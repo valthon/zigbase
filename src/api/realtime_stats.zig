@@ -7,23 +7,23 @@ const conn = @import("../realtime/connection.zig");
 const ApiError = @import("error.zig").ApiError;
 
 pub fn get(ctx: *http.RequestCtx) anyerror!http.Response {
-    const app = ctx.app orelse return ApiError.notFound().toResponse(ctx.allocator);
+    const app = ctx.app orelse return ApiError.notFound().toResponse(ctx.allocator.a);
     var r = try app.pool.acquireReader();
     defer app.pool.releaseReader(&r);
-    const a = (auth.authenticate(app.io, ctx.allocator, app, ctx, &r) catch null) orelse
-        return (ApiError{ .status = 401, .message = "Authentication required." }).toResponse(ctx.allocator);
+    const a = (auth.authenticate(app.io, ctx.allocator.a, app, ctx, &r) catch null) orelse
+        return (ApiError{ .status = 401, .message = "Authentication required." }).toResponse(ctx.allocator.a);
     if (!a.is_superuser)
-        return (ApiError{ .status = 403, .message = "Superuser only." }).toResponse(ctx.allocator);
+        return (ApiError{ .status = 403, .message = "Superuser only." }).toResponse(ctx.allocator.a);
 
     var root: std.json.ObjectMap = .empty;
-    try root.put(ctx.allocator, "connections", .{ .integer = @intCast(conn.connectionCount()) });
-    try root.put(ctx.allocator, "max_connections", .{ .integer = @intCast(conn.MAX_CONNECTIONS) });
-    try root.put(ctx.allocator, "max_subs", .{ .integer = @intCast(conn.MAX_SUBS) });
-    try root.put(ctx.allocator, "outbound_hwm", .{ .integer = @intCast(app.realtime_outbound_hwm) });
+    try root.put(ctx.allocator.a, "connections", .{ .integer = @intCast(conn.connectionCount()) });
+    try root.put(ctx.allocator.a, "max_connections", .{ .integer = @intCast(conn.MAX_CONNECTIONS) });
+    try root.put(ctx.allocator.a, "max_subs", .{ .integer = @intCast(conn.MAX_SUBS) });
+    try root.put(ctx.allocator.a, "outbound_hwm", .{ .integer = @intCast(app.realtime_outbound_hwm) });
     return .{
         .status = 200,
         .content_type = "application/json",
-        .body = try std.json.Stringify.valueAlloc(ctx.allocator, std.json.Value{ .object = root }, .{}),
+        .body = try std.json.Stringify.valueAlloc(ctx.allocator.a, std.json.Value{ .object = root }, .{}),
     };
 }
 

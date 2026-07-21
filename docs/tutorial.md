@@ -260,7 +260,7 @@ const std = @import("std");
 const zigbase = @import("zigbase");
 
 fn confirmBooking(ctx: *zigbase.Ctx) anyerror!zigbase.http.Response {
-    const a = ctx.arena;
+    const a = ctx.arena.a;
     const id = ctx.request.?.param("id") orelse
         return .{ .status = 404, .body = "{\"code\":404,\"message\":\"Not found.\",\"data\":{}}" };
 

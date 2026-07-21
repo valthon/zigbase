@@ -1,4 +1,5 @@
 const std = @import("std");
+const RequestArena = @import("request_arena.zig").RequestArena;
 const http = @import("http.zig");
 
 pub const Route = struct { method: http.Method, pattern: []const u8, handler: http.Handler };
@@ -29,7 +30,7 @@ pub fn matchPath(alloc: std.mem.Allocator, pattern: []const u8, path: []const u8
 pub fn tryDispatch(routes: []const Route, ctx: *http.RequestCtx) anyerror!?http.Response {
     for (routes) |rt| {
         if (rt.method != ctx.method) continue;
-        if (try matchPath(ctx.allocator, rt.pattern, ctx.path)) |params| {
+        if (try matchPath(ctx.allocator.a, rt.pattern, ctx.path)) |params| {
             ctx.params = params;
             return try rt.handler(ctx);
         }
@@ -41,7 +42,7 @@ pub fn tryDispatch(routes: []const Route, ctx: *http.RequestCtx) anyerror!?http.
 /// Returns a 404 envelope when nothing matches.
 pub fn dispatch(routes: []const Route, ctx: *http.RequestCtx) anyerror!http.Response {
     const ApiError = @import("api/error.zig").ApiError;
-    return (try tryDispatch(routes, ctx)) orelse ApiError.notFound().toResponse(ctx.allocator);
+    return (try tryDispatch(routes, ctx)) orelse ApiError.notFound().toResponse(ctx.allocator.a);
 }
 
 fn dummyHandler(ctx: *http.RequestCtx) anyerror!http.Response {
@@ -72,10 +73,10 @@ test "dispatch routes to handler with params, else 404" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const routes = [_]Route{.{ .method = .GET, .pattern = "/api/collections/:idOrName", .handler = dummyHandler }};
-    var ctx = http.RequestCtx{ .method = .GET, .path = "/api/collections/posts", .allocator = arena.allocator() };
+    var ctx = http.RequestCtx{ .method = .GET, .path = "/api/collections/posts", .allocator = RequestArena.from(&arena) };
     const r = try dispatch(&routes, &ctx);
     try std.testing.expectEqualStrings("posts", r.body);
-    var ctx2 = http.RequestCtx{ .method = .GET, .path = "/nope", .allocator = arena.allocator() };
+    var ctx2 = http.RequestCtx{ .method = .GET, .path = "/nope", .allocator = RequestArena.from(&arena) };
     const r2 = try dispatch(&routes, &ctx2);
     try std.testing.expectEqual(@as(u16, 404), r2.status);
 }
@@ -83,10 +84,10 @@ test "tryDispatch returns null when nothing matches, Response when it does" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const routes = [_]Route{.{ .method = .GET, .pattern = "/api/collections/:idOrName", .handler = dummyHandler }};
-    var ctx = http.RequestCtx{ .method = .GET, .path = "/api/collections/posts", .allocator = arena.allocator() };
+    var ctx = http.RequestCtx{ .method = .GET, .path = "/api/collections/posts", .allocator = RequestArena.from(&arena) };
     const hit = try tryDispatch(&routes, &ctx);
     try std.testing.expect(hit != null);
     try std.testing.expectEqualStrings("posts", hit.?.body);
-    var ctx2 = http.RequestCtx{ .method = .GET, .path = "/nope", .allocator = arena.allocator() };
+    var ctx2 = http.RequestCtx{ .method = .GET, .path = "/nope", .allocator = RequestArena.from(&arena) };
     try std.testing.expect((try tryDispatch(&routes, &ctx2)) == null);
 }

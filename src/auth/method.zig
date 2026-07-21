@@ -1,4 +1,5 @@
 const std = @import("std");
+const RequestArena = @import("../request_arena.zig").RequestArena;
 
 pub const InitiateResult = struct { status: u16 = 200, body: ?[]const u8 = null };
 
@@ -56,7 +57,7 @@ pub const AuthCtx = struct {
     const crypto_mod = @import("../crypto.zig");
 
     pub fn findByIdentity(ac: *AuthCtx, conn: *db.Db, identity: []const u8) !?[]const u8 {
-        return api_auth.findByIdentity(ac.ctx.allocator, conn, ac.collection, identity);
+        return api_auth.findByIdentity(ac.ctx.allocator.a, conn, ac.collection, identity);
     }
 
     /// Find-or-create an auth record for `identity` under an already-held writer.
@@ -77,16 +78,16 @@ pub const AuthCtx = struct {
         if (!auto_create) return null;
 
         // 2. Build the minimal auth record data.
-        const tk = try crypto_mod.genToken(ac.app.io, ac.ctx.allocator, 32);
+        const tk = try crypto_mod.genToken(ac.app.io, ac.ctx.allocator.a, 32);
         var data: std.json.ObjectMap = .empty;
         // Set each identity field to the supplied identity (covers both email-only and
         // email+username collections).
         for (ac.collection.options.auth.identityFields) |idf| {
-            try data.put(ac.ctx.allocator, idf, .{ .string = identity });
+            try data.put(ac.ctx.allocator.a, idf, .{ .string = identity });
         }
-        try data.put(ac.ctx.allocator, "passwordHash", .{ .string = "" });
-        try data.put(ac.ctx.allocator, "tokenKey", .{ .string = tk });
-        try data.put(ac.ctx.allocator, "verified", .{ .bool = false });
+        try data.put(ac.ctx.allocator.a, "passwordHash", .{ .string = "" });
+        try data.put(ac.ctx.allocator.a, "tokenKey", .{ .string = tk });
+        try data.put(ac.ctx.allocator.a, "verified", .{ .bool = false });
 
         // 3. Insert. Two create errors are folded into the same enumeration-safe recovery:
         //    - error.Constraint: a UNIQUE collision from a concurrent initiate for the same
@@ -100,7 +101,7 @@ pub const AuthCtx = struct {
         //      since malformed input can never match a real identity).
         //    Any OTHER error propagates unchanged — genuine infra failures must not be masked.
         const rec = records_mod.create(
-            ac.ctx.allocator,
+            ac.ctx.allocator.a,
             ac.app.io,
             conn,
             ac.collection,
@@ -132,7 +133,7 @@ pub const AuthCtx = struct {
     }
 
     pub fn deliverMail(ac: *AuthCtx, to: []const u8, subject: []const u8, body: []const u8) !void {
-        return auth_helpers.deliverAuthMail(ac.app, ac.ctx.allocator, to, subject, body);
+        return auth_helpers.deliverAuthMail(ac.app, ac.ctx.allocator.a, to, subject, body);
     }
 
     pub fn rateLimit(ac: *AuthCtx, scope: []const u8, ident: []const u8) !?http.Response {
@@ -195,7 +196,7 @@ test "AuthCtx helpers: findByIdentity and mintLinkToken delegate correctly" {
     defer env.pool.releaseWriter();
 
     const col = (try collections.get(a, w, "members")).?;
-    var req_ctx = env.ctx(a, .POST, "", &[_]http.Param{});
+    var req_ctx = env.ctx(RequestArena.from(&arena), .POST, "", &[_]http.Param{});
 
     var ac = AuthCtx{
         .app = &env.app,
@@ -240,7 +241,7 @@ test "AuthCtx.resolveOrCreate: unknown identity + auto_create=false returns null
         defer env.pool.releaseWriter();
         break :blk (try collections.get(a, w, "rc_nocreate")).?;
     };
-    var req = env.ctx(a, .POST, "", &[_]http_mod.Param{});
+    var req = env.ctx(RequestArena.from(&arena), .POST, "", &[_]http_mod.Param{});
     var ac = AuthCtx{ .app = &env.app, .ctx = &req, .collection = col, .config = .null };
 
     const w = env.pool.acquireWriter();
@@ -265,7 +266,7 @@ test "AuthCtx.resolveOrCreate: unknown identity + auto_create=true creates recor
         defer env.pool.releaseWriter();
         break :blk (try collections.get(a, w, "rc_create")).?;
     };
-    var req = env.ctx(a, .POST, "", &[_]http_mod.Param{});
+    var req = env.ctx(RequestArena.from(&arena), .POST, "", &[_]http_mod.Param{});
     var ac = AuthCtx{ .app = &env.app, .ctx = &req, .collection = col, .config = .null };
 
     const w = env.pool.acquireWriter();
@@ -297,7 +298,7 @@ test "AuthCtx.resolveOrCreate: known identity + auto_create=true returns existin
         defer env.pool.releaseWriter();
         break :blk (try collections.get(a, w, "rc_existing")).?;
     };
-    var req = env.ctx(a, .POST, "", &[_]http_mod.Param{});
+    var req = env.ctx(RequestArena.from(&arena), .POST, "", &[_]http_mod.Param{});
     var ac = AuthCtx{ .app = &env.app, .ctx = &req, .collection = col, .config = .null };
 
     const w = env.pool.acquireWriter();
@@ -327,7 +328,7 @@ test "AuthCtx.resolveOrCreate: unknown MALFORMED identity + auto_create=true ret
         defer env.pool.releaseWriter();
         break :blk (try collections.get(a, w, "rc_malformed")).?;
     };
-    var req = env.ctx(a, .POST, "", &[_]http_mod.Param{});
+    var req = env.ctx(RequestArena.from(&arena), .POST, "", &[_]http_mod.Param{});
     var ac = AuthCtx{ .app = &env.app, .ctx = &req, .collection = col, .config = .null };
 
     const w = env.pool.acquireWriter();

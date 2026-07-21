@@ -1,4 +1,5 @@
 const std = @import("std");
+const RequestArena = @import("../../request_arena.zig").RequestArena;
 const method_mod = @import("../method.zig");
 const AuthMethod = method_mod.AuthMethod;
 const AuthCtx = method_mod.AuthCtx;
@@ -58,7 +59,7 @@ fn initiateImpl(ctx: *anyopaque, ac: *AuthCtx) anyerror!InitiateResult {
 
     // Parse email from body; on any parse failure return 204 (enumeration-safe)
     const email = blk: {
-        const parsed = std.json.parseFromSlice(std.json.Value, ac.ctx.allocator, ac.ctx.body, .{}) catch
+        const parsed = std.json.parseFromSlice(std.json.Value, ac.ctx.allocator.a, ac.ctx.body, .{}) catch
             return InitiateResult{ .status = 204 };
         if (parsed.value != .object) return InitiateResult{ .status = 204 };
         break :blk strField(parsed.value, "identity") orelse return InitiateResult{ .status = 204 };
@@ -87,12 +88,12 @@ fn initiateImpl(ctx: *anyopaque, ac: *AuthCtx) anyerror!InitiateResult {
         // OTP initiate only needs to know whether a record exists/was-created; discard the id.
         if (try ac.resolveOrCreate(w.conn, email, auto_create)) |_| {
             // Generate a random numeric code of `length` digits (rejection-sampling, no modulo bias)
-            const code = try ac.ctx.allocator.alloc(u8, length);
+            const code = try ac.ctx.allocator.a.alloc(u8, length);
             generateCode(ac.app.io, code);
 
             // Store via ChallengeStore (single-use, TTL'd)
             const store = ChallengeStore{ .conn = w.conn };
-            _ = try store.put(ac.ctx.allocator, ac.app.io, ac.collection.name, "otp", email, code, ttl_s);
+            _ = try store.put(ac.ctx.allocator.a, ac.app.io, ac.collection.name, "otp", email, code, ttl_s);
 
             pending = .{ .email = email, .code = code };
         }
@@ -111,7 +112,7 @@ fn completeImpl(ctx: *anyopaque, ac: *AuthCtx) anyerror!Resolution {
     _ = @as(*OtpMethod, @ptrCast(@alignCast(ctx)));
 
     // Parse {identity, code} from body
-    const parsed = std.json.parseFromSlice(std.json.Value, ac.ctx.allocator, ac.ctx.body, .{}) catch {
+    const parsed = std.json.parseFromSlice(std.json.Value, ac.ctx.allocator.a, ac.ctx.body, .{}) catch {
         return Resolution{ .fail = .{ .status = 400, .message = "identity and code are required." } };
     };
     if (parsed.value != .object) {
@@ -136,7 +137,7 @@ fn completeImpl(ctx: *anyopaque, ac: *AuthCtx) anyerror!Resolution {
     // brute-force enumeration of OTP codes and making exhausted codes untriable after first use.
     const complete_store = ChallengeStore{ .conn = w.conn };
     const stored = (try complete_store.takeByIdentity(
-        ac.ctx.allocator,
+        ac.ctx.allocator.a,
         ac.collection.name,
         "otp",
         email,
@@ -221,7 +222,7 @@ test "OtpMethod: complete with known code resolves to record id" {
         const col = (try collections.get(a, w, "otpmembers")).?;
 
         // Resolve rid for comparison
-        var req_ctx0 = env.ctx(a, .POST, "", &[_]http.Param{});
+        var req_ctx0 = env.ctx(RequestArena.from(&arena), .POST, "", &[_]http.Param{});
         var ac0 = AuthCtx{
             .app = &env.app,
             .ctx = &req_ctx0,
@@ -241,7 +242,7 @@ test "OtpMethod: complete with known code resolves to record id" {
 
     // complete with the correct code → should resolve to the record id
     const body_ok = "{\"identity\":\"u@x.io\",\"code\":\"123456\"}";
-    var req_ok = env.ctx(a, .POST, body_ok, &[_]http.Param{});
+    var req_ok = env.ctx(RequestArena.from(&arena), .POST, body_ok, &[_]http.Param{});
     var ac_ok = AuthCtx{
         .app = &env.app,
         .ctx = &req_ok,
@@ -291,7 +292,7 @@ test "OtpMethod: replay same code returns .fail 400 (single-use)" {
     const body = "{\"identity\":\"u@x.io\",\"code\":\"654321\"}";
 
     // First use: succeeds
-    var req1 = env.ctx(a, .POST, body, &[_]http.Param{});
+    var req1 = env.ctx(RequestArena.from(&arena), .POST, body, &[_]http.Param{});
     var ac1 = AuthCtx{ .app = &env.app, .ctx = &req1, .collection = col, .config = .null };
     const res1 = try am.vtable.complete(am.ctx, &ac1);
     switch (res1) {
@@ -300,7 +301,7 @@ test "OtpMethod: replay same code returns .fail 400 (single-use)" {
     }
 
     // Replay: the code was consumed, must fail
-    var req2 = env.ctx(a, .POST, body, &[_]http.Param{});
+    var req2 = env.ctx(RequestArena.from(&arena), .POST, body, &[_]http.Param{});
     var ac2 = AuthCtx{ .app = &env.app, .ctx = &req2, .collection = col, .config = .null };
     const res2 = try am.vtable.complete(am.ctx, &ac2);
     switch (res2) {
@@ -333,7 +334,7 @@ test "OtpMethod: wrong code returns .fail 400" {
     };
 
     const body = "{\"identity\":\"u@x.io\",\"code\":\"222222\"}";
-    var req = env.ctx(a, .POST, body, &[_]http.Param{});
+    var req = env.ctx(RequestArena.from(&arena), .POST, body, &[_]http.Param{});
     var ac = AuthCtx{ .app = &env.app, .ctx = &req, .collection = col, .config = .null };
 
     var m = try OtpMethod.create(std.testing.allocator, std.testing.io, .{});
@@ -365,7 +366,7 @@ test "OtpMethod: initiate with known email returns 204" {
         break :blk (try collections.get(a, w, "otpmembers4")).?;
     };
 
-    var req = env.ctx(a, .POST, "{\"identity\":\"u@x.io\"}", &[_]http.Param{});
+    var req = env.ctx(RequestArena.from(&arena), .POST, "{\"identity\":\"u@x.io\"}", &[_]http.Param{});
     var ac = AuthCtx{ .app = &env.app, .ctx = &req, .collection = col, .config = .null };
 
     var m = try OtpMethod.create(std.testing.allocator, std.testing.io, .{});
@@ -391,7 +392,7 @@ test "OtpMethod: initiate with unknown email returns 204 (enumeration-safe)" {
         break :blk (try collections.get(a, w, "otpmembers5")).?;
     };
 
-    var req = env.ctx(a, .POST, "{\"identity\":\"nobody@x.io\"}", &[_]http.Param{});
+    var req = env.ctx(RequestArena.from(&arena), .POST, "{\"identity\":\"nobody@x.io\"}", &[_]http.Param{});
     var ac = AuthCtx{ .app = &env.app, .ctx = &req, .collection = col, .config = .null };
 
     var m = try OtpMethod.create(std.testing.allocator, std.testing.io, .{});
@@ -417,7 +418,7 @@ test "OtpMethod: initiate with unparseable body returns 204 (enumeration-safe)" 
         break :blk (try collections.get(a, w, "otpmembers6")).?;
     };
 
-    var req = env.ctx(a, .POST, "not json at all", &[_]http.Param{});
+    var req = env.ctx(RequestArena.from(&arena), .POST, "not json at all", &[_]http.Param{});
     var ac = AuthCtx{ .app = &env.app, .ctx = &req, .collection = col, .config = .null };
 
     var m = try OtpMethod.create(std.testing.allocator, std.testing.io, .{});
@@ -447,7 +448,7 @@ test "OtpMethod: complete with missing fields returns .fail 400" {
     const am = m.method();
 
     // Missing code
-    var req1 = env.ctx(a, .POST, "{\"identity\":\"u@x.io\"}", &[_]http.Param{});
+    var req1 = env.ctx(RequestArena.from(&arena), .POST, "{\"identity\":\"u@x.io\"}", &[_]http.Param{});
     var ac1 = AuthCtx{ .app = &env.app, .ctx = &req1, .collection = col, .config = .null };
     const res1 = try am.vtable.complete(am.ctx, &ac1);
     switch (res1) {
@@ -459,7 +460,7 @@ test "OtpMethod: complete with missing fields returns .fail 400" {
     }
 
     // Missing email
-    var req2 = env.ctx(a, .POST, "{\"code\":\"123456\"}", &[_]http.Param{});
+    var req2 = env.ctx(RequestArena.from(&arena), .POST, "{\"code\":\"123456\"}", &[_]http.Param{});
     var ac2 = AuthCtx{ .app = &env.app, .ctx = &req2, .collection = col, .config = .null };
     const res2 = try am.vtable.complete(am.ctx, &ac2);
     switch (res2) {
@@ -534,7 +535,7 @@ test "OtpMethod: initiate auto_create=true creates record for unknown identity" 
         break :blk (try collections.get(a, w, "otp_ac")).?;
     };
 
-    var req = env.ctx(a, .POST, "{\"identity\":\"brand_new@x.io\"}", &[_]http_mod.Param{});
+    var req = env.ctx(RequestArena.from(&arena), .POST, "{\"identity\":\"brand_new@x.io\"}", &[_]http_mod.Param{});
     var ac = AuthCtx{ .app = &env.app, .ctx = &req, .collection = col, .config = .null };
 
     var m = try OtpMethod.create(std.testing.allocator, std.testing.io, .{});
@@ -546,7 +547,7 @@ test "OtpMethod: initiate auto_create=true creates record for unknown identity" 
     const w2 = env.pool.acquireWriter();
     defer env.pool.releaseWriter();
     const col2 = (try collections.get(a, w2, "otp_ac")).?;
-    var req2 = env.ctx(a, .POST, "", &[_]http_mod.Param{});
+    var req2 = env.ctx(RequestArena.from(&arena), .POST, "", &[_]http_mod.Param{});
     var ac2 = AuthCtx{ .app = &env.app, .ctx = &req2, .collection = col2, .config = .null };
     const rid = try ac2.findByIdentity(w2, "brand_new@x.io");
     try std.testing.expect(rid != null);
@@ -588,7 +589,7 @@ test "OtpMethod: initiate auto_create=false creates nothing for unknown identity
         break :blk (try collections.get(a, w, "otp_noac")).?;
     };
 
-    var req = env.ctx(a, .POST, "{\"identity\":\"ghost@x.io\"}", &[_]http_mod.Param{});
+    var req = env.ctx(RequestArena.from(&arena), .POST, "{\"identity\":\"ghost@x.io\"}", &[_]http_mod.Param{});
     var ac = AuthCtx{ .app = &env.app, .ctx = &req, .collection = col, .config = .null };
 
     var m = try OtpMethod.create(std.testing.allocator, std.testing.io, .{});
@@ -600,7 +601,7 @@ test "OtpMethod: initiate auto_create=false creates nothing for unknown identity
     const w2 = env.pool.acquireWriter();
     defer env.pool.releaseWriter();
     const col2 = (try collections.get(a, w2, "otp_noac")).?;
-    var req2 = env.ctx(a, .POST, "", &[_]http_mod.Param{});
+    var req2 = env.ctx(RequestArena.from(&arena), .POST, "", &[_]http_mod.Param{});
     var ac2 = AuthCtx{ .app = &env.app, .ctx = &req2, .collection = col2, .config = .null };
     const rid = try ac2.findByIdentity(w2, "ghost@x.io");
     try std.testing.expectEqual(@as(?[]const u8, null), rid);
@@ -643,7 +644,7 @@ test "OtpMethod: auto_create initiate then complete succeeds end-to-end" {
     };
 
     // initiate creates record + stores a code (unknown to us — consume and replace)
-    var req_init = env.ctx(a, .POST, "{\"identity\":\"fresh@x.io\"}", &[_]http_mod.Param{});
+    var req_init = env.ctx(RequestArena.from(&arena), .POST, "{\"identity\":\"fresh@x.io\"}", &[_]http_mod.Param{});
     var ac_init = AuthCtx{ .app = &env.app, .ctx = &req_init, .collection = col, .config = .null };
     var m = try OtpMethod.create(std.testing.allocator, std.testing.io, .{});
     const am = m.method();
@@ -664,7 +665,7 @@ test "OtpMethod: auto_create initiate then complete succeeds end-to-end" {
         break :blk (try collections.get(a, w, "otp_e2e")).?;
     };
     const body = "{\"identity\":\"fresh@x.io\",\"code\":\"999999\"}";
-    var req_comp = env.ctx(a, .POST, body, &[_]http_mod.Param{});
+    var req_comp = env.ctx(RequestArena.from(&arena), .POST, body, &[_]http_mod.Param{});
     var ac_comp = AuthCtx{ .app = &env.app, .ctx = &req_comp, .collection = col2, .config = .null };
     const res = try am.vtable.complete(am.ctx, &ac_comp);
     switch (res) {

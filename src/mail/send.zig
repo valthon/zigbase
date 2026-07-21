@@ -219,9 +219,9 @@ pub fn send(app: *App, alloc: std.mem.Allocator, msg: MailMessage) !void {
 /// A malformed payload or a delivery failure is returned so the queue's retry/terminal
 /// policy applies (durable) or the in-process retry runs (memory).
 pub fn jobHandler(ctx: *Ctx, payload: []const u8) anyerror!void {
-    const parsed = try std.json.parseFromSlice(MailMessage, ctx.arena, payload, .{ .ignore_unknown_fields = true });
+    const parsed = try std.json.parseFromSlice(MailMessage, ctx.arena.a, payload, .{ .ignore_unknown_fields = true });
     // `parsed` borrows the ctx arena; no explicit deinit needed (arena owns it).
-    try send(ctx.app, ctx.arena, parsed.value);
+    try send(ctx.app, ctx.arena.a, parsed.value);
 }
 
 // ---------------------------------------------------------------------------

@@ -1,4 +1,5 @@
 const std = @import("std");
+const RequestArena = @import("request_arena.zig").RequestArena;
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 const static_files = @import("static_files.zig");
@@ -1662,7 +1663,7 @@ fn ttlGcJob(ctx: *@import("ctx.zig").Ctx, ev: *events.JobEvent) anyerror!void {
     _ = ev;
     const w = ctx.app.pool.acquireWriter();
     defer ctx.app.pool.releaseWriter();
-    _ = try @import("records.zig").gcExpiredRecords(ctx.arena, w);
+    _ = try @import("records.zig").gcExpiredRecords(ctx.arena.a, w);
 }
 
 /// The framework-internal `_session_gc` job handler (#114): acquires the writer and reaps
@@ -1735,7 +1736,7 @@ fn analyticsRollupRun(ctx: *ctx_mod.Ctx, ev: *events.JobEvent) anyerror!void {
     const spec = reg.byName(name) orelse return;
     const w = ctx.app.pool.acquireWriter();
     defer ctx.app.pool.releaseWriter();
-    try analytics.runRollup(w, ctx.arena, spec);
+    try analytics.runRollup(w, ctx.arena.a, spec);
 }
 
 /// Comptime knobs threaded from `App(cfg)` into the serve path: which storage /
@@ -3350,7 +3351,7 @@ fn bootApp(
         var ev = events.LifecycleEvent{ .app = app };
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
-        var cx = Ctx{ .app = app, .arena = arena.allocator(), .rctx = .{}, .request = null, .bound_conn = null };
+        var cx = Ctx{ .app = app, .arena = RequestArena.from(&arena), .rctx = .{}, .request = null, .bound_conn = null };
         defer cx.deinit();
         h(&cx, &ev) catch |e| {
             std.log.err("refusing to start: onBootstrap hook failed: {s}", .{@errorName(e)});
@@ -3403,7 +3404,7 @@ fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg_in: config.Config, di
         var ev = events.LifecycleEvent{ .app = app };
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
-        var cx = Ctx{ .app = app, .arena = arena.allocator(), .rctx = .{}, .request = null, .bound_conn = null };
+        var cx = Ctx{ .app = app, .arena = RequestArena.from(&arena), .rctx = .{}, .request = null, .bound_conn = null };
         defer cx.deinit();
         h(&cx, &ev) catch |e| {
             std.log.err("refusing to start: onBeforeServe hook failed: {s}", .{@errorName(e)});
@@ -3417,7 +3418,7 @@ fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg_in: config.Config, di
         var ev = events.LifecycleEvent{ .app = app };
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
-        var cx = Ctx{ .app = app, .arena = arena.allocator(), .rctx = .{}, .request = null, .bound_conn = null };
+        var cx = Ctx{ .app = app, .arena = RequestArena.from(&arena), .rctx = .{}, .request = null, .bound_conn = null };
         defer cx.deinit();
         h(&cx, &ev) catch |e| std.log.err("onBeforeTerminate hook failed: {s}", .{@errorName(e)});
     };

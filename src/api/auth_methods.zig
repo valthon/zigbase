@@ -9,6 +9,7 @@
 /// `.otp`, `.webauthn`, `.oauth2`, or `.custom` for unknown slugs). `initiate`
 /// returns whatever the method produced (typically a challenge or 200 OK).
 const std = @import("std");
+const RequestArena = @import("../request_arena.zig").RequestArena;
 const http = @import("../http.zig");
 const db = @import("../db.zig");
 const collections = @import("../collections.zig");
@@ -45,7 +46,7 @@ fn methodEnabled(col: schema.Collection, slug: []const u8) bool {
 /// Extract the `identity` or `email` field from the request body for rate-limit
 /// keying. Returns "" when not parseable or field absent.
 fn identityFromBody(ctx: *http.RequestCtx) []const u8 {
-    const parsed = std.json.parseFromSlice(std.json.Value, ctx.allocator, ctx.body, .{}) catch return "";
+    const parsed = std.json.parseFromSlice(std.json.Value, ctx.allocator.a, ctx.body, .{}) catch return "";
     if (parsed.value != .object) return "";
     const obj = parsed.value.object;
     inline for (.{ "identity", "email" }) |key| {
@@ -76,30 +77,30 @@ const DispatchPhase = enum { initiate, complete };
 
 /// Shared dispatch logic for both initiate and complete.
 fn dispatch(ctx: *http.RequestCtx, phase: DispatchPhase) anyerror!http.Response {
-    const app = ctx.app orelse return (ApiError.internal()).toResponse(ctx.allocator);
+    const app = ctx.app orelse return (ApiError.internal()).toResponse(ctx.allocator.a);
 
     // 1. Load collection under a BRIEF reader. We do NOT hold any connection
     //    across the method call — each method acquires its own (a reader for
     //    read-only work, the writer only when it must persist), so OAuth can
     //    release the writer during its HTTP exchange and password verifies
     //    argon2 under a reader.
-    const col_name = ctx.param("col") orelse return (ApiError.notFound()).toResponse(ctx.allocator);
+    const col_name = ctx.param("col") orelse return (ApiError.notFound()).toResponse(ctx.allocator.a);
     const col = blk: {
-        var r = app.pool.acquireReader() catch return (ApiError.internal()).toResponse(ctx.allocator);
+        var r = app.pool.acquireReader() catch return (ApiError.internal()).toResponse(ctx.allocator.a);
         defer app.pool.releaseReader(&r);
-        break :blk (try collections.get(ctx.allocator, &r, col_name)) orelse
-            return (ApiError.notFound()).toResponse(ctx.allocator);
+        break :blk (try collections.get(ctx.allocator.a, &r, col_name)) orelse
+            return (ApiError.notFound()).toResponse(ctx.allocator.a);
     };
-    if (col.type != .auth) return (ApiError.notFound()).toResponse(ctx.allocator);
+    if (col.type != .auth) return (ApiError.notFound()).toResponse(ctx.allocator.a);
 
     // 2. Method enablement check.
-    const slug = ctx.param("method") orelse return (ApiError.notFound()).toResponse(ctx.allocator);
-    if (!methodEnabled(col, slug)) return (ApiError.notFound()).toResponse(ctx.allocator);
+    const slug = ctx.param("method") orelse return (ApiError.notFound()).toResponse(ctx.allocator.a);
+    if (!methodEnabled(col, slug)) return (ApiError.notFound()).toResponse(ctx.allocator.a);
 
     // 3. Resolve from registry.
-    const reg_ptr = app.auth_methods orelse return (ApiError.notFound()).toResponse(ctx.allocator);
+    const reg_ptr = app.auth_methods orelse return (ApiError.notFound()).toResponse(ctx.allocator.a);
     const reg = @as(*const registry_mod.Registry, @ptrCast(@alignCast(reg_ptr)));
-    const am = reg.get(slug) orelse return (ApiError.notFound()).toResponse(ctx.allocator);
+    const am = reg.get(slug) orelse return (ApiError.notFound()).toResponse(ctx.allocator.a);
 
     // 4. Rate-limit.
     const rl_opt = rateLimitOptFor(col, slug);
@@ -109,7 +110,7 @@ fn dispatch(ctx: *http.RequestCtx, phase: DispatchPhase) anyerror!http.Response 
             // Unconfigured method: keep the prior behavior — the global/default
             // limiter keyed by method slug (collection-agnostic, as before).
             const ident = identityFromBody(ctx);
-            const scope = try std.fmt.allocPrint(ctx.allocator, "auth:{s}", .{slug});
+            const scope = try std.fmt.allocPrint(ctx.allocator.a, "auth:{s}", .{slug});
             if (try auth.rateLimited(ctx, scope, ident)) |resp| return resp;
         },
         .custom => |c| {
@@ -117,7 +118,7 @@ fn dispatch(ctx: *http.RequestCtx, phase: DispatchPhase) anyerror!http.Response 
             // slug (so different methods/collections never share a budget), honoring
             // this method's configured max/window_s instead of the global default.
             const ident = identityFromBody(ctx);
-            const scope = try std.fmt.allocPrint(ctx.allocator, "authm:{s}:{s}", .{ col.name, slug });
+            const scope = try std.fmt.allocPrint(ctx.allocator.a, "authm:{s}:{s}", .{ col.name, slug });
             if (try auth.rateLimitedCustom(ctx, scope, ident, c.max, c.window_s)) |resp| return resp;
         },
     }
@@ -147,7 +148,7 @@ fn dispatch(ctx: *http.RequestCtx, phase: DispatchPhase) anyerror!http.Response 
             // 7b. Map Resolution.
             switch (resolution) {
                 .fail => |f| {
-                    return (ApiError{ .status = f.status, .message = f.message }).toResponse(ctx.allocator);
+                    return (ApiError{ .status = f.status, .message = f.message }).toResponse(ctx.allocator.a);
                 },
                 .record => |rid| {
                     const auth_tag: events.AuthMethod = if (std.mem.eql(u8, slug, "password"))
@@ -169,12 +170,12 @@ fn dispatch(ctx: *http.RequestCtx, phase: DispatchPhase) anyerror!http.Response 
                     defer app.pool.releaseWriter();
                     // Fetch the record once: it feeds the verification gate, the
                     // beforeAuthSuccess hook, and session issuance (no redundant reads).
-                    const rec = (try records.get(ctx.allocator, w, col, rid)) orelse
-                        return (ApiError.notFound()).toResponse(ctx.allocator);
+                    const rec = (try records.get(ctx.allocator.a, w, col, rid)) orelse
+                        return (ApiError.notFound()).toResponse(ctx.allocator.a);
                     // Optional verification gate: refuse to mint a session for a record
                     // whose `verified` field is not true (when the collection requires it).
                     if (col.options.auth.require_verified and !auth.recordVerified(rec))
-                        return (ApiError{ .status = 403, .message = "Email not verified." }).toResponse(ctx.allocator);
+                        return (ApiError{ .status = 403, .message = "Email not verified." }).toResponse(ctx.allocator.a);
 
                     // Transactional login: the beforeAuthSuccess hook's side-writes commit
                     // atomically with session issuance; an aborting hook rolls everything
@@ -201,9 +202,9 @@ fn dispatch(ctx: *http.RequestCtx, phase: DispatchPhase) anyerror!http.Response 
                     // onAuth fires only AFTER a durable commit (session truly issued).
                     auth.emitAuth(ctx, col.name, rec, auth_tag);
                     var root: std.json.ObjectMap = .empty;
-                    try root.put(ctx.allocator, "token", .{ .string = issued.token });
-                    const cookies = try ctx.allocator.dupe(http.Cookie, &issued.cookies);
-                    const body = try std.json.Stringify.valueAlloc(ctx.allocator, std.json.Value{ .object = root }, .{});
+                    try root.put(ctx.allocator.a, "token", .{ .string = issued.token });
+                    const cookies = try ctx.allocator.a.dupe(http.Cookie, &issued.cookies);
+                    const body = try std.json.Stringify.valueAlloc(ctx.allocator.a, std.json.Value{ .object = root }, .{});
                     return http.Response{ .status = 200, .body = body, .cookies = cookies };
                 },
             }
@@ -261,7 +262,7 @@ test "auth-method dispatch: password complete succeeds + 2 cookies + onAuth fire
         .{ .key = "col", .value = "users" },
         .{ .key = "method", .value = "password" },
     };
-    var ctx_ok = env.ctx(a, .POST, "{\"identity\":\"u@x.io\",\"password\":\"longenough\"}", &params_ok);
+    var ctx_ok = env.ctx(RequestArena.from(&arena), .POST, "{\"identity\":\"u@x.io\",\"password\":\"longenough\"}", &params_ok);
     const res = try complete(&ctx_ok);
 
     try std.testing.expectEqual(@as(u16, 200), res.status);
@@ -338,7 +339,7 @@ test "#80 beforeAuthSuccess fires on complete with a writable, committing ctx" {
             method = ev.method;
             rid = ev.record_id;
             var o: std.json.ObjectMap = .empty;
-            try o.put(ctx.arena, "title", .{ .string = "claimed" });
+            try o.put(ctx.arena.a, "title", .{ .string = "claimed" });
             _ = try ctx.records().create("posts", .{ .object = o });
         }
     };
@@ -350,7 +351,7 @@ test "#80 beforeAuthSuccess fires on complete with a writable, committing ctx" {
         .{ .key = "col", .value = "users80a" },
         .{ .key = "method", .value = "password" },
     };
-    var ctx = env.ctx(a, .POST, "{\"identity\":\"u@x.io\",\"password\":\"longenough\"}", &params);
+    var ctx = env.ctx(RequestArena.from(&arena), .POST, "{\"identity\":\"u@x.io\",\"password\":\"longenough\"}", &params);
     const res = try complete(&ctx);
 
     try std.testing.expectEqual(@as(u16, 200), res.status);
@@ -384,7 +385,7 @@ test "#80 aborting beforeAuthSuccess blocks the session AND rolls back its side-
         fn writeThenAbort(ctx: *Ctx, ev: *events.AuthSuccessEvent) anyerror!void {
             _ = ev;
             var o: std.json.ObjectMap = .empty;
-            try o.put(ctx.arena, "title", .{ .string = "should-roll-back" });
+            try o.put(ctx.arena.a, "title", .{ .string = "should-roll-back" });
             _ = try ctx.records().create("posts", .{ .object = o });
             return ctx.fail(403, "not allowed");
         }
@@ -396,7 +397,7 @@ test "#80 aborting beforeAuthSuccess blocks the session AND rolls back its side-
         .{ .key = "col", .value = "users80b" },
         .{ .key = "method", .value = "password" },
     };
-    var ctx = env.ctx(a, .POST, "{\"identity\":\"u@x.io\",\"password\":\"longenough\"}", &params);
+    var ctx = env.ctx(RequestArena.from(&arena), .POST, "{\"identity\":\"u@x.io\",\"password\":\"longenough\"}", &params);
     const res = try complete(&ctx);
 
     // Fail closed: the hook's chosen status, no session cookies.
@@ -414,7 +415,6 @@ test "auth-method dispatch: unknown method slug returns 404" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const a = arena.allocator();
 
     const types = comptime registry_mod.assembleTypes(.{});
     var insts: registry_mod.Instances(types) = undefined;
@@ -427,7 +427,7 @@ test "auth-method dispatch: unknown method slug returns 404" {
         .{ .key = "col", .value = "users2" },
         .{ .key = "method", .value = "nope" },
     };
-    var ctx_nope = env.ctx(a, .POST, "{}", &params_nope);
+    var ctx_nope = env.ctx(RequestArena.from(&arena), .POST, "{}", &params_nope);
     const res = try complete(&ctx_nope);
     try std.testing.expectEqual(@as(u16, 404), res.status);
 }
@@ -473,7 +473,7 @@ test "auth-method dispatch: non-auth collection returns 404" {
         .{ .key = "col", .value = "posts" },
         .{ .key = "method", .value = "password" },
     };
-    var ctx_base = env.ctx(a, .POST, "{}", &params);
+    var ctx_base = env.ctx(RequestArena.from(&arena), .POST, "{}", &params);
     const res = try complete(&ctx_base);
     try std.testing.expectEqual(@as(u16, 404), res.status);
 }
@@ -486,7 +486,6 @@ test "auth-method dispatch: initiate returns 200 body for password" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const a = arena.allocator();
 
     const types = comptime registry_mod.assembleTypes(.{});
     var insts: registry_mod.Instances(types) = undefined;
@@ -499,7 +498,7 @@ test "auth-method dispatch: initiate returns 200 body for password" {
         .{ .key = "col", .value = "users4" },
         .{ .key = "method", .value = "password" },
     };
-    var ctx_init = env.ctx(a, .POST, "{}", &params);
+    var ctx_init = env.ctx(RequestArena.from(&arena), .POST, "{}", &params);
     const res = try initiate(&ctx_init);
     try std.testing.expectEqual(@as(u16, 200), res.status);
 }
@@ -527,7 +526,7 @@ test "auth-method dispatch: wrong password returns 400" {
         .{ .key = "col", .value = "users5" },
         .{ .key = "method", .value = "password" },
     };
-    var ctx_bad = env.ctx(a, .POST, "{\"identity\":\"u@x.io\",\"password\":\"wrongpass\"}", &params);
+    var ctx_bad = env.ctx(RequestArena.from(&arena), .POST, "{\"identity\":\"u@x.io\",\"password\":\"wrongpass\"}", &params);
     const res = try complete(&ctx_bad);
     try std.testing.expectEqual(@as(u16, 400), res.status);
 }
@@ -666,12 +665,12 @@ test "per-method rate limit: custom max rejects after the budget within the wind
     // No such user => method returns 400; the rate-limit gate runs BEFORE the method.
     const body = "{\"identity\":\"nobody@x.io\",\"password\":\"whatever123\"}";
 
-    var c1 = env.ctx(a, .POST, body, &params);
+    var c1 = env.ctx(RequestArena.from(&arena), .POST, body, &params);
     try std.testing.expectEqual(@as(u16, 400), (try complete(&c1)).status);
-    var c2 = env.ctx(a, .POST, body, &params);
+    var c2 = env.ctx(RequestArena.from(&arena), .POST, body, &params);
     try std.testing.expectEqual(@as(u16, 400), (try complete(&c2)).status);
     // 3rd attempt within the window exceeds max=2 => 429.
-    var c3 = env.ctx(a, .POST, body, &params);
+    var c3 = env.ctx(RequestArena.from(&arena), .POST, body, &params);
     try std.testing.expectEqual(@as(u16, 429), (try complete(&c3)).status);
 }
 
@@ -708,13 +707,13 @@ test "per-method rate limit: different collections do not share a bucket" {
     };
 
     // Exhaust collection A's budget (max=1): 1st OK-ish (400), 2nd => 429.
-    var a1 = env.ctx(a, .POST, body, &params_a);
+    var a1 = env.ctx(RequestArena.from(&arena), .POST, body, &params_a);
     try std.testing.expectEqual(@as(u16, 400), (try complete(&a1)).status);
-    var a2 = env.ctx(a, .POST, body, &params_a);
+    var a2 = env.ctx(RequestArena.from(&arena), .POST, body, &params_a);
     try std.testing.expectEqual(@as(u16, 429), (try complete(&a2)).status);
 
     // Collection B has its own bucket: its first attempt must NOT be rate limited.
-    var b1 = env.ctx(a, .POST, body, &params_b);
+    var b1 = env.ctx(RequestArena.from(&arena), .POST, body, &params_b);
     try std.testing.expectEqual(@as(u16, 400), (try complete(&b1)).status);
 }
 
@@ -725,7 +724,6 @@ test "unconfigured method uses the global/default limiter (no regression)" {
     defer env.deinit();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const a = arena.allocator();
 
     const types = comptime registry_mod.assembleTypes(.{});
     var insts: registry_mod.Instances(types) = undefined;
@@ -745,11 +743,11 @@ test "unconfigured method uses the global/default limiter (no regression)" {
     };
     const body = "{\"identity\":\"nobody@x.io\",\"password\":\"whatever123\"}";
 
-    var d1 = env.ctx(a, .POST, body, &params);
+    var d1 = env.ctx(RequestArena.from(&arena), .POST, body, &params);
     try std.testing.expectEqual(@as(u16, 400), (try complete(&d1)).status);
-    var d2 = env.ctx(a, .POST, body, &params);
+    var d2 = env.ctx(RequestArena.from(&arena), .POST, body, &params);
     try std.testing.expectEqual(@as(u16, 400), (try complete(&d2)).status);
     // 3rd exceeds the GLOBAL max=2 (proves the default path still routes through it).
-    var d3 = env.ctx(a, .POST, body, &params);
+    var d3 = env.ctx(RequestArena.from(&arena), .POST, body, &params);
     try std.testing.expectEqual(@as(u16, 429), (try complete(&d3)).status);
 }

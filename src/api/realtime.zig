@@ -12,11 +12,11 @@ const ApiError = @import("error.zig").ApiError;
 const sse = @import("../realtime/sse.zig");
 
 pub fn sseUplink(ctx: *http.RequestCtx) anyerror!http.Response {
-    const cid = ctx.param("clientId") orelse return ApiError.notFound().toResponse(ctx.allocator);
-    const sc = sse.pin(cid) orelse return ApiError.notFound().toResponse(ctx.allocator);
+    const cid = ctx.param("clientId") orelse return ApiError.notFound().toResponse(ctx.allocator.a);
+    const sc = sse.pin(cid) orelse return ApiError.notFound().toResponse(ctx.allocator.a);
     defer sse.unref(sc);
     const reply = (try sse.handleUplink(sc, ctx.allocator, ctx.body)) orelse
-        return ApiError.notFound().toResponse(ctx.allocator); // just-closed == unknown (non-oracle)
+        return ApiError.notFound().toResponse(ctx.allocator.a); // just-closed == unknown (non-oracle)
     return .{ .status = reply.status, .content_type = "application/json", .body = reply.frame };
 }
 

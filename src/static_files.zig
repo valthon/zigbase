@@ -4,6 +4,7 @@
 //! here (server.zig). Sources: a filesystem dir (streamed via Response.file
 //! -> zap sendFile) or a build-generated embedded manifest (comptime bytes).
 const std = @import("std");
+const RequestArena = @import("request_arena.zig").RequestArena;
 const http = @import("http.zig");
 const mime = @import("files/mime.zig");
 const serve_file = @import("files/serve_file.zig");
@@ -196,13 +197,13 @@ fn serveEmbedded(ctx: *http.RequestCtx, files: []const StaticFile, rel: []const 
     const hit = blk: {
         if (rel.len == 0) break :blk findEmbedded(files, "index.html");
         if (findEmbedded(files, rel)) |f| break :blk f;
-        const idx = try std.fmt.allocPrint(ctx.allocator, "{s}/index.html", .{rel});
+        const idx = try std.fmt.allocPrint(ctx.allocator.a, "{s}/index.html", .{rel});
         break :blk findEmbedded(files, idx);
     } orelse return null;
     const content_type = mime.fromExtension(hit.path);
     // §A.4: reuse the §B planner over the embedded bytes. ETag format unchanged
     // (build-time CRC32, quoted) — revalidation and the Playwright assertions hold.
-    const p = try serve_file.plan(ctx.allocator, .{
+    const p = try serve_file.plan(ctx.allocator.a, .{
         .size = hit.bytes.len,
         .etag = hit.etag,
         .range = ctx.header("range") orelse "",
@@ -211,20 +212,20 @@ fn serveEmbedded(ctx: *http.RequestCtx, files: []const StaticFile, rel: []const 
         .head = ctx.method == .HEAD,
     });
     var hs: std.ArrayList(http.Header) = .empty;
-    try hs.appendSlice(ctx.allocator, &.{
+    try hs.appendSlice(ctx.allocator.a, &.{
         .{ .name = "ETag", .value = hit.etag },
         nosniff,
         .{ .name = "Cache-Control", .value = cache_control },
     });
-    if (p.status == 304) return notModified(content_type, try hs.toOwnedSlice(ctx.allocator));
-    try hs.append(ctx.allocator, .{ .name = "Accept-Ranges", .value = "bytes" });
-    if (p.content_range) |cr| try hs.append(ctx.allocator, .{ .name = "Content-Range", .value = cr });
-    if (p.status == 416) return .{ .status = 416, .body = "", .content_type = content_type, .extra_headers = try hs.toOwnedSlice(ctx.allocator) };
+    if (p.status == 304) return notModified(content_type, try hs.toOwnedSlice(ctx.allocator.a));
+    try hs.append(ctx.allocator.a, .{ .name = "Accept-Ranges", .value = "bytes" });
+    if (p.content_range) |cr| try hs.append(ctx.allocator.a, .{ .name = "Content-Range", .value = cr });
+    if (p.status == 416) return .{ .status = 416, .body = "", .content_type = content_type, .extra_headers = try hs.toOwnedSlice(ctx.allocator.a) };
     return .{
         .status = p.status,
         .body = hit.bytes[@intCast(p.offset)..@intCast(p.offset + p.len)],
         .content_type = content_type,
-        .extra_headers = try hs.toOwnedSlice(ctx.allocator),
+        .extra_headers = try hs.toOwnedSlice(ctx.allocator.a),
     };
 }
 
@@ -518,10 +519,10 @@ pub fn validateRouteTargetsDir(io: std.Io, alloc: std.mem.Allocator, root: []con
 
 fn serveDir(io: std.Io, ctx: *http.RequestCtx, root: []const u8, rel: []const u8) !?http.Response {
     const first = if (rel.len == 0) "index.html" else rel;
-    var full = try std.fmt.allocPrint(ctx.allocator, "{s}/{s}", .{ root, first });
+    var full = try std.fmt.allocPrint(ctx.allocator.a, "{s}/{s}", .{ root, first });
     var st = std.Io.Dir.cwd().statFile(io, full, .{}) catch return null;
     if (st.kind == .directory) {
-        full = try std.fmt.allocPrint(ctx.allocator, "{s}/index.html", .{full});
+        full = try std.fmt.allocPrint(ctx.allocator.a, "{s}/index.html", .{full});
         st = std.Io.Dir.cwd().statFile(io, full, .{}) catch return null;
     }
     if (st.kind != .file) return null;
@@ -529,8 +530,8 @@ fn serveDir(io: std.Io, ctx: *http.RequestCtx, root: []const u8, rel: []const u8
     // the root can still point outside it (statFile follows symlinks). Canonicalize the
     // matched file AND the root, and refuse to serve anything whose real path escapes the
     // real root. realPathFile resolves every symlinked component; a miss/escape => 404.
-    const real_root = std.Io.Dir.cwd().realPathFileAlloc(io, root, ctx.allocator) catch return null;
-    const real_full = std.Io.Dir.cwd().realPathFileAlloc(io, full, ctx.allocator) catch return null;
+    const real_root = std.Io.Dir.cwd().realPathFileAlloc(io, root, ctx.allocator.a) catch return null;
+    const real_full = std.Io.Dir.cwd().realPathFileAlloc(io, full, ctx.allocator.a) catch return null;
     if (!withinRoot(real_root, real_full)) return null;
     // §A.2 shim: normalize the Range header against the size of the file facil.io
     // WILL serve — mirroring its .gz sidecar probe (http.c:449-470: Accept-Encoding
@@ -560,13 +561,13 @@ fn serveDir(io: std.Io, ctx: *http.RequestCtx, root: []const u8, rel: []const u8
         var size = st.size;
         if (ctx.header("accept-encoding")) |ae| {
             if (std.mem.indexOf(u8, ae, "gzip") != null and !std.mem.endsWith(u8, full, ".gz")) {
-                const gz = try std.fmt.allocPrint(ctx.allocator, "{s}.gz", .{full});
+                const gz = try std.fmt.allocPrint(ctx.allocator.a, "{s}.gz", .{full});
                 if (std.Io.Dir.cwd().statFile(io, gz, .{})) |gst| {
                     if (gst.kind == .file) size = gst.size; // one extra stat, worst case
                 } else |_| {}
             }
         }
-        if (try normalizeRange(ctx.allocator, raw_range, size)) |norm| switch (norm) {
+        if (try normalizeRange(ctx.allocator.a, raw_range, size)) |norm| switch (norm) {
             .rewrite => |v| ctx.setRequestHeader("range", v),
             // If-Range originally ABSENT: facil.io is guaranteed to process the range, so
             // answer the unsatisfiable form with the owned 416 it cannot emit itself. If
@@ -575,8 +576,8 @@ fn serveDir(io: std.Io, ctx: *http.RequestCtx, root: []const u8, rel: []const u8
             // corner already yields a non-206 there — see the note above).
             .unsatisfiable => if (!had_if_range) {
                 // Tiny owned response — the one static status facil.io cannot emit.
-                const hs416 = try ctx.allocator.dupe(http.Header, &.{
-                    .{ .name = "Content-Range", .value = try std.fmt.allocPrint(ctx.allocator, "bytes */{d}", .{size}) },
+                const hs416 = try ctx.allocator.a.dupe(http.Header, &.{
+                    .{ .name = "Content-Range", .value = try std.fmt.allocPrint(ctx.allocator.a, "bytes */{d}", .{size}) },
                     nosniff,
                 });
                 return .{ .status = 416, .body = "", .content_type = mime.fromExtension(full), .extra_headers = hs416 };
@@ -591,7 +592,7 @@ fn serveDir(io: std.Io, ctx: *http.RequestCtx, root: []const u8, rel: []const u8
     // facil.io never sets Vary itself, so a shared cache in front of dir mode must be
     // told the body (and this shim's own size-driven Range math) depends on
     // Accept-Encoding — no duplicate header is possible.
-    const hs = try ctx.allocator.alloc(http.Header, 2);
+    const hs = try ctx.allocator.a.alloc(http.Header, 2);
     hs[0] = nosniff;
     hs[1] = .{ .name = "Vary", .value = "Accept-Encoding" };
     return .{
@@ -611,21 +612,21 @@ fn serveDir(io: std.Io, ctx: *http.RequestCtx, root: []const u8, rel: []const u8
 /// deliberate, tiny widening of the owned surface, confined to one small HTML file.
 /// F10 still applies: the canonicalized shell must live under the canonicalized root.
 fn serveShellOwned(io: std.Io, ctx: *http.RequestCtx, root: []const u8, shell_rel: []const u8) !?http.Response {
-    const full = try std.fmt.allocPrint(ctx.allocator, "{s}/{s}", .{ root, shell_rel });
+    const full = try std.fmt.allocPrint(ctx.allocator.a, "{s}/{s}", .{ root, shell_rel });
     const st = std.Io.Dir.cwd().statFile(io, full, .{}) catch return null;
     if (st.kind != .file) return null;
-    const real_root = std.Io.Dir.cwd().realPathFileAlloc(io, root, ctx.allocator) catch return null;
-    const real_full = std.Io.Dir.cwd().realPathFileAlloc(io, full, ctx.allocator) catch return null;
+    const real_root = std.Io.Dir.cwd().realPathFileAlloc(io, root, ctx.allocator.a) catch return null;
+    const real_full = std.Io.Dir.cwd().realPathFileAlloc(io, full, ctx.allocator.a) catch return null;
     if (!withinRoot(real_root, real_full)) return null;
     const mtime_s: i64 = @intCast(@divTrunc(st.mtime.nanoseconds, std.time.ns_per_s));
-    const etag = try std.fmt.allocPrint(ctx.allocator, "\"{x}-{x}\"", .{ st.size, @as(u64, @bitCast(mtime_s)) });
-    const hs = try ctx.allocator.dupe(http.Header, &.{
+    const etag = try std.fmt.allocPrint(ctx.allocator.a, "\"{x}-{x}\"", .{ st.size, @as(u64, @bitCast(mtime_s)) });
+    const hs = try ctx.allocator.a.dupe(http.Header, &.{
         .{ .name = "ETag", .value = etag },
         nosniff,
         .{ .name = "Cache-Control", .value = "no-cache" },
     });
     if (serve_file.etagMatches(ctx.if_none_match, etag)) return notModified("text/html; charset=utf-8", hs);
-    const bytes = std.Io.Dir.cwd().readFileAlloc(io, full, ctx.allocator, .limited(16 << 20)) catch return null;
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, full, ctx.allocator.a, .limited(16 << 20)) catch return null;
     return .{ .status = 200, .body = bytes, .content_type = "text/html; charset=utf-8", .extra_headers = hs };
 }
 
@@ -658,7 +659,7 @@ fn serveRel(io: std.Io, ctx: *http.RequestCtx, source: Source, rel: []const u8, 
 pub fn serve(io: std.Io, ctx: *http.RequestCtx, source: Source, fb: Fallback) !?http.Response {
     if (ctx.method != .GET and ctx.method != .HEAD) return null;
     if (std.meta.activeTag(source) == .none) return null;
-    const rel = (try sanitize(ctx.allocator, ctx.path)) orelse return null;
+    const rel = (try sanitize(ctx.allocator.a, ctx.path)) orelse return null;
     // Defense-in-depth (final review; hoisted per follow-up review — owner decision):
     // server.zig already keeps the whole `/api` namespace out of static serving by
     // gating on the RAW request path, but that gate and this fallback's normalization
@@ -685,7 +686,7 @@ pub fn serve(io: std.Io, ctx: *http.RequestCtx, source: Source, fb: Fallback) !?
                 const shell = if (root.len == 0)
                     "index.html"
                 else
-                    try std.fmt.allocPrint(ctx.allocator, "{s}/index.html", .{root});
+                    try std.fmt.allocPrint(ctx.allocator.a, "{s}/index.html", .{root});
                 // §C.3: a FALLBACK-served shell is always no-cache — a cached stale shell
                 // after a redeploy references hashed assets that no longer exist, breaking
                 // deep links. Direct hits on the same file still get the knob value.
@@ -694,7 +695,7 @@ pub fn serve(io: std.Io, ctx: *http.RequestCtx, source: Source, fb: Fallback) !?
             return null;
         },
         .dir => |root| {
-            const shell = (try resolveSpaMarkerDirLive(io, ctx.allocator, root, rel)) orelse return null;
+            const shell = (try resolveSpaMarkerDirLive(io, ctx.allocator.a, root, rel)) orelse return null;
             return serveShellOwned(io, ctx, root, shell);
         },
         .none => unreachable, // gated above
@@ -834,7 +835,7 @@ test "embedded: exact file, root index, directory index, miss" {
     defer arena.deinit();
     const src = Source{ .embedded = &fixture };
 
-    var ctx = http.RequestCtx{ .method = .GET, .path = "/assets/app.js", .allocator = arena.allocator() };
+    var ctx = http.RequestCtx{ .method = .GET, .path = "/assets/app.js", .allocator = RequestArena.from(&arena) };
     const r = (try serve(std.testing.io, &ctx, src, .{})).?;
     try std.testing.expectEqual(@as(u16, 200), r.status);
     try std.testing.expectEqualStrings("console.log(1)", r.body);
@@ -844,19 +845,19 @@ test "embedded: exact file, root index, directory index, miss" {
     try std.testing.expectEqualStrings("ETag", r.extra_headers[0].name);
     try std.testing.expectEqualStrings("\"22222222\"", r.extra_headers[0].value);
 
-    var root = http.RequestCtx{ .method = .GET, .path = "/", .allocator = arena.allocator() };
+    var root = http.RequestCtx{ .method = .GET, .path = "/", .allocator = RequestArena.from(&arena) };
     try std.testing.expectEqualStrings("<h1>home</h1>", (try serve(std.testing.io, &root, src, .{})).?.body);
 
-    var d1 = http.RequestCtx{ .method = .GET, .path = "/docs", .allocator = arena.allocator() };
+    var d1 = http.RequestCtx{ .method = .GET, .path = "/docs", .allocator = RequestArena.from(&arena) };
     try std.testing.expectEqualStrings("<h1>docs</h1>", (try serve(std.testing.io, &d1, src, .{})).?.body);
-    var d2 = http.RequestCtx{ .method = .GET, .path = "/docs/", .allocator = arena.allocator() };
+    var d2 = http.RequestCtx{ .method = .GET, .path = "/docs/", .allocator = RequestArena.from(&arena) };
     try std.testing.expectEqualStrings("<h1>docs</h1>", (try serve(std.testing.io, &d2, src, .{})).?.body);
 
-    var miss = http.RequestCtx{ .method = .GET, .path = "/nope.png", .allocator = arena.allocator() };
+    var miss = http.RequestCtx{ .method = .GET, .path = "/nope.png", .allocator = RequestArena.from(&arena) };
     try std.testing.expect((try serve(std.testing.io, &miss, src, .{})) == null);
 
     // HEAD is served like GET (the transport strips the body).
-    var head = http.RequestCtx{ .method = .HEAD, .path = "/assets/app.js", .allocator = arena.allocator() };
+    var head = http.RequestCtx{ .method = .HEAD, .path = "/assets/app.js", .allocator = RequestArena.from(&arena) };
     const hr = (try serve(std.testing.io, &head, src, .{})).?;
     try std.testing.expectEqual(@as(u16, 200), hr.status);
     try std.testing.expectEqualStrings("application/javascript", hr.content_type);
@@ -869,35 +870,34 @@ test "embedded: If-None-Match yields 304; non-GET/HEAD and .none yield null" {
     defer arena.deinit();
     const src = Source{ .embedded = &fixture };
 
-    var ctx = http.RequestCtx{ .method = .GET, .path = "/assets/app.js", .allocator = arena.allocator(), .if_none_match = "\"22222222\"" };
+    var ctx = http.RequestCtx{ .method = .GET, .path = "/assets/app.js", .allocator = RequestArena.from(&arena), .if_none_match = "\"22222222\"" };
     const r = (try serve(std.testing.io, &ctx, src, .{})).?;
     try std.testing.expectEqual(@as(u16, 304), r.status);
     try std.testing.expectEqualStrings("", r.body);
 
-    var post = http.RequestCtx{ .method = .POST, .path = "/index.html", .allocator = arena.allocator() };
+    var post = http.RequestCtx{ .method = .POST, .path = "/index.html", .allocator = RequestArena.from(&arena) };
     try std.testing.expect((try serve(std.testing.io, &post, src, .{})) == null);
-    var none = http.RequestCtx{ .method = .GET, .path = "/index.html", .allocator = arena.allocator() };
+    var none = http.RequestCtx{ .method = .GET, .path = "/index.html", .allocator = RequestArena.from(&arena) };
     try std.testing.expect((try serve(std.testing.io, &none, Source.none, .{})) == null);
 }
 
 test "embedded: Range 206 subslice + 416 + Cache-Control default and knob (§A.4/§C.2)" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const a = arena.allocator();
     const src = Source{ .embedded = &fixture };
     // knob unset: embedded now sends the max-age=3600 default (was: NO Cache-Control)
-    var plain = http.RequestCtx{ .method = .GET, .path = "/assets/app.js", .allocator = a };
+    var plain = http.RequestCtx{ .method = .GET, .path = "/assets/app.js", .allocator = RequestArena.from(&arena) };
     const rp = (try serve(std.testing.io, &plain, src, .{})).?;
     try std.testing.expectEqualStrings("Cache-Control", rp.extra_headers[2].name);
     try std.testing.expectEqualStrings("max-age=3600", rp.extra_headers[2].value);
     try std.testing.expectEqualStrings("Accept-Ranges", rp.extra_headers[3].name);
     // knob set: the configured value rides through Fallback.cache_control
-    var knob = http.RequestCtx{ .method = .GET, .path = "/assets/app.js", .allocator = a };
+    var knob = http.RequestCtx{ .method = .GET, .path = "/assets/app.js", .allocator = RequestArena.from(&arena) };
     const rk = (try serve(std.testing.io, &knob, src, .{ .cache_control = "public, max-age=86400" })).?;
     try std.testing.expectEqualStrings("public, max-age=86400", rk.extra_headers[2].value);
     // 206 subslice ("console.log(1)" is 14 bytes)
     const rh = [_]http.Param{.{ .key = "range", .value = "bytes=8-" }};
-    var ranged = http.RequestCtx{ .method = .GET, .path = "/assets/app.js", .allocator = a, .headers = &rh };
+    var ranged = http.RequestCtx{ .method = .GET, .path = "/assets/app.js", .allocator = RequestArena.from(&arena), .headers = &rh };
     const r206 = (try serve(std.testing.io, &ranged, src, .{})).?;
     try std.testing.expectEqual(@as(u16, 206), r206.status);
     try std.testing.expectEqualStrings("log(1)", r206.body);
@@ -909,7 +909,7 @@ test "embedded: Range 206 subslice + 416 + Cache-Control default and knob (§A.4
     try std.testing.expect(got_cr);
     // 416
     const rb = [_]http.Param{.{ .key = "range", .value = "bytes=99-" }};
-    var bad = http.RequestCtx{ .method = .GET, .path = "/assets/app.js", .allocator = a, .headers = &rb };
+    var bad = http.RequestCtx{ .method = .GET, .path = "/assets/app.js", .allocator = RequestArena.from(&arena), .headers = &rb };
     try std.testing.expectEqual(@as(u16, 416), (try serve(std.testing.io, &bad, src, .{})).?.status);
 }
 
@@ -925,7 +925,7 @@ test "dir: serves files via file; index resolution; miss; traversal" {
     const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", arena.allocator());
     const src = Source{ .dir = root };
 
-    var ctx = http.RequestCtx{ .method = .GET, .path = "/assets/app.js", .allocator = arena.allocator() };
+    var ctx = http.RequestCtx{ .method = .GET, .path = "/assets/app.js", .allocator = RequestArena.from(&arena) };
     const r = (try serve(std.testing.io, &ctx, src, .{})).?;
     try std.testing.expectEqual(@as(u16, 200), r.status);
     try std.testing.expect(r.file != null);
@@ -936,16 +936,16 @@ test "dir: serves files via file; index resolution; miss; traversal" {
     try std.testing.expectEqualStrings("Vary", r.extra_headers[1].name);
     try std.testing.expectEqualStrings("Accept-Encoding", r.extra_headers[1].value);
 
-    var root_req = http.RequestCtx{ .method = .GET, .path = "/", .allocator = arena.allocator() };
+    var root_req = http.RequestCtx{ .method = .GET, .path = "/", .allocator = RequestArena.from(&arena) };
     const ri = (try serve(std.testing.io, &root_req, src, .{})).?;
     try std.testing.expect(std.mem.endsWith(u8, ri.file.?.path, "index.html"));
 
-    var dir_req = http.RequestCtx{ .method = .GET, .path = "/assets", .allocator = arena.allocator() };
+    var dir_req = http.RequestCtx{ .method = .GET, .path = "/assets", .allocator = RequestArena.from(&arena) };
     try std.testing.expect((try serve(std.testing.io, &dir_req, src, .{})) == null);
 
-    var miss = http.RequestCtx{ .method = .GET, .path = "/nope.css", .allocator = arena.allocator() };
+    var miss = http.RequestCtx{ .method = .GET, .path = "/nope.css", .allocator = RequestArena.from(&arena) };
     try std.testing.expect((try serve(std.testing.io, &miss, src, .{})) == null);
-    var trav = http.RequestCtx{ .method = .GET, .path = "/../secret", .allocator = arena.allocator() };
+    var trav = http.RequestCtx{ .method = .GET, .path = "/../secret", .allocator = RequestArena.from(&arena) };
     try std.testing.expect((try serve(std.testing.io, &trav, src, .{})) == null);
 }
 
@@ -984,11 +984,11 @@ test "dir: a symlink inside the root pointing OUTSIDE it is refused (F10)" {
     const src = Source{ .dir = root };
 
     // The escaping symlink is refused (404 / null).
-    var leak = http.RequestCtx{ .method = .GET, .path = "/leak.txt", .allocator = a };
+    var leak = http.RequestCtx{ .method = .GET, .path = "/leak.txt", .allocator = RequestArena.from(&arena) };
     try std.testing.expect((try serve(std.testing.io, &leak, src, .{})) == null);
 
     // The legitimate file is unaffected.
-    var ok = http.RequestCtx{ .method = .GET, .path = "/ok.txt", .allocator = a };
+    var ok = http.RequestCtx{ .method = .GET, .path = "/ok.txt", .allocator = RequestArena.from(&arena) };
     const r = (try serve(std.testing.io, &ok, src, .{})).?;
     try std.testing.expectEqual(@as(u16, 200), r.status);
     try std.testing.expect(r.file != null);
@@ -1050,7 +1050,7 @@ test "dir shim: open-ended Range is rewritten via setRequestHeader; unsatisfiabl
 
     // Open-ended seek on the base file: rewritten to the closed in-bounds form.
     const rh = [_]http.Param{.{ .key = "range", .value = "bytes=200-" }};
-    var ctx = http.RequestCtx{ .method = .GET, .path = "/big.bin", .allocator = a, .headers = &rh, .raw_header_ctx = &dummy, .raw_header_set_fn = Capture.set };
+    var ctx = http.RequestCtx{ .method = .GET, .path = "/big.bin", .allocator = RequestArena.from(&arena), .headers = &rh, .raw_header_ctx = &dummy, .raw_header_set_fn = Capture.set };
     const r = (try serve(std.testing.io, &ctx, src, .{})).?;
     try std.testing.expectEqual(@as(u16, 200), r.status); // still DELEGATED (facil.io does the 206)
     try std.testing.expect(r.file != null);
@@ -1060,13 +1060,13 @@ test "dir shim: open-ended Range is rewritten via setRequestHeader; unsatisfiabl
     // Accept-Encoding gzip: the SIDECAR's size (100) drives the rewrite.
     Capture.name = "";
     const rh_gz = [_]http.Param{ .{ .key = "range", .value = "bytes=50-" }, .{ .key = "accept-encoding", .value = "gzip, br" } };
-    var ctx_gz = http.RequestCtx{ .method = .GET, .path = "/big.bin", .allocator = a, .headers = &rh_gz, .raw_header_ctx = &dummy, .raw_header_set_fn = Capture.set };
+    var ctx_gz = http.RequestCtx{ .method = .GET, .path = "/big.bin", .allocator = RequestArena.from(&arena), .headers = &rh_gz, .raw_header_ctx = &dummy, .raw_header_set_fn = Capture.set };
     _ = (try serve(std.testing.io, &ctx_gz, src, .{})).?;
     try std.testing.expectEqualStrings("bytes=50-99", Capture.value);
 
     // Unsatisfiable: the shim's OWNED 416 with Content-Range: bytes */N.
     const rh_bad = [_]http.Param{.{ .key = "range", .value = "bytes=5000-" }};
-    var ctx_bad = http.RequestCtx{ .method = .GET, .path = "/big.bin", .allocator = a, .headers = &rh_bad, .raw_header_ctx = &dummy, .raw_header_set_fn = Capture.set };
+    var ctx_bad = http.RequestCtx{ .method = .GET, .path = "/big.bin", .allocator = RequestArena.from(&arena), .headers = &rh_bad, .raw_header_ctx = &dummy, .raw_header_set_fn = Capture.set };
     const r416 = (try serve(std.testing.io, &ctx_bad, src, .{})).?;
     try std.testing.expectEqual(@as(u16, 416), r416.status);
     try std.testing.expectEqualStrings("Content-Range", r416.extra_headers[0].name);
@@ -1080,7 +1080,7 @@ test "dir shim: open-ended Range is rewritten via setRequestHeader; unsatisfiabl
     Capture.value = "";
     Capture.if_range_set = null;
     const rh_ifr = [_]http.Param{ .{ .key = "range", .value = "bytes=200-" }, .{ .key = "if-range", .value = "\"whatever\"" } };
-    var ctx_ifr = http.RequestCtx{ .method = .GET, .path = "/big.bin", .allocator = a, .headers = &rh_ifr, .raw_header_ctx = &dummy, .raw_header_set_fn = Capture.set };
+    var ctx_ifr = http.RequestCtx{ .method = .GET, .path = "/big.bin", .allocator = RequestArena.from(&arena), .headers = &rh_ifr, .raw_header_ctx = &dummy, .raw_header_set_fn = Capture.set };
     _ = (try serve(std.testing.io, &ctx_ifr, src, .{})).?;
     try std.testing.expectEqualStrings("bytes=200-999", Capture.value);
     try std.testing.expectEqualStrings("", Capture.if_range_set.?); // If-Range blanked
@@ -1088,7 +1088,7 @@ test "dir shim: open-ended Range is rewritten via setRequestHeader; unsatisfiabl
     // owned 416): today's behavior is preserved for that corner (facil.io serves its 200;
     // the MISMATCH-should-be-200 case can't be distinguished — see the shim's doc comment).
     const rh_ifr_bad = [_]http.Param{ .{ .key = "range", .value = "bytes=5000-" }, .{ .key = "if-range", .value = "\"whatever\"" } };
-    var ctx_ifr_bad = http.RequestCtx{ .method = .GET, .path = "/big.bin", .allocator = a, .headers = &rh_ifr_bad, .raw_header_ctx = &dummy, .raw_header_set_fn = Capture.set };
+    var ctx_ifr_bad = http.RequestCtx{ .method = .GET, .path = "/big.bin", .allocator = RequestArena.from(&arena), .headers = &rh_ifr_bad, .raw_header_ctx = &dummy, .raw_header_set_fn = Capture.set };
     const r_ifr_bad = (try serve(std.testing.io, &ctx_ifr_bad, src, .{})).?;
     try std.testing.expectEqual(@as(u16, 200), r_ifr_bad.status); // delegated, not 416
 }
@@ -1254,7 +1254,7 @@ test "spa fallback: miss under marked root serves its index.html (embedded: 200/
     const src = Source{ .embedded = &spa_fixture };
     const fb = Fallback{ .spa_roots = &.{ "app", "" }, .spa_marker_enabled = true };
 
-    var deep = http.RequestCtx{ .method = .GET, .path = "/app/orders/1234", .allocator = arena.allocator() };
+    var deep = http.RequestCtx{ .method = .GET, .path = "/app/orders/1234", .allocator = RequestArena.from(&arena) };
     const r = (try serve(std.testing.io, &deep, src, fb)).?;
     try std.testing.expectEqual(@as(u16, 200), r.status);
     try std.testing.expectEqualStrings("<h1>app shell</h1>", r.body);
@@ -1264,11 +1264,11 @@ test "spa fallback: miss under marked root serves its index.html (embedded: 200/
 
     // Extension-bearing misses under the root get the shell too (deliberate: one
     // fixed behavior, same as try_files $uri /index.html).
-    var stale = http.RequestCtx{ .method = .GET, .path = "/app/assets/old.js", .allocator = arena.allocator() };
+    var stale = http.RequestCtx{ .method = .GET, .path = "/app/assets/old.js", .allocator = RequestArena.from(&arena) };
     try std.testing.expectEqualStrings("<h1>app shell</h1>", (try serve(std.testing.io, &stale, src, fb)).?.body);
 
     // Real files always win over the fallback.
-    var real = http.RequestCtx{ .method = .GET, .path = "/app/assets/app.js", .allocator = arena.allocator() };
+    var real = http.RequestCtx{ .method = .GET, .path = "/app/assets/app.js", .allocator = RequestArena.from(&arena) };
     try std.testing.expectEqualStrings("console.log(2)", (try serve(std.testing.io, &real, src, fb)).?.body);
 }
 
@@ -1278,23 +1278,23 @@ test "spa fallback: root marker catches every miss; nested markers longest-prefi
     const src = Source{ .embedded = &spa_fixture };
     const fb = Fallback{ .spa_roots = &.{ "app", "" }, .spa_marker_enabled = true };
 
-    var out = http.RequestCtx{ .method = .GET, .path = "/pricing/enterprise", .allocator = arena.allocator() };
+    var out = http.RequestCtx{ .method = .GET, .path = "/pricing/enterprise", .allocator = RequestArena.from(&arena) };
     try std.testing.expectEqualStrings("<h1>home</h1>", (try serve(std.testing.io, &out, src, fb)).?.body);
-    var in = http.RequestCtx{ .method = .GET, .path = "/app/orders/1", .allocator = arena.allocator() };
+    var in = http.RequestCtx{ .method = .GET, .path = "/app/orders/1", .allocator = RequestArena.from(&arena) };
     try std.testing.expectEqualStrings("<h1>app shell</h1>", (try serve(std.testing.io, &in, src, fb)).?.body);
     // '/'-bounded: /application/x belongs to the ROOT marker, not app/.
-    var appl = http.RequestCtx{ .method = .GET, .path = "/application/x", .allocator = arena.allocator() };
+    var appl = http.RequestCtx{ .method = .GET, .path = "/application/x", .allocator = RequestArena.from(&arena) };
     try std.testing.expectEqualStrings("<h1>home</h1>", (try serve(std.testing.io, &appl, src, fb)).?.body);
     // A dropped inner root (fb without "app") falls through to the outer marker.
     const outer_only = Fallback{ .spa_roots = &.{""}, .spa_marker_enabled = true };
-    var fell = http.RequestCtx{ .method = .GET, .path = "/app/orders/1", .allocator = arena.allocator() };
+    var fell = http.RequestCtx{ .method = .GET, .path = "/app/orders/1", .allocator = RequestArena.from(&arena) };
     try std.testing.expectEqualStrings("<h1>home</h1>", (try serve(std.testing.io, &fell, src, outer_only)).?.body);
 }
 
 test "spa fallback: no marker/no routes => serve returns null (miss 404s, AC3)" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var miss = http.RequestCtx{ .method = .GET, .path = "/app/orders/1", .allocator = arena.allocator() };
+    var miss = http.RequestCtx{ .method = .GET, .path = "/app/orders/1", .allocator = RequestArena.from(&arena) };
     try std.testing.expect((try serve(std.testing.io, &miss, Source{ .embedded = &spa_fixture }, .{})) == null);
 }
 
@@ -1304,7 +1304,7 @@ test "spa fallback: spa_marker_enabled=false suppresses the marker even with roo
     // actually gate the tier, not just be documentation.
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var miss = http.RequestCtx{ .method = .GET, .path = "/app/orders/1", .allocator = arena.allocator() };
+    var miss = http.RequestCtx{ .method = .GET, .path = "/app/orders/1", .allocator = RequestArena.from(&arena) };
     const fb = Fallback{ .spa_roots = &.{ "app", "" }, .spa_marker_enabled = false };
     try std.testing.expect((try serve(std.testing.io, &miss, Source{ .embedded = &spa_fixture }, fb)) == null);
 }
@@ -1320,14 +1320,14 @@ test "spa fallback: an api-looking miss never reaches the fallback, even double-
     const src = Source{ .embedded = &spa_fixture };
     const fb = Fallback{ .spa_roots = &.{""}, .spa_marker_enabled = true }; // root marker would otherwise catch every miss
 
-    var dbl = http.RequestCtx{ .method = .GET, .path = "//api/x", .allocator = arena.allocator() };
+    var dbl = http.RequestCtx{ .method = .GET, .path = "//api/x", .allocator = RequestArena.from(&arena) };
     try std.testing.expect((try serve(std.testing.io, &dbl, src, fb)) == null);
-    var bare = http.RequestCtx{ .method = .GET, .path = "/api", .allocator = arena.allocator() };
+    var bare = http.RequestCtx{ .method = .GET, .path = "/api", .allocator = RequestArena.from(&arena) };
     try std.testing.expect((try serve(std.testing.io, &bare, src, fb)) == null);
-    var normal = http.RequestCtx{ .method = .GET, .path = "/api/x", .allocator = arena.allocator() };
+    var normal = http.RequestCtx{ .method = .GET, .path = "/api/x", .allocator = RequestArena.from(&arena) };
     try std.testing.expect((try serve(std.testing.io, &normal, src, fb)) == null);
     // Non-api misses under the same root marker are unaffected (sanity: the guard is scoped).
-    var other = http.RequestCtx{ .method = .GET, .path = "/pricing", .allocator = arena.allocator() };
+    var other = http.RequestCtx{ .method = .GET, .path = "/pricing", .allocator = RequestArena.from(&arena) };
     try std.testing.expectEqualStrings("<h1>home</h1>", (try serve(std.testing.io, &other, src, fb)).?.body);
 }
 
@@ -1343,7 +1343,7 @@ test "spa fallback: //api/x refuses even when a REAL file exists at api/x (hoist
     defer arena.deinit();
     const a = arena.allocator();
 
-    var dbl_embedded = http.RequestCtx{ .method = .GET, .path = "//api/x", .allocator = a };
+    var dbl_embedded = http.RequestCtx{ .method = .GET, .path = "//api/x", .allocator = RequestArena.from(&arena) };
     try std.testing.expect((try serve(std.testing.io, &dbl_embedded, Source{ .embedded = &spa_fixture }, .{})) == null);
 
     var tmp = std.testing.tmpDir(.{});
@@ -1351,7 +1351,7 @@ test "spa fallback: //api/x refuses even when a REAL file exists at api/x (hoist
     try tmp.dir.createDirPath(std.testing.io, "api");
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "api/x", .data = "not-the-api" });
     const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
-    var dbl_dir = http.RequestCtx{ .method = .GET, .path = "//api/x", .allocator = a };
+    var dbl_dir = http.RequestCtx{ .method = .GET, .path = "//api/x", .allocator = RequestArena.from(&arena) };
     try std.testing.expect((try serve(std.testing.io, &dbl_dir, Source{ .dir = root }, .{})) == null);
 }
 
@@ -1363,11 +1363,11 @@ test "spa fallback: '.spa' itself is never served (embedded + dir, incl. dir liv
     // Embedded: the marker bytes must never appear; with the marker active the
     // request falls through to the shell.
     const src = Source{ .embedded = &spa_fixture };
-    var m1 = http.RequestCtx{ .method = .GET, .path = "/app/.spa", .allocator = a };
+    var m1 = http.RequestCtx{ .method = .GET, .path = "/app/.spa", .allocator = RequestArena.from(&arena) };
     const r1 = (try serve(std.testing.io, &m1, src, .{ .spa_roots = &.{"app"}, .spa_marker_enabled = true })).?;
     try std.testing.expectEqualStrings("<h1>app shell</h1>", r1.body);
     // ...and with NO fallback configured it is a plain miss (null), not the bytes.
-    var m2 = http.RequestCtx{ .method = .GET, .path = "/app/.spa", .allocator = a };
+    var m2 = http.RequestCtx{ .method = .GET, .path = "/app/.spa", .allocator = RequestArena.from(&arena) };
     try std.testing.expect((try serve(std.testing.io, &m2, src, .{})) == null);
     // Other dotfiles keep serving (.well-known must not break): add none here — the
     // refusal is scoped to the literal '.spa' final segment (see isSpaMarkerPath test).
@@ -1378,7 +1378,7 @@ test "spa fallback: '.spa' itself is never served (embedded + dir, incl. dir liv
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = ".spa", .data = "MARKER-SECRET" });
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "index.html", .data = "<h1>root</h1>" });
     const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
-    var m3 = http.RequestCtx{ .method = .GET, .path = "/.spa", .allocator = a };
+    var m3 = http.RequestCtx{ .method = .GET, .path = "/.spa", .allocator = RequestArena.from(&arena) };
     const r3 = (try serve(std.testing.io, &m3, Source{ .dir = root }, .{ .spa_marker_enabled = true })).?;
     // The dir-mode Tier-1 shell is now served OWNED (§C.3), not via file delegation.
     try std.testing.expect(r3.file == null);
@@ -1390,9 +1390,9 @@ test "spa fallback: If-None-Match on the embedded fallback yields 304; HEAD mirr
     defer arena.deinit();
     const src = Source{ .embedded = &spa_fixture };
     const fb = Fallback{ .spa_roots = &.{"app"}, .spa_marker_enabled = true };
-    var cond = http.RequestCtx{ .method = .GET, .path = "/app/deep/link", .allocator = arena.allocator(), .if_none_match = "\"bbbbbbbb\"" };
+    var cond = http.RequestCtx{ .method = .GET, .path = "/app/deep/link", .allocator = RequestArena.from(&arena), .if_none_match = "\"bbbbbbbb\"" };
     try std.testing.expectEqual(@as(u16, 304), (try serve(std.testing.io, &cond, src, fb)).?.status);
-    var head = http.RequestCtx{ .method = .HEAD, .path = "/app/deep/link", .allocator = arena.allocator() };
+    var head = http.RequestCtx{ .method = .HEAD, .path = "/app/deep/link", .allocator = RequestArena.from(&arena) };
     const hr = (try serve(std.testing.io, &head, src, fb)).?;
     try std.testing.expectEqual(@as(u16, 200), hr.status);
     try std.testing.expectEqualStrings("text/html; charset=utf-8", hr.content_type);
@@ -1401,15 +1401,14 @@ test "spa fallback: If-None-Match on the embedded fallback yields 304; HEAD mirr
 test "embedded spa fallback shell is no-cache even with the knob set (§C.3)" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const a = arena.allocator();
     const src = Source{ .embedded = &spa_fixture };
     const fb = Fallback{ .spa_roots = &.{"app"}, .spa_marker_enabled = true, .cache_control = "public, max-age=86400" };
     // fallback-resolved miss: no-cache wins over the knob
-    var miss = http.RequestCtx{ .method = .GET, .path = "/app/deep/link", .allocator = a };
+    var miss = http.RequestCtx{ .method = .GET, .path = "/app/deep/link", .allocator = RequestArena.from(&arena) };
     const rm = (try serve(std.testing.io, &miss, src, fb)).?;
     try std.testing.expectEqualStrings("no-cache", rm.extra_headers[2].value);
     // a DIRECT hit on the same shell file keeps the knob value (deploy-owner's choice)
-    var direct = http.RequestCtx{ .method = .GET, .path = "/app/index.html", .allocator = a };
+    var direct = http.RequestCtx{ .method = .GET, .path = "/app/index.html", .allocator = RequestArena.from(&arena) };
     const rd = (try serve(std.testing.io, &direct, src, fb)).?;
     try std.testing.expectEqualStrings("public, max-age=86400", rd.extra_headers[2].value);
 }
@@ -1423,7 +1422,7 @@ test "spa fallback (dir): shell is served OWNED — no-cache, stat ETag, 304 rev
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", arena.allocator());
-    var deep = http.RequestCtx{ .method = .GET, .path = "/app/orders/1234", .allocator = arena.allocator() };
+    var deep = http.RequestCtx{ .method = .GET, .path = "/app/orders/1234", .allocator = RequestArena.from(&arena) };
     const r = (try serve(std.testing.io, &deep, Source{ .dir = root }, .{ .spa_marker_enabled = true })).?;
     try std.testing.expectEqual(@as(u16, 200), r.status);
     try std.testing.expect(r.file == null); // OWNED body, not a sendFile delegation
@@ -1432,7 +1431,7 @@ test "spa fallback (dir): shell is served OWNED — no-cache, stat ETag, 304 rev
     try std.testing.expectEqualStrings("Cache-Control", r.extra_headers[2].name);
     try std.testing.expectEqualStrings("no-cache", r.extra_headers[2].value);
     // revalidation: 304 on the stat ETag
-    var cond = http.RequestCtx{ .method = .GET, .path = "/app/orders/1234", .allocator = arena.allocator(), .if_none_match = r.extra_headers[0].value };
+    var cond = http.RequestCtx{ .method = .GET, .path = "/app/orders/1234", .allocator = RequestArena.from(&arena), .if_none_match = r.extra_headers[0].value };
     try std.testing.expectEqual(@as(u16, 304), (try serve(std.testing.io, &cond, Source{ .dir = root }, .{ .spa_marker_enabled = true })).?.status);
 }
 
@@ -1457,7 +1456,7 @@ test "spa live (dir): a marker created AFTER boot is picked up on the very next 
 
     // Before the marker exists: a miss under "app/" does NOT get the shell (404/null) —
     // "app" isn't marked yet, and the root has no marker either.
-    var before = http.RequestCtx{ .method = .GET, .path = "/app/orders/1", .allocator = arena.allocator() };
+    var before = http.RequestCtx{ .method = .GET, .path = "/app/orders/1", .allocator = RequestArena.from(&arena) };
     try std.testing.expect((try serve(std.testing.io, &before, src, fb)) == null);
 
     // Simulates a post-boot deploy: the marker is dropped WITHOUT restarting the server
@@ -1465,7 +1464,7 @@ test "spa live (dir): a marker created AFTER boot is picked up on the very next 
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "app/.spa", .data = "" });
 
     // The very next miss under "app/" now gets the shell.
-    var after = http.RequestCtx{ .method = .GET, .path = "/app/orders/1", .allocator = arena.allocator() };
+    var after = http.RequestCtx{ .method = .GET, .path = "/app/orders/1", .allocator = RequestArena.from(&arena) };
     const r = (try serve(std.testing.io, &after, src, fb)).?;
     try std.testing.expect(r.file == null); // OWNED shell (§C.3), not a sendFile delegation
     try std.testing.expectEqualStrings("<h1>app shell</h1>", r.body);
@@ -1485,12 +1484,12 @@ test "spa live (dir): removing a marker post-boot stops the fallback on the next
     const src = Source{ .dir = root };
     const fb = Fallback{ .spa_marker_enabled = true };
 
-    var before = http.RequestCtx{ .method = .GET, .path = "/app/orders/1", .allocator = arena.allocator() };
+    var before = http.RequestCtx{ .method = .GET, .path = "/app/orders/1", .allocator = RequestArena.from(&arena) };
     try std.testing.expect((try serve(std.testing.io, &before, src, fb)) != null);
 
     try tmp.dir.deleteFile(std.testing.io, "app/.spa");
 
-    var after = http.RequestCtx{ .method = .GET, .path = "/app/orders/1", .allocator = arena.allocator() };
+    var after = http.RequestCtx{ .method = .GET, .path = "/app/orders/1", .allocator = RequestArena.from(&arena) };
     try std.testing.expect((try serve(std.testing.io, &after, src, fb)) == null);
 }
 
@@ -1513,17 +1512,17 @@ test "spa live (dir): deepest marker wins; vanished index.html on the deepest ma
 
     // Deepest ("app/admin") wins over "app" and the root. Shells are OWNED (§C.3),
     // so assert body content rather than a delegated file path.
-    var deep = http.RequestCtx{ .method = .GET, .path = "/app/admin/orders/1", .allocator = arena.allocator() };
+    var deep = http.RequestCtx{ .method = .GET, .path = "/app/admin/orders/1", .allocator = RequestArena.from(&arena) };
     const rd = (try serve(std.testing.io, &deep, src, fb)).?;
     try std.testing.expect(rd.file == null);
     try std.testing.expectEqualStrings("<h1>admin shell</h1>", rd.body);
     // A miss under "app/" (but not "app/admin/") gets the "app" shell.
-    var mid = http.RequestCtx{ .method = .GET, .path = "/app/orders/1", .allocator = arena.allocator() };
+    var mid = http.RequestCtx{ .method = .GET, .path = "/app/orders/1", .allocator = RequestArena.from(&arena) };
     const rm = (try serve(std.testing.io, &mid, src, fb)).?;
     try std.testing.expect(rm.file == null);
     try std.testing.expectEqualStrings("<h1>app shell</h1>", rm.body);
     // A miss elsewhere gets the root shell.
-    var out = http.RequestCtx{ .method = .GET, .path = "/pricing", .allocator = arena.allocator() };
+    var out = http.RequestCtx{ .method = .GET, .path = "/pricing", .allocator = RequestArena.from(&arena) };
     const ro = (try serve(std.testing.io, &out, src, fb)).?;
     try std.testing.expect(ro.file == null);
     try std.testing.expectEqualStrings("<h1>root</h1>", ro.body);
@@ -1533,10 +1532,10 @@ test "spa live (dir): deepest marker wins; vanished index.html on the deepest ma
     // mirrors validateSpaMarkersDir/deriveEmbeddedSpaRoots: a marked-but-indexless
     // directory is "absent", not "defer to the next ancestor".
     try tmp.dir.deleteFile(std.testing.io, "app/admin/index.html");
-    var vanished = http.RequestCtx{ .method = .GET, .path = "/app/admin/orders/1", .allocator = arena.allocator() };
+    var vanished = http.RequestCtx{ .method = .GET, .path = "/app/admin/orders/1", .allocator = RequestArena.from(&arena) };
     try std.testing.expect((try serve(std.testing.io, &vanished, src, fb)) == null);
     // A sibling still under "app/" (not "app/admin/") is unaffected.
-    var sibling = http.RequestCtx{ .method = .GET, .path = "/app/orders/2", .allocator = arena.allocator() };
+    var sibling = http.RequestCtx{ .method = .GET, .path = "/app/orders/2", .allocator = RequestArena.from(&arena) };
     const rs = (try serve(std.testing.io, &sibling, src, fb)).?;
     try std.testing.expect(rs.file == null);
     try std.testing.expectEqualStrings("<h1>app shell</h1>", rs.body);
@@ -1567,7 +1566,7 @@ test "spa live (dir): a request path deeper than the ancestor-walk cap still res
     }
     const path = try path_buf.toOwnedSlice(arena.allocator());
 
-    var deep = http.RequestCtx{ .method = .GET, .path = path, .allocator = arena.allocator() };
+    var deep = http.RequestCtx{ .method = .GET, .path = path, .allocator = RequestArena.from(&arena) };
     const r = (try serve(std.testing.io, &deep, src, fb)).?;
     try std.testing.expect(r.file == null); // OWNED shell (§C.3)
     try std.testing.expectEqualStrings("<h1>root</h1>", r.body);
@@ -1616,7 +1615,7 @@ test "spa live (dir): a marker just past the ancestor-walk cap depth is NOT foun
     }
     const req_path = try std.fmt.allocPrint(arena.allocator(), "/{s}", .{req_buf.items});
 
-    var deep = http.RequestCtx{ .method = .GET, .path = req_path, .allocator = arena.allocator() };
+    var deep = http.RequestCtx{ .method = .GET, .path = req_path, .allocator = RequestArena.from(&arena) };
     // No root marker exists here, so the capped walk (jumping to root once exhausted)
     // finds nothing: null, not the deep marker's shell and not an error.
     try std.testing.expect((try serve(std.testing.io, &deep, src, fb)) == null);
@@ -1633,17 +1632,17 @@ test "static_routes: matched on miss only (real file wins); routes beat the mark
     const fb = Fallback{ .routes = &routes, .spa_roots = &.{"app"}, .spa_marker_enabled = true };
 
     // Real file wins over a matching route.
-    var real = http.RequestCtx{ .method = .GET, .path = "/app/assets/app.js", .allocator = arena.allocator() };
+    var real = http.RequestCtx{ .method = .GET, .path = "/app/assets/app.js", .allocator = RequestArena.from(&arena) };
     try std.testing.expectEqualStrings("console.log(2)", (try serve(std.testing.io, &real, src, fb)).?.body);
     // First matching route wins, in declaration order.
-    var order = http.RequestCtx{ .method = .GET, .path = "/app/orders/42", .allocator = arena.allocator() };
+    var order = http.RequestCtx{ .method = .GET, .path = "/app/orders/42", .allocator = RequestArena.from(&arena) };
     try std.testing.expectEqualStrings("<h1>app shell</h1>", (try serve(std.testing.io, &order, src, fb)).?.body);
     // Routes are consulted BEFORE the marker: /app/x matches /app/** -> root index,
     // even though the "app" marker would have served the app shell.
-    var routed = http.RequestCtx{ .method = .GET, .path = "/app/x", .allocator = arena.allocator() };
+    var routed = http.RequestCtx{ .method = .GET, .path = "/app/x", .allocator = RequestArena.from(&arena) };
     try std.testing.expectEqualStrings("<h1>home</h1>", (try serve(std.testing.io, &routed, src, fb)).?.body);
     // Trailing slash never changes the outcome (sanitize normalizes): /app/ == /app.
-    var slash = http.RequestCtx{ .method = .GET, .path = "/app/orders/42/", .allocator = arena.allocator() };
+    var slash = http.RequestCtx{ .method = .GET, .path = "/app/orders/42/", .allocator = RequestArena.from(&arena) };
     try std.testing.expectEqualStrings("<h1>app shell</h1>", (try serve(std.testing.io, &slash, src, fb)).?.body);
 }
 

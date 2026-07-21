@@ -1,4 +1,5 @@
 const std = @import("std");
+const RequestArena = @import("request_arena.zig").RequestArena;
 const App = @import("app.zig").App;
 
 pub const Method = enum { GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD, UNKNOWN };
@@ -10,7 +11,7 @@ pub const RequestCtx = struct {
     path: []const u8,
     query: []const u8 = "",
     body: []const u8 = "",
-    allocator: std.mem.Allocator,
+    allocator: RequestArena,
     /// Present for real requests; null in pure-handler unit tests that don't need the DB.
     app: ?*App = null,
     /// Path params captured by the router (e.g. ":id").
@@ -153,26 +154,26 @@ pub const Handler = *const fn (ctx: *RequestCtx) anyerror!Response;
 
 test "param lookup" {
     const params = [_]Param{ .{ .key = "id", .value = "abc" }, .{ .key = "x", .value = "y" } };
-    var ctx = RequestCtx{ .method = .GET, .path = "/", .allocator = std.testing.allocator, .params = &params };
+    var ctx = RequestCtx{ .method = .GET, .path = "/", .allocator = RequestArena.forTest(std.testing.allocator), .params = &params };
     try std.testing.expectEqualStrings("abc", ctx.param("id").?);
     try std.testing.expect(ctx.param("missing") == null);
 }
 
 test "bearerToken extracts the token after 'Bearer '" {
-    var ctx = RequestCtx{ .method = .GET, .path = "/", .allocator = std.testing.allocator, .authorization = "Bearer abc.def.ghi" };
+    var ctx = RequestCtx{ .method = .GET, .path = "/", .allocator = RequestArena.forTest(std.testing.allocator), .authorization = "Bearer abc.def.ghi" };
     try std.testing.expectEqualStrings("abc.def.ghi", ctx.bearerToken().?);
-    var none = RequestCtx{ .method = .GET, .path = "/", .allocator = std.testing.allocator, .authorization = "" };
+    var none = RequestCtx{ .method = .GET, .path = "/", .allocator = RequestArena.forTest(std.testing.allocator), .authorization = "" };
     try std.testing.expect(none.bearerToken() == null);
-    var basic = RequestCtx{ .method = .GET, .path = "/", .allocator = std.testing.allocator, .authorization = "Basic xyz" };
+    var basic = RequestCtx{ .method = .GET, .path = "/", .allocator = RequestArena.forTest(std.testing.allocator), .authorization = "Basic xyz" };
     try std.testing.expect(basic.bearerToken() == null);
 }
 
 test "cookie parses a named value out of the Cookie header" {
-    var ctx = RequestCtx{ .method = .GET, .path = "/", .allocator = std.testing.allocator, .cookie_header = "a=1; zb_auth=tok123; b=2" };
+    var ctx = RequestCtx{ .method = .GET, .path = "/", .allocator = RequestArena.forTest(std.testing.allocator), .cookie_header = "a=1; zb_auth=tok123; b=2" };
     try std.testing.expectEqualStrings("tok123", ctx.cookie("zb_auth").?);
     try std.testing.expectEqualStrings("1", ctx.cookie("a").?);
     try std.testing.expect(ctx.cookie("missing") == null);
-    var empty = RequestCtx{ .method = .GET, .path = "/", .allocator = std.testing.allocator, .cookie_header = "" };
+    var empty = RequestCtx{ .method = .GET, .path = "/", .allocator = RequestArena.forTest(std.testing.allocator), .cookie_header = "" };
     try std.testing.expect(empty.cookie("zb_auth") == null);
 }
 
@@ -184,6 +185,6 @@ test "Response file ref and UploadedFile default/usage" {
     try std.testing.expectEqual(@as(u64, 10), ranged.file.?.offset);
     const u = UploadedFile{ .field = "cover", .filename = "a.png", .mimetype = "image/png", .bytes = "x" };
     try std.testing.expectEqualStrings("cover", u.field);
-    const ctx = RequestCtx{ .method = .POST, .path = "/", .allocator = std.testing.allocator };
+    const ctx = RequestCtx{ .method = .POST, .path = "/", .allocator = RequestArena.forTest(std.testing.allocator) };
     try std.testing.expect(ctx.files.len == 0 and ctx.form_fields == null);
 }

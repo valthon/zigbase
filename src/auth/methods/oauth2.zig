@@ -1,4 +1,5 @@
 const std = @import("std");
+const RequestArena = @import("../../request_arena.zig").RequestArena;
 const method_mod = @import("../method.zig");
 const AuthMethod = method_mod.AuthMethod;
 const AuthCtx = method_mod.AuthCtx;
@@ -39,7 +40,7 @@ fn initiateImpl(ctx: *anyopaque, ac: *AuthCtx) anyerror!InitiateResult {
     _ = @as(*OAuth2Method, @ptrCast(@alignCast(ctx)));
 
     // Parse provider from body.
-    const parsed = std.json.parseFromSlice(std.json.Value, ac.ctx.allocator, ac.ctx.body, .{}) catch {
+    const parsed = std.json.parseFromSlice(std.json.Value, ac.ctx.allocator.a, ac.ctx.body, .{}) catch {
         return InitiateResult{ .status = 400, .body = "{\"message\":\"provider is required.\"}" };
     };
     if (parsed.value != .object) {
@@ -69,15 +70,15 @@ fn initiateImpl(ctx: *anyopaque, ac: *AuthCtx) anyerror!InitiateResult {
 
     // Build the JSON response.
     var root: std.json.ObjectMap = .empty;
-    try root.put(ac.ctx.allocator, "authURL", .{ .string = provider.authURL });
-    try root.put(ac.ctx.allocator, "clientId", .{ .string = cfg.clientId });
-    var scopes_arr = std.json.Array.init(ac.ctx.allocator);
+    try root.put(ac.ctx.allocator.a, "authURL", .{ .string = provider.authURL });
+    try root.put(ac.ctx.allocator.a, "clientId", .{ .string = cfg.clientId });
+    var scopes_arr = std.json.Array.init(ac.ctx.allocator.a);
     for (provider.scopes) |s| try scopes_arr.append(.{ .string = s });
-    try root.put(ac.ctx.allocator, "scopes", .{ .array = scopes_arr });
+    try root.put(ac.ctx.allocator.a, "scopes", .{ .array = scopes_arr });
     if (state_val) |sv| {
-        try root.put(ac.ctx.allocator, "state", .{ .string = sv });
+        try root.put(ac.ctx.allocator.a, "state", .{ .string = sv });
     }
-    const body = try std.json.Stringify.valueAlloc(ac.ctx.allocator, std.json.Value{ .object = root }, .{});
+    const body = try std.json.Stringify.valueAlloc(ac.ctx.allocator.a, std.json.Value{ .object = root }, .{});
     return InitiateResult{ .status = 200, .body = body };
 }
 
@@ -87,7 +88,7 @@ fn initiateImpl(ctx: *anyopaque, ac: *AuthCtx) anyerror!InitiateResult {
 
 fn completeVtable(ctx: *anyopaque, ac: *AuthCtx) anyerror!Resolution {
     _ = @as(*OAuth2Method, @ptrCast(@alignCast(ctx)));
-    const hc = try oauth_client.httpContext(ac.ctx.allocator, ac.app.io);
+    const hc = try oauth_client.httpContext(ac.ctx.allocator.a, ac.app.io);
     return completeImpl(ac, oauth_client.httpTransport(hc));
 }
 
@@ -116,7 +117,7 @@ pub fn completeImpl(ac: *AuthCtx, transport: oauth_client.Transport) anyerror!Re
     // released at the end of phase 2), so other writes proceed during the exchange.
     const access_token = oauth_client.exchangeCode(
         transport,
-        ac.ctx.allocator,
+        ac.ctx.allocator.a,
         prep.provider,
         prep.cfg.clientId,
         prep.secret,
@@ -127,7 +128,7 @@ pub fn completeImpl(ac: *AuthCtx, transport: oauth_client.Transport) anyerror!Re
 
     const identity = oauth_client.fetchIdentity(
         transport,
-        ac.ctx.allocator,
+        ac.ctx.allocator.a,
         prep.provider,
         access_token,
     ) catch return Resolution{ .fail = .{ .status = 400, .message = "OAuth identity fetch failed." } };
@@ -214,7 +215,7 @@ const TestEnv = struct {
         });
     }
 
-    fn ctx(env: *TestEnv, a: std.mem.Allocator, m: http.Method, body: []const u8, params: []const http.Param) http.RequestCtx {
+    fn ctx(env: *TestEnv, a: RequestArena, m: http.Method, body: []const u8, params: []const http.Param) http.RequestCtx {
         return .{ .method = m, .path = "/", .body = body, .allocator = a, .app = &env.app, .params = params };
     }
 };
@@ -269,7 +270,7 @@ test "OAuth2Method: completeImpl creates a new record (isNew) with valid stub" {
         defer env.pool.releaseWriter();
         break :blk (try collections.get(a, w, "oauth2users")).?;
     };
-    var req = env.ctx(a, .POST, try oauthBody(a), &[_]http.Param{});
+    var req = env.ctx(RequestArena.from(&arena), .POST, try oauthBody(a), &[_]http.Param{});
     var ac = AuthCtx{
         .app = &env.app,
         .ctx = &req,
@@ -306,7 +307,7 @@ test "OAuth2Method: completeImpl second login returns same rid (not new)" {
     // First login. completeImpl acquires its own writer, so we hold none here.
     var rid1: []const u8 = "";
     {
-        var req = env.ctx(a, .POST, try oauthBody(a), &[_]http.Param{});
+        var req = env.ctx(RequestArena.from(&arena), .POST, try oauthBody(a), &[_]http.Param{});
         var ac = AuthCtx{ .app = &env.app, .ctx = &req, .collection = col, .config = .null };
         var stub = OAuthStub{};
         const res = try completeImpl(&ac, stub.transport());
@@ -318,7 +319,7 @@ test "OAuth2Method: completeImpl second login returns same rid (not new)" {
 
     // Second login — same identity.
     {
-        var req = env.ctx(a, .POST, try oauthBody(a), &[_]http.Param{});
+        var req = env.ctx(RequestArena.from(&arena), .POST, try oauthBody(a), &[_]http.Param{});
         var ac = AuthCtx{ .app = &env.app, .ctx = &req, .collection = col, .config = .null };
         var stub = OAuthStub{};
         const res = try completeImpl(&ac, stub.transport());
@@ -343,7 +344,7 @@ test "OAuth2Method: completeImpl token exchange fail returns .fail 400" {
         defer env.pool.releaseWriter();
         break :blk (try collections.get(a, w, "oauth2users3")).?;
     };
-    var req = env.ctx(a, .POST, try oauthBody(a), &[_]http.Param{});
+    var req = env.ctx(RequestArena.from(&arena), .POST, try oauthBody(a), &[_]http.Param{});
     var ac = AuthCtx{
         .app = &env.app,
         .ctx = &req,
@@ -373,7 +374,7 @@ test "OAuth2Method: completeImpl unknown provider returns .fail 404" {
         defer env.pool.releaseWriter();
         break :blk (try collections.get(a, w, "oauth2users4")).?;
     };
-    var req = env.ctx(a, .POST, "{\"provider\":\"github\",\"code\":\"c\",\"codeVerifier\":\"v\",\"redirectUrl\":\"https://app/cb\"}", &[_]http.Param{});
+    var req = env.ctx(RequestArena.from(&arena), .POST, "{\"provider\":\"github\",\"code\":\"c\",\"codeVerifier\":\"v\",\"redirectUrl\":\"https://app/cb\"}", &[_]http.Param{});
     var ac = AuthCtx{
         .app = &env.app,
         .ctx = &req,
@@ -409,7 +410,7 @@ test "OAuth2Method: initiate returns 200 JSON with authURL+clientId+scopes" {
         defer env.pool.releaseWriter();
         break :blk (try collections.get(a, w, "oauth2init1")).?;
     };
-    var req = env.ctx(a, .POST, "{\"provider\":\"google\"}", &[_]http.Param{});
+    var req = env.ctx(RequestArena.from(&arena), .POST, "{\"provider\":\"google\"}", &[_]http.Param{});
     var ac = AuthCtx{
         .app = &env.app,
         .ctx = &req,
@@ -443,7 +444,7 @@ test "OAuth2Method: initiate omits state when oauth_state_server is disabled" {
         defer env.pool.releaseWriter();
         break :blk (try collections.get(a, w, "oauth2initnostate")).?;
     };
-    var req = env.ctx(a, .POST, "{\"provider\":\"google\"}", &[_]http.Param{});
+    var req = env.ctx(RequestArena.from(&arena), .POST, "{\"provider\":\"google\"}", &[_]http.Param{});
     var ac = AuthCtx{ .app = &env.app, .ctx = &req, .collection = col, .config = .null };
 
     var m = try OAuth2Method.create(std.testing.allocator, std.testing.io, .{});
@@ -467,7 +468,7 @@ test "OAuth2Method: initiate missing provider returns 400" {
         defer env.pool.releaseWriter();
         break :blk (try collections.get(a, w, "oauth2init2")).?;
     };
-    var req = env.ctx(a, .POST, "{}", &[_]http.Param{});
+    var req = env.ctx(RequestArena.from(&arena), .POST, "{}", &[_]http.Param{});
     var ac = AuthCtx{
         .app = &env.app,
         .ctx = &req,
@@ -494,7 +495,7 @@ test "OAuth2Method: initiate unknown provider returns 404" {
         defer env.pool.releaseWriter();
         break :blk (try collections.get(a, w, "oauth2init3")).?;
     };
-    var req = env.ctx(a, .POST, "{\"provider\":\"github\"}", &[_]http.Param{});
+    var req = env.ctx(RequestArena.from(&arena), .POST, "{\"provider\":\"github\"}", &[_]http.Param{});
     var ac = AuthCtx{
         .app = &env.app,
         .ctx = &req,
@@ -527,7 +528,7 @@ test "OAuth2Method: server-state — missing state returns .fail 400" {
         break :blk (try collections.get(a, w, "oauth2csrf1")).?;
     };
     // Body has no "state" field — should fail closed before any exchange.
-    var req = env.ctx(a, .POST, try oauthBody(a), &[_]http.Param{});
+    var req = env.ctx(RequestArena.from(&arena), .POST, try oauthBody(a), &[_]http.Param{});
     var ac = AuthCtx{ .app = &env.app, .ctx = &req, .collection = col, .config = .null };
 
     var stub = OAuthStub{};
@@ -554,7 +555,7 @@ test "OAuth2Method: server-state — valid issued state returns .record" {
     const state = blk: {
         const w = env.pool.acquireWriter();
         defer env.pool.releaseWriter();
-        var req = env.ctx(a, .POST, "", &[_]http.Param{});
+        var req = env.ctx(RequestArena.from(&arena), .POST, "", &[_]http.Param{});
         break :blk try oauth.issueState(&req, w, "oauth2csrf2", "google");
     };
 
@@ -564,7 +565,7 @@ test "OAuth2Method: server-state — valid issued state returns .record" {
         defer env.pool.releaseWriter();
         break :blk (try collections.get(a, w, "oauth2csrf2")).?;
     };
-    var req = env.ctx(a, .POST, try oauthBodyWithState(a, state), &[_]http.Param{});
+    var req = env.ctx(RequestArena.from(&arena), .POST, try oauthBodyWithState(a, state), &[_]http.Param{});
     var ac = AuthCtx{ .app = &env.app, .ctx = &req, .collection = col, .config = .null };
 
     var stub = OAuthStub{};
@@ -591,7 +592,7 @@ test "OAuth2Method: server-state — replayed (consumed) state returns .fail 400
     const state = blk: {
         const w = env.pool.acquireWriter();
         defer env.pool.releaseWriter();
-        var req = env.ctx(a, .POST, "", &[_]http.Param{});
+        var req = env.ctx(RequestArena.from(&arena), .POST, "", &[_]http.Param{});
         break :blk try oauth.issueState(&req, w, "oauth2csrf3", "google");
     };
 
@@ -603,7 +604,7 @@ test "OAuth2Method: server-state — replayed (consumed) state returns .fail 400
 
     // First use — consumes the state (should succeed and produce a record).
     {
-        var req = env.ctx(a, .POST, try oauthBodyWithState(a, state), &[_]http.Param{});
+        var req = env.ctx(RequestArena.from(&arena), .POST, try oauthBodyWithState(a, state), &[_]http.Param{});
         var ac = AuthCtx{ .app = &env.app, .ctx = &req, .collection = col, .config = .null };
         var stub = OAuthStub{};
         const res = try completeImpl(&ac, stub.transport());
@@ -615,7 +616,7 @@ test "OAuth2Method: server-state — replayed (consumed) state returns .fail 400
 
     // Second use — state already consumed; must fail 400.
     {
-        var req = env.ctx(a, .POST, try oauthBodyWithState(a, state), &[_]http.Param{});
+        var req = env.ctx(RequestArena.from(&arena), .POST, try oauthBodyWithState(a, state), &[_]http.Param{});
         var ac = AuthCtx{ .app = &env.app, .ctx = &req, .collection = col, .config = .null };
         var stub = OAuthStub{};
         const res = try completeImpl(&ac, stub.transport());

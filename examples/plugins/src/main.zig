@@ -303,7 +303,7 @@ const ApiTokenMethod = struct {
 
         const parsed = std.json.parseFromSlice(
             ApiTokenCompleteInput,
-            ac.ctx.allocator,
+            ac.ctx.allocator.a,
             body,
             .{},
         ) catch return .{ .fail = .{ .status = 400, .message = "invalid JSON" } };
@@ -400,8 +400,9 @@ fn handleAuth(ev: *zigbase.AuthEvent) void {
 //    ev.rctx is *const request.RequestContext which carries:
 //      .auth: ?std.json.Value  -- the authenticated record object
 //    There is no direct `auth_id` shortcut; extract it from the JSON object.
-//    Allocate with ev.arena (the request-scoped allocator that owns ev.record's
-//    JSON storage) -- need the app itself? Use ctx.app.
+//    Allocate with ev.arena.a -- ev.arena is a typed RequestArena and .a is the
+//    request-scoped allocator inside it, the one that owns ev.record's JSON storage.
+//    Need the app itself? Use ctx.app.
 // ---------------------------------------------------------------------------
 fn beforeCreateComment(ctx: *zigbase.Ctx, ev: *zigbase.RecordEvent) anyerror!void {
     _ = ctx;
@@ -412,7 +413,7 @@ fn beforeCreateComment(ctx: *zigbase.Ctx, ev: *zigbase.RecordEvent) anyerror!voi
             .string => |s| s,
             else => return, // malformed auth object -- skip silently
         };
-        try ev.record.object.put(ev.arena, "commenter", .{ .string = auth_id });
+        try ev.record.object.put(ev.arena.a, "commenter", .{ .string = auth_id });
     }
 }
 

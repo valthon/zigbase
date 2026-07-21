@@ -14,6 +14,7 @@
 //! It is registered onto the queue registry in `framework.zig` (gated on `enable_sms_job`).
 
 const std = @import("std");
+const RequestArena = @import("../request_arena.zig").RequestArena;
 const sender = @import("sender.zig");
 const e164 = @import("e164.zig");
 const App = @import("../app.zig").App;
@@ -87,8 +88,8 @@ pub fn send(app: *App, alloc: std.mem.Allocator, msg: SmsMessage) !void {
 /// produced back into an `SmsMessage` and delivers it via `send`. A malformed payload or a delivery
 /// failure is returned so the queue's retry/terminal policy applies.
 pub fn jobHandler(ctx: *Ctx, payload: []const u8) anyerror!void {
-    const parsed = try std.json.parseFromSlice(SmsMessage, ctx.arena, payload, .{ .ignore_unknown_fields = true });
-    try send(ctx.app, ctx.arena, parsed.value);
+    const parsed = try std.json.parseFromSlice(SmsMessage, ctx.arena.a, payload, .{ .ignore_unknown_fields = true });
+    try send(ctx.app, ctx.arena.a, parsed.value);
 }
 
 // ---------------------------------------------------------------------------
@@ -150,7 +151,7 @@ test "jobHandler round-trips a JSON payload into a delivered message" {
 
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
-    var ctx = Ctx{ .app = &app, .arena = arena.allocator() };
+    var ctx = Ctx{ .app = &app, .arena = RequestArena.from(&arena) };
     // The payload is what serializePayload(SmsMessage) would produce.
     try jobHandler(&ctx, "{\"to\":\"+15551234567\",\"body\":\"queued hello\"}");
     try testing.expectEqual(@as(usize, 1), cap.count());

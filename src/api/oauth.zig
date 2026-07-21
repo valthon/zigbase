@@ -1,4 +1,5 @@
 const std = @import("std");
+const RequestArena = @import("../request_arena.zig").RequestArena;
 const http = @import("../http.zig");
 const db = @import("../db.zig");
 const schema = @import("../schema.zig");
@@ -80,26 +81,26 @@ pub fn oauth2Providers(ctx: *http.RequestCtx) anyerror!http.Response {
     // Use a pooled reader so the single global writer lock is not held.
     var r = try app.pool.acquireReader();
     defer app.pool.releaseReader(&r);
-    const col_name = ctx.param("col") orelse return ApiError.notFound().toResponse(ctx.allocator);
-    const col = (try collections.get(ctx.allocator, &r, col_name)) orelse return ApiError.notFound().toResponse(ctx.allocator);
-    if (col.type != .auth or !col.options.auth.oauth2.enabled) return ApiError.notFound().toResponse(ctx.allocator);
+    const col_name = ctx.param("col") orelse return ApiError.notFound().toResponse(ctx.allocator.a);
+    const col = (try collections.get(ctx.allocator.a, &r, col_name)) orelse return ApiError.notFound().toResponse(ctx.allocator.a);
+    if (col.type != .auth or !col.options.auth.oauth2.enabled) return ApiError.notFound().toResponse(ctx.allocator.a);
 
-    var arr = std.json.Array.init(ctx.allocator);
+    var arr = std.json.Array.init(ctx.allocator.a);
     for (col.options.auth.oauth2.providers) |cfg| {
         if (!cfg.enabled) continue;
         const prov = resolveProvider(cfg) orelse continue;
         var o: std.json.ObjectMap = .empty;
-        try o.put(ctx.allocator, "name", .{ .string = cfg.name });
-        try o.put(ctx.allocator, "authURL", .{ .string = prov.authURL });
-        try o.put(ctx.allocator, "clientId", .{ .string = cfg.clientId });
-        var scopes = std.json.Array.init(ctx.allocator);
+        try o.put(ctx.allocator.a, "name", .{ .string = cfg.name });
+        try o.put(ctx.allocator.a, "authURL", .{ .string = prov.authURL });
+        try o.put(ctx.allocator.a, "clientId", .{ .string = cfg.clientId });
+        var scopes = std.json.Array.init(ctx.allocator.a);
         for (prov.scopes) |s| try scopes.append(.{ .string = s });
-        try o.put(ctx.allocator, "scopes", .{ .array = scopes });
+        try o.put(ctx.allocator.a, "scopes", .{ .array = scopes });
         try arr.append(.{ .object = o });
     }
     var root: std.json.ObjectMap = .empty;
-    try root.put(ctx.allocator, "items", .{ .array = arr });
-    return .{ .status = 200, .body = try std.json.Stringify.valueAlloc(ctx.allocator, std.json.Value{ .object = root }, .{}) };
+    try root.put(ctx.allocator.a, "items", .{ .array = arr });
+    return .{ .status = 200, .body = try std.json.Stringify.valueAlloc(ctx.allocator.a, std.json.Value{ .object = root }, .{}) };
 }
 
 // ----------------------------------------------------------------------------
@@ -110,7 +111,7 @@ pub fn oauth2Providers(ctx: *http.RequestCtx) anyerror!http.Response {
 /// Single-use: it is deleted on the first successful callback verification.
 pub fn issueState(ctx: *http.RequestCtx, conn: *db.Db, col_name: []const u8, provider: []const u8) ![]const u8 {
     const app = ctx.app.?;
-    const state = try crypto.genToken(app.io, ctx.allocator, 40);
+    const state = try crypto.genToken(app.io, ctx.allocator.a, 40);
     const now = try auth_api.nowUnix(conn);
     var st = try prep(conn,
         \\INSERT INTO "_oauthStates" ("state","collectionRef","provider","expires","created")
@@ -178,20 +179,20 @@ const strField = common.strField;
 /// Create a new password-less auth record from a provider identity. Returns its id.
 fn createOAuthRecord(ctx: *http.RequestCtx, conn: *db.Db, col: schema.Collection, identity: providers.Identity) ![]const u8 {
     const app = ctx.app.?;
-    const tk = try crypto.genToken(app.io, ctx.allocator, 32);
+    const tk = try crypto.genToken(app.io, ctx.allocator.a, 32);
     var data: std.json.ObjectMap = .empty;
     // SECURITY: only claim the (UNIQUE) email field when the provider VERIFIED it.
     // A provider's unverified email is attacker-controllable, so writing it here would
     // let an attacker squat a victim's address in the namespace. Unverified-email OAuth
     // records are created without an email (verified=false); the user can link/verify later.
     if (identity.emailVerified) {
-        if (identity.email) |e| try data.put(ctx.allocator, "email", .{ .string = e });
+        if (identity.email) |e| try data.put(ctx.allocator.a, "email", .{ .string = e });
     }
-    if (identity.name) |n| try data.put(ctx.allocator, "username", .{ .string = n });
-    try data.put(ctx.allocator, "passwordHash", .{ .string = "" });
-    try data.put(ctx.allocator, "tokenKey", .{ .string = tk });
-    try data.put(ctx.allocator, "verified", .{ .bool = identity.emailVerified });
-    const rec = try records.create(ctx.allocator, app.io, conn, col, std.json.Value{ .object = data });
+    if (identity.name) |n| try data.put(ctx.allocator.a, "username", .{ .string = n });
+    try data.put(ctx.allocator.a, "passwordHash", .{ .string = "" });
+    try data.put(ctx.allocator.a, "tokenKey", .{ .string = tk });
+    try data.put(ctx.allocator.a, "verified", .{ .bool = identity.emailVerified });
+    const rec = try records.create(ctx.allocator.a, app.io, conn, col, std.json.Value{ .object = data });
     return rec.object.get("id").?.string;
 }
 
@@ -233,7 +234,7 @@ pub fn prepareOAuth(ctx: *http.RequestCtx, col: schema.Collection) !PrepareResul
     const cfg = findProviderConfig(col, provider_name) orelse return PrepareResult{ .fail = .{ .status = ApiError.notFound().status, .message = ApiError.notFound().message } };
     const provider = resolveProvider(cfg) orelse return PrepareResult{ .fail = .{ .status = 400, .message = "Provider misconfigured." } };
     if (!redirectAllowed(cfg, redirect_url)) return PrepareResult{ .fail = .{ .status = 400, .message = "redirectUrl not allowed." } };
-    const secret = secrets.decryptSecret(ctx.allocator, app.jwt_secret, cfg.clientSecret) catch
+    const secret = secrets.decryptSecret(ctx.allocator.a, app.jwt_secret, cfg.clientSecret) catch
         return PrepareResult{ .fail = .{ .status = ApiError.internal().status, .message = ApiError.internal().message } };
 
     return PrepareResult{ .ok = .{
@@ -253,13 +254,13 @@ pub fn prepareOAuth(ctx: *http.RequestCtx, col: schema.Collection) !PrepareResul
 pub fn resolveRecordFromIdentity(ctx: *http.RequestCtx, conn: *db.Db, col: schema.Collection, provider_name: []const u8, identity: providers.Identity) !Outcome {
     const app = ctx.app.?;
 
-    const authed = (auth.authenticate(app.io, ctx.allocator, app, ctx, conn) catch null);
+    const authed = (auth.authenticate(app.io, ctx.allocator.a, app, ctx, conn) catch null);
     const authed_rid: ?[]const u8 = if (authed) |x|
         (if (std.mem.eql(u8, x.collection, col.name)) x.record.object.get("id").?.string else null)
     else
         null;
 
-    if (try findLink(ctx.allocator, conn, provider_name, identity.providerUserId)) |link| {
+    if (try findLink(ctx.allocator.a, conn, provider_name, identity.providerUserId)) |link| {
         if (authed_rid) |arid| {
             if (!std.mem.eql(u8, arid, link.recordRef))
                 return Outcome{ .fail = .{ .status = 409, .message = "Provider already linked to another account." } };
@@ -268,14 +269,14 @@ pub fn resolveRecordFromIdentity(ctx: *http.RequestCtx, conn: *db.Db, col: schem
     }
 
     if (authed_rid) |arid| {
-        insertLink(app.io, ctx.allocator, conn, col.name, arid, provider_name, identity.providerUserId) catch
+        insertLink(app.io, ctx.allocator.a, conn, col.name, arid, provider_name, identity.providerUserId) catch
             return Outcome{ .fail = .{ .status = 409, .message = "Provider already linked." } };
         return Outcome{ .record = .{ .rid = arid, .is_new = false } };
     }
 
     const new_rid = createOAuthRecord(ctx, conn, col, identity) catch
         return Outcome{ .fail = .{ .status = 409, .message = "Email already registered; sign in and link instead." } };
-    insertLink(app.io, ctx.allocator, conn, col.name, new_rid, provider_name, identity.providerUserId) catch
+    insertLink(app.io, ctx.allocator.a, conn, col.name, new_rid, provider_name, identity.providerUserId) catch
         return Outcome{ .fail = .{ .status = 409, .message = "Provider already linked." } };
     return Outcome{ .record = .{ .rid = new_rid, .is_new = true } };
 }
@@ -304,26 +305,26 @@ pub fn unlinkProvider(ctx: *http.RequestCtx) anyerror!http.Response {
     const app = ctx.app.?;
     const w = app.pool.acquireWriter();
     defer app.pool.releaseWriter();
-    const col_name = ctx.param("col") orelse return ApiError.notFound().toResponse(ctx.allocator);
-    const rid = ctx.param("id") orelse return ApiError.notFound().toResponse(ctx.allocator);
-    const provider = ctx.param("provider") orelse return ApiError.notFound().toResponse(ctx.allocator);
-    const col = (try collections.get(ctx.allocator, w, col_name)) orelse return ApiError.notFound().toResponse(ctx.allocator);
-    if (col.type != .auth) return ApiError.notFound().toResponse(ctx.allocator);
+    const col_name = ctx.param("col") orelse return ApiError.notFound().toResponse(ctx.allocator.a);
+    const rid = ctx.param("id") orelse return ApiError.notFound().toResponse(ctx.allocator.a);
+    const provider = ctx.param("provider") orelse return ApiError.notFound().toResponse(ctx.allocator.a);
+    const col = (try collections.get(ctx.allocator.a, w, col_name)) orelse return ApiError.notFound().toResponse(ctx.allocator.a);
+    if (col.type != .auth) return ApiError.notFound().toResponse(ctx.allocator.a);
 
-    const authed = (auth.authenticate(app.io, ctx.allocator, app, ctx, w) catch null) orelse
-        return (ApiError{ .status = 403, .message = "Forbidden." }).toResponse(ctx.allocator);
+    const authed = (auth.authenticate(app.io, ctx.allocator.a, app, ctx, w) catch null) orelse
+        return (ApiError{ .status = 403, .message = "Forbidden." }).toResponse(ctx.allocator.a);
     const is_self = std.mem.eql(u8, authed.collection, col.name) and std.mem.eql(u8, authed.record.object.get("id").?.string, rid);
-    if (!authed.is_superuser and !is_self) return (ApiError{ .status = 403, .message = "Forbidden." }).toResponse(ctx.allocator);
+    if (!authed.is_superuser and !is_self) return (ApiError{ .status = 403, .message = "Forbidden." }).toResponse(ctx.allocator.a);
 
-    if ((try linkCount(ctx.allocator, w, col.name, rid)) <= 1 and !(try passwordIsSet(ctx.allocator, w, col.name, rid)))
-        return (ApiError{ .status = 400, .message = "Cannot remove the last credential." }).toResponse(ctx.allocator);
+    if ((try linkCount(ctx.allocator.a, w, col.name, rid)) <= 1 and !(try passwordIsSet(ctx.allocator.a, w, col.name, rid)))
+        return (ApiError{ .status = 400, .message = "Cannot remove the last credential." }).toResponse(ctx.allocator.a);
 
     var st = try prep(w, "DELETE FROM \"_externalAuths\" WHERE \"collectionRef\"=?1 AND \"recordRef\"=?2 AND \"provider\"=?3 RETURNING \"id\";");
     defer st.finalize();
     try st.bindText(1, col.name);
     try st.bindText(2, rid);
     try st.bindText(3, provider);
-    if (!try st.step()) return ApiError.notFound().toResponse(ctx.allocator);
+    if (!try st.step()) return ApiError.notFound().toResponse(ctx.allocator.a);
     return .{ .status = 204, .body = "" };
 }
 
@@ -418,7 +419,7 @@ const TestEnv = struct {
         });
     }
 
-    fn ctx(env: *TestEnv, a: std.mem.Allocator, m: http.Method, body: []const u8, params: []const http.Param) http.RequestCtx {
+    fn ctx(env: *TestEnv, a: RequestArena, m: http.Method, body: []const u8, params: []const http.Param) http.RequestCtx {
         return .{ .method = m, .path = "/", .body = body, .allocator = a, .app = &env.app, .params = params };
     }
 };
@@ -431,7 +432,7 @@ test "auth/oauth2/providers lists enabled providers without secrets" {
     const a = arena.allocator();
     try env.seedOAuthCollection(a, "users");
     const p = [_]http.Param{.{ .key = "col", .value = "users" }};
-    var c = env.ctx(a, .GET, "", &p);
+    var c = env.ctx(RequestArena.from(&arena), .GET, "", &p);
     const res = try oauth2Providers(&c);
     try std.testing.expectEqual(@as(u16, 200), res.status);
     try std.testing.expect(std.mem.startsWith(u8, res.body, "{\"items\":["));
@@ -453,7 +454,7 @@ test "auth/oauth2/providers 404 when oauth2 disabled" {
         _ = try collections.create(a, std.testing.io, w, .{ .id = "", .name = "plain", .type = .auth, .fields = &.{}, .listRule = "", .viewRule = "", .createRule = "", .updateRule = "", .deleteRule = "" });
     }
     const p = [_]http.Param{.{ .key = "col", .value = "plain" }};
-    var c = env.ctx(a, .GET, "", &p);
+    var c = env.ctx(RequestArena.from(&arena), .GET, "", &p);
     try std.testing.expectEqual(@as(u16, 404), (try oauth2Providers(&c)).status);
 }
 
@@ -481,7 +482,7 @@ test "unlink refuses the last credential of a password-less account" {
     const key = crypto2.deriveKey(env.app.jwt_secret, "tk");
     const token = try jwt.sign(a, .{ .id = "r1", .collection = "users", .type = .auth, .iat = 0, .exp = 9999999999 }, &key);
     const p = [_]http.Param{ .{ .key = "col", .value = "users" }, .{ .key = "id", .value = "r1" }, .{ .key = "provider", .value = "google" } };
-    var c = env.ctx(a, .DELETE, "", &p);
+    var c = env.ctx(RequestArena.from(&arena), .DELETE, "", &p);
     c.authorization = try std.fmt.allocPrint(a, "Bearer {s}", .{token});
     try std.testing.expectEqual(@as(u16, 400), (try unlinkProvider(&c)).status);
 }
@@ -504,7 +505,7 @@ test "unlink succeeds when another credential remains (password set)" {
     const key = crypto2.deriveKey(env.app.jwt_secret, "tk2");
     const token = try jwt.sign(a, .{ .id = "r2", .collection = "users", .type = .auth, .iat = 0, .exp = 9999999999 }, &key);
     const p = [_]http.Param{ .{ .key = "col", .value = "users" }, .{ .key = "id", .value = "r2" }, .{ .key = "provider", .value = "google" } };
-    var c = env.ctx(a, .DELETE, "", &p);
+    var c = env.ctx(RequestArena.from(&arena), .DELETE, "", &p);
     c.authorization = try std.fmt.allocPrint(a, "Bearer {s}", .{token});
     try std.testing.expectEqual(@as(u16, 204), (try unlinkProvider(&c)).status);
 }
@@ -520,7 +521,7 @@ test "createOAuthRecord: unverified provider email is NOT claimed (no squat)" {
     const w = env.pool.acquireWriter();
     defer env.pool.releaseWriter();
     const col = (try collections.get(a, w, "users")).?;
-    var req = env.ctx(a, .POST, "", &[_]http.Param{});
+    var req = env.ctx(RequestArena.from(&arena), .POST, "", &[_]http.Param{});
 
     // First identity: provider did NOT verify the email -> record created WITHOUT email.
     const rid1 = try createOAuthRecord(&req, w, col, .{

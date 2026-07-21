@@ -1,4 +1,5 @@
 const std = @import("std");
+const RequestArena = @import("../../request_arena.zig").RequestArena;
 const method_mod = @import("../method.zig");
 const AuthMethod = method_mod.AuthMethod;
 const AuthCtx = method_mod.AuthCtx;
@@ -68,7 +69,7 @@ fn initiateImpl(ctx: *anyopaque, ac: *AuthCtx) anyerror!InitiateResult {
 
     // Parse optional identity from body (usernameless flow supported).
     const identity: []const u8 = blk: {
-        const parsed = std.json.parseFromSlice(std.json.Value, ac.ctx.allocator, ac.ctx.body, .{}) catch break :blk "";
+        const parsed = std.json.parseFromSlice(std.json.Value, ac.ctx.allocator.a, ac.ctx.body, .{}) catch break :blk "";
         if (parsed.value != .object) break :blk "";
         break :blk strField(parsed.value, "identity") orelse "";
     };
@@ -84,7 +85,7 @@ fn initiateImpl(ctx: *anyopaque, ac: *AuthCtx) anyerror!InitiateResult {
     // Store challenge via ChallengeStore with method key "webauthn" (login ceremony).
     const cs = ChallengeStore{ .conn = w.conn };
     const cid = try cs.put(
-        ac.ctx.allocator,
+        ac.ctx.allocator.a,
         ac.app.io,
         ac.collection.name,
         "webauthn",
@@ -94,11 +95,11 @@ fn initiateImpl(ctx: *anyopaque, ac: *AuthCtx) anyerror!InitiateResult {
     );
 
     // Base64url-encode the raw challenge bytes for the browser.
-    const challenge_b64 = try client_data.b64urlNoPad(ac.ctx.allocator, &challenge_raw);
+    const challenge_b64 = try client_data.b64urlNoPad(ac.ctx.allocator.a, &challenge_raw);
 
     // Build the PublicKeyCredentialRequestOptions JSON response.
     const body = try std.fmt.allocPrint(
-        ac.ctx.allocator,
+        ac.ctx.allocator.a,
         "{{\"challenge\":\"{s}\",\"rpId\":\"{s}\",\"ceremonyId\":\"{s}\",\"timeout\":300000}}",
         .{ challenge_b64, wa_opts.rp_id, cid },
     );
@@ -120,7 +121,7 @@ fn completeImpl(ctx: *anyopaque, ac: *AuthCtx) anyerror!Resolution {
     }
 
     // Parse request body.
-    const parsed = std.json.parseFromSlice(std.json.Value, ac.ctx.allocator, ac.ctx.body, .{}) catch {
+    const parsed = std.json.parseFromSlice(std.json.Value, ac.ctx.allocator.a, ac.ctx.body, .{}) catch {
         return Resolution{ .fail = .{ .status = 400, .message = "Invalid JSON body." } };
     };
     if (parsed.value != .object) {
@@ -145,13 +146,13 @@ fn completeImpl(ctx: *anyopaque, ac: *AuthCtx) anyerror!Resolution {
     };
 
     // Decode all base64url fields.
-    const auth_data_bytes = b64urlDecode(ac.ctx.allocator, auth_data_b64) catch {
+    const auth_data_bytes = b64urlDecode(ac.ctx.allocator.a, auth_data_b64) catch {
         return Resolution{ .fail = .{ .status = 400, .message = "Invalid authenticatorData encoding." } };
     };
-    const cdj_bytes = b64urlDecode(ac.ctx.allocator, cdj_b64) catch {
+    const cdj_bytes = b64urlDecode(ac.ctx.allocator.a, cdj_b64) catch {
         return Resolution{ .fail = .{ .status = 400, .message = "Invalid clientDataJSON encoding." } };
     };
-    const sig_bytes = b64urlDecode(ac.ctx.allocator, sig_b64) catch {
+    const sig_bytes = b64urlDecode(ac.ctx.allocator.a, sig_b64) catch {
         return Resolution{ .fail = .{ .status = 400, .message = "Invalid signature encoding." } };
     };
 
@@ -172,7 +173,7 @@ fn completeImpl(ctx: *anyopaque, ac: *AuthCtx) anyerror!Resolution {
         // SECURITY: take() filters by method, so a "webauthn_reg" registration challenge
         // cannot be consumed by this login take() that passes "webauthn".
         const cs = ChallengeStore{ .conn = w.conn };
-        const ch = (try cs.take(ac.ctx.allocator, ceremony_id, "webauthn")) orelse {
+        const ch = (try cs.take(ac.ctx.allocator.a, ceremony_id, "webauthn")) orelse {
             return Resolution{ .fail = .{ .status = 400, .message = "Invalid or expired ceremony." } };
         };
 
@@ -180,7 +181,7 @@ fn completeImpl(ctx: *anyopaque, ac: *AuthCtx) anyerror!Resolution {
         // SECURITY REQUIREMENT 1: user identity comes from the stored credential's record_ref,
         // never from the client request.
         const cred_store = CredentialStore{ .conn = w.conn };
-        const cred = (try cred_store.getByCredentialId(ac.ctx.allocator, credential_id_b64)) orelse {
+        const cred = (try cred_store.getByCredentialId(ac.ctx.allocator.a, credential_id_b64)) orelse {
             return Resolution{ .fail = .{ .status = 400, .message = "Unknown credential." } };
         };
 
@@ -193,7 +194,7 @@ fn completeImpl(ctx: *anyopaque, ac: *AuthCtx) anyerror!Resolution {
         }
 
         // Decode the stored COSE public key (stored as raw COSE bytes, base64url encoded).
-        const decoded_key = b64urlDecode(ac.ctx.allocator, cred.public_key) catch {
+        const decoded_key = b64urlDecode(ac.ctx.allocator.a, cred.public_key) catch {
             return Resolution{ .fail = .{ .status = 400, .message = "Stored credential key is invalid." } };
         };
 
@@ -211,7 +212,7 @@ fn completeImpl(ctx: *anyopaque, ac: *AuthCtx) anyerror!Resolution {
     };
 
     const assertion_result = authenticate_mod.verifyAssertion(
-        ac.ctx.allocator,
+        ac.ctx.allocator.a,
         wa_opts.rp_id,
         wa_opts.origin,
         challenge_raw,
@@ -240,7 +241,7 @@ fn completeImpl(ctx: *anyopaque, ac: *AuthCtx) anyerror!Resolution {
         defer w2.deinit();
 
         const cred_store = CredentialStore{ .conn = w2.conn };
-        const cur = (try cred_store.getByCredentialId(ac.ctx.allocator, credential_id_b64)) orelse {
+        const cur = (try cred_store.getByCredentialId(ac.ctx.allocator.a, credential_id_b64)) orelse {
             // Credential vanished between phases (deleted concurrently) — fail closed.
             return Resolution{ .fail = .{ .status = 400, .message = "Unknown credential." } };
         };
@@ -349,7 +350,7 @@ test "WebAuthnMethod: initiate returns 200 with challenge + rpId + ceremonyId" {
         .method = .POST,
         .path = "/",
         .body = "{}",
-        .allocator = a,
+        .allocator = RequestArena.from(&arena),
         .app = &wenv.app,
     };
     var ac = AuthCtx{
@@ -398,7 +399,7 @@ test "WebAuthnMethod: initiate without webauthn config returns 500" {
         .method = .POST,
         .path = "/",
         .body = "{}",
-        .allocator = a,
+        .allocator = RequestArena.from(&arena),
         .app = &wenv.app,
     };
     var ac = AuthCtx{
@@ -556,7 +557,7 @@ test "WebAuthnMethod: complete succeeds with valid fixture (ES256)" {
         .method = .POST,
         .path = "/",
         .body = body_str,
-        .allocator = a,
+        .allocator = RequestArena.from(&arena),
         .app = &wenv.app,
     };
     var ac = AuthCtx{
@@ -684,7 +685,7 @@ test "WebAuthnMethod: complete with tampered signature returns 401" {
         defer wenv.pool.releaseWriter();
         break :blk (try collections.get(a, w, "wausers4")).?;
     };
-    var req = http.RequestCtx{ .method = .POST, .path = "/", .body = body_str, .allocator = a, .app = &wenv.app };
+    var req = http.RequestCtx{ .method = .POST, .path = "/", .body = body_str, .allocator = RequestArena.from(&arena), .app = &wenv.app };
     var ac = AuthCtx{ .app = &wenv.app, .ctx = &req, .collection = col, .config = .null };
 
     var m = try WebAuthnMethod.create(alloc, std.testing.io, .{});
@@ -744,7 +745,7 @@ test "WebAuthnMethod: complete with unknown credentialId returns 400" {
         defer wenv.pool.releaseWriter();
         break :blk (try collections.get(a, w, "wausers5")).?;
     };
-    var req = http.RequestCtx{ .method = .POST, .path = "/", .body = body_str, .allocator = a, .app = &wenv.app };
+    var req = http.RequestCtx{ .method = .POST, .path = "/", .body = body_str, .allocator = RequestArena.from(&arena), .app = &wenv.app };
     var ac = AuthCtx{ .app = &wenv.app, .ctx = &req, .collection = col, .config = .null };
 
     var m = try WebAuthnMethod.create(alloc, std.testing.io, .{});
@@ -805,7 +806,7 @@ test "WebAuthnMethod: complete with expired ceremonyId returns 400" {
         defer wenv.pool.releaseWriter();
         break :blk (try collections.get(a, w, "wausers6")).?;
     };
-    var req = http.RequestCtx{ .method = .POST, .path = "/", .body = body_str, .allocator = a, .app = &wenv.app };
+    var req = http.RequestCtx{ .method = .POST, .path = "/", .body = body_str, .allocator = RequestArena.from(&arena), .app = &wenv.app };
     var ac = AuthCtx{ .app = &wenv.app, .ctx = &req, .collection = col, .config = .null };
 
     var m = try WebAuthnMethod.create(alloc, std.testing.io, .{});
@@ -920,7 +921,7 @@ test "WebAuthnMethod: complete with clone signal (stored count > new count) retu
         defer wenv.pool.releaseWriter();
         break :blk (try collections.get(a, w, "wausers7")).?;
     };
-    var req = http.RequestCtx{ .method = .POST, .path = "/", .body = body_str, .allocator = a, .app = &wenv.app };
+    var req = http.RequestCtx{ .method = .POST, .path = "/", .body = body_str, .allocator = RequestArena.from(&arena), .app = &wenv.app };
     var ac = AuthCtx{ .app = &wenv.app, .ctx = &req, .collection = col, .config = .null };
 
     var m = try WebAuthnMethod.create(alloc, std.testing.io, .{});
@@ -1058,7 +1059,7 @@ test "WebAuthnMethod: complete rejects a credential bound to a DIFFERENT collect
         defer wenv.pool.releaseWriter();
         break :blk (try collections.get(a, w, "wax_b")).?;
     };
-    var req = http.RequestCtx{ .method = .POST, .path = "/", .body = body_str, .allocator = a, .app = &wenv.app };
+    var req = http.RequestCtx{ .method = .POST, .path = "/", .body = body_str, .allocator = RequestArena.from(&arena), .app = &wenv.app };
     var ac = AuthCtx{ .app = &wenv.app, .ctx = &req, .collection = col, .config = .null };
 
     var m = try WebAuthnMethod.create(alloc, std.testing.io, .{});
@@ -1183,7 +1184,7 @@ test "WebAuthnMethod: complete with require_uv=true rejects an assertion lacking
         defer wenv.pool.releaseWriter();
         break :blk (try collections.get(a, w, "wausers_uv")).?;
     };
-    var req = http.RequestCtx{ .method = .POST, .path = "/", .body = body_str, .allocator = a, .app = &wenv.app };
+    var req = http.RequestCtx{ .method = .POST, .path = "/", .body = body_str, .allocator = RequestArena.from(&arena), .app = &wenv.app };
     var ac = AuthCtx{ .app = &wenv.app, .ctx = &req, .collection = col, .config = .null };
 
     var m = try WebAuthnMethod.create(alloc, std.testing.io, .{});

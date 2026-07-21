@@ -1,4 +1,5 @@
 const std = @import("std");
+const RequestArena = @import("../request_arena.zig").RequestArena;
 const http = @import("../http.zig");
 const app_mod = @import("../app.zig");
 const db = @import("../db.zig");
@@ -30,7 +31,7 @@ const ratelimit = @import("../ratelimit.zig");
 pub fn emitRecord(
     app: *app_mod.App,
     rctx: *const request.RequestContext,
-    arena: std.mem.Allocator,
+    arena: RequestArena,
     conn: *db.Db,
     col_name: []const u8,
     value: *std.json.Value,
@@ -86,9 +87,9 @@ fn validationResponse(ctx: *http.RequestCtx) !http.Response {
     // arena-owned strings, still live for the toResponse render below (same request scope).
     defer records.last_errors = null;
     const verrs = records.last_errors orelse &[_]schema.ValidationError{};
-    const fes = try ctx.allocator.alloc(FieldError, verrs.len);
+    const fes = try ctx.allocator.a.alloc(FieldError, verrs.len);
     for (verrs, 0..) |e, i| fes[i] = .{ .field = e.field, .code = e.code, .message = e.message };
-    return ApiError.validation(fes).toResponse(ctx.allocator);
+    return ApiError.validation(fes).toResponse(ctx.allocator.a);
 }
 
 /// Resolve the `:col` route param to its parsed collection via the app's metadata cache
@@ -98,11 +99,11 @@ fn validationResponse(ctx: *http.RequestCtx) !http.Response {
 fn resolveCollection(ctx: *http.RequestCtx, conn: *db.Db) !colcache.Lease {
     const name = ctx.param("col") orelse return colcache.Lease{ .col = null };
     const cache = if (ctx.app) |a| a.col_cache else null;
-    return colcache.lease(cache, conn, ctx.allocator, name);
+    return colcache.lease(cache, conn, ctx.allocator.a, name);
 }
 
 fn jsonResponse(ctx: *http.RequestCtx, status: u16, v: std.json.Value) !http.Response {
-    return .{ .status = status, .body = try std.json.Stringify.valueAlloc(ctx.allocator, v, .{}) };
+    return .{ .status = status, .body = try std.json.Stringify.valueAlloc(ctx.allocator.a, v, .{}) };
 }
 
 /// Fills auth/superuser from the verified bearer/cookie token (anonymous if absent/invalid), then
@@ -114,7 +115,7 @@ fn buildContext(ctx: *http.RequestCtx, conn: *db.Db, data: ?std.json.Value) requ
     const app = ctx.app orelse return rctx;
     rctx.tenancy_enabled = app.tenancy.enabled;
     rctx.role_ranking = app.role_ranking; // ability `.min_role` comparisons (#155)
-    const a = (auth.authenticate(app.io, ctx.allocator, app, ctx, conn) catch null) orelse return rctx;
+    const a = (auth.authenticate(app.io, ctx.allocator.a, app, ctx, conn) catch null) orelse return rctx;
     rctx.auth = a.record;
     rctx.is_superuser = a.is_superuser;
     rctx.collection = a.collection;
@@ -125,11 +126,11 @@ fn buildContext(ctx: *http.RequestCtx, conn: *db.Db, data: ?std.json.Value) requ
 }
 
 fn forbidden(ctx: *http.RequestCtx) !http.Response {
-    return (ApiError{ .status = 403, .message = "Forbidden." }).toResponse(ctx.allocator);
+    return (ApiError{ .status = 403, .message = "Forbidden." }).toResponse(ctx.allocator.a);
 }
 
 fn hookRejected(ctx: *http.RequestCtx) anyerror!http.Response {
-    return ApiError.badRequest("Request rejected by a hook.").toResponse(ctx.allocator);
+    return ApiError.badRequest("Request rejected by a hook.").toResponse(ctx.allocator.a);
 }
 
 /// For auth collections, transform request data through auth.applyCreate/applyUpdate
@@ -142,9 +143,9 @@ fn prepAuthData(ctx: *http.RequestCtx, col: schema.Collection, data: std.json.Va
     const app = ctx.app.?;
     const min_len = col.options.auth.minPasswordLength;
     const out = if (is_create)
-        auth.applyCreate(app.io, ctx.allocator, data, min_len)
+        auth.applyCreate(app.io, ctx.allocator.a, data, min_len)
     else
-        auth.applyUpdate(app.io, ctx.allocator, data, min_len);
+        auth.applyUpdate(app.io, ctx.allocator.a, data, min_len);
     return out catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.BadPassword, // PasswordTooShort and rare hashing/token failures -> bad request
@@ -158,7 +159,7 @@ fn prepAuthData(ctx: *http.RequestCtx, col: schema.Collection, data: std.json.Va
 const PwFields = struct { password: ?[]const u8 = null, old: ?[]const u8 = null };
 
 fn peekPasswordFields(ctx: *http.RequestCtx) ?PwFields {
-    const raw = if (ctx.form_fields) |ff| ff else (std.json.parseFromSlice(std.json.Value, ctx.allocator, ctx.body, .{}) catch return null).value;
+    const raw = if (ctx.form_fields) |ff| ff else (std.json.parseFromSlice(std.json.Value, ctx.allocator.a, ctx.body, .{}) catch return null).value;
     if (raw != .object) return .{};
     var out = PwFields{};
     if (raw.object.get("password")) |v| if (v == .string) {
@@ -204,24 +205,24 @@ pub fn view(ctx: *http.RequestCtx) anyerror!http.Response {
     defer app.pool.releaseReader(&r);
     var col_lease = try resolveCollection(ctx, &r);
     defer col_lease.release();
-    const col = col_lease.col orelse return ApiError.notFound().toResponse(ctx.allocator);
-    const rid = ctx.param("id") orelse return ApiError.notFound().toResponse(ctx.allocator);
+    const col = col_lease.col orelse return ApiError.notFound().toResponse(ctx.allocator.a);
+    const rid = ctx.param("id") orelse return ApiError.notFound().toResponse(ctx.allocator.a);
     const rctx = buildContext(ctx, &r, null);
     switch (policy.decide(col, .view, &rctx)) {
-        .deny_locked => return ApiError.notFound().toResponse(ctx.allocator),
+        .deny_locked => return ApiError.notFound().toResponse(ctx.allocator.a),
         .allow => {},
-        .check => if (!try policy.authorizes(ctx.allocator, &r, col, .view, rid, &rctx)) return ApiError.notFound().toResponse(ctx.allocator),
+        .check => if (!try policy.authorizes(ctx.allocator.a, &r, col, .view, rid, &rctx)) return ApiError.notFound().toResponse(ctx.allocator.a),
     }
-    var rec = (try records.get(ctx.allocator, &r, col, rid)) orelse return ApiError.notFound().toResponse(ctx.allocator);
-    const qp = try params_mod.parse(ctx.allocator, ctx.query);
-    if (qp.get("expand")) |exp| if (exp.len > 0) try expand_mod.expand(ctx.allocator, &r, col, &rec, exp, 0, &rctx);
+    var rec = (try records.get(ctx.allocator.a, &r, col, rid)) orelse return ApiError.notFound().toResponse(ctx.allocator.a);
+    const qp = try params_mod.parse(ctx.allocator.a, ctx.query);
+    if (qp.get("expand")) |exp| if (exp.len > 0) try expand_mod.expand(ctx.allocator.a, &r, col, &rec, exp, 0, &rctx);
     // `fields=` response projection: a PURE OUTPUT FILTER applied AFTER expand + authorization —
     // it can only narrow the record, never reveal a field it wouldn't otherwise return.
     if (qp.get("fields")) |f| if (f.len > 0) {
         // Attacker-controlled — cap length like filter/sort (records.max_filter_len) to bound
         // parse/projection cost before doing any work.
-        if (f.len > records.max_filter_len) return ApiError.badRequest("`fields` is too long.").toResponse(ctx.allocator);
-        try fields_mod.project(ctx.allocator, &rec, try fields_mod.parse(ctx.allocator, f));
+        if (f.len > records.max_filter_len) return ApiError.badRequest("`fields` is too long.").toResponse(ctx.allocator.a);
+        try fields_mod.project(ctx.allocator.a, &rec, try fields_mod.parse(ctx.allocator.a, f));
     };
     return jsonResponse(ctx, 200, rec);
 }
@@ -237,21 +238,21 @@ pub fn abilities(ctx: *http.RequestCtx) anyerror!http.Response {
     defer app.pool.releaseReader(&r);
     var col_lease = try resolveCollection(ctx, &r);
     defer col_lease.release();
-    const col = col_lease.col orelse return ApiError.notFound().toResponse(ctx.allocator);
-    const rid = ctx.param("id") orelse return ApiError.notFound().toResponse(ctx.allocator);
+    const col = col_lease.col orelse return ApiError.notFound().toResponse(ctx.allocator.a);
+    const rid = ctx.param("id") orelse return ApiError.notFound().toResponse(ctx.allocator.a);
     const rctx = buildContext(ctx, &r, null);
     // The record must exist AND be viewable; otherwise 404 (never leak existence).
-    if ((try records.get(ctx.allocator, &r, col, rid)) == null) return ApiError.notFound().toResponse(ctx.allocator);
-    const can_view = try policy.authorizes(ctx.allocator, &r, col, .view, rid, &rctx);
-    if (!can_view) return ApiError.notFound().toResponse(ctx.allocator);
-    const can_update = try policy.authorizes(ctx.allocator, &r, col, .update, rid, &rctx);
-    const can_delete = try policy.authorizes(ctx.allocator, &r, col, .delete, rid, &rctx);
+    if ((try records.get(ctx.allocator.a, &r, col, rid)) == null) return ApiError.notFound().toResponse(ctx.allocator.a);
+    const can_view = try policy.authorizes(ctx.allocator.a, &r, col, .view, rid, &rctx);
+    if (!can_view) return ApiError.notFound().toResponse(ctx.allocator.a);
+    const can_update = try policy.authorizes(ctx.allocator.a, &r, col, .update, rid, &rctx);
+    const can_delete = try policy.authorizes(ctx.allocator.a, &r, col, .delete, rid, &rctx);
     var obj: std.json.ObjectMap = .empty;
     // `view` is always `true` on a 200: we already returned 404 above unless the caller can view the
     // record, so the response's very existence IS the view grant. It is emitted for a uniform shape.
-    try obj.put(ctx.allocator, "view", .{ .bool = can_view });
-    try obj.put(ctx.allocator, "update", .{ .bool = can_update });
-    try obj.put(ctx.allocator, "delete", .{ .bool = can_delete });
+    try obj.put(ctx.allocator.a, "view", .{ .bool = can_view });
+    try obj.put(ctx.allocator.a, "update", .{ .bool = can_update });
+    try obj.put(ctx.allocator.a, "delete", .{ .bool = can_delete });
     return jsonResponse(ctx, 200, .{ .object = obj });
 }
 
@@ -264,15 +265,15 @@ const Prepared = union(enum) { plan: file_plan.AllPlan, resp: http.Response };
 
 fn prepareRecordData(ctx: *http.RequestCtx, col: schema.Collection, existing: ?std.json.Value) anyerror!Prepared {
     const app = ctx.app.?;
-    const raw = if (ctx.form_fields) |ff| ff else (std.json.parseFromSlice(std.json.Value, ctx.allocator, ctx.body, .{}) catch
-        return .{ .resp = try ApiError.badRequest("Invalid JSON body.").toResponse(ctx.allocator) }).value;
+    const raw = if (ctx.form_fields) |ff| ff else (std.json.parseFromSlice(std.json.Value, ctx.allocator.a, ctx.body, .{}) catch
+        return .{ .resp = try ApiError.badRequest("Invalid JSON body.").toResponse(ctx.allocator.a) }).value;
     // Multipart values are verbatim strings; make them behave like a JSON client.
     // JSON bodies (form_fields == null) are never coerced.
-    const coerced = if (ctx.form_fields != null) try records.coerceFormFields(ctx.allocator, col, raw) else raw;
-    const all = file_plan.planAllFileFields(app.io, ctx.allocator, col, coerced, ctx.files, existing) catch |e| switch (e) {
-        error.TooLarge => return .{ .resp = try (ApiError{ .status = 413, .message = "File too large." }).toResponse(ctx.allocator) },
-        error.TooMany => return .{ .resp = try ApiError.badRequest("Too many files for the field.").toResponse(ctx.allocator) },
-        error.BadMimeType => return .{ .resp = try ApiError.badRequest("File type not allowed.").toResponse(ctx.allocator) },
+    const coerced = if (ctx.form_fields != null) try records.coerceFormFields(ctx.allocator.a, col, raw) else raw;
+    const all = file_plan.planAllFileFields(app.io, ctx.allocator.a, col, coerced, ctx.files, existing) catch |e| switch (e) {
+        error.TooLarge => return .{ .resp = try (ApiError{ .status = 413, .message = "File too large." }).toResponse(ctx.allocator.a) },
+        error.TooMany => return .{ .resp = try ApiError.badRequest("Too many files for the field.").toResponse(ctx.allocator.a) },
+        error.BadMimeType => return .{ .resp = try ApiError.badRequest("File type not allowed.").toResponse(ctx.allocator.a) },
         error.OutOfMemory => return e,
     };
     return .{ .plan = all };
@@ -292,13 +293,13 @@ pub fn create(ctx: *http.RequestCtx) anyerror!http.Response {
         var r = try app.pool.acquireReader();
         defer app.pool.releaseReader(&r);
         col_lease = try resolveCollection(ctx, &r);
-        const col = col_lease.col orelse return ApiError.notFound().toResponse(ctx.allocator);
+        const col = col_lease.col orelse return ApiError.notFound().toResponse(ctx.allocator.a);
         const all = switch (try prepareRecordData(ctx, col, null)) {
             .plan => |p| p,
             .resp => |resp| return resp,
         };
         const data2 = prepAuthData(ctx, col, all.data, true) catch |e| switch (e) {
-            error.BadPassword => return ApiError.badRequest("A password of the required length is required.").toResponse(ctx.allocator),
+            error.BadPassword => return ApiError.badRequest("A password of the required length is required.").toResponse(ctx.allocator.a),
             error.OutOfMemory => return e,
         };
         break :blk .{ col, all, data2 };
@@ -351,33 +352,33 @@ pub fn create(ctx: *http.RequestCtx) anyerror!http.Response {
     // account_id, so even a before-hook that mutated it cannot persist a cross-tenant row.
     if (app.tenancy.enabled and !rctx.is_superuser and !rctx.cross_tenant)
         if (col.options.tenant_field) |tf| if (data_mut == .object)
-            try data_mut.object.put(ctx.allocator, tf, .{ .string = rctx.account_id });
+            try data_mut.object.put(ctx.allocator.a, tf, .{ .string = rctx.account_id });
 
     // KNOWN LIMITATION: a `.check` guard evaluates `@request.data.*` from rctx.data, which is
     // built pre-hook; a hook mutating a guard-referenced field is not seen by the WHERE clause.
-    const rec = records.createInTxn(ctx.allocator, app.io, w, col, data_mut) catch |e| switch (e) {
+    const rec = records.createInTxn(ctx.allocator.a, app.io, w, col, data_mut) catch |e| switch (e) {
         error.Validation => {
             w.rollback() catch {};
             return validationResponse(ctx);
         },
         error.NotObject => {
             w.rollback() catch {};
-            return ApiError.badRequest("Body must be a JSON object.").toResponse(ctx.allocator);
+            return ApiError.badRequest("Body must be a JSON object.").toResponse(ctx.allocator.a);
         },
         // A UNIQUE/CHECK/NOT NULL/FK violation (e.g. a duplicate email on signup) is a client
         // error, not a server fault — 409, never 500. No files have been written yet on the
         // create path (writeUploads runs after the INSERT), so an explicit rollback is enough.
         error.Constraint => {
             w.rollback() catch {};
-            return ApiError.conflict("A record with these values already exists.").toResponse(ctx.allocator);
+            return ApiError.conflict("A record with these values already exists.").toResponse(ctx.allocator.a);
         },
         else => return e, // errdefer rolls back
     };
     // Access-rule guard evaluated INSIDE the transaction:
     // a denial rolls the INSERT back so a forbidden write never persists.
     if (decision == .check) {
-        const guard = (try policy.compilePredicate(ctx.allocator, w, col, .create, &rctx)).?;
-        if (!try records.guardPasses(ctx.allocator, w, col, rec.object.get("id").?.string, guard)) {
+        const guard = (try policy.compilePredicate(ctx.allocator.a, w, col, .create, &rctx)).?;
+        if (!try records.guardPasses(ctx.allocator.a, w, col, rec.object.get("id").?.string, guard)) {
             w.rollback() catch {};
             return forbidden(ctx);
         }
@@ -387,7 +388,7 @@ pub fn create(ctx: *http.RequestCtx) anyerror!http.Response {
     // (via the explicit rollback below); on commit the files and the row are both durable.
     writeUploads(ctx, col, rid, all.writes, all.deletes) catch {
         w.rollback() catch {};
-        return ApiError.internal().toResponse(ctx.allocator);
+        return ApiError.internal().toResponse(ctx.allocator.a);
     };
     // The upload bytes are now durable but the row is not until COMMIT succeeds. A commit
     // failure (SQLITE_FULL/IOERR) rolls the INSERT back via the errdefer above, so without
@@ -432,10 +433,10 @@ pub fn update(ctx: *http.RequestCtx) anyerror!http.Response {
         defer app.pool.releaseReader(&gate_r);
         var gate_lease = try resolveCollection(ctx, &gate_r);
         defer gate_lease.release();
-        const gcol = gate_lease.col orelse return ApiError.notFound().toResponse(ctx.allocator);
+        const gcol = gate_lease.col orelse return ApiError.notFound().toResponse(ctx.allocator.a);
         if (gcol.type == .auth) {
-            const grid = ctx.param("id") orelse return ApiError.notFound().toResponse(ctx.allocator);
-            const pf = peekPasswordFields(ctx) orelse return ApiError.badRequest("Invalid JSON body.").toResponse(ctx.allocator);
+            const grid = ctx.param("id") orelse return ApiError.notFound().toResponse(ctx.allocator.a);
+            const pf = peekPasswordFields(ctx) orelse return ApiError.badRequest("Invalid JSON body.").toResponse(ctx.allocator.a);
             if (pf.password != null) {
                 pw_change = true;
                 const grctx = buildContext(ctx, &gate_r, null);
@@ -446,16 +447,16 @@ pub fn update(ctx: *http.RequestCtx) anyerror!http.Response {
                 }
                 if (!grctx.is_superuser) {
                     if (try api_auth.rateLimited(ctx, "pwchange", grid)) |resp| return resp;
-                    const phc = try api_auth.passwordHashFor(ctx.allocator, &gate_r, gcol.name, grid);
+                    const phc = try api_auth.passwordHashFor(ctx.allocator.a, &gate_r, gcol.name, grid);
                     const opw = pf.old;
                     if (phc == null or phc.?.len == 0 or opw == null) {
                         // Missing target / passwordless target / missing oldPassword: run the
                         // identity-independent argon2 padding so timing can't distinguish them.
-                        crypto.dummyVerify(app.io, ctx.allocator);
-                        return ApiError.badRequest("Invalid credentials.").toResponse(ctx.allocator);
+                        crypto.dummyVerify(app.io, ctx.allocator.a);
+                        return ApiError.badRequest("Invalid credentials.").toResponse(ctx.allocator.a);
                     }
-                    if (!crypto.verifyPassword(app.io, ctx.allocator, phc.?, opw.?))
-                        return ApiError.badRequest("Invalid credentials.").toResponse(ctx.allocator);
+                    if (!crypto.verifyPassword(app.io, ctx.allocator.a, phc.?, opw.?))
+                        return ApiError.badRequest("Invalid credentials.").toResponse(ctx.allocator.a);
                 }
             }
         }
@@ -464,9 +465,9 @@ pub fn update(ctx: *http.RequestCtx) anyerror!http.Response {
     defer app.pool.releaseWriter();
     var col_lease = try resolveCollection(ctx, w);
     defer col_lease.release();
-    const col = col_lease.col orelse return ApiError.notFound().toResponse(ctx.allocator);
-    const rid = ctx.param("id") orelse return ApiError.notFound().toResponse(ctx.allocator);
-    const existing = (try records.get(ctx.allocator, w, col, rid)) orelse return ApiError.notFound().toResponse(ctx.allocator);
+    const col = col_lease.col orelse return ApiError.notFound().toResponse(ctx.allocator.a);
+    const rid = ctx.param("id") orelse return ApiError.notFound().toResponse(ctx.allocator.a);
+    const existing = (try records.get(ctx.allocator.a, w, col, rid)) orelse return ApiError.notFound().toResponse(ctx.allocator.a);
 
     const all = switch (try prepareRecordData(ctx, col, existing)) {
         .plan => |p| p,
@@ -475,7 +476,7 @@ pub fn update(ctx: *http.RequestCtx) anyerror!http.Response {
     const data = all.data;
 
     const data2 = prepAuthData(ctx, col, data, false) catch |e| switch (e) {
-        error.BadPassword => return ApiError.badRequest("A password of the required length is required.").toResponse(ctx.allocator),
+        error.BadPassword => return ApiError.badRequest("A password of the required length is required.").toResponse(ctx.allocator.a),
         error.OutOfMemory => return e,
     };
     const rctx = buildContext(ctx, w, data);
@@ -495,7 +496,7 @@ pub fn update(ctx: *http.RequestCtx) anyerror!http.Response {
             const owner = if (existing == .object) existing.object.get(tf) else null;
             const owner_id = if (owner) |o| (if (o == .string) o.string else "") else "";
             if (!std.mem.eql(u8, owner_id, rctx.account_id))
-                return ApiError.notFound().toResponse(ctx.allocator);
+                return ApiError.notFound().toResponse(ctx.allocator.a);
         }
     }
 
@@ -529,7 +530,7 @@ pub fn update(ctx: *http.RequestCtx) anyerror!http.Response {
             storage.put(app.io, col.name, rid, wr.filename, wr.bytes) catch {
                 deleteWrites(app, col.name, rid, all.writes[0..written]);
                 w.rollback() catch {};
-                return ApiError.internal().toResponse(ctx.allocator);
+                return ApiError.internal().toResponse(ctx.allocator.a);
             };
             written += 1;
         }
@@ -544,7 +545,7 @@ pub fn update(ctx: *http.RequestCtx) anyerror!http.Response {
 
     // KNOWN LIMITATION: a `.check` guard evaluates `@request.data.*` from rctx.data, which is
     // built pre-hook; a hook mutating a guard-referenced field is not seen by the WHERE clause.
-    const updated = records.updateInTxn(ctx.allocator, w, col, rid, data_mut) catch |e| switch (e) {
+    const updated = records.updateInTxn(ctx.allocator.a, w, col, rid, data_mut) catch |e| switch (e) {
         // The `committed`-guarded defer above deletes the written files on each of these
         // pre-commit exits, so no branch repeats the storage cleanup.
         error.Validation => {
@@ -553,27 +554,27 @@ pub fn update(ctx: *http.RequestCtx) anyerror!http.Response {
         },
         error.NotObject => {
             w.rollback() catch {};
-            return ApiError.badRequest("Body must be a JSON object.").toResponse(ctx.allocator);
+            return ApiError.badRequest("Body must be a JSON object.").toResponse(ctx.allocator.a);
         },
         // A UNIQUE/CHECK/NOT NULL/FK violation is a client error → 409, not 500. This is a
         // value-return, so the `committed`-guarded defer above deletes the just-written files.
         error.Constraint => {
             w.rollback() catch {};
-            return ApiError.conflict("A record with these values already exists.").toResponse(ctx.allocator);
+            return ApiError.conflict("A record with these values already exists.").toResponse(ctx.allocator.a);
         },
         else => return e, // errdefer rolls back
     };
     const ur = updated orelse {
         w.rollback() catch {};
-        return ApiError.notFound().toResponse(ctx.allocator);
+        return ApiError.notFound().toResponse(ctx.allocator.a);
     };
     // Access-rule guard evaluated INSIDE the transaction on the UPDATED row:
     // a denial rolls the UPDATE back. A guard miss maps to 404.
     if (decision == .check) {
-        const guard = (try policy.compilePredicate(ctx.allocator, w, col, .update, &rctx)).?;
-        if (!try records.guardPasses(ctx.allocator, w, col, rid, guard)) {
+        const guard = (try policy.compilePredicate(ctx.allocator.a, w, col, .update, &rctx)).?;
+        if (!try records.guardPasses(ctx.allocator.a, w, col, rid, guard)) {
             w.rollback() catch {};
-            return ApiError.notFound().toResponse(ctx.allocator);
+            return ApiError.notFound().toResponse(ctx.allocator.a);
         }
     }
     // Password changed ⇒ applyUpdate rotated `tokenKey` (every outstanding token dies in
@@ -598,7 +599,7 @@ pub fn update(ctx: *http.RequestCtx) anyerror!http.Response {
     var pw_cookies: []const http.Cookie = &.{};
     if (col.type == .auth and pw_change and self_change) {
         if (api_auth.issueSessionNoEmit(ctx, w, col.name, rid)) |issued| {
-            pw_cookies = try ctx.allocator.dupe(http.Cookie, &issued.cookies);
+            pw_cookies = try ctx.allocator.a.dupe(http.Cookie, &issued.cookies);
         } else |e| {
             // Degraded, not fatal: the password IS changed; the caller just has to log in again.
             std.log.warn("password-change re-issue failed ({s}); caller must re-authenticate", .{@errorName(e)});
@@ -615,7 +616,7 @@ pub fn update(ctx: *http.RequestCtx) anyerror!http.Response {
     }
     realtime_ws.broadcast(app, col, .update, broadcast_id, ur_mut, null);
     if (pw_cookies.len > 0) {
-        const body = try std.json.Stringify.valueAlloc(ctx.allocator, ur_mut, .{});
+        const body = try std.json.Stringify.valueAlloc(ctx.allocator.a, ur_mut, .{});
         return .{ .status = 200, .content_type = "application/json", .body = body, .cookies = pw_cookies };
     }
     return jsonResponse(ctx, 200, ur_mut);
@@ -627,16 +628,16 @@ pub fn delete(ctx: *http.RequestCtx) anyerror!http.Response {
     defer app.pool.releaseWriter();
     var col_lease = try resolveCollection(ctx, w);
     defer col_lease.release();
-    const col = col_lease.col orelse return ApiError.notFound().toResponse(ctx.allocator);
-    const rid = ctx.param("id") orelse return ApiError.notFound().toResponse(ctx.allocator);
-    const existing = (try records.get(ctx.allocator, w, col, rid)) orelse return ApiError.notFound().toResponse(ctx.allocator);
+    const col = col_lease.col orelse return ApiError.notFound().toResponse(ctx.allocator.a);
+    const rid = ctx.param("id") orelse return ApiError.notFound().toResponse(ctx.allocator.a);
+    const existing = (try records.get(ctx.allocator.a, w, col, rid)) orelse return ApiError.notFound().toResponse(ctx.allocator.a);
     const rctx = buildContext(ctx, w, null);
     // Gate FIRST (pre-delete authorization): the deleteRule is checked against the live
     // row before the transaction opens — unchanged semantics.
     switch (policy.decide(col, .delete, &rctx)) {
         .deny_locked => return forbidden(ctx),
         .allow => {},
-        .check => if (!try policy.authorizes(ctx.allocator, w, col, .delete, rid, &rctx)) return ApiError.notFound().toResponse(ctx.allocator),
+        .check => if (!try policy.authorizes(ctx.allocator.a, w, col, .delete, rid, &rctx)) return ApiError.notFound().toResponse(ctx.allocator.a),
     }
 
     // A2 KEYSTONE: one transaction spanning the before-hook, the DELETE, and the auth
@@ -656,10 +657,10 @@ pub fn delete(ctx: *http.RequestCtx) anyerror!http.Response {
     // create/update path (all compare ciphertext) — plus the cross-instance NOTIFY token (Postgres
     // only; the wire carries only the token, never the row data). On SQLite with no encrypted
     // fields this reuses `ex_mut` with no extra read (byte-identical).
-    const rt = realtime_ws.prepareDelete(ctx.allocator, app, w, col, rid, ex_mut);
-    if (!try records.deleteInTxn(ctx.allocator, w, col, rid)) {
+    const rt = realtime_ws.prepareDelete(ctx.allocator.a, app, w, col, rid, ex_mut);
+    if (!try records.deleteInTxn(ctx.allocator.a, w, col, rid)) {
         w.rollback() catch {};
-        return ApiError.notFound().toResponse(ctx.allocator);
+        return ApiError.notFound().toResponse(ctx.allocator.a);
     }
     if (col.type == .auth) {
         var st = try w.prepare("DELETE FROM \"_externalAuths\" WHERE \"collectionRef\"=?1 AND \"recordRef\"=?2;");
@@ -689,7 +690,7 @@ pub fn list(ctx: *http.RequestCtx) anyerror!http.Response {
     defer app.pool.releaseReader(&r);
     var col_lease = try resolveCollection(ctx, &r);
     defer col_lease.release();
-    const col = col_lease.col orelse return ApiError.notFound().toResponse(ctx.allocator);
+    const col = col_lease.col orelse return ApiError.notFound().toResponse(ctx.allocator.a);
     const rctx = buildContext(ctx, &r, null);
     var rule_expr: ?[]const u8 = null;
     switch (policy.decide(col, .list, &rctx)) {
@@ -703,7 +704,7 @@ pub fn list(ctx: *http.RequestCtx) anyerror!http.Response {
         // the rule clause here keeps the row-narrowing while avoiding the bogus filter. (#155)
         .check => rule_expr = policy.listRuleFilter(col, &rctx),
     }
-    const qp = try params_mod.parse(ctx.allocator, ctx.query);
+    const qp = try params_mod.parse(ctx.allocator.a, ctx.query);
     const pg = app.pagination;
 
     // Mode selection + enable/disable gating (comptime-configured via App(.{ .pagination = ... })).
@@ -714,9 +715,9 @@ pub fn list(ctx: *http.RequestCtx) anyerror!http.Response {
     const has_token = if (qp.get("cursor")) |c| c.len > 0 else false;
     const has_page_param = qp.get("page") != null or qp.get("perPage") != null;
     if (cursor_present and !pg.cursor_enabled)
-        return ApiError.badRequest("Cursor pagination is disabled.").toResponse(ctx.allocator);
+        return ApiError.badRequest("Cursor pagination is disabled.").toResponse(ctx.allocator.a);
     if (has_page_param and !pg.offset_enabled)
-        return ApiError.badRequest("Offset pagination is disabled; use `cursor`.").toResponse(ctx.allocator);
+        return ApiError.badRequest("Offset pagination is disabled; use `cursor`.").toResponse(ctx.allocator.a);
     // Cursor mode when the client opted in (cursor/limit param) OR offset is disabled. A cursor
     // param was already rejected above when cursor is disabled, so we never reach cursor mode then.
     const cursor_mode = (cursor_present or !pg.offset_enabled) and pg.cursor_enabled;
@@ -738,7 +739,7 @@ pub fn list(ctx: *http.RequestCtx) anyerror!http.Response {
 
     const conn = writer orelse &r;
 
-    const result = records.list(ctx.allocator, conn, col, .{
+    const result = records.list(ctx.allocator.a, conn, col, .{
         .filter = qp.get("filter"),
         .sort = qp.get("sort"),
         // Full-text search (#157): `?search=` (alias `?q=`) composes a bound FTS5 MATCH into the
@@ -763,19 +764,19 @@ pub fn list(ctx: *http.RequestCtx) anyerror!http.Response {
             writer_held = false;
         }
         switch (e) {
-            error.CursorState => return ApiError.gone("Cursor expired; re-fetch from the start.").toResponse(ctx.allocator),
-            error.BadCursorSort => return ApiError.badRequest("Cursor pagination requires a sortable, visible, non-relation sort field.").toResponse(ctx.allocator),
-            error.CursorSig => return ApiError.badRequest("Invalid cursor signature.").toResponse(ctx.allocator),
-            error.CursorSort => return ApiError.badRequest("Cursor does not match the requested sort.").toResponse(ctx.allocator),
-            error.CursorFilter => return ApiError.badRequest("Cursor does not match the requested filter.").toResponse(ctx.allocator),
-            error.BadCursor => return ApiError.badRequest("Invalid cursor.").toResponse(ctx.allocator),
-            error.EncryptedField => return ApiError.badRequest("Cannot filter or sort by an encrypted field.").toResponse(ctx.allocator),
-            error.HiddenField => return ApiError.badRequest("Cannot filter or sort by a hidden field.").toResponse(ctx.allocator),
-            error.NotSearchable => return ApiError.badRequest("This collection has no searchable fields; `search` is not supported here.").toResponse(ctx.allocator),
-            error.SearchDisabled => return ApiError.badRequest("Full-text search is not enabled in this build.").toResponse(ctx.allocator),
-            error.VectorDisabled => return ApiError.badRequest("Vector search is not enabled in this build.").toResponse(ctx.allocator),
-            error.VectorCursorUnsupported => return ApiError.badRequest("Vector search does not support cursor pagination; use offset paging.").toResponse(ctx.allocator),
-            error.BadVector => return ApiError.badRequest("Invalid vector search query.").toResponse(ctx.allocator),
+            error.CursorState => return ApiError.gone("Cursor expired; re-fetch from the start.").toResponse(ctx.allocator.a),
+            error.BadCursorSort => return ApiError.badRequest("Cursor pagination requires a sortable, visible, non-relation sort field.").toResponse(ctx.allocator.a),
+            error.CursorSig => return ApiError.badRequest("Invalid cursor signature.").toResponse(ctx.allocator.a),
+            error.CursorSort => return ApiError.badRequest("Cursor does not match the requested sort.").toResponse(ctx.allocator.a),
+            error.CursorFilter => return ApiError.badRequest("Cursor does not match the requested filter.").toResponse(ctx.allocator.a),
+            error.BadCursor => return ApiError.badRequest("Invalid cursor.").toResponse(ctx.allocator.a),
+            error.EncryptedField => return ApiError.badRequest("Cannot filter or sort by an encrypted field.").toResponse(ctx.allocator.a),
+            error.HiddenField => return ApiError.badRequest("Cannot filter or sort by a hidden field.").toResponse(ctx.allocator.a),
+            error.NotSearchable => return ApiError.badRequest("This collection has no searchable fields; `search` is not supported here.").toResponse(ctx.allocator.a),
+            error.SearchDisabled => return ApiError.badRequest("Full-text search is not enabled in this build.").toResponse(ctx.allocator.a),
+            error.VectorDisabled => return ApiError.badRequest("Vector search is not enabled in this build.").toResponse(ctx.allocator.a),
+            error.VectorCursorUnsupported => return ApiError.badRequest("Vector search does not support cursor pagination; use offset paging.").toResponse(ctx.allocator.a),
+            error.BadVector => return ApiError.badRequest("Invalid vector search query.").toResponse(ctx.allocator.a),
             // A vector query that fails at execution surfaces as a backend runtime error (StepFailed) —
             // only knowable at query time (dims aren't in the field schema). Map it to a clean 400 ONLY
             // when a vector query was requested, so non-vector DB failures keep their 500. (The embedding
@@ -788,8 +789,8 @@ pub fn list(ctx: *http.RequestCtx) anyerror!http.Response {
                 if (qp.get("vector") == null) return e;
                 const emsg = conn.errMsg();
                 if (std.mem.indexOf(u8, emsg, "does not exist") != null and std.mem.indexOf(u8, emsg, "vector") != null)
-                    return ApiError.badRequest("Vector search is unavailable: the pgvector extension is not installed on this database (run `CREATE EXTENSION vector`).").toResponse(ctx.allocator);
-                return ApiError.badRequest("Invalid vector search query: the query embedding's dimension may not match the stored embeddings (or a stored embedding is malformed).").toResponse(ctx.allocator);
+                    return ApiError.badRequest("Vector search is unavailable: the pgvector extension is not installed on this database (run `CREATE EXTENSION vector`).").toResponse(ctx.allocator.a);
+                return ApiError.badRequest("Invalid vector search query: the query embedding's dimension may not match the stored embeddings (or a stored embedding is malformed).").toResponse(ctx.allocator.a);
             },
             // Overflow/BadNumber/TooPrecise are `values.ValueError`s raised when a numeric literal
             // is malformed or out of i64 range. They reach here from two client-controlled inputs:
@@ -797,7 +798,7 @@ pub fn list(ctx: *http.RequestCtx) anyerror!http.Response {
             // decimalToScaledInt) and a cursor boundary value (keyset.jsonToParam, same path). Both
             // are bad input, not a server fault — a 400, never a 500. (A source-level split that
             // returns the sharper "Invalid cursor." for the cursor case belongs in keyset.zig.)
-            error.UnknownField, error.NotARelation, error.MultiRelationTraversal, error.BadFilter, error.BadSort, error.BadValue, error.Overflow, error.BadNumber, error.TooPrecise, error.UnexpectedToken, error.BadOperand, error.Empty, error.UnexpectedChar, error.UnterminatedString, error.TooDeep => return ApiError.badRequest("Invalid filter or sort.").toResponse(ctx.allocator),
+            error.UnknownField, error.NotARelation, error.MultiRelationTraversal, error.BadFilter, error.BadSort, error.BadValue, error.Overflow, error.BadNumber, error.TooPrecise, error.UnexpectedToken, error.BadOperand, error.Empty, error.UnexpectedChar, error.UnterminatedString, error.TooDeep => return ApiError.badRequest("Invalid filter or sort.").toResponse(ctx.allocator.a),
             else => return e,
         }
     };
@@ -810,7 +811,7 @@ pub fn list(ctx: *http.RequestCtx) anyerror!http.Response {
     if (qp.get("expand")) |exp| if (exp.len > 0) {
         // Batch the whole page through one PageCache: the target-collection schema is parsed once
         // (not per row) and each (target,id) view decision is memoized (not re-authorized per row).
-        try expand_mod.expandItems(ctx.allocator, &r, col, result.items, exp, 0, &rctx);
+        try expand_mod.expandItems(ctx.allocator.a, &r, col, result.items, exp, 0, &rctx);
     };
 
     // `fields=` response projection: parse ONCE, apply to EACH record (never the envelope). It is a
@@ -818,28 +819,28 @@ pub fn list(ctx: *http.RequestCtx) anyerror!http.Response {
     if (qp.get("fields")) |f| if (f.len > 0) {
         // Attacker-controlled — cap length like filter/sort (records.max_filter_len). A list can
         // return many records, so an unbounded spec amplifies parse/projection cost per item.
-        if (f.len > records.max_filter_len) return ApiError.badRequest("`fields` is too long.").toResponse(ctx.allocator);
-        const spec = try fields_mod.parse(ctx.allocator, f);
-        for (result.items) |*item| try fields_mod.project(ctx.allocator, item, spec);
+        if (f.len > records.max_filter_len) return ApiError.badRequest("`fields` is too long.").toResponse(ctx.allocator.a);
+        const spec = try fields_mod.parse(ctx.allocator.a, f);
+        for (result.items) |*item| try fields_mod.project(ctx.allocator.a, item, spec);
     };
 
     var root: std.json.ObjectMap = .empty;
-    try root.put(ctx.allocator, "page", .{ .integer = @intCast(result.page) });
-    try root.put(ctx.allocator, "perPage", .{ .integer = @intCast(result.perPage) });
+    try root.put(ctx.allocator.a, "page", .{ .integer = @intCast(result.page) });
+    try root.put(ctx.allocator.a, "perPage", .{ .integer = @intCast(result.perPage) });
     if (result.totalItems) |total| {
         const total_pages: i64 = if (result.perPage == 0) 0 else @divTrunc(total + @as(i64, result.perPage) - 1, @as(i64, result.perPage));
-        try root.put(ctx.allocator, "totalItems", .{ .integer = total });
-        try root.put(ctx.allocator, "totalPages", .{ .integer = total_pages });
+        try root.put(ctx.allocator.a, "totalItems", .{ .integer = total });
+        try root.put(ctx.allocator.a, "totalPages", .{ .integer = total_pages });
     }
     if (result.mode == .cursor) {
-        try root.put(ctx.allocator, "nextCursor", if (result.nextCursor) |c| .{ .string = c } else .null);
-        try root.put(ctx.allocator, "prevCursor", if (result.prevCursor) |c| .{ .string = c } else .null);
-        try root.put(ctx.allocator, "hasNext", .{ .bool = result.hasNext });
-        try root.put(ctx.allocator, "hasPrev", .{ .bool = result.hasPrev });
+        try root.put(ctx.allocator.a, "nextCursor", if (result.nextCursor) |c| .{ .string = c } else .null);
+        try root.put(ctx.allocator.a, "prevCursor", if (result.prevCursor) |c| .{ .string = c } else .null);
+        try root.put(ctx.allocator.a, "hasNext", .{ .bool = result.hasNext });
+        try root.put(ctx.allocator.a, "hasPrev", .{ .bool = result.hasPrev });
     }
-    var arr = std.json.Array.init(ctx.allocator);
+    var arr = std.json.Array.init(ctx.allocator.a);
     for (result.items) |it| try arr.append(it);
-    try root.put(ctx.allocator, "items", .{ .array = arr });
+    try root.put(ctx.allocator.a, "items", .{ .array = arr });
     return jsonResponse(ctx, 200, .{ .object = root });
 }
 
@@ -899,7 +900,7 @@ const TestEnv = struct {
     }
 };
 
-fn ctxFor(env: *TestEnv, a: std.mem.Allocator, m: http.Method, body: []const u8, params: []const http.Param) http.RequestCtx {
+fn ctxFor(env: *TestEnv, a: RequestArena, m: http.Method, body: []const u8, params: []const http.Param) http.RequestCtx {
     return .{ .method = m, .path = "/", .body = body, .allocator = a, .app = &env.app, .params = params };
 }
 
@@ -911,7 +912,7 @@ test "create then view a record over handlers" {
     const a = arena.allocator();
     const col_param = [_]http.Param{.{ .key = "col", .value = "posts" }};
 
-    var cctx = ctxFor(env, a, .POST, "{\"title\":\"hi\"}", &col_param);
+    var cctx = ctxFor(env, RequestArena.from(&arena), .POST, "{\"title\":\"hi\"}", &col_param);
     const cres = try create(&cctx);
     try std.testing.expectEqual(@as(u16, 201), cres.status);
     try std.testing.expect(std.mem.indexOf(u8, cres.body, "\"title\":\"hi\"") != null);
@@ -919,7 +920,7 @@ test "create then view a record over handlers" {
     const parsed = try std.json.parseFromSlice(std.json.Value, a, cres.body, .{});
     const rid = parsed.value.object.get("id").?.string;
     const view_params = [_]http.Param{ .{ .key = "col", .value = "posts" }, .{ .key = "id", .value = rid } };
-    var vctx = ctxFor(env, a, .GET, "", &view_params);
+    var vctx = ctxFor(env, RequestArena.from(&arena), .GET, "", &view_params);
     const vres = try view(&vctx);
     try std.testing.expectEqual(@as(u16, 200), vres.status);
 }
@@ -930,7 +931,7 @@ test "view nonexistent collection -> 404" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const params = [_]http.Param{ .{ .key = "col", .value = "ghosts" }, .{ .key = "id", .value = "x" } };
-    var ctx = ctxFor(env, arena.allocator(), .GET, "", &params);
+    var ctx = ctxFor(env, RequestArena.from(&arena), .GET, "", &params);
     const res = try view(&ctx);
     try std.testing.expectEqual(@as(u16, 404), res.status);
 }
@@ -940,14 +941,13 @@ test "list handler returns the page envelope" {
     defer env.deinit();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const a = arena.allocator();
     const col_param = [_]http.Param{.{ .key = "col", .value = "posts" }};
-    var c1 = ctxFor(env, a, .POST, "{\"title\":\"a\"}", &col_param);
+    var c1 = ctxFor(env, RequestArena.from(&arena), .POST, "{\"title\":\"a\"}", &col_param);
     _ = try create(&c1);
-    var c2 = ctxFor(env, a, .POST, "{\"title\":\"b\"}", &col_param);
+    var c2 = ctxFor(env, RequestArena.from(&arena), .POST, "{\"title\":\"b\"}", &col_param);
     _ = try create(&c2);
 
-    var lctx = http.RequestCtx{ .method = .GET, .path = "/", .query = "perPage=1", .allocator = a, .app = &env.app, .params = &col_param };
+    var lctx = http.RequestCtx{ .method = .GET, .path = "/", .query = "perPage=1", .allocator = RequestArena.from(&arena), .app = &env.app, .params = &col_param };
     const res = try list(&lctx);
     try std.testing.expectEqual(@as(u16, 200), res.status);
     try std.testing.expect(std.mem.indexOf(u8, res.body, "\"totalItems\":2") != null);
@@ -961,13 +961,13 @@ test "fields= projection on view narrows a record to the listed keys" {
     defer arena.deinit();
     const a = arena.allocator();
     const col_param = [_]http.Param{.{ .key = "col", .value = "posts" }};
-    var cctx = ctxFor(env, a, .POST, "{\"title\":\"hi\"}", &col_param);
+    var cctx = ctxFor(env, RequestArena.from(&arena), .POST, "{\"title\":\"hi\"}", &col_param);
     const cres = try create(&cctx);
     const parsed = try std.json.parseFromSlice(std.json.Value, a, cres.body, .{});
     const rid = parsed.value.object.get("id").?.string;
 
     const view_params = [_]http.Param{ .{ .key = "col", .value = "posts" }, .{ .key = "id", .value = rid } };
-    var vctx = http.RequestCtx{ .method = .GET, .path = "/", .query = "fields=id", .allocator = a, .app = &env.app, .params = &view_params };
+    var vctx = http.RequestCtx{ .method = .GET, .path = "/", .query = "fields=id", .allocator = RequestArena.from(&arena), .app = &env.app, .params = &view_params };
     const vres = try view(&vctx);
     try std.testing.expectEqual(@as(u16, 200), vres.status);
     const pv = (try std.json.parseFromSlice(std.json.Value, a, vres.body, .{})).value;
@@ -982,7 +982,7 @@ test "fields= over the length cap is rejected 400 (DoS guard)" {
     defer arena.deinit();
     const a = arena.allocator();
     const col_param = [_]http.Param{.{ .key = "col", .value = "posts" }};
-    var cctx = ctxFor(env, a, .POST, "{\"title\":\"hi\"}", &col_param);
+    var cctx = ctxFor(env, RequestArena.from(&arena), .POST, "{\"title\":\"hi\"}", &col_param);
     const cres = try create(&cctx);
     const rid = (try std.json.parseFromSlice(std.json.Value, a, cres.body, .{})).value.object.get("id").?.string;
 
@@ -991,7 +991,7 @@ test "fields= over the length cap is rejected 400 (DoS guard)" {
     @memset(big, 'a');
     const query = try std.fmt.allocPrint(a, "fields={s}", .{big});
     const view_params = [_]http.Param{ .{ .key = "col", .value = "posts" }, .{ .key = "id", .value = rid } };
-    var vctx = http.RequestCtx{ .method = .GET, .path = "/", .query = query, .allocator = a, .app = &env.app, .params = &view_params };
+    var vctx = http.RequestCtx{ .method = .GET, .path = "/", .query = query, .allocator = RequestArena.from(&arena), .app = &env.app, .params = &view_params };
     const vres = try view(&vctx);
     try std.testing.expectEqual(@as(u16, 400), vres.status);
 }
@@ -1003,7 +1003,7 @@ test "fields= projection cannot widen access to an absent field" {
     defer arena.deinit();
     const a = arena.allocator();
     const col_param = [_]http.Param{.{ .key = "col", .value = "posts" }};
-    var cctx = ctxFor(env, a, .POST, "{\"title\":\"hi\"}", &col_param);
+    var cctx = ctxFor(env, RequestArena.from(&arena), .POST, "{\"title\":\"hi\"}", &col_param);
     const cres = try create(&cctx);
     const parsed = try std.json.parseFromSlice(std.json.Value, a, cres.body, .{});
     const rid = parsed.value.object.get("id").?.string;
@@ -1011,7 +1011,7 @@ test "fields= projection cannot widen access to an absent field" {
     // `secret` is not a field on `posts`, so the built record never contained it. Requesting it
     // via `fields=` must NOT conjure it — projection can only remove keys, never add one.
     const view_params = [_]http.Param{ .{ .key = "col", .value = "posts" }, .{ .key = "id", .value = rid } };
-    var vctx = http.RequestCtx{ .method = .GET, .path = "/", .query = "fields=id,secret", .allocator = a, .app = &env.app, .params = &view_params };
+    var vctx = http.RequestCtx{ .method = .GET, .path = "/", .query = "fields=id,secret", .allocator = RequestArena.from(&arena), .app = &env.app, .params = &view_params };
     const vres = try view(&vctx);
     try std.testing.expectEqual(@as(u16, 200), vres.status);
     const pv = (try std.json.parseFromSlice(std.json.Value, a, vres.body, .{})).value;
@@ -1027,10 +1027,10 @@ test "fields= projection on list narrows each item but keeps the envelope" {
     defer arena.deinit();
     const a = arena.allocator();
     const col_param = [_]http.Param{.{ .key = "col", .value = "posts" }};
-    var c1 = ctxFor(env, a, .POST, "{\"title\":\"a\"}", &col_param);
+    var c1 = ctxFor(env, RequestArena.from(&arena), .POST, "{\"title\":\"a\"}", &col_param);
     _ = try create(&c1);
 
-    var lctx = http.RequestCtx{ .method = .GET, .path = "/", .query = "fields=title", .allocator = a, .app = &env.app, .params = &col_param };
+    var lctx = http.RequestCtx{ .method = .GET, .path = "/", .query = "fields=title", .allocator = RequestArena.from(&arena), .app = &env.app, .params = &col_param };
     const res = try list(&lctx);
     try std.testing.expectEqual(@as(u16, 200), res.status);
     const root = (try std.json.parseFromSlice(std.json.Value, a, res.body, .{})).value;
@@ -1049,11 +1049,10 @@ test "list handler clamps an oversized perPage to the 500 cap (F9 DoS)" {
     defer env.deinit();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const a = arena.allocator();
     const col_param = [_]http.Param{.{ .key = "col", .value = "posts" }};
     // A client asking for a huge page cannot force a huge SQL LIMIT / allocation:
     // the response echoes the clamped perPage (500), not the requested 100000.
-    var lctx = http.RequestCtx{ .method = .GET, .path = "/", .query = "perPage=100000", .allocator = a, .app = &env.app, .params = &col_param };
+    var lctx = http.RequestCtx{ .method = .GET, .path = "/", .query = "perPage=100000", .allocator = RequestArena.from(&arena), .app = &env.app, .params = &col_param };
     const res = try list(&lctx);
     try std.testing.expectEqual(@as(u16, 200), res.status);
     try std.testing.expect(std.mem.indexOf(u8, res.body, "\"perPage\":500") != null);
@@ -1073,15 +1072,14 @@ test "cursor handler: forward mode returns hasNext/nextCursor and omits totalIte
     defer env.deinit();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const a = arena.allocator();
     const col_param = [_]http.Param{.{ .key = "col", .value = "posts" }};
     inline for (.{ "a", "b", "c" }) |t| {
-        var c = ctxFor(env, a, .POST, "{\"title\":\"" ++ t ++ "\"}", &col_param);
+        var c = ctxFor(env, RequestArena.from(&arena), .POST, "{\"title\":\"" ++ t ++ "\"}", &col_param);
         _ = try create(&c);
     }
     // Disable offset so the first page (no cursor token) runs in cursor mode.
     env.app.pagination = .{ .offset_enabled = false, .cursor_enabled = true, .cursor_token = .stateless };
-    var lctx = http.RequestCtx{ .method = .GET, .path = "/", .query = "limit=2", .allocator = a, .app = &env.app, .params = &col_param };
+    var lctx = http.RequestCtx{ .method = .GET, .path = "/", .query = "limit=2", .allocator = RequestArena.from(&arena), .app = &env.app, .params = &col_param };
     const res = try list(&lctx);
     try std.testing.expectEqual(@as(u16, 200), res.status);
     try std.testing.expect(std.mem.indexOf(u8, res.body, "\"hasNext\":true") != null);
@@ -1095,12 +1093,11 @@ test "cursor handler: skipTotal=false includes totalItems" {
     defer env.deinit();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const a = arena.allocator();
     const col_param = [_]http.Param{.{ .key = "col", .value = "posts" }};
-    var c1 = ctxFor(env, a, .POST, "{\"title\":\"a\"}", &col_param);
+    var c1 = ctxFor(env, RequestArena.from(&arena), .POST, "{\"title\":\"a\"}", &col_param);
     _ = try create(&c1);
     env.app.pagination = .{ .offset_enabled = false, .cursor_enabled = true };
-    var lctx = http.RequestCtx{ .method = .GET, .path = "/", .query = "limit=2&skipTotal=false", .allocator = a, .app = &env.app, .params = &col_param };
+    var lctx = http.RequestCtx{ .method = .GET, .path = "/", .query = "limit=2&skipTotal=false", .allocator = RequestArena.from(&arena), .app = &env.app, .params = &col_param };
     const res = try list(&lctx);
     try std.testing.expect(std.mem.indexOf(u8, res.body, "\"totalItems\":1") != null);
     env.app.pagination = .{};
@@ -1114,19 +1111,19 @@ test "cursor handler: garbage cursor -> 400; changed sort -> 400" {
     const a = arena.allocator();
     const col_param = [_]http.Param{.{ .key = "col", .value = "posts" }};
     inline for (.{ "a", "b", "c" }) |t| {
-        var c = ctxFor(env, a, .POST, "{\"title\":\"" ++ t ++ "\"}", &col_param);
+        var c = ctxFor(env, RequestArena.from(&arena), .POST, "{\"title\":\"" ++ t ++ "\"}", &col_param);
         _ = try create(&c);
     }
     // Garbage cursor.
-    var g = http.RequestCtx{ .method = .GET, .path = "/", .query = "cursor=%21%21garbage", .allocator = a, .app = &env.app, .params = &col_param };
+    var g = http.RequestCtx{ .method = .GET, .path = "/", .query = "cursor=%21%21garbage", .allocator = RequestArena.from(&arena), .app = &env.app, .params = &col_param };
     try std.testing.expectEqual(@as(u16, 400), (try list(&g)).status);
     // Get a valid cursor first, then replay it under a different sort -> 400.
-    var first = http.RequestCtx{ .method = .GET, .path = "/", .query = "sort=created&limit=1", .allocator = a, .app = &env.app, .params = &col_param };
+    var first = http.RequestCtx{ .method = .GET, .path = "/", .query = "sort=created&limit=1", .allocator = RequestArena.from(&arena), .app = &env.app, .params = &col_param };
     env.app.pagination = .{ .offset_enabled = false, .cursor_enabled = true };
     const fres = try list(&first);
     const tok = extractStr(fres.body, "nextCursor").?;
     const q2 = try std.fmt.allocPrint(a, "sort=-created&limit=1&cursor={s}", .{tok});
-    var second = http.RequestCtx{ .method = .GET, .path = "/", .query = q2, .allocator = a, .app = &env.app, .params = &col_param };
+    var second = http.RequestCtx{ .method = .GET, .path = "/", .query = q2, .allocator = RequestArena.from(&arena), .app = &env.app, .params = &col_param };
     try std.testing.expectEqual(@as(u16, 400), (try list(&second)).status);
     env.app.pagination = .{};
 }
@@ -1136,17 +1133,16 @@ test "gating: cursor disabled -> cursor param 400; offset disabled -> page param
     defer env.deinit();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const a = arena.allocator();
     const col_param = [_]http.Param{.{ .key = "col", .value = "posts" }};
     // cursor disabled: a cursor param is rejected.
     env.app.pagination = .{ .offset_enabled = true, .cursor_enabled = false };
-    var c = http.RequestCtx{ .method = .GET, .path = "/", .query = "cursor=abc", .allocator = a, .app = &env.app, .params = &col_param };
+    var c = http.RequestCtx{ .method = .GET, .path = "/", .query = "cursor=abc", .allocator = RequestArena.from(&arena), .app = &env.app, .params = &col_param };
     const cres = try list(&c);
     try std.testing.expectEqual(@as(u16, 400), cres.status);
     try std.testing.expect(std.mem.indexOf(u8, cres.body, "Cursor pagination is disabled") != null);
     // offset disabled: a page/perPage param is rejected.
     env.app.pagination = .{ .offset_enabled = false, .cursor_enabled = true };
-    var p = http.RequestCtx{ .method = .GET, .path = "/", .query = "page=2", .allocator = a, .app = &env.app, .params = &col_param };
+    var p = http.RequestCtx{ .method = .GET, .path = "/", .query = "page=2", .allocator = RequestArena.from(&arena), .app = &env.app, .params = &col_param };
     const pres = try list(&p);
     try std.testing.expectEqual(@as(u16, 400), pres.status);
     try std.testing.expect(std.mem.indexOf(u8, pres.body, "Offset pagination is disabled") != null);
@@ -1158,11 +1154,10 @@ test "offset mode response shape is unchanged (regression guard)" {
     defer env.deinit();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const a = arena.allocator();
     const col_param = [_]http.Param{.{ .key = "col", .value = "posts" }};
-    var c1 = ctxFor(env, a, .POST, "{\"title\":\"a\"}", &col_param);
+    var c1 = ctxFor(env, RequestArena.from(&arena), .POST, "{\"title\":\"a\"}", &col_param);
     _ = try create(&c1);
-    var lctx = http.RequestCtx{ .method = .GET, .path = "/", .query = "perPage=10", .allocator = a, .app = &env.app, .params = &col_param };
+    var lctx = http.RequestCtx{ .method = .GET, .path = "/", .query = "perPage=10", .allocator = RequestArena.from(&arena), .app = &env.app, .params = &col_param };
     const res = try list(&lctx);
     // Offset envelope: page/perPage/totalItems/totalPages/items; no cursor fields.
     try std.testing.expect(std.mem.indexOf(u8, res.body, "\"totalItems\":1") != null);
@@ -1193,11 +1188,10 @@ test "locked (null) collection: list 403, create 403" {
     try seedRuled(env, "locked", null, null, null);
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const a = arena.allocator();
     const p = [_]http.Param{.{ .key = "col", .value = "locked" }};
-    var lctx = http.RequestCtx{ .method = .GET, .path = "/", .query = "", .allocator = a, .app = &env.app, .params = &p };
+    var lctx = http.RequestCtx{ .method = .GET, .path = "/", .query = "", .allocator = RequestArena.from(&arena), .app = &env.app, .params = &p };
     try std.testing.expectEqual(@as(u16, 403), (try list(&lctx)).status);
-    var cctx = ctxFor(env, a, .POST, "{\"title\":\"x\"}", &p);
+    var cctx = ctxFor(env, RequestArena.from(&arena), .POST, "{\"title\":\"x\"}", &p);
     try std.testing.expectEqual(@as(u16, 403), (try create(&cctx)).status);
 }
 
@@ -1207,11 +1201,10 @@ test "createRule on request data: empty title -> 403, nonempty -> 201" {
     try seedRuled(env, "guarded", "", "", "@request.data.title != \"\"");
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const a = arena.allocator();
     const p = [_]http.Param{.{ .key = "col", .value = "guarded" }};
-    var bad = ctxFor(env, a, .POST, "{\"title\":\"\"}", &p);
+    var bad = ctxFor(env, RequestArena.from(&arena), .POST, "{\"title\":\"\"}", &p);
     try std.testing.expectEqual(@as(u16, 403), (try create(&bad)).status);
-    var ok = ctxFor(env, a, .POST, "{\"title\":\"hello\"}", &p);
+    var ok = ctxFor(env, RequestArena.from(&arena), .POST, "{\"title\":\"hello\"}", &p);
     try std.testing.expectEqual(@as(u16, 201), (try create(&ok)).status);
 }
 
@@ -1245,7 +1238,7 @@ test "update handler: rule denial -> 403, missing id -> 404" {
     const col_param = [_]http.Param{.{ .key = "col", .value = "ud_upd" }};
 
     // Seed a row via the create handler.
-    var cctx = ctxFor(env, a, .POST, "{\"title\":\"hi\"}", &col_param);
+    var cctx = ctxFor(env, RequestArena.from(&arena), .POST, "{\"title\":\"hi\"}", &col_param);
     const cres = try create(&cctx);
     try std.testing.expectEqual(@as(u16, 201), cres.status);
     const parsed = try std.json.parseFromSlice(std.json.Value, a, cres.body, .{});
@@ -1253,12 +1246,12 @@ test "update handler: rule denial -> 403, missing id -> 404" {
 
     // Existing row, but the locked updateRule denies -> 403.
     const p_exist = [_]http.Param{ .{ .key = "col", .value = "ud_upd" }, .{ .key = "id", .value = rid } };
-    var uctx = ctxFor(env, a, .PATCH, "{\"title\":\"new\"}", &p_exist);
+    var uctx = ctxFor(env, RequestArena.from(&arena), .PATCH, "{\"title\":\"new\"}", &p_exist);
     try std.testing.expectEqual(@as(u16, 403), (try update(&uctx)).status);
 
     // Nonexistent id -> 404 (the not-found check precedes the rule gate).
     const p_missing = [_]http.Param{ .{ .key = "col", .value = "ud_upd" }, .{ .key = "id", .value = "nope" } };
-    var mctx = ctxFor(env, a, .PATCH, "{\"title\":\"new\"}", &p_missing);
+    var mctx = ctxFor(env, RequestArena.from(&arena), .PATCH, "{\"title\":\"new\"}", &p_missing);
     try std.testing.expectEqual(@as(u16, 404), (try update(&mctx)).status);
 }
 
@@ -1272,7 +1265,7 @@ test "delete handler: rule denial -> 403, missing id -> 404" {
     const a = arena.allocator();
     const col_param = [_]http.Param{.{ .key = "col", .value = "ud_del" }};
 
-    var cctx = ctxFor(env, a, .POST, "{\"title\":\"hi\"}", &col_param);
+    var cctx = ctxFor(env, RequestArena.from(&arena), .POST, "{\"title\":\"hi\"}", &col_param);
     const cres = try create(&cctx);
     try std.testing.expectEqual(@as(u16, 201), cres.status);
     const parsed = try std.json.parseFromSlice(std.json.Value, a, cres.body, .{});
@@ -1280,12 +1273,12 @@ test "delete handler: rule denial -> 403, missing id -> 404" {
 
     // Existing row, but the locked deleteRule denies -> 403.
     const p_exist = [_]http.Param{ .{ .key = "col", .value = "ud_del" }, .{ .key = "id", .value = rid } };
-    var dctx = ctxFor(env, a, .DELETE, "", &p_exist);
+    var dctx = ctxFor(env, RequestArena.from(&arena), .DELETE, "", &p_exist);
     try std.testing.expectEqual(@as(u16, 403), (try delete(&dctx)).status);
 
     // Nonexistent id -> 404.
     const p_missing = [_]http.Param{ .{ .key = "col", .value = "ud_del" }, .{ .key = "id", .value = "nope" } };
-    var mctx = ctxFor(env, a, .DELETE, "", &p_missing);
+    var mctx = ctxFor(env, RequestArena.from(&arena), .DELETE, "", &p_missing);
     try std.testing.expectEqual(@as(u16, 404), (try delete(&mctx)).status);
 }
 
@@ -1315,9 +1308,8 @@ test "creating an auth record hashes the password, hides secrets, forces verifie
     try seedAuth(env, "users", "@public");
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const a = arena.allocator();
     const p = [_]http.Param{.{ .key = "col", .value = "users" }};
-    var cctx = ctxFor(env, a, .POST, "{\"email\":\"u@x.io\",\"password\":\"longenough\",\"verified\":true}", &p);
+    var cctx = ctxFor(env, RequestArena.from(&arena), .POST, "{\"email\":\"u@x.io\",\"password\":\"longenough\",\"verified\":true}", &p);
     const res = try create(&cctx);
     try std.testing.expectEqual(@as(u16, 201), res.status);
     try std.testing.expect(std.mem.indexOf(u8, res.body, "passwordHash") == null);
@@ -1336,7 +1328,6 @@ test "#98 register: beforeRegister mutates the account; afterRegister sees it pe
     try seedAuth(env, "regusers", "@public");
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const a = arena.allocator();
 
     const Hook = struct {
         var before_seen: usize = 0;
@@ -1347,7 +1338,7 @@ test "#98 register: beforeRegister mutates the account; afterRegister sees it pe
         fn before(ctx: *Ctx, ev: *events.AuthLifecycleEvent) anyerror!void {
             before_seen += 1;
             before_id_empty = ev.record_id.len == 0; // no id yet at before_register
-            if (ev.record) |r| try r.object.put(ctx.arena, "bio", .{ .string = "seeded" });
+            if (ev.record) |r| try r.object.put(ctx.arena.a, "bio", .{ .string = "seeded" });
         }
         fn after(ctx: *Ctx, ev: *events.AuthLifecycleEvent) anyerror!void {
             _ = ctx;
@@ -1366,7 +1357,7 @@ test "#98 register: beforeRegister mutates the account; afterRegister sees it pe
     defer env.app.dispatch = null;
 
     const p = [_]http.Param{.{ .key = "col", .value = "regusers" }};
-    var cctx = ctxFor(env, a, .POST, "{\"email\":\"r@x.io\",\"password\":\"longenough\"}", &p);
+    var cctx = ctxFor(env, RequestArena.from(&arena), .POST, "{\"email\":\"r@x.io\",\"password\":\"longenough\"}", &p);
     const res = try create(&cctx);
     try std.testing.expectEqual(@as(u16, 201), res.status);
     try std.testing.expectEqual(@as(usize, 1), Hook.before_seen);
@@ -1385,7 +1376,6 @@ test "#98 register: an aborting beforeRegister blocks the account (fail closed)"
     try seedAuth(env, "regblock", "@public");
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const a = arena.allocator();
 
     const Hook = struct {
         fn abort(ctx: *Ctx, ev: *events.AuthLifecycleEvent) anyerror!void {
@@ -1398,7 +1388,7 @@ test "#98 register: an aborting beforeRegister blocks the account (fail closed)"
     defer env.app.dispatch = null;
 
     const p = [_]http.Param{.{ .key = "col", .value = "regblock" }};
-    var cctx = ctxFor(env, a, .POST, "{\"email\":\"blocked@x.io\",\"password\":\"longenough\"}", &p);
+    var cctx = ctxFor(env, RequestArena.from(&arena), .POST, "{\"email\":\"blocked@x.io\",\"password\":\"longenough\"}", &p);
     const res = try create(&cctx);
     try std.testing.expectEqual(@as(u16, 403), res.status);
     // Fail closed: no account row was created.
@@ -1411,7 +1401,6 @@ test "#98 register: lifecycle hook does NOT fire for a non-auth collection creat
     // TestEnv.init seeds a base "posts" collection (createRule @public).
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const a = arena.allocator();
 
     const Hook = struct {
         var seen: usize = 0;
@@ -1427,7 +1416,7 @@ test "#98 register: lifecycle hook does NOT fire for a non-auth collection creat
     defer env.app.dispatch = null;
 
     const p = [_]http.Param{.{ .key = "col", .value = "posts" }};
-    var cctx = ctxFor(env, a, .POST, "{\"title\":\"hi\"}", &p);
+    var cctx = ctxFor(env, RequestArena.from(&arena), .POST, "{\"title\":\"hi\"}", &p);
     const res = try create(&cctx);
     try std.testing.expectEqual(@as(u16, 201), res.status);
     try std.testing.expectEqual(@as(usize, 0), Hook.seen);
@@ -1465,7 +1454,7 @@ fn seedTyped(env: *TestEnv, name: []const u8) !void {
     });
 }
 
-fn formCtx(env: *TestEnv, a: std.mem.Allocator, m: http.Method, fields: std.json.ObjectMap, files: []const http.UploadedFile, params: []const http.Param) http.RequestCtx {
+fn formCtx(env: *TestEnv, a: RequestArena, m: http.Method, fields: std.json.ObjectMap, files: []const http.UploadedFile, params: []const http.Param) http.RequestCtx {
     return .{
         .method = m,
         .path = "/",
@@ -1493,7 +1482,7 @@ test "multipart create: schema coercion (bool/float/multi-select) + verbatim tex
     try ff.put(a, "ratio", .{ .string = "2.50" });
     try ff.put(a, "flag", .{ .string = "true" });
     try ff.put(a, "tags", .{ .string = "[\"x\",\"y\"]" });
-    var ctx = formCtx(env, a, .POST, ff, &.{}, &p);
+    var ctx = formCtx(env, RequestArena.from(&arena), .POST, ff, &.{}, &p);
     const res = try create(&ctx);
     try std.testing.expectEqual(@as(u16, 201), res.status);
     const rec = (try std.json.parseFromSlice(std.json.Value, a, res.body, .{})).value.object;
@@ -1516,7 +1505,7 @@ test "multipart create: file part + fixed-mode decimal in the same request (orig
     try ff.put(a, "title", .{ .string = "b" });
     try ff.put(a, "price", .{ .string = "45.00" });
     const ups = [_]http.UploadedFile{.{ .field = "photos", .filename = "x.jpg", .mimetype = "image/jpeg", .bytes = "\xff\xd8\xff\xe0data" }};
-    var ctx = formCtx(env, a, .POST, ff, &ups, &p);
+    var ctx = formCtx(env, RequestArena.from(&arena), .POST, ff, &ups, &p);
     const res = try create(&ctx);
     try std.testing.expectEqual(@as(u16, 201), res.status);
     const rec = (try std.json.parseFromSlice(std.json.Value, a, res.body, .{})).value.object;
@@ -1539,7 +1528,7 @@ test "multipart update: coercion + removal-key passthrough removes the file" {
     var cff: std.json.ObjectMap = .empty;
     try cff.put(a, "flag", .{ .string = "true" });
     const ups = [_]http.UploadedFile{.{ .field = "photos", .filename = "x.jpg", .mimetype = "image/jpeg", .bytes = "\xff\xd8\xff\xe0data" }};
-    var cctx = formCtx(env, a, .POST, cff, &ups, &p);
+    var cctx = formCtx(env, RequestArena.from(&arena), .POST, cff, &ups, &p);
     const cres = try create(&cctx);
     try std.testing.expectEqual(@as(u16, 201), cres.status);
     const crec = (try std.json.parseFromSlice(std.json.Value, a, cres.body, .{})).value.object;
@@ -1551,7 +1540,7 @@ test "multipart update: coercion + removal-key passthrough removes the file" {
     const minus = try std.fmt.allocPrint(a, "[\"{s}\"]", .{stored});
     try uff.put(a, "photos-", .{ .string = minus });
     const up = [_]http.Param{ .{ .key = "col", .value = "mp_upd" }, .{ .key = "id", .value = rid } };
-    var uctx = formCtx(env, a, .PATCH, uff, &.{}, &up);
+    var uctx = formCtx(env, RequestArena.from(&arena), .PATCH, uff, &.{}, &up);
     const ures = try update(&uctx);
     try std.testing.expectEqual(@as(u16, 200), ures.status);
     const urec = (try std.json.parseFromSlice(std.json.Value, a, ures.body, .{})).value.object;
@@ -1565,13 +1554,12 @@ test "JSON bodies are NEVER coerced: a string for a bool/float field stays a 400
     try seedTyped(env, "mp_json");
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const a = arena.allocator();
     const p = [_]http.Param{.{ .key = "col", .value = "mp_json" }};
-    var c1 = ctxFor(env, a, .POST, "{\"flag\":\"true\"}", &p);
+    var c1 = ctxFor(env, RequestArena.from(&arena), .POST, "{\"flag\":\"true\"}", &p);
     const r1 = try create(&c1);
     try std.testing.expectEqual(@as(u16, 400), r1.status);
     try std.testing.expect(std.mem.indexOf(u8, r1.body, "\"flag\"") != null);
-    var c2 = ctxFor(env, a, .POST, "{\"ratio\":\"2.50\"}", &p);
+    var c2 = ctxFor(env, RequestArena.from(&arena), .POST, "{\"ratio\":\"2.50\"}", &p);
     try std.testing.expectEqual(@as(u16, 400), (try create(&c2)).status);
 }
 
@@ -1587,7 +1575,7 @@ test "multipart auth signup still works (password keys pass through untouched)" 
     try ff.put(a, "email", .{ .string = "mp@x.io" });
     try ff.put(a, "password", .{ .string = "longenough" });
     try ff.put(a, "passwordConfirm", .{ .string = "longenough" });
-    var ctx = formCtx(env, a, .POST, ff, &.{}, &p);
+    var ctx = formCtx(env, RequestArena.from(&arena), .POST, ff, &.{}, &p);
     const res = try create(&ctx);
     try std.testing.expectEqual(@as(u16, 201), res.status);
     try std.testing.expect(std.mem.indexOf(u8, res.body, "mp@x.io") != null);
@@ -1609,7 +1597,7 @@ test "validation error is attributed to the offending field, not the first (Bug 
     try ff.put(a, "ratio", .{ .string = "1.5" });
     try ff.put(a, "flag", .{ .string = "true" });
     try ff.put(a, "price", .{ .string = "abc" });
-    var mctx = formCtx(env, a, .POST, ff, &.{}, &p);
+    var mctx = formCtx(env, RequestArena.from(&arena), .POST, ff, &.{}, &p);
     const mres = try create(&mctx);
     try std.testing.expectEqual(@as(u16, 400), mres.status);
     const mdata = (try std.json.parseFromSlice(std.json.Value, a, mres.body, .{})).value.object.get("data").?.object;
@@ -1619,7 +1607,7 @@ test "validation error is attributed to the offending field, not the first (Bug 
     try std.testing.expect(mdata.get("flag") == null);
 
     // JSON: same shape, same attribution
-    var jctx = ctxFor(env, a, .POST, "{\"title\":\"ok\",\"ratio\":1.5,\"flag\":true,\"price\":\"abc\"}", &p);
+    var jctx = ctxFor(env, RequestArena.from(&arena), .POST, "{\"title\":\"ok\",\"ratio\":1.5,\"flag\":true,\"price\":\"abc\"}", &p);
     const jres = try create(&jctx);
     try std.testing.expectEqual(@as(u16, 400), jres.status);
     const jdata = (try std.json.parseFromSlice(std.json.Value, a, jres.body, .{})).value.object.get("data").?.object;
@@ -1633,9 +1621,8 @@ test "creating an auth record without a password is a 400" {
     try seedAuth(env, "users2", "@public");
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const a = arena.allocator();
     const p = [_]http.Param{.{ .key = "col", .value = "users2" }};
-    var cctx = ctxFor(env, a, .POST, "{\"email\":\"u@x.io\"}", &p);
+    var cctx = ctxFor(env, RequestArena.from(&arena), .POST, "{\"email\":\"u@x.io\"}", &p);
     const res = try create(&cctx);
     try std.testing.expectEqual(@as(u16, 400), res.status);
 }
@@ -1657,10 +1644,10 @@ fn auditThenRejectHook(ctx: *Ctx, ev: *events.RecordEvent) anyerror!void {
     // latter would allocate the throwaway record on app.allocator and trip the test's
     // leak detector; the connection (and thus the shared transaction) is identical.
     const conn = ctx.bound_conn.?;
-    const acol = (try collections.get(ev.arena, conn, "audit")) orelse return error.AuditMissing;
+    const acol = (try collections.get(ev.arena.a, conn, "audit")) orelse return error.AuditMissing;
     var obj: std.json.ObjectMap = .empty;
-    try obj.put(ev.arena, "title", .{ .string = "audit-side-write" });
-    _ = try records.create(ev.arena, ctx.app.io, conn, acol, .{ .object = obj });
+    try obj.put(ev.arena.a, "title", .{ .string = "audit-side-write" });
+    _ = try records.create(ev.arena.a, ctx.app.io, conn, acol, .{ .object = obj });
     return error.HookRejected;
 }
 
@@ -1687,9 +1674,8 @@ test "before-hook side-write rolls back with the triggering write on hook error"
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const a = arena.allocator();
     const col_param = [_]http.Param{.{ .key = "col", .value = "posts" }};
-    var cctx = ctxFor(env, a, .POST, "{\"title\":\"hi\"}", &col_param);
+    var cctx = ctxFor(env, RequestArena.from(&arena), .POST, "{\"title\":\"hi\"}", &col_param);
     const res = try create(&cctx);
 
     // The hook rejected the write -> 400, and BOTH writes rolled back atomically.
@@ -1782,7 +1768,7 @@ test "update pre-authorizes tenant ownership BEFORE the before_update hook fires
     };
 
     // Mint a session token for u1.
-    var mintctx = http.RequestCtx{ .method = .POST, .path = "/", .allocator = a, .app = &app };
+    var mintctx = http.RequestCtx{ .method = .POST, .path = "/", .allocator = RequestArena.from(&arena), .app = &app };
     const tok = blk: {
         const w = pool.acquireWriter();
         defer pool.releaseWriter();
@@ -1794,7 +1780,7 @@ test "update pre-authorizes tenant ownership BEFORE the before_update hook fires
     // Cross-tenant PATCH (accB's row) -> 404, and the before_update hook MUST NOT have fired.
     {
         const params = [_]http.Param{ .{ .key = "col", .value = "projects" }, .{ .key = "id", .value = "rB" } };
-        var uctx = http.RequestCtx{ .method = .PATCH, .path = "/", .body = "{\"title\":\"hax\"}", .allocator = a, .app = &app, .params = &params, .authorization = bearer, .headers = &hdrs };
+        var uctx = http.RequestCtx{ .method = .PATCH, .path = "/", .body = "{\"title\":\"hax\"}", .allocator = RequestArena.from(&arena), .app = &app, .params = &params, .authorization = bearer, .headers = &hdrs };
         const res = try update(&uctx);
         try std.testing.expectEqual(@as(u16, 404), res.status);
         try std.testing.expectEqual(@as(usize, 0), TenantHooks.before_update_calls);
@@ -1802,7 +1788,7 @@ test "update pre-authorizes tenant ownership BEFORE the before_update hook fires
     // In-tenant PATCH (accA's row) -> 200, and the hook DID fire (proves the probe permits legit updates).
     {
         const params = [_]http.Param{ .{ .key = "col", .value = "projects" }, .{ .key = "id", .value = "rA" } };
-        var uctx = http.RequestCtx{ .method = .PATCH, .path = "/", .body = "{\"title\":\"ok\"}", .allocator = a, .app = &app, .params = &params, .authorization = bearer, .headers = &hdrs };
+        var uctx = http.RequestCtx{ .method = .PATCH, .path = "/", .body = "{\"title\":\"ok\"}", .allocator = RequestArena.from(&arena), .app = &app, .params = &params, .authorization = bearer, .headers = &hdrs };
         const res = try update(&uctx);
         try std.testing.expectEqual(@as(u16, 200), res.status);
         try std.testing.expectEqual(@as(usize, 1), TenantHooks.before_update_calls);
@@ -1888,7 +1874,7 @@ const F1Env = struct {
         const w = env.pool.acquireWriter();
         defer env.pool.releaseWriter();
         const tk = (try api_auth.tokenKeyFor(a, w, "users", rid)).?;
-        var mintctx = http.RequestCtx{ .method = .POST, .path = "/", .allocator = a, .app = &env.app };
+        var mintctx = http.RequestCtx{ .method = .POST, .path = "/", .allocator = RequestArena.from(&env.arena), .app = &env.app };
         const tok = try api_auth.mintToken(&mintctx, w, "users", rid, tk, .auth, 100000, "");
         return try std.fmt.allocPrint(a, "Bearer {s}", .{tok});
     }
@@ -1899,7 +1885,7 @@ const F1Env = struct {
         const w = env.pool.acquireWriter();
         defer env.pool.releaseWriter();
         try w.exec("INSERT INTO \"_superusers\" (\"id\",\"created\",\"updated\",\"email\",\"username\",\"passwordHash\",\"tokenKey\",\"verified\") VALUES ('su1','','','admin@x.io','','','sutk',1);");
-        var mintctx = http.RequestCtx{ .method = .POST, .path = "/", .allocator = a, .app = &env.app };
+        var mintctx = http.RequestCtx{ .method = .POST, .path = "/", .allocator = RequestArena.from(&env.arena), .app = &env.app };
         const tok = try api_auth.mintToken(&mintctx, w, "_superusers", "su1", "sutk", .auth, 100000, "");
         return try std.fmt.allocPrint(a, "Bearer {s}", .{tok});
     }
@@ -1941,9 +1927,9 @@ const F1Env = struct {
     }
 };
 
-fn patchCtx(env: *F1Env, a: std.mem.Allocator, rid: []const u8, bearer: []const u8, body: []const u8) http.RequestCtx {
+fn patchCtx(env: *F1Env, a: RequestArena, rid: []const u8, bearer: []const u8, body: []const u8) http.RequestCtx {
     const params = [_]http.Param{ .{ .key = "col", .value = "users" }, .{ .key = "id", .value = rid } };
-    const dup_params = a.dupe(http.Param, &params) catch unreachable;
+    const dup_params = a.a.dupe(http.Param, &params) catch unreachable;
     return .{ .method = .PATCH, .path = "/", .body = body, .allocator = a, .app = &env.app, .params = dup_params, .authorization = bearer };
 }
 
@@ -1956,7 +1942,7 @@ test "F1 PATCH+password: owner with correct oldPassword -> 200, hash replaced, t
     const old_hash = try env.passwordHash(rid);
     const old_tk = try env.tokenKey(rid);
 
-    var uctx = patchCtx(env, a, rid, bearer, "{\"password\":\"newpassword1\",\"oldPassword\":\"oldpassword1\"}");
+    var uctx = patchCtx(env, RequestArena.from(&env.arena), rid, bearer, "{\"password\":\"newpassword1\",\"oldPassword\":\"oldpassword1\"}");
     const res = try update(&uctx);
     try std.testing.expectEqual(@as(u16, 200), res.status);
     try std.testing.expectEqual(@as(usize, 2), res.cookies.len);
@@ -1981,18 +1967,17 @@ test "F1 PATCH+password: owner with correct oldPassword -> 200, hash replaced, t
 test "F1 PATCH+password: wrong and missing oldPassword -> login-identical 400, nothing changed" {
     var env = try F1Env.init(null);
     defer env.deinit();
-    const a = env.arena.allocator();
     const rid = try env.createUser("owner2@x.io", "oldpassword1");
     const bearer = try env.mintOwnerBearer(rid);
     const before_hash = try env.passwordHash(rid);
 
-    var wctx = patchCtx(env, a, rid, bearer, "{\"password\":\"newpassword1\",\"oldPassword\":\"wrongpassword\"}");
+    var wctx = patchCtx(env, RequestArena.from(&env.arena), rid, bearer, "{\"password\":\"newpassword1\",\"oldPassword\":\"wrongpassword\"}");
     const wres = try update(&wctx);
     try std.testing.expectEqual(@as(u16, 400), wres.status);
     try std.testing.expect(std.mem.indexOf(u8, wres.body, "Invalid credentials.") != null);
     try std.testing.expectEqual(@as(usize, 0), wres.cookies.len);
 
-    var mctx = patchCtx(env, a, rid, bearer, "{\"password\":\"newpassword1\"}");
+    var mctx = patchCtx(env, RequestArena.from(&env.arena), rid, bearer, "{\"password\":\"newpassword1\"}");
     const mres = try update(&mctx);
     try std.testing.expectEqual(@as(u16, 400), mres.status);
     try std.testing.expect(std.mem.indexOf(u8, mres.body, "Invalid credentials.") != null);
@@ -2008,7 +1993,7 @@ test "F1 PATCH+password: superuser bypasses oldPassword; target's sessions all d
     const rid = try env.createUser("target@x.io", "originalpw1");
     const su_bearer = try env.mintSuperuserBearer();
 
-    var uctx = patchCtx(env, a, rid, su_bearer, "{\"password\":\"adminreset1\"}");
+    var uctx = patchCtx(env, RequestArena.from(&env.arena), rid, su_bearer, "{\"password\":\"adminreset1\"}");
     const res = try update(&uctx);
     try std.testing.expectEqual(@as(u16, 200), res.status);
     try std.testing.expectEqual(@as(usize, 0), res.cookies.len);
@@ -2022,13 +2007,12 @@ test "F1 PATCH+password: superuser bypasses oldPassword; target's sessions all d
 test "F1 PATCH+password: passwordless target -> 400 for non-superuser (no password bootstrap via PATCH)" {
     var env = try F1Env.init(null);
     defer env.deinit();
-    const a = env.arena.allocator();
     const rid = try env.createUser("nopass@x.io", ""); // no password field at all
     // The target has no session/tokenKey-based bearer (never logged in); mint one anyway via the
     // stored (empty) tokenKey — required only to reach the update() handler as "self".
     const bearer = try env.mintOwnerBearer(rid);
 
-    var uctx = patchCtx(env, a, rid, bearer, "{\"password\":\"newpassword1\",\"oldPassword\":\"anything12\"}");
+    var uctx = patchCtx(env, RequestArena.from(&env.arena), rid, bearer, "{\"password\":\"newpassword1\",\"oldPassword\":\"anything12\"}");
     const res = try update(&uctx);
     try std.testing.expectEqual(@as(u16, 400), res.status);
     try std.testing.expect(std.mem.indexOf(u8, res.body, "Invalid credentials.") != null);
@@ -2054,7 +2038,7 @@ test "F1 PATCH+password: aborting beforePasswordChange leaves password + tokenKe
     const before_hash = try env.passwordHash(rid);
     const before_tk = try env.tokenKey(rid);
 
-    var uctx = patchCtx(env, a, rid, bearer, "{\"password\":\"newpassword1\",\"oldPassword\":\"oldpassword1\"}");
+    var uctx = patchCtx(env, RequestArena.from(&env.arena), rid, bearer, "{\"password\":\"newpassword1\",\"oldPassword\":\"oldpassword1\"}");
     const res = try update(&uctx);
     try std.testing.expectEqual(@as(u16, 403), res.status);
     try std.testing.expectEqual(@as(usize, 1), PwChangeHooks.before_calls);
@@ -2078,8 +2062,8 @@ test "F1 PATCH+password: .table mode purges old rows in-txn and re-issues exactl
 
     // Log in twice (two `_sessions` rows) via issueSession directly (owner tokenKey read fresh
     // each time — password unchanged between the two logins).
-    var lctx1 = http.RequestCtx{ .method = .POST, .path = "/", .allocator = a, .app = &env.app };
-    var lctx2 = http.RequestCtx{ .method = .POST, .path = "/", .allocator = a, .app = &env.app };
+    var lctx1 = http.RequestCtx{ .method = .POST, .path = "/", .allocator = RequestArena.from(&env.arena), .app = &env.app };
+    var lctx2 = http.RequestCtx{ .method = .POST, .path = "/", .allocator = RequestArena.from(&env.arena), .app = &env.app };
     const issued1 = blk: {
         const w = env.pool.acquireWriter();
         defer env.pool.releaseWriter();
@@ -2094,7 +2078,7 @@ test "F1 PATCH+password: .table mode purges old rows in-txn and re-issues exactl
     try std.testing.expectEqual(@as(i64, 2), try env.sessionCountFor(rid));
 
     const bearer = try std.fmt.allocPrint(a, "Bearer {s}", .{issued2.token});
-    var uctx = patchCtx(env, a, rid, bearer, "{\"password\":\"newpassword1\",\"oldPassword\":\"oldpassword1\"}");
+    var uctx = patchCtx(env, RequestArena.from(&env.arena), rid, bearer, "{\"password\":\"newpassword1\",\"oldPassword\":\"oldpassword1\"}");
     const res = try update(&uctx);
     try std.testing.expectEqual(@as(u16, 200), res.status);
     try std.testing.expectEqual(@as(usize, 2), res.cookies.len);
@@ -2118,25 +2102,24 @@ test "F1 PATCH+password: 'pwchange' rate limit 429s BEFORE any argon2/verify wor
     var rl = ratelimit.RateLimiter.init(std.testing.allocator, 1, 3600);
     defer rl.deinit();
     env.app.rate_limiter = &rl;
-    const a = env.arena.allocator();
     const rid = try env.createUser("limited@x.io", "oldpassword1");
     const bearer = try env.mintOwnerBearer(rid);
 
     // First PATCH (wrong oldPassword) consumes the single pwchange budget slot -> 400.
-    var c1 = patchCtx(env, a, rid, bearer, "{\"password\":\"newpassword1\",\"oldPassword\":\"wrongpassword\"}");
+    var c1 = patchCtx(env, RequestArena.from(&env.arena), rid, bearer, "{\"password\":\"newpassword1\",\"oldPassword\":\"wrongpassword\"}");
     const r1 = try update(&c1);
     try std.testing.expectEqual(@as(u16, 400), r1.status);
 
     // Second PATCH (even with the CORRECT oldPassword) -> 429, proving the limiter fires
     // before argon2 verification runs (a correct password would otherwise succeed).
-    var c2 = patchCtx(env, a, rid, bearer, "{\"password\":\"newpassword1\",\"oldPassword\":\"oldpassword1\"}");
+    var c2 = patchCtx(env, RequestArena.from(&env.arena), rid, bearer, "{\"password\":\"newpassword1\",\"oldPassword\":\"oldpassword1\"}");
     const r2 = try update(&c2);
     try std.testing.expectEqual(@as(u16, 429), r2.status);
     try std.testing.expect(std.mem.indexOf(u8, r2.body, "Too many requests") != null);
 
     // A non-password PATCH on the same collection/record is NOT limited (scope isolation:
     // "pwchange" is a distinct bucket from any other scope).
-    var c3 = patchCtx(env, a, rid, bearer, "{\"email\":\"limited2@x.io\"}");
+    var c3 = patchCtx(env, RequestArena.from(&env.arena), rid, bearer, "{\"email\":\"limited2@x.io\"}");
     const r3 = try update(&c3);
     try std.testing.expectEqual(@as(u16, 200), r3.status);
 }
@@ -2149,7 +2132,6 @@ test "F1 PATCH+password: 'pwchange' rate limit 429s BEFORE any argon2/verify wor
 test "F1 PATCH+password: minPasswordLength=0 still gates an empty-string password change" {
     var env = try F1Env.initWithMinLen(null, 0);
     defer env.deinit();
-    const a = env.arena.allocator();
     const rid = try env.createUser("zerolen@x.io", "oldpassword1");
     const bearer = try env.mintOwnerBearer(rid);
     const before_hash = try env.passwordHash(rid);
@@ -2157,7 +2139,7 @@ test "F1 PATCH+password: minPasswordLength=0 still gates an empty-string passwor
 
     // Without oldPassword: the gate must fire (pw_change=true) and reject with the
     // login-identical 400, leaving the password/tokenKey untouched.
-    var uctx = patchCtx(env, a, rid, bearer, "{\"password\":\"\"}");
+    var uctx = patchCtx(env, RequestArena.from(&env.arena), rid, bearer, "{\"password\":\"\"}");
     const res = try update(&uctx);
     try std.testing.expectEqual(@as(u16, 400), res.status);
     try std.testing.expect(std.mem.indexOf(u8, res.body, "Invalid credentials.") != null);
@@ -2167,7 +2149,7 @@ test "F1 PATCH+password: minPasswordLength=0 still gates an empty-string passwor
 
     // With the correct oldPassword, the gate passes and applyUpdate's min_len==0 check
     // (harmlessly) accepts the empty password.
-    var uctx2 = patchCtx(env, a, rid, bearer, "{\"password\":\"\",\"oldPassword\":\"oldpassword1\"}");
+    var uctx2 = patchCtx(env, RequestArena.from(&env.arena), rid, bearer, "{\"password\":\"\",\"oldPassword\":\"oldpassword1\"}");
     const res2 = try update(&uctx2);
     try std.testing.expectEqual(@as(u16, 200), res2.status);
     try std.testing.expect(!std.mem.eql(u8, before_hash, try env.passwordHash(rid)));

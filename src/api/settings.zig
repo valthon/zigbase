@@ -1,4 +1,5 @@
 const std = @import("std");
+const RequestArena = @import("../request_arena.zig").RequestArena;
 const http = @import("../http.zig");
 const auth = @import("../auth.zig");
 const Data = @import("../data.zig").Data;
@@ -29,7 +30,7 @@ fn isSuperuser(ctx: *http.RequestCtx) bool {
     const app = ctx.app orelse return false;
     var r = app.pool.acquireReader() catch return false;
     defer app.pool.releaseReader(&r);
-    const authed = (auth.authenticate(app.io, ctx.allocator, app, ctx, &r) catch null) orelse return false;
+    const authed = (auth.authenticate(app.io, ctx.allocator.a, app, ctx, &r) catch null) orelse return false;
     return authed.is_superuser;
 }
 
@@ -37,12 +38,12 @@ fn requireSuperuser(ctx: *http.RequestCtx) !?http.Response {
     if (isSuperuser(ctx)) return null;
     // Building the 403 body allocates (JSON on the request arena), so OutOfMemory is reachable —
     // propagate it to the server's 500 backstop rather than `catch unreachable` (#29).
-    return try (ApiError{ .status = 403, .message = "Forbidden." }).toResponse(ctx.allocator);
+    return try (ApiError{ .status = 403, .message = "Forbidden." }).toResponse(ctx.allocator.a);
 }
 
 fn dataOnWriter(ctx: *http.RequestCtx) Data {
     const app = ctx.app.?;
-    return .{ .app = app, .conn = app.pool.acquireWriter(), .io = app.io, .alloc = ctx.allocator };
+    return .{ .app = app, .conn = app.pool.acquireWriter(), .io = app.io, .alloc = ctx.allocator.a };
 }
 
 fn entryJson(alloc: std.mem.Allocator, e: Data.KvEntry) !std.json.Value {
@@ -61,11 +62,11 @@ pub fn list(ctx: *http.RequestCtx) anyerror!http.Response {
     const d = dataOnWriter(ctx);
     defer app.pool.releaseWriter();
     const entries = try d.kvList();
-    var arr: std.json.Array = std.json.Array.init(ctx.allocator);
-    for (entries) |e| try arr.append(try entryJson(ctx.allocator, e));
+    var arr: std.json.Array = std.json.Array.init(ctx.allocator.a);
+    for (entries) |e| try arr.append(try entryJson(ctx.allocator.a, e));
     var root: std.json.ObjectMap = .empty;
-    try root.put(ctx.allocator, "items", .{ .array = arr });
-    const body = try std.json.Stringify.valueAlloc(ctx.allocator, std.json.Value{ .object = root }, .{});
+    try root.put(ctx.allocator.a, "items", .{ .array = arr });
+    const body = try std.json.Stringify.valueAlloc(ctx.allocator.a, std.json.Value{ .object = root }, .{});
     return .{ .status = 200, .body = body };
 }
 
@@ -73,11 +74,11 @@ pub fn list(ctx: *http.RequestCtx) anyerror!http.Response {
 pub fn get(ctx: *http.RequestCtx) anyerror!http.Response {
     if (try requireSuperuser(ctx)) |resp| return resp;
     const app = ctx.app.?;
-    const key = ctx.param("key") orelse return ApiError.notFound().toResponse(ctx.allocator);
+    const key = ctx.param("key") orelse return ApiError.notFound().toResponse(ctx.allocator.a);
     const d = dataOnWriter(ctx);
     defer app.pool.releaseWriter();
-    const value = (try d.kvGet(key)) orelse return ApiError.notFound().toResponse(ctx.allocator);
-    const body = try std.json.Stringify.valueAlloc(ctx.allocator, try entryJsonKeyValue(ctx.allocator, key, value), .{});
+    const value = (try d.kvGet(key)) orelse return ApiError.notFound().toResponse(ctx.allocator.a);
+    const body = try std.json.Stringify.valueAlloc(ctx.allocator.a, try entryJsonKeyValue(ctx.allocator.a, key, value), .{});
     return .{ .status = 200, .body = body };
 }
 
@@ -94,9 +95,9 @@ const PutBody = struct { value: []const u8 };
 pub fn put(ctx: *http.RequestCtx) anyerror!http.Response {
     if (try requireSuperuser(ctx)) |resp| return resp;
     const app = ctx.app.?;
-    const key = ctx.param("key") orelse return ApiError.notFound().toResponse(ctx.allocator);
-    const parsed = std.json.parseFromSlice(PutBody, ctx.allocator, ctx.body, .{ .ignore_unknown_fields = true }) catch
-        return ApiError.badRequest("Body must be {\"value\": \"...\"}.").toResponse(ctx.allocator);
+    const key = ctx.param("key") orelse return ApiError.notFound().toResponse(ctx.allocator.a);
+    const parsed = std.json.parseFromSlice(PutBody, ctx.allocator.a, ctx.body, .{ .ignore_unknown_fields = true }) catch
+        return ApiError.badRequest("Body must be {\"value\": \"...\"}.").toResponse(ctx.allocator.a);
     const d = dataOnWriter(ctx);
     defer app.pool.releaseWriter();
     try d.kvSet(key, parsed.value.value);
@@ -107,7 +108,7 @@ pub fn put(ctx: *http.RequestCtx) anyerror!http.Response {
         if (app.feature_cache) |fc| fc.invalidate();
         realtime_ws.broadcastFeaturesChanged(app);
     }
-    const body = try std.json.Stringify.valueAlloc(ctx.allocator, try entryJsonKeyValue(ctx.allocator, key, parsed.value.value), .{});
+    const body = try std.json.Stringify.valueAlloc(ctx.allocator.a, try entryJsonKeyValue(ctx.allocator.a, key, parsed.value.value), .{});
     return .{ .status = 200, .body = body };
 }
 
@@ -115,10 +116,10 @@ pub fn put(ctx: *http.RequestCtx) anyerror!http.Response {
 pub fn delete(ctx: *http.RequestCtx) anyerror!http.Response {
     if (try requireSuperuser(ctx)) |resp| return resp;
     const app = ctx.app.?;
-    const key = ctx.param("key") orelse return ApiError.notFound().toResponse(ctx.allocator);
+    const key = ctx.param("key") orelse return ApiError.notFound().toResponse(ctx.allocator.a);
     const d = dataOnWriter(ctx);
     defer app.pool.releaseWriter();
-    if (!(try d.kvDelete(key))) return ApiError.notFound().toResponse(ctx.allocator);
+    if (!(try d.kvDelete(key))) return ApiError.notFound().toResponse(ctx.allocator.a);
     // Clearing a feature override reverts to the declared default: invalidate the override
     // cache (#230, unconditional / not reactor-gated; the delete is committed) and signal.
     if (isFeatureOverrideKey(key)) {
@@ -167,7 +168,7 @@ const TestEnv = struct {
     }
 };
 
-fn ctxFor(env: *TestEnv, arena: std.mem.Allocator, method: http.Method, path: []const u8, body: []const u8, params: []const http.Param) http.RequestCtx {
+fn ctxFor(env: *TestEnv, arena: RequestArena, method: http.Method, path: []const u8, body: []const u8, params: []const http.Param) http.RequestCtx {
     return .{ .method = method, .path = path, .body = body, .allocator = arena, .app = &env.app, .params = params };
 }
 
@@ -185,12 +186,11 @@ test "settings API requires a superuser" {
     defer env.deinit();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const a = arena.allocator();
 
     // No auth header -> 403 on every verb.
-    var lctx = ctxFor(env, a, .GET, "/api/settings", "", &.{});
+    var lctx = ctxFor(env, RequestArena.from(&arena), .GET, "/api/settings", "", &.{});
     try std.testing.expectEqual(@as(u16, 403), (try list(&lctx)).status);
-    var pctx = ctxFor(env, a, .PUT, "/api/settings/x", "{\"value\":\"1\"}", &.{.{ .key = "key", .value = "x" }});
+    var pctx = ctxFor(env, RequestArena.from(&arena), .PUT, "/api/settings/x", "{\"value\":\"1\"}", &.{.{ .key = "key", .value = "x" }});
     try std.testing.expectEqual(@as(u16, 403), (try put(&pctx)).status);
 }
 
@@ -203,25 +203,25 @@ test "settings API put/get/list/delete round-trips for a superuser" {
     const auth_hdr = try std.fmt.allocPrint(a, "Bearer {s}", .{try env.superuserToken(a)});
 
     // Absent key -> 404.
-    var g0 = ctxFor(env, a, .GET, "/api/settings/beta", "", &.{.{ .key = "key", .value = "beta" }});
+    var g0 = ctxFor(env, RequestArena.from(&arena), .GET, "/api/settings/beta", "", &.{.{ .key = "key", .value = "beta" }});
     g0.authorization = auth_hdr;
     try std.testing.expectEqual(@as(u16, 404), (try get(&g0)).status);
 
     // PUT upserts.
-    var p = ctxFor(env, a, .PUT, "/api/settings/beta", "{\"value\":\"true\"}", &.{.{ .key = "key", .value = "beta" }});
+    var p = ctxFor(env, RequestArena.from(&arena), .PUT, "/api/settings/beta", "{\"value\":\"true\"}", &.{.{ .key = "key", .value = "beta" }});
     p.authorization = auth_hdr;
     const pres = try put(&p);
     try std.testing.expectEqual(@as(u16, 200), pres.status);
 
     // GET returns it.
-    var g = ctxFor(env, a, .GET, "/api/settings/beta", "", &.{.{ .key = "key", .value = "beta" }});
+    var g = ctxFor(env, RequestArena.from(&arena), .GET, "/api/settings/beta", "", &.{.{ .key = "key", .value = "beta" }});
     g.authorization = auth_hdr;
     const gres = try get(&g);
     try std.testing.expectEqual(@as(u16, 200), gres.status);
     try std.testing.expect(std.mem.indexOf(u8, gres.body, "\"value\":\"true\"") != null);
 
     // LIST includes it.
-    var l = ctxFor(env, a, .GET, "/api/settings", "", &.{});
+    var l = ctxFor(env, RequestArena.from(&arena), .GET, "/api/settings", "", &.{});
     l.authorization = auth_hdr;
     const lres = try list(&l);
     try std.testing.expectEqual(@as(u16, 200), lres.status);
@@ -229,15 +229,15 @@ test "settings API put/get/list/delete round-trips for a superuser" {
     try std.testing.expect(std.mem.indexOf(u8, lres.body, "\"beta\"") != null);
 
     // Bad body -> 400.
-    var pb = ctxFor(env, a, .PUT, "/api/settings/beta", "not json", &.{.{ .key = "key", .value = "beta" }});
+    var pb = ctxFor(env, RequestArena.from(&arena), .PUT, "/api/settings/beta", "not json", &.{.{ .key = "key", .value = "beta" }});
     pb.authorization = auth_hdr;
     try std.testing.expectEqual(@as(u16, 400), (try put(&pb)).status);
 
     // DELETE removes (204), then 404.
-    var d1 = ctxFor(env, a, .DELETE, "/api/settings/beta", "", &.{.{ .key = "key", .value = "beta" }});
+    var d1 = ctxFor(env, RequestArena.from(&arena), .DELETE, "/api/settings/beta", "", &.{.{ .key = "key", .value = "beta" }});
     d1.authorization = auth_hdr;
     try std.testing.expectEqual(@as(u16, 204), (try delete(&d1)).status);
-    var d2 = ctxFor(env, a, .DELETE, "/api/settings/beta", "", &.{.{ .key = "key", .value = "beta" }});
+    var d2 = ctxFor(env, RequestArena.from(&arena), .DELETE, "/api/settings/beta", "", &.{.{ .key = "key", .value = "beta" }});
     d2.authorization = auth_hdr;
     try std.testing.expectEqual(@as(u16, 404), (try delete(&d2)).status);
 }

@@ -1,4 +1,5 @@
 const std = @import("std");
+const RequestArena = @import("../../request_arena.zig").RequestArena;
 const method_mod = @import("../method.zig");
 const AuthMethod = method_mod.AuthMethod;
 const AuthCtx = method_mod.AuthCtx;
@@ -35,7 +36,7 @@ fn initiateImpl(ctx: *anyopaque, ac: *AuthCtx) anyerror!InitiateResult {
 
     // Parse email from body; on any parse failure return 204 (enumeration-safe)
     const email = blk: {
-        const parsed = std.json.parseFromSlice(std.json.Value, ac.ctx.allocator, ac.ctx.body, .{}) catch
+        const parsed = std.json.parseFromSlice(std.json.Value, ac.ctx.allocator.a, ac.ctx.body, .{}) catch
             return InitiateResult{ .status = 204 };
         if (parsed.value != .object) return InitiateResult{ .status = 204 };
         break :blk strField(parsed.value, "identity") orelse return InitiateResult{ .status = 204 };
@@ -62,7 +63,7 @@ fn initiateImpl(ctx: *anyopaque, ac: *AuthCtx) anyerror!InitiateResult {
         if (try ac.resolveOrCreate(w.conn, email, true)) |rid| {
             const token = try ac.mintLinkToken(w.conn, rid, ttl, .{});
             const mail_body = try buildMailBody(
-                ac.ctx.allocator,
+                ac.ctx.allocator.a,
                 ac.app.public_url,
                 ac.collection.name,
                 token,
@@ -78,7 +79,7 @@ fn initiateImpl(ctx: *anyopaque, ac: *AuthCtx) anyerror!InitiateResult {
         if (try ac.findByIdentity(&r.conn, email)) |rid| {
             const token = try ac.mintLinkToken(&r.conn, rid, ttl, .{});
             const mail_body = try buildMailBody(
-                ac.ctx.allocator,
+                ac.ctx.allocator.a,
                 ac.app.public_url,
                 ac.collection.name,
                 token,
@@ -101,7 +102,7 @@ fn completeImpl(ctx: *anyopaque, ac: *AuthCtx) anyerror!Resolution {
     _ = @as(*MagicLinkMethod, @ptrCast(@alignCast(ctx)));
 
     // Parse token from body
-    const parsed = std.json.parseFromSlice(std.json.Value, ac.ctx.allocator, ac.ctx.body, .{}) catch {
+    const parsed = std.json.parseFromSlice(std.json.Value, ac.ctx.allocator.a, ac.ctx.body, .{}) catch {
         return Resolution{ .fail = .{ .status = 400, .message = "token is required." } };
     };
     if (parsed.value != .object) {
@@ -191,7 +192,7 @@ test "MagicLinkMethod: complete with valid token resolves to record id" {
         defer env.pool.releaseWriter();
         const col = (try collections.get(a, w, "mlmembers")).?;
 
-        var req_ctx = env.ctx(a, .POST, "", &[_]http.Param{});
+        var req_ctx = env.ctx(RequestArena.from(&arena), .POST, "", &[_]http.Param{});
         var ac_mint = AuthCtx{
             .app = &env.app,
             .ctx = &req_ctx,
@@ -208,7 +209,7 @@ test "MagicLinkMethod: complete with valid token resolves to record id" {
 
     // Build the complete request body
     const body = try std.fmt.allocPrint(a, "{{\"token\":\"{s}\"}}", .{token});
-    var req_ok = env.ctx(a, .POST, body, &[_]http.Param{});
+    var req_ok = env.ctx(RequestArena.from(&arena), .POST, body, &[_]http.Param{});
     var ac_ok = AuthCtx{
         .app = &env.app,
         .ctx = &req_ok,
@@ -230,7 +231,7 @@ test "MagicLinkMethod: complete with valid token resolves to record id" {
     }
 
     // Second use (replay): same token must be rejected (single-use)
-    var req_replay = env.ctx(a, .POST, body, &[_]http.Param{});
+    var req_replay = env.ctx(RequestArena.from(&arena), .POST, body, &[_]http.Param{});
     var ac_replay = AuthCtx{
         .app = &env.app,
         .ctx = &req_replay,
@@ -261,7 +262,7 @@ test "MagicLinkMethod: complete with garbage token returns .fail 400" {
         break :blk (try collections.get(a, w, "mlmembers2")).?;
     };
 
-    var req = env.ctx(a, .POST, "{\"token\":\"not.a.real.token\"}", &[_]http.Param{});
+    var req = env.ctx(RequestArena.from(&arena), .POST, "{\"token\":\"not.a.real.token\"}", &[_]http.Param{});
     var ac = AuthCtx{
         .app = &env.app,
         .ctx = &req,
@@ -295,7 +296,7 @@ test "MagicLinkMethod: complete with missing token field returns .fail 400" {
         break :blk (try collections.get(a, w, "mlmembers3")).?;
     };
 
-    var req = env.ctx(a, .POST, "{\"other\":\"field\"}", &[_]http.Param{});
+    var req = env.ctx(RequestArena.from(&arena), .POST, "{\"other\":\"field\"}", &[_]http.Param{});
     var ac = AuthCtx{
         .app = &env.app,
         .ctx = &req,
@@ -334,7 +335,7 @@ test "MagicLinkMethod: initiate with known email returns 204" {
         break :blk (try collections.get(a, w, "mlmembers4")).?;
     };
 
-    var req = env.ctx(a, .POST, "{\"identity\":\"u@x.io\"}", &[_]http.Param{});
+    var req = env.ctx(RequestArena.from(&arena), .POST, "{\"identity\":\"u@x.io\"}", &[_]http.Param{});
     var ac = AuthCtx{
         .app = &env.app,
         .ctx = &req,
@@ -365,7 +366,7 @@ test "MagicLinkMethod: initiate with unknown email still returns 204 (enumeratio
         break :blk (try collections.get(a, w, "mlmembers5")).?;
     };
 
-    var req = env.ctx(a, .POST, "{\"identity\":\"nobody@x.io\"}", &[_]http.Param{});
+    var req = env.ctx(RequestArena.from(&arena), .POST, "{\"identity\":\"nobody@x.io\"}", &[_]http.Param{});
     var ac = AuthCtx{
         .app = &env.app,
         .ctx = &req,
@@ -396,7 +397,7 @@ test "MagicLinkMethod: initiate with unparseable body returns 204 (enumeration-s
         break :blk (try collections.get(a, w, "mlmembers6")).?;
     };
 
-    var req = env.ctx(a, .POST, "not json at all", &[_]http.Param{});
+    var req = env.ctx(RequestArena.from(&arena), .POST, "not json at all", &[_]http.Param{});
     var ac = AuthCtx{
         .app = &env.app,
         .ctx = &req,
@@ -493,7 +494,7 @@ test "MagicLinkMethod: initiate auto_create=true creates record for unknown iden
         break :blk (try collections.get(a, w, "ml_ac")).?;
     };
 
-    var req = env.ctx(a, .POST, "{\"identity\":\"brand_new@x.io\"}", &[_]http_mod.Param{});
+    var req = env.ctx(RequestArena.from(&arena), .POST, "{\"identity\":\"brand_new@x.io\"}", &[_]http_mod.Param{});
     var ac = AuthCtx{ .app = &env.app, .ctx = &req, .collection = col, .config = .null };
 
     var m = try MagicLinkMethod.create(std.testing.allocator, std.testing.io, .{});
@@ -505,7 +506,7 @@ test "MagicLinkMethod: initiate auto_create=true creates record for unknown iden
     const w2 = env.pool.acquireWriter();
     defer env.pool.releaseWriter();
     const col2 = (try collections.get(a, w2, "ml_ac")).?;
-    var req2 = env.ctx(a, .POST, "", &[_]http_mod.Param{});
+    var req2 = env.ctx(RequestArena.from(&arena), .POST, "", &[_]http_mod.Param{});
     var ac2 = AuthCtx{ .app = &env.app, .ctx = &req2, .collection = col2, .config = .null };
     const rid = try ac2.findByIdentity(w2, "brand_new@x.io");
     try std.testing.expect(rid != null);
@@ -547,7 +548,7 @@ test "MagicLinkMethod: initiate auto_create=false creates nothing for unknown id
         break :blk (try collections.get(a, w, "ml_noac")).?;
     };
 
-    var req = env.ctx(a, .POST, "{\"identity\":\"ghost@x.io\"}", &[_]http_mod.Param{});
+    var req = env.ctx(RequestArena.from(&arena), .POST, "{\"identity\":\"ghost@x.io\"}", &[_]http_mod.Param{});
     var ac = AuthCtx{ .app = &env.app, .ctx = &req, .collection = col, .config = .null };
 
     var m = try MagicLinkMethod.create(std.testing.allocator, std.testing.io, .{});
@@ -559,7 +560,7 @@ test "MagicLinkMethod: initiate auto_create=false creates nothing for unknown id
     const w2 = env.pool.acquireWriter();
     defer env.pool.releaseWriter();
     const col2 = (try collections.get(a, w2, "ml_noac")).?;
-    var req2 = env.ctx(a, .POST, "", &[_]http_mod.Param{});
+    var req2 = env.ctx(RequestArena.from(&arena), .POST, "", &[_]http_mod.Param{});
     var ac2 = AuthCtx{ .app = &env.app, .ctx = &req2, .collection = col2, .config = .null };
     const rid = try ac2.findByIdentity(w2, "ghost@x.io");
     try std.testing.expectEqual(@as(?[]const u8, null), rid);
@@ -602,7 +603,7 @@ test "MagicLinkMethod: auto_create initiate then complete succeeds end-to-end" {
     };
 
     // initiate creates the record
-    var req_init = env.ctx(a, .POST, "{\"identity\":\"fresh@x.io\"}", &[_]http_mod.Param{});
+    var req_init = env.ctx(RequestArena.from(&arena), .POST, "{\"identity\":\"fresh@x.io\"}", &[_]http_mod.Param{});
     var ac_init = AuthCtx{ .app = &env.app, .ctx = &req_init, .collection = col, .config = .null };
     var m = try MagicLinkMethod.create(std.testing.allocator, std.testing.io, .{});
     const am = m.method();
@@ -616,7 +617,7 @@ test "MagicLinkMethod: auto_create initiate then complete succeeds end-to-end" {
         const w = env.pool.acquireWriter();
         defer env.pool.releaseWriter();
         const col2 = (try collections.get(a, w, "ml_e2e")).?;
-        var req_mint = env.ctx(a, .POST, "", &[_]http_mod.Param{});
+        var req_mint = env.ctx(RequestArena.from(&arena), .POST, "", &[_]http_mod.Param{});
         var ac_mint = AuthCtx{ .app = &env.app, .ctx = &req_mint, .collection = col2, .config = .null };
         const rid = (try ac_mint.findByIdentity(w, "fresh@x.io")).?;
         @memcpy(rid_buf[0..rid.len], rid);
@@ -626,7 +627,7 @@ test "MagicLinkMethod: auto_create initiate then complete succeeds end-to-end" {
 
     // complete resolves to the auto-created record's id
     const body = try std.fmt.allocPrint(a, "{{\"token\":\"{s}\"}}", .{token});
-    var req_comp = env.ctx(a, .POST, body, &[_]http_mod.Param{});
+    var req_comp = env.ctx(RequestArena.from(&arena), .POST, body, &[_]http_mod.Param{});
     const col3 = blk: {
         const w = env.pool.acquireWriter();
         defer env.pool.releaseWriter();

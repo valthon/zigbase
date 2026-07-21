@@ -1,4 +1,5 @@
 const std = @import("std");
+const RequestArena = @import("../request_arena.zig").RequestArena;
 const http = @import("../http.zig");
 const app_mod = @import("../app.zig");
 const db = @import("../db.zig");
@@ -21,7 +22,7 @@ fn prepareOAuthConfig(ctx: *http.RequestCtx, def: *schema.Collection, existing: 
     if (def.type != .auth) return;
     const provs = def.options.auth.oauth2.providers;
     if (provs.len == 0) return;
-    const out = try ctx.allocator.alloc(schema.OAuth2Provider, provs.len);
+    const out = try ctx.allocator.a.alloc(schema.OAuth2Provider, provs.len);
     for (provs, 0..) |p, i| {
         var np = p;
         if (oauth_api.resolveProvider(np) == null) return error.BadOAuthConfig;
@@ -36,7 +37,7 @@ fn prepareOAuthConfig(ctx: *http.RequestCtx, def: *schema.Collection, existing: 
             }
             if (np.clientSecret.len == 0 and np.enabled) return error.BadOAuthConfig;
         } else if (!secrets.isEncrypted(np.clientSecret)) {
-            np.clientSecret = try secrets.encryptSecret(app.io, ctx.allocator, app.jwt_secret, np.clientSecret);
+            np.clientSecret = try secrets.encryptSecret(app.io, ctx.allocator.a, app.jwt_secret, np.clientSecret);
         }
         out[i] = np;
     }
@@ -48,7 +49,7 @@ fn isSuperuser(ctx: *http.RequestCtx) bool {
     const app = ctx.app orelse return false;
     var r = app.pool.acquireReader() catch return false;
     defer app.pool.releaseReader(&r);
-    const authed = (auth.authenticate(app.io, ctx.allocator, app, ctx, &r) catch null) orelse return false;
+    const authed = (auth.authenticate(app.io, ctx.allocator.a, app, ctx, &r) catch null) orelse return false;
     return authed.is_superuser;
 }
 
@@ -56,7 +57,7 @@ fn requireSuperuser(ctx: *http.RequestCtx) !?http.Response {
     if (isSuperuser(ctx)) return null;
     // Building the 403 body allocates (JSON on the request arena), so OutOfMemory is reachable —
     // propagate it to the server's 500 backstop rather than `catch unreachable` (#29).
-    return try (ApiError{ .status = 403, .message = "Forbidden." }).toResponse(ctx.allocator);
+    return try (ApiError{ .status = 403, .message = "Forbidden." }).toResponse(ctx.allocator.a);
 }
 
 /// Frozen-collection-metadata mode (issue #234): when `app.collections_frozen` is set the
@@ -64,14 +65,14 @@ fn requireSuperuser(ctx: *http.RequestCtx) !?http.Response {
 /// `.migrations` + a redeploy). Returns a 403 response to short-circuit; null when not frozen.
 fn rejectIfFrozen(ctx: *http.RequestCtx, app: *app_mod.App) !?http.Response {
     if (!app.collections_frozen) return null;
-    return try (ApiError{ .status = 403, .message = "Collections are frozen (`.collections_frozen`); schema changes require a migration and a redeploy." }).toResponse(ctx.allocator);
+    return try (ApiError{ .status = 403, .message = "Collections are frozen (`.collections_frozen`); schema changes require a migration and a redeploy." }).toResponse(ctx.allocator.a);
 }
 
 fn validationResponse(ctx: *http.RequestCtx) !http.Response {
     const verrs = collections.last_errors orelse &[_]schema.ValidationError{};
-    const fes = try ctx.allocator.alloc(FieldError, verrs.len);
+    const fes = try ctx.allocator.a.alloc(FieldError, verrs.len);
     for (verrs, 0..) |e, i| fes[i] = .{ .field = e.field, .code = e.code, .message = e.message };
-    return ApiError.validation(fes).toResponse(ctx.allocator);
+    return ApiError.validation(fes).toResponse(ctx.allocator.a);
 }
 
 pub fn list(ctx: *http.RequestCtx) anyerror!http.Response {
@@ -79,15 +80,15 @@ pub fn list(ctx: *http.RequestCtx) anyerror!http.Response {
     const app = ctx.app.?;
     const w = app.pool.acquireWriter();
     defer app.pool.releaseWriter();
-    const cols = try collections.list(ctx.allocator, w);
-    var arr: std.json.Array = std.json.Array.init(ctx.allocator);
+    const cols = try collections.list(ctx.allocator.a, w);
+    var arr: std.json.Array = std.json.Array.init(ctx.allocator.a);
     for (cols) |c| {
-        const cj = try schema.collectionToJson(ctx.allocator, c);
-        try arr.append((try std.json.parseFromSlice(std.json.Value, ctx.allocator, cj, .{})).value);
+        const cj = try schema.collectionToJson(ctx.allocator.a, c);
+        try arr.append((try std.json.parseFromSlice(std.json.Value, ctx.allocator.a, cj, .{})).value);
     }
     var root: std.json.ObjectMap = .empty;
-    try root.put(ctx.allocator, "items", .{ .array = arr });
-    const body = try std.json.Stringify.valueAlloc(ctx.allocator, std.json.Value{ .object = root }, .{});
+    try root.put(ctx.allocator.a, "items", .{ .array = arr });
+    const body = try std.json.Stringify.valueAlloc(ctx.allocator.a, std.json.Value{ .object = root }, .{});
     return .{ .status = 200, .body = body };
 }
 
@@ -95,74 +96,74 @@ pub fn create(ctx: *http.RequestCtx) anyerror!http.Response {
     if (try requireSuperuser(ctx)) |resp| return resp;
     const app = ctx.app.?;
     if (try rejectIfFrozen(ctx, app)) |resp| return resp;
-    const def = schema.parseCollectionInput(ctx.allocator, ctx.body) catch
-        return ApiError.badRequest("Invalid request body.").toResponse(ctx.allocator);
+    const def = schema.parseCollectionInput(ctx.allocator.a, ctx.body) catch
+        return ApiError.badRequest("Invalid request body.").toResponse(ctx.allocator.a);
     // Fail-closed: can't create an encrypted field with no field key configured
     // (the startup guard only inspects comptime collections). Without this, an
     // encrypted field created at runtime would be unwritable / leak intent.
     if (schema.hasEncryptedField(def) and db.poolFieldCipher(app.pool) == null)
-        return ApiError.badRequest("Encrypted fields require ZIGBASE_FIELD_KEY to be configured.").toResponse(ctx.allocator);
+        return ApiError.badRequest("Encrypted fields require ZIGBASE_FIELD_KEY to be configured.").toResponse(ctx.allocator.a);
     const w = app.pool.acquireWriter();
     defer app.pool.releaseWriter();
     var def_mut = def;
     prepareOAuthConfig(ctx, &def_mut, null) catch
-        return ApiError.badRequest("Invalid OAuth2 provider config (endpoints must be https).").toResponse(ctx.allocator);
-    const created = collections.create(ctx.allocator, app.io, w, def_mut) catch |e| switch (e) {
+        return ApiError.badRequest("Invalid OAuth2 provider config (endpoints must be https).").toResponse(ctx.allocator.a);
+    const created = collections.create(ctx.allocator.a, app.io, w, def_mut) catch |e| switch (e) {
         error.Validation => return validationResponse(ctx),
         // The pre-check (`get() != null`) catches the common duplicate; error.Constraint covers a
         // duplicate that races in between the pre-check and the write — still a 409, never a 500.
-        error.Conflict, error.Constraint => return ApiError.conflict("Collection already exists.").toResponse(ctx.allocator),
+        error.Conflict, error.Constraint => return ApiError.conflict("Collection already exists.").toResponse(ctx.allocator.a),
         else => return e,
     };
     if (app.col_cache) |cc| cc.invalidate(); // R1-4: collection DDL invalidates the metadata cache
-    return .{ .status = 201, .body = try schema.collectionToJson(ctx.allocator, created) };
+    return .{ .status = 201, .body = try schema.collectionToJson(ctx.allocator.a, created) };
 }
 
 pub fn get(ctx: *http.RequestCtx) anyerror!http.Response {
     if (try requireSuperuser(ctx)) |resp| return resp;
     const app = ctx.app.?;
-    const key = ctx.param("idOrName") orelse return ApiError.notFound().toResponse(ctx.allocator);
+    const key = ctx.param("idOrName") orelse return ApiError.notFound().toResponse(ctx.allocator.a);
     const w = app.pool.acquireWriter();
     defer app.pool.releaseWriter();
-    const col = (try collections.get(ctx.allocator, w, key)) orelse return ApiError.notFound().toResponse(ctx.allocator);
-    return .{ .status = 200, .body = try schema.collectionToJson(ctx.allocator, col) };
+    const col = (try collections.get(ctx.allocator.a, w, key)) orelse return ApiError.notFound().toResponse(ctx.allocator.a);
+    return .{ .status = 200, .body = try schema.collectionToJson(ctx.allocator.a, col) };
 }
 
 pub fn update(ctx: *http.RequestCtx) anyerror!http.Response {
     if (try requireSuperuser(ctx)) |resp| return resp;
     const app = ctx.app.?;
     if (try rejectIfFrozen(ctx, app)) |resp| return resp;
-    const key = ctx.param("idOrName") orelse return ApiError.notFound().toResponse(ctx.allocator);
-    const def = schema.parseCollectionInput(ctx.allocator, ctx.body) catch
-        return ApiError.badRequest("Invalid request body.").toResponse(ctx.allocator);
+    const key = ctx.param("idOrName") orelse return ApiError.notFound().toResponse(ctx.allocator.a);
+    const def = schema.parseCollectionInput(ctx.allocator.a, ctx.body) catch
+        return ApiError.badRequest("Invalid request body.").toResponse(ctx.allocator.a);
     if (schema.hasEncryptedField(def) and db.poolFieldCipher(app.pool) == null)
-        return ApiError.badRequest("Encrypted fields require ZIGBASE_FIELD_KEY to be configured.").toResponse(ctx.allocator);
+        return ApiError.badRequest("Encrypted fields require ZIGBASE_FIELD_KEY to be configured.").toResponse(ctx.allocator.a);
     const w = app.pool.acquireWriter();
     defer app.pool.releaseWriter();
-    const existing = collections.get(ctx.allocator, w, key) catch null;
+    const existing = collections.get(ctx.allocator.a, w, key) catch null;
     var def_mut = def;
     prepareOAuthConfig(ctx, &def_mut, existing) catch
-        return ApiError.badRequest("Invalid OAuth2 provider config (endpoints must be https).").toResponse(ctx.allocator);
-    const updated = collections.update(ctx.allocator, app.io, w, key, def_mut) catch |e| switch (e) {
-        error.NotFound => return ApiError.notFound().toResponse(ctx.allocator),
+        return ApiError.badRequest("Invalid OAuth2 provider config (endpoints must be https).").toResponse(ctx.allocator.a);
+    const updated = collections.update(ctx.allocator.a, app.io, w, key, def_mut) catch |e| switch (e) {
+        error.NotFound => return ApiError.notFound().toResponse(ctx.allocator.a),
         error.Validation => return validationResponse(ctx),
-        error.Conflict, error.Constraint => return ApiError.conflict("Conflict.").toResponse(ctx.allocator),
+        error.Conflict, error.Constraint => return ApiError.conflict("Conflict.").toResponse(ctx.allocator.a),
         else => return e,
     };
     if (app.col_cache) |cc| cc.invalidate(); // R1-4: collection DDL invalidates the metadata cache
-    return .{ .status = 200, .body = try schema.collectionToJson(ctx.allocator, updated) };
+    return .{ .status = 200, .body = try schema.collectionToJson(ctx.allocator.a, updated) };
 }
 
 pub fn delete(ctx: *http.RequestCtx) anyerror!http.Response {
     if (try requireSuperuser(ctx)) |resp| return resp;
     const app = ctx.app.?;
     if (try rejectIfFrozen(ctx, app)) |resp| return resp;
-    const key = ctx.param("idOrName") orelse return ApiError.notFound().toResponse(ctx.allocator);
+    const key = ctx.param("idOrName") orelse return ApiError.notFound().toResponse(ctx.allocator.a);
     const w = app.pool.acquireWriter();
     defer app.pool.releaseWriter();
-    collections.delete(ctx.allocator, w, key) catch |e| switch (e) {
-        error.NotFound => return ApiError.notFound().toResponse(ctx.allocator),
-        error.Conflict => return ApiError.conflict("Collection is referenced by a relation.").toResponse(ctx.allocator),
+    collections.delete(ctx.allocator.a, w, key) catch |e| switch (e) {
+        error.NotFound => return ApiError.notFound().toResponse(ctx.allocator.a),
+        error.Conflict => return ApiError.conflict("Collection is referenced by a relation.").toResponse(ctx.allocator.a),
         else => return e,
     };
     if (app.col_cache) |cc| cc.invalidate(); // R1-4: collection DDL invalidates the metadata cache
@@ -205,7 +206,7 @@ const TestEnv = struct {
     }
 };
 
-fn ctxFor(env: *TestEnv, arena: std.mem.Allocator, method: http.Method, path: []const u8, body: []const u8, params: []const http.Param) http.RequestCtx {
+fn ctxFor(env: *TestEnv, arena: RequestArena, method: http.Method, path: []const u8, body: []const u8, params: []const http.Param) http.RequestCtx {
     return .{ .method = method, .path = path, .body = body, .allocator = arena, .app = &env.app, .params = params };
 }
 
@@ -221,18 +222,18 @@ test "create then get then list a collection over handlers" {
     const body =
         \\{"name":"posts","fields":[{"id":"","name":"title","type":"text","options":{}}]}
     ;
-    var cctx = ctxFor(env, a, .POST, "/api/collections", body, &.{});
+    var cctx = ctxFor(env, RequestArena.from(&arena), .POST, "/api/collections", body, &.{});
     cctx.authorization = auth_hdr;
     const cres = try create(&cctx);
     try std.testing.expectEqual(@as(u16, 201), cres.status);
     try std.testing.expect(std.mem.indexOf(u8, cres.body, "\"name\":\"posts\"") != null);
 
-    var gctx = ctxFor(env, a, .GET, "/api/collections/posts", "", &.{.{ .key = "idOrName", .value = "posts" }});
+    var gctx = ctxFor(env, RequestArena.from(&arena), .GET, "/api/collections/posts", "", &.{.{ .key = "idOrName", .value = "posts" }});
     gctx.authorization = auth_hdr;
     const gres = try get(&gctx);
     try std.testing.expectEqual(@as(u16, 200), gres.status);
 
-    var lctx = ctxFor(env, a, .GET, "/api/collections", "", &.{});
+    var lctx = ctxFor(env, RequestArena.from(&arena), .GET, "/api/collections", "", &.{});
     lctx.authorization = auth_hdr;
     const lres = try list(&lctx);
     try std.testing.expectEqual(@as(u16, 200), lres.status);
@@ -253,7 +254,7 @@ test "collections_frozen 403s the runtime DDL endpoints without mutating collect
         const body =
             \\{"name":"posts","fields":[{"id":"","name":"title","type":"text","options":{}}]}
         ;
-        var cctx = ctxFor(env, a, .POST, "/api/collections", body, &.{});
+        var cctx = ctxFor(env, RequestArena.from(&arena), .POST, "/api/collections", body, &.{});
         cctx.authorization = auth_hdr;
         try std.testing.expectEqual(@as(u16, 201), (try create(&cctx)).status);
     }
@@ -267,7 +268,7 @@ test "collections_frozen 403s the runtime DDL endpoints without mutating collect
         const body =
             \\{"name":"comments","fields":[{"id":"","name":"body","type":"text","options":{}}]}
         ;
-        var cctx = ctxFor(env, a, .POST, "/api/collections", body, &.{});
+        var cctx = ctxFor(env, RequestArena.from(&arena), .POST, "/api/collections", body, &.{});
         cctx.authorization = auth_hdr;
         const res = try create(&cctx);
         try std.testing.expectEqual(@as(u16, 403), res.status);
@@ -277,12 +278,12 @@ test "collections_frozen 403s the runtime DDL endpoints without mutating collect
         const body =
             \\{"name":"posts","fields":[{"id":"","name":"title","type":"text","options":{}},{"id":"","name":"extra","type":"text","options":{}}]}
         ;
-        var uctx = ctxFor(env, a, .PUT, "/api/collections/posts", body, &.{.{ .key = "idOrName", .value = "posts" }});
+        var uctx = ctxFor(env, RequestArena.from(&arena), .PUT, "/api/collections/posts", body, &.{.{ .key = "idOrName", .value = "posts" }});
         uctx.authorization = auth_hdr;
         try std.testing.expectEqual(@as(u16, 403), (try update(&uctx)).status);
     }
     {
-        var dctx = ctxFor(env, a, .DELETE, "/api/collections/posts", "", &.{.{ .key = "idOrName", .value = "posts" }});
+        var dctx = ctxFor(env, RequestArena.from(&arena), .DELETE, "/api/collections/posts", "", &.{.{ .key = "idOrName", .value = "posts" }});
         dctx.authorization = auth_hdr;
         try std.testing.expectEqual(@as(u16, 403), (try delete(&dctx)).status);
     }
@@ -291,7 +292,7 @@ test "collections_frozen 403s the runtime DDL endpoints without mutating collect
     const count_after = (try collections.list(a, env.pool.acquireWriter())).len;
     env.pool.releaseWriter();
     try std.testing.expectEqual(count_before, count_after);
-    var gctx = ctxFor(env, a, .GET, "/api/collections/posts", "", &.{.{ .key = "idOrName", .value = "posts" }});
+    var gctx = ctxFor(env, RequestArena.from(&arena), .GET, "/api/collections/posts", "", &.{.{ .key = "idOrName", .value = "posts" }});
     gctx.authorization = auth_hdr;
     try std.testing.expectEqual(@as(u16, 200), (try get(&gctx)).status);
 }
@@ -311,7 +312,7 @@ test "runtime API mirrors the comptime encryption guards (the bypass fix)" {
         const body =
             \\{"name":"vault","fields":[{"id":"","name":"secret","type":"text","encrypted":true,"options":{}}]}
         ;
-        var cctx = ctxFor(env, a, .POST, "/api/collections", body, &.{});
+        var cctx = ctxFor(env, RequestArena.from(&arena), .POST, "/api/collections", body, &.{});
         cctx.authorization = auth_hdr;
         const res = try create(&cctx);
         try std.testing.expectEqual(@as(u16, 400), res.status);
@@ -328,13 +329,13 @@ test "runtime API mirrors the comptime encryption guards (the bypass fix)" {
         const body =
             \\{"name":"nums","fields":[{"id":"","name":"amount","type":"number","encrypted":true,"options":{}}]}
         ;
-        var cctx = ctxFor(env, a, .POST, "/api/collections", body, &.{});
+        var cctx = ctxFor(env, RequestArena.from(&arena), .POST, "/api/collections", body, &.{});
         cctx.authorization = auth_hdr;
         const res = try create(&cctx);
         try std.testing.expectEqual(@as(u16, 400), res.status);
         try std.testing.expect(std.mem.indexOf(u8, res.body, "validation_encrypted_type") != null);
         // Nothing stored: the collection does not exist.
-        var gctx = ctxFor(env, a, .GET, "/api/collections/nums", "", &.{.{ .key = "idOrName", .value = "nums" }});
+        var gctx = ctxFor(env, RequestArena.from(&arena), .GET, "/api/collections/nums", "", &.{.{ .key = "idOrName", .value = "nums" }});
         gctx.authorization = auth_hdr;
         try std.testing.expectEqual(@as(u16, 404), (try get(&gctx)).status);
     }
@@ -344,7 +345,7 @@ test "runtime API mirrors the comptime encryption guards (the bypass fix)" {
         const body =
             \\{"name":"u","fields":[{"id":"","name":"secret","type":"text","unique":true,"encrypted":true,"options":{}}]}
         ;
-        var cctx = ctxFor(env, a, .POST, "/api/collections", body, &.{});
+        var cctx = ctxFor(env, RequestArena.from(&arena), .POST, "/api/collections", body, &.{});
         cctx.authorization = auth_hdr;
         const res = try create(&cctx);
         try std.testing.expectEqual(@as(u16, 400), res.status);
@@ -356,7 +357,7 @@ test "runtime API mirrors the comptime encryption guards (the bypass fix)" {
         const body =
             \\{"name":"ix","fields":[{"id":"","name":"secret","type":"text","encrypted":true,"options":{}}],"indexes":[{"name":"idx_secret","fields":["secret"]}]}
         ;
-        var cctx = ctxFor(env, a, .POST, "/api/collections", body, &.{});
+        var cctx = ctxFor(env, RequestArena.from(&arena), .POST, "/api/collections", body, &.{});
         cctx.authorization = auth_hdr;
         const res = try create(&cctx);
         try std.testing.expectEqual(@as(u16, 400), res.status);
@@ -370,7 +371,7 @@ test "create with invalid name returns 400 with field errors" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    var cctx = ctxFor(env, a, .POST, "/api/collections", "{\"name\":\"1bad\",\"fields\":[]}", &.{});
+    var cctx = ctxFor(env, RequestArena.from(&arena), .POST, "/api/collections", "{\"name\":\"1bad\",\"fields\":[]}", &.{});
     cctx.authorization = try std.fmt.allocPrint(a, "Bearer {s}", .{try env.superuserToken(a)});
     const res = try create(&cctx);
     try std.testing.expectEqual(@as(u16, 400), res.status);
@@ -390,7 +391,7 @@ test "enabled oauth2 provider with no client secret is rejected at save" {
         \\   {"name":"google","clientId":"cid","clientSecret":"","enabled":true,"redirectUrls":["https://app/cb"]}
         \\ ]}}}}
     ;
-    var c = ctxFor(env, a, .POST, "/api/collections", body, &.{});
+    var c = ctxFor(env, RequestArena.from(&arena), .POST, "/api/collections", body, &.{});
     c.authorization = try std.fmt.allocPrint(a, "Bearer {s}", .{token});
     try std.testing.expectEqual(@as(u16, 400), (try create(&c)).status);
 }
@@ -402,11 +403,11 @@ test "collection management requires a superuser" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    var anon = ctxFor(env, a, .GET, "/api/collections", "", &.{});
+    var anon = ctxFor(env, RequestArena.from(&arena), .GET, "/api/collections", "", &.{});
     try std.testing.expectEqual(@as(u16, 403), (try list(&anon)).status);
 
     const token = try env.superuserToken(a);
-    var su = ctxFor(env, a, .GET, "/api/collections", "", &.{});
+    var su = ctxFor(env, RequestArena.from(&arena), .GET, "/api/collections", "", &.{});
     su.authorization = try std.fmt.allocPrint(a, "Bearer {s}", .{token});
     try std.testing.expectEqual(@as(u16, 200), (try list(&su)).status);
 }
@@ -424,7 +425,7 @@ test "creating an oauth2 collection encrypts the clientSecret and redacts it in 
         \\   {"name":"google","clientId":"cid","clientSecret":"PLAINTEXT","enabled":true,"redirectUrls":["https://app/cb"]}
         \\ ]}}}}
     ;
-    var c = ctxFor(env, a, .POST, "/api/collections", body, &.{});
+    var c = ctxFor(env, RequestArena.from(&arena), .POST, "/api/collections", body, &.{});
     c.authorization = try std.fmt.allocPrint(a, "Bearer {s}", .{token});
     const res = try create(&c);
     try std.testing.expectEqual(@as(u16, 201), res.status);
@@ -451,7 +452,7 @@ test "non-https generic provider endpoint is rejected at save" {
         \\    "authURL":"http://a/auth","tokenURL":"http://a/tok","userinfoURL":"http://a/ui"}
         \\ ]}}}}
     ;
-    var c = ctxFor(env, a, .POST, "/api/collections", body, &.{});
+    var c = ctxFor(env, RequestArena.from(&arena), .POST, "/api/collections", body, &.{});
     c.authorization = try std.fmt.allocPrint(a, "Bearer {s}", .{token});
     try std.testing.expectEqual(@as(u16, 400), (try create(&c)).status);
 }
@@ -482,7 +483,7 @@ test "R1-4: collection DDL invalidates the metadata cache (negative entry cleare
     const body =
         \\{"name":"cachedcol","fields":[{"id":"","name":"title","type":"text","options":{}}]}
     ;
-    var ctx = ctxFor(env, a, .POST, "/api/collections", body, &.{});
+    var ctx = ctxFor(env, RequestArena.from(&arena), .POST, "/api/collections", body, &.{});
     ctx.authorization = try std.fmt.allocPrint(a, "Bearer {s}", .{token});
     const resp = try create(&ctx);
     try std.testing.expectEqual(@as(u16, 201), resp.status);

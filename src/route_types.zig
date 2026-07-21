@@ -3,6 +3,7 @@
 //! the per-handler dispatch thunk. Framework-side (the generator imports this for the TS
 //! subset; the framework imports it at comptime to validate + build thunks).
 const std = @import("std");
+const RequestArena = @import("request_arena.zig").RequestArena;
 
 /// A captured path param (mirrors http.Param so route_types stays http-free for unit tests).
 pub const Param = struct { key: []const u8, value: []const u8 };
@@ -189,29 +190,29 @@ pub fn makeThunk(comptime handler: anytype) @import("events.zig").RouteHandler {
             const input: In = if (In == void) {} else blk: {
                 if (comptime isQueryParseable(In)) {
                     if (rc.method == .GET or rc.method == .DELETE) {
-                        break :blk parseQuery(In, a, rc.query) catch
-                            return badRequest(a, "Invalid query parameters.");
+                        break :blk parseQuery(In, a.a, rc.query) catch
+                            return badRequest(a.a, "Invalid query parameters.");
                     }
                 }
-                if (rc.body.len == 0) return badRequest(a, "Missing request body.");
-                break :blk (std.json.parseFromSlice(In, a, rc.body, .{ .ignore_unknown_fields = true }) catch
-                    return badRequest(a, "Invalid JSON body.")).value;
+                if (rc.body.len == 0) return badRequest(a.a, "Missing request body.");
+                break :blk (std.json.parseFromSlice(In, a.a, rc.body, .{ .ignore_unknown_fields = true }) catch
+                    return badRequest(a.a, "Invalid JSON body.")).value;
             };
             // 2. Build Req. Map request params (http.Param) onto route_types.Param.
-            var params = try a.alloc(Param, rc.params.len);
+            var params = try a.a.alloc(Param, rc.params.len);
             for (rc.params, 0..) |p, i| params[i] = .{ .key = p.key, .value = p.value };
             const auth_id = cx.rctx.resolveMacro("@request.auth.id") orelse "";
             var req = Req(In){ .input = input, .params = params, .auth_id = auth_id, .ctx = cx };
             // 3. Call handler; map errors -> status+message.
             const out: Out = handler(&req) catch |e| {
                 if (req.failure) |f|
-                    return jsonError(a, f.status, f.message);
+                    return jsonError(a.a, f.status, f.message);
                 const re: RouteError = @errorCast(e);
-                return jsonError(a, statusForError(re), messageForError(re));
+                return jsonError(a.a, statusForError(re), messageForError(re));
             };
             // 4. Serialize output (204 for void, else 200 JSON).
             if (Out == void) return .{ .status = 204, .body = "" };
-            const body = try std.json.Stringify.valueAlloc(a, out, .{});
+            const body = try std.json.Stringify.valueAlloc(a.a, out, .{});
             return .{ .status = 200, .body = body };
         }
     };
@@ -418,11 +419,11 @@ test "makeThunk: parses input, serializes output (200)" {
         .method = .POST,
         .path = "/api/bookings/bk1/confirm",
         .body = "{\"guests\":2}",
-        .allocator = arena.allocator(),
+        .allocator = RequestArena.from(&arena),
         .params = &params,
     };
     const rctx = @import("request.zig").RequestContext{ .auth = null, .is_superuser = false, .method = "POST" };
-    var cx = Ctx{ .app = undefined, .arena = arena.allocator(), .rctx = rctx, .request = &ctx };
+    var cx = Ctx{ .app = undefined, .arena = RequestArena.from(&arena), .rctx = rctx, .request = &ctx };
     defer cx.deinit();
     const resp = try thunk(&cx);
     try testing.expectEqual(@as(u16, 200), resp.status);
@@ -494,15 +495,15 @@ test "makeThunk wires req.ctx with app + arena" {
     const H = struct {
         fn h(req: *Req(void)) RouteError!void {
             Observed.ctx_ptr = req.ctx;
-            Observed.arena_ptr = req.ctx.arena.ptr;
+            Observed.arena_ptr = req.ctx.arena.a.ptr;
         }
     }.h;
     const thunk = makeThunk(H);
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    var ctx = http.RequestCtx{ .method = .POST, .path = "/x", .allocator = arena.allocator() };
+    var ctx = http.RequestCtx{ .method = .POST, .path = "/x", .allocator = RequestArena.from(&arena) };
     const rctx = @import("request.zig").RequestContext{ .auth = null, .is_superuser = false, .method = "POST" };
-    var cx = Ctx{ .app = undefined, .arena = arena.allocator(), .rctx = rctx, .request = &ctx };
+    var cx = Ctx{ .app = undefined, .arena = RequestArena.from(&arena), .rctx = rctx, .request = &ctx };
     defer cx.deinit();
     _ = try thunk(&cx);
     // req.ctx points exactly at the Ctx the thunk received...
@@ -522,9 +523,9 @@ test "makeThunk: RouteError -> status; req.fail -> custom status+message" {
     const thunk = makeThunk(H);
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    var ctx = http.RequestCtx{ .method = .POST, .path = "/x", .allocator = arena.allocator() };
+    var ctx = http.RequestCtx{ .method = .POST, .path = "/x", .allocator = RequestArena.from(&arena) };
     const rctx = @import("request.zig").RequestContext{ .auth = null, .is_superuser = false, .method = "POST" };
-    var cx = Ctx{ .app = undefined, .arena = arena.allocator(), .rctx = rctx, .request = &ctx };
+    var cx = Ctx{ .app = undefined, .arena = RequestArena.from(&arena), .rctx = rctx, .request = &ctx };
     defer cx.deinit();
     const resp = try thunk(&cx);
     try testing.expectEqual(@as(u16, 404), resp.status);

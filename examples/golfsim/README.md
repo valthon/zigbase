@@ -39,8 +39,8 @@ fn prepareBooking(ctx: *zigbase.Ctx, ev: *zigbase.RecordEvent) anyerror!void {
     const listing = (try ctx.records().get("listings", listing_id, .{})) orelse
         return error.ListingNotFound;
 
-    // 2. Double-booking check — allocate filter with ev.arena.
-    const overlap_filter = try std.fmt.allocPrint(ev.arena,
+    // 2. Double-booking check — allocate filter with ev.arena.a.
+    const overlap_filter = try std.fmt.allocPrint(ev.arena.a,
         "listing = \"{s}\" && status != \"cancelled\" && starts_at < \"{s}\" && ends_at > \"{s}\"",
         .{ listing_id, ends_at, starts_at });
     const conflicts = try ctx.records().list("bookings", .{ .filter = overlap_filter, .perPage = 1 });
@@ -48,16 +48,18 @@ fn prepareBooking(ctx: *zigbase.Ctx, ev: *zigbase.RecordEvent) anyerror!void {
     if ((conflicts.totalItems orelse 0) > 0) return error.TimeSlotConflict; // -> HTTP 400
 
     // 3. Compute price_total = hours × rate (server-side, unforgeable).
-    try rec.put(ev.arena, "price_total", .{ .float = hours * rate });
+    try rec.put(ev.arena.a, "price_total", .{ .float = hours * rate });
 
     // 4. Stamp guest and force status=pending from the server.
-    try rec.put(ev.arena, "guest", .{ .string = try ev.arena.dupe(u8, auth_id) });
-    try rec.put(ev.arena, "status", .{ .string = "pending" });
+    try rec.put(ev.arena.a, "guest", .{ .string = try ev.arena.a.dupe(u8, auth_id) });
+    try rec.put(ev.arena.a, "status", .{ .string = "pending" });
 }
 ```
 
-Record mutations that enter `ev.record` **must** allocate with `ev.arena`
-(the request-scoped allocator that owns `ev.record`). Need the app itself?
+Record mutations that enter `ev.record` **must** allocate with `ev.arena.a`.
+`ev.arena` is a typed `RequestArena` (so a general-purpose allocator can't be
+handed to an arena-scoped API by accident) and `.a` is the request-scoped
+allocator inside it, the one that owns `ev.record`. Need the app itself?
 Use `ctx.app`. Returning any error rejects the write → HTTP 400 to the client.
 
 #### `prepareReview` — `beforeCreate` on `reviews`
@@ -77,7 +79,7 @@ fn prepareReview(ctx: *zigbase.Ctx, ev: *zigbase.RecordEvent) anyerror!void {
     // gate 2: only a CONFIRMED (completed) session may be reviewed
     if (!std.mem.eql(u8, status, "confirmed")) return error.BookingNotConfirmed; // -> 400
     // stamp author from the identity (overwriting any client-supplied value)
-    try rec.put(ev.arena, "author", .{ .string = try ev.arena.dupe(u8, author) });
+    try rec.put(ev.arena.a, "author", .{ .string = try ev.arena.a.dupe(u8, author) });
 }
 ```
 
@@ -296,7 +298,7 @@ fn webhookJob(ctx: *zigbase.Ctx, ev: *zigbase.events.JobEvent) anyerror!void {
     const booking_id = ev.name;
     defer ctx.app.allocator.free(booking_id);       // we own the name we submitted
     const url = (ctx.kv().get("booking_webhook_url") catch return) orelse return;
-    const body = std.fmt.allocPrint(ctx.arena,
+    const body = std.fmt.allocPrint(ctx.arena.a,
         "{{\"event\":\"booking.confirmed\",\"booking\":\"{s}\"}}", .{booking_id}) catch return;
     _ = ctx.http().post(url, .{
         .headers = &.{.{ .name = "Content-Type", .value = "application/json" }},

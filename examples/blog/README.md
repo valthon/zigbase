@@ -69,9 +69,11 @@ fn postsBeforeCreate(ctx: *zigbase.Ctx, ev: *zigbase.RecordEvent) anyerror!void 
 }
 ```
 
-**Allocator discipline**: hook mutations MUST use `ev.arena` (the
-request-scoped allocator that owns `ev.record`). Need the app itself? Use
-`ctx.app`.
+**Allocator discipline**: hook mutations MUST use `ev.arena.a`. `ev.arena` is a
+typed `RequestArena` — not a bare `std.mem.Allocator`, so a general-purpose
+allocator can't be passed to an arena-scoped API by accident — and `.a` is the
+request-scoped allocator inside it, the one that owns `ev.record`. Need the app
+itself? Use `ctx.app`.
 
 ### `slugify` (beforeCreate)
 Derives a URL slug from the post title when one isn't supplied.
@@ -141,7 +143,7 @@ fn getPostBySlug(req: *zigbase.Req(void)) zigbase.RouteError!std.json.Value {
 
     // Read through the per-request capability object — `req.ctx.records()` manages
     // the pooled connection itself (no manual acquireReader / Data wiring).
-    const filter = std.fmt.allocPrint(req.ctx.arena,
+    const filter = std.fmt.allocPrint(req.ctx.arena.a,
         "slug = '{s}' && status = 'published'", .{slug}) catch return error.RouteFailed;
     const result = req.ctx.records().list("posts", .{ .filter = filter, .perPage = 1 }) catch return error.RouteFailed;
     if (result.items.len == 0) return error.NotFound;

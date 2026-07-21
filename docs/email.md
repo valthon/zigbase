@@ -43,7 +43,7 @@ does not (text/plain has no markup) — render both parts and pass them as `.htm
 
 ```zig
 const tpl = zigbase.mail_template;
-const html = try tpl.renderHtml(ctx.arena, "<p>Hi {{ name }}</p>", &.{ .{ .key = "name", .value = user_name } }, &.{});
+const html = try tpl.renderHtml(ctx.arena.a, "<p>Hi {{ name }}</p>", &.{ .{ .key = "name", .value = user_name } }, &.{});
 ```
 
 This layer is **additive and off by default** — an app that only calls `ctx.mail().send` directly

@@ -1,4 +1,5 @@
 const std = @import("std");
+const RequestArena = @import("request_arena.zig").RequestArena;
 const zap = @import("zap");
 const http = @import("http.zig");
 const app_mod = @import("app.zig");
@@ -244,7 +245,7 @@ pub fn Server(comptime gates: Gates) type {
             }
             // Built-in API routes win over custom routes.
             const builtin = router.tryDispatch(routes, ctx) catch {
-                return try ApiError.internal().toResponse(ctx.allocator);
+                return try ApiError.internal().toResponse(ctx.allocator.a);
             };
             if (builtin) |hit| return hit;
             // Public feature-state projection at a CUSTOM-configured path. The default
@@ -256,7 +257,7 @@ pub fn Server(comptime gates: Gates) type {
                     !std.mem.eql(u8, fp, "/api/state") and
                     std.mem.eql(u8, ctx.path, fp))
                 {
-                    return state_api.handle(ctx) catch try ApiError.internal().toResponse(ctx.allocator);
+                    return state_api.handle(ctx) catch try ApiError.internal().toResponse(ctx.allocator.a);
                 }
             }
             if (dispatchCustom(ctx) catch null) |hit| return hit;
@@ -276,7 +277,7 @@ pub fn Server(comptime gates: Gates) type {
                 // Plain-text 404, deliberately NOT the JSON ApiError envelope: static misses are browser-facing, not API responses.
                 return http.Response{ .status = 404, .body = "not found", .content_type = "text/plain; charset=utf-8" };
             }
-            return try ApiError.notFound().toResponse(ctx.allocator);
+            return try ApiError.notFound().toResponse(ctx.allocator.a);
         }
 
         fn onRequest(r: zap.Request) !void {
@@ -288,7 +289,7 @@ pub fn Server(comptime gates: Gates) type {
                 .path = r.path orelse "/",
                 .query = r.query orelse "",
                 .body = r.body orelse "",
-                .allocator = arena.allocator(),
+                .allocator = RequestArena.from(&arena),
                 .app = self.app,
             };
             ctx.authorization = r.getHeader("authorization") orelse "";
@@ -473,7 +474,7 @@ fn setZapStatus(r: zap.Request, status: u16) void {
 }
 
 fn forbiddenResp(ctx: *http.RequestCtx) !http.Response {
-    return (ApiError{ .status = 403, .message = "Forbidden." }).toResponse(ctx.allocator);
+    return (ApiError{ .status = 403, .message = "Forbidden." }).toResponse(ctx.allocator.a);
 }
 
 /// Merge a Ctx's deferred `pending_cookies`/`pending_headers` onto a handler's Response.
@@ -535,7 +536,7 @@ fn guardPathSecret(cx: *Ctx, ctx: *http.RequestCtx, g: events.RouteAuthGuard) !?
             // Empty stored secret never matches; constant-time compare otherwise.
             if (stored.len > 0 and crypto.timingSafeEql(submitted, stored)) return null;
             return switch (ps.on_mismatch) {
-                .not_found => try ApiError.notFound().toResponse(ctx.allocator),
+                .not_found => try ApiError.notFound().toResponse(ctx.allocator.a),
                 .forbidden => try forbiddenResp(ctx),
             };
         },
@@ -591,20 +592,20 @@ fn guardRateLimit(cx: *Ctx, ctx: *http.RequestCtx, rt: events.RuntimeRoute) !?ht
     const limiter = app.rate_limiter orelse return null;
     const key: []const u8 = blk: {
         if (rt.rate_limit_key) |kf| {
-            if (kf(cx)) |subject| break :blk try std.fmt.allocPrint(ctx.allocator, "route:{s}:key:{s}", .{ rt.pattern, subject });
+            if (kf(cx)) |subject| break :blk try std.fmt.allocPrint(ctx.allocator.a, "route:{s}:key:{s}", .{ rt.pattern, subject });
         }
-        if (ctx.remote_ip.len > 0) break :blk try std.fmt.allocPrint(ctx.allocator, "route:{s}:ip:{s}", .{ rt.pattern, ctx.remote_ip });
+        if (ctx.remote_ip.len > 0) break :blk try std.fmt.allocPrint(ctx.allocator.a, "route:{s}:ip:{s}", .{ rt.pattern, ctx.remote_ip });
         if (cx.user()) |u| {
-            if (u.id.len > 0) break :blk try std.fmt.allocPrint(ctx.allocator, "route:{s}:auth:{s}/{s}", .{ rt.pattern, u.collection, u.id });
+            if (u.id.len > 0) break :blk try std.fmt.allocPrint(ctx.allocator.a, "route:{s}:auth:{s}/{s}", .{ rt.pattern, u.collection, u.id });
         }
         // Unidentifiable client — do NOT share a single global bucket (DoS). Skip the limit.
         warnUnkeyedRouteLimitOnce(rt.pattern);
         return null;
     };
     if (limiter.allowCustom(key, clock.nowUnix(app.io), c.max, c.window_s)) return null;
-    const retry = try std.fmt.allocPrint(ctx.allocator, "{d}", .{c.window_s});
-    var resp = try (ApiError{ .status = 429, .message = "Too many requests. Try again later." }).toResponse(ctx.allocator);
-    resp.extra_headers = try ctx.allocator.dupe(http.Header, &.{.{ .name = "Retry-After", .value = retry }});
+    const retry = try std.fmt.allocPrint(ctx.allocator.a, "{d}", .{c.window_s});
+    var resp = try (ApiError{ .status = 429, .message = "Too many requests. Try again later." }).toResponse(ctx.allocator.a);
+    resp.extra_headers = try ctx.allocator.a.dupe(http.Header, &.{.{ .name = "Retry-After", .value = retry }});
     return resp;
 }
 
@@ -617,7 +618,7 @@ fn dispatchCustom(ctx: *http.RequestCtx) anyerror!?http.Response {
     if (d.routes.len == 0) return null;
     for (d.routes) |rt| {
         if (rt.method != ctx.method) continue;
-        if (try router.matchPath(ctx.allocator, rt.pattern, ctx.path)) |params| {
+        if (try router.matchPath(ctx.allocator.a, rt.pattern, ctx.path)) |params| {
             ctx.params = params;
             // Resolve auth on a fresh read-only connection (never the writer lock) — but ONLY
             // when a credential is actually present. `authenticate` returns null on its first
@@ -629,14 +630,14 @@ fn dispatchCustom(ctx: *http.RequestCtx) anyerror!?http.Response {
             // reader" holds below.
             const has_creds = ctx.bearerToken() != null or ctx.cookie("zb_auth") != null;
             var reader: ?@import("db.zig").Db = if (has_creds)
-                (app.pool.acquireReader() catch return try ApiError.internal().toResponse(ctx.allocator))
+                (app.pool.acquireReader() catch return try ApiError.internal().toResponse(ctx.allocator.a))
             else
                 null;
             defer if (reader) |*r| app.pool.releaseReader(r);
-            const authed = if (reader) |*r| (auth.authenticate(app.io, ctx.allocator, app, ctx, r) catch null) else null;
+            const authed = if (reader) |*r| (auth.authenticate(app.io, ctx.allocator.a, app, ctx, r) catch null) else null;
             switch (rt.auth) {
                 .public => {},
-                .authed => if (authed == null) return try (ApiError{ .status = 401, .message = "Not authenticated." }).toResponse(ctx.allocator),
+                .authed => if (authed == null) return try (ApiError{ .status = 401, .message = "Not authenticated." }).toResponse(ctx.allocator.a),
                 .superuser => if (authed == null or !authed.?.is_superuser) return try forbiddenResp(ctx),
             }
             // #243: collection-scoped `.authed` gate. A non-null `authed_collection` implies the
@@ -652,7 +653,7 @@ fn dispatchCustom(ctx: *http.RequestCtx) anyerror!?http.Response {
                 // `auth == .authed` (so the no-token 401 already fired above), but `RuntimeRoute`
                 // is public — a hand-built route pairing `.authed_collection` with a non-`.authed`
                 // level must deny, not panic on a null principal. Reuse the SAME 401 (no oracle).
-                const u = authed orelse return try (ApiError{ .status = 401, .message = "Not authenticated." }).toResponse(ctx.allocator);
+                const u = authed orelse return try (ApiError{ .status = 401, .message = "Not authenticated." }).toResponse(ctx.allocator.a);
                 const uid: []const u8 = switch (u.record) {
                     .object => |o| if (o.get("id")) |v| (switch (v) {
                         .string => |sv| sv,
@@ -663,7 +664,7 @@ fn dispatchCustom(ctx: *http.RequestCtx) anyerror!?http.Response {
                 const collection_ok = std.mem.eql(u8, u.collection, gate.collection) and uid.len > 0;
                 const super_ok = u.is_superuser and gate.allow_superuser and uid.len > 0;
                 if (!(collection_ok or super_ok))
-                    return try (ApiError{ .status = 401, .message = "Not authenticated." }).toResponse(ctx.allocator);
+                    return try (ApiError{ .status = 401, .message = "Not authenticated." }).toResponse(ctx.allocator.a);
             }
             var rctx = request.RequestContext{
                 .auth = if (authed) |a| a.record else null,
@@ -710,9 +711,9 @@ fn dispatchCustom(ctx: *http.RequestCtx) anyerror!?http.Response {
                     var err_ev = events.ErrorEvent{ .app = app, .ctx = &rctx, .err = e, .phase = .request, .message = @errorName(e) };
                     events.dispatchError(app, app.dispatch, &err_ev);
                 }
-                return try mergePending(ctx.allocator, &cx, er);
+                return try mergePending(ctx.allocator.a, &cx, er);
             };
-            return try mergePending(ctx.allocator, &cx, resp);
+            return try mergePending(ctx.allocator.a, &cx, resp);
         }
     }
     return null;
@@ -774,13 +775,13 @@ test "dispatchCustom: deliberate 4xx is NOT reported to onError; genuine 5xx is"
     defer report_log.log_sink = null;
 
     // 1. Deliberate 4xx: 404 response, onError NOT fired.
-    var nf_ctx = http.RequestCtx{ .method = .GET, .path = "/api/nf", .allocator = a, .app = &app };
+    var nf_ctx = http.RequestCtx{ .method = .GET, .path = "/api/nf", .allocator = RequestArena.from(&arena), .app = &app };
     const nf = (try dispatchCustom(&nf_ctx)).?;
     try std.testing.expectEqual(@as(u16, 404), nf.status);
     try std.testing.expectEqual(@as(usize, 0), H.on_error_calls);
 
     // 2. Genuine 5xx: 500 response, onError fired exactly once.
-    var boom_ctx = http.RequestCtx{ .method = .GET, .path = "/api/boom", .allocator = a, .app = &app };
+    var boom_ctx = http.RequestCtx{ .method = .GET, .path = "/api/boom", .allocator = RequestArena.from(&arena), .app = &app };
     const boom = (try dispatchCustom(&boom_ctx)).?;
     try std.testing.expectEqual(@as(u16, 500), boom.status);
     try std.testing.expectEqual(@as(usize, 1), H.on_error_calls);
@@ -817,7 +818,7 @@ test "dispatchCustom: a credential-less public request resolves without acquirin
 
     // No bearer header and no zb_auth cookie: the auth resolve (and its pooled reader acquire)
     // is skipped entirely, and the public handler still runs with an anonymous context.
-    var ctx = http.RequestCtx{ .method = .GET, .path = "/api/ok", .allocator = a, .app = &app };
+    var ctx = http.RequestCtx{ .method = .GET, .path = "/api/ok", .allocator = RequestArena.from(&arena), .app = &app };
     const resp = (try dispatchCustom(&ctx)).?;
     try std.testing.expectEqual(@as(u16, 200), resp.status);
     try std.testing.expectEqualStrings("ok", resp.body);
@@ -825,7 +826,7 @@ test "dispatchCustom: a credential-less public request resolves without acquirin
     const guarded = [_]events.RuntimeRoute{.{ .method = .GET, .pattern = "/api/priv", .handler = H.ok, .auth = .authed }};
     const d2 = events.Dispatch{ .routes = &guarded };
     var app2 = App{ .allocator = a, .io = std.testing.io, .pool = &pool, .dispatch = &d2 };
-    var ctx2 = http.RequestCtx{ .method = .GET, .path = "/api/priv", .allocator = a, .app = &app2 };
+    var ctx2 = http.RequestCtx{ .method = .GET, .path = "/api/priv", .allocator = RequestArena.from(&arena), .app = &app2 };
     const resp2 = (try dispatchCustom(&ctx2)).?;
     try std.testing.expectEqual(@as(u16, 401), resp2.status);
 }
@@ -864,13 +865,13 @@ test "route: socketless seam dispatches a custom-route hit and falls back to 404
 
     // (a) Custom-route hit → the handler's own Response (proves the seam threads ctx.app's
     // dispatch table through the full built-in-miss → custom chain).
-    var hit_ctx = http.RequestCtx{ .method = .GET, .path = "/api/ok", .allocator = a, .app = &app };
+    var hit_ctx = http.RequestCtx{ .method = .GET, .path = "/api/ok", .allocator = RequestArena.from(&arena), .app = &app };
     const hit = try R.route(&hit_ctx);
     try std.testing.expectEqual(@as(u16, 200), hit.status);
     try std.testing.expectEqualStrings("ok", hit.body);
 
     // (b) Unknown path (no built-in, no custom, static disabled) → JSON 404 fallback.
-    var miss_ctx = http.RequestCtx{ .method = .GET, .path = "/api/does-not-exist", .allocator = a, .app = &app };
+    var miss_ctx = http.RequestCtx{ .method = .GET, .path = "/api/does-not-exist", .allocator = RequestArena.from(&arena), .app = &app };
     const miss = try R.route(&miss_ctx);
     try std.testing.expectEqual(@as(u16, 404), miss.status);
     // Built-in records/auth-path dispatch through `route()` is exercised end-to-end by the
@@ -941,11 +942,12 @@ test "dispatchCustom: .auth = .{ .authed = collection } gate is fail-closed (#24
     const plain_authed = [_]events.RuntimeRoute{.{ .method = .GET, .pattern = "/api/any", .handler = H.ok, .auth = .authed }};
 
     const Run = struct {
-        fn call(alloc: std.mem.Allocator, pool: *@import("db.zig").Pool, routes: []const events.RuntimeRoute, path: []const u8, token: ?[]const u8) !u16 {
+        fn call(arena: *std.heap.ArenaAllocator, pool: *@import("db.zig").Pool, routes: []const events.RuntimeRoute, path: []const u8, token: ?[]const u8) !u16 {
+            const alloc = arena.allocator();
             var app2 = App{ .allocator = alloc, .io = std.testing.io, .pool = pool };
             const dispatch = events.Dispatch{ .routes = routes };
             app2.dispatch = &dispatch;
-            var ctx = http.RequestCtx{ .method = .GET, .path = path, .allocator = alloc, .app = &app2 };
+            var ctx = http.RequestCtx{ .method = .GET, .path = path, .allocator = RequestArena.from(arena), .app = &app2 };
             if (token) |t| ctx.authorization = try std.fmt.allocPrint(alloc, "Bearer {s}", .{t});
             const resp = (try dispatchCustom(&ctx)).?;
             return resp.status;
@@ -953,22 +955,22 @@ test "dispatchCustom: .auth = .{ .authed = collection } gate is fail-closed (#24
     };
 
     // 1. Token from the gated collection → handler runs (200).
-    try std.testing.expectEqual(@as(u16, 200), try Run.call(a, &env.pool, &gated_customers, "/api/portal/me", cust_tok));
+    try std.testing.expectEqual(@as(u16, 200), try Run.call(&env.arena, &env.pool, &gated_customers, "/api/portal/me", cust_tok));
     // 2. Token from a DIFFERENT collection → 401 (same as no token, no oracle).
-    try std.testing.expectEqual(@as(u16, 401), try Run.call(a, &env.pool, &gated_customers, "/api/portal/me", ops_tok));
+    try std.testing.expectEqual(@as(u16, 401), try Run.call(&env.arena, &env.pool, &gated_customers, "/api/portal/me", ops_tok));
     // 3. Superuser token, gate WITHOUT allow_superuser → 401.
-    try std.testing.expectEqual(@as(u16, 401), try Run.call(a, &env.pool, &gated_ops, "/api/ops/x", su_tok));
+    try std.testing.expectEqual(@as(u16, 401), try Run.call(&env.arena, &env.pool, &gated_ops, "/api/ops/x", su_tok));
     // 4. Superuser token, gate WITH allow_superuser → allowed (200).
-    try std.testing.expectEqual(@as(u16, 200), try Run.call(a, &env.pool, &gated_ops_super, "/api/ops/x", su_tok));
+    try std.testing.expectEqual(@as(u16, 200), try Run.call(&env.arena, &env.pool, &gated_ops_super, "/api/ops/x", su_tok));
     // 5. No token on a gated route → 401.
-    try std.testing.expectEqual(@as(u16, 401), try Run.call(a, &env.pool, &gated_customers, "/api/portal/me", null));
+    try std.testing.expectEqual(@as(u16, 401), try Run.call(&env.arena, &env.pool, &gated_customers, "/api/portal/me", null));
     // 6. Empty-id principal from the right collection → 401 (defensive).
-    try std.testing.expectEqual(@as(u16, 401), try Run.call(a, &env.pool, &gated_customers, "/api/portal/me", empty_tok));
+    try std.testing.expectEqual(@as(u16, 401), try Run.call(&env.arena, &env.pool, &gated_customers, "/api/portal/me", empty_tok));
     // 7. Back-compat: a plain `.authed` route accepts a principal from ANY collection → 200.
-    try std.testing.expectEqual(@as(u16, 200), try Run.call(a, &env.pool, &plain_authed, "/api/any", ops_tok));
+    try std.testing.expectEqual(@as(u16, 200), try Run.call(&env.arena, &env.pool, &plain_authed, "/api/any", ops_tok));
     // 8. Empty-id SUPERUSER token, gate WITH allow_superuser → 401 (not 200): an empty principal
     // id must fail closed on the `super_ok` path exactly like it does on `collection_ok` (case 6).
-    try std.testing.expectEqual(@as(u16, 401), try Run.call(a, &env.pool, &gated_ops_super, "/api/ops/x", su_empty_tok));
+    try std.testing.expectEqual(@as(u16, 401), try Run.call(&env.arena, &env.pool, &gated_ops_super, "/api/ops/x", su_empty_tok));
 }
 
 test "dispatchCustom merges ctx.setCookie/addHeader on success AND error paths (non-exclusive)" {
@@ -1011,7 +1013,7 @@ test "dispatchCustom merges ctx.setCookie/addHeader on success AND error paths (
 
     // Success path: the handler's own cookie is kept, the deferred cookie is appended, and
     // the deferred header lands in extra_headers (union; raw Response stays usable).
-    var ok_ctx = http.RequestCtx{ .method = .GET, .path = "/api/ok", .allocator = a, .app = &app };
+    var ok_ctx = http.RequestCtx{ .method = .GET, .path = "/api/ok", .allocator = RequestArena.from(&arena), .app = &app };
     const ok = (try dispatchCustom(&ok_ctx)).?;
     try std.testing.expectEqual(@as(u16, 200), ok.status);
     try std.testing.expectEqual(@as(usize, 2), ok.cookies.len);
@@ -1022,7 +1024,7 @@ test "dispatchCustom merges ctx.setCookie/addHeader on success AND error paths (
     try std.testing.expectEqualStrings("X-Test", ok.extra_headers[0].name);
 
     // Error path: the mapped 404 still carries the deferred Set-Cookie.
-    var err_ctx = http.RequestCtx{ .method = .GET, .path = "/api/err", .allocator = a, .app = &app };
+    var err_ctx = http.RequestCtx{ .method = .GET, .path = "/api/err", .allocator = RequestArena.from(&arena), .app = &app };
     const er = (try dispatchCustom(&err_ctx)).?;
     try std.testing.expectEqual(@as(u16, 404), er.status);
     try std.testing.expectEqual(@as(usize, 1), er.cookies.len);
@@ -1044,9 +1046,9 @@ pub fn applyMultipart(ctx: *http.RequestCtx) error{OutOfMemory}!?http.Response {
     if (!std.mem.startsWith(u8, ctx.content_type, "multipart/form-data")) return null;
     // Hand-rolled parser over the raw body: facil.io's param parsing type-guesses
     // multipart values (text "123" -> int), so it must never see this body.
-    const ex = files_multipart.parse(ctx.allocator, ctx.content_type, ctx.body) catch |e| switch (e) {
+    const ex = files_multipart.parse(ctx.allocator.a, ctx.content_type, ctx.body) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
-        error.BadMultipart => return try ApiError.badRequest("Invalid multipart body.").toResponse(ctx.allocator),
+        error.BadMultipart => return try ApiError.badRequest("Invalid multipart body.").toResponse(ctx.allocator.a),
     };
     ctx.form_fields = ex.form_fields;
     ctx.files = ex.files;
@@ -1059,7 +1061,7 @@ test "applyMultipart: malformed multipart body -> 400 'Invalid multipart body.',
     var ctx = http.RequestCtx{
         .method = .POST,
         .path = "/",
-        .allocator = arena.allocator(),
+        .allocator = RequestArena.from(&arena),
         .content_type = "multipart/form-data; boundary=XB",
         .body = "--XB\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\nv", // never terminated
     };
@@ -1076,7 +1078,7 @@ test "applyMultipart: valid multipart populates ctx and returns null; non-multip
     var ctx = http.RequestCtx{
         .method = .POST,
         .path = "/",
-        .allocator = arena.allocator(),
+        .allocator = RequestArena.from(&arena),
         .content_type = "multipart/form-data; boundary=XB",
         .body = "--XB\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\nv\r\n--XB--\r\n",
     };
@@ -1086,7 +1088,7 @@ test "applyMultipart: valid multipart populates ctx and returns null; non-multip
     var jctx = http.RequestCtx{
         .method = .POST,
         .path = "/",
-        .allocator = arena.allocator(),
+        .allocator = RequestArena.from(&arena),
         .content_type = "application/json",
         .body = "{}",
     };
@@ -1155,12 +1157,12 @@ test "guard path_secret: correct config secret -> handler runs (200); wrong/miss
     var app = App{ .allocator = a, .io = std.testing.io, .pool = &env.pool, .dispatch = &dispatch };
 
     // Correct secret: 200.
-    var ok_ctx = http.RequestCtx{ .method = .GET, .path = "/api/s/s3cr3t", .allocator = a, .app = &app };
+    var ok_ctx = http.RequestCtx{ .method = .GET, .path = "/api/s/s3cr3t", .allocator = RequestArena.from(&env.arena), .app = &app };
     const ok = (try dispatchCustom(&ok_ctx)).?;
     try std.testing.expectEqual(@as(u16, 200), ok.status);
 
     // Wrong secret: a BARE 404 (the canonical not-found envelope — no oracle, no 403/401).
-    var bad_ctx = http.RequestCtx{ .method = .GET, .path = "/api/s/nope", .allocator = a, .app = &app };
+    var bad_ctx = http.RequestCtx{ .method = .GET, .path = "/api/s/nope", .allocator = RequestArena.from(&env.arena), .app = &app };
     const bad = (try dispatchCustom(&bad_ctx)).?;
     try std.testing.expectEqual(@as(u16, 404), bad.status);
     try std.testing.expect(std.mem.indexOf(u8, bad.body, "Not found.") != null);
@@ -1187,20 +1189,20 @@ test "guard path_secret: on_mismatch=.forbidden -> 403; query and header sources
     var app = App{ .allocator = a, .io = std.testing.io, .pool = &env.pool, .dispatch = &dispatch };
 
     // Forbidden mode: a mismatch is an explicit 403, not a 404.
-    var f_ctx = http.RequestCtx{ .method = .GET, .path = "/api/forbid", .query = "s=wrong", .allocator = a, .app = &app };
+    var f_ctx = http.RequestCtx{ .method = .GET, .path = "/api/forbid", .query = "s=wrong", .allocator = RequestArena.from(&env.arena), .app = &app };
     try std.testing.expectEqual(@as(u16, 403), (try dispatchCustom(&f_ctx)).?.status);
 
     // Query source: correct value passes (200), wrong 404.
-    var q_ok = http.RequestCtx{ .method = .GET, .path = "/api/q", .query = "k=qsecret", .allocator = a, .app = &app };
+    var q_ok = http.RequestCtx{ .method = .GET, .path = "/api/q", .query = "k=qsecret", .allocator = RequestArena.from(&env.arena), .app = &app };
     try std.testing.expectEqual(@as(u16, 200), (try dispatchCustom(&q_ok)).?.status);
-    var q_bad = http.RequestCtx{ .method = .GET, .path = "/api/q", .query = "k=nah", .allocator = a, .app = &app };
+    var q_bad = http.RequestCtx{ .method = .GET, .path = "/api/q", .query = "k=nah", .allocator = RequestArena.from(&env.arena), .app = &app };
     try std.testing.expectEqual(@as(u16, 404), (try dispatchCustom(&q_bad)).?.status);
 
     // Header source (case-insensitive name match via RequestCtx.headers).
     const hdrs = [_]http.Param{.{ .key = "X-Secret", .value = "hsecret" }};
-    var h_ok = http.RequestCtx{ .method = .GET, .path = "/api/h", .allocator = a, .app = &app, .headers = &hdrs };
+    var h_ok = http.RequestCtx{ .method = .GET, .path = "/api/h", .allocator = RequestArena.from(&env.arena), .app = &app, .headers = &hdrs };
     try std.testing.expectEqual(@as(u16, 200), (try dispatchCustom(&h_ok)).?.status);
-    var h_bad = http.RequestCtx{ .method = .GET, .path = "/api/h", .allocator = a, .app = &app };
+    var h_bad = http.RequestCtx{ .method = .GET, .path = "/api/h", .allocator = RequestArena.from(&env.arena), .app = &app };
     try std.testing.expectEqual(@as(u16, 404), (try dispatchCustom(&h_bad)).?.status);
 }
 
@@ -1231,9 +1233,9 @@ test "guard path_secret: kv source reads the stored secret (#139)" {
     const dispatch = events.Dispatch{ .routes = &table };
     app.dispatch = &dispatch;
 
-    var ok_ctx = http.RequestCtx{ .method = .GET, .path = "/api/kv/kv-value", .allocator = a, .app = &app };
+    var ok_ctx = http.RequestCtx{ .method = .GET, .path = "/api/kv/kv-value", .allocator = RequestArena.from(&env.arena), .app = &app };
     try std.testing.expectEqual(@as(u16, 200), (try dispatchCustom(&ok_ctx)).?.status);
-    var bad_ctx = http.RequestCtx{ .method = .GET, .path = "/api/kv/stale", .allocator = a, .app = &app };
+    var bad_ctx = http.RequestCtx{ .method = .GET, .path = "/api/kv/stale", .allocator = RequestArena.from(&env.arena), .app = &app };
     try std.testing.expectEqual(@as(u16, 404), (try dispatchCustom(&bad_ctx)).?.status);
 
     // Rotation: overwrite the secret -> the old value now 404s (old links break).
@@ -1242,9 +1244,9 @@ test "guard path_secret: kv source reads the stored secret (#139)" {
         defer env.pool.releaseWriter();
         try (Data{ .app = &app, .conn = w, .io = app.io, .alloc = a }).kvSet("deploy_secret", "rotated");
     }
-    var stale = http.RequestCtx{ .method = .GET, .path = "/api/kv/kv-value", .allocator = a, .app = &app };
+    var stale = http.RequestCtx{ .method = .GET, .path = "/api/kv/kv-value", .allocator = RequestArena.from(&env.arena), .app = &app };
     try std.testing.expectEqual(@as(u16, 404), (try dispatchCustom(&stale)).?.status);
-    var fresh = http.RequestCtx{ .method = .GET, .path = "/api/kv/rotated", .allocator = a, .app = &app };
+    var fresh = http.RequestCtx{ .method = .GET, .path = "/api/kv/rotated", .allocator = RequestArena.from(&env.arena), .app = &app };
     try std.testing.expectEqual(@as(u16, 200), (try dispatchCustom(&fresh)).?.status);
 }
 
@@ -1278,31 +1280,31 @@ test "guard rate_limit: per-route bucket, 429 + Retry-After, IP keying, key fn (
 
     // Two allowed for IP 1.1.1.1, the third denied with 429 + Retry-After: 30.
     const ip1 = "1.1.1.1";
-    try std.testing.expectEqual(@as(u16, 200), (try dispatchIp(a, &app, "/api/lim", ip1)).status);
-    try std.testing.expectEqual(@as(u16, 200), (try dispatchIp(a, &app, "/api/lim", ip1)).status);
-    const denied = try dispatchIp(a, &app, "/api/lim", ip1);
+    try std.testing.expectEqual(@as(u16, 200), (try dispatchIp(RequestArena.from(&env.arena), &app, "/api/lim", ip1)).status);
+    try std.testing.expectEqual(@as(u16, 200), (try dispatchIp(RequestArena.from(&env.arena), &app, "/api/lim", ip1)).status);
+    const denied = try dispatchIp(RequestArena.from(&env.arena), &app, "/api/lim", ip1);
     try std.testing.expectEqual(@as(u16, 429), denied.status);
     try std.testing.expectEqual(@as(usize, 1), denied.extra_headers.len);
     try std.testing.expectEqualStrings("Retry-After", denied.extra_headers[0].name);
     try std.testing.expectEqualStrings("30", denied.extra_headers[0].value);
 
     // A DIFFERENT IP has its own bucket (isolation) — immediately allowed.
-    try std.testing.expectEqual(@as(u16, 200), (try dispatchIp(a, &app, "/api/lim", "2.2.2.2")).status);
+    try std.testing.expectEqual(@as(u16, 200), (try dispatchIp(RequestArena.from(&env.arena), &app, "/api/lim", "2.2.2.2")).status);
 
     // rate_limit_key wins over IP: same key from different IPs shares ONE bucket (max=1).
     H.key_val = "tenant-A";
-    try std.testing.expectEqual(@as(u16, 200), (try dispatchIp(a, &app, "/api/keyed", "9.9.9.9")).status);
-    try std.testing.expectEqual(@as(u16, 429), (try dispatchIp(a, &app, "/api/keyed", "8.8.8.8")).status);
+    try std.testing.expectEqual(@as(u16, 200), (try dispatchIp(RequestArena.from(&env.arena), &app, "/api/keyed", "9.9.9.9")).status);
+    try std.testing.expectEqual(@as(u16, 429), (try dispatchIp(RequestArena.from(&env.arena), &app, "/api/keyed", "8.8.8.8")).status);
     // A different key -> fresh budget despite the shared route.
     H.key_val = "tenant-B";
-    try std.testing.expectEqual(@as(u16, 200), (try dispatchIp(a, &app, "/api/keyed", "8.8.8.8")).status);
+    try std.testing.expectEqual(@as(u16, 200), (try dispatchIp(RequestArena.from(&env.arena), &app, "/api/keyed", "8.8.8.8")).status);
 }
 
 /// Dispatch a GET to `path` with a given remote_ip (already resolved as server.zig would,
 /// post trust_proxy) and return the response. Distinct IPs prove per-IP bucket isolation; ""
 /// proves the untrusted-proxy fallback (a spoofed XFF resolves to "" so it cannot evade or
 /// poison another IP's bucket).
-fn dispatchIp(a: std.mem.Allocator, app: *app_mod.App, path: []const u8, ip: []const u8) !http.Response {
+fn dispatchIp(a: RequestArena, app: *app_mod.App, path: []const u8, ip: []const u8) !http.Response {
     var c = http.RequestCtx{ .method = .GET, .path = path, .allocator = a, .app = app, .remote_ip = ip };
     return (try dispatchCustom(&c)).?;
 }
@@ -1330,11 +1332,11 @@ test "guard chain: path_secret AND rate_limit composed on one route" {
 
     // Wrong secret 404s BEFORE the rate limiter is consulted (secret guard is ordered first):
     // it must not consume the budget, so a subsequent correct call still succeeds.
-    try std.testing.expectEqual(@as(u16, 404), (try dispatchIp(a, &app, "/api/both/wrong", "5.5.5.5")).status);
+    try std.testing.expectEqual(@as(u16, 404), (try dispatchIp(RequestArena.from(&env.arena), &app, "/api/both/wrong", "5.5.5.5")).status);
     // Correct secret + within budget: 200.
-    try std.testing.expectEqual(@as(u16, 200), (try dispatchIp(a, &app, "/api/both/open", "5.5.5.5")).status);
+    try std.testing.expectEqual(@as(u16, 200), (try dispatchIp(RequestArena.from(&env.arena), &app, "/api/both/open", "5.5.5.5")).status);
     // Correct secret but over the per-route budget: 429.
-    try std.testing.expectEqual(@as(u16, 429), (try dispatchIp(a, &app, "/api/both/open", "5.5.5.5")).status);
+    try std.testing.expectEqual(@as(u16, 429), (try dispatchIp(RequestArena.from(&env.arena), &app, "/api/both/open", "5.5.5.5")).status);
 }
 
 /// §B transport: transmit `[offset, offset+len)` of `path` through facil.io's PUBLIC

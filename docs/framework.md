@@ -251,10 +251,15 @@ Need the app itself (e.g. `app.allocator`, `app.io`)? Use the hook's `ctx.app`
   swallowed and routed to the error backstop (it does not undo the committed
   write).
 
-### Always allocate record data with `ev.arena`
+### Always allocate record data with `ev.arena.a`
 
-Any allocation that becomes part of `ev.record` MUST use `ev.arena` (the
-request allocator that owns the record's JSON map). Mixing allocators on the
+`ev.arena` is a typed **`RequestArena`**, not a bare `std.mem.Allocator` — the type
+exists so a long-lived general-purpose allocator cannot be handed to an
+arena-scoped API by accident, and so the dependency is visible in every signature.
+The allocator inside it is the field **`.a`**.
+
+Any allocation that becomes part of `ev.record` MUST use `ev.arena.a` (the
+request-scoped allocator that owns the record's JSON map). Mixing allocators on the
 arena-backed JSON map is undefined behavior.
 
 From the worked example's `slugify` (`before_create` on `posts`):
@@ -269,10 +274,10 @@ fn slugify(ctx: *zigbase.Ctx, ev: *zigbase.RecordEvent) anyerror!void {
         else => return,
     } else return;
 
-    const buf = try ev.arena.alloc(u8, title.len); // <-- ev.arena
+    const buf = try ev.arena.a.alloc(u8, title.len); // <-- ev.arena.a
     var len: usize = 0;
     // ... build the slug into buf ...
-    try ev.record.object.put(ev.arena, "slug", .{ .string = buf[0..len] }); // <-- ev.arena
+    try ev.record.object.put(ev.arena.a, "slug", .{ .string = buf[0..len] }); // <-- ev.arena.a
 }
 ```
 
@@ -297,7 +302,7 @@ collection name does not resolve.
 > **Result lifetime:** a `std.json.Value` returned by `ctx.records()` is not part of
 > the `ev.arena`-owned `ev.record` map. It is fine to read for the duration of the
 > hook, but do **not** store one *into* `ev.record` without first copying it with
-> `ev.arena` (mixing allocators on the arena-backed JSON map is UB).
+> `ev.arena.a` (mixing allocators on the arena-backed JSON map is UB).
 
 > **Atomicity:** on the HTTP create/update/delete path a `before*` hook runs
 > **inside** the triggering write's transaction. Side-writes a hook issues via
@@ -428,9 +433,12 @@ the route on a shared secret the caller presents (think unguessable webhook/depl
 In a route handler `ctx.request` is non-null (it is `null` only in job/hook
 contexts). Dereference it to reach the raw request data — a `*http.RequestCtx` with:
 
-- `ctx.arena` — the **request-scoped arena**. Allocate any dynamic response `body`
-  here (the `http.Response.body` slice must outlive the handler return but is freed
-  with the request; a string *literal* needs no allocation).
+- `ctx.arena` — the **request-scoped arena**, a typed `RequestArena` whose allocator
+  is the field `.a`. Allocate any dynamic response `body` with `ctx.arena.a`
+  (the `http.Response.body` slice must outlive the handler return but is freed
+  with the request; a string *literal* needs no allocation). The wrapper type is
+  deliberate: an arena-scoped API cannot be handed a general-purpose allocator by
+  accident, and `.a` is the explicit, greppable bridge to plain-`Allocator` helpers.
 - `ctx.request.?.param("id")` — `?[]const u8`, a path param captured from a
   `:id`-style pattern segment.
 - `ctx.request.?.query` / `ctx.request.?.body` — raw query string / request body.
@@ -442,7 +450,7 @@ fn confirm(ctx: *zigbase.Ctx) anyerror!zigbase.http.Response {
     const req = ctx.request.?;
     const id = req.param("id") orelse
         return .{ .status = 404, .body = "{\"code\":404,\"message\":\"Not found.\"}" };
-    const body = try std.fmt.allocPrint(ctx.arena, "{{\"id\":\"{s}\"}}", .{id});
+    const body = try std.fmt.allocPrint(ctx.arena.a, "{{\"id\":\"{s}\"}}", .{id});
     return .{ .status = 200, .body = body }; // body lives in the request arena
 }
 ```
@@ -453,7 +461,7 @@ for a full worked route.
 ### Response builders + deferred cookies/headers (`ctx`)
 
 The raw `http.Response` literal is always available — but for the common shapes the `ctx`
-carries builders (all allocating on `ctx.arena`) and a deferred-mutation accumulator. They
+carries builders (all allocating on `ctx.arena.a`) and a deferred-mutation accumulator. They
 are conveniences layered over the same `http.Response`; mixing them with a hand-built
 literal is fine.
 
@@ -553,7 +561,7 @@ const rows = try ctx.records().queryAs(OrderRow,
 // Or the free function with an explicit connection (raw writes / migration-owned tables):
 const conn = try ctx.connForRead();                 // *db.Db reader
 // const conn = ctx.app.pool.acquireWriter();       // …or the writer for a raw write
-const also = try zigbase.data.queryAs(OrderRow, conn, ctx.arena, sql, .{min_total});
+const also = try zigbase.data.queryAs(OrderRow, conn, ctx.arena.a, sql, .{min_total});
 ```
 
 Contract:
@@ -721,9 +729,10 @@ fn handler(req: *zigbase.Req(InputType)) zigbase.RouteError!OutputType {
 ```
 
 A typed handler reaches the per-request capability object through `req.ctx`:
-`req.ctx.records()` for DB access, `req.ctx.http()` for outbound HTTP, `req.ctx.arena`
-for allocations, and `req.ctx.app` for the runtime. (`req.app` / `req.arena` remain as
-legacy aliases; prefer `req.ctx.*`.)
+`req.ctx.records()` for DB access, `req.ctx.http()` for outbound HTTP, `req.ctx.arena.a`
+for allocations (`req.ctx.arena` is a typed `RequestArena`; `.a` is the allocator inside it), and `req.ctx.app` for the runtime. `req.ctx` is the only route to those
+capabilities — `Req` itself carries just `input`, `params`, `auth_id`, `failure`, and
+`ctx`.
 
 Register typed routes in `.routes` identically to untyped ones (`.method`, `.path`, `.handler`, optional `.auth` defaulting to `.superuser`). The generator (`zig build gen-client`) reads the comptime `App` declaration and emits a `zb.rpc.*` method for each typed route — named by camel-joining the path segments (`:param` segments omitted):
 
@@ -976,7 +985,7 @@ not (text/plain has no markup). Render both parts and pass them as `.html` / `.t
 
 ```zig
 const tpl = zigbase.mail_template;
-const html = try tpl.renderHtml(ctx.arena, "<p>Hi {{ name }}</p>", &.{ .{ .key = "name", .value = user_name } }, &.{});
+const html = try tpl.renderHtml(ctx.arena.a, "<p>Hi {{ name }}</p>", &.{ .{ .key = "name", .value = user_name } }, &.{});
 ```
 
 **HTTP-API providers.** Two first-class backends implement the same `Mailer` vtable as SMTP, so
@@ -1692,7 +1701,7 @@ _ = try ctx.kv().delete("welcome_banner");          // bool: did a row exist?
 ```
 
 Values are opaque `TEXT`. To store structured data, stringify it yourself (e.g.
-`std.json.Stringify.valueAlloc(ctx.arena, value, .{})`) and parse it back on read.
+`std.json.Stringify.valueAlloc(ctx.arena.a, value, .{})`) and parse it back on read.
 `set` is an upsert that preserves the original `created` timestamp and bumps `updated`.
 
 Reads use the read connection; writes use the bound connection inside a `before`-hook
@@ -1747,13 +1756,13 @@ fn handler(ctx: *zigbase.Ctx) anyerror!zigbase.http.Response {
 }
 ```
 
-> **Caution — allocate for process lifetime, not from `ctx.arena`.** The `ctx.arena`
+> **Caution — allocate for process lifetime, not from `ctx.arena.a`.** The `ctx.arena`
 > inside a lifecycle hook is a per-invocation arena the framework frees the instant the
 > hook returns (before any request is served). The `app_data` pointer above survives
-> because it's heap-allocated via `ctx.app.allocator`, not a stack local or a `ctx.arena`
+> because it's heap-allocated via `ctx.app.allocator`, not a stack local or a `ctx.arena.a`
 > allocation. Allocate everything the handle transitively owns (config strings,
 > `content.title`, …) from `ctx.app.allocator` too (the App allocator, which lives for the
-> process) — or make `AppData` fully by-value/static. Anything allocated from `ctx.arena`
+> process) — or make `AppData` fully by-value/static. Anything allocated from `ctx.arena.a`
 > becomes a dangling read on the first request. The pointer **and everything it reaches**
 > must outlive the app.
 
@@ -2080,7 +2089,7 @@ fn claimGuestPosts(ctx: *zigbase.Ctx, ev: *zigbase.events.AuthSuccessEvent) anye
     const email = ev.record.object.get("email").?.string;
     // ctx.records() reuses the login transaction — this write commits WITH the session.
     var patch: std.json.ObjectMap = .empty;
-    try patch.put(ctx.arena, "author", .{ .string = ev.record_id });
+    try patch.put(ctx.arena.a, "author", .{ .string = ev.record_id });
     for (try guestPostIds(ctx, email)) |id| _ = try ctx.records().update("posts", id, .{ .object = patch });
 }
 // App(.{ .beforeAuthSuccess = claimGuestPosts, ... })
@@ -2174,7 +2183,7 @@ Semantics, consistent across phases:
 fn seedProfile(ctx: *zigbase.Ctx, ev: *zigbase.events.AuthLifecycleEvent) anyerror!void {
     if (ev.phase != .after_register) return;
     var p: std.json.ObjectMap = .empty;
-    try p.put(ctx.arena, "user", .{ .string = ev.record_id });
+    try p.put(ctx.arena.a, "user", .{ .string = ev.record_id });
     _ = try ctx.records().create("profiles", .{ .object = p });
 }
 ```
@@ -2673,7 +2682,7 @@ already performs (one extra column, not an extra round-trip).
 fn changePassword(ctx: *zigbase.Ctx) anyerror!zigbase.http.Response {
     // ... verify + update the password ...
     const issued = try ctx.auth().rotate();           // invalidate all old sessions, keep this one
-    return .{ .status = 200, .body = body, .cookies = try ctx.arena.dupe(zigbase.http.Cookie, &issued.cookies) };
+    return .{ .status = 200, .body = body, .cookies = try ctx.arena.a.dupe(zigbase.http.Cookie, &issued.cookies) };
 }
 ```
 
@@ -2888,7 +2897,7 @@ A job handler receives the JSON payload as bytes and deserializes it:
 
 ```zig
 fn resizeImage(ctx: *zigbase.Ctx, payload: []const u8) anyerror!void {
-    const parsed = try std.json.parseFromSlice(struct { id: []const u8 }, ctx.arena, payload, .{});
+    const parsed = try std.json.parseFromSlice(struct { id: []const u8 }, ctx.arena.a, payload, .{});
     // …do the work; touch the DB via ctx.records() / ctx.app.pool.acquireWriter()…
 }
 ```

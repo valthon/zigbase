@@ -30,6 +30,7 @@
 //!     interpolated.
 
 const std = @import("std");
+const RequestArena = @import("../request_arena.zig").RequestArena;
 const http = @import("../http.zig");
 const db = @import("../db.zig");
 const crypto = @import("../crypto.zig");
@@ -99,18 +100,18 @@ pub fn ingest(io: std.Io, alloc: std.mem.Allocator, w: *db.Db, provider: suppres
 /// provider is unknown; 401 on a bad signature; 400 on malformed JSON; 200 with a written-count
 /// otherwise.
 pub fn webhook_handler(ctx: *http.RequestCtx) anyerror!http.Response {
-    const app = ctx.app orelse return ApiError.notFound().toResponse(ctx.allocator);
+    const app = ctx.app orelse return ApiError.notFound().toResponse(ctx.allocator.a);
     const secret = app.mail.webhook_secret;
     // Ingestion is opt-in: no secret â†’ the route does not exist.
-    if (secret.len == 0) return ApiError.notFound().toResponse(ctx.allocator);
+    if (secret.len == 0) return ApiError.notFound().toResponse(ctx.allocator.a);
 
-    const provider_name = ctx.param("provider") orelse return ApiError.notFound().toResponse(ctx.allocator);
+    const provider_name = ctx.param("provider") orelse return ApiError.notFound().toResponse(ctx.allocator.a);
     const provider: suppression.Provider = if (std.mem.eql(u8, provider_name, "ses"))
         .ses
     else if (std.mem.eql(u8, provider_name, "postmark"))
         .postmark
     else
-        return ApiError.notFound().toResponse(ctx.allocator);
+        return ApiError.notFound().toResponse(ctx.allocator.a);
 
     // Account is part of the SIGNED string (I2), so a tampered header without a matching signature
     // fails verification below â€” a replayer cannot redirect the event to another tenant.
@@ -120,27 +121,27 @@ pub fn webhook_handler(ctx: *http.RequestCtx) anyerror!http.Response {
 
     // Replay-freshness (M5): reject a stale/invalid timestamp before doing any work.
     if (!timestampFresh(ts, clock.nowUnix(app.io))) {
-        return (ApiError{ .status = 401, .message = "Stale or invalid webhook timestamp." }).toResponse(ctx.allocator);
+        return (ApiError{ .status = 401, .message = "Stale or invalid webhook timestamp." }).toResponse(ctx.allocator.a);
     }
 
     // Verify the shared-secret signature over ts+provider+account+body (constant-time). Fail closed.
-    if (!verifySignature(ctx.allocator, secret, ts, provider_name, account, ctx.body, sig)) {
-        return (ApiError{ .status = 401, .message = "Invalid webhook signature." }).toResponse(ctx.allocator);
+    if (!verifySignature(ctx.allocator.a, secret, ts, provider_name, account, ctx.body, sig)) {
+        return (ApiError{ .status = 401, .message = "Invalid webhook signature." }).toResponse(ctx.allocator.a);
     }
 
     const w = app.pool.acquireWriter();
     defer app.pool.releaseWriter();
-    const n = ingest(app.io, ctx.allocator, w, provider, account, ctx.body, provider_name) catch |e| switch (e) {
-        error.SyntaxError, error.UnexpectedEndOfInput => return (ApiError.badRequest("Malformed webhook payload.")).toResponse(ctx.allocator),
+    const n = ingest(app.io, ctx.allocator.a, w, provider, account, ctx.body, provider_name) catch |e| switch (e) {
+        error.SyntaxError, error.UnexpectedEndOfInput => return (ApiError.badRequest("Malformed webhook payload.")).toResponse(ctx.allocator.a),
         else => return e,
     };
 
     var obj: std.json.ObjectMap = .empty;
-    try obj.put(ctx.allocator, "suppressed", .{ .integer = @intCast(n) });
+    try obj.put(ctx.allocator.a, "suppressed", .{ .integer = @intCast(n) });
     return .{
         .status = 200,
         .content_type = "application/json",
-        .body = try std.json.Stringify.valueAlloc(ctx.allocator, std.json.Value{ .object = obj }, .{}),
+        .body = try std.json.Stringify.valueAlloc(ctx.allocator.a, std.json.Value{ .object = obj }, .{}),
     };
 }
 
@@ -213,7 +214,7 @@ test "webhook_handler rejects an invalid signature (401, fail closed)" {
     var ctx = http.RequestCtx{
         .method = .POST,
         .path = "/api/mail/webhooks/ses",
-        .allocator = a,
+        .allocator = RequestArena.from(&arena),
         .app = &app,
         .body = "{\"notificationType\":\"Bounce\"}",
         .params = &.{.{ .key = "provider", .value = "ses" }},
@@ -257,7 +258,7 @@ test "webhook_handler: signed-account event verifies (200); tampering account â†
             .{ .key = ts_header, .value = ts },
             .{ .key = account_header, .value = "acc1" },
         };
-        var ctx = http.RequestCtx{ .method = .POST, .path = "/api/mail/webhooks/ses", .allocator = a, .app = &app, .body = body, .params = &.{.{ .key = "provider", .value = "ses" }}, .headers = &headers };
+        var ctx = http.RequestCtx{ .method = .POST, .path = "/api/mail/webhooks/ses", .allocator = RequestArena.from(&arena), .app = &app, .body = body, .params = &.{.{ .key = "provider", .value = "ses" }}, .headers = &headers };
         const res = try webhook_handler(&ctx);
         try testing.expectEqual(@as(u16, 200), res.status);
     }
@@ -275,7 +276,7 @@ test "webhook_handler: signed-account event verifies (200); tampering account â†
             .{ .key = ts_header, .value = ts },
             .{ .key = account_header, .value = "acc2" }, // not what was signed
         };
-        var ctx = http.RequestCtx{ .method = .POST, .path = "/api/mail/webhooks/ses", .allocator = a, .app = &app, .body = body, .params = &.{.{ .key = "provider", .value = "ses" }}, .headers = &headers };
+        var ctx = http.RequestCtx{ .method = .POST, .path = "/api/mail/webhooks/ses", .allocator = RequestArena.from(&arena), .app = &app, .body = body, .params = &.{.{ .key = "provider", .value = "ses" }}, .headers = &headers };
         const res = try webhook_handler(&ctx);
         try testing.expectEqual(@as(u16, 401), res.status);
     }
@@ -288,7 +289,7 @@ test "webhook_handler 404s when no secret is configured (ingestion opt-in)" {
     var ctx = http.RequestCtx{
         .method = .POST,
         .path = "/api/mail/webhooks/ses",
-        .allocator = arena.allocator(),
+        .allocator = RequestArena.from(&arena),
         .app = &app,
         .params = &.{.{ .key = "provider", .value = "ses" }},
     };

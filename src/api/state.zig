@@ -1,4 +1,5 @@
 const std = @import("std");
+const RequestArena = @import("../request_arena.zig").RequestArena;
 const http = @import("../http.zig");
 const ApiError = @import("error.zig").ApiError;
 const app_mod = @import("../app.zig");
@@ -24,18 +25,18 @@ const feature_cache = @import("../feature_cache.zig");
 
 /// GET <features_public_route>?subject=<id> — resolved flags + experiments, no auth.
 pub fn handle(ctx: *http.RequestCtx) anyerror!http.Response {
-    const app = ctx.app orelse return ApiError.internal().toResponse(ctx.allocator);
+    const app = ctx.app orelse return ApiError.internal().toResponse(ctx.allocator.a);
 
     // Disabled (`.features = .{ .public_route = .disabled }`) → not found.
-    const route = app.features_public_route orelse return ApiError.notFound().toResponse(ctx.allocator);
+    const route = app.features_public_route orelse return ApiError.notFound().toResponse(ctx.allocator.a);
     // Only serve at the configured path. The static routes table mounts the handler at
     // the default "/api/state"; when the consumer remaps it, that static entry must 404
     // (the real mount is dispatched dynamically in server.zig). Guarding here keeps a
     // single source of truth and prevents a second, unconfigured mount from leaking.
-    if (!std.mem.eql(u8, route, ctx.path)) return ApiError.notFound().toResponse(ctx.allocator);
+    if (!std.mem.eql(u8, route, ctx.path)) return ApiError.notFound().toResponse(ctx.allocator.a);
 
     const subject = blk: {
-        const qp = params_mod.parse(ctx.allocator, ctx.query) catch break :blk "";
+        const qp = params_mod.parse(ctx.allocator.a, ctx.query) catch break :blk "";
         break :blk qp.get("subject") orelse "";
     };
 
@@ -45,20 +46,20 @@ pub fn handle(ctx: *http.RequestCtx) anyerror!http.Response {
     if (app.features) |reg| {
         var conn = try app.pool.acquireReader();
         defer app.pool.releaseReader(&conn);
-        const data = Data{ .app = app, .conn = &conn, .io = app.io, .alloc = ctx.allocator };
+        const data = Data{ .app = app, .conn = &conn, .io = app.io, .alloc = ctx.allocator.a };
         // Route the override read through the #230 cache — `/api/state` is the motivating hot
         // path (every SPA polls it on boot). Always a pooled-reader read here (no bound tx),
         // so `bound = false`; degrade-safe to a direct scan inside the helper.
-        const pairs = try feature_cache.overridePairs(ctx.allocator, app.io, app.feature_cache, false, data);
+        const pairs = try feature_cache.overridePairs(ctx.allocator.a, app.io, app.feature_cache, false, data);
         // Reader-first sticky resolution (#129): `/api/state` is UNAUTHENTICATED with a
         // caller-supplied subject, so a sticky HIT must NOT take the global writer. Reads
         // run on the pooled reader; only a first-time MISS briefly borrows the pool writer
         // to persist the assignment, so the public projection agrees with `App.experiment`.
         const sticky = features_resolver.StickyConns{ .read = &conn, .pool = app.pool };
-        resolved = try features_resolver.resolveAll(ctx.allocator, reg.*, pairs, subject, sticky);
+        resolved = try features_resolver.resolveAll(ctx.allocator.a, reg.*, pairs, subject, sticky);
     }
 
-    return .{ .status = 200, .body = try renderJson(ctx.allocator, resolved) };
+    return .{ .status = 200, .body = try renderJson(ctx.allocator.a, resolved) };
 }
 
 /// Serialize to the EXACT public shape: `{"flags":{…bool},"experiments":{…string}}`.
@@ -136,10 +137,9 @@ test "GET /api/state: no auth required, returns resolved flags + experiments" {
     defer env.deinit();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const a = arena.allocator();
 
     // No Authorization header at all — the endpoint is public.
-    var ctx = http.RequestCtx{ .method = .GET, .path = "/api/state", .query = "subject=user-7", .allocator = a, .app = &env.app };
+    var ctx = http.RequestCtx{ .method = .GET, .path = "/api/state", .query = "subject=user-7", .allocator = RequestArena.from(&arena), .app = &env.app };
     const resp = try handle(&ctx);
     try std.testing.expectEqual(@as(u16, 200), resp.status);
 
@@ -162,13 +162,12 @@ test "GET /api/state: reflects a flag + weight override" {
     defer env.deinit();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const a = arena.allocator();
 
     // Override new_dashboard ON and pin the experiment to "compact".
     try env.setKv("flag:new_dashboard", "true");
     try env.setKv("exp:checkout_layout:weights", "[0,100]");
 
-    var ctx = http.RequestCtx{ .method = .GET, .path = "/api/state", .query = "subject=user-7", .allocator = a, .app = &env.app };
+    var ctx = http.RequestCtx{ .method = .GET, .path = "/api/state", .query = "subject=user-7", .allocator = RequestArena.from(&arena), .app = &env.app };
     const resp = try handle(&ctx);
     try std.testing.expectEqual(@as(u16, 200), resp.status);
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"new_dashboard\":true") != null);
@@ -181,7 +180,7 @@ test "GET /api/state: disabled route → 404" {
     env.app.features_public_route = null; // `.features = .{ .public_route = .disabled }`
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var ctx = http.RequestCtx{ .method = .GET, .path = "/api/state", .query = "", .allocator = arena.allocator(), .app = &env.app };
+    var ctx = http.RequestCtx{ .method = .GET, .path = "/api/state", .query = "", .allocator = RequestArena.from(&arena), .app = &env.app };
     try std.testing.expectEqual(@as(u16, 404), (try handle(&ctx)).status);
 }
 
@@ -192,7 +191,7 @@ test "GET /api/state: static mount 404s when remapped to a custom path" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     // The static "/api/state" entry must NOT serve when the mount moved elsewhere.
-    var ctx = http.RequestCtx{ .method = .GET, .path = "/api/state", .query = "", .allocator = arena.allocator(), .app = &env.app };
+    var ctx = http.RequestCtx{ .method = .GET, .path = "/api/state", .query = "", .allocator = RequestArena.from(&arena), .app = &env.app };
     try std.testing.expectEqual(@as(u16, 404), (try handle(&ctx)).status);
 }
 
@@ -207,25 +206,24 @@ test "GET /api/state: served from the #230 override cache (out-of-band _kv chang
     try env.setKv("flag:new_dashboard", "true");
 
     const H = struct {
-        fn hit(app: *app_mod.App, a: std.mem.Allocator) ![]const u8 {
+        fn hit(app: *app_mod.App, a: RequestArena) ![]const u8 {
             var ctx = http.RequestCtx{ .method = .GET, .path = "/api/state", .query = "subject=u", .allocator = a, .app = app };
             return (try handle(&ctx)).body;
         }
     };
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const a = arena.allocator();
 
     // First hit loads the cache snapshot → sees the override.
-    try std.testing.expect(std.mem.indexOf(u8, try H.hit(&env.app, a), "\"new_dashboard\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, try H.hit(&env.app, RequestArena.from(&arena)), "\"new_dashboard\":true") != null);
 
     // Change _kv OUT OF BAND (a raw kvSet, NOT via ctx.setFlag → no invalidate()), like another
     // instance's write. Within the TTL and with no invalidation, /api/state must still serve the
     // CACHED value — proving the projection is served from the cache, not re-scanned per request.
     try env.setKv("flag:new_dashboard", "false");
-    try std.testing.expect(std.mem.indexOf(u8, try H.hit(&env.app, a), "\"new_dashboard\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, try H.hit(&env.app, RequestArena.from(&arena)), "\"new_dashboard\":true") != null);
 
     // An explicit invalidate (what a same-instance override write does) → next hit re-scans → fresh.
     fc.invalidate();
-    try std.testing.expect(std.mem.indexOf(u8, try H.hit(&env.app, a), "\"new_dashboard\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, try H.hit(&env.app, RequestArena.from(&arena)), "\"new_dashboard\":false") != null);
 }
