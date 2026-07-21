@@ -18,6 +18,9 @@ pub const Result = struct {
 /// timing goes through `std.Io.Timestamp.now(io, .awake)` instead, matching the
 /// pattern already established in this repo (see `src/http_client.zig`,
 /// `src/feature_cache.zig`), which is why `run` takes an `io: std.Io` param.
+/// Measure `f` under a leak-detecting general-purpose allocator. The `ns` here is the
+/// raw-malloc cost; the allocation profile (allocs/bytes/buckets) is backing-independent and
+/// is the real signal. The DebugAllocator backing also catches a benchmarked `f` that leaks.
 pub fn run(
     name: []const u8,
     warmup: usize,
@@ -44,6 +47,62 @@ pub fn run(
         try f(ctx, a);
         const t1 = std.Io.Timestamp.now(io, .awake);
         samples[i] = @intCast(t1.nanoseconds - t0.nanoseconds);
+    }
+
+    std.mem.sort(u64, samples, {}, std.sort.asc(u64));
+    const st = counting.stats();
+    return .{
+        .name = name,
+        .ns_median = samples[iters / 2],
+        .ns_p95 = samples[(iters * 95) / 100],
+        .allocs = st.allocs,
+        .bytes = st.bytes,
+        .buckets = st.buckets,
+        .peak_live = st.peak_live,
+    };
+}
+
+/// Measure `f` under a request-style ARENA that is reset between iterations — the model
+/// this codebase actually uses on the per-request path, where a "free" is a no-op and the
+/// whole arena is dropped/reset at the request boundary. The allocs/bytes/buckets are the
+/// same as `run` (the CountingAllocator counts identically regardless of backing); the `ns`
+/// is the production-realistic cost, where many small allocations are cheap bumps. Pairing a
+/// `run` and a `runArena` on the same `f` shows how much of the raw-malloc `ns` is allocator
+/// overhead that the arena erases.
+pub fn runArena(
+    name: []const u8,
+    warmup: usize,
+    iters: usize,
+    io: std.Io,
+    ctx: anytype,
+    comptime f: fn (@TypeOf(ctx), std.mem.Allocator) anyerror!void,
+) !Result {
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(gpa.allocator());
+    defer arena.deinit();
+
+    var w: usize = 0;
+    while (w < warmup) : (w += 1) {
+        try f(ctx, arena.allocator());
+        _ = arena.reset(.retain_capacity);
+    }
+
+    var counting = ca.CountingAllocator.init(arena.allocator());
+    const a = counting.allocator();
+
+    const samples = try gpa.allocator().alloc(u64, iters);
+    defer gpa.allocator().free(samples);
+
+    var i: usize = 0;
+    while (i < iters) : (i += 1) {
+        const t0 = std.Io.Timestamp.now(io, .awake);
+        try f(ctx, a);
+        const t1 = std.Io.Timestamp.now(io, .awake);
+        samples[i] = @intCast(t1.nanoseconds - t0.nanoseconds);
+        // Model the per-request boundary: reset (retain capacity) rather than free per-op.
+        _ = arena.reset(.retain_capacity);
     }
 
     std.mem.sort(u64, samples, {}, std.sort.asc(u64));

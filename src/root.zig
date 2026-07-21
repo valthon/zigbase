@@ -256,6 +256,17 @@ pub const testcapture = @import("testcapture.zig");
 // seeding, and a swappable `CaptureMailer`. See `docs/framework.md` — "Testing your app".
 pub const testing = @import("testing.zig");
 
+// ---- Dev/bench-only internals ---------------------------------------------
+// The lower-level record read path + schema types, exposed ONLY under `dev_mode` (on in
+// Debug, off in every release build — same gate as the dev-only clock/entropy seams). The
+// benchmark harness uses these to exercise `records.get`/`list` directly, without the curated
+// `data` facade. Folds to `struct {}` in release, so a shipped consumer never sees it — it is
+// a dev seam, not a public API surface.
+pub const internal = if (@import("build_options").dev_mode) struct {
+    pub const records = @import("records.zig");
+    pub const schema = @import("schema.zig");
+} else struct {};
+
 // ---- Auth helper surface (consumer-facing magic-link building blocks) ------
 pub const auth = @import("auth_helpers.zig");
 
