@@ -30,7 +30,7 @@ src/auth/methods/webauthn.zig	2	PRE-EXISTING: not yet migrated to the ownership 
 src/auth_helpers.zig	5	PRE-EXISTING: not yet migrated to the ownership contracts
 src/authz/abilities.zig	4	PRE-EXISTING: not yet migrated to the ownership contracts
 src/backend/postgres/conn.zig	1	PRE-EXISTING: not yet migrated to the ownership contracts
-src/captcha.zig	12	PRE-EXISTING: not yet migrated to the ownership contracts
+src/captcha.zig	4	contract-4: verify tests hold an arena-scoped HttpClient response body (sub-slice of max_response_bytes, not individually freeable)
 src/clock_sql.zig	2	PRE-EXISTING: not yet migrated to the ownership contracts
 src/clock_test.zig	1	PRE-EXISTING: not yet migrated to the ownership contracts
 src/clock_vfs.zig	2	PRE-EXISTING: not yet migrated to the ownership contracts
@@ -53,7 +53,6 @@ src/codegen/ts_type.zig	4	PRE-EXISTING: not yet migrated to the ownership contra
 src/codegen/typegen_cli.zig	2	PRE-EXISTING: not yet migrated to the ownership contracts
 src/colcache.zig	6	PRE-EXISTING: not yet migrated to the ownership contracts
 src/collections.zig	10	PRE-EXISTING: not yet migrated to the ownership contracts
-src/crypto.zig	4	PRE-EXISTING: not yet migrated to the ownership contracts
 src/ctx.zig	5	PRE-EXISTING: not yet migrated to the ownership contracts
 src/data.zig	18	PRE-EXISTING: not yet migrated to the ownership contracts
 src/ddl.zig	9	PRE-EXISTING: not yet migrated to the ownership contracts
@@ -120,5 +119,5 @@ src/sms/twilio.zig	2	PRE-EXISTING: not yet migrated to the ownership contracts
 src/static_files.zig	24	PRE-EXISTING: not yet migrated to the ownership contracts
 src/tenancy/tenancy.zig	4	PRE-EXISTING: not yet migrated to the ownership contracts
 src/testcapture.zig	4	PRE-EXISTING: not yet migrated to the ownership contracts
-src/values.zig	11	PRE-EXISTING: not yet migrated to the ownership contracts
+src/values.zig	1	contract-4: readValue returns a std.json.Value graph from a discarded Parsed wrapper (arena-lifetime)
 src/webhook.zig	2	PRE-EXISTING: not yet migrated to the ownership contracts

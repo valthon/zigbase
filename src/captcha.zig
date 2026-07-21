@@ -39,7 +39,11 @@ pub const Provider = enum {
     }
 };
 
-/// The parsed result of a siteverify call. All slices are owned by the caller's allocator.
+/// The parsed result of a siteverify call. Every owned slice (`action`, `hostname`,
+/// `errors` and each string inside it) is an independent allocation on the allocator
+/// passed to `parseResponse`/`verify`; call `deinit` to release them all. (When that
+/// allocator is a request arena — the normal `ctx.verifyCaptcha` path — arena teardown
+/// frees them and `deinit` is unnecessary.)
 pub const Result = struct {
     /// Whether the token was accepted by the provider.
     ok: bool,
@@ -54,9 +58,23 @@ pub const Result = struct {
     /// Provider error codes (e.g. `"timeout-or-duplicate"`, `"invalid-input-response"`).
     /// Empty slice when success is true or when the provider returned no error-codes.
     errors: []const []const u8 = &.{},
+
+    /// Free every allocation owned by this `Result`. Pass the same allocator that
+    /// produced it (`parseResponse`/`verify`'s `alloc`). A no-op for a default/empty
+    /// `Result`. Safe to skip when that allocator is a request arena.
+    pub fn deinit(self: Result, alloc: std.mem.Allocator) void {
+        if (self.action) |s| alloc.free(s);
+        if (self.hostname) |s| alloc.free(s);
+        for (self.errors) |s| alloc.free(s);
+        if (self.errors.len > 0) alloc.free(self.errors);
+    }
 };
 
-/// Parse the provider's JSON response into a `Result`. All strings are arena-owned.
+/// Parse the provider's JSON response into a `Result`. Every string the `Result` keeps
+/// (`action`, `hostname`, each `error-code`) is duped onto `alloc` and owned by the
+/// returned `Result` — release them with `Result.deinit(alloc)`. The transient JSON
+/// parse tree is freed before returning, so this is correct under any allocator, not
+/// only a request arena.
 ///
 /// Expected JSON shape (common to all providers):
 /// ```json
@@ -74,11 +92,14 @@ pub const Result = struct {
 /// no" (`ok=false`) from "we could not reach a verdict" (an error, like the non-2xx and
 /// transport-failure paths) and choose fail-open vs fail-closed accordingly.
 fn parseResponse(alloc: std.mem.Allocator, body: []const u8, provider: Provider) !Result {
-    const parsed = std.json.parseFromSliceLeaky(std.json.Value, alloc, body, .{}) catch |e| {
+    // Non-leaky parse: `parsed` owns its own arena, freed on `deinit` below. The strings
+    // the Result keeps are duped onto `alloc`, so nothing here outlives this function.
+    const parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch |e| {
         std.log.warn("captcha: failed to parse provider response: {s}", .{@errorName(e)});
         return error.CaptchaParseError;
     };
-    const root = switch (parsed) {
+    defer parsed.deinit();
+    const root = switch (parsed.value) {
         .object => |o| o,
         else => {
             std.log.warn("captcha: provider response was not a JSON object", .{});
@@ -110,12 +131,13 @@ fn parseResponse(alloc: std.mem.Allocator, body: []const u8, provider: Provider)
         .recaptcha_v3 => blk: {
             const sv = root.get("action") orelse break :blk null;
             break :blk switch (sv) {
-                .string => |s| s,
+                .string => |s| try alloc.dupe(u8, s),
                 else => null,
             };
         },
         else => null,
     };
+    errdefer if (action) |s| alloc.free(s);
 
     // All four providers (reCAPTCHA v2/v3, hCaptcha, Turnstile) return `hostname` on a
     // successful verify; parse it generically so consumers can do the recommended
@@ -123,30 +145,37 @@ fn parseResponse(alloc: std.mem.Allocator, body: []const u8, provider: Provider)
     const hostname: ?[]const u8 = blk: {
         const sv = root.get("hostname") orelse break :blk null;
         break :blk switch (sv) {
-            .string => |s| s,
+            .string => |s| try alloc.dupe(u8, s),
             else => null,
         };
     };
+    errdefer if (hostname) |s| alloc.free(s);
 
-    // Parse "error-codes" (a JSON array of strings). Use an empty slice on success.
+    // Parse "error-codes" (a JSON array of strings). Dupe each onto `alloc`; use an
+    // empty slice on success. `toOwnedSlice` yields an exactly-sized allocation so
+    // `Result.deinit` can free it.
     const errors: []const []const u8 = blk: {
         const ev = root.get("error-codes") orelse break :blk &.{};
         const arr = switch (ev) {
             .array => |a| a,
             else => break :blk &.{},
         };
-        const out = try alloc.alloc([]const u8, arr.items.len);
-        var count: usize = 0;
+        var list: std.ArrayList([]const u8) = .empty;
+        errdefer {
+            for (list.items) |s| alloc.free(s);
+            list.deinit(alloc);
+        }
         for (arr.items) |item| {
             switch (item) {
                 .string => |s| {
-                    out[count] = s;
-                    count += 1;
+                    const d = try alloc.dupe(u8, s);
+                    errdefer alloc.free(d);
+                    try list.append(alloc, d);
                 },
                 else => {},
             }
         }
-        break :blk out[0..count];
+        break :blk try list.toOwnedSlice(alloc);
     };
 
     return .{
@@ -183,8 +212,9 @@ pub fn verify(
 ) !Result {
     // Free the temporaries here so `verify` doesn't leak when called with a
     // general-purpose allocator (the Ctx call site passes an arena, but the
-    // function must not assume it). The parsed `Result` slices reference the
-    // response body, NOT these buffers, so freeing them before return is safe.
+    // function must not assume it). The parsed `Result` slices are independent
+    // dupes on `alloc` (see `parseResponse`), owning neither these buffers nor
+    // the response body, so freeing these temporaries before return is safe.
     const enc_secret = try url.percentEncode(alloc, secret);
     defer alloc.free(enc_secret);
     const enc_token = try url.percentEncode(alloc, token);
@@ -243,26 +273,32 @@ test "Provider.verifyUrl maps to distinct, expected URLs" {
 // Focused coverage for the shared `url.percentEncode` helper (#46), which this module's
 // `verify` delegates to; registered here because `captcha.zig` is in `root.zig`'s test block.
 test "url.percentEncode: unreserved chars pass through; special chars are percent-encoded" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
+    // Local helper: encode, assert, free the single owned result each call.
+    const Check = struct {
+        fn eq(alloc: std.mem.Allocator, expected: []const u8, input: []const u8) !void {
+            const got = try url.percentEncode(alloc, input);
+            defer alloc.free(got);
+            try std.testing.expectEqualStrings(expected, got);
+        }
+    };
 
-    try std.testing.expectEqualStrings("abc123", try url.percentEncode(a, "abc123"));
-    try std.testing.expectEqualStrings("hello-world_v2.~", try url.percentEncode(a, "hello-world_v2.~"));
-    try std.testing.expectEqualStrings("", try url.percentEncode(a, "")); // empty input edge case
-    try std.testing.expectEqualStrings("%20", try url.percentEncode(a, " ")); // space is %20, not '+'
-    try std.testing.expectEqualStrings("%2B", try url.percentEncode(a, "+"));
-    try std.testing.expectEqualStrings("%3D", try url.percentEncode(a, "="));
-    try std.testing.expectEqualStrings("%26", try url.percentEncode(a, "&"));
-    try std.testing.expectEqualStrings("%0A", try url.percentEncode(a, "\n"));
-    try std.testing.expectEqualStrings("%C3%A9", try url.percentEncode(a, "\xC3\xA9")); // high (non-ASCII) bytes
-    try std.testing.expectEqualStrings("secret%3Dvalue%26more", try url.percentEncode(a, "secret=value&more"));
+    try Check.eq(a, "abc123", "abc123");
+    try Check.eq(a, "hello-world_v2.~", "hello-world_v2.~");
+    try Check.eq(a, "", ""); // empty input edge case
+    try Check.eq(a, "%20", " "); // space is %20, not '+'
+    try Check.eq(a, "%2B", "+");
+    try Check.eq(a, "%3D", "=");
+    try Check.eq(a, "%26", "&");
+    try Check.eq(a, "%0A", "\n");
+    try Check.eq(a, "%C3%A9", "\xC3\xA9"); // high (non-ASCII) bytes
+    try Check.eq(a, "secret%3Dvalue%26more", "secret=value&more");
 }
 
 test "parseResponse: success=true maps to ok=true; no errors" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const r = try parseResponse(arena.allocator(), "{\"success\":true,\"hostname\":\"example.com\"}", .recaptcha_v2);
+    const a = std.testing.allocator;
+    const r = try parseResponse(a, "{\"success\":true,\"hostname\":\"example.com\"}", .recaptcha_v2);
+    defer r.deinit(a);
     try std.testing.expect(r.ok);
     try std.testing.expectEqual(@as(usize, 0), r.errors.len);
     try std.testing.expectEqualStrings("example.com", r.hostname.?);
@@ -271,12 +307,12 @@ test "parseResponse: success=true maps to ok=true; no errors" {
 }
 
 test "parseResponse: recaptcha_v3 extracts score and action" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
+    const a = std.testing.allocator;
     const body =
         \\{"success":true,"score":0.9,"action":"submit","hostname":"example.com"}
     ;
-    const r = try parseResponse(arena.allocator(), body, .recaptcha_v3);
+    const r = try parseResponse(a, body, .recaptcha_v3);
+    defer r.deinit(a);
     try std.testing.expect(r.ok);
     try std.testing.expectApproxEqAbs(@as(f32, 0.9), r.score.?, 0.001);
     try std.testing.expectEqualStrings("submit", r.action.?);
@@ -284,27 +320,29 @@ test "parseResponse: recaptcha_v3 extracts score and action" {
 }
 
 test "parseResponse: score/action null for non-v3 providers" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
+    const a = std.testing.allocator;
     const body = "{\"success\":true,\"score\":0.9,\"action\":\"submit\",\"hostname\":\"example.com\"}";
-    const rv2 = try parseResponse(arena.allocator(), body, .recaptcha_v2);
+    const rv2 = try parseResponse(a, body, .recaptcha_v2);
+    defer rv2.deinit(a);
     try std.testing.expect(rv2.score == null);
     try std.testing.expect(rv2.action == null);
-    const rhc = try parseResponse(arena.allocator(), body, .hcaptcha);
+    const rhc = try parseResponse(a, body, .hcaptcha);
+    defer rhc.deinit(a);
     try std.testing.expect(rhc.score == null);
     try std.testing.expect(rhc.action == null);
-    const rts = try parseResponse(arena.allocator(), body, .turnstile);
+    const rts = try parseResponse(a, body, .turnstile);
+    defer rts.deinit(a);
     try std.testing.expect(rts.score == null);
     try std.testing.expect(rts.action == null);
 }
 
 test "parseResponse: success=false + error-codes" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
+    const a = std.testing.allocator;
     const body =
         \\{"success":false,"error-codes":["timeout-or-duplicate","invalid-input-response"]}
     ;
-    const r = try parseResponse(arena.allocator(), body, .hcaptcha);
+    const r = try parseResponse(a, body, .hcaptcha);
+    defer r.deinit(a);
     try std.testing.expect(!r.ok);
     try std.testing.expectEqual(@as(usize, 2), r.errors.len);
     try std.testing.expectEqualStrings("timeout-or-duplicate", r.errors[0]);
@@ -312,21 +350,20 @@ test "parseResponse: success=false + error-codes" {
 }
 
 test "parseResponse: hcaptcha parses hostname (its schema returns it)" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
+    const a = std.testing.allocator;
     const body = "{\"success\":true,\"hostname\":\"example.com\"}";
-    const r = try parseResponse(arena.allocator(), body, .hcaptcha);
+    const r = try parseResponse(a, body, .hcaptcha);
+    defer r.deinit(a);
     try std.testing.expect(r.ok);
     try std.testing.expectEqualStrings("example.com", r.hostname.?);
 }
 
 test "parseResponse: malformed JSON propagates error.CaptchaParseError" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    // Non-JSON body.
-    try std.testing.expectError(error.CaptchaParseError, parseResponse(arena.allocator(), "not-json", .turnstile));
+    const a = std.testing.allocator;
+    // Non-JSON body. (On error parseResponse frees its own parse tree — nothing to free here.)
+    try std.testing.expectError(error.CaptchaParseError, parseResponse(a, "not-json", .turnstile));
     // Valid JSON but not an object.
-    try std.testing.expectError(error.CaptchaParseError, parseResponse(arena.allocator(), "[1,2,3]", .turnstile));
+    try std.testing.expectError(error.CaptchaParseError, parseResponse(a, "[1,2,3]", .turnstile));
 }
 
 test "verify: mock reCAPTCHA v3 success via testcapture.http" {
@@ -342,6 +379,11 @@ test "verify: mock reCAPTCHA v3 success via testcapture.http" {
         ,
     });
 
+    // Arena is required here (not leak-masking): the HttpClient response is arena-scoped
+    // by contract — on the real network path `resp.body` is a sub-slice of an oversized
+    // fixed buffer, so it is never individually freeable, and `verify` correctly does not
+    // free it. The mocked body/headers are duped onto this allocator but never surfaced to
+    // the test to free. `verify`'s own owned temporaries are freed by its internal defers.
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const client = http_client.HttpClient{ .alloc = arena.allocator(), .io = std.testing.io };
@@ -374,6 +416,11 @@ test "verify: mock hCaptcha failure with error-codes via testcapture.http" {
         ,
     });
 
+    // Arena is required here (not leak-masking): the HttpClient response is arena-scoped
+    // by contract — on the real network path `resp.body` is a sub-slice of an oversized
+    // fixed buffer, so it is never individually freeable, and `verify` correctly does not
+    // free it. The mocked body/headers are duped onto this allocator but never surfaced to
+    // the test to free. `verify`'s own owned temporaries are freed by its internal defers.
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const client = http_client.HttpClient{ .alloc = arena.allocator(), .io = std.testing.io };
@@ -397,6 +444,11 @@ test "verify: mock Turnstile success via testcapture.http" {
         ,
     });
 
+    // Arena is required here (not leak-masking): the HttpClient response is arena-scoped
+    // by contract — on the real network path `resp.body` is a sub-slice of an oversized
+    // fixed buffer, so it is never individually freeable, and `verify` correctly does not
+    // free it. The mocked body/headers are duped onto this allocator but never surfaced to
+    // the test to free. `verify`'s own owned temporaries are freed by its internal defers.
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const client = http_client.HttpClient{ .alloc = arena.allocator(), .io = std.testing.io };
@@ -416,11 +468,12 @@ test "verify: network error propagates as error.TransportFailed" {
     // Enable capture with block_unmocked=true; no mock registered → any request fails.
     testcapture.http.enable(true);
 
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const client = http_client.HttpClient{ .alloc = arena.allocator(), .io = std.testing.io };
+    // No arena: verify frees its own request temporaries via defer, and the blocked
+    // request path returns before allocating any response, so real leak detection applies.
+    const a = std.testing.allocator;
+    const client = http_client.HttpClient{ .alloc = a, .io = std.testing.io };
 
-    try std.testing.expectError(error.TransportFailed, verify(.turnstile, "s", "t", arena.allocator(), client));
+    try std.testing.expectError(error.TransportFailed, verify(.turnstile, "s", "t", a, client));
 }
 
 test "verify: special chars in secret/token are percent-encoded in the POST body" {
@@ -431,6 +484,11 @@ test "verify: special chars in secret/token are percent-encoded in the POST body
     testcapture.http.enable(true);
     testcapture.http.mock("hcaptcha.com", .{ .status = 200, .body = "{\"success\":true}" });
 
+    // Arena is required here (not leak-masking): the HttpClient response is arena-scoped
+    // by contract — on the real network path `resp.body` is a sub-slice of an oversized
+    // fixed buffer, so it is never individually freeable, and `verify` correctly does not
+    // free it. The mocked body/headers are duped onto this allocator but never surfaced to
+    // the test to free. `verify`'s own owned temporaries are freed by its internal defers.
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const client = http_client.HttpClient{ .alloc = arena.allocator(), .io = std.testing.io };
