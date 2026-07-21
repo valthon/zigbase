@@ -57,6 +57,7 @@ collection (with a prominent startup warning for every one).
 | F11 | OAuth `state` is delegated to the client, not enforced server-side | Auth/OAuth | Low/Med | A | Low (redirect-URI allowlist + PKCE present) | **Fixed** (opt-in server-side store) |
 | F12 | Insecure deployment defaults (bind `0.0.0.0`, `cookie_secure=false`, open WS origins) | Config | Med | A | n/a (posture) | **Fixed** |
 | F13 | Unbounded pre-auth allocation from attacker-supplied JWT length | DoS | Med | A | Moderate (unauthenticated; body path allows a 50 MiB token) | **Fixed** |
+| F15 | Over-`maxSelect` relation/select validation runs per-element checks before the count guard | DoS | Low/Med | A | Moderate (authenticated writer; body-bounded array under the writer lock) | **Fixed** |
 
 Items deliberately re-assessed as **not exploitable**: rule **parse errors fail *closed*** (a
 malformed rule yields a 500, the write never runs — see F3 notes); `expand` **does** re-apply the
@@ -618,3 +619,24 @@ production callers, so bounding only them would have left every real path unboun
 
 **Not a full DoS fix on its own.** This bounds per-token amplification, not request volume;
 the rate limiter (F8) and body-size limits remain the controls for that.
+
+### F15 — Over-`maxSelect` relation/select validation does per-element work before the count guard (FIXED)
+
+**Where.** `src/records.zig` — `validateFieldValue`, the `.relation` and `.select` arms.
+
+**Description.** A `relation` field is validated by running one existence query
+(`SELECT 1 FROM "<target>" WHERE "id" = ?`) **per submitted id**, on the writer connection
+under the write lock. The arm checked `countValues(v) > maxSelect` and appended a "too many"
+error, but did **not** short-circuit — it fell through and still ran the per-element loop. So
+a create/update whose `relation` value is an array of N ids (N bounded only by
+`max_upload_size`, ~50 MiB → millions of short ids) drove N prepared existence queries under
+the writer lock even though the request was already invalid on its element count. The `.select`
+arm had the same non-short-circuit shape (its per-element scan is in-memory, so cheaper, but
+still unbounded work on already-invalid input).
+
+**Fix.** Both arms now `return` immediately after appending the count error, rejecting on the
+element count before any per-element work. An over-limit array is reported with a single
+`validation_relation`/`validation_select` error and never reaches the existence loop. Regression
+test: "over-maxSelect relation short-circuits before the per-element existence check" submits an
+over-count array of non-existent ids and asserts only the count error is present (no
+`validation_not_found`), proving the loop was skipped.
