@@ -15,15 +15,18 @@ const gen_client = zigbase.codegen.gen_client;
 test "golden: in-process generate matches the committed dating snapshot" {
     // Skipped unless the committed snapshot exists (it is created in Task 8).
     // Zig 0.16 test IO: std.Io.Dir.cwd().readFileAlloc uses the std.testing.io handle.
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    // gen_client.generate is contract-1 (self-freeing, returns one owned slice), so this
+    // runs under the leak-detecting allocator: both the snapshot read and the generated
+    // text are the only owned results, freed below.
+    const a = std.testing.allocator;
     const committed = std.Io.Dir.cwd().readFileAlloc(
         std.testing.io,
         "clients/typescript/test/codegen/dating/zbase.gen.ts",
         a,
         .limited(64 * 1024 * 1024),
     ) catch return; // absent during earlier tasks -> skip
+    defer a.free(committed);
     const text = try gen_client.generate(a, app.App.collections, app.App.routes, app.App.custom_auth, app.App.flags, app.App.experiments, true, "profiles", "ZbClient", "/api");
+    defer a.free(text);
     try std.testing.expectEqualStrings(committed, text);
 }

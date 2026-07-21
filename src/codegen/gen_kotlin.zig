@@ -79,7 +79,7 @@ fn validatePackageName(name: []const u8) !void {
 /// prefix — this generator's signature legitimately diverges from
 /// gen_dart.generate/gen_python.generate here.
 pub fn generate(
-    alloc: std.mem.Allocator,
+    gpa: std.mem.Allocator,
     cols: []const schema.Collection,
     comptime routes: []const events.RouteMeta,
     comptime custom_auth: []const events.CustomAuthMeta,
@@ -97,6 +97,14 @@ pub fn generate(
     _ = experiments;
     _ = in_repo;
     _ = api_prefix;
+
+    // All the fragment-building below is scratch: every allocPrint/emit call
+    // appends into `w` and never frees its intermediate. Rather than thread a
+    // free through each (many live in cross-file emit_kotlin.zig/guards.zig),
+    // own the scratch here in an arena and hand the caller a single owned copy.
+    var scratch_state = std.heap.ArenaAllocator.init(gpa);
+    defer scratch_state.deinit();
+    const alloc = scratch_state.allocator();
 
     // `package_name` is interpolated straight into the generated `package`
     // line, so a value with newlines/braces/semicolons would inject arbitrary
@@ -195,13 +203,11 @@ pub fn generate(
     for (cols) |c| try emit.emitRealtime(alloc, &w, c);
     try emit.emitClient(alloc, &w, cols, client_name, auth_collection);
 
-    return w.toOwnedSlice(alloc);
+    return gpa.dupe(u8, try w.toOwnedSlice(alloc));
 }
 
 test "generate emits a valid-looking Kotlin client for a mini blog" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const cols = [_]schema.Collection{
         .{ .id = "", .name = "users", .type = .auth, .fields = &.{
             .{ .id = "", .name = "displayName", .options = .{ .text = .{} } },
@@ -215,6 +221,7 @@ test "generate emits a valid-looking Kotlin client for a mini blog" {
         } },
     };
     const out = try generate(a, &cols, &.{}, &.{}, &.{}, &.{}, true, "users", "ZbClient", "/api", "io.github.valthon.zigbase.codegen.dating");
+    defer a.free(out);
 
     // Byte-exact fragment: the enum class in full (Step 1's "byte-exact
     // expected fragment for one small collection").
@@ -249,9 +256,7 @@ test "generate emits a valid-looking Kotlin client for a mini blog" {
 }
 
 test "generate emits fields builders, meta, typed services, realtime, and the ZbClient factory" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const cols = [_]schema.Collection{
         .{ .id = "", .name = "users", .type = .auth, .fields = &.{
             .{ .id = "", .name = "displayName", .options = .{ .text = .{} } },
@@ -265,6 +270,7 @@ test "generate emits fields builders, meta, typed services, realtime, and the Zb
         } },
     };
     const out = try generate(a, &cols, &.{}, &.{}, &.{}, &.{}, true, "users", "ZbClient", "/api", "io.github.valthon.zigbase.codegen.dating");
+    defer a.free(out);
 
     // Byte-exact fragment: PostFields in full — covers every FieldExpr
     // subclass the generator emits (String/Enum/Number/Rel here; Bool is
@@ -403,24 +409,21 @@ test "generate emits fields builders, meta, typed services, realtime, and the Zb
 }
 
 test "json field type is single-nullable everywhere (record AND payload) — not JsonElement??" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const cols = [_]schema.Collection{
         .{ .id = "", .name = "widgets", .fields = &.{
             .{ .id = "", .name = "metadata", .options = .{ .json = .{} } },
         } },
     };
     const out = try generate(a, &cols, &.{}, &.{}, &.{}, &.{}, true, "", "ZbClient", "/api", "io.github.valthon.zigbase.codegen.dating");
+    defer a.free(out);
     try std.testing.expect(std.mem.indexOf(u8, out, "val metadata: JsonElement?,\n") != null); // record (required)
     try std.testing.expect(std.mem.indexOf(u8, out, "val metadata: JsonElement? = null,\n") != null); // Create/Update (optional)
     try std.testing.expect(std.mem.indexOf(u8, out, "JsonElement??") == null);
 }
 
 test "Kotlin keywords are sanitized (wire keys unchanged)" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const cols = [_]schema.Collection{
         .{ .id = "", .name = "users", .type = .auth, .fields = &.{} },
         // `class`/`object` are Kotlin keywords; `expand` collides with the
@@ -433,6 +436,7 @@ test "Kotlin keywords are sanitized (wire keys unchanged)" {
         } },
     };
     const out = try generate(a, &cols, &.{}, &.{}, &.{}, &.{}, true, "users", "ZbClient", "/api", "io.github.valthon.zigbase.codegen.dating");
+    defer a.free(out);
     // Record members: keyword-sanitized Kotlin identifier, wire key untouched via @SerialName.
     try std.testing.expect(std.mem.indexOf(u8, out, "    val class_: String,\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "    val object_: Long,\n") != null);
@@ -450,9 +454,7 @@ test "Kotlin keywords are sanitized (wire keys unchanged)" {
 }
 
 test "select values differing only in case collide into one Kotlin enum entry — a generation error" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     // "active" and "ACTIVE" both uppercase to the enum entry ACTIVE — the
     // second would silently overwrite the first's `("active")` line with
     // `("ACTIVE")` if generation didn't dedup-check before emitting.
@@ -468,9 +470,7 @@ test "select values differing only in case collide into one Kotlin enum entry �
 }
 
 test "two schema names mapping to one Kotlin identifier is a generation error" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const cols = [_]schema.Collection{
         .{ .id = "", .name = "posts", .fields = &.{
             .{ .id = "", .name = "class", .options = .{ .text = .{} } },
@@ -484,9 +484,7 @@ test "two schema names mapping to one Kotlin identifier is a generation error" {
 }
 
 test "a collection with no eligible payload field emits a plain class, not an invalid zero-param data class" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     // `hidden` field is excluded from BOTH Create and Update; a non-auth
     // collection whose only field is hidden has nothing left to carry.
     const cols = [_]schema.Collection{
@@ -495,6 +493,7 @@ test "a collection with no eligible payload field emits a plain class, not an in
         } },
     };
     const out = try generate(a, &cols, &.{}, &.{}, &.{}, &.{}, true, "", "ZbClient", "/api", "io.github.valthon.zigbase.codegen.dating");
+    defer a.free(out);
 
     try std.testing.expect(std.mem.indexOf(u8, out, "class GhostCreate {\n    fun toMap(): Map<String, Any?> = emptyMap()\n}\n\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "class GhostUpdate {\n    fun toMap(): Map<String, Any?> = emptyMap()\n}\n\n") != null);
@@ -503,24 +502,21 @@ test "a collection with no eligible payload field emits a plain class, not an in
 }
 
 test "generate emits the caller-supplied package name, overriding the dating default" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const cols = [_]schema.Collection{
         .{ .id = "", .name = "posts", .fields = &.{
             .{ .id = "", .name = "title", .options = .{ .text = .{} } },
         } },
     };
     const out = try generate(a, &cols, &.{}, &.{}, &.{}, &.{}, true, "", "ZbClient", "/api", "com.example.app");
+    defer a.free(out);
 
     try std.testing.expect(std.mem.indexOf(u8, out, "package com.example.app") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "package io.github.valthon.zigbase.codegen.dating") == null);
 }
 
 test "generate rejects an empty or injection-y --package value" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const cols = [_]schema.Collection{
         .{ .id = "", .name = "posts", .fields = &.{
             .{ .id = "", .name = "title", .options = .{ .text = .{} } },
@@ -541,5 +537,6 @@ test "generate rejects an empty or injection-y --package value" {
     try std.testing.expectError(error.InvalidPackageName, gen(a, &cols, "a..b"));
     try std.testing.expectError(error.InvalidPackageName, gen(a, &cols, "1abc.def"));
     // A well-formed package still generates.
-    _ = try gen(a, &cols, "com.example.app_2");
+    const ok = try gen(a, &cols, "com.example.app_2");
+    a.free(ok);
 }

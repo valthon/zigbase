@@ -6,6 +6,7 @@ const schema = @import("../schema.zig");
 /// uppercase the char that follows. camelCase humps are preserved (sentAt -> SentAt).
 pub fn pascal(alloc: std.mem.Allocator, s: []const u8) ![]const u8 {
     var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc); // free the buffer if an append OOMs mid-build
     var upper_next = true;
     for (s) |ch| {
         if (ch == '_' or ch == '-') {
@@ -26,12 +27,20 @@ pub fn pascal(alloc: std.mem.Allocator, s: []const u8) ![]const u8 {
 /// singularization matching blog.gen.ts: users->User, posts->Post, tags->Tag).
 pub fn recordName(alloc: std.mem.Allocator, col_name: []const u8) ![]const u8 {
     const p = try pascal(alloc, col_name);
-    if (p.len > 1 and p[p.len - 1] == 's') return p[0 .. p.len - 1];
+    // When stripping the trailing 's', return an independently-owned copy rather
+    // than a subslice of `p`: the caller must be able to `free` the result, and
+    // freeing a subslice (whose length differs from the original allocation) is an
+    // invalid free.
+    if (p.len > 1 and p[p.len - 1] == 's') {
+        defer alloc.free(p);
+        return alloc.dupe(u8, p[0 .. p.len - 1]);
+    }
     return p;
 }
 
 fn suffixed(alloc: std.mem.Allocator, col_name: []const u8, suffix: []const u8) ![]const u8 {
     const r = try recordName(alloc, col_name);
+    defer alloc.free(r);
     return std.fmt.allocPrint(alloc, "{s}{s}", .{ r, suffix });
 }
 
@@ -56,11 +65,13 @@ pub fn fieldsName(alloc: std.mem.Allocator, c: []const u8) ![]const u8 {
 pub fn realtimeAliasName(alloc: std.mem.Allocator, c: []const u8) ![]const u8 {
     // Plural collection name + "Realtime" (blog: posts -> PostsRealtime).
     const p = try pascal(alloc, c);
+    defer alloc.free(p);
     return std.fmt.allocPrint(alloc, "{s}Realtime", .{p});
 }
 pub fn serviceName(alloc: std.mem.Allocator, c: []const u8) ![]const u8 {
     // Plural collection name + "Service" (blog: posts -> PostsService).
     const p = try pascal(alloc, c);
+    defer alloc.free(p);
     return std.fmt.allocPrint(alloc, "{s}Service", .{p});
 }
 pub fn metaConst(alloc: std.mem.Allocator, c: []const u8) ![]const u8 {
@@ -82,6 +93,7 @@ pub fn routeMethodName(alloc: std.mem.Allocator, path: []const u8, api_prefix: [
     var rest = path;
     if (std.mem.startsWith(u8, rest, api_prefix)) rest = rest[api_prefix.len..];
     var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc); // free the buffer if an append OOMs mid-build
     var first = true;
     var it = std.mem.tokenizeScalar(u8, rest, '/');
     while (it.next()) |seg| {
@@ -144,27 +156,31 @@ pub fn isReservedName(name: []const u8) bool {
 // Tests
 // ---------------------------------------------------------------------------
 
+/// Assert an owned-slice result equals `expected`, then free it — restores the
+/// leak detection an arena would mask for these single-owned-string manglers.
+fn expectName(al: std.mem.Allocator, expected: []const u8, got: anyerror![]const u8) !void {
+    const g = try got;
+    defer al.free(g);
+    try std.testing.expectEqualStrings(expected, g);
+}
+
 test "pascal + recordName" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    try std.testing.expectEqualStrings("SentAt", try pascal(a, "sentAt"));
-    try std.testing.expectEqualStrings("Profile", try recordName(a, "profiles"));
-    try std.testing.expectEqualStrings("Photo", try recordName(a, "photos"));
-    try std.testing.expectEqualStrings("Tag", try recordName(a, "tags"));
-    try std.testing.expectEqualStrings("Subscription", try recordName(a, "subscriptions"));
-    try std.testing.expectEqualStrings("Wink", try recordName(a, "winks"));
+    const a = std.testing.allocator;
+    try expectName(a, "SentAt", pascal(a, "sentAt"));
+    try expectName(a, "Profile", recordName(a, "profiles"));
+    try expectName(a, "Photo", recordName(a, "photos"));
+    try expectName(a, "Tag", recordName(a, "tags"));
+    try expectName(a, "Subscription", recordName(a, "subscriptions"));
+    try expectName(a, "Wink", recordName(a, "winks"));
 }
 
 test "derived names" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    try std.testing.expectEqualStrings("ProfileWhere", try whereName(a, "profiles"));
-    try std.testing.expectEqualStrings("ProfileCreate", try createName(a, "profiles"));
-    try std.testing.expectEqualStrings("ProfilesService", try serviceName(a, "profiles"));
-    try std.testing.expectEqualStrings("profilesMeta", try metaConst(a, "profiles"));
-    try std.testing.expectEqualStrings("ProfilesRealtime", try realtimeAliasName(a, "profiles"));
+    const a = std.testing.allocator;
+    try expectName(a, "ProfileWhere", whereName(a, "profiles"));
+    try expectName(a, "ProfileCreate", createName(a, "profiles"));
+    try expectName(a, "ProfilesService", serviceName(a, "profiles"));
+    try expectName(a, "profilesMeta", metaConst(a, "profiles"));
+    try expectName(a, "ProfilesRealtime", realtimeAliasName(a, "profiles"));
 }
 
 test "reserved names" {
@@ -177,21 +193,17 @@ test "reserved names" {
 }
 
 test "pascal converts snake_case and simple names" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    try std.testing.expectEqualStrings("Status", try pascal(a, "status"));
-    try std.testing.expectEqualStrings("FieldName", try pascal(a, "field_name"));
-    try std.testing.expectEqualStrings("BlogPost", try pascal(a, "blog_post"));
+    const a = std.testing.allocator;
+    try expectName(a, "Status", pascal(a, "status"));
+    try expectName(a, "FieldName", pascal(a, "field_name"));
+    try expectName(a, "BlogPost", pascal(a, "blog_post"));
 }
 
 test "recordName singularizes and pascal-cases" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    try std.testing.expectEqualStrings("Post", try recordName(a, "posts"));
-    try std.testing.expectEqualStrings("User", try recordName(a, "users"));
-    try std.testing.expectEqualStrings("BlogPost", try recordName(a, "blog_posts"));
+    const a = std.testing.allocator;
+    try expectName(a, "Post", recordName(a, "posts"));
+    try expectName(a, "User", recordName(a, "users"));
+    try expectName(a, "BlogPost", recordName(a, "blog_posts"));
 }
 
 test "routeMethodName camel-joins non-param segments" {

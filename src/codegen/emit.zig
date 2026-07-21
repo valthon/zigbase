@@ -12,10 +12,11 @@ const W = std.ArrayList(u8);
 fn put(alloc: std.mem.Allocator, w: *W, s: []const u8) !void {
     try w.appendSlice(alloc, s);
 }
-/// Format helper — callers must pass an arena allocator; the helper allocs a
-/// temporary string from it and copies the bytes into `w`.
+/// Format helper — allocs a temporary formatted string, copies the bytes into
+/// `w`, then frees the temporary (contract-1; works under any allocator).
 fn putf(alloc: std.mem.Allocator, w: *W, comptime fmt: []const u8, args: anytype) !void {
     const s = try std.fmt.allocPrint(alloc, fmt, args);
+    defer alloc.free(s); // the bytes are copied into `w`; the temp is ours to free
     try w.appendSlice(alloc, s);
 }
 /// Emit `s` as a TS double-quoted string literal (quotes included), escaping the
@@ -95,9 +96,12 @@ fn searchLine(c: schema.Collection) []const u8 {
 
 /// The narrowed `vector?: { field: "a" | "b"; … };` opts line for json-bearing
 /// collections ("" otherwise). getList-only (the server rejects vector + cursor).
+/// Always returns an owned slice (empty-but-owned when not json-bearing) so the
+/// caller can free it unconditionally.
 fn vectorLine(alloc: std.mem.Allocator, c: schema.Collection) ![]const u8 {
-    if (!hasJsonFields(c)) return "";
+    if (!hasJsonFields(c)) return alloc.dupe(u8, "");
     var u: std.ArrayList(u8) = .empty;
+    defer u.deinit(alloc);
     var first = true;
     for (c.fields) |f| {
         if (f.hidden or f.options != .json) continue;
@@ -118,6 +122,7 @@ pub fn emitSelectUnions(alloc: std.mem.Allocator, w: *W, c: schema.Collection) !
     for (c.fields) |f| {
         if (f.options != .select) continue;
         const uname = try tt.selectUnionName(alloc, c.name, f.name);
+        defer alloc.free(uname);
         try putf(alloc, w, "export type {s} = ", .{uname});
         for (f.options.select.values, 0..) |v, i| {
             if (i != 0) try put(alloc, w, " | ");
@@ -133,11 +138,15 @@ pub fn emitSelectUnions(alloc: std.mem.Allocator, w: *W, c: schema.Collection) !
 
 pub fn emitRecord(alloc: std.mem.Allocator, w: *W, c: schema.Collection) !void {
     const rec = try ident.recordName(alloc, c.name);
+    defer alloc.free(rec);
     try putf(alloc, w, "export interface {s} {{\n", .{rec});
-    for (try recordFields(alloc, c)) |f| {
+    const rfs = try recordFields(alloc, c);
+    defer alloc.free(rfs);
+    for (rfs) |f| {
         if (c.options.tenant_field) |tf| if (std.mem.eql(u8, f.name, tf))
             try putf(alloc, w, "  /** Tenant-owned: `{s}` is server-stamped from the active account. */\n", .{tf});
         const ty = try tt.tsTypeOf(alloc, c.name, f);
+        defer alloc.free(ty);
         try putf(alloc, w, "  {s}: {s};\n", .{ f.name, ty });
     }
     try put(alloc, w, "}\n");
@@ -148,16 +157,19 @@ pub fn emitRecord(alloc: std.mem.Allocator, w: *W, c: schema.Collection) !void {
 // ---------------------------------------------------------------------------
 
 /// In *Create, file fields become `File | Blob` (single) or `(File | Blob)[]` (multi).
+/// Always returns an owned slice (matching tt.tsTypeOf's contract), so the caller
+/// frees the result unconditionally.
 fn createFieldType(alloc: std.mem.Allocator, col: []const u8, f: schema.Field) ![]const u8 {
     if (tt.kindOf(f) == .file_name) {
-        if (f.isMultiValue()) return "(File | Blob)[]";
-        return "File | Blob";
+        if (f.isMultiValue()) return alloc.dupe(u8, "(File | Blob)[]");
+        return alloc.dupe(u8, "File | Blob");
     }
     return tt.tsTypeOf(alloc, col, f);
 }
 
 pub fn emitCreate(alloc: std.mem.Allocator, w: *W, c: schema.Collection) !void {
     const cn = try ident.createName(alloc, c.name);
+    defer alloc.free(cn);
     const tenant_field = c.options.tenant_field;
     try putf(alloc, w, "export interface {s} {{\n", .{cn});
     if (c.type == .auth) {
@@ -167,19 +179,25 @@ pub fn emitCreate(alloc: std.mem.Allocator, w: *W, c: schema.Collection) !void {
     for (c.fields) |f| {
         if (f.hidden or isReadOnlySystem(f.name) or !f.required) continue;
         if (tenant_field) |tf| if (std.mem.eql(u8, f.name, tf)) continue;
-        try putf(alloc, w, "  {s}: {s};\n", .{ f.name, try createFieldType(alloc, c.name, f) });
+        const cft = try createFieldType(alloc, c.name, f);
+        defer alloc.free(cft);
+        try putf(alloc, w, "  {s}: {s};\n", .{ f.name, cft });
     }
     for (c.fields) |f| {
         if (f.hidden or isReadOnlySystem(f.name) or f.required) continue;
         if (tenant_field) |tf| if (std.mem.eql(u8, f.name, tf)) continue;
-        try putf(alloc, w, "  {s}?: {s};\n", .{ f.name, try createFieldType(alloc, c.name, f) });
+        const cft = try createFieldType(alloc, c.name, f);
+        defer alloc.free(cft);
+        try putf(alloc, w, "  {s}?: {s};\n", .{ f.name, cft });
     }
     try put(alloc, w, "}\n");
 }
 
 pub fn emitUpdate(alloc: std.mem.Allocator, w: *W, c: schema.Collection) !void {
     const un = try ident.updateName(alloc, c.name);
+    defer alloc.free(un);
     const cn = try ident.createName(alloc, c.name);
+    defer alloc.free(cn);
     if (c.type == .auth) {
         try putf(alloc, w, "export type {s} = Partial<Omit<{s}, \"password\" | \"passwordConfirm\">>;\n", .{ un, cn });
     } else {
@@ -193,6 +211,7 @@ pub fn emitUpdate(alloc: std.mem.Allocator, w: *W, c: schema.Collection) !void {
 
 pub fn emitWhere(alloc: std.mem.Allocator, w: *W, cols: []const schema.Collection, c: schema.Collection) !void {
     const wn = try ident.whereName(alloc, c.name);
+    defer alloc.free(wn);
     try putf(alloc, w, "export interface {s} {{\n", .{wn});
     // Auth synthesized: email + username + verified always (B3: unconditional synthesis).
     if (c.type == .auth) {
@@ -220,12 +239,14 @@ pub fn emitWhere(alloc: std.mem.Allocator, w: *W, cols: []const schema.Collectio
             .unknown => try putf(alloc, w, "  {s}?: unknown;\n", .{f.name}),
             .select_union => {
                 const u = try tt.selectUnionName(alloc, c.name, f.name);
+                defer alloc.free(u);
                 try putf(alloc, w, "  {s}?: EnumOps<{s}> | {s};\n", .{ f.name, u, u });
             },
             .relation_id => {
                 const target = f.options.relation.targetCollectionId;
                 if (!f.isMultiValue() and collectionExists(cols, target)) {
                     const tw = try ident.whereName(alloc, target);
+                    defer alloc.free(tw);
                     try putf(alloc, w, "  {s}?: string | RelOps | {s};\n", .{ f.name, tw });
                 } else {
                     try putf(alloc, w, "  {s}?: string | RelOps;\n", .{f.name});
@@ -254,12 +275,14 @@ fn hasRelations(c: schema.Collection) bool {
 pub fn emitRelations(alloc: std.mem.Allocator, w: *W, cols: []const schema.Collection, c: schema.Collection) !void {
     if (!hasRelations(c)) return;
     const rn = try ident.relationsName(alloc, c.name);
+    defer alloc.free(rn);
     try putf(alloc, w, "export type {s} = {{ ", .{rn});
     var first = true;
     for (c.fields) |f| {
         if (f.options != .relation) continue;
         if (!collectionExists(cols, f.options.relation.targetCollectionId)) continue;
         const tr = try ident.recordName(alloc, f.options.relation.targetCollectionId);
+        defer alloc.free(tr);
         if (!first) try put(alloc, w, "; ");
         first = false;
         if (f.isMultiValue()) {
@@ -274,6 +297,7 @@ pub fn emitRelations(alloc: std.mem.Allocator, w: *W, cols: []const schema.Colle
 pub fn emitExpandKeys(alloc: std.mem.Allocator, w: *W, cols: []const schema.Collection, c: schema.Collection) !void {
     if (!hasRelations(c)) return;
     const en = try ident.expandName(alloc, c.name);
+    defer alloc.free(en);
     try putf(alloc, w, "export type {s} = ", .{en});
     var first = true;
     for (c.fields) |f| {
@@ -298,6 +322,7 @@ pub fn emitExpandKeys(alloc: std.mem.Allocator, w: *W, cols: []const schema.Coll
 
 pub fn emitFields(alloc: std.mem.Allocator, w: *W, c: schema.Collection) !void {
     const fn_ = try ident.fieldsName(alloc, c.name);
+    defer alloc.free(fn_);
     try putf(alloc, w, "export interface {s} {{\n", .{fn_});
     // Auth: always emit all three visible fields (B3: unconditional synthesis).
     if (c.type == .auth) {
@@ -318,6 +343,7 @@ pub fn emitFields(alloc: std.mem.Allocator, w: *W, c: schema.Collection) !void {
         if (c.type == .auth and isAuthSynthesized(f.name)) continue;
         if (isSystemFieldName(f.name)) continue; // synthesized below as system fields
         const base = try tt.tsBaseTypeOf(alloc, c.name, f);
+        defer alloc.free(base);
         try putf(alloc, w, "  {s}: TypedFieldExpr<{s}>;\n", .{ f.name, base });
     }
     // Synthesize system fields id/created/updated (always filterable via fluent builder).
@@ -338,6 +364,7 @@ pub fn emitFields(alloc: std.mem.Allocator, w: *W, c: schema.Collection) !void {
 /// deliberately not included).
 pub fn emitSortUnion(alloc: std.mem.Allocator, w: *W, c: schema.Collection) !void {
     const rec = try ident.recordName(alloc, c.name);
+    defer alloc.free(rec);
     try putf(alloc, w, "export type {s}SortField =", .{rec});
     var first = true;
     if (c.type == .auth) {
@@ -373,15 +400,26 @@ pub fn emitSortUnion(alloc: std.mem.Allocator, w: *W, c: schema.Collection) !voi
 
 pub fn emitService(alloc: std.mem.Allocator, w: *W, c: schema.Collection) !void {
     const svc = try ident.serviceName(alloc, c.name);
+    defer alloc.free(svc);
     const rec = try ident.recordName(alloc, c.name);
+    defer alloc.free(rec);
     const wn = try ident.whereName(alloc, c.name);
+    defer alloc.free(wn);
     const fld = try ident.fieldsName(alloc, c.name);
+    defer alloc.free(fld);
     const sort_ty = try std.fmt.allocPrint(alloc, "{s}Sort | {s}Sort[]", .{ rec, rec });
-    const search = searchLine(c);
+    defer alloc.free(sort_ty);
+    const search = searchLine(c); // static literal — not owned
     const vector = try vectorLine(alloc, c);
+    defer alloc.free(vector);
+    const cn = try ident.createName(alloc, c.name);
+    defer alloc.free(cn);
+    const un = try ident.updateName(alloc, c.name);
+    defer alloc.free(un);
     // Row-abilities doc comment (#155): action names only — the rule ASTs are server business.
     if (c.options.abilities) |ab| {
         var names: std.ArrayList(u8) = .empty;
+        defer names.deinit(alloc);
         if (ab.view != null) try names.appendSlice(alloc, "view, ");
         if (ab.create != null) try names.appendSlice(alloc, "create, ");
         if (ab.update != null) try names.appendSlice(alloc, "update, ");
@@ -392,7 +430,9 @@ pub fn emitService(alloc: std.mem.Allocator, w: *W, c: schema.Collection) !void 
     try putf(alloc, w, "export interface {s} {{\n", .{svc});
     if (hasRelations(c)) {
         const exp = try ident.expandName(alloc, c.name);
+        defer alloc.free(exp);
         const rel = try ident.relationsName(alloc, c.name);
+        defer alloc.free(rel);
         try putf(alloc, w,
             \\  getOne<K extends {0s} = never>(
             \\    id: string,
@@ -451,7 +491,7 @@ pub fn emitService(alloc: std.mem.Allocator, w: *W, c: schema.Collection) !void 
             \\  delete(id: string): Promise<void>;
             \\  filter(fn: (f: {6s}) => Expr): string;
             \\
-        , .{ exp, rec, rel, wn, try ident.createName(alloc, c.name), try ident.updateName(alloc, c.name), fld, sort_ty, search, vector });
+        , .{ exp, rec, rel, wn, cn, un, fld, sort_ty, search, vector });
     } else {
         try putf(alloc, w,
             \\  getOne(id: string, opts?: {{ fields?: string; signal?: AbortSignal; requestKey?: string }}): Promise<{0s}>;
@@ -506,7 +546,7 @@ pub fn emitService(alloc: std.mem.Allocator, w: *W, c: schema.Collection) !void 
             \\  delete(id: string): Promise<void>;
             \\  filter(fn: (f: {4s}) => Expr): string;
             \\
-        , .{ rec, wn, try ident.createName(alloc, c.name), try ident.updateName(alloc, c.name), fld, sort_ty, search, vector });
+        , .{ rec, wn, cn, un, fld, sort_ty, search, vector });
     }
     try put(alloc, w, "  getAbilities(id: string, opts?: { signal?: AbortSignal; requestKey?: string }): Promise<RecordAbilities>;\n");
     if (c.type == .auth) {
@@ -520,6 +560,7 @@ pub fn emitService(alloc: std.mem.Allocator, w: *W, c: schema.Collection) !void 
     }
     if (hasSingleFileFields(c)) {
         const ff = try ident.recordName(alloc, c.name);
+        defer alloc.free(ff);
         try putf(alloc, w,
             \\  fileUrl(record: {0s}, field: {0s}FileField, opts?: FileUrlOptions): string;
             \\
@@ -534,8 +575,11 @@ pub fn emitService(alloc: std.mem.Allocator, w: *W, c: schema.Collection) !void 
 
 pub fn emitRealtimeAlias(alloc: std.mem.Allocator, w: *W, c: schema.Collection) !void {
     const rt = try ident.realtimeAliasName(alloc, c.name);
+    defer alloc.free(rt);
     const rec = try ident.recordName(alloc, c.name);
+    defer alloc.free(rec);
     const wn = try ident.whereName(alloc, c.name);
+    defer alloc.free(wn);
     try putf(alloc, w, "export type {s} = RawTypedRealtime<{s}, {s}>;\n", .{ rt, rec, wn });
 }
 
@@ -545,11 +589,13 @@ pub fn emitRealtimeAlias(alloc: std.mem.Allocator, w: *W, c: schema.Collection) 
 
 pub fn emitMeta(alloc: std.mem.Allocator, w: *W, c: schema.Collection) !void {
     const mc = try ident.metaConst(alloc, c.name);
+    defer alloc.free(mc);
     try putf(alloc, w, "export const {s}: CollectionMeta = {{\n  name: \"{s}\",\n  fields: {{\n", .{ mc, c.name });
     // meta.fields = id (always first) + auth visible (email+username+verified, unconditional) +
     //               user fields (non-hidden, non-read-only-system) +
     //               created + updated (always appended).
     var metaFields: std.ArrayList(schema.Field) = .empty;
+    defer metaFields.deinit(alloc);
     try metaFields.append(alloc, .{ .id = "_id", .name = "id", .options = .{ .text = .{} } });
     if (c.type == .auth) try appendVisibleAuthFields(alloc, &metaFields);
     for (c.fields) |f| {
@@ -685,6 +731,7 @@ pub fn emitRelationResolver(alloc: std.mem.Allocator, w: *W, cols: []const schem
             const target = f.options.relation.targetCollectionId;
             if (!collectionExists(cols, target)) continue;
             const tmeta = try ident.metaConst(alloc, target);
+            defer alloc.free(tmeta);
             try putf(alloc, w, "  if (collection === \"{s}\" && field === \"{s}\") return {s};\n", .{ c.name, f.name, tmeta });
         }
     }
@@ -704,6 +751,7 @@ pub fn emitTypedFiles(alloc: std.mem.Allocator, w: *W, cols: []const schema.Coll
         // fileUrl convenience can't address a multi-value (string[]) file field.
         if (!hasSingleFileFields(c)) continue;
         const rec = try ident.recordName(alloc, c.name);
+        defer alloc.free(rec);
         try putf(alloc, w, "export type {s}FileField = ", .{rec});
         var first = true;
         for (c.fields) |f| {
@@ -745,10 +793,9 @@ test {
 }
 
 test "emitRecord matches Post shape" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     var w: std.ArrayList(u8) = .empty;
+    defer w.deinit(a);
     try emitRecord(a, &w, blogPosts());
     const out = w.items;
     try std.testing.expect(contains(out, "export interface Post {"));
@@ -764,10 +811,9 @@ test "emitRecord matches Post shape" {
 }
 
 test "emitSelectUnions matches PostStatus" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     var w: std.ArrayList(u8) = .empty;
+    defer w.deinit(a);
     try emitSelectUnions(a, &w, blogPosts());
     try std.testing.expect(contains(w.items, "export type PostStatus = \"draft\" | \"published\";"));
 }
@@ -775,14 +821,13 @@ test "emitSelectUnions matches PostStatus" {
 test "emitSelectUnions escapes special chars in select values" {
     // Fix 1: select values are arbitrary []const u8 (schema only checks non-emptiness),
     // so a value containing `"` or `\` must be escaped to stay valid TypeScript.
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const fields = [_]schema.Field{
         .{ .id = "s", .name = "kind", .options = .{ .select = .{ .values = &.{ "a\"b", "c\\d" }, .maxSelect = 1 } } },
     };
     const col = schema.Collection{ .id = "", .name = "things", .fields = &fields };
     var w: std.ArrayList(u8) = .empty;
+    defer w.deinit(a);
     try emitSelectUnions(a, &w, col);
     const out = w.items;
     // Escaped forms present.
@@ -791,10 +836,9 @@ test "emitSelectUnions escapes special chars in select values" {
 }
 
 test "emitCreate matches PostCreate (required first, file -> File | Blob)" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     var w: std.ArrayList(u8) = .empty;
+    defer w.deinit(a);
     try emitCreate(a, &w, blogPosts());
     const out = w.items;
     try std.testing.expect(contains(out, "export interface PostCreate {"));
@@ -808,13 +852,12 @@ test "emitCreate matches PostCreate (required first, file -> File | Blob)" {
 }
 
 test "emitWhere matches PostWhere (nested relation, multi id-only, file omitted, system fields synthesized)" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const users = schema.Collection{ .id = "", .name = "users", .type = .auth, .fields = &.{} };
     const tags = schema.Collection{ .id = "", .name = "tags", .fields = &.{} };
     const cols = [_]schema.Collection{ blogPosts(), users, tags };
     var w: std.ArrayList(u8) = .empty;
+    defer w.deinit(a);
     try emitWhere(a, &w, &cols, blogPosts());
     const out = w.items;
     try std.testing.expect(contains(out, "export interface PostWhere {"));
@@ -838,9 +881,7 @@ test "emitWhere matches PostWhere (nested relation, multi id-only, file omitted,
 }
 
 test "emitExpandKeys falls back to never when every relation targets a collection outside the set" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     // `orphan`'s only relation targets `_accounts`, a live system collection that is
     // never part of the generated set (`cols` below deliberately omits it) — mirrors
     // emitRelations' filter (see its comment above) so the paired *Relations map and
@@ -852,16 +893,16 @@ test "emitExpandKeys falls back to never when every relation targets a collectio
     const orphan = schema.Collection{ .id = "", .name = "orphan", .fields = &fields };
     const cols = [_]schema.Collection{orphan};
     var w: std.ArrayList(u8) = .empty;
+    defer w.deinit(a);
     try emitExpandKeys(a, &w, &cols, orphan);
     const out = w.items;
     try std.testing.expect(contains(out, "export type OrphanExpand = never;"));
 }
 
 test "emitService (expandable) has the getOne<K extends PostExpand = never> shape" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     var w: std.ArrayList(u8) = .empty;
+    defer w.deinit(a);
     try emitService(a, &w, blogPosts());
     const out = w.items;
     try std.testing.expect(contains(out, "export interface PostsService {"));
@@ -875,15 +916,14 @@ test "emitService (expandable) has the getOne<K extends PostExpand = never> shap
 }
 
 test "emitService (no files) does NOT include fileUrl" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const no_file_col = schema.Collection{
         .id = "",
         .name = "tags",
         .fields = &.{.{ .id = "a", .name = "label", .required = true, .options = .{ .text = .{} } }},
     };
     var w: std.ArrayList(u8) = .empty;
+    defer w.deinit(a);
     try emitService(a, &w, no_file_col);
     try std.testing.expect(!contains(w.items, "fileUrl"));
 }
@@ -891,9 +931,7 @@ test "emitService (no files) does NOT include fileUrl" {
 test "emitService + emitTypedFiles restrict FileField/fileUrl to single-value file fields" {
     // Fix 2: a collection with a single-value AND a multi-value file field must
     // expose only the single-value one in <Rec>FileField, and still get fileUrl.
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const fields = [_]schema.Field{
         .{ .id = "av", .name = "avatar", .options = .{ .file = .{ .maxSelect = 1 } } }, // single
         .{ .id = "ph", .name = "photos", .options = .{ .file = .{ .maxSelect = 5 } } }, // multi
@@ -903,6 +941,7 @@ test "emitService + emitTypedFiles restrict FileField/fileUrl to single-value fi
     {
         const cols = [_]schema.Collection{col};
         var w: std.ArrayList(u8) = .empty;
+        defer w.deinit(a);
         try emitTypedFiles(a, &w, &cols);
         const out = w.items;
         try std.testing.expect(contains(out, "export type MemberFileField = \"avatar\";"));
@@ -911,6 +950,7 @@ test "emitService + emitTypedFiles restrict FileField/fileUrl to single-value fi
     // fileUrl IS emitted (single-value file field present).
     {
         var w: std.ArrayList(u8) = .empty;
+        defer w.deinit(a);
         try emitService(a, &w, col);
         try std.testing.expect(contains(w.items, "fileUrl(record: Member, field: MemberFileField, opts?: FileUrlOptions): string;"));
     }
@@ -919,9 +959,7 @@ test "emitService + emitTypedFiles restrict FileField/fileUrl to single-value fi
 test "emitService + emitTypedFiles skip FileField/fileUrl for multi-value-only file fields" {
     // Fix 2: a collection whose ONLY file field is multi-value gets NO FileField
     // union and NO fileUrl method (the record field is string[], not a filename).
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const fields = [_]schema.Field{
         .{ .id = "ph", .name = "photos", .options = .{ .file = .{ .maxSelect = 5 } } }, // multi only
     };
@@ -929,22 +967,23 @@ test "emitService + emitTypedFiles skip FileField/fileUrl for multi-value-only f
     {
         const cols = [_]schema.Collection{col};
         var w: std.ArrayList(u8) = .empty;
+        defer w.deinit(a);
         try emitTypedFiles(a, &w, &cols);
         try std.testing.expect(!contains(w.items, "GalleryFileField"));
         try std.testing.expect(w.items.len == 0);
     }
     {
         var w: std.ArrayList(u8) = .empty;
+        defer w.deinit(a);
         try emitService(a, &w, col);
         try std.testing.expect(!contains(w.items, "fileUrl"));
     }
 }
 
 test "emitMeta matches postsMeta" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     var w: std.ArrayList(u8) = .empty;
+    defer w.deinit(a);
     try emitMeta(a, &w, blogPosts());
     const out = w.items;
     try std.testing.expect(contains(out, "export const postsMeta: CollectionMeta = {"));
@@ -960,10 +999,9 @@ test "emitMeta matches postsMeta" {
 }
 
 test "emitRealtimeAlias matches the generic alias" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     var w: std.ArrayList(u8) = .empty;
+    defer w.deinit(a);
     try emitRealtimeAlias(a, &w, blogPosts());
     try std.testing.expect(contains(w.items, "export type PostsRealtime = RawTypedRealtime<Post, PostWhere>;"));
 }
@@ -982,9 +1020,7 @@ fn countOccurrences(hay: []const u8, needle: []const u8) usize {
 // username / verified (as injectAuthFields would produce).  Both emitWhere and
 // emitFields must emit each of those names exactly once.
 test "emitWhere / emitFields dedup injected auth fields — each appears exactly once" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
 
     // Simulate injectAuthFields output: the three visible auth fields prepended,
     // plus an ordinary user field.
@@ -1005,6 +1041,7 @@ test "emitWhere / emitFields dedup injected auth fields — each appears exactly
     {
         const cols = [_]schema.Collection{injected_auth};
         var w: std.ArrayList(u8) = .empty;
+        defer w.deinit(a);
         try emitWhere(a, &w, &cols, injected_auth);
         const out = w.items;
         // Each auth synthesized field must appear exactly once.
@@ -1022,6 +1059,7 @@ test "emitWhere / emitFields dedup injected auth fields — each appears exactly
     // --- emitFields ---
     {
         var w: std.ArrayList(u8) = .empty;
+        defer w.deinit(a);
         try emitFields(a, &w, injected_auth);
         const out = w.items;
         try std.testing.expectEqual(@as(usize, 1), countOccurrences(out, "email:"));
@@ -1044,6 +1082,7 @@ test "emitWhere / emitFields dedup injected auth fields — each appears exactly
     {
         const cols = [_]schema.Collection{clean_auth};
         var w: std.ArrayList(u8) = .empty;
+        defer w.deinit(a);
         try emitWhere(a, &w, &cols, clean_auth);
         const out = w.items;
         try std.testing.expectEqual(@as(usize, 1), countOccurrences(out, "email?"));
@@ -1056,6 +1095,7 @@ test "emitWhere / emitFields dedup injected auth fields — each appears exactly
     }
     {
         var w: std.ArrayList(u8) = .empty;
+        defer w.deinit(a);
         try emitFields(a, &w, clean_auth);
         const out = w.items;
         try std.testing.expectEqual(@as(usize, 1), countOccurrences(out, "email:"));
@@ -1073,11 +1113,10 @@ test "emitTypedFiles emits only FileField unions (no global TypedFiles / makeFil
     // The global TypedFiles interface and makeFilesSurface have been removed;
     // fileUrl is grafted per-collection in emitService + gen_client.zig's
     // emitClientFactory.
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const cols = [_]schema.Collection{blogPosts()};
     var w: std.ArrayList(u8) = .empty;
+    defer w.deinit(a);
     try emitTypedFiles(a, &w, &cols);
     const out = w.items;
     // Per-collection file-field union is still emitted.
@@ -1089,30 +1128,29 @@ test "emitTypedFiles emits only FileField unions (no global TypedFiles / makeFil
 }
 
 test "emitMeta emits searchable + tenant keys when configured" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const fields = [_]schema.Field{
         .{ .id = "a", .name = "title", .options = .{ .text = .{} }, .searchable = true },
         .{ .id = "b", .name = "account", .options = .{ .text = .{} } },
     };
     const col = schema.Collection{ .id = "", .name = "notes", .fields = &fields, .options = .{ .tenant_field = "account" } };
     var w: std.ArrayList(u8) = .empty;
+    defer w.deinit(a);
     try emitMeta(a, &w, col);
     try std.testing.expect(contains(w.items, "searchable: [\"title\"],"));
     try std.testing.expect(contains(w.items, "tenant: \"account\","));
     // A collection without either feature emits NEITHER key (absent = feature not present).
     var w2: std.ArrayList(u8) = .empty;
+    defer w2.deinit(a);
     try emitMeta(a, &w2, blogPosts());
     try std.testing.expect(!contains(w2.items, "searchable:"));
     try std.testing.expect(!contains(w2.items, "tenant:"));
 }
 
 test "emitSortUnion: visible scalars minus json/multi/file, plus system fields" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     var w: std.ArrayList(u8) = .empty;
+    defer w.deinit(a);
     try emitSortUnion(a, &w, blogPosts());
     const out = w.items;
     // blogPosts: title(text) status(select) price(number) author(single rel) tags(multi rel)
@@ -1124,9 +1162,7 @@ test "emitSortUnion: visible scalars minus json/multi/file, plus system fields" 
 }
 
 test "emitService: search/vector gating, narrowed sort, unconditional getAbilities" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     // Searchable + json collection
     const fields = [_]schema.Field{
         .{ .id = "a", .name = "body", .options = .{ .text = .{} }, .searchable = true },
@@ -1135,6 +1171,7 @@ test "emitService: search/vector gating, narrowed sort, unconditional getAbiliti
     };
     const docs = schema.Collection{ .id = "", .name = "docs", .fields = &fields };
     var w: std.ArrayList(u8) = .empty;
+    defer w.deinit(a);
     try emitService(a, &w, docs);
     const out = w.items;
     try std.testing.expect(contains(out, "search?: string;"));
@@ -1148,6 +1185,7 @@ test "emitService: search/vector gating, narrowed sort, unconditional getAbiliti
 
     // A collection with neither searchable nor json fields gets neither key, still getAbilities.
     var w2: std.ArrayList(u8) = .empty;
+    defer w2.deinit(a);
     try emitService(a, &w2, blogPosts());
     try std.testing.expect(!contains(w2.items, "search?:"));
     try std.testing.expect(!contains(w2.items, "vector?:"));
@@ -1156,9 +1194,7 @@ test "emitService: search/vector gating, narrowed sort, unconditional getAbiliti
 }
 
 test "emitService: abilities doc comment lists configured actions" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const Abilities = @import("../authz/abilities.zig");
     const fields = [_]schema.Field{
         .{ .id = "a", .name = "account", .options = .{ .relation = .{ .targetCollectionId = "accounts", .maxSelect = 1 } } },
@@ -1168,34 +1204,33 @@ test "emitService: abilities doc comment lists configured actions" {
         .delete = .{ .relationship = .{ .via = "account", .min_role = "admin" } },
     } } };
     var w: std.ArrayList(u8) = .empty;
+    defer w.deinit(a);
     try emitService(a, &w, col);
     try std.testing.expect(contains(w.items, "/** Row abilities configured for: update, delete. Check per record via getAbilities(). */"));
     _ = Abilities;
 }
 
 test "emitCreate omits the tenant field (server-stamped); emitRecord keeps + documents it" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const fields = [_]schema.Field{
         .{ .id = "a", .name = "title", .required = true, .options = .{ .text = .{} } },
         .{ .id = "b", .name = "account", .options = .{ .text = .{} } },
     };
     const col = schema.Collection{ .id = "", .name = "notes", .fields = &fields, .options = .{ .tenant_field = "account" } };
     var w: std.ArrayList(u8) = .empty;
+    defer w.deinit(a);
     try emitCreate(a, &w, col);
     try std.testing.expect(!contains(w.items, "account"));
     try std.testing.expect(contains(w.items, "title: string;"));
     var w2: std.ArrayList(u8) = .empty;
+    defer w2.deinit(a);
     try emitRecord(a, &w2, col);
     try std.testing.expect(contains(w2.items, "account: string;"));
     try std.testing.expect(contains(w2.items, "Tenant-owned: `account` is server-stamped"));
 }
 
 test "emitTypedFiles skips collections without file fields" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const tags_col = schema.Collection{
         .id = "",
         .name = "tags",
@@ -1203,6 +1238,7 @@ test "emitTypedFiles skips collections without file fields" {
     };
     const cols = [_]schema.Collection{tags_col};
     var w: std.ArrayList(u8) = .empty;
+    defer w.deinit(a);
     try emitTypedFiles(a, &w, &cols);
     // No FileField union for a collection with no file fields.
     try std.testing.expect(!contains(w.items, "TagFileField"));

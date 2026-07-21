@@ -43,25 +43,35 @@ pub fn checkOperatorNames(alloc: std.mem.Allocator, cols: []const schema.Collect
 
 /// Append every generated type/const name a collection produces to `seen`, erroring
 /// on an invalid identifier, a reserved-name collision, or a duplicate.
-fn registerName(alloc: std.mem.Allocator, seen: *std.ArrayList([]const u8), name: []const u8, owner: []const u8, report: *GuardReport) GuardError!void {
+/// `msg_alloc` owns the caller-visible `report.message` (the single result that
+/// escapes on error). `scratch` owns the transient derived name appended to
+/// `seen`; the caller frees the whole scratch arena in one shot.
+fn registerName(msg_alloc: std.mem.Allocator, scratch: std.mem.Allocator, seen: *std.ArrayList([]const u8), name: []const u8, owner: []const u8, report: *GuardReport) GuardError!void {
     if (!ident.isValidTsIdent(name)) {
-        report.message = try std.fmt.allocPrint(alloc, "codegen: '{s}' (from collection '{s}') is not a valid TS identifier.", .{ name, owner });
+        report.message = try std.fmt.allocPrint(msg_alloc, "codegen: '{s}' (from collection '{s}') is not a valid TS identifier.", .{ name, owner });
         return GuardError.InvalidIdentifier;
     }
     if (ident.isReservedName(name)) {
-        report.message = try std.fmt.allocPrint(alloc, "codegen: generated name '{s}' (from collection '{s}') collides with a reserved typed-core name.", .{ name, owner });
+        report.message = try std.fmt.allocPrint(msg_alloc, "codegen: generated name '{s}' (from collection '{s}') collides with a reserved typed-core name.", .{ name, owner });
         return GuardError.NameCollision;
     }
     for (seen.items) |s| if (std.mem.eql(u8, s, name)) {
-        report.message = try std.fmt.allocPrint(alloc, "codegen: generated name '{s}' (from collection '{s}') collides with another generated name.", .{ name, owner });
+        report.message = try std.fmt.allocPrint(msg_alloc, "codegen: generated name '{s}' (from collection '{s}') collides with another generated name.", .{ name, owner });
         return GuardError.NameCollision;
     };
-    try seen.append(alloc, name);
+    try seen.append(scratch, name);
 }
 
 /// Guard 2: every collection/field name yields a valid TS identifier, and every
 /// generated type name is mutually unique + not reserved.
+///
+/// All derived names and the `seen` list are transient — allocated in an internal
+/// scratch arena and freed here. Only `report.message` (allocated with the
+/// caller's `alloc`) escapes, and only on the error paths.
 pub fn checkIdentifiers(alloc: std.mem.Allocator, cols: []const schema.Collection, report: *GuardReport) GuardError!void {
+    var scratch = std.heap.ArenaAllocator.init(alloc);
+    defer scratch.deinit();
+    const sa = scratch.allocator();
     var seen: std.ArrayList([]const u8) = .empty;
     for (cols) |c| {
         if (!ident.isValidTsIdent(c.name)) {
@@ -78,31 +88,31 @@ pub fn checkIdentifiers(alloc: std.mem.Allocator, cols: []const schema.Collectio
         // This covers the 9 per-collection type/const names plus every select-union
         // type name (one per select field, e.g. PostStatus), all of which are
         // exported and must be mutually unique and not reserved.
-        try registerName(alloc, &seen, try ident.recordName(alloc, c.name), c.name, report);
-        try registerName(alloc, &seen, try ident.whereName(alloc, c.name), c.name, report);
-        try registerName(alloc, &seen, try ident.createName(alloc, c.name), c.name, report);
-        try registerName(alloc, &seen, try ident.updateName(alloc, c.name), c.name, report);
-        try registerName(alloc, &seen, try ident.relationsName(alloc, c.name), c.name, report);
-        try registerName(alloc, &seen, try ident.expandName(alloc, c.name), c.name, report);
-        try registerName(alloc, &seen, try ident.fieldsName(alloc, c.name), c.name, report);
-        try registerName(alloc, &seen, try ident.serviceName(alloc, c.name), c.name, report);
-        try registerName(alloc, &seen, try ident.realtimeAliasName(alloc, c.name), c.name, report);
+        try registerName(alloc, sa, &seen, try ident.recordName(sa, c.name), c.name, report);
+        try registerName(alloc, sa, &seen, try ident.whereName(sa, c.name), c.name, report);
+        try registerName(alloc, sa, &seen, try ident.createName(sa, c.name), c.name, report);
+        try registerName(alloc, sa, &seen, try ident.updateName(sa, c.name), c.name, report);
+        try registerName(alloc, sa, &seen, try ident.relationsName(sa, c.name), c.name, report);
+        try registerName(alloc, sa, &seen, try ident.expandName(sa, c.name), c.name, report);
+        try registerName(alloc, sa, &seen, try ident.fieldsName(sa, c.name), c.name, report);
+        try registerName(alloc, sa, &seen, try ident.serviceName(sa, c.name), c.name, report);
+        try registerName(alloc, sa, &seen, try ident.realtimeAliasName(sa, c.name), c.name, report);
         // Register select-union names (e.g. PostStatus for posts.status).
         for (c.fields) |f| {
             if (f.fieldType() != .select) continue;
-            const union_name = try ts_type.selectUnionName(alloc, c.name, f.name);
-            const owner_ctx = try std.fmt.allocPrint(alloc, "{s} (field '{s}')", .{ c.name, f.name });
-            try registerName(alloc, &seen, union_name, owner_ctx, report);
+            const union_name = try ts_type.selectUnionName(sa, c.name, f.name);
+            const owner_ctx = try std.fmt.allocPrint(sa, "{s} (field '{s}')", .{ c.name, f.name });
+            try registerName(alloc, sa, &seen, union_name, owner_ctx, report);
         }
         // Register the per-collection metadata const (e.g. `postsMeta`), emitted at
         // module scope by emitMeta for EVERY collection.
-        try registerName(alloc, &seen, try ident.metaConst(alloc, c.name), c.name, report);
+        try registerName(alloc, sa, &seen, try ident.metaConst(sa, c.name), c.name, report);
         // Register the `<Rec>FileField` union, emitted by emitTypedFiles only for
         // collections with at least one SINGLE-value file field (mirror that gate
         // exactly so we don't register a name that isn't emitted).
         if (hasSingleFileFields(c)) {
-            const file_union = try std.fmt.allocPrint(alloc, "{s}FileField", .{try ident.recordName(alloc, c.name)});
-            try registerName(alloc, &seen, file_union, c.name, report);
+            const file_union = try std.fmt.allocPrint(sa, "{s}FileField", .{try ident.recordName(sa, c.name)});
+            try registerName(alloc, sa, &seen, file_union, c.name, report);
         }
     }
 }
@@ -123,9 +133,7 @@ fn rel(target: []const u8) schema.FieldOptions {
 }
 
 test "operator-name guard fires on a relation-target field named like an operator" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     // `tags` has a field literally named "in" (a where-operator key); `posts.labels`
     // relates to `tags`, so a nested where on labels would be ambiguous -> must error.
     const tag_fields = [_]schema.Field{.{ .id = "x", .name = "in", .options = .{ .text = .{} } }};
@@ -136,14 +144,13 @@ test "operator-name guard fires on a relation-target field named like an operato
     };
     var report = GuardReport{ .message = "" };
     try std.testing.expectError(GuardError.OperatorNameClash, checkOperatorNames(a, &cols, &report));
+    defer a.free(report.message);
     try std.testing.expect(std.mem.indexOf(u8, report.message, "tags") != null);
     try std.testing.expect(std.mem.indexOf(u8, report.message, "in") != null);
 }
 
 test "operator-name guard passes when no relation target has an operator-named field" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const tag_fields = [_]schema.Field{.{ .id = "x", .name = "label", .options = .{ .text = .{} } }};
     const post_fields = [_]schema.Field{.{ .id = "y", .name = "labels", .options = rel("tags") }};
     const cols = [_]schema.Collection{
@@ -155,9 +162,7 @@ test "operator-name guard passes when no relation target has an operator-named f
 }
 
 test "identifier guard fires on a generated-name collision across collections" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     // "profile" and "profiles" both yield record name "Profile" -> collision.
     const cols = [_]schema.Collection{
         .{ .id = "", .name = "profile", .fields = &.{} },
@@ -165,22 +170,20 @@ test "identifier guard fires on a generated-name collision across collections" {
     };
     var report = GuardReport{ .message = "" };
     try std.testing.expectError(GuardError.NameCollision, checkIdentifiers(a, &cols, &report));
+    defer a.free(report.message);
 }
 
 test "identifier guard fires on a reserved type-name collision" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     // a collection named "RelOpss" -> recordName "RelOps" collides with the import.
     const cols = [_]schema.Collection{.{ .id = "", .name = "RelOpss", .fields = &.{} }};
     var report = GuardReport{ .message = "" };
     try std.testing.expectError(GuardError.NameCollision, checkIdentifiers(a, &cols, &report));
+    defer a.free(report.message);
 }
 
 test "identifier guard passes for the blog shape" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const cols = [_]schema.Collection{
         .{ .id = "", .name = "users", .type = .auth, .fields = &.{} },
         .{ .id = "", .name = "posts", .fields = &.{} },
@@ -191,9 +194,7 @@ test "identifier guard passes for the blog shape" {
 }
 
 test "identifier guard passes for blog shape with select fields" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     // posts.status -> "PostStatus"; posts.visibility -> "PostVisibility"
     // Neither collides with any other generated name.
     const post_fields = [_]schema.Field{
@@ -210,9 +211,7 @@ test "identifier guard passes for blog shape with select fields" {
 }
 
 test "identifier guard fires when select-union name collides with another generated type name" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     // Collection "postStatuss" (plural) yields recordName "PostStatus".
     // Collection "posts" with a field "status" also yields selectUnionName "PostStatus".
     // -> NameCollision.
@@ -225,13 +224,12 @@ test "identifier guard fires when select-union name collides with another genera
     };
     var report = GuardReport{ .message = "" };
     try std.testing.expectError(GuardError.NameCollision, checkIdentifiers(a, &cols, &report));
+    defer a.free(report.message);
     try std.testing.expect(std.mem.indexOf(u8, report.message, "PostStatus") != null);
 }
 
 test "identifier guard fires when a <Rec>FileField union collides with another generated name" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     // "members" has a single-value file field -> emits union "MemberFileField".
     // "memberFileFields" -> recordName strips trailing 's' -> "MemberFileField".
     // -> NameCollision (only caught now that the union name is registered).
@@ -244,13 +242,12 @@ test "identifier guard fires when a <Rec>FileField union collides with another g
     };
     var report = GuardReport{ .message = "" };
     try std.testing.expectError(GuardError.NameCollision, checkIdentifiers(a, &cols, &report));
+    defer a.free(report.message);
     try std.testing.expect(std.mem.indexOf(u8, report.message, "MemberFileField") != null);
 }
 
 test "identifier guard fires when a <collection>Meta const collides with another generated name" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     // "Profile" -> metaConst "ProfileMeta".
     // "profileMetas" -> recordName strips trailing 's' -> "ProfileMeta".
     // -> NameCollision (only caught now that the meta const name is registered).
@@ -260,13 +257,12 @@ test "identifier guard fires when a <collection>Meta const collides with another
     };
     var report = GuardReport{ .message = "" };
     try std.testing.expectError(GuardError.NameCollision, checkIdentifiers(a, &cols, &report));
+    defer a.free(report.message);
     try std.testing.expect(std.mem.indexOf(u8, report.message, "ProfileMeta") != null);
 }
 
 test "identifier guard fires when select-union name collides with a reserved name" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     // Collection "expressions" -> recordName "Expression".
     // Field "rs" on that collection -> selectUnionName "ExpressionRs"? No, let's make
     // one that actually hits a reserved name: collection "exprs", field "s" ->
@@ -292,6 +288,7 @@ test "identifier guard fires when select-union name collides with a reserved nam
     };
     var report = GuardReport{ .message = "" };
     try std.testing.expectError(GuardError.NameCollision, checkIdentifiers(a, &cols, &report));
+    defer a.free(report.message);
     try std.testing.expect(std.mem.indexOf(u8, report.message, "StringOps") != null);
     try std.testing.expect(std.mem.indexOf(u8, report.message, "strings") != null);
 }

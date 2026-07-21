@@ -41,20 +41,24 @@ pub fn kindOf(f: schema.Field) PyKind {
 /// (same PascalCase derivation via the shared identifiers module).
 pub fn selectEnumName(alloc: std.mem.Allocator, col_name: []const u8, field_name: []const u8) ![]const u8 {
     const rec = try ident.recordName(alloc, col_name);
+    defer alloc.free(rec);
     const fp = try ident.pascal(alloc, field_name);
+    defer alloc.free(fp);
     return std.fmt.allocPrint(alloc, "{s}{s}", .{ rec, fp });
 }
 
 /// The scalar (element) Python type of a field — the value domain for a
 /// single element. `[]` multiplicity and nullability are applied by the
 /// caller (pyRecordTypeOf / payload builders).
+/// Always returns an owned slice (even for the fixed keywords), so callers have a single,
+/// consistent ownership contract to free — matching ts_type/dart_type.
 pub fn pyBaseTypeOf(alloc: std.mem.Allocator, col_name: []const u8, f: schema.Field) ![]const u8 {
     return switch (kindOf(f)) {
-        .string, .relation_id, .file_name => "str",
-        .integer => "int",
-        .float_ => "float",
-        .boolean => "bool",
-        .json => "Any",
+        .string, .relation_id, .file_name => alloc.dupe(u8, "str"),
+        .integer => alloc.dupe(u8, "int"),
+        .float_ => alloc.dupe(u8, "float"),
+        .boolean => alloc.dupe(u8, "bool"),
+        .json => alloc.dupe(u8, "Any"),
         .select_enum => try selectEnumName(alloc, col_name, f.name),
     };
 }
@@ -66,13 +70,18 @@ pub fn pyBaseTypeOf(alloc: std.mem.Allocator, col_name: []const u8, f: schema.Fi
 /// - single json      -> `Any` (already inclusive of None)
 /// - everything else  -> `Base` (non-null; empty/zero/false default on read)
 pub fn pyRecordTypeOf(alloc: std.mem.Allocator, col_name: []const u8, f: schema.Field) ![]const u8 {
+    // `base` is now always owned. When we wrap it (multi / single-select) we free the
+    // intermediate and return the wrapper; otherwise `base` IS the single owned result.
     const base = try pyBaseTypeOf(alloc, col_name, f);
-    if (f.isMultiValue()) return std.fmt.allocPrint(alloc, "list[{s}]", .{base});
-    return switch (kindOf(f)) {
-        .select_enum => std.fmt.allocPrint(alloc, "{s} | None", .{base}),
-        .json => "Any",
-        else => base,
-    };
+    if (f.isMultiValue()) {
+        defer alloc.free(base);
+        return std.fmt.allocPrint(alloc, "list[{s}]", .{base});
+    }
+    if (kindOf(f) == .select_enum) {
+        defer alloc.free(base);
+        return std.fmt.allocPrint(alloc, "{s} | None", .{base});
+    }
+    return base; // json ("Any") and all scalars: base is already the owned result
 }
 
 /// The Python `zigbase.typed.FieldType` enum MEMBER name for a field's kind
@@ -104,28 +113,33 @@ fn fieldT(comptime opts: schema.FieldOptions) schema.Field {
     return .{ .id = "x", .name = "f", .options = opts };
 }
 
+// Assert a type-mapper result and free it. Every *_type mapper is now always-owned
+// (the fixed keywords are duped too), so there is one ownership contract: free the
+// result. Running under std.testing.allocator (no masking arena) is real leak detection.
+fn eqType(al: std.mem.Allocator, expected: []const u8, got: anyerror![]const u8) !void {
+    const g = try got;
+    defer al.free(g); // every *_type mapper is now always-owned
+    try std.testing.expectEqualStrings(expected, g);
+}
+
 test "scalar record types" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    try std.testing.expectEqualStrings("str", try pyRecordTypeOf(a, "posts", fieldT(.{ .text = .{} })));
-    try std.testing.expectEqualStrings("str", try pyRecordTypeOf(a, "posts", fieldT(.{ .date = .{} })));
-    try std.testing.expectEqualStrings("float", try pyRecordTypeOf(a, "posts", fieldT(.{ .number = .{} })));
-    try std.testing.expectEqualStrings("int", try pyRecordTypeOf(a, "posts", fieldT(.{ .number = .{ .mode = .int } })));
-    try std.testing.expectEqualStrings("float", try pyRecordTypeOf(a, "posts", fieldT(.{ .number = .{ .mode = .fixed, .scale = 2 } })));
-    try std.testing.expectEqualStrings("bool", try pyRecordTypeOf(a, "posts", fieldT(.{ .bool = .{} })));
-    try std.testing.expectEqualStrings("Any", try pyRecordTypeOf(a, "posts", fieldT(.{ .json = .{} })));
+    const a = std.testing.allocator;
+    try eqType(a, "str", pyRecordTypeOf(a, "posts", fieldT(.{ .text = .{} })));
+    try eqType(a, "str", pyRecordTypeOf(a, "posts", fieldT(.{ .date = .{} })));
+    try eqType(a, "float", pyRecordTypeOf(a, "posts", fieldT(.{ .number = .{} })));
+    try eqType(a, "int", pyRecordTypeOf(a, "posts", fieldT(.{ .number = .{ .mode = .int } })));
+    try eqType(a, "float", pyRecordTypeOf(a, "posts", fieldT(.{ .number = .{ .mode = .fixed, .scale = 2 } })));
+    try eqType(a, "bool", pyRecordTypeOf(a, "posts", fieldT(.{ .bool = .{} })));
+    try eqType(a, "Any", pyRecordTypeOf(a, "posts", fieldT(.{ .json = .{} })));
 }
 
 test "select record type is nullable enum; multi is a list" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const single = schema.Field{ .id = "x", .name = "status", .options = .{ .select = .{ .values = &.{ "draft", "published" }, .maxSelect = 1 } } };
     const multi = schema.Field{ .id = "x", .name = "status", .options = .{ .select = .{ .values = &.{ "a", "b" }, .maxSelect = 3 } } };
-    try std.testing.expectEqualStrings("PostStatus | None", try pyRecordTypeOf(a, "posts", single));
-    try std.testing.expectEqualStrings("list[PostStatus]", try pyRecordTypeOf(a, "posts", multi));
-    try std.testing.expectEqualStrings("PostStatus", try pyBaseTypeOf(a, "posts", multi));
+    try eqType(a, "PostStatus | None", pyRecordTypeOf(a, "posts", single));
+    try eqType(a, "list[PostStatus]", pyRecordTypeOf(a, "posts", multi));
+    try eqType(a, "PostStatus", pyBaseTypeOf(a, "posts", multi));
 }
 
 test "fieldTypeEnum maps bool to BOOLEAN (screaming-snake members)" {
@@ -135,13 +149,11 @@ test "fieldTypeEnum maps bool to BOOLEAN (screaming-snake members)" {
 }
 
 test "relation / file record types" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const rel1 = schema.Field{ .id = "x", .name = "author", .options = .{ .relation = .{ .targetCollectionId = "users", .maxSelect = 1 } } };
     const relN = schema.Field{ .id = "x", .name = "tags", .options = .{ .relation = .{ .targetCollectionId = "tags", .maxSelect = 9 } } };
     const file1 = schema.Field{ .id = "x", .name = "cover", .options = .{ .file = .{ .maxSelect = 1 } } };
-    try std.testing.expectEqualStrings("str", try pyRecordTypeOf(a, "posts", rel1));
-    try std.testing.expectEqualStrings("list[str]", try pyRecordTypeOf(a, "posts", relN));
-    try std.testing.expectEqualStrings("str", try pyRecordTypeOf(a, "posts", file1));
+    try eqType(a, "str", pyRecordTypeOf(a, "posts", rel1));
+    try eqType(a, "list[str]", pyRecordTypeOf(a, "posts", relN));
+    try eqType(a, "str", pyRecordTypeOf(a, "posts", file1));
 }
