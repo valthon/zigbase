@@ -109,6 +109,10 @@ fn columnList(alloc: std.mem.Allocator, col: schema.Collection) ![]u8 {
 
 fn rowToObject(alloc: std.mem.Allocator, stmt: *db.Stmt, col: schema.Collection) !std.json.Value {
     var obj: std.json.ObjectMap = .empty;
+    // Pre-size for id/created/updated + every field so the map backing is allocated once
+    // instead of reallocating as it grows per `put` — fewer, larger allocations on the read
+    // hot path (hidden fields are a slight over-estimate, which only wastes a little capacity).
+    try obj.ensureTotalCapacity(alloc, 3 + col.fields.len);
     try obj.put(alloc, "id", .{ .string = try alloc.dupe(u8, stmt.columnText(0)) });
     try obj.put(alloc, "created", .{ .string = try alloc.dupe(u8, stmt.columnText(1)) });
     try obj.put(alloc, "updated", .{ .string = try alloc.dupe(u8, stmt.columnText(2)) });
@@ -123,6 +127,10 @@ fn rowToObject(alloc: std.mem.Allocator, stmt: *db.Stmt, col: schema.Collection)
 /// (NEVER decrypted) instead of plaintext. Every other field reads identically. Backs `getAtRest`.
 fn rowToObjectAtRest(alloc: std.mem.Allocator, stmt: *db.Stmt, col: schema.Collection) !std.json.Value {
     var obj: std.json.ObjectMap = .empty;
+    // Pre-size for id/created/updated + every field so the map backing is allocated once
+    // instead of reallocating as it grows per `put` — fewer, larger allocations on the read
+    // hot path (hidden fields are a slight over-estimate, which only wastes a little capacity).
+    try obj.ensureTotalCapacity(alloc, 3 + col.fields.len);
     try obj.put(alloc, "id", .{ .string = try alloc.dupe(u8, stmt.columnText(0)) });
     try obj.put(alloc, "created", .{ .string = try alloc.dupe(u8, stmt.columnText(1)) });
     try obj.put(alloc, "updated", .{ .string = try alloc.dupe(u8, stmt.columnText(2)) });
@@ -2177,6 +2185,7 @@ pub fn list(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, q: L
         try pst.bindInt(idx, @as(i64, per) + 1); // fetch limit+1 to detect "has more"
 
         var fetched: std.ArrayList(std.json.Value) = .empty;
+        try fetched.ensureTotalCapacity(alloc, @as(usize, per) + 1); // fetch limit+1 — size once
         while (try pst.step()) try fetched.append(alloc, try rowToObject(alloc, &pst, col));
 
         const has_more = fetched.items.len > per;
@@ -2242,6 +2251,7 @@ pub fn list(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, q: L
     try pst.bindInt(after + 1, offset);
 
     var items: std.ArrayList(std.json.Value) = .empty;
+    try items.ensureTotalCapacity(alloc, per); // at most `per` rows (LIMIT) — size once, no growth
     while (try pst.step()) try items.append(alloc, try rowToObject(alloc, &pst, col));
     const kept_items = try items.toOwnedSlice(alloc);
     const total_pages_rows: i64 = @as(i64, (page)) * @as(i64, per);
