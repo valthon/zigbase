@@ -464,12 +464,27 @@ pub fn authenticate(io: std.Io, alloc: std.mem.Allocator, app: anytype, ctx: *co
     const from_cookie = bearer == null;
     const token = bearer orelse (ctx.cookie("zb_auth") orelse return null);
 
-    const claims = jwt.peekClaims(alloc, token) catch return null;
-    if (claims.type != .auth) return null;
-    if (from_cookie and isUnsafe(ctx.method)) {
-        if (ctx.csrf_token.len == 0 or claims.csrf.len == 0) return null;
-        if (!ctEqlSlices(claims.csrf, ctx.csrf_token)) return null;
+    // Pre-verify gate: token TYPE and (on the cookie path) CSRF, read from an UNVERIFIED
+    // peek. Contract-3 (caller-buffer): the claims borrow the stack `scratch`, and the whole
+    // gate is deliberately SCOPED to a block so both go out of scope before `verifyToken`.
+    // That makes the borrow's safety local and compiler-enforced: nothing below can reference
+    // these claims — in particular they cannot be threaded into `verifyToken` to save its
+    // re-parse, which is the one change that would let a stack borrow escape into the returned
+    // `Authed`. An over-large token was already rejected inside `peekClaims`.
+    {
+        // align(8) so the FixedBufferAllocator wastes no bytes aligning its first allocation
+        // (Claims holds i64/slice fields needing 8-byte alignment), which also makes the
+        // scratch_size worst-case deterministic rather than stack-address dependent.
+        var scratch: [jwt.scratch_size]u8 align(8) = undefined;
+        const claims = jwt.peekClaimsInto(&scratch, token) catch return null;
+        if (claims.type != .auth) return null;
+        if (from_cookie and isUnsafe(ctx.method)) {
+            if (ctx.csrf_token.len == 0 or claims.csrf.len == 0) return null;
+            if (!ctEqlSlices(claims.csrf, ctx.csrf_token)) return null;
+        }
     }
+    // The returned `Authed` borrows entirely from `v` (verifyToken's own arena parse), never
+    // from the scratch above — which is now out of scope.
     const v = verifyToken(alloc, app, conn, token) orelse return null;
     return Authed{ .record = v.record, .collection = v.collection, .is_superuser = v.is_superuser, .sid = v.sid };
 }

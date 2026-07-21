@@ -325,9 +325,17 @@ pub fn deleteSessionReturningCreated(alloc: std.mem.Allocator, conn: *db.Db, sid
 /// `created` = the true session start (not the last refresh), while leaving the new row's
 /// freshly-set `lastSeen` = now. `new_token` is the just-issued JWT (its `sid` names the new
 /// row). No-op when `old_created` is null or the token carries no `sid`. Writer required.
-pub fn carrySessionCreated(alloc: std.mem.Allocator, conn: *db.Db, new_token: []const u8, old_created: ?[]const u8) !void {
+pub fn carrySessionCreated(conn: *db.Db, new_token: []const u8, old_created: ?[]const u8) !void {
     const oc = old_created orelse return;
-    const claims = jwt.peekClaims(alloc, new_token) catch return;
+    // Contract-3 (caller-buffer): `ns` (the token's sid) is bound into the UPDATE with
+    // SQLITE_TRANSIENT, which copies it immediately, and nothing else escapes — the function
+    // returns void. So a stack buffer suffices and the allocator parameter is gone. An
+    // over-large token was already rejected inside `peekClaims`.
+    // align(8) so the FixedBufferAllocator wastes no bytes aligning its first allocation
+    // (Claims holds i64/slice fields needing 8-byte alignment), which also makes the
+    // scratch_size worst-case deterministic rather than stack-address dependent.
+    var scratch: [jwt.scratch_size]u8 align(8) = undefined;
+    const claims = jwt.peekClaimsInto(&scratch, new_token) catch return;
     const ns = claims.sid orelse return;
     if (ns.len == 0) return;
     var st = try prep(conn, "UPDATE \"_sessions\" SET \"created\" = ?2 WHERE \"id\" = ?1;");
