@@ -39,7 +39,7 @@ fn section(alloc: std.mem.Allocator, w: *W, title: []const u8) !void {
 /// in Python — a documented follow-up, same as Dart. `in_repo` is unused
 /// (the snapshot lives inside the client package, so the package import works).
 pub fn generate(
-    alloc: std.mem.Allocator,
+    gpa: std.mem.Allocator,
     cols: []const schema.Collection,
     comptime routes: []const events.RouteMeta,
     comptime custom_auth: []const events.CustomAuthMeta,
@@ -56,6 +56,14 @@ pub fn generate(
     _ = experiments;
     _ = in_repo;
     _ = api_prefix;
+
+    // All the fragment-building below is scratch: every allocPrint/emit call
+    // appends into `w` and never frees its intermediate. Rather than thread a
+    // free through each (many live in cross-file emit_python.zig/guards.zig),
+    // own the scratch here in an arena and hand the caller a single owned copy.
+    var scratch_state = std.heap.ArenaAllocator.init(gpa);
+    defer scratch_state.deinit();
+    const alloc = scratch_state.allocator();
 
     var report = guards.GuardReport{ .message = "" };
     try guards.checkOperatorNames(alloc, cols, &report);
@@ -128,13 +136,11 @@ pub fn generate(
     try emit.emitClient(alloc, &w, cols, client_name, auth_collection);
     try emit.emitAsyncClient(alloc, &w, cols, client_name, auth_collection);
 
-    return w.toOwnedSlice(alloc);
+    return gpa.dupe(u8, try w.toOwnedSlice(alloc));
 }
 
 test "generate emits a valid-looking Python client for a mini blog" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const cols = [_]schema.Collection{
         .{ .id = "", .name = "users", .type = .auth, .fields = &.{
             .{ .id = "", .name = "displayName", .options = .{ .text = .{} } },
@@ -148,6 +154,7 @@ test "generate emits a valid-looking Python client for a mini blog" {
         } },
     };
     const out = try generate(a, &cols, &.{}, &.{}, &.{}, &.{}, true, "users", "ZbClient", "/api");
+    defer a.free(out);
 
     // Byte-exact fragment: the enum class in full (Step 1's "byte-exact
     // expected fragment for one small collection").
@@ -184,9 +191,7 @@ test "generate emits a valid-looking Python client for a mini blog" {
 }
 
 test "Python keywords are sanitized (wire keys unchanged)" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const cols = [_]schema.Collection{
         .{ .id = "", .name = "users", .type = .auth, .fields = &.{} },
         // `class`/`import` are Python keywords; `expand` collides with the
@@ -201,6 +206,7 @@ test "Python keywords are sanitized (wire keys unchanged)" {
         } },
     };
     const out = try generate(a, &cols, &.{}, &.{}, &.{}, &.{}, true, "users", "ZbClient", "/api");
+    defer a.free(out);
     // Record members: keyword-sanitized Python identifier, wire key untouched.
     try std.testing.expect(std.mem.indexOf(u8, out, "class_: str") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "import_: int") != null);
@@ -217,9 +223,7 @@ test "Python keywords are sanitized (wire keys unchanged)" {
 }
 
 test "generate emits fields builder, meta, service, realtime and client fragments (byte-exact)" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const cols = [_]schema.Collection{
         .{ .id = "", .name = "users", .type = .auth, .fields = &.{
             .{ .id = "", .name = "displayName", .options = .{ .text = .{} } },
@@ -233,6 +237,7 @@ test "generate emits fields builder, meta, service, realtime and client fragment
         } },
     };
     const out = try generate(a, &cols, &.{}, &.{}, &.{}, &.{}, true, "users", "ZbClient", "/api");
+    defer a.free(out);
 
     // Byte-exact fragment: the fluent fields builder for `posts` in full —
     // covers every FieldExpr subclass (string/enum/num/relation) plus the
@@ -350,9 +355,7 @@ test "generate emits fields builder, meta, service, realtime and client fragment
 }
 
 test "select values differing only in case collide into one Python enum member — a generation error" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     // "active" and "ACTIVE" both uppercase to the enum member ACTIVE — the
     // second would silently overwrite the first's `= "active"` line with
     // `= "ACTIVE"` if generation didn't dedup-check before emitting.
@@ -378,9 +381,7 @@ test "file_url's Mapping branch uses .get() so an unrequested file field's key m
     // {...}` dict for a caller's Mapping that only carries `cover` (e.g. a
     // partial realtime payload), even though only `cover` is ever selected
     // via `[field]`.
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const cols = [_]schema.Collection{
         .{ .id = "", .name = "posts", .fields = &.{
             .{ .id = "", .name = "cover", .options = .{ .file = .{ .maxSelect = 1 } } },
@@ -388,6 +389,7 @@ test "file_url's Mapping branch uses .get() so an unrequested file field's key m
         } },
     };
     const out = try generate(a, &cols, &.{}, &.{}, &.{}, &.{}, true, "", "ZbClient", "/api");
+    defer a.free(out);
 
     try std.testing.expect(std.mem.indexOf(u8, out, "class PostFileField(Enum):") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "    COVER = \"cover\"") != null);
@@ -409,9 +411,7 @@ test "file_url's Mapping branch uses .get() so an unrequested file field's key m
 }
 
 test "two schema names mapping to one Python identifier is a generation error" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const cols = [_]schema.Collection{
         .{ .id = "", .name = "posts", .fields = &.{
             .{ .id = "", .name = "class", .options = .{ .text = .{} } },

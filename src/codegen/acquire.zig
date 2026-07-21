@@ -87,6 +87,13 @@ pub fn resolveRelationTargets(alloc: std.mem.Allocator, cols: []schema.Collectio
     }
 }
 
+// contract-4 (arena-scoped): buildCollection returns a schema.Collection build-lifetime
+// graph — a duped name plus a schema.fieldsFromJson-allocated []Field whose elements carry
+// their own inner allocations (names, select-value arrays, relation targets), plus indexes
+// and options. schema.zig exposes no deep-free / freeCollection API, so this graph cannot be
+// freed piecewise under std.testing.allocator. (The auth path additionally orphans the
+// filtered-out system fields' inner strings and the all_fields backing array — intermediates
+// the arena reclaims.) Converting requires a schema.freeCollections() deep-free (cross-file).
 test "buildCollection: base collection keeps user fields and parses types" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -110,6 +117,8 @@ test "buildCollection: base collection keeps user fields and parses types" {
     try std.testing.expectEqual(schema.FieldType.number, c.fields[1].fieldType());
 }
 
+// contract-4 (arena-scoped): same as above — buildCollection returns a schema.Collection
+// build-lifetime graph with no piecewise/deep free API in schema.zig.
 test "buildCollection: auth collection strips injected system fields" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

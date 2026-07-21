@@ -31,7 +31,7 @@ fn section(alloc: std.mem.Allocator, w: *W, title: []const u8) !void {
 /// yet emitted in Dart — a documented follow-up. `in_repo` is unused for Dart
 /// (the snapshot lives inside the client package, so the package import works).
 pub fn generate(
-    alloc: std.mem.Allocator,
+    gpa: std.mem.Allocator,
     cols: []const schema.Collection,
     comptime routes: []const events.RouteMeta,
     comptime custom_auth: []const events.CustomAuthMeta,
@@ -48,6 +48,15 @@ pub fn generate(
     _ = experiments;
     _ = in_repo;
     _ = api_prefix;
+
+    // Contract-1 (matches gen_python/gen_kotlin): the emit_dart/emit/guards helpers append
+    // many allocPrint temporaries into `alloc` and never free through each (they live in
+    // cross-file helpers), so own the scratch here in an arena and hand the caller a single
+    // owned copy. `report.message` is set by a failing guard but never read here, so it too
+    // lives in the arena and is reclaimed on return.
+    var scratch_state = std.heap.ArenaAllocator.init(gpa);
+    defer scratch_state.deinit();
+    const alloc = scratch_state.allocator();
 
     var report = guards.GuardReport{ .message = "" };
     try guards.checkOperatorNames(alloc, cols, &report);
@@ -103,13 +112,18 @@ pub fn generate(
     try section(alloc, &w, "Client");
     try emit.emitClient(alloc, &w, cols, client_name, auth_collection);
 
-    return w.toOwnedSlice(alloc);
+    return gpa.dupe(u8, try w.toOwnedSlice(alloc));
 }
 
+// contract-4 (arena-scoped): generate() is a build-time generator that returns one owned
+// string but appends many unfreed intermediates into `a`. Its own `section()`/header
+// allocPrints and — pervasively — every emit_dart.zig helper (e.g. `const s =
+// allocPrint(...); w.appendSlice(a, s);` with no free, throughout the file) leak temporaries
+// into the arena by design. guards.checkOperatorNames/checkIdentifiers likewise allocate into
+// `a`. Freeing the returned slice alone is insufficient; running under std.testing.allocator
+// would require emit_dart.zig + guards.zig (other agents' files) to become leak-free first.
 test "generate emits a valid-looking Dart client for a mini blog" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const cols = [_]schema.Collection{
         .{ .id = "", .name = "users", .type = .auth, .fields = &.{
             .{ .id = "", .name = "displayName", .options = .{ .text = .{} } },
@@ -123,6 +137,7 @@ test "generate emits a valid-looking Dart client for a mini blog" {
         } },
     };
     const out = try generate(a, &cols, &.{}, &.{}, &.{}, &.{}, true, "users", "ZbClient", "/api");
+    defer a.free(out);
     // Spot-check the key generated shapes.
     try std.testing.expect(std.mem.indexOf(u8, out, "class Post {") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "enum PostStatus {") != null);
@@ -138,9 +153,7 @@ test "generate emits a valid-looking Dart client for a mini blog" {
 }
 
 test "Dart reserved words and member collisions are sanitized (wire keys unchanged)" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const cols = [_]schema.Collection{
         .{ .id = "", .name = "users", .type = .auth, .fields = &.{} },
         // `raw` collides with the ZbClient member; fields named `default`/`in`
@@ -155,6 +168,7 @@ test "Dart reserved words and member collisions are sanitized (wire keys unchang
         } },
     };
     const out = try generate(a, &cols, &.{}, &.{}, &.{}, &.{}, true, "users", "ZbClient", "/api");
+    defer a.free(out);
     // Record members: keyword-sanitized Dart identifier, wire key untouched.
     try std.testing.expect(std.mem.indexOf(u8, out, "default_ = coerceString(r['default'])") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "in_ = coerceInt(r['in'])") != null);
@@ -176,9 +190,9 @@ test "Dart reserved words and member collisions are sanitized (wire keys unchang
 }
 
 test "two schema names mapping to one Dart identifier is a generation error" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    // generate() is contract-1: on error its internal arena reclaims every partial-emission
+    // temporary, so a leak-detecting allocator here is safe and asserts exactly that.
+    const a = std.testing.allocator;
     const cols = [_]schema.Collection{
         .{ .id = "", .name = "posts", .fields = &.{
             .{ .id = "", .name = "default", .options = .{ .text = .{} } },

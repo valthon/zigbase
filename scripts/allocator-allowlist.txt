@@ -34,23 +34,10 @@ src/captcha.zig	4	contract-4: verify tests hold an arena-scoped HttpClient respo
 src/clock_sql.zig	2	PRE-EXISTING: not yet migrated to the ownership contracts
 src/clock_test.zig	1	PRE-EXISTING: not yet migrated to the ownership contracts
 src/clock_vfs.zig	2	PRE-EXISTING: not yet migrated to the ownership contracts
-src/codegen/acquire.zig	2	PRE-EXISTING: not yet migrated to the ownership contracts
-src/codegen/acquire_datadir.zig	1	PRE-EXISTING: not yet migrated to the ownership contracts
-src/codegen/acquire_http.zig	2	PRE-EXISTING: not yet migrated to the ownership contracts
-src/codegen/dart_type.zig	3	PRE-EXISTING: not yet migrated to the ownership contracts
-src/codegen/emit.zig	20	PRE-EXISTING: not yet migrated to the ownership contracts
-src/codegen/gen_client.zig	17	PRE-EXISTING: not yet migrated to the ownership contracts
-src/codegen/gen_dart.zig	3	PRE-EXISTING: not yet migrated to the ownership contracts
-src/codegen/gen_kotlin.zig	9	PRE-EXISTING: not yet migrated to the ownership contracts
-src/codegen/gen_python.zig	6	PRE-EXISTING: not yet migrated to the ownership contracts
-src/codegen/gen_test_root.zig	1	PRE-EXISTING: not yet migrated to the ownership contracts
-src/codegen/guards.zig	10	PRE-EXISTING: not yet migrated to the ownership contracts
-src/codegen/identifiers.zig	4	PRE-EXISTING: not yet migrated to the ownership contracts
-src/codegen/kotlin_type.zig	3	PRE-EXISTING: not yet migrated to the ownership contracts
-src/codegen/python_type.zig	3	PRE-EXISTING: not yet migrated to the ownership contracts
-src/codegen/schema_query.zig	2	PRE-EXISTING: not yet migrated to the ownership contracts
-src/codegen/ts_type.zig	4	PRE-EXISTING: not yet migrated to the ownership contracts
-src/codegen/typegen_cli.zig	2	PRE-EXISTING: not yet migrated to the ownership contracts
+src/codegen/acquire.zig	2	contract-4: holds a schema.Collection graph; schema.zig has no deep-free API
+src/codegen/acquire_datadir.zig	1	contract-4: holds a schema.Collection graph; schema.zig has no deep-free API
+src/codegen/acquire_http.zig	2	contract-4: holds a schema.Collection graph; schema.zig has no deep-free API
+src/codegen/typegen_cli.zig	1	contract-4: holds a schema.Collection graph; schema.zig has no deep-free API
 src/colcache.zig	6	PRE-EXISTING: not yet migrated to the ownership contracts
 src/collections.zig	10	PRE-EXISTING: not yet migrated to the ownership contracts
 src/ctx.zig	5	PRE-EXISTING: not yet migrated to the ownership contracts

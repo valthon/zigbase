@@ -144,6 +144,14 @@ test "looksUrlLike: redacts URL/credential targets, allows plain paths" {
     try std.testing.expect(!looksUrlLike(""));
 }
 
+// contract-4 (arena-scoped): acquireFromDb returns a []schema.Collection build-lifetime
+// graph (each Collection carries a schema.fieldsFromJson-allocated []Field with inner
+// allocations) for which schema.zig exposes no deep-free API — it cannot be freed piecewise
+// under std.testing.allocator. It also relies on the arena to reclaim intermediates the
+// function itself does not free: buildIdNameMap's duped id/name entries (map.deinit frees the
+// buckets, not the duped keys/values) and the per-row RawRow JSON dupes (consumed by
+// buildCollection's parsers, then discarded). Converting requires a schema.freeCollections()
+// deep-free (cross-file) plus freeing those intermediates.
 test "acquireFromDb returns user collections (sorted, system excluded, auth stripped)" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

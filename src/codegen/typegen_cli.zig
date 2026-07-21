@@ -137,6 +137,11 @@ fn acquireHttp(alloc: std.mem.Allocator, io: std.Io, opts: Options) ![]schema.Co
 }
 
 test "equivalence: data-dir runtime path reproduces the comptime collection surface" {
+    // contract-4 (arena-scoped): `acquireFromDb` returns a `schema.Collection` graph
+    // (duped names + a `[]Field` with inner allocations) and schema.zig has no piecewise
+    // or deep-free API, so the graph cannot be released under a leak-detecting allocator.
+    // (gen_client.generate is now contract-1, so it is no longer a reason — acquireFromDb
+    // alone keeps this test arena-scoped until a schema deep-free exists.)
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -186,16 +191,17 @@ test "checkOrWrite: write path creates file" {
     // Only covers the write (check=false) path to avoid triggering std.log.err
     // from the Stale/CheckReadFailed branches (which the Zig test runner counts
     // as failures). Stale detection is covered by the checkContent test above.
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const io = std.testing.io;
     const dir = try std.fmt.allocPrint(a, "zig-cache/typegen-test-{d}", .{std.testing.random_seed});
+    defer a.free(dir);
     std.Io.Dir.cwd().createDirPath(io, dir) catch {};
     const path = try std.fmt.allocPrint(a, "{s}/out.ts", .{dir});
+    defer a.free(path);
 
     try checkOrWrite(io, path, "hello", false); // writes
     // Verify the file was written by reading it back with the std.testing.io.
     const readback = try std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(1024));
+    defer a.free(readback);
     try std.testing.expectEqualStrings("hello", readback);
 }

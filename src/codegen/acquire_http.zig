@@ -126,6 +126,13 @@ fn extractToken(alloc: std.mem.Allocator, body: []const u8) ![]const u8 {
     return alloc.dupe(u8, tv.string);
 }
 
+// contract-4 (arena-scoped): parseCollections returns a []schema.Collection build-lifetime
+// graph (buildCollection dupes names and calls schema.fieldsFromJson, which allocates a []Field
+// with inner allocations) for which schema.zig exposes no deep-free API — it cannot be freed
+// piecewise under std.testing.allocator. The intermediate std.json.Parsed and the id_to_name
+// map ARE freed (defer deinit); the arena additionally reclaims the map's duped key/value
+// entries and the valueToJson re-stringified inputs. Converting requires a
+// schema.freeCollections() deep-free (cross-file).
 test "parseCollections: parses /api/collections array, strips auth fields, sorts" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -151,6 +158,8 @@ test "parseCollections: parses /api/collections array, strips auth fields, sorts
     try std.testing.expectEqualStrings("displayName", cols[1].fields[0].name);
 }
 
+// contract-4 (arena-scoped): same as above — parseCollections returns a []schema.Collection
+// build-lifetime graph with no piecewise/deep free API in schema.zig.
 test "parseCollections: resolves UUID targetCollectionId to collection name" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

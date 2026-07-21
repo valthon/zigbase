@@ -53,6 +53,7 @@ pub fn appendVisibleAuthFields(alloc: std.mem.Allocator, list: *std.ArrayList(sc
 /// deduplicated (they are always appended at the end).
 pub fn recordFields(alloc: std.mem.Allocator, c: schema.Collection) ![]schema.Field {
     var list: std.ArrayList(schema.Field) = .empty;
+    errdefer list.deinit(alloc); // free the backing array if an append OOMs mid-build
     try list.append(alloc, .{ .id = "_id", .name = "id", .options = .{ .text = .{} } });
     if (c.type == .auth) try appendVisibleAuthFields(alloc, &list);
     for (c.fields) |f| {
@@ -121,10 +122,9 @@ pub fn checkDuplicateIdents(
 }
 
 test "appendVisibleAuthFields is exactly the non-hidden subset of authSystemFields" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     var list: std.ArrayList(schema.Field) = .empty;
+    defer list.deinit(a);
     try appendVisibleAuthFields(a, &list);
     // The visible auth triple, in schema order, with the canonical stable ids
     // and options — regression guard for the drift hazard this module removes.
@@ -140,9 +140,7 @@ test "appendVisibleAuthFields is exactly the non-hidden subset of authSystemFiel
 }
 
 test "recordFields ordering: id, auth visible, user, created, updated" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const c = schema.Collection{
         .id = "",
         .name = "users",
@@ -154,6 +152,7 @@ test "recordFields ordering: id, auth visible, user, created, updated" {
         },
     };
     const fields = try recordFields(a, c);
+    defer a.free(fields);
     try std.testing.expectEqualStrings("id", fields[0].name);
     try std.testing.expectEqualStrings("email", fields[1].name);
     try std.testing.expectEqualStrings("username", fields[2].name);
