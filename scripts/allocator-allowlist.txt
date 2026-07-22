@@ -95,7 +95,7 @@ src/rewrap.zig	9	PRE-EXISTING: not yet migrated to the ownership contracts
 src/route_types.zig	3	PRE-EXISTING: not yet migrated to the ownership contracts
 src/router.zig	5	PRE-EXISTING: not yet migrated to the ownership contracts
 src/rules.zig	1	PRE-EXISTING: not yet migrated to the ownership contracts
-src/schema.zig	19	PRE-EXISTING: not yet migrated to the ownership contracts
+src/schema.zig	21	PRE-EXISTING: not yet migrated to the ownership contracts
 src/schema_dump.zig	3	PRE-EXISTING: not yet migrated to the ownership contracts
 src/search/fts.zig	2	PRE-EXISTING: not yet migrated to the ownership contracts
 src/search/vector.zig	5	PRE-EXISTING: not yet migrated to the ownership contracts
