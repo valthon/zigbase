@@ -618,3 +618,33 @@ production callers, so bounding only them would have left every real path unboun
 
 **Not a full DoS fix on its own.** This bounds per-token amplification, not request volume;
 the rate limiter (F8) and body-size limits remain the controls for that.
+
+### F14 — Relationship abilities bypassed on realtime delivery (FIXED)
+
+**Where.** `src/realtime/hub.zig` (`shouldDeliver`).
+
+**Description.** A collection's row-level visibility can be narrowed below its access *rule*
+by a relationship **ability** (`App(.{ .abilities = .{ .<col> = .{ .view = … } } })`) — the
+documented guarantee (`docs/abilities.md`) is that effective visibility is `(rule) AND
+(ability) AND (tenant)`, and that this "includes realtime delivery." The REST list/read paths
+enforce it through `policy.matchesRule`, which AND-s the compiled ability predicate into the
+guard stack.
+
+`shouldDeliver` did not. Its fast paths early-returned "deliver" whenever the access rule was
+`@public` (or a delete was rule-allowed) **and** `tenancy.scopeApplies` was false — consulting
+only the *tenant* constraint, never the *ability*. So a collection that is `@public` for the
+view rule but visibility-narrowed by a `view` ability delivered every created/updated/deleted
+record to **every** subscriber over WebSocket/SSE, regardless of whether the subscriber held a
+qualifying membership. A non-member subscribing to the collection received rows it could never
+read over REST — an authorization bypass on the realtime channel.
+
+**Fix.** Introduced `policy.rowConstrained(col, action, rctx)` =
+`abilities.abilityApplies(abilityFor(col, action), rctx) or tenancy.scopeApplies(col, rctx)`
+— the exact condition `policy.decide` already uses to decide whether a row needs per-record
+checking. `shouldDeliver` now gates its fast-path early-returns on `rowConstrained` instead of
+`scopeApplies` alone, so any ability-constrained collection falls through to the per-record
+`matchesRule` evaluation (which composes the ability predicate) exactly like the REST path.
+Deriving both call sites from one shared predicate makes the realtime and REST authorization
+drift-proof: a future ability kind wires into both at once. Regression test in
+`src/realtime/hub.zig` ("@public viewRule + view ability: create is NOT delivered to a
+non-member") proves the empty-qualifying-set case is denied and superusers still receive it.
