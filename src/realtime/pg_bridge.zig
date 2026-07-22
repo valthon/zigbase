@@ -120,6 +120,7 @@ pub fn encode(
     token: ?[]const u8,
 ) ![]u8 {
     var o: std.json.ObjectMap = .empty;
+    defer o.deinit(a); // scratch: valueAlloc reads it into a fresh, self-contained buffer
     try o.put(a, "o", .{ .string = origin });
     try o.put(a, "c", .{ .string = collection });
     try o.put(a, "a", .{ .string = actionStr(action) });
@@ -129,13 +130,21 @@ pub fn encode(
 }
 
 /// A decoded cross-instance event. `token` keys the deleted row's at-rest snapshot in the side
-/// table (delete only; null for create/update).
+/// table (delete only; null for create/update). Each field is an independent, fresh dupe onto the
+/// allocator `decode`/`decodeAny` were given — free with `deinit`.
 pub const Event = struct {
     origin: []const u8,
     collection: []const u8,
     action: protocol.Action,
     id: []const u8,
     token: ?[]const u8,
+
+    pub fn deinit(self: Event, alloc: std.mem.Allocator) void {
+        alloc.free(self.origin);
+        alloc.free(self.collection);
+        alloc.free(self.id);
+        if (self.token) |t| alloc.free(t);
+    }
 };
 
 fn strField(o: std.json.ObjectMap, key: []const u8) ?[]const u8 {
@@ -143,11 +152,16 @@ fn strField(o: std.json.ObjectMap, key: []const u8) ?[]const u8 {
     return if (v == .string) v.string else null;
 }
 
-/// Parse a NOTIFY payload into an `Event` (allocating into `a`), or null if malformed.
+/// Parse a NOTIFY payload into an `Event`. The parse tree is scratch (freed via `parsed.deinit()`
+/// before returning) — every `Event` field is a FRESH dupe onto `a`, not an alias into the freed
+/// tree, so the result is self-contained and safe under any allocator (small, infrequent codec —
+/// unlike `hub.frameForDelivery`'s hot per-subscriber path, duping here costs nothing worth
+/// avoiding). Returns null if malformed.
 pub fn decode(a: std.mem.Allocator, payload: []const u8) ?Event {
-    const parsed = std.json.parseFromSliceLeaky(std.json.Value, a, payload, .{}) catch return null;
-    if (parsed != .object) return null;
-    const o = parsed.object;
+    const parsed = std.json.parseFromSlice(std.json.Value, a, payload, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const o = parsed.value.object;
     const origin = strField(o, "o") orelse return null;
     const collection = strField(o, "c") orelse return null;
     const astr = strField(o, "a") orelse return null;
@@ -160,27 +174,57 @@ pub fn decode(a: std.mem.Allocator, payload: []const u8) ?Event {
         .delete
     else
         return null;
+    const token = strField(o, "t");
     return .{
-        .origin = origin,
-        .collection = collection,
+        .origin = a.dupe(u8, origin) catch return null,
+        .collection = a.dupe(u8, collection) catch return null,
         .action = action,
-        .id = record_id,
-        .token = strField(o, "t"),
+        .id = a.dupe(u8, record_id) catch return null,
+        .token = if (token) |t| (a.dupe(u8, t) catch return null) else null,
     };
 }
 
 // ---- custom-topic broadcast/signal codec (#188 theme) -----------------------
 
 /// A payload-less cross-instance signal: nothing but a topic name rides the wire (spec §2.1).
-pub const Signal = struct { origin: []const u8, topic: []const u8 };
-/// A message-broadcast reference: the frame lives in _rt_broadcasts, keyed by this token.
-pub const MessageRef = struct { origin: []const u8, token: []const u8 };
+/// Both fields are fresh dupes (see `decodeAny`) — free with `deinit`.
+pub const Signal = struct {
+    origin: []const u8,
+    topic: []const u8,
+    pub fn deinit(self: Signal, alloc: std.mem.Allocator) void {
+        alloc.free(self.origin);
+        alloc.free(self.topic);
+    }
+};
+/// A message-broadcast reference: the frame lives in _rt_broadcasts, keyed by this token. Both
+/// fields are fresh dupes (see `decodeAny`) — free with `deinit`.
+pub const MessageRef = struct {
+    origin: []const u8,
+    token: []const u8,
+    pub fn deinit(self: MessageRef, alloc: std.mem.Allocator) void {
+        alloc.free(self.origin);
+        alloc.free(self.token);
+    }
+};
 /// Any decoded zigbase_rt payload kind.
-pub const Payload = union(enum) { record: Event, signal: Signal, message: MessageRef };
+pub const Payload = union(enum) {
+    record: Event,
+    signal: Signal,
+    message: MessageRef,
+
+    pub fn deinit(self: Payload, alloc: std.mem.Allocator) void {
+        switch (self) {
+            .record => |e| e.deinit(alloc),
+            .signal => |s| s.deinit(alloc),
+            .message => |m| m.deinit(alloc),
+        }
+    }
+};
 
 /// Encode {"o":origin,"s":topic}.
 pub fn encodeSignal(a: std.mem.Allocator, origin: []const u8, topic: []const u8) ![]u8 {
     var o: std.json.ObjectMap = .empty;
+    defer o.deinit(a);
     try o.put(a, "o", .{ .string = origin });
     try o.put(a, "s", .{ .string = topic });
     return std.json.Stringify.valueAlloc(a, std.json.Value{ .object = o }, .{});
@@ -189,6 +233,7 @@ pub fn encodeSignal(a: std.mem.Allocator, origin: []const u8, topic: []const u8)
 /// Encode {"o":origin,"m":token}. NO payload bytes — the token keys the side table.
 pub fn encodeMessage(a: std.mem.Allocator, origin: []const u8, token: []const u8) ![]u8 {
     var o: std.json.ObjectMap = .empty;
+    defer o.deinit(a);
     try o.put(a, "o", .{ .string = origin });
     try o.put(a, "m", .{ .string = token });
     return std.json.Stringify.valueAlloc(a, std.json.Value{ .object = o }, .{});
@@ -197,13 +242,27 @@ pub fn encodeMessage(a: std.mem.Allocator, origin: []const u8, token: []const u8
 /// Decode ANY payload kind. Kind detection is by key: "s" => signal, "m" => message, else the
 /// record codec. An OLD instance's decoder (`decode`) returns null on s/m payloads (missing
 /// c/a/i) — rolling upgrades are safe by construction (pinned by test below).
+///
+/// The parse tree is scratch (freed via `parsed.deinit()`) — every returned field is a fresh dupe
+/// onto `a`, matching `decode`'s discipline (this small, infrequent codec is never the hot
+/// per-subscriber path `hub.frameForDelivery` optimizes against).
 pub fn decodeAny(a: std.mem.Allocator, payload: []const u8) ?Payload {
-    const parsed = std.json.parseFromSliceLeaky(std.json.Value, a, payload, .{}) catch return null;
-    if (parsed != .object) return null;
-    const o = parsed.object;
-    const origin = strField(o, "o") orelse return null;
-    if (strField(o, "s")) |topic| return .{ .signal = .{ .origin = origin, .topic = topic } };
-    if (strField(o, "m")) |token| return .{ .message = .{ .origin = origin, .token = token } };
+    {
+        const parsed = std.json.parseFromSlice(std.json.Value, a, payload, .{}) catch return null;
+        defer parsed.deinit();
+        if (parsed.value != .object) return null;
+        const o = parsed.value.object;
+        const origin = strField(o, "o") orelse return null;
+        if (strField(o, "s")) |topic| return .{ .signal = .{
+            .origin = a.dupe(u8, origin) catch return null,
+            .topic = a.dupe(u8, topic) catch return null,
+        } };
+        if (strField(o, "m")) |token| return .{ .message = .{
+            .origin = a.dupe(u8, origin) catch return null,
+            .token = a.dupe(u8, token) catch return null,
+        } };
+    }
+    // Neither "s" nor "m": re-parse via the record codec (self-contained; dupes its own fields).
     const ev = decode(a, payload) orelse return null;
     return .{ .record = ev };
 }
@@ -229,6 +288,7 @@ pub fn storeDeleteSnapshot(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, snap
 fn storeDeleteSnapshotInner(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, snapshot: std.json.Value) ![]const u8 {
     const token = try crypto.genToken(io, alloc, 32);
     const snap_json = try std.json.Stringify.valueAlloc(alloc, snapshot, .{});
+    defer alloc.free(snap_json); // scratch: bound into the INSERT below, not retained after
     // GC orphaned tokens first (writers whose listeners never consumed them). Bounds the table to
     // ~the TTL window of deletes; native PG interval compare on the indexed `created` column.
     // Best-effort: a GC failure must not fail the store itself.
@@ -500,12 +560,12 @@ fn processUntilDrop(ctx: *ListenerCtx, conn: *db.Db) void {
 // ---- tests (codec; the live cross-instance path is in backend/postgres/realtime_pg_test.zig) ---
 
 test "encode/decode round-trip: create is minimal (no token)" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const payload = try encode(a, "abc123", "posts", .create, "REC1", null);
+    defer a.free(payload);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"t\"") == null); // no token key
     const ev = decode(a, payload).?;
+    defer ev.deinit(a);
     try std.testing.expectEqualStrings("abc123", ev.origin);
     try std.testing.expectEqualStrings("posts", ev.collection);
     try std.testing.expectEqual(protocol.Action.create, ev.action);
@@ -514,22 +574,20 @@ test "encode/decode round-trip: create is minimal (no token)" {
 }
 
 test "encode/decode round-trip: delete carries only a token (no row data)" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const payload = try encode(a, "o1", "notes", .delete, "REC1", "tok_xyz");
+    defer a.free(payload);
     // The payload must NOT contain any record/field data — only the token.
     try std.testing.expect(std.mem.indexOf(u8, payload, "tok_xyz") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "owner") == null);
     const ev = decode(a, payload).?;
+    defer ev.deinit(a);
     try std.testing.expectEqual(protocol.Action.delete, ev.action);
     try std.testing.expectEqualStrings("tok_xyz", ev.token.?);
 }
 
 test "decode: malformed / missing fields return null" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     try std.testing.expect(decode(a, "not json") == null);
     try std.testing.expect(decode(a, "{\"c\":\"posts\"}") == null); // missing o/a/i
     try std.testing.expect(decode(a, "{\"o\":\"x\",\"c\":\"p\",\"a\":\"frob\",\"i\":\"1\"}") == null); // bad action
@@ -543,22 +601,27 @@ test "originId is stable within a process" {
 }
 
 test "s/m kinds: encode/decode round-trip; NO payload bytes on the message wire" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const sig = try encodeSignal(a, "o1", "orders");
+    defer a.free(sig);
     const sp = decodeAny(a, sig).?;
+    defer sp.deinit(a);
     try std.testing.expectEqualStrings("orders", sp.signal.topic);
     try std.testing.expectEqualStrings("o1", sp.signal.origin);
     const msg = try encodeMessage(a, "o1", "tok_abc");
+    defer a.free(msg);
     const mp = decodeAny(a, msg).?;
+    defer mp.deinit(a);
     try std.testing.expectEqualStrings("tok_abc", mp.message.token);
     // The message payload carries ONLY origin + token — no topic, no frame, no data.
     try std.testing.expect(std.mem.indexOf(u8, msg, "orders") == null);
     try std.testing.expect(std.mem.indexOf(u8, msg, "data") == null);
     // decodeAny still decodes record payloads (all three kinds through one entry).
     const rec = try encode(a, "o2", "posts", .create, "R1", null);
-    try std.testing.expectEqualStrings("posts", decodeAny(a, rec).?.record.collection);
+    defer a.free(rec);
+    const rp = decodeAny(a, rec).?;
+    defer rp.deinit(a);
+    try std.testing.expectEqualStrings("posts", rp.record.collection);
 }
 
 test "nextBackoff: a healthy session resets; a flapping session floors + grows the reconnect (#43)" {
@@ -584,9 +647,11 @@ test "nextBackoff: a healthy session resets; a flapping session floors + grows t
 }
 
 test "rolling-upgrade tolerance: the OLD record decoder returns null on s/m payloads" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    try std.testing.expect(decode(a, try encodeSignal(a, "o1", "orders")) == null);
-    try std.testing.expect(decode(a, try encodeMessage(a, "o1", "tok")) == null);
+    const a = std.testing.allocator;
+    const sig = try encodeSignal(a, "o1", "orders");
+    defer a.free(sig);
+    try std.testing.expect(decode(a, sig) == null);
+    const msg = try encodeMessage(a, "o1", "tok");
+    defer a.free(msg);
+    try std.testing.expect(decode(a, msg) == null);
 }

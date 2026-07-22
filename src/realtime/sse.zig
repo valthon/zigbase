@@ -166,6 +166,19 @@ pub fn handleUplink(sc: *SseConn, a: RequestArena, body: []const u8) !?Reply {
     const msg = protocol.parseClient(a.a, body) catch {
         return .{ .status = 400, .frame = try protocol.errorFrame(a.a, "bad message") };
     };
+    // `parseClient` dupes its strings fresh onto `a.a` (never an alias of `body`) and none of them
+    // are retained past this function (every use below either reads them transiently or dupes them
+    // again onto `da`, the durable arena) — free them here, on every return path, regardless of
+    // which verb ran. A no-op-ish shrink under the real per-request arena `a` is normally backed
+    // by; a real free under a raw allocator (tests).
+    defer switch (msg) {
+        .auth => |m| a.a.free(m.token),
+        .subscribe => |m| {
+            a.a.free(m.topic);
+            if (m.filter) |f| a.a.free(f);
+        },
+        .unsubscribe => |m| a.a.free(m.topic),
+    };
     const da = sc.durable.allocator();
     switch (msg) {
         .auth => |m| {
@@ -192,7 +205,7 @@ pub fn handleUplink(sc: *SseConn, a: RequestArena, body: []const u8) !?Reply {
                 const sub_id = sse_fio.subscribe(h, channel, onChannelMessage, sc);
                 if (sub_id == 0) {
                     // #30: don't ack a failed fio subscribe as success — roll back + surface an error.
-                    _ = sc.conn.removeSub(m.topic);
+                    _ = sc.conn.removeSub(da, m.topic);
                     std.log.warn("realtime: SSE subscribe to \"{s}\" failed (fio subscribe returned 0)", .{m.topic});
                     return .{ .status = 200, .frame = try protocol.errorFrame(a.a, "subscribe failed") };
                 }
@@ -202,7 +215,7 @@ pub fn handleUplink(sc: *SseConn, a: RequestArena, body: []const u8) !?Reply {
                     // client can't drop. Roll back (fio-unsubscribe + drop the logical sub) and
                     // surface an error instead of acking a success we can't honor (mirror sub_id==0).
                     sse_fio.unsubscribe(h, sub_id);
-                    _ = sc.conn.removeSub(m.topic);
+                    _ = sc.conn.removeSub(da, m.topic);
                     std.log.warn("realtime: SSE subscribe to \"{s}\" failed (sub_id store OOM)", .{m.topic});
                     return .{ .status = 200, .frame = try protocol.errorFrame(a.a, "subscribe failed") };
                 };
@@ -213,7 +226,7 @@ pub fn handleUplink(sc: *SseConn, a: RequestArena, body: []const u8) !?Reply {
             if (sc.sub_ids.fetchRemove(m.topic)) |kv| {
                 if (sc.handle) |h| sse_fio.unsubscribe(h, kv.value);
             }
-            _ = sc.conn.removeSub(m.topic);
+            _ = sc.conn.removeSub(da, m.topic);
             return .{ .status = 200, .frame = try protocol.ackFrame(a.a, "unsubscribe", m.topic) };
         },
     }
@@ -473,27 +486,28 @@ test "threaded stress: pins + closed-checks race markClosedAndRelease with no us
 
 test "handleUplink: closed conn returns null (non-oracle); bad body 400; unsubscribe acks without DB" {
     var app = testApp();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
+    const a = std.testing.allocator;
     const sc = try create(&app);
     _ = connection.reserveConnectionSlot();
     try registryInsert(sc);
     defer registryReset(std.testing.allocator);
 
     // Bad body -> 400 + the exact WS error frame.
-    const bad = (try handleUplink(sc, RequestArena.from(&arena), "not json")).?;
+    const bad = (try handleUplink(sc, RequestArena.forTest(a), "not json")).?;
+    defer a.free(bad.frame);
     try std.testing.expectEqual(@as(u16, 400), bad.status);
     try std.testing.expectEqualStrings("{\"type\":\"error\",\"message\":\"bad message\"}", bad.frame);
 
     // Unsubscribe of an unknown topic: 200 + ack (WS parity — unsubscribe is idempotent).
-    const un = (try handleUplink(sc, RequestArena.from(&arena), "{\"action\":\"unsubscribe\",\"topic\":\"nope\"}")).?;
+    const un = (try handleUplink(sc, RequestArena.forTest(a), "{\"action\":\"unsubscribe\",\"topic\":\"nope\"}")).?;
+    defer a.free(un.frame);
     try std.testing.expectEqual(@as(u16, 200), un.status);
     try std.testing.expect(std.mem.indexOf(u8, un.frame, "\"action\":\"unsubscribe\"") != null);
 
     const pinned = pin(sc.client_id[0..]).?;
     markClosedAndRelease(sc);
     // Closed: the verb reports null — the api layer maps it to the SAME 404 as unknown.
-    try std.testing.expect((try handleUplink(pinned, RequestArena.from(&arena), "{\"action\":\"unsubscribe\",\"topic\":\"x\"}")) == null);
+    try std.testing.expect((try handleUplink(pinned, RequestArena.forTest(a), "{\"action\":\"unsubscribe\",\"topic\":\"x\"}")) == null);
     unref(pinned);
 }
 

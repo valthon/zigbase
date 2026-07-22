@@ -202,6 +202,18 @@ fn onMessage(context: ?*LiveConn, handle: zap.WebSockets.WsHandle, message: []co
         WS.write(handle, try protocol.errorFrame(fa, "bad message"), true) catch {};
         return;
     };
+    // Mirrors sse.zig's handleUplink: `parseClient`'s duped strings are never retained past this
+    // call (each use below either reads them transiently or dupes them again onto `da`) — free them
+    // on every path. `fa` is reset at the top of every callback regardless, so this is a no-op in
+    // practice today, but it keeps this function correct under any allocator, matching handleUplink.
+    defer switch (msg) {
+        .auth => |m| fa.free(m.token),
+        .subscribe => |m| {
+            fa.free(m.topic);
+            if (m.filter) |f| fa.free(f);
+        },
+        .unsubscribe => |m| fa.free(m.topic),
+    };
     switch (msg) {
         .auth => |m| {
             const ok = hub.authVerb(lc.app, &lc.conn, &lc.identity, m.token, lc.requested_account);
@@ -241,7 +253,7 @@ fn onMessage(context: ?*LiveConn, handle: zap.WebSockets.WsHandle, message: []co
                 // #30: a failed fio subscribe must NOT be acked as success — that stranded the
                 // client in a silent dead subscription (zero events until it happened to reconnect).
                 // Roll back the logical sub, log, and reply with an error frame so it can retry.
-                _ = lc.conn.removeSub(m.topic);
+                _ = lc.conn.removeSub(da, m.topic);
                 std.log.warn("realtime: WS subscribe to \"{s}\" failed (fio subscribe returned 0)", .{m.topic});
                 WS.write(handle, try protocol.errorFrame(fa, "subscribe failed"), true) catch {};
                 return;
@@ -254,7 +266,7 @@ fn onMessage(context: ?*LiveConn, handle: zap.WebSockets.WsHandle, message: []co
                 // the sub_id==0 path: fio-unsubscribe the just-created sub, drop the logical sub,
                 // and surface an error frame so the client can retry instead of being told "ok".
                 fio.websocket_unsubscribe(handle, sub_id);
-                _ = lc.conn.removeSub(m.topic);
+                _ = lc.conn.removeSub(da, m.topic);
                 std.log.warn("realtime: WS subscribe to \"{s}\" failed (sub_id store OOM)", .{m.topic});
                 WS.write(handle, try protocol.errorFrame(fa, "subscribe failed"), true) catch {};
                 return;
@@ -266,7 +278,7 @@ fn onMessage(context: ?*LiveConn, handle: zap.WebSockets.WsHandle, message: []co
             if (lc.sub_ids.fetchRemove(m.topic)) |kv| {
                 fio.websocket_unsubscribe(handle, kv.value);
             }
-            _ = lc.conn.removeSub(m.topic);
+            _ = lc.conn.removeSub(da, m.topic);
             WS.write(handle, try protocol.ackFrame(fa, "unsubscribe", m.topic), true) catch {};
         },
     }
@@ -457,8 +469,10 @@ pub fn startRemoteListener(app: *App) void {
 }
 
 /// Build the standard signal frame `{"type":"signal","topic":"<json-escaped topic>"}`.
+/// `o` is scratch: `valueAlloc` reads it into a fresh, self-contained buffer before returning.
 fn signalFrameAlloc(a: std.mem.Allocator, topic: []const u8) ![]const u8 {
     var o: std.json.ObjectMap = .empty;
+    defer o.deinit(a);
     try o.put(a, "type", .{ .string = "signal" });
     try o.put(a, "topic", .{ .string = topic });
     return std.json.Stringify.valueAlloc(a, std.json.Value{ .object = o }, .{});
@@ -470,8 +484,13 @@ fn signalFrameAlloc(a: std.mem.Allocator, topic: []const u8) ![]const u8 {
 /// std.json.Stringify) — it is spliced verbatim, never re-parsed or re-serialized.
 fn messageEnvelopeAlloc(a: std.mem.Allocator, topic: []const u8, data_json: []const u8) ![]const u8 {
     var w: std.ArrayList(u8) = .empty;
+    errdefer w.deinit(a);
     try w.appendSlice(a, "{\"type\":\"message\",\"topic\":");
-    try w.appendSlice(a, try std.json.Stringify.valueAlloc(a, std.json.Value{ .string = topic }, .{}));
+    // Scratch: the json-escaped topic is copied into `w` immediately below, so it is freed here
+    // rather than left to leak (valueAlloc always returns a fresh buffer).
+    const topic_json = try std.json.Stringify.valueAlloc(a, std.json.Value{ .string = topic }, .{});
+    defer a.free(topic_json);
+    try w.appendSlice(a, topic_json);
     try w.appendSlice(a, ",\"data\":");
     try w.appendSlice(a, data_json);
     try w.appendSlice(a, "}");
@@ -613,27 +632,29 @@ test "broadcastTopic/signalTopic are no-ops when inactive (#143)" {
 }
 
 test "messageEnvelopeAlloc splices the standard message envelope + JSON-escapes the topic" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
+    const f1 = try messageEnvelopeAlloc(a, "orders", "{\"id\":\"r1\"}");
+    defer a.free(f1);
     try std.testing.expectEqualStrings(
         "{\"type\":\"message\",\"topic\":\"orders\",\"data\":{\"id\":\"r1\"}}",
-        try messageEnvelopeAlloc(a, "orders", "{\"id\":\"r1\"}"),
+        f1,
     );
     // topic escaping: a quote in the topic must not break the frame
+    const f2 = try messageEnvelopeAlloc(a, "a\"b", "1");
+    defer a.free(f2);
     try std.testing.expectEqualStrings(
         "{\"type\":\"message\",\"topic\":\"a\\\"b\",\"data\":1}",
-        try messageEnvelopeAlloc(a, "a\"b", "1"),
+        f2,
     );
 }
 
 test "broadcastFeaturesChanged uses the standard signal frame (0.10.0 wire fix)" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     // broadcastFeaturesChanged delegates to signalTopic(FEATURES_CHANNEL); this pins the frame.
+    const f = try signalFrameAlloc(a, FEATURES_CHANNEL);
+    defer a.free(f);
     try std.testing.expectEqualStrings(
         "{\"type\":\"signal\",\"topic\":\"__features\"}",
-        try signalFrameAlloc(a, FEATURES_CHANNEL),
+        f,
     );
 }

@@ -146,6 +146,7 @@ pub fn authVerb(app: *App, conn: *Conn, identity_arena: *std.heap.ArenaAllocator
 /// snapshot can deep-copy the identity off the resettable identity arena (see `authVerb`).
 pub fn cloneJson(alloc: std.mem.Allocator, v: std.json.Value) !std.json.Value {
     const json = try std.json.Stringify.valueAlloc(alloc, v, .{});
+    defer alloc.free(json); // scratch: only the re-parsed tree below escapes
     return std.json.parseFromSliceLeaky(std.json.Value, alloc, json, .{});
 }
 
@@ -268,6 +269,7 @@ pub fn shouldDeliver(
     if (clauses.items.len == 0 and !row_constrained) return true;
 
     const combined = if (clauses.items.len > 0) try combineClauses(alloc, clauses.items) else "";
+    defer if (clauses.items.len > 0) alloc.free(combined); // scratch: matchesRule only reads it
     return policy.matchesRule(alloc, reader, col, record_id, combined, &rctx);
 }
 
@@ -449,6 +451,16 @@ pub const EventFrames = struct {
     record_channel: []const u8,
     frame_collection: []const u8,
     frame_record: []const u8,
+
+    /// Free all four allocations. Production callers (ws.zig/pg_bridge.zig) build these under a
+    /// throwaway per-call arena and skip this (arena reclaim); tests running under a raw allocator
+    /// must call it.
+    pub fn deinit(self: EventFrames, alloc: std.mem.Allocator) void {
+        alloc.free(self.collection_channel);
+        alloc.free(self.record_channel);
+        alloc.free(self.frame_collection);
+        alloc.free(self.frame_record);
+    }
 };
 
 /// Private key carrying the deleted record's authorization SNAPSHOT inside the *published* delete
@@ -470,13 +482,18 @@ pub fn buildEventFrames(
     const coll_channel = try alloc.dupe(u8, collection);
     const rec_channel = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ collection, record_id });
 
+    // The delete-only wrapper map (`delete_body`) is pure scratch: both serializeEvent calls below
+    // stringify it into a fresh, self-contained buffer, so it is freed before this function returns
+    // (never escapes). It must NOT be freed for create/update, where `body` is the CALLER's own
+    // `record` value (aliased, not owned here).
+    var delete_body: std.json.ObjectMap = .empty;
+    defer if (action == .delete) delete_body.deinit(alloc);
     const body: std.json.Value = if (action == .delete) blk: {
-        var o: std.json.ObjectMap = .empty;
-        try o.put(alloc, "id", .{ .string = record_id });
+        try delete_body.put(alloc, "id", .{ .string = record_id });
         // Attach the deletion snapshot (if any) so subscribers can re-authorize owner-scoped
         // deletes. Stripped in frameForDelivery before the frame reaches the client.
-        if (record) |snap| try o.put(alloc, delete_snapshot_key, snap);
-        break :blk .{ .object = o };
+        if (record) |snap| try delete_body.put(alloc, delete_snapshot_key, snap);
+        break :blk .{ .object = delete_body };
     } else record.?;
 
     return .{
@@ -527,7 +544,14 @@ pub fn frameForDelivery(
     // per event; the old `parseFromSlice(Value)` built + discarded the whole record on every one of
     // them (10 KiB record × 1000 subscribers = ~10 MiB of throwaway allocation per event). For
     // create/update the record body is returned to the client VERBATIM below — never inspected.
-    const env = std.json.parseFromSliceLeaky(DeliveryEnvelope, a, message, .{ .ignore_unknown_fields = true }) catch return null;
+    //
+    // `parseFromSliceLeaky` never frees what it allocates, and nothing here needs `env` (or the
+    // delete-snapshot subtree) to outlive this call — so it is parsed onto a THROWAWAY scratch
+    // arena backed by `a`, reclaimed on return, rather than leaking per delivery.
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    const sa = scratch.allocator();
+    const env = std.json.parseFromSliceLeaky(DeliveryEnvelope, sa, message, .{ .ignore_unknown_fields = true }) catch return null;
     const action: protocol.Action = if (std.mem.eql(u8, env.action, "create"))
         .create
     else if (std.mem.eql(u8, env.action, "update"))
@@ -550,8 +574,10 @@ pub fn frameForDelivery(
 
     if (action == .delete and delete_snapshot != null) {
         // Re-serialize an id-only delete frame so the private snapshot never reaches the client.
+        // `clean` is scratch too (serializeEvent stringifies it into a fresh, independent buffer
+        // before this call returns) — build it on `sa` so `scratch.deinit()` reclaims it.
         var clean: std.json.ObjectMap = .empty;
-        clean.put(a, "id", .{ .string = record_id }) catch return null;
+        clean.put(sa, "id", .{ .string = record_id }) catch return null;
         return protocol.serializeEvent(a, channel, .delete, .{ .object = clean }) catch null;
     }
     return message;
@@ -569,6 +595,15 @@ const DeliveryEnvelope = struct {
     } = .{},
 };
 
+/// BLOCKED (allocator-contract migration, not a real request-lifetime graph): every test below that
+/// calls `mkColl`/`mkRec` keeps its `std.testing.allocator` wrapped in a real `ArenaAllocator`. Both
+/// `collections.create` and `records.create` allocate scratch (DDL/SQL strings via `alloc.dupeZ`,
+/// validation-error `ArrayList`s, etc.) that they never free — a real leak, but the root cause is in
+/// src/collections.zig / src/records.zig, both outside this batch (each already carries its own
+/// scratch.allocator-allowlist.txt entry pending its own migration). Verified empirically: converting
+/// one such test to a raw `std.testing.allocator` surfaces ~35 leaked allocations, all originating in
+/// `mkColl`/`mkRec` — none in this file. Re-run this file's tests without the arena once
+/// collections.zig/records.zig are migrated.
 const TestDb = struct {
     d: db.Db,
     fn init() !TestDb {
@@ -790,6 +825,7 @@ test "tenant scoping: a subscriber receives ONLY its account's frames; unresolve
     // Before the fix `Conn.requestContext` never set tenancy_enabled/account_id, so a tenant-owned
     // `@public` collection broadcast to every subscriber — a cross-tenant leak. This test FAILS
     // under that code and passes after the fix.
+    // BLOCKED: calls collections.create directly (same TestDb-root-cause leak as above).
     var tdb = try TestDb.init();
     defer tdb.deinit();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -867,13 +903,13 @@ test "expired identity is treated as anonymous" {
 }
 
 test "buildEventFrames: create carries the full record on both channels" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     var rec: std.json.ObjectMap = .empty;
+    defer rec.deinit(a);
     try rec.put(a, "id", .{ .string = "REC1" });
     try rec.put(a, "title", .{ .string = "hi" });
     const ef = try buildEventFrames(a, "posts", .create, "REC1", .{ .object = rec });
+    defer ef.deinit(a);
     try std.testing.expectEqualStrings("posts", ef.collection_channel);
     try std.testing.expectEqualStrings("posts/REC1", ef.record_channel);
     try std.testing.expect(std.mem.indexOf(u8, ef.frame_collection, "\"topic\":\"posts\"") != null);
@@ -883,23 +919,22 @@ test "buildEventFrames: create carries the full record on both channels" {
 }
 
 test "buildEventFrames: delete is id-only (no body fields)" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const ef = try buildEventFrames(a, "posts", .delete, "REC1", null);
+    defer ef.deinit(a);
     try std.testing.expect(std.mem.indexOf(u8, ef.frame_collection, "\"action\":\"delete\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, ef.frame_collection, "\"id\":\"REC1\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, ef.frame_collection, "\"title\"") == null);
 }
 
 test "F4: delete frame carries the private authz snapshot (stripped before client delivery)" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     var snap: std.json.ObjectMap = .empty;
+    defer snap.deinit(a);
     try snap.put(a, "id", .{ .string = "REC1" });
     try snap.put(a, "owner", .{ .string = "u1" });
     const ef = try buildEventFrames(a, "notes", .delete, "REC1", .{ .object = snap });
+    defer ef.deinit(a);
     // The PUBLISHED frame includes the snapshot under the private key so subscribers can authorize.
     try std.testing.expect(std.mem.indexOf(u8, ef.frame_collection, delete_snapshot_key) != null);
     try std.testing.expect(std.mem.indexOf(u8, ef.frame_collection, "\"owner\":\"u1\"") != null);
@@ -952,23 +987,19 @@ test "subscribeDecision: collection topics ALWAYS use collection authz, custom t
 }
 
 test "canSubscribeTopic: default allows any custom topic (public signal channel) (#143)" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
     var app: App = undefined;
     const anon = request.RequestContext{};
     // No dispatch wired (tests/CLI): custom topics default to PUBLIC signal channels.
     app.dispatch = null;
-    try std.testing.expect(canSubscribeTopic(&app, RequestArena.from(&arena), anon, "availability"));
+    try std.testing.expect(canSubscribeTopic(&app, RequestArena.forTest(std.testing.allocator), anon, "availability"));
     // Dispatch present but NO predicate -> still public by default.
     var d = @import("../events.zig").Dispatch{};
     app.dispatch = &d;
-    try std.testing.expect(canSubscribeTopic(&app, RequestArena.from(&arena), anon, "orders"));
+    try std.testing.expect(canSubscribeTopic(&app, RequestArena.forTest(std.testing.allocator), anon, "orders"));
 }
 
 test "canSubscribeTopic: a canSubscribe guard returning false denies (#143)" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const Guard = struct {
         fn deny(ctx: *Ctx, topic: []const u8) bool {
             _ = ctx;
@@ -984,14 +1015,15 @@ test "canSubscribeTopic: a canSubscribe guard returning false denies (#143)" {
     var d = @import("../events.zig").Dispatch{ .realtime_can_subscribe = Guard.deny };
     app.dispatch = &d;
     const anon = request.RequestContext{};
-    try std.testing.expect(!canSubscribeTopic(&app, RequestArena.from(&arena), anon, "private"));
+    try std.testing.expect(!canSubscribeTopic(&app, RequestArena.forTest(a), anon, "private"));
     // A guard gating on auth: anonymous denied, authenticated allowed.
     d.realtime_can_subscribe = Guard.onlyAuthed;
-    try std.testing.expect(!canSubscribeTopic(&app, RequestArena.from(&arena), anon, "private"));
+    try std.testing.expect(!canSubscribeTopic(&app, RequestArena.forTest(a), anon, "private"));
     var rec: std.json.ObjectMap = .empty;
+    defer rec.deinit(a);
     try rec.put(a, "id", .{ .string = "u1" });
     const authed = request.RequestContext{ .auth = .{ .object = rec }, .is_superuser = false };
-    try std.testing.expect(canSubscribeTopic(&app, RequestArena.from(&arena), authed, "private"));
+    try std.testing.expect(canSubscribeTopic(&app, RequestArena.forTest(a), authed, "private"));
 }
 
 const PoolEnv = struct {
@@ -1026,6 +1058,9 @@ const PoolEnv = struct {
 test "subscribeCheck decision table: limit / __features / unknown / auth_required / ok (transport-neutral)" {
     var env = try PoolEnv.init();
     defer env.deinit();
+    // BLOCKED: provisions collections via collections.create (see the TestDb doc comment above) and
+    // subscribeCheck itself reaches collections.get (colcache.lease fallback) for "pub_posts" /
+    // "locked_posts" — both leak scratch SQL; root cause src/collections.zig, outside this batch.
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -1103,15 +1138,20 @@ test "cloneJson / cloneMemberships: deep copy is independent of the source arena
 test "authVerb: bad token clears auth and returns false (transport-neutral)" {
     var env = try PoolEnv.init();
     defer env.deinit();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     var app = App{ .allocator = a, .io = std.testing.io, .pool = &env.pool };
     var c = Conn{};
+    // contract-4 (legitimate, not a masking workaround): `authVerb`'s `identity_arena` parameter is
+    // typed `*std.heap.ArenaAllocator` — the real per-connection identity arena in production — so a
+    // genuine arena is the only value that satisfies the signature here (there is no `forTest`-style
+    // bypass for a concrete `*ArenaAllocator`, only for `RequestArena`). It does not mask leak
+    // detection for the rest of this test: `a` above is the raw allocator, and this arena only ever
+    // receives the deep-cloned identity `authVerb` itself would clone in production.
     var id_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer id_arena.deinit();
     // Pre-install an identity to prove a failed auth CLEARS it (the ws contract).
     var rec: std.json.ObjectMap = .empty;
+    defer rec.deinit(a);
     try rec.put(a, "id", .{ .string = "u1" });
     c.setAuth(.{ .record = .{ .object = rec }, .is_superuser = false, .exp = 9999999999 });
     try std.testing.expect(!authVerb(&app, &c, &id_arena, "not-a-jwt", ""));
@@ -1121,6 +1161,11 @@ test "authVerb: bad token clears auth and returns false (transport-neutral)" {
 test "frameForDelivery: custom topic + __features forward VERBATIM (no authz, no parse requirement)" {
     var env = try PoolEnv.init();
     defer env.deinit();
+    // BLOCKED (contract-4 workaround, not a real request-lifetime graph): the "orders" lookup below
+    // reaches `colcache.lease`'s fallback path -> `collections.get`, which allocates its renumbered
+    // SQL via `dialect.renumberPlaceholders` (always a fresh `dupeZ`, even for the SQLite passthrough
+    // arm) and never frees it — a real leak, but the root cause is in src/collections.zig (`get`) /
+    // src/sql/dialect.zig, both outside this batch. Keep arena-wrapped until that file is migrated.
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -1138,6 +1183,8 @@ test "frameForDelivery: custom topic + __features forward VERBATIM (no authz, no
 test "frameForDelivery: viewRule deny -> null; @public + matching filter -> frame; mismatching filter -> null" {
     var env = try PoolEnv.init();
     defer env.deinit();
+    // BLOCKED: provisions via collections.create + records.create (see the TestDb doc comment
+    // above) — root cause src/collections.zig / src/records.zig, outside this batch.
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -1179,6 +1226,8 @@ test "frameForDelivery: viewRule deny -> null; @public + matching filter -> fram
 test "frameForDelivery: F4 delete snapshot authorizes, then is STRIPPED to an id-only frame" {
     var env = try PoolEnv.init();
     defer env.deinit();
+    // BLOCKED: provisions via collections.create (see the TestDb doc comment above) — root cause
+    // src/collections.zig, outside this batch.
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
