@@ -81,7 +81,7 @@ src/query/parser.zig	9	PRE-EXISTING: not yet migrated to the ownership contracts
 src/query/sort.zig	4	PRE-EXISTING: not yet migrated to the ownership contracts
 src/queue/durable.zig	4	PRE-EXISTING: not yet migrated to the ownership contracts
 src/realtime/connection.zig	3	PRE-EXISTING: not yet migrated to the ownership contracts
-src/realtime/hub.zig	21	PRE-EXISTING: not yet migrated to the ownership contracts
+src/realtime/hub.zig	22	PRE-EXISTING: not yet migrated to the ownership contracts
 src/realtime/pg_bridge.zig	5	PRE-EXISTING: not yet migrated to the ownership contracts
 src/realtime/protocol.zig	4	PRE-EXISTING: not yet migrated to the ownership contracts
 src/realtime/sse.zig	1	PRE-EXISTING: not yet migrated to the ownership contracts

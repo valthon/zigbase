@@ -219,23 +219,27 @@ pub fn shouldDeliver(
     delete_snapshot: ?std.json.Value,
 ) DeliverError!bool {
     const rctx = conn.requestContext(now);
-    // Whether the tenant scope applies to THIS subscriber on THIS collection (tenancy enabled +
-    // tenant-owned + non-superuser). When it does, delivery must be scoped to the subscriber's
-    // active account even if the viewRule alone would `allow` (e.g. `@public`) — otherwise a
-    // tenant-owned collection leaks across accounts over WebSocket. The rule-clause decision below
-    // uses the RAW rule (`rules.decide`), not the tenancy-forced `policy.decide`, so an `@public`
-    // rule never gets compiled as a guard expression — the tenant predicate is composed inside
-    // `policy.matchesRule`.
-    const scope_applies = tenancy.scopeApplies(col, &rctx);
+    // Whether a per-ROW predicate — a tenant scope OR a relationship ability — applies to THIS
+    // subscriber on THIS collection. When it does, delivery must run the guarded query even if the
+    // viewRule alone would `allow` (e.g. `@public`), so the record is narrowed to what this
+    // subscriber may actually see — otherwise a tenant-owned OR ability-guarded collection leaks
+    // across accounts over WebSocket/SSE. Deriving this from `policy.rowConstrained` (the same
+    // condition `policy.decide` uses) keeps realtime delivery from diverging from the REST
+    // chokepoints: tenancy AND abilities are both honored, and neither can be forgotten here
+    // again. The rule-clause decision below still uses the RAW rule (`rules.decide`), so an
+    // `@public` rule never compiles as a guard expression — the tenant/ability predicates are
+    // composed inside `policy.matchesRule`.
+    const row_constrained = policy.rowConstrained(col, .view, &rctx);
 
     if (action == .delete) {
         switch (rules.decide(col.viewRule, &rctx)) {
             .deny_locked => return false, // locked: superuser already short-circuited to .allow
             .allow => {
-                // @public or superuser: anyone may learn of the delete — UNLESS the collection is
-                // tenant-scoped for this subscriber, in which case authorize the deleted row's
-                // snapshot against the tenant predicate (no rule clause). No snapshot -> deny.
-                if (!scope_applies) return true;
+                // @public or superuser: anyone may learn of the delete — UNLESS a per-row
+                // predicate (tenant scope OR a view ability) constrains this subscriber, in which
+                // case authorize the deleted row's snapshot against that composed predicate (no
+                // rule clause). No snapshot -> deny.
+                if (!row_constrained) return true;
                 const snap = delete_snapshot orelse return false;
                 return matchesSnapshot(alloc, io, col, record_id, "", snap, &rctx) catch false;
             },
@@ -257,10 +261,11 @@ pub fn shouldDeliver(
         .check => try clauses.append(alloc, col.viewRule.?),
     }
     if (sub_filter) |f| if (f.len > 0) try clauses.append(alloc, f);
-    // Unconstrained ONLY when there is no rule/filter clause AND no tenant scope. Otherwise run a
-    // guarded query: `matchesRule` ANDs the tenant predicate in (and tolerates an empty rule, so a
-    // tenant-only constraint is evaluated even with no viewRule/filter clause).
-    if (clauses.items.len == 0 and !scope_applies) return true;
+    // Unconstrained ONLY when there is no rule/filter clause AND no per-row predicate (tenant
+    // scope OR a view ability). Otherwise run a guarded query: `matchesRule` ANDs the
+    // tenant/ability predicate in (and tolerates an empty rule, so an ability/tenant-only
+    // constraint is evaluated even with no viewRule/filter clause).
+    if (clauses.items.len == 0 and !row_constrained) return true;
 
     const combined = if (clauses.items.len > 0) try combineClauses(alloc, clauses.items) else "";
     return policy.matchesRule(alloc, reader, col, record_id, combined, &rctx);
@@ -612,6 +617,29 @@ test "public viewRule (@public): create delivered to anyone, no filter" {
     const rid = try tdb.mkRec(a, col, "u1");
     var anon = Conn{};
     try std.testing.expect(try shouldDeliver(a, std.testing.io, &tdb.d, col, &anon, 0, .create, rid, null, null));
+}
+
+test "@public viewRule + view ability: create is NOT delivered to a non-member" {
+    // Regression for the HIGH realtime-abilities bypass: a collection can be `@public` for the
+    // access RULE yet have visibility narrowed by a relationship ability (#155). Realtime
+    // delivery must honor the ability exactly like records.list — before the fix, the `@public`
+    // early-return in shouldDeliver delivered the full record to any subscriber, bypassing it.
+    var tdb = try TestDb.init();
+    defer tdb.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var col = try tdb.mkColl(a, "posts", rules.public_sentinel);
+    // A view ability: visibility depends on the subscriber's relationship via `owner`, not the rule.
+    col.options.abilities = .{ .view = .{ .relationship = .{ .via = "owner" } } };
+    const rid = try tdb.mkRec(a, col, "u1");
+    // A non-superuser subscriber with NO qualifying membership must receive NOTHING: the ability's
+    // empty qualifying set compiles to constant-false, so the guarded query matches no row.
+    var outsider = try authedConn(a, "outsider", false);
+    try std.testing.expect(!(try shouldDeliver(a, std.testing.io, &tdb.d, col, &outsider, 0, .create, rid, null, null)));
+    // A superuser bypasses abilities (consistent with rules.decide) and still receives it.
+    var su = try authedConn(a, "root", true);
+    try std.testing.expect(try shouldDeliver(a, std.testing.io, &tdb.d, col, &su, 0, .create, rid, null, null));
 }
 
 test "empty viewRule (\"\") is now LOCKED: anon receives nothing, superuser does" {
