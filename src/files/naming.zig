@@ -34,7 +34,14 @@ pub fn sanitizeBase(alloc: std.mem.Allocator, name: []const u8) ![]const u8 {
         }
     }
     if (pending_us) try out.append(alloc, '_');
-    const s = std.mem.trim(u8, out.items, "_");
+    var s = std.mem.trim(u8, out.items, "_");
+    // Unsafe chars immediately before a dot can leave a LEADING '.' in the sanitized output even
+    // though the input's leading dots were stripped above (e.g. "*." -> "." , "*.." -> ".."). Such
+    // a result must never be returned — it violates the contract ("Empty / '.' / '..' -> 'file'"
+    // and "can never contain '..'") and would reintroduce path-traversal risk. Strip leading dots
+    // from the OUTPUT too, then re-trim any '_' they exposed; a collapse to empty falls back.
+    while (s.len > 0 and s[0] == '.') s = s[1..];
+    s = std.mem.trim(u8, s, "_");
     if (s.len == 0) return alloc.dupe(u8, "file");
     return alloc.dupe(u8, s);
 }
@@ -60,8 +67,10 @@ pub fn storedName(io: std.Io, alloc: std.mem.Allocator, original: []const u8) ![
 
 test "sanitizeBase strips path components and unsafe chars" {
     const a = std.testing.allocator;
-    const cases = [_][]const u8{ "../../etc/passwd", "a/b/c.png", "a\\b\\c.png", "my file.txt", "..", "", ".", "a*b?.c", ".bashrc" };
-    const expected = [_][]const u8{ "passwd", "c.png", "c.png", "my_file.txt", "file", "file", "file", "a_b.c", "bashrc" };
+    const cases = [_][]const u8{ "../../etc/passwd", "a/b/c.png", "a\\b\\c.png", "my file.txt", "..", "", ".", "a*b?.c", ".bashrc", "*.", "*..", "*.png" };
+    // "*." / "*.." must NOT sanitize to "." / ".." (path-traversal): unsafe chars collapsing next
+    // to a dot leave a leading dot that the output strip removes -> "file". "*.png" -> "png".
+    const expected = [_][]const u8{ "passwd", "c.png", "c.png", "my_file.txt", "file", "file", "file", "a_b.c", "bashrc", "file", "file", "png" };
     for (cases, expected) |c, e| {
         const got = try sanitizeBase(a, c);
         defer a.free(got);
