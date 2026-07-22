@@ -147,7 +147,11 @@ pub fn authVerb(app: *App, conn: *Conn, identity_arena: *std.heap.ArenaAllocator
 pub fn cloneJson(alloc: std.mem.Allocator, v: std.json.Value) !std.json.Value {
     const json = try std.json.Stringify.valueAlloc(alloc, v, .{});
     defer alloc.free(json); // scratch: only the re-parsed tree below escapes
-    return std.json.parseFromSliceLeaky(std.json.Value, alloc, json, .{});
+    // `.alloc_always` forces every string/key in the parsed tree to be copied onto `alloc`, so the
+    // returned value is fully self-contained and does NOT reference `json` — freeing the scratch
+    // buffer above is then safe. With the default (`.alloc_if_needed`), strings that need no
+    // unescaping would alias `json` and dangle after it is freed.
+    return std.json.parseFromSliceLeaky(std.json.Value, alloc, json, .{ .allocate = .alloc_always });
 }
 
 /// Deep-copy the resolved membership slice (account/role strings) onto `alloc`. Public for the same

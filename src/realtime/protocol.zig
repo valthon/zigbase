@@ -36,10 +36,10 @@ pub fn parseClient(alloc: std.mem.Allocator, frame: []const u8) ParseError!Clien
     } else if (std.mem.eql(u8, action, "subscribe")) {
         const topic = objStr(root, "topic") orelse return error.BadMessage;
         const filter = objStr(root, "filter");
-        return .{ .subscribe = .{
-            .topic = try alloc.dupe(u8, topic),
-            .filter = if (filter) |f| try alloc.dupe(u8, f) else null,
-        } };
+        const dup_topic = try alloc.dupe(u8, topic);
+        errdefer alloc.free(dup_topic); // free `topic` if the `filter` dupe OOMs (error return)
+        const dup_filter = if (filter) |f| try alloc.dupe(u8, f) else null;
+        return .{ .subscribe = .{ .topic = dup_topic, .filter = dup_filter } };
     } else if (std.mem.eql(u8, action, "unsubscribe")) {
         const topic = objStr(root, "topic") orelse return error.BadMessage;
         return .{ .unsubscribe = .{ .topic = try alloc.dupe(u8, topic) } };

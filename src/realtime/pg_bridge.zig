@@ -175,13 +175,26 @@ pub fn decode(a: std.mem.Allocator, payload: []const u8) ?Event {
     else
         return null;
     const token = strField(o, "t");
-    return .{
-        .origin = a.dupe(u8, origin) catch return null,
-        .collection = a.dupe(u8, collection) catch return null,
-        .action = action,
-        .id = a.dupe(u8, record_id) catch return null,
-        .token = if (token) |t| (a.dupe(u8, t) catch return null) else null,
+    // Dupe sequentially, freeing earlier successes if a later one OOMs — the function returns
+    // `?Event` (null on failure), so `errdefer` can't clean up; a partial construction must be
+    // unwound by hand or it leaks under a non-arena allocator.
+    const dup_origin = a.dupe(u8, origin) catch return null;
+    const dup_collection = a.dupe(u8, collection) catch {
+        a.free(dup_origin);
+        return null;
     };
+    const dup_id = a.dupe(u8, record_id) catch {
+        a.free(dup_origin);
+        a.free(dup_collection);
+        return null;
+    };
+    const dup_token: ?[]const u8 = if (token) |t| (a.dupe(u8, t) catch {
+        a.free(dup_origin);
+        a.free(dup_collection);
+        a.free(dup_id);
+        return null;
+    }) else null;
+    return .{ .origin = dup_origin, .collection = dup_collection, .action = action, .id = dup_id, .token = dup_token };
 }
 
 // ---- custom-topic broadcast/signal codec (#188 theme) -----------------------
@@ -253,14 +266,23 @@ pub fn decodeAny(a: std.mem.Allocator, payload: []const u8) ?Payload {
         if (parsed.value != .object) return null;
         const o = parsed.value.object;
         const origin = strField(o, "o") orelse return null;
-        if (strField(o, "s")) |topic| return .{ .signal = .{
-            .origin = a.dupe(u8, origin) catch return null,
-            .topic = a.dupe(u8, topic) catch return null,
-        } };
-        if (strField(o, "m")) |token| return .{ .message = .{
-            .origin = a.dupe(u8, origin) catch return null,
-            .token = a.dupe(u8, token) catch return null,
-        } };
+        // Free the first dupe if the second OOMs (see `decode` — `?Payload` can't use errdefer).
+        if (strField(o, "s")) |topic| {
+            const dup_origin = a.dupe(u8, origin) catch return null;
+            const dup_topic = a.dupe(u8, topic) catch {
+                a.free(dup_origin);
+                return null;
+            };
+            return .{ .signal = .{ .origin = dup_origin, .topic = dup_topic } };
+        }
+        if (strField(o, "m")) |token| {
+            const dup_origin = a.dupe(u8, origin) catch return null;
+            const dup_token = a.dupe(u8, token) catch {
+                a.free(dup_origin);
+                return null;
+            };
+            return .{ .message = .{ .origin = dup_origin, .token = dup_token } };
+        }
     }
     // Neither "s" nor "m": re-parse via the record codec (self-contained; dupes its own fields).
     const ev = decode(a, payload) orelse return null;
