@@ -11,6 +11,15 @@ pub const Endpoints = struct {
     authURL: []const u8,
     tokenURL: []const u8,
     userinfoURL: []const u8,
+
+    /// Free all three owned strings. Startup callers (provision.zig) run this under a
+    /// request/startup arena and never call it directly — fields are copied out and reclaimed
+    /// on arena teardown; this exists for callers on a non-arena allocator (e.g. tests).
+    pub fn deinit(self: Endpoints, alloc: std.mem.Allocator) void {
+        alloc.free(self.authURL);
+        alloc.free(self.tokenURL);
+        alloc.free(self.userinfoURL);
+    }
 };
 
 pub const DiscoveryError = error{ DiscoveryFetchFailed, InvalidDiscoveryDocument, InsecureEndpoint, IssuerMismatch } || client.TransportError;
@@ -90,20 +99,17 @@ const StubTransport = struct {
 };
 
 test "discovery: happy path resolves all three endpoints" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     var stub = StubTransport{};
     const eps = try resolve(stub.transport(), a, okta_discovery_url);
+    defer eps.deinit(a);
     try std.testing.expectEqualStrings("https://acme.okta.com/oauth2/v1/authorize", eps.authURL);
     try std.testing.expectEqualStrings("https://acme.okta.com/oauth2/v1/token", eps.tokenURL);
     try std.testing.expectEqualStrings("https://acme.okta.com/oauth2/v1/userinfo", eps.userinfoURL);
 }
 
 test "discovery: missing endpoint / non-string endpoint -> InvalidDiscoveryDocument" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
 
     const missing_userinfo =
         \\{
@@ -126,9 +132,7 @@ test "discovery: missing endpoint / non-string endpoint -> InvalidDiscoveryDocum
 }
 
 test "discovery: http:// endpoint -> InsecureEndpoint" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
 
     const http_userinfo =
         \\{
@@ -142,9 +146,7 @@ test "discovery: http:// endpoint -> InsecureEndpoint" {
 }
 
 test "discovery: issuer mismatch and http issuer -> IssuerMismatch" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
 
     const evil_issuer =
         \\{
@@ -168,9 +170,7 @@ test "discovery: issuer mismatch and http issuer -> IssuerMismatch" {
 }
 
 test "discovery: non-2xx fetch -> DiscoveryFetchFailed" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     var stub = StubTransport{ .status = 404, .body = "not found" };
     try std.testing.expectError(error.DiscoveryFetchFailed, resolve(stub.transport(), a, okta_discovery_url));
 }

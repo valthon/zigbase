@@ -73,6 +73,7 @@ pub fn fetchIdentity(
     access_token: []const u8,
 ) ClientError!providers.Identity {
     const auth_value = try std.fmt.allocPrint(alloc, "Bearer {s}", .{access_token});
+    defer alloc.free(auth_value);
     const headers = [_]Header{
         .{ .name = "authorization", .value = auth_value },
         .{ .name = "accept", .value = "application/json" },
@@ -132,13 +133,17 @@ const StubTransport = struct {
     userinfo_body: []const u8 = "{\"sub\":\"P1\",\"email\":\"u@x.io\",\"email_verified\":true}",
 
     fn call(ctx: *anyopaque, alloc: std.mem.Allocator, method: Method, url: []const u8, headers: []const Header, body: ?[]const u8) TransportError!Response {
+        _ = alloc;
         _ = method;
         _ = headers;
         _ = body;
         const self: *StubTransport = @ptrCast(@alignCast(ctx));
+        // Bodies are returned as-is (not duped): they're comptime/caller-owned string data,
+        // matching the Transport contract that exchangeCode/fetchIdentity never free resp.body
+        // themselves (see the comment in exchangeCode) — nothing here needs freeing.
         if (std.mem.indexOf(u8, url, "token") != null)
-            return .{ .status = self.token_status, .body = try alloc.dupe(u8, self.token_body) };
-        return .{ .status = self.userinfo_status, .body = try alloc.dupe(u8, self.userinfo_body) };
+            return .{ .status = self.token_status, .body = self.token_body };
+        return .{ .status = self.userinfo_status, .body = self.userinfo_body };
     }
 
     fn transport(self: *StubTransport) Transport {
@@ -147,46 +152,44 @@ const StubTransport = struct {
 };
 
 test "exchangeCode returns the access token on 200" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     var stub = StubTransport{};
     const tok = try exchangeCode(stub.transport(), a, providers.lookup("google").?, "cid", "secret", "code", "verifier", "https://app/cb");
+    defer a.free(tok);
     try std.testing.expectEqualStrings("AT123", tok);
 }
 
 test "exchangeCode fails on a non-2xx token response" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     var stub = StubTransport{ .token_status = 400, .token_body = "{\"error\":\"invalid_grant\"}" };
     try std.testing.expectError(error.ProviderError, exchangeCode(stub.transport(), a, providers.lookup("google").?, "cid", "secret", "code", "verifier", "https://app/cb"));
 }
 
 test "fetchIdentity returns a normalized identity" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     var stub = StubTransport{};
     const id = try fetchIdentity(stub.transport(), a, providers.lookup("google").?, "AT123");
+    defer {
+        a.free(id.providerUserId);
+        if (id.email) |e| a.free(e);
+        if (id.name) |n| a.free(n);
+        if (id.avatarUrl) |v| a.free(v);
+    }
     try std.testing.expectEqualStrings("P1", id.providerUserId);
     try std.testing.expectEqualStrings("u@x.io", id.email.?);
     try std.testing.expectEqual(true, id.emailVerified);
 }
 
 test "fetchIdentity fails on a non-2xx userinfo response" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     var stub = StubTransport{ .userinfo_status = 401, .userinfo_body = "unauthorized" };
     try std.testing.expectError(error.ProviderError, fetchIdentity(stub.transport(), a, providers.lookup("google").?, "AT"));
 }
 
 test "httpTransport builds a Transport bound to its context" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const hc = try httpContext(a, std.testing.io);
+    defer a.destroy(hc);
     const t = httpTransport(hc);
     try std.testing.expect(t.ctx == @as(*anyopaque, @ptrCast(hc)));
 }
