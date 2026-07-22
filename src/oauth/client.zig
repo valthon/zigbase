@@ -4,6 +4,11 @@ const urlenc = @import("../url.zig");
 
 pub const Method = enum { GET, POST };
 pub const Header = struct { name: []const u8, value: []const u8 };
+/// A transport response. OWNERSHIP CONTRACT: `body` is **transport-owned** — a caller must NOT
+/// free it and must `dupe` anything it needs to retain. The production transport (`httpCall`)
+/// backs `body` with a sub-slice of a fixed response buffer scoped to the request arena, so an
+/// `alloc.free(resp.body)` would be an invalid free. Stubs return a borrowed/static slice for the
+/// same reason. (See `exchangeCode` and `discovery.resolve`.)
 pub const Response = struct { status: u16, body: []const u8 };
 
 pub const TransportError = error{ TransportFailed, ResponseTooLarge } || std.mem.Allocator.Error;

@@ -65,7 +65,9 @@ pub fn parseDocument(alloc: std.mem.Allocator, discovery_url: []const u8, body: 
 pub fn resolve(transport: client.Transport, alloc: std.mem.Allocator, discovery_url: []const u8) DiscoveryError!Endpoints {
     const headers = [_]client.Header{.{ .name = "accept", .value = "application/json" }};
     const resp = try transport.call(transport.ctx, alloc, .GET, discovery_url, &headers, null);
-    defer alloc.free(resp.body);
+    // `resp.body` is transport-owned — do NOT free it (same contract as `client.exchangeCode`).
+    // The production transport returns a sub-slice of a larger fixed response buffer, so
+    // `alloc.free(resp.body)` would be an invalid free; `parseDocument` dupes what it keeps.
     if (resp.status < 200 or resp.status >= 300) return error.DiscoveryFetchFailed;
     return parseDocument(alloc, discovery_url, resp.body);
 }
@@ -89,8 +91,11 @@ const StubTransport = struct {
         _ = url;
         _ = headers;
         _ = req_body;
+        _ = alloc;
         const self: *StubTransport = @ptrCast(@alignCast(ctx));
-        return .{ .status = self.status, .body = try alloc.dupe(u8, self.body) };
+        // Borrowed body — `resp.body` is transport-owned and the caller never frees it (matches
+        // the production transport's fixed-buffer sub-slice; see client.Response).
+        return .{ .status = self.status, .body = self.body };
     }
 
     fn transport(self: *StubTransport) client.Transport {
