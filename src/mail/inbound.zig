@@ -89,6 +89,10 @@ pub fn timestampFresh(timestamp: []const u8, now_unix: i64) bool {
 /// suppressions written. A malformed payload propagates `error.SyntaxError`.
 pub fn ingest(io: std.Io, alloc: std.mem.Allocator, w: *db.Db, provider: suppression.Provider, account: []const u8, body: []const u8, source: []const u8) !usize {
     const events = try suppression.parseProvider(alloc, provider, body);
+    defer {
+        for (events) |ev| alloc.free(ev.email);
+        alloc.free(events);
+    }
     for (events) |ev| {
         try suppression.upsert(io, alloc, w, account, ev.email, ev.reason, source);
     }
@@ -137,6 +141,7 @@ pub fn webhook_handler(ctx: *http.RequestCtx) anyerror!http.Response {
     };
 
     var obj: std.json.ObjectMap = .empty;
+    defer obj.deinit(ctx.allocator.a);
     try obj.put(ctx.allocator.a, "suppressed", .{ .integer = @intCast(n) });
     return .{
         .status = 200,
@@ -187,9 +192,7 @@ test "ingest maps an SES permanent bounce into a suppression row" {
     var d = try db.Db.openMemory();
     defer d.close();
     try migrations.run(&d);
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = testing.allocator;
     const body =
         \\{"notificationType":"Bounce","bounce":{"bounceType":"Permanent","bouncedRecipients":[{"emailAddress":"bad@x.io"}]}}
     ;
@@ -199,14 +202,13 @@ test "ingest maps an SES permanent bounce into a suppression row" {
 }
 
 test "webhook_handler rejects an invalid signature (401, fail closed)" {
-    // No pool is touched on the rejection path, so an undefined pool is safe here. ctx.allocator is
-    // an arena (mirrors production) so the response body is reclaimed (no leak). Use a FRESH timestamp
-    // so the request passes the freshness gate and actually exercises the signature check.
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    var app = App{ .allocator = testing.allocator, .io = testing.io, .pool = undefined, .mail = .{ .webhook_secret = "shh" } };
+    // No pool is touched on the rejection path, so an undefined pool is safe here.
+    // Use a FRESH timestamp so the request passes the freshness gate and actually
+    // exercises the signature check.
+    const a = std.testing.allocator;
+    var app = App{ .allocator = a, .io = testing.io, .pool = undefined, .mail = .{ .webhook_secret = "shh" } };
     const ts = try std.fmt.allocPrint(a, "{d}", .{clock.nowUnix(testing.io)});
+    defer a.free(ts);
     const headers = [_]http.Param{
         .{ .key = sig_header, .value = "deadbeef" }, // not the real signature
         .{ .key = ts_header, .value = ts },
@@ -214,13 +216,14 @@ test "webhook_handler rejects an invalid signature (401, fail closed)" {
     var ctx = http.RequestCtx{
         .method = .POST,
         .path = "/api/mail/webhooks/ses",
-        .allocator = RequestArena.from(&arena),
+        .allocator = RequestArena.forTest(a),
         .app = &app,
         .body = "{\"notificationType\":\"Bounce\"}",
         .params = &.{.{ .key = "provider", .value = "ses" }},
         .headers = &headers,
     };
     const res = try webhook_handler(&ctx);
+    defer a.free(res.body);
     try testing.expectEqual(@as(u16, 401), res.status);
 }
 
@@ -244,12 +247,12 @@ test "webhook_handler: signed-account event verifies (200); tampering account â†
     const body =
         \\{"notificationType":"Bounce","bounce":{"bounceType":"Permanent","bouncedRecipients":[{"emailAddress":"bad@x.io"}]}}
     ;
-    var arena = std.heap.ArenaAllocator.init(ga);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = ga;
     const ts = try std.fmt.allocPrint(a, "{d}", .{clock.nowUnix(testing.io)});
+    defer a.free(ts);
     // A relay signs ts.provider.account.body and injects X-Account-Id.
     const sig = try signMailInbound(a, "relay-secret", ts, "ses", "acc1", body);
+    defer a.free(sig);
 
     // (1) Correctly signed for acc1 â†’ 200, suppression scoped to acc1 (NOT global).
     {
@@ -258,8 +261,9 @@ test "webhook_handler: signed-account event verifies (200); tampering account â†
             .{ .key = ts_header, .value = ts },
             .{ .key = account_header, .value = "acc1" },
         };
-        var ctx = http.RequestCtx{ .method = .POST, .path = "/api/mail/webhooks/ses", .allocator = RequestArena.from(&arena), .app = &app, .body = body, .params = &.{.{ .key = "provider", .value = "ses" }}, .headers = &headers };
+        var ctx = http.RequestCtx{ .method = .POST, .path = "/api/mail/webhooks/ses", .allocator = RequestArena.forTest(a), .app = &app, .body = body, .params = &.{.{ .key = "provider", .value = "ses" }}, .headers = &headers };
         const res = try webhook_handler(&ctx);
+        defer a.free(res.body);
         try testing.expectEqual(@as(u16, 200), res.status);
     }
     {
@@ -276,23 +280,24 @@ test "webhook_handler: signed-account event verifies (200); tampering account â†
             .{ .key = ts_header, .value = ts },
             .{ .key = account_header, .value = "acc2" }, // not what was signed
         };
-        var ctx = http.RequestCtx{ .method = .POST, .path = "/api/mail/webhooks/ses", .allocator = RequestArena.from(&arena), .app = &app, .body = body, .params = &.{.{ .key = "provider", .value = "ses" }}, .headers = &headers };
+        var ctx = http.RequestCtx{ .method = .POST, .path = "/api/mail/webhooks/ses", .allocator = RequestArena.forTest(a), .app = &app, .body = body, .params = &.{.{ .key = "provider", .value = "ses" }}, .headers = &headers };
         const res = try webhook_handler(&ctx);
+        defer a.free(res.body);
         try testing.expectEqual(@as(u16, 401), res.status);
     }
 }
 
 test "webhook_handler 404s when no secret is configured (ingestion opt-in)" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    var app = App{ .allocator = testing.allocator, .io = testing.io, .pool = undefined, .mail = .{} };
+    const a = std.testing.allocator;
+    var app = App{ .allocator = a, .io = testing.io, .pool = undefined, .mail = .{} };
     var ctx = http.RequestCtx{
         .method = .POST,
         .path = "/api/mail/webhooks/ses",
-        .allocator = RequestArena.from(&arena),
+        .allocator = RequestArena.forTest(a),
         .app = &app,
         .params = &.{.{ .key = "provider", .value = "ses" }},
     };
     const res = try webhook_handler(&ctx);
+    defer a.free(res.body);
     try testing.expectEqual(@as(u16, 404), res.status);
 }

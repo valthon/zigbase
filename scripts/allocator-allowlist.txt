@@ -54,10 +54,7 @@ src/files/storage.zig	1	PRE-EXISTING: not yet migrated to the ownership contract
 src/framework.zig	1	PRE-EXISTING: not yet migrated to the ownership contracts
 src/http_client.zig	6	PRE-EXISTING: not yet migrated to the ownership contracts
 src/import.zig	16	PRE-EXISTING: not yet migrated to the ownership contracts
-src/mail/bulk.zig	15	PRE-EXISTING: not yet migrated to the ownership contracts
-src/mail/inbound.zig	3	PRE-EXISTING: not yet migrated to the ownership contracts
-src/mail/senders.zig	6	PRE-EXISTING: not yet migrated to the ownership contracts
-src/mail/suppression.zig	4	PRE-EXISTING: not yet migrated to the ownership contracts
+src/mail/bulk.zig	1	BLOCKED (contract-4, out-of-scope root cause): the "jobHandler wires the RFC 8058 List-Unsubscribe URL" test calls src/mail/unsubscribe.zig's `verify`, which by written design allocates its decode buffer and returns `Parts` as slices into it without ever freeing it (see that file's own tests, all arena-scoped for the same reason). Fixing unsubscribe.zig (contract-2: Parts owns its decode buffer) is deferred to the mail-unsubscribe batch, alongside api/mail_unsubscribe.zig which is its main consumer.
 src/migrator.zig	14	PRE-EXISTING: not yet migrated to the ownership contracts
 src/oauth/client.zig	5	PRE-EXISTING: not yet migrated to the ownership contracts
 src/oauth/discovery.zig	5	PRE-EXISTING: not yet migrated to the ownership contracts
