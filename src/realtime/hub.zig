@@ -235,9 +235,10 @@ pub fn shouldDeliver(
         switch (rules.decide(col.viewRule, &rctx)) {
             .deny_locked => return false, // locked: superuser already short-circuited to .allow
             .allow => {
-                // @public or superuser: anyone may learn of the delete — UNLESS the collection is
-                // tenant-scoped for this subscriber, in which case authorize the deleted row's
-                // snapshot against the tenant predicate (no rule clause). No snapshot -> deny.
+                // @public or superuser: anyone may learn of the delete — UNLESS a per-row
+                // predicate (tenant scope OR a view ability) constrains this subscriber, in which
+                // case authorize the deleted row's snapshot against that composed predicate (no
+                // rule clause). No snapshot -> deny.
                 if (!row_constrained) return true;
                 const snap = delete_snapshot orelse return false;
                 return matchesSnapshot(alloc, io, col, record_id, "", snap, &rctx) catch false;
@@ -260,9 +261,10 @@ pub fn shouldDeliver(
         .check => try clauses.append(alloc, col.viewRule.?),
     }
     if (sub_filter) |f| if (f.len > 0) try clauses.append(alloc, f);
-    // Unconstrained ONLY when there is no rule/filter clause AND no tenant scope. Otherwise run a
-    // guarded query: `matchesRule` ANDs the tenant predicate in (and tolerates an empty rule, so a
-    // tenant-only constraint is evaluated even with no viewRule/filter clause).
+    // Unconstrained ONLY when there is no rule/filter clause AND no per-row predicate (tenant
+    // scope OR a view ability). Otherwise run a guarded query: `matchesRule` ANDs the
+    // tenant/ability predicate in (and tolerates an empty rule, so an ability/tenant-only
+    // constraint is evaluated even with no viewRule/filter clause).
     if (clauses.items.len == 0 and !row_constrained) return true;
 
     const combined = if (clauses.items.len > 0) try combineClauses(alloc, clauses.items) else "";
