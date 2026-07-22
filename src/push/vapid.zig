@@ -68,9 +68,12 @@ pub fn buildJwt(
 ) Error![]u8 {
     const claims = Claims{ .aud = endpoint_origin, .exp = exp_unix, .sub = subject };
     const claims_json = try std.json.Stringify.valueAlloc(alloc, claims, .{});
+    defer alloc.free(claims_json);
     const claims_b64 = try b64enc(alloc, claims_json);
+    defer alloc.free(claims_b64);
 
     const signing_input = try std.fmt.allocPrint(alloc, "{s}.{s}", .{ header_b64, claims_b64 });
+    defer alloc.free(signing_input);
 
     const sk = Ecdsa.SecretKey.fromBytes(private_key) catch return error.InvalidKey;
     const kp = Ecdsa.KeyPair.fromSecretKey(sk) catch return error.InvalidKey;
@@ -79,6 +82,7 @@ pub fn buildJwt(
     const sig = kp.sign(signing_input, noise) catch return error.InvalidKey;
     const sig_raw = sig.toBytes(); // raw r||s (64 bytes), the JWS/ES256 form.
     const sig_b64 = try b64enc(alloc, &sig_raw);
+    defer alloc.free(sig_b64);
 
     return std.fmt.allocPrint(alloc, "{s}.{s}", .{ signing_input, sig_b64 });
 }
@@ -103,7 +107,9 @@ pub fn vapidAuthHeader(
 ) Error![]u8 {
     _ = now_unix;
     const jwt = try buildJwt(alloc, io, endpoint_origin, subject, private_key, exp_unix);
+    defer alloc.free(jwt);
     const k = try publicKeyB64(alloc, public_key);
+    defer alloc.free(k);
     return std.fmt.allocPrint(alloc, "vapid t={s}, k={s}", .{ jwt, k });
 }
 
@@ -119,22 +125,20 @@ fn b64dec(alloc: std.mem.Allocator, s: []const u8) ![]u8 {
 }
 
 test "vapid: header segment decodes to the ES256 JWT header" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const decoded = try b64dec(a, header_b64);
+    defer a.free(decoded);
     try std.testing.expectEqualStrings("{\"typ\":\"JWT\",\"alg\":\"ES256\"}", decoded);
 }
 
 test "vapid: JWT claims JSON is {aud,exp,sub} and the signature round-trips + is 64-byte r||s" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
 
     const kp = try Ecdsa.KeyPair.generateDeterministic([_]u8{0x7} ** 32);
     const priv = kp.secret_key.toBytes();
 
     const jwt = try buildJwt(a, std.testing.io, "https://push.example.com", "mailto:ops@example.com", priv, 1700000000);
+    defer a.free(jwt);
 
     var it = std.mem.splitScalar(u8, jwt, '.');
     const h = it.next().?;
@@ -145,6 +149,7 @@ test "vapid: JWT claims JSON is {aud,exp,sub} and the signature round-trips + is
     try std.testing.expectEqualStrings(header_b64, h);
 
     const claims_json = try b64dec(a, c);
+    defer a.free(claims_json);
     try std.testing.expectEqualStrings(
         "{\"aud\":\"https://push.example.com\",\"exp\":1700000000,\"sub\":\"mailto:ops@example.com\"}",
         claims_json,
@@ -152,21 +157,22 @@ test "vapid: JWT claims JSON is {aud,exp,sub} and the signature round-trips + is
 
     // Signature MUST be raw r||s (64 bytes), NOT DER.
     const sig_bytes = try b64dec(a, s);
+    defer a.free(sig_bytes);
     try std.testing.expectEqual(@as(usize, 64), sig_bytes.len);
 
     // Round-trip verify over "header.claims".
     const signing_input = try std.fmt.allocPrint(a, "{s}.{s}", .{ h, c });
+    defer a.free(signing_input);
     const sig = Ecdsa.Signature.fromBytes(sig_bytes[0..64].*);
     try sig.verify(signing_input, kp.public_key);
 }
 
 test "vapid: tampered claims break signature verification" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
 
     const kp = try Ecdsa.KeyPair.generateDeterministic([_]u8{0x9} ** 32);
     const jwt = try buildJwt(a, std.testing.io, "https://p.example", "mailto:x@e.com", kp.secret_key.toBytes(), 1700000000);
+    defer a.free(jwt);
 
     var it = std.mem.splitScalar(u8, jwt, '.');
     const h = it.next().?;
@@ -175,21 +181,24 @@ test "vapid: tampered claims break signature verification" {
 
     // Flip a byte in the claims segment; the same signature must no longer verify.
     const bad_c = try a.dupe(u8, c);
+    defer a.free(bad_c);
     bad_c[0] = if (bad_c[0] == 'e') 'f' else 'e';
     const bad_input = try std.fmt.allocPrint(a, "{s}.{s}", .{ h, bad_c });
-    const sig = Ecdsa.Signature.fromBytes((try b64dec(a, s))[0..64].*);
+    defer a.free(bad_input);
+    const sig_bytes = try b64dec(a, s);
+    defer a.free(sig_bytes);
+    const sig = Ecdsa.Signature.fromBytes(sig_bytes[0..64].*);
     try std.testing.expectError(error.SignatureVerificationFailed, sig.verify(bad_input, kp.public_key));
 }
 
 test "vapid: Authorization header shape is `vapid t=..., k=base64url(public_key)`" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
 
     const kp = try Ecdsa.KeyPair.generateDeterministic([_]u8{0x3} ** 32);
     const pub_sec1 = kp.public_key.toUncompressedSec1();
 
     const hdr = try vapidAuthHeader(a, std.testing.io, "https://push.example.com", "mailto:ops@example.com", pub_sec1, kp.secret_key.toBytes(), 1699999000, 1700000000);
+    defer a.free(hdr);
 
     try std.testing.expect(std.mem.startsWith(u8, hdr, "vapid t="));
     const k_marker = ", k=";
@@ -198,9 +207,11 @@ test "vapid: Authorization header shape is `vapid t=..., k=base64url(public_key)
 
     // k must be base64url(public_key).
     const expected_k = try publicKeyB64(a, pub_sec1);
+    defer a.free(expected_k);
     try std.testing.expectEqualStrings(expected_k, k_val);
     // And it must decode back to the 65-byte SEC1 key.
     const decoded = try b64dec(a, k_val);
+    defer a.free(decoded);
     try std.testing.expectEqualSlices(u8, &pub_sec1, decoded);
 
     // The token between "t=" and ", k=" is a well-formed 3-segment JWT.
@@ -213,11 +224,11 @@ test "vapid: Authorization header shape is `vapid t=..., k=base64url(public_key)
 }
 
 test "vapid: publicKeyB64FromKeyPair matches publicKeyB64 of the SEC1 key" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const kp = try Ecdsa.KeyPair.generateDeterministic([_]u8{0x5} ** 32);
     const from_kp = try publicKeyB64FromKeyPair(a, kp);
+    defer a.free(from_kp);
     const from_bytes = try publicKeyB64(a, kp.public_key.toUncompressedSec1());
+    defer a.free(from_bytes);
     try std.testing.expectEqualStrings(from_bytes, from_kp);
 }

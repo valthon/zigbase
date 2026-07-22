@@ -84,6 +84,7 @@ pub const Keypair = struct {
 pub fn generateKeypair(alloc: std.mem.Allocator, io: std.Io) !Keypair {
     const kp = Ecdsa.KeyPair.generate(io);
     const public_b64 = try vapid.publicKeyB64FromKeyPair(alloc, kp);
+    errdefer alloc.free(public_b64);
     const priv = kp.secret_key.toBytes();
     const private_b64 = try alloc.alloc(u8, b64.Encoder.calcSize(priv.len));
     _ = b64.Encoder.encode(private_b64, &priv);
@@ -114,17 +115,19 @@ test "resolve: half-configured keys fail fast" {
 }
 
 test "resolve: a matched keypair configures push; a mismatched one fails" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = testing.allocator;
 
     const kp = try generateKeypair(a, testing.io);
+    defer a.free(kp.public_b64);
+    defer a.free(kp.private_b64);
     const r = try resolve("mailto:ops@example.com", kp.public_b64, kp.private_b64);
     try testing.expect(r.configured);
     try testing.expectEqualStrings("mailto:ops@example.com", r.subject);
 
     // A public key from a DIFFERENT pair must be rejected.
     const other = try generateKeypair(a, testing.io);
+    defer a.free(other.public_b64);
+    defer a.free(other.private_b64);
     try testing.expectError(error.VapidKeyMismatch, resolve("s", other.public_b64, kp.private_b64));
 
     // Garbage / wrong-length keys are rejected as invalid.
@@ -133,12 +136,12 @@ test "resolve: a matched keypair configures push; a mismatched one fails" {
 }
 
 test "generateKeypair: output round-trips through vapidAuthHeader + verifies" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = testing.allocator;
 
     // Generate as the CLI does, then reload via resolve (as serveImpl does).
     const kp = try generateKeypair(a, testing.io);
+    defer a.free(kp.public_b64);
+    defer a.free(kp.private_b64);
     const rt = try resolve("mailto:ops@example.com", kp.public_b64, kp.private_b64);
     try testing.expect(rt.configured);
 
@@ -146,6 +149,7 @@ test "generateKeypair: output round-trips through vapidAuthHeader + verifies" {
     // signature — this ties the CLI-generated keypair to a signature that a push service
     // would accept.
     const hdr = try vapid.vapidAuthHeader(a, testing.io, "https://push.example.com", rt.subject, rt.vapid_public, rt.vapid_private, 1700000000, 1700000000 + 12 * 3600);
+    defer a.free(hdr);
     try testing.expect(std.mem.startsWith(u8, hdr, "vapid t="));
 
     // Extract "header.claims.signature" and verify against the public key.
@@ -158,6 +162,7 @@ test "generateKeypair: output round-trips through vapidAuthHeader + verifies" {
     const c = it.next().?;
     const s = it.next().?;
     const signing_input = try std.fmt.allocPrint(a, "{s}.{s}", .{ h, c });
+    defer a.free(signing_input);
     var sig_bytes: [64]u8 = undefined;
     try b64.Decoder.decode(&sig_bytes, s);
     const sig = Ecdsa.Signature.fromBytes(sig_bytes);

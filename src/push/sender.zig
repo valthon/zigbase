@@ -79,7 +79,9 @@ pub fn originOf(url: []const u8) []const u8 {
 /// JSON-escaped; `data` is passed through as raw JSON (`null` when empty).
 fn buildPayload(alloc: std.mem.Allocator, msg: PushMessage) ![]u8 {
     const title = try std.json.Stringify.valueAlloc(alloc, msg.title, .{});
+    defer alloc.free(title);
     const body = try std.json.Stringify.valueAlloc(alloc, msg.body, .{});
+    defer alloc.free(body);
     const data: []const u8 = if (msg.data.len == 0) "null" else msg.data;
     return std.fmt.allocPrint(alloc, "{{\"title\":{s},\"body\":{s},\"data\":{s}}}", .{ title, body, data });
 }
@@ -103,20 +105,29 @@ pub fn deliver(ctx: *Ctx, cfg: config.Runtime, sub: PushSubscription, msg: PushM
     var salt: [16]u8 = undefined;
     io.random(&salt);
 
-    // (3) Build + encrypt the payload (RFC 8291 aes128gcm).
+    // (3) Build + encrypt the payload (RFC 8291 aes128gcm). Both are pure scratch — the
+    // encrypted body and the header string are only read synchronously by the POST below,
+    // never retained — so `deliver` frees them itself rather than leaving them for the
+    // caller's request arena to reclaim.
     const payload = try buildPayload(a.a, msg);
+    defer a.a.free(payload);
     const body = encrypt.encrypt(a.a, io, payload, ua_public, auth_secret, as_public, as_private, salt) catch |e| switch (e) {
         error.InvalidPublicKey => return error.InvalidSubscriptionKey,
         error.OutOfMemory => return error.OutOfMemory,
     };
+    defer a.a.free(body);
 
     // (4) VAPID Authorization header (RFC 8292 ES256 JWT + raw key).
     const now = clock.nowUnix(io);
     const auth_header = vapid.vapidAuthHeader(a.a, io, originOf(sub.endpoint), cfg.subject, cfg.vapid_public, cfg.vapid_private, now, now + jwt_ttl_s) catch return error.InvalidSubscriptionKey;
+    defer a.a.free(auth_header);
 
     // (5) POST. A transport error is transient → `.failed`.
     var headers: std.ArrayList(http_client.Header) = .empty;
-    try headers.append(a.a, .{ .name = "TTL", .value = try std.fmt.allocPrint(a.a, "{d}", .{msg.ttl_s}) });
+    defer headers.deinit(a.a);
+    const ttl_str = try std.fmt.allocPrint(a.a, "{d}", .{msg.ttl_s});
+    defer a.a.free(ttl_str);
+    try headers.append(a.a, .{ .name = "TTL", .value = ttl_str });
     try headers.append(a.a, .{ .name = "Content-Encoding", .value = "aes128gcm" });
     try headers.append(a.a, .{ .name = "Content-Type", .value = "application/octet-stream" });
     try headers.append(a.a, .{ .name = "Authorization", .value = auth_header });
@@ -167,37 +178,30 @@ test "originOf extracts scheme://host[:port]" {
 }
 
 test "buildPayload JSON-escapes title/body and passes data through" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    try testing.expectEqualStrings(
-        "{\"title\":\"Hi\",\"body\":\"there\",\"data\":null}",
-        try buildPayload(a, .{ .title = "Hi", .body = "there" }),
-    );
+    const a = testing.allocator;
+    const p1 = try buildPayload(a, .{ .title = "Hi", .body = "there" });
+    defer a.free(p1);
+    try testing.expectEqualStrings("{\"title\":\"Hi\",\"body\":\"there\",\"data\":null}", p1);
+
     // Opaque data is spliced in raw; a quote in the title is escaped.
-    try testing.expectEqualStrings(
-        "{\"title\":\"a\\\"b\",\"body\":\"\",\"data\":{\"n\":1}}",
-        try buildPayload(a, .{ .title = "a\"b", .data = "{\"n\":1}" }),
-    );
+    const p2 = try buildPayload(a, .{ .title = "a\"b", .data = "{\"n\":1}" });
+    defer a.free(p2);
+    try testing.expectEqualStrings("{\"title\":\"a\\\"b\",\"body\":\"\",\"data\":{\"n\":1}}", p2);
 }
 
 // --- Delivery over the test HTTP capture/mock seam ---------------------------
 
 const TestEnv = struct {
-    arena: std.heap.ArenaAllocator,
     app: App,
 
     fn init() TestEnv {
-        return .{
-            .arena = std.heap.ArenaAllocator.init(testing.allocator),
-            .app = App{ .allocator = testing.allocator, .io = testing.io, .pool = undefined },
-        };
+        return .{ .app = App{ .allocator = testing.allocator, .io = testing.io, .pool = undefined } };
     }
+    // `forTest` (not a real arena): `deliver` must be correct under ANY allocator, so
+    // running it on the leak-checked `std.testing.allocator` directly is a strictly
+    // harsher, and more useful, exercise than masking it behind an arena.
     fn ctx(self: *TestEnv) Ctx {
-        return Ctx{ .app = &self.app, .arena = RequestArena.from(&self.arena), .rctx = .{}, .request = null, .bound_conn = null };
-    }
-    fn deinit(self: *TestEnv) void {
-        self.arena.deinit();
+        return Ctx{ .app = &self.app, .arena = RequestArena.forTest(testing.allocator), .rctx = .{}, .request = null, .bound_conn = null };
     }
 };
 
@@ -219,9 +223,11 @@ test "deliver: composes a well-formed POST and maps 201 → delivered" {
     testcapture.http.mock("push.example.com", .{ .status = 201 });
 
     var env = TestEnv.init();
-    defer env.deinit();
     var cx = env.ctx();
-    const cfg = try testCfg(env.arena.allocator());
+    // The keypair's base64 buffers are throwaway scratch discarded the instant `resolve`
+    // copies their bytes into the fixed-size `Runtime` fields below — page_allocator (not
+    // leak-checked) avoids tracking them individually for a value nothing keeps.
+    const cfg = try testCfg(std.heap.page_allocator);
 
     const res = try deliver(&cx, cfg, .{ .endpoint = test_endpoint, .p256dh = test_p256dh, .auth = test_auth }, .{ .title = "Hello", .body = "world", .ttl_s = 120 });
     try testing.expectEqual(PushResult.delivered, res);
@@ -265,9 +271,8 @@ test "deliver: 410 → gone (prune), 500 → failed (retry)" {
         testcapture.http.mock("push.example.com", .{ .status = case[0] });
 
         var env = TestEnv.init();
-        defer env.deinit();
         var cx = env.ctx();
-        const cfg = try testCfg(env.arena.allocator());
+        const cfg = try testCfg(std.heap.page_allocator);
         const res = try deliver(&cx, cfg, .{ .endpoint = test_endpoint, .p256dh = test_p256dh, .auth = test_auth }, .{ .title = "x" });
         try testing.expectEqual(case[1], res);
     }
@@ -281,9 +286,11 @@ test "deliver: a corrupt subscription key is a terminal error (no network)" {
     testcapture.http.enable(true); // block unmocked: proves no POST is attempted
 
     var env = TestEnv.init();
-    defer env.deinit();
     var cx = env.ctx();
-    const cfg = try testCfg(env.arena.allocator());
+    // The keypair's base64 buffers are throwaway scratch discarded the instant `resolve`
+    // copies their bytes into the fixed-size `Runtime` fields below — page_allocator (not
+    // leak-checked) avoids tracking them individually for a value nothing keeps.
+    const cfg = try testCfg(std.heap.page_allocator);
     try testing.expectError(error.InvalidSubscriptionKey, deliver(&cx, cfg, .{ .endpoint = test_endpoint, .p256dh = "not-a-valid-key", .auth = test_auth }, .{ .title = "x" }));
     try testing.expectEqual(@as(usize, 0), testcapture.http.requestCount());
 }

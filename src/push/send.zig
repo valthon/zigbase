@@ -82,13 +82,19 @@ pub const PushApi = struct {
 /// An un-decodable subscription key is terminal (logged, no retry). When push is not
 /// configured the handler is a network-free no-op (completes).
 pub fn jobHandler(ctx: *Ctx, payload: []const u8) anyerror!void {
-    const job = std.json.parseFromSliceLeaky(PushJob, ctx.arena.a, payload, .{ .ignore_unknown_fields = true }) catch {
+    // Self-contained parse: `parsed` owns its own arena (built over `ctx.app.allocator`, not
+    // the request arena) and is freed here regardless of outcome — the job's
+    // subscription/message fields are only read synchronously below, never retained past
+    // this call, so there is no reason to make this function's own scratch outlive it.
+    var parsed = std.json.parseFromSlice(PushJob, ctx.app.allocator, payload, .{ .ignore_unknown_fields = true }) catch {
         // A malformed payload is a programmer error, not a transient failure — drop it (no
         // retry). `warn`, not `err`: `std.log.err` on a path a passing test exercises fails
         // Zig's test runner (see the same note in ctx.enqueueByName / events.zig).
         std.log.warn("push job payload is not valid JSON; dropping (no retry)", .{});
         return;
     };
+    defer parsed.deinit();
+    const job = parsed.value;
     const cfg = ctx.app.push;
     if (!cfg.configured) {
         std.log.info("[push:noop] queued push for {s} dropped (no VAPID keys configured)", .{job.subscription.endpoint});
@@ -122,20 +128,16 @@ const test_auth = "BTBZMqHH6r4Tts7J_aSIgg";
 const test_endpoint = "https://push.example.com/wpush/v1/sub-1";
 
 const JobEnv = struct {
-    arena: std.heap.ArenaAllocator,
     app: App,
 
     fn init(push_cfg: config.Runtime) JobEnv {
-        return .{
-            .arena = std.heap.ArenaAllocator.init(testing.allocator),
-            .app = App{ .allocator = testing.allocator, .io = testing.io, .pool = undefined, .push = push_cfg },
-        };
+        return .{ .app = App{ .allocator = testing.allocator, .io = testing.io, .pool = undefined, .push = push_cfg } };
     }
+    // `forTest` (not a real arena): `jobHandler`/`deliver` must be correct under ANY
+    // allocator, so running them on the leak-checked `std.testing.allocator` directly is a
+    // strictly harsher, and more useful, exercise than masking them behind an arena.
     fn ctx(self: *JobEnv) Ctx {
-        return Ctx{ .app = &self.app, .arena = RequestArena.from(&self.arena), .rctx = .{}, .request = null, .bound_conn = null };
-    }
-    fn deinit(self: *JobEnv) void {
-        self.arena.deinit();
+        return Ctx{ .app = &self.app, .arena = RequestArena.forTest(testing.allocator), .rctx = .{}, .request = null, .bound_conn = null };
     }
 };
 
@@ -160,9 +162,10 @@ test "jobHandler: .failed → error (queue retries)" {
     testcapture.http.mock("push.example.com", .{ .status = 500 });
 
     var env = JobEnv.init(try configuredCfg(std.heap.page_allocator));
-    defer env.deinit();
     var cx = env.ctx();
-    try testing.expectError(error.PushDeliveryFailed, jobHandler(&cx, try jobPayload(env.arena.allocator())));
+    const payload = try jobPayload(testing.allocator);
+    defer testing.allocator.free(payload);
+    try testing.expectError(error.PushDeliveryFailed, jobHandler(&cx, payload));
 }
 
 test "jobHandler: .gone → completes (no error, no retry)" {
@@ -173,9 +176,10 @@ test "jobHandler: .gone → completes (no error, no retry)" {
     testcapture.http.mock("push.example.com", .{ .status = 410 });
 
     var env = JobEnv.init(try configuredCfg(std.heap.page_allocator));
-    defer env.deinit();
     var cx = env.ctx();
-    try jobHandler(&cx, try jobPayload(env.arena.allocator())); // no error
+    const payload = try jobPayload(testing.allocator);
+    defer testing.allocator.free(payload);
+    try jobHandler(&cx, payload); // no error
 }
 
 test "jobHandler: unconfigured push is a network-free no-op" {
@@ -185,15 +189,15 @@ test "jobHandler: unconfigured push is a network-free no-op" {
     testcapture.http.enable(true); // block unmocked — a network attempt would error
 
     var env = JobEnv.init(.{}); // configured = false
-    defer env.deinit();
     var cx = env.ctx();
-    try jobHandler(&cx, try jobPayload(env.arena.allocator())); // completes, no network
+    const payload = try jobPayload(testing.allocator);
+    defer testing.allocator.free(payload);
+    try jobHandler(&cx, payload); // completes, no network
     try testing.expectEqual(@as(usize, 0), testcapture.http.requestCount());
 }
 
 test "jobHandler: malformed payload is dropped (no throw, no retry)" {
     var env = JobEnv.init(.{});
-    defer env.deinit();
     var cx = env.ctx();
     try jobHandler(&cx, "{ not json");
 }
@@ -205,7 +209,6 @@ test "PushApi.send: unconfigured is a no-op returning .delivered" {
     testcapture.http.enable(true);
 
     var env = JobEnv.init(.{});
-    defer env.deinit();
     var cx = env.ctx();
     const api = PushApi{ .ctx = &cx };
     const res = try api.send(.{ .endpoint = test_endpoint, .p256dh = test_p256dh, .auth = test_auth }, .{ .title = "x" });

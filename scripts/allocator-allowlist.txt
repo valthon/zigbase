@@ -65,11 +65,6 @@ src/oauth/providers.zig	3	PRE-EXISTING: not yet migrated to the ownership contra
 src/oauth/secrets.zig	5	PRE-EXISTING: not yet migrated to the ownership contracts
 src/policy.zig	16	PRE-EXISTING: not yet migrated to the ownership contracts
 src/provision.zig	29	PRE-EXISTING: not yet migrated to the ownership contracts
-src/push/config.zig	2	PRE-EXISTING: not yet migrated to the ownership contracts
-src/push/encrypt.zig	3	PRE-EXISTING: not yet migrated to the ownership contracts
-src/push/send.zig	1	PRE-EXISTING: not yet migrated to the ownership contracts
-src/push/sender.zig	2	PRE-EXISTING: not yet migrated to the ownership contracts
-src/push/vapid.zig	5	PRE-EXISTING: not yet migrated to the ownership contracts
 src/query/compiler.zig	31	PRE-EXISTING: not yet migrated to the ownership contracts
 src/query/expand.zig	9	PRE-EXISTING: not yet migrated to the ownership contracts
 src/query/fields.zig	12	PRE-EXISTING: not yet migrated to the ownership contracts
