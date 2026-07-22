@@ -64,6 +64,18 @@ pub fn abilityFor(col: schema.Collection, action: Action) ?abilities.Ability {
     };
 }
 
+/// True iff a per-ROW predicate — a tenant scope OR a relationship ability — constrains
+/// `action` on `col` for `rctx`, i.e. even an `allow`/`@public` access rule must still run the
+/// guarded query to narrow which rows are visible. This is the SAME condition that forces
+/// `decide` to `.check` (below). The realtime hub uses it to decide whether an `@public`-rule
+/// delivery may short-circuit: deriving it here — rather than re-checking only tenancy at the
+/// delivery site — is what keeps realtime from diverging from `decide`'s tenant+ability
+/// composition (the gap that let abilities be enforced on `records.list` but skipped on
+/// realtime delivery).
+pub fn rowConstrained(col: schema.Collection, action: Action, rctx: *const request.RequestContext) bool {
+    return abilities.abilityApplies(abilityFor(col, action), rctx) or tenancy.scopeApplies(col, rctx);
+}
+
 /// The pure, per-collection authorization decision for `action`. Delegates to `rules.decide` on
 /// the action's rule, then composes tenancy:
 ///   - `deny_locked` SHORT-CIRCUITS FIRST (the fail-closed floor — locked beats everything).
