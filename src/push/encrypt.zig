@@ -180,9 +180,7 @@ fn b64dec(comptime N: usize, s: []const u8) [N]u8 {
 }
 
 test "RFC 8291 Appendix A: intermediates + final body match the published vector" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
 
     // Appendix A inputs (base64url, no padding).
     const plaintext = "When I grow up, I want to be a watermelon";
@@ -207,6 +205,7 @@ test "RFC 8291 Appendix A: intermediates + final body match the published vector
     try std.testing.expectEqual(b64dec(12, "4h_95klXJ5E_qnoN"), keys.nonce);
 
     const body = try encrypt(a, std.testing.io, plaintext, ua_public, auth_secret, as_public, as_private, salt);
+    defer a.free(body);
 
     // Reconstruct the expected 144-byte body from the RFC's PUBLISHED pieces:
     //   header = salt(16) || rs(4, BE=4096) || idlen(1=65) || keyid(=as_public, 65)
@@ -230,9 +229,7 @@ test "RFC 8291 Appendix A: intermediates + final body match the published vector
 }
 
 test "encrypt: body header framing (salt, rs, idlen, keyid) is well-formed" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
 
     const auth_secret = [_]u8{0x11} ** 16;
     const ua_public = b64dec(65, "BCVxsr7N_eNgVRqvHtD0zTZsEc6-VV-JvLexhqUzORcxaOzi6-AYWXvTBHm4bjyPjs7Vd8pZGH6SRpkNtoIAiw4");
@@ -241,6 +238,7 @@ test "encrypt: body header framing (salt, rs, idlen, keyid) is well-formed" {
     const salt = [_]u8{0x22} ** 16;
 
     const body = try encrypt(a, std.testing.io, "hello", ua_public, auth_secret, as_public, as_private, salt);
+    defer a.free(body);
 
     try std.testing.expectEqualSlices(u8, &salt, body[0..16]);
     try std.testing.expectEqual(@as(u32, 4096), std.mem.readInt(u32, body[16..20], .big));
@@ -251,9 +249,7 @@ test "encrypt: body header framing (salt, rs, idlen, keyid) is well-formed" {
 }
 
 test "encrypt: a bad UA public key fails closed" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const bad_ua = [_]u8{0x00} ** 65; // not a valid SEC1 point.
     try std.testing.expectError(error.InvalidPublicKey, encrypt(
         a,
