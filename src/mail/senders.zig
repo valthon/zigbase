@@ -314,7 +314,9 @@ test "requestVerification is idempotent + reports already-verified" {
     const r3 = try requestVerification(testing.io, a, &d, "acc1", "from@app.com");
     defer a.free(r3.id);
     defer a.free(r3.email);
-    defer a.free(r3.token);
+    // On the already-verified path `token` is the "" literal (no token issued), never an owned
+    // allocation — freeing it would be an invalid free. Only free a real issued token.
+    defer if (r3.token.len > 0) a.free(r3.token);
     try testing.expect(r3.already_verified);
     try testing.expectEqualStrings("", r3.token);
     try testing.expectEqualStrings(r1.id, r3.id); // same row re-used
