@@ -28,6 +28,25 @@ const QueryCtx = struct { conn: *Db };
 const RecCtx = struct { conn: *Db, col: schema.Collection, id0: []const u8 };
 
 // Single-record read (the findById shape): one prepare + one row -> one json.Value object.
+// The query filter-compile path: lex -> parse -> compile a filter string into
+// parameter-bound SQL. Runs on every filtered list request; allocates the token slice, the
+// AST (interlinked *Node graph), and the SQL string + params. Arena-lifetime, so runArena.
+const lexer = zigbase.internal.query.lexer;
+const parser = zigbase.internal.query.parser;
+const compiler = zigbase.internal.query.compiler;
+const joiner_mod = zigbase.internal.query.joiner;
+const Dialect = zigbase.internal.db.Dialect;
+
+const FilterCtx = struct { conn: *Db, col: schema.Collection, filter: []const u8 };
+
+fn benchFilterCompile(c: FilterCtx, a: std.mem.Allocator) anyerror!void {
+    var j = joiner_mod.Joiner.init(a, c.conn, c.col);
+    const toks = try lexer.lex(a, c.filter);
+    const ast = try parser.parse(a, toks);
+    const compiled = try compiler.compile(a, &j, ast, null, Dialect.sqlite, &.{});
+    std.mem.doNotOptimizeAway(&compiled);
+}
+
 fn benchFindByIdJson(c: RecCtx, a: std.mem.Allocator) anyerror!void {
     const rec = try records.get(a, c.conn, c.col, c.id0);
     std.mem.doNotOptimizeAway(&rec);
@@ -145,6 +164,11 @@ pub fn main(init: std.process.Init) !void {
     // measured under the request arena. Contrast with data/queryAs (typed struct) above.
     try results.append(alloc, try harness.runArena("records/findById-json", 100, 2000, init.io, rctx, benchFindByIdJson));
     try results.append(alloc, try harness.runArena("records/list-json-30", 50, 1000, init.io, rctx, benchListJson));
+
+    // The query filter-compile path (lex -> parse -> compile) — runs on every filtered list
+    // request. A moderately complex filter exercising comparisons, AND/OR, and grouping.
+    const fctx = FilterCtx{ .conn = &rdb, .col = post_col, .filter = "title = \"hi\" && views > 5 && (title = \"a\" || title = \"b\")" };
+    try results.append(alloc, try harness.runArena("query/filter-compile", 100, 2000, init.io, fctx, benchFilterCompile));
 
     var buf: [4096]u8 = undefined;
     var w = std.Io.File.stdout().writer(init.io, &buf);
