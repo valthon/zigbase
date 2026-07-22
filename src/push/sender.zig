@@ -212,6 +212,11 @@ const test_endpoint = "https://push.example.com/wpush/v1/subscription-abc";
 
 fn testCfg(a: std.mem.Allocator) !config.Runtime {
     const kp = try config.generateKeypair(a, testing.io);
+    // `resolve` copies the base64 bytes into `Runtime`'s fixed-size fields, so the keypair
+    // buffers are scratch once it returns — free them (contract-1), keeping the helper leak-clean
+    // under a real leak-detecting allocator.
+    defer a.free(kp.public_b64);
+    defer a.free(kp.private_b64);
     return config.resolve("mailto:ops@example.com", kp.public_b64, kp.private_b64);
 }
 
@@ -224,10 +229,7 @@ test "deliver: composes a well-formed POST and maps 201 → delivered" {
 
     var env = TestEnv.init();
     var cx = env.ctx();
-    // The keypair's base64 buffers are throwaway scratch discarded the instant `resolve`
-    // copies their bytes into the fixed-size `Runtime` fields below — page_allocator (not
-    // leak-checked) avoids tracking them individually for a value nothing keeps.
-    const cfg = try testCfg(std.heap.page_allocator);
+    const cfg = try testCfg(testing.allocator);
 
     const res = try deliver(&cx, cfg, .{ .endpoint = test_endpoint, .p256dh = test_p256dh, .auth = test_auth }, .{ .title = "Hello", .body = "world", .ttl_s = 120 });
     try testing.expectEqual(PushResult.delivered, res);
@@ -272,7 +274,7 @@ test "deliver: 410 → gone (prune), 500 → failed (retry)" {
 
         var env = TestEnv.init();
         var cx = env.ctx();
-        const cfg = try testCfg(std.heap.page_allocator);
+        const cfg = try testCfg(testing.allocator);
         const res = try deliver(&cx, cfg, .{ .endpoint = test_endpoint, .p256dh = test_p256dh, .auth = test_auth }, .{ .title = "x" });
         try testing.expectEqual(case[1], res);
     }
@@ -287,10 +289,7 @@ test "deliver: a corrupt subscription key is a terminal error (no network)" {
 
     var env = TestEnv.init();
     var cx = env.ctx();
-    // The keypair's base64 buffers are throwaway scratch discarded the instant `resolve`
-    // copies their bytes into the fixed-size `Runtime` fields below — page_allocator (not
-    // leak-checked) avoids tracking them individually for a value nothing keeps.
-    const cfg = try testCfg(std.heap.page_allocator);
+    const cfg = try testCfg(testing.allocator);
     try testing.expectError(error.InvalidSubscriptionKey, deliver(&cx, cfg, .{ .endpoint = test_endpoint, .p256dh = "not-a-valid-key", .auth = test_auth }, .{ .title = "x" }));
     try testing.expectEqual(@as(usize, 0), testcapture.http.requestCount());
 }

@@ -143,6 +143,10 @@ const JobEnv = struct {
 
 fn configuredCfg(a: std.mem.Allocator) !config.Runtime {
     const kp = try config.generateKeypair(a, testing.io);
+    // `resolve` copies the base64 bytes into `Runtime`'s fixed-size fields, so the keypair
+    // buffers are scratch once it returns — free them (contract-1) to stay leak-clean.
+    defer a.free(kp.public_b64);
+    defer a.free(kp.private_b64);
     return config.resolve("mailto:ops@example.com", kp.public_b64, kp.private_b64);
 }
 
@@ -161,7 +165,7 @@ test "jobHandler: .failed → error (queue retries)" {
     testcapture.http.enable(true);
     testcapture.http.mock("push.example.com", .{ .status = 500 });
 
-    var env = JobEnv.init(try configuredCfg(std.heap.page_allocator));
+    var env = JobEnv.init(try configuredCfg(testing.allocator));
     var cx = env.ctx();
     const payload = try jobPayload(testing.allocator);
     defer testing.allocator.free(payload);
@@ -175,7 +179,7 @@ test "jobHandler: .gone → completes (no error, no retry)" {
     testcapture.http.enable(true);
     testcapture.http.mock("push.example.com", .{ .status = 410 });
 
-    var env = JobEnv.init(try configuredCfg(std.heap.page_allocator));
+    var env = JobEnv.init(try configuredCfg(testing.allocator));
     var cx = env.ctx();
     const payload = try jobPayload(testing.allocator);
     defer testing.allocator.free(payload);
