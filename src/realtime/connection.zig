@@ -133,8 +133,28 @@ pub const Conn = struct {
         vp.* = if (filter) |f| try alloc.dupe(u8, f) else null;
         return true;
     }
-    pub fn removeSub(self: *Conn, topic: []const u8) bool {
-        return self.subs.remove(topic);
+    /// Drop `topic`'s subscription, freeing the dupe'd key/filter it was holding (matching
+    /// `updateFilter`'s discipline). `alloc` must be the SAME allocator `addSub`/`updateFilter` used
+    /// to dupe them (the connection-durable arena in production; safe as a no-op free on it, and a
+    /// real free under a plain allocator in tests). Returns false when `topic` wasn't subscribed.
+    pub fn removeSub(self: *Conn, alloc: std.mem.Allocator, topic: []const u8) bool {
+        const kv = self.subs.fetchRemove(topic) orelse return false;
+        alloc.free(kv.key);
+        if (kv.value) |f| alloc.free(f);
+        return true;
+    }
+
+    /// Free every remaining subscription's dupe'd key/filter plus the map's own storage. `alloc`
+    /// must match what `addSub`/`updateFilter` used. Production connections never call this (the
+    /// whole connection-durable arena is torn down at once instead); it exists for standalone/test
+    /// use of a `Conn` under a plain allocator.
+    pub fn deinit(self: *Conn, alloc: std.mem.Allocator) void {
+        var it = self.subs.iterator();
+        while (it.next()) |e| {
+            alloc.free(e.key_ptr.*);
+            if (e.value_ptr.*) |f| alloc.free(f);
+        }
+        self.subs.deinit(alloc);
     }
     pub fn hasSub(self: *const Conn, topic: []const u8) bool {
         return self.subs.contains(topic);
@@ -165,25 +185,23 @@ pub const Conn = struct {
 };
 
 test "subscriptions add/remove/get filter" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     var conn = Conn{};
+    defer conn.deinit(a);
     try conn.addSub(a, "posts", "status='x'");
     try conn.addSub(a, "users/REC1", null);
     try std.testing.expect(conn.hasSub("posts"));
     try std.testing.expectEqualStrings("status='x'", conn.subFilter("posts").?.*.?);
     try std.testing.expect(conn.subFilter("users/REC1").?.* == null);
-    try std.testing.expect(conn.removeSub("posts"));
+    try std.testing.expect(conn.removeSub(a, "posts"));
     try std.testing.expect(!conn.hasSub("posts"));
-    try std.testing.expect(!conn.removeSub("missing"));
+    try std.testing.expect(!conn.removeSub(a, "missing"));
 }
 
 test "updateFilter: dedup path replaces the filter in place without growing subs.count (#3)" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     var conn = Conn{};
+    defer conn.deinit(a);
     // A topic that isn't subscribed yet: updateFilter is a no-op miss (caller does addSub).
     try std.testing.expect(!(try conn.updateFilter(a, "posts", "status='x'")));
     try std.testing.expectEqual(@as(usize, 0), conn.subs.count());
@@ -207,12 +225,12 @@ test "updateFilter: dedup path replaces the filter in place without growing subs
 }
 
 test "requestContext: anonymous, authed, expired" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     var conn = Conn{};
+    defer conn.deinit(a);
     try std.testing.expect(conn.requestContext(1000).auth == null);
     var rec: std.json.ObjectMap = .empty;
+    defer rec.deinit(a);
     try rec.put(a, "id", .{ .string = "u1" });
     conn.setAuth(.{ .record = .{ .object = rec }, .is_superuser = false, .exp = 2000 });
     const c1 = conn.requestContext(1500);

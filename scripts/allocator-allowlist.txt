@@ -64,12 +64,7 @@ src/query/params.zig	1	PRE-EXISTING: not yet migrated to the ownership contracts
 src/query/parser.zig	9	PRE-EXISTING: not yet migrated to the ownership contracts
 src/query/sort.zig	4	PRE-EXISTING: not yet migrated to the ownership contracts
 src/queue/durable.zig	4	PRE-EXISTING: not yet migrated to the ownership contracts
-src/realtime/connection.zig	3	PRE-EXISTING: not yet migrated to the ownership contracts
-src/realtime/hub.zig	22	PRE-EXISTING: not yet migrated to the ownership contracts
-src/realtime/pg_bridge.zig	5	PRE-EXISTING: not yet migrated to the ownership contracts
-src/realtime/protocol.zig	4	PRE-EXISTING: not yet migrated to the ownership contracts
-src/realtime/sse.zig	1	PRE-EXISTING: not yet migrated to the ownership contracts
-src/realtime/ws.zig	2	PRE-EXISTING: not yet migrated to the ownership contracts
+src/realtime/hub.zig	16	15 BLOCKED: mkColl/mkRec (TestDb) or collections.create/get leak scratch SQL — root cause src/collections.zig (create/get: unfreed DDL/dupeZ'd SQL, validation-error ArrayLists) and src/records.zig (create: same) and src/sql/dialect.zig (renumberPlaceholders: unfreed dupeZ), none in this batch; verified empirically (one converted test surfaced ~35 leaks, all in mkColl/mkRec). 1 contract-4: authVerb's identity_arena is the real *ArenaAllocator parameter type (production identity arena), not a masking workaround.
 src/records.zig	62	PRE-EXISTING: not yet migrated to the ownership contracts
 src/records_hooks_test.zig	4	PRE-EXISTING: not yet migrated to the ownership contracts
 src/report/send.zig	1	PRE-EXISTING: not yet migrated to the ownership contracts
