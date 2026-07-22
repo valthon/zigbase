@@ -64,15 +64,21 @@ fn cacheControlFor(col: schema.Collection) []const u8 {
         "private";
 }
 
-/// Resolve the requester's identity for a file download: either a `?token=` file/auth JWT, or
-/// the normal bearer/cookie auth. Returns an `auth.Authed` (not `auth.Verified`) so the caller
-/// can feed it straight into `tenancy.resolveRequest` — mirroring `dispatchCustom` and
-/// `api/records.zig`'s `buildContext`, the other REST chokepoints that resolve tenant scope.
+/// Resolve the requester's identity for a file download: either a `?token=` **file** JWT (the
+/// purpose-built, scoped token minted by `POST /api/files/token`), or the normal bearer/cookie
+/// auth. Returns an `auth.Authed` (not `auth.Verified`) so the caller can feed it straight into
+/// `tenancy.resolveRequest` — mirroring `dispatchCustom` and `api/records.zig`'s `buildContext`,
+/// the other REST chokepoints that resolve tenant scope.
+///
+/// The `?token=` param accepts ONLY `.file` tokens, never a full `.auth` session token: a query
+/// param travels in URLs (access logs, `Referer` headers, browser history), so permitting session
+/// tokens there would invite long-lived credentials into those sinks. Session-authenticated
+/// downloads use the `Authorization: Bearer` header or the auth cookie via `authenticate` below.
 fn fileIdentity(ctx: *http.RequestCtx, conn: *db.Db) ?auth.Authed {
     const app = ctx.app.?;
     const qp = params_mod.parse(ctx.allocator.a, ctx.query) catch null;
     if (qp) |p| if (p.get("token")) |tok| {
-        if (auth.verifyTokenOfTypes(ctx.allocator.a, app, conn, tok, &.{ .auth, .file })) |v|
+        if (auth.verifyTokenOfTypes(ctx.allocator.a, app, conn, tok, &.{.file})) |v|
             return .{ .record = v.record, .collection = v.collection, .is_superuser = v.is_superuser, .sid = v.sid };
     };
     return auth.authenticate(app.io, ctx.allocator.a, app, ctx, conn) catch null;
@@ -271,6 +277,30 @@ test "PIN: file-download view-authz + cache route through policy byte-identicall
         // The Cache-Control public/private decision is identical too.
         try std.testing.expectEqual(rules.isPublic(col.viewRule), policy.isPublic(col.viewRule));
     }
+}
+
+test "fileIdentity rejects a full .auth token supplied via ?token= (only .file accepted)" {
+    // Security hardening: the file-download `?token=` param accepts ONLY purpose-built `.file`
+    // tokens. A full session (`.auth`) token supplied there must NOT authenticate the download —
+    // session tokens must never travel in URLs (logs / Referer / history). With no bearer/cookie,
+    // the fallthrough is unauthenticated, so fileIdentity returns null.
+    const app_mod = @import("../app.zig");
+    const migrations = @import("../migrations.zig");
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try migrations.run(&d);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    _ = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "users", .type = .auth, .fields = &.{} });
+    try d.exec("INSERT INTO \"users\" (\"id\",\"created\",\"updated\",\"email\",\"tokenKey\",\"verified\") VALUES ('rec1','','','u@x.io','tk',1);");
+    var app = app_mod.App{ .allocator = std.testing.allocator, .io = std.testing.io, .pool = undefined };
+    const key = crypto.deriveKey(app.jwt_secret, "tk");
+    const auth_tok = try jwt.sign(a, .{ .id = "rec1", .collection = "users", .type = .auth, .iat = 0, .exp = 9999999999 }, &key);
+    const query = try std.fmt.allocPrint(a, "token={s}", .{auth_tok});
+    var ctx = http.RequestCtx{ .method = .GET, .path = "/api/files/users/rec1/x.png", .query = query, .allocator = RequestArena.from(&arena), .app = &app, .params = &[_]http.Param{} };
+    // Pre-hardening (accepted set `.{ .auth, .file }`) this returned the .auth record; now null.
+    try std.testing.expect(fileIdentity(&ctx, &d) == null);
 }
 
 // Guards the security-review fix: a `@public` viewRule must NOT make a TENANT-OWNED collection's

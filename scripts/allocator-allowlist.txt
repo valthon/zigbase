@@ -8,7 +8,7 @@ src/api/auth.zig	42	PRE-EXISTING: not yet migrated to the ownership contracts
 src/api/auth_methods.zig	10	PRE-EXISTING: not yet migrated to the ownership contracts
 src/api/collections.zig	9	PRE-EXISTING: not yet migrated to the ownership contracts
 src/api/features.zig	4	PRE-EXISTING: not yet migrated to the ownership contracts
-src/api/files.zig	2	PRE-EXISTING: not yet migrated to the ownership contracts
+src/api/files.zig	3	PRE-EXISTING: not yet migrated to the ownership contracts
 src/api/health.zig	1	PRE-EXISTING: not yet migrated to the ownership contracts
 src/api/magic_link_consume.zig	7	PRE-EXISTING: not yet migrated to the ownership contracts
 src/api/mail_unsubscribe.zig	6	PRE-EXISTING: not yet migrated to the ownership contracts
@@ -19,7 +19,7 @@ src/api/sessions.zig	6	PRE-EXISTING: not yet migrated to the ownership contracts
 src/api/settings.zig	2	PRE-EXISTING: not yet migrated to the ownership contracts
 src/api/state.zig	5	PRE-EXISTING: not yet migrated to the ownership contracts
 src/api/webauthn_register.zig	4	PRE-EXISTING: not yet migrated to the ownership contracts
-src/auth.zig	16	PRE-EXISTING: not yet migrated to the ownership contracts
+src/auth.zig	17	PRE-EXISTING: not yet migrated to the ownership contracts
 src/auth/challenge_store.zig	4	PRE-EXISTING: not yet migrated to the ownership contracts
 src/auth/method.zig	5	PRE-EXISTING: not yet migrated to the ownership contracts
 src/auth/methods/magic_link.zig	11	PRE-EXISTING: not yet migrated to the ownership contracts
