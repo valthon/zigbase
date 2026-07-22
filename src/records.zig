@@ -908,6 +908,38 @@ test "over-maxSelect relation short-circuits before the per-element existence ch
     }
 }
 
+test "over-maxSelect select short-circuits before the per-value allowed-set scan" {
+    // Same short-circuit for `.select`: an over-maxSelect array must be rejected on the COUNT
+    // before the per-value allowed-set scan runs. Both the count error and the membership error
+    // share the code `validation_select`, so this asserts on the MESSAGE: an over-limit array
+    // containing an invalid value must yield ONLY "Too many values." — the presence of "Value not
+    // in the allowed set." would prove the loop ran on already-invalid input.
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try migrations.run(&d);
+    const fields = [_]schema.Field{.{ .id = "f1", .name = "tags", .options = .{ .select = .{ .values = &.{ "x", "y" }, .maxSelect = 2 } } }};
+    const col = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "tagged", .fields = &fields });
+    // Three values (> maxSelect=2), one of which ("bad") is NOT in the allowed set {x,y}.
+    var tags = std.json.Array.init(a);
+    try tags.append(.{ .string = "x" });
+    try tags.append(.{ .string = "y" });
+    try tags.append(.{ .string = "bad" });
+    var data: std.json.ObjectMap = .empty;
+    try data.put(a, "tags", .{ .array = tags });
+    try std.testing.expectError(error.Validation, create(a, std.testing.io, &d, col, .{ .object = data }));
+    const errs = last_errors orelse return error.TestExpectedEqual;
+    var saw_too_many = false;
+    for (errs) |e| {
+        if (std.mem.eql(u8, e.message, "Too many values.")) saw_too_many = true;
+        // The allowed-set scan running on over-count input would append this — must NOT happen.
+        if (std.mem.eql(u8, e.message, "Value not in the allowed set.")) return error.TestUnexpectedResult;
+    }
+    try std.testing.expect(saw_too_many);
+}
+
 // ---------------------------------------------------------------------------
 // Field-constraint enforcement tests (TDD; Bug 3). The schema stores
 // text min/max, number min/max, and date min/max, but validateFieldValue

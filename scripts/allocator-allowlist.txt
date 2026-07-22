@@ -86,7 +86,7 @@ src/realtime/pg_bridge.zig	5	PRE-EXISTING: not yet migrated to the ownership con
 src/realtime/protocol.zig	4	PRE-EXISTING: not yet migrated to the ownership contracts
 src/realtime/sse.zig	1	PRE-EXISTING: not yet migrated to the ownership contracts
 src/realtime/ws.zig	2	PRE-EXISTING: not yet migrated to the ownership contracts
-src/records.zig	61	PRE-EXISTING: not yet migrated to the ownership contracts
+src/records.zig	62	PRE-EXISTING: not yet migrated to the ownership contracts
 src/records_hooks_test.zig	4	PRE-EXISTING: not yet migrated to the ownership contracts
 src/report/send.zig	1	PRE-EXISTING: not yet migrated to the ownership contracts
 src/report/sentry.zig	1	PRE-EXISTING: not yet migrated to the ownership contracts
