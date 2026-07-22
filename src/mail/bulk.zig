@@ -189,12 +189,19 @@ pub fn sendBulk(
             try st.bindText(1, &rid);
             try st.bindText(2, batch_id);
             try st.bindText(3, r.to);
-            try st.bindText(4, try varsToJson(arena, r.vars));
+            // bindText copies (SQLITE_TRANSIENT), so vars_json is pure scratch once
+            // `step()` returns — free it every iteration rather than letting it ride
+            // on the caller's arena for the whole batch.
+            const vars_json = try varsToJson(arena, r.vars);
+            defer arena.free(vars_json);
+            try st.bindText(4, vars_json);
             if (try st.step()) {
                 // Distinct recipient: enqueue exactly one item job. Small constant
-                // payload — the template lives once on the batch row.
+                // payload — the template lives once on the batch row. `enqueue`'s
+                // bindText also copies, so this is scratch too.
                 total += 1;
                 const payload = try std.json.Stringify.valueAlloc(arena, .{ .batch = batch_id, .to = r.to }, .{});
+                defer arena.free(payload);
                 _ = try durable.enqueue(w, io, q, job_kind, payload, run_at);
             }
         }
@@ -298,7 +305,20 @@ fn markStatus(app: *App, rcpt_id: []const u8, status: []const u8, last_error: []
 /// see the file doc comment. Registered beside the `"mail"` kind in framework.zig.
 pub fn jobHandler(ctx: *Ctx, payload: []const u8) anyerror!void {
     const app = ctx.app;
-    const parsed = try std.json.parseFromSlice(ItemPayload, ctx.arena.a, payload, .{ .ignore_unknown_fields = true });
+    // Everything this handler allocates is pure internal scratch — nothing escapes
+    // the function (it returns void). Route it through a private arena layered on
+    // top of `ctx.arena.a` rather than `ctx.arena.a` directly: the handler must not
+    // leak under ANY allocator (see RequestArena's doc comment — a raw GPA is a
+    // valid, harsher execution), and freeing ~9 duped fields individually across
+    // this function's many early-return branches would be pure duplication. One
+    // `defer scratch.deinit()` reclaims all of it on every path, including under a
+    // real per-request arena in production (layering an arena on an arena is fine).
+    var scratch = std.heap.ArenaAllocator.init(ctx.arena.a);
+    defer scratch.deinit();
+    const sa = scratch.allocator();
+
+    const parsed = try std.json.parseFromSlice(ItemPayload, sa, payload, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
     const p = parsed.value;
 
     // 1. Load recipient + batch. Anything already resolved → SUCCESS no-op (dedup).
@@ -315,8 +335,8 @@ pub fn jobHandler(ctx: *Ctx, payload: []const u8) anyerror!void {
         try st.bindText(2, p.to);
         if (!try st.step()) return; // row gone — nothing to deliver
         if (!std.mem.eql(u8, st.columnText(1), "pending")) return; // at-least-once dedup
-        rcpt_id = try ctx.arena.a.dupe(u8, st.columnText(0));
-        vars_json = try ctx.arena.a.dupe(u8, st.columnText(2));
+        rcpt_id = try sa.dupe(u8, st.columnText(0));
+        vars_json = try sa.dupe(u8, st.columnText(2));
         rcpt_attempts = st.columnInt(3);
 
         var bst = try rd.prepare(
@@ -327,15 +347,15 @@ pub fn jobHandler(ctx: *Ctx, payload: []const u8) anyerror!void {
         try bst.bindText(1, p.batch);
         if (!try bst.step()) return; // orphaned job — no-op
         batch = .{
-            .account = try ctx.arena.a.dupe(u8, bst.columnText(0)),
-            .list = try ctx.arena.a.dupe(u8, bst.columnText(1)),
-            .queue = try ctx.arena.a.dupe(u8, bst.columnText(2)),
-            .from_addr = try ctx.arena.a.dupe(u8, bst.columnText(3)),
-            .reply_to = try ctx.arena.a.dupe(u8, bst.columnText(4)),
-            .subject_tpl = try ctx.arena.a.dupe(u8, bst.columnText(5)),
-            .text_tpl = try ctx.arena.a.dupe(u8, bst.columnText(6)),
-            .html_tpl = try ctx.arena.a.dupe(u8, bst.columnText(7)),
-            .status = try ctx.arena.a.dupe(u8, bst.columnText(8)),
+            .account = try sa.dupe(u8, bst.columnText(0)),
+            .list = try sa.dupe(u8, bst.columnText(1)),
+            .queue = try sa.dupe(u8, bst.columnText(2)),
+            .from_addr = try sa.dupe(u8, bst.columnText(3)),
+            .reply_to = try sa.dupe(u8, bst.columnText(4)),
+            .subject_tpl = try sa.dupe(u8, bst.columnText(5)),
+            .text_tpl = try sa.dupe(u8, bst.columnText(6)),
+            .html_tpl = try sa.dupe(u8, bst.columnText(7)),
+            .status = try sa.dupe(u8, bst.columnText(8)),
         };
     }
     if (std.mem.eql(u8, batch.status, "canceled")) return; // canceled batches drain as no-ops
@@ -343,20 +363,20 @@ pub fn jobHandler(ctx: *Ctx, payload: []const u8) anyerror!void {
     // 2. Per-recipient render — HTML part escaped by default (renderHtml), subject/
     //    text via renderText. A render failure is hopeless across retries (same vars
     //    every time) → status 'invalid', job SUCCESS (never burn the queue on it).
-    const vars = varsFromJson(ctx.arena.a, vars_json) catch {
+    const vars = varsFromJson(sa, vars_json) catch {
         return markStatus(app, rcpt_id, "invalid", "BadVarsJson");
     };
-    const subject = template.renderText(ctx.arena.a, batch.subject_tpl, vars, &.{}) catch |e| {
+    const subject = template.renderText(sa, batch.subject_tpl, vars, &.{}) catch |e| {
         return markStatus(app, rcpt_id, "invalid", @errorName(e));
     };
     const text: ?[]const u8 = if (batch.text_tpl.len > 0)
-        template.renderText(ctx.arena.a, batch.text_tpl, vars, &.{}) catch |e| {
+        template.renderText(sa, batch.text_tpl, vars, &.{}) catch |e| {
             return markStatus(app, rcpt_id, "invalid", @errorName(e));
         }
     else
         null;
     const html: ?[]const u8 = if (batch.html_tpl.len > 0)
-        template.renderHtml(ctx.arena.a, batch.html_tpl, vars, &.{}) catch |e| {
+        template.renderHtml(sa, batch.html_tpl, vars, &.{}) catch |e| {
             return markStatus(app, rcpt_id, "invalid", @errorName(e));
         }
     else
@@ -367,7 +387,7 @@ pub fn jobHandler(ctx: *Ctx, payload: []const u8) anyerror!void {
     {
         var rd = try app.pool.acquireReader();
         defer app.pool.releaseReader(&rd);
-        if (try suppression.isSuppressed(ctx.arena.a, &rd, batch.account, p.to, .list)) {
+        if (try suppression.isSuppressed(sa, &rd, batch.account, p.to, .list)) {
             return markStatus(app, rcpt_id, "suppressed", "");
         }
     }
@@ -377,7 +397,7 @@ pub fn jobHandler(ctx: *Ctx, payload: []const u8) anyerror!void {
     // RFC 8058 headers ride ONLY list mail, and only when the feature is configured.
     // Emitted even when batch.list == "" (the token just carries an empty list).
     const list_unsub: ?[]const u8 = if (app.mail.unsubscribe_base_url.len > 0)
-        try unsubscribe.buildUrl(ctx.arena.a, app.mail.unsubscribe_base_url, app.jwt_secret, batch.account, batch.list, p.to)
+        try unsubscribe.buildUrl(sa, app.mail.unsubscribe_base_url, app.jwt_secret, batch.account, batch.list, p.to)
     else
         null;
     const msg = mail_send.MailMessage{
@@ -390,7 +410,7 @@ pub fn jobHandler(ctx: *Ctx, payload: []const u8) anyerror!void {
         .account = if (batch.account.len > 0) batch.account else null,
         .list_unsubscribe = list_unsub,
     };
-    mail_send.send(app, ctx.arena.a, msg) catch |e| switch (e) {
+    mail_send.send(app, sa, msg) catch |e| switch (e) {
         error.RecipientSuppressed => return markStatus(app, rcpt_id, "suppressed", @errorName(e)),
         // Validation outcomes are hopeless across retries (vars/templates won't change).
         error.InvalidAddress, error.HeaderInjection, error.EmptyBody, error.SenderNotVerified => {
@@ -508,8 +528,19 @@ const BulkEnv = struct {
         return st.columnInt(0);
     }
 
-    /// One recipient row's report fields, duped onto `arena`.
-    const Row = struct { status: []const u8, last_error: []const u8, attempts: i64, sent_at: []const u8 };
+    /// One recipient row's report fields, duped onto `arena`. Caller frees via `deinit`.
+    const Row = struct {
+        status: []const u8,
+        last_error: []const u8,
+        attempts: i64,
+        sent_at: []const u8,
+
+        fn deinit(self: Row, alloc: std.mem.Allocator) void {
+            alloc.free(self.status);
+            alloc.free(self.last_error);
+            alloc.free(self.sent_at);
+        }
+    };
     fn row(env: *BulkEnv, arena: std.mem.Allocator, batch_id: []const u8, email: []const u8) !Row {
         const w = env.pool.acquireWriter();
         defer env.pool.releaseWriter();
@@ -558,9 +589,9 @@ test "sendBulk validation fails fast and persists NOTHING" {
     const env = try BulkEnv.init(.{});
     defer env.deinit();
     env.app.queues = @ptrCast(&test_registry);
-    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
+    // Every branch below errors before sendBulk allocates anything (validation is
+    // fail-fast, ahead of the batch-id alloc) — plain testing.allocator, nothing to free.
+    const arena = std.testing.allocator;
 
     const good = BulkRecipient{ .to = "good@x.io" };
     // A bad recipient ANYWHERE fails the whole call.
@@ -604,9 +635,7 @@ test "sendBulk dedups byte-identical recipients (UNIQUE batch,email): total==2, 
     const env = try BulkEnv.init(.{});
     defer env.deinit();
     env.app.queues = @ptrCast(&test_registry);
-    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
+    const arena = std.testing.allocator;
 
     const batch_id = try BulkEnv.submit(env, arena, &test_registry, .{
         .subject = "Hi",
@@ -618,6 +647,7 @@ test "sendBulk dedups byte-identical recipients (UNIQUE batch,email): total==2, 
         },
         .queue = "emails",
     }, "");
+    defer arena.free(batch_id);
 
     try testing.expectEqual(@as(i64, 2), try BulkEnv.countTable(env, "_mail_batch_recipients"));
     try testing.expectEqual(@as(i64, 2), try BulkEnv.countJobsOfKind(env, job_kind));
@@ -634,9 +664,7 @@ test "fan-out + personalization: pollOnce drains, per-recipient render, html-esc
     const m = cap.mailer();
     env.app.mailer = &m;
     env.app.queues = @ptrCast(&test_registry);
-    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
+    const arena = std.testing.allocator;
 
     const batch_id = try BulkEnv.submit(env, arena, &test_registry, .{
         .subject = "Hi {{ name }}",
@@ -647,6 +675,7 @@ test "fan-out + personalization: pollOnce drains, per-recipient render, html-esc
         },
         .queue = "emails",
     }, "");
+    defer arena.free(batch_id);
 
     try drain(env, &test_registry);
 
@@ -666,7 +695,9 @@ test "fan-out + personalization: pollOnce drains, per-recipient render, html-esc
     }
 
     const ra = try BulkEnv.row(env, arena, batch_id, "a@x.io");
+    defer ra.deinit(arena);
     const rb = try BulkEnv.row(env, arena, batch_id, "b@x.io");
+    defer rb.deinit(arena);
     try testing.expectEqualStrings("sent", ra.status);
     try testing.expectEqualStrings("sent", rb.status);
     try testing.expect(ra.sent_at.len > 0);
@@ -687,6 +718,15 @@ test "jobHandler wires the RFC 8058 List-Unsubscribe URL when configured (round-
     const m = cap.mailer();
     env.app.mailer = &m;
     env.app.queues = @ptrCast(&test_registry);
+    // BLOCKED (contract-4, out-of-scope root cause): `unsubscribe.verify` below
+    // (src/mail/unsubscribe.zig, NOT in this migration batch) allocates its decode
+    // buffer and returns `Parts` as slices INTO it without ever freeing it — by
+    // written design ("designed for arena-allocator callers", see that file's Parts
+    // doc comment and its own tests, which all run under a scratch arena for the
+    // same reason). Fixing that is out of scope here; keep this one test's outer
+    // arena so the leak detector doesn't flag unsubscribe.zig's known design. The
+    // two `jobHandler` invocations below are independently verified leak-clean via
+    // `RequestArena.forTest`.
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -700,9 +740,7 @@ test "jobHandler wires the RFC 8058 List-Unsubscribe URL when configured (round-
     }, "acc1");
     const payload = try std.json.Stringify.valueAlloc(arena, .{ .batch = batch_id, .to = "a@x.io" }, .{});
     {
-        var job_arena = std.heap.ArenaAllocator.init(testing.allocator);
-        defer job_arena.deinit();
-        var cx = Ctx{ .app = &env.app, .arena = RequestArena.from(&job_arena), .rctx = .{} };
+        var cx = Ctx{ .app = &env.app, .arena = RequestArena.forTest(std.testing.allocator), .rctx = .{} };
         defer cx.deinit();
         try jobHandler(&cx, payload);
     }
@@ -729,9 +767,7 @@ test "jobHandler wires the RFC 8058 List-Unsubscribe URL when configured (round-
     }, "acc1");
     const payload2 = try std.json.Stringify.valueAlloc(arena, .{ .batch = batch_id2, .to = "b@x.io" }, .{});
     {
-        var job_arena = std.heap.ArenaAllocator.init(testing.allocator);
-        defer job_arena.deinit();
-        var cx = Ctx{ .app = &env.app, .arena = RequestArena.from(&job_arena), .rctx = .{} };
+        var cx = Ctx{ .app = &env.app, .arena = RequestArena.forTest(std.testing.allocator), .rctx = .{} };
         defer cx.deinit();
         try jobHandler(&cx, payload2);
     }
@@ -754,9 +790,7 @@ test "jobHandler is idempotent by row status: same payload twice sends once" {
     const m = cap.mailer();
     env.app.mailer = &m;
     env.app.queues = @ptrCast(&test_registry);
-    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
+    const arena = std.testing.allocator;
 
     const batch_id = try BulkEnv.submit(env, arena, &test_registry, .{
         .subject = "Hi",
@@ -764,25 +798,24 @@ test "jobHandler is idempotent by row status: same payload twice sends once" {
         .recipients = &.{.{ .to = "a@x.io" }},
         .queue = "emails",
     }, "");
+    defer arena.free(batch_id);
     const payload = try std.json.Stringify.valueAlloc(arena, .{ .batch = batch_id, .to = "a@x.io" }, .{});
+    defer arena.free(payload);
 
     {
-        var job_arena = std.heap.ArenaAllocator.init(testing.allocator);
-        defer job_arena.deinit();
-        var cx = Ctx{ .app = &env.app, .arena = RequestArena.from(&job_arena), .rctx = .{} };
+        var cx = Ctx{ .app = &env.app, .arena = RequestArena.forTest(arena), .rctx = .{} };
         defer cx.deinit();
         try jobHandler(&cx, payload);
     }
     {
-        var job_arena = std.heap.ArenaAllocator.init(testing.allocator);
-        defer job_arena.deinit();
-        var cx = Ctx{ .app = &env.app, .arena = RequestArena.from(&job_arena), .rctx = .{} };
+        var cx = Ctx{ .app = &env.app, .arena = RequestArena.forTest(arena), .rctx = .{} };
         defer cx.deinit();
         try jobHandler(&cx, payload); // redelivery — must be a no-op
     }
 
     try testing.expectEqual(@as(usize, 1), cap.count());
     const r = try BulkEnv.row(env, arena, batch_id, "a@x.io");
+    defer r.deinit(arena);
     try testing.expectEqualStrings("sent", r.status);
 }
 
@@ -794,9 +827,7 @@ test "suppressed recipient is a REPORTED OUTCOME (row suppressed, job done, noth
     const m = cap.mailer();
     env.app.mailer = &m;
     env.app.queues = @ptrCast(&test_registry);
-    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
+    const arena = std.testing.allocator;
 
     {
         const w = env.pool.acquireWriter();
@@ -810,14 +841,17 @@ test "suppressed recipient is a REPORTED OUTCOME (row suppressed, job done, noth
         .recipients = &.{ .{ .to = "blocked@x.io" }, .{ .to = "ok@x.io" } },
         .queue = "emails",
     }, "");
+    defer arena.free(batch_id);
 
     try drain(env, &test_registry);
 
     try testing.expectEqual(@as(usize, 0), cap.countTo("blocked@x.io"));
     try testing.expectEqual(@as(usize, 1), cap.countTo("ok@x.io"));
     const rblocked = try BulkEnv.row(env, arena, batch_id, "blocked@x.io");
+    defer rblocked.deinit(arena);
     try testing.expectEqualStrings("suppressed", rblocked.status);
     const rok = try BulkEnv.row(env, arena, batch_id, "ok@x.io");
+    defer rok.deinit(arena);
     try testing.expectEqualStrings("sent", rok.status);
     // A suppressed recipient is NOT a job failure — every item job is 'done'.
     try BulkEnv.expectAllJobs(env, job_kind, "done");
@@ -831,9 +865,7 @@ test "unsubscribe suppression blocks .list delivery but NOT a transactional send
     const m = cap.mailer();
     env.app.mailer = &m;
     env.app.queues = @ptrCast(&test_registry);
-    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
+    const arena = std.testing.allocator;
 
     {
         const w = env.pool.acquireWriter();
@@ -847,12 +879,14 @@ test "unsubscribe suppression blocks .list delivery but NOT a transactional send
         .recipients = &.{.{ .to = "opted-out@x.io" }},
         .queue = "emails",
     }, "");
+    defer arena.free(batch_id);
 
     try drain(env, &test_registry);
 
     // .list delivery honors the unsubscribe row: reported as 'suppressed', nothing captured.
     try testing.expectEqual(@as(usize, 0), cap.countTo("opted-out@x.io"));
     const row = try BulkEnv.row(env, arena, batch_id, "opted-out@x.io");
+    defer row.deinit(arena);
     try testing.expectEqualStrings("suppressed", row.status);
 
     // A transactional send() to the SAME address (check_suppression on) is UNAFFECTED — a
@@ -869,9 +903,7 @@ test "render error marks the row invalid and the job still SUCCEEDS (never retri
     const m = cap.mailer();
     env.app.mailer = &m;
     env.app.queues = @ptrCast(&test_registry);
-    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
+    const arena = std.testing.allocator;
 
     const batch_id = try BulkEnv.submit(env, arena, &test_registry, .{
         .subject = "{{ broken", // UnterminatedTag at render time
@@ -879,11 +911,13 @@ test "render error marks the row invalid and the job still SUCCEEDS (never retri
         .recipients = &.{.{ .to = "a@x.io" }},
         .queue = "emails",
     }, "");
+    defer arena.free(batch_id);
 
     try drain(env, &test_registry);
 
     try testing.expectEqual(@as(usize, 0), cap.count());
     const r = try BulkEnv.row(env, arena, batch_id, "a@x.io");
+    defer r.deinit(arena);
     try testing.expectEqualStrings("invalid", r.status);
     try testing.expectEqualStrings("UnterminatedTag", r.last_error);
     try BulkEnv.expectAllJobs(env, job_kind, "done");
@@ -912,9 +946,7 @@ test "backend error: attempts mirrored, error propagates, terminal attempt marks
     env.app.mailer = &fm;
     report_log.log_sink = noopLogSink; // swallow the intentional terminal-failure .err log
     defer report_log.log_sink = null;
-    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
+    const arena = std.testing.allocator;
 
     const reg = queue_mod.Registry{
         .queues = &.{.{ .name = "emails", .backend = .durable, .retry = .{ .max_attempts = 2, .base_ms = 0, .jitter = false } }},
@@ -928,10 +960,12 @@ test "backend error: attempts mirrored, error propagates, terminal attempt marks
         .recipients = &.{.{ .to = "a@x.io" }},
         .queue = "emails",
     }, "");
+    defer arena.free(batch_id);
 
     // First poll: attempt 1 fails → row mirrors attempts=1, still pending; job retried (pending).
     _ = try durable.pollOnce(&env.app, &reg, test_worker);
     const r1 = try BulkEnv.row(env, arena, batch_id, "a@x.io");
+    defer r1.deinit(arena);
     try testing.expectEqualStrings("pending", r1.status);
     try testing.expectEqual(@as(i64, 1), r1.attempts);
     try testing.expectEqualStrings("Boom", r1.last_error);
@@ -940,6 +974,7 @@ test "backend error: attempts mirrored, error propagates, terminal attempt marks
     // Second poll: attempt 2 is terminal (max_attempts=2) → row failed, job failed.
     _ = try durable.pollOnce(&env.app, &reg, test_worker);
     const r2 = try BulkEnv.row(env, arena, batch_id, "a@x.io");
+    defer r2.deinit(arena);
     try testing.expectEqualStrings("failed", r2.status);
     try testing.expectEqual(@as(i64, 2), r2.attempts);
     try BulkEnv.expectAllJobs(env, job_kind, "failed");
@@ -953,9 +988,7 @@ test "cancelBatch: pending rows -> canceled, stray jobs drain as no-ops, idempot
     const m = cap.mailer();
     env.app.mailer = &m;
     env.app.queues = @ptrCast(&test_registry);
-    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
+    const arena = std.testing.allocator;
 
     const batch_id = try BulkEnv.submit(env, arena, &test_registry, .{
         .subject = "Hi",
@@ -963,6 +996,7 @@ test "cancelBatch: pending rows -> canceled, stray jobs drain as no-ops, idempot
         .recipients = &.{ .{ .to = "a@x.io" }, .{ .to = "b@x.io" } },
         .queue = "emails",
     }, "");
+    defer arena.free(batch_id);
 
     try testing.expectEqual(@as(usize, 2), try BulkEnv.cancel(env, batch_id));
     {
@@ -975,7 +1009,9 @@ test "cancelBatch: pending rows -> canceled, stray jobs drain as no-ops, idempot
         try testing.expectEqualStrings("canceled", st.columnText(0));
     }
     const ra = try BulkEnv.row(env, arena, batch_id, "a@x.io");
+    defer ra.deinit(arena);
     const rb = try BulkEnv.row(env, arena, batch_id, "b@x.io");
+    defer rb.deinit(arena);
     try testing.expectEqualStrings("canceled", ra.status);
     try testing.expectEqualStrings("canceled", rb.status);
 
@@ -998,9 +1034,7 @@ test "tenancy: unverified sender rejected at submit (nothing persisted); verifie
     const m = cap.mailer();
     env.app.mailer = &m;
     env.app.queues = @ptrCast(&test_registry);
-    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
+    const arena = std.testing.allocator;
 
     // Unverified From for an account-scoped batch → rejected at submit; nothing persisted.
     try testing.expectError(error.SenderNotVerified, BulkEnv.submit(env, arena, &test_registry, .{
@@ -1043,10 +1077,12 @@ test "tenancy: unverified sender rejected at submit (nothing persisted); verifie
         .recipients = &.{.{ .to = "shared@x.io" }},
         .queue = "emails",
     }, "acc1");
+    defer arena.free(batch_id);
 
     try drain(env, &test_registry);
     try testing.expectEqual(@as(usize, 1), cap.countTo("shared@x.io"));
     const r = try BulkEnv.row(env, arena, batch_id, "shared@x.io");
+    defer r.deinit(arena);
     try testing.expectEqualStrings("sent", r.status);
 }
 

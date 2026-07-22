@@ -231,11 +231,12 @@ test "validateEmail accepts plain addresses, rejects malformed" {
 test "requestVerification → confirm marks the identity verified" {
     var d = try testDb();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = testing.allocator;
 
     const req = try requestVerification(testing.io, a, &d, "acc1", "from@app.com");
+    defer a.free(req.id);
+    defer a.free(req.email);
+    defer a.free(req.token);
     try testing.expect(!req.already_verified);
     try testing.expect(req.token.len > 0);
     // Not verified yet → enforcement would reject.
@@ -251,12 +252,13 @@ test "requestVerification → confirm marks the identity verified" {
 test "isVerified + confirm are address-case-insensitive (I1 normalization)" {
     var d = try testDb();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = testing.allocator;
 
     // Request with a mixed-case address; it is stored lowercased.
     const req = try requestVerification(testing.io, a, &d, "acc1", "From.User@App.COM");
+    defer a.free(req.id);
+    defer a.free(req.email);
+    defer a.free(req.token);
     try testing.expectEqualStrings("from.user@app.com", req.email);
     try testing.expect(try confirm(a, &d, "acc1", req.id, req.token));
     // A send From a differently-cased spelling of the same address still matches the verified row.
@@ -267,11 +269,12 @@ test "isVerified + confirm are address-case-insensitive (I1 normalization)" {
 test "confirm fails closed on wrong token, wrong account, or replay" {
     var d = try testDb();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = testing.allocator;
 
     const req = try requestVerification(testing.io, a, &d, "acc1", "from@app.com");
+    defer a.free(req.id);
+    defer a.free(req.email);
+    defer a.free(req.token);
     // Wrong token.
     try testing.expect(!try confirm(a, &d, "acc1", req.id, "not-the-token"));
     // Wrong account (cross-account verification blocked).
@@ -285,11 +288,12 @@ test "confirm fails closed on wrong token, wrong account, or replay" {
 test "isVerified is account-scoped (no cross-account leak)" {
     var d = try testDb();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = testing.allocator;
 
     const req = try requestVerification(testing.io, a, &d, "acc1", "shared@app.com");
+    defer a.free(req.id);
+    defer a.free(req.email);
+    defer a.free(req.token);
     _ = try confirm(a, &d, "acc1", req.id, req.token);
     // acc1 verified; acc2 (same email, different account) is NOT.
     try testing.expect(try isVerified(a, &d, "acc1", "shared@app.com"));
@@ -299,20 +303,36 @@ test "isVerified is account-scoped (no cross-account leak)" {
 test "requestVerification is idempotent + reports already-verified" {
     var d = try testDb();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = testing.allocator;
 
     const r1 = try requestVerification(testing.io, a, &d, "acc1", "from@app.com");
+    defer a.free(r1.id);
+    defer a.free(r1.email);
+    defer a.free(r1.token);
     _ = try confirm(a, &d, "acc1", r1.id, r1.token);
     // Once verified, a re-request reports already-verified (no token, no throttle — it returns first).
     const r3 = try requestVerification(testing.io, a, &d, "acc1", "from@app.com");
+    defer a.free(r3.id);
+    defer a.free(r3.email);
+    // On the already-verified path `token` is the "" literal (no token issued), never an owned
+    // allocation — freeing it would be an invalid free. Only free a real issued token.
+    defer if (r3.token.len > 0) a.free(r3.token);
     try testing.expect(r3.already_verified);
     try testing.expectEqualStrings("", r3.token);
     try testing.expectEqualStrings(r1.id, r3.id); // same row re-used
 
     // Exactly one row for (acc1, from@app.com).
     const list = try listForAccount(a, &d, "acc1");
+    defer {
+        for (list) |it| {
+            a.free(it.id);
+            a.free(it.email);
+            a.free(it.status);
+            a.free(it.verified_at);
+            a.free(it.created);
+        }
+        a.free(list);
+    }
     try testing.expectEqual(@as(usize, 1), list.len);
     try testing.expectEqualStrings("verified", list[0].status);
 }
@@ -320,16 +340,27 @@ test "requestVerification is idempotent + reports already-verified" {
 test "requestVerification throttles a re-send within the window (I3)" {
     var d = try testDb();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = testing.allocator;
 
     // First request issues a token; an immediate re-request (same second → age < interval) is throttled.
     const r1 = try requestVerification(testing.io, a, &d, "acc1", "from@app.com");
+    defer a.free(r1.id);
+    defer a.free(r1.email);
+    defer a.free(r1.token);
     try testing.expect(r1.token.len > 0);
     try testing.expectError(error.VerificationThrottled, requestVerification(testing.io, a, &d, "acc1", "from@app.com"));
     // Still exactly one row, still pending with its original token (no resend, no row churn).
     const list = try listForAccount(a, &d, "acc1");
+    defer {
+        for (list) |it| {
+            a.free(it.id);
+            a.free(it.email);
+            a.free(it.status);
+            a.free(it.verified_at);
+            a.free(it.created);
+        }
+        a.free(list);
+    }
     try testing.expectEqual(@as(usize, 1), list.len);
     try testing.expectEqualStrings("pending", list[0].status);
 }
