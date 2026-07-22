@@ -89,9 +89,14 @@ fn initiateImpl(ctx: *anyopaque, ac: *AuthCtx) anyerror!InitiateResult {
         }
     } // connection released above — SMTP send happens below without parking a connection
 
-    // Deliver the link by email (outside reader lock — SMTP may block)
+    // Deliver the link by email off the request path via the token-mail queue: the SMTP send's
+    // latency AND any send failure run on the worker, so neither is observable on the response —
+    // closing the timing/status oracle a synchronous send would create (a send only ever happens
+    // for an existing account). This targets the mail-delivery signals specifically; the per-account
+    // work above (lookup/create, token mint, body build) still differs, so it is not full
+    // constant-time.
     if (pending) |p| {
-        try ac.deliverMail(p.email, "Your sign-in link", p.mail_body);
+        ac.deliverMail(p.email, "Your sign-in link", p.mail_body);
     }
 
     // ALWAYS return 204 — never reveal whether the email was found

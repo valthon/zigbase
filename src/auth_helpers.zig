@@ -125,16 +125,21 @@ pub fn consumeLinkToken(conn: *db.Db, claims: jwt.Claims) !void {
 
 // ---- Mail delivery -------------------------------------------------------------
 
-/// Deliver an auth-related email (magic link, reset link, etc.) via the app's
-/// configured mailer. Falls back to a log line when no mailer is wired (CI/tests).
+/// Deliver an auth-related email (OTP code, magic link, etc.) NON-BLOCKINGLY via the token-mail
+/// queue seam. The SMTP send — its latency AND any failure — happens on the background worker
+/// (or, in tests/CLI, inline with errors swallowed), so neither the send latency nor a send
+/// failure is observable on the initiate response. That closes the mail-delivery enumeration
+/// oracle: a synchronous `try deliverToken` here would leak account existence via response timing
+/// and status, since only an existing account ever reaches the send. (It does not equalize the
+/// per-account work an initiate does before delivery — this targets the delivery signals.)
+/// Best-effort: never fails.
 pub fn deliverAuthMail(
     app: *app_mod.App,
-    alloc: std.mem.Allocator,
     to: []const u8,
     subject: []const u8,
     body: []const u8,
-) !void {
-    return api_auth.deliverToken(app, alloc, to, subject, body);
+) void {
+    api_auth.enqueueTokenMail(app, to, subject, body);
 }
 
 // ---- Rate limiting -------------------------------------------------------------

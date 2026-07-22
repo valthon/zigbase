@@ -59,6 +59,7 @@ collection (with a prominent startup warning for every one).
 | F13 | Unbounded pre-auth allocation from attacker-supplied JWT length | DoS | Med | A | Moderate (unauthenticated; body path allows a 50 MiB token) | **Fixed** |
 | F14 | Relationship abilities bypassed on realtime (WS/SSE) delivery | Authz / Realtime | **High** | A | Moderate (non-member receives ability-restricted rows over realtime) | **Fixed** |
 | F15 | Over-`maxSelect` relation/select validation runs per-element checks before the count guard | DoS | Low/Med | A | Moderate (authenticated writer; body-bounded array under the writer lock) | **Fixed** |
+| F16 | OTP/magic-link initiate leaks account existence via send timing + status | Info-leak / Auth | Med | A | Moderate (unauthenticated enumeration of the user table) | **Fixed** |
 
 Items deliberately re-assessed as **not exploitable**: rule **parse errors fail *closed*** (a
 malformed rule yields a 500, the write never runs — see F3 notes); `expand` **does** re-apply the
@@ -671,3 +672,43 @@ element count before any per-element work. An over-limit array is reported with 
 test: "over-maxSelect relation short-circuits before the per-element existence check" submits an
 over-count array of non-existent ids and asserts only the count error is present (no
 `validation_not_found`), proving the loop was skipped.
+
+### F16 — OTP / magic-link initiate leaks account existence (FIXED)
+
+**Where.** `src/auth/methods/otp.zig` and `src/auth/methods/magic_link.zig` (the `initiate`
+handlers), through `src/auth/method.zig` (`AuthCtx.deliverMail`) and
+`src/auth_helpers.zig` (`deliverAuthMail`).
+
+**Description.** Both initiate handlers built a `pending` mail payload **only** when the
+identity resolved to an existing (or auto-created) record, then delivered it with a
+synchronous, error-propagating `try ac.deliverMail(...)`. That single call was the enumeration
+oracle:
+
+- **Timing.** For a registered email the request blocked on the full SMTP round-trip (plus the
+  challenge-store write / token mint); for an unregistered email `pending` was null and the
+  handler returned `204` immediately. The latency delta is directly measurable against a real
+  SMTP mailer.
+- **Status.** `deliverMail` propagated a send failure up to a `500`. A send can only fail for an
+  account that exists (an unknown email never reaches the send), so `500` vs `204`
+  distinguished registered from unregistered even without timing analysis.
+
+Both handlers *intended* to be enumeration-safe — they always return `204` on the happy path —
+but the synchronous delivery defeated that. The sibling `request-verification` /
+`request-password-reset` endpoints had already been hardened against exactly this by routing
+mail through the `__token_mail` memory queue, whose handler swallows delivery errors precisely
+because "a propagated failure … would only ever occur for existing accounts, re-opening the
+enumeration oracle." OTP and magic-link never adopted that seam.
+
+**Fix.** `deliverAuthMail` (and thus `AuthCtx.deliverMail`) now delivers through the shared
+`enqueueTokenMail` seam instead of a synchronous `deliverToken`. The SMTP send — its latency
+and any failure — happens on the background worker (or, in tests/CLI, inline with errors
+swallowed), so initiate returns `204` with identical timing and status whether or not the email
+matched a record. The whole method-layer mail path is now non-failing by construction.
+Regression test: "OtpMethod: initiate with a failing mailer still returns 204 (no status
+oracle)" installs an always-failing mailer and asserts an existing-account initiate still
+returns `204` — verified failing-first (it returns the mailer error under the old synchronous
+path). Magic-link shares the identical `deliverMail` seam.
+
+**Residual.** Enumeration via other differences (e.g. rate-limit behavior, or a slower initiate
+for existing accounts due to the challenge-store write) is out of scope here; this closes the
+mail-delivery timing and the send-failure status oracles, which were the observable ones.

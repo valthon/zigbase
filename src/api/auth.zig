@@ -924,7 +924,12 @@ const TokenMail = struct { to: []const u8, subject: []const u8, body: []const u8
 /// the payload and returns immediately; without one (unit tests / CLI) it runs inline but the
 /// handler still swallows errors, so no send failure is ever observable on the response.
 /// Best-effort: a serialize/enqueue failure is logged and the mail dropped.
-fn enqueueTokenMail(app: *@import("../app.zig").App, to: []const u8, subject: []const u8, body: []const u8) void {
+///
+/// Public so the auth-method layer (OTP / magic-link initiate) delivers through this same seam
+/// rather than a synchronous `try deliverToken` — otherwise those endpoints leak account
+/// existence via response timing and via a propagated send failure (only existing accounts can
+/// fail to send). See `auth_helpers.deliverAuthMail`.
+pub fn enqueueTokenMail(app: *@import("../app.zig").App, to: []const u8, subject: []const u8, body: []const u8) void {
     const payload = std.json.Stringify.valueAlloc(app.allocator, TokenMail{ .to = to, .subject = subject, .body = body }, .{}) catch |e| {
         std.log.warn("[mail:token] failed to serialize ({s}); dropping", .{@errorName(e)});
         return;
