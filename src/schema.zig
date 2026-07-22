@@ -847,6 +847,31 @@ pub fn validate(alloc: std.mem.Allocator, c: Collection, errors: *std.ArrayList(
                 try errors.append(alloc, .{ .field = "identityFields", .code = "validation_invalid_identity_field", .message = "Identity field must be a valid identifier." });
         }
     }
+
+    // `tenant_field` and `ttl_field` name a column that is interpolated into SQL — the
+    // tenant-scope predicate (`"<col>"."<tenant_field>" = ?`) and the TTL GC delete
+    // respectively. The comptime `.collections` path validates them (provision.zig); the runtime
+    // collections API reaches here, so mirror those constraints EXACTLY — a valid identifier
+    // naming an existing field OF THE RIGHT TYPE — otherwise the runtime API can persist a schema
+    // state comptime would reject. `tenant_field` is a SECURITY gate: an invalid identifier makes
+    // `tenancy.scopeApplies` fall through to false, serving a tenant-owned collection UN-scoped
+    // (cross-tenant rows). Rejecting at the boundary keeps that state unreachable.
+    if (c.options.tenant_field) |tf| {
+        // Must be TEXT-storage: an account id is bound and compared as text, so a number/bool
+        // tenant_field would fail closed silently at runtime (mirrors provision.zig).
+        const f = fieldByName(c, tf);
+        const ok = isValidIdentifier(tf) and f != null and f.?.storageClass() == .text;
+        if (!ok)
+            try errors.append(alloc, .{ .field = "tenant_field", .code = "validation_invalid_tenant_field", .message = "tenant_field must be a valid identifier naming an existing TEXT-storage field (it holds an account id)." });
+    }
+    if (c.options.ttl_field) |tf| {
+        // Must be date/autodate: the TTL GC compares it via SQLite strftime, which interprets a
+        // non-date column in surprising ways (mirrors provision.zig).
+        const f = fieldByName(c, tf);
+        const ok = isValidIdentifier(tf) and f != null and (f.?.fieldType() == .date or f.?.fieldType() == .autodate);
+        if (!ok)
+            try errors.append(alloc, .{ .field = "ttl_field", .code = "validation_invalid_ttl_field", .message = "ttl_field must be a valid identifier naming an existing date/autodate field." });
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1553,6 +1578,112 @@ test "validate accepts an auth collection with valid identity fields" {
     };
     try validate(a, c, &errs);
     for (errs.items) |e| try std.testing.expect(!std.mem.eql(u8, e.code, "validation_invalid_identity_field"));
+}
+
+test "validate rejects a tenant_field that is not a valid identifier or names no field" {
+    // Security gate: an invalid tenant_field makes tenancy.scopeApplies fall through to false,
+    // serving a tenant-owned collection UN-scoped (cross-tenant). The runtime collections API
+    // (superuser create/update) must reject it at the boundary so that state is unreachable.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const fields = [_]Field{.{ .id = "f1", .name = "account", .options = .{ .text = .{} } }};
+
+    // (a) invalid identifier (embeds a dash — not a legal SQL identifier)
+    {
+        var errs: std.ArrayList(ValidationError) = .empty;
+        const c = Collection{ .id = "c", .name = "posts", .fields = &fields, .options = .{ .tenant_field = "acc-ount" } };
+        try validate(a, c, &errs);
+        var found = false;
+        for (errs.items) |e| if (std.mem.eql(u8, e.code, "validation_invalid_tenant_field")) {
+            found = true;
+        };
+        try std.testing.expect(found);
+    }
+    // (b) valid identifier but names no existing field (dangling reference)
+    {
+        var errs: std.ArrayList(ValidationError) = .empty;
+        const c = Collection{ .id = "c", .name = "posts", .fields = &fields, .options = .{ .tenant_field = "nonexistent" } };
+        try validate(a, c, &errs);
+        var found = false;
+        for (errs.items) |e| if (std.mem.eql(u8, e.code, "validation_invalid_tenant_field")) {
+            found = true;
+        };
+        try std.testing.expect(found);
+    }
+    // (c) valid identifier naming an existing NON-TEXT field (number) — rejected: an account id is
+    //     text-storage, so a number/bool tenant_field would fail closed silently (mirrors comptime).
+    {
+        const num_fields = [_]Field{.{ .id = "n1", .name = "count", .options = .{ .number = .{ .mode = .int } } }};
+        var errs: std.ArrayList(ValidationError) = .empty;
+        const c = Collection{ .id = "c", .name = "posts", .fields = &num_fields, .options = .{ .tenant_field = "count" } };
+        try validate(a, c, &errs);
+        var found = false;
+        for (errs.items) |e| if (std.mem.eql(u8, e.code, "validation_invalid_tenant_field")) {
+            found = true;
+        };
+        try std.testing.expect(found);
+    }
+    // (d) control — a valid identifier naming an existing TEXT field is accepted
+    {
+        var errs: std.ArrayList(ValidationError) = .empty;
+        const c = Collection{ .id = "c", .name = "posts", .fields = &fields, .options = .{ .tenant_field = "account" } };
+        try validate(a, c, &errs);
+        for (errs.items) |e| try std.testing.expect(!std.mem.eql(u8, e.code, "validation_invalid_tenant_field"));
+    }
+}
+
+test "validate rejects a ttl_field that is not a valid identifier, names no field, or is not a date" {
+    // The TTL GC compares the field via SQLite strftime; the runtime API must mirror the comptime
+    // constraint that ttl_field names an existing date/autodate field, else GC misbehaves.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const fields = [_]Field{
+        .{ .id = "d1", .name = "expires", .options = .{ .date = .{} } },
+        .{ .id = "t1", .name = "name", .options = .{ .text = .{} } },
+    };
+
+    // (a) invalid identifier
+    {
+        var errs: std.ArrayList(ValidationError) = .empty;
+        const c = Collection{ .id = "c", .name = "posts", .fields = &fields, .options = .{ .ttl_field = "exp-ires" } };
+        try validate(a, c, &errs);
+        var found = false;
+        for (errs.items) |e| if (std.mem.eql(u8, e.code, "validation_invalid_ttl_field")) {
+            found = true;
+        };
+        try std.testing.expect(found);
+    }
+    // (b) valid identifier but names no existing field
+    {
+        var errs: std.ArrayList(ValidationError) = .empty;
+        const c = Collection{ .id = "c", .name = "posts", .fields = &fields, .options = .{ .ttl_field = "nonexistent" } };
+        try validate(a, c, &errs);
+        var found = false;
+        for (errs.items) |e| if (std.mem.eql(u8, e.code, "validation_invalid_ttl_field")) {
+            found = true;
+        };
+        try std.testing.expect(found);
+    }
+    // (c) valid identifier naming an existing NON-date field (text) — rejected
+    {
+        var errs: std.ArrayList(ValidationError) = .empty;
+        const c = Collection{ .id = "c", .name = "posts", .fields = &fields, .options = .{ .ttl_field = "name" } };
+        try validate(a, c, &errs);
+        var found = false;
+        for (errs.items) |e| if (std.mem.eql(u8, e.code, "validation_invalid_ttl_field")) {
+            found = true;
+        };
+        try std.testing.expect(found);
+    }
+    // (d) control — a valid identifier naming an existing date field is accepted
+    {
+        var errs: std.ArrayList(ValidationError) = .empty;
+        const c = Collection{ .id = "c", .name = "posts", .fields = &fields, .options = .{ .ttl_field = "expires" } };
+        try validate(a, c, &errs);
+        for (errs.items) |e| try std.testing.expect(!std.mem.eql(u8, e.code, "validation_invalid_ttl_field"));
+    }
 }
 
 test "oauth2 options round-trip through optionsToJson(false)/optionsFromJson" {

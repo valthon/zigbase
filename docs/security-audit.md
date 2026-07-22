@@ -61,6 +61,7 @@ collection (with a prominent startup warning for every one).
 | F15 | Over-`maxSelect` relation/select validation runs per-element checks before the count guard | DoS | Low/Med | A | Moderate (authenticated writer; body-bounded array under the writer lock) | **Fixed** |
 | F16 | OTP/magic-link initiate leaks account existence via send timing + status | Info-leak / Auth | Med | A | Moderate (unauthenticated enumeration of the user table) | **Fixed** |
 | F17 | File `?token=` accepted full `.auth` session tokens (session tokens in URLs) | Info-leak / hardening | Low | A | Low (session token exposed via logs/Referer if used in a URL) | **Fixed** |
+| F18 | Runtime API accepted an invalid/dangling `tenant_field`, scoping then fails open | Authz / Tenancy | Med | A | Low (superuser misconfig → cross-tenant leak to non-superusers) | **Fixed** |
 
 Items deliberately re-assessed as **not exploitable**: rule **parse errors fail *closed*** (a
 malformed rule yields a 500, the write never runs — see F3 notes); `expand` **does** re-apply the
@@ -735,3 +736,36 @@ UI already fetch protected files with a `.file` token (via `POST /api/files/toke
 cookie/header. Regression tests: "fileIdentity rejects a full .auth token supplied via ?token="
 (the handler path) and "verifyTokenOfTypes rejects a full .auth token under .file-only" (the type
 gate). Pre-1.0 behavior change — see the `Breaking` changelog note.
+
+### F18 — Runtime API accepted an invalid/dangling `tenant_field` (tenancy fails open) (FIXED)
+
+**Where.** `src/schema.zig` (`validate`); the fail-open sink is `src/tenancy/tenancy.zig`
+(`scopeApplies`).
+
+**Description.** `tenancy.scopeApplies` returns
+`… and isValidIdentifier(col.name) and isValidIdentifier(tf)` — i.e. if the `tenant_field`
+identifier is invalid it returns **false**, which means "tenant scoping does not apply." Both the
+forced per-row `check` (`policy.decide`) and the bound scope predicate (`scopePredicate`) then
+vanish, so a tenant-owned collection is governed by its bare access rule. If that rule is
+`@public`, the collection is served **un-scoped across all tenants** — a cross-tenant row leak.
+(Contrast `abilities`, which fails **closed** via a constant-false predicate.)
+
+The comptime `.collections` path validates `tenant_field` to name an existing field, so it can
+never reach this state. But the runtime collections API (superuser create/update) parsed
+`tenant_field` from JSON (`optionsFromJson`) with **no** validation, so a superuser could set an
+invalid identifier (e.g. one containing a dash) or a dangling reference (naming no field) and
+silently create a fail-open tenant collection.
+
+**Fix.** `schema.validate` — the runtime API's validation chokepoint, which already mirrors the
+comptime constraints (identity fields, encryption, searchable) — now rejects a `tenant_field`
+(and `ttl_field`) that is not a valid identifier or names no existing field
+(`validation_invalid_tenant_field` / `validation_invalid_ttl_field`). This is the fail-fast fix:
+the misconfiguration is refused at the boundary with an actionable error, so the
+`scopeApplies` fail-open branch is unreachable by construction rather than merely mitigated.
+Regression test: "validate rejects a tenant_field that is not a valid identifier or names no
+field" covers the invalid-identifier, dangling-reference, and valid-control cases.
+
+**Residual.** `scopeApplies` still *structurally* fails open on an invalid identifier; that
+branch is now unreachable via both configuration paths. Converting it to a constant-false
+(fail-closed) predicate for parity with `abilities` is optional defense-in-depth, tracked
+separately.
