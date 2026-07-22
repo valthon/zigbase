@@ -126,11 +126,13 @@ pub fn consumeLinkToken(conn: *db.Db, claims: jwt.Claims) !void {
 // ---- Mail delivery -------------------------------------------------------------
 
 /// Deliver an auth-related email (OTP code, magic link, etc.) NON-BLOCKINGLY via the token-mail
-/// queue seam. This is enumeration-safe by construction: the SMTP send — its latency AND any
-/// failure — happens on the background worker (or, in tests/CLI, inline with errors swallowed),
-/// so an initiate handler returns with identical timing and status whether or not the email
-/// matched a record. A synchronous `try deliverToken` here would re-open the oracle, since only
-/// an existing account ever reaches the send. Best-effort: never fails.
+/// queue seam. The SMTP send — its latency AND any failure — happens on the background worker
+/// (or, in tests/CLI, inline with errors swallowed), so neither the send latency nor a send
+/// failure is observable on the initiate response. That closes the mail-delivery enumeration
+/// oracle: a synchronous `try deliverToken` here would leak account existence via response timing
+/// and status, since only an existing account ever reaches the send. (It does not equalize the
+/// per-account work an initiate does before delivery — this targets the delivery signals.)
+/// Best-effort: never fails.
 pub fn deliverAuthMail(
     app: *app_mod.App,
     to: []const u8,

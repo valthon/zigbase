@@ -132,8 +132,9 @@ pub const AuthCtx = struct {
         return auth_helpers.consumeLinkToken(conn, claims);
     }
 
-    /// Deliver an auth email (OTP code, magic link) NON-BLOCKINGLY via the token-mail queue —
-    /// enumeration-safe (identical timing/status regardless of account existence). Never fails.
+    /// Deliver an auth email (OTP code, magic link) NON-BLOCKINGLY via the token-mail queue. The
+    /// SMTP send's latency and any send failure run on the worker, so neither surfaces on the
+    /// response — closing the mail-delivery timing/status enumeration oracle. Never fails.
     pub fn deliverMail(ac: *AuthCtx, to: []const u8, subject: []const u8, body: []const u8) void {
         auth_helpers.deliverAuthMail(ac.app, to, subject, body);
     }

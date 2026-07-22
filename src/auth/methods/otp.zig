@@ -99,8 +99,12 @@ fn initiateImpl(ctx: *anyopaque, ac: *AuthCtx) anyerror!InitiateResult {
         }
     } // writer released here — SMTP send happens below without holding the writer lock
 
-    // Deliver the code by email off the request path (enumeration-safe: the send's latency and
-    // any failure happen on the queue worker, so timing/status are identical for an unknown email).
+    // Deliver the code by email off the request path via the token-mail queue: the SMTP send's
+    // latency AND any send failure run on the worker, so neither is observable on the response —
+    // closing the timing/status oracle a synchronous send would create (a send only ever happens
+    // for an existing account). This targets the mail-delivery signals specifically; the per-account
+    // work above (resolve/create, code gen, challenge write) still differs, so it is not full
+    // constant-time.
     if (pending) |p| {
         ac.deliverMail(p.email, "Your sign-in code", p.code);
     }
@@ -386,12 +390,13 @@ test "OtpMethod: initiate with a failing mailer still returns 204 (no status ora
     // reaches the send), an existence oracle. The fix routes delivery through the non-blocking
     // token-mail queue, which swallows send failures, so initiate returns 204 regardless.
     const FailMailer = struct {
+        var sink: u8 = 0; // stable, non-null ctx pointee — sendFn ignores it, but avoid `undefined`
         fn sendFn(_: *anyopaque, _: std.Io, _: std.mem.Allocator, _: mailer_mod.Email) anyerror!void {
             return error.MailerBoom;
         }
         const vt = mailer_mod.Mailer.VTable{ .send = sendFn };
         fn mailer() mailer_mod.Mailer {
-            return .{ .ptr = undefined, .vtable = &vt }; // stateless: sendFn ignores ptr
+            return .{ .ptr = &sink, .vtable = &vt };
         }
     };
 
