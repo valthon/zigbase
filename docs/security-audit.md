@@ -58,6 +58,7 @@ collection (with a prominent startup warning for every one).
 | F12 | Insecure deployment defaults (bind `0.0.0.0`, `cookie_secure=false`, open WS origins) | Config | Med | A | n/a (posture) | **Fixed** |
 | F13 | Unbounded pre-auth allocation from attacker-supplied JWT length | DoS | Med | A | Moderate (unauthenticated; body path allows a 50 MiB token) | **Fixed** |
 | F14 | Relationship abilities bypassed on realtime (WS/SSE) delivery | Authz / Realtime | **High** | A | Moderate (non-member receives ability-restricted rows over realtime) | **Fixed** |
+| F15 | Over-`maxSelect` relation/select validation runs per-element checks before the count guard | DoS | Low/Med | A | Moderate (authenticated writer; body-bounded array under the writer lock) | **Fixed** |
 | F16 | OTP/magic-link initiate leaks account existence via send timing + status | Info-leak / Auth | Med | A | Moderate (unauthenticated enumeration of the user table) | **Fixed** |
 
 Items deliberately re-assessed as **not exploitable**: rule **parse errors fail *closed*** (a
@@ -650,6 +651,27 @@ Deriving both call sites from one shared predicate makes the realtime and REST a
 drift-proof: a future ability kind wires into both at once. Regression test in
 `src/realtime/hub.zig` ("@public viewRule + view ability: create is NOT delivered to a
 non-member") proves the empty-qualifying-set case is denied and superusers still receive it.
+
+### F15 — Over-`maxSelect` relation/select validation does per-element work before the count guard (FIXED)
+
+**Where.** `src/records.zig` — `validateFieldValue`, the `.relation` and `.select` arms.
+
+**Description.** A `relation` field is validated by running one existence query
+(`SELECT 1 FROM "<target>" WHERE "id" = ?`) **per submitted id**, on the writer connection
+under the write lock. The arm checked `countValues(v) > maxSelect` and appended a "too many"
+error, but did **not** short-circuit — it fell through and still ran the per-element loop. So
+a create/update whose `relation` value is an array of N ids (N bounded only by
+`max_upload_size`, ~50 MiB → millions of short ids) drove N prepared existence queries under
+the writer lock even though the request was already invalid on its element count. The `.select`
+arm had the same non-short-circuit shape (its per-element scan is in-memory, so cheaper, but
+still unbounded work on already-invalid input).
+
+**Fix.** Both arms now `return` immediately after appending the count error, rejecting on the
+element count before any per-element work. An over-limit array is reported with a single
+`validation_relation`/`validation_select` error and never reaches the existence loop. Regression
+test: "over-maxSelect relation short-circuits before the per-element existence check" submits an
+over-count array of non-existent ids and asserts only the count error is present (no
+`validation_not_found`), proving the loop was skipped.
 
 ### F16 — OTP / magic-link initiate leaks account existence (FIXED)
 

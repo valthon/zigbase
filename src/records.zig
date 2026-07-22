@@ -324,8 +324,10 @@ fn validateFieldValue(alloc: std.mem.Allocator, conn: *db.Db, f: schema.Field, v
             try appendMinMax(alloc, errs, f.name, @as(f64, @floatFromInt(sv)) / pow, o.min, o.max);
         },
         .select => |o| {
-            if (countValues(v) > o.maxSelect)
+            if (countValues(v) > o.maxSelect) {
                 try errs.append(alloc, .{ .field = f.name, .code = "validation_select", .message = "Too many values." });
+                return; // reject on count; skip the per-value scan so an over-limit array can't drive unbounded work
+            }
             const items: []const std.json.Value = switch (v) {
                 .array => |arr| arr.items,
                 .string => &.{v},
@@ -343,8 +345,11 @@ fn validateFieldValue(alloc: std.mem.Allocator, conn: *db.Db, f: schema.Field, v
             };
         },
         .relation => |o| {
-            if (countValues(v) > o.maxSelect)
+            if (countValues(v) > o.maxSelect) {
                 try errs.append(alloc, .{ .field = f.name, .code = "validation_relation", .message = "Too many relations." });
+                return; // reject on count BEFORE the per-element existence SELECTs, so an over-limit
+                // array can't drive N writer-lock queries from already-invalid input
+            }
             const tcol = (try collections.get(alloc, conn, o.targetCollectionId)) orelse {
                 try errs.append(alloc, .{ .field = f.name, .code = "validation_relation", .message = "Relation target missing." });
                 return;
@@ -870,6 +875,69 @@ test "create rejects a value outside a select's allowed set" {
     var data: std.json.ObjectMap = .empty;
     try data.put(a, "status", .{ .string = "banana" });
     try std.testing.expectError(error.Validation, create(a, std.testing.io, &d, col, .{ .object = data }));
+}
+
+test "over-maxSelect relation short-circuits before the per-element existence check" {
+    // DoS guard: `.relation` validation runs one existence SELECT per submitted id under the
+    // writer lock. An over-maxSelect array is already invalid, so it must be rejected on the
+    // COUNT before the loop — otherwise an attacker-sized array drives N writer-lock queries.
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try migrations.run(&d);
+    const targets = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "targets", .fields = &[_]schema.Field{.{ .id = "t1", .name = "name", .options = .{ .text = .{} } }} });
+    const fields = [_]schema.Field{.{ .id = "f1", .name = "refs", .options = .{ .relation = .{ .targetCollectionId = targets.id, .maxSelect = 2 } } }};
+    const col = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "holders", .fields = &fields });
+    // Three non-existent ids (> maxSelect=2). Pre-fix: the loop runs 3 existence SELECTs and each
+    // absent id also appends `validation_not_found`. Post-fix: the count check returns first, so
+    // ONLY the "too many" error exists and the per-element loop never runs.
+    var refs = std.json.Array.init(a);
+    try refs.append(.{ .string = "nope1" });
+    try refs.append(.{ .string = "nope2" });
+    try refs.append(.{ .string = "nope3" });
+    var data: std.json.ObjectMap = .empty;
+    try data.put(a, "refs", .{ .array = refs });
+    try std.testing.expectError(error.Validation, create(a, std.testing.io, &d, col, .{ .object = data }));
+    try expectFieldCode("refs", "validation_relation"); // the over-count error is present
+    const errs = last_errors orelse return error.TestExpectedEqual;
+    for (errs) |e| {
+        // A per-element existence error would prove the loop ran despite the over-count input.
+        if (std.mem.eql(u8, e.code, "validation_not_found")) return error.TestUnexpectedResult;
+    }
+}
+
+test "over-maxSelect select short-circuits before the per-value allowed-set scan" {
+    // Same short-circuit for `.select`: an over-maxSelect array must be rejected on the COUNT
+    // before the per-value allowed-set scan runs. Both the count error and the membership error
+    // share the code `validation_select`, so this asserts on the MESSAGE: an over-limit array
+    // containing an invalid value must yield ONLY "Too many values." — the presence of "Value not
+    // in the allowed set." would prove the loop ran on already-invalid input.
+    var d = try db.Db.openMemory();
+    defer d.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try migrations.run(&d);
+    const fields = [_]schema.Field{.{ .id = "f1", .name = "tags", .options = .{ .select = .{ .values = &.{ "x", "y" }, .maxSelect = 2 } } }};
+    const col = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "tagged", .fields = &fields });
+    // Three values (> maxSelect=2), one of which ("bad") is NOT in the allowed set {x,y}.
+    var tags = std.json.Array.init(a);
+    try tags.append(.{ .string = "x" });
+    try tags.append(.{ .string = "y" });
+    try tags.append(.{ .string = "bad" });
+    var data: std.json.ObjectMap = .empty;
+    try data.put(a, "tags", .{ .array = tags });
+    try std.testing.expectError(error.Validation, create(a, std.testing.io, &d, col, .{ .object = data }));
+    const errs = last_errors orelse return error.TestExpectedEqual;
+    var saw_too_many = false;
+    for (errs) |e| {
+        if (std.mem.eql(u8, e.message, "Too many values.")) saw_too_many = true;
+        // The allowed-set scan running on over-count input would append this — must NOT happen.
+        if (std.mem.eql(u8, e.message, "Value not in the allowed set.")) return error.TestUnexpectedResult;
+    }
+    try std.testing.expect(saw_too_many);
 }
 
 // ---------------------------------------------------------------------------
