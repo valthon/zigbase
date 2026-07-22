@@ -181,80 +181,99 @@ test "parseRange: malformed / multi-range / non-bytes are ignored (.none -> full
 }
 
 test "plan: If-None-Match wins over Range; weak comparison; list; star" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = testing.allocator;
     const etag = "\"0123456789abcdef\"";
     // single + Range present: 304 still wins (evaluation order)
     const p1 = try plan(a, .{ .size = 100, .etag = etag, .if_none_match = etag, .range = "bytes=0-9" });
+    defer if (p1.content_range) |cr| a.free(cr);
     try testing.expectEqual(@as(u16, 304), p1.status);
     // weak comparison: W/ on the client's side matches our strong tag
-    try testing.expectEqual(@as(u16, 304), (try plan(a, .{ .size = 100, .etag = etag, .if_none_match = "W/\"0123456789abcdef\"" })).status);
+    const p_wk = try plan(a, .{ .size = 100, .etag = etag, .if_none_match = "W/\"0123456789abcdef\"" });
+    defer if (p_wk.content_range) |cr| a.free(cr);
+    try testing.expectEqual(@as(u16, 304), p_wk.status);
     // list member
-    try testing.expectEqual(@as(u16, 304), (try plan(a, .{ .size = 100, .etag = etag, .if_none_match = "\"x\", \"0123456789abcdef\"" })).status);
+    const p_list = try plan(a, .{ .size = 100, .etag = etag, .if_none_match = "\"x\", \"0123456789abcdef\"" });
+    defer if (p_list.content_range) |cr| a.free(cr);
+    try testing.expectEqual(@as(u16, 304), p_list.status);
     // star
-    try testing.expectEqual(@as(u16, 304), (try plan(a, .{ .size = 100, .etag = etag, .if_none_match = "*" })).status);
+    const p_star = try plan(a, .{ .size = 100, .etag = etag, .if_none_match = "*" });
+    defer if (p_star.content_range) |cr| a.free(cr);
+    try testing.expectEqual(@as(u16, 304), p_star.status);
     // mismatch: falls through to the Range
     const p2 = try plan(a, .{ .size = 100, .etag = etag, .if_none_match = "\"nope\"", .range = "bytes=0-9" });
+    defer if (p2.content_range) |cr| a.free(cr);
     try testing.expectEqual(@as(u16, 206), p2.status);
     try testing.expectEqualStrings("bytes 0-9/100", p2.content_range.?);
 }
 
 test "plan: If-Range strong match honors Range; mismatch/weak refuse it (full 200)" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = testing.allocator;
     const etag = "\"0123456789abcdef\"";
     const hit = try plan(a, .{ .size = 100, .etag = etag, .if_range = etag, .range = "bytes=10-19" });
+    defer if (hit.content_range) |cr| a.free(cr);
     try testing.expectEqual(@as(u16, 206), hit.status);
     try testing.expectEqual(@as(u64, 10), hit.offset);
     try testing.expectEqual(@as(u64, 10), hit.len);
     // mismatched validator: Range ignored, full 200 with the whole entity
     const miss = try plan(a, .{ .size = 100, .etag = etag, .if_range = "\"old\"", .range = "bytes=10-19" });
+    defer if (miss.content_range) |cr| a.free(cr);
     try testing.expectEqual(@as(u16, 200), miss.status);
     try testing.expectEqual(@as(u64, 100), miss.len);
     // WEAK validator: strong comparison required -> refused even for the same opaque tag
     const weak = try plan(a, .{ .size = 100, .etag = etag, .if_range = "W/\"0123456789abcdef\"", .range = "bytes=10-19" });
+    defer if (weak.content_range) |cr| a.free(cr);
     try testing.expectEqual(@as(u16, 200), weak.status);
     // If-Range mismatch also suppresses a WOULD-BE-416 range (the range is ignored, not evaluated)
     const not416 = try plan(a, .{ .size = 100, .etag = etag, .if_range = "\"old\"", .range = "bytes=500-" });
+    defer if (not416.content_range) |cr| a.free(cr);
     try testing.expectEqual(@as(u16, 200), not416.status);
 }
 
 test "plan: 200 / 206 / 416 shapes + HEAD parity" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = testing.allocator;
     const etag = "\"0123456789abcdef\"";
     const full = try plan(a, .{ .size = 42, .etag = etag });
+    defer if (full.content_range) |cr| a.free(cr);
     try testing.expectEqual(@as(u16, 200), full.status);
     try testing.expectEqual(@as(u64, 42), full.len);
     try testing.expect(full.content_range == null);
     const p206 = try plan(a, .{ .size = 1000, .etag = etag, .range = "bytes=200-" });
+    defer if (p206.content_range) |cr| a.free(cr);
     try testing.expectEqual(@as(u16, 206), p206.status);
     try testing.expectEqualStrings("bytes 200-999/1000", p206.content_range.?);
     const p416 = try plan(a, .{ .size = 1000, .etag = etag, .range = "bytes=2000-" });
+    defer if (p416.content_range) |cr| a.free(cr);
     try testing.expectEqual(@as(u16, 416), p416.status);
     try testing.expectEqualStrings("bytes */1000", p416.content_range.?);
     // HEAD: byte-identical plan (the caller just doesn't transmit the body)
     const head = try plan(a, .{ .size = 1000, .etag = etag, .range = "bytes=200-", .head = true });
+    defer if (head.content_range) |cr| a.free(cr);
     try testing.expectEqual(p206.status, head.status);
     try testing.expectEqual(p206.len, head.len);
 }
 
 test "fileEtag: quoted 16-hex, deterministic, distinct per identity component" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = testing.allocator;
     const e1 = try fileEtag(a, "docs", "r1", "a_ab12cd34ef.png");
+    defer a.free(e1);
     try testing.expectEqual(@as(usize, 18), e1.len); // 2 quotes + 16 hex
     try testing.expectEqual(@as(u8, '"'), e1[0]);
     try testing.expectEqual(@as(u8, '"'), e1[e1.len - 1]);
-    try testing.expectEqualStrings(e1, try fileEtag(a, "docs", "r1", "a_ab12cd34ef.png"));
-    try testing.expect(!std.mem.eql(u8, e1, try fileEtag(a, "docs", "r2", "a_ab12cd34ef.png")));
-    try testing.expect(!std.mem.eql(u8, e1, try fileEtag(a, "docs2", "r1", "a_ab12cd34ef.png")));
+    const e1b = try fileEtag(a, "docs", "r1", "a_ab12cd34ef.png");
+    defer a.free(e1b);
+    try testing.expectEqualStrings(e1, e1b);
+    const e2 = try fileEtag(a, "docs", "r2", "a_ab12cd34ef.png");
+    defer a.free(e2);
+    try testing.expect(!std.mem.eql(u8, e1, e2));
+    const e3 = try fileEtag(a, "docs2", "r1", "a_ab12cd34ef.png");
+    defer a.free(e3);
+    try testing.expect(!std.mem.eql(u8, e1, e3));
     // The separator prevents (col="a", rid="b/c") colliding with (col="a/b", rid="c")
-    try testing.expect(!std.mem.eql(u8, try fileEtag(a, "ab", "c", "n"), try fileEtag(a, "a", "bc", "n")));
+    const e4 = try fileEtag(a, "ab", "c", "n");
+    defer a.free(e4);
+    const e5 = try fileEtag(a, "a", "bc", "n");
+    defer a.free(e5);
+    try testing.expect(!std.mem.eql(u8, e4, e5));
 }
 
 test "etagMatches uses RFC 7232 weak comparison (moved from static_files.zig)" {

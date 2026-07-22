@@ -108,17 +108,18 @@ pub const LocalStorage = struct {
 test "LocalStorage put/fetch/read/delete/deleteRecord round-trip" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(root);
 
     var local = LocalStorage.init(root);
     const st = local.storage();
 
     try st.put(std.testing.io, "posts", "rec1", "cover_ab12.png", "PNGDATA");
     const p = (try st.fetch(std.testing.io, a, "posts", "rec1", "cover_ab12.png")).?;
+    defer a.free(p);
     const back = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, p, a, .limited(1 << 20));
+    defer a.free(back);
     try std.testing.expectEqualStrings("PNGDATA", back);
 
     try st.delete(std.testing.io, "posts", "rec1", "cover_ab12.png");
@@ -128,6 +129,7 @@ test "LocalStorage put/fetch/read/delete/deleteRecord round-trip" {
     try st.put(std.testing.io, "posts", "rec2", "b.txt", "B");
     try st.deleteRecord(std.testing.io, "posts", "rec2");
     const dir2 = (try st.fetch(std.testing.io, a, "posts", "rec2", "a.txt")).?;
+    defer a.free(dir2);
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().readFileAlloc(std.testing.io, dir2, a, .limited(16)));
 
     try st.delete(std.testing.io, "posts", "ghost", "none.txt"); // missing -> no-op
