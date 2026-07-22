@@ -46,11 +46,8 @@ src/dumpload.zig	4	PRE-EXISTING: not yet migrated to the ownership contracts
 src/feature_cache.zig	7	PRE-EXISTING: not yet migrated to the ownership contracts
 src/features_resolver.zig	14	PRE-EXISTING: not yet migrated to the ownership contracts
 src/field_policy.zig	8	PRE-EXISTING: not yet migrated to the ownership contracts
-src/files/naming.zig	2	PRE-EXISTING: not yet migrated to the ownership contracts
-src/files/plan.zig	11	PRE-EXISTING: not yet migrated to the ownership contracts
-src/files/s3.zig	17	PRE-EXISTING: not yet migrated to the ownership contracts
-src/files/serve_file.zig	4	PRE-EXISTING: not yet migrated to the ownership contracts
-src/files/storage.zig	1	PRE-EXISTING: not yet migrated to the ownership contracts
+src/files/plan.zig	11	contract-4: planFileField/planAllFileFields return a json.Value tree (FieldPlan.value / AllPlan.data) whose string elements alias PlannedWrite.filename (freshly allocated) or borrow directly from the caller-owned `existing`/`data` inputs; deletes borrow from `existing` too. Individual frees would double-free the aliased writes or free memory this call never owned. Production (api/records.zig prepareRecordData) always passes ctx.allocator.a (the request arena); the graph is reclaimed wholesale at request end.
+src/files/s3.zig	7	BLOCKED: root cause is src/http_client.zig (out of this batch) — `HttpClient.request`/`download` allocate response scratch (fixed max_response_bytes body buffer, redirect buffer, captured header array/strings) on the caller's allocator and never free it (house convention: HttpResponse has no deinit). These 7 tests call the raw `Client` ops (put/getToWriter/head + the LIVE MinIO test) directly, bypassing S3Storage's per-op arena wrapping that reclaims this scratch in production; a raw testing.allocator here reports it as a leak. See each test's in-file comment.
 src/framework.zig	1	PRE-EXISTING: not yet migrated to the ownership contracts
 src/http_client.zig	6	PRE-EXISTING: not yet migrated to the ownership contracts
 src/import.zig	16	PRE-EXISTING: not yet migrated to the ownership contracts

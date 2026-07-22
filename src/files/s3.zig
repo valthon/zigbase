@@ -734,9 +734,7 @@ test "Client.init: explicit s3_force_path_style=false is respected with an endpo
 }
 
 test "presignGet: virtual-hosted URL — host+path match addressing, https, has signature/expires" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     var cfg = config.Config{};
     cfg.s3_bucket = "zbtest";
     cfg.s3_region = "us-east-1";
@@ -745,7 +743,9 @@ test "presignGet: virtual-hosted URL — host+path match addressing, https, has 
     var host_buf: [256]u8 = undefined;
     const client = Client.init(cfg, &host_buf); // no endpoint => virtual-hosted
     const key = try client.objectKey(a, "posts", "rec1", "a.png");
+    defer a.free(key);
     const url = try client.presignGet(std.testing.io, a, key, 900);
+    defer a.free(url);
     // Virtual-hosted: bucket rides the host, key is the path.
     try std.testing.expect(std.mem.startsWith(u8, url, "https://zbtest.s3.us-east-1.amazonaws.com/posts/rec1/a.png?"));
     try std.testing.expect(std.mem.indexOf(u8, url, "X-Amz-Signature=") != null);
@@ -754,9 +754,7 @@ test "presignGet: virtual-hosted URL — host+path match addressing, https, has 
 }
 
 test "presignGet: path-style URL — bucket in the path, honors the endpoint host" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     var cfg = config.Config{};
     cfg.s3_bucket = "zbtest";
     cfg.s3_region = "us-east-1";
@@ -766,7 +764,9 @@ test "presignGet: path-style URL — bucket in the path, honors the endpoint hos
     var host_buf: [256]u8 = undefined;
     const client = Client.init(cfg, &host_buf);
     const key = try client.objectKey(a, "posts", "rec1", "a.png");
+    defer a.free(key);
     const url = try client.presignGet(std.testing.io, a, key, 1800);
+    defer a.free(url);
     // Path-style: bucket is a path segment on the endpoint host.
     try std.testing.expect(std.mem.startsWith(u8, url, "https://minio.example.com/zbtest/posts/rec1/a.png?"));
     try std.testing.expect(std.mem.indexOf(u8, url, "X-Amz-Signature=") != null);
@@ -774,9 +774,7 @@ test "presignGet: path-style URL — bucket in the path, honors the endpoint hos
 }
 
 test "presignGet: an http endpoint yields an http presigned URL (scheme honored)" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     var cfg = config.Config{};
     cfg.s3_bucket = "zbtest";
     cfg.s3_region = "us-east-1";
@@ -786,7 +784,9 @@ test "presignGet: an http endpoint yields an http presigned URL (scheme honored)
     var host_buf: [256]u8 = undefined;
     const client = Client.init(cfg, &host_buf);
     const key = try client.objectKey(a, "posts", "rec1", "a.png");
+    defer a.free(key);
     const url = try client.presignGet(std.testing.io, a, key, 900);
+    defer a.free(url);
     // The presigned URL must match the endpoint scheme, or it is undialable.
     try std.testing.expect(std.mem.startsWith(u8, url, "http://minio.local:9000/zbtest/posts/rec1/a.png?"));
     try std.testing.expect(std.mem.indexOf(u8, url, "X-Amz-Signature=") != null);
@@ -811,8 +811,14 @@ test "put: sends signed headers and the path-style, space-encoded URL" {
     defer testcapture.http.reset();
     testcapture.http.mock("zbtest/col/r1/a%20b.png", .{ .status = 200 });
 
-    // Client op internals scratch-allocate (paths/headers/authorization) on whatever
-    // allocator is passed in — an arena avoids having to free each one individually.
+    // BLOCKED (contract-4, root cause outside this batch): `Client.put` -> `putOnce` ->
+    // `HttpClient.request` (src/http_client.zig) allocates its response scratch (the
+    // fixed `max_response_bytes` body buffer, the redirect buffer, and the captured
+    // header array/strings) on this allocator and never frees it — by house convention
+    // `HttpResponse` has no `deinit`; every production caller (S3Storage's putImpl et
+    // al.) wraps the call in its own disposable arena. A raw `std.testing.allocator`
+    // here would report that http_client.zig scratch as a leak; fixing it means
+    // changing http_client.zig, which is out of this batch's scope. Kept arena-wrapped.
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -843,6 +849,9 @@ test "put: sends signed headers and the path-style, space-encoded URL" {
 
 test "put: 500 retries once then errors; 200 succeeds with a single request" {
     if (!testcapture.enabled) return error.SkipZigTest;
+    // BLOCKED (contract-4, root cause outside this batch): see the identical arena note
+    // on "put: sends signed headers…" above — `HttpClient.request` (http_client.zig)
+    // scratch is never freed by the callee.
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -863,6 +872,11 @@ test "put: 500 retries once then errors; 200 succeeds with a single request" {
 
 test "getToWriter: 500 retries once then errors; 200 succeeds with a single request" {
     if (!testcapture.enabled) return error.SkipZigTest;
+    // BLOCKED (contract-4, root cause outside this batch): `Client.getToWriter` ->
+    // `HttpClient.download` (http_client.zig) allocates its own response scratch
+    // (extra-headers array, redirect buffer, captured header array/strings) and never
+    // frees it — same house-convention gap as `request()` (see "put: sends signed
+    // headers…" above). Out of this batch's scope to fix.
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -889,6 +903,8 @@ test "getToWriter: 500 retries once then errors; 200 succeeds with a single requ
 
 test "getToWriter: a 500 WITH a body on the first attempt does not corrupt the retry's write" {
     if (!testcapture.enabled) return error.SkipZigTest;
+    // BLOCKED (contract-4, root cause outside this batch): see the `download()` scratch
+    // note on "getToWriter: 500 retries…" above.
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -914,6 +930,8 @@ test "getToWriter: a 500 WITH a body on the first attempt does not corrupt the r
 
 test "getToWriter: a failing destination writer is not retried" {
     if (!testcapture.enabled) return error.SkipZigTest;
+    // BLOCKED (contract-4, root cause outside this batch): see the `download()` scratch
+    // note on "getToWriter: 500 retries…" above.
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -933,6 +951,9 @@ test "getToWriter: a failing destination writer is not retried" {
 
 test "head: returns the raw status for 200/404/403 without erroring" {
     if (!testcapture.enabled) return error.SkipZigTest;
+    // BLOCKED (contract-4, root cause outside this batch): `Client.head` -> `request()`
+    // (http_client.zig) scratch is never freed by the callee — see "put: sends signed
+    // headers…" above.
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -1058,9 +1079,9 @@ test "S3Storage.create: startup probe — 404 and 200 succeed (the common case)"
     if (!testcapture.enabled) return error.SkipZigTest;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const cache_dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", arena.allocator());
+    const a = testing.allocator;
+    const cache_dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(cache_dir);
     const cfg = testCfg(cache_dir);
 
     testcapture.http.enable(true);
@@ -1084,9 +1105,9 @@ test "S3Storage.probe: 403 and an unmocked/blocked transport both fail closed" {
     if (!testcapture.enabled) return error.SkipZigTest;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const cache_dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", arena.allocator());
+    const a = testing.allocator;
+    const cache_dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(cache_dir);
     const cfg = testCfg(cache_dir);
 
     testcapture.http.enable(true);
@@ -1109,9 +1130,9 @@ test "S3Storage.fetch: cache miss downloads+spools; cache hit skips the network;
     if (!testcapture.enabled) return error.SkipZigTest;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const cache_dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", arena.allocator());
+    const a = testing.allocator;
+    const cache_dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(cache_dir);
     const cfg = testCfg(cache_dir);
 
     testcapture.http.enable(true);
@@ -1156,9 +1177,9 @@ test "S3Storage: put/delete round-trip through the vtable" {
     if (!testcapture.enabled) return error.SkipZigTest;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const cache_dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", arena.allocator());
+    const a = testing.allocator;
+    const cache_dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(cache_dir);
     const cfg = testCfg(cache_dir);
 
     testcapture.http.enable(true);
@@ -1188,9 +1209,9 @@ test "S3Storage.delete: removes the spool entry alongside the remote object" {
     if (!testcapture.enabled) return error.SkipZigTest;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const cache_dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", arena.allocator());
+    const a = testing.allocator;
+    const cache_dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(cache_dir);
     const cfg = testCfg(cache_dir);
 
     testcapture.http.enable(true);
@@ -1218,9 +1239,9 @@ test "S3Storage: eviction removes oldest spool entries once over cache_max_bytes
     if (!testcapture.enabled) return error.SkipZigTest;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const cache_dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", arena.allocator());
+    const a = testing.allocator;
+    const cache_dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(cache_dir);
     var cfg = testCfg(cache_dir);
     cfg.s3_cache_max_bytes = 100; // low-water = 75; three 60-byte entries force eviction
 
@@ -1257,9 +1278,9 @@ test "S3Storage: a cache hit bumps mtime so eviction approximates last-access LR
     if (!testcapture.enabled) return error.SkipZigTest;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const cache_dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", arena.allocator());
+    const a = testing.allocator;
+    const cache_dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(cache_dir);
     var cfg = testCfg(cache_dir);
     // cap 170 -> low-water = 127. Two 60-byte entries (120) stay under the cap;
     // the third (180) trips eviction, which frees exactly one 60-byte entry
@@ -1337,6 +1358,10 @@ test "LIVE MinIO: put/head/get/list/delete round-trip (object verifiably GONE)" 
     const bucket = testEnv("ZIGBASE_S3_TEST_BUCKET") orelse return error.SkipZigTest;
     const key_id = testEnv("ZIGBASE_S3_TEST_KEY") orelse return error.SkipZigTest;
     const secret = testEnv("ZIGBASE_S3_TEST_SECRET") orelse return error.SkipZigTest;
+    // BLOCKED (contract-4, root cause outside this batch): this exercises the raw
+    // `Client` ops directly (put/head/getToWriter/listKeys/delete), each of which routes
+    // through `HttpClient.request`/`download` (http_client.zig) — see "put: sends
+    // signed headers…" above for the scratch-never-freed detail.
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();

@@ -18,7 +18,9 @@ pub fn sanitizeBase(alloc: std.mem.Allocator, name: []const u8) ![]const u8 {
     if (base.len == 0) return alloc.dupe(u8, "file");
 
     var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(alloc);
+    // Always freed (not just on error): every return below is a fresh `alloc.dupe` of
+    // (a trim of) `out.items`, never `out`'s own backing buffer, so it's always scratch.
+    defer out.deinit(alloc);
     // `pending_us` is a run of unsafe chars collapsed to a single `_`, emitted
     // lazily so it can be dropped when it would sit right next to a `.`.
     var pending_us = false;
@@ -40,6 +42,7 @@ pub fn sanitizeBase(alloc: std.mem.Allocator, name: []const u8) ![]const u8 {
 /// "<stem>_<10 base36>.<ext>" where stem/ext come from the sanitized name (ext lowercased, <=16).
 pub fn storedName(io: std.Io, alloc: std.mem.Allocator, original: []const u8) ![]const u8 {
     const clean = try sanitizeBase(alloc, original);
+    defer alloc.free(clean); // scratch: the return is always a fresh allocPrint, never `clean` itself
     var rand: [10]u8 = undefined;
     id.generate(io, &rand);
     if (std.mem.lastIndexOfScalar(u8, clean, '.')) |dot| {
@@ -56,34 +59,32 @@ pub fn storedName(io: std.Io, alloc: std.mem.Allocator, original: []const u8) ![
 }
 
 test "sanitizeBase strips path components and unsafe chars" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    try std.testing.expectEqualStrings("passwd", try sanitizeBase(a, "../../etc/passwd"));
-    try std.testing.expectEqualStrings("c.png", try sanitizeBase(a, "a/b/c.png"));
-    try std.testing.expectEqualStrings("c.png", try sanitizeBase(a, "a\\b\\c.png"));
-    try std.testing.expectEqualStrings("my_file.txt", try sanitizeBase(a, "my file.txt"));
-    try std.testing.expectEqualStrings("file", try sanitizeBase(a, ".."));
-    try std.testing.expectEqualStrings("file", try sanitizeBase(a, ""));
-    try std.testing.expectEqualStrings("file", try sanitizeBase(a, "."));
-    try std.testing.expectEqualStrings("a_b.c", try sanitizeBase(a, "a*b?.c"));
-    try std.testing.expectEqualStrings("bashrc", try sanitizeBase(a, ".bashrc"));
+    const a = std.testing.allocator;
+    const cases = [_][]const u8{ "../../etc/passwd", "a/b/c.png", "a\\b\\c.png", "my file.txt", "..", "", ".", "a*b?.c", ".bashrc" };
+    const expected = [_][]const u8{ "passwd", "c.png", "c.png", "my_file.txt", "file", "file", "file", "a_b.c", "bashrc" };
+    for (cases, expected) |c, e| {
+        const got = try sanitizeBase(a, c);
+        defer a.free(got);
+        try std.testing.expectEqualStrings(e, got);
+    }
 }
 
 test "storedName keeps a sanitized stem + ext and adds a random suffix" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const n1 = try storedName(std.testing.io, a, "Photo Final.JPG");
+    defer a.free(n1);
     try std.testing.expect(std.mem.startsWith(u8, n1, "Photo_Final_"));
     try std.testing.expect(std.mem.endsWith(u8, n1, ".jpg"));
     try std.testing.expect(std.mem.indexOfScalar(u8, n1, '/') == null);
     const n2 = try storedName(std.testing.io, a, "Photo Final.JPG");
+    defer a.free(n2);
     try std.testing.expect(!std.mem.eql(u8, n1, n2));
     const n3 = try storedName(std.testing.io, a, "README");
+    defer a.free(n3);
     try std.testing.expect(std.mem.startsWith(u8, n3, "README_"));
     try std.testing.expect(std.mem.indexOfScalar(u8, n3, '.') == null);
     const n4 = try storedName(std.testing.io, a, "../../x.png");
+    defer a.free(n4);
     try std.testing.expect(std.mem.indexOf(u8, n4, "..") == null);
     try std.testing.expect(std.mem.indexOfScalar(u8, n4, '/') == null);
 }
