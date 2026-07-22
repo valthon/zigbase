@@ -1,7 +1,6 @@
 # path<TAB>count<TAB>justification
 # A test may wrap testing.allocator in an arena ONLY if the code under test takes
 # RequestArena (contract 4). Every line here is a promise to remove it or justify it.
-src/aead.zig	5	PRE-EXISTING: not yet migrated to the ownership contracts
 src/analytics/analytics.zig	3	PRE-EXISTING: not yet migrated to the ownership contracts
 src/analytics/api.zig	3	PRE-EXISTING: not yet migrated to the ownership contracts
 src/api/auth.zig	42	PRE-EXISTING: not yet migrated to the ownership contracts
@@ -59,10 +58,6 @@ src/mail/inbound.zig	3	PRE-EXISTING: not yet migrated to the ownership contracts
 src/mail/senders.zig	6	PRE-EXISTING: not yet migrated to the ownership contracts
 src/mail/suppression.zig	4	PRE-EXISTING: not yet migrated to the ownership contracts
 src/migrator.zig	14	PRE-EXISTING: not yet migrated to the ownership contracts
-src/oauth/client.zig	5	PRE-EXISTING: not yet migrated to the ownership contracts
-src/oauth/discovery.zig	5	PRE-EXISTING: not yet migrated to the ownership contracts
-src/oauth/providers.zig	3	PRE-EXISTING: not yet migrated to the ownership contracts
-src/oauth/secrets.zig	5	PRE-EXISTING: not yet migrated to the ownership contracts
 src/policy.zig	16	PRE-EXISTING: not yet migrated to the ownership contracts
 src/provision.zig	29	PRE-EXISTING: not yet migrated to the ownership contracts
 src/push/config.zig	2	PRE-EXISTING: not yet migrated to the ownership contracts

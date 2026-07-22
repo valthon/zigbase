@@ -71,15 +71,18 @@ pub fn seal(io: std.Io, alloc: std.mem.Allocator, key: [32]u8, version: u16, pla
     var nonce: [12]u8 = undefined;
     io.random(&nonce);
     const ct = try alloc.alloc(u8, plaintext.len);
+    defer alloc.free(ct); // scratch — only the final envelope escapes
     var tag: [16]u8 = undefined;
     Aes256Gcm.encrypt(ct, &tag, plaintext, "", nonce, key);
 
     const raw = try alloc.alloc(u8, 12 + ct.len + 16);
+    defer alloc.free(raw); // scratch
     @memcpy(raw[0..12], &nonce);
     @memcpy(raw[12 .. 12 + ct.len], ct);
     @memcpy(raw[12 + ct.len ..], &tag);
 
     const enc = try alloc.alloc(u8, b64.Encoder.calcSize(raw.len));
+    defer alloc.free(enc); // scratch
     _ = b64.Encoder.encode(enc, raw);
     return std.fmt.allocPrint(alloc, "v{d}:{s}", .{ version, enc });
 }
@@ -96,6 +99,7 @@ pub fn open(alloc: std.mem.Allocator, key: [32]u8, blob: []const u8) Error![]u8 
     const raw_len = b64.Decoder.calcSizeForSlice(enc) catch return error.BadEnvelope;
     if (raw_len < 12 + 16) return error.BadEnvelope;
     const raw = try alloc.alloc(u8, raw_len);
+    defer alloc.free(raw); // scratch — `ct` is a sub-slice of it, read by decrypt below
     b64.Decoder.decode(raw, enc) catch return error.BadEnvelope;
 
     const ct_len = raw_len - 12 - 16;
@@ -104,6 +108,7 @@ pub fn open(alloc: std.mem.Allocator, key: [32]u8, blob: []const u8) Error![]u8 
     const tag: [16]u8 = raw[12 + ct_len ..][0..16].*;
 
     const pt = try alloc.alloc(u8, ct_len);
+    errdefer alloc.free(pt); // freed on the decrypt-verify failure path; escapes on success
     Aes256Gcm.decrypt(pt, ct, tag, "", nonce, key) catch return error.BadEnvelope;
     return pt;
 }
@@ -120,31 +125,31 @@ pub fn openV1(alloc: std.mem.Allocator, key: [32]u8, blob: []const u8) Error![]u
 }
 
 test "sealV1 then openV1 round-trips" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const key = deriveKey("master-secret", "test-domain-v1");
     const blob = try sealV1(std.testing.io, a, key, "the-plaintext");
+    defer a.free(blob);
     try std.testing.expect(std.mem.startsWith(u8, blob, "v1:"));
     try std.testing.expect(isEnvelope(blob));
     // Ciphertext-at-rest: the blob must not contain the plaintext.
     try std.testing.expect(std.mem.indexOf(u8, blob, "the-plaintext") == null);
     const pt = try openV1(a, key, blob);
+    defer a.free(pt);
     try std.testing.expectEqualStrings("the-plaintext", pt);
 }
 
 test "openV1 fails closed on wrong key, tamper, and non-envelope" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const key = deriveKey("master", "dom-v1");
     const blob = try sealV1(std.testing.io, a, key, "s3cr3t");
+    defer a.free(blob);
 
     // Wrong key.
     const other = deriveKey("master", "different-domain-v1");
     try std.testing.expectError(error.BadEnvelope, openV1(a, other, blob));
     // Tamper the last byte.
     const buf = try a.dupe(u8, blob);
+    defer a.free(buf);
     buf[buf.len - 1] = if (buf[buf.len - 1] == 'A') 'B' else 'A';
     try std.testing.expectError(error.BadEnvelope, openV1(a, key, buf));
     // Non-envelope (no prefix).
@@ -158,12 +163,13 @@ test "deriveKey is domain-separated: same secret, different domains -> different
 }
 
 test "empty plaintext round-trips" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const key = deriveKey("k", "d-v1");
     const blob = try sealV1(std.testing.io, a, key, "");
-    try std.testing.expectEqualStrings("", try openV1(a, key, blob));
+    defer a.free(blob);
+    const pt = try openV1(a, key, blob);
+    defer a.free(pt);
+    try std.testing.expectEqualStrings("", pt);
 }
 
 test "parseVersion: digits between v and colon, else null" {
@@ -180,24 +186,26 @@ test "parseVersion: digits between v and colon, else null" {
 }
 
 test "seal stamps the version; open decrypts regardless of version value" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const key = deriveKey("master", "dom-v2");
     const blob = try seal(std.testing.io, a, key, 2, "payload");
+    defer a.free(blob);
     try std.testing.expect(std.mem.startsWith(u8, blob, "v2:"));
     try std.testing.expectEqual(@as(?u16, 2), parseVersion(blob));
-    try std.testing.expectEqualStrings("payload", try open(a, key, blob));
+    const pt = try open(a, key, blob);
+    defer a.free(pt);
+    try std.testing.expectEqualStrings("payload", pt);
 }
 
 test "rotation: a v2 blob does not decrypt under a v1-generation key" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const k1 = deriveKey("secret", "zigbase-field-encryption-v1");
     const k2 = deriveKey("secret", "zigbase-field-encryption-v2");
     const blob_v2 = try seal(std.testing.io, a, k2, 2, "data");
+    defer a.free(blob_v2);
     // Wrong generation key fails closed; correct one decrypts.
     try std.testing.expectError(error.BadEnvelope, open(a, k1, blob_v2));
-    try std.testing.expectEqualStrings("data", try open(a, k2, blob_v2));
+    const pt = try open(a, k2, blob_v2);
+    defer a.free(pt);
+    try std.testing.expectEqualStrings("data", pt);
 }

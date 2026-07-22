@@ -90,14 +90,19 @@ fn jsonToBool(v: std.json.Value) bool {
 /// Extract a normalized Identity from a userinfo JSON document using `provider.mapping`.
 pub fn extractIdentity(alloc: std.mem.Allocator, provider: Provider, json: []const u8) ExtractError!Identity {
     const parsed = std.json.parseFromSlice(std.json.Value, alloc, json, .{}) catch return error.InvalidJson;
+    defer parsed.deinit(); // scratch tree; the fields we keep are duped onto `alloc` below
     const root = parsed.value;
     if (root != .object) return error.InvalidJson;
     const obj = root.object;
 
     const id_val = obj.get(provider.mapping.id) orelse return error.NoProviderId;
     const pid = (try jsonToStr(alloc, id_val)) orelse return error.NoProviderId;
+    errdefer alloc.free(pid);
 
     var out = Identity{ .providerUserId = pid };
+    errdefer if (out.email) |e| alloc.free(e);
+    errdefer if (out.name) |n| alloc.free(n);
+    errdefer if (out.avatarUrl) |v| alloc.free(v);
     if (provider.mapping.email) |k| if (obj.get(k)) |v| {
         out.email = try jsonToStr(alloc, v);
     };
@@ -124,14 +129,20 @@ test "lookup returns presets and null for unknown" {
     try std.testing.expectEqualStrings("sub", g.mapping.id);
 }
 
+fn freeIdentity(alloc: std.mem.Allocator, id: Identity) void {
+    alloc.free(id.providerUserId);
+    if (id.email) |e| alloc.free(e);
+    if (id.name) |n| alloc.free(n);
+    if (id.avatarUrl) |v| alloc.free(v);
+}
+
 test "extractIdentity reads google-shaped userinfo" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const json =
         \\{"sub":"123","email":"u@x.io","email_verified":true,"name":"U","picture":"http://p"}
     ;
     const id = try extractIdentity(a, lookup("google").?, json);
+    defer freeIdentity(a, id);
     try std.testing.expectEqualStrings("123", id.providerUserId);
     try std.testing.expectEqualStrings("u@x.io", id.email.?);
     try std.testing.expectEqual(true, id.emailVerified);
@@ -139,21 +150,18 @@ test "extractIdentity reads google-shaped userinfo" {
 }
 
 test "extractIdentity reads github-shaped userinfo (numeric id, no email_verified)" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const json =
         \\{"id":456,"login":"octo","email":"o@x.io","avatar_url":"http://a"}
     ;
     const id = try extractIdentity(a, lookup("github").?, json);
+    defer freeIdentity(a, id);
     try std.testing.expectEqualStrings("456", id.providerUserId);
     try std.testing.expectEqualStrings("o@x.io", id.email.?);
     try std.testing.expectEqual(false, id.emailVerified);
 }
 
 test "extractIdentity fails when the id field is missing" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     try std.testing.expectError(error.NoProviderId, extractIdentity(a, lookup("google").?, "{\"email\":\"x@y.z\"}"));
 }

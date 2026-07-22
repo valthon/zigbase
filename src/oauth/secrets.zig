@@ -29,46 +29,44 @@ pub fn decryptSecret(alloc: std.mem.Allocator, app_secret: []const u8, blob: []c
 }
 
 test "encrypt then decrypt round-trips" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const blob = try encryptSecret(std.testing.io, a, "app-secret", "my-client-secret");
+    defer a.free(blob);
     try std.testing.expect(std.mem.startsWith(u8, blob, "v1:"));
     try std.testing.expect(isEncrypted(blob));
     const pt = try decryptSecret(a, "app-secret", blob);
+    defer a.free(pt);
     try std.testing.expectEqualStrings("my-client-secret", pt);
 }
 
 test "wrong app secret fails authentication" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const blob = try encryptSecret(std.testing.io, a, "app-secret", "s3cr3t");
+    defer a.free(blob);
     try std.testing.expectError(error.BadSecret, decryptSecret(a, "other-secret", blob));
 }
 
 test "tampered blob fails authentication" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const blob = try encryptSecret(std.testing.io, a, "app-secret", "s3cr3t");
+    defer a.free(blob);
     const buf = try a.dupe(u8, blob);
+    defer a.free(buf);
     buf[buf.len - 1] = if (buf[buf.len - 1] == 'A') 'B' else 'A';
     try std.testing.expectError(error.BadSecret, decryptSecret(a, "app-secret", buf));
 }
 
 test "isEncrypted distinguishes plaintext from blobs; decrypt rejects non-blob" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     try std.testing.expect(!isEncrypted("plaintext-secret"));
     try std.testing.expectError(error.BadSecret, decryptSecret(a, "app-secret", "plaintext-secret"));
 }
 
 test "empty plaintext round-trips" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const blob = try encryptSecret(std.testing.io, a, "app-secret", "");
-    try std.testing.expectEqualStrings("", try decryptSecret(a, "app-secret", blob));
+    defer a.free(blob);
+    const pt = try decryptSecret(a, "app-secret", blob);
+    defer a.free(pt);
+    try std.testing.expectEqualStrings("", pt);
 }

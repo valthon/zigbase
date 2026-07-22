@@ -11,6 +11,15 @@ pub const Endpoints = struct {
     authURL: []const u8,
     tokenURL: []const u8,
     userinfoURL: []const u8,
+
+    /// Free all three owned strings. Startup callers (provision.zig) run this under a
+    /// request/startup arena and never call it directly — fields are copied out and reclaimed
+    /// on arena teardown; this exists for callers on a non-arena allocator (e.g. tests).
+    pub fn deinit(self: Endpoints, alloc: std.mem.Allocator) void {
+        alloc.free(self.authURL);
+        alloc.free(self.tokenURL);
+        alloc.free(self.userinfoURL);
+    }
 };
 
 pub const DiscoveryError = error{ DiscoveryFetchFailed, InvalidDiscoveryDocument, InsecureEndpoint, IssuerMismatch } || client.TransportError;
@@ -56,7 +65,9 @@ pub fn parseDocument(alloc: std.mem.Allocator, discovery_url: []const u8, body: 
 pub fn resolve(transport: client.Transport, alloc: std.mem.Allocator, discovery_url: []const u8) DiscoveryError!Endpoints {
     const headers = [_]client.Header{.{ .name = "accept", .value = "application/json" }};
     const resp = try transport.call(transport.ctx, alloc, .GET, discovery_url, &headers, null);
-    defer alloc.free(resp.body);
+    // `resp.body` is transport-owned — do NOT free it (same contract as `client.exchangeCode`).
+    // The production transport returns a sub-slice of a larger fixed response buffer, so
+    // `alloc.free(resp.body)` would be an invalid free; `parseDocument` dupes what it keeps.
     if (resp.status < 200 or resp.status >= 300) return error.DiscoveryFetchFailed;
     return parseDocument(alloc, discovery_url, resp.body);
 }
@@ -80,8 +91,11 @@ const StubTransport = struct {
         _ = url;
         _ = headers;
         _ = req_body;
+        _ = alloc;
         const self: *StubTransport = @ptrCast(@alignCast(ctx));
-        return .{ .status = self.status, .body = try alloc.dupe(u8, self.body) };
+        // Borrowed body — `resp.body` is transport-owned and the caller never frees it (matches
+        // the production transport's fixed-buffer sub-slice; see client.Response).
+        return .{ .status = self.status, .body = self.body };
     }
 
     fn transport(self: *StubTransport) client.Transport {
@@ -90,20 +104,17 @@ const StubTransport = struct {
 };
 
 test "discovery: happy path resolves all three endpoints" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     var stub = StubTransport{};
     const eps = try resolve(stub.transport(), a, okta_discovery_url);
+    defer eps.deinit(a);
     try std.testing.expectEqualStrings("https://acme.okta.com/oauth2/v1/authorize", eps.authURL);
     try std.testing.expectEqualStrings("https://acme.okta.com/oauth2/v1/token", eps.tokenURL);
     try std.testing.expectEqualStrings("https://acme.okta.com/oauth2/v1/userinfo", eps.userinfoURL);
 }
 
 test "discovery: missing endpoint / non-string endpoint -> InvalidDiscoveryDocument" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
 
     const missing_userinfo =
         \\{
@@ -126,9 +137,7 @@ test "discovery: missing endpoint / non-string endpoint -> InvalidDiscoveryDocum
 }
 
 test "discovery: http:// endpoint -> InsecureEndpoint" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
 
     const http_userinfo =
         \\{
@@ -142,9 +151,7 @@ test "discovery: http:// endpoint -> InsecureEndpoint" {
 }
 
 test "discovery: issuer mismatch and http issuer -> IssuerMismatch" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
 
     const evil_issuer =
         \\{
@@ -168,9 +175,7 @@ test "discovery: issuer mismatch and http issuer -> IssuerMismatch" {
 }
 
 test "discovery: non-2xx fetch -> DiscoveryFetchFailed" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     var stub = StubTransport{ .status = 404, .body = "not found" };
     try std.testing.expectError(error.DiscoveryFetchFailed, resolve(stub.transport(), a, okta_discovery_url));
 }
