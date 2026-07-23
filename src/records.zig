@@ -29,7 +29,13 @@ const param_sink = @import("sql/param_sink.zig");
 /// positional bind order (`sql/param_sink.zig`). Every CRUD/query `prepare` of a placeholder-
 /// bearing statement in this file routes through here so the `$n` rework has one chokepoint.
 fn prep(alloc: std.mem.Allocator, h: *db.Db, sql: [:0]const u8) !db.Stmt {
-    return h.prepare(try param_sink.renumberZ(alloc, db.dbDialect(h), sql));
+    const renumbered = try param_sink.renumberZ(alloc, db.dbDialect(h), sql);
+    // SQLite returns `sql` itself (same pointer, no allocation); Postgres allocates a fresh
+    // `$n` string. `prepare` copies the statement text, so the Postgres allocation is scratch
+    // that can be freed immediately — free it here so every `prep` caller stays leak-correct
+    // under a non-arena allocator instead of each leaking one rewritten string per statement.
+    defer if (renumbered.ptr != sql.ptr) alloc.free(renumbered);
+    return h.prepare(renumbered);
 }
 
 /// A compiled rule constraint enforced atomically on create/update.
@@ -102,7 +108,9 @@ fn columnList(alloc: std.mem.Allocator, col: schema.Collection) ![]u8 {
     try out.appendSlice(alloc, "\"id\",\"created\",\"updated\"");
     for (col.fields) |f| {
         try out.append(alloc, ',');
-        try out.appendSlice(alloc, try ddl.quoteIdent(alloc, f.name));
+        const q = try ddl.quoteIdent(alloc, f.name);
+        defer alloc.free(q); // quoteIdent's buffer is copied into `out`; free the temporary
+        try out.appendSlice(alloc, q);
     }
     return out.toOwnedSlice(alloc);
 }
@@ -156,8 +164,10 @@ fn rowToObjectAtRest(alloc: std.mem.Allocator, stmt: *db.Stmt, col: schema.Colle
 /// pre-delete inside the delete transaction).
 pub fn getAtRest(alloc: std.mem.Allocator, r: *db.Db, col: schema.Collection, id: []const u8) !?std.json.Value {
     const cols = try columnList(alloc, col);
+    defer alloc.free(cols);
     if (!schema.isValidIdentifier(col.name)) return null; // identifier gate before interpolation
     const sql = try std.fmt.allocPrintSentinel(alloc, "SELECT {s} FROM \"{s}\" WHERE \"id\" = ?1;", .{ cols, col.name }, 0);
+    defer alloc.free(sql);
     var st = try prep(alloc, r, sql);
     defer st.finalize();
     try st.bindText(1, id);
@@ -167,6 +177,7 @@ pub fn getAtRest(alloc: std.mem.Allocator, r: *db.Db, col: schema.Collection, id
 
 pub fn get(alloc: std.mem.Allocator, r: *db.Db, col: schema.Collection, id: []const u8) RecordError!?std.json.Value {
     const cols = try columnList(alloc, col);
+    defer alloc.free(cols);
     // TTL read-time exclusion: never return an expired row. Mirrors gcExpiredRecords: both
     // sides are normalised via strftime so non-canonical date values (offsets, space, date-
     // only) compare correctly as instants, not lexically. The three-clause OR matches the
@@ -178,12 +189,15 @@ pub fn get(alloc: std.mem.Allocator, r: *db.Db, col: schema.Collection, id: []co
         if (col.options.ttl_field) |tf| {
             if (schema.isValidIdentifier(col.name) and schema.isValidIdentifier(tf)) {
                 const qtf = try std.fmt.allocPrint(alloc, "\"{s}\"", .{tf});
+                defer alloc.free(qtf);
                 const ttl_pred = try dialect.ttlVisiblePredicate(alloc, qtf);
+                defer alloc.free(ttl_pred);
                 break :blk try std.fmt.allocPrintSentinel(alloc, "SELECT {s} FROM \"{s}\" WHERE \"id\" = ?1 AND ({s});", .{ cols, col.name, ttl_pred }, 0);
             }
         }
         break :blk try std.fmt.allocPrintSentinel(alloc, "SELECT {s} FROM \"{s}\" WHERE \"id\" = ?1;", .{ cols, col.name }, 0);
     };
+    defer alloc.free(sql);
     var st = try prep(alloc, r, sql);
     defer st.finalize();
     try st.bindText(1, id);
@@ -350,7 +364,13 @@ fn validateFieldValue(alloc: std.mem.Allocator, conn: *db.Db, f: schema.Field, v
                 return; // reject on count BEFORE the per-element existence SELECTs, so an over-limit
                 // array can't drive N writer-lock queries from already-invalid input
             }
-            const tcol = (try collections.get(alloc, conn, o.targetCollectionId)) orelse {
+            // The target collection load and per-element existence SQL are scratch that never
+            // escapes; reclaim them via a child arena so validation stays leak-correct under a
+            // non-arena allocator. `errs` still escapes on `alloc` (read after return).
+            var scratch = std.heap.ArenaAllocator.init(alloc);
+            defer scratch.deinit();
+            const sa = scratch.allocator();
+            const tcol = (try collections.get(sa, conn, o.targetCollectionId)) orelse {
                 try errs.append(alloc, .{ .field = f.name, .code = "validation_relation", .message = "Relation target missing." });
                 return;
             };
@@ -360,8 +380,8 @@ fn validateFieldValue(alloc: std.mem.Allocator, conn: *db.Db, f: schema.Field, v
                 else => &.{},
             };
             for (items) |it| if (it == .string) {
-                const q = try std.fmt.allocPrintSentinel(alloc, "SELECT 1 FROM \"{s}\" WHERE \"id\" = ?1;", .{tcol.name}, 0);
-                var st = try prep(alloc, conn, q);
+                const q = try std.fmt.allocPrintSentinel(sa, "SELECT 1 FROM \"{s}\" WHERE \"id\" = ?1;", .{tcol.name}, 0);
+                var st = try prep(sa, conn, q);
                 defer st.finalize();
                 try st.bindText(1, it.string);
                 if (!try st.step())
@@ -627,15 +647,24 @@ pub fn createInTxn(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, col: schema.
 pub fn createInTxnOpts(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, col: schema.Collection, data: std.json.Value, opts: CreateOpts) RecordError!std.json.Value {
     last_errors = null;
     if (data != .object) return error.NotObject;
+    // `errs` escapes via `last_errors` (read by the API layer after this returns), so it stays on
+    // `alloc`. Everything else here — the column/value/bind lists, the quoted identifiers, the
+    // INSERT SQL — is scratch that never leaves this call; route it through a child arena so the
+    // insert path is leak-correct under any allocator (the returned record is the only other
+    // allocation kept on `alloc`).
     var errs: std.ArrayList(schema.ValidationError) = .empty;
+    errdefer errs.deinit(alloc); // handed to the caller via last_errors as an OWNED slice; freed here on the OOM edge
+    var scratch = std.heap.ArenaAllocator.init(alloc);
+    defer scratch.deinit();
+    const sa = scratch.allocator();
 
     const dialect = db.dbDialect(w);
     const now_iso = dialect.nowIso8601Expr();
 
     var cols: std.ArrayList(u8) = .empty;
     var vals: std.ArrayList(u8) = .empty;
-    try cols.appendSlice(alloc, "\"id\",\"created\",\"updated\"");
-    try vals.appendSlice(alloc, try std.fmt.allocPrint(alloc, "?1,{s},{s}", .{ now_iso, now_iso }));
+    try cols.appendSlice(sa, "\"id\",\"created\",\"updated\"");
+    try vals.appendSlice(sa, try std.fmt.allocPrint(sa, "?1,{s},{s}", .{ now_iso, now_iso }));
 
     var binds: std.ArrayList(BindItem) = .empty;
     var next: usize = 2;
@@ -644,10 +673,10 @@ pub fn createInTxnOpts(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, col: sch
         // autodate is server-set, so it must be handled before the required check
         // (a required autodate field correctly receives no client value).
         if (f.fieldType() == .autodate) {
-            try cols.append(alloc, ',');
-            try cols.appendSlice(alloc, try ddl.quoteIdent(alloc, f.name));
-            try vals.append(alloc, ',');
-            try vals.appendSlice(alloc, if (f.options.autodate.onCreate) now_iso else "NULL");
+            try cols.append(sa, ',');
+            try cols.appendSlice(sa, try ddl.quoteIdent(sa, f.name));
+            try vals.append(sa, ',');
+            try vals.appendSlice(sa, if (f.options.autodate.onCreate) now_iso else "NULL");
             continue;
         }
         if (f.required and (provided == null or isEmpty(provided.?))) {
@@ -656,20 +685,20 @@ pub fn createInTxnOpts(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, col: sch
         }
         if (provided) |pv| {
             try validateFieldValue(alloc, w, f, pv, &errs);
-            try cols.append(alloc, ',');
-            try cols.appendSlice(alloc, try ddl.quoteIdent(alloc, f.name));
-            try vals.append(alloc, ',');
-            try vals.appendSlice(alloc, try std.fmt.allocPrint(alloc, "?{d}", .{next}));
-            try binds.append(alloc, .{ .idx = @intCast(next), .field = f, .value = pv });
+            try cols.append(sa, ',');
+            try cols.appendSlice(sa, try ddl.quoteIdent(sa, f.name));
+            try vals.append(sa, ',');
+            try vals.appendSlice(sa, try std.fmt.allocPrint(sa, "?{d}", .{next}));
+            try binds.append(sa, .{ .idx = @intCast(next), .field = f, .value = pv });
             next += 1;
         }
     }
     if (errs.items.len > 0) {
-        last_errors = errs.items;
+        last_errors = try errs.toOwnedSlice(alloc);
         return error.Validation;
     }
 
-    const rcols = try columnList(alloc, col);
+    const rcols = try columnList(sa, col);
     // The id bound at ?1. Default: a freshly-generated id (client `id` ignored). Import-only:
     // when `opts.allow_provided_id` is set the source record's own non-empty `id` is preserved
     // (validated by isPlausibleRecordId first). `gen_id` outlives the bind/step below.
@@ -684,14 +713,14 @@ pub fn createInTxnOpts(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, col: sch
         }
     }
 
-    const sql = try std.fmt.allocPrintSentinel(alloc, "INSERT INTO \"{s}\" ({s}) VALUES ({s}) RETURNING {s};", .{ col.name, cols.items, vals.items, rcols }, 0);
-    var st = try prep(alloc, w, sql);
+    const sql = try std.fmt.allocPrintSentinel(sa, "INSERT INTO \"{s}\" ({s}) VALUES ({s}) RETURNING {s};", .{ col.name, cols.items, vals.items, rcols }, 0);
+    var st = try prep(sa, w, sql);
     defer st.finalize();
     try st.bindText(1, id_slice);
     for (binds.items) |b| {
-        values.bindValue(alloc, &st, b.idx, b.field, b.value) catch |e| {
+        values.bindValue(sa, &st, b.idx, b.field, b.value) catch |e| {
             try errs.append(alloc, .{ .field = b.field.name, .code = convCode(e), .message = "Invalid value." });
-            last_errors = errs.items;
+            last_errors = try errs.toOwnedSlice(alloc);
             return error.Validation;
         };
     }
@@ -708,6 +737,70 @@ fn seedPosts(d: *db.Db, a: std.mem.Allocator) !schema.Collection {
         .{ .id = "f2", .name = "price", .options = .{ .number = .{ .mode = .fixed, .scale = 2 } } },
     };
     return collections.create(a, std.testing.io, d, .{ .id = "", .name = "posts", .fields = &fields });
+}
+
+/// Free a record whose values are all scalar strings (id/created/updated + text fields). Keys are
+/// static ("id"/…) or borrowed from the collection schema, so only the string values and the map
+/// backing are owned. Used by the leak-detection regression test below.
+fn freeStringRecord(a: std.mem.Allocator, rec: std.json.Value) void {
+    var obj = rec.object;
+    var it = obj.iterator();
+    while (it.next()) |e| if (e.value_ptr.* == .string) a.free(e.value_ptr.*.string);
+    obj.deinit(a);
+}
+
+test "write path frees its DDL/SQL scratch under the checking allocator" {
+    // The whole point: run create + record-insert + read (hit and miss) under the RAW
+    // leak-detecting std.testing.allocator, with NO arena to mask leaks. Any column-list, DDL,
+    // INSERT/SELECT or placeholder-rewrite scratch the write path failed to free is reported as a
+    // leak here. This is the regression guard for the allocator-ownership fix — before it, one
+    // `create` here surfaced ~30 leaked allocations.
+    const a = std.testing.allocator;
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try migrations.run(&d);
+
+    // A base collection with a literal field def: create()'s returned collection borrows the field
+    // name/id and the rules from `def`, so its ONLY owned parts are the collection id and the field
+    // array. (An auth collection or generated field ids would add owned strings; kept simple here.)
+    const fields = [_]schema.Field{.{ .id = "f1", .name = "title", .options = .{ .text = .{} } }};
+    const def = schema.Collection{ .id = "", .name = "posts", .fields = &fields, .listRule = "", .viewRule = "", .createRule = "", .updateRule = "", .deleteRule = "" };
+    const full = try collections.create(a, std.testing.io, &d, def);
+    defer a.free(full.id);
+    defer a.free(full.fields);
+    try std.testing.expectEqual(@as(usize, 15), full.id.len);
+
+    // Insert a record. rowToObject's result is the only allocation kept on `a`; free it by hand.
+    var data: std.json.ObjectMap = .empty;
+    try data.put(a, "title", .{ .string = "hello" });
+    const rec = try create(a, std.testing.io, &d, full, .{ .object = data });
+    data.deinit(a);
+    const rid = try a.dupe(u8, rec.object.get("id").?.string);
+    defer a.free(rid);
+    freeStringRecord(a, rec);
+
+    // Read the row back (exercises get()'s column-list + SELECT scratch and rowToObject).
+    const got = (try get(a, &d, full, rid)) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("hello", got.object.get("title").?.string);
+    freeStringRecord(a, got);
+
+    // Update it (exercises updateInTxn's SET-list/bind/UPDATE-SQL scratch; the returned record is
+    // the only allocation kept on `a`).
+    var udata: std.json.ObjectMap = .empty;
+    try udata.put(a, "title", .{ .string = "world" });
+    const upd = (try update(a, &d, full, rid, .{ .object = udata })) orelse return error.TestUnexpectedResult;
+    udata.deinit(a);
+    try std.testing.expectEqualStrings("world", upd.object.get("title").?.string);
+    freeStringRecord(a, upd);
+
+    // Read-miss paths allocate their SQL scratch but return null (no row/collection to free) — so a
+    // leak here can only be that unfreed scratch.
+    try std.testing.expect((try get(a, &d, full, "missingid0000000")) == null);
+    try std.testing.expect((try collections.get(a, &d, "no-such-collection")) == null);
+
+    // Delete frees its DELETE SQL scratch; returns a bool (nothing to free).
+    try std.testing.expect(try delete(a, &d, full, rid));
+    try std.testing.expect(!try delete(a, &d, full, "missingid0000000"));
 }
 
 test "createInTxnOpts: default IGNORES a client-supplied id (server always generates)" {
@@ -1174,44 +1267,51 @@ pub fn update(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection, id: [
 pub fn updateInTxn(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection, id: []const u8, data: std.json.Value) RecordError!?std.json.Value {
     last_errors = null;
     if (data != .object) return error.NotObject;
+    // Same ownership split as createInTxnOpts: `errs` escapes via last_errors (OWNED slice) on the
+    // caller allocator; the SET list, binds and UPDATE SQL are scratch reclaimed by a child arena;
+    // the returned record stays on `alloc`.
     var errs: std.ArrayList(schema.ValidationError) = .empty;
+    errdefer errs.deinit(alloc);
+    var scratch = std.heap.ArenaAllocator.init(alloc);
+    defer scratch.deinit();
+    const sa = scratch.allocator();
 
     const dialect = db.dbDialect(w);
     const now_iso = dialect.nowIso8601Expr();
 
     var sets: std.ArrayList(u8) = .empty;
-    try sets.appendSlice(alloc, try std.fmt.allocPrint(alloc, "\"updated\"={s}", .{now_iso}));
+    try sets.appendSlice(sa, try std.fmt.allocPrint(sa, "\"updated\"={s}", .{now_iso}));
     var binds: std.ArrayList(BindItem) = .empty;
     var next: usize = 2; // ?1 is the id in WHERE
 
     for (col.fields) |f| {
         if (f.fieldType() == .autodate) {
             if (f.options.autodate.onUpdate) {
-                try sets.appendSlice(alloc, try std.fmt.allocPrint(alloc, ",\"{s}\"={s}", .{ f.name, now_iso }));
+                try sets.appendSlice(sa, try std.fmt.allocPrint(sa, ",\"{s}\"={s}", .{ f.name, now_iso }));
             }
             continue;
         }
         const provided = data.object.get(f.name) orelse continue; // partial: only provided fields
         try validateFieldValue(alloc, w, f, provided, &errs);
-        try sets.appendSlice(alloc, try std.fmt.allocPrint(alloc, ",\"{s}\"=?{d}", .{ f.name, next }));
-        try binds.append(alloc, .{ .idx = @intCast(next), .field = f, .value = provided });
+        try sets.appendSlice(sa, try std.fmt.allocPrint(sa, ",\"{s}\"=?{d}", .{ f.name, next }));
+        try binds.append(sa, .{ .idx = @intCast(next), .field = f, .value = provided });
         next += 1;
     }
     if (errs.items.len > 0) {
-        last_errors = errs.items;
+        last_errors = try errs.toOwnedSlice(alloc);
         return error.Validation;
     }
 
-    const rcols = try columnList(alloc, col);
+    const rcols = try columnList(sa, col);
 
-    const sql = try std.fmt.allocPrintSentinel(alloc, "UPDATE \"{s}\" SET {s} WHERE \"id\"=?1 RETURNING {s};", .{ col.name, sets.items, rcols }, 0);
-    var st = try prep(alloc, w, sql);
+    const sql = try std.fmt.allocPrintSentinel(sa, "UPDATE \"{s}\" SET {s} WHERE \"id\"=?1 RETURNING {s};", .{ col.name, sets.items, rcols }, 0);
+    var st = try prep(sa, w, sql);
     defer st.finalize();
     try st.bindText(1, id);
     for (binds.items) |b| {
-        values.bindValue(alloc, &st, b.idx, b.field, b.value) catch |e| {
+        values.bindValue(sa, &st, b.idx, b.field, b.value) catch |e| {
             try errs.append(alloc, .{ .field = b.field.name, .code = convCode(e), .message = "Invalid value." });
-            last_errors = errs.items;
+            last_errors = try errs.toOwnedSlice(alloc);
             return error.Validation;
         };
     }
@@ -1229,6 +1329,7 @@ pub fn delete(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection, id: [
 /// be inside one (or accept autocommit). Returns true if a row was deleted.
 pub fn deleteInTxn(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection, id: []const u8) RecordError!bool {
     const sql = try std.fmt.allocPrintSentinel(alloc, "DELETE FROM \"{s}\" WHERE \"id\"=?1 RETURNING \"id\";", .{col.name}, 0);
+    defer alloc.free(sql);
     var st = try prep(alloc, w, sql);
     defer st.finalize();
     try st.bindText(1, id);
