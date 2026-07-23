@@ -760,14 +760,12 @@ test "write path frees its DDL/SQL scratch under the checking allocator" {
     defer d.close();
     try migrations.run(&d);
 
-    // A base collection with a literal field def: create()'s returned collection borrows the field
-    // name/id and the rules from `def`, so its ONLY owned parts are the collection id and the field
-    // array. (An auth collection or generated field ids would add owned strings; kept simple here.)
+    // A base collection with a literal field def: create() returns a fully-owned reload (every
+    // string/slice on `a`), so it is freed with a single Collection.deinit.
     const fields = [_]schema.Field{.{ .id = "f1", .name = "title", .options = .{ .text = .{} } }};
     const def = schema.Collection{ .id = "", .name = "posts", .fields = &fields, .listRule = "", .viewRule = "", .createRule = "", .updateRule = "", .deleteRule = "" };
     const full = try collections.create(a, std.testing.io, &d, def);
-    defer a.free(full.id);
-    defer a.free(full.fields);
+    defer full.deinit(a);
     try std.testing.expectEqual(@as(usize, 15), full.id.len);
 
     // Insert a record. rowToObject's result is the only allocation kept on `a`; free it by hand.

@@ -18,34 +18,34 @@ pub threadlocal var last_errors: ?[]const schema.ValidationError = null;
 
 pub fn create(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, def: schema.Collection) EngineError!schema.Collection {
     last_errors = null;
-    // assign field ids where empty. `fields`, the generated ids and `col.id` all escape via the
-    // returned collection on success, but leak on any error return below (validation, conflict,
-    // DDL/insert failure), so each carries an errdefer that fires ONLY on an error path. `built`
-    // bounds the id cleanup to the ids actually generated (covers a mid-loop OOM too).
-    const fields = try alloc.alloc(schema.Field, def.fields.len);
-    errdefer alloc.free(fields);
-    var built: usize = 0;
-    errdefer for (def.fields[0..built], 0..) |df, i| {
-        if (df.id.len == 0) alloc.free(fields[i].id);
-    };
+
+    // Build the working collection entirely on a scratch child arena: only the validation
+    // errors (via `last_errors`) and the final fully-owned reload escape on `alloc`. Because
+    // nothing else escapes, the field array, the generated field/collection ids, the auth
+    // injection and all DDL/probe/insert scratch live on `sa` and are reclaimed on return —
+    // so none of them needs an errdefer.
+    var scratch = std.heap.ArenaAllocator.init(alloc);
+    defer scratch.deinit();
+    const sa = scratch.allocator();
+
+    // assign field ids where empty (on the scratch arena)
+    const fields = try sa.alloc(schema.Field, def.fields.len);
     for (def.fields, 0..) |f, i| {
         fields[i] = f;
         if (f.id.len == 0) {
             var fid = id.fieldId(io);
-            fields[i].id = try alloc.dupe(u8, &fid);
+            fields[i].id = try sa.dupe(u8, &fid);
         }
-        built = i + 1;
     }
     var col = def;
     col.fields = fields;
     var cid = id.collectionId(io);
-    col.id = try alloc.dupe(u8, &cid);
-    errdefer alloc.free(col.id);
+    col.id = try sa.dupe(u8, &cid);
 
     // validate. `errs` escapes via `last_errors` (read by the API layer after return) as an OWNED
-    // slice, so the caller can free it on a non-arena allocator; `toOwnedSlice` shrinks the
-    // ArrayList buffer to exactly its length. `errdefer` covers the OOM edge and any later error
-    // (where `errs` is empty, so deinit is a no-op).
+    // slice on `alloc`, so the caller can free it on a non-arena allocator; `toOwnedSlice` shrinks
+    // the ArrayList buffer to exactly its length. `errdefer` covers the OOM edge and any later
+    // error (where `errs` is empty, so deinit is a no-op).
     var errs: std.ArrayList(schema.ValidationError) = .empty;
     errdefer errs.deinit(alloc);
     try schema.validate(alloc, col, &errs);
@@ -54,29 +54,13 @@ pub fn create(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, def: schema.Colle
         return error.Validation;
     }
 
-    // The duplicate-name probe, the relation-resolved DDL view, the generated DDL/index SQL and
-    // the row insert are all scratch that never escapes this call — reclaim them via a child arena
-    // so create() is leak-correct under any allocator (contract 1), including the GPA/Postgres
-    // paths. Only `full` and the field/collection ids it points at stay on `alloc` (the return).
-    var scratch = std.heap.ArenaAllocator.init(alloc);
-    defer scratch.deinit();
-    const sa = scratch.allocator();
-
     // reject duplicate collection name up front (→ 409 instead of a raw DbError → 500)
     if ((try get(sa, w, def.name)) != null) return error.Conflict;
 
-    // For auth collections, prepend the system columns so the physical table and the
-    // loaded collection carry them; only the user fields (`col`) are persisted in _collections.
-    const full = try schema.injectAuthFields(alloc, col);
-    // For auth collections injectAuthFields copies `fields` into a fresh array (so `full.fields`
-    // differs), orphaning the array allocated above; for base collections `full.fields` IS that
-    // array and escapes via the return. `col.fields` still aliases it and is read by insertRow
-    // below, so the orphan is freed only after the last use, just before returning.
-    const fields_orphaned = full.fields.ptr != fields.ptr;
-    // On error after this point the auth-injected array (full.fields) would leak too — the earlier
-    // errdefer only covers the old `fields` array. Guard so base collections (where full.fields IS
-    // `fields`) don't double-free.
-    errdefer if (fields_orphaned) alloc.free(full.fields);
+    // For auth collections, prepend the system columns so the physical table carries them; only
+    // the user fields (`col`) are persisted in _collections. On `sa`, so the array injectAuthFields
+    // allocates (and the inner array it orphans for auth) are both reclaimed with the scratch arena.
+    const full = try schema.injectAuthFields(sa, col);
     // build a DDL view where each single-relation's target collection id is resolved to its table name
     const ddl_col = try resolveRelations(sa, w, full);
 
@@ -92,8 +76,12 @@ pub fn create(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, def: schema.Colle
     }
     try insertRow(sa, w, col);
     try w.commit();
-    if (fields_orphaned) alloc.free(fields);
-    return full;
+
+    // Return a fully-owned reload on `alloc`. The just-persisted row round-trips through
+    // toJson/fromJson to the same shape the former hand-assembled `full` had (now including
+    // real created/updated timestamps), but every string/slice is owned — a non-arena caller
+    // can `deinit` it. The reload keys on the generated collection id.
+    return (try get(alloc, w, col.id)).?;
 }
 
 /// Returns a copy of `col` where each relation field's targetCollectionId is replaced by the
@@ -197,6 +185,29 @@ fn rowToCollection(alloc: std.mem.Allocator, st: *db.Stmt) EngineError!schema.Co
     };
 }
 
+/// Load one FULLY-OWNED collection from the current row of `st`: `rowToCollection` plus auth
+/// system-field injection. For auth collections injectAuthFields allocates a fresh fields array
+/// (the six static system fields prepended, the user fields shallow-copied in) and thereby ORPHANS
+/// the inner `fieldsFromJson` array — its ARRAY BACKING only, since every element string is still
+/// referenced by the injected array. Free that backing so the result is a single owned graph the
+/// caller can `Collection.deinit`. Base collections are returned unchanged (no injection, no orphan).
+fn loadOwned(alloc: std.mem.Allocator, st: *db.Stmt) EngineError!schema.Collection {
+    const loaded = try rowToCollection(alloc, st);
+    if (loaded.type != .auth) return loaded;
+    // If injectAuthFields OOMs, `loaded` is a fully-owned but NOT-yet-injected collection whose
+    // ownership shape is a BASE collection (fields = the raw fieldsFromJson user array, no static
+    // prefix). Free it as such — as `.auth`, deinit would skip the first six fields (and slice out
+    // of bounds when there are fewer than six user fields).
+    errdefer {
+        var b = loaded;
+        b.type = .base;
+        b.deinit(alloc);
+    }
+    const full = try schema.injectAuthFields(alloc, loaded);
+    alloc.free(loaded.fields);
+    return full;
+}
+
 pub fn get(alloc: std.mem.Allocator, w: *db.Db, id_or_name: []const u8) EngineError!?schema.Collection {
     const sql = try db.dbDialect(w).renumberPlaceholders(alloc, select_cols ++ " WHERE id = ?1 OR name = ?1 LIMIT 1;");
     defer alloc.free(sql); // renumberPlaceholders always returns an owned copy (dupeZ on SQLite too)
@@ -204,15 +215,21 @@ pub fn get(alloc: std.mem.Allocator, w: *db.Db, id_or_name: []const u8) EngineEr
     defer st.finalize();
     try st.bindText(1, id_or_name);
     if (!try st.step()) return null;
-    return try schema.injectAuthFields(alloc, try rowToCollection(alloc, &st));
+    return try loadOwned(alloc, &st);
 }
 
 pub fn list(alloc: std.mem.Allocator, w: *db.Db) EngineError![]schema.Collection {
     var out: std.ArrayList(schema.Collection) = .empty;
+    // Each element is a fully-owned collection; on any error free every one loaded so far plus the
+    // backing buffer, so list() is leak-correct under a raw (non-arena) allocator too.
+    errdefer {
+        for (out.items) |c| c.deinit(alloc);
+        out.deinit(alloc);
+    }
     var st = try w.prepare(select_cols ++ " ORDER BY created;");
     defer st.finalize();
     while (try st.step()) {
-        try out.append(alloc, try schema.injectAuthFields(alloc, try rowToCollection(alloc, &st)));
+        try out.append(alloc, try loadOwned(alloc, &st));
     }
     return out.toOwnedSlice(alloc);
 }
@@ -220,43 +237,32 @@ pub fn list(alloc: std.mem.Allocator, w: *db.Db) EngineError![]schema.Collection
 pub fn update(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, id_or_name: []const u8, newdef: schema.Collection) EngineError!schema.Collection {
     last_errors = null;
 
-    // The existing collection load, the relation-resolved DDL view, the rebuild-plan SQL and the
-    // row update are scratch that never escapes; reclaim them via a child arena so update() is
-    // leak-correct under any allocator. The returned `newc_full` (and the ids/fields it points at)
-    // is the only allocation kept on `alloc`.
+    // Like create(): everything except the validation errors (via `last_errors`) and the final
+    // fully-owned reload is scratch on `sa` and reclaimed on return — the existing-collection load,
+    // the field array, generated field ids, the duped id/name, the auth injection, and every DDL/
+    // rebuild statement. None of them needs an errdefer.
     var scratch = std.heap.ArenaAllocator.init(alloc);
     defer scratch.deinit();
     const sa = scratch.allocator();
 
     const old = (try get(sa, w, id_or_name)) orelse return error.NotFound;
 
-    // assign ids to new fields lacking one; preserve existing ids. Like create(), `fields`, the
-    // generated ids and the duped id/name escape via `newc_full` on success but leak on any error
-    // return below, so each gets an error-only errdefer; `built` bounds the id cleanup.
-    const fields = try alloc.alloc(schema.Field, newdef.fields.len);
-    errdefer alloc.free(fields);
-    var built: usize = 0;
-    errdefer for (newdef.fields[0..built], 0..) |df, i| {
-        if (df.id.len == 0) alloc.free(fields[i].id);
-    };
+    // assign ids to new fields lacking one; preserve existing ids (all on the scratch arena)
+    const fields = try sa.alloc(schema.Field, newdef.fields.len);
     for (newdef.fields, 0..) |f, i| {
         fields[i] = f;
         if (f.id.len == 0) {
             var fid = id.fieldId(io);
-            fields[i].id = try alloc.dupe(u8, &fid);
+            fields[i].id = try sa.dupe(u8, &fid);
         }
-        built = i + 1;
     }
     var newc = newdef;
     newc.fields = fields;
-    // `old` lives on the scratch arena, but its id/name escape via `newc_full`, so dupe them onto
-    // `alloc`. Rename is not supported in SP2, so the name is preserved from `old`.
-    newc.id = try alloc.dupe(u8, old.id);
-    errdefer alloc.free(newc.id);
-    newc.name = try alloc.dupe(u8, old.name);
-    errdefer alloc.free(newc.name);
+    // Rename is not supported in SP2, so the id/name are preserved from `old`.
+    newc.id = try sa.dupe(u8, old.id);
+    newc.name = try sa.dupe(u8, old.name);
 
-    // validate (see create(): last_errors is handed back as an OWNED, freeable slice)
+    // validate (see create(): last_errors is handed back as an OWNED, freeable slice on `alloc`)
     var errs: std.ArrayList(schema.ValidationError) = .empty;
     errdefer errs.deinit(alloc);
     try schema.validate(alloc, newc, &errs);
@@ -268,16 +274,8 @@ pub fn update(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, id_or_name: []con
     // Inject auth system fields (after validation, which only sees user fields) so the rebuild
     // preserves the auth columns: `old` is auth-injected (from get), so both sides carry the
     // auth field ids and rebuildPlan keeps them. Without this an auth-collection update would
-    // drop email/passwordHash/tokenKey/etc and destroy all credentials.
-    const newc_full = try schema.injectAuthFields(alloc, newc);
-    // Auth injection copies `fields` into a fresh array, orphaning the one above; base collections
-    // keep it (it escapes via the return). `newc.fields` still aliases it and is read by updateRow,
-    // so the orphan is freed only after the last use, just before returning.
-    const fields_orphaned = newc_full.fields.ptr != fields.ptr;
-    // On error after this point the auth-injected array (newc_full.fields) would leak; guard so
-    // base collections (where it IS `fields`) don't double-free with the earlier errdefer.
-    errdefer if (fields_orphaned) alloc.free(newc_full.fields);
-
+    // drop email/passwordHash/tokenKey/etc and destroy all credentials. On `sa`.
+    const newc_full = try schema.injectAuthFields(sa, newc);
     // relation-resolved view for the rebuild's FK generation
     const ddl_new = try resolveRelations(sa, w, newc_full);
 
@@ -305,9 +303,10 @@ pub fn update(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, id_or_name: []con
     if (sqlite_rebuild) {
         try w.exec("PRAGMA foreign_keys=ON;");
     }
-    if (fields_orphaned) alloc.free(fields);
 
-    return newc_full;
+    // Return a fully-owned reload on `alloc` (keyed on old.id — rename is unsupported), matching
+    // the former hand-assembled `newc_full` but with every string/slice owned.
+    return (try get(alloc, w, old.id)).?;
 }
 
 fn updateRow(alloc: std.mem.Allocator, w: *db.Db, col_id: []const u8, col: schema.Collection) EngineError!void {
@@ -361,34 +360,33 @@ pub fn delete(alloc: std.mem.Allocator, w: *db.Db, id_or_name: []const u8) Engin
     try w.commit();
 }
 
-test "create/update free caller-allocator scratch on success AND every error path" {
+test "create/update return a fully-owned reload and leak nothing on any error path" {
     // Runs create/update SUCCESS and ERROR paths under the RAW leak-detecting allocator — no arena
-    // to mask a missed free OR a double-free. create()/update() dupe the field array, generated
-    // field ids, the collection id and (update) the id/name onto the caller allocator; every one of
-    // them escapes via the return on success but must be freed by an errdefer when a later step
-    // fails. The arena-wrapped collections tests cannot catch this (the arena reclaims regardless),
-    // so this is the guard for the error-path leaks flagged in review.
+    // to mask a missed free OR a double-free. create()/update() now build their working collection
+    // on a scratch child arena and return a fully-owned reload (via get()), so the ONLY things that
+    // escape on `alloc` are that reload and the validation `last_errors`. On every error path the
+    // scratch arena reclaims all working state, so nothing must leak; the reload is freed via
+    // `Collection.deinit`. The arena-wrapped collections tests cannot catch a double-free/UAF in the
+    // owned graph (the arena reclaims regardless), so this is the guard.
     const a = std.testing.allocator;
     var d = try db.Db.openMemory();
     defer d.close();
     try migrations.run(&d);
 
-    // base create SUCCESS — owned parts are the collection id and the field array (field names/ids
-    // are borrowed from the literal def).
+    // base create SUCCESS — a fully-owned reload.
     const bfields = [_]schema.Field{.{ .id = "f1", .name = "title", .options = .{ .text = .{} } }};
     const bdef = schema.Collection{ .id = "", .name = "posts", .fields = &bfields, .listRule = "", .viewRule = "", .createRule = "", .updateRule = "", .deleteRule = "" };
     const base = try create(a, std.testing.io, &d, bdef);
-    a.free(base.id);
-    a.free(base.fields);
+    base.deinit(a);
 
-    // create CONFLICT (duplicate name) — the probe runs before injectAuthFields, so the field
-    // array, the generated field id and the collection id must all be freed by errdefers.
+    // create CONFLICT (duplicate name) — the probe runs before any escaping alloc; the scratch
+    // arena must reclaim the field array + generated id with no leak.
     const cfields = [_]schema.Field{.{ .id = "", .name = "note", .options = .{ .text = .{} } }};
     const cdef = schema.Collection{ .id = "", .name = "posts", .fields = &cfields, .listRule = "", .viewRule = "", .createRule = "", .updateRule = "", .deleteRule = "" };
     try std.testing.expectError(error.Conflict, create(a, std.testing.io, &d, cdef));
 
-    // create VALIDATION error (bad collection name) with an empty-id field — the id is generated
-    // before validation fails, so the generated-id errdefer must free it.
+    // create VALIDATION error (bad collection name) with an empty-id field — the id is generated on
+    // the scratch arena before validation fails; only `last_errors` escapes on `alloc`.
     const vfields = [_]schema.Field{.{ .id = "", .name = "x", .options = .{ .text = .{} } }};
     const vdef = schema.Collection{ .id = "", .name = "1bad", .fields = &vfields, .listRule = "", .viewRule = "", .createRule = "", .updateRule = "", .deleteRule = "" };
     try std.testing.expectError(error.Validation, create(a, std.testing.io, &d, vdef));
@@ -398,34 +396,29 @@ test "create/update free caller-allocator scratch on success AND every error pat
         last_errors = null;
     }
 
-    // auth create SUCCESS — full.fields is a fresh array (owned) whose element strings are static
-    // system fields or borrowed user names, so only the array + id are freed; the OLD user-field
-    // array is the orphan create() frees internally.
+    // auth create SUCCESS — the reload exercises loadOwned's static-field skip + orphan-free and is
+    // fully owned; deinit must skip the six static system fields and free only the injected backing
+    // plus the user fields.
     const afields = [_]schema.Field{.{ .id = "af1", .name = "bio", .options = .{ .text = .{} } }};
     const adef = schema.Collection{ .id = "", .name = "members", .type = .auth, .fields = &afields, .listRule = "", .viewRule = "", .createRule = "", .updateRule = "", .deleteRule = "" };
     const auth = try create(a, std.testing.io, &d, adef);
-    a.free(auth.id);
-    a.free(auth.fields);
+    auth.deinit(a);
 
     // auth create ERROR after injectAuthFields — a relation to a missing target makes
-    // resolveRelations fail once the auth-injected array + orphan already exist, exercising the
-    // full.fields errdefer alongside the old-array / id ones.
+    // resolveRelations fail once the auth-injected array + orphan already exist on the scratch
+    // arena; the arena must reclaim them with no leak.
     const rfields = [_]schema.Field{.{ .id = "r1", .name = "ref", .options = .{ .relation = .{ .targetCollectionId = "ghost", .maxSelect = 1 } } }};
     const rdef = schema.Collection{ .id = "", .name = "linkers", .type = .auth, .fields = &rfields, .listRule = "", .viewRule = "", .createRule = "", .updateRule = "", .deleteRule = "" };
     try std.testing.expectError(error.Validation, create(a, std.testing.io, &d, rdef));
 
-    // update SUCCESS (base) — id/name are duped (owned), the field array is owned; field ids are
-    // borrowed literals.
+    // update SUCCESS (base) — a fully-owned reload.
     const ufields = [_]schema.Field{ .{ .id = "f1", .name = "title", .options = .{ .text = .{} } }, .{ .id = "f2", .name = "body", .options = .{ .text = .{} } } };
     const udef = schema.Collection{ .id = "", .name = "posts", .fields = &ufields, .listRule = "", .viewRule = "", .createRule = "", .updateRule = "", .deleteRule = "" };
     const upd = try update(a, std.testing.io, &d, "posts", udef);
-    a.free(upd.id);
-    a.free(upd.name);
-    a.free(upd.fields);
+    upd.deinit(a);
 
-    // update VALIDATION error — the id/name dupes and the generated field id already exist on
-    // `alloc` when validation fails on the bad field name, so their errdefers must free them (the
-    // exact leak flagged in review).
+    // update VALIDATION error — the id/name dupes and the generated field id live on the scratch
+    // arena when validation fails on the bad field name; only `last_errors` escapes.
     const ubadfields = [_]schema.Field{.{ .id = "", .name = "1bad", .options = .{ .text = .{} } }};
     const ubaddef = schema.Collection{ .id = "", .name = "posts", .fields = &ubadfields, .listRule = "", .viewRule = "", .createRule = "", .updateRule = "", .deleteRule = "" };
     try std.testing.expectError(error.Validation, update(a, std.testing.io, &d, "posts", ubaddef));
@@ -434,7 +427,7 @@ test "create/update free caller-allocator scratch on success AND every error pat
         last_errors = null;
     }
 
-    // update NOT-FOUND — errors before any caller-allocator alloc; must simply not leak.
+    // update NOT-FOUND — errors before any escaping alloc; must simply not leak.
     try std.testing.expectError(error.NotFound, update(a, std.testing.io, &d, "no-such", udef));
 }
 
@@ -442,23 +435,28 @@ test "create persists a collection and builds its physical table" {
     var d = try db.Db.openMemory();
     defer d.close();
     try migrations.run(&d);
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
+    const a = std.testing.allocator;
     const fields = [_]schema.Field{
         .{ .id = "f1", .name = "title", .required = true, .options = .{ .text = .{} } },
         .{ .id = "f2", .name = "price", .options = .{ .number = .{ .mode = .fixed, .scale = 2 } } },
     };
     const def = schema.Collection{ .id = "", .name = "posts", .fields = &fields };
-    const created = try create(arena.allocator(), std.testing.io, &d, def);
+    const created = try create(a, std.testing.io, &d, def);
+    defer created.deinit(a);
     try std.testing.expect(created.id.len == 15);
     var st = try d.prepare("SELECT COUNT(*) FROM pragma_table_info('posts') WHERE name IN ('id','created','updated','title','price');");
     defer st.finalize();
     try std.testing.expect((try st.step()));
     try std.testing.expectEqual(@as(i64, 5), st.columnInt(0));
-    const got = (try get(arena.allocator(), &d, "posts")).?;
+    const got = (try get(a, &d, "posts")).?;
+    defer got.deinit(a);
     try std.testing.expectEqualStrings("posts", got.name);
     try std.testing.expectEqual(@as(usize, 2), got.fields.len);
-    const all = try list(arena.allocator(), &d);
+    const all = try list(a, &d);
+    defer {
+        for (all) |c| c.deinit(a);
+        a.free(all);
+    }
     var user_count: usize = 0;
     for (all) |c| if (!c.system) {
         user_count += 1;
@@ -470,22 +468,24 @@ test "create rejects an invalid collection" {
     var d = try db.Db.openMemory();
     defer d.close();
     try migrations.run(&d);
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
+    const a = std.testing.allocator;
     const def = schema.Collection{ .id = "", .name = "1bad", .fields = &.{} };
-    try std.testing.expectError(error.Validation, create(arena.allocator(), std.testing.io, &d, def));
+    try std.testing.expectError(error.Validation, create(a, std.testing.io, &d, def));
+    if (last_errors) |le| {
+        a.free(le);
+        last_errors = null;
+    }
 }
 
 test "update rebuilds table and preserves data across a field rename" {
     var d = try db.Db.openMemory();
     defer d.close();
     try migrations.run(&d);
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
 
     const f0 = [_]schema.Field{.{ .id = "f1", .name = "title", .options = .{ .text = .{} } }};
     const created = try create(a, std.testing.io, &d, .{ .id = "", .name = "posts", .fields = &f0 });
+    defer created.deinit(a);
     try d.exec("INSERT INTO posts (id, created, updated, title) VALUES ('r1','t','t','hello');");
 
     const f1 = [_]schema.Field{
@@ -494,7 +494,8 @@ test "update rebuilds table and preserves data across a field rename" {
     };
     var newdef = created;
     newdef.fields = &f1;
-    _ = try update(a, std.testing.io, &d, created.id, newdef);
+    const updated = try update(a, std.testing.io, &d, created.id, newdef);
+    defer updated.deinit(a);
 
     var st = try d.prepare("SELECT headline, views FROM posts WHERE id='r1';");
     defer st.finalize();
@@ -507,12 +508,14 @@ test "create rejects an index name containing SQL (injection guard)" {
     var d = try db.Db.openMemory();
     defer d.close();
     try migrations.run(&d);
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const evil = [_]schema.Index{.{ .name = "x\" ON \"posts\" (\"id\"); DROP TABLE \"_collections\"; --", .fields = &.{"id"}, .unique = false }};
     const def = schema.Collection{ .id = "", .name = "posts", .fields = &.{}, .indexes = &evil };
     try std.testing.expectError(error.Validation, create(a, std.testing.io, &d, def));
+    if (last_errors) |le| {
+        a.free(le);
+        last_errors = null;
+    }
     // _collections still exists
     var st = try d.prepare("SELECT COUNT(*) FROM \"_collections\";");
     defer st.finalize();
@@ -523,10 +526,9 @@ test "create rejects a duplicate collection name with Conflict" {
     var d = try db.Db.openMemory();
     defer d.close();
     try migrations.run(&d);
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    _ = try create(a, std.testing.io, &d, .{ .id = "", .name = "posts", .fields = &.{} });
+    const a = std.testing.allocator;
+    const created = try create(a, std.testing.io, &d, .{ .id = "", .name = "posts", .fields = &.{} });
+    defer created.deinit(a);
     try std.testing.expectError(error.Conflict, create(a, std.testing.io, &d, .{ .id = "", .name = "posts", .fields = &.{} }));
 }
 
@@ -534,16 +536,19 @@ test "unique field enforces uniqueness at the db level" {
     var d = try db.Db.openMemory();
     defer d.close();
     try migrations.run(&d);
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const fields = [_]schema.Field{.{ .id = "f1", .name = "slug", .unique = true, .options = .{ .text = .{} } }};
-    _ = try create(a, std.testing.io, &d, .{ .id = "", .name = "posts", .fields = &fields });
+    const created = try create(a, std.testing.io, &d, .{ .id = "", .name = "posts", .fields = &fields });
+    defer created.deinit(a);
     try d.exec("INSERT INTO posts (id, created, updated, slug) VALUES ('r1','t','t','x');");
     try std.testing.expectError(db.DbError.ExecFailed, d.exec("INSERT INTO posts (id, created, updated, slug) VALUES ('r2','t','t','x');"));
 }
 
 test "auth collection gets system columns; passwordHash hidden in metadata" {
+    // NOT converted to the raw allocator: schema.collectionToJson builds intermediate
+    // ObjectMaps/parse-trees (root, fparsed/iparsed/oparsed scratch) that it never frees itself —
+    // it is only ever leak-correct under an arena. Left arena-wrapped per task instructions rather
+    // than touching that non-test code.
     var d = try db.Db.openMemory();
     defer d.close();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -569,12 +574,11 @@ test "auth collection gets system columns; passwordHash hidden in metadata" {
 test "updating an auth collection preserves its auth columns (credentials not dropped)" {
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     try migrations.run(&d);
     const f0 = [_]schema.Field{.{ .id = "f1", .name = "bio", .options = .{ .text = .{} } }};
     const created = try create(a, std.testing.io, &d, .{ .id = "", .name = "users", .type = .auth, .fields = &f0 });
+    defer created.deinit(a);
     // seed a credential row directly
     try d.exec("INSERT INTO users (id,created,updated,email,passwordHash,tokenKey,verified) VALUES ('u1','t','t','a@b.c','$argon2id$hash','tk',1);");
 
@@ -585,7 +589,8 @@ test "updating an auth collection preserves its auth columns (credentials not dr
     };
     var newdef = created;
     newdef.fields = &f1;
-    _ = try update(a, std.testing.io, &d, created.id, newdef);
+    const updated = try update(a, std.testing.io, &d, created.id, newdef);
+    defer updated.deinit(a);
 
     // the credential survives the rebuild
     var st = try d.prepare("SELECT email, passwordHash, tokenKey, verified, nickname FROM users WHERE id='u1';");
@@ -600,13 +605,13 @@ test "delete drops the table; delete refuses when referenced by a relation" {
     var d = try db.Db.openMemory();
     defer d.close();
     try migrations.run(&d);
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
 
     const users = try create(a, std.testing.io, &d, .{ .id = "", .name = "users", .fields = &.{} });
+    defer users.deinit(a);
     const pf = [_]schema.Field{.{ .id = "f1", .name = "author", .options = .{ .relation = .{ .targetCollectionId = users.id, .maxSelect = 1 } } }};
-    _ = try create(a, std.testing.io, &d, .{ .id = "", .name = "posts", .fields = &pf });
+    const posts = try create(a, std.testing.io, &d, .{ .id = "", .name = "posts", .fields = &pf });
+    defer posts.deinit(a);
 
     try std.testing.expectError(error.Conflict, delete(a, &d, "users"));
     try delete(a, &d, "posts");
@@ -618,15 +623,14 @@ test "auth collection enforces identity uniqueness via partial unique index, all
     var d = try db.Db.openMemory();
     defer d.close();
     try @import("migrations.zig").run(&d);
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    _ = try create(a, std.testing.io, &d, .{
+    const a = std.testing.allocator;
+    const created = try create(a, std.testing.io, &d, .{
         .id = "",
         .name = "members",
         .type = .auth,
         .fields = &[_]schema.Field{.{ .id = "f1", .name = "bio", .options = .{ .text = .{} } }},
     });
+    defer created.deinit(a);
     // two distinct emails ok
     try d.exec("INSERT INTO \"members\" (\"id\",\"created\",\"updated\",\"email\") VALUES ('a','','','x@y.z');");
     try d.exec("INSERT INTO \"members\" (\"id\",\"created\",\"updated\",\"email\") VALUES ('b','','','q@y.z');");
@@ -635,4 +639,157 @@ test "auth collection enforces identity uniqueness via partial unique index, all
     // two empty emails allowed (partial index excludes them)
     try d.exec("INSERT INTO \"members\" (\"id\",\"created\",\"updated\",\"email\") VALUES ('d','','','');");
     try d.exec("INSERT INTO \"members\" (\"id\",\"created\",\"updated\",\"email\") VALUES ('e','','','');");
+}
+
+test "deinit frees a fully-owned base collection: every field type + indexes + rules + ttl/tenant" {
+    // The exhaustive mirror check: a base collection populated with EVERY field type carrying owned
+    // options (text pattern, date min/max, select values, relation target, file mimeTypes, …), plus
+    // multiple indexes (unique / partial-where / multi-column), all five rules, and ttl/tenant
+    // fields. Read back with get() → a fully-owned graph → Collection.deinit under the RAW
+    // leak-detecting allocator. A missed free leaks; a stray free of a static/borrowed string, or
+    // freeing an already-freed pointer, panics the DebugAllocator. Zero leaks == the deinit mirrors
+    // fromJson exactly.
+    const a = std.testing.allocator;
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try migrations.run(&d);
+
+    // relation target created first (its id is the relation field's targetCollectionId)
+    const tfields = [_]schema.Field{.{ .id = "t1", .name = "label", .options = .{ .text = .{} } }};
+    const target = try create(a, std.testing.io, &d, .{ .id = "", .name = "targets", .fields = &tfields });
+    defer target.deinit(a);
+
+    const values = [_][]const u8{ "red", "green", "blue" };
+    const mimes = [_][]const u8{ "image/png", "image/jpeg" };
+    const fields = [_]schema.Field{
+        .{ .id = "f_title", .name = "title", .options = .{ .text = .{ .min = 1, .max = 100, .pattern = "^[a-z]+$" } } },
+        .{ .id = "f_email", .name = "contact", .options = .{ .email = .{} } },
+        .{ .id = "f_url", .name = "homepage", .options = .{ .url = .{} } },
+        .{ .id = "f_editor", .name = "body", .options = .{ .editor = .{} } },
+        .{ .id = "f_date", .name = "start_at", .options = .{ .date = .{ .min = "2020-01-01T00:00:00Z", .max = "2030-01-01T00:00:00Z" } } },
+        .{ .id = "f_auto", .name = "made_at", .options = .{ .autodate = .{ .onCreate = true } } },
+        .{ .id = "f_bool", .name = "active", .options = .{ .bool = .{} } },
+        .{ .id = "f_num", .name = "qty", .options = .{ .number = .{ .mode = .fixed, .scale = 2 } } },
+        .{ .id = "f_json", .name = "meta", .options = .{ .json = .{} } },
+        .{ .id = "f_select", .name = "color", .options = .{ .select = .{ .values = &values, .maxSelect = 1 } } },
+        .{ .id = "f_rel", .name = "owner", .options = .{ .relation = .{ .targetCollectionId = target.id, .maxSelect = 1 } } },
+        .{ .id = "f_file", .name = "avatar", .options = .{ .file = .{ .maxSelect = 1, .mimeTypes = &mimes } } },
+        .{ .id = "f_acct", .name = "account", .options = .{ .text = .{} } },
+    };
+    const cols = [_][]const u8{ "title", "qty" };
+    const indexes = [_]schema.Index{
+        .{ .name = "idx_title", .fields = &[_][]const u8{"title"}, .unique = true },
+        .{ .name = "idx_active", .fields = &[_][]const u8{"active"}, .where = "active = 1" },
+        .{ .name = "idx_multi", .fields = &cols },
+    };
+    const def = schema.Collection{
+        .id = "",
+        .name = "widgets",
+        .fields = &fields,
+        .indexes = &indexes,
+        .listRule = "@public",
+        .viewRule = "@public",
+        .createRule = "@public",
+        .updateRule = "@public",
+        .deleteRule = "@public",
+        .options = .{ .ttl_field = "made_at", .tenant_field = "account" },
+    };
+    const created = try create(a, std.testing.io, &d, def);
+    defer created.deinit(a);
+
+    const got = (try get(a, &d, "widgets")).?;
+    try std.testing.expectEqualStrings("widgets", got.name);
+    try std.testing.expectEqual(@as(usize, fields.len), got.fields.len);
+    try std.testing.expect(schema.fieldByName(got, "title") != null);
+    try std.testing.expect(schema.fieldByName(got, "owner") != null);
+    try std.testing.expectEqual(@as(usize, 3), got.indexes.len);
+    try std.testing.expectEqualStrings("made_at", got.options.ttl_field.?);
+    try std.testing.expectEqualStrings("account", got.options.tenant_field.?);
+    got.deinit(a);
+
+    // list() returns fully-owned collections too — free every one via deinit (no orphan leak).
+    const all = try list(a, &d);
+    defer {
+        for (all) |c| c.deinit(a);
+        a.free(all);
+    }
+    try std.testing.expect(all.len >= 2);
+}
+
+test "deinit frees a fully-owned auth collection: static-field skip + orphan-free + oauth2/identity" {
+    // Auth path: identityFields, a populated oauth2 provider (name/clientId/clientSecret/
+    // redirectUrls/scopes/authURL/tokenURL), and a user field. get() prepends the six STATIC
+    // system fields (authSystemFields) and frees the orphaned inner fields array (loadOwned). deinit
+    // must SKIP those six static fields (freeing their static id/name would panic) and free only the
+    // injected slice backing + the user field + the whole options graph. RAW allocator → zero leaks.
+    const a = std.testing.allocator;
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try migrations.run(&d);
+
+    const ids = [_][]const u8{ "email", "username" };
+    const redirects = [_][]const u8{ "https://app.example/cb", "https://app.example/cb2" };
+    const scopes = [_][]const u8{ "openid", "email" };
+    const providers = [_]schema.OAuth2Provider{.{
+        .name = "google",
+        .clientId = "client-123",
+        .clientSecret = "secret-xyz",
+        .redirectUrls = &redirects,
+        .authURL = "https://accounts.example/auth",
+        .tokenURL = "https://accounts.example/token",
+        .scopes = &scopes,
+    }};
+    const ufields = [_]schema.Field{.{ .id = "u_bio", .name = "bio", .options = .{ .text = .{} } }};
+    const def = schema.Collection{
+        .id = "",
+        .name = "accounts",
+        .type = .auth,
+        .fields = &ufields,
+        .options = .{ .auth = .{
+            .identityFields = &ids,
+            .oauth2 = .{ .enabled = true, .providers = &providers },
+        } },
+    };
+    const created = try create(a, std.testing.io, &d, def);
+    defer created.deinit(a);
+
+    const got = (try get(a, &d, "accounts")).?;
+    // 6 static system fields + 1 user field
+    try std.testing.expectEqual(@as(usize, 7), got.fields.len);
+    try std.testing.expectEqualStrings("email", got.fields[0].name); // static system field
+    try std.testing.expect(schema.fieldByName(got, "bio") != null);
+    try std.testing.expectEqual(@as(usize, 2), got.options.auth.identityFields.len);
+    try std.testing.expectEqual(@as(usize, 1), got.options.auth.oauth2.providers.len);
+    try std.testing.expectEqualStrings("google", got.options.auth.oauth2.providers[0].name);
+    try std.testing.expectEqual(@as(usize, 2), got.options.auth.oauth2.providers[0].redirectUrls.len);
+    got.deinit(a);
+}
+
+test "create and update return deinit-safe fully-owned reloads (base and auth)" {
+    // Proves the reload returned by create()/update() is a single fully-owned graph: deinit it
+    // directly under the RAW allocator (no get() round-trip needed). Covers base and auth for both.
+    const a = std.testing.allocator;
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try migrations.run(&d);
+
+    // base create → deinit the reload
+    const bf = [_]schema.Field{.{ .id = "f1", .name = "title", .options = .{ .text = .{} } }};
+    const bc = try create(a, std.testing.io, &d, .{ .id = "", .name = "posts", .fields = &bf });
+    bc.deinit(a);
+
+    // base update (add a field) → deinit the reload
+    const bf2 = [_]schema.Field{ .{ .id = "f1", .name = "title", .options = .{ .text = .{} } }, .{ .id = "", .name = "body", .options = .{ .text = .{} } } };
+    const bu = try update(a, std.testing.io, &d, "posts", .{ .id = "", .name = "posts", .fields = &bf2 });
+    bu.deinit(a);
+
+    // auth create → deinit the reload (static-field skip on the reload path)
+    const af = [_]schema.Field{.{ .id = "a1", .name = "bio", .options = .{ .text = .{} } }};
+    const ac = try create(a, std.testing.io, &d, .{ .id = "", .name = "users", .type = .auth, .fields = &af });
+    ac.deinit(a);
+
+    // auth update → deinit the reload
+    const af2 = [_]schema.Field{ .{ .id = "a1", .name = "bio", .options = .{ .text = .{} } }, .{ .id = "", .name = "nick", .options = .{ .text = .{} } } };
+    const au = try update(a, std.testing.io, &d, "users", .{ .id = "", .name = "users", .type = .auth, .fields = &af2 });
+    au.deinit(a);
 }
