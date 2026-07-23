@@ -3,6 +3,20 @@ const testcapture = @import("testcapture.zig");
 
 pub const Method = enum { GET, POST, PUT, PATCH, DELETE, HEAD };
 pub const Header = struct { name: []const u8, value: []const u8 };
+
+/// Ownership: ARENA-SCOPED (contract 4). This type intentionally has no `deinit`.
+///
+/// `request()` allocates the response — the captured header array and its duped
+/// name/value strings, plus internal scratch (the `max_response_bytes` body buffer,
+/// redirect buffer, decompress buffer) — on the `HttpClient.alloc` allocator and never
+/// frees any of it. `body` is a sub-slice of the single fixed `max_response_bytes`
+/// buffer (see `request`), NOT an independent allocation, so it cannot be freed on its
+/// own — freeing `body` would free an interior slice of the wrong length. The whole
+/// graph is therefore reclaimed wholesale when the allocator is torn down.
+///
+/// Callers MUST pass a request-scoped / arena allocator (every in-tree caller does:
+/// the request/job arena, or a per-op disposable arena). Read or copy out anything you
+/// need to keep — the entire response is invalid once that allocator is reset.
 pub const HttpResponse = struct {
     status: u16,
     /// Response headers captured from the server reply.
@@ -13,6 +27,8 @@ pub const HttpResponse = struct {
     /// like `Content-Type`, `Location`, and `X-*` rate-limit headers are all
     /// present here.
     headers: []const Header,
+    /// The response body — a sub-slice of the fixed `max_response_bytes` buffer, valid for
+    /// the lifetime of `HttpClient.alloc`. Not individually freeable (see the type doc).
     body: []const u8,
 };
 
@@ -39,6 +55,10 @@ pub const PostOptions = struct { headers: []const Header = &.{}, body: ?[]const 
 
 /// Result of `HttpClient.download`: the body itself was streamed through the caller's
 /// writer, not buffered here.
+///
+/// Ownership: ARENA-SCOPED (contract 4), same as `HttpResponse` — the captured headers
+/// and `download`'s internal scratch live on the passed allocator and are never freed
+/// here; there is no `deinit`. Pass a request-scoped / arena allocator.
 pub const DownloadResult = struct {
     status: u16,
     headers: []const Header,
