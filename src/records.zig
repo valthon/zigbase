@@ -115,33 +115,78 @@ fn columnList(alloc: std.mem.Allocator, col: schema.Collection) ![]u8 {
     return out.toOwnedSlice(alloc);
 }
 
-fn rowToObject(alloc: std.mem.Allocator, stmt: *db.Stmt, col: schema.Collection) !std.json.Value {
+/// Interned-mode key layout for `rowToObject`/`rowToObjectAtRest`: `["id","created","updated",
+/// col.fields[0].name, col.fields[1].name, …]`, length `3 + col.fields.len`. When a caller passes
+/// this (list, which mints it ONCE per query), the record BORROWS its top-level keys from the
+/// keyset — no per-row key dupe on the list hot path; the ListResult owns and frees the keyset.
+/// When `null` (single-record get/create/update), the record instead DUPES every top-level key
+/// onto `alloc` so the returned Value is self-contained and freeable via `freeRecord` off any
+/// allocator. Either way the field VALUES are always freshly allocated on `alloc`.
+///
+/// `keyOf(keys, alloc, slot, name)`: slot 0/1/2 = id/created/updated, slot `3+i` = field i.
+fn keyOf(keys: ?[]const []const u8, alloc: std.mem.Allocator, slot: usize, name: []const u8) ![]const u8 {
+    if (keys) |ks| {
+        // The keyset is minted by buildListKeys as exactly `3 + col.fields.len` against the SAME
+        // `col` rowToObject iterates, so `slot` is always in range; assert the invariant so a
+        // future caller that passes a mismatched keyset trips in safe builds instead of reading OOB.
+        std.debug.assert(slot < ks.len);
+        return ks[slot]; // interned: borrow
+    }
+    return alloc.dupe(u8, name); // self-contained: own
+}
+
+/// Mint the interned key slice `list` hands to every `rowToObject` for one query — the shared,
+/// owned `["id","created","updated", col.fields[0].name, …]` (length `3 + col.fields.len`). Built
+/// ONCE per list so no row dupes its keys; the returned `ListResult` owns it and frees it in
+/// `deinit`. `errdefer` unwinds a partial fill if a later dupe OOMs, so nothing leaks on failure.
+fn buildListKeys(alloc: std.mem.Allocator, col: schema.Collection) ![]const []const u8 {
+    const keys = try alloc.alloc([]const u8, 3 + col.fields.len);
+    var filled: usize = 0;
+    errdefer {
+        for (keys[0..filled]) |k| alloc.free(k);
+        alloc.free(keys);
+    }
+    keys[0] = try alloc.dupe(u8, "id");
+    filled = 1;
+    keys[1] = try alloc.dupe(u8, "created");
+    filled = 2;
+    keys[2] = try alloc.dupe(u8, "updated");
+    filled = 3;
+    for (col.fields, 0..) |f, i| {
+        keys[3 + i] = try alloc.dupe(u8, f.name);
+        filled = 3 + i + 1;
+    }
+    return keys;
+}
+
+fn rowToObject(alloc: std.mem.Allocator, stmt: *db.Stmt, col: schema.Collection, keys: ?[]const []const u8) !std.json.Value {
     var obj: std.json.ObjectMap = .empty;
     // Pre-size for id/created/updated + every field so the map backing is allocated once
     // instead of reallocating as it grows per `put` — fewer, larger allocations on the read
     // hot path (hidden fields are a slight over-estimate, which only wastes a little capacity).
     try obj.ensureTotalCapacity(alloc, 3 + col.fields.len);
-    try obj.put(alloc, "id", .{ .string = try alloc.dupe(u8, stmt.columnText(0)) });
-    try obj.put(alloc, "created", .{ .string = try alloc.dupe(u8, stmt.columnText(1)) });
-    try obj.put(alloc, "updated", .{ .string = try alloc.dupe(u8, stmt.columnText(2)) });
+    try obj.put(alloc, try keyOf(keys, alloc, 0, "id"), .{ .string = try alloc.dupe(u8, stmt.columnText(0)) });
+    try obj.put(alloc, try keyOf(keys, alloc, 1, "created"), .{ .string = try alloc.dupe(u8, stmt.columnText(1)) });
+    try obj.put(alloc, try keyOf(keys, alloc, 2, "updated"), .{ .string = try alloc.dupe(u8, stmt.columnText(2)) });
     for (col.fields, 0..) |f, i| {
         const v = try values.readValue(alloc, stmt, @intCast(3 + i), f);
-        if (!f.hidden) try obj.put(alloc, f.name, v);
+        if (!f.hidden) try obj.put(alloc, try keyOf(keys, alloc, 3 + i, f.name), v);
     }
     return .{ .object = obj };
 }
 
 /// Like `rowToObject`, but encrypted fields are returned as their AT-REST ciphertext envelope
 /// (NEVER decrypted) instead of plaintext. Every other field reads identically. Backs `getAtRest`.
-fn rowToObjectAtRest(alloc: std.mem.Allocator, stmt: *db.Stmt, col: schema.Collection) !std.json.Value {
+/// `keys` follows the same interned/self-contained contract as `rowToObject`.
+fn rowToObjectAtRest(alloc: std.mem.Allocator, stmt: *db.Stmt, col: schema.Collection, keys: ?[]const []const u8) !std.json.Value {
     var obj: std.json.ObjectMap = .empty;
     // Pre-size for id/created/updated + every field so the map backing is allocated once
     // instead of reallocating as it grows per `put` — fewer, larger allocations on the read
     // hot path (hidden fields are a slight over-estimate, which only wastes a little capacity).
     try obj.ensureTotalCapacity(alloc, 3 + col.fields.len);
-    try obj.put(alloc, "id", .{ .string = try alloc.dupe(u8, stmt.columnText(0)) });
-    try obj.put(alloc, "created", .{ .string = try alloc.dupe(u8, stmt.columnText(1)) });
-    try obj.put(alloc, "updated", .{ .string = try alloc.dupe(u8, stmt.columnText(2)) });
+    try obj.put(alloc, try keyOf(keys, alloc, 0, "id"), .{ .string = try alloc.dupe(u8, stmt.columnText(0)) });
+    try obj.put(alloc, try keyOf(keys, alloc, 1, "created"), .{ .string = try alloc.dupe(u8, stmt.columnText(1)) });
+    try obj.put(alloc, try keyOf(keys, alloc, 2, "updated"), .{ .string = try alloc.dupe(u8, stmt.columnText(2)) });
     for (col.fields, 0..) |f, i| {
         const idx: c_int = @intCast(3 + i);
         const v: std.json.Value = if (f.encrypted)
@@ -151,7 +196,7 @@ fn rowToObjectAtRest(alloc: std.mem.Allocator, stmt: *db.Stmt, col: schema.Colle
             (if (stmt.isNull(idx)) std.json.Value{ .null = {} } else std.json.Value{ .string = try alloc.dupe(u8, stmt.columnText(idx)) })
         else
             try values.readValue(alloc, stmt, idx, f);
-        if (!f.hidden) try obj.put(alloc, f.name, v);
+        if (!f.hidden) try obj.put(alloc, try keyOf(keys, alloc, 3 + i, f.name), v);
     }
     return .{ .object = obj };
 }
@@ -172,7 +217,7 @@ pub fn getAtRest(alloc: std.mem.Allocator, r: *db.Db, col: schema.Collection, id
     defer st.finalize();
     try st.bindText(1, id);
     if (!try st.step()) return null;
-    return try rowToObjectAtRest(alloc, &st, col);
+    return try rowToObjectAtRest(alloc, &st, col, null);
 }
 
 pub fn get(alloc: std.mem.Allocator, r: *db.Db, col: schema.Collection, id: []const u8) RecordError!?std.json.Value {
@@ -202,7 +247,7 @@ pub fn get(alloc: std.mem.Allocator, r: *db.Db, col: schema.Collection, id: []co
     defer st.finalize();
     try st.bindText(1, id);
     if (!try st.step()) return null;
-    return try rowToObject(alloc, &st, col);
+    return try rowToObject(alloc, &st, col, null);
 }
 
 pub threadlocal var last_errors: ?[]const schema.ValidationError = null;
@@ -725,7 +770,7 @@ pub fn createInTxnOpts(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, col: sch
         };
     }
     if (!try st.step()) return error.NotFound;
-    const rec = try rowToObject(alloc, &st, col);
+    const rec = try rowToObject(alloc, &st, col, null);
     while (try st.step()) {} // drain to DONE so the statement isn't active at commit time
     return rec;
 }
@@ -739,10 +784,34 @@ fn seedPosts(d: *db.Db, a: std.mem.Allocator) !schema.Collection {
     return collections.create(a, std.testing.io, d, .{ .id = "", .name = "posts", .fields = &fields });
 }
 
-/// Free a record whose values are all scalar strings (id/created/updated + text fields). Keys are
-/// static ("id"/…) or borrowed from the collection schema, so only the string values and the map
-/// backing are owned. Used by the leak-detection regression test below.
-fn freeStringRecord(a: std.mem.Allocator, rec: std.json.Value) void {
+/// Free a SELF-CONTAINED scalar record `Value` — the shape `rowToObject`/`rowToObjectAtRest`
+/// return in `keys == null` (self-contained) mode, i.e. what `get`/`getAtRest`/`create`/`update`
+/// hand back. In that mode EVERY top-level key is OWNED (duped onto `a`) alongside every scalar
+/// `.string` VALUE, so this frees both, then the `ObjectMap` backing. Non-string scalar values
+/// (int/float/bool/null) carry no allocation and are skipped.
+///
+/// NOT valid on a record containing a `json` or multi-value field: `values.readValue` leaves those
+/// sub-trees arena-scoped (the `Parsed` wrapper is discarded), so they are not individually
+/// freeable — such records still require an arena. NOT valid on an INTERNED-mode list item either:
+/// those BORROW their keys from the `ListResult` keyset (use `ListResult.deinit`). Intended for
+/// tests and non-arena callers on scalar collections.
+pub fn freeRecord(a: std.mem.Allocator, rec: std.json.Value) void {
+    if (rec != .object) return;
+    var obj = rec.object;
+    var it = obj.iterator();
+    while (it.next()) |e| {
+        a.free(e.key_ptr.*); // owned in self-contained mode
+        if (e.value_ptr.* == .string) a.free(e.value_ptr.*.string);
+    }
+    obj.deinit(a);
+}
+
+/// Free one INTERNED-mode record (a `list` item whose keys BORROW from the shared keyset): its
+/// owned scalar `.string` VALUES + the `ObjectMap` backing, but NOT its keys (the keyset owns
+/// them). Same json/multi-value caveat as `freeRecord`. Used by `ListResult.deinit` and to free
+/// the `list` probe (N+1) sentinel row that is fetched to detect "has more" but never returned.
+fn freeInternedRecord(a: std.mem.Allocator, rec: std.json.Value) void {
+    if (rec != .object) return;
     var obj = rec.object;
     var it = obj.iterator();
     while (it.next()) |e| if (e.value_ptr.* == .string) a.free(e.value_ptr.*.string);
@@ -775,12 +844,12 @@ test "write path frees its DDL/SQL scratch under the checking allocator" {
     data.deinit(a);
     const rid = try a.dupe(u8, rec.object.get("id").?.string);
     defer a.free(rid);
-    freeStringRecord(a, rec);
+    freeRecord(a, rec);
 
     // Read the row back (exercises get()'s column-list + SELECT scratch and rowToObject).
     const got = (try get(a, &d, full, rid)) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("hello", got.object.get("title").?.string);
-    freeStringRecord(a, got);
+    freeRecord(a, got);
 
     // Update it (exercises updateInTxn's SET-list/bind/UPDATE-SQL scratch; the returned record is
     // the only allocation kept on `a`).
@@ -789,7 +858,7 @@ test "write path frees its DDL/SQL scratch under the checking allocator" {
     const upd = (try update(a, &d, full, rid, .{ .object = udata })) orelse return error.TestUnexpectedResult;
     udata.deinit(a);
     try std.testing.expectEqualStrings("world", upd.object.get("title").?.string);
-    freeStringRecord(a, upd);
+    freeRecord(a, upd);
 
     // Read-miss paths allocate their SQL scratch but return null (no row/collection to free) — so a
     // leak here can only be that unfreed scratch.
@@ -799,6 +868,110 @@ test "write path frees its DDL/SQL scratch under the checking allocator" {
     // Delete frees its DELETE SQL scratch; returns a bool (nothing to free).
     try std.testing.expect(try delete(a, &d, full, rid));
     try std.testing.expect(!try delete(a, &d, full, "missingid0000000"));
+}
+
+/// Seed a scalar collection with a text, a fixed-number (returns a `.string`), and a bool field —
+/// the exhaustive shape for the self-contained-record / interned-keyset leak proofs below. Returns
+/// a fully-owned Collection (`.deinit(a)`).
+fn seedMulti(d: *db.Db, a: std.mem.Allocator) !schema.Collection {
+    try migrations.run(d);
+    const fields = [_]schema.Field{
+        .{ .id = "f1", .name = "title", .options = .{ .text = .{} } },
+        .{ .id = "f2", .name = "price", .options = .{ .number = .{ .mode = .fixed, .scale = 2 } } },
+        .{ .id = "f3", .name = "active", .options = .{ .bool = .{} } },
+    };
+    const def = schema.Collection{ .id = "", .name = "widgets", .fields = &fields, .listRule = "", .viewRule = "", .createRule = "", .updateRule = "", .deleteRule = "" };
+    return collections.create(a, std.testing.io, d, def);
+}
+
+// Insert one widget with the given title/price/active on `a`, returning the self-contained record.
+fn insertWidget(d: *db.Db, a: std.mem.Allocator, col: schema.Collection, title: []const u8, price: []const u8, active: bool) !std.json.Value {
+    var data: std.json.ObjectMap = .empty;
+    defer data.deinit(a);
+    try data.put(a, "title", .{ .string = title });
+    try data.put(a, "price", .{ .string = price });
+    try data.put(a, "active", .{ .bool = active });
+    return create(a, std.testing.io, d, col, .{ .object = data });
+}
+
+test "freeRecord: a self-contained multi-field get() record frees with zero leaks (owned keys)" {
+    // RAW std.testing.allocator: no arena to mask a leak. A `get` record is SELF-CONTAINED — every
+    // top-level KEY is duped (owned), so `freeRecord` (which frees keys AND scalar string values)
+    // must reclaim it exactly. Fields: text (.string), fixed-number (.string), bool (no alloc).
+    const a = std.testing.allocator;
+    var d = try db.Db.openMemory();
+    defer d.close();
+    const col = try seedMulti(&d, a);
+    defer col.deinit(a);
+
+    const created = try insertWidget(&d, a, col, "hello", "9.99", true);
+    const rid = try a.dupe(u8, created.object.get("id").?.string);
+    defer a.free(rid);
+    freeRecord(a, created); // (c) create -> freeRecord
+
+    // (a) get a multi-field record -> freeRecord -> zero leaks.
+    const got = (try get(a, &d, col, rid)) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("hello", got.object.get("title").?.string);
+    try std.testing.expectEqualStrings("9.99", got.object.get("price").?.string);
+    try std.testing.expectEqual(true, got.object.get("active").?.bool);
+    freeRecord(a, got);
+}
+
+/// Assemble a `ListResult` the way `list` does internally — ONE interned keyset (`buildListKeys`)
+/// shared by every row read via `rowToObject(…, keys)`. Self-freeing of all SQL scratch; the only
+/// escaping allocations are the ListResult's owned graph (keyset + items), reclaimed by its
+/// `deinit`. The `errdefer`s unwind the keyset/items on any read failure before ownership transfers
+/// at `return`. Lets the leak proof exercise the record-ownership infra without dragging in the
+/// public `list`'s un-migrated (allowlisted) query scratch.
+fn assembleListResult(d: *db.Db, a: std.mem.Allocator, col: schema.Collection) !ListResult {
+    const keys = try buildListKeys(a, col);
+    errdefer {
+        for (keys) |k| a.free(k);
+        a.free(keys);
+    }
+    const cols = try columnList(a, col);
+    defer a.free(cols);
+    const sql = try std.fmt.allocPrintSentinel(a, "SELECT {s} FROM \"{s}\" ORDER BY \"id\";", .{ cols, col.name }, 0);
+    defer a.free(sql);
+    var st = try prep(a, d, sql);
+    defer st.finalize();
+    var items: std.ArrayList(std.json.Value) = .empty;
+    errdefer {
+        for (items.items) |rec| freeInternedRecord(a, rec);
+        items.deinit(a);
+    }
+    while (try st.step()) try items.append(a, try rowToObject(a, &st, col, keys));
+    return ListResult{ .page = 1, .perPage = 10, .totalItems = @intCast(items.items.len), .items = try items.toOwnedSlice(a), .keys = keys };
+}
+
+test "ListResult.deinit: interned keyset + item values free exactly once (zero leaks)" {
+    // (b) RAW std.testing.allocator, no arena to mask a leak. `res.deinit(a)` must free the ONE
+    // interned keyset exactly once (not per row) and each item's owned scalar values + ObjectMap —
+    // a per-item key free would DOUBLE-FREE the shared keyset and the DebugAllocator would panic.
+    const a = std.testing.allocator;
+    var d = try db.Db.openMemory();
+    defer d.close();
+    const col = try seedMulti(&d, a);
+    defer col.deinit(a);
+
+    inline for (.{ "one", "two", "three" }, .{ "1.00", "2.00", "3.00" }) |t, p| {
+        const rec = try insertWidget(&d, a, col, t, p, false);
+        freeRecord(a, rec);
+    }
+
+    var res = try assembleListResult(&d, a, col);
+    defer res.deinit(a);
+    try std.testing.expectEqual(@as(usize, 3), res.items.len);
+    try std.testing.expectEqual(@as(usize, 3 + col.fields.len), res.keys.len);
+    // Every item BORROWS its top-level keys from the shared keyset — SAME pointer, not a per-row
+    // dupe. Checked for all three rows (id + title) so the interning is proven, not sampled. (Row
+    // order is by random id, so we assert pointer identity + shape, never a positional value.)
+    for (res.items) |item| {
+        try std.testing.expectEqual(res.keys[0].ptr, item.object.getKey("id").?.ptr);
+        try std.testing.expectEqual(res.keys[3].ptr, item.object.getKey("title").?.ptr);
+        try std.testing.expectEqual(@as(usize, 4), item.object.get("price").?.string.len); // "N.00"
+        try std.testing.expectEqual(false, item.object.get("active").?.bool);
+    }
 }
 
 test "createInTxnOpts: default IGNORES a client-supplied id (server always generates)" {
@@ -1314,7 +1487,7 @@ pub fn updateInTxn(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection, 
         };
     }
     if (!try st.step()) return null;
-    const rec = try rowToObject(alloc, &st, col);
+    const rec = try rowToObject(alloc, &st, col, null);
     while (try st.step()) {} // drain to DONE so the statement isn't active at commit time
     return rec;
 }
@@ -1510,11 +1683,30 @@ pub const ListResult = struct {
     /// Offset mode: always set. Cursor mode: set only when skipTotal==false, else null.
     totalItems: ?i64,
     items: []std.json.Value,
+    /// The OWNED interned keyset (`["id","created","updated", field names…]`) every item's
+    /// top-level keys BORROW from — minted once by `buildListKeys`, freed by `deinit`. Empty
+    /// (`&.{}`) only for a default-constructed result that never ran a query.
+    keys: []const []const u8 = &.{},
     /// Cursor-mode navigation (null/false in offset mode).
     nextCursor: ?[]const u8 = null,
     prevCursor: ?[]const u8 = null,
     hasNext: bool = false,
     hasPrev: bool = false,
+
+    /// Free a `ListResult` returned by `list` on the SAME allocator `list` was given. Each item's
+    /// keys are BORROWED from the shared keyset, so per item we free only its owned scalar `.string`
+    /// VALUES and its `ObjectMap` backing (NOT its keys — see `freeRecord` for the free-list rationale
+    /// and the json/multi-value caveat); then the keyset (each key + the slice), the `items` slice,
+    /// and the owned cursor tokens. An item holding a `json`/multi-value sub-tree still needs an arena
+    /// (those sub-trees are arena-orphaned by `readValue`), same caveat as `freeRecord`.
+    pub fn deinit(self: *ListResult, alloc: std.mem.Allocator) void {
+        for (self.items) |rec| freeInternedRecord(alloc, rec);
+        for (self.keys) |k| alloc.free(k);
+        if (self.keys.len > 0) alloc.free(self.keys);
+        alloc.free(self.items);
+        if (self.nextCursor) |c| alloc.free(c);
+        if (self.prevCursor) |c| alloc.free(c);
+    }
 };
 
 fn baseColumnList(alloc: std.mem.Allocator, col: schema.Collection) ![]u8 {
@@ -2307,6 +2499,16 @@ pub fn list(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, q: L
         break :blk if (requested == 0) 30 else @min(requested, 500);
     };
 
+    // Intern the top-level keys ONCE for this query: every row BORROWS these instead of duping its
+    // own (the list hot path), and the returned `ListResult` owns + frees them in `deinit`. Freed
+    // by hand on the error paths below (before either successful return hands ownership over), since
+    // the two `return .{…}` sites are the only places `keys` escapes.
+    const keys = try buildListKeys(alloc, col);
+    errdefer {
+        for (keys) |k| alloc.free(k);
+        alloc.free(keys);
+    }
+
     // ----- CURSOR (keyset) MODE -----
     // Entered when a token is supplied OR cursorMode is forced (the first page of a walk / when
     // offset mode is disabled). The first page (no token) has no keyset predicate, hasPrev=false.
@@ -2352,12 +2554,28 @@ pub fn list(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, q: L
         try pst.bindInt(idx, @as(i64, per) + 1); // fetch limit+1 to detect "has more"
 
         var fetched: std.ArrayList(std.json.Value) = .empty;
+        // Free the accumulated rows (their scalar values + ObjectMaps; keys are interned in `keys`,
+        // freed by its own errdefer above) and the buffer on ANY error return between here and the
+        // successful return below — a mid-fetch step()/rowToObject failure, or a later mint/count
+        // failure. The probe row is dropped from `items` right after it's freed (below) so this
+        // never double-frees it.
+        errdefer {
+            for (fetched.items) |rec| freeInternedRecord(alloc, rec);
+            fetched.deinit(alloc);
+        }
         try fetched.ensureTotalCapacity(alloc, @as(usize, per) + 1); // fetch limit+1 — size once
-        while (try pst.step()) try fetched.append(alloc, try rowToObject(alloc, &pst, col));
+        while (try pst.step()) try fetched.append(alloc, try rowToObject(alloc, &pst, col, keys));
 
         const has_more = fetched.items.len > per;
-        var kept = fetched.items;
-        if (has_more) kept = kept[0..per];
+        // Free the probe (N+1) row: fetched only to detect "has more", never returned. Under an
+        // arena this was reclaimed en masse; under a raw allocator it would leak, so free it now
+        // (its keys are interned in `keys`, so only its scalar values + ObjectMap are freed), and
+        // drop it from `items` so the errdefer above can't double-free it.
+        if (has_more) {
+            freeInternedRecord(alloc, fetched.items[per]);
+            fetched.shrinkRetainingCapacity(per);
+        }
+        const kept = fetched.items[0..@min(fetched.items.len, per)];
         // Backward page: re-reverse into forward order.
         if (!forward) std.mem.reverse(std.json.Value, kept);
 
@@ -2386,12 +2604,20 @@ pub fn list(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, q: L
         var total: ?i64 = null;
         if (!q.skipTotal) total = try countTotal(alloc, conn, col, joins_sql.items, where_clause, params);
 
+        // Hand back an EXACT-length owned `items` slice (cursor mode fetched into an N+1-capacity
+        // buffer and the probe row is already freed) so `ListResult.deinit` frees `items` cleanly
+        // off any allocator — the buffer length must match the allocation. `kept` is a prefix of
+        // `fetched`'s buffer in the correct final order, so shrink-then-own preserves it.
+        fetched.shrinkRetainingCapacity(kept.len);
+        const kept_owned = try fetched.toOwnedSlice(alloc);
+
         return .{
             .mode = .cursor,
             .page = 0,
             .perPage = per,
             .totalItems = total,
-            .items = kept,
+            .items = kept_owned,
+            .keys = keys,
             .nextCursor = next_cursor,
             .prevCursor = prev_cursor,
             .hasNext = has_next,
@@ -2418,8 +2644,14 @@ pub fn list(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, q: L
     try pst.bindInt(after + 1, offset);
 
     var items: std.ArrayList(std.json.Value) = .empty;
+    // Free already-fetched rows + the buffer if a later step()/rowToObject fails mid-loop (keys are
+    // interned in `keys`; toOwnedSlice below empties `items`, so success never double-frees).
+    errdefer {
+        for (items.items) |rec| freeInternedRecord(alloc, rec);
+        items.deinit(alloc);
+    }
     try items.ensureTotalCapacity(alloc, per); // at most `per` rows (LIMIT) — size once, no growth
-    while (try pst.step()) try items.append(alloc, try rowToObject(alloc, &pst, col));
+    while (try pst.step()) try items.append(alloc, try rowToObject(alloc, &pst, col, keys));
     const kept_items = try items.toOwnedSlice(alloc);
     const total_pages_rows: i64 = @as(i64, (page)) * @as(i64, per);
     return .{
@@ -2428,6 +2660,7 @@ pub fn list(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, q: L
         .perPage = per,
         .totalItems = total,
         .items = kept_items,
+        .keys = keys,
         // Offset mode derives has_next/has_prev from page math so the handler can answer either.
         .hasNext = total > total_pages_rows,
         .hasPrev = page > 1,

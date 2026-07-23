@@ -599,15 +599,22 @@ const DeliveryEnvelope = struct {
     } = .{},
 };
 
-/// BLOCKED (allocator-contract migration, not a real request-lifetime graph): every test below that
-/// calls `mkColl`/`mkRec` keeps its `std.testing.allocator` wrapped in a real `ArenaAllocator`. Both
-/// `collections.create` and `records.create` allocate scratch (DDL/SQL strings via `alloc.dupeZ`,
-/// validation-error `ArrayList`s, etc.) that they never free — a real leak, but the root cause is in
-/// src/collections.zig / src/records.zig, both outside this batch (each already carries its own
-/// scratch.allocator-allowlist.txt entry pending its own migration). Verified empirically: converting
-/// one such test to a raw `std.testing.allocator` surfaces ~35 leaked allocations, all originating in
-/// `mkColl`/`mkRec` — none in this file. Re-run this file's tests without the arena once
-/// collections.zig/records.zig are migrated.
+/// The former write-path scratch leak (collections.create/records.create not freeing their DDL/SQL
+/// scratch) is FIXED, so `mkColl`/`mkRec` are now leak-clean under the RAW `std.testing.allocator`:
+/// `mkColl` returns a fully-owned Collection freed by `Collection.deinit`, and `mkRec` frees the
+/// input map + the returned self-contained record (`records.freeRecord`), escaping only a duped id.
+/// The `@public`/empty/null/id-only-delete `shouldDeliver` tests are therefore un-masked.
+///
+/// GUARDED_QUERY_MASK — the tests that REMAIN wrapped in a `std.testing.allocator` arena all drive
+/// the guarded-query authz path: `shouldDeliver` (or `matchesSnapshot`) -> `policy.matchesRule`,
+/// which builds the compiled `Guard` (where_sql / joins / params, plus ability + tenant predicates)
+/// on the passed allocator and NEVER frees it — arena-lifetime scratch owned by the un-migrated
+/// `policy.zig` / `rules.zig` / records-guard code (each a separate allowlist entry). That scratch
+/// is not reachable to free from the test, so those tests cannot be un-masked until that path is
+/// migrated. Two further tests are legitimate contract-4 (they call code that TAKES a
+/// `RequestArena`/`*ArenaAllocator`: `subscribeCheck`, `authVerb`), and the two `frameForDelivery`
+/// collection-lookup tests additionally leak the collection graph that `colcache.lease`'s
+/// cache==null fallback loads into `a` and its no-op `release()` never frees.
 const TestDb = struct {
     d: db.Db,
     fn init() !TestDb {
@@ -630,11 +637,18 @@ const TestDb = struct {
             .deleteRule = "",
         });
     }
+    /// Insert a record and return ONLY its id, duped onto `a` (caller `defer a.free(rid)`). The
+    /// record graph is self-contained: the input map and the returned self-contained record are freed
+    /// here (`records.freeRecord`) so nothing escapes but the duped id — mirrors the write-path
+    /// leak-detector test in records.zig.
     fn mkRec(self: *TestDb, a: std.mem.Allocator, col: schema.Collection, owner: []const u8) ![]const u8 {
         var data: std.json.ObjectMap = .empty;
         try data.put(a, "owner", .{ .string = owner });
         const rec = try records.create(a, std.testing.io, &self.d, col, .{ .object = data });
-        return rec.object.get("id").?.string;
+        data.deinit(a);
+        const rid = try a.dupe(u8, rec.object.get("id").?.string);
+        records.freeRecord(a, rec);
+        return rid;
     }
 };
 
@@ -646,14 +660,25 @@ fn authedConn(a: std.mem.Allocator, id: []const u8, is_super: bool) !Conn {
     return c;
 }
 
+/// Free the auth-record ObjectMap backing a test `Conn` (from `authedConn` or an inline
+/// `setAuth`). Its keys are static ("id") and its values are caller LITERALS — neither is
+/// owned by `a` — so ONLY the map's backing array is freed (never the entries, unlike
+/// `records.freeRecord`). No-op on an unauthenticated (anon) Conn.
+fn freeConn(a: std.mem.Allocator, c: *Conn) void {
+    if (c.auth) |ident| {
+        var obj = ident.record.object;
+        obj.deinit(a);
+    }
+}
+
 test "public viewRule (@public): create delivered to anyone, no filter" {
     var tdb = try TestDb.init();
     defer tdb.deinit();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const col = try tdb.mkColl(a, "posts", rules.public_sentinel);
+    defer col.deinit(a);
     const rid = try tdb.mkRec(a, col, "u1");
+    defer a.free(rid);
     var anon = Conn{};
     try std.testing.expect(try shouldDeliver(a, std.testing.io, &tdb.d, col, &anon, 0, .create, rid, null, null));
 }
@@ -665,6 +690,13 @@ test "@public viewRule + view ability: create is NOT delivered to a non-member" 
     // early-return in shouldDeliver delivered the full record to any subscriber, bypassing it.
     var tdb = try TestDb.init();
     defer tdb.deinit();
+    // MASKED (guarded-query scratch leak, out of batch): the ability path drives
+    // shouldDeliver -> policy.matchesRule -> abilities.abilityPredicate/records.guardPasses,
+    // which build the Guard (where_sql/joins/params) on the passed allocator and never free it
+    // (arena-lifetime by design; policy.zig/abilities.zig/records-guard are separate, un-migrated
+    // allowlist entries). mkColl/mkRec/authedConn themselves are leak-clean now — see the converted
+    // @public/empty/null/delete tests — but this test cannot be un-masked until the guarded-query
+    // path is migrated.
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -684,34 +716,39 @@ test "@public viewRule + view ability: create is NOT delivered to a non-member" 
 test "empty viewRule (\"\") is now LOCKED: anon receives nothing, superuser does" {
     var tdb = try TestDb.init();
     defer tdb.deinit();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const col = try tdb.mkColl(a, "posts", "");
+    defer col.deinit(a);
     const rid = try tdb.mkRec(a, col, "u1");
+    defer a.free(rid);
     var anon = Conn{};
     try std.testing.expect(!try shouldDeliver(a, std.testing.io, &tdb.d, col, &anon, 0, .create, rid, null, null));
     var su = try authedConn(a, "admin", true);
+    defer freeConn(a, &su);
     try std.testing.expect(try shouldDeliver(a, std.testing.io, &tdb.d, col, &su, 0, .create, rid, null, null));
 }
 
 test "null viewRule: superuser-only" {
     var tdb = try TestDb.init();
     defer tdb.deinit();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const col = try tdb.mkColl(a, "locked", null);
+    defer col.deinit(a);
     const rid = try tdb.mkRec(a, col, "u1");
+    defer a.free(rid);
     var anon = Conn{};
     try std.testing.expect(!try shouldDeliver(a, std.testing.io, &tdb.d, col, &anon, 0, .create, rid, null, null));
     var su = try authedConn(a, "admin", true);
+    defer freeConn(a, &su);
     try std.testing.expect(try shouldDeliver(a, std.testing.io, &tdb.d, col, &su, 0, .create, rid, null, null));
 }
 
 test "macro viewRule: only the owner receives the record" {
     var tdb = try TestDb.init();
     defer tdb.deinit();
+    // MASKED (guarded-query scratch leak, out of batch — see GUARDED_QUERY_MASK below): the
+    // `.check` viewRule drives shouldDeliver -> policy.matchesRule, which never frees the compiled
+    // Guard. Un-maskable only once policy.zig/rules.zig migrate.
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -728,6 +765,8 @@ test "macro viewRule: only the owner receives the record" {
 test "subscription filter narrows within an authorized viewRule" {
     var tdb = try TestDb.init();
     defer tdb.deinit();
+    // MASKED (guarded-query scratch leak, out of batch — see GUARDED_QUERY_MASK below): the
+    // subscription filter compiles to a Guard via policy.matchesRule, whose scratch is never freed.
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -741,23 +780,27 @@ test "subscription filter narrows within an authorized viewRule" {
 test "delete is id-only: locked -> only superuser; @public -> anyone" {
     var tdb = try TestDb.init();
     defer tdb.deinit();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const pub_col = try tdb.mkColl(a, "p", rules.public_sentinel);
+    defer pub_col.deinit(a);
     const locked = try tdb.mkColl(a, "l", null);
+    defer locked.deinit(a);
     var anon = Conn{};
     // @public: anyone learns of the delete (no snapshot needed).
     try std.testing.expect(try shouldDeliver(a, std.testing.io, &tdb.d, pub_col, &anon, 0, .delete, "GONE", null, null));
     // null/locked: only a superuser.
     try std.testing.expect(!try shouldDeliver(a, std.testing.io, &tdb.d, locked, &anon, 0, .delete, "GONE", null, null));
     var su = try authedConn(a, "admin", true);
+    defer freeConn(a, &su);
     try std.testing.expect(try shouldDeliver(a, std.testing.io, &tdb.d, locked, &su, 0, .delete, "GONE", null, null));
 }
 
 test "F4: owner-scoped delete only notifies the owner (snapshot authz)" {
     var tdb = try TestDb.init();
     defer tdb.deinit();
+    // MASKED (guarded-query scratch leak, out of batch — see GUARDED_QUERY_MASK below): the
+    // owner-scoped delete authorizes the snapshot via matchesSnapshot -> policy.matchesRule, whose
+    // compiled-Guard scratch is never freed.
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -788,6 +831,9 @@ test "#18 hoist: the thread-local delete sandbox is reused per-subscriber AND re
     // computed from that subscriber's own rctx — never leaked from a prior cache occupant.
     var tdb = try TestDb.init();
     defer tdb.deinit();
+    // MASKED (guarded-query scratch leak, out of batch — see GUARDED_QUERY_MASK below): each
+    // delete authz runs matchesSnapshot -> policy.matchesRule, whose compiled-Guard scratch is
+    // never freed. (The thread-local sandbox itself is page-allocator backed and not tracked.)
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -829,7 +875,9 @@ test "tenant scoping: a subscriber receives ONLY its account's frames; unresolve
     // Before the fix `Conn.requestContext` never set tenancy_enabled/account_id, so a tenant-owned
     // `@public` collection broadcast to every subscriber — a cross-tenant leak. This test FAILS
     // under that code and passes after the fix.
-    // BLOCKED: calls collections.create directly (same TestDb-root-cause leak as above).
+    // MASKED (guarded-query scratch leak, out of batch — see GUARDED_QUERY_MASK below): a
+    // tenant-owned collection runs shouldDeliver -> policy.matchesRule (tenancy.scopePredicate +
+    // guardPasses), whose compiled-Guard scratch is never freed.
     var tdb = try TestDb.init();
     defer tdb.deinit();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -893,6 +941,9 @@ test "tenant scoping: a subscriber receives ONLY its account's frames; unresolve
 test "expired identity is treated as anonymous" {
     var tdb = try TestDb.init();
     defer tdb.deinit();
+    // MASKED (guarded-query scratch leak, out of batch — see GUARDED_QUERY_MASK below): the
+    // `.check` viewRule drives shouldDeliver -> policy.matchesRule, whose compiled-Guard scratch is
+    // never freed.
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -1062,9 +1113,11 @@ const PoolEnv = struct {
 test "subscribeCheck decision table: limit / __features / unknown / auth_required / ok (transport-neutral)" {
     var env = try PoolEnv.init();
     defer env.deinit();
-    // BLOCKED: provisions collections via collections.create (see the TestDb doc comment above) and
-    // subscribeCheck itself reaches collections.get (colcache.lease fallback) for "pub_posts" /
-    // "locked_posts" — both leak scratch SQL; root cause src/collections.zig, outside this batch.
+    // MASKED (legitimate contract-4): `subscribeCheck` TAKES a `RequestArena` and, by that
+    // contract, leaks its `collections.get` lookup graph into the arena wholesale (production frees
+    // it at request end). A `RequestArena` is exactly the contract-4 case the ratchet permits an
+    // arena for, so this test keeps one. (The setup also provisions collections on `a`, discarding
+    // the returned graphs — an arena reclaims those too.)
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -1165,14 +1218,11 @@ test "authVerb: bad token clears auth and returns false (transport-neutral)" {
 test "frameForDelivery: custom topic + __features forward VERBATIM (no authz, no parse requirement)" {
     var env = try PoolEnv.init();
     defer env.deinit();
-    // BLOCKED (contract-4 workaround, not a real request-lifetime graph): the "orders" lookup below
-    // reaches `colcache.lease`'s fallback path -> `collections.get`, which allocates its renumbered
-    // SQL via `dialect.renumberPlaceholders` (always a fresh `dupeZ`, even for the SQLite passthrough
-    // arm) and never frees it — a real leak, but the root cause is in src/collections.zig (`get`) /
-    // src/sql/dialect.zig, both outside this batch. Keep arena-wrapped until that file is migrated.
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    // Leak-clean under the raw allocator: "orders" is not a collection (`collections.get` returns
+    // null after freeing its own SELECT scratch — see collections.zig `defer alloc.free(sql)`), so
+    // no collection graph is materialized; and both topics forward the message VERBATIM (no
+    // guarded-query path, no owned frame allocated). Nothing escapes onto `a`.
+    const a = std.testing.allocator;
     var app = App{ .allocator = a, .io = std.testing.io, .pool = &env.pool };
     var anon = Conn{};
     // A non-collection topic: the exact message bytes come back (pointer-equal slice).
@@ -1187,8 +1237,11 @@ test "frameForDelivery: custom topic + __features forward VERBATIM (no authz, no
 test "frameForDelivery: viewRule deny -> null; @public + matching filter -> frame; mismatching filter -> null" {
     var env = try PoolEnv.init();
     defer env.deinit();
-    // BLOCKED: provisions via collections.create + records.create (see the TestDb doc comment
-    // above) — root cause src/collections.zig / src/records.zig, outside this batch.
+    // MASKED (guarded-query + colcache-fallback graph leak, out of batch — see GUARDED_QUERY_MASK):
+    // frameForDelivery looks up "fitems" via colcache.lease, whose cache==null fallback loads the
+    // collection graph into `a` and never frees it (no-op release()); the filter path additionally
+    // runs policy.matchesRule, whose compiled-Guard scratch is never freed. Neither is reachable to
+    // free from the test.
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -1230,8 +1283,10 @@ test "frameForDelivery: viewRule deny -> null; @public + matching filter -> fram
 test "frameForDelivery: F4 delete snapshot authorizes, then is STRIPPED to an id-only frame" {
     var env = try PoolEnv.init();
     defer env.deinit();
-    // BLOCKED: provisions via collections.create (see the TestDb doc comment above) — root cause
-    // src/collections.zig, outside this batch.
+    // MASKED (guarded-query + colcache-fallback graph leak, out of batch — see GUARDED_QUERY_MASK):
+    // frameForDelivery looks up "fnotes" via colcache.lease (cache==null fallback loads the
+    // collection graph into `a`, never freed by the no-op release()), and the owner-scoped delete
+    // authorizes the snapshot via policy.matchesRule, whose compiled-Guard scratch is never freed.
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
