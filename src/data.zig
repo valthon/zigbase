@@ -245,6 +245,11 @@ pub const Data = struct {
 
     pub fn findById(self: Data, col_name: []const u8, id: []const u8) !?std.json.Value {
         const col = (try collections.get(self.alloc, self.conn, col_name)) orelse return null;
+        // `records.get` returns a SELF-CONTAINED record (owns its keys + scalar values), so the
+        // loaded collection is only read and can be freed here — the long-standing Data-facade
+        // `collections.get` leak on the GPA path. (Was UAF-unsafe while record keys borrowed
+        // `col.fields[i].name`; the self-contained-key change makes freeing `col` correct.)
+        defer col.deinit(self.alloc);
         return records.get(self.alloc, self.conn, col, id);
     }
     /// Create a record. On an **auth** collection this runs the same credential transforms
@@ -258,6 +263,9 @@ pub const Data = struct {
     /// `value` isn't a JSON object; `error.PasswordTooShort` if a supplied password is too short.
     pub fn create(self: Data, col_name: []const u8, value: std.json.Value) !std.json.Value {
         const col = (try collections.get(self.alloc, self.conn, col_name)) orelse return error.UnknownCollection;
+        // `records.create` returns a SELF-CONTAINED record; `col` is only read → free it here
+        // (fixes the Data-facade `collections.get` leak on the GPA path).
+        defer col.deinit(self.alloc);
         if (col.type != .auth) return records.create(self.alloc, self.io, self.conn, col, value);
         // Surface the same error as the non-auth path (records.create) for a non-object
         // value, rather than applyProvision's misleading PasswordTooShort.
@@ -271,14 +279,21 @@ pub const Data = struct {
     }
     pub fn update(self: Data, col_name: []const u8, id: []const u8, value: std.json.Value) !?std.json.Value {
         const col = (try collections.get(self.alloc, self.conn, col_name)) orelse return error.UnknownCollection;
+        // `records.update` returns a SELF-CONTAINED record; `col` is only read → free it here.
+        defer col.deinit(self.alloc);
         return records.update(self.alloc, self.conn, col, id, value);
     }
     pub fn delete(self: Data, col_name: []const u8, id: []const u8) !bool {
         const col = (try collections.get(self.alloc, self.conn, col_name)) orelse return error.UnknownCollection;
+        // `records.delete` returns a bool and only reads `col` → free it here.
+        defer col.deinit(self.alloc);
         return records.delete(self.alloc, self.conn, col, id);
     }
     pub fn list(self: Data, col_name: []const u8, q: records.ListQuery) !records.ListResult {
         const col = (try collections.get(self.alloc, self.conn, col_name)) orelse return error.UnknownCollection;
+        // The returned `ListResult` OWNS its interned keyset (independent of `col`) and each item is
+        // self-contained-valued, so `col` is only read → free it here.
+        defer col.deinit(self.alloc);
         return records.list(self.alloc, self.conn, col, q);
     }
 
@@ -469,9 +484,7 @@ test "Data kvSet/kvGet/kvDelete round-trip; upsert preserves created" {
     defer conn.close();
     try migrations.run(&conn);
 
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const io = std.testing.io;
     var app = App{ .allocator = a, .io = io, .pool = undefined };
     const d = Data{ .app = &app, .conn = &conn, .io = io, .alloc = a };
@@ -481,16 +494,21 @@ test "Data kvSet/kvGet/kvDelete round-trip; upsert preserves created" {
 
     // Set then get round-trips.
     try d.kvSet("greeting", "hello");
-    try std.testing.expectEqualStrings("hello", (try d.kvGet("greeting")).?);
+    const got1 = (try d.kvGet("greeting")).?;
+    try std.testing.expectEqualStrings("hello", got1);
+    a.free(got1);
 
     // Capture created, then update and assert value changed but created preserved.
     var st = try conn.prepare("SELECT created, updated FROM \"_kv\" WHERE key='greeting';");
     try std.testing.expect((try st.step()));
     const created0 = try a.dupe(u8, st.columnText(0));
+    defer a.free(created0);
     st.finalize();
 
     try d.kvSet("greeting", "world");
-    try std.testing.expectEqualStrings("world", (try d.kvGet("greeting")).?);
+    const got2 = (try d.kvGet("greeting")).?;
+    try std.testing.expectEqualStrings("world", got2);
+    a.free(got2);
     var st2 = try conn.prepare("SELECT created FROM \"_kv\" WHERE key='greeting';");
     defer st2.finalize();
     try std.testing.expect((try st2.step()));
@@ -506,9 +524,7 @@ test "Data.kvList returns all entries ordered by key" {
     var conn = try db.Db.openMemory();
     defer conn.close();
     try migrations.run(&conn);
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     var app = App{ .allocator = a, .io = std.testing.io, .pool = undefined };
     const d = Data{ .app = &app, .conn = &conn, .io = std.testing.io, .alloc = a };
 
@@ -516,6 +532,15 @@ test "Data.kvList returns all entries ordered by key" {
     try d.kvSet("b", "2");
     try d.kvSet("a", "1");
     const list = try d.kvList();
+    defer {
+        for (list) |e| {
+            a.free(e.key);
+            a.free(e.value);
+            a.free(e.created);
+            a.free(e.updated);
+        }
+        a.free(list);
+    }
     try std.testing.expectEqual(@as(usize, 2), list.len);
     try std.testing.expectEqualStrings("a", list[0].key);
     try std.testing.expectEqualStrings("1", list[0].value);
@@ -526,9 +551,7 @@ test "Data.kvScanPrefix returns only prefix-matching entries across multiple pre
     var conn = try db.Db.openMemory();
     defer conn.close();
     try migrations.run(&conn);
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     var app = App{ .allocator = a, .io = std.testing.io, .pool = undefined };
     const d = Data{ .app = &app, .conn = &conn, .io = std.testing.io, .alloc = a };
 
@@ -537,6 +560,15 @@ test "Data.kvScanPrefix returns only prefix-matching entries across multiple pre
     try d.kvSet("welcome_banner", "hi"); // unrelated key — must NOT match
 
     const hits = try d.kvScanPrefix(&.{ "flag:", "exp:" });
+    defer {
+        for (hits) |e| {
+            a.free(e.key);
+            a.free(e.value);
+            a.free(e.created);
+            a.free(e.updated);
+        }
+        a.free(hits);
+    }
     try std.testing.expectEqual(@as(usize, 2), hits.len);
     // Ordered by key: "exp:..." sorts before "flag:...".
     try std.testing.expectEqualStrings("exp:layout:weights", hits[0].key);
@@ -553,31 +585,37 @@ test "Data.create then findById round-trips a record" {
     try conn.exec("PRAGMA foreign_keys=ON;");
     try migrations.run(&conn);
 
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const io = std.testing.io;
 
     const fields = [_]schema.Field{
         .{ .id = "f1", .name = "title", .required = true, .options = .{ .text = .{} } },
     };
-    _ = try collections.create(a, io, &conn, .{ .id = "", .name = "posts", .fields = &fields });
+    var col = try collections.create(a, io, &conn, .{ .id = "", .name = "posts", .fields = &fields });
+    defer col.deinit(a);
 
     var app = App{ .allocator = a, .io = io, .pool = undefined };
     const d = Data{ .app = &app, .conn = &conn, .io = io, .alloc = a };
 
     var obj: std.json.ObjectMap = .empty;
+    defer obj.deinit(a);
     try obj.put(a, "title", .{ .string = "hello" });
     const created = try d.create("posts", .{ .object = obj });
+    defer records.freeRecord(a, created);
     const id = created.object.get("id").?.string;
 
     const found = (try d.findById("posts", id)).?;
+    defer records.freeRecord(a, found);
     try std.testing.expectEqualStrings("hello", found.object.get("title").?.string);
 }
 
 test "Data record methods round-trip create/findById/update/list/delete" {
     // Functional coverage on an arena for all five record methods (the leak-clean GPA-path
     // regression for these lives in events.zig, driven through a WriterData handle).
+    // Stays on an arena: the `d.list` call below drives the un-migrated `query/` subsystem
+    // (lexer/parser/compiler/sort/keyset/tenancy), which leaks its own SQL/sort/cursor scratch
+    // on a raw allocator (pre-existing; see `src/records.zig` allowlist entry / the `query/*`
+    // set in `scripts/allocator-allowlist.txt`).
     var conn = try db.Db.openMemory();
     defer conn.close();
     try conn.exec("PRAGMA foreign_keys=ON;");
@@ -627,6 +665,15 @@ test "Data typed I/O: createAs/getAs/updateAs round-trip through T" {
     try conn.exec("PRAGMA foreign_keys=ON;");
     try migrations.run(&conn);
 
+    // Stays on an arena: `createAs`/`getAs`/`updateAs` each parse the intermediate
+    // `std.json.Value` returned by `create`/`findById`/`update` into `T` via
+    // `parseFromValueLeaky`, but never free that intermediate `Value` themselves
+    // (no `records.freeRecord`/deinit call on `created`/`found`/`updated` inside those
+    // three Data methods) — a real, pre-existing leak on the raw-allocator path (each
+    // owned string in the discarded intermediate record: id/title/price/created/updated
+    // etc.), confirmed here (46 leaked allocations) while attempting this conversion.
+    // Out of scope to fix here (test-only conversion; the fix belongs in `data.zig`'s
+    // non-test `createAs`/`getAs`/`updateAs`) — reported instead of forced.
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -760,15 +807,14 @@ test "Data.create on an unknown collection errors; findById collapses to null" {
     try conn.exec("PRAGMA foreign_keys=ON;");
     try migrations.run(&conn);
 
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const io = std.testing.io;
 
     var app = App{ .allocator = a, .io = io, .pool = undefined };
     const d = Data{ .app = &app, .conn = &conn, .io = io, .alloc = a };
 
     var obj: std.json.ObjectMap = .empty;
+    defer obj.deinit(a);
     try obj.put(a, "title", .{ .string = "hello" });
     try std.testing.expectError(error.UnknownCollection, d.create("nope", .{ .object = obj }));
 
@@ -786,9 +832,7 @@ test "queryAs maps result columns to struct fields BY NAME, not position" {
         \\INSERT INTO orders (id, total, note, paid) VALUES
         \\ (1, 10.5, 'first', 1), (2, 99.0, 'second', 0), (3, 4.0, 'third', 1);
     );
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
 
     // Field order is DELIBERATELY unlike the SELECT column order, and `label` maps to an
     // `AS`-aliased column — so a correct result proves name-mapping, not position. `descr`
@@ -801,6 +845,10 @@ test "queryAs maps result columns to struct fields BY NAME, not position" {
         id: i64,
     };
     const rows = try queryAs(Row, &conn, a, "SELECT id, total, note AS label, paid, note AS descr FROM orders WHERE total > ?1 ORDER BY id;", .{@as(f64, 6.0)});
+    defer {
+        for (rows) |r| a.free(r.label);
+        a.free(rows);
+    }
 
     try std.testing.expectEqual(@as(usize, 2), rows.len);
     try std.testing.expectEqual(@as(i64, 1), rows[0].id);
@@ -817,12 +865,14 @@ test "queryAs optional field: NULL → null, present → value" {
     defer conn.close();
     try conn.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, note TEXT);");
     try conn.exec("INSERT INTO t (id, note) VALUES (1, 'has'), (2, NULL);");
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
 
     const Row = struct { id: i64, note: ?[]const u8 };
     const rows = try queryAs(Row, &conn, a, "SELECT id, note FROM t ORDER BY id;", .{});
+    defer {
+        for (rows) |r| if (r.note) |n| a.free(n);
+        a.free(rows);
+    }
     try std.testing.expectEqual(@as(usize, 2), rows.len);
     try std.testing.expectEqualStrings("has", rows[0].note.?);
     try std.testing.expect(rows[1].note == null);
@@ -833,13 +883,12 @@ test "queryAs optional field with NO matching column decodes to null" {
     defer conn.close();
     try conn.exec("CREATE TABLE t (id INTEGER PRIMARY KEY);");
     try conn.exec("INSERT INTO t (id) VALUES (7);");
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
 
     // `missing` has no column in the SELECT; being optional, it resolves to null (not an error).
     const Row = struct { id: i64, missing: ?[]const u8 };
     const rows = try queryAs(Row, &conn, a, "SELECT id FROM t;", .{});
+    defer a.free(rows);
     try std.testing.expectEqual(@as(usize, 1), rows.len);
     try std.testing.expectEqual(@as(i64, 7), rows[0].id);
     try std.testing.expect(rows[0].missing == null);
@@ -850,9 +899,7 @@ test "queryAs: a non-optional field with no matching column errors (even with ze
     defer conn.close();
     try conn.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT);");
     // No rows inserted — the missing-column check still fires off the column description.
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
 
     const Row = struct { id: i64, absent: []const u8 };
     try std.testing.expectError(error.ColumnNotFound, queryAs(Row, &conn, a, "SELECT id, name FROM t;", .{}));
@@ -866,13 +913,15 @@ test "queryAs binds positional args of each supported type (text/int/float/bool)
         \\INSERT INTO t (id, name, qty, price, active) VALUES
         \\ (1, 'keep', 5, 2.50, 1), (2, 'skip', 5, 2.50, 1), (3, 'keep', 9, 9.99, 0);
     );
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
 
     const Row = struct { id: i64, name: []const u8 };
     // text ?1, int ?2, float ?3, bool ?4 — all four bound positionally in one query.
     const rows = try queryAs(Row, &conn, a, "SELECT id, name FROM t WHERE name = ?1 AND qty = ?2 AND price = ?3 AND active = ?4;", .{ @as([]const u8, "keep"), @as(i64, 5), @as(f64, 2.50), true });
+    defer {
+        for (rows) |r| a.free(r.name);
+        a.free(rows);
+    }
     try std.testing.expectEqual(@as(usize, 1), rows.len);
     try std.testing.expectEqual(@as(i64, 1), rows[0].id);
     try std.testing.expectEqualStrings("keep", rows[0].name);
@@ -883,25 +932,32 @@ test "queryAs: string-literal and optional args bind correctly" {
     defer conn.close();
     try conn.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT);");
     try conn.exec("INSERT INTO t (id, name) VALUES (1, 'ada'), (2, 'grace');");
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
 
     const Row = struct { id: i64, name: []const u8 };
     // A bare string literal (`*const [3:0]u8`) coerces to bound TEXT.
     const rows = try queryAs(Row, &conn, a, "SELECT id, name FROM t WHERE name = ?1;", .{"ada"});
+    defer {
+        for (rows) |r| a.free(r.name);
+        a.free(rows);
+    }
     try std.testing.expectEqual(@as(usize, 1), rows.len);
     try std.testing.expectEqualStrings("ada", rows[0].name);
 
     // An optional arg: Some binds the payload…
     const some: ?i64 = 2;
     const r2 = try queryAs(Row, &conn, a, "SELECT id, name FROM t WHERE id = ?1;", .{some});
+    defer {
+        for (r2) |r| a.free(r.name);
+        a.free(r2);
+    }
     try std.testing.expectEqual(@as(usize, 1), r2.len);
     try std.testing.expectEqualStrings("grace", r2[0].name);
 
     // …and null binds SQL NULL (matches no row here).
     const none: ?i64 = null;
     const r3 = try queryAs(Row, &conn, a, "SELECT id, name FROM t WHERE id = ?1;", .{none});
+    defer a.free(r3);
     try std.testing.expectEqual(@as(usize, 0), r3.len);
 }
 
@@ -912,15 +968,17 @@ test "queryAs: a JOIN with an aliased column across tables decodes by name" {
     try conn.exec("CREATE TABLE orders (id INTEGER PRIMARY KEY, customer_id INTEGER, total REAL);");
     try conn.exec("INSERT INTO customers (id, email) VALUES (10, 'a@x.io');");
     try conn.exec("INSERT INTO orders (id, customer_id, total) VALUES (1, 10, 42.0);");
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
 
     const OrderRow = struct { id: i64, total: f64, customer_email: []const u8 };
     const rows = try queryAs(OrderRow, &conn, a,
         \\SELECT o.id, o.total, c.email AS customer_email
         \\FROM orders o JOIN customers c ON c.id = o.customer_id;
     , .{});
+    defer {
+        for (rows) |r| a.free(r.customer_email);
+        a.free(rows);
+    }
     try std.testing.expectEqual(@as(usize, 1), rows.len);
     try std.testing.expectEqual(@as(i64, 1), rows[0].id);
     try std.testing.expectEqual(@as(f64, 42.0), rows[0].total);
@@ -931,9 +989,7 @@ test "queryAs: a u64 arg above i64 max errors instead of panicking" {
     var conn = try db.Db.openMemory();
     defer conn.close();
     try conn.exec("CREATE TABLE t (id INTEGER PRIMARY KEY);");
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
 
     const Row = struct { id: i64 };
     // A u64 beyond i64 max would `@intCast`-panic; `std.math.cast` makes it a loud error.
@@ -942,7 +998,8 @@ test "queryAs: a u64 arg above i64 max errors instead of panicking" {
 
     // A u64 that DOES fit i64 binds fine (proves the cast, not a blanket reject).
     const fits: u64 = 7;
-    _ = try queryAs(Row, &conn, a, "SELECT id FROM t WHERE id = ?1;", .{fits});
+    const rows = try queryAs(Row, &conn, a, "SELECT id FROM t WHERE id = ?1;", .{fits});
+    a.free(rows);
 }
 
 test "queryAs: a column value that overflows a narrow/unsigned field errors instead of panicking" {
@@ -951,9 +1008,7 @@ test "queryAs: a column value that overflows a narrow/unsigned field errors inst
     try conn.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER, small INTEGER);");
     // n=300 overflows a u8; small=-5 is negative into an unsigned field.
     try conn.exec("INSERT INTO t (id, n, small) VALUES (1, 300, -5), (2, 42, 7);");
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
 
     // Reading 300 into a u8 field would `@intCast`-panic in a Safe build; the checked cast
     // makes it a loud, recoverable error.
@@ -966,6 +1021,7 @@ test "queryAs: a column value that overflows a narrow/unsigned field errors inst
 
     // A value that FITS the narrow field decodes correctly (proves it's a real cast, not a reject).
     const rows = try queryAs(Narrow, &conn, a, "SELECT id, n FROM t WHERE id = ?1;", .{@as(i64, 2)});
+    defer a.free(rows);
     try std.testing.expectEqual(@as(usize, 1), rows.len);
     try std.testing.expectEqual(@as(u8, 42), rows[0].n);
 }
