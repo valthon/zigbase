@@ -111,7 +111,142 @@ pub const Collection = struct {
     options: CollectionOptions = .{},
     created: []const u8 = "",
     updated: []const u8 = "",
+
+    /// Free a FULLY-OWNED collection graph — exactly the shape returned by
+    /// `collections.get`/`create`/`update` (every string/slice duped onto `alloc`
+    /// by the `*FromJson` loaders). It mirrors those allocations one-for-one.
+    ///
+    /// Do NOT call this on a comptime/borrowed collection (a `.collections` literal,
+    /// a colcache lease, or a hand-assembled mixed-ownership value): those alias
+    /// static string literals, and freeing a static pointer is undefined behavior.
+    ///
+    /// AUTH collections: `get` prepends `authSystemFields()` — a comptime `const` —
+    /// via `injectAuthFields`. Those leading `authSystemFields().len` entries are
+    /// static (their id/name/options point at literals), so they are SKIPPED here;
+    /// only the injected array backing (owned) and the user fields after it are
+    /// freed. `Allocator.free` is a no-op on an empty slice, so empty owned slices
+    /// (e.g. a base collection's `identityFields`/`providers`) need no guard.
+    pub fn deinit(self: Collection, alloc: std.mem.Allocator) void {
+        alloc.free(self.id);
+        alloc.free(self.name);
+        alloc.free(self.created);
+        alloc.free(self.updated);
+        freeOptStrOwned(alloc, self.listRule);
+        freeOptStrOwned(alloc, self.viewRule);
+        freeOptStrOwned(alloc, self.createRule);
+        freeOptStrOwned(alloc, self.updateRule);
+        freeOptStrOwned(alloc, self.deleteRule);
+
+        for (self.indexes) |idx| {
+            alloc.free(idx.name);
+            freeStrArrayOwned(alloc, idx.fields);
+            freeOptStrOwned(alloc, idx.where);
+        }
+        alloc.free(self.indexes);
+
+        // The leading auth system fields are static (from authSystemFields()); skip
+        // them and free only the user fields, then the (owned) slice backing.
+        const skip = if (self.type == .auth) authSystemFields().len else 0;
+        for (self.fields[skip..]) |f| {
+            alloc.free(f.id);
+            alloc.free(f.name);
+            switch (f.options) {
+                .text => |t| freeOptStrOwned(alloc, t.pattern),
+                .date => |d| {
+                    freeOptStrOwned(alloc, d.min);
+                    freeOptStrOwned(alloc, d.max);
+                },
+                .select => |s| freeStrArrayOwned(alloc, s.values),
+                .relation => |r| alloc.free(r.targetCollectionId),
+                .file => |fo| if (fo.mimeTypes) |m| freeStrArrayOwned(alloc, m),
+                else => {},
+            }
+        }
+        alloc.free(self.fields);
+
+        deinitOptions(alloc, self.options);
+    }
 };
+
+/// Free an optional owned string (no-op on null or an empty slice).
+fn freeOptStrOwned(alloc: std.mem.Allocator, s: ?[]const u8) void {
+    if (s) |v| alloc.free(v);
+}
+
+/// Free an owned string array and every element (no-op on an empty slice).
+fn freeStrArrayOwned(alloc: std.mem.Allocator, arr: []const []const u8) void {
+    for (arr) |s| alloc.free(s);
+    alloc.free(arr);
+}
+
+/// Dupe a string array and every element onto `alloc` (the inverse of freeStrArrayOwned).
+fn dupeStrArrayOwned(alloc: std.mem.Allocator, arr: []const []const u8) ![]const []const u8 {
+    const out = try alloc.alloc([]const u8, arr.len);
+    errdefer alloc.free(out);
+    var n: usize = 0;
+    errdefer for (out[0..n]) |s| alloc.free(s);
+    while (n < arr.len) : (n += 1) out[n] = try alloc.dupe(u8, arr[n]);
+    return out;
+}
+
+/// A default `CollectionOptions` whose `identityFields` is OWNED (a dupe of the static default),
+/// so the result is a fully-owned graph `Collection.deinit` can free. Used by `optionsFromJson`
+/// as the starting point / malformed-input fallback.
+fn defaultOwnedOptions(alloc: std.mem.Allocator) !CollectionOptions {
+    var opts = CollectionOptions{};
+    opts.auth.identityFields = try dupeStrArrayOwned(alloc, opts.auth.identityFields);
+    return opts;
+}
+
+fn freeAbilityOwned(alloc: std.mem.Allocator, ab: ?@import("authz/abilities.zig").Ability) void {
+    if (ab) |a| {
+        alloc.free(a.relationship.via);
+        alloc.free(a.relationship.min_role);
+    }
+}
+
+/// Free the owned strings/slices in a fully-owned `CollectionOptions` (mirrors
+/// `optionsFromJson`). See `Collection.deinit`.
+fn deinitOptions(alloc: std.mem.Allocator, o: CollectionOptions) void {
+    freeOptStrOwned(alloc, o.ttl_field);
+    freeOptStrOwned(alloc, o.tenant_field);
+    if (o.abilities) |ab| {
+        freeAbilityOwned(alloc, ab.view);
+        freeAbilityOwned(alloc, ab.update);
+        freeAbilityOwned(alloc, ab.delete);
+        freeAbilityOwned(alloc, ab.create);
+    }
+
+    freeStrArrayOwned(alloc, o.auth.identityFields);
+    for (o.auth.oauth2.providers) |p| {
+        alloc.free(p.name);
+        alloc.free(p.clientId);
+        alloc.free(p.clientSecret);
+        freeStrArrayOwned(alloc, p.redirectUrls);
+        freeOptStrOwned(alloc, p.authURL);
+        freeOptStrOwned(alloc, p.tokenURL);
+        freeOptStrOwned(alloc, p.userinfoURL);
+        freeOptStrOwned(alloc, p.discoveryURL);
+        if (p.scopes) |sc| freeStrArrayOwned(alloc, sc);
+    }
+    alloc.free(o.auth.oauth2.providers);
+
+    // methods: password/otp carry no owned strings; magic_link/webauthn do. On a
+    // get/create/update reload, optionsToJson always re-emits every string field of
+    // a present method, so optionsFromJson always dupes them (never leaves a static
+    // default) — freeing them is exact. Absent methods stay null and are skipped.
+    if (o.auth.methods.magic_link) |ml| {
+        alloc.free(ml.redirect_default);
+        freeStrArrayOwned(alloc, ml.redirect_allow);
+    }
+    if (o.auth.methods.webauthn) |wa| {
+        alloc.free(wa.rp_id);
+        alloc.free(wa.rp_name);
+        alloc.free(wa.origin);
+        alloc.free(wa.credentials_collection);
+    }
+    freeStrArrayOwned(alloc, o.auth.methods.custom);
+}
 
 pub const OAuth2Provider = struct {
     name: []const u8,
@@ -430,11 +565,15 @@ fn rateLimitToJsonAlloc(alloc: std.mem.Allocator, rl: RateLimitOpt) !std.json.Va
 }
 
 pub fn optionsFromJson(alloc: std.mem.Allocator, s: []const u8) !CollectionOptions {
-    const parsed = std.json.parseFromSlice(std.json.Value, alloc, s, .{}) catch return .{};
+    const parsed = std.json.parseFromSlice(std.json.Value, alloc, s, .{}) catch return try defaultOwnedOptions(alloc);
     defer parsed.deinit();
     const root = parsed.value;
-    if (root != .object) return .{};
-    var opts = CollectionOptions{};
+    if (root != .object) return try defaultOwnedOptions(alloc);
+    // `identityFields` must be OWNED for the whole options graph to be freeable by
+    // Collection.deinit — otherwise a stored options JSON without an `auth` block (a base
+    // collection, or a system collection) would leave the static `&.{"email"}` default in place,
+    // which deinit would then try (and fail) to free. Start owned; a parsed value replaces it below.
+    var opts = try defaultOwnedOptions(alloc);
     // `ttl` lives at the options root (sibling of `auth`); parse it regardless of
     // whether the `auth` block is present.
     if (root.object.get("ttl")) |tv| if (tv == .object) if (tv.object.get("field")) |fv| if (fv == .string) {
@@ -459,7 +598,10 @@ pub fn optionsFromJson(alloc: std.mem.Allocator, s: []const u8) !CollectionOptio
     if (av.object.get("identityFields")) |idv| if (idv == .array) {
         var list: std.ArrayList([]const u8) = .empty;
         for (idv.array.items) |it| if (it == .string) try list.append(alloc, try alloc.dupe(u8, it.string));
-        if (list.items.len > 0) opts.auth.identityFields = try list.toOwnedSlice(alloc);
+        if (list.items.len > 0) {
+            freeStrArrayOwned(alloc, opts.auth.identityFields); // free the owned default before replacing
+            opts.auth.identityFields = try list.toOwnedSlice(alloc);
+        } else list.deinit(alloc);
     };
     if (av.object.get("minPasswordLength")) |mv| if (mv == .integer) {
         opts.auth.minPasswordLength = std.math.cast(u8, mv.integer) orelse 8;
@@ -523,6 +665,10 @@ pub fn optionsFromJson(alloc: std.mem.Allocator, s: []const u8) !CollectionOptio
         };
         if (mo.get("magic_link")) |mlv| if (mlv == .object) {
             var ml = MagicLinkMethodOpts{};
+            // Own the `"/"` default up-front so the options graph is fully freeable by
+            // Collection.deinit even when the JSON omits `redirect_default` — don't rely on
+            // optionsToJson always re-emitting it (same discipline as identityFields above).
+            ml.redirect_default = try alloc.dupe(u8, ml.redirect_default);
             if (mlv.object.get("ttl_s")) |x| if (x == .integer) {
                 ml.ttl_s = x.integer;
             };
@@ -531,6 +677,7 @@ pub fn optionsFromJson(alloc: std.mem.Allocator, s: []const u8) !CollectionOptio
             };
             if (mlv.object.get("rate_limit")) |rlv| ml.rate_limit = rateLimitFromJson(rlv);
             if (mlv.object.get("redirect_default")) |x| if (x == .string) {
+                alloc.free(ml.redirect_default); // free the owned default before replacing
                 ml.redirect_default = try alloc.dupe(u8, x.string);
             };
             if (mlv.object.get("redirect_allow")) |x| if (x == .array) {
@@ -912,6 +1059,7 @@ fn fieldToValue(alloc: std.mem.Allocator, f: Field) !Value {
     try obj.put(alloc, "unique", jBool(f.unique));
     try obj.put(alloc, "encrypted", jBool(f.encrypted));
     try obj.put(alloc, "searchable", jBool(f.searchable));
+    try obj.put(alloc, "hidden", jBool(f.hidden));
     try obj.put(alloc, "type", jStr(@tagName(std.meta.activeTag(f.options))));
 
     var opts: ObjectMap = .empty;
@@ -1130,6 +1278,7 @@ fn fieldFromValue(alloc: std.mem.Allocator, v: Value) !Field {
         .name = name,
         .required = getBool(v, "required", false),
         .unique = getBool(v, "unique", false),
+        .hidden = getBool(v, "hidden", false),
         .encrypted = getBool(v, "encrypted", false),
         .searchable = getBool(v, "searchable", false),
         .options = try optionsFromValue(alloc, t, opts),
@@ -1542,6 +1691,34 @@ test "abilities deserialization fails closed on a malformed (non-string) min_rol
     try std.testing.expectEqualStrings("", ok.relationship.min_role);
     const pok = (try abilities_mod.abilityPredicate(a, col, ok, &rctx, dialect.Dialect.sqlite)).?;
     try std.testing.expectEqualStrings("\"posts\".\"account\" IN (?)", pok.sql);
+}
+
+test "optionsFromJson yields a fully-owned graph deinitOptions frees (methods + abilities)" {
+    // Guards the deinit paths the Collection leak tests don't reach: magic_link/webauthn method
+    // strings, methods.custom, and abilities via/min_role. Run under the RAW checking allocator:
+    // any static/borrowed pointer freed here (e.g. a leftover default) crashes the DebugAllocator,
+    // and any unfreed dupe leaks.
+    const a = std.testing.allocator;
+    const j =
+        \\{"auth":{"identityFields":["email","username"],
+        \\ "methods":{
+        \\   "magic_link":{"redirect_default":"/app","redirect_allow":["/a","/b/"]},
+        \\   "webauthn":{"rp_id":"x.dev","rp_name":"X","origin":"https://x.dev","credentials_collection":"creds"},
+        \\   "custom":["slug_a","slug_b"]}},
+        \\ "abilities":{"view":{"via":"owner","min_role":"admin"},"delete":{"via":"team"}}}
+    ;
+    const opts = try optionsFromJson(a, j);
+    deinitOptions(a, opts);
+}
+
+test "optionsFromJson: a magic_link block omitting redirect_default is still freeable" {
+    // The "/" default is a static literal; the loader must OWN it up-front (not rely on
+    // optionsToJson re-emitting it) so deinit never frees a static pointer. Without that fix this
+    // test crashes the checking allocator on the free.
+    const a = std.testing.allocator;
+    const opts = try optionsFromJson(a, "{\"auth\":{\"methods\":{\"magic_link\":{\"ttl_s\":60}}}}");
+    try std.testing.expectEqualStrings("/", opts.auth.methods.magic_link.?.redirect_default);
+    deinitOptions(a, opts);
 }
 
 test "validate rejects an auth collection with a non-identifier identity field" {
