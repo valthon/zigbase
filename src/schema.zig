@@ -599,8 +599,11 @@ pub fn optionsFromJson(alloc: std.mem.Allocator, s: []const u8) !CollectionOptio
         var list: std.ArrayList([]const u8) = .empty;
         for (idv.array.items) |it| if (it == .string) try list.append(alloc, try alloc.dupe(u8, it.string));
         if (list.items.len > 0) {
-            freeStrArrayOwned(alloc, opts.auth.identityFields); // free the owned default before replacing
-            opts.auth.identityFields = try list.toOwnedSlice(alloc);
+            // Acquire the replacement BEFORE freeing the owned default, so an OOM in
+            // toOwnedSlice leaves `identityFields` pointing at valid memory (never a dangle).
+            const owned = try list.toOwnedSlice(alloc);
+            freeStrArrayOwned(alloc, opts.auth.identityFields);
+            opts.auth.identityFields = owned;
         } else list.deinit(alloc);
     };
     if (av.object.get("minPasswordLength")) |mv| if (mv == .integer) {
@@ -677,8 +680,10 @@ pub fn optionsFromJson(alloc: std.mem.Allocator, s: []const u8) !CollectionOptio
             };
             if (mlv.object.get("rate_limit")) |rlv| ml.rate_limit = rateLimitFromJson(rlv);
             if (mlv.object.get("redirect_default")) |x| if (x == .string) {
-                alloc.free(ml.redirect_default); // free the owned default before replacing
-                ml.redirect_default = try alloc.dupe(u8, x.string);
+                // Acquire before freeing the owned default (OOM-safe: no dangling pointer).
+                const owned = try alloc.dupe(u8, x.string);
+                alloc.free(ml.redirect_default);
+                ml.redirect_default = owned;
             };
             if (mlv.object.get("redirect_allow")) |x| if (x == .array) {
                 var list: std.ArrayList([]const u8) = .empty;
