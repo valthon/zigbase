@@ -435,23 +435,28 @@ test "create persists a collection and builds its physical table" {
     var d = try db.Db.openMemory();
     defer d.close();
     try migrations.run(&d);
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
+    const a = std.testing.allocator;
     const fields = [_]schema.Field{
         .{ .id = "f1", .name = "title", .required = true, .options = .{ .text = .{} } },
         .{ .id = "f2", .name = "price", .options = .{ .number = .{ .mode = .fixed, .scale = 2 } } },
     };
     const def = schema.Collection{ .id = "", .name = "posts", .fields = &fields };
-    const created = try create(arena.allocator(), std.testing.io, &d, def);
+    const created = try create(a, std.testing.io, &d, def);
+    defer created.deinit(a);
     try std.testing.expect(created.id.len == 15);
     var st = try d.prepare("SELECT COUNT(*) FROM pragma_table_info('posts') WHERE name IN ('id','created','updated','title','price');");
     defer st.finalize();
     try std.testing.expect((try st.step()));
     try std.testing.expectEqual(@as(i64, 5), st.columnInt(0));
-    const got = (try get(arena.allocator(), &d, "posts")).?;
+    const got = (try get(a, &d, "posts")).?;
+    defer got.deinit(a);
     try std.testing.expectEqualStrings("posts", got.name);
     try std.testing.expectEqual(@as(usize, 2), got.fields.len);
-    const all = try list(arena.allocator(), &d);
+    const all = try list(a, &d);
+    defer {
+        for (all) |c| c.deinit(a);
+        a.free(all);
+    }
     var user_count: usize = 0;
     for (all) |c| if (!c.system) {
         user_count += 1;
@@ -463,22 +468,24 @@ test "create rejects an invalid collection" {
     var d = try db.Db.openMemory();
     defer d.close();
     try migrations.run(&d);
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
+    const a = std.testing.allocator;
     const def = schema.Collection{ .id = "", .name = "1bad", .fields = &.{} };
-    try std.testing.expectError(error.Validation, create(arena.allocator(), std.testing.io, &d, def));
+    try std.testing.expectError(error.Validation, create(a, std.testing.io, &d, def));
+    if (last_errors) |le| {
+        a.free(le);
+        last_errors = null;
+    }
 }
 
 test "update rebuilds table and preserves data across a field rename" {
     var d = try db.Db.openMemory();
     defer d.close();
     try migrations.run(&d);
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
 
     const f0 = [_]schema.Field{.{ .id = "f1", .name = "title", .options = .{ .text = .{} } }};
     const created = try create(a, std.testing.io, &d, .{ .id = "", .name = "posts", .fields = &f0 });
+    defer created.deinit(a);
     try d.exec("INSERT INTO posts (id, created, updated, title) VALUES ('r1','t','t','hello');");
 
     const f1 = [_]schema.Field{
@@ -487,7 +494,8 @@ test "update rebuilds table and preserves data across a field rename" {
     };
     var newdef = created;
     newdef.fields = &f1;
-    _ = try update(a, std.testing.io, &d, created.id, newdef);
+    const updated = try update(a, std.testing.io, &d, created.id, newdef);
+    defer updated.deinit(a);
 
     var st = try d.prepare("SELECT headline, views FROM posts WHERE id='r1';");
     defer st.finalize();
@@ -500,12 +508,14 @@ test "create rejects an index name containing SQL (injection guard)" {
     var d = try db.Db.openMemory();
     defer d.close();
     try migrations.run(&d);
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const evil = [_]schema.Index{.{ .name = "x\" ON \"posts\" (\"id\"); DROP TABLE \"_collections\"; --", .fields = &.{"id"}, .unique = false }};
     const def = schema.Collection{ .id = "", .name = "posts", .fields = &.{}, .indexes = &evil };
     try std.testing.expectError(error.Validation, create(a, std.testing.io, &d, def));
+    if (last_errors) |le| {
+        a.free(le);
+        last_errors = null;
+    }
     // _collections still exists
     var st = try d.prepare("SELECT COUNT(*) FROM \"_collections\";");
     defer st.finalize();
@@ -516,10 +526,9 @@ test "create rejects a duplicate collection name with Conflict" {
     var d = try db.Db.openMemory();
     defer d.close();
     try migrations.run(&d);
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    _ = try create(a, std.testing.io, &d, .{ .id = "", .name = "posts", .fields = &.{} });
+    const a = std.testing.allocator;
+    const created = try create(a, std.testing.io, &d, .{ .id = "", .name = "posts", .fields = &.{} });
+    defer created.deinit(a);
     try std.testing.expectError(error.Conflict, create(a, std.testing.io, &d, .{ .id = "", .name = "posts", .fields = &.{} }));
 }
 
@@ -527,16 +536,19 @@ test "unique field enforces uniqueness at the db level" {
     var d = try db.Db.openMemory();
     defer d.close();
     try migrations.run(&d);
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const fields = [_]schema.Field{.{ .id = "f1", .name = "slug", .unique = true, .options = .{ .text = .{} } }};
-    _ = try create(a, std.testing.io, &d, .{ .id = "", .name = "posts", .fields = &fields });
+    const created = try create(a, std.testing.io, &d, .{ .id = "", .name = "posts", .fields = &fields });
+    defer created.deinit(a);
     try d.exec("INSERT INTO posts (id, created, updated, slug) VALUES ('r1','t','t','x');");
     try std.testing.expectError(db.DbError.ExecFailed, d.exec("INSERT INTO posts (id, created, updated, slug) VALUES ('r2','t','t','x');"));
 }
 
 test "auth collection gets system columns; passwordHash hidden in metadata" {
+    // NOT converted to the raw allocator: schema.collectionToJson builds intermediate
+    // ObjectMaps/parse-trees (root, fparsed/iparsed/oparsed scratch) that it never frees itself —
+    // it is only ever leak-correct under an arena. Left arena-wrapped per task instructions rather
+    // than touching that non-test code.
     var d = try db.Db.openMemory();
     defer d.close();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -562,12 +574,11 @@ test "auth collection gets system columns; passwordHash hidden in metadata" {
 test "updating an auth collection preserves its auth columns (credentials not dropped)" {
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     try migrations.run(&d);
     const f0 = [_]schema.Field{.{ .id = "f1", .name = "bio", .options = .{ .text = .{} } }};
     const created = try create(a, std.testing.io, &d, .{ .id = "", .name = "users", .type = .auth, .fields = &f0 });
+    defer created.deinit(a);
     // seed a credential row directly
     try d.exec("INSERT INTO users (id,created,updated,email,passwordHash,tokenKey,verified) VALUES ('u1','t','t','a@b.c','$argon2id$hash','tk',1);");
 
@@ -578,7 +589,8 @@ test "updating an auth collection preserves its auth columns (credentials not dr
     };
     var newdef = created;
     newdef.fields = &f1;
-    _ = try update(a, std.testing.io, &d, created.id, newdef);
+    const updated = try update(a, std.testing.io, &d, created.id, newdef);
+    defer updated.deinit(a);
 
     // the credential survives the rebuild
     var st = try d.prepare("SELECT email, passwordHash, tokenKey, verified, nickname FROM users WHERE id='u1';");
@@ -593,13 +605,13 @@ test "delete drops the table; delete refuses when referenced by a relation" {
     var d = try db.Db.openMemory();
     defer d.close();
     try migrations.run(&d);
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
 
     const users = try create(a, std.testing.io, &d, .{ .id = "", .name = "users", .fields = &.{} });
+    defer users.deinit(a);
     const pf = [_]schema.Field{.{ .id = "f1", .name = "author", .options = .{ .relation = .{ .targetCollectionId = users.id, .maxSelect = 1 } } }};
-    _ = try create(a, std.testing.io, &d, .{ .id = "", .name = "posts", .fields = &pf });
+    const posts = try create(a, std.testing.io, &d, .{ .id = "", .name = "posts", .fields = &pf });
+    defer posts.deinit(a);
 
     try std.testing.expectError(error.Conflict, delete(a, &d, "users"));
     try delete(a, &d, "posts");
@@ -611,15 +623,14 @@ test "auth collection enforces identity uniqueness via partial unique index, all
     var d = try db.Db.openMemory();
     defer d.close();
     try @import("migrations.zig").run(&d);
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    _ = try create(a, std.testing.io, &d, .{
+    const a = std.testing.allocator;
+    const created = try create(a, std.testing.io, &d, .{
         .id = "",
         .name = "members",
         .type = .auth,
         .fields = &[_]schema.Field{.{ .id = "f1", .name = "bio", .options = .{ .text = .{} } }},
     });
+    defer created.deinit(a);
     // two distinct emails ok
     try d.exec("INSERT INTO \"members\" (\"id\",\"created\",\"updated\",\"email\") VALUES ('a','','','x@y.z');");
     try d.exec("INSERT INTO \"members\" (\"id\",\"created\",\"updated\",\"email\") VALUES ('b','','','q@y.z');");
