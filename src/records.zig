@@ -792,35 +792,33 @@ fn seedPosts(d: *db.Db, a: std.mem.Allocator) !schema.Collection {
 
 /// Free a SELF-CONTAINED scalar record `Value` — the shape `rowToObject`/`rowToObjectAtRest`
 /// return in `keys == null` (self-contained) mode, i.e. what `get`/`getAtRest`/`create`/`update`
-/// hand back. In that mode EVERY top-level key is OWNED (duped onto `a`) alongside every scalar
-/// `.string` VALUE, so this frees both, then the `ObjectMap` backing. Non-string scalar values
-/// (int/float/bool/null) carry no allocation and are skipped.
+/// hand back. In that mode EVERY top-level key is OWNED (duped onto `a`), and every field VALUE is
+/// OWNED on `a` — a scalar `.string`, OR a nested `json`/multi-value sub-tree (`.object`/`.array`)
+/// that `values.readValue` now deep-clones onto `a`. `values.freeValue` frees each value recursively
+/// (nested keys/strings/maps included); non-string scalars (int/float/bool/null) carry no allocation.
 ///
-/// NOT valid on a record containing a `json` or multi-value field: `values.readValue` leaves those
-/// sub-trees arena-scoped (the `Parsed` wrapper is discarded), so they are not individually
-/// freeable — such records still require an arena. NOT valid on an INTERNED-mode list item either:
-/// those BORROW their keys from the `ListResult` keyset (use `ListResult.deinit`). Intended for
-/// tests and non-arena callers on scalar collections.
+/// NOT valid on an INTERNED-mode list item: those BORROW their keys from the `ListResult` keyset
+/// (use `ListResult.deinit`). Intended for tests and non-arena callers.
 pub fn freeRecord(a: std.mem.Allocator, rec: std.json.Value) void {
     if (rec != .object) return;
     var obj = rec.object;
     var it = obj.iterator();
     while (it.next()) |e| {
-        a.free(e.key_ptr.*); // owned in self-contained mode
-        if (e.value_ptr.* == .string) a.free(e.value_ptr.*.string);
+        a.free(e.key_ptr.*); // owned key (self-contained mode)
+        values.freeValue(a, e.value_ptr.*); // owned value: scalar string OR nested json/array tree
     }
     obj.deinit(a);
 }
 
 /// Free one INTERNED-mode record (a `list` item whose keys BORROW from the shared keyset): its
-/// owned scalar `.string` VALUES + the `ObjectMap` backing, but NOT its keys (the keyset owns
-/// them). Same json/multi-value caveat as `freeRecord`. Used by `ListResult.deinit` and to free
-/// the `list` probe (N+1) sentinel row that is fetched to detect "has more" but never returned.
+/// owned field VALUES (scalar strings AND nested json/multi-value sub-trees, via `values.freeValue`)
+/// + the `ObjectMap` backing, but NOT its keys (the keyset owns them). Used by `ListResult.deinit`
+/// and to free the `list` probe (N+1) sentinel row fetched to detect "has more" but never returned.
 fn freeInternedRecord(a: std.mem.Allocator, rec: std.json.Value) void {
     if (rec != .object) return;
     var obj = rec.object;
     var it = obj.iterator();
-    while (it.next()) |e| if (e.value_ptr.* == .string) a.free(e.value_ptr.*.string);
+    while (it.next()) |e| values.freeValue(a, e.value_ptr.*); // key borrowed from keyset; value owned
     obj.deinit(a);
 }
 
@@ -923,6 +921,64 @@ test "freeRecord: a self-contained multi-field get() record frees with zero leak
     freeRecord(a, got);
 }
 
+test "freeRecord: json + multi-value sub-trees are freed recursively (owned graph, zero leaks)" {
+    // RAW std.testing.allocator, no arena. Proves the readValue-owned-tree change end-to-end: a record
+    // over a collection with a `json` field (holding a nested object + array of strings) and a
+    // multi-select field round-trips through create + get, and `freeRecord` reclaims the ENTIRE graph
+    // — nested keys, strings, arrays, and maps — exactly once. A leak trips the leak detector; a
+    // double-free (e.g. freeing a shared/aliased sub-value twice, or freeing an interned key) panics.
+    const a = std.testing.allocator;
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try migrations.run(&d);
+    const fields = [_]schema.Field{
+        .{ .id = "f1", .name = "meta", .options = .{ .json = .{} } },
+        .{ .id = "f2", .name = "tags", .options = .{ .select = .{ .values = &.{ "x", "y" }, .maxSelect = 3 } } },
+    };
+    const col = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "docs", .fields = &fields });
+    defer col.deinit(a);
+
+    // Build the input graph. Its container backings are owned by `a`; the string ELEMENTS are
+    // literals (not owned), so the input is torn down by deiniting each container (NOT `freeValue`,
+    // which would try to free the literals). `create` reads the input and returns a fully independent
+    // record (from the INSERT ... RETURNING row), so freeing the input after create is safe.
+    var inner = std.json.Array.init(a);
+    try inner.append(.{ .string = "alpha" });
+    try inner.append(.{ .string = "beta" });
+    var meta: std.json.ObjectMap = .empty;
+    try meta.put(a, "arr", .{ .array = inner });
+    try meta.put(a, "n", .{ .integer = 7 });
+    var tags = std.json.Array.init(a);
+    try tags.append(.{ .string = "x" });
+    try tags.append(.{ .string = "y" });
+    var data: std.json.ObjectMap = .empty;
+    try data.put(a, "meta", .{ .object = meta });
+    try data.put(a, "tags", .{ .array = tags });
+
+    const created = try create(a, std.testing.io, &d, col, .{ .object = data });
+    // Tear down the input containers (bottom-up; literals untouched). `Array` is a Managed ArrayList
+    // (deinit takes no allocator); `ObjectMap` is unmanaged (deinit takes `a`).
+    inner.deinit();
+    meta.deinit(a);
+    tags.deinit();
+    data.deinit(a);
+
+    const rid = try a.dupe(u8, created.object.get("id").?.string);
+    defer a.free(rid);
+    // The created record already carries the owned json/multi sub-trees — free it recursively.
+    freeRecord(a, created);
+
+    // Read it back and assert the nested shape survived the round-trip, then free the whole graph.
+    const got = (try get(a, &d, col, rid)) orelse return error.TestUnexpectedResult;
+    const gmeta = got.object.get("meta").?.object;
+    try std.testing.expectEqual(@as(i64, 7), gmeta.get("n").?.integer);
+    try std.testing.expectEqualStrings("alpha", gmeta.get("arr").?.array.items[0].string);
+    try std.testing.expectEqualStrings("beta", gmeta.get("arr").?.array.items[1].string);
+    try std.testing.expectEqual(@as(usize, 2), got.object.get("tags").?.array.items.len);
+    try std.testing.expectEqualStrings("x", got.object.get("tags").?.array.items[0].string);
+    freeRecord(a, got);
+}
+
 /// Assemble a `ListResult` the way `list` does internally — ONE interned keyset (`buildListKeys`)
 /// shared by every row read via `rowToObject(…, keys)`. Self-freeing of all SQL scratch; the only
 /// escaping allocations are the ListResult's owned graph (keyset + items), reclaimed by its
@@ -977,6 +1033,53 @@ test "ListResult.deinit: interned keyset + item values free exactly once (zero l
         try std.testing.expectEqual(res.keys[3].ptr, item.object.getKey("title").?.ptr);
         try std.testing.expectEqual(@as(usize, 4), item.object.get("price").?.string.len); // "N.00"
         try std.testing.expectEqual(false, item.object.get("active").?.bool);
+    }
+}
+
+test "ListResult.deinit: interned-mode json/multi sub-trees free recursively (zero leaks)" {
+    // RAW std.testing.allocator. Interned-mode counterpart of the freeRecord json/multi proof: every
+    // list item BORROWS its top-level keys from the shared keyset but OWNS its field VALUES — including
+    // the `json`/multi-value sub-trees. `res.deinit(a)` (→ freeInternedRecord → freeValue) must recurse
+    // those sub-trees and free them exactly once, while NEVER freeing the interned top-level keys.
+    const a = std.testing.allocator;
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try migrations.run(&d);
+    const fields = [_]schema.Field{
+        .{ .id = "f1", .name = "meta", .options = .{ .json = .{} } },
+        .{ .id = "f2", .name = "tags", .options = .{ .select = .{ .values = &.{ "x", "y" }, .maxSelect = 3 } } },
+    };
+    const col = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "docs", .fields = &fields });
+    defer col.deinit(a);
+
+    // Two rows, each with a nested json object + a multi-select array.
+    inline for (.{ "a1", "b2" }) |slug| {
+        var inner = std.json.Array.init(a);
+        try inner.append(.{ .string = slug });
+        var meta: std.json.ObjectMap = .empty;
+        try meta.put(a, "arr", .{ .array = inner });
+        var tags = std.json.Array.init(a);
+        try tags.append(.{ .string = "x" });
+        try tags.append(.{ .string = "y" });
+        var data: std.json.ObjectMap = .empty;
+        try data.put(a, "meta", .{ .object = meta });
+        try data.put(a, "tags", .{ .array = tags });
+        const rec = try create(a, std.testing.io, &d, col, .{ .object = data });
+        inner.deinit();
+        meta.deinit(a);
+        tags.deinit();
+        data.deinit(a);
+        freeRecord(a, rec);
+    }
+
+    var res = try assembleListResult(&d, a, col);
+    defer res.deinit(a);
+    try std.testing.expectEqual(@as(usize, 2), res.items.len);
+    for (res.items) |item| {
+        // Top-level keys are interned (borrowed from the keyset); the json sub-tree is owned.
+        try std.testing.expectEqual(res.keys[0].ptr, item.object.getKey("id").?.ptr);
+        try std.testing.expectEqual(@as(usize, 1), item.object.get("meta").?.object.get("arr").?.array.items.len);
+        try std.testing.expectEqual(@as(usize, 2), item.object.get("tags").?.array.items.len);
     }
 }
 
@@ -1711,11 +1814,10 @@ pub const ListResult = struct {
     hasPrev: bool = false,
 
     /// Free a `ListResult` returned by `list` on the SAME allocator `list` was given. Each item's
-    /// keys are BORROWED from the shared keyset, so per item we free only its owned scalar `.string`
-    /// VALUES and its `ObjectMap` backing (NOT its keys — see `freeRecord` for the free-list rationale
-    /// and the json/multi-value caveat); then the keyset (each key + the slice), the `items` slice,
-    /// and the owned cursor tokens. An item holding a `json`/multi-value sub-tree still needs an arena
-    /// (those sub-trees are arena-orphaned by `readValue`), same caveat as `freeRecord`.
+    /// keys are BORROWED from the shared keyset, so per item we free only its owned field VALUES
+    /// (scalar strings AND nested `json`/multi-value sub-trees, via `freeInternedRecord`/`freeValue`)
+    /// and its `ObjectMap` backing (NOT its keys); then the keyset (each key + the slice), the
+    /// `items` slice, and the owned cursor tokens.
     pub fn deinit(self: *ListResult, alloc: std.mem.Allocator) void {
         for (self.items) |rec| freeInternedRecord(alloc, rec);
         for (self.keys) |k| alloc.free(k);
