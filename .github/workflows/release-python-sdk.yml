@@ -33,6 +33,11 @@ jobs:
         working-directory: clients/python
         run: mise exec python@3.13 -- python -m pip install --quiet -e '.[dev,realtime]' build twine
 
+      - name: Pin ruff
+        # Version-sensitive format/lint output: pin the same ruff the CI python-sdk + codegen jobs
+        # pin, so a floating `ruff>=0.8` release can't fail a release cut on formatting alone.
+        run: mise exec python@3.13 -- python -m pip install --quiet ruff==0.15.21
+
       - name: Lint (format)
         working-directory: clients/python
         run: mise exec python@3.13 -- python -m ruff format --check .
