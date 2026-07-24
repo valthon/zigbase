@@ -183,10 +183,27 @@ pub fn makeThunk(comptime handler: anytype) @import("events.zig").RouteHandler {
         fn run(cx: *Ctx) anyerror!http.Response {
             const a = cx.arena;
             const rc = cx.request.?; // typed routes always run with an HTTP request
+
+            // The parsed input, the params view, and any parse arena are all request-scoped SCRATCH
+            // — only the serialized Response body escapes. Free them explicitly so the thunk is
+            // self-freeing under ANY allocator (production passes the request arena, which reclaims
+            // wholesale, but the correctness — and the tests' leak detection via `forTest` — must not
+            // depend on that). Everything the handler reads stays alive until AFTER serialization.
+
+            // 2. Params: map request params (http.Param) onto route_types.Param. The Param VALUES
+            // borrow from `rc` (the request), so only the slice itself is owned here.
+            const params = try a.a.alloc(Param, rc.params.len);
+            defer a.a.free(params);
+            for (rc.params, 0..) |p, i| params[i] = .{ .key = p.key, .value = p.value };
+
             // 1. Parse input (void -> skip; GET/DELETE -> query; else JSON body).
             // The GET query branch is gated behind a comptime `isQueryParseable(In)`
             // so that complex POST-body types (with nested slices, enums, optional
             // structs) don't instantiate `parseQuery` and hit its @compileError paths.
+            // The JSON branch keeps its `Parsed` handle so its parse arena is freed (the old
+            // `parseFromSlice(...).value` discarded it, leaking that arena onto `a.a`).
+            var parsed: ?std.json.Parsed(In) = null;
+            defer if (parsed) |*p| p.deinit();
             const input: In = if (In == void) {} else blk: {
                 if (comptime isQueryParseable(In)) {
                     if (rc.method == .GET or rc.method == .DELETE) {
@@ -195,12 +212,12 @@ pub fn makeThunk(comptime handler: anytype) @import("events.zig").RouteHandler {
                     }
                 }
                 if (rc.body.len == 0) return badRequest(a.a, "Missing request body.");
-                break :blk (std.json.parseFromSlice(In, a.a, rc.body, .{ .ignore_unknown_fields = true }) catch
-                    return badRequest(a.a, "Invalid JSON body.")).value;
+                const p = std.json.parseFromSlice(In, a.a, rc.body, .{ .ignore_unknown_fields = true }) catch
+                    return badRequest(a.a, "Invalid JSON body.");
+                parsed = p;
+                break :blk p.value;
             };
-            // 2. Build Req. Map request params (http.Param) onto route_types.Param.
-            var params = try a.a.alloc(Param, rc.params.len);
-            for (rc.params, 0..) |p, i| params[i] = .{ .key = p.key, .value = p.value };
+
             const auth_id = cx.rctx.resolveMacro("@request.auth.id") orelse "";
             var req = Req(In){ .input = input, .params = params, .auth_id = auth_id, .ctx = cx };
             // 3. Call handler; map errors -> status+message.
@@ -210,7 +227,8 @@ pub fn makeThunk(comptime handler: anytype) @import("events.zig").RouteHandler {
                 const re: RouteError = @errorCast(e);
                 return jsonError(a.a, statusForError(re), messageForError(re));
             };
-            // 4. Serialize output (204 for void, else 200 JSON).
+            // 4. Serialize output (204 for void, else 200 JSON). `out` may borrow from `input`, so
+            // this runs BEFORE the deferred `parsed.deinit()` frees the parse arena.
             if (Out == void) return .{ .status = 204, .body = "" };
             const body = try std.json.Stringify.valueAlloc(a.a, out, .{});
             return .{ .status = 200, .body = body };
@@ -412,20 +430,22 @@ test "makeThunk: parses input, serializes output (200)" {
     }.h;
     const thunk = makeThunk(H);
 
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
+    // The thunk is self-freeing, so it runs on a `forTest` RequestArena (raw testing.allocator with
+    // leak detection ON); only the 200 response body escapes and is freed here.
+    const a = testing.allocator;
     var params = [_]http.Param{.{ .key = "id", .value = "bk1" }};
     var ctx = http.RequestCtx{
         .method = .POST,
         .path = "/api/bookings/bk1/confirm",
         .body = "{\"guests\":2}",
-        .allocator = RequestArena.from(&arena),
+        .allocator = RequestArena.forTest(a),
         .params = &params,
     };
     const rctx = @import("request.zig").RequestContext{ .auth = null, .is_superuser = false, .method = "POST" };
-    var cx = Ctx{ .app = undefined, .arena = RequestArena.from(&arena), .rctx = rctx, .request = &ctx };
+    var cx = Ctx{ .app = undefined, .arena = RequestArena.forTest(a), .rctx = rctx, .request = &ctx };
     defer cx.deinit();
     const resp = try thunk(&cx);
+    defer a.free(resp.body);
     try testing.expectEqual(@as(u16, 200), resp.status);
     try testing.expect(std.mem.indexOf(u8, resp.body, "\"confirmed\":true") != null);
     try testing.expect(std.mem.indexOf(u8, resp.body, "\"id\":\"bk1\"") != null);
@@ -499,17 +519,16 @@ test "makeThunk wires req.ctx with app + arena" {
         }
     }.h;
     const thunk = makeThunk(H);
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    var ctx = http.RequestCtx{ .method = .POST, .path = "/x", .allocator = RequestArena.from(&arena) };
+    const a = testing.allocator;
+    var ctx = http.RequestCtx{ .method = .POST, .path = "/x", .allocator = RequestArena.forTest(a) };
     const rctx = @import("request.zig").RequestContext{ .auth = null, .is_superuser = false, .method = "POST" };
-    var cx = Ctx{ .app = undefined, .arena = RequestArena.from(&arena), .rctx = rctx, .request = &ctx };
+    var cx = Ctx{ .app = undefined, .arena = RequestArena.forTest(a), .rctx = rctx, .request = &ctx };
     defer cx.deinit();
-    _ = try thunk(&cx);
+    _ = try thunk(&cx); // void output -> 204, empty body; nothing escapes to free
     // req.ctx points exactly at the Ctx the thunk received...
     try testing.expect(Observed.ctx_ptr == &cx);
-    // ...and that Ctx's arena is the request arena.
-    try testing.expect(Observed.arena_ptr == arena.allocator().ptr);
+    // ...and that Ctx's arena is the one the thunk received (the forTest allocator).
+    try testing.expect(Observed.arena_ptr == a.ptr);
 }
 
 test "makeThunk: RouteError -> status; req.fail -> custom status+message" {
@@ -521,13 +540,13 @@ test "makeThunk: RouteError -> status; req.fail -> custom status+message" {
         }
     }.h;
     const thunk = makeThunk(H);
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    var ctx = http.RequestCtx{ .method = .POST, .path = "/x", .allocator = RequestArena.from(&arena) };
+    const a = testing.allocator;
+    var ctx = http.RequestCtx{ .method = .POST, .path = "/x", .allocator = RequestArena.forTest(a) };
     const rctx = @import("request.zig").RequestContext{ .auth = null, .is_superuser = false, .method = "POST" };
-    var cx = Ctx{ .app = undefined, .arena = RequestArena.from(&arena), .rctx = rctx, .request = &ctx };
+    var cx = Ctx{ .app = undefined, .arena = RequestArena.forTest(a), .rctx = rctx, .request = &ctx };
     defer cx.deinit();
     const resp = try thunk(&cx);
+    defer a.free(resp.body); // the jsonError body is owned on the forTest allocator
     try testing.expectEqual(@as(u16, 404), resp.status);
     try testing.expect(std.mem.indexOf(u8, resp.body, "Booking not found") != null);
 }
