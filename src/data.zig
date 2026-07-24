@@ -33,6 +33,44 @@ fn assertFieldsExist(comptime T: type, comptime Input: type, comptime who: []con
     }
 }
 
+/// True iff `T` (recursively) contains a raw-JSON field type (`std.json.Value`/`ObjectMap`/`Array`).
+/// Recurses through EVERY composite kind — struct, union, optional, error-union, array, vector, and
+/// pointers of any size — so an aliasing raw-json type can't hide behind a union arm or a `*Value`.
+fn containsRawJson(comptime T: type) bool {
+    if (T == std.json.Value or T == std.json.ObjectMap or T == std.json.Array) return true;
+    return switch (@typeInfo(T)) {
+        .@"struct" => |s| blk: {
+            inline for (s.fields) |f| if (containsRawJson(f.type)) break :blk true;
+            break :blk false;
+        },
+        .@"union" => |u| blk: {
+            inline for (u.fields) |f| if (containsRawJson(f.type)) break :blk true;
+            break :blk false;
+        },
+        .optional => |o| containsRawJson(o.child),
+        .error_union => |e| containsRawJson(e.payload),
+        .array => |a| containsRawJson(a.child),
+        .vector => |v| containsRawJson(v.child),
+        // Any pointer to a non-`u8` child can alias a raw-json value (`*Value`, `[]Value`, …);
+        // `[]const u8`/`*u8` (child `u8`) is a concrete, copied string.
+        .pointer => |p| p.child != u8 and containsRawJson(p.child),
+        else => false,
+    };
+}
+
+/// Reject a typed-I/O `T` that (recursively) holds a raw-JSON field. `createAs`/`getAs`/`updateAs`
+/// `parseFromValueLeaky` the intermediate record into `T` and then FREE that record: concrete
+/// scalar/string fields are deep-copied so freeing is safe, but a `std.json.Value` field is
+/// returned as an ALIAS into the record — freeing it would dangle a string field (UAF) or leak a
+/// nested tree. Fail at compile time with an actionable message rather than ship that footgun;
+/// typed I/O is for concrete types (use the untyped `create`/`findById`/`update` for raw JSON).
+fn assertNoRawJson(comptime T: type, comptime who: []const u8) void {
+    if (comptime containsRawJson(T))
+        @compileError(who ++ ": " ++ @typeName(T) ++ " contains a std.json.Value/ObjectMap/Array field, " ++
+            "which parseFromValue aliases into the intermediate record this call frees after parsing. " ++
+            "Use concrete field types for typed I/O, or the untyped create/findById/update for raw JSON.");
+}
+
 // ===========================================================================
 // queryAs — name-mapped raw-SQL row decoding (#240)
 // ===========================================================================
@@ -330,16 +368,32 @@ pub const Data = struct {
     /// id/autodate columns `T` doesn't name are ignored on the read back.
     pub fn createAs(self: Data, comptime T: type, col_name: []const u8, input: anytype) !T {
         comptime assertFieldsExist(T, @TypeOf(input), "createAs");
+        comptime assertNoRawJson(T, "createAs");
         var parsed_value = try self.valueFromStruct(input);
         defer parsed_value.deinit();
         const created = try self.create(col_name, parsed_value.value);
+        // `created` is a fresh record owned by `self.alloc`, an intermediate here.
+        // `parseFromValueLeaky` DEEP-COPIES every scalar/string field of `T` (the Value-source
+        // `.slice`/`.string` path allocs+memcpys) — and `assertNoRawJson` rejected the one `T`
+        // shape parseFromValue would ALIAS (a raw `std.json.Value` field) — so freeing `created`
+        // after the parse can never dangle a value `T` now owns. `records.freeRecord` frees the
+        // WHOLE intermediate RECURSIVELY, including any json/multi-value sub-trees of the
+        // collection (owned + freeable since the readValue migration), so this leaks nothing on
+        // any collection shape. `defer` covers both the success and parse-error returns.
+        defer records.freeRecord(self.alloc, created);
         return try std.json.parseFromValueLeaky(T, self.alloc, created, .{ .ignore_unknown_fields = true });
     }
 
     /// Fetch a record by id, parsed into `T`, or `null` if the collection or record is
     /// not found. No opts arg — expand/projection is a future addition.
     pub fn getAs(self: Data, comptime T: type, col_name: []const u8, id: []const u8) !?T {
+        comptime assertNoRawJson(T, "getAs");
         const found = (try self.findById(col_name, id)) orelse return null;
+        // Same intermediate-Value ownership as `createAs`: `found` is a self-contained record on
+        // `self.alloc`; `parseFromValueLeaky` deep-copies into `T`, so freeing it afterwards is
+        // UAF-safe. `orelse return null` above runs before we acquire `found`, so nothing leaks
+        // on the not-found path.
+        defer records.freeRecord(self.alloc, found);
         return try std.json.parseFromValueLeaky(T, self.alloc, found, .{ .ignore_unknown_fields = true });
     }
 
@@ -348,9 +402,15 @@ pub const Data = struct {
     /// `patch` must exist on `T` (checked at comptime).
     pub fn updateAs(self: Data, comptime T: type, col_name: []const u8, id: []const u8, patch: anytype) !?T {
         comptime assertFieldsExist(T, @TypeOf(patch), "updateAs");
+        comptime assertNoRawJson(T, "updateAs");
         var parsed_value = try self.valueFromStruct(patch);
         defer parsed_value.deinit();
         const updated = (try self.update(col_name, id, parsed_value.value)) orelse return null;
+        // Same intermediate-Value ownership as `createAs`: `updated` is a self-contained record on
+        // `self.alloc`; `parseFromValueLeaky` deep-copies into `T`, so freeing it afterwards is
+        // UAF-safe. `orelse return null` runs before we acquire `updated`, so nothing leaks on the
+        // not-found path.
+        defer records.freeRecord(self.alloc, updated);
         return try std.json.parseFromValueLeaky(T, self.alloc, updated, .{ .ignore_unknown_fields = true });
     }
 
@@ -671,18 +731,13 @@ test "Data typed I/O: createAs/getAs/updateAs round-trip through T" {
     try conn.exec("PRAGMA foreign_keys=ON;");
     try migrations.run(&conn);
 
-    // Stays on an arena: `createAs`/`getAs`/`updateAs` each parse the intermediate
-    // `std.json.Value` returned by `create`/`findById`/`update` into `T` via
-    // `parseFromValueLeaky`, but never free that intermediate `Value` themselves
-    // (no `records.freeRecord`/deinit call on `created`/`found`/`updated` inside those
-    // three Data methods) — a real, pre-existing leak on the raw-allocator path (each
-    // owned string in the discarded intermediate record: id/title/price/created/updated
-    // etc.), confirmed here (46 leaked allocations) while attempting this conversion.
-    // Out of scope to fix here (test-only conversion; the fix belongs in `data.zig`'s
-    // non-test `createAs`/`getAs`/`updateAs`) — reported instead of forced.
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    // Runs under the RAW leak detector (no arena): `createAs`/`getAs`/`updateAs` now free the
+    // intermediate `std.json.Value` returned by `create`/`findById`/`update` (via
+    // `records.freeRecord`) after `parseFromValueLeaky` deep-copies it into `T`, so the only
+    // allocations that survive each call are the `T`-owned strings — which this test frees by
+    // hand. Before the data.zig fix this leaked 46 allocations (the discarded intermediate
+    // record: id/title/price/qty-string/created/updated etc.).
+    const a = std.testing.allocator;
     const io = std.testing.io;
 
     const fields = [_]schema.Field{
@@ -692,7 +747,10 @@ test "Data typed I/O: createAs/getAs/updateAs round-trip through T" {
         .{ .id = "f4", .name = "confirmed", .options = .{ .bool = .{} } },
         .{ .id = "f5", .name = "note", .options = .{ .text = .{} } },
     };
-    _ = try collections.create(a, io, &conn, .{ .id = "", .name = "widgets", .fields = &fields });
+    // The provisioning create() returns a fully-owned collection; the Data methods reload their
+    // own copy, so free this one explicitly.
+    const setup_col = try collections.create(a, io, &conn, .{ .id = "", .name = "widgets", .fields = &fields });
+    defer setup_col.deinit(a);
 
     var app = App{ .allocator = a, .io = io, .pool = undefined };
     const d = Data{ .app = &app, .conn = &conn, .io = io, .alloc = a };
@@ -709,6 +767,17 @@ test "Data typed I/O: createAs/getAs/updateAs round-trip through T" {
         confirmed: bool,
         note: ?[]const u8,
     };
+    // Every `[]const u8`/`?[]const u8` field of a returned `Widget` is a deep copy owned by
+    // `a` (parseFromValueLeaky allocs+memcpys each string on `self.alloc`); the scalar `qty`/
+    // `confirmed` fields own nothing. Free exactly those string fields.
+    const freeWidget = struct {
+        fn f(alloc: std.mem.Allocator, w: Widget) void {
+            alloc.free(w.id);
+            alloc.free(w.title);
+            alloc.free(w.price);
+            if (w.note) |n| alloc.free(n);
+        }
+    }.f;
 
     // createAs: a numeric field is passed AS A NUMBER (proves Part 1 + Part 2 compose);
     // `note` is omitted (optional → null).
@@ -718,6 +787,7 @@ test "Data typed I/O: createAs/getAs/updateAs round-trip through T" {
         .price = 5.0,
         .confirmed = true,
     });
+    defer freeWidget(a, created);
     try std.testing.expectEqualStrings("hello", created.title);
     try std.testing.expectEqual(@as(i64, 7), created.qty);
     try std.testing.expectEqualStrings("5.00", created.price); // 5.0 scaled to fixed(2)
@@ -726,6 +796,7 @@ test "Data typed I/O: createAs/getAs/updateAs round-trip through T" {
 
     // getAs: fetch the same record as Widget.
     const got = (try d.getAs(Widget, "widgets", created.id)).?;
+    defer freeWidget(a, got);
     try std.testing.expectEqualStrings("hello", got.title);
     try std.testing.expectEqual(@as(i64, 7), got.qty);
     try std.testing.expectEqualStrings("5.00", got.price);
@@ -736,6 +807,7 @@ test "Data typed I/O: createAs/getAs/updateAs round-trip through T" {
 
     // updateAs: change one field; the rest stay intact; the optional round-trips a value.
     const updated = (try d.updateAs(Widget, "widgets", created.id, .{ .qty = 99, .note = "restocked" })).?;
+    defer freeWidget(a, updated);
     try std.testing.expectEqual(@as(i64, 99), updated.qty);
     try std.testing.expectEqualStrings("hello", updated.title); // untouched
     try std.testing.expectEqualStrings("5.00", updated.price); // untouched
@@ -752,23 +824,24 @@ test "Data typed I/O on the raw GPA path: valueFromStruct and parseFromValueLeak
     // and the `parseFromValue` wrapper `createAs`/`getAs`/`updateAs` used to return (rather
     // than `parseFromValueLeaky`) are real, permanent leaks on that path; an arena masks
     // them by reclaiming everything at once. `std.testing.allocator` fails the test on any
-    // unfreed byte, so it catches exactly this class of bug. (Schema/collection setup below
-    // stays on a throwaway arena — GPA leak-checking that is orthogonal to this PR's fix.)
+    // unfreed byte, so it catches exactly this class of bug. Schema/collection setup and the
+    // manually-built parse-input object below run on `std.testing.allocator` too (each freed
+    // via its own owner), so the whole test is leak-checked.
     var conn = try db.Db.openMemory();
     defer conn.close();
     try conn.exec("PRAGMA foreign_keys=ON;");
     try migrations.run(&conn);
 
-    var setup_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer setup_arena.deinit();
-    const sa = setup_arena.allocator();
+    const a = std.testing.allocator;
     const io = std.testing.io;
 
     const fields = [_]schema.Field{
         .{ .id = "f1", .name = "title", .required = true, .options = .{ .text = .{} } },
         .{ .id = "f2", .name = "price", .options = .{ .number = .{ .mode = .fixed, .scale = 2 } } },
     };
-    _ = try collections.create(sa, io, &conn, .{ .id = "", .name = "gadgets", .fields = &fields });
+    // Fully-owned collection returned by provisioning; freed explicitly.
+    const setup_col = try collections.create(a, io, &conn, .{ .id = "", .name = "gadgets", .fields = &fields });
+    defer setup_col.deinit(a);
 
     // `valueFromStruct` on its own, GPA-backed: must not leak the intermediate `bytes` (the
     // fix adds `defer self.alloc.free(bytes)`), and returns a `Parsed(Value)` the caller
@@ -783,20 +856,20 @@ test "Data typed I/O on the raw GPA path: valueFromStruct and parseFromValueLeak
     }
 
     // The `parseFromValueLeaky` swap in `createAs`/`getAs`/`updateAs`: parse a manually-built
-    // `std.json.Value` (on a throwaway arena — irrelevant to what's under test) into `T` on
-    // the GPA, then free exactly the fields `T` owns. Before the fix this used
-    // `parseFromValue` and threw away (leaked) the `Parsed(T)` wrapper's arena on every call.
+    // `std.json.Value` into `T` on the GPA, then free exactly the fields `T` owns. Before the
+    // fix this used `parseFromValue` and threw away (leaked) the `Parsed(T)` wrapper's arena on
+    // every call. The input `obj` (keys + literal string values) is freed via `obj.deinit(a)`;
+    // parseFromValueLeaky deep-copies each string into `g`, so freeing `obj` never dangles `g`.
     const Gadget = struct { title: []const u8, price: []const u8, note: ?[]const u8 };
-    var src_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer src_arena.deinit();
     var obj: std.json.ObjectMap = .empty;
-    try obj.put(src_arena.allocator(), "title", .{ .string = "hi" });
-    try obj.put(src_arena.allocator(), "price", .{ .string = "5.00" });
-    try obj.put(src_arena.allocator(), "note", .null);
-    const g = try std.json.parseFromValueLeaky(Gadget, std.testing.allocator, .{ .object = obj }, .{ .ignore_unknown_fields = true });
+    defer obj.deinit(a);
+    try obj.put(a, "title", .{ .string = "hi" });
+    try obj.put(a, "price", .{ .string = "5.00" });
+    try obj.put(a, "note", .null);
+    const g = try std.json.parseFromValueLeaky(Gadget, a, .{ .object = obj }, .{ .ignore_unknown_fields = true });
     defer {
-        std.testing.allocator.free(g.title);
-        std.testing.allocator.free(g.price);
+        a.free(g.title);
+        a.free(g.price);
     }
     try std.testing.expectEqualStrings("hi", g.title);
     try std.testing.expectEqualStrings("5.00", g.price);
