@@ -1,10 +1,12 @@
 //! Pure SQL string generation from schema types.
 //!
-//! All functions allocate into the supplied `alloc` and assume it is an
-//! arena: intermediate fragments (quoted idents, column defs, allocPrint
-//! results) are appended into the returned buffer but not individually freed.
-//! The engine creates one arena per operation, so this is leak-free in
-//! practice. Identifiers come from names already validated by
+//! Every public function is self-freeing (allocator ownership contract 1): intermediate
+//! fragments (quoted idents, column defs, allocPrint results) are scratch, built on a
+//! function-local arena and copied into the returned buffer; only the final result (a `[]u8`,
+//! or — for `rebuildPlan`/`rebuildPlanPg` — the returned `[]const []u8` and each of its
+//! individually `alloc`-owned statements) escapes on the caller's allocator. The engine still
+//! calls these under a per-operation arena in production, so this is correctness/contract only,
+//! not a perf change. Identifiers come from names already validated by
 //! `schema.isValidIdentifier` (letters/digits/underscore only), so inline
 //! `"{s}"` interpolation is injection-safe; `quoteIdent` is available for
 //! defensive quoting where escaping might matter.
@@ -65,18 +67,24 @@ fn nameIn(names: []const []const u8, name: []const u8) bool {
 }
 
 pub fn createTableSql(alloc: std.mem.Allocator, c: schema.Collection, single_rel_target: ?[]const u8, d: dialect.Dialect, skip_fk_fields: []const []const u8) ![]u8 {
+    // Self-freeing (contract 1): every intermediate fragment (quoted idents, column defs,
+    // allocPrint'd clauses) is scratch, built on a function-local arena and copied into `out`
+    // via `appendSlice`; only `out`'s final `toOwnedSlice` escapes on `alloc`.
+    var scratch = std.heap.ArenaAllocator.init(alloc);
+    defer scratch.deinit();
+    const sa = scratch.allocator();
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(alloc);
     try out.appendSlice(alloc, "CREATE TABLE ");
-    const tbl = try quoteIdent(alloc, c.name);
+    const tbl = try quoteIdent(sa, c.name);
     try out.appendSlice(alloc, tbl);
     // The base text columns (incl. the `id` keyset tiebreaker) get the byte-order collation pin so
     // text ORDER BY / keyset pagination produces the SAME order on Postgres as on SQLite (BINARY).
     const tc = d.textCollate();
-    try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, " (\"id\" TEXT{s} PRIMARY KEY, \"created\" TEXT{s}, \"updated\" TEXT{s}", .{ tc, tc, tc }));
+    try out.appendSlice(alloc, try std.fmt.allocPrint(sa, " (\"id\" TEXT{s} PRIMARY KEY, \"created\" TEXT{s}, \"updated\" TEXT{s}", .{ tc, tc, tc }));
     for (c.fields) |f| {
         try out.appendSlice(alloc, ", ");
-        try out.appendSlice(alloc, try columnDef(alloc, f, d, fieldCollate(c, f, d)));
+        try out.appendSlice(alloc, try columnDef(sa, f, d, fieldCollate(c, f, d)));
     }
     for (c.fields) |f| {
         switch (f.options) {
@@ -86,7 +94,7 @@ pub fn createTableSql(alloc: std.mem.Allocator, c: schema.Collection, single_rel
             .relation => |r| if (r.maxSelect == 1 and !nameIn(skip_fk_fields, f.name)) {
                 const target = single_rel_target orelse r.targetCollectionId;
                 const on_delete = if (r.cascadeDelete) "CASCADE" else "SET NULL";
-                try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, ", FOREIGN KEY (\"{s}\") REFERENCES \"{s}\" (\"id\") ON DELETE {s}", .{ f.name, target, on_delete }));
+                try out.appendSlice(alloc, try std.fmt.allocPrint(sa, ", FOREIGN KEY (\"{s}\") REFERENCES \"{s}\" (\"id\") ON DELETE {s}", .{ f.name, target, on_delete }));
             },
             else => {},
         }
@@ -96,6 +104,10 @@ pub fn createTableSql(alloc: std.mem.Allocator, c: schema.Collection, single_rel
 }
 
 pub fn createIndexSql(alloc: std.mem.Allocator, table: []const u8, idx: schema.Index, d: dialect.Dialect) ![]u8 {
+    // Self-freeing (contract 1): see `createTableSql`.
+    var scratch = std.heap.ArenaAllocator.init(alloc);
+    defer scratch.deinit();
+    const sa = scratch.allocator();
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(alloc);
     // Case-insensitive collation routes through the dialect (#159): SQLite collates each column
@@ -104,17 +116,17 @@ pub fn createIndexSql(alloc: std.mem.Allocator, table: []const u8, idx: schema.I
     // and a UNIQUE one over `lower("col")` rejects case-variant duplicates just like SQLite's. A
     // `.binary` index is the plain quoted column on both backends.
     try out.appendSlice(alloc, if (idx.unique) "CREATE UNIQUE INDEX " else "CREATE INDEX ");
-    try out.appendSlice(alloc, try quoteIdent(alloc, idx.name));
+    try out.appendSlice(alloc, try quoteIdent(sa, idx.name));
     try out.appendSlice(alloc, " ON ");
-    try out.appendSlice(alloc, try quoteIdent(alloc, table));
+    try out.appendSlice(alloc, try quoteIdent(sa, table));
     try out.append(alloc, ' ');
     try out.append(alloc, '(');
     for (idx.fields, 0..) |fname, i| {
         if (i > 0) try out.append(alloc, ',');
-        const col_quoted = try quoteIdent(alloc, fname);
+        const col_quoted = try quoteIdent(sa, fname);
         switch (idx.collation) {
             .binary => try out.appendSlice(alloc, col_quoted),
-            .nocase => try out.appendSlice(alloc, try d.nocaseIndexExpr(alloc, col_quoted)),
+            .nocase => try out.appendSlice(alloc, try d.nocaseIndexExpr(sa, col_quoted)),
         }
     }
     try out.append(alloc, ')');
@@ -164,22 +176,36 @@ pub fn addDeferrableFkSql(alloc: std.mem.Allocator, table: []const u8, field: []
 pub fn rebuildPlan(alloc: std.mem.Allocator, old: schema.Collection, new: schema.Collection, d: dialect.Dialect) ![]const []u8 {
     if (d.kind == .postgres) return rebuildPlanPg(alloc, old, new, d);
 
-    var stmts: std.ArrayList([]u8) = .empty;
-    errdefer stmts.deinit(alloc);
+    // Self-freeing (contract 1): `tmp`/`new_cols`/`src_cols` and every column-fragment allocPrint
+    // are scratch (consumed to build one of the returned statements, then discarded) — built on
+    // a function-local arena. Only the statements themselves (each individually `alloc`-owned,
+    // matching `stmts`' backing array) escape.
+    var scratch = std.heap.ArenaAllocator.init(alloc);
+    defer scratch.deinit();
+    const sa = scratch.allocator();
 
-    const tmp = try std.fmt.allocPrint(alloc, "{s}__new", .{new.name});
+    var stmts: std.ArrayList([]u8) = .empty;
+    // `stmts.items` reflects exactly the statements successfully appended so far (append only
+    // grows `.len` on success), so an OOM anywhere below frees exactly what's already owned —
+    // no separate bookkeeping needed.
+    errdefer {
+        for (stmts.items) |s| alloc.free(s);
+        stmts.deinit(alloc);
+    }
+
+    const tmp = try std.fmt.allocPrint(sa, "{s}__new", .{new.name});
     var tmp_col = new;
     tmp_col.name = tmp;
     try stmts.append(alloc, try createTableSql(alloc, tmp_col, null, d, &.{}));
 
     var new_cols: std.ArrayList(u8) = .empty;
     var src_cols: std.ArrayList(u8) = .empty;
-    try new_cols.appendSlice(alloc, "\"id\",\"created\",\"updated\"");
-    try src_cols.appendSlice(alloc, "\"id\",\"created\",\"updated\"");
+    try new_cols.appendSlice(sa, "\"id\",\"created\",\"updated\"");
+    try src_cols.appendSlice(sa, "\"id\",\"created\",\"updated\"");
     for (new.fields) |nf| {
-        try new_cols.append(alloc, ',');
-        try new_cols.appendSlice(alloc, try std.fmt.allocPrint(alloc, "\"{s}\"", .{nf.name}));
-        try src_cols.append(alloc, ',');
+        try new_cols.append(sa, ',');
+        try new_cols.appendSlice(sa, try std.fmt.allocPrint(sa, "\"{s}\"", .{nf.name}));
+        try src_cols.append(sa, ',');
         const old_match = blk: {
             for (old.fields) |of| {
                 if (std.mem.eql(u8, of.id, nf.id)) break :blk of;
@@ -188,12 +214,12 @@ pub fn rebuildPlan(alloc: std.mem.Allocator, old: schema.Collection, new: schema
         };
         if (old_match) |of| {
             if (of.storageClass() == nf.storageClass()) {
-                try src_cols.appendSlice(alloc, try std.fmt.allocPrint(alloc, "\"{s}\"", .{of.name}));
+                try src_cols.appendSlice(sa, try std.fmt.allocPrint(sa, "\"{s}\"", .{of.name}));
             } else {
-                try src_cols.appendSlice(alloc, try std.fmt.allocPrint(alloc, "CAST(\"{s}\" AS {s})", .{ of.name, d.sqlType(nf.storageClass()) }));
+                try src_cols.appendSlice(sa, try std.fmt.allocPrint(sa, "CAST(\"{s}\" AS {s})", .{ of.name, d.sqlType(nf.storageClass()) }));
             }
         } else {
-            try src_cols.appendSlice(alloc, "NULL");
+            try src_cols.appendSlice(sa, "NULL");
         }
     }
     try stmts.append(alloc, try std.fmt.allocPrint(alloc, "INSERT INTO \"{s}\" ({s}) SELECT {s} FROM \"{s}\";", .{ tmp, new_cols.items, src_cols.items, old.name }));
@@ -219,7 +245,11 @@ pub fn rebuildPlan(alloc: std.mem.Allocator, old: schema.Collection, new: schema
 /// Retained columns keep their data; the table is never dropped.
 fn rebuildPlanPg(alloc: std.mem.Allocator, old: schema.Collection, new: schema.Collection, d: dialect.Dialect) ![]const []u8 {
     var stmts: std.ArrayList([]u8) = .empty;
-    errdefer stmts.deinit(alloc);
+    // See `rebuildPlan`: `stmts.items` is exactly what's been successfully appended so far.
+    errdefer {
+        for (stmts.items) |s| alloc.free(s);
+        stmts.deinit(alloc);
+    }
     const tbl = new.name;
 
     // 1a. Drop the FK of every old single relation field (converges all relation changes; gemini #2).
@@ -288,9 +318,7 @@ fn rebuildPlanPg(alloc: std.mem.Allocator, old: schema.Collection, new: schema.C
 // ---------------------------------------------------------------------------
 
 test "createTableSql includes system columns, field columns, and FK for single relation" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const fields = [_]schema.Field{
         .{ .id = "a", .name = "title", .options = .{ .text = .{} } },
         .{ .id = "b", .name = "price", .options = .{ .number = .{ .mode = .float } } },
@@ -298,6 +326,7 @@ test "createTableSql includes system columns, field columns, and FK for single r
     };
     const col = schema.Collection{ .id = "c1", .name = "posts", .fields = &fields };
     const sql = try createTableSql(a, col, "users", .sqlite, &.{});
+    defer a.free(sql);
     // SQLite is byte-identical: textCollate() is "" so no COLLATE clauses appear.
     try std.testing.expect(std.mem.indexOf(u8, sql, "\"id\" TEXT PRIMARY KEY") != null);
     try std.testing.expect(std.mem.indexOf(u8, sql, "\"created\" TEXT") != null);
@@ -308,9 +337,7 @@ test "createTableSql includes system columns, field columns, and FK for single r
 }
 
 test "createTableSql (Postgres) pins TEXT columns to COLLATE \"C\" except .nocase-indexed ones" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const fields = [_]schema.Field{
         .{ .id = "a", .name = "title", .options = .{ .text = .{} } }, // plain text -> COLLATE "C"
         .{ .id = "b", .name = "email", .options = .{ .text = .{} } }, // covered by a .nocase index -> no COLLATE
@@ -319,6 +346,7 @@ test "createTableSql (Postgres) pins TEXT columns to COLLATE \"C\" except .nocas
     const idx = [_]schema.Index{.{ .name = "idx_email", .fields = &.{"email"}, .unique = true, .collation = .nocase }};
     const col = schema.Collection{ .id = "c1", .name = "posts", .fields = &fields, .indexes = &idx };
     const sql = try createTableSql(a, col, null, .postgres, &.{});
+    defer a.free(sql);
     // System tiebreaker columns + plain text field get the byte-order collation.
     try std.testing.expect(std.mem.indexOf(u8, sql, "\"id\" TEXT COLLATE \"C\" PRIMARY KEY") != null);
     try std.testing.expect(std.mem.indexOf(u8, sql, "\"created\" TEXT COLLATE \"C\"") != null);
@@ -331,15 +359,14 @@ test "createTableSql (Postgres) pins TEXT columns to COLLATE \"C\" except .nocas
 }
 
 test "createTableSql omits the FK clause for skip_fk_fields (cycle edges) but keeps the column" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const fields = [_]schema.Field{
         .{ .id = "a", .name = "author", .options = .{ .relation = .{ .targetCollectionId = "users", .maxSelect = 1 } } },
         .{ .id = "b", .name = "pair", .options = .{ .relation = .{ .targetCollectionId = "twins", .maxSelect = 1 } } },
     };
     const col = schema.Collection{ .id = "c1", .name = "posts", .fields = &fields };
     const sql = try createTableSql(a, col, null, .postgres, &.{"pair"});
+    defer a.free(sql);
     // The skipped edge keeps its COLUMN (data still loads) but loses the inline FK.
     try std.testing.expect(std.mem.indexOf(u8, sql, "\"pair\" TEXT") != null);
     try std.testing.expect(std.mem.indexOf(u8, sql, "FOREIGN KEY (\"pair\")") == null);
@@ -348,59 +375,64 @@ test "createTableSql omits the FK clause for skip_fk_fields (cycle edges) but ke
 }
 
 test "addDeferrableFkSql matches rebuildPlanPg naming and emits DEFERRABLE INITIALLY IMMEDIATE" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
+    const s1 = try addDeferrableFkSql(a, "posts", "pair", "twins", false);
+    defer a.free(s1);
     try std.testing.expectEqualStrings(
         "ALTER TABLE \"posts\" ADD CONSTRAINT \"fk_posts_pair\" FOREIGN KEY (\"pair\") REFERENCES \"twins\" (\"id\") ON DELETE SET NULL DEFERRABLE INITIALLY IMMEDIATE;",
-        try addDeferrableFkSql(a, "posts", "pair", "twins", false),
+        s1,
     );
+    const s2 = try addDeferrableFkSql(a, "posts", "pair", "twins", true);
+    defer a.free(s2);
     try std.testing.expectEqualStrings(
         "ALTER TABLE \"posts\" ADD CONSTRAINT \"fk_posts_pair\" FOREIGN KEY (\"pair\") REFERENCES \"twins\" (\"id\") ON DELETE CASCADE DEFERRABLE INITIALLY IMMEDIATE;",
-        try addDeferrableFkSql(a, "posts", "pair", "twins", true),
+        s2,
     );
 }
 
 test "createIndexSql builds unique and non-unique" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const u = try createIndexSql(a, "posts", .{ .name = "idx_title", .fields = &.{"title"}, .unique = true }, .sqlite);
+    defer a.free(u);
     try std.testing.expectEqualStrings("CREATE UNIQUE INDEX \"idx_title\" ON \"posts\" (\"title\");", u);
     const n = try createIndexSql(a, "posts", .{ .name = "idx_ab", .fields = &.{ "a", "b" }, .unique = false }, .sqlite);
+    defer a.free(n);
     try std.testing.expectEqualStrings("CREATE INDEX \"idx_ab\" ON \"posts\" (\"a\",\"b\");", n);
 }
 
 test "createIndexSql emits COLLATE NOCASE and a partial WHERE predicate" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const ci = try createIndexSql(a, "customers", .{ .name = "idx_email", .fields = &.{"email"}, .unique = true, .collation = .nocase }, .sqlite);
+    defer a.free(ci);
     try std.testing.expectEqualStrings("CREATE UNIQUE INDEX \"idx_email\" ON \"customers\" (\"email\" COLLATE NOCASE);", ci);
     const partial = try createIndexSql(a, "posts", .{ .name = "idx_active", .fields = &.{"slug"}, .unique = true, .where = "deleted_at IS NULL" }, .sqlite);
+    defer a.free(partial);
     try std.testing.expectEqualStrings("CREATE UNIQUE INDEX \"idx_active\" ON \"posts\" (\"slug\") WHERE deleted_at IS NULL;", partial);
     // collation applies per-column, predicate follows the column list
     const both = try createIndexSql(a, "t", .{ .name = "idx_both", .fields = &.{ "a", "b" }, .collation = .nocase, .where = "a IS NOT NULL" }, .sqlite);
+    defer a.free(both);
     try std.testing.expectEqualStrings("CREATE INDEX \"idx_both\" ON \"t\" (\"a\" COLLATE NOCASE,\"b\" COLLATE NOCASE) WHERE a IS NOT NULL;", both);
     // an empty or whitespace-only predicate emits no WHERE clause (not "WHERE ;")
     const empty = try createIndexSql(a, "t", .{ .name = "idx_e", .fields = &.{"a"}, .where = "" }, .sqlite);
+    defer a.free(empty);
     try std.testing.expectEqualStrings("CREATE INDEX \"idx_e\" ON \"t\" (\"a\");", empty);
     const ws = try createIndexSql(a, "t", .{ .name = "idx_w", .fields = &.{"a"}, .where = "  \t\n" }, .sqlite);
+    defer a.free(ws);
     try std.testing.expectEqualStrings("CREATE INDEX \"idx_w\" ON \"t\" (\"a\");", ws);
     // Postgres: no built-in NOCASE collation, so `.nocase` becomes a `lower()` FUNCTIONAL index
     // (#159) — a UNIQUE one over `lower("email")` rejects case-variant duplicates, giving PG the
     // same case-insensitive uniqueness SQLite gets from COLLATE NOCASE.
     const pg_ci = try createIndexSql(a, "customers", .{ .name = "idx_email", .fields = &.{"email"}, .unique = true, .collation = .nocase }, .postgres);
+    defer a.free(pg_ci);
     try std.testing.expectEqualStrings("CREATE UNIQUE INDEX \"idx_email\" ON \"customers\" (lower(\"email\"));", pg_ci);
     // Multi-column `.nocase` lowers each column independently on Postgres.
     const pg_both = try createIndexSql(a, "t", .{ .name = "idx_both", .fields = &.{ "a", "b" }, .collation = .nocase, .where = "a IS NOT NULL" }, .postgres);
+    defer a.free(pg_both);
     try std.testing.expectEqualStrings("CREATE INDEX \"idx_both\" ON \"t\" (lower(\"a\"),lower(\"b\")) WHERE a IS NOT NULL;", pg_both);
 }
 
 test "rebuildPlan copies retained columns by field id, adds new, drops removed" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const old_fields = [_]schema.Field{
         .{ .id = "f1", .name = "title", .options = .{ .text = .{} } },
         .{ .id = "f2", .name = "old_price", .options = .{ .number = .{ .mode = .float } } },
@@ -412,6 +444,10 @@ test "rebuildPlan copies retained columns by field id, adds new, drops removed" 
     const old = schema.Collection{ .id = "c1", .name = "posts", .fields = &old_fields };
     const new = schema.Collection{ .id = "c1", .name = "posts", .fields = &new_fields };
     const plan = try rebuildPlan(a, old, new, .sqlite);
+    defer {
+        for (plan) |s| a.free(s);
+        a.free(plan);
+    }
     // No indexes in the fixture, so the plan is exactly: create, insert, drop, rename.
     try std.testing.expectEqual(@as(usize, 4), plan.len);
     try std.testing.expect(std.mem.indexOf(u8, plan[0], "\"posts__new\"") != null);
@@ -424,9 +460,7 @@ test "rebuildPlan copies retained columns by field id, adds new, drops removed" 
 }
 
 test "rebuildPlan (Postgres) emits in-place ALTERs keyed by field id (rename, add, drop)" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const old_fields = [_]schema.Field{
         .{ .id = "f1", .name = "title", .options = .{ .text = .{} } },
         .{ .id = "f2", .name = "old_price", .options = .{ .number = .{ .mode = .float } } },
@@ -438,6 +472,10 @@ test "rebuildPlan (Postgres) emits in-place ALTERs keyed by field id (rename, ad
     const old = schema.Collection{ .id = "c1", .name = "posts", .fields = &old_fields };
     const new = schema.Collection{ .id = "c1", .name = "posts", .fields = &new_fields };
     const plan = try rebuildPlan(a, old, new, .postgres);
+    defer {
+        for (plan) |s| a.free(s);
+        a.free(plan);
+    }
     // No table rebuild: targeted ALTERs only — drop old_price, rename title->headline, add views.
     var saw_drop = false;
     var saw_rename = false;
@@ -454,10 +492,9 @@ test "rebuildPlan (Postgres) emits in-place ALTERs keyed by field id (rename, ad
 }
 
 test "authIdentityIndexSql builds a partial unique index over non-empty values" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const sql = try authIdentityIndexSql(a, "users", "email");
+    defer a.free(sql);
     try std.testing.expectEqualStrings(
         "CREATE UNIQUE INDEX IF NOT EXISTS \"idx_auth_users_email\" ON \"users\" (\"email\") WHERE \"email\" != '';",
         sql,
