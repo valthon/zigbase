@@ -1,9 +1,7 @@
 # path<TAB>count<TAB>justification
 # A test may wrap testing.allocator in an arena ONLY if the code under test takes
 # RequestArena (contract 4). Every line here is a promise to remove it or justify it.
-src/analytics/analytics.zig	3	PRE-EXISTING: not yet migrated to the ownership contracts
-src/analytics/api.zig	3	PRE-EXISTING: not yet migrated to the ownership contracts
-src/api/auth.zig	42	PRE-EXISTING: not yet migrated to the ownership contracts
+src/api/auth.zig	40	2 non-handler outliers un-masked (a dead unused arena in the gcExpiredSessions test, and the backlog test whose arena only held transient session-id strings). 40 remain: genuine handler tests holding a RequestArena/Response graph (contract-4) or a collection+record graph whose masking is gated on records.zig's still-masked create/error-path leaks (e.g. the `expectError(error.Constraint, records.create(...))` at ~line 188) — separate un-migrated root causes.
 src/api/auth_methods.zig	10	PRE-EXISTING: not yet migrated to the ownership contracts
 src/api/collections.zig	9	PRE-EXISTING: not yet migrated to the ownership contracts
 src/api/features.zig	4	PRE-EXISTING: not yet migrated to the ownership contracts
@@ -11,15 +9,13 @@ src/api/files.zig	3	PRE-EXISTING: not yet migrated to the ownership contracts
 src/api/health.zig	1	PRE-EXISTING: not yet migrated to the ownership contracts
 src/api/magic_link_consume.zig	7	PRE-EXISTING: not yet migrated to the ownership contracts
 src/api/mail_unsubscribe.zig	6	PRE-EXISTING: not yet migrated to the ownership contracts
-src/api/oauth.zig	6	PRE-EXISTING: not yet migrated to the ownership contracts
+src/api/oauth.zig	5	The "deleting an auth record removes its external-auth links" outlier is un-masked (seedOAuthCollection now self-frees its encrypted-secret blob + created collection; the test frees the fetched collection via Collection.deinit) and runs under std.testing.allocator. 5 remain: genuine handler tests holding a RequestArena/Response graph (contract-4).
 src/api/records.zig	35	PRE-EXISTING: not yet migrated to the ownership contracts
-src/api/senders.zig	1	PRE-EXISTING: not yet migrated to the ownership contracts
 src/api/sessions.zig	6	PRE-EXISTING: not yet migrated to the ownership contracts
 src/api/settings.zig	2	PRE-EXISTING: not yet migrated to the ownership contracts
 src/api/state.zig	5	PRE-EXISTING: not yet migrated to the ownership contracts
 src/api/webauthn_register.zig	4	PRE-EXISTING: not yet migrated to the ownership contracts
-src/auth.zig	17	PRE-EXISTING: not yet migrated to the ownership contracts
-src/auth/challenge_store.zig	4	PRE-EXISTING: not yet migrated to the ownership contracts
+src/auth.zig	6	The 11 applyCreate/applyProvision/applyUpdate tests are un-masked (each returns a graph freed via freeProvisioned, run under std.testing.allocator). 6 remain: the verifyToken/verifyTokenOfTypes/authenticate family, which return the `Verified`/`Authed` graph from an internal JWT-claims parse (deferred design work per the batch scope) — arena-scoped pending that migration.
 src/auth/method.zig	5	PRE-EXISTING: not yet migrated to the ownership contracts
 src/auth/methods/magic_link.zig	11	PRE-EXISTING: not yet migrated to the ownership contracts
 src/auth/methods/oauth2.zig	11	PRE-EXISTING: not yet migrated to the ownership contracts
@@ -27,7 +23,6 @@ src/auth/methods/otp.zig	11	PRE-EXISTING: not yet migrated to the ownership cont
 src/auth/methods/password.zig	3	PRE-EXISTING: not yet migrated to the ownership contracts
 src/auth/methods/webauthn.zig	2	PRE-EXISTING: not yet migrated to the ownership contracts
 src/auth_helpers.zig	5	PRE-EXISTING: not yet migrated to the ownership contracts
-src/authz/abilities.zig	4	PRE-EXISTING: not yet migrated to the ownership contracts
 src/backend/postgres/conn.zig	1	PRE-EXISTING: not yet migrated to the ownership contracts
 src/captcha.zig	4	contract-4: verify tests hold an arena-scoped HttpClient response body (sub-slice of max_response_bytes, not individually freeable)
 src/clock_sql.zig	2	PRE-EXISTING: not yet migrated to the ownership contracts
@@ -55,7 +50,6 @@ src/query/expand.zig	9	PRE-EXISTING: not yet migrated to the ownership contracts
 src/query/fields.zig	12	PRE-EXISTING: not yet migrated to the ownership contracts
 src/query/params.zig	1	PRE-EXISTING: not yet migrated to the ownership contracts
 src/query/sort.zig	4	PRE-EXISTING: not yet migrated to the ownership contracts
-src/queue/durable.zig	4	PRE-EXISTING: not yet migrated to the ownership contracts
 src/realtime/hub.zig	2	The guarded-query authz scratch leak is fixed (policy.matchesRule/rules.matches/records.guardPasses self-free their compiled Guard) and colcache.lease's cache==null fallback now owns a private arena that release() deinits, so all 7 shouldDeliver tests AND both frameForDelivery collection-lookup tests run under the raw std.testing.allocator (mkColl/pub_col/locked_col/fnotes -> Collection.deinit, mkRec/rec -> records.freeRecord + buildEventFrames called before the free, authedConn -> freeConn, ef/lf -> EventFrames.deinit, the F4 test's re-serialized id-only frame -> a.free(out)). 2 remain masked, both legitimate contract-4: subscribeCheck takes a RequestArena and authVerb's identity_arena is a real *ArenaAllocator.
 src/records.zig	42	20 list-driving tests converted to std.testing.allocator now that records.list self-frees its whole SQL-compilation graph (joiner/FTS/vector/lexer/parser/compiler/keyset/sort/tenancy/ttl scratch) on a function-local arena and only the ListResult (interned keys + items + cursors) escapes on the caller allocator (freed via ListResult.deinit). json/multi-value records are now FULLY FREEABLE off any allocator: values.readValue deep-clones the parse tree onto the caller allocator and freeRecord/freeInternedRecord/ListResult.deinit recurse it via values.freeValue — proven by two NEW non-arena tests ("freeRecord: json + multi-value sub-trees are freed recursively" and "ListResult.deinit: interned-mode json/multi sub-trees free recursively"). 42 remain masked: none of them call list — they drive get/create/update/coerce/field-validation/encrypted/gcExpiredRecords/gcCursorStates whose scratch or returned records are gated on other un-migrated paths (the get/create/update record graph not yet converted to free via freeRecord, coerce's intermediate ObjectMaps + its own parseFromSlice-discard leak, and rowToObject's error-path partial-record leak the encrypted/validation expectError tests hit — all separate root causes).
 src/records_hooks_test.zig	4	PRE-EXISTING: not yet migrated to the ownership contracts
@@ -63,14 +57,11 @@ src/report/send.zig	1	PRE-EXISTING: not yet migrated to the ownership contracts
 src/report/sentry.zig	1	PRE-EXISTING: not yet migrated to the ownership contracts
 src/request_arena.zig	1	PRE-EXISTING: not yet migrated to the ownership contracts
 src/rewrap.zig	9	PRE-EXISTING: not yet migrated to the ownership contracts
-src/route_types.zig	3	PRE-EXISTING: not yet migrated to the ownership contracts
 src/router.zig	5	PRE-EXISTING: not yet migrated to the ownership contracts
 src/schema.zig	21	PRE-EXISTING: not yet migrated to the ownership contracts
 src/schema_dump.zig	3	PRE-EXISTING: not yet migrated to the ownership contracts
 src/search/vector.zig	5	PRE-EXISTING: not yet migrated to the ownership contracts
-src/server.zig	2	PRE-EXISTING: not yet migrated to the ownership contracts
-src/sms/send.zig	2	PRE-EXISTING: not yet migrated to the ownership contracts
-src/sms/twilio.zig	2	PRE-EXISTING: not yet migrated to the ownership contracts
+src/server.zig	2	contract-4: the applyMultipart tests hold the `files/multipart.zig` Extracted graph, whose form-field KEYS/VALUES and file bytes BORROW from the request `body` (parseDisposition borrows names, duping only on the rare backslash-escape path), while the ObjectMap/array backings + files slice are owned — the owned-vs-borrowed split is not tracked, so a general Extracted.deinit cannot free it safely. Reclaimed wholesale by the request arena. (parse() also leaves its dash_boundary/delim scratch on the caller allocator; both are deferred to a files/multipart.zig redesign.)
 src/static_files.zig	24	PRE-EXISTING: not yet migrated to the ownership contracts
 src/tenancy/tenancy.zig	4	PRE-EXISTING: not yet migrated to the ownership contracts
 src/testcapture.zig	4	PRE-EXISTING: not yet migrated to the ownership contracts
