@@ -137,36 +137,58 @@ pub const Collection = struct {
         freeOptStrOwned(alloc, self.updateRule);
         freeOptStrOwned(alloc, self.deleteRule);
 
-        for (self.indexes) |idx| {
-            alloc.free(idx.name);
-            freeStrArrayOwned(alloc, idx.fields);
-            freeOptStrOwned(alloc, idx.where);
-        }
+        for (self.indexes) |idx| freeIndexOwned(alloc, idx);
         alloc.free(self.indexes);
 
         // The leading auth system fields are static (from authSystemFields()); skip
         // them and free only the user fields, then the (owned) slice backing.
         const skip = if (self.type == .auth) authSystemFields().len else 0;
-        for (self.fields[skip..]) |f| {
-            alloc.free(f.id);
-            alloc.free(f.name);
-            switch (f.options) {
-                .text => |t| freeOptStrOwned(alloc, t.pattern),
-                .date => |d| {
-                    freeOptStrOwned(alloc, d.min);
-                    freeOptStrOwned(alloc, d.max);
-                },
-                .select => |s| freeStrArrayOwned(alloc, s.values),
-                .relation => |r| alloc.free(r.targetCollectionId),
-                .file => |fo| if (fo.mimeTypes) |m| freeStrArrayOwned(alloc, m),
-                else => {},
-            }
-        }
+        for (self.fields[skip..]) |f| freeFieldOwned(alloc, f);
         alloc.free(self.fields);
 
         deinitOptions(alloc, self.options);
     }
 };
+
+/// Free one owned `Field`'s id/name/options (the inverse of `fieldFromValue`). Does NOT free a
+/// backing array — callers that own the array free it separately (see `freeFieldsOwned`, or
+/// `Collection.deinit`'s skip-aware loop over `self.fields[skip..]`).
+fn freeFieldOwned(alloc: std.mem.Allocator, f: Field) void {
+    alloc.free(f.id);
+    alloc.free(f.name);
+    switch (f.options) {
+        .text => |t| freeOptStrOwned(alloc, t.pattern),
+        .date => |d| {
+            freeOptStrOwned(alloc, d.min);
+            freeOptStrOwned(alloc, d.max);
+        },
+        .select => |s| freeStrArrayOwned(alloc, s.values),
+        .relation => |r| alloc.free(r.targetCollectionId),
+        .file => |fo| if (fo.mimeTypes) |m| freeStrArrayOwned(alloc, m),
+        else => {},
+    }
+}
+
+/// Free a fully-owned `[]Field` — exactly the shape `fieldsFromJson` returns (every field's
+/// id/name/options duped). Frees every field's owned parts, then the backing array itself.
+fn freeFieldsOwned(alloc: std.mem.Allocator, fields: []const Field) void {
+    for (fields) |f| freeFieldOwned(alloc, f);
+    alloc.free(fields);
+}
+
+/// Free one owned `Index`'s name/fields/where (the inverse of the `indexesFromJson` loop body).
+/// Does NOT free a backing array — see `freeIndexesOwned`.
+fn freeIndexOwned(alloc: std.mem.Allocator, idx: Index) void {
+    alloc.free(idx.name);
+    freeStrArrayOwned(alloc, idx.fields);
+    freeOptStrOwned(alloc, idx.where);
+}
+
+/// Free a fully-owned `[]Index` — exactly the shape `indexesFromJson` returns.
+fn freeIndexesOwned(alloc: std.mem.Allocator, idxs: []const Index) void {
+    for (idxs) |idx| freeIndexOwned(alloc, idx);
+    alloc.free(idxs);
+}
 
 /// Free an optional owned string (no-op on null or an empty slice).
 fn freeOptStrOwned(alloc: std.mem.Allocator, s: ?[]const u8) void {
@@ -418,102 +440,108 @@ pub const CollectionOptions = struct {
 };
 
 pub fn optionsToJson(alloc: std.mem.Allocator, c: Collection, redact: bool) ![]u8 {
+    // Self-freeing (contract 1): the whole ObjectMap/Array tree below is scratch, built on a
+    // function-local arena reclaimed on every return (incl. error paths) — same discipline as
+    // `collectionToJson`. Only the final serialized string escapes, allocated on `alloc`.
+    var scratch = std.heap.ArenaAllocator.init(alloc);
+    defer scratch.deinit();
+    const sa = scratch.allocator();
     var root: ObjectMap = .empty;
     var auth: ObjectMap = .empty;
-    var ids = std.json.Array.init(alloc);
+    var ids = std.json.Array.init(sa);
     for (c.options.auth.identityFields) |f| try ids.append(.{ .string = f });
-    try auth.put(alloc, "identityFields", .{ .array = ids });
-    try auth.put(alloc, "minPasswordLength", .{ .integer = c.options.auth.minPasswordLength });
-    try auth.put(alloc, "require_verified", .{ .bool = c.options.auth.require_verified });
+    try auth.put(sa, "identityFields", .{ .array = ids });
+    try auth.put(sa, "minPasswordLength", .{ .integer = c.options.auth.minPasswordLength });
+    try auth.put(sa, "require_verified", .{ .bool = c.options.auth.require_verified });
 
     var oauth2: ObjectMap = .empty;
-    try oauth2.put(alloc, "enabled", .{ .bool = c.options.auth.oauth2.enabled });
-    var provs = std.json.Array.init(alloc);
+    try oauth2.put(sa, "enabled", .{ .bool = c.options.auth.oauth2.enabled });
+    var provs = std.json.Array.init(sa);
     for (c.options.auth.oauth2.providers) |p| {
         var po: ObjectMap = .empty;
-        try po.put(alloc, "name", .{ .string = p.name });
-        try po.put(alloc, "clientId", .{ .string = p.clientId });
-        try po.put(alloc, "clientSecret", .{ .string = if (redact) "" else p.clientSecret });
-        try po.put(alloc, "enabled", .{ .bool = p.enabled });
-        var rus = std.json.Array.init(alloc);
+        try po.put(sa, "name", .{ .string = p.name });
+        try po.put(sa, "clientId", .{ .string = p.clientId });
+        try po.put(sa, "clientSecret", .{ .string = if (redact) "" else p.clientSecret });
+        try po.put(sa, "enabled", .{ .bool = p.enabled });
+        var rus = std.json.Array.init(sa);
         for (p.redirectUrls) |u| try rus.append(.{ .string = u });
-        try po.put(alloc, "redirectUrls", .{ .array = rus });
-        if (p.authURL) |u| try po.put(alloc, "authURL", .{ .string = u });
-        if (p.tokenURL) |u| try po.put(alloc, "tokenURL", .{ .string = u });
-        if (p.userinfoURL) |u| try po.put(alloc, "userinfoURL", .{ .string = u });
-        if (p.discoveryURL) |u| try po.put(alloc, "discoveryURL", .{ .string = u });
+        try po.put(sa, "redirectUrls", .{ .array = rus });
+        if (p.authURL) |u| try po.put(sa, "authURL", .{ .string = u });
+        if (p.tokenURL) |u| try po.put(sa, "tokenURL", .{ .string = u });
+        if (p.userinfoURL) |u| try po.put(sa, "userinfoURL", .{ .string = u });
+        if (p.discoveryURL) |u| try po.put(sa, "discoveryURL", .{ .string = u });
         if (p.scopes) |sc| {
-            var sa = std.json.Array.init(alloc);
-            for (sc) |s| try sa.append(.{ .string = s });
-            try po.put(alloc, "scopes", .{ .array = sa });
+            var scarr = std.json.Array.init(sa);
+            for (sc) |s| try scarr.append(.{ .string = s });
+            try po.put(sa, "scopes", .{ .array = scarr });
         }
         try provs.append(.{ .object = po });
     }
-    try oauth2.put(alloc, "providers", .{ .array = provs });
-    try auth.put(alloc, "oauth2", .{ .object = oauth2 });
+    try oauth2.put(sa, "providers", .{ .array = provs });
+    try auth.put(sa, "oauth2", .{ .object = oauth2 });
 
     // Serialize methods
     var methods: ObjectMap = .empty;
     if (c.options.auth.methods.password) |pw| {
         var pw_obj: ObjectMap = .empty;
-        try pw_obj.put(alloc, "rate_limit", try rateLimitToJsonAlloc(alloc, pw.rate_limit));
-        try methods.put(alloc, "password", .{ .object = pw_obj });
+        try pw_obj.put(sa, "rate_limit", try rateLimitToJsonAlloc(sa, pw.rate_limit));
+        try methods.put(sa, "password", .{ .object = pw_obj });
     }
     if (c.options.auth.methods.magic_link) |ml| {
         var ml_obj: ObjectMap = .empty;
-        try ml_obj.put(alloc, "ttl_s", .{ .integer = ml.ttl_s });
-        try ml_obj.put(alloc, "auto_create", .{ .bool = ml.auto_create });
-        try ml_obj.put(alloc, "rate_limit", try rateLimitToJsonAlloc(alloc, ml.rate_limit));
-        try ml_obj.put(alloc, "redirect_default", .{ .string = ml.redirect_default });
-        var allow_arr = std.json.Array.init(alloc);
+        try ml_obj.put(sa, "ttl_s", .{ .integer = ml.ttl_s });
+        try ml_obj.put(sa, "auto_create", .{ .bool = ml.auto_create });
+        try ml_obj.put(sa, "rate_limit", try rateLimitToJsonAlloc(sa, ml.rate_limit));
+        try ml_obj.put(sa, "redirect_default", .{ .string = ml.redirect_default });
+        var allow_arr = std.json.Array.init(sa);
         for (ml.redirect_allow) |p| try allow_arr.append(.{ .string = p });
-        try ml_obj.put(alloc, "redirect_allow", .{ .array = allow_arr });
-        try methods.put(alloc, "magic_link", .{ .object = ml_obj });
+        try ml_obj.put(sa, "redirect_allow", .{ .array = allow_arr });
+        try methods.put(sa, "magic_link", .{ .object = ml_obj });
     }
     if (c.options.auth.methods.otp) |otp| {
         var otp_obj: ObjectMap = .empty;
-        try otp_obj.put(alloc, "length", .{ .integer = @as(i64, otp.length) });
-        try otp_obj.put(alloc, "ttl_s", .{ .integer = otp.ttl_s });
-        try otp_obj.put(alloc, "auto_create", .{ .bool = otp.auto_create });
-        try otp_obj.put(alloc, "rate_limit", try rateLimitToJsonAlloc(alloc, otp.rate_limit));
-        try methods.put(alloc, "otp", .{ .object = otp_obj });
+        try otp_obj.put(sa, "length", .{ .integer = @as(i64, otp.length) });
+        try otp_obj.put(sa, "ttl_s", .{ .integer = otp.ttl_s });
+        try otp_obj.put(sa, "auto_create", .{ .bool = otp.auto_create });
+        try otp_obj.put(sa, "rate_limit", try rateLimitToJsonAlloc(sa, otp.rate_limit));
+        try methods.put(sa, "otp", .{ .object = otp_obj });
     }
     if (c.options.auth.methods.webauthn) |wa| {
         var wa_obj: ObjectMap = .empty;
-        try wa_obj.put(alloc, "rp_id", .{ .string = wa.rp_id });
-        try wa_obj.put(alloc, "rp_name", .{ .string = wa.rp_name });
-        try wa_obj.put(alloc, "origin", .{ .string = wa.origin });
-        try wa_obj.put(alloc, "credentials_collection", .{ .string = wa.credentials_collection });
-        try wa_obj.put(alloc, "require_uv", .{ .bool = wa.require_uv });
-        try wa_obj.put(alloc, "rate_limit", try rateLimitToJsonAlloc(alloc, wa.rate_limit));
-        try methods.put(alloc, "webauthn", .{ .object = wa_obj });
+        try wa_obj.put(sa, "rp_id", .{ .string = wa.rp_id });
+        try wa_obj.put(sa, "rp_name", .{ .string = wa.rp_name });
+        try wa_obj.put(sa, "origin", .{ .string = wa.origin });
+        try wa_obj.put(sa, "credentials_collection", .{ .string = wa.credentials_collection });
+        try wa_obj.put(sa, "require_uv", .{ .bool = wa.require_uv });
+        try wa_obj.put(sa, "rate_limit", try rateLimitToJsonAlloc(sa, wa.rate_limit));
+        try methods.put(sa, "webauthn", .{ .object = wa_obj });
     }
     if (c.options.auth.methods.custom.len > 0) {
-        var custom_arr = std.json.Array.init(alloc);
+        var custom_arr = std.json.Array.init(sa);
         for (c.options.auth.methods.custom) |slug| try custom_arr.append(.{ .string = slug });
-        try methods.put(alloc, "custom", .{ .array = custom_arr });
+        try methods.put(sa, "custom", .{ .array = custom_arr });
     }
-    try auth.put(alloc, "methods", .{ .object = methods });
+    try auth.put(sa, "methods", .{ .object = methods });
 
-    try root.put(alloc, "auth", .{ .object = auth });
+    try root.put(sa, "auth", .{ .object = auth });
 
     if (c.options.ttl_field) |tf| {
         var ttl: ObjectMap = .empty;
-        try ttl.put(alloc, "field", .{ .string = tf });
-        try root.put(alloc, "ttl", .{ .object = ttl });
+        try ttl.put(sa, "field", .{ .string = tf });
+        try root.put(sa, "ttl", .{ .object = ttl });
     }
     if (c.options.tenant_field) |tf| {
         var tenant: ObjectMap = .empty;
-        try tenant.put(alloc, "field", .{ .string = tf });
-        try root.put(alloc, "tenant", .{ .object = tenant });
+        try tenant.put(sa, "field", .{ .string = tf });
+        try root.put(sa, "tenant", .{ .object = tenant });
     }
     if (c.options.abilities) |ab| {
         var abilities: ObjectMap = .empty;
-        try abilityToJson(alloc, &abilities, "view", ab.view);
-        try abilityToJson(alloc, &abilities, "update", ab.update);
-        try abilityToJson(alloc, &abilities, "delete", ab.delete);
-        try abilityToJson(alloc, &abilities, "create", ab.create);
-        try root.put(alloc, "abilities", .{ .object = abilities });
+        try abilityToJson(sa, &abilities, "view", ab.view);
+        try abilityToJson(sa, &abilities, "update", ab.update);
+        try abilityToJson(sa, &abilities, "delete", ab.delete);
+        try abilityToJson(sa, &abilities, "create", ab.create);
+        try root.put(sa, "abilities", .{ .object = abilities });
     }
     return std.json.Stringify.valueAlloc(alloc, std.json.Value{ .object = root }, .{});
 }
@@ -824,16 +852,20 @@ pub fn injectAuthFields(alloc: std.mem.Allocator, col: Collection) !Collection {
 }
 
 test "injectAuthFields prepends the auth system fields for auth collections only" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const user = [_]Field{.{ .id = "f1", .name = "bio", .options = .{ .text = .{} } }};
     const auth_col = try injectAuthFields(a, .{ .id = "c", .name = "users", .type = .auth, .fields = &user });
+    // injectAuthFields allocates exactly one array (the memcpy'd backing); every Field it holds
+    // is a shallow copy pointing at `authSystemFields()`/`user`'s own (literal/borrowed) strings,
+    // so freeing the backing array is the whole obligation — freeing the elements too would
+    // double-free those borrowed strings.
+    defer a.free(auth_col.fields);
     try std.testing.expectEqual(@as(usize, 7), auth_col.fields.len); // 6 system + 1 user
     try std.testing.expectEqualStrings("email", auth_col.fields[0].name);
     try std.testing.expect(fieldByName(auth_col, "passwordHash").?.hidden);
     // token_epoch is a hidden system field (#99 session epoch).
     try std.testing.expect(fieldByName(auth_col, "token_epoch").?.hidden);
+    // base/view collections are returned unchanged (base_col.fields IS &user; no new allocation).
     const base_col = try injectAuthFields(a, .{ .id = "c", .name = "posts", .type = .base, .fields = &user });
     try std.testing.expectEqual(@as(usize, 1), base_col.fields.len);
 }
@@ -1119,24 +1151,33 @@ fn fieldToValue(alloc: std.mem.Allocator, f: Field) !Value {
 }
 
 pub fn fieldsToJson(alloc: std.mem.Allocator, fields: []const Field) ![]u8 {
-    var arr = Array.init(alloc);
-    for (fields) |f| try arr.append(try fieldToValue(alloc, f));
+    // Self-freeing (contract 1): the Value tree is scratch, built on a function-local arena
+    // reclaimed on every return; only the final serialized string escapes, allocated on `alloc`.
+    var scratch = std.heap.ArenaAllocator.init(alloc);
+    defer scratch.deinit();
+    const sa = scratch.allocator();
+    var arr = Array.init(sa);
+    for (fields) |f| try arr.append(try fieldToValue(sa, f));
     const root = Value{ .array = arr };
     return std.json.Stringify.valueAlloc(alloc, root, .{});
 }
 
 pub fn indexesToJson(alloc: std.mem.Allocator, idx: []const Index) ![]u8 {
-    var arr = Array.init(alloc);
+    // Self-freeing (contract 1): see `fieldsToJson`.
+    var scratch = std.heap.ArenaAllocator.init(alloc);
+    defer scratch.deinit();
+    const sa = scratch.allocator();
+    var arr = Array.init(sa);
     for (idx) |ix| {
         var obj: ObjectMap = .empty;
-        try obj.put(alloc, "name", jStr(ix.name));
-        var farr = Array.init(alloc);
+        try obj.put(sa, "name", jStr(ix.name));
+        var farr = Array.init(sa);
         for (ix.fields) |fn_| try farr.append(jStr(fn_));
-        try obj.put(alloc, "fields", .{ .array = farr });
-        try obj.put(alloc, "unique", jBool(ix.unique));
+        try obj.put(sa, "fields", .{ .array = farr });
+        try obj.put(sa, "unique", jBool(ix.unique));
         if (ix.collation != .binary)
-            try obj.put(alloc, "collation", jStr(@tagName(ix.collation)));
-        if (ix.where) |w| try obj.put(alloc, "where", jStr(w));
+            try obj.put(sa, "collation", jStr(@tagName(ix.collation)));
+        if (ix.where) |w| try obj.put(sa, "where", jStr(w));
         try arr.append(.{ .object = obj });
     }
     return std.json.Stringify.valueAlloc(alloc, Value{ .array = arr }, .{});
@@ -1352,20 +1393,52 @@ pub fn parseCollectionInput(alloc: std.mem.Allocator, s: []const u8) !Collection
     const obj = parsed.value;
     if (obj != .object) return error.InvalidSchema;
 
+    // The `fv`/`iv`/`ov` re-stringify-then-reparse round trips below are pure scratch (each is
+    // immediately consumed by fieldsFromJson/indexesFromJson/optionsFromJson, which dupe every
+    // retained value onto `alloc` themselves) — build them on a function-local scratch arena so
+    // the intermediate JSON text doesn't escape. Production always calls this under a request
+    // arena, so this scratch was always reclaimed wholesale; the raw-allocator test now proves it.
+    var scratch = std.heap.ArenaAllocator.init(alloc);
+    defer scratch.deinit();
+    const sa = scratch.allocator();
+
     const name = try alloc.dupe(u8, (objGetStr(obj, "name")) orelse return error.InvalidSchema);
     const ctype = std.meta.stringToEnum(CollectionType, objGetStr(obj, "type") orelse "base") orelse .base;
 
     const raw_fields = if (obj.object.get("fields")) |fv| blk: {
-        const fs = try std.json.Stringify.valueAlloc(alloc, fv, .{});
+        const fs = try std.json.Stringify.valueAlloc(sa, fv, .{});
         break :blk try fieldsFromJson(alloc, fs);
     } else &[_]Field{};
+    // `raw_fields` is the fully-owned array fieldsFromJson returns; every kept element's
+    // ownership is transferred into `kept`, every filtered (system-named) element's owned parts
+    // are freed here instead — either way `raw_fields`' OWN backing array is spent once this
+    // loop is done, so it is freed unconditionally on the way out (`defer`), while an OOM
+    // mid-loop (`errdefer`, registered after so it runs first) frees whatever the loop already
+    // decided (`kept`) plus whatever it hadn't reached yet (`raw_fields[scanned..]`).
+    defer alloc.free(raw_fields);
     var kept: std.ArrayList(Field) = .empty;
-    for (raw_fields) |f| if (!isSystemFieldName(f.name)) try kept.append(alloc, f);
+    var scanned: usize = 0;
+    errdefer {
+        for (kept.items) |kf| freeFieldOwned(alloc, kf);
+        kept.deinit(alloc);
+        for (raw_fields[scanned..]) |rf| freeFieldOwned(alloc, rf);
+    }
+    for (raw_fields) |f| {
+        if (isSystemFieldName(f.name)) {
+            // A submitted field colliding with a reserved system name is dropped rather than
+            // kept — without freeing it here, its id/name/options dupe would leak (previously
+            // masked by the request arena).
+            freeFieldOwned(alloc, f);
+        } else {
+            try kept.append(alloc, f);
+        }
+        scanned += 1;
+    }
     const fields = try kept.toOwnedSlice(alloc);
 
     const empty_indexes: []const Index = &.{};
     const indexes = if (obj.object.get("indexes")) |iv| blk: {
-        const is = try std.json.Stringify.valueAlloc(alloc, iv, .{});
+        const is = try std.json.Stringify.valueAlloc(sa, iv, .{});
         break :blk try indexesFromJson(alloc, is);
     } else empty_indexes;
 
@@ -1381,7 +1454,7 @@ pub fn parseCollectionInput(alloc: std.mem.Allocator, s: []const u8) !Collection
         .updateRule = try dupOptStr(alloc, objGetStr(obj, "updateRule")),
         .deleteRule = try dupOptStr(alloc, objGetStr(obj, "deleteRule")),
         .options = if (obj.object.get("options")) |ov|
-            try optionsFromJson(alloc, try std.json.Stringify.valueAlloc(alloc, ov, .{}))
+            try optionsFromJson(alloc, try std.json.Stringify.valueAlloc(sa, ov, .{}))
         else
             .{},
     };
@@ -1425,26 +1498,34 @@ pub fn collectionToJson(alloc: std.mem.Allocator, c: Collection) ![]u8 {
 }
 
 test "parseCollectionInput then collectionToJson round-trips the essentials" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
+    // An explicit (empty) "options" object routes parseCollectionInput through optionsFromJson's
+    // fully-owned path, rather than the bare struct-default `.{}` fallback (whose identityFields
+    // is the STATIC `&.{"email"}`) — production always runs this under a request arena and never
+    // individually deinits, so that default-literal path is fine there, but it isn't something
+    // Collection.deinit can safely free directly. Supplying "options":{} keeps this test on the
+    // fully-owned shape a get/create/update reload actually has.
     const input =
-        \\{"name":"posts","fields":[
+        \\{"name":"posts","options":{},"fields":[
         \\  {"id":"f1","name":"title","required":true,"type":"text","options":{}},
         \\  {"id":"f2","name":"price","type":"number","options":{"mode":"fixed","scale":2}}
         \\]}
     ;
-    const col = try parseCollectionInput(a, input);
+    var col = try parseCollectionInput(a, input);
     try std.testing.expectEqualStrings("posts", col.name);
     try std.testing.expectEqual(CollectionType.base, col.type);
     try std.testing.expectEqual(@as(usize, 2), col.fields.len);
     try std.testing.expectEqualStrings("", col.id);
 
-    var full = col;
-    full.id = "abc123def456ghi";
-    full.created = "2026-01-01 00:00:00";
-    full.updated = "2026-01-01 00:00:00";
-    const out = try collectionToJson(a, full);
+    // id/created/updated are stamped by the DB layer on insert; parseCollectionInput leaves them
+    // "" (an empty literal, a no-op to free). Give them owned values here so the whole graph is
+    // the fully-owned shape `Collection.deinit` expects (matching a real create() reload).
+    col.id = try a.dupe(u8, "abc123def456ghi");
+    col.created = try a.dupe(u8, "2026-01-01 00:00:00");
+    col.updated = try a.dupe(u8, "2026-01-01 00:00:00");
+    defer col.deinit(a);
+    const out = try collectionToJson(a, col);
+    defer a.free(out);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"id\":\"abc123def456ghi\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"name\":\"posts\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"schema\":[") != null);
@@ -1506,9 +1587,7 @@ test "sqlType mapping" {
 }
 
 test "round-trip fields through json" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const fields = [_]Field{
         .{ .id = "aaaaaaaa", .name = "title", .required = true, .options = .{ .text = .{ .max = 200 } } },
         .{ .id = "bbbbbbbb", .name = "price", .options = .{ .number = .{ .mode = .fixed, .scale = 2 } } },
@@ -1516,7 +1595,9 @@ test "round-trip fields through json" {
         .{ .id = "dddddddd", .name = "author", .options = .{ .relation = .{ .targetCollectionId = "users", .cascadeDelete = true } } },
     };
     const jsonStr = try fieldsToJson(a, &fields);
+    defer a.free(jsonStr);
     const back = try fieldsFromJson(a, jsonStr);
+    defer freeFieldsOwned(a, back);
     try std.testing.expectEqual(fields.len, back.len);
     try std.testing.expectEqualStrings("title", back[0].name);
     try std.testing.expect(back[0].required);
@@ -1531,15 +1612,16 @@ test "round-trip fields through json" {
 }
 
 test "searchable field flag round-trips through fieldsToJson/fieldsFromJson" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const fields = [_]Field{
         .{ .id = "aaaaaaaa", .name = "title", .searchable = true, .options = .{ .text = .{} } },
         .{ .id = "bbbbbbbb", .name = "slug", .options = .{ .text = .{} } }, // default: not searchable
         .{ .id = "cccccccc", .name = "body", .searchable = true, .options = .{ .editor = .{} } },
     };
-    const back = try fieldsFromJson(a, try fieldsToJson(a, &fields));
+    const fjson = try fieldsToJson(a, &fields);
+    defer a.free(fjson);
+    const back = try fieldsFromJson(a, fjson);
+    defer freeFieldsOwned(a, back);
     try std.testing.expect(back[0].searchable);
     try std.testing.expect(!back[1].searchable);
     try std.testing.expect(back[2].searchable);
@@ -1547,6 +1629,7 @@ test "searchable field flag round-trips through fieldsToJson/fieldsFromJson" {
 
     // A searchable flag on a non-text type, or on an encrypted field, is a validation error.
     var errs: std.ArrayList(ValidationError) = .empty;
+    defer errs.deinit(a);
     const bad = Collection{ .id = "c", .name = "posts", .fields = &[_]Field{
         .{ .id = "n1234567", .name = "count", .searchable = true, .options = .{ .number = .{} } },
         .{ .id = "e1234567", .name = "secret", .searchable = true, .encrypted = true, .options = .{ .text = .{} } },
@@ -1563,12 +1646,12 @@ test "searchable field flag round-trips through fieldsToJson/fieldsFromJson" {
 }
 
 test "indexes round-trip" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const idx = [_]Index{.{ .name = "idx_title", .fields = &.{"title"}, .unique = true }};
     const s = try indexesToJson(a, &idx);
+    defer a.free(s);
     const back = try indexesFromJson(a, s);
+    defer freeIndexesOwned(a, back);
     try std.testing.expectEqual(@as(usize, 1), back.len);
     try std.testing.expectEqualStrings("idx_title", back[0].name);
     try std.testing.expect(back[0].unique);
@@ -1578,15 +1661,15 @@ test "indexes round-trip" {
 }
 
 test "indexes round-trip collation and where predicate" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const idx = [_]Index{
         .{ .name = "idx_email", .fields = &.{"email"}, .unique = true, .collation = .nocase },
         .{ .name = "idx_active", .fields = &.{"slug"}, .unique = true, .where = "deleted_at IS NULL" },
     };
     const s = try indexesToJson(a, &idx);
+    defer a.free(s);
     const back = try indexesFromJson(a, s);
+    defer freeIndexesOwned(a, back);
     try std.testing.expectEqual(@as(usize, 2), back.len);
     try std.testing.expectEqual(Collation.nocase, back[0].collation);
     try std.testing.expect(back[0].where == null);
@@ -1595,73 +1678,84 @@ test "indexes round-trip collation and where predicate" {
 }
 
 test "collection options round-trip identity fields" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const c = Collection{ .id = "c", .name = "users", .type = .auth, .fields = &.{}, .options = .{ .auth = .{ .identityFields = &.{ "email", "username" }, .minPasswordLength = 10 } } };
     const s = try optionsToJson(a, c, false);
+    defer a.free(s);
     const back = try optionsFromJson(a, s);
+    defer deinitOptions(a, back);
     try std.testing.expectEqual(@as(usize, 2), back.auth.identityFields.len);
     try std.testing.expectEqualStrings("username", back.auth.identityFields[1]);
     try std.testing.expectEqual(@as(u8, 10), back.auth.minPasswordLength);
 }
 
 test "require_verified round-trips through optionsToJson/optionsFromJson" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     // default false
     const d = Collection{ .id = "c", .name = "users", .type = .auth, .fields = &.{} };
-    const back_d = try optionsFromJson(a, try optionsToJson(a, d, false));
+    const sd = try optionsToJson(a, d, false);
+    defer a.free(sd);
+    const back_d = try optionsFromJson(a, sd);
+    defer deinitOptions(a, back_d);
     try std.testing.expectEqual(false, back_d.auth.require_verified);
     // explicit true
     const c = Collection{ .id = "c", .name = "users", .type = .auth, .fields = &.{}, .options = .{ .auth = .{ .require_verified = true } } };
-    const back = try optionsFromJson(a, try optionsToJson(a, c, false));
+    const s = try optionsToJson(a, c, false);
+    defer a.free(s);
+    const back = try optionsFromJson(a, s);
+    defer deinitOptions(a, back);
     try std.testing.expectEqual(true, back.auth.require_verified);
 }
 
 test "ttl_field round-trips through optionsToJson/optionsFromJson" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     // default: no ttl_field => omitted from JSON, parses back as null
     const d = Collection{ .id = "c", .name = "posts", .fields = &.{} };
-    const back_d = try optionsFromJson(a, try optionsToJson(a, d, false));
+    const sd = try optionsToJson(a, d, false);
+    defer a.free(sd);
+    const back_d = try optionsFromJson(a, sd);
+    defer deinitOptions(a, back_d);
     try std.testing.expect(back_d.ttl_field == null);
     // explicit ttl_field is emitted and parsed back
     const c = Collection{ .id = "c", .name = "posts", .fields = &.{}, .options = .{ .ttl_field = "expires_at" } };
     const s = try optionsToJson(a, c, false);
+    defer a.free(s);
     try std.testing.expect(std.mem.indexOf(u8, s, "\"ttl\"") != null);
     const back = try optionsFromJson(a, s);
+    defer deinitOptions(a, back);
     try std.testing.expect(back.ttl_field != null);
     try std.testing.expectEqualStrings("expires_at", back.ttl_field.?);
 }
 
 test "tenant_field round-trips through optionsToJson/optionsFromJson" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     // default: no tenant_field => omitted from JSON, parses back as null
     const d = Collection{ .id = "c", .name = "posts", .fields = &.{} };
-    const back_d = try optionsFromJson(a, try optionsToJson(a, d, false));
+    const sd = try optionsToJson(a, d, false);
+    defer a.free(sd);
+    const back_d = try optionsFromJson(a, sd);
+    defer deinitOptions(a, back_d);
     try std.testing.expect(back_d.tenant_field == null);
     // explicit tenant_field is emitted and parsed back, alongside an unrelated ttl_field
     const c = Collection{ .id = "c", .name = "posts", .fields = &.{}, .options = .{ .tenant_field = "account", .ttl_field = "expires_at" } };
     const s = try optionsToJson(a, c, false);
+    defer a.free(s);
     try std.testing.expect(std.mem.indexOf(u8, s, "\"tenant\"") != null);
     const back = try optionsFromJson(a, s);
+    defer deinitOptions(a, back);
     try std.testing.expect(back.tenant_field != null);
     try std.testing.expectEqualStrings("account", back.tenant_field.?);
     try std.testing.expectEqualStrings("expires_at", back.ttl_field.?);
 }
 
 test "abilities round-trip through optionsToJson/optionsFromJson" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     // default: no abilities => omitted from JSON, parses back as null
     const d = Collection{ .id = "c", .name = "posts", .fields = &.{} };
-    const back_d = try optionsFromJson(a, try optionsToJson(a, d, false));
+    const sd = try optionsToJson(a, d, false);
+    defer a.free(sd);
+    const back_d = try optionsFromJson(a, sd);
+    defer deinitOptions(a, back_d);
     try std.testing.expect(back_d.abilities == null);
     // explicit per-action abilities are emitted and parsed back
     const ab = @import("authz/abilities.zig").Abilities{
@@ -1670,36 +1764,45 @@ test "abilities round-trip through optionsToJson/optionsFromJson" {
     };
     const c = Collection{ .id = "c", .name = "posts", .fields = &.{}, .options = .{ .abilities = ab } };
     const s = try optionsToJson(a, c, false);
+    defer a.free(s);
     try std.testing.expect(std.mem.indexOf(u8, s, "\"abilities\"") != null);
-    const back = (try optionsFromJson(a, s)).abilities.?;
-    try std.testing.expectEqualStrings("account", back.view.?.relationship.via);
-    try std.testing.expectEqualStrings("", back.view.?.relationship.min_role);
-    try std.testing.expectEqualStrings("editor", back.update.?.relationship.min_role);
-    try std.testing.expect(back.delete == null and back.create == null);
+    const back = try optionsFromJson(a, s);
+    defer deinitOptions(a, back);
+    const back_ab = back.abilities.?;
+    try std.testing.expectEqualStrings("account", back_ab.view.?.relationship.via);
+    try std.testing.expectEqualStrings("", back_ab.view.?.relationship.min_role);
+    try std.testing.expectEqualStrings("editor", back_ab.update.?.relationship.min_role);
+    try std.testing.expect(back_ab.delete == null and back_ab.create == null);
 }
 
 test "abilities deserialization fails closed on a malformed (non-string) min_role" {
     const abilities_mod = @import("authz/abilities.zig");
     const request = @import("request.zig");
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const col = Collection{ .id = "c", .name = "posts", .fields = &.{} };
     const mem = [_]request.Membership{.{ .account = "acc1", .role = "owner" }}; // a top-rank member
     const rctx = request.RequestContext{ .memberships = &mem };
 
     // `min_role` PRESENT but a number (malformed): must NOT widen to "any member" — it parses to the
     // deny sentinel so even a top-rank member is filtered out → constant-false "0" → deny.
-    const bad = (try optionsFromJson(a, "{\"abilities\":{\"view\":{\"via\":\"account\",\"min_role\":3}}}")).abilities.?.view.?;
+    const bad_opts = try optionsFromJson(a, "{\"abilities\":{\"view\":{\"via\":\"account\",\"min_role\":3}}}");
+    defer deinitOptions(a, bad_opts);
+    const bad = bad_opts.abilities.?.view.?;
     try std.testing.expectEqualStrings(abilities_mod.invalid_min_role, bad.relationship.min_role);
     const pbad = (try abilities_mod.abilityPredicate(a, col, bad, &rctx, dialect.Dialect.sqlite)).?;
     try std.testing.expectEqualStrings("0", pbad.sql);
+    // pbad.sql is the static `constFalse()` literal and pbad.params is the static empty-slice
+    // default — nothing owned to free on this branch.
 
     // Control — `min_role` ABSENT still means "any active member qualifies" (a real IN predicate,
     // not a deny). This is the legitimate omit-the-floor case and must stay green.
-    const ok = (try optionsFromJson(a, "{\"abilities\":{\"view\":{\"via\":\"account\"}}}")).abilities.?.view.?;
+    const ok_opts = try optionsFromJson(a, "{\"abilities\":{\"view\":{\"via\":\"account\"}}}");
+    defer deinitOptions(a, ok_opts);
+    const ok = ok_opts.abilities.?.view.?;
     try std.testing.expectEqualStrings("", ok.relationship.min_role);
     const pok = (try abilities_mod.abilityPredicate(a, col, ok, &rctx, dialect.Dialect.sqlite)).?;
+    defer a.free(pok.sql);
+    defer a.free(pok.params);
     try std.testing.expectEqualStrings("\"posts\".\"account\" IN (?)", pok.sql);
 }
 
@@ -1732,10 +1835,9 @@ test "optionsFromJson: a magic_link block omitting redirect_default is still fre
 }
 
 test "validate rejects an auth collection with a non-identifier identity field" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     var errs: std.ArrayList(ValidationError) = .empty;
+    defer errs.deinit(a);
     const c = Collection{
         .id = "c",
         .name = "users",
@@ -1752,10 +1854,9 @@ test "validate rejects an auth collection with a non-identifier identity field" 
 }
 
 test "validate accepts an auth collection with valid identity fields" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     var errs: std.ArrayList(ValidationError) = .empty;
+    defer errs.deinit(a);
     const c = Collection{
         .id = "c",
         .name = "users",
@@ -1771,14 +1872,13 @@ test "validate rejects a tenant_field that is not a valid identifier or names no
     // Security gate: an invalid tenant_field makes tenancy.scopeApplies fall through to false,
     // serving a tenant-owned collection UN-scoped (cross-tenant). The runtime collections API
     // (superuser create/update) must reject it at the boundary so that state is unreachable.
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const fields = [_]Field{.{ .id = "f1", .name = "account", .options = .{ .text = .{} } }};
 
     // (a) invalid identifier (embeds a dash — not a legal SQL identifier)
     {
         var errs: std.ArrayList(ValidationError) = .empty;
+        defer errs.deinit(a);
         const c = Collection{ .id = "c", .name = "posts", .fields = &fields, .options = .{ .tenant_field = "acc-ount" } };
         try validate(a, c, &errs);
         var found = false;
@@ -1790,6 +1890,7 @@ test "validate rejects a tenant_field that is not a valid identifier or names no
     // (b) valid identifier but names no existing field (dangling reference)
     {
         var errs: std.ArrayList(ValidationError) = .empty;
+        defer errs.deinit(a);
         const c = Collection{ .id = "c", .name = "posts", .fields = &fields, .options = .{ .tenant_field = "nonexistent" } };
         try validate(a, c, &errs);
         var found = false;
@@ -1803,6 +1904,7 @@ test "validate rejects a tenant_field that is not a valid identifier or names no
     {
         const num_fields = [_]Field{.{ .id = "n1", .name = "count", .options = .{ .number = .{ .mode = .int } } }};
         var errs: std.ArrayList(ValidationError) = .empty;
+        defer errs.deinit(a);
         const c = Collection{ .id = "c", .name = "posts", .fields = &num_fields, .options = .{ .tenant_field = "count" } };
         try validate(a, c, &errs);
         var found = false;
@@ -1814,6 +1916,7 @@ test "validate rejects a tenant_field that is not a valid identifier or names no
     // (d) control — a valid identifier naming an existing TEXT field is accepted
     {
         var errs: std.ArrayList(ValidationError) = .empty;
+        defer errs.deinit(a);
         const c = Collection{ .id = "c", .name = "posts", .fields = &fields, .options = .{ .tenant_field = "account" } };
         try validate(a, c, &errs);
         for (errs.items) |e| try std.testing.expect(!std.mem.eql(u8, e.code, "validation_invalid_tenant_field"));
@@ -1823,9 +1926,7 @@ test "validate rejects a tenant_field that is not a valid identifier or names no
 test "validate rejects a ttl_field that is not a valid identifier, names no field, or is not a date" {
     // The TTL GC compares the field via SQLite strftime; the runtime API must mirror the comptime
     // constraint that ttl_field names an existing date/autodate field, else GC misbehaves.
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const fields = [_]Field{
         .{ .id = "d1", .name = "expires", .options = .{ .date = .{} } },
         .{ .id = "t1", .name = "name", .options = .{ .text = .{} } },
@@ -1834,6 +1935,7 @@ test "validate rejects a ttl_field that is not a valid identifier, names no fiel
     // (a) invalid identifier
     {
         var errs: std.ArrayList(ValidationError) = .empty;
+        defer errs.deinit(a);
         const c = Collection{ .id = "c", .name = "posts", .fields = &fields, .options = .{ .ttl_field = "exp-ires" } };
         try validate(a, c, &errs);
         var found = false;
@@ -1845,6 +1947,7 @@ test "validate rejects a ttl_field that is not a valid identifier, names no fiel
     // (b) valid identifier but names no existing field
     {
         var errs: std.ArrayList(ValidationError) = .empty;
+        defer errs.deinit(a);
         const c = Collection{ .id = "c", .name = "posts", .fields = &fields, .options = .{ .ttl_field = "nonexistent" } };
         try validate(a, c, &errs);
         var found = false;
@@ -1856,6 +1959,7 @@ test "validate rejects a ttl_field that is not a valid identifier, names no fiel
     // (c) valid identifier naming an existing NON-date field (text) — rejected
     {
         var errs: std.ArrayList(ValidationError) = .empty;
+        defer errs.deinit(a);
         const c = Collection{ .id = "c", .name = "posts", .fields = &fields, .options = .{ .ttl_field = "name" } };
         try validate(a, c, &errs);
         var found = false;
@@ -1867,6 +1971,7 @@ test "validate rejects a ttl_field that is not a valid identifier, names no fiel
     // (d) control — a valid identifier naming an existing date field is accepted
     {
         var errs: std.ArrayList(ValidationError) = .empty;
+        defer errs.deinit(a);
         const c = Collection{ .id = "c", .name = "posts", .fields = &fields, .options = .{ .ttl_field = "expires" } };
         try validate(a, c, &errs);
         for (errs.items) |e| try std.testing.expect(!std.mem.eql(u8, e.code, "validation_invalid_ttl_field"));
@@ -1874,14 +1979,14 @@ test "validate rejects a ttl_field that is not a valid identifier, names no fiel
 }
 
 test "oauth2 options round-trip through optionsToJson(false)/optionsFromJson" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const providers = [_]OAuth2Provider{.{ .name = "google", .clientId = "cid", .clientSecret = "v1:blob", .enabled = true, .redirectUrls = &.{"https://app/cb"} }};
     const c = Collection{ .id = "c", .name = "users", .type = .auth, .fields = &.{}, .options = .{ .auth = .{ .oauth2 = .{ .enabled = true, .providers = &providers } } } };
     const s = try optionsToJson(a, c, false);
+    defer a.free(s);
     try std.testing.expect(std.mem.indexOf(u8, s, "\"clientSecret\":\"v1:blob\"") != null);
     const back = try optionsFromJson(a, s);
+    defer deinitOptions(a, back);
     try std.testing.expectEqual(true, back.auth.oauth2.enabled);
     try std.testing.expectEqual(@as(usize, 1), back.auth.oauth2.providers.len);
     try std.testing.expectEqualStrings("cid", back.auth.oauth2.providers[0].clientId);
@@ -1924,38 +2029,36 @@ test "validate rejects a date field whose min is after max" {
 }
 
 test "optionsToJson(true) redacts clientSecret" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const providers = [_]OAuth2Provider{.{ .name = "google", .clientId = "cid", .clientSecret = "v1:blob", .redirectUrls = &.{} }};
     const c = Collection{ .id = "c", .name = "users", .type = .auth, .fields = &.{}, .options = .{ .auth = .{ .oauth2 = .{ .enabled = true, .providers = &providers } } } };
     const s = try optionsToJson(a, c, true);
+    defer a.free(s);
     try std.testing.expect(std.mem.indexOf(u8, s, "v1:blob") == null);
     try std.testing.expect(std.mem.indexOf(u8, s, "\"clientSecret\":\"\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, s, "\"clientId\":\"cid\"") != null);
 }
 
 test "collectionToJson redacts oauth2 clientSecret" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const providers = [_]OAuth2Provider{.{ .name = "google", .clientId = "cid", .clientSecret = "v1:topsecret", .redirectUrls = &.{} }};
     const c = Collection{ .id = "id1", .name = "users", .type = .auth, .fields = &.{}, .options = .{ .auth = .{ .oauth2 = .{ .enabled = true, .providers = &providers } } } };
     const out = try collectionToJson(a, c);
+    defer a.free(out);
     try std.testing.expect(std.mem.indexOf(u8, out, "topsecret") == null);
 }
 
 test "AuthOptions.methods serializes + parses (magic_link ttl, password default)" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const allow = [_][]const u8{ "/club/", "/dashboard" };
     const c = Collection{ .id = "c", .name = "users", .type = .auth, .fields = &.{}, .options = .{ .auth = .{ .methods = .{
         .password = .{},
         .magic_link = .{ .ttl_s = 1200, .auto_create = true, .redirect_default = "/club/welcome", .redirect_allow = &allow },
     } } } };
     const json = try optionsToJson(a, c, false);
+    defer a.free(json);
     const back = try optionsFromJson(a, json);
+    defer deinitOptions(a, back);
     try std.testing.expect(back.auth.methods.password != null);
     try std.testing.expect(back.auth.methods.magic_link != null);
     try std.testing.expectEqual(@as(i64, 1200), back.auth.methods.magic_link.?.ttl_s);
@@ -1968,15 +2071,15 @@ test "AuthOptions.methods serializes + parses (magic_link ttl, password default)
 }
 
 test "AuthOptions.methods custom slugs round-trip" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const slugs = [_][]const u8{ "sso_saml", "passkey_corp" };
     const c = Collection{ .id = "c", .name = "users", .type = .auth, .fields = &.{}, .options = .{ .auth = .{ .methods = .{
         .custom = &slugs,
     } } } };
     const json = try optionsToJson(a, c, false);
+    defer a.free(json);
     const back = try optionsFromJson(a, json);
+    defer deinitOptions(a, back);
     try std.testing.expectEqual(@as(usize, 2), back.auth.methods.custom.len);
     try std.testing.expectEqualStrings("sso_saml", back.auth.methods.custom[0]);
     try std.testing.expectEqualStrings("passkey_corp", back.auth.methods.custom[1]);

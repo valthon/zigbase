@@ -50,7 +50,6 @@ src/report/send.zig	1	PRE-EXISTING: not yet migrated to the ownership contracts
 src/request_arena.zig	1	PRE-EXISTING: not yet migrated to the ownership contracts
 src/rewrap.zig	9	PRE-EXISTING: not yet migrated to the ownership contracts
 src/router.zig	2	contract-4: "dispatch routes to handler…" and "tryDispatch returns null…" drive dispatch/tryDispatch through a real http.RequestCtx, whose .allocator is a RequestArena (ctx.allocator.a) — dummyHandler and ApiError.notFound().toResponse both allocate through it. The 3 matchPath tests (pure builder over a plain std.mem.Allocator, no interlinked graph) now run under raw std.testing.allocator, freeing the returned []http.Param directly.
-src/schema.zig	21	PRE-EXISTING: not yet migrated to the ownership contracts
 src/schema_dump.zig	3	PRE-EXISTING: not yet migrated to the ownership contracts
 src/search/vector.zig	5	PRE-EXISTING: not yet migrated to the ownership contracts
 src/server.zig	2	contract-4: the applyMultipart tests hold the `files/multipart.zig` Extracted graph, whose form-field KEYS/VALUES and file bytes BORROW from the request `body` (parseDisposition borrows names, duping only on the rare backslash-escape path), while the ObjectMap/array backings + files slice are owned — the owned-vs-borrowed split is not tracked, so a general Extracted.deinit cannot free it safely. Reclaimed wholesale by the request arena. (parse() also leaves its dash_boundary/delim scratch on the caller allocator; both are deferred to a files/multipart.zig redesign.)
