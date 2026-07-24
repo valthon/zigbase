@@ -589,13 +589,15 @@ test "documented @public list rule + ability: listRuleFilter avoids the 400 and 
 /// `pinBase`'s posts table, re-typed with `title` searchable (the physical column is identical),
 /// and its FTS5 index provisioned. Returns the collection to drive `records.list(.{ .search })`.
 fn searchableBase(a: std.mem.Allocator, d: *db.Db) !schema.Collection {
-    const base = try pinBase(a, d);
-    const fields = try a.dupe(schema.Field, &[_]schema.Field{
+    try migrations.run(d);
+    // Create the `posts` table directly with `title` searchable, so the returned collection is
+    // fully owned (create() dupes id/name/field names) and safe to Collection.deinit — no orphaned
+    // base fields, no string-literal names reaching the free path.
+    const col = try collections.create(a, std.testing.io, d, .{ .id = "", .name = "posts", .fields = &[_]schema.Field{
         .{ .id = "f1", .name = "title", .searchable = true, .options = .{ .text = .{} } },
         .{ .id = "f2", .name = "owner", .options = .{ .text = .{} } },
-    });
-    var col = base;
-    col.fields = fields;
+    } });
+    errdefer col.deinit(a); // ensureIndex failure must not leak the just-created collection.
     try fts.ensureIndex(a, d, col);
     return col;
 }
@@ -603,10 +605,12 @@ fn searchableBase(a: std.mem.Allocator, d: *db.Db) !schema.Collection {
 test "records.list full-text search on a tenant-owned collection returns only the caller's account rows" {
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    var col = try searchableBase(a, &d);
+    const a = std.testing.allocator;
+    // `base_col` is the fully-owned create() reload; free it once. `col` is an unowned copy that
+    // overwrites `tenant_field` with a string LITERAL, so it must never reach Collection.deinit.
+    const base_col = try searchableBase(a, &d);
+    defer base_col.deinit(a);
+    var col = base_col;
     col.options.tenant_field = "owner"; // owning-account column
     // Two accounts each own a row whose title MATCHES the search term "budget".
     try d.exec("INSERT INTO posts (id,created,updated,title,owner) VALUES " ++
@@ -616,27 +620,32 @@ test "records.list full-text search on a tenant-owned collection returns only th
     const pub_col = withRule(col, "@public");
     // A member of acc1 searching "budget" gets ONLY acc1's matching row — acc2's match is scoped out.
     const m1 = request.RequestContext{ .tenancy_enabled = true, .account_id = "acc1" };
-    const r1 = try records.list(a, &d, pub_col, .{ .search = "budget", .rule = listRuleFilter(pub_col, &m1), .rctx = &m1 });
+    var r1 = try records.list(a, &d, pub_col, .{ .search = "budget", .rule = listRuleFilter(pub_col, &m1), .rctx = &m1 });
+    defer r1.deinit(a);
     try std.testing.expectEqual(@as(usize, 1), r1.items.len);
     try std.testing.expectEqualStrings("acc1", r1.items[0].object.get("owner").?.string);
 
     // A member of acc2 sees only acc2's row; a principal with no active account sees none.
     const m2 = request.RequestContext{ .tenancy_enabled = true, .account_id = "acc2" };
-    const r2 = try records.list(a, &d, pub_col, .{ .search = "budget", .rule = listRuleFilter(pub_col, &m2), .rctx = &m2 });
+    var r2 = try records.list(a, &d, pub_col, .{ .search = "budget", .rule = listRuleFilter(pub_col, &m2), .rctx = &m2 });
+    defer r2.deinit(a);
     try std.testing.expectEqual(@as(usize, 1), r2.items.len);
     try std.testing.expectEqualStrings("acc2", r2.items[0].object.get("owner").?.string);
     const none = request.RequestContext{ .tenancy_enabled = true, .account_id = "" };
-    const r0 = try records.list(a, &d, pub_col, .{ .search = "budget", .rule = listRuleFilter(pub_col, &none), .rctx = &none });
+    var r0 = try records.list(a, &d, pub_col, .{ .search = "budget", .rule = listRuleFilter(pub_col, &none), .rctx = &none });
+    defer r0.deinit(a);
     try std.testing.expectEqual(@as(usize, 0), r0.items.len);
 }
 
 test "records.list full-text search respects the view ability (denied rows absent from results)" {
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
+    // `col` is the fully-owned create() reload; free it once. The `withRule`/`withAbility` copies
+    // below share its owned fields/id/name and only overwrite rule/ability slots with string
+    // LITERALS, so they are never handed to Collection.deinit.
     const col = try searchableBase(a, &d);
+    defer col.deinit(a);
     // Three rows owned by three accounts; ALL match the search term "report".
     try d.exec("INSERT INTO posts (id,created,updated,title,owner) VALUES " ++
         "('r1','t','t','annual report','acc1')," ++
@@ -649,7 +658,8 @@ test "records.list full-text search respects the view ability (denied rows absen
         .{ .account = "acc2", .role = "viewer" },
     };
     const rctx = request.RequestContext{ .memberships = &mem };
-    const res = try records.list(a, &d, guarded, .{ .search = "report", .rule = listRuleFilter(guarded, &rctx), .rctx = &rctx });
+    var res = try records.list(a, &d, guarded, .{ .search = "report", .rule = listRuleFilter(guarded, &rctx), .rctx = &rctx });
+    defer res.deinit(a);
     const owners = listOwners(res.items);
     defer std.testing.allocator.free(owners);
     // Only acc1's row survives BOTH the MATCH and the ability — acc2 (viewer) and acc3 (non-member)
@@ -663,10 +673,12 @@ test "records.list full-text search respects the view ability (denied rows absen
 test "records.list full-text search ranks by bm25 and binds a basic-operator query safely" {
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const col = withRule(try searchableBase(a, &d), "@public");
+    const a = std.testing.allocator;
+    // `base` is the fully-owned create() reload; free it once. `col` is the `withRule` copy that
+    // overwrites the rule slots with a string LITERAL, so it is never handed to Collection.deinit.
+    const base = try searchableBase(a, &d);
+    defer base.deinit(a);
+    const col = withRule(base, "@public");
     try d.exec("INSERT INTO posts (id,created,updated,title,owner) VALUES " ++
         "('r1','t','t','alpha alpha alpha','acc1')," ++ // most relevant for "alpha"
         "('r2','t','t','alpha beta','acc1')," ++
@@ -674,13 +686,15 @@ test "records.list full-text search ranks by bm25 and binds a basic-operator que
     const anon = request.RequestContext{};
 
     // Ranked ordering: the row with the densest "alpha" match comes first (bm25 via FTS `rank`).
-    const ranked = try records.list(a, &d, col, .{ .search = "alpha", .rule = listRuleFilter(col, &anon), .rctx = &anon });
+    var ranked = try records.list(a, &d, col, .{ .search = "alpha", .rule = listRuleFilter(col, &anon), .rctx = &anon });
+    defer ranked.deinit(a);
     try std.testing.expectEqual(@as(usize, 2), ranked.items.len);
     try std.testing.expectEqualStrings("r1", ranked.items[0].object.get("id").?.string);
 
     // A basic-operator (OR) query parses + binds safely and returns the union of matches — no error,
     // no injection: the operator is preserved while each term is a bound, quoted token.
-    const ored = try records.list(a, &d, col, .{ .search = "alpha OR gamma", .rule = listRuleFilter(col, &anon), .rctx = &anon });
+    var ored = try records.list(a, &d, col, .{ .search = "alpha OR gamma", .rule = listRuleFilter(col, &anon), .rctx = &anon });
+    defer ored.deinit(a);
     try std.testing.expectEqual(@as(usize, 3), ored.items.len); // r1,r2 (alpha) + r3 (gamma)
 
     // A search on a collection with NO searchable field is a clean error (handler -> 400), never a
@@ -694,10 +708,12 @@ test "records.list full-text search ranks by bm25 and binds a basic-operator que
 test "records.list full-text search intersects with the filter (search still constrains)" {
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const col = withRule(try searchableBase(a, &d), "@public");
+    const a = std.testing.allocator;
+    // `base` is the fully-owned create() reload; free it once. `col` is the `withRule` copy that
+    // overwrites the rule slots with a string LITERAL, so it is never handed to Collection.deinit.
+    const base = try searchableBase(a, &d);
+    defer base.deinit(a);
+    const col = withRule(base, "@public");
     // r1: matches "budget" AND owner acc1; r2: matches "budget" but owner acc2; r3: owner acc1 but
     // does NOT match "budget".
     try d.exec("INSERT INTO posts (id,created,updated,title,owner) VALUES " ++
@@ -710,12 +726,13 @@ test "records.list full-text search intersects with the filter (search still con
     // FAILS-BEFORE: the filter block ASSIGNED where_sql, clobbering the FTS MATCH (and dropping its
     // bound param), so `search=budget&filter=owner='acc1'` returned every owner=acc1 row — r1 AND r3
     // (r3 lacks "budget"). PASSES-AFTER: the filter AND-composes onto the MATCH, so r3 is excluded.
-    const res = try records.list(a, &d, col, .{
+    var res = try records.list(a, &d, col, .{
         .search = "budget",
         .filter = "owner = \"acc1\"",
         .rule = listRuleFilter(col, &anon),
         .rctx = &anon,
     });
+    defer res.deinit(a);
     try std.testing.expectEqual(@as(usize, 1), res.items.len);
     try std.testing.expectEqualStrings("r1", res.items[0].object.get("id").?.string);
 }
@@ -723,19 +740,23 @@ test "records.list full-text search intersects with the filter (search still con
 test "records.list search that sanitizes to empty returns no rows (not the full scoped list)" {
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const col = withRule(try searchableBase(a, &d), "@public");
+    const a = std.testing.allocator;
+    // `base` is the fully-owned create() reload; free it once. `col` is the `withRule` copy that
+    // overwrites the rule slots with a string LITERAL, so it is never handed to Collection.deinit.
+    const base = try searchableBase(a, &d);
+    defer base.deinit(a);
+    const col = withRule(base, "@public");
     try d.exec("INSERT INTO posts (id,created,updated,title,owner) VALUES " ++
         "('r1','t','t','hello world','acc1'),('r2','t','t','goodbye world','acc1');");
     const anon = request.RequestContext{};
 
     // A non-empty search that sanitizes to nothing (operator-only) matches NOTHING — it must NOT
     // degrade to a full (scoped) list just because the user "searched".
-    const empty = try records.list(a, &d, col, .{ .search = "AND", .rule = listRuleFilter(col, &anon), .rctx = &anon });
+    var empty = try records.list(a, &d, col, .{ .search = "AND", .rule = listRuleFilter(col, &anon), .rctx = &anon });
+    defer empty.deinit(a);
     try std.testing.expectEqual(@as(usize, 0), empty.items.len);
     // Sanity: a real term still returns its match (the short-circuit is specific to empty queries).
-    const real = try records.list(a, &d, col, .{ .search = "hello", .rule = listRuleFilter(col, &anon), .rctx = &anon });
+    var real = try records.list(a, &d, col, .{ .search = "hello", .rule = listRuleFilter(col, &anon), .rctx = &anon });
+    defer real.deinit(a);
     try std.testing.expectEqual(@as(usize, 1), real.items.len);
 }
