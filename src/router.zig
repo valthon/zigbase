@@ -50,24 +50,20 @@ fn dummyHandler(ctx: *http.RequestCtx) anyerror!http.Response {
 }
 
 test "matchPath: literal match yields empty params" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const p = (try matchPath(arena.allocator(), "/api/collections", "/api/collections")).?;
+    const p = (try matchPath(std.testing.allocator, "/api/collections", "/api/collections")).?;
+    defer std.testing.allocator.free(p);
     try std.testing.expectEqual(@as(usize, 0), p.len);
 }
 test "matchPath: captures a param" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const p = (try matchPath(arena.allocator(), "/api/collections/:idOrName", "/api/collections/posts")).?;
+    const p = (try matchPath(std.testing.allocator, "/api/collections/:idOrName", "/api/collections/posts")).?;
+    defer std.testing.allocator.free(p);
     try std.testing.expectEqual(@as(usize, 1), p.len);
     try std.testing.expectEqualStrings("idOrName", p[0].key);
     try std.testing.expectEqualStrings("posts", p[0].value);
 }
 test "matchPath: literal mismatch and length mismatch return null" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    try std.testing.expect((try matchPath(arena.allocator(), "/api/collections", "/api/users")) == null);
-    try std.testing.expect((try matchPath(arena.allocator(), "/api/collections/:id", "/api/collections")) == null);
+    try std.testing.expect((try matchPath(std.testing.allocator, "/api/collections", "/api/users")) == null);
+    try std.testing.expect((try matchPath(std.testing.allocator, "/api/collections/:id", "/api/collections")) == null);
 }
 test "dispatch routes to handler with params, else 404" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);

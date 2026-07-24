@@ -338,11 +338,11 @@ test "classify maps status families to dispositions" {
 }
 
 test "signBody is HMAC-SHA256 over '<ts>.<body>' and is deterministic" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = testing.allocator;
     const sig1 = try signBody(a, "shh", "1700000000", "{\"x\":1}");
+    defer a.free(sig1);
     const sig2 = try signBody(a, "shh", "1700000000", "{\"x\":1}");
+    defer a.free(sig2);
     try testing.expectEqualStrings(sig1, sig2); // deterministic
     try testing.expectEqual(@as(usize, 64), sig1.len); // 32-byte digest, hex
 
@@ -354,6 +354,7 @@ test "signBody is HMAC-SHA256 over '<ts>.<body>' and is deterministic" {
 
     // A different timestamp or body changes the signature.
     const sig3 = try signBody(a, "shh", "1700000001", "{\"x\":1}");
+    defer a.free(sig3);
     try testing.expect(!std.mem.eql(u8, sig1, sig3));
 }
 

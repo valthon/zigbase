@@ -137,14 +137,18 @@ test "frozen: CURRENT_TIMESTAMP / CURRENT_DATE / CURRENT_TIME honor the freeze (
     var d = try db.Db.openMemory(); // routes through vfsName() -> the frozen wrapper
     defer d.close();
 
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
 
     const want_ts = datetime.formatUtc(frozen_unix); // "2029-03-07 16:00:00"
-    try std.testing.expectEqualStrings(&want_ts, try scalarText(&d, a, "SELECT CURRENT_TIMESTAMP"));
-    try std.testing.expectEqualStrings("2029-03-07", try scalarText(&d, a, "SELECT CURRENT_DATE"));
-    try std.testing.expectEqualStrings("16:00:00", try scalarText(&d, a, "SELECT CURRENT_TIME"));
+    const got1 = try scalarText(&d, a, "SELECT CURRENT_TIMESTAMP");
+    defer a.free(got1);
+    try std.testing.expectEqualStrings(&want_ts, got1);
+    const got2 = try scalarText(&d, a, "SELECT CURRENT_DATE");
+    defer a.free(got2);
+    try std.testing.expectEqualStrings("2029-03-07", got2);
+    const got3 = try scalarText(&d, a, "SELECT CURRENT_TIME");
+    defer a.free(got3);
+    try std.testing.expectEqualStrings("16:00:00", got3);
 }
 
 test "frozen: a column DEFAULT CURRENT_TIMESTAMP inserts the frozen instant (dev build only)" {
@@ -156,10 +160,10 @@ test "frozen: a column DEFAULT CURRENT_TIMESTAMP inserts the frozen instant (dev
     try d.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, created TEXT DEFAULT CURRENT_TIMESTAMP);");
     try d.exec("INSERT INTO t (id) VALUES (1);");
 
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
     const want = datetime.formatUtc(frozen_unix);
-    try std.testing.expectEqualStrings(&want, try scalarText(&d, arena.allocator(), "SELECT created FROM t WHERE id = 1"));
+    const got = try scalarText(&d, std.testing.allocator, "SELECT created FROM t WHERE id = 1");
+    defer std.testing.allocator.free(got);
+    try std.testing.expectEqualStrings(&want, got);
 }
 
 test "no freeze: CURRENT_TIMESTAMP tracks the real wall clock (delegation, dev build)" {
