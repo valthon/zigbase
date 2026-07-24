@@ -149,7 +149,9 @@ fn buildSqlite(alloc: std.mem.Allocator, col: schema.Collection, raw_term: []con
 
 fn buildSqliteImpl(alloc: std.mem.Allocator, col: schema.Collection, raw_term: []const u8) !?Search {
     const q = (try sanitize(alloc, raw_term)) orelse return null;
+    errdefer alloc.free(q); // q ESCAPES into `.param.text` on success; free it only on an error below
     const ft = try tableName(alloc, col.name);
+    defer alloc.free(ft); // internal scratch: copied into the SQL strings below, never escapes
     return .{
         .join_sql = try std.fmt.allocPrint(alloc, "JOIN \"{s}\" ON \"{s}\".\"rowid\" = \"{s}\".\"rowid\"", .{ ft, ft, col.name }),
         .where_sql = try std.fmt.allocPrint(alloc, "\"{s}\" MATCH ?", .{ft}),
@@ -168,7 +170,9 @@ fn buildPostgres(alloc: std.mem.Allocator, col: schema.Collection, raw_term: []c
     const capped = utf8SafeCap(trimmed, max_term_len); // cap on a UTF-8 boundary (never mid-codepoint)
     if (capped.len == 0) return null;
     const term = try alloc.dupe(u8, capped);
+    errdefer alloc.free(term); // term ESCAPES into `.param`/`.order_param` (one alloc) on success
     const tsv = try tableName(alloc, col.name); // the generated tsvector column name
+    defer alloc.free(tsv); // internal scratch: copied into the SQL strings below, never escapes
     return .{
         .join_sql = "",
         .where_sql = try std.fmt.allocPrint(alloc, "\"{s}\".\"{s}\" @@ plainto_tsquery('{s}', ?)", .{ col.name, tsv, pg_ts_config }),
@@ -264,44 +268,52 @@ pub fn ensureIndex(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection) 
 
 fn ensureIndexSqliteImpl(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection) !void {
     if (!schema.isValidIdentifier(col.name)) return;
-    const ft = try tableName(alloc, col.name);
-    const cols = try searchableColumns(alloc, col);
+    // Self-freeing (contract 1): every allocation here is scratch — the FTS5 table name, the
+    // searchable-column list, the existence/columns/triggers probes, and the CREATE VIRTUAL TABLE /
+    // CREATE TRIGGER / rebuild DDL strings — all consumed by `w.exec`/`w.prepare` (SQLite copies the
+    // statement text) and none escaping the void return. Build them on a function-local arena so the
+    // idempotent per-collection provisioning is leak-correct under any allocator.
+    var scratch = std.heap.ArenaAllocator.init(alloc);
+    defer scratch.deinit();
+    const sa = scratch.allocator();
+    const ft = try tableName(sa, col.name);
+    const cols = try searchableColumns(sa, col);
 
     if (cols.len == 0) {
         // Not searchable: only touch the DB if a stale index actually exists (so a non-searchable
         // collection costs one cheap existence check, not four DROPs, at every startup).
-        if (try tableExists(alloc, w, ft)) try dropIndex(alloc, w, col.name, ft);
+        if (try tableExists(sa, w, ft)) try dropIndex(sa, w, col.name, ft);
         return;
     }
 
-    if (try tableExists(alloc, w, ft)) {
-        if ((try columnsMatch(alloc, w, ft, cols)) and (try triggersPresent(alloc, w, col.name)))
+    if (try tableExists(sa, w, ft)) {
+        if ((try columnsMatch(sa, w, ft, cols)) and (try triggersPresent(sa, w, col.name)))
             return; // up to date — idempotent no-op
-        try dropIndex(alloc, w, col.name, ft); // drift / missing triggers — rebuild from scratch
+        try dropIndex(sa, w, col.name, ft); // drift / missing triggers — rebuild from scratch
     }
 
     // CREATE VIRTUAL TABLE "<col>_fts" USING fts5(c1, c2, …, content='<col>');
     var create: std.ArrayList(u8) = .empty;
-    try create.appendSlice(alloc, try std.fmt.allocPrint(alloc, "CREATE VIRTUAL TABLE \"{s}\" USING fts5(", .{ft}));
+    try create.appendSlice(sa, try std.fmt.allocPrint(sa, "CREATE VIRTUAL TABLE \"{s}\" USING fts5(", .{ft}));
     for (cols, 0..) |cn, i| {
-        if (i > 0) try create.appendSlice(alloc, ", ");
-        try create.appendSlice(alloc, try std.fmt.allocPrint(alloc, "\"{s}\"", .{cn}));
+        if (i > 0) try create.appendSlice(sa, ", ");
+        try create.appendSlice(sa, try std.fmt.allocPrint(sa, "\"{s}\"", .{cn}));
     }
-    try create.appendSlice(alloc, try std.fmt.allocPrint(alloc, ", content=\"{s}\");", .{col.name}));
-    try w.exec(try toZ(alloc, create.items));
+    try create.appendSlice(sa, try std.fmt.allocPrint(sa, ", content=\"{s}\");", .{col.name}));
+    try w.exec(try toZ(sa, create.items));
 
     // Sync triggers (FTS5 external-content pattern). On delete/update we issue the special 'delete'
     // command so the index discards the old terms before re-indexing the new row.
-    const col_list = try columnList(alloc, cols, null);
-    const new_list = try columnList(alloc, cols, "new");
-    const old_list = try columnList(alloc, cols, "old");
+    const col_list = try columnList(sa, cols, null);
+    const new_list = try columnList(sa, cols, "new");
+    const old_list = try columnList(sa, cols, "old");
 
-    try w.exec(try toZ(alloc, try std.fmt.allocPrint(alloc, "CREATE TRIGGER \"{s}_ai\" AFTER INSERT ON \"{s}\" BEGIN INSERT INTO \"{s}\"(rowid, {s}) VALUES (new.rowid, {s}); END;", .{ ft, col.name, ft, col_list, new_list })));
-    try w.exec(try toZ(alloc, try std.fmt.allocPrint(alloc, "CREATE TRIGGER \"{s}_ad\" AFTER DELETE ON \"{s}\" BEGIN INSERT INTO \"{s}\"(\"{s}\", rowid, {s}) VALUES ('delete', old.rowid, {s}); END;", .{ ft, col.name, ft, ft, col_list, old_list })));
-    try w.exec(try toZ(alloc, try std.fmt.allocPrint(alloc, "CREATE TRIGGER \"{s}_au\" AFTER UPDATE ON \"{s}\" BEGIN INSERT INTO \"{s}\"(\"{s}\", rowid, {s}) VALUES ('delete', old.rowid, {s}); INSERT INTO \"{s}\"(rowid, {s}) VALUES (new.rowid, {s}); END;", .{ ft, col.name, ft, ft, col_list, old_list, ft, col_list, new_list })));
+    try w.exec(try toZ(sa, try std.fmt.allocPrint(sa, "CREATE TRIGGER \"{s}_ai\" AFTER INSERT ON \"{s}\" BEGIN INSERT INTO \"{s}\"(rowid, {s}) VALUES (new.rowid, {s}); END;", .{ ft, col.name, ft, col_list, new_list })));
+    try w.exec(try toZ(sa, try std.fmt.allocPrint(sa, "CREATE TRIGGER \"{s}_ad\" AFTER DELETE ON \"{s}\" BEGIN INSERT INTO \"{s}\"(\"{s}\", rowid, {s}) VALUES ('delete', old.rowid, {s}); END;", .{ ft, col.name, ft, ft, col_list, old_list })));
+    try w.exec(try toZ(sa, try std.fmt.allocPrint(sa, "CREATE TRIGGER \"{s}_au\" AFTER UPDATE ON \"{s}\" BEGIN INSERT INTO \"{s}\"(\"{s}\", rowid, {s}) VALUES ('delete', old.rowid, {s}); INSERT INTO \"{s}\"(rowid, {s}) VALUES (new.rowid, {s}); END;", .{ ft, col.name, ft, ft, col_list, old_list, ft, col_list, new_list })));
 
     // Repopulate from the content table (no-op on an empty table).
-    try w.exec(try toZ(alloc, try std.fmt.allocPrint(alloc, "INSERT INTO \"{s}\"(\"{s}\") VALUES ('rebuild');", .{ ft, ft })));
+    try w.exec(try toZ(sa, try std.fmt.allocPrint(sa, "INSERT INTO \"{s}\"(\"{s}\") VALUES ('rebuild');", .{ ft, ft })));
 
     std.log.info("provision: ensured FTS5 search index '{s}' on '{s}' ({d} field(s))", .{ ft, col.name, cols.len });
 }
@@ -562,22 +574,28 @@ const collections = @import("../collections.zig");
 const migrations = @import("../migrations.zig");
 const records = @import("../records.zig");
 
+/// sanitize returns an owned `?[]const u8` on the passed allocator; assert then free it, so the
+/// test runs under the raw leak detector (sanitize is self-freeing / contract-1 already).
+fn expectSanitized(expected: ?[]const u8, input: []const u8) !void {
+    const a = std.testing.allocator;
+    const got = try sanitize(a, input);
+    defer if (got) |g| a.free(g);
+    if (expected) |e| try std.testing.expectEqualStrings(e, got.?) else try std.testing.expect(got == null);
+}
+
 test "sanitize quotes tokens, preserves operators, drops dangling ones" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    try std.testing.expectEqualStrings("\"foo\" \"bar\"", (try sanitize(a, "foo bar")).?);
-    try std.testing.expectEqualStrings("\"alpha\" OR \"gamma\"", (try sanitize(a, "alpha OR gamma")).?);
-    try std.testing.expectEqualStrings("\"foo\"*", (try sanitize(a, "foo*")).?);
+    try expectSanitized("\"foo\" \"bar\"", "foo bar");
+    try expectSanitized("\"alpha\" OR \"gamma\"", "alpha OR gamma");
+    try expectSanitized("\"foo\"*", "foo*");
     // Leading/trailing/doubled operators are dropped so the query is always well-formed.
-    try std.testing.expectEqualStrings("\"foo\"", (try sanitize(a, "OR foo OR")).?);
+    try expectSanitized("\"foo\"", "OR foo OR");
     // Consecutive operators collapse to the last one seen (always well-formed, never doubled).
-    try std.testing.expectEqualStrings("\"a\" AND \"b\"", (try sanitize(a, "a OR AND b")).?);
+    try expectSanitized("\"a\" AND \"b\"", "a OR AND b");
     // A double-quote injection attempt is escaped into a literal token, never a syntax break.
-    try std.testing.expectEqualStrings("\"a\"\"b\"", (try sanitize(a, "a\"b")).?);
+    try expectSanitized("\"a\"\"b\"", "a\"b");
     // Empty / operator-only input yields no query.
-    try std.testing.expect((try sanitize(a, "   ")) == null);
-    try std.testing.expect((try sanitize(a, "AND OR")) == null);
+    try expectSanitized(null, "   ");
+    try expectSanitized(null, "AND OR");
 }
 
 test "fts5 flag: enabled reflects build_options (default true in the test build)" {
@@ -588,9 +606,7 @@ test "ensureIndex provisions FTS5, triggers keep it in sync, MATCH search return
     if (comptime !enabled) return error.SkipZigTest; // requires SQLite compiled with FTS5
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const io = std.testing.io;
     try migrations.run(&d);
     const fields = [_]schema.Field{
@@ -599,23 +615,36 @@ test "ensureIndex provisions FTS5, triggers keep it in sync, MATCH search return
         .{ .id = "f3", .name = "slug", .options = .{ .text = .{} } },
     };
     const col = try collections.create(a, io, &d, .{ .id = "", .name = "articles", .fields = &fields });
+    defer col.deinit(a);
 
-    try ensureIndex(a, &d, col); // first provision
+    try ensureIndex(a, &d, col); // first provision (now self-freeing — no leaked DDL scratch)
     try ensureIndex(a, &d, col); // idempotent second call is a no-op (no error)
 
-    // Insert through the records layer so the AFTER INSERT trigger populates the index.
+    // Insert through the records layer so the AFTER INSERT trigger populates the index. Each input
+    // ObjectMap and each returned (self-contained) record is freed on the raw allocator.
     inline for (.{
         .{ "zig programming language", "a fast systems language" },
         .{ "cooking pasta", "boil water and add salt" },
     }) |row| {
         var obj: std.json.ObjectMap = .empty;
+        defer obj.deinit(a);
         try obj.put(a, "title", .{ .string = row[0] });
         try obj.put(a, "body", .{ .string = row[1] });
-        _ = try records.create(a, io, &d, col, .{ .object = obj });
+        const rec = try records.create(a, io, &d, col, .{ .object = obj });
+        records.freeRecord(a, rec);
     }
 
     const s = (try build(a, db.dbDialect(&d), col, "zig")).?;
+    // SQLite `build` returns an owned Search (join/where/order SQL + the sanitized param text), no
+    // aliasing (order_param is null on SQLite) — free the four heap slices after use.
+    defer {
+        a.free(s.join_sql);
+        a.free(s.where_sql);
+        a.free(s.order_sql);
+        a.free(s.param.text);
+    }
     const sql = try std.fmt.allocPrintSentinel(a, "SELECT \"articles\".\"title\" FROM \"articles\" {s} WHERE {s};", .{ s.join_sql, s.where_sql }, 0);
+    defer a.free(sql);
     var st = try d.prepare(sql);
     defer st.finalize();
     try st.bindText(1, s.param.text);
