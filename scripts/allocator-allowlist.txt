@@ -54,7 +54,6 @@ src/provision.zig	29	PRE-EXISTING: not yet migrated to the ownership contracts
 src/query/compiler.zig	31	SUT-driven: compile() is now self-freeing (scratch SQL fragments on a function-local arena; where_sql + every params[i].text duped onto the caller allocator). Every test drives lex/parse/compile on the RAW std.testing.allocator and frees the returned Compiled (freeCompiled) + AST (parser.freeNode) + tokens (lexer.freeTokens), so compile's own allocations ARE leak-checked. The remaining arena is a SETUP arena only (db-backed collections.create + the joiner, which has inherent per-resolve intermediates with no deinit — a separate joiner.zig migration), mirroring the sort.zig/joiner.zig precedent.
 src/query/expand.zig	9	PRE-EXISTING: not yet migrated to the ownership contracts
 src/query/fields.zig	12	PRE-EXISTING: not yet migrated to the ownership contracts
-src/query/joiner.zig	3	PRE-EXISTING: not yet migrated to the ownership contracts
 src/query/params.zig	1	PRE-EXISTING: not yet migrated to the ownership contracts
 src/query/sort.zig	4	PRE-EXISTING: not yet migrated to the ownership contracts
 src/queue/durable.zig	4	PRE-EXISTING: not yet migrated to the ownership contracts
