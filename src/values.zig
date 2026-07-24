@@ -23,7 +23,12 @@ fn cipherOf(stmt: *db.Stmt) ?*const field_policy.Cipher {
 fn bindStorage(alloc: std.mem.Allocator, stmt: *db.Stmt, idx: c_int, field: schema.Field, storage: []const u8) (EncryptError || db.DbError || std.mem.Allocator.Error)!void {
     if (field.encrypted) {
         const cph = cipherOf(stmt) orelse return error.FieldKeyMissing;
-        return stmt.bindText(idx, try cph.seal(alloc, storage));
+        // `bindText` COPIES immediately on both backends (SQLite SQLITE_TRANSIENT; Postgres dupes into
+        // its param arena), so the sealed envelope is scratch — free it once bound. Self-freeing
+        // (contract 1) so an encrypted bind is leak-correct even off a non-arena allocator.
+        const sealed = try cph.seal(alloc, storage);
+        defer alloc.free(sealed);
+        return stmt.bindText(idx, sealed);
     }
     return stmt.bindText(idx, storage);
 }
@@ -175,13 +180,17 @@ pub fn bindValue(alloc: std.mem.Allocator, stmt: *db.Stmt, idx: c_int, field: sc
             },
         },
         .json => {
+            // `s` is scratch: `bindStorage`/`bindText` copy it immediately (see bindStorage), so free
+            // it here — self-freeing (contract 1) so a json bind doesn't leak off a non-arena allocator.
             const s = try std.json.Stringify.valueAlloc(alloc, v, .{});
+            defer alloc.free(s);
             try bindStorage(alloc, stmt, idx, field, s);
         },
         .select, .relation, .file => {
             if (field.isMultiValue()) {
                 if (v != .array) return error.TypeMismatch;
                 const s = try std.json.Stringify.valueAlloc(alloc, v, .{});
+                defer alloc.free(s); // scratch: bindText copies immediately (contract 1, no leak off an arena)
                 try stmt.bindText(idx, s);
             } else {
                 if (v != .string) return error.TypeMismatch;
@@ -191,9 +200,86 @@ pub fn bindValue(alloc: std.mem.Allocator, stmt: *db.Stmt, idx: c_int, field: sc
     }
 }
 
+/// Recursively free an OWNED `std.json.Value` tree allocated on `alloc`: a `.string`/`.number_string`'s
+/// bytes, or an `.object`/`.array`'s nested keys + values plus the map/list backing. Scalar variants
+/// (null/bool/integer/float) own nothing and are skipped. This is the inverse of the ownership
+/// `readValue` establishes — the whole parse tree for a json/multi-value field lives on `alloc` — so a
+/// record's field VALUES (including nested json/array sub-trees) can be freed off any allocator.
+///
+/// Only valid on an OWNED tree (one produced by `readValue`/`cloneValue`, whose every string+key+map
+/// was allocated on `alloc`). Never call it on a borrowed/aliased value, or on a top-level record's
+/// KEYS (those follow the record's own owned/interned key contract — see records.freeRecord).
+pub fn freeValue(alloc: std.mem.Allocator, v: std.json.Value) void {
+    switch (v) {
+        .string => |s| alloc.free(s),
+        .number_string => |s| alloc.free(s),
+        .array => |arr| {
+            for (arr.items) |item| freeValue(alloc, item);
+            var m = arr;
+            m.deinit(); // Managed Array: frees on its stored allocator (== `alloc` by construction)
+        },
+        .object => |obj| {
+            var m = obj;
+            var it = m.iterator();
+            while (it.next()) |e| {
+                alloc.free(e.key_ptr.*); // nested keys are ALWAYS owned (unlike top-level record keys)
+                freeValue(alloc, e.value_ptr.*);
+            }
+            m.deinit(alloc);
+        },
+        else => {},
+    }
+}
+
+/// Deep-clone `v` onto `alloc`, producing a fully-OWNED, individually-freeable tree (free with
+/// `freeValue`). Leak-safe: an OOM at any depth unwinds via `errdefer`, freeing every partial
+/// allocation before returning the error. Used by `readValue` to hand a json/multi-value field back
+/// as an owned graph WITHOUT the leaky-on-error semantics of `parseFromSliceLeaky` (which orphans a
+/// half-built tree on a parse/alloc failure — see `parseOwned`).
+fn cloneValue(alloc: std.mem.Allocator, v: std.json.Value) std.mem.Allocator.Error!std.json.Value {
+    switch (v) {
+        .null, .bool, .integer, .float => return v,
+        .number_string => |s| return .{ .number_string = try alloc.dupe(u8, s) },
+        .string => |s| return .{ .string = try alloc.dupe(u8, s) },
+        .array => |arr| {
+            var out = std.json.Array.init(alloc);
+            errdefer freeValue(alloc, .{ .array = out });
+            try out.ensureTotalCapacity(arr.items.len);
+            for (arr.items) |item| out.appendAssumeCapacity(try cloneValue(alloc, item));
+            return .{ .array = out };
+        },
+        .object => |obj| {
+            var out: std.json.ObjectMap = .empty;
+            errdefer freeValue(alloc, .{ .object = out });
+            // The source tree came from a completed parse, so its keys are already unique.
+            try out.ensureTotalCapacity(alloc, obj.count());
+            var it = obj.iterator();
+            while (it.next()) |e| {
+                const k = try alloc.dupe(u8, e.key_ptr.*);
+                errdefer alloc.free(k); // freed only if the value clone below fails (k not yet inserted)
+                out.putAssumeCapacity(k, try cloneValue(alloc, e.value_ptr.*));
+            }
+            return .{ .object = out };
+        },
+    }
+}
+
+/// Parse stored JSON text into a fully-OWNED value tree on `alloc` (freeable via `freeValue`), with
+/// NO leak on a parse error: `parseFromSlice` builds the tree in its own arena (cleaned up on error,
+/// and by `deinit`), then `cloneValue` deep-copies it onto `alloc`. Both steps are leak-safe, so a
+/// corrupt stored value — only reachable via direct DB tampering, since `bindValue` always writes
+/// `Stringify`-valid JSON — surfaces the error without orphaning memory.
+fn parseOwned(alloc: std.mem.Allocator, txt: []const u8) !std.json.Value {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, txt, .{});
+    defer parsed.deinit();
+    return cloneValue(alloc, parsed.value);
+}
+
 /// Read a column value from a stepped statement into a `std.json.Value` according to the field's type.
-/// Requires an arena allocator: the parse tree for json/multi-value fields is allocated into `alloc`
-/// and is never freed individually — it lives until the arena is released.
+/// The returned value is fully OWNED on `alloc`: scalar fields allocate their one string (if any), and
+/// json/multi-value fields return a deep-cloned parse tree (every nested key/string/map on `alloc`).
+/// Free the result with `freeValue` (or, as a record field value, via records.freeRecord). No arena is
+/// required.
 pub fn readValue(alloc: std.mem.Allocator, stmt: *db.Stmt, idx: c_int, field: schema.Field) !std.json.Value {
     if (stmt.isNull(idx)) return .null;
     switch (field.options) {
@@ -207,18 +293,20 @@ pub fn readValue(alloc: std.mem.Allocator, stmt: *db.Stmt, idx: c_int, field: sc
             .fixed => return .{ .string = try scaledIntToDecimal(alloc, stmt.columnInt(idx), o.scale orelse 0) },
         },
         .json => {
-            // Fast path: parseFromSlice copies into `alloc` during the parse and the
-            // columnText slice stays valid for that call, so a non-encrypted JSON value
-            // needs no intermediate dup. Only route through readStorage (decrypt) when
-            // the field is encrypted. (The text/string branch still MUST dup —
-            // columnText is invalidated on the next stmt.step.)
-            const txt = if (field.encrypted) try readStorage(alloc, stmt, idx, field) else stmt.columnText(idx);
-            return (try std.json.parseFromSlice(std.json.Value, alloc, txt, .{})).value;
+            // Only route through readStorage (decrypt) when the field is encrypted; a plaintext
+            // JSON column is parsed straight from the borrowed columnText slice (valid for this
+            // call). `parseOwned` returns an OWNED tree on `alloc`, freeable via `freeValue`.
+            if (field.encrypted) {
+                const txt = try readStorage(alloc, stmt, idx, field);
+                defer alloc.free(txt); // decrypted scratch: the owned tree is a deep copy, not a borrow
+                return parseOwned(alloc, txt);
+            }
+            return parseOwned(alloc, stmt.columnText(idx));
         },
         .select, .relation, .file => {
             const txt = stmt.columnText(idx);
             if (field.isMultiValue()) {
-                return (try std.json.parseFromSlice(std.json.Value, alloc, txt, .{})).value;
+                return parseOwned(alloc, txt);
             }
             return .{ .string = try alloc.dupe(u8, txt) };
         },
@@ -352,20 +440,17 @@ test "bindValue on the raw GPA path: numeric-as-number writes free their allocPr
 }
 
 test "multi-select round-trips as an array" {
-    // Arena-scoped by contract (NO_SLOP.md 2.2a, contract-4): for a multi-value field
-    // readValue returns `(try std.json.parseFromSlice(...)).value`, DISCARDING the
-    // std.json.Parsed wrapper that owns the parse arena. The returned Value graph
-    // therefore cannot be freed piecewise — the backing arena handle is gone by design
-    // (readValue's doc-comment states it "Requires an arena allocator"). readValue is
-    // only ever driven request-scoped, so the caller's arena reclaims the tree.
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    // RAW std.testing.allocator, no arena to mask a leak. For a multi-value field `readValue` now
+    // returns a fully-OWNED array tree on `a` (deep-cloned from the parse), so it frees piecewise via
+    // `freeValue`. The input array passed to `roundTrip`/`bindValue` is also owned here and freed.
+    const a = std.testing.allocator;
     const f = schema.Field{ .id = "f", .name = "tags", .options = .{ .select = .{ .values = &.{ "x", "y" }, .maxSelect = 3 } } };
     var arr = std.json.Array.init(a);
+    defer arr.deinit(); // the write-side input (its two string elements are literals, not owned)
     try arr.append(.{ .string = "x" });
     try arr.append(.{ .string = "y" });
     const out = try roundTrip(a, f, "TEXT", .{ .array = arr });
+    defer freeValue(a, out); // read-side result: the owned, deep-cloned array tree
     try std.testing.expectEqual(@as(usize, 2), out.array.items.len);
     try std.testing.expectEqualStrings("x", out.array.items[0].string);
 }
