@@ -1,0 +1,3 @@
+### Internal
+
+- Un-masked the last 2 maskable `src/realtime/hub.zig` tests: the `colcache.lease` uncached-fallback fix and `policy.matchesRule`'s self-freeing compiled `Guard` (both landed in earlier PRs) made the two `frameForDelivery` collection-lookup tests leak-clean, so they now drive the raw `std.testing.allocator` — mirroring the already-unmasked `shouldDeliver` tests in the same file. Deleted the now-stale `GUARDED_QUERY_MASK` comment block describing the leak as unfixed. Allowlist entry for `src/realtime/hub.zig` drops from 4 to 2 (the 2 remaining tests are genuine contract-4: `subscribeCheck` takes a `RequestArena`, `authVerb`'s `identity_arena` is a real `*ArenaAllocator`).
