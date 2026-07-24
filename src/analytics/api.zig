@@ -77,14 +77,31 @@ const Bound = struct {
 
     fn add(self: *Bound, comptime col_op: []const u8, value: []const u8) !void {
         const n = self.params.items.len + 1;
-        try self.conds.append(self.alloc, try std.fmt.allocPrint(self.alloc, col_op ++ " ?{d}", .{n}));
-        try self.params.append(self.alloc, value);
+        const cond = try std.fmt.allocPrint(self.alloc, col_op ++ " ?{d}", .{n});
+        // If the second append OOMs, the just-built `cond` would leak (a bare `errdefer` would be
+        // wrong AFTER the list took ownership, but here ownership only transfers on success).
+        self.conds.append(self.alloc, cond) catch |e| {
+            self.alloc.free(cond);
+            return e;
+        };
+        try self.params.append(self.alloc, value); // `value` is borrowed — Bound never owns it
     }
 
     fn whereClause(self: *Bound) ![]const u8 {
         if (self.conds.items.len == 0) return "";
         const joined = try std.mem.join(self.alloc, " AND ", self.conds.items);
+        defer self.alloc.free(joined); // scratch: only the wrapped result escapes
         return std.fmt.allocPrint(self.alloc, " WHERE {s}", .{joined});
+    }
+
+    /// Free everything `Bound` OWNS: the per-condition SQL fragments (built by `add`/the cursor
+    /// clause) and the two list backings. The `params` VALUES are borrowed (query/scope slices),
+    /// so they are never freed here. Optional in production (the request arena reclaims wholesale);
+    /// it makes the builder honest under the leak detector.
+    fn deinit(self: *Bound) void {
+        for (self.conds.items) |c| self.alloc.free(c);
+        self.conds.deinit(self.alloc);
+        self.params.deinit(self.alloc);
     }
 
     fn bindAll(self: *Bound, st: *db.Stmt) !void {
@@ -309,13 +326,17 @@ test "parseLimit clamps to [1,200] with a default of 50" {
     try std.testing.expectEqual(@as(usize, 200), parseLimit("9999"));
 }
 
+const values = @import("../values.zig");
+
 test "parsePayload: valid JSON round-trips; empty/garbage -> null" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    // parsePayload parses with `.alloc_always`, so a successful value is a fully-OWNED tree on the
+    // caller allocator (freeable via values.freeValue); the empty/garbage cases return `.null` and
+    // own nothing. That lets it run under the raw leak-detecting allocator.
+    const a = std.testing.allocator;
     try std.testing.expect(parsePayload(a, "") == .null);
     try std.testing.expect(parsePayload(a, "not json") == .null);
     const v = parsePayload(a, "{\"plan\":\"pro\"}");
+    defer values.freeValue(a, v);
     try std.testing.expect(v == .object);
     try std.testing.expectEqualStrings("pro", v.object.get("plan").?.string);
 }
@@ -326,23 +347,25 @@ test "parsePayload's result is independent of the source buffer (owns its bytes)
     // invalidate that buffer, so the parsed value must reference none of `text`. Mutating the source
     // buffer right after parsing must not affect the value. (This holds because dynamic `Value` parse
     // copies every string via `.alloc_always`; the test pins that invariant against any std change.)
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const buf = try a.dupe(u8, "{\"k\":\"alpha\"}");
+    defer a.free(buf);
     const v = parsePayload(a, buf);
+    defer values.freeValue(a, v);
     @memset(buf, 'X'); // invalidate the source bytes, as a later step() would
     try std.testing.expectEqualStrings("alpha", v.object.get("k").?.string);
 }
 
 test "Bound builds a parameterized WHERE and binds in order" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var b = Bound{ .alloc = arena.allocator() };
-    try std.testing.expectEqualStrings("", try b.whereClause());
+    const a = std.testing.allocator;
+    var b = Bound{ .alloc = a };
+    defer b.deinit();
+    try std.testing.expectEqualStrings("", try b.whereClause()); // empty: no allocation
     try b.add("\"account\" =", "acc1");
     try b.add("\"name\" =", "user.signup");
-    try std.testing.expectEqualStrings(" WHERE \"account\" = ?1 AND \"name\" = ?2", try b.whereClause());
+    const where = try b.whereClause();
+    defer a.free(where);
+    try std.testing.expectEqualStrings(" WHERE \"account\" = ?1 AND \"name\" = ?2", where);
     try std.testing.expectEqual(@as(usize, 2), b.params.items.len);
     try std.testing.expectEqualStrings("acc1", b.params.items[0]);
 }
