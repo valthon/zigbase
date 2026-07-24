@@ -58,7 +58,6 @@ src/query/compiler.zig	31	PRE-EXISTING: not yet migrated to the ownership contra
 src/query/expand.zig	9	PRE-EXISTING: not yet migrated to the ownership contracts
 src/query/fields.zig	12	PRE-EXISTING: not yet migrated to the ownership contracts
 src/query/joiner.zig	3	PRE-EXISTING: not yet migrated to the ownership contracts
-src/query/keyset.zig	17	PRE-EXISTING: not yet migrated to the ownership contracts
 src/query/lexer.zig	5	PRE-EXISTING: not yet migrated to the ownership contracts
 src/query/params.zig	1	PRE-EXISTING: not yet migrated to the ownership contracts
 src/query/parser.zig	9	PRE-EXISTING: not yet migrated to the ownership contracts
