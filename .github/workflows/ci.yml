@@ -525,6 +525,14 @@ jobs:
           echo "ZIGBASE_TEST_DATING_BINARY=$GITHUB_WORKSPACE/artifacts/zig-out/bin/dating-server" >> "$GITHUB_ENV"
       - name: Install
         run: mise exec python@3.13 -- python -m pip install --quiet -e 'clients/python[dev,realtime]'
+      - name: Pin ruff
+        # `ruff format`/`ruff check` output is version-sensitive — a new ruff release can reformat
+        # or re-lint a previously-clean tree, so the floating `ruff>=0.8` dev floor turns a green
+        # main red on any later PR without a code change (it did: markdown code-block formatting
+        # landed in a post-0.15.21 release and reflowed clients/python/README.md). Pin the SAME
+        # version the codegen job pins so both format gates move deliberately, never on a surprise
+        # upstream release.
+        run: mise exec python@3.13 -- python -m pip install --quiet ruff==0.15.21
       - name: Lint (format)
         working-directory: clients/python
         run: mise exec python@3.13 -- python -m ruff format --check .
