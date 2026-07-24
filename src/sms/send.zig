@@ -113,11 +113,9 @@ test "normalize canonicalizes to/from and requires a body" {
 }
 
 test "send with no sender wired is a network-free log fallback (bad number still rejected first)" {
-    // `send` allocates the normalized number on its allocator; production passes the ctx arena
-    // (freed wholesale), so use an arena here to mirror that lifetime.
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    // `send` is self-freeing: it frees the normalized number it allocates before returning, so it
+    // runs correctly under the raw leak-detecting allocator (not only a request arena).
+    const a = testing.allocator;
     var app = App{ .allocator = a, .io = testing.io, .pool = undefined };
     // No sms_sender → log fallback; a valid message succeeds with no network.
     try send(&app, a, .{ .to = "+15551234567", .body = "hi" });
@@ -128,10 +126,8 @@ test "send with no sender wired is a network-free log fallback (bad number still
 const CaptureSms = @import("capture.zig").CaptureSms;
 
 test "send delivers through the configured sender with a normalized number" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    var cap = CaptureSms.init(testing.allocator);
+    const a = testing.allocator;
+    var cap = CaptureSms.init(a);
     defer cap.deinit();
     var iface = cap.sender();
     var app = App{ .allocator = a, .io = testing.io, .pool = undefined, .sms_sender = &iface };

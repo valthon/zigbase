@@ -40,16 +40,19 @@ pub const TwilioSender = struct {
     fn send(ptr: *anyopaque, io: std.Io, alloc: std.mem.Allocator, sms: Sms) anyerror!void {
         const self: *TwilioSender = @ptrCast(@alignCast(ptr));
 
-        const url = try messagesUrl(alloc, self.account_sid);
-        defer alloc.free(url);
+        // `send` returns void, so NOTHING it allocates escapes: the URL, auth header, form body,
+        // and the http_client's response scratch (a fixed `max_response_bytes` buffer that
+        // `HttpResponse` has no deinit for) are all one-shot. Route them through a function-local
+        // arena so `send` is self-freeing under ANY allocator, not only a request arena.
+        var scratch = std.heap.ArenaAllocator.init(alloc);
+        defer scratch.deinit();
+        const sa = scratch.allocator();
 
-        const auth = try basicAuthHeader(alloc, self.account_sid, self.auth_token);
-        defer alloc.free(auth);
+        const url = try messagesUrl(sa, self.account_sid);
+        const auth = try basicAuthHeader(sa, self.account_sid, self.auth_token);
+        const body = try buildBody(sa, sms.from orelse self.from, sms);
 
-        const body = try buildBody(alloc, sms.from orelse self.from, sms);
-        defer alloc.free(body);
-
-        var client = http_client.HttpClient{ .alloc = alloc, .io = io };
+        var client = http_client.HttpClient{ .alloc = sa, .io = io };
         const res = try client.request(.{
             .method = .POST,
             .url = url,
@@ -142,12 +145,12 @@ test "send builds the right URL + Basic auth + encoded body (via the http captur
     testcapture.http.enable(true); // block unmocked → no real network
     testcapture.http.mock("api.twilio.com", .{ .status = 201, .body = "{\"sid\":\"SMxxxx\"}" });
 
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-
+    // `TwilioSender.send` is self-freeing (contract-1), so it runs under the raw leak-detecting
+    // allocator — the captured request survives in the (page-allocator-backed) capture store.
+    const a = testing.allocator;
     var tw = TwilioSender.init("ACtest", "tok", "+15550000000");
     const s = tw.sender();
-    try s.send(std.testing.io, arena.allocator(), .{ .to = "+15551234567", .body = "Hi there" });
+    try s.send(std.testing.io, a, .{ .to = "+15551234567", .body = "Hi there" });
 
     try testing.expectEqual(@as(usize, 1), testcapture.http.requestCount());
     const rq = testcapture.http.requestAt(0).?;
@@ -161,7 +164,8 @@ test "send builds the right URL + Basic auth + encoded body (via the http captur
             const enc = std.base64.standard.Encoder;
             var buf: [64]u8 = undefined;
             const b64 = enc.encode(buf[0..enc.calcSize("ACtest:tok".len)], "ACtest:tok");
-            const want = try std.fmt.allocPrint(arena.allocator(), "Basic {s}", .{b64});
+            const want = try std.fmt.allocPrint(a, "Basic {s}", .{b64});
+            defer a.free(want);
             try testing.expectEqualStrings(want, h.value);
         }
     }
@@ -177,11 +181,9 @@ test "a non-2xx Twilio status surfaces as an error" {
     testcapture.http.enable(true);
     testcapture.http.mock("api.twilio.com", .{ .status = 401, .body = "{\"message\":\"auth\"}" });
 
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
     var tw = TwilioSender.init("ACtest", "bad", "+15550000000");
     const s = tw.sender();
-    try testing.expectError(error.TwilioSendFailed, s.send(std.testing.io, arena.allocator(), .{
+    try testing.expectError(error.TwilioSendFailed, s.send(std.testing.io, testing.allocator, .{
         .to = "+15551234567",
         .body = "x",
     }));
