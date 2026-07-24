@@ -48,16 +48,26 @@ pub fn compileGuard(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collecti
 }
 
 /// True if `id`'s row satisfies a `check`-state rule (guarded SELECT 1).
+/// Self-freeing (contract 1): the compiled guard, joins, SQL and `$n`-renumber are
+/// all scratch consumed to run one `SELECT 1` — none escape the `bool` return — so
+/// the function builds and frees them on a function-local arena. This makes it
+/// leak-correct under ANY allocator (a general-purpose allocator, the test leak
+/// detector) rather than relying on the caller passing an arena. (When `alloc` is
+/// itself an arena — every production call site — the scratch lives and dies with
+/// that arena as before; the deinit frees back into it, which is a no-op there.)
 pub fn matches(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, id: []const u8, rule: []const u8, rctx: *const request.RequestContext) RuleError!bool {
-    const g = try compileGuard(alloc, conn, col, rule, rctx);
+    var scratch = std.heap.ArenaAllocator.init(alloc);
+    defer scratch.deinit();
+    const sa = scratch.allocator();
+    const g = try compileGuard(sa, conn, col, rule, rctx);
     var joins: std.ArrayList(u8) = .empty;
     for (g.joins) |jn| {
-        try joins.append(alloc, ' ');
-        try joins.appendSlice(alloc, jn);
+        try joins.append(sa, ' ');
+        try joins.appendSlice(sa, jn);
     }
-    const sql = try std.fmt.allocPrintSentinel(alloc, "SELECT 1 FROM \"{s}\"{s} WHERE \"{s}\".\"id\"=?1 AND ({s});", .{ col.name, joins.items, col.name, g.where_sql }, 0);
+    const sql = try std.fmt.allocPrintSentinel(sa, "SELECT 1 FROM \"{s}\"{s} WHERE \"{s}\".\"id\"=?1 AND ({s});", .{ col.name, joins.items, col.name, g.where_sql }, 0);
     const param_sink = @import("sql/param_sink.zig");
-    var st = try conn.prepare(try param_sink.renumberZ(alloc, db.dbDialect(conn), sql));
+    var st = try conn.prepare(try param_sink.renumberZ(sa, db.dbDialect(conn), sql));
     defer st.finalize();
     try st.bindText(1, id);
     _ = try records.bindParams(&st, g.params, 2);
@@ -93,13 +103,12 @@ test "isPublic: only the exact sentinel is public" {
 test "matches runs a guarded select" {
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const migrations = @import("migrations.zig");
     const collections = @import("collections.zig");
     try migrations.run(&d);
     const col = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "posts", .fields = &[_]schema.Field{.{ .id = "f1", .name = "title", .options = .{ .text = .{} } }} });
+    defer col.deinit(a);
     try d.exec("INSERT INTO posts (id,created,updated,title) VALUES ('r1','t','t','ok');");
     const anon = request.RequestContext{};
     try std.testing.expect(try matches(a, &d, col, "r1", "title = \"ok\"", &anon));

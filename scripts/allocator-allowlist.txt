@@ -52,7 +52,7 @@ src/http_client.zig	6	contract-4: HttpResponse/DownloadResult are arena-scoped b
 src/import.zig	16	PRE-EXISTING: not yet migrated to the ownership contracts
 src/mail/bulk.zig	1	BLOCKED (contract-4, out-of-scope root cause): the "jobHandler wires the RFC 8058 List-Unsubscribe URL" test calls src/mail/unsubscribe.zig's `verify`, which by written design allocates its decode buffer and returns `Parts` as slices into it without ever freeing it (see that file's own tests, all arena-scoped for the same reason). Fixing unsubscribe.zig (contract-2: Parts owns its decode buffer) is deferred to the mail-unsubscribe batch, alongside api/mail_unsubscribe.zig which is its main consumer.
 src/migrator.zig	14	PRE-EXISTING: not yet migrated to the ownership contracts
-src/policy.zig	16	PRE-EXISTING: not yet migrated to the ownership contracts
+src/policy.zig	15	"PIN: policy.authorizes …" is un-masked (drives only the self-freeing rules.matches/policy.authorizes bool executors). 15 remain: 6 PIN/ability tests (compilePredicate/tenancy/abilities-unset/ability-guarded/ability-no-membership + the compileGuard-parity PIN) READ the compiled Guard returned by compilePredicate/rules.compileGuard directly (where_sql/joins/params) — a returned graph with no Guard.deinit helper, a separate returned-graph contract from the now-fixed bool-executor scratch; 8 "records.list …" tests drive the un-migrated records.list query subsystem scratch (lexer/parser/compiler/keyset/sort/tenancy); 1 "PIN: policy.decide …" leaks the pinBase collection graph (orthogonal collection-graph reclaim).
 src/provision.zig	29	PRE-EXISTING: not yet migrated to the ownership contracts
 src/query/compiler.zig	31	PRE-EXISTING: not yet migrated to the ownership contracts
 src/query/expand.zig	9	PRE-EXISTING: not yet migrated to the ownership contracts
@@ -64,7 +64,7 @@ src/query/params.zig	1	PRE-EXISTING: not yet migrated to the ownership contracts
 src/query/parser.zig	9	PRE-EXISTING: not yet migrated to the ownership contracts
 src/query/sort.zig	4	PRE-EXISTING: not yet migrated to the ownership contracts
 src/queue/durable.zig	4	PRE-EXISTING: not yet migrated to the ownership contracts
-src/realtime/hub.zig	11	The write-path scratch leak is fixed, so the returned-graph reclaim tests are un-masked: the @public/empty/null/id-only-delete shouldDeliver tests + the custom-topic frameForDelivery test now run under the raw std.testing.allocator (mkColl -> Collection.deinit, mkRec -> records.freeRecord, authedConn -> freeConn). 11 remain masked, all on out-of-batch leaks: 7 shouldDeliver tests drive the guarded-query authz path (policy.matchesRule builds a Guard — where_sql/joins/params/ability+tenant predicates — on the passed allocator and never frees it; policy.zig/rules.zig/records-guard are separate un-migrated entries); 2 frameForDelivery collection-lookup tests additionally leak the collection graph colcache.lease's cache==null fallback loads into `a` (no-op release()); and 2 are legitimate contract-4 — subscribeCheck takes a RequestArena and authVerb's identity_arena is a real *ArenaAllocator. Un-maskable once policy.zig/rules.zig migrate (and colcache.get frees/owns via a lease for the 2 frameForDelivery tests).
+src/realtime/hub.zig	4	The guarded-query authz scratch leak is now fixed (policy.matchesRule/rules.matches/records.guardPasses self-free their compiled Guard), so the 7 shouldDeliver tests that drive that path (@public+ability, macro/check viewRule, subscription filter, F4 owner-scoped delete, #18 hoist sandbox, tenant scoping, expired identity) are un-masked and run under the raw std.testing.allocator (mkColl -> Collection.deinit with a base/mutated-copy split for the ability/tenant_field literals, mkRec -> records.freeRecord + a.free(rid), authedConn -> freeConn, snapshots/shared auth maps deinit'd once). 4 remain masked: 2 frameForDelivery collection-lookup tests leak the collection graph colcache.lease's cache==null fallback loads into `a` (no-op release()); 2 are legitimate contract-4 — subscribeCheck takes a RequestArena and authVerb's identity_arena is a real *ArenaAllocator. The 2 frameForDelivery tests are un-maskable once colcache.get owns/frees via a lease.
 src/records.zig	62	PRE-EXISTING: not yet migrated to the ownership contracts
 src/records_hooks_test.zig	4	PRE-EXISTING: not yet migrated to the ownership contracts
 src/report/send.zig	1	PRE-EXISTING: not yet migrated to the ownership contracts
@@ -73,7 +73,6 @@ src/request_arena.zig	1	PRE-EXISTING: not yet migrated to the ownership contract
 src/rewrap.zig	9	PRE-EXISTING: not yet migrated to the ownership contracts
 src/route_types.zig	3	PRE-EXISTING: not yet migrated to the ownership contracts
 src/router.zig	5	PRE-EXISTING: not yet migrated to the ownership contracts
-src/rules.zig	1	PRE-EXISTING: not yet migrated to the ownership contracts
 src/schema.zig	21	PRE-EXISTING: not yet migrated to the ownership contracts
 src/schema_dump.zig	3	PRE-EXISTING: not yet migrated to the ownership contracts
 src/search/fts.zig	2	PRE-EXISTING: not yet migrated to the ownership contracts

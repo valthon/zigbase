@@ -150,12 +150,17 @@ pub fn compilePredicate(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Coll
 /// `deny_locked` → false, `check` → `rules.matches` (a guarded `SELECT 1`). Byte-identical to the
 /// inline `decide` + `rules.matches` the chokepoints used before.
 pub fn authorizes(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, action: Action, record_id: []const u8, rctx: *const request.RequestContext) PolicyError!bool {
+    // Self-freeing (contract 1): the composed guard is scratch consumed to run one probe —
+    // it never escapes the `bool` return — so it compiles on a function-local arena.
+    var scratch = std.heap.ArenaAllocator.init(alloc);
+    defer scratch.deinit();
+    const sa = scratch.allocator();
     // Route through compilePredicate so the SAME composition (rule AND tenant-scope) governs the
     // single-record check that governs list. A null predicate is the `allow` state (true); the
     // constant-false `"0"` guard is `deny_locked` (false); anything else is a guarded SELECT 1.
-    const guard = (try compilePredicate(alloc, conn, col, action, rctx)) orelse return true;
+    const guard = (try compilePredicate(sa, conn, col, action, rctx)) orelse return true;
     if (std.mem.eql(u8, guard.where_sql, "0")) return false;
-    return records.guardPasses(alloc, conn, col, record_id, guard);
+    return records.guardPasses(sa, conn, col, record_id, guard);
 }
 
 /// Evaluate an ARBITRARY combined rule expression against `record_id` (a guarded `SELECT 1`).
@@ -163,20 +168,28 @@ pub fn authorizes(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection
 /// one expression that is not a single action rule. A thin pass-through to the rules primitive so
 /// realtime authz also funnels through the policy layer (the seam PR5 composes into).
 pub fn matchesRule(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, record_id: []const u8, rule: []const u8, rctx: *const request.RequestContext) PolicyError!bool {
+    // Self-freeing (contract 1): the compiled guard and its ability/tenant composition are
+    // scratch consumed to run one probe — none escape the `bool` return — so the function
+    // builds and frees them on a function-local arena. This makes it leak-correct under ANY
+    // allocator, not only when the caller passes an arena. (When `alloc` is itself an arena —
+    // the realtime delivery path — the scratch lives and dies with it as before.)
+    var scratch = std.heap.ArenaAllocator.init(alloc);
+    defer scratch.deinit();
+    const sa = scratch.allocator();
     // An EMPTY `rule` contributes no rule-clause — the realtime hub passes "" when a collection's
     // viewRule is `@public`/`allow` (no expression to compile) but an ability or the tenant scope
     // must still constrain delivery. A non-empty rule compiles to a guard as before.
-    var guard: ?Guard = if (rule.len > 0) try rules.compileGuard(alloc, conn, col, rule, rctx) else null;
+    var guard: ?Guard = if (rule.len > 0) try rules.compileGuard(sa, conn, col, rule, rctx) else null;
     // Realtime delivery on an ability- or tenant-guarded collection is narrowed to what the
     // subscriber may VIEW too (the composition funnels through this one place). Each is null =
     // no-op (byte-identical to the prior `rules.matches` for a plain collection / no-tenancy app).
-    if (try abilities.abilityPredicate(alloc, col, abilityFor(col, .view), rctx, db.dbDialect(conn))) |ap|
-        guard = try andPredicate(alloc, guard, ap.sql, ap.params);
-    if (try tenancy.scopePredicate(alloc, col, rctx)) |sp| guard = try andPredicate(alloc, guard, sp.sql, &.{sp.param});
+    if (try abilities.abilityPredicate(sa, col, abilityFor(col, .view), rctx, db.dbDialect(conn))) |ap|
+        guard = try andPredicate(sa, guard, ap.sql, ap.params);
+    if (try tenancy.scopePredicate(sa, col, rctx)) |sp| guard = try andPredicate(sa, guard, sp.sql, &.{sp.param});
     // No rule clause AND no ability AND no tenant scope => unconstrained (deliver). Otherwise run
     // the guarded SELECT 1.
     const g = guard orelse return true;
-    return records.guardPasses(alloc, conn, col, record_id, g);
+    return records.guardPasses(sa, conn, col, record_id, g);
 }
 
 // ---- Back-compat PIN tests --------------------------------------------------
@@ -254,13 +267,13 @@ test "PIN: policy.compilePredicate byte-identical to rules.compileGuard for a ch
 test "PIN: policy.authorizes matches rules decide+matches for allow/deny/check" {
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const base = try pinBase(a, &d);
+    defer base.deinit(a);
     const col = withRule(base, "owner = @request.auth.id");
     try d.exec("INSERT INTO posts (id,created,updated,title,owner) VALUES ('r1','t','t','x','u1');");
     var auth: std.json.ObjectMap = .empty;
+    defer auth.deinit(a);
     try auth.put(a, "id", .{ .string = "u1" });
     const owner = request.RequestContext{ .auth = .{ .object = auth } };
     const su = request.RequestContext{ .is_superuser = true };
@@ -270,6 +283,7 @@ test "PIN: policy.authorizes matches rules decide+matches for allow/deny/check" 
     try std.testing.expectEqual(try rules.matches(a, &d, col, "r1", col.viewRule.?, &owner), try authorizes(a, &d, col, .view, "r1", &owner));
     try std.testing.expect(try authorizes(a, &d, col, .view, "r1", &owner));
     var stranger: std.json.ObjectMap = .empty;
+    defer stranger.deinit(a);
     try stranger.put(a, "id", .{ .string = "u2" });
     const other = request.RequestContext{ .auth = .{ .object = stranger } };
     try std.testing.expect(!try authorizes(a, &d, col, .view, "r1", &other));
