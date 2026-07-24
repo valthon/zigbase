@@ -110,6 +110,16 @@ pub fn compile(alloc: std.mem.Allocator, j: *joiner.Joiner, node: *parser.Node, 
     return .{ .where_sql = owned_sql, .params = owned_params };
 }
 
+/// Free a `Compiled` produced by `compile` on the SAME allocator `compile` was given. `compile`
+/// returns a fully self-contained result (`where_sql` plus a `params` slice whose every `.text`
+/// is duped onto that allocator), so freeing is uniform — the one place a non-arena caller frees
+/// a compiled filter.
+pub fn freeCompiled(a: std.mem.Allocator, c: Compiled) void {
+    a.free(c.where_sql);
+    for (c.params) |p| if (p == .text) a.free(p.text);
+    a.free(c.params);
+}
+
 fn emit(alloc: std.mem.Allocator, j: *joiner.Joiner, node: *parser.Node, params: *std.ArrayList(Param), rctx: ?*const request.RequestContext, dialect: Dialect, filter_args: []const FilterArg) CompileError![]u8 {
     switch (node.*) {
         .logic => |lg| {
@@ -378,14 +388,6 @@ fn setup(d: *db.Db, a: std.mem.Allocator) !schema.Collection {
         .{ .id = "f4", .name = "active", .options = .{ .bool = .{} } },
     };
     return collections.create(a, std.testing.io, d, .{ .id = "", .name = "posts", .fields = &pf });
-}
-
-// Free a `Compiled` produced by `compile` on `a`: `compile` returns a fully self-contained result
-// (where_sql + a params slice whose every `.text` is duped onto `a`), so freeing is uniform.
-fn freeCompiled(a: std.mem.Allocator, c: Compiled) void {
-    a.free(c.where_sql);
-    for (c.params) |p| if (p == .text) a.free(p.text);
-    a.free(c.params);
 }
 
 // `a` drives the SUT (lex/parse/compile) so its OWN allocations are leak-checked; the tokens and
