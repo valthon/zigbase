@@ -23,7 +23,6 @@ src/auth/methods/otp.zig	11	PRE-EXISTING: not yet migrated to the ownership cont
 src/auth/methods/password.zig	3	PRE-EXISTING: not yet migrated to the ownership contracts
 src/auth/methods/webauthn.zig	2	PRE-EXISTING: not yet migrated to the ownership contracts
 src/auth_helpers.zig	5	PRE-EXISTING: not yet migrated to the ownership contracts
-src/backend/postgres/conn.zig	1	PRE-EXISTING: not yet migrated to the ownership contracts
 src/captcha.zig	4	contract-4: verify tests hold an arena-scoped HttpClient response body (sub-slice of max_response_bytes, not individually freeable)
 src/clock_test.zig	1	PRE-EXISTING: not yet migrated to the ownership contracts
 src/codegen/acquire.zig	2	buildCollection is the internal builder (looped by acquireFromDb); returns a bare arena-lifetime Collection on the caller allocator. Public entry points are contract-2 (Acquired).
@@ -44,12 +43,10 @@ src/policy.zig	7	"PIN: policy.authorizes …" is un-masked (drives only the self
 src/provision.zig	29	PRE-EXISTING: not yet migrated to the ownership contracts
 src/query/expand.zig	9	PRE-EXISTING: not yet migrated to the ownership contracts
 src/query/fields.zig	12	PRE-EXISTING: not yet migrated to the ownership contracts
-src/query/params.zig	1	PRE-EXISTING: not yet migrated to the ownership contracts
 src/query/sort.zig	4	SUT-driven: all 4 tests now drive compile()/compileTerms() themselves on the RAW std.testing.allocator, freeing the returned []SortTerm / ORDER BY string ("compile() frees its intermediate terms slice" already did; the other 3 now follow the same split). The 4 remaining ArenaAllocator.init(testing.allocator) lines are SETUP-only arenas for db-backed collections.create + the joiner, which has inherent per-resolve intermediates with no deinit — a separate joiner.zig migration — mirroring the query/compiler.zig precedent.
 src/realtime/hub.zig	2	The guarded-query authz scratch leak is fixed (policy.matchesRule/rules.matches/records.guardPasses self-free their compiled Guard) and colcache.lease's cache==null fallback now owns a private arena that release() deinits, so all 7 shouldDeliver tests AND both frameForDelivery collection-lookup tests run under the raw std.testing.allocator (mkColl/pub_col/locked_col/fnotes -> Collection.deinit, mkRec/rec -> records.freeRecord + buildEventFrames called before the free, authedConn -> freeConn, ef/lf -> EventFrames.deinit, the F4 test's re-serialized id-only frame -> a.free(out)). 2 remain masked, both legitimate contract-4: subscribeCheck takes a RequestArena and authVerb's identity_arena is a real *ArenaAllocator.
 src/records_hooks_test.zig	4	PRE-EXISTING: not yet migrated to the ownership contracts
 src/report/send.zig	1	PRE-EXISTING: not yet migrated to the ownership contracts
-src/report/sentry.zig	1	PRE-EXISTING: not yet migrated to the ownership contracts
 src/request_arena.zig	1	PRE-EXISTING: not yet migrated to the ownership contracts
 src/rewrap.zig	9	PRE-EXISTING: not yet migrated to the ownership contracts
 src/router.zig	2	contract-4: "dispatch routes to handler…" and "tryDispatch returns null…" drive dispatch/tryDispatch through a real http.RequestCtx, whose .allocator is a RequestArena (ctx.allocator.a) — dummyHandler and ApiError.notFound().toResponse both allocate through it. The 3 matchPath tests (pure builder over a plain std.mem.Allocator, no interlinked graph) now run under raw std.testing.allocator, freeing the returned []http.Param directly.

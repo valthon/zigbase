@@ -44,23 +44,31 @@ pub fn buildEnvelope(
     level: []const u8,
 ) !Envelope {
     const url = try ingestUrl(alloc, dsn);
+    errdefer alloc.free(url);
     const pubkey = try publicKey(dsn);
     const auth_header = try std.fmt.allocPrint(
         alloc,
         "Sentry sentry_version=7, sentry_key={s}",
         .{pubkey},
     );
+    errdefer alloc.free(auth_header);
 
-    // Event payload: {message, level, platform:"other"}.
+    // Event payload: {message, level, platform:"other"}. Scratch only — folded into `body`
+    // below, never part of the returned Envelope — so it is freed here, not by the caller.
     var obj: std.json.ObjectMap = .empty;
+    defer obj.deinit(alloc);
     try obj.put(alloc, "message", .{ .string = message });
     try obj.put(alloc, "level", .{ .string = level });
     try obj.put(alloc, "platform", .{ .string = "other" });
     const payload = try std.json.Stringify.valueAlloc(alloc, std.json.Value{ .object = obj }, .{});
+    defer alloc.free(payload);
 
-    // Envelope header references the DSN; item header carries the payload length.
+    // Envelope header references the DSN; item header carries the payload length. Also
+    // scratch — `body` copies their contents, so they're freed here too.
     const header = try std.fmt.allocPrint(alloc, "{{\"dsn\":\"{s}\"}}", .{dsn});
+    defer alloc.free(header);
     const item_header = try std.fmt.allocPrint(alloc, "{{\"type\":\"event\",\"length\":{d}}}", .{payload.len});
+    defer alloc.free(item_header);
     const body = try std.fmt.allocPrint(alloc, "{s}\n{s}\n{s}", .{ header, item_header, payload });
 
     return .{ .url = url, .auth_header = auth_header, .body = body };
@@ -121,11 +129,12 @@ pub const SentryReporter = struct {
 };
 
 test "buildEnvelope produces a valid Sentry envelope with the message" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
 
     const out = try buildEnvelope(a, "https://pub@o1.ingest.sentry.io/42", "boom: error.HookRejected", "error");
+    defer a.free(out.url);
+    defer a.free(out.auth_header);
+    defer a.free(out.body);
     var it = std.mem.splitScalar(u8, out.body, '\n');
     const hdr = it.next().?;
     try std.testing.expect(std.mem.indexOf(u8, hdr, "\"dsn\"") != null);
