@@ -142,6 +142,18 @@ pub fn lex(alloc: std.mem.Allocator, input: []const u8) LexError![]Token {
     return toks.toOwnedSlice(alloc);
 }
 
+/// Free a token slice produced by `lex`. Frees the slice itself plus every OWNED (unescaped)
+/// string buffer — the ones whose `.text` does NOT point into `input`; zero-copy plain strings
+/// slice into `input` and are left alone. Mirrors the ownership `lex`'s errdefer already frees on
+/// the failure path, so the success path is symmetric. `input` MUST be the same buffer passed to
+/// `lex` (the pointer-range test needs it).
+pub fn freeTokens(alloc: std.mem.Allocator, input: []const u8, toks: []const Token) void {
+    for (toks) |t| {
+        if (t.kind == .string and !pointsInto(t.text, input)) alloc.free(t.text);
+    }
+    alloc.free(toks);
+}
+
 /// True if `slice` starts inside `parent`'s byte range — i.e. it is a zero-copy
 /// sub-slice rather than a separately allocated (unescaped) buffer.
 fn pointsInto(slice: []const u8, parent: []const u8) bool {
@@ -194,10 +206,10 @@ fn unescape(alloc: std.mem.Allocator, body: []const u8) LexError![]const u8 {
 }
 
 test "lex a relation-path comparison" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const toks = try lex(a, "author.name ~ \"ab\" && price >= 10.5");
+    const a = std.testing.allocator;
+    const input = "author.name ~ \"ab\" && price >= 10.5";
+    const toks = try lex(a, input);
+    defer freeTokens(a, input, toks);
     const kinds = [_]TokKind{ .ident, .like, .string, .l_and, .ident, .ge, .number, .eof };
     try std.testing.expectEqual(kinds.len, toks.len);
     for (kinds, 0..) |k, i| try std.testing.expectEqual(k, toks[i].kind);
@@ -207,9 +219,9 @@ test "lex a relation-path comparison" {
 }
 
 test "lex rejects malformed input" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    // Every case returns an error; `lex` frees any owned buffers on its failure path, so the raw
+    // testing allocator needs no per-case teardown here.
+    const a = std.testing.allocator;
     // Unterminated string literal.
     try std.testing.expectError(error.UnterminatedString, lex(a, "title = \"abc"));
     // A lone '&' (not '&&') is invalid.
@@ -295,15 +307,17 @@ test "lex frees owned escaped-string buffers on success (no leak)" {
 }
 
 test "lex the `in` operator, a list, and a list macro" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const toks = try lex(a, "status in (\"a\", \"b\") || account in @request.account.ids");
+    const a = std.testing.allocator;
+    const input = "status in (\"a\", \"b\") || account in @request.account.ids";
+    const toks = try lex(a, input);
+    defer freeTokens(a, input, toks);
     const kinds = [_]TokKind{ .ident, .in, .lparen, .string, .comma, .string, .rparen, .l_or, .ident, .in, .ident, .eof };
     try std.testing.expectEqual(kinds.len, toks.len);
     for (kinds, 0..) |k, i| try std.testing.expectEqual(k, toks[i].kind);
     // The exact bareword "in" is the operator; words merely starting with it stay identifiers.
-    const toks2 = try lex(a, "internal = 1 && index = 2");
+    const input2 = "internal = 1 && index = 2";
+    const toks2 = try lex(a, input2);
+    defer freeTokens(a, input2, toks2);
     try std.testing.expectEqual(TokKind.ident, toks2[0].kind);
     try std.testing.expectEqualStrings("internal", toks2[0].text);
     try std.testing.expectEqual(TokKind.ident, toks2[4].kind);
@@ -311,18 +325,20 @@ test "lex the `in` operator, a list, and a list macro" {
 }
 
 test "lex a `?` bound-value placeholder" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const toks = try lex(arena.allocator(), "name = ? && age >= ?");
+    const a = std.testing.allocator;
+    const input = "name = ? && age >= ?";
+    const toks = try lex(a, input);
+    defer freeTokens(a, input, toks);
     const kinds = [_]TokKind{ .ident, .eq, .placeholder, .l_and, .ident, .ge, .placeholder, .eof };
     try std.testing.expectEqual(kinds.len, toks.len);
     for (kinds, 0..) |k, i| try std.testing.expectEqual(k, toks[i].kind);
 }
 
 test "lex an @request macro path" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const toks = try lex(arena.allocator(), "owner = @request.auth.id");
+    const a = std.testing.allocator;
+    const input = "owner = @request.auth.id";
+    const toks = try lex(a, input);
+    defer freeTokens(a, input, toks);
     try std.testing.expectEqual(TokKind.ident, toks[0].kind);
     try std.testing.expectEqual(TokKind.eq, toks[1].kind);
     try std.testing.expectEqual(TokKind.ident, toks[2].kind);

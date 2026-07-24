@@ -76,9 +76,48 @@ pub fn compile(alloc: std.mem.Allocator, j: *joiner.Joiner, node: *parser.Node, 
     // equal filter_args.len. This also means a filter STRING that smuggles a `?` on the REST path
     // (which supplies no filter_args) fails safely here rather than binding an unbound placeholder.
     if (countPlaceholders(node) != filter_args.len) return error.BadFilter;
+    // Everything `emit` builds is SCRATCH: the child-string wrapping (`(l AND r)`), the
+    // nocase-operand wrappers, the `IN (…)` buffer, and the transient decimal strings the
+    // placeholder path funnels through `coerceScalar` are all consumed to produce the final
+    // `where_sql` + `params`. Build them on a function-local arena; only the final SQL (duped) and
+    // the params (each `.text` duped) escape on `alloc`. This makes `compile` self-freeing
+    // (contract 1) under ANY allocator — including the test leak detector — instead of leaning on
+    // the caller passing an arena. In production `alloc` IS an arena, so the dupes are a cheap
+    // extra copy reclaimed at request end, and the returned params no longer alias the lexer's
+    // token/unescape buffers (they own their bytes).
+    var scratch = std.heap.ArenaAllocator.init(alloc);
+    defer scratch.deinit();
+    const sa = scratch.allocator();
     var params: std.ArrayList(Param) = .empty;
-    const sql = try emit(alloc, j, node, &params, rctx, dialect, filter_args);
-    return .{ .where_sql = sql, .params = try params.toOwnedSlice(alloc) };
+    const sql = try emit(sa, j, node, &params, rctx, dialect, filter_args);
+
+    const owned_sql = try alloc.dupe(u8, sql);
+    errdefer alloc.free(owned_sql);
+    const owned_params = try alloc.alloc(Param, params.items.len);
+    errdefer alloc.free(owned_params);
+    // Track how many `.text` dupes have landed so a mid-loop OOM frees exactly those (and no more).
+    var filled: usize = 0;
+    errdefer for (owned_params[0..filled]) |p| {
+        if (p == .text) alloc.free(p.text);
+    };
+    for (params.items, 0..) |p, i| {
+        owned_params[i] = switch (p) {
+            .text => |t| .{ .text = try alloc.dupe(u8, t) },
+            else => p,
+        };
+        filled = i + 1;
+    }
+    return .{ .where_sql = owned_sql, .params = owned_params };
+}
+
+/// Free a `Compiled` produced by `compile` on the SAME allocator `compile` was given. `compile`
+/// returns a fully self-contained result (`where_sql` plus a `params` slice whose every `.text`
+/// is duped onto that allocator), so freeing is uniform — the one place a non-arena caller frees
+/// a compiled filter.
+pub fn freeCompiled(a: std.mem.Allocator, c: Compiled) void {
+    a.free(c.where_sql);
+    for (c.params) |p| if (p == .text) a.free(p.text);
+    a.free(c.params);
 }
 
 fn emit(alloc: std.mem.Allocator, j: *joiner.Joiner, node: *parser.Node, params: *std.ArrayList(Param), rctx: ?*const request.RequestContext, dialect: Dialect, filter_args: []const FilterArg) CompileError![]u8 {
@@ -351,30 +390,40 @@ fn setup(d: *db.Db, a: std.mem.Allocator) !schema.Collection {
     return collections.create(a, std.testing.io, d, .{ .id = "", .name = "posts", .fields = &pf });
 }
 
+// `a` drives the SUT (lex/parse/compile) so its OWN allocations are leak-checked; the tokens and
+// AST are transient scratch freed here (compile duped everything it keeps), and the returned
+// `Compiled` is owned by `a`. Tests pass the raw testing allocator for `a` while keeping the
+// joiner/schema on a separate setup arena.
 fn compileFilter(a: std.mem.Allocator, d: *db.Db, posts: schema.Collection, filter: []const u8, j: *joiner.Joiner) !Compiled {
     _ = d;
     _ = posts;
     const toks = try lexer.lex(a, filter);
+    defer lexer.freeTokens(a, filter, toks);
     const ast = try parser.parse(a, toks);
+    defer parser.freeNode(a, ast);
     return compile(a, j, ast, null, Dialect.sqlite, &.{});
 }
 
 /// Like `compileFilter` but with bound `?` placeholder values.
 fn compileFilterArgs(a: std.mem.Allocator, filter: []const u8, j: *joiner.Joiner, filter_args: []const FilterArg) !Compiled {
     const toks = try lexer.lex(a, filter);
+    defer lexer.freeTokens(a, filter, toks);
     const ast = try parser.parse(a, toks);
+    defer parser.freeNode(a, ast);
     return compile(a, j, ast, null, Dialect.sqlite, filter_args);
 }
 
 test "compile text equality binds the literal" {
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const posts = try setup(&d, a);
-    var j = joiner.Joiner.init(a, &d, posts);
+    var sarena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer sarena.deinit();
+    const sa = sarena.allocator(); // setup arena: schema (collections.create), joiner, rctx scaffolding
+    const a = std.testing.allocator; // SUT allocator: lex/parse/compile output is leak-checked
+    const posts = try setup(&d, sa);
+    var j = joiner.Joiner.init(sa, &d, posts);
     const c = try compileFilter(a, &d, posts, "title = \"hi\"", &j);
+    defer freeCompiled(a, c);
     try std.testing.expectEqualStrings("\"posts\".\"title\" = ?", c.where_sql);
     try std.testing.expectEqual(@as(usize, 1), c.params.len);
     try std.testing.expectEqualStrings("hi", c.params[0].text);
@@ -385,12 +434,13 @@ test "compile makes a .nocase column equality/IN case-insensitive on BOTH backen
     const collections = @import("../collections.zig");
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    var sarena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer sarena.deinit();
+    const sa = sarena.allocator(); // setup arena: schema (collections.create), joiner, rctx scaffolding
+    const a = std.testing.allocator; // SUT allocator: lex/parse/compile output is leak-checked
     try migrations.run(&d);
     const idx = [_]schema.Index{.{ .name = "idx_people_addr", .fields = &.{"addr"}, .unique = true, .collation = .nocase }};
-    const people = try collections.create(a, std.testing.io, &d, .{
+    const people = try collections.create(sa, std.testing.io, &d, .{
         .id = "",
         .name = "people",
         .fields = &[_]schema.Field{
@@ -417,9 +467,12 @@ test "compile makes a .nocase column equality/IN case-insensitive on BOTH backen
     };
     for (cases) |cs| {
         const toks = try lexer.lex(a, cs.filter);
+        defer lexer.freeTokens(a, cs.filter, toks);
         const ast = try parser.parse(a, toks);
-        var j = joiner.Joiner.init(a, &d, people);
+        defer parser.freeNode(a, ast);
+        var j = joiner.Joiner.init(sa, &d, people);
         const c = try compile(a, &j, ast, null, cs.dia, &.{});
+        defer freeCompiled(a, c);
         try std.testing.expectEqualStrings(cs.want, c.where_sql);
     }
 }
@@ -427,12 +480,14 @@ test "compile makes a .nocase column equality/IN case-insensitive on BOTH backen
 test "compile fixed comparison scales the numeric literal to an int param" {
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const posts = try setup(&d, a);
-    var j = joiner.Joiner.init(a, &d, posts);
+    var sarena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer sarena.deinit();
+    const sa = sarena.allocator(); // setup arena: schema (collections.create), joiner, rctx scaffolding
+    const a = std.testing.allocator; // SUT allocator: lex/parse/compile output is leak-checked
+    const posts = try setup(&d, sa);
+    var j = joiner.Joiner.init(sa, &d, posts);
     const c = try compileFilter(a, &d, posts, "price >= 10.50", &j);
+    defer freeCompiled(a, c);
     try std.testing.expectEqualStrings("\"posts\".\"price\" >= ?", c.where_sql);
     try std.testing.expectEqual(@as(i64, 1050), c.params[0].int);
 }
@@ -440,12 +495,14 @@ test "compile fixed comparison scales the numeric literal to an int param" {
 test "compile LIKE wraps the term in percents" {
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const posts = try setup(&d, a);
-    var j = joiner.Joiner.init(a, &d, posts);
+    var sarena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer sarena.deinit();
+    const sa = sarena.allocator(); // setup arena: schema (collections.create), joiner, rctx scaffolding
+    const a = std.testing.allocator; // SUT allocator: lex/parse/compile output is leak-checked
+    const posts = try setup(&d, sa);
+    var j = joiner.Joiner.init(sa, &d, posts);
     const c = try compileFilter(a, &d, posts, "title ~ \"ab\"", &j);
+    defer freeCompiled(a, c);
     try std.testing.expectEqualStrings("\"posts\".\"title\" LIKE ?", c.where_sql);
     try std.testing.expectEqualStrings("%ab%", c.params[0].text);
 }
@@ -453,12 +510,14 @@ test "compile LIKE wraps the term in percents" {
 test "compile a relation-path filter emits a join and uses the alias" {
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const posts = try setup(&d, a);
-    var j = joiner.Joiner.init(a, &d, posts);
+    var sarena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer sarena.deinit();
+    const sa = sarena.allocator(); // setup arena: schema (collections.create), joiner, rctx scaffolding
+    const a = std.testing.allocator; // SUT allocator: lex/parse/compile output is leak-checked
+    const posts = try setup(&d, sa);
+    var j = joiner.Joiner.init(sa, &d, posts);
     const c = try compileFilter(a, &d, posts, "author.name = \"x\"", &j);
+    defer freeCompiled(a, c);
     try std.testing.expectEqual(@as(usize, 1), j.joins.items.len);
     try std.testing.expect(std.mem.indexOf(u8, j.joins.items[0], "LEFT JOIN \"users\" AS j1 ON \"posts\".\"author\" = j1.\"id\"") != null);
     try std.testing.expectEqualStrings("j1.\"name\" = ?", c.where_sql);
@@ -468,12 +527,14 @@ test "compile a relation-path filter emits a join and uses the alias" {
 test "compile logical grouping" {
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const posts = try setup(&d, a);
-    var j = joiner.Joiner.init(a, &d, posts);
+    var sarena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer sarena.deinit();
+    const sa = sarena.allocator(); // setup arena: schema (collections.create), joiner, rctx scaffolding
+    const a = std.testing.allocator; // SUT allocator: lex/parse/compile output is leak-checked
+    const posts = try setup(&d, sa);
+    var j = joiner.Joiner.init(sa, &d, posts);
     const c = try compileFilter(a, &d, posts, "title = \"a\" && price > 1.00", &j);
+    defer freeCompiled(a, c);
     try std.testing.expectEqualStrings("(\"posts\".\"title\" = ? AND \"posts\".\"price\" > ?)", c.where_sql);
     try std.testing.expectEqual(@as(usize, 2), c.params.len);
 }
@@ -481,23 +542,26 @@ test "compile logical grouping" {
 test "compile a dedup of a repeated relation prefix uses one join" {
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const posts = try setup(&d, a);
-    var j = joiner.Joiner.init(a, &d, posts);
-    _ = try compileFilter(a, &d, posts, "author.name = \"x\" || author.id = \"y\"", &j);
+    var sarena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer sarena.deinit();
+    const sa = sarena.allocator(); // setup arena: schema (collections.create), joiner, rctx scaffolding
+    const a = std.testing.allocator; // SUT allocator: lex/parse/compile output is leak-checked
+    const posts = try setup(&d, sa);
+    var j = joiner.Joiner.init(sa, &d, posts);
+    const c = try compileFilter(a, &d, posts, "author.name = \"x\" || author.id = \"y\"", &j);
+    defer freeCompiled(a, c);
     try std.testing.expectEqual(@as(usize, 1), j.joins.items.len); // single join reused
 }
 
 test "compile rejects an unknown field" {
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const posts = try setup(&d, a);
-    var j = joiner.Joiner.init(a, &d, posts);
+    var sarena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer sarena.deinit();
+    const sa = sarena.allocator(); // setup arena: schema (collections.create), joiner, rctx scaffolding
+    const a = std.testing.allocator; // SUT allocator: lex/parse/compile output is leak-checked
+    const posts = try setup(&d, sa);
+    var j = joiner.Joiner.init(sa, &d, posts);
     try std.testing.expectError(error.UnknownField, compileFilter(a, &d, posts, "nonsuch = 1", &j));
 }
 
@@ -508,16 +572,18 @@ test "SQL injection: string literal with metacharacters stays in params, never i
     // must appear verbatim in params[0].text.
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const posts = try setup(&d, a);
-    var j = joiner.Joiner.init(a, &d, posts);
+    var sarena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer sarena.deinit();
+    const sa = sarena.allocator(); // setup arena: schema (collections.create), joiner, rctx scaffolding
+    const a = std.testing.allocator; // SUT allocator: lex/parse/compile output is leak-checked
+    const posts = try setup(&d, sa);
+    var j = joiner.Joiner.init(sa, &d, posts);
     // Use single-quotes in the filter so the double-quote inside the value is not
     // the filter string delimiter, letting us embed " characters in the value.
     const dangerous = "x\" OR \"1\"=\"1; DROP TABLE posts;--";
     const filter = "title = 'x\" OR \"1\"=\"1; DROP TABLE posts;--'";
     const c = try compileFilter(a, &d, posts, filter, &j);
+    defer freeCompiled(a, c);
     // (a) where_sql must be exactly the parameterised form — no injected SQL
     try std.testing.expectEqualStrings("\"posts\".\"title\" = ?", c.where_sql);
     // (b) the dangerous text must be bound as the first (and only) parameter
@@ -531,12 +597,14 @@ test "compile binds an escaped string literal's unescaped value as a param" {
     // must bind the real, unescaped O'Brien-style value into params.
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const posts = try setup(&d, a);
-    var j = joiner.Joiner.init(a, &d, posts);
+    var sarena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer sarena.deinit();
+    const sa = sarena.allocator(); // setup arena: schema (collections.create), joiner, rctx scaffolding
+    const a = std.testing.allocator; // SUT allocator: lex/parse/compile output is leak-checked
+    const posts = try setup(&d, sa);
+    var j = joiner.Joiner.init(sa, &d, posts);
     const c = try compileFilter(a, &d, posts, "title = 'O\\'Brien \\\"Jr\\\"'", &j);
+    defer freeCompiled(a, c);
     try std.testing.expectEqualStrings("\"posts\".\"title\" = ?", c.where_sql);
     try std.testing.expectEqual(@as(usize, 1), c.params.len);
     try std.testing.expectEqualStrings("O'Brien \"Jr\"", c.params[0].text);
@@ -545,17 +613,22 @@ test "compile binds an escaped string literal's unescaped value as a param" {
 test "compile a macro rule binds the auth id as a param" {
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const posts = try setup(&d, a);
+    var sarena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer sarena.deinit();
+    const sa = sarena.allocator(); // setup arena: schema (collections.create), joiner, rctx scaffolding
+    const a = std.testing.allocator; // SUT allocator: lex/parse/compile output is leak-checked
+    const posts = try setup(&d, sa);
     var auth: std.json.ObjectMap = .empty;
-    try auth.put(a, "id", .{ .string = "u1" });
+    try auth.put(sa, "id", .{ .string = "u1" });
     const rctx = request.RequestContext{ .auth = .{ .object = auth } };
-    const toks = try lexer.lex(a, "title = @request.auth.id");
+    const src = "title = @request.auth.id";
+    const toks = try lexer.lex(a, src);
+    defer lexer.freeTokens(a, src, toks);
     const ast = try parser.parse(a, toks);
-    var j = joiner.Joiner.init(a, &d, posts);
+    defer parser.freeNode(a, ast);
+    var j = joiner.Joiner.init(sa, &d, posts);
     const c = try compile(a, &j, ast, &rctx, Dialect.sqlite, &.{});
+    defer freeCompiled(a, c);
     try std.testing.expectEqualStrings("\"posts\".\"title\" = ?", c.where_sql);
     try std.testing.expectEqualStrings("u1", c.params[0].text);
 }
@@ -563,25 +636,31 @@ test "compile a macro rule binds the auth id as a param" {
 test "compile @ path without a context errors" {
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const posts = try setup(&d, a);
-    const toks = try lexer.lex(a, "title = @request.auth.id");
+    var sarena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer sarena.deinit();
+    const sa = sarena.allocator(); // setup arena: schema (collections.create), joiner, rctx scaffolding
+    const a = std.testing.allocator; // SUT allocator: lex/parse/compile output is leak-checked
+    const posts = try setup(&d, sa);
+    const src = "title = @request.auth.id";
+    const toks = try lexer.lex(a, src);
+    defer lexer.freeTokens(a, src, toks);
     const ast = try parser.parse(a, toks);
-    var j = joiner.Joiner.init(a, &d, posts);
+    defer parser.freeNode(a, ast);
+    var j = joiner.Joiner.init(sa, &d, posts);
     try std.testing.expectError(error.BadFilter, compile(a, &j, ast, null, Dialect.sqlite, &.{}));
 }
 
 test "compile `in` with a literal list emits placeholders and binds each element" {
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const posts = try setup(&d, a);
-    var j = joiner.Joiner.init(a, &d, posts);
+    var sarena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer sarena.deinit();
+    const sa = sarena.allocator(); // setup arena: schema (collections.create), joiner, rctx scaffolding
+    const a = std.testing.allocator; // SUT allocator: lex/parse/compile output is leak-checked
+    const posts = try setup(&d, sa);
+    var j = joiner.Joiner.init(sa, &d, posts);
     const c = try compileFilter(a, &d, posts, "title in (\"a\", \"b\", \"c\")", &j);
+    defer freeCompiled(a, c);
     try std.testing.expectEqualStrings("\"posts\".\"title\" IN (?,?,?)", c.where_sql);
     try std.testing.expectEqual(@as(usize, 3), c.params.len);
     try std.testing.expectEqualStrings("a", c.params[0].text);
@@ -591,12 +670,14 @@ test "compile `in` with a literal list emits placeholders and binds each element
 test "compile `in` coerces list elements to the column type" {
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const posts = try setup(&d, a);
-    var j = joiner.Joiner.init(a, &d, posts);
+    var sarena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer sarena.deinit();
+    const sa = sarena.allocator(); // setup arena: schema (collections.create), joiner, rctx scaffolding
+    const a = std.testing.allocator; // SUT allocator: lex/parse/compile output is leak-checked
+    const posts = try setup(&d, sa);
+    var j = joiner.Joiner.init(sa, &d, posts);
     const c = try compileFilter(a, &d, posts, "price in (1.00, 2.50)", &j);
+    defer freeCompiled(a, c);
     try std.testing.expectEqualStrings("\"posts\".\"price\" IN (?,?)", c.where_sql);
     try std.testing.expectEqual(@as(i64, 100), c.params[0].int);
     try std.testing.expectEqual(@as(i64, 250), c.params[1].int);
@@ -605,16 +686,21 @@ test "compile `in` coerces list elements to the column type" {
 test "compile `in @request.account.ids` binds each membership id" {
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const posts = try setup(&d, a);
+    var sarena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer sarena.deinit();
+    const sa = sarena.allocator(); // setup arena: schema (collections.create), joiner, rctx scaffolding
+    const a = std.testing.allocator; // SUT allocator: lex/parse/compile output is leak-checked
+    const posts = try setup(&d, sa);
     const mem = [_]request.Membership{ .{ .account = "acc1" }, .{ .account = "acc2" } };
     const rctx = request.RequestContext{ .memberships = &mem };
-    const toks = try lexer.lex(a, "author in @request.account.ids");
+    const src = "author in @request.account.ids";
+    const toks = try lexer.lex(a, src);
+    defer lexer.freeTokens(a, src, toks);
     const ast = try parser.parse(a, toks);
-    var j = joiner.Joiner.init(a, &d, posts);
+    defer parser.freeNode(a, ast);
+    var j = joiner.Joiner.init(sa, &d, posts);
     const c = try compile(a, &j, ast, &rctx, Dialect.sqlite, &.{});
+    defer freeCompiled(a, c);
     try std.testing.expectEqualStrings("\"posts\".\"author\" IN (?,?)", c.where_sql);
     try std.testing.expectEqualStrings("acc1", c.params[0].text);
     try std.testing.expectEqualStrings("acc2", c.params[1].text);
@@ -623,21 +709,27 @@ test "compile `in @request.account.ids` binds each membership id" {
 test "compile `in` with an empty set is a constant-false predicate (fail-closed)" {
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const posts = try setup(&d, a);
+    var sarena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer sarena.deinit();
+    const sa = sarena.allocator(); // setup arena: schema (collections.create), joiner, rctx scaffolding
+    const a = std.testing.allocator; // SUT allocator: lex/parse/compile output is leak-checked
+    const posts = try setup(&d, sa);
     // Empty literal list.
-    var j1 = joiner.Joiner.init(a, &d, posts);
+    var j1 = joiner.Joiner.init(sa, &d, posts);
     const c1 = try compileFilter(a, &d, posts, "title in ()", &j1);
+    defer freeCompiled(a, c1);
     try std.testing.expectEqualStrings("0", c1.where_sql);
     try std.testing.expectEqual(@as(usize, 0), c1.params.len);
     // Empty membership set via the macro.
     const rctx = request.RequestContext{}; // no memberships
-    const toks = try lexer.lex(a, "author in @request.account.ids");
+    const src = "author in @request.account.ids";
+    const toks = try lexer.lex(a, src);
+    defer lexer.freeTokens(a, src, toks);
     const ast = try parser.parse(a, toks);
-    var j2 = joiner.Joiner.init(a, &d, posts);
+    defer parser.freeNode(a, ast);
+    var j2 = joiner.Joiner.init(sa, &d, posts);
     const c2 = try compile(a, &j2, ast, &rctx, Dialect.sqlite, &.{});
+    defer freeCompiled(a, c2);
     try std.testing.expectEqualStrings("0", c2.where_sql);
 }
 
@@ -645,17 +737,22 @@ test "compile a relation-path macro rule (account.owner_user = @request.auth.id)
     // PR1 confirms relationship traversal + macros compose (the foundation for ability rules).
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const posts = try setup(&d, a); // posts.author -> users
+    var sarena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer sarena.deinit();
+    const sa = sarena.allocator(); // setup arena: schema (collections.create), joiner, rctx scaffolding
+    const a = std.testing.allocator; // SUT allocator: lex/parse/compile output is leak-checked
+    const posts = try setup(&d, sa); // posts.author -> users
     var auth: std.json.ObjectMap = .empty;
-    try auth.put(a, "id", .{ .string = "u1" });
+    try auth.put(sa, "id", .{ .string = "u1" });
     const rctx = request.RequestContext{ .auth = .{ .object = auth } };
-    const toks = try lexer.lex(a, "author.name = @request.auth.id");
+    const src = "author.name = @request.auth.id";
+    const toks = try lexer.lex(a, src);
+    defer lexer.freeTokens(a, src, toks);
     const ast = try parser.parse(a, toks);
-    var j = joiner.Joiner.init(a, &d, posts);
+    defer parser.freeNode(a, ast);
+    var j = joiner.Joiner.init(sa, &d, posts);
     const c = try compile(a, &j, ast, &rctx, Dialect.sqlite, &.{});
+    defer freeCompiled(a, c);
     try std.testing.expectEqual(@as(usize, 1), j.joins.items.len);
     try std.testing.expectEqualStrings("j1.\"name\" = ?", c.where_sql);
     try std.testing.expectEqualStrings("u1", c.params[0].text);
@@ -664,15 +761,20 @@ test "compile a relation-path macro rule (account.owner_user = @request.auth.id)
 test "compile a method-vs-literal rule binds both as text" {
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const posts = try setup(&d, a);
+    var sarena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer sarena.deinit();
+    const sa = sarena.allocator(); // setup arena: schema (collections.create), joiner, rctx scaffolding
+    const a = std.testing.allocator; // SUT allocator: lex/parse/compile output is leak-checked
+    const posts = try setup(&d, sa);
     const rctx = request.RequestContext{ .method = "GET" };
-    const toks = try lexer.lex(a, "@request.method = \"GET\"");
+    const src = "@request.method = \"GET\"";
+    const toks = try lexer.lex(a, src);
+    defer lexer.freeTokens(a, src, toks);
     const ast = try parser.parse(a, toks);
-    var j = joiner.Joiner.init(a, &d, posts);
+    defer parser.freeNode(a, ast);
+    var j = joiner.Joiner.init(sa, &d, posts);
     const c = try compile(a, &j, ast, &rctx, Dialect.sqlite, &.{});
+    defer freeCompiled(a, c);
     try std.testing.expectEqualStrings("? = ?", c.where_sql);
     try std.testing.expectEqualStrings("GET", c.params[0].text);
     try std.testing.expectEqualStrings("GET", c.params[1].text);
@@ -681,44 +783,51 @@ test "compile a method-vs-literal rule binds both as text" {
 test "filter_args: a `?` placeholder binds each scalar arg type, coerced to the field's type" {
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const posts = try setup(&d, a); // title:text, price:fixed(2), active:bool
+    var sarena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer sarena.deinit();
+    const sa = sarena.allocator(); // setup arena: schema (collections.create), joiner, rctx scaffolding
+    const a = std.testing.allocator; // SUT allocator: lex/parse/compile output is leak-checked
+    const posts = try setup(&d, sa); // title:text, price:fixed(2), active:bool
 
     // string on a text field -> bound as text
     {
-        var j = joiner.Joiner.init(a, &d, posts);
+        var j = joiner.Joiner.init(sa, &d, posts);
         const c = try compileFilterArgs(a, "title = ?", &j, &.{.{ .string = "hello" }});
+        defer freeCompiled(a, c);
         try std.testing.expectEqualStrings("\"posts\".\"title\" = ?", c.where_sql);
         try std.testing.expectEqual(@as(usize, 1), c.params.len);
         try std.testing.expectEqualStrings("hello", c.params[0].text);
     }
     // int on a fixed(scale=2) column -> scaled int (5 -> 500), same as the literal path
     {
-        var j = joiner.Joiner.init(a, &d, posts);
+        var j = joiner.Joiner.init(sa, &d, posts);
         const c = try compileFilterArgs(a, "price = ?", &j, &.{.{ .int = 5 }});
+        defer freeCompiled(a, c);
         try std.testing.expectEqual(@as(i64, 500), c.params[0].int);
     }
     // float on a fixed(scale=2) column -> scaled int (3.5 -> 350)
     {
-        var j = joiner.Joiner.init(a, &d, posts);
+        var j = joiner.Joiner.init(sa, &d, posts);
         const c = try compileFilterArgs(a, "price = ?", &j, &.{.{ .float = 3.5 }});
+        defer freeCompiled(a, c);
         try std.testing.expectEqual(@as(i64, 350), c.params[0].int);
     }
     // bool on a bool field -> 0/1 int
     {
-        var j = joiner.Joiner.init(a, &d, posts);
+        var j = joiner.Joiner.init(sa, &d, posts);
         const c = try compileFilterArgs(a, "active = ?", &j, &.{.{ .bool = true }});
+        defer freeCompiled(a, c);
         try std.testing.expectEqual(@as(i64, 1), c.params[0].int);
-        var j2 = joiner.Joiner.init(a, &d, posts);
+        var j2 = joiner.Joiner.init(sa, &d, posts);
         const c2 = try compileFilterArgs(a, "active = ?", &j2, &.{.{ .bool = false }});
+        defer freeCompiled(a, c2);
         try std.testing.expectEqual(@as(i64, 0), c2.params[0].int);
     }
     // null -> SQL NULL param regardless of field type
     {
-        var j = joiner.Joiner.init(a, &d, posts);
+        var j = joiner.Joiner.init(sa, &d, posts);
         const c = try compileFilterArgs(a, "title = ?", &j, &.{.null});
+        defer freeCompiled(a, c);
         try std.testing.expectEqualStrings("\"posts\".\"title\" = ?", c.where_sql);
         try std.testing.expect(c.params[0] == .null);
     }
@@ -729,53 +838,60 @@ test "filter_args: a placeholder coerces by field type identically to an inline 
     // the SAME scaled-int param as the inline literal `price = 5.00`, not a raw unscaled value.
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const posts = try setup(&d, a); // price is fixed(scale=2)
+    var sarena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer sarena.deinit();
+    const sa = sarena.allocator(); // setup arena: schema (collections.create), joiner, rctx scaffolding
+    const a = std.testing.allocator; // SUT allocator: lex/parse/compile output is leak-checked
+    const posts = try setup(&d, sa); // price is fixed(scale=2)
 
-    var jl = joiner.Joiner.init(a, &d, posts);
+    var jl = joiner.Joiner.init(sa, &d, posts);
     const lit = try compileFilter(a, &d, posts, "price = 5.00", &jl);
+    defer freeCompiled(a, lit);
     try std.testing.expectEqual(@as(i64, 500), lit.params[0].int);
 
     // float arg matches the inline literal
-    var jf = joiner.Joiner.init(a, &d, posts);
+    var jf = joiner.Joiner.init(sa, &d, posts);
     const cf = try compileFilterArgs(a, "price = ?", &jf, &.{.{ .float = 5.0 }});
+    defer freeCompiled(a, cf);
     try std.testing.expectEqual(lit.params[0].int, cf.params[0].int);
 
     // int arg matches too
-    var ji = joiner.Joiner.init(a, &d, posts);
+    var ji = joiner.Joiner.init(sa, &d, posts);
     const ci = try compileFilterArgs(a, "price = ?", &ji, &.{.{ .int = 5 }});
+    defer freeCompiled(a, ci);
     try std.testing.expectEqual(lit.params[0].int, ci.params[0].int);
 }
 
 test "filter_args: an incompatible arg/field pairing is a loud BadValue" {
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const posts = try setup(&d, a);
+    var sarena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer sarena.deinit();
+    const sa = sarena.allocator(); // setup arena: schema (collections.create), joiner, rctx scaffolding
+    const a = std.testing.allocator; // SUT allocator: lex/parse/compile output is leak-checked
+    const posts = try setup(&d, sa);
     // A non-numeric arg for a numeric column errors (never silently binds garbage) — mirrors the
     // literal path (`price = "x"` also errors). A number for a bool column likewise errors.
-    var j1 = joiner.Joiner.init(a, &d, posts);
+    var j1 = joiner.Joiner.init(sa, &d, posts);
     try std.testing.expectError(error.BadValue, compileFilterArgs(a, "price = ?", &j1, &.{.{ .string = "5.00" }}));
-    var j2 = joiner.Joiner.init(a, &d, posts);
+    var j2 = joiner.Joiner.init(sa, &d, posts);
     try std.testing.expectError(error.BadValue, compileFilterArgs(a, "active = ?", &j2, &.{.{ .int = 1 }}));
 }
 
 test "filter_args: a bound string with filter metacharacters stays literal (injection-safe)" {
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const posts = try setup(&d, a);
-    var j = joiner.Joiner.init(a, &d, posts);
+    var sarena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer sarena.deinit();
+    const sa = sarena.allocator(); // setup arena: schema (collections.create), joiner, rctx scaffolding
+    const a = std.testing.allocator; // SUT allocator: lex/parse/compile output is leak-checked
+    const posts = try setup(&d, sa);
+    var j = joiner.Joiner.init(sa, &d, posts);
     // The value is full of filter grammar: quotes, `||`, `(`, `--`, a stray `?`. NONE of it is
     // re-lexed — the whole string is bound verbatim as the single param.
     const dangerous = "a\" || 1=1 -- ) ? (";
     const c = try compileFilterArgs(a, "title = ?", &j, &.{.{ .string = dangerous }});
+    defer freeCompiled(a, c);
     try std.testing.expectEqualStrings("\"posts\".\"title\" = ?", c.where_sql);
     try std.testing.expectEqual(@as(usize, 1), c.params.len);
     try std.testing.expectEqualStrings(dangerous, c.params[0].text);
@@ -784,15 +900,17 @@ test "filter_args: a bound string with filter metacharacters stays literal (inje
 test "filter_args: multiple placeholders bind left-to-right by index" {
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const posts = try setup(&d, a);
-    var j = joiner.Joiner.init(a, &d, posts);
+    var sarena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer sarena.deinit();
+    const sa = sarena.allocator(); // setup arena: schema (collections.create), joiner, rctx scaffolding
+    const a = std.testing.allocator; // SUT allocator: lex/parse/compile output is leak-checked
+    const posts = try setup(&d, sa);
+    var j = joiner.Joiner.init(sa, &d, posts);
     const c = try compileFilterArgs(a, "title = ? && price >= ?", &j, &.{
         .{ .string = "first" },
         .{ .int = 100 },
     });
+    defer freeCompiled(a, c);
     try std.testing.expectEqualStrings("(\"posts\".\"title\" = ? AND \"posts\".\"price\" >= ?)", c.where_sql);
     try std.testing.expectEqual(@as(usize, 2), c.params.len);
     try std.testing.expectEqualStrings("first", c.params[0].text);
@@ -803,15 +921,17 @@ test "filter_args: multiple placeholders bind left-to-right by index" {
 test "filter_args: placeholders work inside an `in (...)` list" {
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const posts = try setup(&d, a);
-    var j = joiner.Joiner.init(a, &d, posts);
+    var sarena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer sarena.deinit();
+    const sa = sarena.allocator(); // setup arena: schema (collections.create), joiner, rctx scaffolding
+    const a = std.testing.allocator; // SUT allocator: lex/parse/compile output is leak-checked
+    const posts = try setup(&d, sa);
+    var j = joiner.Joiner.init(sa, &d, posts);
     const c = try compileFilterArgs(a, "title in (?, ?)", &j, &.{
         .{ .string = "x" },
         .{ .string = "y" },
     });
+    defer freeCompiled(a, c);
     try std.testing.expectEqualStrings("\"posts\".\"title\" IN (?,?)", c.where_sql);
     try std.testing.expectEqualStrings("x", c.params[0].text);
     try std.testing.expectEqualStrings("y", c.params[1].text);
@@ -820,12 +940,14 @@ test "filter_args: placeholders work inside an `in (...)` list" {
 test "filter_args: a bound string is usable as a LIKE term" {
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const posts = try setup(&d, a);
-    var j = joiner.Joiner.init(a, &d, posts);
+    var sarena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer sarena.deinit();
+    const sa = sarena.allocator(); // setup arena: schema (collections.create), joiner, rctx scaffolding
+    const a = std.testing.allocator; // SUT allocator: lex/parse/compile output is leak-checked
+    const posts = try setup(&d, sa);
+    var j = joiner.Joiner.init(sa, &d, posts);
     const c = try compileFilterArgs(a, "title ~ ?", &j, &.{.{ .string = "ab" }});
+    defer freeCompiled(a, c);
     try std.testing.expectEqualStrings("\"posts\".\"title\" LIKE ?", c.where_sql);
     try std.testing.expectEqualStrings("%ab%", c.params[0].text);
 }
@@ -835,29 +957,31 @@ test "filter_args: a non-string arg in a LIKE term is a loud BadValue" {
     // never coerced into a `%…%` pattern).
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const posts = try setup(&d, a);
-    var j = joiner.Joiner.init(a, &d, posts);
+    var sarena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer sarena.deinit();
+    const sa = sarena.allocator(); // setup arena: schema (collections.create), joiner, rctx scaffolding
+    const a = std.testing.allocator; // SUT allocator: lex/parse/compile output is leak-checked
+    const posts = try setup(&d, sa);
+    var j = joiner.Joiner.init(sa, &d, posts);
     try std.testing.expectError(error.BadValue, compileFilterArgs(a, "title ~ ?", &j, &.{.{ .int = 5 }}));
 }
 
 test "filter_args: arg-count mismatch is a loud BadFilter (both directions)" {
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const posts = try setup(&d, a);
+    var sarena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer sarena.deinit();
+    const sa = sarena.allocator(); // setup arena: schema (collections.create), joiner, rctx scaffolding
+    const a = std.testing.allocator; // SUT allocator: lex/parse/compile output is leak-checked
+    const posts = try setup(&d, sa);
     // Two placeholders, one arg.
-    var j1 = joiner.Joiner.init(a, &d, posts);
+    var j1 = joiner.Joiner.init(sa, &d, posts);
     try std.testing.expectError(error.BadFilter, compileFilterArgs(a, "title = ? && price = ?", &j1, &.{.{ .int = 1 }}));
     // Zero placeholders, one arg.
-    var j2 = joiner.Joiner.init(a, &d, posts);
+    var j2 = joiner.Joiner.init(sa, &d, posts);
     try std.testing.expectError(error.BadFilter, compileFilterArgs(a, "price = 1", &j2, &.{.{ .int = 1 }}));
     // One placeholder, zero args.
-    var j3 = joiner.Joiner.init(a, &d, posts);
+    var j3 = joiner.Joiner.init(sa, &d, posts);
     try std.testing.expectError(error.BadFilter, compileFilterArgs(a, "title = ?", &j3, &.{}));
 }
 
@@ -866,23 +990,26 @@ test "filter_args: REST safety — a `?` in the filter with no filter_args fails
     // cannot smuggle an unbound placeholder — it hits the same count-mismatch guard.
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const posts = try setup(&d, a);
-    var j = joiner.Joiner.init(a, &d, posts);
+    var sarena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer sarena.deinit();
+    const sa = sarena.allocator(); // setup arena: schema (collections.create), joiner, rctx scaffolding
+    const a = std.testing.allocator; // SUT allocator: lex/parse/compile output is leak-checked
+    const posts = try setup(&d, sa);
+    var j = joiner.Joiner.init(sa, &d, posts);
     try std.testing.expectError(error.BadFilter, compileFilter(a, &d, posts, "title = ?", &j));
 }
 
 test "filter_args: back-compat — a filter with no `?` and no args compiles unchanged" {
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const posts = try setup(&d, a);
-    var j = joiner.Joiner.init(a, &d, posts);
+    var sarena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer sarena.deinit();
+    const sa = sarena.allocator(); // setup arena: schema (collections.create), joiner, rctx scaffolding
+    const a = std.testing.allocator; // SUT allocator: lex/parse/compile output is leak-checked
+    const posts = try setup(&d, sa);
+    var j = joiner.Joiner.init(sa, &d, posts);
     const c = try compileFilterArgs(a, "title = \"hi\"", &j, &.{});
+    defer freeCompiled(a, c);
     try std.testing.expectEqualStrings("\"posts\".\"title\" = ?", c.where_sql);
     try std.testing.expectEqualStrings("hi", c.params[0].text);
 }
@@ -890,40 +1017,45 @@ test "filter_args: back-compat — a filter with no `?` and no args compiles unc
 test "inline `= null` binds SQL NULL, identical to a bound FilterArg.null" {
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const posts = try setup(&d, a);
+    var sarena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer sarena.deinit();
+    const sa = sarena.allocator(); // setup arena: schema (collections.create), joiner, rctx scaffolding
+    const a = std.testing.allocator; // SUT allocator: lex/parse/compile output is leak-checked
+    const posts = try setup(&d, sa);
 
     // Inline literal `title = null` -> a bound `.null` param (SQL NULL), NOT the empty string.
-    var j = joiner.Joiner.init(a, &d, posts);
+    var j = joiner.Joiner.init(sa, &d, posts);
     const c = try compileFilterArgs(a, "title = null", &j, &.{});
+    defer freeCompiled(a, c);
     try std.testing.expectEqualStrings("\"posts\".\"title\" = ?", c.where_sql);
     try std.testing.expect(c.params[0] == .null);
 
     // A null literal on a TYPED (numeric) column also binds SQL NULL — not a coercion BadValue.
-    var jn = joiner.Joiner.init(a, &d, posts);
+    var jn = joiner.Joiner.init(sa, &d, posts);
     const cn = try compileFilterArgs(a, "price = null", &jn, &.{});
+    defer freeCompiled(a, cn);
     try std.testing.expect(cn.params[0] == .null);
 
     // The bound-placeholder path (`title = ?` + FilterArg.null) produces the identical param.
-    var jp = joiner.Joiner.init(a, &d, posts);
+    var jp = joiner.Joiner.init(sa, &d, posts);
     const cp = try compileFilterArgs(a, "title = ?", &jp, &.{.null});
+    defer freeCompiled(a, cp);
     try std.testing.expect(cp.params[0] == .null);
 }
 
 test "LIKE with a null operand is rejected (fail closed), never a match-everything %% term" {
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const posts = try setup(&d, a);
+    var sarena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer sarena.deinit();
+    const sa = sarena.allocator(); // setup arena: schema (collections.create), joiner, rctx scaffolding
+    const a = std.testing.allocator; // SUT allocator: lex/parse/compile output is leak-checked
+    const posts = try setup(&d, sa);
     // Inline `title ~ null`: a null has no TEXT representation, so it must be a loud BadValue rather
     // than binding `"%%"` (which would match every row).
-    var j1 = joiner.Joiner.init(a, &d, posts);
+    var j1 = joiner.Joiner.init(sa, &d, posts);
     try std.testing.expectError(error.BadValue, compileFilterArgs(a, "title ~ null", &j1, &.{}));
     // Bound `title ~ ?` + FilterArg.null is likewise rejected (a non-string placeholder in a LIKE).
-    var j2 = joiner.Joiner.init(a, &d, posts);
+    var j2 = joiner.Joiner.init(sa, &d, posts);
     try std.testing.expectError(error.BadValue, compileFilterArgs(a, "title ~ ?", &j2, &.{.null}));
 }
