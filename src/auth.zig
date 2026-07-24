@@ -145,13 +145,15 @@ pub fn applyUpdate(io: std.Io, alloc: std.mem.Allocator, data: std.json.Value, m
 }
 
 test "applyCreate hashes the password, sets tokenKey/verified, strips plaintext" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    // applyCreate/applyProvision/applyUpdate all return a graph freeable via freeProvisioned, so
+    // they run under the raw leak-detecting allocator.
+    const a = std.testing.allocator;
     var data: std.json.ObjectMap = .empty;
+    defer data.deinit(a);
     try data.put(a, "email", .{ .string = "a@b.c" });
     try data.put(a, "password", .{ .string = "longenough" });
     const out = try applyCreate(std.testing.io, a, .{ .object = data }, 8);
+    defer freeProvisioned(a, out);
     try std.testing.expect(out.object.get("password") == null);
     try std.testing.expect(std.mem.startsWith(u8, out.object.get("passwordHash").?.string, "$argon2id$"));
     try std.testing.expectEqual(@as(usize, 32), out.object.get("tokenKey").?.string.len);
@@ -160,12 +162,12 @@ test "applyCreate hashes the password, sets tokenKey/verified, strips plaintext"
 }
 
 test "applyProvision generates tokenKey/verified with NO password (passwordless flow)" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     var data: std.json.ObjectMap = .empty;
+    defer data.deinit(a);
     try data.put(a, "email", .{ .string = "a@b.c" });
     const out = try applyProvision(std.testing.io, a, .{ .object = data }, 8);
+    defer freeProvisioned(a, out);
     // No password supplied -> no passwordHash, but a tokenKey is still generated.
     try std.testing.expect(out.object.get("passwordHash") == null);
     try std.testing.expectEqual(@as(usize, 32), out.object.get("tokenKey").?.string.len);
@@ -174,36 +176,35 @@ test "applyProvision generates tokenKey/verified with NO password (passwordless 
 }
 
 test "applyProvision hashes a supplied password and still strips plaintext" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     var data: std.json.ObjectMap = .empty;
+    defer data.deinit(a);
     try data.put(a, "email", .{ .string = "a@b.c" });
     try data.put(a, "password", .{ .string = "longenough" });
     const out = try applyProvision(std.testing.io, a, .{ .object = data }, 8);
+    defer freeProvisioned(a, out);
     try std.testing.expect(out.object.get("password") == null);
     try std.testing.expect(std.mem.startsWith(u8, out.object.get("passwordHash").?.string, "$argon2id$"));
     try std.testing.expectEqual(@as(usize, 32), out.object.get("tokenKey").?.string.len);
 }
 
 test "applyProvision rejects a short password when one is supplied" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     var data: std.json.ObjectMap = .empty;
+    defer data.deinit(a);
     try data.put(a, "password", .{ .string = "short" });
     try std.testing.expectError(error.PasswordTooShort, applyProvision(std.testing.io, a, .{ .object = data }, 8));
 }
 
 test "applyProvision strips client-supplied tokenKey/verified (forces server values)" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     var data: std.json.ObjectMap = .empty;
+    defer data.deinit(a);
     try data.put(a, "email", .{ .string = "a@b.c" });
     try data.put(a, "tokenKey", .{ .string = "client-supplied" });
     try data.put(a, "verified", .{ .bool = true });
     const out = try applyProvision(std.testing.io, a, .{ .object = data }, 8);
+    defer freeProvisioned(a, out);
     try std.testing.expect(!std.mem.eql(u8, out.object.get("tokenKey").?.string, "client-supplied"));
     try std.testing.expectEqual(@as(usize, 32), out.object.get("tokenKey").?.string.len);
     try std.testing.expectEqual(false, out.object.get("verified").?.bool);
@@ -243,53 +244,54 @@ test "applyProvision short-password failure leaks nothing under the gpa" {
 }
 
 test "applyCreate rejects a short password" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     var data: std.json.ObjectMap = .empty;
+    defer data.deinit(a);
     try data.put(a, "password", .{ .string = "short" });
     try std.testing.expectError(error.PasswordTooShort, applyCreate(std.testing.io, a, .{ .object = data }, 8));
 }
 
 test "applyUpdate rotates tokenKey when a new password is given, no-ops otherwise" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     var with_pw: std.json.ObjectMap = .empty;
+    defer with_pw.deinit(a);
     try with_pw.put(a, "password", .{ .string = "longenough" });
     const updated = try applyUpdate(std.testing.io, a, .{ .object = with_pw }, 8);
+    defer freeProvisioned(a, updated);
     try std.testing.expect(updated.object.get("tokenKey") != null);
     try std.testing.expect(updated.object.get("password") == null);
 
     var no_pw: std.json.ObjectMap = .empty;
+    defer no_pw.deinit(a);
     try no_pw.put(a, "bio", .{ .string = "hi" });
     const same = try applyUpdate(std.testing.io, a, .{ .object = no_pw }, 8);
+    defer freeProvisioned(a, same);
     try std.testing.expect(same.object.get("tokenKey") == null); // unchanged
     try std.testing.expectEqualStrings("hi", same.object.get("bio").?.string);
 }
 
 test "applyCreate forces verified=false even if the client sends verified=true" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     var data: std.json.ObjectMap = .empty;
+    defer data.deinit(a);
     try data.put(a, "email", .{ .string = "a@b.c" });
     try data.put(a, "password", .{ .string = "longenough" });
     try data.put(a, "verified", .{ .bool = true });
     const out = try applyCreate(std.testing.io, a, .{ .object = data }, 8);
+    defer freeProvisioned(a, out);
     try std.testing.expectEqual(false, out.object.get("verified").?.bool);
 }
 
 test "applyUpdate strips client-supplied passwordHash/tokenKey/verified (no password)" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     var data: std.json.ObjectMap = .empty;
+    defer data.deinit(a);
     try data.put(a, "email", .{ .string = "e@x.io" });
     try data.put(a, "verified", .{ .bool = true });
     try data.put(a, "passwordHash", .{ .string = "$argon2id$evil" });
     try data.put(a, "tokenKey", .{ .string = "evil" });
     const out = try applyUpdate(std.testing.io, a, .{ .object = data }, 8);
+    defer freeProvisioned(a, out);
     try std.testing.expect(out.object.get("verified") == null);
     try std.testing.expect(out.object.get("passwordHash") == null);
     try std.testing.expect(out.object.get("tokenKey") == null);
@@ -297,29 +299,29 @@ test "applyUpdate strips client-supplied passwordHash/tokenKey/verified (no pass
 }
 
 test "applyUpdate with password sets server passwordHash/tokenKey and ignores client ones" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     var data: std.json.ObjectMap = .empty;
+    defer data.deinit(a);
     try data.put(a, "password", .{ .string = "longenough" });
     try data.put(a, "tokenKey", .{ .string = "evil" });
     try data.put(a, "verified", .{ .bool = true });
     const out = try applyUpdate(std.testing.io, a, .{ .object = data }, 8);
+    defer freeProvisioned(a, out);
     try std.testing.expect(std.mem.startsWith(u8, out.object.get("passwordHash").?.string, "$argon2id$"));
     try std.testing.expect(!std.mem.eql(u8, out.object.get("tokenKey").?.string, "evil")); // server-generated
     try std.testing.expect(out.object.get("verified") == null); // never client-set on update
 }
 
 test "applyCreate strips client passwordHash/tokenKey (forces server values)" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     var data: std.json.ObjectMap = .empty;
+    defer data.deinit(a);
     try data.put(a, "email", .{ .string = "e@x.io" });
     try data.put(a, "password", .{ .string = "longenough" });
     try data.put(a, "passwordHash", .{ .string = "$argon2id$evil" });
     try data.put(a, "tokenKey", .{ .string = "evil" });
     const out = try applyCreate(std.testing.io, a, .{ .object = data }, 8);
+    defer freeProvisioned(a, out);
     try std.testing.expect(!std.mem.eql(u8, out.object.get("passwordHash").?.string, "$argon2id$evil"));
     try std.testing.expect(!std.mem.eql(u8, out.object.get("tokenKey").?.string, "evil"));
     try std.testing.expectEqual(false, out.object.get("verified").?.bool);
