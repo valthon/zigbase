@@ -159,6 +159,19 @@ pub const Cache = struct {
 /// the child is a request arena (bytes survive until the request arena is reclaimed,
 /// exactly the pre-cache behavior), a real reclaim when the child is a raw GPA (colcache/
 /// hub unit tests) — closing the leak WITHOUT changing the arena-caller lifetime.
+///
+/// CALLER CONTRACT for the uncached-request-arena case: the byte-survival guarantee holds as
+/// long as the owned arena's node is NOT the request arena's live TAIL allocation at the moment
+/// `release()` runs — because request-arena `rawFree` only rewinds when the freed block IS the
+/// tail, so a non-tail free is a pure no-op (the `col` bytes stay put). That holds whenever
+/// request-arena allocations made AFTER `lease()` are still live at release time, which is the
+/// norm: a handler reads/serializes the record after leasing, and zigbase request arenas are
+/// reset WHOLESALE at request end, never individually rewound mid-request. The current callers
+/// satisfy it (`records.create` releases via a function-scope `defer`; `hub.frameForDelivery`
+/// copies `col.name` into the serialized frame before returning). A future uncached caller must
+/// NOT release the lease while the owned arena is the request arena's tail and then keep aliasing
+/// `col.name` (e.g. release early, before any further request-arena work) — copy `col.name` out
+/// first if in doubt.
 pub const Lease = struct {
     col: ?schema.Collection,
     entry: ?*Entry = null,
