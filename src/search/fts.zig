@@ -152,12 +152,16 @@ fn buildSqliteImpl(alloc: std.mem.Allocator, col: schema.Collection, raw_term: [
     errdefer alloc.free(q); // q ESCAPES into `.param.text` on success; free it only on an error below
     const ft = try tableName(alloc, col.name);
     defer alloc.free(ft); // internal scratch: copied into the SQL strings below, never escapes
-    return .{
-        .join_sql = try std.fmt.allocPrint(alloc, "JOIN \"{s}\" ON \"{s}\".\"rowid\" = \"{s}\".\"rowid\"", .{ ft, ft, col.name }),
-        .where_sql = try std.fmt.allocPrint(alloc, "\"{s}\" MATCH ?", .{ft}),
-        .order_sql = try std.fmt.allocPrint(alloc, "\"{s}\".\"rank\"", .{ft}),
-        .param = .{ .text = q },
-    };
+    // Build each escaping fragment into an errdefer'd local: if a LATER allocPrint OOMs, the
+    // already-built ones are freed. On success they move into the returned Search (errdefer does
+    // not fire), where the caller owns them.
+    const join_sql = try std.fmt.allocPrint(alloc, "JOIN \"{s}\" ON \"{s}\".\"rowid\" = \"{s}\".\"rowid\"", .{ ft, ft, col.name });
+    errdefer alloc.free(join_sql);
+    const where_sql = try std.fmt.allocPrint(alloc, "\"{s}\" MATCH ?", .{ft});
+    errdefer alloc.free(where_sql);
+    const order_sql = try std.fmt.allocPrint(alloc, "\"{s}\".\"rank\"", .{ft});
+    errdefer alloc.free(order_sql); // last today, but errdefer'd too so a future line before the return can't leak it
+    return .{ .join_sql = join_sql, .where_sql = where_sql, .order_sql = order_sql, .param = .{ .text = q } };
 }
 
 /// Postgres lowering: no JOIN (the `tsvector` is a generated column on the base table), a bound
@@ -173,10 +177,15 @@ fn buildPostgres(alloc: std.mem.Allocator, col: schema.Collection, raw_term: []c
     errdefer alloc.free(term); // term ESCAPES into `.param`/`.order_param` (one alloc) on success
     const tsv = try tableName(alloc, col.name); // the generated tsvector column name
     defer alloc.free(tsv); // internal scratch: copied into the SQL strings below, never escapes
+    // where_sql into an errdefer'd local so an order_sql OOM frees it (join_sql is a literal).
+    const where_sql = try std.fmt.allocPrint(alloc, "\"{s}\".\"{s}\" @@ plainto_tsquery('{s}', ?)", .{ col.name, tsv, pg_ts_config });
+    errdefer alloc.free(where_sql);
+    const order_sql = try std.fmt.allocPrint(alloc, "ts_rank(\"{s}\".\"{s}\", plainto_tsquery('{s}', ?)) DESC", .{ col.name, tsv, pg_ts_config });
+    errdefer alloc.free(order_sql); // last today, but errdefer'd too so a future line before the return can't leak it
     return .{
         .join_sql = "",
-        .where_sql = try std.fmt.allocPrint(alloc, "\"{s}\".\"{s}\" @@ plainto_tsquery('{s}', ?)", .{ col.name, tsv, pg_ts_config }),
-        .order_sql = try std.fmt.allocPrint(alloc, "ts_rank(\"{s}\".\"{s}\", plainto_tsquery('{s}', ?)) DESC", .{ col.name, tsv, pg_ts_config }),
+        .where_sql = where_sql,
+        .order_sql = order_sql,
         .param = .{ .text = term },
         .order_param = .{ .text = term },
     };
@@ -194,6 +203,8 @@ pub fn sanitize(alloc: std.mem.Allocator, raw: []const u8) !?[]const u8 {
     const capped = utf8SafeCap(trimmed, max_term_len); // cap on a UTF-8 boundary (never mid-codepoint)
 
     var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc); // free the partial buffer if an append OOMs mid-build (the `out.items
+    // .len == 0` early return leaves `out` empty/unallocated, so its no-op deinit there is harmless)
     var emitted_term = false;
     var pending_op: ?[]const u8 = null; // an operator seen AFTER a term, applied to the next term
     var it = std.mem.tokenizeAny(u8, capped, " \t\r\n");
