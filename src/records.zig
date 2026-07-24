@@ -58,9 +58,15 @@ fn guardJoinsSql(alloc: std.mem.Allocator, joins: []const []const u8) ![]u8 {
 /// Public so an HTTP handler that owns the write transaction can evaluate the
 /// access-rule guard inside that same transaction (see api/records.zig).
 pub fn guardPasses(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection, rid: []const u8, g: Guard) !bool {
-    const js = try guardJoinsSql(alloc, g.joins);
-    const sql = try std.fmt.allocPrintSentinel(alloc, "SELECT 1 FROM \"{s}\"{s} WHERE \"{s}\".\"id\"=?1 AND ({s});", .{ col.name, js, col.name, g.where_sql }, 0);
-    var st = try prep(alloc, w, sql);
+    // Self-freeing (contract 1): the joins-SQL, the assembled SELECT, and the prepared
+    // statement's `$n`-renumber are scratch consumed to run one probe — nothing escapes the
+    // `bool` return. Build them on a function-local arena. The caller-owned `g` is untouched.
+    var scratch = std.heap.ArenaAllocator.init(alloc);
+    defer scratch.deinit();
+    const sa = scratch.allocator();
+    const js = try guardJoinsSql(sa, g.joins);
+    const sql = try std.fmt.allocPrintSentinel(sa, "SELECT 1 FROM \"{s}\"{s} WHERE \"{s}\".\"id\"=?1 AND ({s});", .{ col.name, js, col.name, g.where_sql }, 0);
+    var st = try prep(sa, w, sql);
     defer st.finalize();
     try st.bindText(1, rid);
     _ = try bindParams(&st, g.params, 2);

@@ -690,26 +690,24 @@ test "@public viewRule + view ability: create is NOT delivered to a non-member" 
     // early-return in shouldDeliver delivered the full record to any subscriber, bypassing it.
     var tdb = try TestDb.init();
     defer tdb.deinit();
-    // MASKED (guarded-query scratch leak, out of batch): the ability path drives
-    // shouldDeliver -> policy.matchesRule -> abilities.abilityPredicate/records.guardPasses,
-    // which build the Guard (where_sql/joins/params) on the passed allocator and never free it
-    // (arena-lifetime by design; policy.zig/abilities.zig/records-guard are separate, un-migrated
-    // allowlist entries). mkColl/mkRec/authedConn themselves are leak-clean now — see the converted
-    // @public/empty/null/delete tests — but this test cannot be un-masked until the guarded-query
-    // path is migrated.
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    var col = try tdb.mkColl(a, "posts", rules.public_sentinel);
+    const a = std.testing.allocator;
+    // The DB-owned collection is freed via `Collection.deinit`; the ability mutation below lives on a
+    // struct COPY (`col`) so the owned base never carries the literal `.via` into deinit.
+    const base = try tdb.mkColl(a, "posts", rules.public_sentinel);
+    defer base.deinit(a);
+    var col = base;
     // A view ability: visibility depends on the subscriber's relationship via `owner`, not the rule.
     col.options.abilities = .{ .view = .{ .relationship = .{ .via = "owner" } } };
     const rid = try tdb.mkRec(a, col, "u1");
+    defer a.free(rid);
     // A non-superuser subscriber with NO qualifying membership must receive NOTHING: the ability's
     // empty qualifying set compiles to constant-false, so the guarded query matches no row.
     var outsider = try authedConn(a, "outsider", false);
+    defer freeConn(a, &outsider);
     try std.testing.expect(!(try shouldDeliver(a, std.testing.io, &tdb.d, col, &outsider, 0, .create, rid, null, null)));
     // A superuser bypasses abilities (consistent with rules.decide) and still receives it.
     var su = try authedConn(a, "root", true);
+    defer freeConn(a, &su);
     try std.testing.expect(try shouldDeliver(a, std.testing.io, &tdb.d, col, &su, 0, .create, rid, null, null));
 }
 
@@ -746,16 +744,15 @@ test "null viewRule: superuser-only" {
 test "macro viewRule: only the owner receives the record" {
     var tdb = try TestDb.init();
     defer tdb.deinit();
-    // MASKED (guarded-query scratch leak, out of batch — see GUARDED_QUERY_MASK below): the
-    // `.check` viewRule drives shouldDeliver -> policy.matchesRule, which never frees the compiled
-    // Guard. Un-maskable only once policy.zig/rules.zig migrate.
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const col = try tdb.mkColl(a, "notes", "owner = @request.auth.id");
+    defer col.deinit(a);
     const rid = try tdb.mkRec(a, col, "u1");
+    defer a.free(rid);
     var owner = try authedConn(a, "u1", false);
+    defer freeConn(a, &owner);
     var other = try authedConn(a, "u2", false);
+    defer freeConn(a, &other);
     var anon = Conn{};
     try std.testing.expect(try shouldDeliver(a, std.testing.io, &tdb.d, col, &owner, 0, .update, rid, null, null));
     try std.testing.expect(!try shouldDeliver(a, std.testing.io, &tdb.d, col, &other, 0, .update, rid, null, null));
@@ -765,13 +762,11 @@ test "macro viewRule: only the owner receives the record" {
 test "subscription filter narrows within an authorized viewRule" {
     var tdb = try TestDb.init();
     defer tdb.deinit();
-    // MASKED (guarded-query scratch leak, out of batch — see GUARDED_QUERY_MASK below): the
-    // subscription filter compiles to a Guard via policy.matchesRule, whose scratch is never freed.
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const col = try tdb.mkColl(a, "items", rules.public_sentinel);
+    defer col.deinit(a);
     const rid = try tdb.mkRec(a, col, "alice");
+    defer a.free(rid);
     var anon = Conn{};
     try std.testing.expect(try shouldDeliver(a, std.testing.io, &tdb.d, col, &anon, 0, .create, rid, "owner = \"alice\"", null));
     try std.testing.expect(!try shouldDeliver(a, std.testing.io, &tdb.d, col, &anon, 0, .create, rid, "owner = \"bob\"", null));
@@ -798,22 +793,21 @@ test "delete is id-only: locked -> only superuser; @public -> anyone" {
 test "F4: owner-scoped delete only notifies the owner (snapshot authz)" {
     var tdb = try TestDb.init();
     defer tdb.deinit();
-    // MASKED (guarded-query scratch leak, out of batch — see GUARDED_QUERY_MASK below): the
-    // owner-scoped delete authorizes the snapshot via matchesSnapshot -> policy.matchesRule, whose
-    // compiled-Guard scratch is never freed.
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const col = try tdb.mkColl(a, "notes", "owner = @request.auth.id");
+    defer col.deinit(a);
     // The deleted row's snapshot: owned by u1. The live row is gone (delete already committed),
     // so authorization must come from this snapshot.
     var snap: std.json.ObjectMap = .empty;
+    defer snap.deinit(a);
     try snap.put(a, "id", .{ .string = "GONE" });
     try snap.put(a, "owner", .{ .string = "u1" });
     const snapshot: std.json.Value = .{ .object = snap };
 
     var owner = try authedConn(a, "u1", false);
+    defer freeConn(a, &owner);
     var other = try authedConn(a, "u2", false);
+    defer freeConn(a, &other);
     var anon = Conn{};
     // Owner: receives the delete. Non-owner and anonymous: do NOT (no id leak).
     try std.testing.expect(try shouldDeliver(a, std.testing.io, &tdb.d, col, &owner, 0, .delete, "GONE", null, snapshot));
@@ -831,25 +825,25 @@ test "#18 hoist: the thread-local delete sandbox is reused per-subscriber AND re
     // computed from that subscriber's own rctx — never leaked from a prior cache occupant.
     var tdb = try TestDb.init();
     defer tdb.deinit();
-    // MASKED (guarded-query scratch leak, out of batch — see GUARDED_QUERY_MASK below): each
-    // delete authz runs matchesSnapshot -> policy.matchesRule, whose compiled-Guard scratch is
-    // never freed. (The thread-local sandbox itself is page-allocator backed and not tracked.)
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const col = try tdb.mkColl(a, "notes", "owner = @request.auth.id");
+    defer col.deinit(a);
 
     var snap1: std.json.ObjectMap = .empty;
+    defer snap1.deinit(a);
     try snap1.put(a, "id", .{ .string = "R1" });
     try snap1.put(a, "owner", .{ .string = "u1" });
     const s1: std.json.Value = .{ .object = snap1 };
     var snap2: std.json.ObjectMap = .empty;
+    defer snap2.deinit(a);
     try snap2.put(a, "id", .{ .string = "R2" });
     try snap2.put(a, "owner", .{ .string = "u2" });
     const s2: std.json.Value = .{ .object = snap2 };
 
     var owner1 = try authedConn(a, "u1", false); // owns R1
+    defer freeConn(a, &owner1);
     var owner2 = try authedConn(a, "u2", false); // owns R2
+    defer freeConn(a, &owner2);
     var anon = Conn{};
 
     // Event 1 (snapshot owned by u1): first call BUILDS the sandbox, the next two REUSE it. Each
@@ -875,32 +869,33 @@ test "tenant scoping: a subscriber receives ONLY its account's frames; unresolve
     // Before the fix `Conn.requestContext` never set tenancy_enabled/account_id, so a tenant-owned
     // `@public` collection broadcast to every subscriber — a cross-tenant leak. This test FAILS
     // under that code and passes after the fix.
-    // MASKED (guarded-query scratch leak, out of batch — see GUARDED_QUERY_MASK below): a
-    // tenant-owned collection runs shouldDeliver -> policy.matchesRule (tenancy.scopePredicate +
-    // guardPasses), whose compiled-Guard scratch is never freed.
     var tdb = try TestDb.init();
     defer tdb.deinit();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
 
     // A tenant-owned collection with a NATURAL @public viewRule (the whole point of auto-scoping).
     const fields = [_]schema.Field{
         .{ .id = "f1", .name = "title", .options = .{ .text = .{} } },
         .{ .id = "f2", .name = "account", .options = .{ .text = .{} } },
     };
-    var col = try collections.create(a, std.testing.io, &tdb.d, .{
+    // The DB-owned collection is freed via `Collection.deinit`; the `tenant_field` mutation below
+    // lives on a struct COPY (`col`) so the owned base never carries the literal into deinit.
+    const base_col = try collections.create(a, std.testing.io, &tdb.d, .{
         .id = "",
         .name = "projects",
         .fields = &fields,
         .viewRule = rules.public_sentinel,
     });
+    defer base_col.deinit(a);
+    var col = base_col;
     col.options.tenant_field = "account";
     try tdb.d.exec("INSERT INTO projects (id,created,updated,title,account) VALUES " ++
         "('rA','t','t','a','accA'),('rB','t','t','b','accB');");
 
-    // A subscriber whose connection is scoped to accA (tenancy_enabled + resolved account).
+    // A subscriber whose connection is scoped to accA (tenancy_enabled + resolved account). The one
+    // `rec` map is shared (by value) across connA/connNone/legacy, so free its backing exactly once.
     var rec: std.json.ObjectMap = .empty;
+    defer rec.deinit(a);
     try rec.put(a, "id", .{ .string = "uA" });
     var connA = Conn{ .tenancy_enabled = true, .account_id = "accA" };
     connA.setAuth(.{ .record = .{ .object = rec }, .is_superuser = false, .exp = 9999999999 });
@@ -913,9 +908,11 @@ test "tenant scoping: a subscriber receives ONLY its account's frames; unresolve
 
     // delete uses the pre-delete snapshot: accA's snapshot delivered, accB's not.
     var snapA: std.json.ObjectMap = .empty;
+    defer snapA.deinit(a);
     try snapA.put(a, "id", .{ .string = "rA" });
     try snapA.put(a, "account", .{ .string = "accA" });
     var snapB: std.json.ObjectMap = .empty;
+    defer snapB.deinit(a);
     try snapB.put(a, "id", .{ .string = "rB" });
     try snapB.put(a, "account", .{ .string = "accB" });
     try std.testing.expect(try shouldDeliver(a, std.testing.io, &tdb.d, col, &connA, 0, .delete, "rA", null, .{ .object = snapA }));
@@ -931,6 +928,7 @@ test "tenant scoping: a subscriber receives ONLY its account's frames; unresolve
     // A superuser bypasses tenancy (receives both); tenancy OFF on the conn = byte-identical legacy
     // (@public delivers all), proving the gate is the per-connection tenancy flag.
     var su = try authedConn(a, "admin", true);
+    defer freeConn(a, &su);
     su.tenancy_enabled = true;
     try std.testing.expect(try shouldDeliver(a, std.testing.io, &tdb.d, col, &su, 0, .create, "rB", null, null));
     var legacy = Conn{ .tenancy_enabled = false };
@@ -941,17 +939,15 @@ test "tenant scoping: a subscriber receives ONLY its account's frames; unresolve
 test "expired identity is treated as anonymous" {
     var tdb = try TestDb.init();
     defer tdb.deinit();
-    // MASKED (guarded-query scratch leak, out of batch — see GUARDED_QUERY_MASK below): the
-    // `.check` viewRule drives shouldDeliver -> policy.matchesRule, whose compiled-Guard scratch is
-    // never freed.
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const col = try tdb.mkColl(a, "notes", "owner = @request.auth.id");
+    defer col.deinit(a);
     const rid = try tdb.mkRec(a, col, "u1");
+    defer a.free(rid);
     var rec: std.json.ObjectMap = .empty;
     try rec.put(a, "id", .{ .string = "u1" });
     var c = Conn{};
+    defer freeConn(a, &c);
     c.setAuth(.{ .record = .{ .object = rec }, .is_superuser = false, .exp = 100 });
     try std.testing.expect(try shouldDeliver(a, std.testing.io, &tdb.d, col, &c, 50, .update, rid, null, null));
     try std.testing.expect(!try shouldDeliver(a, std.testing.io, &tdb.d, col, &c, 200, .update, rid, null, null));
