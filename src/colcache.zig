@@ -137,27 +137,78 @@ pub const Cache = struct {
     }
 };
 
-/// A borrowed view of a collection's parsed metadata. `col == null` means "not a
-/// collection". The memory behind `col` belongs to the cache entry (or to
-/// `fallback_alloc` on the uncached path) — treat it as READ-ONLY and do not retain it
-/// past `release()`.
+/// A view of a collection's parsed metadata. `col == null` means "not a collection".
+/// Treat `col` as READ-ONLY and do not retain it past `release()`.
+///
+/// OWNERSHIP: exactly one of two shapes, distinguished by which cleanup handle is set.
+///  - CACHED (hit or miss, `cache`+`entry` set, `owned_arena == null`): `col` is
+///    BORROWED from the cache entry's arena; the entry refcount owns it. `release()`
+///    drops this borrower's ref (the last releaser frees the arena) and must NEVER free
+///    `col` directly — doing so would corrupt the cache's own copy (UAF/double-free).
+///  - OWNED (uncached, `cache == null`, `owned_arena` set): `lease` loaded `col` into a
+///    private arena that this lease OWNS, built on the caller's `fallback_alloc`.
+///    `release()` reclaims it with `owned_arena.deinit()`.
+///
+/// Why a per-lease arena (not `Collection.deinit(fallback_alloc)` directly): `deinit`
+/// frees each node through `Allocator.free`, which in safety builds fills the freed slice
+/// with `undefined` BEFORE the backing free runs. When `fallback_alloc` is itself the
+/// request arena — the production/uncached callers (records handlers) load `col` there
+/// and legitimately alias `col.name` from hooks/events read up to request end — that
+/// poison corrupts the still-referenced bytes. `owned_arena.deinit()` instead frees only
+/// its node buffers via the child's `rawFree` (no poison wrapper): a no-op rewind when
+/// the child is a request arena (bytes survive until the request arena is reclaimed,
+/// exactly the pre-cache behavior), a real reclaim when the child is a raw GPA (colcache/
+/// hub unit tests) — closing the leak WITHOUT changing the arena-caller lifetime.
+///
+/// CALLER CONTRACT for the uncached-request-arena case: the byte-survival guarantee holds as
+/// long as the owned arena's node is NOT the request arena's live TAIL allocation at the moment
+/// `release()` runs — because request-arena `rawFree` only rewinds when the freed block IS the
+/// tail, so a non-tail free is a pure no-op (the `col` bytes stay put). That holds whenever
+/// request-arena allocations made AFTER `lease()` are still live at release time, which is the
+/// norm: a handler reads/serializes the record after leasing, and zigbase request arenas are
+/// reset WHOLESALE at request end, never individually rewound mid-request. The current callers
+/// satisfy it (`records.create` releases via a function-scope `defer`; `hub.frameForDelivery`
+/// copies `col.name` into the serialized frame before returning). A future uncached caller must
+/// NOT release the lease while the owned arena is the request arena's tail and then keep aliasing
+/// `col.name` (e.g. release early, before any further request-arena work) — copy `col.name` out
+/// first if in doubt.
 pub const Lease = struct {
     col: ?schema.Collection,
     entry: ?*Entry = null,
     cache: ?*Cache = null,
+    /// Set ONLY on the uncached path; the private arena that owns `col` (built on the
+    /// caller's fallback allocator). Mutually exclusive with `cache`.
+    owned_arena: ?std.heap.ArenaAllocator = null,
 
     pub fn release(self: *Lease) void {
-        if (self.cache) |c| if (self.entry) |e| c.unref(e);
+        if (self.cache) |c| {
+            if (self.entry) |e| c.unref(e); // cached borrow: drop the ref, never free col
+        } else if (self.owned_arena) |*arena| {
+            arena.deinit(); // uncached owned graph: reclaim its private arena once
+        }
+        // Clear every handle so a second release() is an idempotent no-op (no double-free).
+        self.col = null;
         self.entry = null;
         self.cache = null;
+        self.owned_arena = null;
     }
 };
 
-/// Cached `collections.get`. With `cache == null` (unit tests, CLI, Postgres backend)
-/// this is a plain direct load into `fallback_alloc` and release() is a no-op.
+/// Cached `collections.get`. With `cache == null` (unit tests, CLI, Postgres backend) the
+/// returned lease OWNS a private arena (built on `fallback_alloc`) holding `col`, reclaimed
+/// on `release()`. With a cache, hits/misses borrow the entry arena and `release()` only
+/// drops the refcount (see `Lease` ownership notes).
 pub fn lease(cache: ?*Cache, conn: *db.Db, fallback_alloc: std.mem.Allocator, name: []const u8) !Lease {
-    const c = cache orelse
-        return .{ .col = try collections.get(fallback_alloc, conn, name) };
+    if (cache == null) {
+        // Own a private arena so `release()` reclaims the load even when `fallback_alloc`
+        // is a raw GPA (unit tests), without freeing individual nodes through the poison-
+        // on-free wrapper that would corrupt request-arena callers' aliases (see Lease).
+        var arena = std.heap.ArenaAllocator.init(fallback_alloc);
+        errdefer arena.deinit();
+        const col = try collections.get(arena.allocator(), conn, name);
+        return .{ .col = col, .owned_arena = arena };
+    }
+    const c = cache.?;
     if (c.acquire(name)) |e|
         return .{ .col = e.col, .entry = e, .cache = c };
     // Miss: snapshot the generation, load OUTSIDE the lock into a fresh entry arena.
@@ -182,75 +233,72 @@ fn testDbWithPosts(a: std.mem.Allocator) !db.Db {
     var d = try db.Db.openMemory();
     errdefer d.close();
     try migrations.run(&d);
-    _ = try collections.create(a, std.testing.io, &d, .{
+    // create() returns a fully-owned collection graph (scratch is on an internal arena);
+    // free it so the setup is leak-clean under a raw (non-arena) allocator.
+    const created = try collections.create(a, std.testing.io, &d, .{
         .id = "",
         .name = "posts",
         .fields = &[_]schema.Field{.{ .id = "f1", .name = "title", .options = .{ .text = .{} } }},
     });
+    created.deinit(a);
     return d;
 }
 
 test "colcache: miss loads + publishes; second lease is the same entry (hit)" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    var d = try testDbWithPosts(arena.allocator());
+    var d = try testDbWithPosts(testing.allocator);
     defer d.close();
     var cache = Cache.init(testing.allocator);
     defer cache.deinit();
 
-    var l1 = try lease(&cache, &d, arena.allocator(), "posts");
+    // fallback_alloc is unused with a cache (misses load into the entry arena, hits reuse
+    // it), so the leak detector governs the entry arenas the cache frees.
+    var l1 = try lease(&cache, &d, testing.allocator, "posts");
     defer l1.release();
     try testing.expect(l1.col != null);
     try testing.expectEqualStrings("posts", l1.col.?.name);
-    var l2 = try lease(&cache, &d, arena.allocator(), "posts");
+    var l2 = try lease(&cache, &d, testing.allocator, "posts");
     defer l2.release();
     try testing.expect(l1.entry.? == l2.entry.?); // served from cache, not re-parsed
 }
 
 test "colcache: negative entries are cached and cleared by invalidate" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    var d = try testDbWithPosts(arena.allocator());
+    var d = try testDbWithPosts(testing.allocator);
     defer d.close();
     var cache = Cache.init(testing.allocator);
     defer cache.deinit();
 
-    var miss1 = try lease(&cache, &d, arena.allocator(), "nope");
+    var miss1 = try lease(&cache, &d, testing.allocator, "nope");
     try testing.expect(miss1.col == null);
     const neg_entry = miss1.entry.?;
     miss1.release();
-    var miss2 = try lease(&cache, &d, arena.allocator(), "nope");
+    var miss2 = try lease(&cache, &d, testing.allocator, "nope");
     try testing.expect(miss2.entry.? == neg_entry); // negative HIT
     miss2.release();
     cache.invalidate();
-    var miss3 = try lease(&cache, &d, arena.allocator(), "nope");
+    var miss3 = try lease(&cache, &d, testing.allocator, "nope");
     defer miss3.release();
     try testing.expect(miss3.entry.? != neg_entry); // reloaded after DDL
 }
 
 test "colcache: invalidate keeps in-flight leases alive (refcount) and reloads after" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    var d = try testDbWithPosts(arena.allocator());
+    var d = try testDbWithPosts(testing.allocator);
     defer d.close();
     var cache = Cache.init(testing.allocator);
     defer cache.deinit();
 
-    var held = try lease(&cache, &d, arena.allocator(), "posts");
+    var held = try lease(&cache, &d, testing.allocator, "posts");
     cache.invalidate();
     // The detached entry is still fully usable by its holder.
     try testing.expectEqualStrings("posts", held.col.?.name);
     try testing.expectEqualStrings("title", held.col.?.fields[held.col.?.fields.len - 1].name);
-    var fresh = try lease(&cache, &d, arena.allocator(), "posts");
+    var fresh = try lease(&cache, &d, testing.allocator, "posts");
     defer fresh.release();
     try testing.expect(fresh.entry.? != held.entry.?);
     held.release(); // last ref on the detached entry frees it (leak check = the allocator)
 }
 
 test "colcache: a load that raced an invalidation is NOT published (generation guard)" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    var d = try testDbWithPosts(arena.allocator());
+    var d = try testDbWithPosts(testing.allocator);
     defer d.close();
     var cache = Cache.init(testing.allocator);
     defer cache.deinit();
@@ -278,13 +326,12 @@ test "colcache: concurrent lease/invalidate/release stress (no UAF, no leak)" {
 
     // Each thread gets its OWN sqlite connection (mirrors the production reader pool). Built
     // single-threaded here so collection provisioning never races; the connections are then
-    // only READ concurrently.
-    var setup_arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer setup_arena.deinit();
+    // only READ concurrently. testDbWithPosts frees its own setup graph, so a raw allocator
+    // stays leak-clean.
     var dbs: [n_threads]db.Db = undefined;
     var opened: usize = 0;
     defer for (dbs[0..opened]) |*d| d.close();
-    while (opened < n_threads) : (opened += 1) dbs[opened] = try testDbWithPosts(setup_arena.allocator());
+    while (opened < n_threads) : (opened += 1) dbs[opened] = try testDbWithPosts(testing.allocator);
 
     const Worker = struct {
         cache: *Cache,
@@ -347,12 +394,14 @@ test "colcache: concurrent lease/invalidate/release stress (no UAF, no leak)" {
     held.release();
 }
 
-test "colcache: null cache falls back to a direct uncached load" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    var d = try testDbWithPosts(arena.allocator());
+test "colcache: null cache falls back to a direct uncached load (lease owns + frees)" {
+    var d = try testDbWithPosts(testing.allocator);
     defer d.close();
-    var l = try lease(null, &d, arena.allocator(), "posts");
-    defer l.release(); // no-op
+    // cache == null: the lease OWNS the loaded graph on testing.allocator and frees it
+    // on release() — the leak detector proves both the ownership and the one-shot free.
+    var l = try lease(null, &d, testing.allocator, "posts");
+    defer l.release();
     try testing.expect(l.col != null and l.entry == null);
+    try testing.expect(l.owned_arena != null); // owns a private arena, not a cache borrow
+    try testing.expectEqualStrings("posts", l.col.?.name);
 }

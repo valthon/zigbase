@@ -36,7 +36,6 @@ src/clock_vfs.zig	2	PRE-EXISTING: not yet migrated to the ownership contracts
 src/codegen/acquire.zig	2	buildCollection is the internal builder (looped by acquireFromDb); returns a bare arena-lifetime Collection on the caller allocator. Public entry points are contract-2 (Acquired).
 src/codegen/acquire_datadir.zig	1	arena is test SETUP (provision.applySpecs scaffolding); the SUT acquireFromDb runs under the leak detector via the Acquired handle.
 src/codegen/typegen_cli.zig	1	arena is test SETUP (provisioning + generate scaffolding); the SUT acquireFromDb runs under the leak detector via the Acquired handle.
-src/colcache.zig	6	PRE-EXISTING: not yet migrated to the ownership contracts
 src/ctx.zig	5	PRE-EXISTING: not yet migrated to the ownership contracts
 src/ddl.zig	9	PRE-EXISTING: not yet migrated to the ownership contracts
 src/dumpload.zig	4	PRE-EXISTING: not yet migrated to the ownership contracts
