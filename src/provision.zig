@@ -860,13 +860,32 @@ pub fn injectOAuthSecrets(
     return out;
 }
 
+/// Free the OWNED parts of a `resolveDiscoveryProviders`-built provider array: for each of the
+/// first `done` providers (the rest, if any, never got as far as being touched), the resolved
+/// authURL/tokenURL/userinfoURL dupes IFF that provider actually has a `discoveryURL` (the only
+/// path that overwrites them with fresh owned strings — a provider without one is an untouched
+/// shallow copy whose URL fields, if set at all, are BORROWED from the original spec and must
+/// never be freed here), then the backing array itself.
+fn freeResolvedProviders(alloc: std.mem.Allocator, ps: []schema.OAuth2Provider, done: usize) void {
+    for (ps[0..done]) |p| {
+        if (p.discoveryURL != null) {
+            if (p.authURL) |u| alloc.free(u);
+            if (p.tokenURL) |u| alloc.free(u);
+            if (p.userinfoURL) |u| alloc.free(u);
+        }
+    }
+    alloc.free(ps);
+}
+
 /// Resolve every `discoveryURL` provider's endpoints via OIDC discovery (spec §F4). Runs at
 /// startup, after env-secret injection, BEFORE applySpecs persists the collection options —
 /// so the resolved endpoints are stored exactly like literal generic endpoints. The fetch
 /// happens on every startup for deterministic fail-fast (a broken IdP config can never boot
 /// a server with dead login); persistence still follows the normal provisioning caveat
 /// (existing collections are not rewritten — re-resolution needs a migration/admin PATCH).
-/// ANY failure propagates — the caller aborts startup loudly.
+/// ANY failure propagates — the caller aborts startup loudly (production has no cleanup to do,
+/// the process exits; the errdefer below exists so a non-arena caller — e.g. a test — never sees
+/// this as a leak).
 pub fn resolveDiscoveryProviders(
     alloc: std.mem.Allocator,
     transport: oauth_client.Transport,
@@ -882,14 +901,27 @@ pub fn resolveDiscoveryProviders(
     if (!any) return specs; // zero-cost when no discovery provider is configured
 
     const out = try alloc.alloc(schema.Collection, specs.len);
+    // Every provider array `out[ci]` has actually had replaced (vs. still aliasing `specs[ci]`'s
+    // original array), plus how far into it processing got — freed on any later error.
+    var replaced: std.ArrayList(struct { ps: []schema.OAuth2Provider, done: usize }) = .empty;
+    errdefer {
+        for (replaced.items) |r| freeResolvedProviders(alloc, r.ps, r.done);
+        replaced.deinit(alloc);
+        alloc.free(out);
+    }
     for (specs, 0..) |c, ci| {
         out[ci] = c;
         if (c.type != .auth or c.options.auth.oauth2.providers.len == 0) continue;
         const src = c.options.auth.oauth2.providers;
         const np = try alloc.alloc(schema.OAuth2Provider, src.len);
+        try replaced.append(alloc, .{ .ps = np, .done = 0 });
+        const slot = &replaced.items[replaced.items.len - 1];
         for (src, 0..) |p, i| {
             np[i] = p;
-            const durl = p.discoveryURL orelse continue;
+            const durl = p.discoveryURL orelse {
+                slot.done = i + 1;
+                continue;
+            };
             const eps = discovery.resolve(transport, alloc, durl) catch |e| {
                 // .warn, not .err: the real startup failure is logged (at .err) by the
                 // framework.zig caller, which is not itself hit by these unit tests — an
@@ -903,9 +935,13 @@ pub fn resolveDiscoveryProviders(
             np[i].tokenURL = eps.tokenURL;
             np[i].userinfoURL = eps.userinfoURL;
             std.log.info("oauth provider '{s}': endpoints resolved via OIDC discovery", .{p.name});
+            slot.done = i + 1;
         }
         out[ci].options.auth.oauth2.providers = np;
     }
+    // Success: every `np` array's ownership transferred into `out`; only the bookkeeping list
+    // itself (not the arrays it points at) is discarded.
+    replaced.deinit(alloc);
     return out;
 }
 
@@ -1175,6 +1211,16 @@ fn recordMigration(m: *Migrator, name: []const u8) db.DbError!void {
 /// One applied consumer-migration ledger row (`prov:`-prefixed name + its `applied_at`).
 pub const AppliedMigration = struct { name: []const u8, applied_at: []const u8 };
 
+/// Free a fully-owned `[]AppliedMigration` — exactly the shape `appliedConsumerMigrations`/
+/// `recentConsumerMigrations` return (every `.name`/`.applied_at` duped onto `alloc`).
+pub fn freeAppliedMigrations(alloc: std.mem.Allocator, ms: []const AppliedMigration) void {
+    for (ms) |m| {
+        alloc.free(m.name);
+        alloc.free(m.applied_at);
+    }
+    alloc.free(ms);
+}
+
 /// Strip the `prov:` ledger prefix a consumer migration is recorded under; returns the bare id.
 fn stripProv(name: []const u8) []const u8 {
     return if (std.mem.startsWith(u8, name, "prov:")) name[5..] else name;
@@ -1183,9 +1229,14 @@ fn stripProv(name: []const u8) []const u8 {
 /// Read the applied CONSUMER migrations from the `_migrations` ledger, in apply order
 /// (`id` ascending). Names retain the `prov:` prefix. Mirrors `migrationApplied`'s dialect-aware
 /// `m.prepare` (placeholder renumbering, harmless here — the query is placeholder-free) so it
-/// works on SQLite and Postgres. Everything is duped from `alloc` (pass an arena; caller owns it).
+/// works on SQLite and Postgres. Self-freeing (contract 1): `Migrator.prepare` lowers the SQL onto
+/// `m.arena` and never frees that scratch (SQLite copies the SQL text internally on prepare, so
+/// it's safe to reclaim right after) — give it a function-local arena rather than `alloc`, so only
+/// the retained `AppliedMigration` dupes escape on `alloc`.
 pub fn appliedConsumerMigrations(alloc: std.mem.Allocator, w: *db.Db) ![]AppliedMigration {
-    var m = Migrator{ .db = w, .dialect = db.dbDialect(w), .arena = alloc, .io = undefined };
+    var scratch = std.heap.ArenaAllocator.init(alloc);
+    defer scratch.deinit();
+    var m = Migrator{ .db = w, .dialect = db.dbDialect(w), .arena = scratch.allocator(), .io = undefined };
     var st = try m.prepare("SELECT \"name\", \"applied_at\" FROM \"_migrations\" WHERE \"name\" LIKE 'prov:%' ORDER BY \"id\";");
     defer st.finalize();
     var list: std.ArrayList(AppliedMigration) = .empty;
@@ -1210,28 +1261,64 @@ pub const MigrationStatus = struct {
     orphaned: []AppliedMigration,
     applied_count: usize,
     pending_count: usize,
+
+    /// Free a fully-owned `MigrationStatus` (the shape `migrationStatus` returns). Each
+    /// `declared[i].applied_at` (when present) and both of `orphaned[i]`'s strings are owned
+    /// dupes, freed individually; `declared[i].id` BORROWS the caller's own `migs[i].id` and is
+    /// never freed here.
+    pub fn deinit(self: MigrationStatus, alloc: std.mem.Allocator) void {
+        for (self.declared) |e| if (e.applied_at) |at| alloc.free(at);
+        alloc.free(self.declared);
+        for (self.orphaned) |o| {
+            alloc.free(o.name);
+            alloc.free(o.applied_at);
+        }
+        alloc.free(self.orphaned);
+    }
 };
 
 /// Compute the applied/pending/orphaned buckets by cross-referencing the compiled-in migrations
-/// (`migs`, in declared order) against the ledger. Allocates from `alloc` (pass an arena).
+/// (`migs`, in declared order) against the ledger. Owned-result (contract 2): `applied` (the raw
+/// ledger read) is scratch, freed before return — every string retained in the result is a FRESH
+/// dupe, not a borrow into `applied`'s buffers (a borrow would leave `orphaned[i].name`, a
+/// stripped-prefix sub-slice, impossible to free on its own). Free the result with
+/// `MigrationStatus.deinit`.
 pub fn migrationStatus(alloc: std.mem.Allocator, w: *db.Db, migs: []const Migration) !MigrationStatus {
     const applied = try appliedConsumerMigrations(alloc, w);
+    defer {
+        for (applied) |ar| {
+            alloc.free(ar.name);
+            alloc.free(ar.applied_at);
+        }
+        alloc.free(applied);
+    }
 
     const declared = try alloc.alloc(StatusEntry, migs.len);
+    errdefer alloc.free(declared);
     var applied_count: usize = 0;
-    for (migs, 0..) |mig, i| {
+    var di: usize = 0;
+    errdefer for (declared[0..di]) |e| if (e.applied_at) |at| alloc.free(at);
+    while (di < migs.len) : (di += 1) {
+        const mig = migs[di];
         var at: ?[]const u8 = null;
         for (applied) |ar| {
             if (std.mem.eql(u8, stripProv(ar.name), mig.id)) {
-                at = ar.applied_at;
+                at = try alloc.dupe(u8, ar.applied_at);
                 break;
             }
         }
         if (at != null) applied_count += 1;
-        declared[i] = .{ .id = mig.id, .applied_at = at };
+        declared[di] = .{ .id = mig.id, .applied_at = at };
     }
 
     var orphans: std.ArrayList(AppliedMigration) = .empty;
+    errdefer {
+        for (orphans.items) |o| {
+            alloc.free(o.name);
+            alloc.free(o.applied_at);
+        }
+        orphans.deinit(alloc);
+    }
     for (applied) |ar| {
         const id = stripProv(ar.name);
         var known = false;
@@ -1239,7 +1326,12 @@ pub fn migrationStatus(alloc: std.mem.Allocator, w: *db.Db, migs: []const Migrat
             known = true;
             break;
         };
-        if (!known) try orphans.append(alloc, .{ .name = id, .applied_at = ar.applied_at });
+        if (!known) {
+            const owned_id = try alloc.dupe(u8, id);
+            errdefer alloc.free(owned_id);
+            const owned_at = try alloc.dupe(u8, ar.applied_at);
+            try orphans.append(alloc, .{ .name = owned_id, .applied_at = owned_at });
+        }
     }
 
     return .{
@@ -1257,9 +1349,12 @@ pub fn migrationStatus(alloc: std.mem.Allocator, w: *db.Db, migs: []const Migrat
 /// Read the N most-recently-applied CONSUMER migrations, NEWEST FIRST (`id` descending). Mirrors
 /// `appliedConsumerMigrations` but bounded + reversed so a rollback reverses the last-applied
 /// migrations first. Dialect-aware via `m.prepare` (SQLite `?1` → Postgres `$1`); the bound `LIMIT`
-/// is portable across both backends. Everything is duped from `alloc` (pass an arena; caller owns).
+/// is portable across both backends. Self-freeing (contract 1): see `appliedConsumerMigrations` —
+/// `m.arena` is a function-local scratch arena, not `alloc`; only the returned dupes escape.
 pub fn recentConsumerMigrations(alloc: std.mem.Allocator, w: *db.Db, limit: usize) ![]AppliedMigration {
-    var m = Migrator{ .db = w, .dialect = db.dbDialect(w), .arena = alloc, .io = undefined };
+    var scratch = std.heap.ArenaAllocator.init(alloc);
+    defer scratch.deinit();
+    var m = Migrator{ .db = w, .dialect = db.dbDialect(w), .arena = scratch.allocator(), .io = undefined };
     var st = try m.prepare("SELECT \"name\", \"applied_at\" FROM \"_migrations\" WHERE \"name\" LIKE 'prov:%' ORDER BY \"id\" DESC LIMIT ?1;");
     defer st.finalize();
     // Clamp rather than @intCast: a hostile N (e.g. u64 max from the CLI) must cap the LIMIT, not
@@ -1307,6 +1402,28 @@ pub const RollbackOutcome = union(enum) {
     ok: [][]const u8,
     irreversible: struct { reversed: [][]const u8, id: []const u8 },
     orphaned: struct { reversed: [][]const u8, id: []const u8 },
+
+    /// Free a fully-owned `RollbackOutcome` — every id and the `reversed`/`ok` backing array(s)
+    /// are `alloc`-owned dupes (see `rollbackMigrations`); `.reversed = &.{}` on a pre-flight
+    /// refusal is a static empty literal, a no-op to free.
+    pub fn deinit(self: RollbackOutcome, alloc: std.mem.Allocator) void {
+        switch (self) {
+            .ok => |ids| {
+                for (ids) |id| alloc.free(id);
+                alloc.free(ids);
+            },
+            .irreversible => |r| {
+                for (r.reversed) |id| alloc.free(id);
+                alloc.free(r.reversed);
+                alloc.free(r.id);
+            },
+            .orphaned => |r| {
+                for (r.reversed) |id| alloc.free(id);
+                alloc.free(r.reversed);
+                alloc.free(r.id);
+            },
+        }
+    }
 };
 
 /// Reverse the `n` most-recently-applied CONSUMER migrations, newest first. The reverse of a
@@ -1616,15 +1733,14 @@ test "stable field ids are deterministic and collision-distinct" {
 }
 
 test "topoOrder places relation targets before dependents" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const lf = [_]schema.Field{.{ .id = "r", .name = "owner", .options = .{ .relation = .{ .targetCollectionId = "users", .maxSelect = 1 } } }};
     const specs = [_]schema.Collection{
         .{ .id = "", .name = "listings", .fields = &lf },
         .{ .id = "", .name = "users", .fields = &.{} },
     };
     const order = try topoOrder(a, &specs);
+    defer a.free(order);
     // users (idx 1) must come before listings (idx 0)
     try std.testing.expectEqual(@as(usize, 2), order.len);
     var pos_users: usize = 0;
@@ -1653,9 +1769,7 @@ test "applySpecs provisions collections + name-based relation resolves to target
     var d = try db.Db.openMemory();
     defer d.close();
     try migrations.run(&d);
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
 
     const lf = [_]schema.Field{
         .{ .id = "f_owner", .name = "owner", .options = .{ .relation = .{ .targetCollectionId = "users", .maxSelect = 1 } } },
@@ -1669,7 +1783,9 @@ test "applySpecs provisions collections + name-based relation resolves to target
     try applySpecs(a, std.testing.io, &d, &specs);
 
     const users = (try collections.get(a, &d, "users")).?;
+    defer users.deinit(a);
     const listings = (try collections.get(a, &d, "listings")).?;
+    defer listings.deinit(a);
     try std.testing.expectEqual(schema.CollectionType.auth, users.type);
     // the relation's stored targetCollectionId equals the users collection's id
     const owner = schema.fieldByName(listings, "owner").?;
@@ -1682,6 +1798,10 @@ test "applySpecs provisions collections + name-based relation resolves to target
     // re-provision: clean no-op (no error, no duplicate collection)
     try applySpecs(a, std.testing.io, &d, &specs);
     const all = try collections.list(a, &d);
+    defer {
+        for (all) |c| c.deinit(a);
+        a.free(all);
+    }
     var listings_count: usize = 0;
     for (all) |c| if (std.mem.eql(u8, c.name, "listings")) {
         listings_count += 1;
@@ -1693,9 +1813,7 @@ test "applySpecs additively adds a new field (auto-migration), preserving data" 
     var d = try db.Db.openMemory();
     defer d.close();
     try migrations.run(&d);
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
 
     const v1 = [_]schema.Field{.{ .id = "f_title", .name = "title", .options = .{ .text = .{} } }};
     const s1 = [_]schema.Collection{.{ .id = "", .name = "posts", .fields = &v1 }};
@@ -1721,9 +1839,7 @@ test "applySpecs persists a ttl_field added to an existing collection (then GC r
     var d = try db.Db.openMemory();
     defer d.close();
     try migrations.run(&d);
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
 
     // v1: a collection with a date field but NO ttl_field.
     const fields = [_]schema.Field{
@@ -1735,7 +1851,11 @@ test "applySpecs persists a ttl_field added to an existing collection (then GC r
     try d.exec("INSERT INTO \"sessions\" (\"id\",\"created\",\"updated\",\"token\",\"expires_at\") VALUES ('s1','','','t','2000-01-01T00:00:00Z');");
 
     // Before: ttl_field not set, GC reaps nothing.
-    try std.testing.expect((try collections.get(a, &d, "sessions")).?.options.ttl_field == null);
+    {
+        const before = (try collections.get(a, &d, "sessions")).?;
+        defer before.deinit(a);
+        try std.testing.expect(before.options.ttl_field == null);
+    }
     try std.testing.expectEqual(@as(usize, 0), try @import("records.zig").gcExpiredRecords(a, &d));
 
     // v2: same fields, now declaring .ttl_field — must be persisted by re-provisioning.
@@ -1744,6 +1864,7 @@ test "applySpecs persists a ttl_field added to an existing collection (then GC r
 
     // The persisted options blob now carries the ttl_field...
     const live = (try collections.get(a, &d, "sessions")).?;
+    defer live.deinit(a);
     try std.testing.expect(live.options.ttl_field != null);
     try std.testing.expectEqualStrings("expires_at", live.options.ttl_field.?);
 
@@ -1759,9 +1880,7 @@ test "applySpecs logs+skips a destructive type change (does not destroy data)" {
     var d = try db.Db.openMemory();
     defer d.close();
     try migrations.run(&d);
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
 
     const v1 = [_]schema.Field{.{ .id = "f_n", .name = "n", .options = .{ .text = .{} } }};
     const s1 = [_]schema.Collection{.{ .id = "", .name = "items", .fields = &v1 }};
@@ -1780,6 +1899,7 @@ test "applySpecs logs+skips a destructive type change (does not destroy data)" {
     try std.testing.expectEqualStrings("keepme", st.columnText(0));
     // and the live schema still reports text (skip preserved it)
     const live = (try collections.get(a, &d, "items")).?;
+    defer live.deinit(a);
     try std.testing.expectEqual(schema.FieldType.text, schema.fieldByName(live, "n").?.fieldType());
 }
 
@@ -1787,9 +1907,7 @@ test "applySpecs rejects an unknown relation target" {
     var d = try db.Db.openMemory();
     defer d.close();
     try migrations.run(&d);
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const lf = [_]schema.Field{.{ .id = "f_o", .name = "owner", .options = .{ .relation = .{ .targetCollectionId = "ghosts", .maxSelect = 1 } } }};
     const specs = [_]schema.Collection{.{ .id = "", .name = "listings", .fields = &lf }};
     try std.testing.expectError(error.UnknownRelationTarget, applySpecs(a, std.testing.io, &d, &specs));
@@ -1920,9 +2038,7 @@ test "runMigrations runs each explicit migration once (idempotent)" {
     var d = try db.Db.openMemory();
     defer d.close();
     try migrations.run(&d);
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
 
     const M = struct {
         var calls: usize = 0;
@@ -1942,9 +2058,7 @@ test "runMigrations applies a change-migration forward (schema effect present)" 
     var d = try db.Db.openMemory();
     defer d.close();
     try migrations.run(&d);
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
 
     const M = struct {
         fn change(m: *Migrator) anyerror!void {
@@ -1968,9 +2082,7 @@ test "runMigrations honors .transactional = false (no wrapping tx)" {
     var d = try db.Db.openMemory();
     defer d.close();
     try migrations.run(&d);
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
 
     // VACUUM cannot run inside a transaction. It succeeds ONLY because a `.transactional = false`
     // migration is applied without the wrapping BEGIN/COMMIT.
@@ -1992,9 +2104,7 @@ test "runMigrations: legacy { id, up } is unaffected (backward-compat)" {
     var d = try db.Db.openMemory();
     defer d.close();
     try migrations.run(&d);
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
 
     const M = struct {
         var calls: usize = 0;
@@ -2018,9 +2128,7 @@ test "appliedConsumerMigrations returns applied prov: rows in apply (id) order" 
     var d = try db.Db.openMemory();
     defer d.close();
     try migrations.run(&d);
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
 
     const M = struct {
         fn up(m: *Migrator) anyerror!void {
@@ -2036,6 +2144,7 @@ test "appliedConsumerMigrations returns applied prov: rows in apply (id) order" 
     try runMigrations(a, std.testing.io, &d, &migs);
 
     const applied = try appliedConsumerMigrations(a, &d);
+    defer freeAppliedMigrations(a, applied);
     try std.testing.expectEqual(@as(usize, 3), applied.len);
     // Apply order, NOT declared/alphabetical: 0003_c was recorded first.
     try std.testing.expectEqualStrings("prov:0003_c", applied[0].name);
@@ -2048,9 +2157,7 @@ test "migrationStatus computes applied / pending / orphaned buckets" {
     var d = try db.Db.openMemory();
     defer d.close();
     try migrations.run(&d);
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
 
     const M = struct {
         fn up(m: *Migrator) anyerror!void {
@@ -2068,6 +2175,7 @@ test "migrationStatus computes applied / pending / orphaned buckets" {
         .{ .id = "0002_b", .up = M.up },
     };
     const status = try migrationStatus(a, &d, &declared);
+    defer status.deinit(a);
 
     try std.testing.expectEqual(@as(usize, 1), status.applied_count);
     try std.testing.expectEqual(@as(usize, 1), status.pending_count);
@@ -2086,9 +2194,9 @@ test "migrationStatus: empty declared set with no ledger rows is all-zero" {
     var d = try db.Db.openMemory();
     defer d.close();
     try migrations.run(&d);
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const status = try migrationStatus(arena.allocator(), &d, &[_]Migration{});
+    const a = std.testing.allocator;
+    const status = try migrationStatus(a, &d, &[_]Migration{});
+    defer status.deinit(a);
     try std.testing.expectEqual(@as(usize, 0), status.applied_count);
     try std.testing.expectEqual(@as(usize, 0), status.pending_count);
     try std.testing.expectEqual(@as(usize, 0), status.orphaned.len);
@@ -2099,6 +2207,7 @@ test "migrationStatus: empty declared set with no ledger rows is all-zero" {
 
 fn tableExistsDb(d: *db.Db, alloc: std.mem.Allocator, name: []const u8) !bool {
     const sql = try std.fmt.allocPrintSentinel(alloc, "SELECT 1 FROM \"{s}\" LIMIT 0;", .{name}, 0);
+    defer alloc.free(sql);
     var st = d.prepare(sql) catch return false;
     st.finalize();
     return true;
@@ -2106,6 +2215,7 @@ fn tableExistsDb(d: *db.Db, alloc: std.mem.Allocator, name: []const u8) !bool {
 
 fn ledgerHas(d: *db.Db, alloc: std.mem.Allocator, name: []const u8) !bool {
     const sql = try std.fmt.allocPrintSentinel(alloc, "SELECT 1 FROM \"_migrations\" WHERE \"name\" = '{s}';", .{name}, 0);
+    defer alloc.free(sql);
     var st = try d.prepare(sql);
     defer st.finalize();
     return try st.step();
@@ -2115,9 +2225,7 @@ test "rollbackMigrations: reverses createTable + a separate addColumn (newest-fi
     var d = try db.Db.openMemory();
     defer d.close();
     try migrations.run(&d);
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
 
     // Two migrations: create the table, then add a column in a LATER migration. Rolling both back
     // newest-first reverses the addColumn (dropColumn) before the createTable (dropTable) — the
@@ -2140,6 +2248,7 @@ test "rollbackMigrations: reverses createTable + a separate addColumn (newest-fi
     try std.testing.expect(try ledgerHas(&d, a, "prov:0002_label"));
 
     const outcome = try rollbackMigrations(a, std.testing.io, &d, &migs, 2);
+    defer outcome.deinit(a);
     try std.testing.expect(outcome == .ok);
     try std.testing.expectEqual(@as(usize, 2), outcome.ok.len);
     try std.testing.expectEqualStrings("0002_label", outcome.ok[0]);
@@ -2158,9 +2267,7 @@ test "rollbackMigrations: rollback N reverses the N newest, newest-first; the re
     var d = try db.Db.openMemory();
     defer d.close();
     try migrations.run(&d);
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
 
     const M = struct {
         fn a_(m: *Migrator) anyerror!void {
@@ -2181,6 +2288,7 @@ test "rollbackMigrations: rollback N reverses the N newest, newest-first; the re
     try runMigrations(a, std.testing.io, &d, &migs);
 
     const outcome = try rollbackMigrations(a, std.testing.io, &d, &migs, 2);
+    defer outcome.deinit(a);
     try std.testing.expect(outcome == .ok);
     // Newest first: 0003_c then 0002_b.
     try std.testing.expectEqual(@as(usize, 2), outcome.ok.len);
@@ -2200,9 +2308,7 @@ test "rollbackMigrations: N exceeding applied count rolls back all applied (min(
     var d = try db.Db.openMemory();
     defer d.close();
     try migrations.run(&d);
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
 
     const M = struct {
         fn change(m: *Migrator) anyerror!void {
@@ -2213,6 +2319,7 @@ test "rollbackMigrations: N exceeding applied count rolls back all applied (min(
     try runMigrations(a, std.testing.io, &d, &migs);
 
     const outcome = try rollbackMigrations(a, std.testing.io, &d, &migs, 99);
+    defer outcome.deinit(a);
     try std.testing.expect(outcome == .ok);
     try std.testing.expectEqual(@as(usize, 1), outcome.ok.len);
     try std.testing.expect(!try tableExistsDb(&d, a, "solo"));
@@ -2222,9 +2329,7 @@ test "rollbackMigrations: a lone `up` migration is refused up front, changing no
     var d = try db.Db.openMemory();
     defer d.close();
     try migrations.run(&d);
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
 
     const M = struct {
         fn up(m: *Migrator) anyerror!void {
@@ -2235,6 +2340,7 @@ test "rollbackMigrations: a lone `up` migration is refused up front, changing no
     try runMigrations(a, std.testing.io, &d, &migs);
 
     const outcome = try rollbackMigrations(a, std.testing.io, &d, &migs, 1);
+    defer outcome.deinit(a);
     try std.testing.expect(outcome == .irreversible);
     try std.testing.expectEqualStrings("0001_only_up", outcome.irreversible.id);
     // Pre-flight refusal: nothing was reversed before the offender.
@@ -2248,9 +2354,7 @@ test "rollbackMigrations: a `change` reversing into raw() is refused; its tx und
     var d = try db.Db.openMemory();
     defer d.close();
     try migrations.run(&d);
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
 
     // Forward: create a table, then a raw statement. Reverse re-runs the change inverted — it drops
     // the table (partial) then hits raw(), which has no inverse → the tx must restore the table.
@@ -2264,6 +2368,7 @@ test "rollbackMigrations: a `change` reversing into raw() is refused; its tx und
     try runMigrations(a, std.testing.io, &d, &migs);
 
     const outcome = try rollbackMigrations(a, std.testing.io, &d, &migs, 1);
+    defer outcome.deinit(a);
     try std.testing.expect(outcome == .irreversible);
     try std.testing.expectEqualStrings("0001_mixed", outcome.irreversible.id);
     // The offender is the only (and newest) migration, so nothing was reversed before it.
@@ -2277,9 +2382,7 @@ test "rollbackMigrations: an orphaned ledger row is refused and its row left int
     var d = try db.Db.openMemory();
     defer d.close();
     try migrations.run(&d);
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
 
     const M = struct {
         fn change(m: *Migrator) anyerror!void {
@@ -2290,6 +2393,7 @@ test "rollbackMigrations: an orphaned ledger row is refused and its row left int
     try runMigrations(a, std.testing.io, &d, &[_]Migration{.{ .id = "0001_gone", .change = M.change }});
     const now_declared = [_]Migration{}; // the migration was deleted from source
     const outcome = try rollbackMigrations(a, std.testing.io, &d, &now_declared, 1);
+    defer outcome.deinit(a);
     try std.testing.expect(outcome == .orphaned);
     try std.testing.expectEqualStrings("0001_gone", outcome.orphaned.id);
     // Orphan is a pre-flight refusal: nothing was reversed.
@@ -2302,9 +2406,7 @@ test "rollbackMigrations: a mid-batch irreversible commits the newer reversal, r
     var d = try db.Db.openMemory();
     defer d.close();
     try migrations.run(&d);
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
 
     // Three migrations. The NEWEST (0003) reverses cleanly (createTable → dropTable). An OLDER one
     // (0002) reverses into raw() — irreversible, only knowable by running. `rollback 3` must:
@@ -2332,6 +2434,7 @@ test "rollbackMigrations: a mid-batch irreversible commits the newer reversal, r
     try runMigrations(a, std.testing.io, &d, &migs);
 
     const outcome = try rollbackMigrations(a, std.testing.io, &d, &migs, 3);
+    defer outcome.deinit(a);
     try std.testing.expect(outcome == .irreversible);
     try std.testing.expectEqualStrings("0002_two", outcome.irreversible.id);
     // The newest was reversed+committed BEFORE the offender — and it is reported.
@@ -2351,9 +2454,7 @@ test "rollbackMigrations: system migrations are never touched" {
     var d = try db.Db.openMemory();
     defer d.close();
     try migrations.run(&d);
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
 
     // Count system (non-prov) ledger rows before.
     var count_st = try d.prepare("SELECT count(*) FROM \"_migrations\" WHERE \"name\" NOT LIKE 'prov:%';");
@@ -2372,6 +2473,7 @@ test "rollbackMigrations: system migrations are never touched" {
 
     // Rolling back "everything" (huge N) reverses only the consumer migration.
     const outcome = try rollbackMigrations(a, std.testing.io, &d, &migs, 1000);
+    defer outcome.deinit(a);
     try std.testing.expect(outcome == .ok);
     try std.testing.expectEqual(@as(usize, 1), outcome.ok.len);
 
@@ -2387,10 +2489,9 @@ test "rollbackMigrations: nothing applied rolls back nothing (empty ok)" {
     var d = try db.Db.openMemory();
     defer d.close();
     try migrations.run(&d);
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const outcome = try rollbackMigrations(a, std.testing.io, &d, &[_]Migration{}, 1);
+    defer outcome.deinit(a);
     try std.testing.expect(outcome == .ok);
     try std.testing.expectEqual(@as(usize, 0), outcome.ok.len);
 }
@@ -2495,9 +2596,7 @@ test "buildCollection lowers .auth.oauth2 providers" {
 }
 
 test "injectOAuthSecrets sources clientId/secret from env and encrypts the secret" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
 
     const Getter = struct {
         fn get(_: @This(), key: []const u8) ?[]const u8 {
@@ -2516,18 +2615,27 @@ test "injectOAuthSecrets sources clientId/secret from env and encrypts the secre
     }};
 
     const out = try injectOAuthSecrets(a, std.testing.io, "app-secret-32-bytes-long-xxxxxxx", Getter{}, &cols);
-    const p = out[0].options.auth.oauth2.providers[0];
+    const np = out[0].options.auth.oauth2.providers;
+    // Only clientId/clientSecret were actually duped (sourced from env, then encrypted); name and
+    // redirectUrls remain borrowed from `provs`/the literal above — the outer `out`/`np` arrays are
+    // injectOAuthSecrets' own fresh allocations.
+    defer {
+        a.free(np[0].clientId);
+        a.free(np[0].clientSecret);
+        a.free(np);
+        a.free(out);
+    }
+    const p = np[0];
     try std.testing.expectEqualStrings("gid-123", p.clientId);
     try std.testing.expect(secrets.isEncrypted(p.clientSecret));
     // round-trips back to the raw env value
     const pt = try secrets.decryptSecret(a, "app-secret-32-bytes-long-xxxxxxx", p.clientSecret);
+    defer a.free(pt);
     try std.testing.expectEqualStrings("raw-secret", pt);
 }
 
 test "injectOAuthSecrets leaves providers untouched when env is absent" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const Getter = struct {
         fn get(_: @This(), _: []const u8) ?[]const u8 {
             return null;
@@ -2542,15 +2650,21 @@ test "injectOAuthSecrets leaves providers untouched when env is absent" {
         .options = .{ .auth = .{ .oauth2 = .{ .enabled = true, .providers = &provs } } },
     }};
     const out = try injectOAuthSecrets(a, std.testing.io, "app-secret", Getter{}, &cols);
-    const p = out[0].options.auth.oauth2.providers[0];
+    // Neither clientId nor clientSecret was ever set (env absent, no literal secret), so `np`
+    // holds only the "" defaults copied through from `provs` — nothing owned beyond the two
+    // fresh outer arrays injectOAuthSecrets itself allocated.
+    const np = out[0].options.auth.oauth2.providers;
+    defer {
+        a.free(np);
+        a.free(out);
+    }
+    const p = np[0];
     try std.testing.expectEqualStrings("", p.clientId);
     try std.testing.expectEqualStrings("", p.clientSecret);
 }
 
 test "injectOAuthSecrets encrypts a plaintext clientSecret baked into the literal (no env)" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const Getter = struct {
         fn get(_: @This(), _: []const u8) ?[]const u8 {
             return null;
@@ -2567,16 +2681,23 @@ test "injectOAuthSecrets encrypts a plaintext clientSecret baked into the litera
         .options = .{ .auth = .{ .oauth2 = .{ .enabled = true, .providers = &provs } } },
     }};
     const out = try injectOAuthSecrets(a, std.testing.io, "app-secret-32-bytes-long-xxxxxxx", Getter{}, &cols);
-    const p = out[0].options.auth.oauth2.providers[0];
+    // Only clientSecret ended up owned (the literal plaintext got encrypted in place); clientId
+    // stayed at its "" default (env absent) and name is borrowed from `provs`.
+    const np = out[0].options.auth.oauth2.providers;
+    defer {
+        a.free(np[0].clientSecret);
+        a.free(np);
+        a.free(out);
+    }
+    const p = np[0];
     try std.testing.expect(secrets.isEncrypted(p.clientSecret));
     const pt = try secrets.decryptSecret(a, "app-secret-32-bytes-long-xxxxxxx", p.clientSecret);
+    defer a.free(pt);
     try std.testing.expectEqualStrings("literal-secret", pt);
 }
 
 test "injectOAuthSecrets passes non-oauth collections through" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const Getter = struct {
         fn get(_: @This(), _: []const u8) ?[]const u8 {
             return null;
@@ -2602,12 +2723,17 @@ const DiscoveryStubTransport = struct {
     ,
 
     fn call(ctx: *anyopaque, alloc: std.mem.Allocator, method: oauth_client.Method, url: []const u8, headers: []const oauth_client.Header, req_body: ?[]const u8) oauth_client.TransportError!oauth_client.Response {
+        _ = alloc;
         _ = method;
         _ = url;
         _ = headers;
         _ = req_body;
         const self: *DiscoveryStubTransport = @ptrCast(@alignCast(ctx));
-        return .{ .status = self.status, .body = try alloc.dupe(u8, self.body) };
+        // Returned as-is (not duped): comptime/caller-owned string data, matching the Transport
+        // contract that `discovery.resolve` never frees `resp.body` itself (see its own comment)
+        // — mirrors `oauth/client.zig`'s StubTransport precedent. Duping here would leak (nothing
+        // downstream ever frees resp.body).
+        return .{ .status = self.status, .body = self.body };
     }
 
     fn transport(self: *DiscoveryStubTransport) oauth_client.Transport {
@@ -2616,9 +2742,7 @@ const DiscoveryStubTransport = struct {
 };
 
 test "resolveDiscoveryProviders fills endpoints for a discovery provider" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     var stub = DiscoveryStubTransport{};
     const provs = [_]schema.OAuth2Provider{.{ .name = "okta", .discoveryURL = "https://acme.okta.com/.well-known/openid-configuration" }};
     const cols = [_]schema.Collection{.{
@@ -2629,16 +2753,24 @@ test "resolveDiscoveryProviders fills endpoints for a discovery provider" {
         .options = .{ .auth = .{ .oauth2 = .{ .enabled = true, .providers = &provs } } },
     }};
     const out = try resolveDiscoveryProviders(a, stub.transport(), &cols);
-    const p = out[0].options.auth.oauth2.providers[0];
+    const np = out[0].options.auth.oauth2.providers;
+    // The one provider has a discoveryURL, so its authURL/tokenURL/userinfoURL are fresh owned
+    // dupes (parseDocument's contract — see discovery.zig); name/discoveryURL stay borrowed.
+    defer {
+        a.free(np[0].authURL.?);
+        a.free(np[0].tokenURL.?);
+        a.free(np[0].userinfoURL.?);
+        a.free(np);
+        a.free(out);
+    }
+    const p = np[0];
     try std.testing.expectEqualStrings("https://acme.okta.com/oauth2/v1/authorize", p.authURL.?);
     try std.testing.expectEqualStrings("https://acme.okta.com/oauth2/v1/token", p.tokenURL.?);
     try std.testing.expectEqualStrings("https://acme.okta.com/oauth2/v1/userinfo", p.userinfoURL.?);
 }
 
 test "resolveDiscoveryProviders propagates a discovery failure" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     var stub = DiscoveryStubTransport{ .status = 500, .body = "boom" };
     const provs = [_]schema.OAuth2Provider{.{ .name = "okta", .discoveryURL = "https://acme.okta.com/.well-known/openid-configuration" }};
     const cols = [_]schema.Collection{.{
@@ -2652,9 +2784,7 @@ test "resolveDiscoveryProviders propagates a discovery failure" {
 }
 
 test "resolveDiscoveryProviders returns the same slice when no provider uses discovery" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     var stub = DiscoveryStubTransport{};
     const provs = [_]schema.OAuth2Provider{.{ .name = "google" }};
     const cols = [_]schema.Collection{.{
