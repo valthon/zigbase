@@ -610,48 +610,54 @@ test "Data.create then findById round-trips a record" {
 }
 
 test "Data record methods round-trip create/findById/update/list/delete" {
-    // Functional coverage on an arena for all five record methods (the leak-clean GPA-path
-    // regression for these lives in events.zig, driven through a WriterData handle).
-    // Stays on an arena: the `d.list` call below drives the un-migrated `query/` subsystem
-    // (lexer/parser/compiler/sort/keyset/tenancy), which leaks its own SQL/sort/cursor scratch
-    // on a raw allocator (pre-existing; see `src/records.zig` allowlist entry / the `query/*`
-    // set in `scripts/allocator-allowlist.txt`).
+    // Functional coverage under the RAW leak detector for all five record methods. Each Data
+    // method reloads + frees its own collection internally; the returned records are
+    // SELF-CONTAINED (freed via records.freeRecord) and `d.list` returns a ListResult that owns
+    // its interned keyset (freed via ListResult.deinit) — scalar-only collection (text + int),
+    // so no json/multi sub-tree escapes.
     var conn = try db.Db.openMemory();
     defer conn.close();
     try conn.exec("PRAGMA foreign_keys=ON;");
     try migrations.run(&conn);
 
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const io = std.testing.io;
 
     const fields = [_]schema.Field{
         .{ .id = "f1", .name = "title", .required = true, .options = .{ .text = .{} } },
         .{ .id = "f2", .name = "qty", .options = .{ .number = .{ .mode = .int } } },
     };
-    _ = try collections.create(a, io, &conn, .{ .id = "", .name = "posts", .fields = &fields });
+    // The provisioning create() returns a fully-owned collection; the Data methods below
+    // reload their own copy, so free this one explicitly.
+    const col = try collections.create(a, io, &conn, .{ .id = "", .name = "posts", .fields = &fields });
+    defer col.deinit(a);
 
     var app = App{ .allocator = a, .io = io, .pool = undefined };
     const d = Data{ .app = &app, .conn = &conn, .io = io, .alloc = a };
 
     var input: std.json.ObjectMap = .empty;
+    defer input.deinit(a);
     try input.put(a, "title", .{ .string = "hello" });
     try input.put(a, "qty", .{ .integer = 7 });
     const created = try d.create("posts", .{ .object = input });
+    defer records.freeRecord(a, created);
     try std.testing.expectEqualStrings("hello", created.object.get("title").?.string);
     const id = created.object.get("id").?.string;
 
     const found = (try d.findById("posts", id)).?;
+    defer records.freeRecord(a, found);
     try std.testing.expectEqualStrings("hello", found.object.get("title").?.string);
 
     var patch: std.json.ObjectMap = .empty;
+    defer patch.deinit(a);
     try patch.put(a, "qty", .{ .integer = 99 });
     const updated = (try d.update("posts", id, .{ .object = patch })).?;
+    defer records.freeRecord(a, updated);
     try std.testing.expectEqualStrings("99", updated.object.get("qty").?.string); // int mode → string
     try std.testing.expectEqualStrings("hello", updated.object.get("title").?.string); // untouched
 
-    const res = try d.list("posts", .{});
+    var res = try d.list("posts", .{});
+    defer res.deinit(a);
     try std.testing.expectEqual(@as(usize, 1), res.items.len);
     try std.testing.expectEqualStrings("hello", res.items[0].object.get("title").?.string);
 

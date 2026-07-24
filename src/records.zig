@@ -1033,16 +1033,20 @@ test "isPlausibleRecordId gate" {
 test "list tenant scoping: only the active account's rows; superuser sees all; off = unchanged" {
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     try migrations.run(&d);
     const fields = [_]schema.Field{
         .{ .id = "f1", .name = "title", .options = .{ .text = .{} } },
         .{ .id = "f2", .name = "account", .options = .{ .text = .{} } },
     };
-    var col = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "posts", .fields = &fields });
-    col.options.tenant_field = "account"; // make it tenant-owned
+    // `col` is the fully-owned create() reload (tenant_field == null); free it once. The
+    // mutation below assigns a string LITERAL, so run list() against a SHALLOW COPY whose
+    // literal tenant_field is never handed to Collection.deinit (it shares field pointers
+    // with `col`, freed exactly once via `col.deinit`).
+    const col = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "posts", .fields = &fields });
+    defer col.deinit(a);
+    var tcol = col;
+    tcol.options.tenant_field = "account"; // make it tenant-owned
     try d.exec("INSERT INTO posts (id,created,updated,title,account) VALUES " ++
         "('r1','2026-01-01T00:00:00Z','t','a','acc1')," ++
         "('r2','2026-01-02T00:00:00Z','t','b','acc1')," ++
@@ -1050,27 +1054,32 @@ test "list tenant scoping: only the active account's rows; superuser sees all; o
 
     // Active account acc1 -> only its 2 rows.
     const member = request.RequestContext{ .tenancy_enabled = true, .account_id = "acc1" };
-    const r1 = try list(a, &d, col, .{ .rctx = &member });
+    var r1 = try list(a, &d, tcol, .{ .rctx = &member });
+    defer r1.deinit(a);
     try std.testing.expectEqual(@as(?i64, 2), r1.totalItems);
     for (r1.items) |it| try std.testing.expectEqualStrings("acc1", it.object.get("account").?.string);
 
     // No account context (empty) -> no rows (fail closed).
     const noacct = request.RequestContext{ .tenancy_enabled = true, .account_id = "" };
-    const r2 = try list(a, &d, col, .{ .rctx = &noacct });
+    var r2 = try list(a, &d, tcol, .{ .rctx = &noacct });
+    defer r2.deinit(a);
     try std.testing.expectEqual(@as(?i64, 0), r2.totalItems);
 
     // Superuser bypasses scoping -> all 3 rows.
     const su = request.RequestContext{ .tenancy_enabled = true, .is_superuser = true, .account_id = "acc1" };
-    const r3 = try list(a, &d, col, .{ .rctx = &su });
+    var r3 = try list(a, &d, tcol, .{ .rctx = &su });
+    defer r3.deinit(a);
     try std.testing.expectEqual(@as(?i64, 3), r3.totalItems);
 
     // Tenancy OFF -> all 3 rows (byte-identical to pre-tenancy, even though tenant_field is set).
     const off = request.RequestContext{ .tenancy_enabled = false, .account_id = "acc1" };
-    const r4 = try list(a, &d, col, .{ .rctx = &off });
+    var r4 = try list(a, &d, tcol, .{ .rctx = &off });
+    defer r4.deinit(a);
     try std.testing.expectEqual(@as(?i64, 3), r4.totalItems);
 
     // The tenant predicate composes with a user filter (still scoped to acc1).
-    const r5 = try list(a, &d, col, .{ .rctx = &member, .filter = "title = \"a\"" });
+    var r5 = try list(a, &d, tcol, .{ .rctx = &member, .filter = "title = \"a\"" });
+    defer r5.deinit(a);
     try std.testing.expectEqual(@as(?i64, 1), r5.totalItems);
     try std.testing.expectEqualStrings("r1", r5.items[0].object.get("id").?.string);
 }
@@ -1555,25 +1564,27 @@ test "update rejects an over-precise fixed value and leaves the row unchanged" {
 test "list clamps pagination bounds" {
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const col = try seedPosts(&d, a);
+    defer col.deinit(a);
     try d.exec("INSERT INTO posts (id,created,updated,title,price) VALUES ('r1','t','t','a',1),('r2','t','t','b',2);");
 
     // perPage=0 -> default 30.
     {
-        const res = try list(a, &d, col, .{ .perPage = 0 });
+        var res = try list(a, &d, col, .{ .perPage = 0 });
+        defer res.deinit(a);
         try std.testing.expectEqual(@as(u32, 30), res.perPage);
     }
     // perPage above the cap is clamped to 500.
     {
-        const res = try list(a, &d, col, .{ .perPage = 1000 });
+        var res = try list(a, &d, col, .{ .perPage = 1000 });
+        defer res.deinit(a);
         try std.testing.expectEqual(@as(u32, 500), res.perPage);
     }
     // page=0 -> normalized to 1.
     {
-        const res = try list(a, &d, col, .{ .page = 0 });
+        var res = try list(a, &d, col, .{ .page = 0 });
+        defer res.deinit(a);
         try std.testing.expectEqual(@as(u32, 1), res.page);
     }
 }
@@ -1581,17 +1592,17 @@ test "list clamps pagination bounds" {
 test "list: filter_args with an empty/absent filter is a loud BadFilter (never silently ignored)" {
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const col = try seedPosts(&d, a);
+    defer col.deinit(a);
 
     // filter == null but args supplied -> 0 placeholders vs 1 arg is a mismatch.
     try std.testing.expectError(error.BadFilter, list(a, &d, col, .{ .filter_args = &.{.{ .string = "x" }} }));
     // filter == "" (empty) but args supplied -> same mismatch.
     try std.testing.expectError(error.BadFilter, list(a, &d, col, .{ .filter = "", .filter_args = &.{.{ .string = "x" }} }));
     // Sanity: empty filter with NO args stays a clean full list (the guard only fires on args).
-    _ = try list(a, &d, col, .{ .filter = "" });
+    var res = try list(a, &d, col, .{ .filter = "" });
+    defer res.deinit(a);
 }
 
 test "delete removes the row; 404 on missing" {
@@ -1925,9 +1936,7 @@ test "ttl read-exclusion: get returns null for expired, row for future+null, non
 test "ttl read-exclusion: list excludes expired, includes future+null, non-ttl unaffected" {
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     try migrations.run(&d);
 
     const sfields = [_]schema.Field{
@@ -1935,6 +1944,7 @@ test "ttl read-exclusion: list excludes expired, includes future+null, non-ttl u
         .{ .id = "f2", .name = "expires_at", .options = .{ .date = .{} } },
     };
     const col = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "sessions", .fields = &sfields, .options = .{ .ttl_field = "expires_at" } });
+    defer col.deinit(a);
 
     try d.exec("INSERT INTO sessions (id,created,updated,token,expires_at) VALUES ('past','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','a','2000-01-01T00:00:00Z');");
     try d.exec("INSERT INTO sessions (id,created,updated,token,expires_at) VALUES ('future','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','b','2999-01-01T00:00:00Z');");
@@ -1942,10 +1952,12 @@ test "ttl read-exclusion: list excludes expired, includes future+null, non-ttl u
 
     const pfields = [_]schema.Field{.{ .id = "f3", .name = "title", .options = .{ .text = .{} } }};
     const pcol = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "posts", .fields = &pfields });
+    defer pcol.deinit(a);
     try d.exec("INSERT INTO posts (id,created,updated,title) VALUES ('p1','2000-01-01T00:00:00Z','2000-01-01T00:00:00Z','keep');");
 
     // list: only 2 of the 3 session rows are returned (future + null; past is hidden).
-    const r = try list(a, &d, col, .{});
+    var r = try list(a, &d, col, .{});
+    defer r.deinit(a);
     try std.testing.expectEqual(@as(?i64, 2), r.totalItems);
     try std.testing.expectEqual(@as(usize, 2), r.items.len);
 
@@ -1963,16 +1975,15 @@ test "ttl read-exclusion: list excludes expired, includes future+null, non-ttl u
     try std.testing.expect(saw_never);
 
     // list: non-ttl collection returns all rows unaffected.
-    const pr = try list(a, &d, pcol, .{});
+    var pr = try list(a, &d, pcol, .{});
+    defer pr.deinit(a);
     try std.testing.expectEqual(@as(?i64, 1), pr.totalItems);
 }
 
 test "ttl read-exclusion: composes with user filter (both predicates ANDed)" {
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     try migrations.run(&d);
 
     const sfields = [_]schema.Field{
@@ -1980,13 +1991,15 @@ test "ttl read-exclusion: composes with user filter (both predicates ANDed)" {
         .{ .id = "f2", .name = "expires_at", .options = .{ .date = .{} } },
     };
     const col = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "sessions", .fields = &sfields, .options = .{ .ttl_field = "expires_at" } });
+    defer col.deinit(a);
 
     try d.exec("INSERT INTO sessions (id,created,updated,token,expires_at) VALUES ('past_a','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','tokenA','2000-01-01T00:00:00Z');");
     try d.exec("INSERT INTO sessions (id,created,updated,token,expires_at) VALUES ('future_a','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','tokenA','2999-01-01T00:00:00Z');");
     try d.exec("INSERT INTO sessions (id,created,updated,token,expires_at) VALUES ('future_b','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','tokenB','2999-01-01T00:00:00Z');");
 
     // filter=token='tokenA' should match 2 rows (past_a + future_a), but TTL hides past_a.
-    const r = try list(a, &d, col, .{ .filter = "token='tokenA'" });
+    var r = try list(a, &d, col, .{ .filter = "token='tokenA'" });
+    defer r.deinit(a);
     try std.testing.expectEqual(@as(?i64, 1), r.totalItems);
     try std.testing.expectEqual(@as(usize, 1), r.items.len);
     const id_val = r.items[0].object.get("id") orelse return error.MissingId;
@@ -1999,9 +2012,7 @@ test "ttl read-exclusion: instant comparison not lexical (offset/space/date-only
     // would wrongly hide this row. strftime normalises both sides so it is kept.
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     try migrations.run(&d);
 
     const fields = [_]schema.Field{
@@ -2009,6 +2020,7 @@ test "ttl read-exclusion: instant comparison not lexical (offset/space/date-only
         .{ .id = "f2", .name = "expires_at", .options = .{ .date = .{} } },
     };
     const col = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "tokens", .fields = &fields, .options = .{ .ttl_field = "expires_at" } });
+    defer col.deinit(a);
 
     // KEPT — future instant whose literal sorts BEFORE canonical now (negative offset).
     try d.exec("INSERT INTO tokens (id,created,updated,label,expires_at) VALUES ('future_neg','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','a', strftime('%Y-%m-%dT%H:%M:%S','now','-1 minute') || '-05:00');");
@@ -2020,14 +2032,19 @@ test "ttl read-exclusion: instant comparison not lexical (offset/space/date-only
     try d.exec("INSERT INTO tokens (id,created,updated,label,expires_at) VALUES ('past_offset','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','d','2000-01-01T00:00:00+05:00');");
     try d.exec("INSERT INTO tokens (id,created,updated,label,expires_at) VALUES ('past_space','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','e','2000-01-01 00:00:00');");
 
-    const r = try list(a, &d, col, .{});
+    var r = try list(a, &d, col, .{});
+    defer r.deinit(a);
     // 3 kept (future_neg, future_z, garbage) + 2 hidden (past_offset, past_space).
     try std.testing.expectEqual(@as(?i64, 3), r.totalItems);
 
     // Also verify get: future_neg must be returned; past_offset must not.
-    try std.testing.expect(null != try get(a, &d, col, "future_neg"));
+    const got_neg = try get(a, &d, col, "future_neg");
+    try std.testing.expect(null != got_neg);
+    if (got_neg) |g| freeRecord(a, g);
     try std.testing.expect(null == try get(a, &d, col, "past_offset"));
-    try std.testing.expect(null != try get(a, &d, col, "garbage")); // unparseable → kept
+    const got_garbage = try get(a, &d, col, "garbage"); // unparseable → kept
+    try std.testing.expect(null != got_garbage);
+    if (got_garbage) |g| freeRecord(a, g);
 }
 
 test "gcExpiredRecords deletes past rows, keeps future rows, ignores non-ttl collections" {
@@ -2310,8 +2327,21 @@ test "encrypted field with no cipher fails closed (never plaintext)" {
 pub fn list(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, q: ListQuery) !ListResult {
     if (q.filter) |fstr| if (fstr.len > max_filter_len) return error.BadFilter;
     if (q.sort) |sstr| if (sstr.len > max_filter_len) return error.BadSort;
+    // Self-freeing (contract 1): the entire SQL-compilation graph — the joiner, the FTS/vector
+    // predicates, the lexed/parsed/compiled filter+rule, the ability/tenant/ttl clauses, the sort
+    // terms, the keyset decode/build, the assembled page/count SQL and prepared-statement scratch —
+    // is consumed to prepare and run the statement and NEVER escapes the result. Build it all on a
+    // function-local arena the function frees. Only the values that OUTLIVE the call stay on
+    // `alloc`: the interned `keys`, the row `items` (via rowToObject), and the minted next/prev
+    // cursors (duped onto `alloc` from their sa-built tokens). This makes `list` leak-correct under
+    // ANY allocator (a general-purpose allocator, the test leak detector) rather than relying on the
+    // caller passing an arena. (When `alloc` is itself an arena — every production caller — the
+    // scratch lives and dies with that arena as before; the deinit frees no capacity back into it.)
+    var scratch = std.heap.ArenaAllocator.init(alloc);
+    defer scratch.deinit();
+    const sa = scratch.allocator();
     const dialect = db.dbDialect(conn);
-    var j = joiner.Joiner.init(alloc, conn, col);
+    var j = joiner.Joiner.init(sa, conn, col);
     var where_sql: []const u8 = "";
     var params: []const compiler.Param = &.{};
 
@@ -2328,12 +2358,12 @@ pub fn list(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, q: L
         const trimmed = std.mem.trim(u8, sterm, " \t\r\n");
         if (trimmed.len > 0) {
             if (!fts.isSearchable(col)) return error.NotSearchable;
-            if (try fts.build(alloc, dialect, col, sterm)) |s| {
+            if (try fts.build(sa, dialect, col, sterm)) |s| {
                 // Postgres' tsvector lives on the base table → no JOIN (empty join_sql); SQLite's
                 // FTS5 shadow table needs one. Only append a non-empty join.
-                if (s.join_sql.len > 0) try j.joins.append(alloc, s.join_sql);
+                if (s.join_sql.len > 0) try j.joins.append(sa, s.join_sql);
                 where_sql = s.where_sql;
-                const p = try alloc.alloc(compiler.Param, 1);
+                const p = try sa.alloc(compiler.Param, 1);
                 p[0] = s.param;
                 params = p;
                 search_order = s.order_sql;
@@ -2361,10 +2391,10 @@ pub fn list(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, q: L
     if (q.vectorSpec) |vspec| if (vspec.len > 0) {
         // `vector.build` carries the explicit `error.VectorDisabled` in a default build, so the
         // handler's error mapping stays well-typed regardless of the `-Dvector` flag.
-        const v = try vector.build(alloc, dialect, col, vspec);
+        const v = try vector.build(sa, dialect, col, vspec);
         if (q.cursor != null or q.cursorMode) return error.VectorCursorUnsupported;
         where_sql = if (where_sql.len > 0)
-            try std.fmt.allocPrint(alloc, "({s}) AND ({s})", .{ where_sql, v.where_sql })
+            try std.fmt.allocPrint(sa, "({s}) AND ({s})", .{ where_sql, v.where_sql })
         else
             v.where_sql;
         vector_order = v.order_sql;
@@ -2379,20 +2409,20 @@ pub fn list(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, q: L
     if ((q.filter == null or q.filter.?.len == 0) and q.filter_args.len > 0) return error.BadFilter;
 
     if (q.filter) |fstr| if (fstr.len > 0) {
-        const toks = try lexer.lex(alloc, fstr);
-        const ast = try parser.parse(alloc, toks);
-        const compiled = try compiler.compile(alloc, &j, ast, null, dialect, q.filter_args);
+        const toks = try lexer.lex(sa, fstr);
+        const ast = try parser.parse(sa, toks);
+        const compiled = try compiler.compile(sa, &j, ast, null, dialect, q.filter_args);
         // AND-compose onto any prior clause (the FTS `MATCH` / vector predicate set above) and
         // APPEND params — never assign, which would clobber the search predicate AND drop its bound
         // term, so `?search=X&filter=Y` would silently ignore the search. Mirrors the rule block.
         where_sql = if (where_sql.len > 0)
-            try std.fmt.allocPrint(alloc, "({s}) AND ({s})", .{ where_sql, compiled.where_sql })
+            try std.fmt.allocPrint(sa, "({s}) AND ({s})", .{ where_sql, compiled.where_sql })
         else
             compiled.where_sql;
         var merged: std.ArrayList(compiler.Param) = .empty;
-        try merged.appendSlice(alloc, params);
-        try merged.appendSlice(alloc, compiled.params);
-        params = try merged.toOwnedSlice(alloc);
+        try merged.appendSlice(sa, params);
+        try merged.appendSlice(sa, compiled.params);
+        params = try merged.toOwnedSlice(sa);
     };
     if (q.rule) |rstr| if (rstr.len > 0) {
         // The list rule is operator-authored and trusted: permit references to hidden fields (a
@@ -2400,18 +2430,18 @@ pub fn list(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, q: L
         // sort below still rejects a hidden sort key.
         j.allow_hidden = true;
         defer j.allow_hidden = false;
-        const rtoks = try lexer.lex(alloc, rstr);
-        const rast = try parser.parse(alloc, rtoks);
-        const rc = try compiler.compile(alloc, &j, rast, q.rctx, dialect, &.{});
+        const rtoks = try lexer.lex(sa, rstr);
+        const rast = try parser.parse(sa, rtoks);
+        const rc = try compiler.compile(sa, &j, rast, q.rctx, dialect, &.{});
         if (where_sql.len > 0) {
-            where_sql = try std.fmt.allocPrint(alloc, "({s}) AND ({s})", .{ where_sql, rc.where_sql });
+            where_sql = try std.fmt.allocPrint(sa, "({s}) AND ({s})", .{ where_sql, rc.where_sql });
         } else {
             where_sql = rc.where_sql;
         }
         var merged: std.ArrayList(compiler.Param) = .empty;
-        try merged.appendSlice(alloc, params);
-        try merged.appendSlice(alloc, rc.params);
-        params = try merged.toOwnedSlice(alloc);
+        try merged.appendSlice(sa, params);
+        try merged.appendSlice(sa, rc.params);
+        params = try merged.toOwnedSlice(sa);
     };
 
     // Ability scoping (#155): AND the lowered `"<col>"."<via>" IN (?,…)` view-ability predicate so a
@@ -2423,16 +2453,15 @@ pub fn list(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, q: L
     // SQL. Identifiers are gated in `abilityPredicate`; account-ids are bound.
     if (q.rctx) |rctx| {
         const view_ability = if (col.options.abilities) |ab| ab.view else null;
-        if (try abilities.abilityPredicate(alloc, col, view_ability, rctx, dialect)) |ap| {
+        if (try abilities.abilityPredicate(sa, col, view_ability, rctx, dialect)) |ap| {
             where_sql = if (where_sql.len > 0)
-                try std.fmt.allocPrint(alloc, "({s}) AND ({s})", .{ where_sql, ap.sql })
+                try std.fmt.allocPrint(sa, "({s}) AND ({s})", .{ where_sql, ap.sql })
             else
                 ap.sql;
             var merged: std.ArrayList(compiler.Param) = .empty;
-            defer merged.deinit(alloc);
-            try merged.appendSlice(alloc, params);
-            try merged.appendSlice(alloc, ap.params);
-            params = try merged.toOwnedSlice(alloc);
+            try merged.appendSlice(sa, params);
+            try merged.appendSlice(sa, ap.params);
+            params = try merged.toOwnedSlice(sa);
         }
     }
 
@@ -2448,10 +2477,10 @@ pub fn list(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, q: L
     // Security: both col.name and tf validated through isValidIdentifier (GC pattern).
     if (col.options.ttl_field) |tf| {
         if (schema.isValidIdentifier(col.name) and schema.isValidIdentifier(tf)) {
-            const qtf = try std.fmt.allocPrint(alloc, "\"{s}\".\"{s}\"", .{ col.name, tf });
-            const ttl_pred = try dialect.ttlVisiblePredicate(alloc, qtf);
+            const qtf = try std.fmt.allocPrint(sa, "\"{s}\".\"{s}\"", .{ col.name, tf });
+            const ttl_pred = try dialect.ttlVisiblePredicate(sa, qtf);
             where_sql = if (where_sql.len > 0)
-                try std.fmt.allocPrint(alloc, "({s}) AND ({s})", .{ where_sql, ttl_pred })
+                try std.fmt.allocPrint(sa, "({s}) AND ({s})", .{ where_sql, ttl_pred })
             else
                 ttl_pred;
         }
@@ -2462,44 +2491,43 @@ pub fn list(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, q: L
     // is appended LAST (after filter+rule params); the TTL block above binds no params, so the
     // trailing `?` here is the last placeholder in `where_sql` and therefore the last param. Null
     // (no tenancy / not tenant-owned / superuser) is a no-op → byte-identical to the prior SQL.
-    if (q.rctx) |rctx| if (try tenancy.scopePredicate(alloc, col, rctx)) |sp| {
+    if (q.rctx) |rctx| if (try tenancy.scopePredicate(sa, col, rctx)) |sp| {
         where_sql = if (where_sql.len > 0)
-            try std.fmt.allocPrint(alloc, "({s}) AND ({s})", .{ where_sql, sp.sql })
+            try std.fmt.allocPrint(sa, "({s}) AND ({s})", .{ where_sql, sp.sql })
         else
             sp.sql;
         var merged: std.ArrayList(compiler.Param) = .empty;
-        defer merged.deinit(alloc); // no-op after toOwnedSlice (success); frees on an OOM error path
-        try merged.appendSlice(alloc, params);
-        try merged.append(alloc, sp.param);
-        params = try merged.toOwnedSlice(alloc);
+        try merged.appendSlice(sa, params);
+        try merged.append(sa, sp.param);
+        params = try merged.toOwnedSlice(sa);
     };
 
     // Resolve the client sort into structured terms. Cursor mode appends an `id` tiebreaker so the
     // order is strictly total (keyset requires it); OFFSET mode keeps its historical ORDER BY
     // (client sort or the default `created DESC`) UNCHANGED so existing offset clients are byte-
     // identical.
-    const base_terms = if (q.sort) |sstr| (if (sstr.len > 0) try sort.compileTerms(alloc, &j, sstr) else &.{}) else &.{};
+    const base_terms = if (q.sort) |sstr| (if (sstr.len > 0) try sort.compileTerms(sa, &j, sstr) else &.{}) else &.{};
     var offset_order_sql: []const u8 = if (base_terms.len > 0)
-        try sort.orderByFromTerms(alloc, base_terms, dialect)
+        try sort.orderByFromTerms(sa, base_terms, dialect)
     else
-        try std.fmt.allocPrint(alloc, "\"{s}\".\"created\" DESC{s}", .{ col.name, dialect.nullsOrder(.desc) });
+        try std.fmt.allocPrint(sa, "\"{s}\".\"created\" DESC{s}", .{ col.name, dialect.nullsOrder(.desc) });
     // Search/vector relevance leads the OFFSET ordering: bm25 `rank` (FTS) and/or nearest-neighbor
     // distance (vector), with any client sort kept as the tiebreaker. Cursor mode keeps the keyset
     // order (the MATCH/where predicate still scopes the page; vector cursors are rejected above).
     if (search_order) |so|
-        offset_order_sql = if (base_terms.len > 0) try std.fmt.allocPrint(alloc, "{s}, {s}", .{ so, offset_order_sql }) else so;
+        offset_order_sql = if (base_terms.len > 0) try std.fmt.allocPrint(sa, "{s}, {s}", .{ so, offset_order_sql }) else so;
     if (vector_order) |vo|
-        offset_order_sql = if (base_terms.len > 0 or search_order != null) try std.fmt.allocPrint(alloc, "{s}, {s}", .{ vo, offset_order_sql }) else vo;
-    const eff_terms = try effectiveSortTerms(alloc, col, base_terms);
-    const order_sql = try sort.orderByFromTerms(alloc, eff_terms, dialect);
+        offset_order_sql = if (base_terms.len > 0 or search_order != null) try std.fmt.allocPrint(sa, "{s}, {s}", .{ vo, offset_order_sql }) else vo;
+    const eff_terms = try effectiveSortTerms(sa, col, base_terms);
+    const order_sql = try sort.orderByFromTerms(sa, eff_terms, dialect);
 
     var joins_sql: std.ArrayList(u8) = .empty;
     for (j.joins.items) |jn| {
-        try joins_sql.append(alloc, ' ');
-        try joins_sql.appendSlice(alloc, jn);
+        try joins_sql.append(sa, ' ');
+        try joins_sql.appendSlice(sa, jn);
     }
-    const where_clause = if (where_sql.len > 0) try std.fmt.allocPrint(alloc, " WHERE {s}", .{where_sql}) else "";
-    const bcols = try baseColumnList(alloc, col);
+    const where_clause = if (where_sql.len > 0) try std.fmt.allocPrint(sa, " WHERE {s}", .{where_sql}) else "";
+    const bcols = try baseColumnList(sa, col);
     const per: u32 = blk: {
         const requested = if ((q.cursor != null or q.cursorMode) and q.limit != null) q.limit.? else q.perPage;
         break :blk if (requested == 0) 30 else @min(requested, 500);
@@ -2524,7 +2552,7 @@ pub fn list(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, q: L
         try validateCursorSort(eff_terms);
         // The token binds to the PUBLIC effective-sort spec (e.g. "-created,id"), not the column
         // SQL — so an SDK that synthesizes the same spec produces a matching cursor.
-        const eff_sort_str = try effectiveSortString(alloc, eff_terms);
+        const eff_sort_str = try effectiveSortString(sa, eff_terms);
         // Fold the SANITIZED search term into the cursor hash so a token minted under `?search=X` is
         // rejected when replayed with a different search (else the boundary would straddle a
         // different result set). Vector + cursor is rejected earlier, so the vector spec can't reach
@@ -2532,7 +2560,10 @@ pub fn list(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, q: L
         const fh = keyset.filterHash(q.filter, q.rule, search_term_hash);
 
         // Decode the boundary cursor (if any). first_page = no token supplied.
-        const maybe_cur: ?keyset.Cursor = if (q.cursor) |token| try decodeCursor(alloc, q, conn, col, token, eff_sort_str, fh) else null;
+        // `decodeCursor` runs on the scratch arena: the decoded boundary keys are read below to
+        // build the keyset predicate and never outlive this call. (This also subsumes the keyset
+        // codec's own Parsed-discard scratch — reclaimed by `scratch.deinit` rather than leaked.)
+        const maybe_cur: ?keyset.Cursor = if (q.cursor) |token| try decodeCursor(sa, q, conn, col, token, eff_sort_str, fh) else null;
         if (maybe_cur) |cur| if (cur.keys.len != eff_terms.len) return error.BadCursor;
         const forward = if (maybe_cur) |cur| cur.forward else true;
 
@@ -2540,20 +2571,20 @@ pub fn list(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, q: L
         var win_where: []const u8 = where_clause;
         var ks_params: []const compiler.Param = &.{};
         if (maybe_cur) |cur| {
-            const ks = try keyset.build(alloc, eff_terms, cur.keys, forward, dialect);
+            const ks = try keyset.build(sa, eff_terms, cur.keys, forward, dialect);
             ks_params = ks.params;
             win_where = if (where_sql.len > 0)
-                try std.fmt.allocPrint(alloc, " WHERE ({s}) AND {s}", .{ where_sql, ks.where_sql })
+                try std.fmt.allocPrint(sa, " WHERE ({s}) AND {s}", .{ where_sql, ks.where_sql })
             else
-                try std.fmt.allocPrint(alloc, " WHERE {s}", .{ks.where_sql});
+                try std.fmt.allocPrint(sa, " WHERE {s}", .{ks.where_sql});
         }
 
         // Backward travel: reverse the ORDER BY so the DB returns the rows CLOSEST to the boundary
         // going backward; we re-reverse the page into forward order after fetch.
-        const fetch_order = if (forward) order_sql else try reversedOrderBy(alloc, eff_terms, dialect);
+        const fetch_order = if (forward) order_sql else try reversedOrderBy(sa, eff_terms, dialect);
 
-        const page_sql = try std.fmt.allocPrintSentinel(alloc, "SELECT {s} FROM \"{s}\"{s}{s} ORDER BY {s} LIMIT ?;", .{ bcols, col.name, joins_sql.items, win_where, fetch_order }, 0);
-        var pst = try prep(alloc, conn, page_sql);
+        const page_sql = try std.fmt.allocPrintSentinel(sa, "SELECT {s} FROM \"{s}\"{s}{s} ORDER BY {s} LIMIT ?;", .{ bcols, col.name, joins_sql.items, win_where, fetch_order }, 0);
+        var pst = try prep(sa, conn, page_sql);
         defer pst.finalize();
         var idx = try bindParams(&pst, params, 1);
         idx = try bindParams(&pst, ks_params, idx);
@@ -2600,15 +2631,25 @@ pub fn list(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, q: L
             has_prev = has_more;
             has_next = true;
         }
+        // The minted tokens ESCAPE into the ListResult, so they are duped onto `alloc`; `mintCursor`
+        // builds them (and its encode scratch) on the scratch arena, reclaimed on return.
         var next_cursor: ?[]const u8 = null;
+        errdefer if (next_cursor) |nc| alloc.free(nc);
         var prev_cursor: ?[]const u8 = null;
+        errdefer if (prev_cursor) |pc| alloc.free(pc);
         if (kept.len > 0) {
-            if (has_next) next_cursor = try mintCursor(alloc, q, conn, col, eff_terms, kept[kept.len - 1], true, eff_sort_str, fh);
-            if (has_prev) prev_cursor = try mintCursor(alloc, q, conn, col, eff_terms, kept[0], false, eff_sort_str, fh);
+            if (has_next) {
+                if (try mintCursor(sa, q, conn, col, eff_terms, kept[kept.len - 1], true, eff_sort_str, fh)) |tok|
+                    next_cursor = try alloc.dupe(u8, tok);
+            }
+            if (has_prev) {
+                if (try mintCursor(sa, q, conn, col, eff_terms, kept[0], false, eff_sort_str, fh)) |tok|
+                    prev_cursor = try alloc.dupe(u8, tok);
+            }
         }
 
         var total: ?i64 = null;
-        if (!q.skipTotal) total = try countTotal(alloc, conn, col, joins_sql.items, where_clause, params);
+        if (!q.skipTotal) total = try countTotal(sa, conn, col, joins_sql.items, where_clause, params);
 
         // Hand back an EXACT-length owned `items` slice (cursor mode fetched into an N+1-capacity
         // buffer and the probe row is already freed) so `ListResult.deinit` frees `items` cleanly
@@ -2632,11 +2673,11 @@ pub fn list(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, q: L
     }
 
     // ----- OFFSET MODE (unchanged wire behavior) -----
-    const total = try countTotal(alloc, conn, col, joins_sql.items, where_clause, params);
+    const total = try countTotal(sa, conn, col, joins_sql.items, where_clause, params);
     const page: u32 = if (q.page == 0) 1 else q.page;
     const offset: i64 = @as(i64, (page - 1)) * @as(i64, per);
-    const page_sql = try std.fmt.allocPrintSentinel(alloc, "SELECT {s} FROM \"{s}\"{s}{s} ORDER BY {s} LIMIT ? OFFSET ?;", .{ bcols, col.name, joins_sql.items, where_clause, offset_order_sql }, 0);
-    var pst = try prep(alloc, conn, page_sql);
+    const page_sql = try std.fmt.allocPrintSentinel(sa, "SELECT {s} FROM \"{s}\"{s}{s} ORDER BY {s} LIMIT ? OFFSET ?;", .{ bcols, col.name, joins_sql.items, where_clause, offset_order_sql }, 0);
+    var pst = try prep(sa, conn, page_sql);
     defer pst.finalize();
     var after = try bindParams(&pst, params, 1);
     // The relevance ORDER BY carries up to two `?`s, in the SAME textual order they were prepended
@@ -2711,12 +2752,12 @@ pub fn bindParams(st: *db.Stmt, params: []const compiler.Param, start: c_int) !c
 test "list filters, sorts, and paginates" {
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const col = try seedPosts(&d, a); // posts(title text, price fixed/2)
+    defer col.deinit(a);
     try d.exec("INSERT INTO posts (id,created,updated,title,price) VALUES ('r1','2026-01-01T00:00:00Z','t','aaa',100),('r2','2026-01-02T00:00:00Z','t','bbb',200),('r3','2026-01-03T00:00:00Z','t','ccc',300);");
-    const res = try list(a, &d, col, .{ .filter = "price >= 2.00", .sort = "-created", .page = 1, .perPage = 1 });
+    var res = try list(a, &d, col, .{ .filter = "price >= 2.00", .sort = "-created", .page = 1, .perPage = 1 });
+    defer res.deinit(a);
     try std.testing.expectEqual(@as(i64, 2), res.totalItems);
     try std.testing.expectEqual(@as(usize, 1), res.items.len);
     try std.testing.expectEqualStrings("r3", res.items[0].object.get("id").?.string);
@@ -2725,11 +2766,11 @@ test "list filters, sorts, and paginates" {
 test "list rejects an over-long filter (DoS cap) before lexing" {
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const col = try seedPosts(&d, a);
+    defer col.deinit(a);
     const big = try a.alloc(u8, max_filter_len + 1);
+    defer a.free(big);
     @memset(big, '(');
     try std.testing.expectError(error.BadFilter, list(a, &d, col, .{ .filter = big }));
 }
@@ -2737,12 +2778,12 @@ test "list rejects an over-long filter (DoS cap) before lexing" {
 test "list applies a rule clause AND-ed with the filter" {
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const col = try seedPosts(&d, a);
+    defer col.deinit(a);
     try d.exec("INSERT INTO posts (id,created,updated,title,price) VALUES ('r1','t','t','keep',100),('r2','t','t','drop',100);");
-    const res = try list(a, &d, col, .{ .rule = "title = \"keep\"" });
+    var res = try list(a, &d, col, .{ .rule = "title = \"keep\"" });
+    defer res.deinit(a);
     try std.testing.expectEqual(@as(i64, 1), res.totalItems);
     try std.testing.expectEqualStrings("r1", res.items[0].object.get("id").?.string);
 }
@@ -2761,25 +2802,41 @@ fn seedSeq(d: *db.Db, n: usize) !void {
 test "cursor: forward walk to exhaustion has no dup/skip and ends hasNext=false" {
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const col = try seedPosts(&d, a);
+    defer col.deinit(a);
     try seedSeq(&d, 7); // r001..r007, created ascending
-    // Sort created ASC so the natural sequence is r001..r007.
+    // Sort created ASC so the natural sequence is r001..r007. Keep every page's ListResult
+    // alive to the end of the test: `seen` and the walking `cursor` BORROW from each page's
+    // owned graph (item keysets / minted nextCursor), so all pages are freed together after
+    // the assertions below rather than per iteration (which would dangle those borrows).
+    var pages_results: std.ArrayList(ListResult) = .empty;
+    defer {
+        for (pages_results.items) |*pr| pr.deinit(a);
+        pages_results.deinit(a);
+    }
     var seen: std.ArrayList([]const u8) = .empty;
+    defer seen.deinit(a);
     var cursor: ?[]const u8 = null;
     var pages: usize = 0;
     while (true) {
-        const res = try list(a, &d, col, .{ .sort = "created", .perPage = 3, .limit = 3, .cursor = cursor, .cursorMode = true });
-        try std.testing.expectEqual(records_list_mode_cursor, res.mode);
-        for (res.items) |it| try seen.append(a, it.object.get("id").?.string);
+        var res = try list(a, &d, col, .{ .sort = "created", .perPage = 3, .limit = 3, .cursor = cursor, .cursorMode = true });
+        // Transfer ownership into `pages_results` (freed together at test end). On an append OOM,
+        // free `res` here — a plain `errdefer res.deinit(a)` would double-free once ownership has
+        // transferred and a later in-iteration `try` fails (the pages_results defer frees it too).
+        pages_results.append(a, res) catch |e| {
+            res.deinit(a);
+            return e;
+        };
+        const cur = &pages_results.items[pages_results.items.len - 1];
+        try std.testing.expectEqual(records_list_mode_cursor, cur.mode);
+        for (cur.items) |it| try seen.append(a, it.object.get("id").?.string);
         pages += 1;
-        if (!res.hasNext) {
-            try std.testing.expect(res.nextCursor == null);
+        if (!cur.hasNext) {
+            try std.testing.expect(cur.nextCursor == null);
             break;
         }
-        cursor = res.nextCursor.?;
+        cursor = cur.nextCursor.?;
         try std.testing.expect(pages < 10); // guard against an infinite loop
     }
     try std.testing.expectEqual(@as(usize, 7), seen.items.len);
@@ -2796,22 +2853,24 @@ const records_list_mode_cursor: ListMode = .cursor;
 test "cursor: forward then prevCursor returns the prior window in forward order" {
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const col = try seedPosts(&d, a);
+    defer col.deinit(a);
     try seedSeq(&d, 6); // r001..r006
     // page 1 (r001,r002), page 2 (r003,r004)
-    const p1 = try list(a, &d, col, .{ .sort = "created", .limit = 2, .cursor = null, .cursorMode = true });
+    var p1 = try list(a, &d, col, .{ .sort = "created", .limit = 2, .cursor = null, .cursorMode = true });
+    defer p1.deinit(a);
     try std.testing.expectEqualStrings("r001", p1.items[0].object.get("id").?.string);
     try std.testing.expectEqualStrings("r002", p1.items[1].object.get("id").?.string);
     try std.testing.expect(p1.hasNext);
-    const p2 = try list(a, &d, col, .{ .sort = "created", .limit = 2, .cursor = p1.nextCursor.? });
+    var p2 = try list(a, &d, col, .{ .sort = "created", .limit = 2, .cursor = p1.nextCursor.? });
+    defer p2.deinit(a);
     try std.testing.expectEqualStrings("r003", p2.items[0].object.get("id").?.string);
     try std.testing.expectEqualStrings("r004", p2.items[1].object.get("id").?.string);
     try std.testing.expect(p2.hasPrev);
     // Walk back from page 2: should reproduce page 1 in forward order.
-    const back = try list(a, &d, col, .{ .sort = "created", .limit = 2, .cursor = p2.prevCursor.? });
+    var back = try list(a, &d, col, .{ .sort = "created", .limit = 2, .cursor = p2.prevCursor.? });
+    defer back.deinit(a);
     try std.testing.expectEqual(@as(usize, 2), back.items.len);
     try std.testing.expectEqualStrings("r001", back.items[0].object.get("id").?.string);
     try std.testing.expectEqualStrings("r002", back.items[1].object.get("id").?.string);
@@ -2820,16 +2879,17 @@ test "cursor: forward then prevCursor returns the prior window in forward order"
 test "cursor: a deleted boundary row still paginates correctly (no skip)" {
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const col = try seedPosts(&d, a);
+    defer col.deinit(a);
     try seedSeq(&d, 5); // r001..r005
-    const p1 = try list(a, &d, col, .{ .sort = "created", .limit = 2, .cursor = null, .cursorMode = true });
+    var p1 = try list(a, &d, col, .{ .sort = "created", .limit = 2, .cursor = null, .cursorMode = true });
+    defer p1.deinit(a);
     try std.testing.expectEqualStrings("r002", p1.items[1].object.get("id").?.string);
     // Delete the boundary row (r002) before fetching the next page.
     try d.exec("DELETE FROM posts WHERE id='r002';");
-    const p2 = try list(a, &d, col, .{ .sort = "created", .limit = 2, .cursor = p1.nextCursor.? });
+    var p2 = try list(a, &d, col, .{ .sort = "created", .limit = 2, .cursor = p1.nextCursor.? });
+    defer p2.deinit(a);
     // Keyset is value-based: the next window is still r003,r004 — no skip, no error.
     try std.testing.expectEqualStrings("r003", p2.items[0].object.get("id").?.string);
     try std.testing.expectEqualStrings("r004", p2.items[1].object.get("id").?.string);
@@ -2838,12 +2898,12 @@ test "cursor: a deleted boundary row still paginates correctly (no skip)" {
 test "cursor: rule clause is still AND-ed (no rule bypass)" {
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const col = try seedPosts(&d, a);
+    defer col.deinit(a);
     try d.exec("INSERT INTO posts (id,created,updated,title,price) VALUES ('r1','2026-01-01T00:00:00Z','t','keep',1),('r2','2026-01-02T00:00:00Z','t','drop',1),('r3','2026-01-03T00:00:00Z','t','keep',1);");
-    const res = try list(a, &d, col, .{ .sort = "created", .limit = 50, .rule = "title = \"keep\"", .cursor = null, .cursorMode = true });
+    var res = try list(a, &d, col, .{ .sort = "created", .limit = 50, .rule = "title = \"keep\"", .cursor = null, .cursorMode = true });
+    defer res.deinit(a);
     try std.testing.expectEqual(@as(usize, 2), res.items.len);
     try std.testing.expectEqualStrings("r1", res.items[0].object.get("id").?.string);
     try std.testing.expectEqualStrings("r3", res.items[1].object.get("id").?.string);
@@ -2855,26 +2915,27 @@ test "cursor: rule clause is still AND-ed (no rule bypass)" {
 test "cursor: skipTotal default omits the count; opt-in includes it" {
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const col = try seedPosts(&d, a);
+    defer col.deinit(a);
     try seedSeq(&d, 4);
-    const cheap = try list(a, &d, col, .{ .sort = "created", .limit = 2, .cursorMode = true, .skipTotal = true });
+    var cheap = try list(a, &d, col, .{ .sort = "created", .limit = 2, .cursorMode = true, .skipTotal = true });
+    defer cheap.deinit(a);
     try std.testing.expect(cheap.totalItems == null);
-    const withTotal = try list(a, &d, col, .{ .sort = "created", .limit = 2, .cursorMode = true, .skipTotal = false });
+    var withTotal = try list(a, &d, col, .{ .sort = "created", .limit = 2, .cursorMode = true, .skipTotal = false });
+    defer withTotal.deinit(a);
     try std.testing.expectEqual(@as(i64, 4), withTotal.totalItems.?);
 }
 
 test "cursor: changed sort/filter between pages is rejected (BadCursor variants)" {
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const col = try seedPosts(&d, a);
+    defer col.deinit(a);
     try seedSeq(&d, 4);
-    const p1 = try list(a, &d, col, .{ .sort = "created", .limit = 2, .cursor = null, .cursorMode = true });
+    var p1 = try list(a, &d, col, .{ .sort = "created", .limit = 2, .cursor = null, .cursorMode = true });
+    defer p1.deinit(a);
     const tok = p1.nextCursor.?;
     // Different sort -> CursorSort.
     try std.testing.expectError(error.CursorSort, list(a, &d, col, .{ .sort = "-created", .limit = 2, .cursor = tok }));
@@ -2887,18 +2948,20 @@ test "cursor: changed sort/filter between pages is rejected (BadCursor variants)
 test "cursor: signed token round-trips across pages and rejects tampering" {
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const col = try seedPosts(&d, a);
+    defer col.deinit(a);
     try seedSeq(&d, 4);
     const secret = "a-32-byte-minimum-test-secret!!!!";
-    const p1 = try list(a, &d, col, .{ .sort = "created", .limit = 2, .cursorMode = true, .cursorToken = .signed, .signingSecret = secret });
+    var p1 = try list(a, &d, col, .{ .sort = "created", .limit = 2, .cursorMode = true, .cursorToken = .signed, .signingSecret = secret });
+    defer p1.deinit(a);
     const tok = p1.nextCursor.?;
-    const p2 = try list(a, &d, col, .{ .sort = "created", .limit = 2, .cursor = tok, .cursorToken = .signed, .signingSecret = secret });
+    var p2 = try list(a, &d, col, .{ .sort = "created", .limit = 2, .cursor = tok, .cursorToken = .signed, .signingSecret = secret });
+    defer p2.deinit(a);
     try std.testing.expectEqualStrings("r003", p2.items[0].object.get("id").?.string);
     // Tamper a byte -> CursorSig.
     const bad = try a.dupe(u8, tok);
+    defer a.free(bad);
     bad[0] = if (bad[0] == 'A') 'B' else 'A';
     try std.testing.expectError(error.CursorSig, list(a, &d, col, .{ .sort = "created", .limit = 2, .cursor = bad, .cursorToken = .signed, .signingSecret = secret }));
 }
@@ -2906,16 +2969,17 @@ test "cursor: signed token round-trips across pages and rejects tampering" {
 test "cursor: stateful token stores state, walks pages, and 410s on unknown id" {
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const col = try seedPosts(&d, a);
+    defer col.deinit(a);
     try seedSeq(&d, 4);
-    const p1 = try list(a, &d, col, .{ .sort = "created", .limit = 2, .cursorMode = true, .cursorToken = .stateful, .io = std.testing.io, .writer = &d });
+    var p1 = try list(a, &d, col, .{ .sort = "created", .limit = 2, .cursorMode = true, .cursorToken = .stateful, .io = std.testing.io, .writer = &d });
+    defer p1.deinit(a);
     const tok = p1.nextCursor.?;
     // The token is a short opaque id, not a base64 payload.
     try std.testing.expect(tok.len <= 64);
-    const p2 = try list(a, &d, col, .{ .sort = "created", .limit = 2, .cursor = tok, .cursorToken = .stateful, .io = std.testing.io, .writer = &d });
+    var p2 = try list(a, &d, col, .{ .sort = "created", .limit = 2, .cursor = tok, .cursorToken = .stateful, .io = std.testing.io, .writer = &d });
+    defer p2.deinit(a);
     try std.testing.expectEqualStrings("r003", p2.items[0].object.get("id").?.string);
     // Unknown id -> CursorState (handler maps to 410).
     try std.testing.expectError(error.CursorState, list(a, &d, col, .{ .sort = "created", .limit = 2, .cursor = "deadbeefdeadbeefdeadbeefdeadbeef", .cursorToken = .stateful, .io = std.testing.io, .writer = &d }));
@@ -2924,15 +2988,14 @@ test "cursor: stateful token stores state, walks pages, and 410s on unknown id" 
 test "cursor: a hidden sort field is rejected (HiddenField) end-to-end, not silently null" {
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     try migrations.run(&d);
     const fields = [_]schema.Field{
         .{ .id = "f1", .name = "title", .options = .{ .text = .{} } },
         .{ .id = "f2", .name = "secret", .hidden = true, .options = .{ .text = .{} } },
     };
     const col = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "notes", .fields = &fields });
+    defer col.deinit(a);
     try d.exec("INSERT INTO notes (id,created,updated,title,secret) VALUES ('r1','t','t','a','x');");
     // Sorting a cursor walk by a hidden field must fail loudly rather than mint a null boundary. The
     // joiner rejects it (HiddenField) as the sort spec resolves — the single chokepoint — so this
@@ -2943,27 +3006,27 @@ test "cursor: a hidden sort field is rejected (HiddenField) end-to-end, not sile
 test "cursor: a relation-path sort is rejected (BadCursorSort)" {
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     try migrations.run(&d);
     const users = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "users", .fields = &[_]schema.Field{.{ .id = "u1", .name = "name", .options = .{ .text = .{} } }} });
+    defer users.deinit(a);
     const pf = [_]schema.Field{.{ .id = "f3", .name = "author", .options = .{ .relation = .{ .targetCollectionId = users.id, .maxSelect = 1 } } }};
     const posts = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "posts2", .fields = &pf });
+    defer posts.deinit(a);
     try std.testing.expectError(error.BadCursorSort, list(a, &d, posts, .{ .sort = "author.name", .cursorMode = true, .limit = 2 }));
 }
 
 test "offset mode ORDER BY is unchanged (no id tiebreaker appended)" {
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const col = try seedPosts(&d, a);
+    defer col.deinit(a);
     // Two rows with the SAME created: offset order falls back to physical/rowid order (the prior
     // behavior), NOT an id tiebreaker — r1 then r2 as inserted.
     try d.exec("INSERT INTO posts (id,created,updated,title,price) VALUES ('z9','2026-01-01T00:00:00Z','t','a',1),('a1','2026-01-01T00:00:00Z','t','b',1);");
-    const res = try list(a, &d, col, .{ .sort = "created", .page = 1, .perPage = 10 });
+    var res = try list(a, &d, col, .{ .sort = "created", .page = 1, .perPage = 10 });
+    defer res.deinit(a);
     try std.testing.expectEqual(records_list_mode_offset, res.mode);
     // Insertion order preserved (id tiebreaker would have put 'a1' before 'z9').
     try std.testing.expectEqualStrings("z9", res.items[0].object.get("id").?.string);
