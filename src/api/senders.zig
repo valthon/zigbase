@@ -73,17 +73,23 @@ fn resolveScope(ctx: *http.RequestCtx, app: *app_mod.App, reader: *db.Db, out: *
 /// was a bare JSON array in 0.9.0 — unified with the analytics endpoints' `{items}` shape
 /// (and leaves room for future paging keys).
 fn listBody(alloc: std.mem.Allocator, ids: []const senders.Identity) ![]const u8 {
-    var arr = std.json.Array.init(alloc);
+    // The intermediate json Array/ObjectMap tree is one-shot scratch; only the stringified body
+    // escapes. Build the tree on a function-local arena so `listBody` self-frees under ANY allocator
+    // (its string values borrow from `ids`; Stringify copies them into the returned bytes).
+    var scratch = std.heap.ArenaAllocator.init(alloc);
+    defer scratch.deinit();
+    const sa = scratch.allocator();
+    var arr = std.json.Array.init(sa);
     for (ids) |it| {
         var o: std.json.ObjectMap = .empty;
-        try o.put(alloc, "id", .{ .string = it.id });
-        try o.put(alloc, "email", .{ .string = it.email });
-        try o.put(alloc, "status", .{ .string = it.status });
-        try o.put(alloc, "verified_at", .{ .string = it.verified_at });
+        try o.put(sa, "id", .{ .string = it.id });
+        try o.put(sa, "email", .{ .string = it.email });
+        try o.put(sa, "status", .{ .string = it.status });
+        try o.put(sa, "verified_at", .{ .string = it.verified_at });
         try arr.append(.{ .object = o });
     }
     var root: std.json.ObjectMap = .empty;
-    try root.put(alloc, "items", .{ .array = arr });
+    try root.put(sa, "items", .{ .array = arr });
     return std.json.Stringify.valueAlloc(alloc, std.json.Value{ .object = root }, .{});
 }
 
@@ -228,16 +234,19 @@ test "verify requires authentication (401 without auth)" {
 }
 
 test "list envelope: {items:[...]} wraps the identities (0.10.0 wire shape)" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    // listBody is self-freeing, so it runs under the raw leak-detecting allocator.
+    const a = testing.allocator;
     const ids = [_]senders.Identity{
         .{ .id = "s1", .email = "a@x.io", .status = "verified", .verified_at = "2026-01-01 00:00:00", .created = "2026-01-01 00:00:00" },
     };
+    const one = try listBody(a, &ids);
+    defer a.free(one);
     try testing.expectEqualStrings(
         "{\"items\":[{\"id\":\"s1\",\"email\":\"a@x.io\",\"status\":\"verified\",\"verified_at\":\"2026-01-01 00:00:00\"}]}",
-        try listBody(a, &ids),
+        one,
     );
     // Empty account -> empty items array, still enveloped.
-    try testing.expectEqualStrings("{\"items\":[]}", try listBody(a, &.{}));
+    const empty = try listBody(a, &.{});
+    defer a.free(empty);
+    try testing.expectEqualStrings("{\"items\":[]}", empty);
 }
