@@ -545,18 +545,13 @@ test "unique field enforces uniqueness at the db level" {
 }
 
 test "auth collection gets system columns; passwordHash hidden in metadata" {
-    // NOT converted to the raw allocator: schema.collectionToJson builds intermediate
-    // ObjectMaps/parse-trees (root, fparsed/iparsed/oparsed scratch) that it never frees itself —
-    // it is only ever leak-correct under an arena. Left arena-wrapped per task instructions rather
-    // than touching that non-test code.
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     try migrations.run(&d);
     const fields = [_]schema.Field{.{ .id = "f1", .name = "bio", .options = .{ .text = .{} } }};
-    _ = try create(a, std.testing.io, &d, .{ .id = "", .name = "users", .type = .auth, .fields = &fields });
+    const created = try create(a, std.testing.io, &d, .{ .id = "", .name = "users", .type = .auth, .fields = &fields });
+    created.deinit(a);
 
     var st = try d.prepare("SELECT COUNT(*) FROM pragma_table_info('users') WHERE name IN ('email','username','passwordHash','tokenKey','verified');");
     defer st.finalize();
@@ -564,9 +559,13 @@ test "auth collection gets system columns; passwordHash hidden in metadata" {
     try std.testing.expectEqual(@as(i64, 5), st.columnInt(0));
 
     const got = (try get(a, &d, "users")).?;
+    defer got.deinit(a);
     try std.testing.expect(schema.fieldByName(got, "email") != null);
     try std.testing.expect(schema.fieldByName(got, "bio") != null);
+    // collectionToJson self-frees its scratch (contract 1): returns only the serialized
+    // string on `a`, so the raw testing allocator catches any leak.
     const json = try schema.collectionToJson(a, got);
+    defer a.free(json);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"email\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "passwordHash") == null);
 }

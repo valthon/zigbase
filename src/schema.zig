@@ -1389,33 +1389,38 @@ pub fn parseCollectionInput(alloc: std.mem.Allocator, s: []const u8) !Collection
 
 /// Serialize a Collection to its API JSON shape.
 pub fn collectionToJson(alloc: std.mem.Allocator, c: Collection) ![]u8 {
+    // Self-freeing (contract 1): every intermediate — the root ObjectMap, the per-section
+    // JSON strings, and the parse trees reparsed back into Values — is scratch, built on a
+    // function-local arena that is reclaimed on every return (incl. error paths). Only the
+    // final serialized string escapes, allocated on `alloc`.
+    var s = std.heap.ArenaAllocator.init(alloc);
+    defer s.deinit();
+    const sa = s.allocator();
     var root: ObjectMap = .empty;
-    try root.put(alloc, "id", .{ .string = c.id });
-    try root.put(alloc, "name", .{ .string = c.name });
-    try root.put(alloc, "type", .{ .string = @tagName(c.type) });
-    try root.put(alloc, "system", .{ .bool = c.system });
-    // Embed fields/indexes as arrays by reparsing their JSON. The parse trees stay alive
-    // until after Stringify reads them (defers run after the return expression evaluates).
+    try root.put(sa, "id", .{ .string = c.id });
+    try root.put(sa, "name", .{ .string = c.name });
+    try root.put(sa, "type", .{ .string = @tagName(c.type) });
+    try root.put(sa, "system", .{ .bool = c.system });
+    // Embed fields/indexes as arrays by reparsing their JSON. The parse trees live on the
+    // scratch arena, so they stay valid until the final Stringify reads them and are freed
+    // wholesale by `s.deinit()` after the return expression evaluates.
     var visible: std.ArrayList(Field) = .empty;
-    for (c.fields) |f| if (!f.hidden) try visible.append(alloc, f);
-    const fields_str = try fieldsToJson(alloc, visible.items);
-    const fparsed = try std.json.parseFromSlice(Value, alloc, fields_str, .{});
-    defer fparsed.deinit();
-    try root.put(alloc, "schema", fparsed.value);
-    const idx_str = try indexesToJson(alloc, c.indexes);
-    const iparsed = try std.json.parseFromSlice(Value, alloc, idx_str, .{});
-    defer iparsed.deinit();
-    try root.put(alloc, "indexes", iparsed.value);
-    try root.put(alloc, "listRule", optStrValue(c.listRule));
-    try root.put(alloc, "viewRule", optStrValue(c.viewRule));
-    try root.put(alloc, "createRule", optStrValue(c.createRule));
-    try root.put(alloc, "updateRule", optStrValue(c.updateRule));
-    try root.put(alloc, "deleteRule", optStrValue(c.deleteRule));
-    try root.put(alloc, "created", .{ .string = c.created });
-    try root.put(alloc, "updated", .{ .string = c.updated });
-    const oparsed = try std.json.parseFromSlice(std.json.Value, alloc, try optionsToJson(alloc, c, true), .{});
-    defer oparsed.deinit();
-    try root.put(alloc, "options", oparsed.value);
+    for (c.fields) |f| if (!f.hidden) try visible.append(sa, f);
+    const fields_str = try fieldsToJson(sa, visible.items);
+    const fparsed = try std.json.parseFromSlice(Value, sa, fields_str, .{});
+    try root.put(sa, "schema", fparsed.value);
+    const idx_str = try indexesToJson(sa, c.indexes);
+    const iparsed = try std.json.parseFromSlice(Value, sa, idx_str, .{});
+    try root.put(sa, "indexes", iparsed.value);
+    try root.put(sa, "listRule", optStrValue(c.listRule));
+    try root.put(sa, "viewRule", optStrValue(c.viewRule));
+    try root.put(sa, "createRule", optStrValue(c.createRule));
+    try root.put(sa, "updateRule", optStrValue(c.updateRule));
+    try root.put(sa, "deleteRule", optStrValue(c.deleteRule));
+    try root.put(sa, "created", .{ .string = c.created });
+    try root.put(sa, "updated", .{ .string = c.updated });
+    const oparsed = try std.json.parseFromSlice(std.json.Value, sa, try optionsToJson(sa, c, true), .{});
+    try root.put(sa, "options", oparsed.value);
     return std.json.Stringify.valueAlloc(alloc, Value{ .object = root }, .{});
 }
 
