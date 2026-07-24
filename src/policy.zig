@@ -505,10 +505,12 @@ fn hasOwner(owners: [][]const u8, want: []const u8) bool {
 test "records.list narrows to ability-viewable rows (viewer + non-member excluded)" {
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
+    // `base` is the fully-owned create() reload; free it once. The `withRule`/`withAbility`
+    // copies below share its owned fields/id/name and only overwrite rule/ability slots with
+    // string LITERALS, so they are never handed to Collection.deinit.
     const base = try pinBase(a, &d);
+    defer base.deinit(a);
     // Three rows owned by three different accounts.
     try d.exec("INSERT INTO posts (id,created,updated,title,owner) VALUES " ++
         "('r1','t','t','x','acc1'),('r2','t','t','y','acc2'),('r3','t','t','z','acc3');");
@@ -519,7 +521,8 @@ test "records.list narrows to ability-viewable rows (viewer + non-member exclude
         .{ .account = "acc2", .role = "viewer" },
     };
     const rctx = request.RequestContext{ .memberships = &mem };
-    const res = try records.list(a, &d, col, .{ .rule = listRuleFilter(col, &rctx), .rctx = &rctx });
+    var res = try records.list(a, &d, col, .{ .rule = listRuleFilter(col, &rctx), .rctx = &rctx });
+    defer res.deinit(a);
     const owners = listOwners(res.items);
     defer std.testing.allocator.free(owners);
     // Only acc1's row (editor >= editor). acc2 (viewer) and acc3 (non-member) are filtered out.
@@ -532,31 +535,31 @@ test "records.list narrows to ability-viewable rows (viewer + non-member exclude
 test "records.list ability empty-set returns zero rows (fail closed, not all rows)" {
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const base = try pinBase(a, &d);
+    defer base.deinit(a);
     try d.exec("INSERT INTO posts (id,created,updated,title,owner) VALUES " ++
         "('r1','t','t','x','acc1'),('r2','t','t','y','acc2');");
     const col = withRule(withAbility(base, "editor"), "@public");
     // No qualifying membership (only a viewer of acc1, below the editor floor) -> constant-false.
     const mem = [_]request.Membership{.{ .account = "acc1", .role = "viewer" }};
     const rctx = request.RequestContext{ .memberships = &mem };
-    const res = try records.list(a, &d, col, .{ .rule = listRuleFilter(col, &rctx), .rctx = &rctx });
+    var res = try records.list(a, &d, col, .{ .rule = listRuleFilter(col, &rctx), .rctx = &rctx });
+    defer res.deinit(a);
     try std.testing.expectEqual(@as(usize, 0), res.items.len);
     // And a principal with no memberships at all also gets zero rows (never the full table).
     const anon = request.RequestContext{};
-    const res2 = try records.list(a, &d, col, .{ .rule = listRuleFilter(col, &anon), .rctx = &anon });
+    var res2 = try records.list(a, &d, col, .{ .rule = listRuleFilter(col, &anon), .rctx = &anon });
+    defer res2.deinit(a);
     try std.testing.expectEqual(@as(usize, 0), res2.items.len);
 }
 
 test "documented @public list rule + ability: listRuleFilter avoids the 400 and narrows" {
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const base = try pinBase(a, &d);
+    defer base.deinit(a);
     try d.exec("INSERT INTO posts (id,created,updated,title,owner) VALUES ('r1','t','t','x','acc1');");
     const col = withRule(withAbility(base, ""), "@public"); // .rules.list = "@public" + view ability
     const mem = [_]request.Membership{.{ .account = "acc1", .role = "viewer" }};
@@ -569,7 +572,8 @@ test "documented @public list rule + ability: listRuleFilter avoids the 400 and 
     // PASSES-AFTER: `listRuleFilter` returns null for an `@public` (allow) rule, so the handler now
     // passes no rule clause; the view ability still narrows the result (200, ability-scoped rows).
     try std.testing.expect(listRuleFilter(col, &rctx) == null);
-    const res = try records.list(a, &d, col, .{ .rule = listRuleFilter(col, &rctx), .rctx = &rctx });
+    var res = try records.list(a, &d, col, .{ .rule = listRuleFilter(col, &rctx), .rctx = &rctx });
+    defer res.deinit(a);
     try std.testing.expectEqual(@as(usize, 1), res.items.len); // acc1 member sees acc1's row
     try std.testing.expectEqualStrings("acc1", res.items[0].object.get("owner").?.string);
 }
