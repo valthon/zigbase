@@ -1,0 +1,2 @@
+### Internal
+- Converted all 16 arena-masked tests in `import.zig` (bulk NDJSON import) to the raw leak-detecting `std.testing.allocator`: the shared `seedPosts` fixture and every inline `collections.create` call now free the returned collection graph via `Collection.deinit`, and the one test reading a record back through the engine frees it via `records.freeRecord` (an existing helper documented as intended for non-arena callers). Dropped the `import.zig` allocator-contract allowlist entry (16 → 0).
