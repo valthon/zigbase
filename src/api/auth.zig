@@ -2096,8 +2096,6 @@ fn insertSessionRow(env: *TestEnv, id: []const u8, expires: ?i64) !void {
 test "#114 gcExpiredSessions deletes expired rows; NULL/future survive" {
     var env = try TestEnv.initAuth("users");
     defer env.deinit();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
 
     try insertSessionRow(env, "past", 1); // long-expired (unix secs)
     try insertSessionRow(env, "noexp", null); // never expires
@@ -2124,14 +2122,15 @@ test "#114 gcExpiredSessions deletes expired rows; NULL/future survive" {
 test "#114 gcExpiredSessions drains a backlog larger than the batch size" {
     var env = try TestEnv.initAuth("users");
     defer env.deinit();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    // The arena only backed transient session-id strings; each is bound (copied) by insertSessionRow,
+    // so it runs under the raw leak-detecting allocator, freeing each id right after the insert.
+    const a = std.testing.allocator;
 
     const total: usize = session_gc_batch + 50; // forces >1 batch
     var i: usize = 0;
     while (i < total) : (i += 1) {
         const id = try std.fmt.allocPrint(a, "s{d}", .{i});
+        defer a.free(id);
         try insertSessionRow(env, id, 1); // all expired
     }
     try std.testing.expectEqual(@as(i64, @intCast(total)), try sessionCount(env));
