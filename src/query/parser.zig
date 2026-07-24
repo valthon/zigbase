@@ -48,18 +48,25 @@ const Parser = struct {
 
     fn parseOr(self: *Parser) ParseError!*Node {
         var left = try self.parseAnd();
+        // Everything built below hangs off `left` once `mk` folds it in; on any later error the
+        // whole partial subtree must be freed (parse() must not leak on a mid-string failure).
+        errdefer freeNode(self.alloc, left);
         while (self.peek() == .l_or) {
             _ = self.next();
             const right = try self.parseAnd();
+            // `right` is not yet owned by a node until `mk` succeeds; free it if `mk` OOMs.
+            errdefer freeNode(self.alloc, right);
             left = try self.mk(.{ .logic = .{ .op = .l_or, .l = left, .r = right } });
         }
         return left;
     }
     fn parseAnd(self: *Parser) ParseError!*Node {
         var left = try self.parsePrimary();
+        errdefer freeNode(self.alloc, left);
         while (self.peek() == .l_and) {
             _ = self.next();
             const right = try self.parsePrimary();
+            errdefer freeNode(self.alloc, right);
             left = try self.mk(.{ .logic = .{ .op = .l_and, .l = left, .r = right } });
         }
         return left;
@@ -71,6 +78,7 @@ const Parser = struct {
             defer self.depth -= 1;
             _ = self.next();
             const inner = try self.parseOr();
+            errdefer freeNode(self.alloc, inner);
             if (self.peek() != .rparen) return error.UnexpectedToken;
             _ = self.next();
             return inner;
@@ -82,6 +90,9 @@ const Parser = struct {
             .in => try self.inOperand(),
             else => return error.UnexpectedToken,
         };
+        // `rhs` may own an `in (...)` list slice; free it if the enclosing `mk` OOMs. (`lhs` is
+        // always a scalar operand borrowing token text, so it owns nothing.)
+        errdefer if (rhs == .list) self.alloc.free(rhs.list);
         return self.mk(.{ .cmp = .{ .lhs = lhs, .op = op, .rhs = rhs } });
     }
     /// Parse the right-hand side of an `in` operator: either a list-valued macro
@@ -99,6 +110,9 @@ const Parser = struct {
         if (self.peek() != .lparen) return error.UnexpectedToken;
         _ = self.next();
         var items: std.ArrayList(Operand) = .empty;
+        // Elements borrow token text; only the backing array is owned. Free it on any error before
+        // `toOwnedSlice` transfers ownership out.
+        errdefer items.deinit(self.alloc);
         if (self.peek() != .rparen) {
             while (true) {
                 try items.append(self.alloc, try self.operand());
@@ -138,37 +152,60 @@ pub fn parse(alloc: std.mem.Allocator, toks: []const lexer.Token) ParseError!*No
     if (toks.len == 0 or toks[0].kind == .eof) return error.Empty;
     var p = Parser{ .alloc = alloc, .toks = toks };
     const node = try p.parseOr();
+    // A trailing token rejects the whole parse; free the AST built so far rather than leak it.
+    errdefer freeNode(alloc, node);
     if (p.peek() != .eof) return error.UnexpectedToken;
     return node;
 }
 
+/// Recursively free an AST returned by `parse` (or a partial subtree during error unwinding).
+/// Frees every `*Node` and each owned `in (...)` list slice. Operand payloads (`.str`/`.num`/
+/// `.path`/`.list_macro`, and the elements inside a `.list`) BORROW lexer token text and are NOT
+/// freed here — free the tokens separately (order-independent: this never dereferences that text).
+/// The AST is a strict tree with no shared nodes, so a single top-down walk frees each node once.
+pub fn freeNode(alloc: std.mem.Allocator, node: *Node) void {
+    switch (node.*) {
+        .logic => |lg| {
+            freeNode(alloc, lg.l);
+            freeNode(alloc, lg.r);
+        },
+        // Only the RHS of a cmp can own memory (the `in (...)` list slice); the LHS is always a
+        // scalar operand that borrows token text.
+        .cmp => |c| if (c.rhs == .list) alloc.free(c.rhs.list),
+    }
+    alloc.destroy(node);
+}
+
 test "parse precedence: a = 1 && b = 2 || c = 3" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const toks = try lexer.lex(a, "a = 1 && b = 2 || c = 3");
+    const a = std.testing.allocator;
+    const input = "a = 1 && b = 2 || c = 3";
+    const toks = try lexer.lex(a, input);
+    defer lexer.freeTokens(a, input, toks);
     const root = try parse(a, toks);
+    defer freeNode(a, root);
     try std.testing.expectEqual(lexer.TokKind.l_or, root.logic.op);
     try std.testing.expectEqual(lexer.TokKind.l_and, root.logic.l.logic.op);
     try std.testing.expectEqualStrings("c", root.logic.r.cmp.lhs.path);
 }
 
 test "parse a parenthesized relation comparison" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const toks = try lexer.lex(a, "(author.name = \"x\")");
+    const a = std.testing.allocator;
+    const input = "(author.name = \"x\")";
+    const toks = try lexer.lex(a, input);
+    defer lexer.freeTokens(a, input, toks);
     const root = try parse(a, toks);
+    defer freeNode(a, root);
     try std.testing.expectEqualStrings("author.name", root.cmp.lhs.path);
     try std.testing.expectEqualStrings("x", root.cmp.rhs.str);
 }
 
 test "parse the `in` operator with a literal list" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const toks = try lexer.lex(a, "status in (\"a\", \"b\", \"c\")");
+    const a = std.testing.allocator;
+    const input = "status in (\"a\", \"b\", \"c\")";
+    const toks = try lexer.lex(a, input);
+    defer lexer.freeTokens(a, input, toks);
     const root = try parse(a, toks);
+    defer freeNode(a, root);
     try std.testing.expectEqual(lexer.TokKind.in, root.cmp.op);
     try std.testing.expectEqualStrings("status", root.cmp.lhs.path);
     try std.testing.expectEqual(@as(usize, 3), root.cmp.rhs.list.len);
@@ -177,51 +214,56 @@ test "parse the `in` operator with a literal list" {
 }
 
 test "parse the `in` operator with a list macro" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const toks = try lexer.lex(a, "account in @request.account.ids");
+    const a = std.testing.allocator;
+    const input = "account in @request.account.ids";
+    const toks = try lexer.lex(a, input);
+    defer lexer.freeTokens(a, input, toks);
     const root = try parse(a, toks);
+    defer freeNode(a, root);
     try std.testing.expectEqual(lexer.TokKind.in, root.cmp.op);
     try std.testing.expectEqualStrings("account", root.cmp.lhs.path);
     try std.testing.expectEqualStrings("@request.account.ids", root.cmp.rhs.list_macro);
 }
 
 test "parse an empty `in ()` list" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const toks = try lexer.lex(a, "x in ()");
+    const a = std.testing.allocator;
+    const input = "x in ()";
+    const toks = try lexer.lex(a, input);
+    defer lexer.freeTokens(a, input, toks);
     const root = try parse(a, toks);
+    defer freeNode(a, root);
     try std.testing.expectEqual(@as(usize, 0), root.cmp.rhs.list.len);
 }
 
 test "parse rejects a trailing token" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const toks = try lexer.lex(a, "a = 1 b = 2");
+    // The partial AST built before the trailing token is detected must be freed by `parse` itself
+    // (its errdefer), so this runs leak-clean on the raw testing allocator.
+    const a = std.testing.allocator;
+    const input = "a = 1 b = 2";
+    const toks = try lexer.lex(a, input);
+    defer lexer.freeTokens(a, input, toks);
     try std.testing.expectError(error.UnexpectedToken, parse(a, toks));
 }
 
 test "parse rejects pathologically deep nesting (no stack overflow)" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(a);
     for (0..100) |_| try buf.append(a, '(');
     try buf.appendSlice(a, "a = 1");
     for (0..100) |_| try buf.append(a, ')');
     const toks = try lexer.lex(a, buf.items);
+    defer lexer.freeTokens(a, buf.items, toks);
     try std.testing.expectError(error.TooDeep, parse(a, toks));
 }
 
 test "parse assigns `?` placeholders sequential 0-based indices left-to-right" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const toks = try lexer.lex(a, "a = ? && b = ? || c = ?");
+    const a = std.testing.allocator;
+    const input = "a = ? && b = ? || c = ?";
+    const toks = try lexer.lex(a, input);
+    defer lexer.freeTokens(a, input, toks);
     const root = try parse(a, toks);
+    defer freeNode(a, root);
     // ((a = ?0) AND (b = ?1)) OR (c = ?2)
     try std.testing.expectEqual(@as(usize, 0), root.logic.l.logic.l.cmp.rhs.placeholder);
     try std.testing.expectEqual(@as(usize, 1), root.logic.l.logic.r.cmp.rhs.placeholder);
@@ -229,10 +271,11 @@ test "parse assigns `?` placeholders sequential 0-based indices left-to-right" {
 }
 
 test "parse still accepts moderate nesting (depth 5)" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const toks = try lexer.lex(a, "(((((a = 1)))))");
+    const a = std.testing.allocator;
+    const input = "(((((a = 1)))))";
+    const toks = try lexer.lex(a, input);
+    defer lexer.freeTokens(a, input, toks);
     const root = try parse(a, toks);
+    defer freeNode(a, root);
     try std.testing.expectEqualStrings("a", root.cmp.lhs.path);
 }
