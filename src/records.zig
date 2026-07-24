@@ -165,18 +165,47 @@ fn buildListKeys(alloc: std.mem.Allocator, col: schema.Collection) ![]const []co
     return keys;
 }
 
+/// Insert one already-owned field value under its (borrowed-or-owned) key into a `rowToObject`
+/// accumulator. `v` is owned by the caller; on any failure here (a self-contained key dupe OOM)
+/// the `errdefer` frees `v` — it is NOT yet in `obj`, so the caller's row-level `errdefer` (which
+/// frees only what landed in `obj`) never double-frees it. Requires capacity pre-reserved by
+/// `ensureTotalCapacity`, so the insert itself cannot fail or grow.
+fn putRowValue(obj: *std.json.ObjectMap, alloc: std.mem.Allocator, keys: ?[]const []const u8, slot: usize, name: []const u8, v: std.json.Value) !void {
+    errdefer values.freeValue(alloc, v);
+    obj.putAssumeCapacity(try keyOf(keys, alloc, slot, name), v);
+}
+
+/// Free a partially-built `rowToObject`/`rowToObjectAtRest` accumulator when a mid-row read
+/// (e.g. an encrypted-field decode that fails closed) errors after some entries already landed:
+/// self-contained mode owns its keys (`freeRecord`), interned mode borrows them from the keyset
+/// (`freeInternedRecord`). Either way the field VALUES built so far are owned and freed via
+/// `values.freeValue`, and the `ObjectMap` backing is reclaimed — nothing leaks on the error path.
+fn freePartialRow(alloc: std.mem.Allocator, obj: std.json.ObjectMap, keys: ?[]const []const u8) void {
+    if (keys == null) freeRecord(alloc, .{ .object = obj }) else freeInternedRecord(alloc, .{ .object = obj });
+}
+
 fn rowToObject(alloc: std.mem.Allocator, stmt: *db.Stmt, col: schema.Collection, keys: ?[]const []const u8) !std.json.Value {
     var obj: std.json.ObjectMap = .empty;
+    // A mid-row read can fail AFTER id/created/updated + earlier fields are in place — e.g. an
+    // encrypted field whose envelope fails closed (error.BadEnvelope). Free the partial record so
+    // the read path stays leak-correct under any allocator, not just a request arena.
+    errdefer freePartialRow(alloc, obj, keys);
     // Pre-size for id/created/updated + every field so the map backing is allocated once
     // instead of reallocating as it grows per `put` — fewer, larger allocations on the read
     // hot path (hidden fields are a slight over-estimate, which only wastes a little capacity).
     try obj.ensureTotalCapacity(alloc, 3 + col.fields.len);
-    try obj.put(alloc, try keyOf(keys, alloc, 0, "id"), .{ .string = try alloc.dupe(u8, stmt.columnText(0)) });
-    try obj.put(alloc, try keyOf(keys, alloc, 1, "created"), .{ .string = try alloc.dupe(u8, stmt.columnText(1)) });
-    try obj.put(alloc, try keyOf(keys, alloc, 2, "updated"), .{ .string = try alloc.dupe(u8, stmt.columnText(2)) });
+    try putRowValue(&obj, alloc, keys, 0, "id", .{ .string = try alloc.dupe(u8, stmt.columnText(0)) });
+    try putRowValue(&obj, alloc, keys, 1, "created", .{ .string = try alloc.dupe(u8, stmt.columnText(1)) });
+    try putRowValue(&obj, alloc, keys, 2, "updated", .{ .string = try alloc.dupe(u8, stmt.columnText(2)) });
     for (col.fields, 0..) |f, i| {
         const v = try values.readValue(alloc, stmt, @intCast(3 + i), f);
-        if (!f.hidden) try obj.put(alloc, try keyOf(keys, alloc, 3 + i, f.name), v);
+        // A hidden field is still read (so its column is consumed) but never stored — free the
+        // owned value instead of dropping it on the floor (a leak under a non-arena allocator).
+        if (f.hidden) {
+            values.freeValue(alloc, v);
+            continue;
+        }
+        try putRowValue(&obj, alloc, keys, 3 + i, f.name, v);
     }
     return .{ .object = obj };
 }
@@ -186,13 +215,16 @@ fn rowToObject(alloc: std.mem.Allocator, stmt: *db.Stmt, col: schema.Collection,
 /// `keys` follows the same interned/self-contained contract as `rowToObject`.
 fn rowToObjectAtRest(alloc: std.mem.Allocator, stmt: *db.Stmt, col: schema.Collection, keys: ?[]const []const u8) !std.json.Value {
     var obj: std.json.ObjectMap = .empty;
+    // Symmetric with rowToObject: a mid-row read can fail after earlier entries are in place, so
+    // free the partial record on error rather than relying on a caller arena.
+    errdefer freePartialRow(alloc, obj, keys);
     // Pre-size for id/created/updated + every field so the map backing is allocated once
     // instead of reallocating as it grows per `put` — fewer, larger allocations on the read
     // hot path (hidden fields are a slight over-estimate, which only wastes a little capacity).
     try obj.ensureTotalCapacity(alloc, 3 + col.fields.len);
-    try obj.put(alloc, try keyOf(keys, alloc, 0, "id"), .{ .string = try alloc.dupe(u8, stmt.columnText(0)) });
-    try obj.put(alloc, try keyOf(keys, alloc, 1, "created"), .{ .string = try alloc.dupe(u8, stmt.columnText(1)) });
-    try obj.put(alloc, try keyOf(keys, alloc, 2, "updated"), .{ .string = try alloc.dupe(u8, stmt.columnText(2)) });
+    try putRowValue(&obj, alloc, keys, 0, "id", .{ .string = try alloc.dupe(u8, stmt.columnText(0)) });
+    try putRowValue(&obj, alloc, keys, 1, "created", .{ .string = try alloc.dupe(u8, stmt.columnText(1)) });
+    try putRowValue(&obj, alloc, keys, 2, "updated", .{ .string = try alloc.dupe(u8, stmt.columnText(2)) });
     for (col.fields, 0..) |f, i| {
         const idx: c_int = @intCast(3 + i);
         const v: std.json.Value = if (f.encrypted)
@@ -202,7 +234,11 @@ fn rowToObjectAtRest(alloc: std.mem.Allocator, stmt: *db.Stmt, col: schema.Colle
             (if (stmt.isNull(idx)) std.json.Value{ .null = {} } else std.json.Value{ .string = try alloc.dupe(u8, stmt.columnText(idx)) })
         else
             try values.readValue(alloc, stmt, idx, f);
-        if (!f.hidden) try obj.put(alloc, try keyOf(keys, alloc, 3 + i, f.name), v);
+        if (f.hidden) {
+            values.freeValue(alloc, v);
+            continue;
+        }
+        try putRowValue(&obj, alloc, keys, 3 + i, f.name, v);
     }
     return .{ .object = obj };
 }
@@ -1084,43 +1120,49 @@ test "ListResult.deinit: interned-mode json/multi sub-trees free recursively (ze
 }
 
 test "createInTxnOpts: default IGNORES a client-supplied id (server always generates)" {
+    const a = std.testing.allocator;
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
     const col = try seedPosts(&d, a);
+    defer col.deinit(a);
     var obj: std.json.ObjectMap = .empty;
+    defer obj.deinit(a);
     try obj.put(a, "id", .{ .string = "client-forced-id" });
     try obj.put(a, "title", .{ .string = "hi" });
     // Default opts (the HTTP/route/hook path): the client id must be thrown away.
     const rec = try create(a, std.testing.io, &d, col, .{ .object = obj });
+    defer freeRecord(a, rec);
     try std.testing.expect(!std.mem.eql(u8, "client-forced-id", rec.object.get("id").?.string));
     try std.testing.expectEqual(@as(usize, 15), rec.object.get("id").?.string.len);
 }
 
 test "createInTxnOpts: allow_provided_id PRESERVES a valid id; rejects an implausible one" {
+    const a = std.testing.allocator;
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
     const col = try seedPosts(&d, a);
+    defer col.deinit(a);
     // A valid provided id is preserved verbatim.
     var obj: std.json.ObjectMap = .empty;
+    defer obj.deinit(a);
     try obj.put(a, "id", .{ .string = "my-imported-id-01" });
     try obj.put(a, "title", .{ .string = "hi" });
     const rec = try createInTxnOpts(a, std.testing.io, &d, col, .{ .object = obj }, .{ .allow_provided_id = true });
+    defer freeRecord(a, rec);
     try std.testing.expectEqualStrings("my-imported-id-01", rec.object.get("id").?.string);
-    // An implausible id (embedded space) is rejected fail-closed.
+    // An implausible id (embedded space) is rejected fail-closed (InvalidId returns before any
+    // validation error is recorded, so last_errors stays null — nothing to free here).
     var bad: std.json.ObjectMap = .empty;
+    defer bad.deinit(a);
     try bad.put(a, "id", .{ .string = "bad id" });
     try bad.put(a, "title", .{ .string = "x" });
     try std.testing.expectError(error.InvalidId, createInTxnOpts(a, std.testing.io, &d, col, .{ .object = bad }, .{ .allow_provided_id = true }));
     // An empty/absent id under allow_provided_id falls back to a generated id.
     var noid: std.json.ObjectMap = .empty;
+    defer noid.deinit(a);
     try noid.put(a, "title", .{ .string = "y" });
     const gen = try createInTxnOpts(a, std.testing.io, &d, col, .{ .object = noid }, .{ .allow_provided_id = true });
+    defer freeRecord(a, gen);
     try std.testing.expectEqual(@as(usize, 15), gen.object.get("id").?.string.len);
 }
 
@@ -1188,14 +1230,14 @@ test "list tenant scoping: only the active account's rows; superuser sees all; o
 }
 
 test "get returns a record as a JSON object with typed values" {
+    const a = std.testing.allocator;
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
     const col = try seedPosts(&d, a);
+    defer col.deinit(a);
     try d.exec("INSERT INTO posts (id,created,updated,title,price) VALUES ('r1','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','hello',1050);");
     const rec = (try get(a, &d, col, "r1")).?;
+    defer freeRecord(a, rec);
     try std.testing.expectEqualStrings("r1", rec.object.get("id").?.string);
     try std.testing.expectEqualStrings("hello", rec.object.get("title").?.string);
     try std.testing.expectEqualStrings("10.50", rec.object.get("price").?.string);
@@ -1203,16 +1245,17 @@ test "get returns a record as a JSON object with typed values" {
 }
 
 test "create inserts a record, sets id/timestamps, returns it" {
+    const a = std.testing.allocator;
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
     const col = try seedPosts(&d, a);
+    defer col.deinit(a);
     var data: std.json.ObjectMap = .empty;
+    defer data.deinit(a);
     try data.put(a, "title", .{ .string = "hi" });
     try data.put(a, "price", .{ .string = "3.25" });
     const rec = try create(a, std.testing.io, &d, col, .{ .object = data });
+    defer freeRecord(a, rec);
     try std.testing.expectEqual(@as(usize, 15), rec.object.get("id").?.string.len);
     try std.testing.expect(rec.object.get("created").?.string.len > 0);
     try std.testing.expectEqualStrings("hi", rec.object.get("title").?.string);
@@ -1220,66 +1263,68 @@ test "create inserts a record, sets id/timestamps, returns it" {
 }
 
 test "create rejects an over-precise fixed value with a field error" {
+    const a = std.testing.allocator;
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
     const col = try seedPosts(&d, a);
+    defer col.deinit(a);
     var data: std.json.ObjectMap = .empty;
+    defer data.deinit(a);
     try data.put(a, "price", .{ .string = "1.999" });
     try std.testing.expectError(error.Validation, create(a, std.testing.io, &d, col, .{ .object = data }));
     try std.testing.expect(last_errors != null and last_errors.?.len >= 1);
+    freeLastErrors(a);
 }
 
 test "create rejects a missing required field" {
+    const a = std.testing.allocator;
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
     try migrations.run(&d);
     const fields = [_]schema.Field{.{ .id = "f1", .name = "title", .required = true, .options = .{ .text = .{} } }};
     const col = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "posts", .fields = &fields });
+    defer col.deinit(a);
     const data: std.json.ObjectMap = .empty;
-    try std.testing.expectError(error.Validation, create(a, std.testing.io, &d, col, .{ .object = data }));
+    try expectValidation(a, create(a, std.testing.io, &d, col, .{ .object = data }));
 }
 
 test "create rejects a value outside a select's allowed set" {
+    const a = std.testing.allocator;
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
     try migrations.run(&d);
     const fields = [_]schema.Field{.{ .id = "f1", .name = "status", .options = .{ .select = .{ .values = &.{ "open", "closed" }, .maxSelect = 1 } } }};
     const col = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "tickets", .fields = &fields });
+    defer col.deinit(a);
     var data: std.json.ObjectMap = .empty;
+    defer data.deinit(a);
     try data.put(a, "status", .{ .string = "banana" });
-    try std.testing.expectError(error.Validation, create(a, std.testing.io, &d, col, .{ .object = data }));
+    try expectValidation(a, create(a, std.testing.io, &d, col, .{ .object = data }));
 }
 
 test "over-maxSelect relation short-circuits before the per-element existence check" {
     // DoS guard: `.relation` validation runs one existence SELECT per submitted id under the
     // writer lock. An over-maxSelect array is already invalid, so it must be rejected on the
     // COUNT before the loop — otherwise an attacker-sized array drives N writer-lock queries.
+    const a = std.testing.allocator;
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
     try migrations.run(&d);
     const targets = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "targets", .fields = &[_]schema.Field{.{ .id = "t1", .name = "name", .options = .{ .text = .{} } }} });
+    defer targets.deinit(a);
     const fields = [_]schema.Field{.{ .id = "f1", .name = "refs", .options = .{ .relation = .{ .targetCollectionId = targets.id, .maxSelect = 2 } } }};
     const col = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "holders", .fields = &fields });
+    defer col.deinit(a);
     // Three non-existent ids (> maxSelect=2). Pre-fix: the loop runs 3 existence SELECTs and each
     // absent id also appends `validation_not_found`. Post-fix: the count check returns first, so
     // ONLY the "too many" error exists and the per-element loop never runs.
     var refs = std.json.Array.init(a);
+    defer refs.deinit();
     try refs.append(.{ .string = "nope1" });
     try refs.append(.{ .string = "nope2" });
     try refs.append(.{ .string = "nope3" });
     var data: std.json.ObjectMap = .empty;
+    defer data.deinit(a);
     try data.put(a, "refs", .{ .array = refs });
     try std.testing.expectError(error.Validation, create(a, std.testing.io, &d, col, .{ .object = data }));
     try expectFieldCode("refs", "validation_relation"); // the over-count error is present
@@ -1288,6 +1333,7 @@ test "over-maxSelect relation short-circuits before the per-element existence ch
         // A per-element existence error would prove the loop ran despite the over-count input.
         if (std.mem.eql(u8, e.code, "validation_not_found")) return error.TestUnexpectedResult;
     }
+    freeLastErrors(a);
 }
 
 test "over-maxSelect select short-circuits before the per-value allowed-set scan" {
@@ -1296,20 +1342,21 @@ test "over-maxSelect select short-circuits before the per-value allowed-set scan
     // share the code `validation_select`, so this asserts on the MESSAGE: an over-limit array
     // containing an invalid value must yield ONLY "Too many values." — the presence of "Value not
     // in the allowed set." would prove the loop ran on already-invalid input.
+    const a = std.testing.allocator;
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
     try migrations.run(&d);
     const fields = [_]schema.Field{.{ .id = "f1", .name = "tags", .options = .{ .select = .{ .values = &.{ "x", "y" }, .maxSelect = 2 } } }};
     const col = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "tagged", .fields = &fields });
+    defer col.deinit(a);
     // Three values (> maxSelect=2), one of which ("bad") is NOT in the allowed set {x,y}.
     var tags = std.json.Array.init(a);
+    defer tags.deinit();
     try tags.append(.{ .string = "x" });
     try tags.append(.{ .string = "y" });
     try tags.append(.{ .string = "bad" });
     var data: std.json.ObjectMap = .empty;
+    defer data.deinit(a);
     try data.put(a, "tags", .{ .array = tags });
     try std.testing.expectError(error.Validation, create(a, std.testing.io, &d, col, .{ .object = data }));
     const errs = last_errors orelse return error.TestExpectedEqual;
@@ -1320,6 +1367,7 @@ test "over-maxSelect select short-circuits before the per-value allowed-set scan
         if (std.mem.eql(u8, e.message, "Value not in the allowed set.")) return error.TestUnexpectedResult;
     }
     try std.testing.expect(saw_too_many);
+    freeLastErrors(a);
 }
 
 // ---------------------------------------------------------------------------
@@ -1349,121 +1397,132 @@ fn expectFieldCode(field: []const u8, code: []const u8) !void {
     return error.TestExpectedEqual;
 }
 
+/// Free + clear the threadlocal `last_errors` a failed create/update leaves as an OWNED slice on
+/// `a`. Production reclaims it via the request arena; a raw-allocator test must free it here — and
+/// BEFORE a second failing write overwrites the pointer (createInTxnOpts/updateInTxn null it but
+/// never free the prior slice) — or the leak detector trips.
+fn freeLastErrors(a: std.mem.Allocator) void {
+    if (last_errors) |e| a.free(e);
+    last_errors = null;
+}
+
+/// Assert a create/update failed validation with `code` on `field`, then free the OWNED
+/// `last_errors` it left on `a`. `res` is the already-evaluated create/update error union.
+fn expectRejected(a: std.mem.Allocator, res: anytype, field: []const u8, code: []const u8) !void {
+    try std.testing.expectError(error.Validation, res);
+    try expectFieldCode(field, code);
+    freeLastErrors(a);
+}
+
+/// Assert a create/update failed validation (without pinning a specific field code), then free the
+/// OWNED `last_errors` it left on `a`.
+fn expectValidation(a: std.mem.Allocator, res: anytype) !void {
+    try std.testing.expectError(error.Validation, res);
+    freeLastErrors(a);
+}
+
 fn createOne(a: std.mem.Allocator, d: *db.Db, col: schema.Collection, key: []const u8, v: std.json.Value) RecordError!std.json.Value {
     var data: std.json.ObjectMap = .empty;
+    defer data.deinit(a);
     try data.put(a, key, v);
     return create(a, std.testing.io, d, col, .{ .object = data });
 }
 
 test "text min/max enforce unicode codepoint counts" {
+    const a = std.testing.allocator;
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
     const col = try seedConstrained(&d, a);
-    try std.testing.expectError(error.Validation, createOne(a, &d, col, "title", .{ .string = "a" }));
-    try expectFieldCode("title", "validation_min");
-    try std.testing.expectError(error.Validation, createOne(a, &d, col, "title", .{ .string = "abcdef" }));
-    try expectFieldCode("title", "validation_max");
+    defer col.deinit(a);
+    try expectRejected(a, createOne(a, &d, col, "title", .{ .string = "a" }), "title", "validation_min");
+    try expectRejected(a, createOne(a, &d, col, "title", .{ .string = "abcdef" }), "title", "validation_max");
     // "héllo" is 5 codepoints but 6 bytes: max=5 must count codepoints, not bytes
-    _ = try createOne(a, &d, col, "title", .{ .string = "héllo" });
-    _ = try createOne(a, &d, col, "title", .{ .string = "ab" });
+    freeRecord(a, try createOne(a, &d, col, "title", .{ .string = "héllo" }));
+    freeRecord(a, try createOne(a, &d, col, "title", .{ .string = "ab" }));
 }
 
 test "email field rejects control chars (CRLF/NUL) and obviously-bogus addresses" {
+    const a = std.testing.allocator;
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
     try migrations.run(&d);
     const fields = [_]schema.Field{.{ .id = "f1", .name = "contact", .options = .{ .email = .{} } }};
     const col = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "contacts", .fields = &fields });
+    defer col.deinit(a);
 
     // CRLF injection attempt (would inject a Bcc header on outbound SMTP) is rejected.
-    try std.testing.expectError(error.Validation, createOne(a, &d, col, "contact", .{ .string = "victim@x.io\r\nBcc: spam@evil.com" }));
-    try expectFieldCode("contact", "validation_invalid_email");
+    try expectRejected(a, createOne(a, &d, col, "contact", .{ .string = "victim@x.io\r\nBcc: spam@evil.com" }), "contact", "validation_invalid_email");
     // A bare newline, a space, and a NUL are each rejected.
-    try std.testing.expectError(error.Validation, createOne(a, &d, col, "contact", .{ .string = "a@b.io\nx" }));
-    try std.testing.expectError(error.Validation, createOne(a, &d, col, "contact", .{ .string = "a b@x.io" }));
-    try std.testing.expectError(error.Validation, createOne(a, &d, col, "contact", .{ .string = "a@b.io\x00" }));
+    try expectValidation(a, createOne(a, &d, col, "contact", .{ .string = "a@b.io\nx" }));
+    try expectValidation(a, createOne(a, &d, col, "contact", .{ .string = "a b@x.io" }));
+    try expectValidation(a, createOne(a, &d, col, "contact", .{ .string = "a@b.io\x00" }));
     // Other ASCII control chars (TAB, vertical tab, form feed, DEL) are rejected too.
-    try std.testing.expectError(error.Validation, createOne(a, &d, col, "contact", .{ .string = "a\tb@x.io" }));
-    try std.testing.expectError(error.Validation, createOne(a, &d, col, "contact", .{ .string = "a@b.io\x0b" }));
-    try std.testing.expectError(error.Validation, createOne(a, &d, col, "contact", .{ .string = "a@b.io\x7f" }));
+    try expectValidation(a, createOne(a, &d, col, "contact", .{ .string = "a\tb@x.io" }));
+    try expectValidation(a, createOne(a, &d, col, "contact", .{ .string = "a@b.io\x0b" }));
+    try expectValidation(a, createOne(a, &d, col, "contact", .{ .string = "a@b.io\x7f" }));
     // Structurally-bogus addresses are rejected.
-    try std.testing.expectError(error.Validation, createOne(a, &d, col, "contact", .{ .string = "no-at-sign" }));
-    try std.testing.expectError(error.Validation, createOne(a, &d, col, "contact", .{ .string = "@nolocal.io" }));
-    try std.testing.expectError(error.Validation, createOne(a, &d, col, "contact", .{ .string = "nodomain@" }));
-    try std.testing.expectError(error.Validation, createOne(a, &d, col, "contact", .{ .string = "two@at@x.io" }));
+    try expectValidation(a, createOne(a, &d, col, "contact", .{ .string = "no-at-sign" }));
+    try expectValidation(a, createOne(a, &d, col, "contact", .{ .string = "@nolocal.io" }));
+    try expectValidation(a, createOne(a, &d, col, "contact", .{ .string = "nodomain@" }));
+    try expectValidation(a, createOne(a, &d, col, "contact", .{ .string = "two@at@x.io" }));
     // A normal address is accepted, and clearing (empty/null) stays possible.
-    _ = try createOne(a, &d, col, "contact", .{ .string = "user@example.com" });
-    _ = try createOne(a, &d, col, "contact", .{ .string = "" });
-    _ = try createOne(a, &d, col, "contact", .null);
+    freeRecord(a, try createOne(a, &d, col, "contact", .{ .string = "user@example.com" }));
+    freeRecord(a, try createOne(a, &d, col, "contact", .{ .string = "" }));
+    freeRecord(a, try createOne(a, &d, col, "contact", .null));
 }
 
 test "text min does not reject an explicitly empty optional value (clearing stays possible)" {
+    const a = std.testing.allocator;
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
     const col = try seedConstrained(&d, a);
-    _ = try createOne(a, &d, col, "title", .{ .string = "" });
-    _ = try createOne(a, &d, col, "title", .null);
+    defer col.deinit(a);
+    freeRecord(a, try createOne(a, &d, col, "title", .{ .string = "" }));
+    freeRecord(a, try createOne(a, &d, col, "title", .null));
 }
 
 test "fixed-mode number min/max compare the decimal value" {
+    const a = std.testing.allocator;
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
     const col = try seedConstrained(&d, a);
-    try std.testing.expectError(error.Validation, createOne(a, &d, col, "price", .{ .string = "-1" }));
-    try expectFieldCode("price", "validation_min");
-    try std.testing.expectError(error.Validation, createOne(a, &d, col, "price", .{ .string = "-0.01" }));
-    try expectFieldCode("price", "validation_min");
-    try std.testing.expectError(error.Validation, createOne(a, &d, col, "price", .{ .string = "100.01" }));
-    try expectFieldCode("price", "validation_max");
-    _ = try createOne(a, &d, col, "price", .{ .string = "0" });
-    _ = try createOne(a, &d, col, "price", .{ .string = "100.00" });
-    _ = try createOne(a, &d, col, "price", .{ .string = "45.00" });
+    defer col.deinit(a);
+    try expectRejected(a, createOne(a, &d, col, "price", .{ .string = "-1" }), "price", "validation_min");
+    try expectRejected(a, createOne(a, &d, col, "price", .{ .string = "-0.01" }), "price", "validation_min");
+    try expectRejected(a, createOne(a, &d, col, "price", .{ .string = "100.01" }), "price", "validation_max");
+    freeRecord(a, try createOne(a, &d, col, "price", .{ .string = "0" }));
+    freeRecord(a, try createOne(a, &d, col, "price", .{ .string = "100.00" }));
+    freeRecord(a, try createOne(a, &d, col, "price", .{ .string = "45.00" }));
 }
 
 test "int-mode number min/max" {
+    const a = std.testing.allocator;
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
     const col = try seedConstrained(&d, a);
-    try std.testing.expectError(error.Validation, createOne(a, &d, col, "seats", .{ .string = "0" }));
-    try expectFieldCode("seats", "validation_min");
-    try std.testing.expectError(error.Validation, createOne(a, &d, col, "seats", .{ .string = "9" }));
-    try expectFieldCode("seats", "validation_max");
-    _ = try createOne(a, &d, col, "seats", .{ .string = "1" });
-    _ = try createOne(a, &d, col, "seats", .{ .string = "8" });
+    defer col.deinit(a);
+    try expectRejected(a, createOne(a, &d, col, "seats", .{ .string = "0" }), "seats", "validation_min");
+    try expectRejected(a, createOne(a, &d, col, "seats", .{ .string = "9" }), "seats", "validation_max");
+    freeRecord(a, try createOne(a, &d, col, "seats", .{ .string = "1" }));
+    freeRecord(a, try createOne(a, &d, col, "seats", .{ .string = "8" }));
 }
 
 test "fixed-mode bound equality: a value textually equal to the f64 bound passes (divide semantics)" {
     // Pins the divide-based compare: "0.10" with min=0.1 must pass. Multiplying the
     // bound out instead (f64(0.1)*100 = 10.000000000000002 > sv=10) would false-reject.
+    const a = std.testing.allocator;
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
     try migrations.run(&d);
     const fields = [_]schema.Field{
         .{ .id = "f1", .name = "amt", .options = .{ .number = .{ .mode = .fixed, .scale = 2, .min = 0.1, .max = 0.3 } } },
     };
     const col = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "tenths", .fields = &fields });
-    _ = try createOne(a, &d, col, "amt", .{ .string = "0.10" }); // == min
-    _ = try createOne(a, &d, col, "amt", .{ .string = "0.30" }); // == max
-    try std.testing.expectError(error.Validation, createOne(a, &d, col, "amt", .{ .string = "0.09" }));
-    try std.testing.expectError(error.Validation, createOne(a, &d, col, "amt", .{ .string = "0.31" }));
+    defer col.deinit(a);
+    freeRecord(a, try createOne(a, &d, col, "amt", .{ .string = "0.10" })); // == min
+    freeRecord(a, try createOne(a, &d, col, "amt", .{ .string = "0.30" })); // == max
+    try expectValidation(a, createOne(a, &d, col, "amt", .{ .string = "0.09" }));
+    try expectValidation(a, createOne(a, &d, col, "amt", .{ .string = "0.31" }));
 }
 
 test "int-mode bounds compare as f64: values beyond 2^53 lose precision (documented edge)" {
@@ -1471,80 +1530,69 @@ test "int-mode bounds compare as f64: values beyond 2^53 lose precision (documen
     // integers above 2^53 exactly. 9007199254740993 (2^53+1) rounds to 2^53 when
     // compared, so a max of 9007199254740992 does NOT reject it. This is the
     // accepted behavior; exact enforcement would need decimal bounds in the schema.
+    const a = std.testing.allocator;
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
     try migrations.run(&d);
     const fields = [_]schema.Field{
         .{ .id = "f1", .name = "big", .options = .{ .number = .{ .mode = .int, .max = 9007199254740992.0 } } },
     };
     const col = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "bigints", .fields = &fields });
-    _ = try createOne(a, &d, col, "big", .{ .string = "9007199254740993" });
+    defer col.deinit(a);
+    freeRecord(a, try createOne(a, &d, col, "big", .{ .string = "9007199254740993" }));
 }
 
 test "float-mode number min/max (float and integer JSON values)" {
+    const a = std.testing.allocator;
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
     const col = try seedConstrained(&d, a);
-    try std.testing.expectError(error.Validation, createOne(a, &d, col, "ratio", .{ .float = -0.5 }));
-    try expectFieldCode("ratio", "validation_min");
-    try std.testing.expectError(error.Validation, createOne(a, &d, col, "ratio", .{ .float = 1.5 }));
-    try expectFieldCode("ratio", "validation_max");
-    try std.testing.expectError(error.Validation, createOne(a, &d, col, "ratio", .{ .integer = 2 }));
-    try expectFieldCode("ratio", "validation_max");
-    _ = try createOne(a, &d, col, "ratio", .{ .float = 0.5 });
-    _ = try createOne(a, &d, col, "ratio", .{ .integer = 1 });
+    defer col.deinit(a);
+    try expectRejected(a, createOne(a, &d, col, "ratio", .{ .float = -0.5 }), "ratio", "validation_min");
+    try expectRejected(a, createOne(a, &d, col, "ratio", .{ .float = 1.5 }), "ratio", "validation_max");
+    try expectRejected(a, createOne(a, &d, col, "ratio", .{ .integer = 2 }), "ratio", "validation_max");
+    freeRecord(a, try createOne(a, &d, col, "ratio", .{ .float = 0.5 }));
+    freeRecord(a, try createOne(a, &d, col, "ratio", .{ .integer = 1 }));
 }
 
 test "date values are validated and min/max enforced" {
+    const a = std.testing.allocator;
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
     const col = try seedConstrained(&d, a); // "when": min 2026-01-01, max 2026-12-31
+    defer col.deinit(a);
     // garbage is rejected
-    try std.testing.expectError(error.Validation, createOne(a, &d, col, "when", .{ .string = "2026-06-10 25:99:99" }));
-    try expectFieldCode("when", "validation_date");
+    try expectRejected(a, createOne(a, &d, col, "when", .{ .string = "2026-06-10 25:99:99" }), "when", "validation_date");
     // below min / above max rejected, across mixed formats
-    try std.testing.expectError(error.Validation, createOne(a, &d, col, "when", .{ .string = "2025-12-31 23:59:59" }));
-    try expectFieldCode("when", "validation_min");
-    try std.testing.expectError(error.Validation, createOne(a, &d, col, "when", .{ .string = "2027-01-01T00:00:00Z" }));
-    try expectFieldCode("when", "validation_max");
+    try expectRejected(a, createOne(a, &d, col, "when", .{ .string = "2025-12-31 23:59:59" }), "when", "validation_min");
+    try expectRejected(a, createOne(a, &d, col, "when", .{ .string = "2027-01-01T00:00:00Z" }), "when", "validation_max");
     // an in-range value in the canonical stored form is accepted
-    _ = try createOne(a, &d, col, "when", .{ .string = "2026-06-10T08:00:00Z" });
+    freeRecord(a, try createOne(a, &d, col, "when", .{ .string = "2026-06-10T08:00:00Z" }));
 }
 
 test "text pattern is enforced" {
+    const a = std.testing.allocator;
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
     const col = try seedConstrained(&d, a);
-    try std.testing.expectError(error.Validation, createOne(a, &d, col, "slug", .{ .string = "Has Spaces" }));
-    try expectFieldCode("slug", "validation_pattern");
-    _ = try createOne(a, &d, col, "slug", .{ .string = "ok-slug-1" });
+    defer col.deinit(a);
+    try expectRejected(a, createOne(a, &d, col, "slug", .{ .string = "Has Spaces" }), "slug", "validation_pattern");
+    freeRecord(a, try createOne(a, &d, col, "slug", .{ .string = "ok-slug-1" }));
 }
 
 test "update enforces the same constraints" {
+    const a = std.testing.allocator;
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
     const col = try seedConstrained(&d, a);
+    defer col.deinit(a);
     const rec = try createOne(a, &d, col, "price", .{ .string = "1.00" });
+    defer freeRecord(a, rec); // owns `rid` for the lifetime of the test
     const rid = rec.object.get("id").?.string;
     var data: std.json.ObjectMap = .empty;
+    defer data.deinit(a);
     try data.put(a, "price", .{ .string = "-1" });
-    try std.testing.expectError(error.Validation, update(a, &d, col, rid, .{ .object = data }));
-    try expectFieldCode("price", "validation_min");
+    try expectRejected(a, update(a, &d, col, rid, .{ .object = data }), "price", "validation_min");
 }
 
 pub fn update(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection, id: []const u8, data: std.json.Value) RecordError!?std.json.Value {
@@ -1628,15 +1676,16 @@ pub fn deleteInTxn(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection, 
 test "update merges provided fields, bumps updated, 404 on missing" {
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const col = try seedPosts(&d, a);
+    defer col.deinit(a);
     try d.exec("INSERT INTO posts (id,created,updated,title,price) VALUES ('r1','t','t','old',100);");
 
     var data: std.json.ObjectMap = .empty;
+    defer data.deinit(a);
     try data.put(a, "title", .{ .string = "new" }); // price omitted -> unchanged
     const rec = (try update(a, &d, col, "r1", .{ .object = data })).?;
+    defer freeRecord(a, rec);
     try std.testing.expectEqualStrings("new", rec.object.get("title").?.string);
     try std.testing.expectEqualStrings("1.00", rec.object.get("price").?.string);
 
@@ -1645,21 +1694,23 @@ test "update merges provided fields, bumps updated, 404 on missing" {
 }
 
 test "update rejects an over-precise fixed value and leaves the row unchanged" {
+    const a = std.testing.allocator;
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
     const col = try seedPosts(&d, a);
+    defer col.deinit(a);
     try d.exec("INSERT INTO posts (id,created,updated,title,price) VALUES ('r1','t','t','keep',100);");
 
     var data: std.json.ObjectMap = .empty;
+    defer data.deinit(a);
     try data.put(a, "price", .{ .string = "1.999" }); // scale=2 -> too precise
     try std.testing.expectError(error.Validation, update(a, &d, col, "r1", .{ .object = data }));
     try std.testing.expect(last_errors != null and last_errors.?.len >= 1);
+    freeLastErrors(a);
 
     // The row must be untouched (price still "1.00", title still "keep").
     const rec = (try get(a, &d, col, "r1")).?;
+    defer freeRecord(a, rec);
     try std.testing.expectEqualStrings("keep", rec.object.get("title").?.string);
     try std.testing.expectEqualStrings("1.00", rec.object.get("price").?.string);
 }
@@ -1709,34 +1760,34 @@ test "list: filter_args with an empty/absent filter is a loud BadFilter (never s
 }
 
 test "delete removes the row; 404 on missing" {
+    const a = std.testing.allocator;
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
     const col = try seedPosts(&d, a);
+    defer col.deinit(a);
     try d.exec("INSERT INTO posts (id,created,updated,title,price) VALUES ('r1','t','t','x',1);");
     try std.testing.expect(try delete(a, &d, col, "r1"));
     try std.testing.expect(!try delete(a, &d, col, "r1"));
 }
 
 test "createInTxn inserts without opening its own transaction" {
+    const a = std.testing.allocator;
     var conn = try db.Db.openMemory();
     defer conn.close();
     try conn.exec("PRAGMA foreign_keys=ON;");
     try migrations.run(&conn);
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
     const io = std.testing.io;
     const fields = [_]schema.Field{.{ .id = "f1", .name = "title", .required = true, .options = .{ .text = .{} } }};
     const col = try collections.create(a, io, &conn, .{ .id = "", .name = "posts", .fields = &fields });
+    defer col.deinit(a);
 
     // Caller owns the transaction; createInTxn must participate, not nest.
     try conn.beginImmediate();
     var o: std.json.ObjectMap = .empty;
+    defer o.deinit(a);
     try o.put(a, "title", .{ .string = "x" });
     const rec = try createInTxn(a, io, &conn, col, .{ .object = o });
+    defer freeRecord(a, rec);
     try conn.rollback(); // caller rolls back -> row must be gone
     try std.testing.expect((try get(a, &conn, col, rec.object.get("id").?.string)) == null);
 }
@@ -1999,12 +2050,18 @@ pub fn gcCursorStates(w: *db.Db) db.DbError!void {
 // TTL read-time exclusion tests
 // ---------------------------------------------------------------------------
 
+/// get() `id` and assert whether a row came back, freeing the returned record. For read-path
+/// visibility tests (TTL exclusion) that care only about presence, not contents.
+fn expectVisible(a: std.mem.Allocator, d: *db.Db, col: schema.Collection, id: []const u8, visible: bool) !void {
+    const rec = try get(a, d, col, id);
+    try std.testing.expectEqual(visible, rec != null);
+    if (rec) |r| freeRecord(a, r);
+}
+
 test "ttl read-exclusion: get returns null for expired, row for future+null, non-ttl unaffected" {
+    const a = std.testing.allocator;
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
     try migrations.run(&d);
 
     // TTL collection: expires_at is the ttl_field.
@@ -2013,6 +2070,7 @@ test "ttl read-exclusion: get returns null for expired, row for future+null, non
         .{ .id = "f2", .name = "expires_at", .options = .{ .date = .{} } },
     };
     const col = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "sessions", .fields = &sfields, .options = .{ .ttl_field = "expires_at" } });
+    defer col.deinit(a);
 
     try d.exec("INSERT INTO sessions (id,created,updated,token,expires_at) VALUES ('past','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','a','2000-01-01T00:00:00Z');");
     try d.exec("INSERT INTO sessions (id,created,updated,token,expires_at) VALUES ('future','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','b','2999-01-01T00:00:00Z');");
@@ -2024,15 +2082,16 @@ test "ttl read-exclusion: get returns null for expired, row for future+null, non
         .{ .id = "f4", .name = "created_at", .options = .{ .date = .{} } },
     };
     const pcol = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "posts", .fields = &pfields });
+    defer pcol.deinit(a);
     try d.exec("INSERT INTO posts (id,created,updated,title,created_at) VALUES ('p1','2000-01-01T00:00:00Z','2000-01-01T00:00:00Z','keep','2000-01-01T00:00:00Z');");
 
     // get: expired → null; future → returned; null ttl → returned.
-    try std.testing.expect(null == try get(a, &d, col, "past"));
-    try std.testing.expect(null != try get(a, &d, col, "future"));
-    try std.testing.expect(null != try get(a, &d, col, "never"));
+    try expectVisible(a, &d, col, "past", false);
+    try expectVisible(a, &d, col, "future", true);
+    try expectVisible(a, &d, col, "never", true);
 
     // get: non-ttl collection is unaffected.
-    try std.testing.expect(null != try get(a, &d, pcol, "p1"));
+    try expectVisible(a, &d, pcol, "p1", true);
 }
 
 test "ttl read-exclusion: list excludes expired, includes future+null, non-ttl unaffected" {
@@ -2150,25 +2209,25 @@ test "ttl read-exclusion: instant comparison not lexical (offset/space/date-only
 }
 
 test "gcExpiredRecords deletes past rows, keeps future rows, ignores non-ttl collections" {
+    const a = std.testing.allocator;
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
     try migrations.run(&d);
     // A collection that opts into TTL via a date field.
     const sfields = [_]schema.Field{
         .{ .id = "f1", .name = "token", .options = .{ .text = .{} } },
         .{ .id = "f2", .name = "expires_at", .options = .{ .date = .{} } },
     };
-    _ = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "sessions", .fields = &sfields, .options = .{ .ttl_field = "expires_at" } });
+    const sessions = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "sessions", .fields = &sfields, .options = .{ .ttl_field = "expires_at" } });
+    defer sessions.deinit(a);
     try d.exec("INSERT INTO sessions (id,created,updated,token,expires_at) VALUES ('past','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','a','2000-01-01T00:00:00Z');");
     try d.exec("INSERT INTO sessions (id,created,updated,token,expires_at) VALUES ('future','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','b','2999-01-01T00:00:00Z');");
     // A null ttl value must NOT be treated as expired.
     try d.exec("INSERT INTO sessions (id,created,updated,token,expires_at) VALUES ('never','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','c',NULL);");
     // A collection WITHOUT a ttl_field must be untouched.
     const pfields = [_]schema.Field{.{ .id = "f3", .name = "title", .options = .{ .text = .{} } }};
-    _ = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "posts", .fields = &pfields });
+    const posts = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "posts", .fields = &pfields });
+    defer posts.deinit(a);
     try d.exec("INSERT INTO posts (id,created,updated,title) VALUES ('p1','2000-01-01T00:00:00Z','2000-01-01T00:00:00Z','keep');");
 
     const deleted = try gcExpiredRecords(a, &d);
@@ -2193,17 +2252,16 @@ test "gcExpiredRecords: no scratch leak on a non-arena (GPA) caller" {
     // the per-collection quoted-field and predicate strings whenever the caller passed a real GPA.
     // Call it with the leak-DETECTING testing allocator DIRECTLY (not an arena) — the internal
     // arena must free every allocation, or the test framework flags the leak.
+    const a = std.testing.allocator;
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
     try migrations.run(&d);
     const sfields = [_]schema.Field{
         .{ .id = "f1", .name = "token", .options = .{ .text = .{} } },
         .{ .id = "f2", .name = "expires_at", .options = .{ .date = .{} } },
     };
-    _ = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "sessions", .fields = &sfields, .options = .{ .ttl_field = "expires_at" } });
+    const sessions = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "sessions", .fields = &sfields, .options = .{ .ttl_field = "expires_at" } });
+    defer sessions.deinit(a);
     try d.exec("INSERT INTO sessions (id,created,updated,token,expires_at) VALUES ('past','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','a','2000-01-01T00:00:00Z');");
 
     // The load-bearing line: gcExpiredRecords receives the leak-checked GPA, not the arena `a`.
@@ -2217,17 +2275,16 @@ test "gcExpiredRecords compares ttl as an instant, not lexically (offsets/date-o
     // wrongly reaps a FUTURE instant whose literal sorts before "now" (e.g. a negative
     // UTC offset: '-' < 'Z'). The GC normalizes both sides via strftime, so it compares
     // true instants.
+    const a = std.testing.allocator;
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
     try migrations.run(&d);
     const fields = [_]schema.Field{
         .{ .id = "f1", .name = "label", .options = .{ .text = .{} } },
         .{ .id = "f2", .name = "expires_at", .options = .{ .date = .{} } },
     };
-    _ = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "tokens", .fields = &fields, .options = .{ .ttl_field = "expires_at" } });
+    const tokens = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "tokens", .fields = &fields, .options = .{ .ttl_field = "expires_at" } });
+    defer tokens.deinit(a);
 
     // KEPT — future instant whose literal sorts BEFORE "now" (the exact lexical-vs-instant
     // bug). Built in SQL relative to now: a wall-clock literal one minute in the past (so it
@@ -2264,18 +2321,18 @@ test "gcExpiredRecords compares ttl as an instant, not lexically (offsets/date-o
 test "gcExpiredRecords is resilient: a drifted collection does not abort the sweep" {
     // A TTL collection whose physical table was dropped (but whose `_collections`
     // metadata remains) must not prevent GC of a second, healthy TTL collection.
+    const a = std.testing.allocator;
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
     try migrations.run(&d);
     const fields = [_]schema.Field{
         .{ .id = "f1", .name = "label", .options = .{ .text = .{} } },
         .{ .id = "f2", .name = "expires_at", .options = .{ .date = .{} } },
     };
-    _ = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "drifted", .fields = &fields, .options = .{ .ttl_field = "expires_at" } });
-    _ = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "healthy", .fields = &fields, .options = .{ .ttl_field = "expires_at" } });
+    const drifted = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "drifted", .fields = &fields, .options = .{ .ttl_field = "expires_at" } });
+    defer drifted.deinit(a); // the in-memory Collection is freed regardless of the dropped table
+    const healthy = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "healthy", .fields = &fields, .options = .{ .ttl_field = "expires_at" } });
+    defer healthy.deinit(a);
     try d.exec("INSERT INTO healthy (id,created,updated,label,expires_at) VALUES ('h1','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','x','2000-01-01T00:00:00Z');");
     // Simulate drift: drop the table out from under the still-present metadata row.
     try d.exec("DROP TABLE drifted;");
@@ -2353,11 +2410,12 @@ fn rawCell(d: *db.Db, alloc: std.mem.Allocator, sql: [:0]const u8) ![]const u8 {
 }
 
 test "encrypted field: round-trip through records, ciphertext-at-rest, strict fail-closed" {
+    // RAW std.testing.allocator: the fail-closed `get` errors mid-row inside rowToObject (the
+    // encrypted envelope won't decode), so the partial record MUST be freed by rowToObject's
+    // errdefer — a leak here would trip the detector. This is the regression guard for that fix.
+    const a = std.testing.allocator;
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
     const io = std.testing.io;
     try migrations.run(&d);
 
@@ -2371,6 +2429,7 @@ test "encrypted field: round-trip through records, ciphertext-at-rest, strict fa
         .{ .id = "f3", .name = "plain", .options = .{ .text = .{} } },
     };
     const col = try collections.create(a, io, &d, .{ .id = "", .name = "vault", .fields = &fields });
+    defer col.deinit(a);
 
     var obj: std.json.ObjectMap = .empty;
     try obj.put(a, "secret", .{ .string = "topsecret" });
@@ -2379,51 +2438,63 @@ test "encrypted field: round-trip through records, ciphertext-at-rest, strict fa
     try obj.put(a, "blob", .{ .object = jblob });
     try obj.put(a, "plain", .{ .string = "visible" });
     const created = try create(a, io, &d, col, .{ .object = obj });
-    const id = created.object.get("id").?.string;
+    // Input containers own only their backings (values are literals/an integer): tear down bottom-up.
+    jblob.deinit(a);
+    obj.deinit(a);
+    const rid = try a.dupe(u8, created.object.get("id").?.string);
+    defer a.free(rid);
+    freeRecord(a, created);
 
     // (a) Read-back through the records API returns PLAINTEXT (transparent).
-    const got = (try get(a, &d, col, id)).?;
+    const got = (try get(a, &d, col, rid)).?;
     try std.testing.expectEqualStrings("topsecret", got.object.get("secret").?.string);
     try std.testing.expectEqual(@as(i64, 1234), got.object.get("blob").?.object.get("pin").?.integer);
     try std.testing.expectEqualStrings("visible", got.object.get("plain").?.string);
+    freeRecord(a, got);
 
     // (b) Ciphertext-at-rest: the raw SQLite cells hold a v1 envelope, NOT the plaintext.
     const raw_secret = try rawCell(&d, a, "SELECT secret FROM vault;");
+    defer a.free(raw_secret);
     try std.testing.expect(std.mem.startsWith(u8, raw_secret, "v1:"));
     try std.testing.expect(std.mem.indexOf(u8, raw_secret, "topsecret") == null);
     const raw_blob = try rawCell(&d, a, "SELECT blob FROM vault;");
+    defer a.free(raw_blob);
     try std.testing.expect(std.mem.startsWith(u8, raw_blob, "v1:"));
     try std.testing.expect(std.mem.indexOf(u8, raw_blob, "1234") == null);
     // The non-encrypted field is stored as plaintext.
     const raw_plain = try rawCell(&d, a, "SELECT plain FROM vault;");
+    defer a.free(raw_plain);
     try std.testing.expectEqualStrings("visible", raw_plain);
 
-    // (c) Strict fail-closed: decrypting the real envelope with the WRONG key fails.
+    // (c) Strict fail-closed: decrypting the real envelope with the WRONG key fails. `get` errors
+    // partway through rowToObject; its errdefer must reclaim the id/created/updated already built.
     var wrong = field_policy.Cipher.fromEnv(io, "a-totally-different-key");
     db.dbSetFieldCipher(&d, @ptrCast(&wrong));
-    try std.testing.expectError(error.BadEnvelope, get(a, &d, col, id));
+    try std.testing.expectError(error.BadEnvelope, get(a, &d, col, rid));
 
     // A legacy/plaintext stored value (no envelope) also fails closed — no passthrough.
     db.dbSetFieldCipher(&d, @ptrCast(&cipher));
     try d.exec("UPDATE vault SET secret='legacy-plaintext';");
-    try std.testing.expectError(error.BadEnvelope, get(a, &d, col, id));
+    try std.testing.expectError(error.BadEnvelope, get(a, &d, col, rid));
 }
 
 test "encrypted field with no cipher fails closed (never plaintext)" {
+    const a = std.testing.allocator;
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
     const io = std.testing.io;
     try migrations.run(&d);
     // No cipher stamped: d.field_cipher == null.
     const fields = [_]schema.Field{.{ .id = "f1", .name = "secret", .encrypted = true, .options = .{ .text = .{} } }};
     const col = try collections.create(a, io, &d, .{ .id = "", .name = "vault2", .fields = &fields });
+    defer col.deinit(a);
     var obj: std.json.ObjectMap = .empty;
+    defer obj.deinit(a);
     try obj.put(a, "secret", .{ .string = "x" });
-    // Write to an encrypted field with no key configured must fail (not store plaintext).
+    // Write to an encrypted field with no key configured must fail (not store plaintext). The bind
+    // failure leaves an OWNED `last_errors` slice on `a` — free it so the detector stays quiet.
     try std.testing.expectError(error.Validation, create(a, io, &d, col, .{ .object = obj }));
+    freeLastErrors(a);
 }
 
 pub fn list(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, q: ListQuery) !ListResult {
