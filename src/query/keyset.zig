@@ -202,12 +202,28 @@ fn emitCmpRung(alloc: std.mem.Allocator, sql: *std.ArrayList(u8), params: *std.A
 pub const Cursor = struct {
     /// Direction of travel: true = forward ("after"), false = backward ("before").
     forward: bool,
-    /// Boundary sort-key values in effective-sort order (id last). Owned by the decode arena.
+    /// Boundary sort-key values in effective-sort order (id last). For a DECODED cursor these
+    /// alias `owned`'s parse arena; free them by calling `deinit`.
     keys: []std.json.Value,
     /// The EFFECTIVE sort string (with id tiebreaker), for sort-binding validation.
     sort_str: []const u8,
     /// fnv64 of the normalized filter + rule, for filter-binding validation.
     filter_hash: u64,
+    /// The owned `std.json` parse result that `keys`/`sort_str` alias for a DECODED cursor
+    /// (contract 2: caller frees via `deinit`). null for a caller-built/encode-side cursor
+    /// (`mintCursor`, tests) — `deinit` is then a no-op.
+    owned: ?std.json.Parsed(Wire) = null,
+
+    /// Free the parse arena backing a decoded cursor's `keys`/`sort_str`. No allocator argument —
+    /// `std.json.Parsed` carries its own arena. A no-op for a cursor with no owned backing. Takes
+    /// `*Cursor` and clears `owned` so a repeat call is a safe no-op (and `keys`/`sort_str` are
+    /// visibly invalidated), rather than double-freeing the arena.
+    pub fn deinit(self: *Cursor) void {
+        if (self.owned) |p| {
+            p.deinit();
+            self.owned = null;
+        }
+    }
 };
 
 /// On-wire payload struct (compact keys: v/d/k/s/fh). `d` is "f"/"b"; `fh` is a hex string so it
@@ -252,17 +268,22 @@ fn payloadBytes(alloc: std.mem.Allocator, c: Cursor) ![]u8 {
 
 /// Parse raw JSON payload bytes back into a `Cursor` (no signature/state concerns).
 fn parsePayload(alloc: std.mem.Allocator, json_bytes: []const u8) DecodeError!Cursor {
-    const parsed = std.json.parseFromSlice(Wire, alloc, json_bytes, .{ .ignore_unknown_fields = true }) catch return error.BadCursor;
+    // `.alloc_always`: copy every string/value into the parse arena so the returned Cursor aliases
+    // ONLY `parsed` (freed by `Cursor.deinit`), never the caller's `json_bytes` (b64 buffer). The
+    // Parsed wrapper is RETAINED in `.owned` — the reject paths below errdefer-free it.
+    const parsed = std.json.parseFromSlice(Wire, alloc, json_bytes, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch return error.BadCursor;
+    errdefer parsed.deinit();
     const w = parsed.value;
     if (w.v != token_version) return error.BadCursor;
     const forward = if (std.mem.eql(u8, w.d, "f")) true else if (std.mem.eql(u8, w.d, "b")) false else return error.BadCursor;
     const fh = std.fmt.parseInt(u64, w.fh, 16) catch return error.BadCursor;
-    return .{ .forward = forward, .keys = w.k, .sort_str = w.s, .filter_hash = fh };
+    return .{ .forward = forward, .keys = w.k, .sort_str = w.s, .filter_hash = fh, .owned = parsed };
 }
 
 /// Encode a `Cursor` as a STATELESS token (Approach A): base64url(payload).
 pub fn encodeStateless(alloc: std.mem.Allocator, c: Cursor) ![]u8 {
     const payload = try payloadBytes(alloc, c);
+    defer alloc.free(payload); // scratch: b64Encode copies it into the returned token
     return b64Encode(alloc, payload);
 }
 
@@ -271,6 +292,7 @@ pub fn encodeStateless(alloc: std.mem.Allocator, c: Cursor) ![]u8 {
 pub fn decodeStateless(alloc: std.mem.Allocator, token: []const u8) DecodeError!Cursor {
     if (token.len > max_cursor_len) return error.BadCursor;
     const payload = b64Decode(alloc, token) catch return error.BadCursor;
+    defer alloc.free(payload); // scratch: parsePayload copies (alloc_always) into the Cursor's arena
     return parsePayload(alloc, payload);
 }
 
@@ -279,10 +301,13 @@ pub fn decodeStateless(alloc: std.mem.Allocator, token: []const u8) DecodeError!
 /// keeps verification a simple split-on-'.' with no re-encode ambiguity.
 pub fn encodeSigned(alloc: std.mem.Allocator, c: Cursor, secret: []const u8) ![]u8 {
     const payload = try payloadBytes(alloc, c);
+    defer alloc.free(payload); // scratch
     const p_b64 = try b64Encode(alloc, payload);
+    defer alloc.free(p_b64); // scratch: copied into the returned token by allocPrint
     var mac: [32]u8 = undefined;
     HmacSha256.create(&mac, p_b64, secret);
     const mac_b64 = try b64Encode(alloc, &mac);
+    defer alloc.free(mac_b64); // scratch: copied into the returned token by allocPrint
     return std.fmt.allocPrint(alloc, "{s}.{s}", .{ p_b64, mac_b64 });
 }
 
@@ -298,10 +323,12 @@ pub fn decodeSigned(alloc: std.mem.Allocator, token: []const u8, secret: []const
     var expected: [32]u8 = undefined;
     HmacSha256.create(&expected, p_b64, secret);
     const provided = b64Decode(alloc, mac_b64) catch return error.CursorSig;
+    defer alloc.free(provided); // scratch: only compared, never escapes
     if (provided.len != 32) return error.CursorSig;
     if (!std.crypto.timing_safe.eql([32]u8, expected, provided[0..32].*)) return error.CursorSig;
 
     const payload = b64Decode(alloc, p_b64) catch return error.BadCursor;
+    defer alloc.free(payload); // scratch: parsePayload copies (alloc_always) into the Cursor's arena
     return parsePayload(alloc, payload);
 }
 
@@ -325,6 +352,7 @@ fn b64Encode(alloc: std.mem.Allocator, data: []const u8) ![]u8 {
 
 fn b64Decode(alloc: std.mem.Allocator, s: []const u8) ![]u8 {
     const out = try alloc.alloc(u8, try b64.Decoder.calcSizeForSlice(s));
+    errdefer alloc.free(out); // a malformed-base64 `decode` failure must not leak the buffer
     try b64.Decoder.decode(out, s);
     return out;
 }
@@ -343,12 +371,14 @@ fn fieldTerm(col_sql: []const u8, field: schema.Field, desc: bool) sort.SortTerm
 }
 
 test "keyset: single ASC term + id tiebreaker, forward" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = testing.allocator;
     const terms = [_]sort.SortTerm{ sysTerm("c", false), sysTerm("id", false) };
     const boundary = [_]std.json.Value{ .{ .string = "2026-01-03T00:00:00Z" }, .{ .string = "r3" } };
     const ks = try build(a, &terms, &boundary, true, Dialect.sqlite);
+    defer {
+        a.free(ks.where_sql);
+        a.free(ks.params);
+    }
     try testing.expectEqualStrings("((c > ?) OR (c = ? AND id > ?))", ks.where_sql);
     try testing.expectEqual(@as(usize, 3), ks.params.len);
     try testing.expectEqualStrings("2026-01-03T00:00:00Z", ks.params[0].text);
@@ -357,34 +387,40 @@ test "keyset: single ASC term + id tiebreaker, forward" {
 }
 
 test "keyset: single DESC term flips the operator" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = testing.allocator;
     const terms = [_]sort.SortTerm{ sysTerm("c", true), sysTerm("id", true) };
     const boundary = [_]std.json.Value{ .{ .string = "2026-01-03T00:00:00Z" }, .{ .string = "r3" } };
     const ks = try build(a, &terms, &boundary, true, Dialect.sqlite);
+    defer {
+        a.free(ks.where_sql);
+        a.free(ks.params);
+    }
     try testing.expectEqualStrings("((c < ?) OR (c = ? AND id < ?))", ks.where_sql);
 }
 
 test "keyset: backward flips every comparison op" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = testing.allocator;
     // forward DESC -> '<'; backward DESC -> '>'
     const terms = [_]sort.SortTerm{ sysTerm("c", true), sysTerm("id", true) };
     const boundary = [_]std.json.Value{ .{ .string = "t" }, .{ .string = "r3" } };
     const ks = try build(a, &terms, &boundary, false, Dialect.sqlite);
+    defer {
+        a.free(ks.where_sql);
+        a.free(ks.params);
+    }
     try testing.expectEqualStrings("((c > ?) OR (c = ? AND id > ?))", ks.where_sql);
 }
 
 test "keyset: mixed DESC,ASC uses the per-term operator" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = testing.allocator;
     // effective: created DESC, price ASC, id ASC
     const terms = [_]sort.SortTerm{ sysTerm("created", true), sysTerm("price", false), sysTerm("id", false) };
     const boundary = [_]std.json.Value{ .{ .string = "t" }, .{ .string = "2.00" }, .{ .string = "r3" } };
     const ks = try build(a, &terms, &boundary, true, Dialect.sqlite);
+    defer {
+        a.free(ks.where_sql);
+        a.free(ks.params);
+    }
     try testing.expectEqualStrings(
         "((created < ?) OR (created = ? AND price > ?) OR (created = ? AND price = ? AND id > ?))",
         ks.where_sql,
@@ -392,63 +428,73 @@ test "keyset: mixed DESC,ASC uses the per-term operator" {
 }
 
 test "keyset: NULL boundary, ASC term (NULLs first)" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = testing.allocator;
     // score ASC nullable, id ASC; boundary score is NULL -> cmp rung 'IS NOT NULL', no param
     const terms = [_]sort.SortTerm{ sysTerm("score", false), sysTerm("id", false) };
     const boundary = [_]std.json.Value{ .null, .{ .string = "r3" } };
     const ks = try build(a, &terms, &boundary, true, Dialect.sqlite);
+    defer {
+        a.free(ks.where_sql);
+        a.free(ks.params);
+    }
     try testing.expectEqualStrings("((score IS NOT NULL) OR (score IS NULL AND id > ?))", ks.where_sql);
     try testing.expectEqual(@as(usize, 1), ks.params.len);
     try testing.expectEqualStrings("r3", ks.params[0].text);
 }
 
 test "keyset: NULL boundary, DESC term (NULLs last) is never-true on the cmp rung" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = testing.allocator;
     const score = schema.Field{ .id = "s", .name = "score", .options = .{ .number = .{ .mode = .float } } };
     const terms = [_]sort.SortTerm{ fieldTerm("score", score, true), sysTerm("id", false) };
     const boundary = [_]std.json.Value{ .null, .{ .string = "r3" } };
     const ks = try build(a, &terms, &boundary, true, Dialect.sqlite);
+    defer {
+        a.free(ks.where_sql);
+        a.free(ks.params);
+    }
     try testing.expectEqualStrings("((0) OR (score IS NULL AND id > ?))", ks.where_sql);
 }
 
 test "keyset: non-NULL boundary over a nullable DESC column uses (< OR IS NULL)" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = testing.allocator;
     // a nullable (not required) float field
     const score = schema.Field{ .id = "s", .name = "score", .options = .{ .number = .{ .mode = .float } } };
     const terms = [_]sort.SortTerm{ fieldTerm("score", score, true), sysTerm("id", false) };
     const boundary = [_]std.json.Value{ .{ .float = 1.5 }, .{ .string = "r3" } };
     const ks = try build(a, &terms, &boundary, true, Dialect.sqlite);
+    defer {
+        a.free(ks.where_sql);
+        a.free(ks.params);
+    }
     // Boundary score is non-NULL (1.5), so the equality rung is `score = ?`, not `IS NULL`.
     // The cmp rung's own parens nest inside the OR-rung parens: ((...)).
     try testing.expectEqualStrings("(((score < ? OR score IS NULL)) OR (score = ? AND id > ?))", ks.where_sql);
 }
 
 test "keyset: a REQUIRED column skips the IS NULL branch on a DESC cmp rung" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = testing.allocator;
     const score = schema.Field{ .id = "s", .name = "score", .required = true, .options = .{ .number = .{ .mode = .float } } };
     const terms = [_]sort.SortTerm{ fieldTerm("score", score, true), sysTerm("id", false) };
     const boundary = [_]std.json.Value{ .{ .float = 1.5 }, .{ .string = "r3" } };
     const ks = try build(a, &terms, &boundary, true, Dialect.sqlite);
+    defer {
+        a.free(ks.where_sql);
+        a.free(ks.params);
+    }
     try testing.expectEqualStrings("((score < ?) OR (score = ? AND id > ?))", ks.where_sql);
 }
 
 test "keyset: type coercion into the right Param variant" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = testing.allocator;
     const price = schema.Field{ .id = "f", .name = "price", .options = .{ .number = .{ .mode = .fixed, .scale = 2 } } };
     const ratio = schema.Field{ .id = "g", .name = "ratio", .options = .{ .number = .{ .mode = .float } } };
     const terms = [_]sort.SortTerm{ fieldTerm("price", price, false), fieldTerm("ratio", ratio, false), sysTerm("id", false) };
     const boundary = [_]std.json.Value{ .{ .string = "10.50" }, .{ .float = 1.5 }, .{ .string = "r3" } };
     const ks = try build(a, &terms, &boundary, true, Dialect.sqlite);
+    defer {
+        a.free(ks.where_sql);
+        a.free(ks.params);
+    }
     // Param order follows the OR-of-AND ladder (eq prefixes repeat boundary values):
     //   [price>], [price=, ratio>], [price=, ratio=, id>]
     // => [int, int, double, int, double, text]. fixed "10.50" -> int 1050; float -> double; id -> text.
@@ -459,21 +505,21 @@ test "keyset: type coercion into the right Param variant" {
 }
 
 test "keyset: injection-safe — SQL metacharacters stay in params, never the SQL" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = testing.allocator;
     const terms = [_]sort.SortTerm{ sysTerm("c", false), sysTerm("id", false) };
     const evil = "x'); DROP TABLE posts;--";
     const boundary = [_]std.json.Value{ .{ .string = evil }, .{ .string = "r3" } };
     const ks = try build(a, &terms, &boundary, true, Dialect.sqlite);
+    defer {
+        a.free(ks.where_sql);
+        a.free(ks.params);
+    }
     try testing.expect(std.mem.indexOf(u8, ks.where_sql, "DROP") == null);
     try testing.expectEqualStrings(evil, ks.params[0].text);
 }
 
 test "keyset: arity mismatch and empty terms are rejected" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = testing.allocator;
     const terms = [_]sort.SortTerm{sysTerm("c", false)};
     const two = [_]std.json.Value{ .{ .string = "a" }, .{ .string = "b" } };
     try testing.expectError(error.BadCursor, build(a, &terms, &two, true, Dialect.sqlite));
@@ -503,53 +549,53 @@ fn expectSameCursor(want: Cursor, got: Cursor) !void {
 }
 
 test "stateless codec round-trips" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = testing.allocator;
     const c = try sampleCursor(a);
+    defer a.free(c.keys); // sampleCursor's keys are manually allocated (owned == null)
     const tok = try encodeStateless(a, c);
-    const back = try decodeStateless(a, tok);
+    defer a.free(tok);
+    var back = try decodeStateless(a, tok);
+    defer back.deinit(); // decoded cursor owns its parse arena
     try expectSameCursor(c, back);
 }
 
 test "stateless: oversized token rejected before decode" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = testing.allocator;
     const big = try a.alloc(u8, max_cursor_len + 1);
+    defer a.free(big);
     @memset(big, 'A');
     try testing.expectError(error.BadCursor, decodeStateless(a, big));
 }
 
 test "stateless: malformed base64 / payload rejected" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = testing.allocator;
     try testing.expectError(error.BadCursor, decodeStateless(a, "!!!not base64!!!"));
     const not_json = try b64Encode(a, "this is not json");
+    defer a.free(not_json);
     try testing.expectError(error.BadCursor, decodeStateless(a, not_json));
 }
 
 test "stateless: unknown version rejected" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = testing.allocator;
     const bad = try b64Encode(a, "{\"v\":99,\"d\":\"f\",\"k\":[],\"s\":\"id\",\"fh\":\"0\"}");
+    defer a.free(bad);
     try testing.expectError(error.BadCursor, decodeStateless(a, bad));
 }
 
 test "signed codec round-trips and rejects tampering" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = testing.allocator;
     const secret = "a-very-long-server-jwt-secret-32b!!";
     const c = try sampleCursor(a);
+    defer a.free(c.keys); // sampleCursor's keys are manually allocated (owned == null)
     const tok = try encodeSigned(a, c, secret);
-    const back = try decodeSigned(a, tok, secret);
+    defer a.free(tok);
+    var back = try decodeSigned(a, tok, secret);
+    defer back.deinit(); // decoded cursor owns its parse arena
     try expectSameCursor(c, back);
 
     // Flip a byte in the payload portion -> MAC fails.
     const tampered = try a.dupe(u8, tok);
+    defer a.free(tampered);
     tampered[0] = if (tampered[0] == 'A') 'B' else 'A';
     try testing.expectError(error.CursorSig, decodeSigned(a, tampered, secret));
 
@@ -561,12 +607,13 @@ test "signed codec round-trips and rejects tampering" {
 }
 
 test "stateful payload round-trips through the store blob form" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = testing.allocator;
     const c = try sampleCursor(a);
+    defer a.free(c.keys); // sampleCursor's keys are manually allocated (owned == null)
     const blob = try statefulPayload(a, c);
-    const back = try decodeStatefulPayload(a, blob);
+    defer a.free(blob);
+    var back = try decodeStatefulPayload(a, blob);
+    defer back.deinit(); // decoded cursor owns its parse arena
     try expectSameCursor(c, back);
 }
 

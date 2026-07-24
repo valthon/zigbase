@@ -2561,8 +2561,9 @@ pub fn list(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, q: L
 
         // Decode the boundary cursor (if any). first_page = no token supplied.
         // `decodeCursor` runs on the scratch arena: the decoded boundary keys are read below to
-        // build the keyset predicate and never outlive this call. (This also subsumes the keyset
-        // codec's own Parsed-discard scratch — reclaimed by `scratch.deinit` rather than leaked.)
+        // build the keyset predicate and never outlive this call. The Cursor owns a `std.json`
+        // parse arena (allocated from `sa`) that its keys alias; we don't call `cur.deinit()` here
+        // because `scratch.deinit` reclaims it wholesale with the rest of the list scratch.
         const maybe_cur: ?keyset.Cursor = if (q.cursor) |token| try decodeCursor(sa, q, conn, col, token, eff_sort_str, fh) else null;
         if (maybe_cur) |cur| if (cur.keys.len != eff_terms.len) return error.BadCursor;
         const forward = if (maybe_cur) |cur| cur.forward else true;
