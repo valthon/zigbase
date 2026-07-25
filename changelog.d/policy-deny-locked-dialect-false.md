@@ -1,6 +1,6 @@
-### Fixes
+### Security
 
-- Made the fail-closed `deny_locked` authorization predicate dialect-correct on Postgres. It
+- Hardened the fail-closed `deny_locked` authorization floor for Postgres dialect-portability. It
   hardcoded the SQLite-only `0` false-literal (`WHERE 0`), which Postgres rejects
   (`argument of WHERE must be type boolean`); it now uses the dialect's `constFalse()` (`false` on
   Postgres) — the same constant the ability/tenant composition already emits — so the fail-closed
