@@ -603,18 +603,13 @@ const DeliveryEnvelope = struct {
 /// scratch) is FIXED, so `mkColl`/`mkRec` are now leak-clean under the RAW `std.testing.allocator`:
 /// `mkColl` returns a fully-owned Collection freed by `Collection.deinit`, and `mkRec` frees the
 /// input map + the returned self-contained record (`records.freeRecord`), escaping only a duped id.
-/// The `@public`/empty/null/id-only-delete `shouldDeliver` tests are therefore un-masked.
-///
-/// GUARDED_QUERY_MASK — the tests that REMAIN wrapped in a `std.testing.allocator` arena all drive
-/// the guarded-query authz path: `shouldDeliver` (or `matchesSnapshot`) -> `policy.matchesRule`,
-/// which builds the compiled `Guard` (where_sql / joins / params, plus ability + tenant predicates)
-/// on the passed allocator and NEVER frees it — arena-lifetime scratch owned by the un-migrated
-/// `policy.zig` / `rules.zig` / records-guard code (each a separate allowlist entry). That scratch
-/// is not reachable to free from the test, so those tests cannot be un-masked until that path is
-/// migrated. Two further tests are legitimate contract-4 (they call code that TAKES a
-/// `RequestArena`/`*ArenaAllocator`: `subscribeCheck`, `authVerb`), and the two `frameForDelivery`
-/// collection-lookup tests additionally leak the collection graph that `colcache.lease`'s
-/// cache==null fallback loads into `a` and its no-op `release()` never frees.
+/// The `@public`/empty/null/id-only-delete `shouldDeliver` tests are therefore un-masked. The
+/// guarded-query authz path (`shouldDeliver`/`matchesSnapshot` -> `policy.matchesRule`) and the
+/// `colcache.lease` collection-lookup (its cache==null fallback owns a private arena, freed by
+/// `release()`) are BOTH self-freeing, so every `shouldDeliver` and `frameForDelivery` test in this
+/// file now runs under the raw `std.testing.allocator`. Only two tests remain wrapped in an arena,
+/// and both are legitimate contract-4 (they call code that TAKES a `RequestArena`/`*ArenaAllocator`
+/// by contract): `subscribeCheck` and `authVerb`.
 const TestDb = struct {
     d: db.Db,
     fn init() !TestDb {
@@ -1233,21 +1228,15 @@ test "frameForDelivery: custom topic + __features forward VERBATIM (no authz, no
 test "frameForDelivery: viewRule deny -> null; @public + matching filter -> frame; mismatching filter -> null" {
     var env = try PoolEnv.init();
     defer env.deinit();
-    // MASKED (guarded-query + colcache-fallback graph leak, out of batch — see GUARDED_QUERY_MASK):
-    // frameForDelivery looks up "fitems" via colcache.lease, whose cache==null fallback loads the
-    // collection graph into `a` and never frees it (no-op release()); the filter path additionally
-    // runs policy.matchesRule, whose compiled-Guard scratch is never freed. Neither is reachable to
-    // free from the test.
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     var app = App{ .allocator = a, .io = std.testing.io, .pool = &env.pool };
-    var rid: []const u8 = undefined;
-    var rec_val: std.json.Value = undefined;
+    var pub_col: schema.Collection = undefined;
+    var locked_col: schema.Collection = undefined;
+    var rec: std.json.Value = undefined;
     {
         const w = env.pool.acquireWriter();
         defer env.pool.releaseWriter();
-        const pub_col = try collections.create(a, std.testing.io, w, .{
+        pub_col = try collections.create(a, std.testing.io, w, .{
             .id = "",
             .name = "fitems",
             .fields = &[_]schema.Field{.{ .id = "f1", .name = "owner", .options = .{ .text = .{} } }},
@@ -1255,16 +1244,27 @@ test "frameForDelivery: viewRule deny -> null; @public + matching filter -> fram
         });
         var data: std.json.ObjectMap = .empty;
         try data.put(a, "owner", .{ .string = "alice" });
-        rec_val = try records.create(a, std.testing.io, w, pub_col, .{ .object = data });
-        rid = rec_val.object.get("id").?.string;
-        _ = try collections.create(a, std.testing.io, w, .{
+        rec = try records.create(a, std.testing.io, w, pub_col, .{ .object = data });
+        data.deinit(a);
+        locked_col = try collections.create(a, std.testing.io, w, .{
             .id = "",
             .name = "flocked",
             .fields = &.{},
             .viewRule = null,
         });
     }
-    const ef = try buildEventFrames(a, "fitems", .create, rid, rec_val);
+    defer pub_col.deinit(a);
+    defer locked_col.deinit(a);
+
+    const rid = rec.object.get("id").?.string;
+    const ef = try buildEventFrames(a, "fitems", .create, rid, rec);
+    defer ef.deinit(a);
+    // Reuses the same record body for a differently-named/locked topic — only the frame's channel
+    // name matters for this assertion, not the record contents.
+    const lf = try buildEventFrames(a, "flocked", .create, "R1", rec);
+    defer lf.deinit(a);
+    records.freeRecord(a, rec);
+
     var anon = Conn{};
     // @public, no filter: delivered verbatim.
     try std.testing.expectEqualStrings(ef.frame_collection, frameForDelivery(a, &app, &anon, null, "fitems", ef.frame_collection).?);
@@ -1272,46 +1272,52 @@ test "frameForDelivery: viewRule deny -> null; @public + matching filter -> fram
     try std.testing.expect(frameForDelivery(a, &app, &anon, "owner = \"alice\"", "fitems", ef.frame_collection) != null);
     try std.testing.expect(frameForDelivery(a, &app, &anon, "owner = \"bob\"", "fitems", ef.frame_collection) == null);
     // Locked collection: anonymous denied outright (frame for a locked col).
-    const lf = try buildEventFrames(a, "flocked", .create, "R1", rec_val);
     try std.testing.expect(frameForDelivery(a, &app, &anon, null, "flocked", lf.frame_collection) == null);
 }
 
 test "frameForDelivery: F4 delete snapshot authorizes, then is STRIPPED to an id-only frame" {
     var env = try PoolEnv.init();
     defer env.deinit();
-    // MASKED (guarded-query + colcache-fallback graph leak, out of batch — see GUARDED_QUERY_MASK):
-    // frameForDelivery looks up "fnotes" via colcache.lease (cache==null fallback loads the
-    // collection graph into `a`, never freed by the no-op release()), and the owner-scoped delete
-    // authorizes the snapshot via policy.matchesRule, whose compiled-Guard scratch is never freed.
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     var app = App{ .allocator = a, .io = std.testing.io, .pool = &env.pool };
+    var fnotes: schema.Collection = undefined;
     {
         const w = env.pool.acquireWriter();
         defer env.pool.releaseWriter();
-        _ = try collections.create(a, std.testing.io, w, .{
+        fnotes = try collections.create(a, std.testing.io, w, .{
             .id = "",
             .name = "fnotes",
             .fields = &[_]schema.Field{.{ .id = "f1", .name = "owner", .options = .{ .text = .{} } }},
             .viewRule = "owner = @request.auth.id",
         });
     }
+    defer fnotes.deinit(a);
+
     var snap: std.json.ObjectMap = .empty;
     try snap.put(a, "id", .{ .string = "GONE" });
     try snap.put(a, "owner", .{ .string = "u1" });
     const ef = try buildEventFrames(a, "fnotes", .delete, "GONE", .{ .object = snap });
+    defer ef.deinit(a);
+    // `buildEventFrames` only ALIASES `snap` into its own scratch wrapper (stringified into the
+    // independent `ef` buffers before returning) — the map itself is still ours to free (values are
+    // literals, so only the backing array needs it, matching `freeConn`'s convention below).
+    snap.deinit(a);
     // The published frame carries the private snapshot (precondition).
     try std.testing.expect(std.mem.indexOf(u8, ef.frame_collection, delete_snapshot_key) != null);
 
     var owner = try authedConn(a, "u1", false);
+    defer freeConn(a, &owner);
     var other = try authedConn(a, "u2", false);
+    defer freeConn(a, &other);
     // Owner: delivered — and the delivered frame is ID-ONLY (snapshot + owner field stripped).
+    // The id-only frame is a FRESH re-serialization (frameForDelivery strips the snapshot before
+    // returning), so it escapes onto `a` and must be freed here — unlike the verbatim-forward case.
     const out = frameForDelivery(a, &app, &owner, null, "fnotes", ef.frame_collection).?;
+    defer a.free(out);
     try std.testing.expect(std.mem.indexOf(u8, out, delete_snapshot_key) == null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"owner\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"id\":\"GONE\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"action\":\"delete\"") != null);
-    // Non-owner: nothing (no id leak).
+    // Non-owner: nothing (no id leak, and nothing allocated on the deny path).
     try std.testing.expect(frameForDelivery(a, &app, &other, null, "fnotes", ef.frame_collection) == null);
 }
