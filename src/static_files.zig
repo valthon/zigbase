@@ -87,8 +87,13 @@ pub fn normalizeRange(alloc: std.mem.Allocator, raw: []const u8, size: u64) !?Ra
         .unsatisfiable => .unsatisfiable,
         .slice => |s| blk: {
             const canonical = try std.fmt.allocPrint(alloc, "bytes={d}-{d}", .{ s.offset, s.offset + s.len - 1 });
-            // Already exactly what facil.io handles? Don't touch the request.
-            if (std.mem.eql(u8, std.mem.trim(u8, raw, " \t"), canonical)) break :blk null;
+            // Already exactly what facil.io handles? Don't touch the request. Free the
+            // scratch here — a null return owns nothing, so on a non-arena allocator this
+            // string would otherwise leak (a no-op under the request arena in production).
+            if (std.mem.eql(u8, std.mem.trim(u8, raw, " \t"), canonical)) {
+                alloc.free(canonical);
+                break :blk null;
+            }
             break :blk .{ .rewrite = canonical };
         },
     };
@@ -995,14 +1000,26 @@ test "dir: a symlink inside the root pointing OUTSIDE it is refused (F10)" {
 }
 
 test "normalizeRange matrix (§A.2): open/suffix/overlong rewritten; in-bounds/malformed/multi passthrough; 416 forms" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    // normalizeRange is a pure builder: a `.rewrite` owns its allocPrint'd string, while
+    // `.unsatisfiable`/null own nothing. Run under the raw leak detector, freeing each
+    // returned rewrite. `expectRewrite` asserts the rewrite value and frees it.
+    const a = std.testing.allocator;
+    const expectRewrite = struct {
+        fn f(al: std.mem.Allocator, raw: []const u8, size: u64, want: []const u8) !void {
+            switch ((try normalizeRange(al, raw, size)).?) {
+                .rewrite => |r| {
+                    defer al.free(r);
+                    try std.testing.expectEqualStrings(want, r);
+                },
+                .unsatisfiable => return error.TestExpectedRewrite,
+            }
+        }
+    }.f;
     // rewrites into the canonical closed form
-    try std.testing.expectEqualStrings("bytes=200-999", (try normalizeRange(a, "bytes=200-", 1000)).?.rewrite);
-    try std.testing.expectEqualStrings("bytes=900-999", (try normalizeRange(a, "bytes=-100", 1000)).?.rewrite);
-    try std.testing.expectEqualStrings("bytes=0-999", (try normalizeRange(a, "bytes=-5000", 1000)).?.rewrite); // n >= size
-    try std.testing.expectEqualStrings("bytes=900-999", (try normalizeRange(a, "bytes=900-5000", 1000)).?.rewrite); // clamp
+    try expectRewrite(a, "bytes=200-", 1000, "bytes=200-999");
+    try expectRewrite(a, "bytes=-100", 1000, "bytes=900-999");
+    try expectRewrite(a, "bytes=-5000", 1000, "bytes=0-999"); // n >= size
+    try expectRewrite(a, "bytes=900-5000", 1000, "bytes=900-999"); // clamp
     // unsatisfiable -> caller's 416
     try std.testing.expect((try normalizeRange(a, "bytes=1000-", 1000)).? == .unsatisfiable);
     try std.testing.expect((try normalizeRange(a, "bytes=-0", 1000)).? == .unsatisfiable);
@@ -1653,10 +1670,12 @@ test "static_routes startup validation (dir): present + dir-index targets pass; 
     try tmp.dir.createDirPath(std.testing.io, "app");
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "app/index.html", .data = "<h1>app</h1>" });
 
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    // validateRouteTargetsDir self-frees its per-route scratch and returns a StaticRoute
+    // that borrows `match`/`serve` from the input arrays (nothing owned), so the arena
+    // only ever held `root`. Run under the raw leak detector, freeing `root` directly.
+    const a = std.testing.allocator;
     const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(root);
 
     // Exact-file target, directory target (resolves to app/index.html), and "/" (root index).
     const good = [_]StaticRoute{

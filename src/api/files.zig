@@ -254,16 +254,18 @@ test "PIN: file-download view-authz + cache route through policy byte-identicall
     const migrations = @import("../migrations.zig");
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    // rules.matches/policy.authorizes are contract-1 self-freeing, so only the
+    // created Collection and the test-built owner ObjectMap remain to free — no arena.
+    const a = std.testing.allocator;
     try migrations.run(&d);
     const base = try collections_mod.create(a, std.testing.io, &d, .{ .id = "", .name = "docs", .fields = &[_]schema.Field{
         .{ .id = "d1", .name = "owner", .options = .{ .text = .{} } },
         .{ .id = "d2", .name = "file", .options = .{ .file = .{ .maxSelect = 1 } } },
     } });
+    defer base.deinit(a);
     try d.exec("INSERT INTO docs (id,created,updated,owner,file) VALUES ('r1','t','t','u1','a.png');");
     var owner_obj: std.json.ObjectMap = .empty;
+    defer owner_obj.deinit(a);
     try owner_obj.put(a, "id", .{ .string = "u1" });
     const owner = request.RequestContext{ .auth = .{ .object = owner_obj } };
 
@@ -354,9 +356,10 @@ test "isInlineSafeExt allows only known-safe types" {
 }
 
 test "recordReferencesFile matches single + array file fields, ignores non-file fields" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    // recordReferencesFile is a pure bool predicate — it allocates nothing — so the
+    // arena only ever held the test-built input. Build it on the raw leak detector and
+    // free the ObjectMap + nested Array directly.
+    const a = std.testing.allocator;
 
     const fields = [_]schema.Field{
         .{ .id = "f1", .name = "avatar", .options = .{ .file = .{ .maxSelect = 1 } } },
@@ -366,8 +369,10 @@ test "recordReferencesFile matches single + array file fields, ignores non-file 
     const col = schema.Collection{ .id = "c1", .name = "media", .fields = &fields };
 
     var rec: std.json.ObjectMap = .empty;
+    defer rec.deinit(a);
     try rec.put(a, "avatar", .{ .string = "pic.png" });
     var gallery = std.json.Array.init(a);
+    defer gallery.deinit(); // the array backing rec's "gallery" value (rec.deinit won't recurse)
     try gallery.append(.{ .string = "g1.png" });
     try gallery.append(.{ .string = "g2.png" });
     try rec.put(a, "gallery", .{ .array = gallery });
