@@ -71,18 +71,19 @@ test "sort compiles direction and relation paths" {
     const collections = @import("../collections.zig");
     var d = try db.Db.openMemory();
     defer d.close();
-    // Use an ARENA only for the schema-setup churn (collections.create, joiner), but drive
-    // compile() itself on the raw testing allocator so a leaked return would fail the test.
-    var setup = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer setup.deinit();
-    const sa = setup.allocator();
-    try migrations.run(&d);
-    const users = try collections.create(sa, std.testing.io, &d, .{ .id = "", .name = "users", .fields = &[_]schema.Field{.{ .id = "u1", .name = "name", .options = .{ .text = .{} } }} });
-    const pf = [_]schema.Field{.{ .id = "f3", .name = "author", .options = .{ .relation = .{ .targetCollectionId = users.id, .maxSelect = 1 } } }};
-    const posts = try collections.create(sa, std.testing.io, &d, .{ .id = "", .name = "posts", .fields = &pf });
-    var j = joiner.Joiner.init(sa, &d, posts); // joiner allocations live in the arena
-
+    // Everything runs on the raw testing allocator: the created collections free via Collection.deinit,
+    // the joiner (its per-resolve intermediates) frees via j.deinit(), and compile()'s returned
+    // string frees below — so a leak anywhere fails the test.
     const a = std.testing.allocator;
+    try migrations.run(&d);
+    const users = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "users", .fields = &[_]schema.Field{.{ .id = "u1", .name = "name", .options = .{ .text = .{} } }} });
+    defer users.deinit(a);
+    const pf = [_]schema.Field{.{ .id = "f3", .name = "author", .options = .{ .relation = .{ .targetCollectionId = users.id, .maxSelect = 1 } } }};
+    const posts = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "posts", .fields = &pf });
+    defer posts.deinit(a);
+    var j = joiner.Joiner.init(a, &d, posts);
+    defer j.deinit();
+
     const ob = try compile(a, &j, "-created,author.name", Dialect.sqlite); // returned string owned by `a`
     defer a.free(ob);
     try std.testing.expectEqualStrings("\"posts\".\"created\" DESC, j1.\"name\" ASC", ob);
@@ -94,20 +95,20 @@ test "compile() frees its intermediate terms slice (no leak on the testing alloc
     const collections = @import("../collections.zig");
     var d = try db.Db.openMemory();
     defer d.close();
-    // Use an ARENA only for the schema-setup churn (collections.create), but drive compile()
-    // itself on the raw testing allocator so a leaked `terms` slice fails the test.
-    var setup = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer setup.deinit();
-    const sa = setup.allocator();
+    // Everything runs on the raw testing allocator: the created collection frees via Collection.deinit,
+    // the joiner frees via j.deinit(), and compile()'s returned string frees below — so a leaked
+    // `terms` slice (or anything else) fails the test.
+    const a = std.testing.allocator;
     try migrations.run(&d);
     const pf = [_]schema.Field{
         .{ .id = "f1", .name = "title", .options = .{ .text = .{} } },
         .{ .id = "f2", .name = "price", .options = .{ .number = .{ .mode = .fixed, .scale = 2 } } },
     };
-    const posts = try collections.create(sa, std.testing.io, &d, .{ .id = "", .name = "posts", .fields = &pf });
+    const posts = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "posts", .fields = &pf });
+    defer posts.deinit(a);
 
-    const a = std.testing.allocator;
-    var j = joiner.Joiner.init(sa, &d, posts); // joiner allocations live in the arena
+    var j = joiner.Joiner.init(a, &d, posts);
+    defer j.deinit();
     const ob = try compile(a, &j, "-created,price", Dialect.sqlite); // returned string owned by `a`
     defer a.free(ob);
     try std.testing.expectEqualStrings("\"posts\".\"created\" DESC, \"posts\".\"price\" ASC", ob);
@@ -120,21 +121,20 @@ test "compileTerms surfaces resolved col_sql, direction, and field per term" {
     const collections = @import("../collections.zig");
     var d = try db.Db.openMemory();
     defer d.close();
-    // Use an ARENA only for the schema-setup churn (collections.create, joiner), but drive
-    // compileTerms/compile themselves on the raw testing allocator so a leaked return
-    // (the terms slice, or the ORDER BY string) would fail the test.
-    var setup = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer setup.deinit();
-    const sa = setup.allocator();
+    // Everything runs on the raw testing allocator: the created collection frees via Collection.deinit,
+    // the joiner frees via j.deinit(), and the returned terms slice / ORDER BY string free below —
+    // so a leaked return fails the test.
+    const a = std.testing.allocator;
     try migrations.run(&d);
     const pf = [_]schema.Field{
         .{ .id = "f1", .name = "title", .options = .{ .text = .{} } },
         .{ .id = "f2", .name = "price", .options = .{ .number = .{ .mode = .fixed, .scale = 2 } } },
     };
-    const posts = try collections.create(sa, std.testing.io, &d, .{ .id = "", .name = "posts", .fields = &pf });
-    var j = joiner.Joiner.init(sa, &d, posts); // joiner allocations live in the arena
+    const posts = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "posts", .fields = &pf });
+    defer posts.deinit(a);
+    var j = joiner.Joiner.init(a, &d, posts);
+    defer j.deinit();
 
-    const a = std.testing.allocator;
     const terms = try compileTerms(a, &j, "-created,price"); // returned slice owned by `a`
     defer a.free(terms);
     try std.testing.expectEqual(@as(usize, 2), terms.len);
@@ -160,16 +160,15 @@ test "sort error paths: bare sign, unknown column, empty" {
     const collections = @import("../collections.zig");
     var d = try db.Db.openMemory();
     defer d.close();
-    // Use an ARENA only for the schema-setup churn (collections.create, joiner), but drive
-    // compile() itself on the raw testing allocator so a leaked return would fail the test.
-    var setup = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer setup.deinit();
-    const sa = setup.allocator();
-    try migrations.run(&d);
-    const posts = try collections.create(sa, std.testing.io, &d, .{ .id = "", .name = "posts", .fields = &[_]schema.Field{.{ .id = "f1", .name = "title", .options = .{ .text = .{} } }} });
-
-    var j = joiner.Joiner.init(sa, &d, posts); // joiner allocations live in the arena
+    // Everything runs on the raw testing allocator: the created collection frees via Collection.deinit
+    // and the joiner frees via j.deinit(), so a leaked compile() return fails the test.
     const a = std.testing.allocator;
+    try migrations.run(&d);
+    const posts = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "posts", .fields = &[_]schema.Field{.{ .id = "f1", .name = "title", .options = .{ .text = .{} } }} });
+    defer posts.deinit(a);
+
+    var j = joiner.Joiner.init(a, &d, posts);
+    defer j.deinit();
     // A bare sign with no column is a bad sort spec.
     try std.testing.expectError(error.BadSort, compile(a, &j, "-", Dialect.sqlite));
     // Sorting on a nonexistent column propagates from the joiner.

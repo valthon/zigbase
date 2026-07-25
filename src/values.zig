@@ -235,8 +235,9 @@ pub fn freeValue(alloc: std.mem.Allocator, v: std.json.Value) void {
 /// `freeValue`). Leak-safe: an OOM at any depth unwinds via `errdefer`, freeing every partial
 /// allocation before returning the error. Used by `readValue` to hand a json/multi-value field back
 /// as an owned graph WITHOUT the leaky-on-error semantics of `parseFromSliceLeaky` (which orphans a
-/// half-built tree on a parse/alloc failure — see `parseOwned`).
-fn cloneValue(alloc: std.mem.Allocator, v: std.json.Value) std.mem.Allocator.Error!std.json.Value {
+/// half-built tree on a parse/alloc failure — see `parseOwned`), and by `records.zig`'s multipart
+/// coercion to own its output without reaching into another module's private helper.
+pub fn cloneValue(alloc: std.mem.Allocator, v: std.json.Value) std.mem.Allocator.Error!std.json.Value {
     switch (v) {
         .null, .bool, .integer, .float => return v,
         .number_string => |s| return .{ .number_string = try alloc.dupe(u8, s) },

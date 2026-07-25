@@ -39,10 +39,61 @@ fn prep(alloc: std.mem.Allocator, h: *db.Db, sql: [:0]const u8) !db.Stmt {
 }
 
 /// A compiled rule constraint enforced atomically on create/update.
+///
+/// A Guard produced by `own` (via `rules.compileGuard` / `policy.compilePredicate`) SOLELY owns its
+/// whole graph — `where_sql`, every `joins` string, and every `.text` param — on ONE allocator, so
+/// it can be released with `deinit`. Production compiles a Guard on a request/rule arena and never
+/// calls `deinit` (the arena reclaims it wholesale); `deinit` exists so the leak-detecting test
+/// allocator can verify the compile path is honest.
 pub const Guard = struct {
     where_sql: []const u8,
     joins: []const []const u8 = &.{},
     params: []const compiler.Param = &.{},
+
+    /// Deep-clone `where_sql` + `joins` (each string) + `params` (each `.text`) onto `alloc`,
+    /// returning a Guard that owns its entire graph and aliases none of the inputs. Callers build
+    /// the parts on a scratch arena (the joiner's join strings, the compiler's `where_sql`/params,
+    /// a borrowed ability/tenant param, a `dialect.constFalse()` literal) and hand them here so the
+    /// escaping Guard is self-contained. Leak-safe: an OOM mid-clone unwinds every partial
+    /// allocation via `errdefer` before returning the error.
+    pub fn own(alloc: std.mem.Allocator, where_sql: []const u8, joins: []const []const u8, params: []const compiler.Param) std.mem.Allocator.Error!Guard {
+        const w = try alloc.dupe(u8, where_sql);
+        errdefer alloc.free(w);
+
+        const js = try alloc.alloc([]const u8, joins.len);
+        errdefer alloc.free(js);
+        var jn: usize = 0;
+        errdefer for (js[0..jn]) |s| alloc.free(s);
+        while (jn < joins.len) : (jn += 1) js[jn] = try alloc.dupe(u8, joins[jn]);
+
+        const ps = try alloc.alloc(compiler.Param, params.len);
+        errdefer alloc.free(ps);
+        var pn: usize = 0;
+        errdefer for (ps[0..pn]) |p| switch (p) {
+            .text => |t| alloc.free(t),
+            else => {},
+        };
+        while (pn < params.len) : (pn += 1) ps[pn] = switch (params[pn]) {
+            .text => |t| .{ .text = try alloc.dupe(u8, t) },
+            else => params[pn],
+        };
+
+        return .{ .where_sql = w, .joins = js, .params = ps };
+    }
+
+    /// Release everything an `own`-built Guard holds. A zero-length `joins`/`params` free is a
+    /// no-op, so the empty defaults are safe. NOT valid on a hand-assembled Guard whose `where_sql`
+    /// is a string literal (freeing a static pointer is undefined behavior) — always build via `own`.
+    pub fn deinit(self: Guard, alloc: std.mem.Allocator) void {
+        alloc.free(self.where_sql);
+        for (self.joins) |jn| alloc.free(jn);
+        alloc.free(self.joins);
+        for (self.params) |p| switch (p) {
+            .text => |t| alloc.free(t),
+            else => {},
+        };
+        alloc.free(self.params);
+    }
 };
 
 fn guardJoinsSql(alloc: std.mem.Allocator, joins: []const []const u8) ![]u8 {
@@ -518,83 +569,52 @@ pub fn coerceFormFields(alloc: std.mem.Allocator, col: schema.Collection, data: 
     return .{ .object = out };
 }
 
-/// Deep-clone a json Value onto `alloc` into a fully-OWNED, individually-freeable tree (free with
-/// `values.freeValue`). An OOM at any depth unwinds via `errdefer`, freeing every partial
-/// allocation. Local mirror of values' internal clone so multipart coercion can own its output
-/// without reaching into another module's private helper.
-fn coerceClone(alloc: std.mem.Allocator, v: std.json.Value) std.mem.Allocator.Error!std.json.Value {
-    switch (v) {
-        .null, .bool, .integer, .float => return v,
-        .number_string => |s| return .{ .number_string = try alloc.dupe(u8, s) },
-        .string => |s| return .{ .string = try alloc.dupe(u8, s) },
-        .array => |arr| {
-            var out = std.json.Array.init(alloc);
-            errdefer values.freeValue(alloc, .{ .array = out });
-            try out.ensureTotalCapacity(arr.items.len);
-            for (arr.items) |item| out.appendAssumeCapacity(try coerceClone(alloc, item));
-            return .{ .array = out };
-        },
-        .object => |obj| {
-            var out: std.json.ObjectMap = .empty;
-            errdefer values.freeValue(alloc, .{ .object = out });
-            try out.ensureTotalCapacity(alloc, obj.count());
-            var it = obj.iterator();
-            while (it.next()) |e| {
-                const k = try alloc.dupe(u8, e.key_ptr.*);
-                errdefer alloc.free(k); // freed only if the value clone below fails (k not yet inserted)
-                out.putAssumeCapacity(k, try coerceClone(alloc, e.value_ptr.*));
-            }
-            return .{ .object = out };
-        },
-    }
-}
-
 /// Coerce one multipart field value to its schema-shaped JSON, returning an OWNED value on `alloc`
 /// (free with `values.freeValue`): scalars own nothing; a passed-through string is duped; a parsed
 /// json/array tree is deep-cloned off its temporary `Parsed` handle, which is then freed. Nothing
 /// in the result aliases `v`.
 fn coerceFieldValue(alloc: std.mem.Allocator, col: schema.Collection, key: []const u8, v: std.json.Value) std.mem.Allocator.Error!std.json.Value {
-    const f = schema.fieldByName(col, key) orelse return coerceClone(alloc, v);
-    if (v != .string) return coerceClone(alloc, v);
+    const f = schema.fieldByName(col, key) orelse return values.cloneValue(alloc, v);
+    if (v != .string) return values.cloneValue(alloc, v);
     const s = v.string;
     switch (f.options) {
         .bool => {
             if (s.len == 0) return .null; // multipart "" = clear
             if (std.mem.eql(u8, s, "true")) return .{ .bool = true };
             if (std.mem.eql(u8, s, "false")) return .{ .bool = false };
-            return coerceClone(alloc, v);
+            return values.cloneValue(alloc, v);
         },
         .number => |o| {
             if (s.len == 0) return .null; // multipart "" = clear (all modes)
-            if (o.mode != .float) return coerceClone(alloc, v); // int/fixed: strings are the accepted JSON form
-            const x = std.fmt.parseFloat(f64, s) catch return coerceClone(alloc, v);
-            if (!std.math.isFinite(x)) return coerceClone(alloc, v); // JSON can't carry nan/inf; let validation reject
+            if (o.mode != .float) return values.cloneValue(alloc, v); // int/fixed: strings are the accepted JSON form
+            const x = std.fmt.parseFloat(f64, s) catch return values.cloneValue(alloc, v);
+            if (!std.math.isFinite(x)) return values.cloneValue(alloc, v); // JSON can't carry nan/inf; let validation reject
             return .{ .float = x };
         },
         .json => {
             if (s.len == 0) return .null; // multipart "" = clear
             // Parse into a temporary handle, deep-clone its tree onto `alloc`, then free the handle
             // (its arena) — no leaked Parsed, and the returned tree is independently freeable.
-            const parsed = std.json.parseFromSlice(std.json.Value, alloc, s, .{}) catch return coerceClone(alloc, v);
+            const parsed = std.json.parseFromSlice(std.json.Value, alloc, s, .{}) catch return values.cloneValue(alloc, v);
             defer parsed.deinit();
-            return coerceClone(alloc, parsed.value);
+            return values.cloneValue(alloc, parsed.value);
         },
         .select, .relation => {
-            if (!f.isMultiValue()) return coerceClone(alloc, v);
+            if (!f.isMultiValue()) return values.cloneValue(alloc, v);
             if (s.len == 0) return .null; // multipart "" = clear
             if (std.json.parseFromSlice(std.json.Value, alloc, s, .{})) |parsed| {
                 defer parsed.deinit();
-                if (parsed.value == .array) return coerceClone(alloc, parsed.value);
+                if (parsed.value == .array) return values.cloneValue(alloc, parsed.value);
             } else |_| {}
             // A single occurrence (-F tags=x) wraps as a one-element array of the ORIGINAL string
             // (owned), mirroring how repeated keys arrive as string arrays.
             var arr = std.json.Array.init(alloc);
             errdefer values.freeValue(alloc, .{ .array = arr });
             try arr.ensureTotalCapacity(1);
-            arr.appendAssumeCapacity(try coerceClone(alloc, v));
+            arr.appendAssumeCapacity(try values.cloneValue(alloc, v));
             return .{ .array = arr };
         },
-        else => return coerceClone(alloc, v),
+        else => return values.cloneValue(alloc, v),
     }
 }
 
