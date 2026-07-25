@@ -476,9 +476,9 @@ test "http: not capturing returns passthrough" {
     if (!enabled) return error.SkipZigTest;
     http.reset();
     defer http.reset();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const oc = try http.intercept(arena.allocator(), .{ .url = "https://x.io/" });
+    // .passthrough carries no allocation, so intercept() can be driven directly on the raw
+    // testing allocator with nothing to free.
+    const oc = try http.intercept(std.testing.allocator, .{ .url = "https://x.io/" });
     try std.testing.expectEqual(Outcome.passthrough, oc);
 }
 
@@ -492,9 +492,9 @@ test "prod gate: capture is comptime-eliminated when dev_mode is off" {
 
     http.enable(true);
     http.mock("x", .{ .status = 500 });
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const oc = try http.intercept(arena.allocator(), .{ .url = "https://x.io/" });
+    // .passthrough carries no allocation, so intercept() can be driven directly on the raw
+    // testing allocator with nothing to free.
+    const oc = try http.intercept(std.testing.allocator, .{ .url = "https://x.io/" });
     try std.testing.expectEqual(Outcome.passthrough, oc);
     try std.testing.expectEqual(@as(usize, 0), http.requestCount());
 }

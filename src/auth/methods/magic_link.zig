@@ -417,17 +417,15 @@ test "MagicLinkMethod: initiate with unparseable body returns 204 (enumeration-s
 }
 
 test "buildMailBody: raw token when public_url is empty" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const body = try buildMailBody(arena.allocator(), "", "users", "TOK.EN", "/");
+    const body = try buildMailBody(std.testing.allocator, "", "users", "TOK.EN", "/");
+    defer std.testing.allocator.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "TOK.EN") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "http") == null);
 }
 
 test "buildMailBody: clickable consume link when public_url is set (trailing slash trimmed)" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const body = try buildMailBody(arena.allocator(), "http://blog.test/", "users", "TOK.EN", "/dashboard");
+    const body = try buildMailBody(std.testing.allocator, "http://blog.test/", "users", "TOK.EN", "/dashboard");
+    defer std.testing.allocator.free(body);
     try std.testing.expectEqualStrings(
         "Click the link to sign in:\n\nhttp://blog.test/api/collections/users/auth/magic-link/consume?token=TOK.EN&redirect=/dashboard\n",
         body,

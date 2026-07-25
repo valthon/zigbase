@@ -806,6 +806,14 @@ pub const Conn = struct {
         if (n < 0) return ConnError.Protocol;
         const vals = arena.alloc(?[]const u8, @intCast(n)) catch return ConnError.OutOfMemory;
         var i: usize = 0;
+        // A malformed row (bad length sentinel, truncated body, OOM) errors out mid-loop —
+        // free the dupes already built for columns 0..i (vals[i] itself is never freed here:
+        // it is only ever written by the same statement that would otherwise return the
+        // error, so it's still unset on every error path) plus the `vals` slice itself.
+        errdefer {
+            for (vals[0..i]) |v| if (v) |bytes| arena.free(bytes);
+            arena.free(vals);
+        }
         while (i < vals.len) : (i += 1) {
             const vlen = cur.int32() orelse return ConnError.Protocol;
             if (vlen == -1) {
@@ -944,17 +952,17 @@ test "cursor reads ints, strings, and rest with underflow guards" {
 }
 
 test "parseDataRow: -1 is NULL, other negative lengths are rejected as malformed" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
 
     // One column, length -1 (0xFFFFFFFF) → NULL.
     const null_row = [_]u8{ 0, 1, 0xFF, 0xFF, 0xFF, 0xFF };
     const vals = try Conn.parseDataRow(a, &null_row);
+    defer a.free(vals);
     try std.testing.expectEqual(@as(usize, 1), vals.len);
     try std.testing.expect(vals[0] == null);
 
-    // One column, length -2 (0xFFFFFFFE) → not a valid sentinel → Protocol error.
+    // One column, length -2 (0xFFFFFFFE) → not a valid sentinel → Protocol error. The `vals`
+    // scratch parseDataRow allocated before hitting the error is freed by its own errdefer.
     const bad_row = [_]u8{ 0, 1, 0xFF, 0xFF, 0xFF, 0xFE };
     try std.testing.expectError(ConnError.Protocol, Conn.parseDataRow(a, &bad_row));
 }

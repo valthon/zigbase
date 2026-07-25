@@ -198,33 +198,31 @@ const MapGetter = struct {
 };
 
 test "seal/open round-trips a storage string and ciphertext-at-rest holds" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const cph = Cipher.fromEnv(std.testing.io, "operator-field-key");
     const blob = try cph.seal(a, "sensitive-value");
+    defer a.free(blob);
     try std.testing.expect(aead.isEnvelope(blob));
     try std.testing.expect(std.mem.startsWith(u8, blob, "v1:"));
     try std.testing.expect(std.mem.indexOf(u8, blob, "sensitive-value") == null);
-    try std.testing.expectEqualStrings("sensitive-value", try cph.open(a, blob));
+    const opened = try cph.open(a, blob);
+    defer a.free(opened);
+    try std.testing.expectEqualStrings("sensitive-value", opened);
 }
 
 test "open is strict: legacy plaintext fails closed" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const cph = Cipher.fromEnv(std.testing.io, "k");
     try std.testing.expectError(error.BadEnvelope, cph.open(a, "legacy-plaintext"));
 }
 
 test "multi-gen: writes use primary version; old generations still decrypt" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
 
     // Old single-key deployment: write v1: with "oldkey".
     const old = Cipher.fromEnv(std.testing.io, "oldkey");
     const v1_blob = try old.seal(a, "secret-payload");
+    defer a.free(v1_blob);
     try std.testing.expect(std.mem.startsWith(u8, v1_blob, "v1:"));
 
     // Rotate: primary = generation 2 ("newkey"), generation 1 = "oldkey" (read-only).
@@ -233,19 +231,23 @@ test "multi-gen: writes use primary version; old generations still decrypt" {
 
     // Writes now stamp v2:.
     const v2_blob = try ring.seal(a, "secret-payload");
+    defer a.free(v2_blob);
     try std.testing.expect(std.mem.startsWith(u8, v2_blob, "v2:"));
     // Both the legacy v1 blob and the new v2 blob decrypt under the ring.
-    try std.testing.expectEqualStrings("secret-payload", try ring.open(a, v1_blob));
-    try std.testing.expectEqualStrings("secret-payload", try ring.open(a, v2_blob));
+    const opened_v1 = try ring.open(a, v1_blob);
+    defer a.free(opened_v1);
+    try std.testing.expectEqualStrings("secret-payload", opened_v1);
+    const opened_v2 = try ring.open(a, v2_blob);
+    defer a.free(opened_v2);
+    try std.testing.expectEqualStrings("secret-payload", opened_v2);
 }
 
 test "multi-gen open fails closed on an unconfigured generation" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     // A v1 blob, but the ring only knows generation 2 (no V1 supplied).
     const old = Cipher.fromEnv(std.testing.io, "oldkey");
     const v1_blob = try old.seal(a, "x");
+    defer a.free(v1_blob);
     const getter = MapGetter{ .pairs = &.{} };
     const ring = try Cipher.resolve(std.testing.io, getter, "newkey", 2);
     try std.testing.expectError(error.BadEnvelope, ring.open(a, v1_blob));
@@ -263,13 +265,14 @@ test "resolve: bad generation and primary conflict are rejected" {
 test "generation 1 domain matches the legacy single-key domain (back-compat)" {
     // A v1 blob written by the pre-rotation build must decrypt when generation 1
     // is configured with the same raw key.
+    const a = std.testing.allocator;
     const legacy_key = aead.deriveKey("rawkey", FIELD_KEY_DOMAIN);
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
     const blob = try aead.sealV1(std.testing.io, a, legacy_key, "legacy");
+    defer a.free(blob);
     const cph = Cipher.fromEnv(std.testing.io, "rawkey");
-    try std.testing.expectEqualStrings("legacy", try cph.open(a, blob));
+    const opened = try cph.open(a, blob);
+    defer a.free(opened);
+    try std.testing.expectEqualStrings("legacy", opened);
 }
 
 test "isEncryptableType allows only text/editor/json" {
@@ -284,32 +287,32 @@ test "isEncryptableType allows only text/editor/json" {
 }
 
 test "fake mode: seal is readable and self-labeling; open round-trips" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const cph = Cipher.fake(std.testing.io, "@test@");
     const blob = try cph.seal(a, "John Doe loves cheese");
+    defer a.free(blob);
     try std.testing.expectEqualStrings("fake:@test@:John Doe loves cheese", blob);
     try std.testing.expect(!aead.isEnvelope(blob)); // not a v<N>: envelope
-    try std.testing.expectEqualStrings("John Doe loves cheese", try cph.open(a, blob));
+    const opened = try cph.open(a, blob);
+    defer a.free(opened);
+    try std.testing.expectEqualStrings("John Doe loves cheese", opened);
 }
 
 test "fake mode: a different label fails closed (verifies which key)" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const blob = try Cipher.fake(std.testing.io, "k1").seal(a, "x");
+    defer a.free(blob);
     try std.testing.expectError(error.BadEnvelope, Cipher.fake(std.testing.io, "k2").open(a, blob));
 }
 
 test "fake and real envelopes are mutually unreadable" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const real = Cipher.fromEnv(std.testing.io, "operator-key");
     const fake_c = Cipher.fake(std.testing.io, "@test@");
     const real_blob = try real.seal(a, "s");
+    defer a.free(real_blob);
     const fake_blob = try fake_c.seal(a, "s");
+    defer a.free(fake_blob);
     try std.testing.expectError(error.BadEnvelope, real.open(a, fake_blob)); // prod can't read fake
     try std.testing.expectError(error.BadEnvelope, fake_c.open(a, real_blob)); // fake can't read real
 }

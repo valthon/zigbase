@@ -36,16 +36,29 @@ pub fn parse(alloc: std.mem.Allocator, query: []const u8) !Params {
 }
 
 fn decode(alloc: std.mem.Allocator, s: []const u8) ![]u8 {
-    const buf = try alloc.alloc(u8, s.len);
-    for (s, 0..) |c, i| buf[i] = if (c == '+') ' ' else c;
-    return std.Uri.percentDecodeInPlace(buf);
+    // `percentDecodeInPlace` may shrink the buffer (each "%XX" collapses to one byte), so
+    // its return is a sub-slice of `buf` shorter than the allocation — freeing THAT slice
+    // at its reported (decoded) length would be an invalid free under any allocator that
+    // checks the original allocation size (as opposed to an arena, which no-ops on free
+    // and so never surfaces the mismatch). Decode into scratch, then dupe the decoded
+    // result to a right-sized, independently-freeable buffer.
+    const scratch = try alloc.alloc(u8, s.len);
+    defer alloc.free(scratch);
+    for (s, 0..) |c, i| scratch[i] = if (c == '+') ' ' else c;
+    const decoded = std.Uri.percentDecodeInPlace(scratch);
+    return alloc.dupe(u8, decoded);
 }
 
 test "parse decodes pairs" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const p = try parse(a, "filter=name%3D%22x%22&page=2&q=a+b");
+    defer {
+        for (p.pairs) |pair| {
+            a.free(pair.key);
+            a.free(pair.value);
+        }
+        a.free(p.pairs);
+    }
     try std.testing.expectEqualStrings("name=\"x\"", p.get("filter").?);
     try std.testing.expectEqualStrings("2", p.get("page").?);
     try std.testing.expectEqualStrings("a b", p.get("q").?);

@@ -237,9 +237,8 @@ test "no freeze: overridden builtins pass through to real SQLite" {
     try std.testing.expect((try scalarInt(&d, "SELECT unixepoch('now')")) > 1577836800);
 
     // An explicit (non-'now') datetime is returned verbatim — pure pass-through.
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const got = try scalarText(&d, arena.allocator(), "SELECT datetime('2020-01-02 03:04:05')");
+    const got = try scalarText(&d, std.testing.allocator, "SELECT datetime('2020-01-02 03:04:05')");
+    defer std.testing.allocator.free(got);
     try std.testing.expectEqualStrings("2020-01-02 03:04:05", got);
 }
 
@@ -251,19 +250,29 @@ test "frozen: consumer SQL 'now' resolves to the frozen instant (dev build only)
     defer d.close();
     register(db.sqliteHandle(&d));
 
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
 
     try std.testing.expectEqual(frozen_unix, try scalarInt(&d, "SELECT unixepoch('now')"));
-    try std.testing.expectEqualStrings("2029-03-07 16:00:00", try scalarText(&d, a, "SELECT datetime('now')"));
-    try std.testing.expectEqualStrings("2029-03-07", try scalarText(&d, a, "SELECT date('now')"));
-    try std.testing.expectEqualStrings("16:00:00", try scalarText(&d, a, "SELECT time('now')"));
-    try std.testing.expectEqualStrings("2029", try scalarText(&d, a, "SELECT strftime('%Y', 'now')"));
+    const got1 = try scalarText(&d, a, "SELECT datetime('now')");
+    defer a.free(got1);
+    try std.testing.expectEqualStrings("2029-03-07 16:00:00", got1);
+    const got2 = try scalarText(&d, a, "SELECT date('now')");
+    defer a.free(got2);
+    try std.testing.expectEqualStrings("2029-03-07", got2);
+    const got3 = try scalarText(&d, a, "SELECT time('now')");
+    defer a.free(got3);
+    try std.testing.expectEqualStrings("16:00:00", got3);
+    const got4 = try scalarText(&d, a, "SELECT strftime('%Y', 'now')");
+    defer a.free(got4);
+    try std.testing.expectEqualStrings("2029", got4);
     // Modifiers still work: 'now' is replaced, the rest of the math is genuine SQLite.
-    try std.testing.expectEqualStrings("2029-03-08 16:00:00", try scalarText(&d, a, "SELECT datetime('now','+1 day')"));
+    const got5 = try scalarText(&d, a, "SELECT datetime('now','+1 day')");
+    defer a.free(got5);
+    try std.testing.expectEqualStrings("2029-03-08 16:00:00", got5);
     // Implicit-'now' (zero-arg) form is frozen too.
-    try std.testing.expectEqualStrings("2029-03-07 16:00:00", try scalarText(&d, a, "SELECT datetime()"));
+    const got6 = try scalarText(&d, a, "SELECT datetime()");
+    defer a.free(got6);
+    try std.testing.expectEqualStrings("2029-03-07 16:00:00", got6);
     // Case/whitespace-insensitive 'now'.
     try std.testing.expectEqual(frozen_unix, try scalarInt(&d, "SELECT unixepoch(' NOW ')"));
     // Explicit (non-'now') values are NOT touched even under a freeze.

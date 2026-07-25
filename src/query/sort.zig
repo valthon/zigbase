@@ -71,15 +71,20 @@ test "sort compiles direction and relation paths" {
     const collections = @import("../collections.zig");
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    // Use an ARENA only for the schema-setup churn (collections.create, joiner), but drive
+    // compile() itself on the raw testing allocator so a leaked return would fail the test.
+    var setup = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer setup.deinit();
+    const sa = setup.allocator();
     try migrations.run(&d);
-    const users = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "users", .fields = &[_]schema.Field{.{ .id = "u1", .name = "name", .options = .{ .text = .{} } }} });
+    const users = try collections.create(sa, std.testing.io, &d, .{ .id = "", .name = "users", .fields = &[_]schema.Field{.{ .id = "u1", .name = "name", .options = .{ .text = .{} } }} });
     const pf = [_]schema.Field{.{ .id = "f3", .name = "author", .options = .{ .relation = .{ .targetCollectionId = users.id, .maxSelect = 1 } } }};
-    const posts = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "posts", .fields = &pf });
-    var j = joiner.Joiner.init(a, &d, posts);
-    const ob = try compile(a, &j, "-created,author.name", Dialect.sqlite);
+    const posts = try collections.create(sa, std.testing.io, &d, .{ .id = "", .name = "posts", .fields = &pf });
+    var j = joiner.Joiner.init(sa, &d, posts); // joiner allocations live in the arena
+
+    const a = std.testing.allocator;
+    const ob = try compile(a, &j, "-created,author.name", Dialect.sqlite); // returned string owned by `a`
+    defer a.free(ob);
     try std.testing.expectEqualStrings("\"posts\".\"created\" DESC, j1.\"name\" ASC", ob);
 }
 
@@ -115,17 +120,23 @@ test "compileTerms surfaces resolved col_sql, direction, and field per term" {
     const collections = @import("../collections.zig");
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    // Use an ARENA only for the schema-setup churn (collections.create, joiner), but drive
+    // compileTerms/compile themselves on the raw testing allocator so a leaked return
+    // (the terms slice, or the ORDER BY string) would fail the test.
+    var setup = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer setup.deinit();
+    const sa = setup.allocator();
     try migrations.run(&d);
     const pf = [_]schema.Field{
         .{ .id = "f1", .name = "title", .options = .{ .text = .{} } },
         .{ .id = "f2", .name = "price", .options = .{ .number = .{ .mode = .fixed, .scale = 2 } } },
     };
-    const posts = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "posts", .fields = &pf });
-    var j = joiner.Joiner.init(a, &d, posts);
-    const terms = try compileTerms(a, &j, "-created,price");
+    const posts = try collections.create(sa, std.testing.io, &d, .{ .id = "", .name = "posts", .fields = &pf });
+    var j = joiner.Joiner.init(sa, &d, posts); // joiner allocations live in the arena
+
+    const a = std.testing.allocator;
+    const terms = try compileTerms(a, &j, "-created,price"); // returned slice owned by `a`
+    defer a.free(terms);
     try std.testing.expectEqual(@as(usize, 2), terms.len);
     // system column "created": DESC, no schema.Field (binds as text)
     try std.testing.expectEqualStrings("\"posts\".\"created\"", terms[0].col_sql);
@@ -138,7 +149,9 @@ test "compileTerms surfaces resolved col_sql, direction, and field per term" {
     try std.testing.expect(terms[1].field != null);
     try std.testing.expectEqual(schema.FieldType.number, terms[1].field.?.fieldType());
     // and the string compiler still produces the same ORDER BY it always did.
-    try std.testing.expectEqualStrings("\"posts\".\"created\" DESC, \"posts\".\"price\" ASC", try compile(a, &j, "-created,price", Dialect.sqlite));
+    const ob = try compile(a, &j, "-created,price", Dialect.sqlite);
+    defer a.free(ob);
+    try std.testing.expectEqualStrings("\"posts\".\"created\" DESC, \"posts\".\"price\" ASC", ob);
 }
 
 test "sort error paths: bare sign, unknown column, empty" {
@@ -147,18 +160,25 @@ test "sort error paths: bare sign, unknown column, empty" {
     const collections = @import("../collections.zig");
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    // Use an ARENA only for the schema-setup churn (collections.create, joiner), but drive
+    // compile() itself on the raw testing allocator so a leaked return would fail the test.
+    var setup = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer setup.deinit();
+    const sa = setup.allocator();
     try migrations.run(&d);
-    const posts = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "posts", .fields = &[_]schema.Field{.{ .id = "f1", .name = "title", .options = .{ .text = .{} } }} });
+    const posts = try collections.create(sa, std.testing.io, &d, .{ .id = "", .name = "posts", .fields = &[_]schema.Field{.{ .id = "f1", .name = "title", .options = .{ .text = .{} } }} });
 
-    var j = joiner.Joiner.init(a, &d, posts);
+    var j = joiner.Joiner.init(sa, &d, posts); // joiner allocations live in the arena
+    const a = std.testing.allocator;
     // A bare sign with no column is a bad sort spec.
     try std.testing.expectError(error.BadSort, compile(a, &j, "-", Dialect.sqlite));
     // Sorting on a nonexistent column propagates from the joiner.
     try std.testing.expectError(error.UnknownField, compile(a, &j, "nope", Dialect.sqlite));
     // Empty / whitespace-only spec yields an empty ORDER BY fragment.
-    try std.testing.expectEqualStrings("", try compile(a, &j, "", Dialect.sqlite));
-    try std.testing.expectEqualStrings("", try compile(a, &j, "   ", Dialect.sqlite));
+    const empty1 = try compile(a, &j, "", Dialect.sqlite);
+    defer a.free(empty1);
+    try std.testing.expectEqualStrings("", empty1);
+    const empty2 = try compile(a, &j, "   ", Dialect.sqlite);
+    defer a.free(empty2);
+    try std.testing.expectEqualStrings("", empty2);
 }

@@ -103,6 +103,17 @@ pub const Resolution = struct {
     account_id: []const u8 = "",
     account_role: []const u8 = "",
     memberships: []const request.Membership = &.{},
+
+    /// Free the membership list this resolution owns. `account_id`/`account_role` are never
+    /// separately allocated — either "" or an alias into one of `memberships`' entries — so
+    /// freeing them here would double-free; only the membership dupes + the slice are owned.
+    pub fn deinit(self: Resolution, alloc: std.mem.Allocator) void {
+        for (self.memberships) |m| {
+            alloc.free(m.account);
+            alloc.free(m.role);
+        }
+        alloc.free(self.memberships);
+    }
 };
 
 /// Defensive cap on memberships read per request (bounds allocation; a principal in this many
@@ -274,9 +285,7 @@ fn macFor(secret: []const u8, account_id: []const u8, out: *[HmacSha256.mac_leng
 const migrations = @import("../migrations.zig");
 
 test "scopePredicate: null unless enabled + tenant-owned + non-superuser" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const fields = [_]schema.Field{.{ .id = "f1", .name = "account", .options = .{ .text = .{} } }};
     var col = schema.Collection{ .id = "c", .name = "posts", .fields = &fields };
 
@@ -300,6 +309,7 @@ test "scopePredicate: null unless enabled + tenant-owned + non-superuser" {
     {
         const rctx = request.RequestContext{ .tenancy_enabled = true, .account_id = "acc1" };
         const sp = (try scopePredicate(a, col, &rctx)).?;
+        defer a.free(sp.sql);
         try std.testing.expectEqualStrings("\"posts\".\"account\" = ?", sp.sql);
         try std.testing.expectEqualStrings("acc1", sp.param.text);
     }
@@ -308,9 +318,7 @@ test "scopePredicate: null unless enabled + tenant-owned + non-superuser" {
 test "resolve: only active memberships; requested account must be a member" {
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     try migrations.run(&d);
     try d.exec("INSERT INTO \"_memberships\" (\"id\",\"created\",\"updated\",\"account\",\"user_collection\",\"user\",\"role\",\"status\") VALUES " ++
         "('m1','','','acc1','users','u1','owner','active')," ++
@@ -319,22 +327,26 @@ test "resolve: only active memberships; requested account must be a member" {
 
     // Requested an account the user actively belongs to.
     const r1 = try resolve(a, &d, "users", "u1", "acc2");
+    defer r1.deinit(a);
     try std.testing.expectEqualStrings("acc2", r1.account_id);
     try std.testing.expectEqualStrings("viewer", r1.account_role);
     try std.testing.expectEqual(@as(usize, 2), r1.memberships.len); // only the 2 active
 
     // Requested an account whose membership is not active -> no active scope (fail closed).
     const r2 = try resolve(a, &d, "users", "u1", "acc3");
+    defer r2.deinit(a);
     try std.testing.expectEqualStrings("", r2.account_id);
     try std.testing.expectEqual(@as(usize, 2), r2.memberships.len);
 
     // No requested account -> membership list still populated, no active scope.
     const r3 = try resolve(a, &d, "users", "u1", "");
+    defer r3.deinit(a);
     try std.testing.expectEqualStrings("", r3.account_id);
     try std.testing.expectEqual(@as(usize, 2), r3.memberships.len);
 
     // Unknown user -> empty.
     const r4 = try resolve(a, &d, "users", "ghost", "acc1");
+    defer r4.deinit(a);
     try std.testing.expectEqual(@as(usize, 0), r4.memberships.len);
 }
 
@@ -467,16 +479,16 @@ test "resolveRequest: shared chokepoint for records/files/dispatchCustom" {
 }
 
 test "signAccount/verifyAccount round-trip; tamper fails closed" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const secret = "app-jwt-secret";
     const signed = try signAccount(a, secret, "acc-123");
+    defer a.free(signed);
     try std.testing.expectEqualStrings("acc-123", verifyAccount(secret, signed).?);
     // Wrong secret -> null.
     try std.testing.expect(verifyAccount("other", signed) == null);
     // Tampered account id -> null (MAC no longer matches).
     const tampered = try std.fmt.allocPrint(a, "acc-999.{s}", .{signed[std.mem.lastIndexOfScalar(u8, signed, '.').? + 1 ..]});
+    defer a.free(tampered);
     try std.testing.expect(verifyAccount(secret, tampered) == null);
     // Malformed (no dot) -> null.
     try std.testing.expect(verifyAccount(secret, "nodothere") == null);

@@ -261,9 +261,7 @@ fn dataFor(d: *db.Db, a: std.mem.Allocator) Data {
 }
 
 test "feature_cache: instant local invalidation makes the next snapshot see the write" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = testing.allocator;
     var d = try testDb();
     defer d.close();
     var cache = FeatureOverrideCache.init(testing.allocator);
@@ -289,9 +287,7 @@ test "feature_cache: instant local invalidation makes the next snapshot see the 
 }
 
 test "feature_cache: a version-current snapshot is served WITHOUT re-scanning (cache hit)" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = testing.allocator;
     var d = try testDb();
     defer d.close();
     var cache = FeatureOverrideCache.init(testing.allocator);
@@ -314,9 +310,7 @@ test "feature_cache: a version-current snapshot is served WITHOUT re-scanning (c
 }
 
 test "feature_cache: an entry older than the TTL is re-scanned (cross-instance self-heal)" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = testing.allocator;
     var d = try testDb();
     defer d.close();
     var cache = FeatureOverrideCache.init(testing.allocator);
@@ -352,9 +346,7 @@ test "feature_cache: an entry older than the TTL is re-scanned (cross-instance s
 }
 
 test "feature_cache: get() serves per-key lookups and is invalidated instantly" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = testing.allocator;
     var d = try testDb();
     defer d.close();
     var cache = FeatureOverrideCache.init(testing.allocator);
@@ -365,17 +357,19 @@ test "feature_cache: get() serves per-key lookups and is invalidated instantly" 
     try testing.expect((try cache.get(testing.io, data, "flag:beta")) == null);
     try data.kvSet("flag:beta", "true");
     cache.invalidate();
-    try testing.expectEqualStrings("true", (try cache.get(testing.io, data, "flag:beta")).?);
+    const beta = (try cache.get(testing.io, data, "flag:beta")).?; // dupe owned by `a` (data.alloc)
+    defer a.free(beta);
+    try testing.expectEqualStrings("true", beta);
     // exp:*:weights lookups are served from the same snapshot.
     try data.kvSet("exp:layout:weights", "[10,90]");
     cache.invalidate();
-    try testing.expectEqualStrings("[10,90]", (try cache.get(testing.io, data, "exp:layout:weights")).?);
+    const weights = (try cache.get(testing.io, data, "exp:layout:weights")).?;
+    defer a.free(weights);
+    try testing.expectEqualStrings("[10,90]", weights);
 }
 
 test "feature_cache: only flag:/exp: keys are cached; unrelated settings are ignored" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = testing.allocator;
     var d = try testDb();
     defer d.close();
     var cache = FeatureOverrideCache.init(testing.allocator);
@@ -395,9 +389,7 @@ test "feature_cache: only flag:/exp: keys are cached; unrelated settings are ign
 }
 
 test "feature_cache: a scan error is surfaced (caller degrades to a direct read)" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = testing.allocator;
     var d = try db.Db.openMemory(); // NO migrations → no `_kv` table
     defer d.close();
     var cache = FeatureOverrideCache.init(testing.allocator);
@@ -410,9 +402,7 @@ test "feature_cache: a scan error is surfaced (caller degrades to a direct read)
 }
 
 test "feature_cache: in-flight snapshot survives a concurrent invalidate + rescan (refcount)" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = testing.allocator;
     var d = try testDb();
     defer d.close();
     var cache = FeatureOverrideCache.init(testing.allocator);

@@ -17,26 +17,21 @@ src/api/state.zig	5	PRE-EXISTING: not yet migrated to the ownership contracts
 src/api/webauthn_register.zig	4	PRE-EXISTING: not yet migrated to the ownership contracts
 src/auth.zig	6	The 11 applyCreate/applyProvision/applyUpdate tests are un-masked (each returns a graph freed via freeProvisioned, run under std.testing.allocator). 6 remain: the verifyToken/verifyTokenOfTypes/authenticate family, which return the `Verified`/`Authed` graph from an internal JWT-claims parse (deferred design work per the batch scope) — arena-scoped pending that migration.
 src/auth/method.zig	5	PRE-EXISTING: not yet migrated to the ownership contracts
-src/auth/methods/magic_link.zig	11	PRE-EXISTING: not yet migrated to the ownership contracts
+src/auth/methods/magic_link.zig	9	contract-4: the 9 remaining `MagicLinkMethod:` tests (method()/complete/initiate/ttl_s/auto_create, valid+garbage+missing token, known/unknown/unparseable email) all call `initiate`/`complete` through a real `AuthCtx`/`http.RequestCtx` whose allocator is a `RequestArena` (`RequestArena.from(&arena)`) — the exact production shape every auth-method chokepoint is invoked with. The 2 "buildMailBody: …" tests (a pure builder returning one allocPrint'd string) now run under raw std.testing.allocator, freeing the returned body.
 src/auth/methods/oauth2.zig	11	PRE-EXISTING: not yet migrated to the ownership contracts
 src/auth/methods/otp.zig	11	PRE-EXISTING: not yet migrated to the ownership contracts
 src/auth/methods/password.zig	3	PRE-EXISTING: not yet migrated to the ownership contracts
 src/auth/methods/webauthn.zig	2	PRE-EXISTING: not yet migrated to the ownership contracts
 src/auth_helpers.zig	5	PRE-EXISTING: not yet migrated to the ownership contracts
-src/backend/postgres/conn.zig	1	PRE-EXISTING: not yet migrated to the ownership contracts
 src/captcha.zig	4	contract-4: verify tests hold an arena-scoped HttpClient response body (sub-slice of max_response_bytes, not individually freeable)
-src/clock_sql.zig	2	PRE-EXISTING: not yet migrated to the ownership contracts
 src/clock_test.zig	1	PRE-EXISTING: not yet migrated to the ownership contracts
-src/clock_vfs.zig	2	PRE-EXISTING: not yet migrated to the ownership contracts
 src/codegen/acquire.zig	2	buildCollection is the internal builder (looped by acquireFromDb); returns a bare arena-lifetime Collection on the caller allocator. Public entry points are contract-2 (Acquired).
 src/codegen/acquire_datadir.zig	1	arena is test SETUP (provision.applySpecs scaffolding); the SUT acquireFromDb runs under the leak detector via the Acquired handle.
 src/codegen/typegen_cli.zig	1	arena is test SETUP (provisioning + generate scaffolding); the SUT acquireFromDb runs under the leak detector via the Acquired handle.
 src/ctx.zig	5	PRE-EXISTING: not yet migrated to the ownership contracts
 src/ddl.zig	9	PRE-EXISTING: not yet migrated to the ownership contracts
 src/dumpload.zig	4	PRE-EXISTING: not yet migrated to the ownership contracts
-src/feature_cache.zig	7	PRE-EXISTING: not yet migrated to the ownership contracts
 src/features_resolver.zig	14	PRE-EXISTING: not yet migrated to the ownership contracts
-src/field_policy.zig	8	PRE-EXISTING: not yet migrated to the ownership contracts
 src/files/plan.zig	11	contract-4: planFileField/planAllFileFields return a json.Value tree (FieldPlan.value / AllPlan.data) whose string elements alias PlannedWrite.filename (freshly allocated) or borrow directly from the caller-owned `existing`/`data` inputs; deletes borrow from `existing` too. Individual frees would double-free the aliased writes or free memory this call never owned. Production (api/records.zig prepareRecordData) always passes ctx.allocator.a (the request arena); the graph is reclaimed wholesale at request end.
 src/files/s3.zig	7	contract-4: these tests call the raw `Client` ops (put/getToWriter/head + the LIVE MinIO test) directly and hold an HttpResponse/DownloadResult, which is arena-scoped BY DESIGN — its body is a sub-slice of the fixed max_response_bytes buffer (not individually freeable) and request()/download() leave their response scratch on the passed allocator (there is intentionally no deinit; see the documented contract on http_client.HttpResponse). In production S3Storage wraps each op in a per-op arena that reclaims this wholesale; the tests mirror that with an arena. Not un-maskable without changing the fixed-buffer response design.
 src/framework.zig	1	PRE-EXISTING: not yet migrated to the ownership contracts
@@ -48,20 +43,18 @@ src/policy.zig	7	"PIN: policy.authorizes …" is un-masked (drives only the self
 src/provision.zig	29	PRE-EXISTING: not yet migrated to the ownership contracts
 src/query/expand.zig	9	PRE-EXISTING: not yet migrated to the ownership contracts
 src/query/fields.zig	12	PRE-EXISTING: not yet migrated to the ownership contracts
-src/query/params.zig	1	PRE-EXISTING: not yet migrated to the ownership contracts
-src/query/sort.zig	4	PRE-EXISTING: not yet migrated to the ownership contracts
+src/query/sort.zig	4	SUT-driven: all 4 tests now drive compile()/compileTerms() themselves on the RAW std.testing.allocator, freeing the returned []SortTerm / ORDER BY string ("compile() frees its intermediate terms slice" already did; the other 3 now follow the same split). The 4 remaining ArenaAllocator.init(testing.allocator) lines are SETUP-only arenas for db-backed collections.create + the joiner, which has inherent per-resolve intermediates with no deinit — a separate joiner.zig migration — mirroring the query/compiler.zig precedent.
 src/realtime/hub.zig	2	The guarded-query authz scratch leak is fixed (policy.matchesRule/rules.matches/records.guardPasses self-free their compiled Guard) and colcache.lease's cache==null fallback now owns a private arena that release() deinits, so all 7 shouldDeliver tests AND both frameForDelivery collection-lookup tests run under the raw std.testing.allocator (mkColl/pub_col/locked_col/fnotes -> Collection.deinit, mkRec/rec -> records.freeRecord + buildEventFrames called before the free, authedConn -> freeConn, ef/lf -> EventFrames.deinit, the F4 test's re-serialized id-only frame -> a.free(out)). 2 remain masked, both legitimate contract-4: subscribeCheck takes a RequestArena and authVerb's identity_arena is a real *ArenaAllocator.
 src/records_hooks_test.zig	4	PRE-EXISTING: not yet migrated to the ownership contracts
 src/report/send.zig	1	PRE-EXISTING: not yet migrated to the ownership contracts
-src/report/sentry.zig	1	PRE-EXISTING: not yet migrated to the ownership contracts
 src/request_arena.zig	1	PRE-EXISTING: not yet migrated to the ownership contracts
 src/rewrap.zig	9	PRE-EXISTING: not yet migrated to the ownership contracts
-src/router.zig	5	PRE-EXISTING: not yet migrated to the ownership contracts
+src/router.zig	2	contract-4: "dispatch routes to handler…" and "tryDispatch returns null…" drive dispatch/tryDispatch through a real http.RequestCtx, whose .allocator is a RequestArena (ctx.allocator.a) — dummyHandler and ApiError.notFound().toResponse both allocate through it. The 3 matchPath tests (pure builder over a plain std.mem.Allocator, no interlinked graph) now run under raw std.testing.allocator, freeing the returned []http.Param directly.
 src/schema.zig	21	PRE-EXISTING: not yet migrated to the ownership contracts
 src/schema_dump.zig	3	PRE-EXISTING: not yet migrated to the ownership contracts
 src/search/vector.zig	5	PRE-EXISTING: not yet migrated to the ownership contracts
 src/server.zig	2	contract-4: the applyMultipart tests hold the `files/multipart.zig` Extracted graph, whose form-field KEYS/VALUES and file bytes BORROW from the request `body` (parseDisposition borrows names, duping only on the rare backslash-escape path), while the ObjectMap/array backings + files slice are owned — the owned-vs-borrowed split is not tracked, so a general Extracted.deinit cannot free it safely. Reclaimed wholesale by the request arena. (parse() also leaves its dash_boundary/delim scratch on the caller allocator; both are deferred to a files/multipart.zig redesign.)
 src/static_files.zig	24	PRE-EXISTING: not yet migrated to the ownership contracts
-src/tenancy/tenancy.zig	4	PRE-EXISTING: not yet migrated to the ownership contracts
-src/testcapture.zig	4	PRE-EXISTING: not yet migrated to the ownership contracts
-src/webhook.zig	2	PRE-EXISTING: not yet migrated to the ownership contracts
+src/tenancy/tenancy.zig	1	contract-4: "resolveRequest: shared chokepoint for records/files/dispatchCustom" drives resolveRequest through a real http.RequestCtx whose .allocator is a RequestArena (ctx.allocator.a) — the exact production shape (api/records.zig, server.zig, api/files.zig all call it with a request arena). The other 3 tests (scopePredicate/resolve/signAccount) are pure builders and now run under raw std.testing.allocator: scopePredicate's Scoped.sql is freed directly, resolve()'s Resolution now has a deinit() (frees the membership dupes + slice; account_id/account_role are aliases into a membership, not separately owned) called by each test, and signAccount's returned string is freed.
+src/testcapture.zig	2	contract-4: "http: mock returns a canned response…" and "http: unmocked URL is blocked…" drive a real http_client.HttpClient.post/get, whose returned HttpResponse is arena-scoped by design (see the http_client.zig allowlist entry — its body is a sub-slice of the fixed max_response_bytes buffer, no deinit). The 2 "…intercept…" tests (http.intercept() returning bare `.passthrough`, which carries no allocation) now run directly on raw std.testing.allocator.
+src/webhook.zig	1	contract-4: DeliverEnv.init() (~L567) constructs the shared `deliver()` test harness — its `.ctx()` returns a real `Ctx` whose `.arena` field is a `RequestArena` (`RequestArena.from(&self.arena)`), the exact production shape `deliver`/`attemptOnce`/`webhookJobHandler` are always called with. The 7 `deliver:`/`webhookJobHandler` tests below legitimately drive that arena-backed Ctx. "signBody is HMAC-SHA256…" (a pure builder returning one owned buffer) now runs under raw std.testing.allocator, freeing each returned signature.
