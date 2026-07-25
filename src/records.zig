@@ -2105,11 +2105,18 @@ fn loadStatefulCursor(alloc: std.mem.Allocator, q: ListQuery, conn: *db.Db, col:
 /// Decode + validate a cursor in the selected format, binding it to the request's effective sort
 /// and filter. Mismatches surface as the specific DecodeError the handler maps to 400/410.
 fn decodeCursor(alloc: std.mem.Allocator, q: ListQuery, conn: *db.Db, col: schema.Collection, token: []const u8, sort_str: []const u8, filter_hash: u64) keyset.DecodeError!keyset.Cursor {
-    const cur = switch (q.cursorToken) {
+    var cur = switch (q.cursorToken) {
         .stateless => try keyset.decodeStateless(alloc, token),
         .signed => try keyset.decodeSigned(alloc, token, q.signingSecret),
         .stateful => try loadStatefulCursor(alloc, q, conn, col, token),
     };
+    // A successful decode hands back a Cursor OWNING a `std.json` parse arena (contract 2 —
+    // `Cursor.deinit` frees it). The binding checks below reject AFTER that allocation, so
+    // without this the arena is dropped on the floor: reclaimed only because the production
+    // caller happens to pass a request scratch arena, and a real leak under any other
+    // allocator. `errdefer` covers both reject paths and keeps `decodeCursor` honest to the
+    // contract `Cursor` advertises; the success path returns `cur` with `owned` intact.
+    errdefer cur.deinit();
     if (!std.mem.eql(u8, cur.sort_str, sort_str)) return error.CursorSort;
     if (cur.filter_hash != filter_hash) return error.CursorFilter;
     return cur;
@@ -3325,4 +3332,41 @@ test "gcCursorStates prunes only expired rows" {
     defer st.finalize();
     _ = try st.step();
     try std.testing.expectEqual(@as(i64, 1), st.columnInt(0));
+}
+
+test "decodeCursor frees the decoded parse arena when it rejects on sort/filter binding" {
+    // `decodeCursor` decodes FIRST (allocating a std.json parse arena owned by the returned
+    // Cursor, contract 2) and only then validates the sort/filter binding. Both reject paths
+    // return an error AFTER that allocation, so without an `errdefer cur.deinit()` the arena is
+    // dropped on the floor — invisible in production only because the caller passes a request
+    // scratch arena, but a real leak under any other allocator.
+    //
+    // Run on raw `std.testing.allocator` (leak detection ON) precisely so the reject paths are
+    // held to contract 2 rather than to the caller's arena. Before the fix this leaked 6
+    // allocations; a regression re-fails here rather than silently relying on the arena.
+    const a = std.testing.allocator;
+
+    var keys = [_]std.json.Value{.{ .string = "abc" }};
+    const token = try keyset.encodeStateless(a, .{
+        .forward = true,
+        .keys = &keys,
+        .sort_str = "id",
+        .filter_hash = 7,
+    });
+    defer a.free(token);
+
+    const q = ListQuery{ .cursorToken = .stateless };
+    const col: schema.Collection = undefined;
+    var conn: db.Db = undefined;
+
+    // Sort-binding mismatch: decode succeeds, validation rejects, arena is orphaned.
+    try std.testing.expectError(
+        error.CursorSort,
+        decodeCursor(a, q, &conn, col, token, "-created", 7),
+    );
+    // Filter-binding mismatch: same shape.
+    try std.testing.expectError(
+        error.CursorFilter,
+        decodeCursor(a, q, &conn, col, token, "id", 999),
+    );
 }
