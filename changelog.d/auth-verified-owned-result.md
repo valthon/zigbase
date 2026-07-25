@@ -1,0 +1,3 @@
+### Internal
+
+- Gave `auth.verifyToken`/`verifyTokenOfTypes`/`authenticate` a contract-2 owned result: the returned `Verified`/`Authed` now owns its record graph plus duped `collection`/`sid` (freed via a new `deinit`), with every transient parse/lookup routed to an internal scratch arena. Returned claims/identity values are byte-identical; production arena callers are unaffected. Un-masks the 6 verify/authenticate tests and the api/auth.zig "findByIdentity nocase" test (the latter now that records.zig's create/error-path partial-record leak is fixed), dropping them to the raw leak-detecting `std.testing.allocator`.
