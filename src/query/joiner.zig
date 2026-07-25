@@ -54,7 +54,7 @@ pub const Joiner = struct {
     pub fn resolve(self: *Joiner, path: []const u8) JoinError!ColumnRef {
         const sa = self.scratch.allocator();
         var cur_col = self.base;
-        var cur_alias = try std.fmt.allocPrint(sa, "\"{s}\"", .{self.base.name});
+        var cur_alias: []const u8 = try std.fmt.allocPrint(sa, "\"{s}\"", .{self.base.name});
         var prefix_buf: std.ArrayList(u8) = .empty;
 
         var it = std.mem.splitScalar(u8, path, '.');
@@ -91,7 +91,10 @@ pub const Joiner = struct {
             try prefix_buf.appendSlice(sa, seg);
             const prefix = prefix_buf.items;
             if (self.find(prefix)) |s| {
-                cur_alias = try sa.dupe(u8, s.alias);
+                // `s.alias` already lives in the scratch arena and cur_alias is only ever READ
+                // (into an allocPrint) — never mutated in place — so alias it directly (mirrors the
+                // new-join branch below, which also assigns `cur_alias = alias` without a dupe).
+                cur_alias = s.alias;
                 cur_col = s.col;
             } else {
                 const target = (try collections.get(sa, self.conn, rf.options.relation.targetCollectionId)) orelse return error.UnknownField;
