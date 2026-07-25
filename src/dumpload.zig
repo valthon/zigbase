@@ -287,6 +287,7 @@ pub const CreatePlan = struct {
 fn planCreateOrder(a: std.mem.Allocator, cols: []const schema.Collection) Error!CreatePlan {
     const n = cols.len;
     const placed = try a.alloc(bool, n);
+    defer a.free(placed); // pure scratch (Kahn-order bookkeeping); never part of the returned plan
     @memset(placed, false);
     var order: std.ArrayList(usize) = .empty;
     var progress = true;
@@ -885,15 +886,15 @@ fn relField(comptime id: []const u8, comptime name: []const u8, comptime target:
 }
 
 test "dumpload: planCreateOrder — acyclic graph orders dependencies first, zero cycle edges" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const al = arena.allocator();
+    const al = std.testing.allocator;
     const post_fields = [_]schema.Field{relField("f1", "author", "authors")};
     const cols = [_]schema.Collection{
         .{ .id = "c_posts", .name = "posts", .fields = &post_fields },
         .{ .id = "c_auth", .name = "authors", .fields = &.{} },
     };
     const plan = try planCreateOrder(al, &cols);
+    defer al.free(plan.order);
+    defer al.free(plan.cycle_edges);
     try std.testing.expectEqual(@as(usize, 0), plan.cycle_edges.len);
     try std.testing.expectEqual(@as(usize, 2), plan.order.len);
     try std.testing.expectEqual(@as(usize, 1), plan.order[0]); // authors first
@@ -901,14 +902,14 @@ test "dumpload: planCreateOrder — acyclic graph orders dependencies first, zer
 }
 
 test "dumpload: planCreateOrder — a self-relation is ALWAYS a cycle edge (but places normally)" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const al = arena.allocator();
+    const al = std.testing.allocator;
     const node_fields = [_]schema.Field{relField("f1", "parent", "nodes")};
     const cols = [_]schema.Collection{
         .{ .id = "c_nodes", .name = "nodes", .fields = &node_fields },
     };
     const plan = try planCreateOrder(al, &cols);
+    defer al.free(plan.order);
+    defer al.free(plan.cycle_edges);
     try std.testing.expectEqual(@as(usize, 1), plan.order.len);
     try std.testing.expectEqual(@as(usize, 1), plan.cycle_edges.len);
     try std.testing.expectEqual(@as(usize, 0), plan.cycle_edges[0].col_idx);
@@ -916,9 +917,7 @@ test "dumpload: planCreateOrder — a self-relation is ALWAYS a cycle edge (but 
 }
 
 test "dumpload: planCreateOrder — 2-cycle and 3-cycle mark every in-cycle edge" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const al = arena.allocator();
+    const al = std.testing.allocator;
     {
         const af = [_]schema.Field{relField("f1", "buddy", "beta")};
         const bf = [_]schema.Field{relField("f2", "buddy", "alpha")};
@@ -927,6 +926,8 @@ test "dumpload: planCreateOrder — 2-cycle and 3-cycle mark every in-cycle edge
             .{ .id = "c_b", .name = "beta", .fields = &bf },
         };
         const plan = try planCreateOrder(al, &cols);
+        defer al.free(plan.order);
+        defer al.free(plan.cycle_edges);
         try std.testing.expectEqual(@as(usize, 2), plan.order.len); // both still created
         try std.testing.expectEqual(@as(usize, 2), plan.cycle_edges.len);
     }
@@ -940,14 +941,14 @@ test "dumpload: planCreateOrder — 2-cycle and 3-cycle mark every in-cycle edge
             .{ .id = "c_z", .name = "z", .fields = &zf },
         };
         const plan = try planCreateOrder(al, &cols);
+        defer al.free(plan.order);
+        defer al.free(plan.cycle_edges);
         try std.testing.expectEqual(@as(usize, 3), plan.cycle_edges.len);
     }
 }
 
 test "dumpload: planCreateOrder — a diamond feeding a cycle only defers the in-cycle edges" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const al = arena.allocator();
+    const al = std.testing.allocator;
     // base <- x, base <- y (acyclic diamond); a -> {x, b}, b -> {y, a} (a/b cycle).
     const xf = [_]schema.Field{relField("f1", "root", "base")};
     const yf = [_]schema.Field{relField("f2", "root", "base")};
@@ -961,6 +962,8 @@ test "dumpload: planCreateOrder — a diamond feeding a cycle only defers the in
         .{ .id = "c_b", .name = "b", .fields = &bf },
     };
     const plan = try planCreateOrder(al, &cols);
+    defer al.free(plan.order);
+    defer al.free(plan.cycle_edges);
     try std.testing.expectEqual(@as(usize, 5), plan.order.len);
     // ONLY a.pair and b.pair are cycle edges — a.via/b.via point at placed (acyclic) nodes.
     try std.testing.expectEqual(@as(usize, 2), plan.cycle_edges.len);

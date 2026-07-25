@@ -369,11 +369,10 @@ fn runNdjson(app: *App, w: *db.Db, io: std.Io, ndjson: []const u8, opts: Options
 test "import: multi-row NDJSON creates all rows through the engine (defaults applied)" {
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const io = std.testing.io;
-    _ = try seedPosts(&d, a, io);
+    const posts_col = try seedPosts(&d, a, io);
+    defer posts_col.deinit(a);
     var app = testApp(std.testing.allocator, io);
 
     const ndjson =
@@ -396,11 +395,10 @@ test "import: multi-row NDJSON creates all rows through the engine (defaults app
 test "import: blank lines are skipped" {
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const io = std.testing.io;
-    _ = try seedPosts(&d, a, io);
+    const posts_col = try seedPosts(&d, a, io);
+    defer posts_col.deinit(a);
     var app = testApp(std.testing.allocator, io);
 
     const ndjson = "{\"title\":\"x\",\"slug\":\"x\"}\n\n   \n{\"title\":\"y\",\"slug\":\"y\"}\n";
@@ -411,11 +409,10 @@ test "import: blank lines are skipped" {
 test "import: batch boundary smaller than row count commits every batch" {
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const io = std.testing.io;
-    _ = try seedPosts(&d, a, io);
+    const posts_col = try seedPosts(&d, a, io);
+    defer posts_col.deinit(a);
     var app = testApp(std.testing.allocator, io);
 
     const ndjson =
@@ -439,11 +436,10 @@ test "import: batch_size=1 commits every row (commit/begin cycle bookkeeping)" {
     // rows must still persist and the final commit must leave no open transaction dangling.
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const io = std.testing.io;
-    _ = try seedPosts(&d, a, io);
+    const posts_col = try seedPosts(&d, a, io);
+    defer posts_col.deinit(a);
     var app = testApp(std.testing.allocator, io);
 
     const ndjson =
@@ -465,11 +461,10 @@ test "import: batch_size=1 commits every row (commit/begin cycle bookkeeping)" {
 test "import: id preservation on vs off" {
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const io = std.testing.io;
-    _ = try seedPosts(&d, a, io);
+    const posts_col = try seedPosts(&d, a, io);
+    defer posts_col.deinit(a);
     var app = testApp(std.testing.allocator, io);
 
     // preserve_ids = true (default): the provided id survives.
@@ -493,11 +488,10 @@ test "import: id preservation on vs off" {
 test "import: duplicate preserved id fails fast and names the line" {
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const io = std.testing.io;
-    _ = try seedPosts(&d, a, io);
+    const posts_col = try seedPosts(&d, a, io);
+    defer posts_col.deinit(a);
     var app = testApp(std.testing.allocator, io);
 
     const ndjson =
@@ -516,11 +510,10 @@ test "import: duplicate preserved id fails fast and names the line" {
 test "import: malformed JSON line fails with its line number" {
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const io = std.testing.io;
-    _ = try seedPosts(&d, a, io);
+    const posts_col = try seedPosts(&d, a, io);
+    defer posts_col.deinit(a);
     var app = testApp(std.testing.allocator, io);
 
     const ndjson = "{\"title\":\"ok\",\"slug\":\"ok\"}\n{not json}\n";
@@ -530,11 +523,10 @@ test "import: malformed JSON line fails with its line number" {
 test "import: a non-object line is rejected" {
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const io = std.testing.io;
-    _ = try seedPosts(&d, a, io);
+    const posts_col = try seedPosts(&d, a, io);
+    defer posts_col.deinit(a);
     var app = testApp(std.testing.allocator, io);
     try std.testing.expectError(error.RowNotObject, runNdjson(&app, &d, io, "[1,2,3]", .{ .collection = "posts" }));
 }
@@ -542,11 +534,10 @@ test "import: a non-object line is rejected" {
 test "import: upsert create-then-update by key" {
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const io = std.testing.io;
-    _ = try seedPosts(&d, a, io);
+    const posts_col = try seedPosts(&d, a, io);
+    defer posts_col.deinit(a);
     var app = testApp(std.testing.allocator, io);
 
     // First import creates.
@@ -571,11 +562,10 @@ test "import: multi-row upsert reuses the lookup statement across a batch bounda
     // creates and updates in one stream, spanning multiple batches.
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const io = std.testing.io;
-    _ = try seedPosts(&d, a, io);
+    const posts_col = try seedPosts(&d, a, io);
+    defer posts_col.deinit(a);
     var app = testApp(std.testing.allocator, io);
 
     // Seed two distinct slugs, then re-touch one and add a third — 4 lines, batch_size 1.
@@ -604,11 +594,10 @@ test "import: multi-row upsert reuses the lookup statement across a batch bounda
 test "import: batch_size of 0 is rejected (runtime check, not a debug assert)" {
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const io = std.testing.io;
-    _ = try seedPosts(&d, a, io);
+    const posts_col = try seedPosts(&d, a, io);
+    defer posts_col.deinit(a);
     var app = testApp(std.testing.allocator, io);
     try std.testing.expectError(error.InvalidBatchSize, runNdjson(&app, &d, io, "{\"title\":\"x\",\"slug\":\"x\"}", .{ .collection = "posts", .batch_size = 0 }));
 }
@@ -616,13 +605,12 @@ test "import: batch_size of 0 is rejected (runtime check, not a debug assert)" {
 test "import: validation error reports the failing 1-based line" {
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const io = std.testing.io;
     try migrations.run(&d);
     const fields = [_]schema.Field{.{ .id = "f1", .name = "title", .required = true, .options = .{ .text = .{} } }};
-    _ = try collections.create(a, io, &d, .{ .id = "", .name = "notes", .fields = &fields });
+    const notes_col = try collections.create(a, io, &d, .{ .id = "", .name = "notes", .fields = &fields });
+    defer notes_col.deinit(a);
     var app = testApp(std.testing.allocator, io);
 
     // Row 2 is missing the required `title`.
@@ -633,11 +621,10 @@ test "import: validation error reports the failing 1-based line" {
 test "import: unknown collection and injection-guarded bad names are rejected" {
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const io = std.testing.io;
-    _ = try seedPosts(&d, a, io);
+    const posts_col = try seedPosts(&d, a, io);
+    defer posts_col.deinit(a);
     var app = testApp(std.testing.allocator, io);
 
     try std.testing.expectError(error.UnknownCollection, runNdjson(&app, &d, io, "{}", .{ .collection = "nope" }));
@@ -652,9 +639,7 @@ test "import: unknown collection and injection-guarded bad names are rejected" {
 test "import: an .encrypted field is sealed at rest (ciphertext, not plaintext)" {
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const io = std.testing.io;
     try migrations.run(&d);
     // Stamp a field cipher on the connection, as bootApp's pool does in the real flow.
@@ -665,6 +650,7 @@ test "import: an .encrypted field is sealed at rest (ciphertext, not plaintext)"
         .{ .id = "f2", .name = "plain", .options = .{ .text = .{} } },
     };
     const col = try collections.create(a, io, &d, .{ .id = "", .name = "vault", .fields = &fields });
+    defer col.deinit(a);
     var app = testApp(std.testing.allocator, io);
 
     _ = try runNdjson(&app, &d, io, "{\"id\":\"vaultrow01\",\"secret\":\"topsecret\",\"plain\":\"visible\"}", .{ .collection = "vault" });
@@ -678,21 +664,21 @@ test "import: an .encrypted field is sealed at rest (ciphertext, not plaintext)"
     try std.testing.expect(std.mem.indexOf(u8, raw, "topsecret") == null);
     // Read-back through the engine decrypts transparently.
     const got = (try records.get(a, &d, col, "vaultrow01")).?;
+    defer records.freeRecord(a, got);
     try std.testing.expectEqualStrings("topsecret", got.object.get("secret").?.string);
 }
 
 test "import: an encrypted field cannot be an upsert key" {
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const io = std.testing.io;
     try migrations.run(&d);
     var cipher = field_policy.Cipher.fromEnv(io, "k");
     db.dbSetFieldCipher(&d, @ptrCast(&cipher));
     const fields = [_]schema.Field{.{ .id = "f1", .name = "secret", .encrypted = true, .options = .{ .text = .{} } }};
-    _ = try collections.create(a, io, &d, .{ .id = "", .name = "vault2", .fields = &fields });
+    const vault2_col = try collections.create(a, io, &d, .{ .id = "", .name = "vault2", .fields = &fields });
+    defer vault2_col.deinit(a);
     var app = testApp(std.testing.allocator, io);
     try std.testing.expectError(error.EncryptedUpsertKey, runNdjson(&app, &d, io, "{}", .{ .collection = "vault2", .upsert_key = "secret" }));
 }
@@ -700,13 +686,11 @@ test "import: an encrypted field cannot be an upsert key" {
 test "import: auth collection hashes the password (never stored plaintext)" {
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const io = std.testing.io;
     try migrations.run(&d);
     const users = try collections.create(a, io, &d, .{ .id = "", .name = "members", .type = .auth, .fields = &.{} });
-    _ = users;
+    defer users.deinit(a);
     var app = testApp(std.testing.allocator, io);
 
     _ = try runNdjson(&app, &d, io, "{\"id\":\"member0001\",\"email\":\"a@b.c\",\"password\":\"supersecret\"}", .{ .collection = "members" });

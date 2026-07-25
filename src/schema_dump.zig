@@ -197,6 +197,7 @@ fn pgColumnType(a: std.mem.Allocator, udt: []const u8, char_max: ?i64, num_prec:
     if (udt.len > 1 and udt[0] == '_') {
         // Array element modifiers are not available on the array column row; use the bare base type.
         const base = try pgBaseType(a, udt[1..], null, null, null);
+        defer a.free(base); // scratch: only the "{s}[]" formatted result escapes
         return try std.fmt.allocPrint(a, "{s}[]", .{base});
     }
     return try pgBaseType(a, udt, char_max, num_prec, num_scale);
@@ -207,27 +208,32 @@ fn pgColumnType(a: std.mem.Allocator, udt: []const u8, char_max: ?i64, num_prec:
 /// DDL if the type exists, and quoting closes the only path by which a DB-derived value reached the
 /// CREATE TABLE output unescaped. (The dump does not recreate custom types — see the docs caveat.)
 fn pgBaseType(a: std.mem.Allocator, udt: []const u8, char_max: ?i64, num_prec: ?i64, num_scale: ?i64) ![]const u8 {
+    // Every branch returns an ALLOC-OWNED string (contract 1: only the return escapes) — the
+    // fixed-keyword branches `dupe` their literal rather than handing it back raw, so the whole
+    // return type is uniformly caller-owned (a raw allocator can free every result the same way;
+    // production always passes a per-dump scratch arena, so this is just extra scratch it already
+    // reclaims wholesale).
     const eql = std.mem.eql;
-    if (eql(u8, udt, "int8")) return "bigint";
-    if (eql(u8, udt, "int4")) return "integer";
-    if (eql(u8, udt, "int2")) return "smallint";
-    if (eql(u8, udt, "bool")) return "boolean";
-    if (eql(u8, udt, "float4")) return "real";
-    if (eql(u8, udt, "float8")) return "double precision";
-    if (eql(u8, udt, "timestamptz")) return "timestamp with time zone";
-    if (eql(u8, udt, "timestamp")) return "timestamp without time zone";
-    if (eql(u8, udt, "text")) return "text";
+    if (eql(u8, udt, "int8")) return a.dupe(u8, "bigint");
+    if (eql(u8, udt, "int4")) return a.dupe(u8, "integer");
+    if (eql(u8, udt, "int2")) return a.dupe(u8, "smallint");
+    if (eql(u8, udt, "bool")) return a.dupe(u8, "boolean");
+    if (eql(u8, udt, "float4")) return a.dupe(u8, "real");
+    if (eql(u8, udt, "float8")) return a.dupe(u8, "double precision");
+    if (eql(u8, udt, "timestamptz")) return a.dupe(u8, "timestamp with time zone");
+    if (eql(u8, udt, "timestamp")) return a.dupe(u8, "timestamp without time zone");
+    if (eql(u8, udt, "text")) return a.dupe(u8, "text");
     if (eql(u8, udt, "varchar")) {
         if (char_max) |n| return try std.fmt.allocPrint(a, "character varying({d})", .{n});
-        return "character varying";
+        return a.dupe(u8, "character varying");
     }
     if (eql(u8, udt, "bpchar")) {
         if (char_max) |n| return try std.fmt.allocPrint(a, "character({d})", .{n});
-        return "character";
+        return a.dupe(u8, "character");
     }
     if (eql(u8, udt, "numeric")) {
         if (num_prec) |p| return try std.fmt.allocPrint(a, "numeric({d},{d})", .{ p, num_scale orelse 0 });
-        return "numeric";
+        return a.dupe(u8, "numeric");
     }
     return try quoteIdent(a, udt);
 }
@@ -319,41 +325,75 @@ fn quoteIdent(a: std.mem.Allocator, s: []const u8) ![]const u8 {
 // ---------------------------------------------------------------------------
 
 test "sqlLiteral doubles single quotes" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    try std.testing.expectEqualStrings("'it''s'", try sqlLiteral(arena.allocator(), "it's"));
-    try std.testing.expectEqualStrings("'plain'", try sqlLiteral(arena.allocator(), "plain"));
+    const a = std.testing.allocator;
+    const s1 = try sqlLiteral(a, "it's");
+    defer a.free(s1);
+    try std.testing.expectEqualStrings("'it''s'", s1);
+    const s2 = try sqlLiteral(a, "plain");
+    defer a.free(s2);
+    try std.testing.expectEqualStrings("'plain'", s2);
 }
 
 test "quoteIdent doubles double quotes" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    try std.testing.expectEqualStrings("\"posts\"", try quoteIdent(arena.allocator(), "posts"));
-    try std.testing.expectEqualStrings("\"a\"\"b\"", try quoteIdent(arena.allocator(), "a\"b"));
+    const a = std.testing.allocator;
+    const s1 = try quoteIdent(a, "posts");
+    defer a.free(s1);
+    try std.testing.expectEqualStrings("\"posts\"", s1);
+    const s2 = try quoteIdent(a, "a\"b");
+    defer a.free(s2);
+    try std.testing.expectEqualStrings("\"a\"\"b\"", s2);
 }
 
 test "pgColumnType maps common udt names canonically" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    try std.testing.expectEqualStrings("bigint", try pgColumnType(a, "int8", null, null, null));
-    try std.testing.expectEqualStrings("integer", try pgColumnType(a, "int4", null, null, null));
-    try std.testing.expectEqualStrings("boolean", try pgColumnType(a, "bool", null, null, null));
-    try std.testing.expectEqualStrings("timestamp with time zone", try pgColumnType(a, "timestamptz", null, null, null));
-    try std.testing.expectEqualStrings("character varying(255)", try pgColumnType(a, "varchar", 255, null, null));
-    try std.testing.expectEqualStrings("character varying", try pgColumnType(a, "varchar", null, null, null));
-    try std.testing.expectEqualStrings("numeric(10,2)", try pgColumnType(a, "numeric", null, 10, 2));
+    const a = std.testing.allocator;
+    // Every `pgColumnType` result below is caller-owned (see `pgBaseType`'s dupe discipline) and
+    // freed immediately after its assertion.
+    const t1 = try pgColumnType(a, "int8", null, null, null);
+    defer a.free(t1);
+    try std.testing.expectEqualStrings("bigint", t1);
+    const t2 = try pgColumnType(a, "int4", null, null, null);
+    defer a.free(t2);
+    try std.testing.expectEqualStrings("integer", t2);
+    const t3 = try pgColumnType(a, "bool", null, null, null);
+    defer a.free(t3);
+    try std.testing.expectEqualStrings("boolean", t3);
+    const t4 = try pgColumnType(a, "timestamptz", null, null, null);
+    defer a.free(t4);
+    try std.testing.expectEqualStrings("timestamp with time zone", t4);
+    const t5 = try pgColumnType(a, "varchar", 255, null, null);
+    defer a.free(t5);
+    try std.testing.expectEqualStrings("character varying(255)", t5);
+    const t6 = try pgColumnType(a, "varchar", null, null, null);
+    defer a.free(t6);
+    try std.testing.expectEqualStrings("character varying", t6);
+    const t7 = try pgColumnType(a, "numeric", null, 10, 2);
+    defer a.free(t7);
+    try std.testing.expectEqualStrings("numeric(10,2)", t7);
     // Array types (leading-underscore udt) reconstruct the base type + "[]".
-    try std.testing.expectEqualStrings("integer[]", try pgColumnType(a, "_int4", null, null, null));
-    try std.testing.expectEqualStrings("text[]", try pgColumnType(a, "_text", null, null, null));
-    try std.testing.expectEqualStrings("bigint[]", try pgColumnType(a, "_int8", null, null, null));
+    const t8 = try pgColumnType(a, "_int4", null, null, null);
+    defer a.free(t8);
+    try std.testing.expectEqualStrings("integer[]", t8);
+    const t9 = try pgColumnType(a, "_text", null, null, null);
+    defer a.free(t9);
+    try std.testing.expectEqualStrings("text[]", t9);
+    const t10 = try pgColumnType(a, "_int8", null, null, null);
+    defer a.free(t10);
+    try std.testing.expectEqualStrings("bigint[]", t10);
     // Unknown/custom type is QUOTED (not raw), so an adversarial type name cannot break out.
-    try std.testing.expectEqualStrings("\"jsonb\"", try pgColumnType(a, "jsonb", null, null, null));
-    try std.testing.expectEqualStrings("\"my_enum\"", try pgColumnType(a, "my_enum", null, null, null));
+    const t11 = try pgColumnType(a, "jsonb", null, null, null);
+    defer a.free(t11);
+    try std.testing.expectEqualStrings("\"jsonb\"", t11);
+    const t12 = try pgColumnType(a, "my_enum", null, null, null);
+    defer a.free(t12);
+    try std.testing.expectEqualStrings("\"my_enum\"", t12);
     // A crafted udt_name with an embedded double-quote is escaped (doubled) inside the quotes.
-    try std.testing.expectEqualStrings("\"ev\"\"il\"", try pgColumnType(a, "ev\"il", null, null, null));
+    const t13 = try pgColumnType(a, "ev\"il", null, null, null);
+    defer a.free(t13);
+    try std.testing.expectEqualStrings("\"ev\"\"il\"", t13);
     // An array of an unknown type quotes the base and appends "[]".
-    try std.testing.expectEqualStrings("\"my_enum\"[]", try pgColumnType(a, "_my_enum", null, null, null));
+    const t14 = try pgColumnType(a, "_my_enum", null, null, null);
+    defer a.free(t14);
+    try std.testing.expectEqualStrings("\"my_enum\"[]", t14);
 }
 
 test "schemaDump (sqlite) emits CREATE TABLE/INDEX verbatim + the ledger INSERT" {

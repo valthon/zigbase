@@ -82,9 +82,18 @@ fn anyEncryptedField(cols: []const schema.Collection) bool {
 /// never leaks; this just turns a silently half-broken server into a loud startup refusal.
 /// The returned slice is owned by `arena`. Logging lives in the caller so this stays a
 /// pure, unit-testable scan (a `.err` log would otherwise fail the test runner).
-fn liveEncryptedCollection(arena: std.mem.Allocator, w: *db.Db) !?[]const u8 {
-    const live = try @import("collections.zig").list(arena, w);
-    for (live) |c| if (schema.hasEncryptedField(c)) return c.name;
+/// Self-freeing (contract 1): `collections.list`'s returned graph is scratch — freed here on
+/// every return — and only an owned dupe of the matched collection's name escapes on `alloc`.
+/// Production always calls this with a startup scan arena (see `serveImpl`), so the dupe/free
+/// here is just extra bookkeeping reclaimed wholesale like everything else; it also lets a
+/// non-arena caller (e.g. a test) use the raw leak-detecting allocator directly.
+fn liveEncryptedCollection(alloc: std.mem.Allocator, w: *db.Db) !?[]const u8 {
+    const live = try @import("collections.zig").list(alloc, w);
+    defer {
+        for (live) |c| c.deinit(alloc);
+        alloc.free(live);
+    }
+    for (live) |c| if (schema.hasEncryptedField(c)) return try alloc.dupe(u8, c.name);
     return null;
 }
 
@@ -4286,22 +4295,23 @@ test "liveEncryptedCollection detects a RUNTIME-created encrypted collection (dr
     var d = try db.Db.openMemory();
     defer d.close();
     try migrations.run(&d);
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
 
     // A plain collection created at RUNTIME (as via the collections API) — no encrypted
     // field, so the scan finds nothing and serveImpl proceeds even without a key.
     const plain = [_]schema.Field{.{ .id = "", .name = "title", .options = .{ .text = .{} } }};
-    _ = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "notes", .fields = &plain });
+    const notes = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "notes", .fields = &plain });
+    defer notes.deinit(a);
     try std.testing.expect((try liveEncryptedCollection(a, &d)) == null);
 
     // Simulate the gap #102 closes: a collection with an encrypted field was created at
     // runtime (while a key was set). It is now DB-resident, invisible to the comptime
     // guard. The scan must surface it so serveImpl refuses to start without a key.
     const enc = [_]schema.Field{.{ .id = "", .name = "secret", .encrypted = true, .options = .{ .text = .{} } }};
-    _ = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "vault", .fields = &enc });
+    const vault = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "vault", .fields = &enc });
+    defer vault.deinit(a);
     const found = try liveEncryptedCollection(a, &d);
+    defer if (found) |f| a.free(f);
     try std.testing.expect(found != null);
     try std.testing.expectEqualStrings("vault", found.?);
 }
