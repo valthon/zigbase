@@ -1403,6 +1403,9 @@ pub fn parseCollectionInput(alloc: std.mem.Allocator, s: []const u8) !Collection
     const sa = scratch.allocator();
 
     const name = try alloc.dupe(u8, (objGetStr(obj, "name")) orelse return error.InvalidSchema);
+    // `name` escapes into the returned Collection; any later fallible step in this function
+    // (fieldsFromJson/indexesFromJson/the rule dupes/optionsFromJson) must not leak it on error.
+    errdefer alloc.free(name);
     const ctype = std.meta.stringToEnum(CollectionType, objGetStr(obj, "type") orelse "base") orelse .base;
 
     const raw_fields = if (obj.object.get("fields")) |fv| blk: {
@@ -1435,12 +1438,23 @@ pub fn parseCollectionInput(alloc: std.mem.Allocator, s: []const u8) !Collection
         scanned += 1;
     }
     const fields = try kept.toOwnedSlice(alloc);
+    // `fields` escapes into the returned Collection; the loop-scoped errdefer above only covers
+    // `kept`/`raw_fields` DURING the loop and is now inert (toOwnedSlice empties `kept.items`,
+    // and `scanned == raw_fields.len` empties `raw_fields[scanned..]`) — a fresh errdefer is
+    // needed so a later fallible step (indexesFromJson/the rule dupes/optionsFromJson) doesn't
+    // leak `fields`.
+    errdefer freeFieldsOwned(alloc, fields);
 
     const empty_indexes: []const Index = &.{};
     const indexes = if (obj.object.get("indexes")) |iv| blk: {
         const is = try std.json.Stringify.valueAlloc(sa, iv, .{});
         break :blk try indexesFromJson(alloc, is);
     } else empty_indexes;
+    // `indexes` escapes into the returned Collection; same reasoning as `fields` above. On the
+    // `empty_indexes` (absent-key) branch this is the static empty literal — freeing a
+    // zero-length slice is a documented no-op (see `Collection.deinit`'s header comment), so this
+    // errdefer is safe on either branch.
+    errdefer freeIndexesOwned(alloc, indexes);
 
     return .{
         .id = "",
