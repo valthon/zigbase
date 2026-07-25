@@ -65,11 +65,28 @@ pub fn mint(alloc: std.mem.Allocator, jwt_secret: []const u8, account: []const u
     return out;
 }
 
-/// The verified token fields (slices into an alloc'd decode buffer — arena usage).
-pub const Parts = struct { account: []const u8, list: []const u8, recipient: []const u8 };
+/// The verified token fields. The three field slices point INTO `backing` (the
+/// decoded payload buffer), which `Parts` owns — contract-2 owned-result: the caller
+/// frees the whole thing with `deinit`. (The payload is a single small token buffer,
+/// so own-by-value with one free is the honest fit — no arena required.)
+pub const Parts = struct {
+    account: []const u8,
+    list: []const u8,
+    recipient: []const u8,
+    /// The decode buffer the three fields slice into. Owned; freed by `deinit`.
+    backing: []u8,
+
+    /// Free the backing decode buffer. Must be called exactly once on a `Parts`
+    /// returned by `verify`; the field slices are invalid afterward.
+    pub fn deinit(self: *Parts, alloc: std.mem.Allocator) void {
+        alloc.free(self.backing);
+        self.* = undefined;
+    }
+};
 
 /// Verify `token`. Returns null on ANY failure — malformed, oversized, bad MAC,
 /// wrong version, wrong field count — deliberately indistinguishable (non-oracle).
+/// On success the returned `Parts` owns its decode buffer (caller `deinit`s it).
 pub fn verify(alloc: std.mem.Allocator, jwt_secret: []const u8, token: []const u8) ?Parts {
     const dot = std.mem.indexOfScalar(u8, token, '.') orelse return null;
     const p_enc = token[0..dot];
@@ -78,6 +95,10 @@ pub fn verify(alloc: std.mem.Allocator, jwt_secret: []const u8, token: []const u
 
     const p_len = b64.Decoder.calcSizeForSlice(p_enc) catch return null;
     const payload = alloc.alloc(u8, p_len) catch return null;
+    // Own the decode buffer through every failure path (a `?` return does not fire
+    // errdefer); on success `Parts` takes ownership and this frees nothing.
+    var owned = false;
+    defer if (!owned) alloc.free(payload);
     b64.Decoder.decode(payload, p_enc) catch return null;
 
     var mac_given: [HmacSha256.mac_length]u8 = undefined;
@@ -99,7 +120,8 @@ pub fn verify(alloc: std.mem.Allocator, jwt_secret: []const u8, token: []const u
     const recipient = it.next() orelse return null;
     if (it.next() != null) return null;
     if (recipient.len == 0) return null;
-    return .{ .account = account, .list = list, .recipient = recipient };
+    owned = true;
+    return .{ .account = account, .list = list, .recipient = recipient, .backing = payload };
 }
 
 /// Build the full public unsubscribe URL: `<base>/api/mail/unsubscribe?t=<token>`.
@@ -117,18 +139,17 @@ pub fn buildUrl(alloc: std.mem.Allocator, base_url: []const u8, jwt_secret: []co
 
 const testing = std.testing;
 
-// `verify` never frees its internal decode buffer (it's designed for arena-allocator
-// callers — see the `Parts` doc comment), so every test that calls `verify` runs its
-// alloc through a scratch arena rather than `testing.allocator` directly.
+// `verify` returns an owned `Parts` (contract-2): its `deinit` frees the decode
+// buffer, so these tests run under the raw leak-detecting `testing.allocator`.
+// Failure cases return null and free the buffer internally — nothing to deinit.
 
 test "mint -> verify round-trips the exact fields, including empty account and empty list" {
     const a = testing.allocator;
-    var arena = std.heap.ArenaAllocator.init(a);
-    defer arena.deinit();
 
     const token = try mint(a, "s3cret", "acc1", "news", "user@x.io");
     defer a.free(token);
-    const parts = verify(arena.allocator(), "s3cret", token) orelse return error.TestExpectedNonNull;
+    var parts = verify(a, "s3cret", token) orelse return error.TestExpectedNonNull;
+    defer parts.deinit(a);
     try testing.expectEqualStrings("acc1", parts.account);
     try testing.expectEqualStrings("news", parts.list);
     try testing.expectEqualStrings("user@x.io", parts.recipient);
@@ -136,7 +157,8 @@ test "mint -> verify round-trips the exact fields, including empty account and e
     // Empty account AND empty list (a system/unscoped send) round-trip too.
     const token2 = try mint(a, "s3cret", "", "", "user@x.io");
     defer a.free(token2);
-    const parts2 = verify(arena.allocator(), "s3cret", token2) orelse return error.TestExpectedNonNull;
+    var parts2 = verify(a, "s3cret", token2) orelse return error.TestExpectedNonNull;
+    defer parts2.deinit(a);
     try testing.expectEqualStrings("", parts2.account);
     try testing.expectEqualStrings("", parts2.list);
     try testing.expectEqualStrings("user@x.io", parts2.recipient);
@@ -144,8 +166,6 @@ test "mint -> verify round-trips the exact fields, including empty account and e
 
 test "verify rejects a tampered payload half" {
     const a = testing.allocator;
-    var arena = std.heap.ArenaAllocator.init(a);
-    defer arena.deinit();
 
     const token = try mint(a, "s3cret", "acc1", "news", "user@x.io");
     defer a.free(token);
@@ -153,13 +173,11 @@ test "verify rejects a tampered payload half" {
     defer a.free(bad);
     // Flip one byte in the payload half.
     bad[0] = if (bad[0] == 'A') 'B' else 'A';
-    try testing.expect(verify(arena.allocator(), "s3cret", bad) == null);
+    try testing.expect(verify(a, "s3cret", bad) == null);
 }
 
 test "verify rejects a tampered MAC half" {
     const a = testing.allocator;
-    var arena = std.heap.ArenaAllocator.init(a);
-    defer arena.deinit();
 
     const token = try mint(a, "s3cret", "acc1", "news", "user@x.io");
     defer a.free(token);
@@ -167,40 +185,37 @@ test "verify rejects a tampered MAC half" {
     defer a.free(bad);
     const last = bad.len - 1;
     bad[last] = if (bad[last] == 'A') 'B' else 'A';
-    try testing.expect(verify(arena.allocator(), "s3cret", bad) == null);
+    try testing.expect(verify(a, "s3cret", bad) == null);
 }
 
 test "verify rejects the wrong secret" {
     const a = testing.allocator;
-    var arena = std.heap.ArenaAllocator.init(a);
-    defer arena.deinit();
 
     const token = try mint(a, "s3cret", "acc1", "news", "user@x.io");
     defer a.free(token);
-    try testing.expect(verify(arena.allocator(), "other-secret", token) == null);
+    try testing.expect(verify(a, "other-secret", token) == null);
 }
 
 test "verify rejects malformed tokens: truncated, dot-less, oversized" {
     const a = testing.allocator;
-    var arena = std.heap.ArenaAllocator.init(a);
-    defer arena.deinit();
-    const aa = arena.allocator();
 
-    try testing.expect(verify(aa, "s3cret", "") == null);
-    try testing.expect(verify(aa, "s3cret", "no-dot-here") == null);
-    try testing.expect(verify(aa, "s3cret", ".") == null);
-    try testing.expect(verify(aa, "s3cret", "ab.") == null);
-    try testing.expect(verify(aa, "s3cret", ".cd") == null);
+    try testing.expect(verify(a, "s3cret", "") == null);
+    try testing.expect(verify(a, "s3cret", "no-dot-here") == null);
+    try testing.expect(verify(a, "s3cret", ".") == null);
+    try testing.expect(verify(a, "s3cret", "ab.") == null);
+    try testing.expect(verify(a, "s3cret", ".cd") == null);
 
     const token = try mint(a, "s3cret", "acc1", "news", "user@x.io");
     defer a.free(token);
     const truncated = token[0 .. token.len - 5];
-    try testing.expect(verify(aa, "s3cret", truncated) == null);
+    try testing.expect(verify(a, "s3cret", truncated) == null);
 
-    const oversized = try aa.alloc(u8, max_part_len + 10);
+    const oversized = try a.alloc(u8, max_part_len + 10);
+    defer a.free(oversized);
     @memset(oversized, 'A');
-    const oversized_token = try std.fmt.allocPrint(aa, "{s}.AAAA", .{oversized});
-    try testing.expect(verify(aa, "s3cret", oversized_token) == null);
+    const oversized_token = try std.fmt.allocPrint(a, "{s}.AAAA", .{oversized});
+    defer a.free(oversized_token);
+    try testing.expect(verify(a, "s3cret", oversized_token) == null);
 }
 
 test "deriveKey is stable and secret-dependent" {
