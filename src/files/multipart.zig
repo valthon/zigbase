@@ -193,8 +193,16 @@ pub fn parse(alloc: std.mem.Allocator, content_type: []const u8, body: []const u
     var files: std.ArrayList(http.UploadedFile) = .empty;
 
     const boundary = boundaryFromContentType(content_type) orelse return error.BadMultipart;
+    // Transient matching scratch: these two derived delimiter strings are used only
+    // to scan `body` within this call and are never referenced by the returned
+    // `Extracted` graph (whose field names/values and file bytes borrow from `body`,
+    // and whose map/array backings are the escaping owned state). Free them here so
+    // a non-arena caller doesn't leak them; the `defer` on `dash_boundary` is armed
+    // before the second (fallible) allocPrint so an OOM there still reclaims it.
     const dash_boundary = try std.fmt.allocPrint(alloc, "--{s}", .{boundary});
+    defer alloc.free(dash_boundary);
     const delim = try std.fmt.allocPrint(alloc, "\r\n--{s}", .{boundary});
+    defer alloc.free(delim);
 
     // First delimiter: "--<boundary>" at the very start of the body, else a full
     // "\r\n--<boundary>" after a preamble — both with a valid RFC 2046 tail.
