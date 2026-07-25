@@ -327,6 +327,15 @@ test "applyCreate strips client passwordHash/tokenKey (forces server values)" {
     try std.testing.expectEqual(false, out.object.get("verified").?.bool);
 }
 
+/// Free the owned strings shared by `Authed`/`Verified` (contract-2). `record` is a
+/// self-contained json graph (duped keys + owned values, via `records.get`/`superuserRecord`);
+/// `collection` and `sid` are freshly duped slices — none alias the input token, ctx, or a literal.
+fn freeIdentity(alloc: std.mem.Allocator, record: std.json.Value, collection: []const u8, sid: []const u8) void {
+    @import("records.zig").freeRecord(alloc, record);
+    alloc.free(collection);
+    alloc.free(sid);
+}
+
 pub const Authed = struct {
     record: std.json.Value, // the auth record with hidden fields stripped
     collection: []const u8,
@@ -334,6 +343,11 @@ pub const Authed = struct {
     /// Server-side session id (Variant B, #99); "" in epoch mode or when the token carries
     /// no `sid`. Lets logout/refresh target the exact `_sessions` row for this request.
     sid: []const u8 = "",
+
+    /// Free the owned graph (contract-2). Must be the SAME allocator passed to `authenticate`.
+    pub fn deinit(self: *Authed, alloc: std.mem.Allocator) void {
+        freeIdentity(alloc, self.record, self.collection, self.sid);
+    }
 };
 
 pub const Verified = struct {
@@ -343,6 +357,11 @@ pub const Verified = struct {
     exp: i64,
     /// See `Authed.sid`.
     sid: []const u8 = "",
+
+    /// Free the owned graph (contract-2). Must be the SAME allocator passed to `verifyToken*`.
+    pub fn deinit(self: *Verified, alloc: std.mem.Allocator) void {
+        freeIdentity(alloc, self.record, self.collection, self.sid);
+    }
 };
 
 /// Resolve a JWT string to a verified identity (no HTTP ctx, no CSRF — the caller owns transport).
@@ -355,7 +374,15 @@ pub fn verifyToken(alloc: std.mem.Allocator, app: anytype, conn: *db.Db, token: 
 /// Like verifyToken but accepts any of `types` for the claim's `type`. The file endpoint uses
 /// {.auth, .file}; the main API uses verifyToken (.auth only).
 pub fn verifyTokenOfTypes(alloc: std.mem.Allocator, app: anytype, conn: *db.Db, token: []const u8, types: []const jwt.TokenType) ?Verified {
-    const claims = jwt.peekClaims(alloc, token) catch return null;
+    // Contract-2 (owned-result): every transient parse/lookup (peekClaims, collections.get,
+    // tokenKeyEpochFor, jwt.verify) lands on this scratch arena and is reclaimed on return; only
+    // the record graph (owned on `alloc`) and the freshly-duped `collection`/`sid` escape, so the
+    // returned `Verified` is a self-contained graph freed by `Verified.deinit` under any allocator.
+    var scratch = std.heap.ArenaAllocator.init(alloc);
+    defer scratch.deinit();
+    const sa = scratch.allocator();
+
+    const claims = jwt.peekClaims(sa, token) catch return null;
     var ok = false;
     for (types) |t| if (claims.type == t) {
         ok = true;
@@ -365,14 +392,14 @@ pub fn verifyTokenOfTypes(alloc: std.mem.Allocator, app: anytype, conn: *db.Db, 
     const is_super = std.mem.eql(u8, claims.collection, "_superusers");
     // Resolve the collection once and reuse it for both the tokenKey lookup and the
     // record fetch — avoids a redundant collections.get on every authenticated request.
-    const col_or_null = if (is_super) null else (collections.get(alloc, conn, claims.collection) catch return null) orelse return null;
+    const col_or_null = if (is_super) null else (collections.get(sa, conn, claims.collection) catch return null) orelse return null;
     const table = if (is_super) "_superusers" else col_or_null.?.name;
     // One SELECT fetches BOTH the signing-key material AND the current session epoch (#99),
     // so epoch revocation adds no extra query on the hot verify path.
-    const ke = (tokenKeyEpochFor(alloc, conn, table, claims.id) catch return null) orelse return null;
+    const ke = (tokenKeyEpochFor(sa, conn, table, claims.id) catch return null) orelse return null;
     const key = crypto.deriveKey(app.jwt_secret, ke.token_key);
     const now = nowUnix(conn) catch return null;
-    const verified = jwt.verify(alloc, token, &key, now) catch return null;
+    const verified = jwt.verify(sa, token, &key, now) catch return null;
     // Session-epoch gate: reject a token whose (signature-verified) epoch no longer matches
     // the record's current epoch — i.e. "revoke all sessions" was issued. Fail closed. Only
     // `.auth` session tokens are gated; short-lived `.file` tokens are minted separately and
@@ -382,17 +409,30 @@ pub fn verifyTokenOfTypes(alloc: std.mem.Allocator, app: anytype, conn: *db.Db, 
     // must reference a live `_sessions` row (present + unexpired) — per-device revocation.
     // Absent/expired/error → reject (fail closed, same discipline as the epoch check). In
     // epoch mode this whole block is skipped, so the verify hot path does ZERO extra work.
-    const sid: []const u8 = verified.sid orelse "";
-    if (app.session_store == .table and verified.type == .auth and sid.len > 0) {
-        if (!(sessionActive(conn, sid, now) catch return null)) return null;
+    const sid_scratch: []const u8 = verified.sid orelse "";
+    if (app.session_store == .table and verified.type == .auth and sid_scratch.len > 0) {
+        if (!(sessionActive(conn, sid_scratch, now) catch return null)) return null;
     }
+    // The record graph is the one allocation that OUTLIVES the scratch arena, so build it on
+    // `alloc` directly (owned; freed by `Verified.deinit` via records.freeRecord).
     const rec = if (is_super)
         (superuserRecord(alloc, conn, claims.id) catch return null) orelse return null
     else blk: {
         const records = @import("records.zig");
         break :blk (records.get(alloc, conn, col_or_null.?, claims.id) catch return null) orelse return null;
     };
-    return .{ .record = rec, .collection = claims.collection, .is_superuser = is_super, .exp = claims.exp, .sid = sid };
+    // Dupe the two escaping strings onto `alloc` so nothing aliases the scratch parse (which is
+    // about to drop), the input token, or a literal. On an OOM here, free what we already own.
+    const collection = alloc.dupe(u8, claims.collection) catch {
+        @import("records.zig").freeRecord(alloc, rec);
+        return null;
+    };
+    const sid = alloc.dupe(u8, sid_scratch) catch {
+        alloc.free(collection);
+        @import("records.zig").freeRecord(alloc, rec);
+        return null;
+    };
+    return .{ .record = rec, .collection = collection, .is_superuser = is_super, .exp = claims.exp, .sid = sid };
 }
 
 /// Variant B: true iff session `sid` exists and is unexpired (`expires IS NULL OR expires > now`).
@@ -445,16 +485,33 @@ fn ctEqlSlices(x: []const u8, y: []const u8) bool {
 }
 
 /// Build a record object for a _superusers row (id/email/verified; secrets excluded).
+/// Keys AND string values are duped onto `alloc` so the returned graph is self-contained and
+/// symmetric with `records.get` — freeable by `records.freeRecord` (which frees keys), never
+/// aliasing a string literal. On a mid-build OOM the partial graph is freed (leak-correct under
+/// any allocator, not just a request arena).
 fn superuserRecord(alloc: std.mem.Allocator, conn: *db.Db, rid: []const u8) !?std.json.Value {
     var st = try prep(conn, "SELECT \"id\",\"email\",\"verified\" FROM \"_superusers\" WHERE \"id\" = ?1;");
     defer st.finalize();
     try st.bindText(1, rid);
     if (!try st.step()) return null;
     var obj: std.json.ObjectMap = .empty;
-    try obj.put(alloc, "id", .{ .string = try alloc.dupe(u8, st.columnText(0)) });
-    try obj.put(alloc, "email", .{ .string = try alloc.dupe(u8, st.columnText(1)) });
-    try obj.put(alloc, "verified", .{ .bool = st.columnInt(2) != 0 });
+    errdefer @import("records.zig").freeRecord(alloc, .{ .object = obj });
+    try obj.ensureTotalCapacity(alloc, 3);
+    try putOwnedString(alloc, &obj, "id", st.columnText(0));
+    try putOwnedString(alloc, &obj, "email", st.columnText(1));
+    // The bool value allocates nothing; only its key is duped. If this key-dupe OOMs, the
+    // errdefer above frees the id/email entries already in place.
+    obj.putAssumeCapacity(try alloc.dupe(u8, "verified"), .{ .bool = st.columnInt(2) != 0 });
     return .{ .object = obj };
+}
+
+/// Put a duped `key`→(duped `val` string) into a pre-sized object. Value is duped first so a
+/// key-dupe OOM cannot strand it; on that OOM the value is freed before the error propagates.
+fn putOwnedString(alloc: std.mem.Allocator, obj: *std.json.ObjectMap, key: []const u8, val: []const u8) !void {
+    const v = try alloc.dupe(u8, val);
+    errdefer alloc.free(v);
+    const k = try alloc.dupe(u8, key);
+    obj.putAssumeCapacity(k, .{ .string = v });
 }
 
 /// Resolve the request's auth token (bearer or zb_auth cookie) to a record, or null if
@@ -485,20 +542,19 @@ pub fn authenticate(io: std.Io, alloc: std.mem.Allocator, app: anytype, ctx: *co
             if (!ctEqlSlices(claims.csrf, ctx.csrf_token)) return null;
         }
     }
-    // The returned `Authed` borrows entirely from `v` (verifyToken's own arena parse), never
-    // from the scratch above — which is now out of scope.
+    // `v` is a contract-2 owned graph on `alloc`. The returned `Authed` TAKES OWNERSHIP of its
+    // record/collection/sid (we do not deinit `v`); only the scalar `exp` is dropped. So a single
+    // `Authed.deinit(alloc)` frees exactly this graph — no double-free, no leak.
     const v = verifyToken(alloc, app, conn, token) orelse return null;
     return Authed{ .record = v.record, .collection = v.collection, .is_superuser = v.is_superuser, .sid = v.sid };
 }
 
 test "authenticate resolves a valid bearer token to its record" {
+    const a = std.testing.allocator;
     var d = try db.Db.openMemory();
     defer d.close();
     try migrations.run(&d);
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    _ = try collections.create(a, std.testing.io, &d, .{
+    var created = try collections.create(a, std.testing.io, &d, .{
         .id = "",
         .name = "users",
         .type = .auth,
@@ -509,12 +565,17 @@ test "authenticate resolves a valid bearer token to its record" {
         .updateRule = "",
         .deleteRule = "",
     });
+    defer created.deinit(a);
     try d.exec("INSERT INTO \"users\" (\"id\",\"created\",\"updated\",\"email\",\"tokenKey\",\"verified\") VALUES ('rec1','','','u@x.io','tk-secret',1);");
     var app = App{ .allocator = std.testing.allocator, .io = std.testing.io, .pool = undefined };
     const key = crypto.deriveKey(app.jwt_secret, "tk-secret");
     const token = try jwt.sign(a, .{ .id = "rec1", .collection = "users", .type = .auth, .iat = 0, .exp = 9999999999 }, &key);
-    var ctx = http.RequestCtx{ .method = .GET, .path = "/", .allocator = RequestArena.from(&arena), .authorization = try std.fmt.allocPrint(a, "Bearer {s}", .{token}) };
-    const authed = (try authenticate(app.io, a, &app, &ctx, &d)) orelse return error.TestUnexpectedNull;
+    defer a.free(token);
+    const authz = try std.fmt.allocPrint(a, "Bearer {s}", .{token});
+    defer a.free(authz);
+    var ctx = http.RequestCtx{ .method = .GET, .path = "/", .allocator = RequestArena.forTest(a), .authorization = authz };
+    var authed = (try authenticate(app.io, a, &app, &ctx, &d)) orelse return error.TestUnexpectedNull;
+    defer authed.deinit(a);
     try std.testing.expectEqualStrings("users", authed.collection);
     try std.testing.expectEqual(false, authed.is_superuser);
     try std.testing.expectEqualStrings("rec1", authed.record.object.get("id").?.string);
@@ -522,78 +583,89 @@ test "authenticate resolves a valid bearer token to its record" {
 }
 
 test "authenticate rejects a token signed with the wrong key (returns null)" {
+    const a = std.testing.allocator;
     var d = try db.Db.openMemory();
     defer d.close();
     try migrations.run(&d);
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    _ = try collections.create(a, std.testing.io, &d, .{
+    var created = try collections.create(a, std.testing.io, &d, .{
         .id = "",
         .name = "users",
         .type = .auth,
         .fields = &[_]schema.Field{.{ .id = "f1", .name = "bio", .options = .{ .text = .{} } }},
     });
+    defer created.deinit(a);
     try d.exec("INSERT INTO \"users\" (\"id\",\"created\",\"updated\",\"email\",\"tokenKey\",\"verified\") VALUES ('rec1','','','u@x.io','tk-secret',1);");
     var app = App{ .allocator = std.testing.allocator, .io = std.testing.io, .pool = undefined };
     const wrong = crypto.deriveKey(app.jwt_secret, "different-key");
     const token = try jwt.sign(a, .{ .id = "rec1", .collection = "users", .type = .auth, .iat = 0, .exp = 9999999999 }, &wrong);
-    var ctx = http.RequestCtx{ .method = .GET, .path = "/", .allocator = RequestArena.from(&arena), .authorization = try std.fmt.allocPrint(a, "Bearer {s}", .{token}) };
+    defer a.free(token);
+    const authz = try std.fmt.allocPrint(a, "Bearer {s}", .{token});
+    defer a.free(authz);
+    var ctx = http.RequestCtx{ .method = .GET, .path = "/", .allocator = RequestArena.forTest(a), .authorization = authz };
     try std.testing.expect((try authenticate(app.io, a, &app, &ctx, &d)) == null);
 }
 
 test "authenticate requires CSRF on the cookie + unsafe-method path" {
+    const a = std.testing.allocator;
     var d = try db.Db.openMemory();
     defer d.close();
     try migrations.run(&d);
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    _ = try collections.create(a, std.testing.io, &d, .{
+    var created = try collections.create(a, std.testing.io, &d, .{
         .id = "",
         .name = "users",
         .type = .auth,
         .fields = &[_]schema.Field{.{ .id = "f1", .name = "bio", .options = .{ .text = .{} } }},
     });
+    defer created.deinit(a);
     try d.exec("INSERT INTO \"users\" (\"id\",\"created\",\"updated\",\"email\",\"tokenKey\",\"verified\") VALUES ('rec1','','','u@x.io','tk-secret',1);");
     var app = App{ .allocator = std.testing.allocator, .io = std.testing.io, .pool = undefined };
     const key = crypto.deriveKey(app.jwt_secret, "tk-secret");
     const token = try jwt.sign(a, .{ .id = "rec1", .collection = "users", .type = .auth, .csrf = "csrf-abc", .iat = 0, .exp = 9999999999 }, &key);
+    defer a.free(token);
     const cookie_hdr = try std.fmt.allocPrint(a, "zb_auth={s}", .{token});
-    var bad = http.RequestCtx{ .method = .POST, .path = "/", .allocator = RequestArena.from(&arena), .cookie_header = cookie_hdr };
+    defer a.free(cookie_hdr);
+    var bad = http.RequestCtx{ .method = .POST, .path = "/", .allocator = RequestArena.forTest(a), .cookie_header = cookie_hdr };
     try std.testing.expect((try authenticate(app.io, a, &app, &bad, &d)) == null);
-    var mismatch = http.RequestCtx{ .method = .POST, .path = "/", .allocator = RequestArena.from(&arena), .cookie_header = cookie_hdr, .csrf_token = "csrf-WRONG" };
+    var mismatch = http.RequestCtx{ .method = .POST, .path = "/", .allocator = RequestArena.forTest(a), .cookie_header = cookie_hdr, .csrf_token = "csrf-WRONG" };
     try std.testing.expect((try authenticate(app.io, a, &app, &mismatch, &d)) == null);
-    var ok = http.RequestCtx{ .method = .POST, .path = "/", .allocator = RequestArena.from(&arena), .cookie_header = cookie_hdr, .csrf_token = "csrf-abc" };
-    try std.testing.expect((try authenticate(app.io, a, &app, &ok, &d)) != null);
-    var get = http.RequestCtx{ .method = .GET, .path = "/", .allocator = RequestArena.from(&arena), .cookie_header = cookie_hdr };
-    try std.testing.expect((try authenticate(app.io, a, &app, &get, &d)) != null);
+    var ok = http.RequestCtx{ .method = .POST, .path = "/", .allocator = RequestArena.forTest(a), .cookie_header = cookie_hdr, .csrf_token = "csrf-abc" };
+    {
+        var au = (try authenticate(app.io, a, &app, &ok, &d)) orelse return error.TestUnexpectedNull;
+        au.deinit(a);
+    }
+    var get = http.RequestCtx{ .method = .GET, .path = "/", .allocator = RequestArena.forTest(a), .cookie_header = cookie_hdr };
+    {
+        var au = (try authenticate(app.io, a, &app, &get, &d)) orelse return error.TestUnexpectedNull;
+        au.deinit(a);
+    }
 }
 
 test "verifyToken resolves a valid token string to a record + exp" {
+    const a = std.testing.allocator;
     var d = try db.Db.openMemory();
     defer d.close();
     try migrations.run(&d);
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    _ = try collections.create(a, std.testing.io, &d, .{
+    var created = try collections.create(a, std.testing.io, &d, .{
         .id = "",
         .name = "users",
         .type = .auth,
         .fields = &[_]schema.Field{.{ .id = "f1", .name = "bio", .options = .{ .text = .{} } }},
     });
+    defer created.deinit(a);
     try d.exec("INSERT INTO \"users\" (\"id\",\"created\",\"updated\",\"email\",\"tokenKey\",\"verified\") VALUES ('rec1','','','u@x.io','tk-secret',1);");
     var app = App{ .allocator = std.testing.allocator, .io = std.testing.io, .pool = undefined };
     const key = crypto.deriveKey(app.jwt_secret, "tk-secret");
     const token = try jwt.sign(a, .{ .id = "rec1", .collection = "users", .type = .auth, .iat = 0, .exp = 9999999999 }, &key);
-    const v = verifyToken(a, &app, &d, token) orelse return error.TestUnexpectedNull;
+    defer a.free(token);
+    var v = verifyToken(a, &app, &d, token) orelse return error.TestUnexpectedNull;
+    defer v.deinit(a);
     try std.testing.expectEqualStrings("users", v.collection);
     try std.testing.expectEqual(false, v.is_superuser);
     try std.testing.expectEqual(@as(i64, 9999999999), v.exp);
     try std.testing.expectEqualStrings("rec1", v.record.object.get("id").?.string);
     const wrong = crypto.deriveKey(app.jwt_secret, "other");
     const bad = try jwt.sign(a, .{ .id = "rec1", .collection = "users", .type = .auth, .iat = 0, .exp = 9999999999 }, &wrong);
+    defer a.free(bad);
     try std.testing.expect(verifyToken(a, &app, &d, bad) == null);
 }
 
@@ -601,18 +673,22 @@ test "verifyTokenOfTypes accepts a file token only when allowed" {
     var d = try db.Db.openMemory();
     defer d.close();
     try migrations.run(&d);
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    _ = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "users", .type = .auth, .fields = &.{} });
+    const a = std.testing.allocator;
+    var created = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "users", .type = .auth, .fields = &.{} });
+    defer created.deinit(a);
     try d.exec("INSERT INTO \"users\" (\"id\",\"created\",\"updated\",\"email\",\"tokenKey\",\"verified\") VALUES ('rec1','','','u@x.io','tk',1);");
     var app = App{ .allocator = std.testing.allocator, .io = std.testing.io, .pool = undefined };
     const key = crypto.deriveKey(app.jwt_secret, "tk");
     const file_tok = try jwt.sign(a, .{ .id = "rec1", .collection = "users", .type = .file, .iat = 0, .exp = 9999999999 }, &key);
+    defer a.free(file_tok);
     try std.testing.expect(verifyToken(a, &app, &d, file_tok) == null);
-    try std.testing.expect(verifyTokenOfTypes(a, &app, &d, file_tok, &.{ .auth, .file }) != null);
+    {
+        var v = verifyTokenOfTypes(a, &app, &d, file_tok, &.{ .auth, .file }) orelse return error.TestUnexpectedNull;
+        v.deinit(a);
+    }
     const wrong = crypto.deriveKey(app.jwt_secret, "other");
     const bad = try jwt.sign(a, .{ .id = "rec1", .collection = "users", .type = .file, .iat = 0, .exp = 9999999999 }, &wrong);
+    defer a.free(bad);
     try std.testing.expect(verifyTokenOfTypes(a, &app, &d, bad, &.{ .auth, .file }) == null);
 }
 
@@ -620,17 +696,20 @@ test "verifyTokenOfTypes rejects a full .auth token under .file-only (file ?toke
     // The file-download `?token=` path (api/files.zig fileIdentity) accepts ONLY `.file` tokens,
     // so a full session (`.auth`) token can never authenticate a download via a URL query param
     // (which would leak the session token into logs / Referer / history). Pin that type gate.
+    const a = std.testing.allocator;
     var d = try db.Db.openMemory();
     defer d.close();
     try migrations.run(&d);
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    _ = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "users", .type = .auth, .fields = &.{} });
+    var created = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "users", .type = .auth, .fields = &.{} });
+    defer created.deinit(a);
     try d.exec("INSERT INTO \"users\" (\"id\",\"created\",\"updated\",\"email\",\"tokenKey\",\"verified\") VALUES ('rec1','','','u@x.io','tk',1);");
     var app = App{ .allocator = std.testing.allocator, .io = std.testing.io, .pool = undefined };
     const key = crypto.deriveKey(app.jwt_secret, "tk");
     const auth_tok = try jwt.sign(a, .{ .id = "rec1", .collection = "users", .type = .auth, .iat = 0, .exp = 9999999999 }, &key);
+    defer a.free(auth_tok);
     try std.testing.expect(verifyTokenOfTypes(a, &app, &d, auth_tok, &.{.file}) == null); // rejected: file-only
-    try std.testing.expect(verifyTokenOfTypes(a, &app, &d, auth_tok, &.{.auth}) != null); // sanity: valid .auth token
+    {
+        var v = verifyTokenOfTypes(a, &app, &d, auth_tok, &.{.auth}) orelse return error.TestUnexpectedNull; // sanity: valid .auth token
+        v.deinit(a);
+    }
 }

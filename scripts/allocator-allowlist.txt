@@ -15,7 +15,6 @@ src/api/sessions.zig	6	PRE-EXISTING: not yet migrated to the ownership contracts
 src/api/settings.zig	2	PRE-EXISTING: not yet migrated to the ownership contracts
 src/api/state.zig	5	PRE-EXISTING: not yet migrated to the ownership contracts
 src/api/webauthn_register.zig	4	PRE-EXISTING: not yet migrated to the ownership contracts
-src/auth.zig	6	The 11 applyCreate/applyProvision/applyUpdate tests are un-masked (each returns a graph freed via freeProvisioned, run under std.testing.allocator). 6 remain: the verifyToken/verifyTokenOfTypes/authenticate family, which return the `Verified`/`Authed` graph from an internal JWT-claims parse (deferred design work per the batch scope) — arena-scoped pending that migration.
 src/auth/method.zig	5	PRE-EXISTING: not yet migrated to the ownership contracts
 src/auth/methods/magic_link.zig	9	contract-4: the 9 remaining `MagicLinkMethod:` tests (method()/complete/initiate/ttl_s/auto_create, valid+garbage+missing token, known/unknown/unparseable email) all call `initiate`/`complete` through a real `AuthCtx`/`http.RequestCtx` whose allocator is a `RequestArena` (`RequestArena.from(&arena)`) — the exact production shape every auth-method chokepoint is invoked with. The 2 "buildMailBody: …" tests (a pure builder returning one allocPrint'd string) now run under raw std.testing.allocator, freeing the returned body.
 src/auth/methods/oauth2.zig	11	PRE-EXISTING: not yet migrated to the ownership contracts
