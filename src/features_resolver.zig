@@ -33,6 +33,16 @@ pub const ResolvedExperiment = struct { name: []const u8, variant: []const u8 };
 pub const Resolved = struct {
     flags: []const ResolvedFlag = &.{},
     experiments: []const ResolvedExperiment = &.{},
+
+    /// Free the two owned slices `resolveAll` allocated on `alloc`. Only the slices
+    /// themselves are owned: every `ResolvedFlag.name`/`ResolvedExperiment.name` aliases
+    /// a static `def.name`, and every `.variant` aliases a static `def.variants[i]` entry
+    /// (`resolveExperimentImpl` always returns one of them — even a stored sticky hit is
+    /// mapped back to the declared slice), so no entry field is separately freed here.
+    pub fn deinit(self: *Resolved, alloc: std.mem.Allocator) void {
+        alloc.free(self.flags);
+        alloc.free(self.experiments);
+    }
 };
 
 fn isTruthy(v: []const u8) bool {
@@ -496,9 +506,9 @@ test "weight override changes the split" {
         .variants = &.{ "control", "compact" },
         .weights = &.{ 50, 50 },
     };
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    // resolveExperiment self-frees its scratch and returns a static `def.variants`
+    // string, so it is honest under the raw leak detector — no arena needed.
+    const a = std.testing.allocator;
 
     // Count variants under declared 50/50 vs an override pinning everything to control.
     var control_default: usize = 0;
@@ -521,9 +531,7 @@ test "resolveExperiment falls back to declared weights on a bad override" {
         .variants = &.{ "control", "compact" },
         .weights = &.{ 100, 0 }, // declared: always control
     };
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     // Malformed / wrong-length / all-zero overrides all fall back to declared.
     try std.testing.expectEqualStrings("control", try resolveExperiment(a, null, "not json", def, "x"));
     try std.testing.expectEqualStrings("control", try resolveExperiment(a, null, "[1,2,3]", def, "x"));
@@ -545,11 +553,10 @@ test "resolveAll returns every declared flag + experiment via the batched scan" 
         .{ .key = "flag:new_dashboard", .value = "true" },
         .{ .key = "exp:layout:weights", .value = "[0,100]" },
     };
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
 
-    const resolved = try resolveAll(a, reg, &entries, "user-7", null);
+    var resolved = try resolveAll(a, reg, &entries, "user-7", null);
+    defer resolved.deinit(a);
     try std.testing.expectEqual(@as(usize, 2), resolved.flags.len);
     // checkout_enabled has no override → declared default true.
     try std.testing.expectEqualStrings("checkout_enabled", resolved.flags[0].name);
@@ -583,9 +590,7 @@ test "sticky experiment SURVIVES a weight change (#129)" {
     defer d.close();
     try d.exec(assignments_ddl);
 
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
 
     const def = ExperimentDef{
         .name = "checkout_layout",
@@ -621,9 +626,7 @@ test "non-sticky experiment FOLLOWS the new weights (no persistence)" {
     defer d.close();
     try d.exec(assignments_ddl);
 
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
 
     const def = ExperimentDef{
         .name = "layout",
@@ -649,9 +652,7 @@ test "sticky never persists an empty-subject assignment" {
     defer d.close();
     try d.exec(assignments_ddl);
 
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
 
     const def = ExperimentDef{
         .name = "layout",
@@ -677,9 +678,7 @@ test "sticky HIT is reader-first: resolves with NO write (#129/#130)" {
     defer d.close();
     try d.exec(assignments_ddl);
 
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
 
     const def = ExperimentDef{
         .name = "checkout_layout",
@@ -707,9 +706,7 @@ test "resolveAll honors a sticky PERSISTED variant across a weight override (#12
     defer d.close();
     try d.exec(assignments_ddl);
 
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
 
     const reg = Registry{
         .flags = &.{},
@@ -720,20 +717,23 @@ test "resolveAll honors a sticky PERSISTED variant across a weight override (#12
     const sc = StickyConns{ .read = &d, .pool = null }; // single conn doubles as reader + writer
 
     // First projection persists the assignment under the declared 50/50 weights.
-    const r1 = try resolveAll(a, reg, &.{}, "user-42", sc);
+    var r1 = try resolveAll(a, reg, &.{}, "user-42", sc);
+    defer r1.deinit(a);
     const persisted = r1.experiments[0].variant;
 
     // Now apply a weight override that would force EVERYONE to the opposite variant.
     const opposite = if (std.mem.eql(u8, persisted, "control")) "[0,100]" else "[100,0]";
     const entries = [_]KvPair{.{ .key = "exp:checkout_layout:weights", .value = opposite }};
-    const r2 = try resolveAll(a, reg, &entries, "user-42", sc);
+    var r2 = try resolveAll(a, reg, &entries, "user-42", sc);
+    defer r2.deinit(a);
     // Sticky → the projection still reports the persisted variant.
     try std.testing.expectEqualStrings(persisted, r2.experiments[0].variant);
 
     // A brand-new subject under the override DOES follow the new weights (proves the
     // override is live for the unseen subject, so the stickiness above is real).
     const forced = if (std.mem.eql(u8, persisted, "control")) "compact" else "control";
-    const r3 = try resolveAll(a, reg, &entries, "newcomer-9", sc);
+    var r3 = try resolveAll(a, reg, &entries, "newcomer-9", sc);
+    defer r3.deinit(a);
     try std.testing.expectEqualStrings(forced, r3.experiments[0].variant);
 }
 
@@ -755,9 +755,7 @@ test "resolveAll batched sticky reads == per-experiment resolve (equivalence, #2
     defer d.close();
     try d.exec(assignments_ddl);
 
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
 
     const e1 = ExperimentDef{ .name = "checkout_layout", .variants = &.{ "control", "compact" }, .weights = &.{ 50, 50 }, .sticky = true };
     const e2 = ExperimentDef{ .name = "pricing", .variants = &.{ "a", "b", "c" }, .weights = &.{ 34, 33, 33 }, .sticky = true };
@@ -779,7 +777,8 @@ test "resolveAll batched sticky reads == per-experiment resolve (equivalence, #2
     const s3 = try resolveExperiment(a, sc, null, e3, subject);
 
     // Batched resolveAll must produce byte-identical variants.
-    const r = try resolveAll(a, reg, &.{}, subject, sc);
+    var r = try resolveAll(a, reg, &.{}, subject, sc);
+    defer r.deinit(a);
     try std.testing.expectEqualStrings(s1, r.experiments[0].variant);
     try std.testing.expectEqualStrings(s2, r.experiments[1].variant);
     try std.testing.expectEqualStrings(s3, r.experiments[2].variant);
@@ -793,9 +792,7 @@ test "resolveAll batched all-hits writes NO new rows (batch is actually used, #2
     defer d.close();
     try d.exec(assignments_ddl);
 
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
 
     const e1 = ExperimentDef{ .name = "checkout_layout", .variants = &.{ "control", "compact" }, .weights = &.{ 50, 50 }, .sticky = true };
     const e2 = ExperimentDef{ .name = "pricing", .variants = &.{ "a", "b", "c" }, .weights = &.{ 34, 33, 33 }, .sticky = true };
@@ -813,7 +810,8 @@ test "resolveAll batched all-hits writes NO new rows (batch is actually used, #2
     // batched SELECT satisfies them, so NO per-experiment read/persist runs. Forbid writes to
     // prove it: any INSERT (a miss-path persist) would fail with SQLITE_READONLY.
     try d.exec("PRAGMA query_only=ON;");
-    const r = try resolveAll(a, reg, &.{}, "user-42", sc);
+    var r = try resolveAll(a, reg, &.{}, "user-42", sc);
+    defer r.deinit(a);
     try d.exec("PRAGMA query_only=OFF;");
 
     try std.testing.expectEqualStrings("compact", r.experiments[0].variant);
@@ -827,9 +825,7 @@ test "resolveAll batched: a stored UNDECLARED variant is a MISS (recompute), lik
     defer d.close();
     try d.exec(assignments_ddl);
 
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
 
     const def = ExperimentDef{ .name = "checkout_layout", .variants = &.{ "control", "compact" }, .weights = &.{ 50, 50 }, .sticky = true };
     const reg = Registry{ .flags = &.{}, .experiments = &.{def} };
@@ -844,7 +840,8 @@ test "resolveAll batched: a stored UNDECLARED variant is a MISS (recompute), lik
     // Batched resolveAll agrees with the single-accessor path, and returns a DECLARED variant
     // (the recomputed bucket), never the stored 'legacy'.
     const single = try resolveExperiment(a, sc, null, def, "user-42");
-    const r = try resolveAll(a, reg, &.{}, "user-42", sc);
+    var r = try resolveAll(a, reg, &.{}, "user-42", sc);
+    defer r.deinit(a);
     try std.testing.expectEqualStrings(single, r.experiments[0].variant);
     try std.testing.expect(std.mem.eql(u8, r.experiments[0].variant, "control") or std.mem.eql(u8, r.experiments[0].variant, "compact"));
 }
@@ -854,9 +851,7 @@ test "resolveAll batched: a sticky MISS is bucketed + persisted, stable on re-re
     defer d.close();
     try d.exec(assignments_ddl);
 
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
 
     const def = ExperimentDef{ .name = "checkout_layout", .variants = &.{ "control", "compact" }, .weights = &.{ 50, 50 }, .sticky = true };
     const reg = Registry{ .flags = &.{}, .experiments = &.{def} };
@@ -864,12 +859,14 @@ test "resolveAll batched: a sticky MISS is bucketed + persisted, stable on re-re
 
     // No seeded row → the batch misses → resolveAll persists the bucketed variant.
     try std.testing.expectEqual(@as(i64, 0), try assignmentRowCount(&d));
-    const r1 = try resolveAll(a, reg, &.{}, "user-42", sc);
+    var r1 = try resolveAll(a, reg, &.{}, "user-42", sc);
+    defer r1.deinit(a);
     const v = r1.experiments[0].variant;
     try std.testing.expectEqual(@as(i64, 1), try assignmentRowCount(&d));
 
     // A second resolveAll returns the now-stored variant (a batch HIT) and writes no new row.
-    const r2 = try resolveAll(a, reg, &.{}, "user-42", sc);
+    var r2 = try resolveAll(a, reg, &.{}, "user-42", sc);
+    defer r2.deinit(a);
     try std.testing.expectEqualStrings(v, r2.experiments[0].variant);
     try std.testing.expectEqual(@as(i64, 1), try assignmentRowCount(&d));
 }
@@ -880,30 +877,28 @@ test "resolveAll issues NO assignment query when no experiment is sticky (#229)"
     // Intentionally do NOT create `_experiment_assignments`: any read of it would error with
     // "no such table", so a clean pure-hash resolve proves the batch read was skipped entirely.
 
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
 
     const def = ExperimentDef{ .name = "layout", .variants = &.{ "control", "compact" }, .weights = &.{ 50, 50 }, .sticky = false };
     const reg = Registry{ .flags = &.{}, .experiments = &.{def} };
     const sc = StickyConns{ .read = &d, .pool = null };
 
-    const r = try resolveAll(a, reg, &.{}, "user-1", sc);
+    var r = try resolveAll(a, reg, &.{}, "user-1", sc);
+    defer r.deinit(a);
     // Pure-hash result matches the single-accessor pure path (no sticky connection needed).
     const expect = try resolveExperiment(a, null, null, def, "user-1");
     try std.testing.expectEqualStrings(expect, r.experiments[0].variant);
 }
 
 test "resolveAll with sticky==null takes the pure-hash path for a sticky experiment (#229)" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
 
     // A sticky experiment, but `sticky == null` → never touches the table (no db at all).
     const def = ExperimentDef{ .name = "checkout_layout", .variants = &.{ "control", "compact" }, .weights = &.{ 50, 50 }, .sticky = true };
     const reg = Registry{ .flags = &.{}, .experiments = &.{def} };
 
-    const r = try resolveAll(a, reg, &.{}, "user-42", null);
+    var r = try resolveAll(a, reg, &.{}, "user-42", null);
+    defer r.deinit(a);
     const expect = try resolveExperiment(a, null, null, def, "user-42");
     try std.testing.expectEqualStrings(expect, r.experiments[0].variant);
 }
