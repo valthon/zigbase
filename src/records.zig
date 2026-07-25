@@ -497,7 +497,7 @@ fn validateFieldValue(alloc: std.mem.Allocator, conn: *db.Db, f: schema.Field, v
 /// So an empty multipart value clears every field type: text-likes store "",
 /// bool/number/json/multi-value fields store null. Keys that match no schema
 /// field ("<field>-" removal keys, auth password/passwordConfirm) and
-/// non-string values pass through untouched.
+/// non-string values keep their value unchanged (deep-cloned as-is, never aliased).
 ///
 /// Ownership (contract 1, self-freeing): for an OBJECT input the result is a fully-OWNED graph on
 /// `alloc` — every top-level key is duped and every value is a deep clone (or freshly-parsed tree),
@@ -2500,19 +2500,21 @@ test "encrypted field: round-trip through records, ciphertext-at-rest, strict fa
     const col = try collections.create(a, io, &d, .{ .id = "", .name = "vault", .fields = &fields });
     defer col.deinit(a);
 
+    // Input containers own only their backings (values are literals/an integer). `defer` frees them
+    // bottom-up (jblob before obj) on EVERY exit path — including an early error out of the build or
+    // create() below — without the double-free a lingering errdefer would cause once they are freed.
     var obj: std.json.ObjectMap = .empty;
+    defer obj.deinit(a);
     try obj.put(a, "secret", .{ .string = "topsecret" });
     var jblob: std.json.ObjectMap = .empty;
+    defer jblob.deinit(a);
     try jblob.put(a, "pin", .{ .integer = 1234 });
     try obj.put(a, "blob", .{ .object = jblob });
     try obj.put(a, "plain", .{ .string = "visible" });
     const created = try create(a, io, &d, col, .{ .object = obj });
-    // Input containers own only their backings (values are literals/an integer): tear down bottom-up.
-    jblob.deinit(a);
-    obj.deinit(a);
+    defer freeRecord(a, created); // frees on every exit path, covering the a.dupe below
     const rid = try a.dupe(u8, created.object.get("id").?.string);
     defer a.free(rid);
-    freeRecord(a, created);
 
     // (a) Read-back through the records API returns PLAINTEXT (transparent).
     const got = (try get(a, &d, col, rid)).?;
