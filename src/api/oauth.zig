@@ -395,7 +395,10 @@ const TestEnv = struct {
     }
 
     fn seedOAuthCollection(env: *TestEnv, a: std.mem.Allocator, name: []const u8) !void {
+        // `blob` (the encrypted provider secret) and the created collection are both copied into
+        // the persisted schema, so free them here — the helper is self-cleaning under any allocator.
         const blob = try secrets.encryptSecret(std.testing.io, a, env.app.jwt_secret, "stub-secret");
+        defer a.free(blob);
         const provs = [_]schema.OAuth2Provider{.{
             .name = "google",
             .clientId = "cid",
@@ -405,7 +408,7 @@ const TestEnv = struct {
         }};
         const w = env.pool.acquireWriter();
         defer env.pool.releaseWriter();
-        _ = try collections.create(a, std.testing.io, w, .{
+        const created = try collections.create(a, std.testing.io, w, .{
             .id = "",
             .name = name,
             .type = .auth,
@@ -417,6 +420,7 @@ const TestEnv = struct {
             .deleteRule = "",
             .options = .{ .auth = .{ .oauth2 = .{ .enabled = true, .providers = &provs } } },
         });
+        created.deinit(a);
     }
 
     fn ctx(env: *TestEnv, a: RequestArena, m: http.Method, body: []const u8, params: []const http.Param) http.RequestCtx {
@@ -568,9 +572,9 @@ test "createOAuthRecord: unverified provider email is NOT claimed (no squat)" {
 test "deleting an auth record removes its external-auth links" {
     var env = try TestEnv.init();
     defer env.deinit();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    // The only owned graph here is the collection fetched below; everything else binds transient
+    // scratch, so this runs under the raw leak-detecting allocator.
+    const a = std.testing.allocator;
     try env.seedOAuthCollection(a, "users");
     {
         const w = env.pool.acquireWriter();
@@ -582,6 +586,7 @@ test "deleting an auth record removes its external-auth links" {
         const w = env.pool.acquireWriter();
         defer env.pool.releaseWriter();
         const col = (try collections.get(a, w, "users")).?;
+        defer col.deinit(a);
         _ = try records.delete(a, w, col, "r3");
         var st = try w.prepare("DELETE FROM \"_externalAuths\" WHERE \"collectionRef\"=?1 AND \"recordRef\"=?2;");
         defer st.finalize();

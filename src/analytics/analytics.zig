@@ -199,12 +199,20 @@ pub fn provisionSummary(conn: *db.Db, alloc: std.mem.Allocator, name: []const u8
 /// neither double-counts nor drops. Idempotent: a re-run with no new events (max_rowid unchanged)
 /// is an exact no-op. `computed_at` is SQLite's now (honoring `ZIGBASE_FAKE_NOW`).
 pub fn runRollup(conn: *db.Db, alloc: std.mem.Allocator, spec: RollupSpec) !void {
-    try provisionSummary(conn, alloc, spec.name);
-    const table = try summaryTable(alloc, spec.name);
+    // `runRollup` returns void, so every allocation it makes (the summary-table name, watermark
+    // key, the fetched watermark/now text, and the aggregation SQL) is one-shot scratch. Route it
+    // through a function-local arena so `runRollup` is self-freeing under ANY allocator — a
+    // production caller passes a job arena, but the correctness must not depend on that.
+    var scratch = std.heap.ArenaAllocator.init(alloc);
+    defer scratch.deinit();
+    const a = scratch.allocator();
 
-    const wkey = try watermarkKey(alloc, spec.name);
+    try provisionSummary(conn, a, spec.name);
+    const table = try summaryTable(a, spec.name);
+
+    const wkey = try watermarkKey(a, spec.name);
     const watermark: i64 = blk: {
-        const s = (try kvGet(conn, alloc, wkey)) orelse break :blk 0;
+        const s = (try kvGet(conn, a, wkey)) orelse break :blk 0;
         break :blk std.fmt.parseInt(i64, s, 10) catch 0;
     };
 
@@ -213,7 +221,7 @@ pub fn runRollup(conn: *db.Db, alloc: std.mem.Allocator, spec: RollupSpec) !void
     const max_rowid = try scalarMaxRowid(conn, spec.event);
     if (max_rowid <= watermark) return; // no new events — exact no-op (preserves idempotency)
 
-    const computed_at = try scalarNow(conn, alloc);
+    const computed_at = try scalarNow(conn, a);
 
     const account_expr: []const u8 = if (spec.group_account) "\"account\"" else "''";
     const actor_expr: []const u8 = if (spec.group_actor) "\"actor\"" else "''";
@@ -225,7 +233,7 @@ pub fn runRollup(conn: *db.Db, alloc: std.mem.Allocator, spec: RollupSpec) !void
     // existing-row reference with the target table name and the conflict-source with `excluded.` —
     // ONE statement valid on both backends. (The SELECT aggregate is aliased `AS "value"` too so the
     // projection is unambiguous.)
-    const sql = try std.fmt.allocPrintSentinel(alloc,
+    const sql = try std.fmt.allocPrintSentinel(a,
         \\INSERT INTO "{s}" ("bucket","account","actor","value","computed_at")
         \\ SELECT {s} AS b, {s} AS a, {s} AS ac, COUNT(*) AS "value", ?2
         \\ FROM "_events"
@@ -243,8 +251,8 @@ pub fn runRollup(conn: *db.Db, alloc: std.mem.Allocator, spec: RollupSpec) !void
     try st.bindInt(4, max_rowid);
     _ = try st.step();
 
-    const new_mark = try std.fmt.allocPrint(alloc, "{d}", .{max_rowid});
-    try kvSet(conn, alloc, wkey, new_mark);
+    const new_mark = try std.fmt.allocPrint(a, "{d}", .{max_rowid});
+    try kvSet(conn, a, wkey, new_mark);
 }
 
 /// The current max `rowid` among `_events` rows of `event` name (0 when none), snapshotted on the
@@ -328,10 +336,11 @@ test "insertEvent appends an immutable row with server-stamped timestamps" {
 }
 
 test "summaryTable gates the rollup name through isValidIdentifier" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    try std.testing.expectEqualStrings("_rollup_signups", try summaryTable(a, "signups"));
+    // summaryTable is contract-1: only the returned name escapes, on the caller allocator.
+    const a = std.testing.allocator;
+    const t = try summaryTable(a, "signups");
+    defer a.free(t);
+    try std.testing.expectEqualStrings("_rollup_signups", t);
     try std.testing.expectError(error.InvalidIdentifier, summaryTable(a, "bad-name"));
     try std.testing.expectError(error.InvalidIdentifier, summaryTable(a, "drop;table"));
 }
@@ -339,9 +348,8 @@ test "summaryTable gates the rollup name through isValidIdentifier" {
 test "runRollup aggregates incrementally and is idempotent" {
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    // runRollup is self-freeing, so it runs under the raw leak-detecting allocator.
+    const a = std.testing.allocator;
     try migrations.run(&d);
 
     // Two signups for acc1, one for acc2 — all in the same day bucket.
@@ -384,9 +392,7 @@ test "runRollup aggregates incrementally and is idempotent" {
 test "runRollup does not drop an event sharing the prior pass's wall-clock second (rowid watermark)" {
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     try migrations.run(&d);
 
     const spec = RollupSpec{

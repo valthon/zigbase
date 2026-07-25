@@ -42,6 +42,9 @@ pub const ChallengeStore = struct {
         var id_buf: [32]u8 = undefined;
         id_gen.generate(io, &id_buf);
         const cid = try alloc.dupe(u8, &id_buf);
+        // `cid` is the single escaping allocation; free it if any step below fails so `put` is
+        // self-freeing under a raw allocator (not only a request arena).
+        errdefer alloc.free(cid);
         const now = try nowUnixDb(self.conn);
         var st = try prep(self.conn,
             \\INSERT INTO "_authChallenges"
@@ -125,6 +128,9 @@ pub const ChallengeStore = struct {
             if (!try sel.step()) return null;
             break :blk try alloc.dupe(u8, sel.columnText(0));
         };
+        // `cid` is intermediate scratch (only the payload escapes): free it on every exit so
+        // takeByIdentity is self-freeing, not reliant on a caller arena.
+        defer alloc.free(cid);
         // Guarded UPDATE by that id (same atomicity guarantee as take). Capture changesCount()
         // before finalize so the single-use gate never depends on statement-finalize ordering.
         var changed: i64 = 0;
@@ -176,18 +182,20 @@ test "ChallengeStore: put/take single-use, take returns null on replay, expired 
     defer d.close();
     try migrations.run(&d);
 
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    // put/take/takeByIdentity are contract-1 (only the returned buffer escapes), so this runs under
+    // the raw leak-detecting allocator, freeing each returned id/payload.
+    const a = std.testing.allocator;
 
     const store = ChallengeStore{ .conn = &d };
 
     // put a challenge with 1 hour TTL
     const cid = try store.put(a, std.testing.io, "users", "otp", "alice@example.com", "secret-payload", 3600);
+    defer a.free(cid);
     try std.testing.expect(cid.len == 32);
 
     // take once -> returns payload
     const p1 = try store.take(a, cid, "otp");
+    defer if (p1) |p| a.free(p);
     try std.testing.expect(p1 != null);
     try std.testing.expectEqualStrings("secret-payload", p1.?);
 
@@ -197,6 +205,7 @@ test "ChallengeStore: put/take single-use, take returns null on replay, expired 
 
     // put a challenge with negative TTL (already expired at insert)
     const expired_id = try store.put(a, std.testing.io, "users", "otp", "bob@example.com", "should-not-get", -1);
+    defer a.free(expired_id);
     const p3 = try store.take(a, expired_id, "otp");
     try std.testing.expect(p3 == null);
 
@@ -211,14 +220,13 @@ test "ChallengeStore: take with wrong method returns null (cross-method isolatio
     defer d.close();
     try migrations.run(&d);
 
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
 
     const store = ChallengeStore{ .conn = &d };
 
     // Put a registration challenge under "webauthn_reg"
     const cid = try store.put(a, std.testing.io, "users", "webauthn_reg", "user1", "reg-payload", 3600);
+    defer a.free(cid);
 
     // Attempting to take it with the login method "webauthn" must return null
     const wrong = try store.take(a, cid, "webauthn");
@@ -226,6 +234,7 @@ test "ChallengeStore: take with wrong method returns null (cross-method isolatio
 
     // The challenge must still be unconsumed — taking with the correct method succeeds
     const correct = try store.take(a, cid, "webauthn_reg");
+    defer if (correct) |p| a.free(p);
     try std.testing.expect(correct != null);
     try std.testing.expectEqualStrings("reg-payload", correct.?);
 
@@ -240,24 +249,27 @@ test "ChallengeStore: takeByIdentity returns and consumes the newest matching ch
     defer d.close();
     try migrations.run(&d);
 
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
 
     const store = ChallengeStore{ .conn = &d };
 
     // Put two challenges for the same identity — oldest then newest.
     // Insert with explicit created timestamps to guarantee ordering (SQLite datetime('now')
     // has 1-second resolution; two inserts in the same second get the same created value).
-    _ = try store.put(a, std.testing.io, "users", "otp", "carol@example.com", "old-payload", 3600);
-    _ = try store.put(a, std.testing.io, "users", "otp", "carol@example.com", "new-payload", 7200);
+    // The put ids are unused here; free them immediately.
+    const oid = try store.put(a, std.testing.io, "users", "otp", "carol@example.com", "old-payload", 3600);
+    a.free(oid);
+    const nid = try store.put(a, std.testing.io, "users", "otp", "carol@example.com", "new-payload", 7200);
+    a.free(nid);
 
     // takeByIdentity should return one of them (newest unconsumed)
     const p1 = try store.takeByIdentity(a, "users", "otp", "carol@example.com");
+    defer if (p1) |p| a.free(p);
     try std.testing.expect(p1 != null);
 
     // second call should return the other one
     const p2 = try store.takeByIdentity(a, "users", "otp", "carol@example.com");
+    defer if (p2) |p| a.free(p);
     try std.testing.expect(p2 != null);
 
     // p1 and p2 are the two distinct payloads (order may vary within same second)
@@ -271,7 +283,8 @@ test "ChallengeStore: takeByIdentity returns and consumes the newest matching ch
     try std.testing.expect(p3 == null);
 
     // no match for different method
-    _ = try store.put(a, std.testing.io, "users", "magic", "dave@example.com", "magic-payload", 3600);
+    const mid = try store.put(a, std.testing.io, "users", "magic", "dave@example.com", "magic-payload", 3600);
+    a.free(mid);
     const p4 = try store.takeByIdentity(a, "users", "otp", "dave@example.com");
     try std.testing.expect(p4 == null);
 }
@@ -282,21 +295,23 @@ test "gcAuthChallenges removes expired and consumed rows, leaves live ones" {
     defer d.close();
     try migrations.run(&d);
 
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
 
     const store = ChallengeStore{ .conn = &d };
 
-    // Insert a live challenge (far future expiry)
+    // Insert a live challenge (far future expiry). live_id is asserted after GC, so it must outlive.
     const live_id = try store.put(a, std.testing.io, "users", "otp", "eve@example.com", "live", 9999999);
+    defer a.free(live_id);
 
-    // Insert an expired challenge (TTL in the past)
-    _ = try store.put(a, std.testing.io, "users", "otp", "frank@example.com", "expired", -1);
+    // Insert an expired challenge (TTL in the past); its id is unused.
+    const expired_id = try store.put(a, std.testing.io, "users", "otp", "frank@example.com", "expired", -1);
+    a.free(expired_id);
 
     // Insert a live challenge and then consume it
     const consumed_id = try store.put(a, std.testing.io, "users", "otp", "grace@example.com", "consumed", 3600);
-    _ = try store.take(a, consumed_id, "otp");
+    defer a.free(consumed_id);
+    const consumed_payload = try store.take(a, consumed_id, "otp");
+    defer if (consumed_payload) |p| a.free(p);
 
     // Verify 3 rows before GC
     {

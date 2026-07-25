@@ -121,7 +121,8 @@ pub fn enqueue(w: *db.Db, io: std.Io, def: QueueDef, kind: []const u8, payload: 
     return jid;
 }
 
-/// A claimed (now in-flight) durable job. All slices are owned by `arena`.
+/// A claimed (now in-flight) durable job. Its four string slices are OWNED (each duped on the
+/// allocator `claimBatch` was given); free a `[]Claimed` result via `freeClaimed`.
 pub const Claimed = struct {
     id: []const u8,
     queue: []const u8,
@@ -129,14 +130,51 @@ pub const Claimed = struct {
     payload: []const u8,
     attempts: i64,
     max_attempts: i64,
+
+    /// Free this claim's four owned string slices (NOT the containing slice — see `freeClaimed`).
+    fn deinit(self: Claimed, alloc: std.mem.Allocator) void {
+        alloc.free(self.id);
+        alloc.free(self.queue);
+        alloc.free(self.kind);
+        alloc.free(self.payload);
+    }
 };
+
+/// Free a `claimBatch` result: each `Claimed`'s owned strings, then the backing slice. Contract-2 —
+/// production drivers (`pollOnce`) pass a poll arena that reclaims wholesale, but a direct caller
+/// (and the leak-checked tests) frees the graph honestly with this.
+pub fn freeClaimed(alloc: std.mem.Allocator, claimed: []Claimed) void {
+    for (claimed) |c| c.deinit(alloc);
+    alloc.free(claimed);
+}
+
+/// Dupe one claimed row's owned strings off `alloc`, with per-field cleanup so a mid-dupe OOM frees
+/// the earlier fields (nothing is appended yet on failure).
+fn claimOne(alloc: std.mem.Allocator, st: *db.Stmt) !Claimed {
+    const cid = try alloc.dupe(u8, st.columnText(0));
+    errdefer alloc.free(cid);
+    const cqueue = try alloc.dupe(u8, st.columnText(1));
+    errdefer alloc.free(cqueue);
+    const ckind = try alloc.dupe(u8, st.columnText(2));
+    errdefer alloc.free(ckind);
+    const cpayload = try alloc.dupe(u8, st.columnText(3));
+    errdefer alloc.free(cpayload);
+    return .{
+        .id = cid,
+        .queue = cqueue,
+        .kind = ckind,
+        .payload = cpayload,
+        .attempts = st.columnInt(4),
+        .max_attempts = st.columnInt(5),
+    };
+}
 
 /// Atomically claim up to `limit` ready rows for `queue_names`, ORDER BY priority,run_at —
 /// so higher-priority queues drain first (strict priority). Marks each row `claimed`
 /// (claimed_at=now, claimed_by=worker) and RETURNs it. The writer must be held by the caller.
 /// Returns an empty slice when nothing is ready.
 pub fn claimBatch(
-    arena: std.mem.Allocator,
+    alloc: std.mem.Allocator,
     w: *db.Db,
     queue_names: []const []const u8,
     worker_name: []const u8,
@@ -145,10 +183,15 @@ pub fn claimBatch(
 ) ![]Claimed {
     if (queue_names.len == 0 or limit == 0) return &.{};
 
-    // Build the IN (?,?,…) list dynamically; queue names are BOUND params (no injection).
+    // The dynamic `IN (?,?,…)` SQL is one-shot scratch — only the claimed rows escape. Build it on a
+    // function-local arena so the SQL text/builder never leak onto `alloc` (queue names are BOUND
+    // params, no injection).
+    var scratch = std.heap.ArenaAllocator.init(alloc);
+    defer scratch.deinit();
+    const sa = scratch.allocator();
+
     var sql: std.ArrayList(u8) = .empty;
-    defer sql.deinit(arena);
-    try sql.appendSlice(arena,
+    try sql.appendSlice(sa,
         \\UPDATE "_queue_jobs" SET "status"='claimed', "claimed_at"=?1, "claimed_by"=?2
         \\ WHERE "id" IN (
         \\   SELECT "id" FROM "_queue_jobs"
@@ -157,15 +200,15 @@ pub fn claimBatch(
     var numbuf: [20]u8 = undefined;
     var pidx: usize = 4;
     for (queue_names, 0..) |_, i| {
-        if (i != 0) try sql.append(arena, ',');
-        try sql.append(arena, '?');
-        try sql.appendSlice(arena, std.fmt.bufPrint(&numbuf, "{d}", .{pidx}) catch unreachable);
+        if (i != 0) try sql.append(sa, ',');
+        try sql.append(sa, '?');
+        try sql.appendSlice(sa, std.fmt.bufPrint(&numbuf, "{d}", .{pidx}) catch unreachable);
         pidx += 1;
     }
-    try sql.appendSlice(arena, ") ORDER BY \"priority\" ASC, \"run_at\" ASC LIMIT ?");
-    try sql.appendSlice(arena, std.fmt.bufPrint(&numbuf, "{d}", .{pidx}) catch unreachable);
-    try sql.appendSlice(arena, ") RETURNING \"id\",\"queue\",\"kind\",\"payload\",\"attempts\",\"max_attempts\";");
-    const sql_z = try arena.dupeZ(u8, sql.items);
+    try sql.appendSlice(sa, ") ORDER BY \"priority\" ASC, \"run_at\" ASC LIMIT ?");
+    try sql.appendSlice(sa, std.fmt.bufPrint(&numbuf, "{d}", .{pidx}) catch unreachable);
+    try sql.appendSlice(sa, ") RETURNING \"id\",\"queue\",\"kind\",\"payload\",\"attempts\",\"max_attempts\";");
+    const sql_z = try sa.dupeZ(u8, sql.items);
 
     var st = try w.prepare(sql_z);
     defer st.finalize();
@@ -175,18 +218,21 @@ pub fn claimBatch(
     for (queue_names, 0..) |qn, i| try st.bindText(@intCast(4 + i), qn);
     try st.bindInt(@intCast(pidx), @intCast(limit));
 
+    // The claimed rows escape on `alloc` (contract-2, freed via `freeClaimed`). On any error mid-scan
+    // the rows already built are freed — a raw allocator must not leak them (production's arena would).
     var out: std.ArrayList(Claimed) = .empty;
-    while (try st.step()) {
-        try out.append(arena, .{
-            .id = try arena.dupe(u8, st.columnText(0)),
-            .queue = try arena.dupe(u8, st.columnText(1)),
-            .kind = try arena.dupe(u8, st.columnText(2)),
-            .payload = try arena.dupe(u8, st.columnText(3)),
-            .attempts = st.columnInt(4),
-            .max_attempts = st.columnInt(5),
-        });
+    errdefer {
+        for (out.items) |c| c.deinit(alloc);
+        out.deinit(alloc);
     }
-    return out.toOwnedSlice(arena);
+    while (try st.step()) {
+        const c = try claimOne(alloc, &st);
+        out.append(alloc, c) catch |e| {
+            c.deinit(alloc); // not yet appended — free before the errdefer sweeps the rest
+            return e;
+        };
+    }
+    return out.toOwnedSlice(alloc);
 }
 
 /// Mark a claimed job `done` (success). Writer held by caller.
@@ -426,9 +472,11 @@ test "durable enqueue + claimBatch claims ready pending rows and marks them clai
     // A future row must NOT be claimed yet.
     _ = try enqueue(&d, io, def, "mail", "{\"a\":3}", clock.nowUnix(io) + 3600);
 
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const claimed = try claimBatch(arena.allocator(), &d, &.{"default"}, "w1", 10, clock.nowUnix(io));
+    // claimBatch returns an owned graph (contract-2), freed via freeClaimed — so it runs under the
+    // raw leak-detecting allocator.
+    const a = testing.allocator;
+    const claimed = try claimBatch(a, &d, &.{"default"}, "w1", 10, clock.nowUnix(io));
+    defer freeClaimed(a, claimed);
     try testing.expectEqual(@as(usize, 2), claimed.len);
     try testing.expectEqual(@as(i64, 2), try countStatus(&d, "claimed"));
     try testing.expectEqual(@as(i64, 1), try countStatus(&d, "pending"));
@@ -446,15 +494,17 @@ test "durable claimBatch drains queues in strict priority order" {
     _ = try enqueue(&d, io, .{ .name = "norm", .backend = .durable, .priority = .normal }, "k", "no", now);
     _ = try enqueue(&d, io, .{ .name = "high", .backend = .durable, .priority = .high }, "k", "hi", now);
 
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
+    const a = testing.allocator;
     const qs: []const []const u8 = &.{ "low", "norm", "high" };
     // Claim one at a time: priority decides which comes first regardless of insert order.
-    const c1 = try claimBatch(arena.allocator(), &d, qs, "w", 1, now);
+    const c1 = try claimBatch(a, &d, qs, "w", 1, now);
+    defer freeClaimed(a, c1);
     try testing.expectEqualStrings("hi", c1[0].payload);
-    const c2 = try claimBatch(arena.allocator(), &d, qs, "w", 1, now);
+    const c2 = try claimBatch(a, &d, qs, "w", 1, now);
+    defer freeClaimed(a, c2);
     try testing.expectEqualStrings("no", c2[0].payload);
-    const c3 = try claimBatch(arena.allocator(), &d, qs, "w", 1, now);
+    const c3 = try claimBatch(a, &d, qs, "w", 1, now);
+    defer freeClaimed(a, c3);
     try testing.expectEqualStrings("lo", c3[0].payload);
 }
 
@@ -542,11 +592,14 @@ test "enqueue returns the persisted job id; a future run_at is not claimed until
         try testing.expect(try st.step());
         try testing.expectEqualStrings("pending", st.columnText(0));
     }
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
+    const a = testing.allocator;
     // Before due: nothing claimable. At/after due: claimed.
-    try testing.expectEqual(@as(usize, 0), (try claimBatch(arena.allocator(), &d, &.{"default"}, "w", 10, 1_999_999)).len);
-    try testing.expectEqual(@as(usize, 1), (try claimBatch(arena.allocator(), &d, &.{"default"}, "w", 10, 2_000_000)).len);
+    const before = try claimBatch(a, &d, &.{"default"}, "w", 10, 1_999_999);
+    defer freeClaimed(a, before);
+    try testing.expectEqual(@as(usize, 0), before.len);
+    const after = try claimBatch(a, &d, &.{"default"}, "w", 10, 2_000_000);
+    defer freeClaimed(a, after);
+    try testing.expectEqual(@as(usize, 1), after.len);
 }
 
 test "cancelJob: pending -> true; claimed/done/second-cancel -> false (changes()==0 no-match rule)" {
@@ -560,9 +613,10 @@ test "cancelJob: pending -> true; claimed/done/second-cancel -> false (changes()
     try testing.expect(!try cancelJob(&d, &jid)); // already canceled -> no match
     try testing.expect(!try cancelJob(&d, "nonexistent-id!")); // unknown -> no match
     // A canceled job is invisible to the claim query.
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    try testing.expectEqual(@as(usize, 0), (try claimBatch(arena.allocator(), &d, &.{"default"}, "w", 10, clock.nowUnix(io) + 7200)).len);
+    const a = testing.allocator;
+    const claimed = try claimBatch(a, &d, &.{"default"}, "w", 10, clock.nowUnix(io) + 7200);
+    defer freeClaimed(a, claimed);
+    try testing.expectEqual(@as(usize, 0), claimed.len);
 }
 
 test "gcDoneJobs reaps old canceled rows" {

@@ -91,22 +91,39 @@ pub fn abilityPredicate(
 
     const ranking = rctx.role_ranking;
     var params: std.ArrayList(compiler.Param) = .empty;
+    // The param SLICE escapes (contract-2), but the ArrayList must not leak if a later append/build
+    // step fails; free it on any error until ownership transfers via toOwnedSlice.
+    errdefer params.deinit(alloc);
     for (rctx.memberships) |m| {
         const qualifies = if (rel.min_role.len == 0) true else ranking.gte(m.role, rel.min_role);
         if (!qualifies) continue;
         try params.append(alloc, .{ .text = m.account });
     }
     const n = params.items.len;
-    if (n == 0) return Predicate{ .sql = dialect.constFalse() }; // empty set -> constant-false, fail closed
+    if (n == 0) {
+        params.deinit(alloc); // empty set -> constant-false, fail closed (no owned params escape)
+        return Predicate{ .sql = dialect.constFalse() };
+    }
 
+    // Build the `IN (?,?,…)` fragment directly (no allocPrint scratch to leak); only the finished
+    // buffer escapes as `sql`.
     var buf: std.ArrayList(u8) = .empty;
-    try buf.appendSlice(alloc, try std.fmt.allocPrint(alloc, "\"{s}\".\"{s}\" IN (", .{ col.name, rel.via }));
+    errdefer buf.deinit(alloc);
+    try buf.appendSlice(alloc, "\"");
+    try buf.appendSlice(alloc, col.name);
+    try buf.appendSlice(alloc, "\".\"");
+    try buf.appendSlice(alloc, rel.via);
+    try buf.appendSlice(alloc, "\" IN (");
     for (0..n) |i| {
         if (i > 0) try buf.append(alloc, ',');
         try buf.append(alloc, '?');
     }
     try buf.append(alloc, ')');
-    return Predicate{ .sql = try buf.toOwnedSlice(alloc), .params = try params.toOwnedSlice(alloc) };
+
+    const sql = try buf.toOwnedSlice(alloc);
+    errdefer alloc.free(sql); // if binding the params slice OOMs, the sql buffer must not leak
+    const bound = try params.toOwnedSlice(alloc);
+    return Predicate{ .sql = sql, .params = bound };
 }
 
 // ---- Comptime lowering + validation -----------------------------------------
@@ -214,35 +231,27 @@ fn lowerRule(comptime cname: []const u8, comptime col: schema.Collection, compti
 
 // ---- Tests ------------------------------------------------------------------
 
-const migrations = @import("../migrations.zig");
-const collections = @import("../collections.zig");
-const db = @import("../db.zig");
-
-fn setupPosts(a: std.mem.Allocator, d: *db.Db) !schema.Collection {
-    try migrations.run(d);
-    const accounts = try collections.create(a, std.testing.io, d, .{ .id = "", .name = "accounts", .fields = &[_]schema.Field{
-        .{ .id = "an", .name = "name", .options = .{ .text = .{} } },
-    } });
-    return collections.create(a, std.testing.io, d, .{ .id = "", .name = "posts", .fields = &[_]schema.Field{
-        .{ .id = "f1", .name = "title", .options = .{ .text = .{} } },
-        .{ .id = "f2", .name = "account", .options = .{ .relation = .{ .targetCollectionId = accounts.id, .maxSelect = 1 } } },
-    } });
-}
+// `abilityPredicate` reads only `col.name` (the DB is irrelevant to it), so these tests drive it
+// with a stack-literal collection under the RAW leak-detecting allocator. The IN-predicate case
+// returns two owned buffers (`sql` + `params`) freed directly; the fail-closed/superuser cases
+// return a `constFalse` literal / null and own nothing.
+const test_posts_fields = [_]schema.Field{
+    .{ .id = "f1", .name = "title", .options = .{ .text = .{} } },
+    .{ .id = "f2", .name = "account", .options = .{ .relation = .{ .targetCollectionId = "accounts", .maxSelect = 1 } } },
+};
+const test_posts = schema.Collection{ .id = "cp", .name = "posts", .fields = &test_posts_fields };
 
 test "abilityPredicate: binds qualifying account ids; emits an IN predicate" {
-    var d = try db.Db.openMemory();
-    defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const posts = try setupPosts(a, &d);
+    const a = std.testing.allocator;
     const mem = [_]request.Membership{
         .{ .account = "acc1", .role = "owner" },
         .{ .account = "acc2", .role = "viewer" },
     };
     const rctx = request.RequestContext{ .memberships = &mem };
     const ab = Ability{ .relationship = .{ .via = "account", .min_role = "editor" } };
-    const p = (try abilityPredicate(a, posts, ab, &rctx, Dialect.sqlite)).?;
+    const p = (try abilityPredicate(a, test_posts, ab, &rctx, Dialect.sqlite)).?;
+    defer a.free(p.sql);
+    defer a.free(p.params);
     // Only acc1 (owner >= editor) qualifies; acc2 (viewer) is filtered out.
     try std.testing.expectEqualStrings("\"posts\".\"account\" IN (?)", p.sql);
     try std.testing.expectEqual(@as(usize, 1), p.params.len);
@@ -250,31 +259,23 @@ test "abilityPredicate: binds qualifying account ids; emits an IN predicate" {
 }
 
 test "abilityPredicate: no min_role -> every membership qualifies" {
-    var d = try db.Db.openMemory();
-    defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const posts = try setupPosts(a, &d);
+    const a = std.testing.allocator;
     const mem = [_]request.Membership{ .{ .account = "a1", .role = "viewer" }, .{ .account = "a2", .role = "viewer" } };
     const rctx = request.RequestContext{ .memberships = &mem };
     const ab = Ability{ .relationship = .{ .via = "account" } };
-    const p = (try abilityPredicate(a, posts, ab, &rctx, Dialect.sqlite)).?;
+    const p = (try abilityPredicate(a, test_posts, ab, &rctx, Dialect.sqlite)).?;
+    defer a.free(p.sql);
+    defer a.free(p.params);
     try std.testing.expectEqualStrings("\"posts\".\"account\" IN (?,?)", p.sql);
     try std.testing.expectEqual(@as(usize, 2), p.params.len);
 }
 
 test "abilityPredicate: empty qualifying set is constant-false (fail closed)" {
-    var d = try db.Db.openMemory();
-    defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const posts = try setupPosts(a, &d);
-    // No memberships at all.
+    const a = std.testing.allocator;
+    // No memberships at all — constFalse literal, no owned buffers.
     {
         const rctx = request.RequestContext{};
-        const p = (try abilityPredicate(a, posts, .{ .relationship = .{ .via = "account" } }, &rctx, Dialect.sqlite)).?;
+        const p = (try abilityPredicate(a, test_posts, .{ .relationship = .{ .via = "account" } }, &rctx, Dialect.sqlite)).?;
         try std.testing.expectEqualStrings("0", p.sql);
         try std.testing.expectEqual(@as(usize, 0), p.params.len);
     }
@@ -282,23 +283,18 @@ test "abilityPredicate: empty qualifying set is constant-false (fail closed)" {
     {
         const mem = [_]request.Membership{.{ .account = "a1", .role = "viewer" }};
         const rctx = request.RequestContext{ .memberships = &mem };
-        const p = (try abilityPredicate(a, posts, .{ .relationship = .{ .via = "account", .min_role = "owner" } }, &rctx, Dialect.sqlite)).?;
+        const p = (try abilityPredicate(a, test_posts, .{ .relationship = .{ .via = "account", .min_role = "owner" } }, &rctx, Dialect.sqlite)).?;
         try std.testing.expectEqualStrings("0", p.sql);
     }
 }
 
 test "abilityPredicate: superuser bypass -> null (no predicate)" {
-    var d = try db.Db.openMemory();
-    defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const posts = try setupPosts(a, &d);
+    const a = std.testing.allocator;
     const rctx = request.RequestContext{ .is_superuser = true };
-    try std.testing.expect((try abilityPredicate(a, posts, .{ .relationship = .{ .via = "account" } }, &rctx, Dialect.sqlite)) == null);
+    try std.testing.expect((try abilityPredicate(a, test_posts, .{ .relationship = .{ .via = "account" } }, &rctx, Dialect.sqlite)) == null);
     // No ability rule -> null too.
     const member = request.RequestContext{};
-    try std.testing.expect((try abilityPredicate(a, posts, null, &member, Dialect.sqlite)) == null);
+    try std.testing.expect((try abilityPredicate(a, test_posts, null, &member, Dialect.sqlite)) == null);
 }
 
 test "applyAbilities: lowers config onto the matching collection's options" {
