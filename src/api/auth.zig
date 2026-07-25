@@ -145,11 +145,9 @@ test "findByIdentity: a .nocase email index makes the SQLite lookup case-insensi
     // Mirror of the Postgres auth_pg_test case: with a `.nocase` UNIQUE index on email, finding by
     // a DIFFERENT case must resolve the stored record on SQLite too (COLLATE NOCASE index), so both
     // backends behave identically — a user registered as `Bob@x.com` can log in as `bob@x.com`.
+    const a = std.testing.allocator;
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
     try migrations.run(&d);
 
     const col = try collections.create(a, std.testing.io, &d, .{
@@ -164,27 +162,38 @@ test "findByIdentity: a .nocase email index makes the SQLite lookup case-insensi
         .updateRule = "",
         .deleteRule = "",
     });
+    defer col.deinit(a);
 
     var data: std.json.ObjectMap = .empty;
+    defer data.deinit(a);
     try data.put(a, "email", .{ .string = "Bob@x.com" });
     try data.put(a, "password", .{ .string = "correct horse battery" });
     const prepared = try auth.applyCreate(std.testing.io, a, .{ .object = data }, col.options.auth.minPasswordLength);
+    defer auth.freeProvisioned(a, prepared);
     const rec = try records.create(a, std.testing.io, &d, col, prepared);
+    defer records.freeRecord(a, rec);
     const rid = rec.object.get("id").?.string;
 
-    // Case-INSENSITIVE lookup: different cases all resolve the same record.
-    try std.testing.expectEqualStrings(rid, (try findByIdentity(a, &d, col, "bob@x.com")).?);
-    try std.testing.expectEqualStrings(rid, (try findByIdentity(a, &d, col, "BOB@X.COM")).?);
-    try std.testing.expectEqualStrings(rid, (try findByIdentity(a, &d, col, "Bob@x.com")).?);
+    // Case-INSENSITIVE lookup: different cases all resolve the same record. Each hit is a freshly
+    // duped id string (contract-1), freed after the compare.
+    for ([_][]const u8{ "bob@x.com", "BOB@X.COM", "Bob@x.com" }) |q| {
+        const hit = (try findByIdentity(a, &d, col, q)).?;
+        defer a.free(hit);
+        try std.testing.expectEqualStrings(rid, hit);
+    }
     // A non-matching identity still returns null.
     try std.testing.expect((try findByIdentity(a, &d, col, "carol@x.com")) == null);
 
     // Case-variant uniqueness: a second record with a case-variant email is rejected by the
     // COLLATE NOCASE unique index (duplicate identity) — parity with the Postgres lower() index.
     var data2: std.json.ObjectMap = .empty;
+    defer data2.deinit(a);
     try data2.put(a, "email", .{ .string = "bob@x.com" });
     try data2.put(a, "password", .{ .string = "another good passphrase" });
     const prepared2 = try auth.applyCreate(std.testing.io, a, .{ .object = data2 }, col.options.auth.minPasswordLength);
+    defer auth.freeProvisioned(a, prepared2);
+    // records.create frees its own partial record on the constraint error (rowToObject errdefer,
+    // #334); `prepared2` remains ours to free above.
     try std.testing.expectError(error.Constraint, records.create(a, std.testing.io, &d, col, prepared2));
 }
 

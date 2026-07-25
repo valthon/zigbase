@@ -1,7 +1,7 @@
 # path<TAB>count<TAB>justification
 # A test may wrap testing.allocator in an arena ONLY if the code under test takes
 # RequestArena (contract 4). Every line here is a promise to remove it or justify it.
-src/api/auth.zig	40	2 non-handler outliers un-masked (a dead unused arena in the gcExpiredSessions test, and the backlog test whose arena only held transient session-id strings). 40 remain: genuine handler tests holding a RequestArena/Response graph (contract-4) or a collection+record graph whose masking is gated on records.zig's still-masked create/error-path leaks (e.g. the `expectError(error.Constraint, records.create(...))` at ~line 188) — separate un-migrated root causes.
+src/api/auth.zig	39	3 non-handler outliers un-masked: a dead unused arena in the gcExpiredSessions test; the backlog test whose arena only held transient session-id strings; and the "findByIdentity nocase" test (now that records.zig's create/error-path partial-record leak is fixed, #334, it frees col via Collection.deinit, the applyCreate graphs via freeProvisioned, the record via freeRecord, and each findByIdentity hit — a duped id string — after its compare). 39 remain: genuine handler tests holding a RequestArena/Response graph (contract-4).
 src/api/auth_methods.zig	10	PRE-EXISTING: not yet migrated to the ownership contracts
 src/api/collections.zig	9	PRE-EXISTING: not yet migrated to the ownership contracts
 src/api/features.zig	4	PRE-EXISTING: not yet migrated to the ownership contracts
