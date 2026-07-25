@@ -222,31 +222,38 @@ test "data.create provisions a usable auth row: mintLinkToken + issueSession suc
 }
 
 test "data.create on a non-auth collection inserts plainly (no provisioning)" {
+    // Runs under the RAW leak-detecting allocator: the Data facade is contract-2 honest — it frees
+    // its own scratch (the fetched collection + any provision transforms) internally, and returns a
+    // self-contained record the caller frees via `records.freeRecord`.
+    const a = std.testing.allocator;
     var conn = try db.Db.openMemory();
     defer conn.close();
     try conn.exec("PRAGMA foreign_keys=ON;");
     try @import("migrations.zig").run(&conn);
 
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
     const io = std.testing.io;
 
-    _ = try collections.create(a, io, &conn, .{
+    // collections.create returns a fully-owned reload → free it via Collection.deinit.
+    const col = try collections.create(a, io, &conn, .{
         .id = "",
         .name = "posts",
         .fields = &[_]@import("schema.zig").Field{.{ .id = "f1", .name = "title", .options = .{ .text = .{} } }},
     });
+    col.deinit(a);
 
     var app = app_mod.App{ .allocator = a, .io = io, .pool = undefined };
     const d = Data{ .app = &app, .conn = &conn, .io = io, .alloc = a };
+    // The input object is caller-owned scratch (only READ by create) → the test frees it. Keys/values
+    // are string literals, so ObjectMap.deinit frees only its own backing (no double-free).
     var fields: std.json.ObjectMap = .empty;
+    defer fields.deinit(a);
     try fields.put(a, "title", .{ .string = "hi" });
     // Non-auth: plain insert, no tokenKey transform — the value is stored as given.
     const created = try d.create("posts", .{ .object = fields });
+    defer @import("records.zig").freeRecord(a, created);
     try std.testing.expectEqualStrings("hi", created.object.get("title").?.string);
     try std.testing.expect(created.object.get("tokenKey") == null);
-    // Unknown collection still errors.
+    // Unknown collection still errors (and allocates nothing to leak on that path).
     try std.testing.expectError(error.UnknownCollection, d.create("nope", .{ .object = fields }));
 }
 

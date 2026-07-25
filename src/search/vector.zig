@@ -54,6 +54,17 @@ pub const Vector = struct {
     where_sql: []const u8,
     order_sql: []const u8,
     param: compiler.Param,
+
+    /// Free the two OWNED SQL fragments (`where_sql` and `order_sql`, each an `allocPrint` on the
+    /// caller allocator). `param.text` is deliberately NOT freed: it BORROWS from the caller-owned
+    /// `raw` query-string input passed to `build` (it is a sub-slice of it), so freeing it here
+    /// would free memory this struct never owned. In production `records.list` passes the request
+    /// arena and reclaims the whole graph wholesale; this `deinit` lets a raw-allocator caller (the
+    /// tests) free exactly the owned slices.
+    pub fn deinit(self: Vector, alloc: std.mem.Allocator) void {
+        alloc.free(self.where_sql);
+        alloc.free(self.order_sql);
+    }
 };
 
 /// The nearest-neighbor distance metric a `?vector=` query selects (default cosine).
@@ -100,6 +111,7 @@ pub fn build(alloc: std.mem.Allocator, dialect: db.Dialect, col: schema.Collecti
     // ORDER-BY expression differs. The single bound `?` (the query embedding) is renumbered to `$n`
     // on Postgres by the records.list ParamSink pass.
     const where_sql = try std.fmt.allocPrint(alloc, "\"{s}\".\"{s}\" IS NOT NULL", .{ col.name, field });
+    errdefer alloc.free(where_sql); // free the first fragment if the second allocPrint OOMs
     const order_sql = switch (dialect.kind) {
         // sqlite-vec scalar distance functions over the JSON-array column.
         .sqlite => try std.fmt.allocPrint(alloc, "{s}(\"{s}\".\"{s}\", ?)", .{
@@ -174,30 +186,31 @@ fn validEmbedding(alloc: std.mem.Allocator, s: []const u8) std.mem.Allocator.Err
 
 test "vector build is disabled (clean error) in a default build" {
     if (comptime enabled) return error.SkipZigTest;
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
+    // `build` returns `error.VectorDisabled` on its first line before allocating anything, so the
+    // raw leak-detecting allocator is safe here (no owned graph escapes).
+    const a = std.testing.allocator;
     const col = schema.Collection{ .id = "c", .name = "docs", .fields = &[_]schema.Field{
         .{ .id = "f1", .name = "embedding", .options = .{ .json = .{} } },
     } };
-    try std.testing.expectError(error.VectorDisabled, build(arena.allocator(), db.Dialect.sqlite, col, "embedding:[0.1,0.2]"));
-    try std.testing.expectError(error.VectorDisabled, build(arena.allocator(), db.Dialect.postgres, col, "embedding:[0.1,0.2]"));
+    try std.testing.expectError(error.VectorDisabled, build(a, db.Dialect.sqlite, col, "embedding:[0.1,0.2]"));
+    try std.testing.expectError(error.VectorDisabled, build(a, db.Dialect.postgres, col, "embedding:[0.1,0.2]"));
 }
 
 test "vector build parses field/metric/embedding and binds the query vector (SQLite)" {
     if (comptime !enabled) return error.SkipZigTest;
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const col = schema.Collection{ .id = "c", .name = "docs", .fields = &[_]schema.Field{
         .{ .id = "f1", .name = "embedding", .options = .{ .json = .{} } },
         .{ .id = "f2", .name = "n", .options = .{ .number = .{} } },
     } };
     const v = try build(a, db.Dialect.sqlite, col, "embedding:[0.1,0.2,0.3]");
+    defer v.deinit(a);
     try std.testing.expectEqualStrings("\"docs\".\"embedding\" IS NOT NULL", v.where_sql);
     try std.testing.expectEqualStrings("vec_distance_cosine(\"docs\".\"embedding\", ?)", v.order_sql);
     try std.testing.expectEqualStrings("[0.1,0.2,0.3]", v.param.text);
     // l2 metric prefix selects the L2 distance function.
     const v2 = try build(a, db.Dialect.sqlite, col, "embedding:l2:[1,2,3]");
+    defer v2.deinit(a);
     try std.testing.expectEqualStrings("vec_distance_L2(\"docs\".\"embedding\", ?)", v2.order_sql);
     // Unknown / non-storable target field is rejected.
     try std.testing.expectError(error.BadVector, build(a, db.Dialect.sqlite, col, "missing:[1,2]"));
@@ -211,19 +224,19 @@ test "vector build parses field/metric/embedding and binds the query vector (SQL
 
 test "vector build lowers to pgvector operators under the Postgres dialect" {
     if (comptime !enabled) return error.SkipZigTest;
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     const col = schema.Collection{ .id = "c", .name = "docs", .fields = &[_]schema.Field{
         .{ .id = "f1", .name = "embedding", .options = .{ .json = .{} } },
     } };
     // Cosine (default) → `<=>`; both operands cast to `vector`. WHERE fragment is backend-identical.
     const v = try build(a, db.Dialect.postgres, col, "embedding:[0.1,0.2,0.3]");
+    defer v.deinit(a);
     try std.testing.expectEqualStrings("\"docs\".\"embedding\" IS NOT NULL", v.where_sql);
     try std.testing.expectEqualStrings("(\"docs\".\"embedding\")::vector <=> ?::vector", v.order_sql);
     try std.testing.expectEqualStrings("[0.1,0.2,0.3]", v.param.text);
     // l2 metric → `<->`.
     const v2 = try build(a, db.Dialect.postgres, col, "embedding:l2:[1,2,3]");
+    defer v2.deinit(a);
     try std.testing.expectEqualStrings("(\"docs\".\"embedding\")::vector <-> ?::vector", v2.order_sql);
     // Same validation as SQLite: unknown field / malformed embedding rejected at build time.
     try std.testing.expectError(error.BadVector, build(a, db.Dialect.postgres, col, "missing:[1,2]"));
@@ -231,13 +244,14 @@ test "vector build lowers to pgvector operators under the Postgres dialect" {
     // The `?::vector` placeholder renumbers to `$n::vector` under the Postgres ParamSink.
     const param_sink = @import("../sql/param_sink.zig");
     const rn = try param_sink.renumber(a, db.Dialect.postgres, v.order_sql);
+    defer a.free(rn); // owned: postgres renumber rewrites onto a fresh buffer
     try std.testing.expectEqualStrings("(\"docs\".\"embedding\")::vector <=> $1::vector", rn);
 }
 
 test "validEmbedding accepts numeric arrays and rejects malformed input (build-independent)" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    // `validEmbedding` allocates its parse tree on `alloc` and frees it via `parsed.deinit` before
+    // returning a bool, so nothing escapes — the raw leak detector verifies that.
+    const a = std.testing.allocator;
     try std.testing.expect(try validEmbedding(a, "[1,2,3]"));
     try std.testing.expect(try validEmbedding(a, "[0.1, -2.5, 3e2]"));
     try std.testing.expect(!try validEmbedding(a, "[]"));
@@ -251,9 +265,7 @@ test "sqlite-vec extension is registered and vec_distance functions evaluate (KN
     if (comptime !enabled) return error.SkipZigTest;
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
     // The extension registered on open() exposes vec_distance_*; identical vectors -> distance 0.
     var st = try d.prepare("SELECT vec_distance_cosine('[1,2,3]', '[1,2,3]');");
     defer st.finalize();
@@ -266,7 +278,9 @@ test "sqlite-vec extension is registered and vec_distance functions evaluate (KN
     const v = try build(a, db.Dialect.sqlite, schema.Collection{ .id = "e", .name = "emb", .fields = &[_]schema.Field{
         .{ .id = "f1", .name = "v", .options = .{ .json = .{} } },
     } }, "v:l2:[1,0]");
+    defer v.deinit(a);
     const sql = try std.fmt.allocPrintSentinel(a, "SELECT id FROM emb WHERE {s} ORDER BY {s};", .{ v.where_sql, v.order_sql }, 0);
+    defer a.free(sql);
     var qs = try d.prepare(sql);
     defer qs.finalize();
     try qs.bindText(1, v.param.text);
