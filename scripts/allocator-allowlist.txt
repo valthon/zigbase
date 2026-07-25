@@ -22,7 +22,7 @@ src/auth/methods/oauth2.zig	11	PRE-EXISTING: not yet migrated to the ownership c
 src/auth/methods/otp.zig	11	PRE-EXISTING: not yet migrated to the ownership contracts
 src/auth/methods/password.zig	3	PRE-EXISTING: not yet migrated to the ownership contracts
 src/auth/methods/webauthn.zig	2	PRE-EXISTING: not yet migrated to the ownership contracts
-src/auth_helpers.zig	5	PRE-EXISTING: not yet migrated to the ownership contracts
+src/auth_helpers.zig	4	The "data.create on a non-auth collection inserts plainly" test is un-masked: the Data facade is contract-2 honest (frees its own collection + provision scratch internally) and returns a self-contained record freed via records.freeRecord, so it runs under raw std.testing.allocator (collection freed via Collection.deinit, input ObjectMap freed by the test). 4 remain, all genuine contract-4: they drive mintLinkToken/verifyLinkToken/issueSession/mintToken through a real http.RequestCtx whose .allocator is a RequestArena (`RequestArena.from(&arena)`, ctx.allocator.a) — the exact production shape these auth helpers are always invoked with; the LinkToken/Claims/Issued graphs they return are request-arena-owned and reclaimed wholesale at request end.
 src/captcha.zig	4	contract-4: verify tests hold an arena-scoped HttpClient response body (sub-slice of max_response_bytes, not individually freeable)
 src/clock_test.zig	1	PRE-EXISTING: not yet migrated to the ownership contracts
 src/codegen/acquire.zig	2	buildCollection is the internal builder (looped by acquireFromDb); returns a bare arena-lifetime Collection on the caller allocator. Public entry points are contract-2 (Acquired).
