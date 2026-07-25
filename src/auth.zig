@@ -348,6 +348,16 @@ pub const Authed = struct {
     pub fn deinit(self: *Authed, alloc: std.mem.Allocator) void {
         freeIdentity(alloc, self.record, self.collection, self.sid);
     }
+
+    /// Build a NON-owning `Authed` from borrowed data (string literals, a caller-owned record,
+    /// arena-lifetime slices) — for test fixtures and callers that never transfer ownership.
+    /// The owned-result path (`authenticate`) builds `Authed` directly; this is its explicit
+    /// counterpart so a borrowed construction can't be copy-paste-confused for an owned one.
+    /// Do NOT call `deinit` on the result — its `collection`/`record` are not owned by any single
+    /// allocator, so `deinit` would free borrowed/literal memory.
+    pub fn borrowed(record: std.json.Value, collection: []const u8, is_superuser: bool) Authed {
+        return .{ .record = record, .collection = collection, .is_superuser = is_superuser };
+    }
 };
 
 pub const Verified = struct {

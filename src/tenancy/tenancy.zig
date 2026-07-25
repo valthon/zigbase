@@ -426,7 +426,7 @@ test "resolveRequest: shared chokepoint for records/files/dispatchCustom" {
         off.tenancy = .{};
         var ctx = http.RequestCtx{ .method = .GET, .path = "/", .allocator = RequestArena.from(&arena) };
         var rctx = request.RequestContext{};
-        const a = auth.Authed{ .record = authed_record, .collection = "profiles", .is_superuser = false };
+        const a = auth.Authed.borrowed(authed_record, "profiles", false);
         resolveRequest(&ctx, &d, &off, a, &rctx);
         try std.testing.expect(!rctx.tenancy_enabled);
         try std.testing.expectEqualStrings("", rctx.account_id);
@@ -440,7 +440,7 @@ test "resolveRequest: shared chokepoint for records/files/dispatchCustom" {
         var hdrs = [_]http.Param{.{ .key = "x-account-id", .value = "acc1" }};
         var ctx = http.RequestCtx{ .method = .GET, .path = "/", .allocator = RequestArena.from(&arena), .headers = &hdrs };
         var rctx = request.RequestContext{};
-        const a = auth.Authed{ .record = authed_record, .collection = "profiles", .is_superuser = true };
+        const a = auth.Authed.borrowed(authed_record, "profiles", true);
         resolveRequest(&ctx, &d, &app, a, &rctx);
         try std.testing.expect(rctx.tenancy_enabled);
         try std.testing.expectEqualStrings("", rctx.account_id);
@@ -451,7 +451,7 @@ test "resolveRequest: shared chokepoint for records/files/dispatchCustom" {
         var hdrs = [_]http.Param{.{ .key = "x-account-id", .value = "acc1" }};
         var ctx = http.RequestCtx{ .method = .GET, .path = "/", .allocator = RequestArena.from(&arena), .headers = &hdrs };
         var rctx = request.RequestContext{};
-        const a = auth.Authed{ .record = authed_record, .collection = "profiles", .is_superuser = false };
+        const a = auth.Authed.borrowed(authed_record, "profiles", false);
         resolveRequest(&ctx, &d, &app, a, &rctx);
         try std.testing.expectEqualStrings("acc1", rctx.account_id);
         try std.testing.expectEqualStrings("editor", rctx.account_role);
@@ -463,7 +463,7 @@ test "resolveRequest: shared chokepoint for records/files/dispatchCustom" {
         var hdrs = [_]http.Param{.{ .key = "x-account-id", .value = "acc2" }};
         var ctx = http.RequestCtx{ .method = .GET, .path = "/", .allocator = RequestArena.from(&arena), .headers = &hdrs };
         var rctx = request.RequestContext{};
-        const a = auth.Authed{ .record = authed_record, .collection = "profiles", .is_superuser = false };
+        const a = auth.Authed.borrowed(authed_record, "profiles", false);
         resolveRequest(&ctx, &d, &app, a, &rctx);
         try std.testing.expectEqualStrings("", rctx.account_id);
     }
@@ -472,7 +472,7 @@ test "resolveRequest: shared chokepoint for records/files/dispatchCustom" {
     {
         var ctx = http.RequestCtx{ .method = .GET, .path = "/", .allocator = RequestArena.from(&arena) };
         var rctx = request.RequestContext{};
-        const a = auth.Authed{ .record = authed_record, .collection = "profiles", .is_superuser = false };
+        const a = auth.Authed.borrowed(authed_record, "profiles", false);
         resolveRequest(&ctx, &d, &app, a, &rctx);
         try std.testing.expectEqualStrings("", rctx.account_id);
     }
