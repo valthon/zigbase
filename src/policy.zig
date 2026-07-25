@@ -134,7 +134,11 @@ pub fn listRuleFilter(col: schema.Collection, rctx: *const request.RequestContex
 pub fn compilePredicate(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, action: Action, rctx: *const request.RequestContext) PolicyError!?Guard {
     const rule = ruleFor(col, action);
     const base = rules.decide(rule, rctx);
-    if (base == .deny_locked) return try Guard.own(alloc, "0", &.{}, &.{}); // fail-closed: AND-ing denies all rows
+    // Fail-closed: a constant-false predicate so AND-ing it denies every row. Use the DIALECT's
+    // false literal (`0` on SQLite, `false` on Postgres — Postgres rejects a bare `WHERE 0`), the
+    // same `constFalse()` the ability/tenant composition already emits. `Guard.own` deep-clones it,
+    // so passing the dialect literal is fine (the Guard owns its copy).
+    if (base == .deny_locked) return try Guard.own(alloc, db.dbDialect(conn).constFalse(), &.{}, &.{});
     // Compose the whole predicate on a function-local scratch arena, then deep-clone the FINAL Guard
     // onto `alloc` (via `Guard.own`) so the escaping graph solely owns its bytes and aliases nothing:
     // not the joiner's scratch, not the borrowed ability/tenant param `.text` (which point into
@@ -167,9 +171,11 @@ pub fn authorizes(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection
     const sa = scratch.allocator();
     // Route through compilePredicate so the SAME composition (rule AND tenant-scope) governs the
     // single-record check that governs list. A null predicate is the `allow` state (true); the
-    // constant-false `"0"` guard is `deny_locked` (false); anything else is a guarded SELECT 1.
+    // dialect constant-false guard is `deny_locked` (false); anything else is a guarded SELECT 1.
+    // Compare against the DIALECT's false literal (`0`/`false`) so the short-circuit fires on both
+    // backends (a fallthrough to guardPasses would still deny, but needlessly queries on Postgres).
     const guard = (try compilePredicate(sa, conn, col, action, rctx)) orelse return true;
-    if (std.mem.eql(u8, guard.where_sql, "0")) return false;
+    if (std.mem.eql(u8, guard.where_sql, db.dbDialect(conn).constFalse())) return false;
     return records.guardPasses(sa, conn, col, record_id, guard);
 }
 
