@@ -38,13 +38,23 @@ pub fn decide(rule: ?[]const u8, rctx: *const request.RequestContext) Decision {
 pub const RuleError = error{BadRule} || lexer.LexError || parser.ParseError || compiler.CompileError || db.DbError || std.mem.Allocator.Error || @typeInfo(@typeInfo(@TypeOf(joiner.Joiner.resolve)).@"fn".return_type.?).error_union.error_set;
 
 /// Compile a `check`-state rule into a records.Guard (its own joiner; standalone guarded query).
+/// Self-contained (contract 2): the lexer tokens, the parsed AST, and the joiner (its join-clause
+/// strings + resolved target-collection graphs) are scratch consumed to produce the guard — none
+/// escape. Build them on a function-local arena, then deep-clone the escaping graph (`where_sql` +
+/// `joins` + `params`) onto `alloc` via `Guard.own`, so the returned Guard solely owns its bytes
+/// and aliases neither the joiner's scratch nor the lexer's buffers. Free it with `Guard.deinit`.
+/// (In production `alloc` is a request/rule arena, so the deep clone is a cheap extra copy reclaimed
+/// wholesale at request end.)
 pub fn compileGuard(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, rule: []const u8, rctx: *const request.RequestContext) RuleError!records.Guard {
-    const toks = try lexer.lex(alloc, rule);
-    const ast = try parser.parse(alloc, toks);
-    var j = joiner.Joiner.init(alloc, conn, col);
+    var scratch = std.heap.ArenaAllocator.init(alloc);
+    defer scratch.deinit();
+    const sa = scratch.allocator();
+    const toks = try lexer.lex(sa, rule);
+    const ast = try parser.parse(sa, toks);
+    var j = joiner.Joiner.init(sa, conn, col);
     j.allow_hidden = true; // operator-authored rule: may gate access on a hidden field (trusted, not serialized)
-    const c = try compiler.compile(alloc, &j, ast, rctx, db.dbDialect(conn), &.{});
-    return .{ .where_sql = c.where_sql, .joins = j.joins.items, .params = c.params };
+    const c = try compiler.compile(sa, &j, ast, rctx, db.dbDialect(conn), &.{});
+    return records.Guard.own(alloc, c.where_sql, j.joins.items, c.params);
 }
 
 /// True if `id`'s row satisfies a `check`-state rule (guarded SELECT 1).

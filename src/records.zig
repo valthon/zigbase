@@ -39,10 +39,61 @@ fn prep(alloc: std.mem.Allocator, h: *db.Db, sql: [:0]const u8) !db.Stmt {
 }
 
 /// A compiled rule constraint enforced atomically on create/update.
+///
+/// A Guard produced by `own` (via `rules.compileGuard` / `policy.compilePredicate`) SOLELY owns its
+/// whole graph — `where_sql`, every `joins` string, and every `.text` param — on ONE allocator, so
+/// it can be released with `deinit`. Production compiles a Guard on a request/rule arena and never
+/// calls `deinit` (the arena reclaims it wholesale); `deinit` exists so the leak-detecting test
+/// allocator can verify the compile path is honest.
 pub const Guard = struct {
     where_sql: []const u8,
     joins: []const []const u8 = &.{},
     params: []const compiler.Param = &.{},
+
+    /// Deep-clone `where_sql` + `joins` (each string) + `params` (each `.text`) onto `alloc`,
+    /// returning a Guard that owns its entire graph and aliases none of the inputs. Callers build
+    /// the parts on a scratch arena (the joiner's join strings, the compiler's `where_sql`/params,
+    /// a borrowed ability/tenant param, a `dialect.constFalse()` literal) and hand them here so the
+    /// escaping Guard is self-contained. Leak-safe: an OOM mid-clone unwinds every partial
+    /// allocation via `errdefer` before returning the error.
+    pub fn own(alloc: std.mem.Allocator, where_sql: []const u8, joins: []const []const u8, params: []const compiler.Param) std.mem.Allocator.Error!Guard {
+        const w = try alloc.dupe(u8, where_sql);
+        errdefer alloc.free(w);
+
+        const js = try alloc.alloc([]const u8, joins.len);
+        errdefer alloc.free(js);
+        var jn: usize = 0;
+        errdefer for (js[0..jn]) |s| alloc.free(s);
+        while (jn < joins.len) : (jn += 1) js[jn] = try alloc.dupe(u8, joins[jn]);
+
+        const ps = try alloc.alloc(compiler.Param, params.len);
+        errdefer alloc.free(ps);
+        var pn: usize = 0;
+        errdefer for (ps[0..pn]) |p| switch (p) {
+            .text => |t| alloc.free(t),
+            else => {},
+        };
+        while (pn < params.len) : (pn += 1) ps[pn] = switch (params[pn]) {
+            .text => |t| .{ .text = try alloc.dupe(u8, t) },
+            else => params[pn],
+        };
+
+        return .{ .where_sql = w, .joins = js, .params = ps };
+    }
+
+    /// Release everything an `own`-built Guard holds. A zero-length `joins`/`params` free is a
+    /// no-op, so the empty defaults are safe. NOT valid on a hand-assembled Guard whose `where_sql`
+    /// is a string literal (freeing a static pointer is undefined behavior) — always build via `own`.
+    pub fn deinit(self: Guard, alloc: std.mem.Allocator) void {
+        alloc.free(self.where_sql);
+        for (self.joins) |jn| alloc.free(jn);
+        alloc.free(self.joins);
+        for (self.params) |p| switch (p) {
+            .text => |t| alloc.free(t),
+            else => {},
+        };
+        alloc.free(self.params);
+    }
 };
 
 fn guardJoinsSql(alloc: std.mem.Allocator, joins: []const []const u8) ![]u8 {

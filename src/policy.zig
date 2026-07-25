@@ -134,16 +134,26 @@ pub fn listRuleFilter(col: schema.Collection, rctx: *const request.RequestContex
 pub fn compilePredicate(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, action: Action, rctx: *const request.RequestContext) PolicyError!?Guard {
     const rule = ruleFor(col, action);
     const base = rules.decide(rule, rctx);
-    if (base == .deny_locked) return Guard{ .where_sql = "0" }; // fail-closed: AND-ing denies all rows
+    if (base == .deny_locked) return try Guard.own(alloc, "0", &.{}, &.{}); // fail-closed: AND-ing denies all rows
+    // Compose the whole predicate on a function-local scratch arena, then deep-clone the FINAL Guard
+    // onto `alloc` (via `Guard.own`) so the escaping graph solely owns its bytes and aliases nothing:
+    // not the joiner's scratch, not the borrowed ability/tenant param `.text` (which point into
+    // `rctx`), and not a `dialect.constFalse()` literal. The intermediate composition churn dies with
+    // the scratch. (In production `alloc` is a request arena, so this is a cheap extra copy reclaimed
+    // at request end; correctness — a self-contained, `deinit`-able Guard — is the point, not perf.)
+    var scratch = std.heap.ArenaAllocator.init(alloc);
+    defer scratch.deinit();
+    const sa = scratch.allocator();
     // The access-rule predicate (null for `allow`; the compiled guard for `check`).
-    var guard: ?Guard = if (base == .check) try rules.compileGuard(alloc, conn, col, rule.?, rctx) else null;
+    var guard: ?Guard = if (base == .check) try rules.compileGuard(sa, conn, col, rule.?, rctx) else null;
     // Compose the ability predicate (#155), then the tenant-scope predicate (#156) — the order in
     // the brief: (rule) AND (ability) AND (tenant). Each is null when it does not apply, leaving the
     // composed SQL byte-identical to the pre-abilities/pre-tenancy guard (pinned below).
-    if (try abilities.abilityPredicate(alloc, col, abilityFor(col, action), rctx, db.dbDialect(conn))) |ap|
-        guard = try andPredicate(alloc, guard, ap.sql, ap.params);
-    if (try tenancy.scopePredicate(alloc, col, rctx)) |sp| guard = try andPredicate(alloc, guard, sp.sql, &.{sp.param});
-    return guard;
+    if (try abilities.abilityPredicate(sa, col, abilityFor(col, action), rctx, db.dbDialect(conn))) |ap|
+        guard = try andPredicate(sa, guard, ap.sql, ap.params);
+    if (try tenancy.scopePredicate(sa, col, rctx)) |sp| guard = try andPredicate(sa, guard, sp.sql, &.{sp.param});
+    const g = guard orelse return null;
+    return try Guard.own(alloc, g.where_sql, g.joins, g.params);
 }
 
 /// Whether `record_id` is authorized for `action` under the composed policy. PR1: `allow` → true,
@@ -224,10 +234,12 @@ fn withRule(col: schema.Collection, rule: ?[]const u8) schema.Collection {
 test "PIN: policy.decide matches rules.decide for every action and rule state" {
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
+    // `base` is the fully-owned create() reload; free it once. The `withRule` copies below share its
+    // owned fields/id/name and only overwrite rule slots with string LITERALS, so they are never
+    // handed to Collection.deinit. `decide` allocates nothing (returns an enum).
     const base = try pinBase(a, &d);
+    defer base.deinit(a);
     const states = [_]?[]const u8{ null, "", "@public", "owner = @request.auth.id" };
     const ctxs = [_]request.RequestContext{ .{}, .{ .is_superuser = true } };
     for (states) |rule| {
@@ -243,25 +255,32 @@ test "PIN: policy.decide matches rules.decide for every action and rule state" {
 test "PIN: policy.compilePredicate byte-identical to rules.compileGuard for a check rule" {
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
+    // `base` is the fully-owned create() reload; free it once. The `withRule` copies share its owned
+    // fields/id/name and only overwrite rule slots with string LITERALS, so they never reach
+    // Collection.deinit. Every returned Guard is `Guard.own`-built (fully owned) -> free via deinit.
     const base = try pinBase(a, &d);
+    defer base.deinit(a);
     const rule = "owner = @request.auth.id";
     const col = withRule(base, rule);
     var auth: std.json.ObjectMap = .empty;
+    defer auth.deinit(a);
     try auth.put(a, "id", .{ .string = "u1" });
     const rctx = request.RequestContext{ .auth = .{ .object = auth } };
 
     const want = try rules.compileGuard(a, &d, col, rule, &rctx);
+    defer want.deinit(a);
     const got = (try compilePredicate(a, &d, col, .update, &rctx)).?;
+    defer got.deinit(a);
     try std.testing.expectEqualStrings(want.where_sql, got.where_sql);
     try std.testing.expectEqual(want.params.len, got.params.len);
     for (want.params, got.params) |w, g| try std.testing.expectEqualStrings(w.text, g.text);
 
     // allow state -> null predicate; locked state -> constant-false guard.
     try std.testing.expect((try compilePredicate(a, &d, withRule(base, "@public"), .update, &rctx)) == null);
-    try std.testing.expectEqualStrings("0", (try compilePredicate(a, &d, withRule(base, null), .update, &rctx)).?.where_sql);
+    const locked = (try compilePredicate(a, &d, withRule(base, null), .update, &rctx)).?;
+    defer locked.deinit(a);
+    try std.testing.expectEqualStrings("0", locked.where_sql);
 }
 
 test "PIN: policy.authorizes matches rules decide+matches for allow/deny/check" {
@@ -302,12 +321,14 @@ test "PIN: policy.authorizes matches rules decide+matches for allow/deny/check" 
 test "PIN: tenancy enabled but no tenant_field is byte-identical to no-tenancy" {
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
+    // `base` is the fully-owned create() reload; free it once. `withRule` copies share its owned
+    // fields and only overwrite rule slots with string LITERALS, so they never reach Collection.deinit.
     const base = try pinBase(a, &d); // posts: NO tenant_field
+    defer base.deinit(a);
     try d.exec("INSERT INTO posts (id,created,updated,title,owner) VALUES ('r1','t','t','x','u1');");
     var auth: std.json.ObjectMap = .empty;
+    defer auth.deinit(a);
     try auth.put(a, "id", .{ .string = "u1" });
     const states = [_]?[]const u8{ null, "", "@public", "owner = @request.auth.id" };
     for (states) |rule| {
@@ -318,9 +339,12 @@ test "PIN: tenancy enabled but no tenant_field is byte-identical to no-tenancy" 
         inline for (.{ .list, .view, .create, .update, .delete }) |action| {
             // Decision identical.
             try std.testing.expectEqual(decide(col, action, &off), decide(col, action, &on));
-            // Compiled predicate identical (where_sql + params).
+            // Compiled predicate identical (where_sql + params). Each returned Guard is `own`-built
+            // (fully owned) — free per iteration whenever non-null.
             const g_off = try compilePredicate(a, &d, col, action, &off);
+            defer if (g_off) |go| go.deinit(a);
             const g_on = try compilePredicate(a, &d, col, action, &on);
+            defer if (g_on) |go| go.deinit(a);
             try std.testing.expectEqual(g_off == null, g_on == null);
             if (g_off) |go| {
                 try std.testing.expectEqualStrings(go.where_sql, g_on.?.where_sql);
@@ -340,20 +364,25 @@ test "PIN: tenancy enabled but no tenant_field is byte-identical to no-tenancy" 
 test "tenant-owned collection: decide forces check + compilePredicate binds the account scope" {
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    var base = try pinBase(a, &d); // posts(title, owner)
-    base.options.tenant_field = "owner"; // owning-account column
+    const a = std.testing.allocator;
+    // `base` is the fully-owned create() reload (tenant_field = null) — free it once. `scoped` is an
+    // unowned copy that overwrites `tenant_field` with a string LITERAL; the `withRule` copies below
+    // share base's owned fields while overwriting rule/tenant slots with literals, so none reach
+    // Collection.deinit. Every returned Guard is `own`-built (fully owned) — free via deinit.
+    const base = try pinBase(a, &d); // posts(title, owner)
+    defer base.deinit(a);
+    var scoped = base;
+    scoped.options.tenant_field = "owner"; // owning-account column (literal, never owned)
 
     const member = request.RequestContext{ .tenancy_enabled = true, .account_id = "acc1" };
     const su = request.RequestContext{ .tenancy_enabled = true, .is_superuser = true, .account_id = "acc1" };
     const xt = request.RequestContext{ .tenancy_enabled = true, .cross_tenant = true, .account_id = "acc1" };
 
     // @public would normally `allow`; tenancy forces `.check` so the row is scoped.
-    const pub_col = withRule(base, "@public");
+    const pub_col = withRule(scoped, "@public");
     try std.testing.expectEqual(Decision.check, decide(pub_col, .list, &member));
     const g = (try compilePredicate(a, &d, pub_col, .list, &member)).?;
+    defer g.deinit(a);
     try std.testing.expectEqualStrings("\"posts\".\"owner\" = ?", g.where_sql);
     try std.testing.expectEqual(@as(usize, 1), g.params.len);
     try std.testing.expectEqualStrings("acc1", g.params[0].text);
@@ -365,13 +394,16 @@ test "tenant-owned collection: decide forces check + compilePredicate binds the 
     try std.testing.expect((try compilePredicate(a, &d, pub_col, .list, &xt)) == null);
 
     // A locked rule STILL short-circuits to deny before tenancy (fail-closed floor preserved).
-    const locked = withRule(base, null);
+    const locked = withRule(scoped, null);
     try std.testing.expectEqual(Decision.deny_locked, decide(locked, .list, &member));
-    try std.testing.expectEqualStrings("0", (try compilePredicate(a, &d, locked, .list, &member)).?.where_sql);
+    const lg = (try compilePredicate(a, &d, locked, .list, &member)).?;
+    defer lg.deinit(a);
+    try std.testing.expectEqualStrings("0", lg.where_sql);
 
     // A `check` rule ANDs with the tenant predicate (both fragments present).
-    const owned = withRule(base, "title = \"x\"");
+    const owned = withRule(scoped, "title = \"x\"");
     const g2 = (try compilePredicate(a, &d, owned, .update, &member)).?;
+    defer g2.deinit(a);
     try std.testing.expect(std.mem.indexOf(u8, g2.where_sql, "\"posts\".\"owner\" = ?") != null);
     try std.testing.expect(std.mem.indexOf(u8, g2.where_sql, ") AND (") != null);
 }
@@ -393,10 +425,11 @@ fn withAbility(col: schema.Collection, min_role: []const u8) schema.Collection {
 test "PIN: abilities unset is byte-identical to no-abilities" {
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
+    // `base` is the fully-owned create() reload; free it once. `withRule` copies share its owned
+    // fields and only overwrite rule slots with string LITERALS, so they never reach Collection.deinit.
     const base = try pinBase(a, &d); // posts: NO abilities
+    defer base.deinit(a);
     try d.exec("INSERT INTO posts (id,created,updated,title,owner) VALUES ('r1','t','t','x','acc1');");
     const mem = [_]request.Membership{.{ .account = "acc1", .role = "owner" }};
     const states = [_]?[]const u8{ null, "", "@public", "owner = @request.auth.id" };
@@ -406,13 +439,16 @@ test "PIN: abilities unset is byte-identical to no-abilities" {
         inline for (.{ .list, .view, .create, .update, .delete }) |action| {
             // decide() must match the bare rule decision (no ability forcing a check).
             try std.testing.expectEqual(rules.decide(rule, &rctx), decide(col, action, &rctx));
-            // compiled predicate must match rules.compileGuard exactly (or null/"0").
+            // compiled predicate must match rules.compileGuard exactly (or null/"0"). Every returned
+            // Guard is `own`-built (fully owned) — free per iteration.
             const got = try compilePredicate(a, &d, col, action, &rctx);
+            defer if (got) |gg| gg.deinit(a);
             switch (rules.decide(rule, &rctx)) {
                 .allow => try std.testing.expect(got == null),
                 .deny_locked => try std.testing.expectEqualStrings("0", got.?.where_sql),
                 .check => {
                     const want = try rules.compileGuard(a, &d, col, rule.?, &rctx);
+                    defer want.deinit(a);
                     try std.testing.expectEqualStrings(want.where_sql, got.?.where_sql);
                     try std.testing.expectEqual(want.params.len, got.?.params.len);
                 },
@@ -424,10 +460,12 @@ test "PIN: abilities unset is byte-identical to no-abilities" {
 test "ability-guarded collection: decide forces check + compilePredicate binds the membership IN-set" {
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
+    // `base` is the fully-owned create() reload; free it once. The `withRule`/`withAbility` copies
+    // share its owned fields and only overwrite rule/ability slots with string LITERALS, so they
+    // never reach Collection.deinit. Every returned Guard is `own`-built (fully owned) — free via deinit.
     const base = try pinBase(a, &d);
+    defer base.deinit(a);
     const mem = [_]request.Membership{
         .{ .account = "acc1", .role = "owner" },
         .{ .account = "acc2", .role = "viewer" },
@@ -439,6 +477,7 @@ test "ability-guarded collection: decide forces check + compilePredicate binds t
     const pub_col = withRule(withAbility(base, "editor"), "@public");
     try std.testing.expectEqual(Decision.check, decide(pub_col, .view, &member));
     const g = (try compilePredicate(a, &d, pub_col, .view, &member)).?;
+    defer g.deinit(a);
     // Only acc1 (owner >= editor) qualifies; the predicate binds exactly that id.
     try std.testing.expectEqualStrings("\"posts\".\"owner\" IN (?)", g.where_sql);
     try std.testing.expectEqual(@as(usize, 1), g.params.len);
@@ -451,11 +490,14 @@ test "ability-guarded collection: decide forces check + compilePredicate binds t
     // A locked rule STILL short-circuits to deny before abilities (fail-closed floor preserved).
     const locked = withRule(withAbility(base, "editor"), null);
     try std.testing.expectEqual(Decision.deny_locked, decide(locked, .view, &member));
-    try std.testing.expectEqualStrings("0", (try compilePredicate(a, &d, locked, .view, &member)).?.where_sql);
+    const lg = (try compilePredicate(a, &d, locked, .view, &member)).?;
+    defer lg.deinit(a);
+    try std.testing.expectEqualStrings("0", lg.where_sql);
 
     // A `check` rule ANDs with the ability predicate (both fragments present).
     const owned = withRule(withAbility(base, ""), "title = \"x\"");
     const g2 = (try compilePredicate(a, &d, owned, .update, &member)).?;
+    defer g2.deinit(a);
     try std.testing.expect(std.mem.indexOf(u8, g2.where_sql, "\"posts\".\"owner\" IN (") != null);
     try std.testing.expect(std.mem.indexOf(u8, g2.where_sql, ") AND (") != null);
 }
@@ -463,17 +505,21 @@ test "ability-guarded collection: decide forces check + compilePredicate binds t
 test "ability with no qualifying membership compiles to constant-false (fail closed)" {
     var d = try db.Db.openMemory();
     defer d.close();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = std.testing.allocator;
+    // `base` is the fully-owned create() reload; free it once. The `withRule`/`withAbility` copies
+    // overwrite rule/ability slots with string LITERALS, so they never reach Collection.deinit. The
+    // compilePredicate Guard is `own`-built (fully owned); `authorizes` self-frees (returns a bool).
     const base = try pinBase(a, &d);
+    defer base.deinit(a);
     try d.exec("INSERT INTO posts (id,created,updated,title,owner) VALUES ('r1','t','t','x','acc1');");
     // Principal has a membership, but below the ability's role floor -> empty set -> "0".
     const mem = [_]request.Membership{.{ .account = "acc1", .role = "viewer" }};
     const rctx = request.RequestContext{ .memberships = &mem };
     const col = withRule(withAbility(base, "owner"), "@public");
     try std.testing.expectEqual(Decision.check, decide(col, .view, &rctx));
-    try std.testing.expectEqualStrings("0", (try compilePredicate(a, &d, col, .view, &rctx)).?.where_sql);
+    const cf = (try compilePredicate(a, &d, col, .view, &rctx)).?;
+    defer cf.deinit(a);
+    try std.testing.expectEqualStrings("0", cf.where_sql);
     // authorizes() therefore denies even though the row exists and the rule is @public.
     try std.testing.expect(!try authorizes(a, &d, col, .view, "r1", &rctx));
 
