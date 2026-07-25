@@ -718,18 +718,11 @@ test "jobHandler wires the RFC 8058 List-Unsubscribe URL when configured (round-
     const m = cap.mailer();
     env.app.mailer = &m;
     env.app.queues = @ptrCast(&test_registry);
-    // BLOCKED (contract-4, out-of-scope root cause): `unsubscribe.verify` below
-    // (src/mail/unsubscribe.zig, NOT in this migration batch) allocates its decode
-    // buffer and returns `Parts` as slices INTO it without ever freeing it — by
-    // written design ("designed for arena-allocator callers", see that file's Parts
-    // doc comment and its own tests, which all run under a scratch arena for the
-    // same reason). Fixing that is out of scope here; keep this one test's outer
-    // arena so the leak detector doesn't flag unsubscribe.zig's known design. The
-    // two `jobHandler` invocations below are independently verified leak-clean via
+    // Raw leak-detecting allocator: `unsubscribe.verify` now returns an owned `Parts`
+    // (contract-2) freed via `parts.deinit`, and every submit/payload/send allocation
+    // below is individually freed. Each `jobHandler` runs under its own
     // `RequestArena.forTest`.
-    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
+    const arena = std.testing.allocator;
 
     const batch_id = try BulkEnv.submit(env, arena, &test_registry, .{
         .subject = "Hi",
@@ -738,7 +731,9 @@ test "jobHandler wires the RFC 8058 List-Unsubscribe URL when configured (round-
         .queue = "emails",
         .list = "news",
     }, "acc1");
+    defer arena.free(batch_id);
     const payload = try std.json.Stringify.valueAlloc(arena, .{ .batch = batch_id, .to = "a@x.io" }, .{});
+    defer arena.free(payload);
     {
         var cx = Ctx{ .app = &env.app, .arena = RequestArena.forTest(std.testing.allocator), .rctx = .{} };
         defer cx.deinit();
@@ -750,7 +745,8 @@ test "jobHandler wires the RFC 8058 List-Unsubscribe URL when configured (round-
     try testing.expect(std.mem.startsWith(u8, lu, "https://app.example/api/mail/unsubscribe?t="));
     const marker = "?t=";
     const token = lu[std.mem.indexOf(u8, lu, marker).? + marker.len ..];
-    const parts = unsubscribe.verify(arena, "s", token) orelse return error.TestExpectedNonNull;
+    var parts = unsubscribe.verify(arena, "s", token) orelse return error.TestExpectedNonNull;
+    defer parts.deinit(arena);
     try testing.expectEqualStrings("acc1", parts.account);
     try testing.expectEqualStrings("news", parts.list);
     try testing.expectEqualStrings("a@x.io", parts.recipient);
@@ -765,7 +761,9 @@ test "jobHandler wires the RFC 8058 List-Unsubscribe URL when configured (round-
         .queue = "emails",
         .list = "news",
     }, "acc1");
+    defer arena.free(batch_id2);
     const payload2 = try std.json.Stringify.valueAlloc(arena, .{ .batch = batch_id2, .to = "b@x.io" }, .{});
+    defer arena.free(payload2);
     {
         var cx = Ctx{ .app = &env.app, .arena = RequestArena.forTest(std.testing.allocator), .rctx = .{} };
         defer cx.deinit();
