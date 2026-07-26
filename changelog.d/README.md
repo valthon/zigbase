@@ -74,12 +74,21 @@ Decision rule:
 
 ## At release
 
-`scripts/release.sh` runs `scripts/assemble-changelog.sh <version> <date>`, which:
+The release PR runs `scripts/assemble-changelog.sh [<version> [<date>]]` (version defaults to
+`build.zig.zon`'s), which:
 
 1. reads every `changelog.d/*.md` fragment and splits each on its `### <Section>` headings,
 2. aggregates the bullets per section across all fragments, in the canonical order above,
    under a new `## [<version>] - <date>` block,
-3. inserts that block into both `CHANGELOG.md` and `site/src/content/docs/changelog.md`, and
+3. inserts that block into `CHANGELOG.md`, and
 4. `git rm`s the consumed fragment files.
+
+It does **not** write `site/src/content/docs/changelog.md` — that mirror is a generated build
+artifact, regenerated from `CHANGELOG.md` by `site/scripts/gen-docs-mirror.mjs` on
+`npm run dev`/`build`. Never hand-edit it.
+
+The assembled block matters beyond the repo: the `v*` release workflow extracts it with
+`scripts/extract-release-notes.sh` and uses it as the GitHub release body, so it is what
+consumers read on the release page. Review it for internal consistency before merging.
 
 Do not run the assembler in a feature PR — only add your fragment.
