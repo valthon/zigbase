@@ -596,7 +596,9 @@ When SQLite, sqlite-vec, `zap`, or facil.io publishes a security release:
 4. **Rebuild and verify** with `zig build versions` that the new versions are what you expect.
 5. **Add a changelog fragment** under `changelog.d/` with a `### Security` bullet describing the
    dependency bump and the CVE(s) it addresses.
-6. **Release** per `scripts/release.sh` (the fragment is assembled into the changelog).
+6. **Release** by landing the version bump + assembled changelog on `main`, then pushing a
+   `v<version>` tag — `.github/workflows/release.yml` builds and publishes from the tag (the
+   fragment is assembled into the changelog as part of the release PR).
 
 ### F13 — Unbounded pre-auth allocation from attacker-supplied JWT length (FIXED)
 
