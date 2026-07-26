@@ -156,6 +156,11 @@ pub fn peekClaims(alloc: std.mem.Allocator, token: []const u8) JwtError!Claims {
     _ = it.next() orelse return error.Malformed; // header
     const p = it.next() orelse return error.Malformed; // payload
     _ = it.next() orelse return error.Malformed; // signature
+    // Reject a 4th segment, exactly as `verify` does. Not a live vulnerability — `verify` is
+    // authoritative and refuses any such token — but a peek that accepts a shape verify rejects
+    // is a gratuitous divergence between the two parsers, and the cheapest kind of bug to
+    // prevent is the one where two readers of the same bytes disagree about what they are.
+    if (it.next() != null) return error.Malformed;
     const payload_json = b64dec(alloc, p) catch return error.Malformed;
     const parsed = std.json.parseFromSlice(Claims, alloc, payload_json, .{}) catch return error.Malformed;
     return parsed.value;
@@ -381,6 +386,32 @@ test "peekClaims decodes the payload without checking the signature" {
     try std.testing.expectEqualStrings("u1", peeked.id);
     try std.testing.expectEqualStrings("users", peeked.collection);
     try std.testing.expectError(error.Malformed, peekClaimsInto(&scratch, "nope"));
+}
+
+test "peekClaims and verify agree on token SHAPE (a 4th segment is rejected by both)" {
+    // The two functions parse the same bytes for different purposes, so they must not disagree
+    // about what a well-formed token is. `verify` has always rejected a 4th segment; `peekClaims`
+    // used to accept it and decode the payload anyway. Assert the agreement directly rather than
+    // just the new rejection, so a future edit to EITHER parser that reintroduces the divergence
+    // fails here.
+    const a = std.testing.allocator;
+    const key = crypto.deriveKey("secret", "tk1");
+    const claims = Claims{ .id = "u1", .collection = "users", .type = .auth, .iat = 1000, .exp = 2000 };
+    const token = try sign(a, claims, &key);
+    defer a.free(token);
+
+    // A genuine, signature-valid token with one extra segment appended.
+    const four = try std.fmt.allocPrint(a, "{s}.extra", .{token});
+    defer a.free(four);
+
+    var scratch: [scratch_size]u8 = undefined;
+    try std.testing.expectError(error.Malformed, verifyInto(&scratch, four, &key, 1500));
+    try std.testing.expectError(error.Malformed, peekClaimsInto(&scratch, four));
+
+    // Control: the same token WITHOUT the extra segment is still accepted by both, so the test
+    // proves the 4th segment is what is rejected — not that the token was bad to begin with.
+    _ = try verifyInto(&scratch, token, &key, 1500);
+    _ = try peekClaimsInto(&scratch, token);
 }
 
 test "#99 token_epoch claim round-trips; a pre-epoch token (no claim) parses as 0" {
