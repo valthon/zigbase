@@ -81,7 +81,23 @@ fn pgIndexName(alloc: std.mem.Allocator, col_name: []const u8) ![]u8 {
 /// The Postgres text-search configuration used for both the generated `tsvector` and the
 /// `plainto_tsquery` at read time (they MUST agree). `'simple'` mirrors SQLite FTS5's default
 /// unicode61 tokenizer (no stemming, no stopwords) for the closest cross-backend parity.
+///
+/// MUST stay a comptime literal. Unlike every other identifier interpolated into SQL here, this
+/// one lands inside a SINGLE-QUOTED SQL LITERAL (`plainto_tsquery('…')`), an escaping context
+/// `schema.isValidIdentifier` does not cover — so a runtime value carrying a `'` would be
+/// injection, not a rejected identifier. Every use below concatenates it at COMPTIME (`++`)
+/// rather than formatting it with `{s}`, which makes that structural: a runtime value cannot be
+/// `++`-ed into a comptime string, so making this configurable (e.g. a per-collection language)
+/// fails to COMPILE instead of silently opening an injection. Prefer compile errors to runtime
+/// crashes, and runtime crashes to bugs.
 const pg_ts_config = "simple";
+
+comptime {
+    // Belt-and-braces on the literal itself: the `++` sites above prevent a RUNTIME value, and
+    // this prevents an author-written one that would break out of the surrounding single quotes.
+    for (pg_ts_config) |c| if (c == '\'' or c == '\\')
+        @compileError("pg_ts_config is interpolated into a single-quoted SQL literal and must not contain a quote or backslash");
+}
 
 /// True iff `col` has at least one valid, searchable column AND a valid table identifier — i.e.
 /// `ensureIndex` will provision an FTS5 index and `build` can compose a MATCH predicate for it.
@@ -178,9 +194,9 @@ fn buildPostgres(alloc: std.mem.Allocator, col: schema.Collection, raw_term: []c
     const tsv = try tableName(alloc, col.name); // the generated tsvector column name
     defer alloc.free(tsv); // internal scratch: copied into the SQL strings below, never escapes
     // where_sql into an errdefer'd local so an order_sql OOM frees it (join_sql is a literal).
-    const where_sql = try std.fmt.allocPrint(alloc, "\"{s}\".\"{s}\" @@ plainto_tsquery('{s}', ?)", .{ col.name, tsv, pg_ts_config });
+    const where_sql = try std.fmt.allocPrint(alloc, "\"{s}\".\"{s}\" @@ plainto_tsquery('" ++ pg_ts_config ++ "', ?)", .{ col.name, tsv });
     errdefer alloc.free(where_sql);
-    const order_sql = try std.fmt.allocPrint(alloc, "ts_rank(\"{s}\".\"{s}\", plainto_tsquery('{s}', ?)) DESC", .{ col.name, tsv, pg_ts_config });
+    const order_sql = try std.fmt.allocPrint(alloc, "ts_rank(\"{s}\".\"{s}\", plainto_tsquery('" ++ pg_ts_config ++ "', ?)) DESC", .{ col.name, tsv });
     errdefer alloc.free(order_sql); // last today, but errdefer'd too so a future line before the return can't leak it
     return .{
         .join_sql = "",
@@ -393,11 +409,8 @@ fn ensureIndexPg(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection) !v
     // generated column); coalesce keeps NULL columns from voiding the whole vector.
     var expr: std.ArrayList(u8) = .empty;
     defer expr.deinit(alloc);
-    {
-        const head = try std.fmt.allocPrint(alloc, "to_tsvector('{s}', ", .{pg_ts_config});
-        defer alloc.free(head);
-        try expr.appendSlice(alloc, head);
-    }
+    // Comptime-concatenated, so there is nothing to format and nothing to free.
+    try expr.appendSlice(alloc, "to_tsvector('" ++ pg_ts_config ++ "', ");
     for (cols, 0..) |cn, i| {
         if (i > 0) try expr.appendSlice(alloc, " || ' ' || ");
         const frag = try std.fmt.allocPrint(alloc, "coalesce(\"{s}\",'')", .{cn});
@@ -662,4 +675,43 @@ test "ensureIndex provisions FTS5, triggers keep it in sync, MATCH search return
     try std.testing.expect(try st.step());
     try std.testing.expectEqualStrings("zig programming language", st.columnText(0));
     try std.testing.expect(!try st.step()); // only the one matching row
+}
+
+test "Postgres lowering emits the exact tsquery SQL, with the ts config as a fixed literal" {
+    // `buildPostgres` is pure (allocator + collection + term), so it is testable with no live
+    // Postgres — yet nothing asserted its emitted SQL, leaving the whole read-side lowering
+    // uncovered in the default build (the `*_pg_test.zig` suites need a real server and skip).
+    //
+    // Pinning the exact strings does double duty: it covers that lowering, and it holds the
+    // `pg_ts_config` interpolation to a FIXED, quote-free literal. The config lands inside a
+    // single-quoted SQL literal — an escaping context `schema.isValidIdentifier` does not cover
+    // — so if it ever became a runtime value, this asserts the resulting SQL is still exactly
+    // what we expect rather than something a stray quote reshaped.
+    const a = std.testing.allocator;
+    const fields = [_]schema.Field{
+        .{ .id = "f1", .name = "title", .searchable = true, .options = .{ .text = .{} } },
+    };
+    const col = schema.Collection{ .id = "c1", .name = "articles", .fields = &fields };
+
+    const got = (try buildPostgres(a, col, "  hello world  ")).?;
+    // `param` and `order_param` intentionally alias ONE `term` allocation — free it once.
+    defer a.free(got.where_sql);
+    defer a.free(got.order_sql);
+    defer a.free(got.param.text);
+
+    try std.testing.expectEqualStrings(
+        "\"articles\".\"articles_fts\" @@ plainto_tsquery('simple', ?)",
+        got.where_sql,
+    );
+    try std.testing.expectEqualStrings(
+        "ts_rank(\"articles\".\"articles_fts\", plainto_tsquery('simple', ?)) DESC",
+        got.order_sql,
+    );
+    // The term is bound, never interpolated — and trimmed, not passed through raw.
+    try std.testing.expectEqualStrings("hello world", got.param.text);
+    try std.testing.expectEqualStrings("hello world", got.order_param.?.text);
+    try std.testing.expectEqualStrings("", got.join_sql);
+
+    // A term that trims to nothing yields no search clause at all (rather than an empty MATCH).
+    try std.testing.expect((try buildPostgres(a, col, "   \t\n ")) == null);
 }
