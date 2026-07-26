@@ -2,8 +2,8 @@
 
 Every recorded change adds a small **fragment** file in this directory instead of editing
 `CHANGELOG.md`. At release time `scripts/assemble-changelog.sh` collects the fragments into
-a new version section in `CHANGELOG.md` (and its published mirror
-`site/src/content/docs/changelog.md`) and deletes them.
+a new version section in `CHANGELOG.md` and deletes them. (The published mirror
+`site/src/content/docs/changelog.md` is a generated artifact — see [At release](#at-release).)
 
 This exists so parallel PRs never touch the same lines of `CHANGELOG.md` and never
 conflict on it. Two PRs each adding their own fragment file merge cleanly; two PRs each
