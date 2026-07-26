@@ -1,0 +1,22 @@
+---
+name: releasing
+description: Cut a ZigBase release — bump the version, assemble the changelog.d/ fragments, run the required changelog consistency review, and push the v* tag that triggers CI publishing (GitHub release + Docker image + npm). Use when preparing a release PR, publishing a release, bumping the version in build.zig.zon, assembling changelog fragments, or releasing a client SDK.
+---
+
+# Releasing ZigBase
+
+**A release is cut by pushing a `v<version>` tag — CI does the rest.** `.github/workflows/release.yml` fires on `v[0-9]*` and is the primary path: it builds the 4-target matrix once (`{x86_64,aarch64}-{linux-musl,macos}`, ReleaseSafe, `-Dcpu=baseline`) and fans that one build out to **three** publish jobs — the **GitHub release** (tarballs + `SHA256SUMS`, body extracted from `CHANGELOG.md` by `scripts/extract-release-notes.sh`), the **multi-arch Docker image** `ghcr.io/valthon/zigbase` (tagged `latest`, `X.Y.Z`, `X.Y`, `X`), and **npm** `@zigbase/server*` (platform packages → meta, OIDC trusted publishing with provenance). Every job first runs `scripts/assert-version.sh`, so **the tag must match `build.zig.zon` or the whole run fails** — land the version bump on `main` before tagging. A separate `typegen-v*` tag publishes `@zigbase/typegen` (pure JS, no binary build).
+
+So the release PR itself only has to prepare the tree: bump the version in **`build.zig.zon`** (the single source of truth, which also drives the build-time-derived `site/src/config/site.ts` via `serverVersion()`) and **`KNOWN_LIMITATIONS.md`**, grep `README.md` and `docs/*.md` for any hardcoded version reference, and **assemble the `changelog.d/` fragments** via `scripts/assemble-changelog.sh` (see below). Then merge, tag, push the tag. Because the GitHub release body is extracted from `CHANGELOG.md`, the consistency review below is what consumers actually read on the release page.
+
+`scripts/release.sh [--publish]` does the same cross-compile + `gh release create` **locally**, but it is the **manual fallback for bootstrap / offline / emergency releases only** — it does NOT publish the Docker image or the npm packages. Prefer the tag. (It also assembles the changelog if that has not happened yet, and skips it — not an error — when it already has.)
+
+The client SDKs are versioned **independently of the server and of each other**, each on its own tag + workflow: TypeScript `client-v*` (`clients/typescript`, see its `RELEASING.md`), Dart `dart-client-v*`, Python `python-client-v*`, Kotlin `kotlin-client-v*`. A coupled release bumps each one separately. Breaking changes pre-1.0 bump the minor (0.x.0).
+
+## The required consistency review
+
+**Required: review the assembled changelog for internal consistency before opening the release PR.** Read every bullet — not just the section counts. The core defect to remove: a `Fixes`/`Changed`/`Breaking` bullet whose subject was *introduced in this same release*. A bug in a feature that never shipped is invisible to consumers, so the entry is dev-internal noise — fold it into that feature's own `Features` bullet (which should describe the correct final behavior) or drop it, rather than narrating a mid-development bug as a fix. Verify each questionable subject against the previous release tag: `git cat-file -e v<prev>:<path>` / `git show v<prev>:<file> | grep …` — absent at the prev tag ⇒ new this release ⇒ same-version noise; present ⇒ legit consumer-facing entry. Also merge cross-section duplicates (the same change written in both `Features` and `Fixes`).
+
+## The assembler
+
+`scripts/assemble-changelog.sh [<version> [<date>]] [--dry-run]` parses every `changelog.d/*.md` fragment, splits each on its `### <Section>` headings, aggregates the bullets per section across all fragments (canonical order: Breaking, Features, Fixes, Changed, Performance, Deprecated, Removed, Security, Internal; empty sections omitted), and inserts a new `## [<version>] - <date>` block directly above the most recent released-version heading in `CHANGELOG.md` (there is deliberately **no** `## [Unreleased]` section — do not add one); the site mirror is regenerated from it at build time. Then `git rm`s the consumed fragments. It fails loudly with no fragments or an unknown `### <name>` section; `release.sh` skips it (not an error) when the changelog is already assembled. `--dry-run` prints the assembled section without touching any file. Don't run it in a feature PR — only add a fragment.
