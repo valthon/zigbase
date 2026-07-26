@@ -1,3 +1,0 @@
-### Internal
-
-- Replaced 24 stale "PRE-EXISTING: not yet migrated" placeholder justifications in `scripts/allocator-allowlist.txt` with accurate per-file contract-4 reasons (handler/AuthCtx/Ctx tests driving the code under test through a real `RequestArena`, in-place json.Value graph mutation in query/expand + query/fields, the Migrator's designed run-scoped arena, rewrapColumn's escaping `Failure.id`, jwt claims aliasing, setup-only scaffolding). Counts unchanged; no code changes. The 3 files the audit found genuinely addressable (`src/features_resolver.zig`, `src/api/files.zig`, `src/static_files.zig`) keep their placeholder pending actual migration in a follow-up PR.

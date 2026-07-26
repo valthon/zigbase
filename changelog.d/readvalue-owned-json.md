@@ -1,5 +1,0 @@
-### Fixes
-- Fixed a memory leak when reading or writing `json` and multi-value (`select`/`relation`/`file`) record fields on a non-arena allocator: `readValue` used to return a `std.json.Value` sub-tree from a discarded `std.json.Parsed` wrapper (freeable only under an arena), and `bindValue` never freed the `Stringify` (and encrypted-seal) scratch it allocated. `readValue` now returns a fully-owned, individually-freeable tree, and `bindValue` frees its bind scratch — so `records.freeRecord`/`ListResult.deinit` reclaim a whole record (nested json/array sub-trees included) off any allocator.
-
-### Internal
-- `values.readValue` deep-clones json/multi-value parse trees onto the caller allocator (via a leak-safe `cloneValue`, with no partial-tree leak on a corrupt-value parse error), and `values.freeValue` recursively frees an owned `std.json.Value` graph. `records.freeRecord`/`freeInternedRecord`/`ListResult.deinit` now recurse nested json/array field values through it, removing the long-standing "arena-only" caveat on records over json/multi-value collections; proven by new non-arena leak-detector tests.

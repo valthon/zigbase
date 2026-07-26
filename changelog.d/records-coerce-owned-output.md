@@ -1,2 +1,0 @@
-### Internal
-- `records.coerceFormFields` (multipart field coercion) is now self-freeing (contract 1): its result is a fully-owned json graph on the caller allocator — keys are duped and values are deep-cloned or freshly parsed, aliasing nothing in the input — and the temporary `std.json.Parsed` handles from parsing json/multi-select fields are freed instead of being discarded. This un-masks the 11 coerce tests (they now run under the raw leak-detecting `std.testing.allocator`) and lets `src/records.zig` drop off the allocator allowlist entirely.
