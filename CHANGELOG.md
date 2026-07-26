@@ -4,6 +4,389 @@ All notable changes to ZigBase are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.12.0] - 2026-07-26
+
+### Breaking
+
+- The three request-scoped allocator seams are now the typed `zigbase.RequestArena` instead of a bare `std.mem.Allocator`: `RecordEvent.arena` (`ev.arena` in hooks), `Ctx.arena` (`ctx.arena` / `req.ctx.arena` in custom routes and jobs), and `RequestCtx.allocator` (`ctx.allocator`). The allocator itself is the field `.a` on the wrapper, so every place you passed one of these seams to something that wants an allocator, append `.a`: `ev.arena.alloc(...)` → `ev.arena.a.alloc(...)`, `ev.record.object.put(ev.arena, …)` → `ev.record.object.put(ev.arena.a, …)`, `std.fmt.allocPrint(req.ctx.arena, …)` → `std.fmt.allocPrint(req.ctx.arena.a, …)`, `ac.ctx.allocator` → `ac.ctx.allocator.a`. Passing a seam straight through to another ZigBase API that takes a `RequestArena` needs no change; the compiler flags every site that does.
+
+  Why the break is worth it: these arenas die at the end of the request, and the old bare-`Allocator` type made the two easiest lifetime bugs invisible — handing an arena-scoped API a long-lived general-purpose allocator (a leak), or stashing a request arena somewhere that outlives the request (a dangling read). `RequestArena` is constructible only from a real `std.heap.ArenaAllocator` at the boundary that owns it, so the first mistake no longer compiles, and the deliberate `.a` escape hatch makes the second one greppable instead of the default path.
+- The dev-only build option `-Ddev-clock` is renamed `-Ddev-mode` (it already gated the frozen clock, seeded entropy, and test-capture; it now also gates the new fake field-crypto). Update any CI/e2e invocation of `-Ddev-clock=…` to `-Ddev-mode=…`.
+- A file download URL built with a raw `.auth` session token in `?token=` (rather than a `.file`
+  token from `POST /api/files/token`) is no longer authenticated by that token. No first-party
+  client did this — the SDKs and admin UI already use `.file` tokens or the auth cookie/header —
+  but a hand-built URL relying on the old behavior must switch to a `.file` token.
+- `jwt.sign` now returns `error.TokenTooLarge` rather than minting a token that exceeds
+  `jwt.max_token_len`, so this module can never produce a token it would itself refuse.
+  An application putting more than ~3 KB into the caller-supplied `pl` claim now fails at
+  sign time instead of at the next request. Applications within that budget are unaffected.
+
+### Features
+
+- `zigbase.checkSql` / `checkedSql`: comptime validation of raw-SQL table/column identifiers
+  against the `.collections` schema, failing the build on an unknown table or a mistyped
+  qualified column. Best-effort by design (tables strict, qualified columns checked, unqualified
+  columns/functions untouched) to guarantee zero false compile errors on valid SQL — including
+  upserts: the `UPDATE` in `ON CONFLICT ... DO UPDATE SET` is recognized as a conflict clause
+  (no table operand), not an `UPDATE <table>` statement.
+- `zigbase.Query.select`: a comptime, schema-checked single-table SELECT builder that emits
+  validated SQL + positional binds for `queryAs` — an unknown table/column is a build error, and
+  binds are positional by construction. SELECT-only / single-table in v1 (joins, writes, and `in`
+  are noted as future work).
+- Official Dart client SDK (`clients/dart`, pub package `zigbase_client`): REST records API with offset + cursor pagination, injection-safe filters, per-collection auth (password, OAuth2/PKCE, sessions), pluggable auth stores, file uploads/URLs, accounts/analytics/senders services, and realtime subscriptions over WebSocket with auto-reconnect. Dart VM, Flutter, and Flutter web.
+- **Dart codegen.** The client generator now emits Dart alongside TypeScript. Pass
+  `--lang dart` to `zigbase typegen` (runtime introspection) or `zig build gen-client`
+  (comptime, via the `genClientStep` `lang` option) to generate a `zbase.gen.dart` — concrete
+  typed record classes, per-collection typed services (typed CRUD, a fluent where-builder that
+  compiles to server filter strings, int/fixed decimal-string coercion, typed expand, files, and
+  realtime) over the base `@zigbase/client` Dart SDK's new `package:zigbase_client/typed.dart`
+  runtime. Typed `rpc.*`, auth-method, and feature-flag surfaces remain TypeScript-only for now.
+- `zigbase.testing` can now boot apps that declare `.encrypted` fields (#260): pass `StartOptions.field_key` for real AES-GCM, or let it default to a dev-only **fake-encrypt** mode that stores readable `fake:<key>:<value>` at rest (label defaults to `@test@`) so encrypted values are eyeball-able while debugging. Also selectable on `zigbase serve` via `ZIGBASE_FIELD_CRYPTO=fake`. Fake crypto is compiled out of release binaries (the `dev_mode` gate) and its envelopes are mutually unreadable with real ciphertext, so a fake DB can never be served by a production binary.
+- Added `jwt.verifyInto` and `jwt.peekClaimsInto`, which decode and verify a token into a caller-provided scratch buffer with **zero heap allocation**. An over-large token fails closed with `error.TokenTooLarge`. `jwt.scratch_size` (16384) sizes that buffer for the measured worst case — escape-heavy claims force `std.json` to copy rather than borrow, and the consumption-to-token-length ratio *rises* with size (>4x at ~5.7 KB), so it covers 14800 bytes for any token within `max_token_len`. The allocator-taking `jwt.verify`/`jwt.peekClaims` remain for callers already holding a request arena.
+- `zigbase.jwt`, `zigbase.crypto`, and `zigbase.RequestArena` are now public exports of the framework module, for consumers that need to mint/verify tokens, derive keys, or take the compile-enforced request-arena contract type directly.
+- Kotlin client SDK (`clients/kotlin`, Maven `io.github.valthon:zigbase-client` 0.1.0): coroutines-first `ZigbaseClient` covering auth (password, refresh, OAuth2/PKCE, sessions), records CRUD with offset + cursor pagination and an injection-safe filter builder, multipart file uploads, file URLs/tokens, and accounts/analytics/senders services. Realtime and typed codegen tiers follow.
+- Kotlin SDK realtime tier (`zb.realtime`, bundled — no extra dependency): ack-gated `subscribe`/`subscribeTopic` with an unsubscribe-function return, `stream()`/`streamTopic()` cold `Flow`s, custom broadcast topics (`signal`/`message`), automatic re-auth from `authStore` on login/logout/refresh, and exponential-backoff reconnection with full resubscribe.
+- Kotlin SDK typed tier: `zigbase typegen --lang kotlin` generates `@Serializable` record data classes with `fromRecord` coercion, `Create`/`Update` payloads with `toMap` wire encoding, injection-safe fluent filter builders, and typed collection services (plus Flow-based typed realtime) over the new `io.github.valthon.zigbase.typed` runtime — golden-gated in CI against the dating fixture.
+- `zigbase typegen --lang kotlin` gains a `--package <name>` flag that sets the emitted `package` declaration, honored on both the CLI and the comptime `gen-client` build step, so a consumer wiring `genClientStep` with `lang: "kotlin"` targets their own app's package instead of getting an unoverridable namespace in a file marked "do not edit". Unqualified invocations still default to the dating fixture's `io.github.valthon.zigbase.codegen.dating` namespace (keeping the committed golden and `zig build gen-dating-kotlin-client` byte-stable).
+- `captcha.Result` and `oauth.discovery.Endpoints` gain a `deinit(allocator)` that frees their
+  owned strings, so a result produced with a non-arena allocator can be released. Callers on the
+  request-arena path (the usual `ctx.verifyCaptcha`, `resolve`/`parseDocument`) do not need it.
+- New `zigbase import` subcommand + `zigbase.Import` library entrypoint: encryption-aware,
+  offline (no HTTP server) bulk NDJSON record import that streams and batches through the
+  record engine — validation, defaults, `.encrypted` field envelope, and auth password
+  hashing all applied — with optional `--upsert-key` idempotency and source-id preservation.
+- Python client SDK (`clients/python`, PyPI `zigbase` 0.1.0): sync `ZigBase` and async `AsyncZigBase` clients covering auth (password, refresh, OAuth2/PKCE, sessions), records CRUD with offset + cursor pagination and an injection-safe filter builder, file URLs/tokens, and accounts/analytics/senders services. Realtime and typed codegen tiers follow.
+- Python SDK realtime tier (`zigbase[realtime]`): `AsyncZigBase.realtime` with ack-gated `subscribe`/`unsubscribe`, `stream()` async iteration, custom broadcast topics (`signal`/`message`), automatic re-auth on auth-store changes, and exponential-backoff reconnection with full resubscribe.
+- Python SDK typed tier (`zigbase[typed]`): `zigbase typegen --lang python` generates Pydantic v2 record models, injection-safe fluent filter builders, and typed sync/async collection services (plus async typed realtime) over the new `zigbase.typed` runtime, golden-gated in CI against the dating fixture. A `select`-typed field's `eq`/`neq`/`in_list` accept `None` for null filtering; a generated record's `expand` attribute (and each relation on its `<Rec>Expand` submodel) defaults to an empty value, so manual instantiation (tests, mocks) never requires building an expand submodel by hand.
+- Vendored/native component versions (SQLite, sqlite-vec, zap, facil.io, zigbase) are now
+  discoverable via `zig build versions`, the enriched `--version` output + a startup log line,
+  and a `versions` object on `GET /api/health`.
+- Building against an unsupported Zig version now fails at compile time with a clear
+  required-vs-actual message instead of an opaque deep-compilation error.
+
+### Fixes
+
+- Many of the memory-leak fixes below were surfaced by the allocator-ownership migration described
+  under **Internal**. They share a shape: the leaked scratch was always reclaimed by the
+  per-request or per-job arena a deployed server passes, so running servers were unaffected — but
+  the leak was real for a framework consumer calling the same API with a general-purpose
+  allocator, and it blinded the leak detector on that path. Each entry says which case it is.
+- Static-file range handling: `normalizeRange` no longer leaks its scratch `bytes=a-b`
+  string on the already-canonical passthrough path (returned `null` without freeing the
+  freshly allocated buffer). A no-op under the request arena every production caller
+  passes, but a genuine leak under any non-arena allocator.
+- Made several framework helpers self-freeing under any allocator (allocator ownership contracts 1
+  & 2), removing latent scratch/result leaks that were reclaimed only when the caller passed a
+  request/job arena — as every in-tree call site does, so deployed servers were unaffected, but the
+  leaks were real for a general-purpose-allocator caller:
+  - `sms/twilio.zig` `TwilioSender.send` now routes its URL/auth/body build **and** the `HttpClient`
+    response scratch (a fixed `max_response_bytes` buffer that has no `deinit`) through a
+    function-local arena.
+  - `analytics/analytics.zig` `runRollup` builds its summary-table/watermark/aggregation-SQL scratch
+    on a function-local arena.
+  - `api/senders.zig` `listBody` builds its intermediate JSON envelope on a function-local arena
+    (only the stringified body escapes).
+  - `queue/durable.zig` `claimBatch` self-frees its dynamic `IN (…)` SQL scratch and returns an
+    owned `[]Claimed` freed via the new `freeClaimed` (contract-2), with per-row error-path cleanup.
+  - `authz/abilities.zig` `abilityPredicate` frees the `allocPrint`-built `"<col>"."<via>" IN (`
+    prefix it leaked on every non-empty ability predicate (it was passed straight into
+    `appendSlice`, which copies, without freeing the temporary), and adds error-path frees for
+    its predicate buffers.
+  - `auth/challenge_store.zig` `takeByIdentity` frees its intermediate challenge id (previously
+    leaked on every call), and `put` frees the generated id on a mid-insert error.
+  - `route_types.zig` typed-route dispatch thunk (`makeThunk`) now frees its params view and — the
+    real fix — keeps and deinits the JSON `Parsed` handle it previously discarded (`parseFromSlice(…).value`),
+    which leaked that parse arena; only the serialized response body escapes.
+- Vector search (`-Dvector`) `build`: on an allocation failure while composing the `ORDER BY`
+  distance expression, the already-allocated `WHERE` fragment is now freed (added `errdefer`),
+  closing an out-of-memory-path leak.
+- A collection field's `hidden` flag is now persisted and round-trips through a reload. It was never written to the stored schema, so every collection load silently reset user fields to `hidden = false` (the API and admin then reported hidden fields as visible); it now survives create/update/get correctly.
+- Fixed a memory leak on the auth-collection load path: `get` (and the create/update it now backs) leaked the inner fields array when prepending the auth system columns, on non-arena allocators.
+- Fixed a memory leak in the `Data` facade's typed record I/O: `createAs`/`getAs`/`updateAs` parsed the intermediate `std.json.Value` record returned by `create`/`findById`/`update` into `T` but never freed that intermediate, leaking every owned string in the discarded record (~46 allocations per call) on non-arena allocators. The intermediate is now freed after the parse deep-copies into `T`.
+- `dumpload.planCreateOrder` (the `migrate load` dependency-order planner) leaked its Kahn-algorithm `placed` scratch buffer on every call. Always masked by the migration's request arena; now freed explicitly.
+- `schema_dump.pgColumnType`'s array-type branch (Postgres schema dump, `_<udt>` columns) leaked the base type string it formats into the final `<base>[]` result. Always masked by the per-dump scratch arena; now freed explicitly.
+- Fix a memory leak in stored-filename sanitization (`files/naming.zig`): `sanitizeBase` freed its
+  scratch `ArrayList` only via `errdefer`, so every successful call leaked the buffer, and
+  `storedName` never freed the sanitized intermediate. Latent behind the upload request-arena, a
+  real leak under any non-arena allocator. Now contract-1 (`defer`-freed; the return is always a
+  fresh copy).
+- JWT signing no longer leaks its intermediate buffers when handed a non-arena allocator: `jwt.sign` now frees the payload JSON, both base64 encodings, and the signing input, leaving only the returned token allocated.
+- Fix a memory leak in captcha response parsing. `captcha.parseResponse` (reached via
+  `ctx.verifyCaptcha`) parsed the provider's JSON with a leaky parser and never freed the
+  tree, and returned `Result` fields that borrowed it — including an `errors` slice that was
+  an un-freeable sub-slice of a larger allocation. It now frees the parse tree and returns
+  independently-owned dupes. Requests served through a per-request arena were unaffected in
+  practice (arena teardown reclaimed the tree); the leak bit any caller using a
+  general-purpose allocator.
+- Fix several memory leaks in the mail subsystem, latent in the request/job-arena path but real
+  under any non-arena allocator:
+  - Bulk email: `bulk.sendBulk` never freed the per-recipient `vars_json`/durable-job `payload`
+    scratch (freed per iteration now that SQLite/enqueue copy it), and `bulk.jobHandler` never
+    freed the ~9 fields it rendered per delivery (now routed through a function-scoped scratch
+    arena freed on every return path).
+  - Inbound webhooks: `suppression.parseProvider`/`mapSes`/`mapPostmark` never freed the provider
+    JSON parse tree and returned `Event.email` as a slice borrowed from it (now duped before the
+    tree is freed); `inbound.ingest` discarded the suppression `Event` slice without freeing it;
+    and `inbound.webhook_handler` leaked its response `ObjectMap`.
+- Multipart form-data parsing no longer leaks its per-request delimiter scratch: `files/multipart.parse` allocated two derived boundary-matching strings on every call and never freed them, leaking that memory for any caller that does not pass an arena allocator (the production HTTP upload path is arena-backed, so served requests were unaffected).
+- Creating or updating a record with file uploads no longer orphans the uploaded bytes in storage when the write is rolled back (a failed commit, a denied access-rule guard, or a validation error) — the just-written files are now always removed on any pre-commit failure.
+- Failures while cleaning up files after a delete/update (e.g. a transient object-store error) are now logged instead of silently swallowed, so orphaned-file accumulation is diagnosable.
+- A malformed or out-of-range numeric value in a `filter`, `sort`, or cursor (e.g. `price=99999999999999999999`) now returns `400 Invalid filter or sort.` instead of `500`.
+- The request error path no longer risks panicking the server (or invoking undefined behavior in a `ReleaseFast` embed) when the machine is out of memory: rendering a 500 that itself fails to allocate now falls back to a preallocated static error body.
+- Malformed `.cron` schedule strings are now rejected at compile time (wrong field count, full day names like `MONDAY`, a trailing/doubled space) instead of silently making a job fire once at boot and then retire without ever running on schedule. The same validation applies to `.auth.session.gc_cron`.
+- A cron/interval job whose schedule has no future fire (e.g. an impossible date like Feb 30) is now retired at startup and logged, instead of being treated like a reactive job and run at an arbitrary boot time; jobs that retire for having no next fire are now logged rather than vanishing silently.
+- Cron expressions now support the full standard grammar: `<lo>-<hi>/<step>` ranges (e.g. `0-23/2` for every other hour) and day-of-week `7` as a Sunday alias (`0` and `7` both mean Sunday). Out-of-range field values (minute > 59, hour > 23, month > 12, day-of-month `0`, day-of-week > 7, etc.) are now rejected at compile time rather than compiling into a job that silently never fires.
+- Typo'd keys in more config surfaces are now a loud `@compileError` instead of being silently ignored: route specs (`.rate_limit`/`.rate_limit_key`/etc.), background job specs, `.auth.methods` and each built-in method's options (`.magic_link`/`.otp`/`.password`/`.webauthn`), `.auth.oauth2` and its provider literals (e.g. `.tokenURL`), collection `.indexes` entries (`.unique`/`.collation`/`.where`), and the `.pools` tuning group.
+- Duplicate or empty `.migrations` ids are now a compile error; previously a copy-pasted id silently skipped the second migration on every environment.
+- A failure to create the data directory at startup (permissions, read-only filesystem, out of space) is now logged with the path and cause instead of being swallowed and later surfacing only as an opaque database-open error.
+- Realtime: a failed `subscribe` is no longer acked to the client as success. Neither a facil.io `subscribe` failure nor a failure to record the just-created transport subscription (under memory pressure) can now strand the client — previously the first left a silent dead subscription and the second left a live subscription a later unsubscribe could never cancel. Both now roll back the logical subscription, log, and return an error frame the client can retry, on both the WebSocket and SSE transports.
+- Realtime: a dropped broadcast/signal/message frame (allocation failure on an already-committed write) is now logged with the collection/topic and action, matching the cross-instance paths, so a client-reported "missed update" is diagnosable instead of vanishing silently.
+- Realtime (Postgres): cross-instance delete-snapshot and broadcast side-table failures now distinguish a genuinely-absent row (a forged/expired token — a quiet fail-closed drop) from a real database/parse error, which is now logged instead of collapsed into the same silent null.
+- Realtime (Postgres): the cross-instance `LISTEN` reconnect backoff now resets only after a connection has stayed healthy for several seconds, and sleeps before reconnecting after a short-lived session. A proxy or mid-failover node that accepts the connection and `LISTEN` but drops it on the first wait no longer drives a zero-delay connect/reconnect loop.
+- A write that violates a database integrity constraint — most commonly a duplicate value on a unique field, such as signing up with an email that is already registered — now returns **409 Conflict** instead of **500 Internal Server Error**. Clients, SDKs, and error monitoring can now tell a routine user conflict apart from a genuine server fault. This applies to record create/update, runtime collection create/update, and WebAuthn credential registration, on both the SQLite and Postgres backends. Underneath, the internal database error set gained a distinct `error.Constraint` (SQLite `SQLITE_CONSTRAINT`; Postgres SQLSTATE class 23), raised from the prepared-statement `step()` path instead of collapsing every failure into `error.StepFailed`, so a custom route that lets a `ctx.records()` write propagate surfaces the 409 automatically. **Framework consumers who matched on `error.StepFailed` for a unique-violation race should match `error.Constraint`.** The `exec()`/COMMIT path (including deferred-constraint failures) is unchanged and still reports `error.ExecFailed`.
+- Additive `ADD COLUMN` steps in the system migrations (session `token_epoch`, `_collections.options`, `_suppressions.updated`) no longer swallow every error as if it were the benign "duplicate column" case. A genuine DDL failure (lock timeout, disk full, connection drop) now propagates and aborts the migration instead of being recorded as applied with the column still missing — which could permanently break token issue/verify for an auth collection with no migration-based repair. Idempotence now comes from a backend-catalog column-existence check.
+- On Postgres builds, a pathological placeholder count in developer-authored raw SQL now surfaces a prepare error instead of panicking the process. This covers both a numbered `?N` with an out-of-range or overflowing index (for example `?10000000` or a 20-plus-digit run), which previously panicked at statement-execution time, and an extreme number of anonymous `?` placeholders, whose running counter is now bounded by the same param cap rather than overflowing the placeholder buffer during renumbering.
+- Outbound webhook delivery now bounds the total time one attempt sequence spends sleeping between retries, so a receiver returning a large `Retry-After` (or a long configured backoff) can no longer keep a delivery running past the queue's `visibility_timeout_s` — which previously let the job be re-dispatched as a concurrent duplicate and stalled other jobs on the worker for minutes.
+- Fixed a table-name string leak on the out-of-memory error path of the database dump-load (`migrate load`) copy loop.
+- S3 storage: the spool cache-fill path no longer leaks the joined cache path for a non-arena caller when the spool directory is unwritable or full; a failed per-object remote delete (orphaning a billed object after its record is gone) and a cache directory that becomes unlistable at runtime (silently disabling spool eviction) are now logged instead of swallowed.
+- SMTP mailer: a partially-built CA bundle is freed when a system-trust-store rescan fails mid-load, closing a leak on hosts with a malformed or unreadable certificate.
+- `GET /api/features`: an out-of-memory error while rendering the `403 Forbidden` body now propagates to the `500` backstop instead of hitting an `unreachable` (a panic in safe builds).
+- Comptime `.migrations` bare-tuple entries now reject an unknown key (a typo'd `.transational`/`.donw` was silently dropped) with a loud `@compileError`, matching every other list-shaped config key.
+- Webhook deliveries: at startup, warn about any declared queue whose `visibility_timeout_s` is too small to safely host a webhook delivery's in-handler retry backoff, which could otherwise let the queue re-dispatch an in-flight delivery as a concurrent duplicate.
+- The "per-route rate limit cannot identify the client" startup warning now fires once per distinct route pattern instead of once per process, so a second unprotected route is no longer silently skipped from the log.
+- Fixed a rare crash where enqueuing a background job (for example an error report) at the moment the in-memory job pool was shutting down could dereference a just-cleared pool pointer and panic the process. `App.submit` now null-checks the pool rather than asserting it, so a submit that races shutdown fails cleanly (the job is dropped) instead of crashing.
+- Fix memory leaks in the shared AES-256-GCM envelope (`aead.seal`/`aead.open`) that backs every
+  at-rest secret — OAuth client secrets and `.encrypted` record fields. `seal` never freed its
+  ciphertext/raw/base64 scratch buffers (three allocations per call) and `open` never freed its
+  decode buffer (plus the plaintext on a decrypt-verify failure). Served through a per-request
+  arena the buffers were reclaimed at request end, but any non-arena caller (e.g. a batch
+  re-encrypt) leaked on every encrypt/decrypt. Now contract-1: all scratch is freed, only the
+  result escapes.
+- Fix leaks on the OAuth login path: `oauth.client.fetchIdentity` never freed the `Bearer <token>`
+  authorization header it built, and `oauth.providers.extractIdentity` never freed the JSON parse
+  tree of the provider's userinfo response (leaked on every third-party login).
+- `provision.appliedConsumerMigrations`/`recentConsumerMigrations` (the `migrate status`/`migrate rollback` ledger readers) leaked the lowered SQL scratch `Migrator.prepare` builds on every call. Always masked by the CLI's request arena; both now lower onto a function-local scratch arena instead.
+- `provision.migrationStatus`'s `orphaned[i].name` was an un-freeable mid-buffer offset into an internal ledger-read array the caller never saw (freeing it directly would have been an invalid free of a non-base pointer) — `MigrationStatus` now dupes every retained string fresh and ships a `deinit`, so the result is a normal owned graph instead of an implicit arena-only value.
+- `provision.resolveDiscoveryProviders` leaked its partially-built collection/provider arrays when an OIDC discovery fetch failed mid-batch. Inert in production (the caller aborts startup on this error), but a real leak on any other caller; now freed via a tracked rollback on error.
+- Fixed a memory leak when reading or writing `json` and multi-value (`select`/`relation`/`file`) record fields on a non-arena allocator: `readValue` used to return a `std.json.Value` sub-tree from a discarded `std.json.Parsed` wrapper (freeable only under an arena), and `bindValue` never freed the `Stringify` (and encrypted-seal) scratch it allocated. `readValue` now returns a fully-owned, individually-freeable tree, and `bindValue` frees its bind scratch — so `records.freeRecord`/`ListResult.deinit` reclaim a whole record (nested json/array sub-trees included) off any allocator.
+- Fix memory leaks throughout the realtime subsystem, latent behind the per-connection/per-request
+  arena but real under any non-arena allocator:
+  - `realtime/connection.removeSub` used `HashMap.remove`, silently dropping the entry without
+    freeing the duped subscription key/filter — a connection that subscribed/unsubscribed
+    repeatedly accumulated leaked topics until disconnect. Now `fetchRemove` + explicit frees, with
+    a new `Conn.deinit` freeing all remaining subscriptions.
+  - Realtime frame building (`protocol.zig`, `ws.zig`, `pg_bridge.zig`, `hub.zig`) leaked scratch
+    `ObjectMap`s and JSON stringify/parse buffers on nearly every emitted event/signal/ack frame.
+  - `realtime/pg_bridge.decode`/`decodeAny` (the Postgres realtime bridge) parsed with a leaky
+    parser and returned struct fields aliased into the never-freed tree; now dupes each field fresh
+    with `Event`/`Signal`/`MessageRef`/`Payload` `deinit` methods. Also fixes an unfreed
+    delete-snapshot JSON buffer in `storeDeleteSnapshotInner`.
+- Fixed a long-standing memory leak in the `Data` facade: `findById`/`create`/`update`/`delete`/`list` loaded the collection metadata via `collections.get` and never freed it, leaking on every call when driven by a general-purpose (non-request-arena) allocator. Record `Value`s now own their top-level keys, so the facade can free the collection safely.
+- Fixed a cursor-mode `records.list` result that returned a capacity-padded item slice and left the pagination probe row unfreed — harmless under a request arena but a wrong-size free / leak on a non-arena allocator. The result is now an exact-length owned slice with a `deinit`.
+- Fixed a memory leak on the record read path: when an encrypted field failed to decrypt part-way through building a row (fail-closed `error.BadEnvelope`), `records.get`/`getAtRest`/`create`/`update`/`list` leaked the partially-decoded record. `rowToObject`/`rowToObjectAtRest` now free the partial record on a mid-row read error. The same functions also leaked a hidden field's decoded value (read but never stored); that value is now freed too. Both matter for a framework consumer that calls these APIs with a plain (non-arena) allocator.
+- `parseCollectionInput` (the runtime collection create/update request parser) leaked its filtered field-array scratch on every call: the intermediate array `fieldsFromJson` returns was discarded without freeing its backing allocation, and a submitted field whose name collided with a reserved system name (e.g. `"email"` on a base collection) leaked that field's own id/name/options dupe entirely. It also leaked the escaping `name`/`fields`/`indexes` themselves on a trailing error path (any of `indexesFromJson`, the rule-string dupes, or `optionsFromJson` failing after they were built) — none of these were reachable via `errdefer` once each value's own local guard went out of scope. All are always masked in production by the request arena; all are now freed explicitly.
+- Fixed memory leaks throughout the collection and record write/read paths (`collections.create`/`update`/`delete`, record insert/update/delete, and record reads) when driven by a non-arena allocator. The HTTP request path reclaims this scratch through its per-request arena, but callers that pass a general-purpose allocator — the Postgres backend's collection-cache fallback and direct `Data`-facade use — leaked the DDL, SQL, column-list and `$n` placeholder-rewrite scratch on every call. These operations now free that scratch internally on both success and error paths, and validation failures hand their error list back as an owned, freeable slice, so each operation is leak-correct under any allocator.
+
+### Changed
+
+- `Data.createAs`/`getAs`/`updateAs` now reject a `T` that (recursively) contains a raw-JSON field (`std.json.Value`/`ObjectMap`/`Array`) at **compile time** with an actionable message. `parseFromValueLeaky` (used by these methods) returns such a field as an alias into the intermediate record they now free — which would dangle a string field (use-after-free) — so typed I/O is restricted to concrete field types; use the untyped `create`/`findById`/`update` for raw JSON.
+
+### Performance
+
+- Realtime: per-subscriber event delivery now parses only the three envelope fields it needs (`action`, `record.id`, and the delete-authorization snapshot) with a typed, unknown-field-skipping parse, instead of materializing the entire record body into a throwaway JSON tree for every subscriber. A create/update of a large record fanned out to many subscribers no longer does O(subscribers × record-size) redundant allocation.
+- List-endpoint `?expand=` now resolves each relation target's schema once per page and reuses each `(collection, id)` view-authorization decision across rows, instead of re-loading and re-parsing the target collection and re-authorizing on every returned record. This removes redundant `_collections` reads/parses and duplicate rule queries on `GET …/records?expand=…`, most impactful on the Postgres backend where each was a network round trip.
+- Realtime delete authorization: the per-subscriber in-memory authorization sandbox for a deleted record is now reused across every subscriber of the same delete event that is served on a given worker thread, instead of being rebuilt once per subscriber. Large delete fan-outs do far less redundant work; per-subscriber authorization decisions are unchanged.
+- Pre-size the record-read hot path's growing collections so their backing is allocated once
+  instead of reallocating as they fill. `records.rowToObject` (and its at-rest sibling)
+  pre-sizes the per-record `std.json.ObjectMap` to id/created/updated + the collection's
+  fields; `records.list` pre-sizes its result-item list to the page limit. Measured with
+  `zig build bench`, a 30-record list read dropped from ~260 to ~226 allocations per page
+  (~13%) — the 512-byte size bucket fell from 38 to 6 — and a single-record read drops an
+  allocation. Output is byte-identical (insertion/append order is unchanged), verified by the
+  record + cursor-pagination browser tests.
+
+### Security
+
+- Closed an account-enumeration oracle across every token-mail endpoint: OTP **initiate**,
+  magic-link **initiate**, `request-verification`, and `request-password-reset`. Each previously
+  sent its code/link synchronously and only for an existing (or auto-created) account, so both
+  the response timing and a propagated SMTP failure (`500` vs `204`) revealed whether an email
+  was registered — and a mailer outage turned the endpoint into a boolean existence oracle.
+  Delivery now goes through the non-blocking token-mail queue on all four, so each returns `204`
+  with identical timing and status regardless of whether the email matched a record.
+- File downloads via the `?token=` query parameter now accept **only** purpose-built `.file`
+  tokens (minted by `POST /api/files/token`), not full `.auth` session tokens. A session token
+  in a URL query travels into access logs, `Referer` headers, and browser history, so permitting
+  it there invited long-lived credentials into those sinks. Session-authenticated downloads
+  continue to work via the `Authorization: Bearer` header or the auth cookie.
+- Bound JWT token length before any allocation. `jwt.verify` and `jwt.peekClaims` now
+  reject a token longer than `jwt.max_token_len` (4096 bytes) as `error.TokenTooLarge`
+  as their first statement. Previously nothing on the request path bounded token length,
+  while a request body may be `max_upload_size` (50 MiB by default) and a realtime frame
+  256 KiB — and because a token is decoded *before* its signature is checked, an
+  unauthenticated request could drive allocation proportional to the token it supplied.
+- Realtime: a duplicate `subscribe` to a topic a socket already holds now REPLACES its subscription in place instead of stacking a second facil.io subscription. The old behavior let an (even anonymous) client loop subscribes on any public collection to bypass the per-connection `MAX_SUBS` cap entirely, grow per-connection memory without bound, multiply every published event's server-side authorization/delivery work N×, and orphan all-but-the-last facil.io subscription until socket close — a connection-scoped denial-of-service. Applies to both the WebSocket and SSE transports.
+- Realtime: a connection can no longer be driven to unbounded memory growth by looping `auth`
+  frames — closing an inbound-driven single-connection memory-exhaustion vector. `auth` frames are
+  now verified on a throwaway scratch arena, with only a successful identity persisted, and that
+  verified identity is held in a dedicated arena reclaimed on each re-authentication. Previously
+  every `auth` frame leaked permanently into the connection-durable arena (freed only at connection
+  close) — including a garbage token, which allocated during pre-validation claim parsing, so the
+  attack needed no credentials at all — and even valid repeated re-authentication grew the
+  connection without bound.
+- Client-supplied `?filter=` and `?sort=` can no longer reference hidden fields (`passwordHash`, `tokenKey`, `token_epoch`, or any field marked `hidden`). Previously such a query on a non-locked collection turned row presence/absence into a boolean oracle, allowing character-by-character extraction of a per-user server secret the API never serializes. The query builder now rejects hidden fields in client input the same way it already rejects encrypted ones (closed, with a `400`), matching the read layer's visibility rule exactly so no serialized column is affected. Trusted, operator-authored access rules may still gate on a hidden field — a rule is a server-side `WHERE` clause whose truth is never returned to the client, so it is no oracle.
+- Per-route rate limiting no longer collapses every client into a single shared bucket when the client cannot be identified (a `.custom` route limit with no `rate_limit_key`, on a directly-exposed server where `ZIGBASE_TRUST_PROXY` is off and the client IP is unknown). Previously one anonymous caller could exhaust the shared bucket and 429 the route for everyone. The bucket is now keyed per client — the app-supplied key function, else the trusted-proxy client IP, else the authenticated principal — and when none of those can distinguish the caller the limit is skipped (fail-open) with a one-time warning rather than enforced as a poisonable global bucket.
+- The WebAuthn challenge check now uses the shared constant-time `crypto.timingSafeEql` helper instead of a private byte-for-byte copy, so future hardening of the constant-time primitive reaches the ceremony verification.
+- Hardened the fail-closed `deny_locked` authorization floor for Postgres dialect-portability. It
+  hardcoded the SQLite-only `0` false-literal (`WHERE 0`), which Postgres rejects
+  (`argument of WHERE must be type boolean`); it now uses the dialect's `constFalse()` (`false` on
+  Postgres) — the same constant the ability/tenant composition already emits — so the fail-closed
+  floor is guaranteed-valid SQL on both backends. (In current code this branch is short-circuited by
+  `authorizes` before it reaches a statement, so no live query was affected; the fix hardens the
+  path against any evaluator that runs the guard directly.)
+- Realtime (WebSocket/SSE) delivery now enforces relationship **abilities**, not just the
+  access rule and tenant scope. A collection that was `@public` for its view rule but
+  visibility-narrowed by a `view` ability previously delivered every record to every
+  subscriber, bypassing the ability on the realtime channel (REST reads were unaffected).
+  Effective realtime visibility is now `(rule) AND (ability) AND (tenant)`, matching the
+  documented guarantee and the REST list/read paths.
+- Record validation now rejects an over-`maxSelect` `relation` or `select` value on the
+  element **count**, before running the per-element existence checks. Previously an
+  over-limit `relation` array still ran one existence `SELECT` per submitted id under the
+  writer lock, so an attacker-sized array (bounded only by the request body limit) could
+  drive a large number of queries from input already known to be invalid.
+- The runtime collections API now validates `tenant_field` (and `ttl_field`): it must be a valid
+  identifier that names an existing field, rejected with an actionable error otherwise. Previously
+  a superuser could set an invalid or dangling `tenant_field` via the admin API; because
+  `tenancy.scopeApplies` treats an invalid identifier as "scoping does not apply", the tenant-owned
+  collection would then be served **un-scoped** — a cross-tenant row leak. The comptime
+  `.collections` path already enforced this; the runtime API now mirrors it, keeping the fail-open
+  state unreachable.
+- `zig build audit` compares pinned dependency versions against a curated in-repo advisory
+  table (`docs/security-advisories.md`); documented update process for vendored C security fixes.
+
+### Internal
+
+- **Allocator-ownership contract migration.** CI now ratchets against leak-masked tests
+  (`scripts/allocator-allowlist.txt`): a test may wrap `std.testing.allocator` in an arena only
+  where the code under test genuinely takes a `RequestArena` (contract 4), and every remaining
+  line carries a written justification. Driving that ratchet down took the bulk of this release —
+  from 121 files / 889 masked tests at introduction to 44 / 299 — by giving the framework's
+  internals explicit ownership contracts: a function either frees all of its own scratch and
+  returns one caller-owned value (contract 1), or returns an owned handle with a `deinit`
+  (contract 2). Converted subsystems include `records`/`collections`/`schema`/`ddl`, the whole
+  `query/` stack (lexer, parser, compiler, joiner, sort, keyset, params), `policy`/`rules`/`authz`,
+  `realtime/`, `mail/`, `oauth/` + `aead`, `files/`, `push/`, `provision`, `import`, `codegen/`,
+  and the leaf libraries. **This is a correctness change, not a memory or performance
+  improvement:** every in-tree caller already passes a request/job arena that reclaimed the scratch
+  and still does (an arena-backed scratch arena frees no capacity on deinit), so deployed servers
+  are unaffected. The value is that the leak detector can now see these paths, and that a framework
+  consumer driving them with a general-purpose allocator no longer leaks. The consumer-visible
+  leaks the conversion surfaced are listed under **Fixes**.
+- New ownership primitives added along the way, usable directly by framework consumers:
+  `schema.Collection.deinit` (plus `freeFieldsOwned`/`freeIndexesOwned` for a standalone
+  `[]Field`/`[]Index`), `records.ListResult.deinit`, `query.Joiner.deinit`, `Cursor.deinit`,
+  `Guard.own`/`Guard.deinit`, `auth.Verified`/`Authed.deinit`, `tenancy.Resolution.deinit`,
+  `features_resolver.Resolved.deinit`, `search.Vector.deinit`, `mail.unsubscribe.Parts.deinit`,
+  `provision.MigrationStatus.deinit`/`RollbackOutcome.deinit`/`freeAppliedMigrations`,
+  `queue.freeClaimed`, `values.freeValue`, and an `Acquired` handle (`{ arena, collections }`,
+  mirroring `std.json.Parsed`) for the codegen acquire adapters. `collections.create`/`update` now
+  return a fully-owned reload of the just-written row rather than a mixed-ownership hand-assembled
+  value, and record `Value`s returned by `get`/`create`/`update` own their top-level keys, while
+  `records.list` interns one shared key set per query (borrowed by every row, freed once via
+  `ListResult.deinit`) so the list read path adds no per-row key allocation.
+- Un-masking `src/codegen/` (86 tests) surfaced pervasive ownership bugs in the client generators
+  that the masking arena had hidden: `identifiers.recordName` returned a sub-slice of an internal
+  allocation (freeing it was an invalid free), the shared `emit.putf` format helper leaked at every
+  call site, every language generator leaked all of its scratch, and `gen_client.generate` leaked
+  the whole generated buffer on its reachable `error.RpcTypeNameCollision` path. All are fixed —
+  generators own their scratch internally and return a single caller-owned slice, and the
+  `ts`/`dart`/`python`/`kotlin` type mappers return a uniform always-owned string. Generated client
+  output is byte-identical (golden snapshots unchanged). This is a build-time tool, so none of
+  these bugs affected the shipped server.
+- Documented the arena-scoped ownership contract (contract 4) on `http_client.HttpResponse` and
+  `DownloadResult`: the response body is a sub-slice of the fixed `max_response_bytes` buffer and
+  `request()`/`download()` leave their scratch on the passed allocator, so there is intentionally
+  no `deinit` and callers must pass a request-scoped/arena allocator.
+- Converted the two JWT verification call sites whose claims are consumed internally
+  (`auth.authenticate`, `api/auth.carrySessionCreated`) from the arena-scoped `peekClaims` to the
+  caller-buffer `peekClaimsInto`, removing an allocation from the per-request auth path. The
+  remaining four sites return borrowed claims and stay on the arena (safely bounded by
+  `jwt.max_token_len`). In `authenticate` the peek is scoped to a block so the stack-borrowed
+  claims cannot escape into the returned `Authed` — a compiler-enforced guard rather than a prose
+  one.
+- Added `NO_SLOP.md`, a Zig code-review standard for AI reviewers distilled from Andrew Kelley's
+  positions and the official Zig docs, and referenced it from `CLAUDE.md`. Its §4 also records the
+  outcome of a data-oriented-design audit of the four structures it names: none is currently
+  high-cardinality enough for §4 to apply, so the guidance is now "do not 'fix' these without a
+  profile" rather than an open invitation to reflexive DoD.
+- Pointed the benchmark harness (`zig build bench`) at the real record read paths for the first
+  time (it had only measured the jwt exemplar), reached through a `dev_mode`-gated `internal` seam
+  in `root.zig` that folds to `struct {}` in any release build, so it adds nothing to the shipped
+  public surface. `data/queryAs-50rows` measures the typed row-decode path (~3 small allocations
+  per row); `records/findById-json` and `records/list-json-30` measure the JSON path every REST
+  read returns — ~3x more allocations and ~6x more bytes per record than the typed path, and ~8.7
+  allocs/record for a batched `list` vs ~13 for individual `findById` (the per-record prepare/SQL
+  that N+1 gets each pay). A new `harness.runArena` measures an op under a request-style arena
+  reset between iterations: identical allocation count but ~15x faster than raw malloc — which is
+  the point, since the allocation count/size distribution is the real backing-independent signal
+  while the raw-malloc ns is overhead the arena erases. A `query/filter-compile` benchmark of the
+  SQL-injection-critical filter path is a useful negative result: ~24 allocations / ~6us, ~40x
+  cheaper than a record list read, confirming filter compilation is not a hotspot.
+- Postgres full-text search now concatenates its text-search configuration into the emitted SQL at
+  **comptime** (`++`) instead of formatting it with `{s}`. The value lands inside a single-quoted
+  SQL literal — an escaping context `schema.isValidIdentifier` does not cover — so making it
+  configurable later now fails to *compile* rather than silently opening an injection, and a
+  comptime guard additionally rejects a quote or backslash in the literal. The emitted SQL is
+  byte-identical (verified by running the new test against the previous implementation). Added
+  alongside it, the first unit coverage for the Postgres full-text lowering: `buildPostgres` is
+  pure, but nothing asserted its emitted SQL, so the read-side lowering had been exercised only by
+  the live-Postgres suites (skipped in a default build).
+- `jwt.peekClaims` now rejects a token carrying a 4th segment, matching `jwt.verify`. Not a
+  vulnerability (`verify` is authoritative and always refused such a token), but the two parsers
+  read the same bytes and should not disagree about what a well-formed token is.
+- Added `release-dart-sdk.yml`, a `dart-client-v*`-tag-triggered workflow that verifies
+  (`dart analyze`, format check, unit tests, tag/`pubspec.yaml` version consistency,
+  `dart pub publish --dry-run`) and then publishes `zigbase_client` to pub.dev via the
+  official OIDC-based automated-publishing flow. The first publish still needs one-time
+  owner setup on pub.dev — see `clients/dart/RELEASING.md`.
+- Pinned `ruff==0.15.21` in the `python-sdk` CI job and the Python SDK release workflow's
+  format/lint gates (matching the codegen job), so a floating `ruff>=0.8` release can no longer
+  turn a green `main` red on a later PR without any code change — as happened when post-0.15.21
+  markdown code-block formatting reflowed `clients/python/README.md`.
+- The live SASLprep/SCRAM PostgreSQL tests now skip when the suite role lacks the `CREATEROLE`
+  privilege their throwaway login-role fixtures require, instead of failing with an opaque
+  `ExecFailed` out of the setup DDL. Running the suite against a plain dev PostgreSQL whose suite
+  role is not a superuser no longer reports two misleading SCRAM failures; CI (whose suite role is
+  a superuser) still runs them. The module header documents both preconditions and how to point
+  `ZIGBASE_PG_TEST_URL` at a privileged role to run them locally.
+- Deduplication sweep: consolidated three byte-identical RFC 3986 percent-encoders (captcha,
+  Twilio SMS, OAuth token exchange) into one `url.percentEncode`; the copy-pasted JSON body
+  plumbing (`parseBody`/`strField`/`jsonResponse`) shared across the auth/OAuth handlers into
+  `api/common.zig`; the near-identical `request-verification`/`request-password-reset` handlers and
+  the `findByEmail`/`findByIdentity` lookup loop into a single `findByField` helper (preserving the
+  subtle nocase / guarded-free memory semantics); `records.zig`'s private `coerceClone` into the
+  canonical `values.cloneValue` it was a byte-for-byte copy of; and the record create/update
+  file-cleanup block that had been copy-pasted into four return branches into one commit-guarded
+  scope guard.
+- Hoisted the byte-identical, language-neutral schema-query helpers that the four client emitters
+  (`emit.zig`/`emit_dart.zig`/`emit_kotlin.zig`/`emit_python.zig`) each kept their own copy of into
+  a single `src/codegen/schema_query.zig`. The visible auth fields are now derived from the
+  canonical `schema.authSystemFields()` (filtered to its non-hidden subset) rather than a
+  hand-maintained triple in each emitter, so a new non-hidden auth system field flows into every
+  generated SDK automatically instead of silently diverging until all four copies are edited. Pure
+  refactor — generated client bytes are unchanged. Also corrected the Dart/Python/Kotlin generator
+  module docs, which claimed the shared identifier guard is "language-neutral": it is TS-derived
+  (TS identifier validity + the TS typed-core reserved-name set) and applied to every language as a
+  conservative lowest common denominator, with the actual per-language keyword/member sanitizing
+  living in each emitter.
+- `records.last_errors` (the validation-detail threadlocal) is cleared once consumed, so it never
+  outlives the per-request arena it points into. `gcExpiredRecords` (the TTL sweep) allocates its
+  per-collection scratch from an internal arena, and system migration 0010 allocates its
+  collection-name scratch from the run-scoped migrator arena instead of `std.heap.page_allocator` —
+  restoring `std.testing.allocator` leak visibility for both paths and removing ~15 lines of manual
+  cleanup from the latter.
+
 ## [0.11.0] - 2026-07-07
 
 ### Breaking

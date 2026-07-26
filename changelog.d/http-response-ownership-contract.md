@@ -1,2 +1,0 @@
-### Internal
-- Documented the arena-scoped ownership contract (contract 4) on `http_client.HttpResponse` and `DownloadResult`: the response body is a sub-slice of the fixed `max_response_bytes` buffer and `request()`/`download()` leave their scratch on the passed allocator, so there is intentionally no `deinit` and callers must pass a request-scoped/arena allocator. Relabeled the `files/s3.zig` and `http_client.zig` allocator-allowlist entries from provisional debt to this now-earned justification.

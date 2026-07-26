@@ -4666,7 +4666,7 @@ itself — are aggregated at build time (zero runtime cost) and surfaced four wa
 
   ```json
   { "status": "ok", "backend": "sqlite",
-    "versions": { "zigbase": "0.11.0", "commit": "…", "sqlite": "3.53.2",
+    "versions": { "zigbase": "0.12.0", "commit": "…", "sqlite": "3.53.2",
                   "sqliteVec": "v0.1.6", "zap": "0.10.6", "facil": "0.7.4" } }
   ```
 

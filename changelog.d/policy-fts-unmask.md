@@ -1,3 +1,0 @@
-### Internal
-
-- Un-masked the five `records.list` full-text-search authorization tests (`policy.zig`) — they drove both `records.list` and `fts.ensureIndex`, now that both are self-freeing they run under the raw leak detector. The `searchableBase` test helper is rewritten to create its collection directly (a fully-owned reload) instead of swapping a literal-named field array onto a `pinBase` collection, which had orphaned the base fields and would have crashed `Collection.deinit` on the string literals. The allocator-contract allowlist for `policy.zig` drops 12→7 (the remaining seven are the returned-`Guard`-graph PIN/ability tests and one collection-graph leak, still awaiting their own migrations).
