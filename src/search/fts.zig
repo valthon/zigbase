@@ -93,7 +93,7 @@ fn pgIndexName(alloc: std.mem.Allocator, col_name: []const u8) ![]u8 {
 const pg_ts_config = "simple";
 
 comptime {
-    // Belt-and-braces on the literal itself: the `++` sites above prevent a RUNTIME value, and
+    // Belt-and-braces on the literal itself: the `++` sites below prevent a RUNTIME value, and
     // this prevents an author-written one that would break out of the surrounding single quotes.
     for (pg_ts_config) |c| if (c == '\'' or c == '\\')
         @compileError("pg_ts_config is interpolated into a single-quoted SQL literal and must not contain a quote or backslash");
