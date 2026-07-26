@@ -124,7 +124,18 @@ From Kelley's *Practical Data-Oriented Design* talk. These matter because Zig's 
 
 **Reviewer stance:** don't demand DoD everywhere (it's a readability trade-off). *Do* flag a struct that (a) is instantiated in large quantities on a hot path and (b) is obviously bloated by padding, embedded rare fields, or pointers where indexes would do. Justify with the size/cache argument, and prefer measurement over assertion (Kelley empirically validated every DoD change).
 
-> **This repo:** `db.zig`'s pool, `query/` compiler nodes, `schema.zig` field descriptors, and realtime subscriber records are the high-cardinality structures where §4 actually bites — apply it there, not to one-shot config structs.
+> **This repo:** `db.zig`'s pool, `query/` compiler nodes, `schema.zig` field descriptors, and realtime subscriber records are the *candidate* structures for §4 — apply it there, not to one-shot config structs.
+>
+> **Audited 2026-07-25 — §4 does not currently bite on any of them, and that is a finding, not an omission.** Each was checked against the "most of it in memory" test and none qualifies:
+>
+> | Structure | Cardinality | Verdict |
+> | --------- | ----------- | ------- |
+> | `db.zig` reader pool | a handful of warm connections | not high-cardinality |
+> | `query/parser.zig` `Node` | per-request parse tree, paren depth capped at 32 (`max_depth`) and bounded by query length | short-lived and bounded |
+> | `schema.zig` `Field` | one set per collection, resolved at provision time | cold, read-mostly |
+> | realtime subscribers | the one genuinely unbounded set — grows with connected clients | worth re-measuring if fan-out ever shows up in a profile |
+>
+> **Do not "fix" these.** Converting a per-request parse tree to `MultiArrayList`, or swapping pointers for `u32` indexes in a pool of ~8 connections, buys nothing and costs the pointer type-safety §4 itself warns about — it would be exactly the reflexive-DoD violation of the reviewer stance directly above. Kelley empirically validated every DoD change; the honest conclusion here is that the measurement says *no change*. Re-open this only with a profile showing one of these structures on a hot path.
 
 ---
 
