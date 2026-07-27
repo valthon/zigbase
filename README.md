@@ -248,6 +248,12 @@ ZigBase is **secure by default**:
   `--trust-proxy` (`ZIGBASE_TRUST_PROXY=true`) is set, so direct exposure can't be bypassed
   by spoofing those headers. Enable it only behind a trusted reverse proxy.
 
+**Reporting a vulnerability:** please report privately via
+[the Security tab](https://github.com/valthon/zigbase/security/advisories/new), never in a
+public issue. [SECURITY.md](SECURITY.md) covers supported versions, what to include, what to
+expect, and what is explicitly out of scope. The full threat model and every past finding
+with its fix are in [docs/security-audit.md](docs/security-audit.md).
+
 ## Project layout
 
 ```
@@ -285,6 +291,7 @@ examples/
 - [docs/kotlin-sdk.md](docs/kotlin-sdk.md) — the official Kotlin SDK: a coroutine-first `ZigbaseClient` for auth, records, offset + cursor pagination, and files
 - [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md) — current caveats
 - [CHANGELOG.md](CHANGELOG.md) — release history
+- [SECURITY.md](SECURITY.md) — supported versions and how to report a vulnerability
 
 ## Changelog
 
