@@ -1,0 +1,2 @@
+### Internal
+- `CODE_OF_CONDUCT.md` now matches the canonical Contributor Covenant 2.1 text exactly, differing only in the `[INSERT CONTACT METHOD]` substitution, so GitHub's community profile identifies it as Contributor Covenant rather than "Other". The guidance it previously carried inline — conduct concerns go to the enforcement contact, not to a public issue and not to the security advisory form — moved to `CONTRIBUTING.md`, which already routes the other "never file this publicly" case.

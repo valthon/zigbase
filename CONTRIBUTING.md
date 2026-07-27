@@ -5,7 +5,13 @@ well-scoped contributions — a bug report with a real repro, a docs fix, a focu
 genuinely useful.
 
 By participating you agree to abide by the [Code of Conduct](CODE_OF_CONDUCT.md).
-For **security vulnerabilities**, do not open an issue — follow [SECURITY.md](SECURITY.md).
+
+**Two things never belong in a public issue**, and they go to different places:
+
+- **Security vulnerabilities** → GitHub's private advisory form, per [SECURITY.md](SECURITY.md).
+- **Conduct concerns** → the enforcement contact in the
+  [Code of Conduct](CODE_OF_CONDUCT.md#enforcement). The security advisory form is for
+  security reports only.
 
 ## Table of contents
 
