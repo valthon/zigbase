@@ -1,0 +1,14 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 📚 Documentation
+    url: https://valthon.github.io/zigbase
+    about: Guides, the REST API reference, the framework/embedding docs, and configuration tables.
+  - name: 🔒 Report a security vulnerability
+    url: https://github.com/valthon/zigbase/security/advisories/new
+    about: Please report vulnerabilities privately, never in a public issue. See SECURITY.md.
+  - name: 📋 Known limitations
+    url: https://github.com/valthon/zigbase/blob/main/KNOWN_LIMITATIONS.md
+    about: Current gaps and deliberate trade-offs. Check here before filing — it may already be listed.
+  - name: 🛠️ Contributing guide
+    url: https://github.com/valthon/zigbase/blob/main/CONTRIBUTING.md
+    about: Development setup, the two test suites, the quality bar, and how to open a PR.

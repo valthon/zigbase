@@ -1,0 +1,158 @@
+name: 🐞 Bug report
+description: Something in ZigBase behaves incorrectly.
+title: "[bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a report.
+
+        > ⚠️ **Found a security vulnerability?** Do not file it here — report it privately via
+        > [the Security tab](https://github.com/valthon/zigbase/security/advisories/new).
+        > See [SECURITY.md](https://github.com/valthon/zigbase/blob/main/SECURITY.md).
+
+        Several ZigBase subsystems are **compile-time gated** and simply absent from a stock
+        build, so the version and build-flag questions below are what make a report actionable.
+
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Before filing
+      options:
+        - label: I searched [existing issues](https://github.com/valthon/zigbase/issues?q=is%3Aissue) and this is not a duplicate.
+          required: true
+        - label: I checked [KNOWN_LIMITATIONS.md](https://github.com/valthon/zigbase/blob/main/KNOWN_LIMITATIONS.md) and this is not a documented trade-off.
+          required: true
+        - label: I reproduced this on the latest [release](https://github.com/valthon/zigbase/releases) or on `main`.
+          required: false
+
+  - type: input
+    id: version
+    attributes:
+      label: ZigBase version
+      description: Output of `zigbase --version`, or the commit SHA you built from.
+      placeholder: "0.12.0 (commit abc1234)"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Which part of ZigBase?
+      options:
+        - Server / REST API
+        - Framework (embedding via App(.{...}) — hooks, routes, cron, plugins)
+        - Admin UI (/_/)
+        - CLI (serve / migrate / superuser / rewrap)
+        - Schema, provisioning, or migrations
+        - Realtime (WebSocket / SSE)
+        - Auth / OAuth2 / sessions
+        - Files & storage
+        - Email / mailer
+        - TypeScript SDK
+        - Dart SDK
+        - Python SDK
+        - Kotlin SDK
+        - Build system / packaging / Docker
+        - Not sure
+    validations:
+      required: true
+
+  - type: dropdown
+    id: deployment
+    attributes:
+      label: How are you running it?
+      options:
+        - Stock binary (`zigbase serve`)
+        - Docker image (ghcr.io/valthon/zigbase)
+        - Embedded as a Zig library in my own app
+        - One of the examples (blog / golfsim / plugins)
+        - Built from source for development
+    validations:
+      required: true
+
+  - type: dropdown
+    id: backend
+    attributes:
+      label: Database backend
+      options:
+        - SQLite (default)
+        - PostgreSQL (-Dpostgres=true)
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: build-flags
+    attributes:
+      label: Non-default build flags in play
+      description: Leave all unchecked for a stock build. These subsystems are absent unless compiled in.
+      options:
+        - label: "`-Dvector=true` (vector search)"
+        - label: "`-Ds3=true` (S3-compatible storage)"
+        - label: "`-Dfts5=false` (lean build, no SQLite FTS5)"
+        - label: "`-Ddev-mode=true` (dev-only test seams — on by default in `Debug`)"
+        - label: "Other (describe it in the additional-context field)"
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Linux
+        - macOS (Apple Silicon)
+        - macOS (Intel)
+        - WSL2
+        - Docker (any host)
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: The actual behavior, including any error message or HTTP status code.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect to happen?
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description: >
+        A minimal reproduction is worth far more than a description. A `curl` sequence, a small
+        `App(.{...})` config, or a failing test is ideal. Include the collection schema and any
+        relevant access rules.
+      placeholder: |
+        1. Start the server: `zigbase serve --insecure-cookies --data-dir ./zb_data`
+        2. Create a collection with: ...
+        3. Request: `curl -i 'http://127.0.0.1:8090/api/collections/posts/records?filter=...'`
+        4. Observe: 500 instead of 200
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant server log output
+      description: Paste the server's stderr around the failure. This is rendered as code — no backticks needed.
+      render: text
+    validations:
+      required: false
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Anything else?
+      description: >
+        Reverse proxy in front? `--trust-proxy` set? Custom `Storage`/`Mailer` plugin? Screenshots
+        for admin-UI issues? Anything that might matter.
+    validations:
+      required: false

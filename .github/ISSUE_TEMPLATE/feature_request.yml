@@ -1,0 +1,107 @@
+name: ✨ Feature request
+description: Propose a new capability or an improvement to an existing one.
+title: "[feature] "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the idea.
+
+        Two things worth knowing before you write:
+
+        - **ZigBase is opinionated about its API surface.** For anything non-trivial, please get
+          agreement on the approach here *before* writing the code — an unsolicited large PR is
+          likely to need substantial rework.
+        - **ZigBase is pre-1.0** and deliberately prefers the better API over backward
+          compatibility. A proposal that breaks an existing API is not disqualified; it just needs
+          to be the better design.
+
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Before filing
+      options:
+        - label: I searched [existing issues](https://github.com/valthon/zigbase/issues?q=is%3Aissue) and this has not been proposed already.
+          required: true
+        - label: I checked [KNOWN_LIMITATIONS.md](https://github.com/valthon/zigbase/blob/main/KNOWN_LIMITATIONS.md) and the [docs](https://valthon.github.io/zigbase) — this is not already tracked or already possible.
+          required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this solve?
+      description: >
+        Describe the concrete use case, not the solution. What are you trying to build, and where
+        does ZigBase get in the way today? What do you do instead right now?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: >
+        What should ZigBase do? If it touches an API, sketch it — a config literal, a route shape,
+        a function signature. Concrete beats abstract.
+      placeholder: |
+        App(.{
+            .thing = .{ .enabled = true, .knob = 42 },
+        })
+    validations:
+      required: true
+
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Which surface would this touch?
+      options:
+        - REST API (endpoints, query syntax, response shapes)
+        - Framework / comptime API (App config, hooks, routes, cron, plugins)
+        - Schema, fields, or migrations
+        - Access rules & authorization
+        - Auth / OAuth2 / sessions
+        - Realtime (WebSocket / SSE)
+        - Files & storage
+        - Email / mailer
+        - Admin UI
+        - CLI / configuration / deployment
+        - A client SDK (TypeScript / Dart / Python / Kotlin)
+        - Not sure
+    validations:
+      required: true
+
+  - type: dropdown
+    id: plane
+    attributes:
+      label: Where would this be configured?
+      description: >
+        ZigBase assigns config to planes deliberately (see docs/framework.md §3) — **comptime** for
+        structure, **environment** for values that vary per deployment, **build flag** for anything
+        that costs binary size or links a dependency. Best guess is fine.
+      options:
+        - Comptime App config (structure)
+        - Environment variable / CLI flag (deploy-varying value)
+        - Build flag (has binary-size or dependency cost)
+        - No configuration needed
+        - Not sure
+    validations:
+      required: false
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: >
+        Other designs you weighed, how other backends (PocketBase, Supabase, Firebase) handle this,
+        or why an existing ZigBase feature does not cover it.
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: commitment
+    attributes:
+      label: Scope
+      options:
+        - label: This would be a **breaking change** to an existing API.
+        - label: I would be willing to implement this myself, given agreement on the approach.

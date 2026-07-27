@@ -248,6 +248,12 @@ ZigBase is **secure by default**:
   `--trust-proxy` (`ZIGBASE_TRUST_PROXY=true`) is set, so direct exposure can't be bypassed
   by spoofing those headers. Enable it only behind a trusted reverse proxy.
 
+**Reporting a vulnerability:** please report privately via
+[the Security tab](https://github.com/valthon/zigbase/security/advisories/new), never in a
+public issue. [SECURITY.md](SECURITY.md) covers supported versions, what to include, what to
+expect, and what is explicitly out of scope. The full threat model and every past finding
+with its fix are in [docs/security-audit.md](docs/security-audit.md).
+
 ## Project layout
 
 ```
@@ -285,6 +291,21 @@ examples/
 - [docs/kotlin-sdk.md](docs/kotlin-sdk.md) — the official Kotlin SDK: a coroutine-first `ZigbaseClient` for auth, records, offset + cursor pagination, and files
 - [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md) — current caveats
 - [CHANGELOG.md](CHANGELOG.md) — release history
+- [CONTRIBUTING.md](CONTRIBUTING.md) — development setup, the two test suites, the quality bar, and how to open a PR
+- [SECURITY.md](SECURITY.md) — supported versions and how to report a vulnerability
+
+## Contributing
+
+Contributions are welcome — bug reports with a real reproduction, docs fixes, and focused PRs
+especially. Start with **[CONTRIBUTING.md](CONTRIBUTING.md)**: it covers the pinned toolchain,
+the **two** test suites (a green `zig build test` does *not* imply a green browser suite), the
+[`NO_SLOP.md`](NO_SLOP.md) quality bar, changelog fragments, and the docs/examples sync rules.
+
+For anything non-trivial, open an issue and get agreement on the approach before writing the
+code. AI-assisted contributions are welcome and are judged on the same terms as any other code
+— see [CONTRIBUTING.md → AI-assisted contributions](CONTRIBUTING.md#ai-assisted-contributions).
+
+Everyone participating is expected to follow the [Code of Conduct](CODE_OF_CONDUCT.md).
 
 ## Changelog
 

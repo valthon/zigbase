@@ -1,0 +1,78 @@
+name: 📚 Documentation issue
+description: Something in the docs is wrong, missing, or confusing.
+title: "[docs] "
+labels: ["documentation"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Documentation bugs are real bugs — stale guidance on a backend can be actively unsafe.
+
+        > 💡 **Sending a PR instead?** Edit the **canonical** file, not the published mirror. Pages
+        > under `site/src/content/docs/` are *generated* from `docs/*.md` (plus `CHANGELOG.md` and
+        > `KNOWN_LIMITATIONS.md`) and are gitignored build artifacts — hand-edits there are lost.
+        > The only site-authored pages are `configuration.md`, `overview.md`, and the `.mdx` pages.
+        > See [CONTRIBUTING.md](https://github.com/valthon/zigbase/blob/main/CONTRIBUTING.md#keeping-docs-and-examples-in-sync).
+
+  - type: dropdown
+    id: location
+    attributes:
+      label: Where is the problem?
+      options:
+        - Published docs site (valthon.github.io/zigbase)
+        - README.md
+        - docs/*.md in the repository
+        - KNOWN_LIMITATIONS.md
+        - CHANGELOG.md
+        - An example's README (blog / golfsim / plugins)
+        - A client SDK's docs (TypeScript / Dart / Python / Kotlin)
+        - Doc comments in the source
+    validations:
+      required: true
+
+  - type: input
+    id: page
+    attributes:
+      label: Page or file
+      description: The URL of the page, or the path in the repository. A heading or anchor helps.
+      placeholder: "docs/framework.md § Scheduled jobs — or https://valthon.github.io/zigbase/docs/api/"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: kind
+    attributes:
+      label: What kind of problem?
+      options:
+        - Factually wrong — it does not behave as documented
+        - Out of date — it described an older version
+        - Missing — a feature or option is not documented at all
+        - Confusing or ambiguous
+        - Broken link, bad example code, or a typo
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What is wrong?
+      description: >
+        Quote the passage if you can. For "factually wrong", say what the docs claim and what
+        actually happens — that is a code bug or a docs bug, and either way it needs fixing.
+    validations:
+      required: true
+
+  - type: textarea
+    id: suggestion
+    attributes:
+      label: Suggested wording or fix
+      description: Even a rough sketch of the correct explanation is genuinely helpful.
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: commitment
+    attributes:
+      label: Scope
+      options:
+        - label: I would be willing to open a PR for this.
