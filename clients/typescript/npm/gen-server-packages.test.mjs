@@ -57,6 +57,39 @@ test("meta README has a row per target", () => {
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
+test("alias package.json: bare name, own bin, thin file list, no platform gate", () => {
+  const dir = generate();
+  try {
+    const pkg = readJson(dir, "alias", "package.json");
+    assert.equal(pkg.name, "zigbase");
+    assert.equal(pkg.version, "9.9.9");
+    assert.equal(pkg.license, "Apache-2.0");
+    // Its own bin, or `npx zigbase` and `npm i -g zigbase` have no command to run.
+    assert.equal(pkg.bin.zigbase, "bin/zigbase.js");
+    assert.equal(pkg.main, "index.js");
+    assert.deepEqual(pkg.files, ["bin", "index.js", "README.md"]);
+    assert.deepEqual(pkg.publishConfig, { access: "public" });
+    // No os/cpu: the alias installs everywhere and lets @zigbase/server's
+    // optionalDependencies pick the platform.
+    assert.equal(pkg.os, undefined);
+    assert.equal(pkg.cpu, undefined);
+    // No optionalDependencies either — it owns no binary.
+    assert.equal(pkg.optionalDependencies, undefined);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("alias pins @zigbase/server to its own exact version", () => {
+  const dir = generate();
+  try {
+    const pkg = readJson(dir, "alias", "package.json");
+    const meta = readJson(dir, "server", "package.json");
+    // A skew here ships an alias whose only dependency does not exist.
+    assert.deepEqual(pkg.dependencies, { "@zigbase/server": "9.9.9" });
+    assert.equal(pkg.dependencies["@zigbase/server"], meta.version);
+    assert.equal(pkg.version, meta.version);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
 test("one entry per target -> one platform dir each, no more", () => {
   const dir = generate();
   try {
