@@ -1,0 +1,5 @@
+### Features
+- The server is now distributed under the bare npm name `zigbase` in addition to `@zigbase/server`, so `npx zigbase serve …` works and `require("zigbase")` re-exports `binaryPath()`. The alias ships no binary and pins one exact `@zigbase/server` version, which stays the canonical package to depend on; installing both is harmless even though both provide a `zigbase` command. The unscoped name is claimed by a one-time manual publish — see `clients/typescript/npm/RELEASING.md`.
+
+### Internal
+- `gen-server-packages.mjs` emits the alias manifest from the same `build.zig.zon` version as the meta package, so the alias and its `@zigbase/server` pin cannot drift, and `publish.mjs` re-checks the pin before publishing. It gains a `--what alias` scope (no cross-build, publishes only `zigbase`) which is also how the name gets claimed; `release.yml` publishes the alias after the meta on a `v*` tag. New `test-alias-install.mjs` packs real tarballs and installs them with no registry access, covering the `npx` path that requires the alias to declare its own bin, argv and exit-code forwarding through both shims, and the duplicate-bin case.
