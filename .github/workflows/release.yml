@@ -171,6 +171,15 @@ jobs:
         run: chmod +x clients/typescript/npm/server-*/zigbase
       - name: Publish server packages (platform → meta) with provenance
         run: node clients/typescript/npm/publish.mjs --skip-build --provenance --what server
+      # The bare `zigbase` alias pins the exact @zigbase/server version, so it
+      # ships with every server release and only after the meta package above.
+      # PREREQUISITE, ONCE: the unscoped name must already exist on the registry
+      # with a trusted publisher configured — OIDC cannot bootstrap a package that
+      # has never been published. Until a human does the manual name-claim publish
+      # (clients/typescript/npm/RELEASING.md § "Claiming the bare `zigbase` name"),
+      # this step fails with a 403 while the server packages above still publish.
+      - name: Publish the bare `zigbase` alias with provenance
+        run: node clients/typescript/npm/publish.mjs --skip-build --provenance --what alias
 
   publish-typegen:
     if: startsWith(github.ref_name, 'typegen-v')

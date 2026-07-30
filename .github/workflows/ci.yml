@@ -468,6 +468,11 @@ jobs:
         run: mise exec node@24 -- npm install && mise exec node@24 -- npm run typecheck && mise exec node@24 -- npm run test:e2e
       - name: Server package generator unit test
         run: cd clients/typescript/npm && mise exec node@24 -- node --test gen-server-packages.test.mjs
+      # Packs the bare `zigbase` alias + @zigbase/server + a stub platform package
+      # into tarballs and installs them. No zig build, and no registry access
+      # (a dead registry / an empty offline cache proves resolution stays local).
+      - name: Bare `zigbase` alias install test
+        run: cd clients/typescript/npm && mise exec node@24 -- node --test test-alias-install.mjs
 
   dart-sdk:
     runs-on: ubuntu-latest

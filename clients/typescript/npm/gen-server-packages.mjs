@@ -1,8 +1,9 @@
 #!/usr/bin/env node
-// Generate the @zigbase/server* npm package.json + README files from the single
-// source of truth (server/targets.json) and the version in build.zig.zon. The
-// generated files are gitignored; only this script + targets.json are committed.
-// Adding a platform = one entry in server/targets.json.
+// Generate the @zigbase/server* npm package.json + README files, plus the bare
+// `zigbase` alias manifest, from the single source of truth (server/targets.json)
+// and the version in build.zig.zon. The generated files are gitignored; only this
+// script + targets.json are committed. Adding a platform = one entry in
+// server/targets.json.
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -33,7 +34,44 @@ export function versionFromBuildZon(repoRoot) {
 }
 
 /**
- * Generate the platform + meta package.json/README into `npmDir`.
+ * The bare, unscoped `zigbase` alias. Emitted from the *same* `version` binding
+ * as the meta package on purpose: the alias pins `@zigbase/server` exactly, and a
+ * skew between the two would install an alias whose only dependency does not
+ * exist. Sharing one variable makes that unrepresentable, which is why this lives
+ * inside genServerPackages rather than in a generator of its own.
+ *
+ * Only package.json is generated (the version must track build.zig.zon);
+ * index.js, bin/zigbase.js and README.md are committed sources with no dynamic
+ * content.
+ */
+function writeAliasPackage(npmDir, version) {
+  const dir = join(npmDir, "alias");
+  mkdirSync(dir, { recursive: true });
+  const path = join(dir, "package.json");
+  writeJson(path, {
+    name: "zigbase",
+    version,
+    description: "ZigBase server — alias of @zigbase/server (the canonical package).",
+    // Declared even though @zigbase/server declares the same bin name: `npx
+    // zigbase` takes the command from the requested package's own manifest, and a
+    // global install links only the installed package's own bins. See
+    // alias/bin/zigbase.js and alias/README.md.
+    bin: { zigbase: "bin/zigbase.js" },
+    main: "index.js",
+    files: ["bin", "index.js", "README.md"],
+    engines: { node: ">=18" },
+    publishConfig: { access: "public" },
+    // Exact, not a range: the alias is a pointer to one @zigbase/server release.
+    dependencies: { "@zigbase/server": version },
+    repository: REPO,
+    license: LICENSE,
+  });
+  return path;
+}
+
+/**
+ * Generate the platform + meta package.json/README and the alias manifest into
+ * `npmDir`.
  * @returns {string[]} the paths written.
  */
 export function genServerPackages({ version, targets, npmDir }) {
@@ -139,6 +177,7 @@ a clear error.
 `,
   );
   written.push(metaPath, metaReadmePath);
+  written.push(writeAliasPackage(npmDir, version));
   return written;
 }
 
@@ -149,5 +188,5 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
   const targets = JSON.parse(readFileSync(join(npmDir, "server", "targets.json"), "utf8"));
   const version = versionFromBuildZon(repoRoot);
   const written = genServerPackages({ version, targets, npmDir });
-  console.log(`generated ${written.length} files for @zigbase/server* at version ${version}`);
+  console.log(`generated ${written.length} files for @zigbase/server* + zigbase at version ${version}`);
 }
