@@ -295,6 +295,30 @@ pub fn build(b: *std.Build) void {
     const run_bench_tests = b.addRunArtifact(bench_tests);
     test_step.dependOn(&run_bench_tests.step);
 
+    // Coverage-guided targets for parsers that consume attacker-controlled bytes.
+    // Keep this off `test_step`: importing the parser modules into this root also
+    // discovers their unit tests, so wiring it there would run 56 duplicate tests in
+    // every CI test configuration. `zig build fuzz` runs seeds; --fuzz=N generates.
+    const fuzz_step = b.step("fuzz", "Fuzz attacker-controlled parser surfaces (pass --fuzz=N)");
+    const fuzz_compile_step = b.step("fuzz-compile", "Compile fuzz harnesses without running imported tests");
+    inline for (.{
+        "src/fuzz_filter.zig",
+        "src/fuzz_query_connstr.zig",
+        "src/fuzz_webauthn.zig",
+    }) |root_source_file| {
+        const parser_fuzz_mod = b.createModule(.{
+            .root_source_file = b.path(root_source_file),
+            .target = target,
+            // Zig 0.16.0's Debug test runner has a StackTrace type mismatch when it
+            // rebuilds fuzz mode. ReleaseSafe preserves runtime safety while also
+            // making campaigns fast enough for useful local iteration counts.
+            .optimize = .ReleaseSafe,
+        });
+        const parser_fuzz_tests = b.addTest(.{ .root_module = parser_fuzz_mod });
+        fuzz_compile_step.dependOn(&parser_fuzz_tests.step);
+        fuzz_step.dependOn(&b.addRunArtifact(parser_fuzz_tests).step);
+    }
+
     // --- codegen: generate the dating fixture's typed client -------------------
     // This is the Plan-1 Definition of Done for Task 7. Uses b.path(...) directly
     // (no b.dependency) since the dating fixture lives in this repo.

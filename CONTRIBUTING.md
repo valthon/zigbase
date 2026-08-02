@@ -168,7 +168,12 @@ zig fmt --check src build.zig     # formatting gate
 ./scripts/check-gating.sh         # optional subsystems must be comptime-gated (absent-symbols check)
 ./scripts/check-allocator-contracts.sh   # allocator ownership-contract ratchet
 zig build audit                   # pinned dependency versions vs. docs/security-advisories.md
+zig build fuzz --fuzz=100000      # bounded coverage-guided parser fuzzing
 ```
+
+The parser fuzz targets cover filter/query grammars, PostgreSQL connection strings, and
+WebAuthn CBOR/authenticator data. Use `zig build fuzz --fuzz` to run continuously;
+`zig build fuzz` executes only the checked-in seed corpora and exits.
 
 CI additionally builds all three examples and several fixture binaries, and runs PostgreSQL,
 PostgreSQL-over-TLS, S3/MinIO, and the four client-SDK jobs. If your change touches a client SDK's
