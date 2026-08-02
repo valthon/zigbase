@@ -6,6 +6,12 @@ const crypto = zigbase.crypto;
 const data = zigbase.data;
 const Db = zigbase.Db;
 
+comptime {
+    if (zigbase.internal.dev_mode_enabled) {
+        @compileError("benchmark module must keep dev_mode off so measurements match production seams");
+    }
+}
+
 // A representative record row: an id + two text columns + a number. `data.queryAs` decodes
 // each result column BY NAME into these fields, allocating a copy of every text value per row
 // — the per-row read/coerce cost that runs on every list/query request.

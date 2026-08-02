@@ -1,5 +1,55 @@
 const std = @import("std");
 
+const BuildOptionValues = struct {
+    version: []const u8,
+    min_zig_version: []const u8,
+    commit: []const u8,
+    dev_mode: bool,
+    internal_api: bool,
+    vector: bool,
+    postgres: bool,
+    s3: bool,
+    fts5: bool,
+    sqlite_version: []const u8,
+    sqlite_source_id: []const u8,
+    sqlite_vec_version: []const u8,
+    zap_version: []const u8,
+    zap_commit: []const u8,
+    facil_version: []const u8,
+};
+
+fn createBuildOptions(b: *std.Build, values: BuildOptionValues) *std.Build.Step.Options {
+    const options = b.addOptions();
+    inline for (@typeInfo(BuildOptionValues).@"struct".fields) |field| {
+        options.addOption(field.type, field.name, @field(values, field.name));
+    }
+    return options;
+}
+
+fn configureZigbaseModule(
+    b: *std.Build,
+    module: *std.Build.Module,
+    build_options: *std.Build.Step.Options,
+    zap_module: *std.Build.Module,
+    sqlite_flags: []const []const u8,
+    vector: bool,
+) void {
+    module.addOptions("build_options", build_options);
+    module.addIncludePath(b.path("vendor/sqlite"));
+    module.addCSourceFile(.{
+        .file = b.path("vendor/sqlite/sqlite3.c"),
+        .flags = sqlite_flags,
+    });
+    if (vector) {
+        module.addIncludePath(b.path("vendor/sqlite-vec"));
+        module.addCSourceFile(.{
+            .file = b.path("vendor/sqlite-vec/sqlite-vec.c"),
+            .flags = &.{ "-DSQLITE_CORE", "-DSQLITE_VEC_STATIC" },
+        });
+    }
+    module.addImport("zap", zap_module);
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -26,12 +76,9 @@ pub fn build(b: *std.Build) void {
     // `git rev-parse` and, if that's unavailable (sandboxed configure step, no git on PATH),
     // falls back to a spawn-free parse of `.git` (worktree-aware) before giving up.
     const commit_override = b.option([]const u8, "commit", "Commit SHA to bake into --version (CI/release inject the real SHA; default: auto-detect from git)");
-    const build_options = b.addOptions();
-    build_options.addOption([]const u8, "version", @import("build.zig.zon").version);
+    const commit = commit_override orelse gitCommit(b);
     // Single-source the required Zig version so the compile-time guard in
     // src/zig_compat.zig can reject an unsupported compiler with a clear message.
-    build_options.addOption([]const u8, "min_zig_version", @import("build.zig.zon").minimum_zig_version);
-    build_options.addOption([]const u8, "commit", commit_override orelse gitCommit(b));
     // Dev-only seams (injectable clock, seeded entropy, test-capture, fake field-crypto).
     // Compiled in ONLY when this is true so a production binary can never use any of them.
     // Defaults to on in Debug, off in any release/optimized build; the release script
@@ -39,7 +86,6 @@ pub fn build(b: *std.Build) void {
     // override code folds to comptime-dead. Override with -Ddev-mode=true to build a
     // debuggable binary that still honors the dev-only env vars (e2e dev).
     const dev_mode = b.option(bool, "dev-mode", "Compile in the dev-only, never-in-prod seams: ZIGBASE_FAKE_NOW clock, ZIGBASE_FAKE_SEED entropy, test-capture, and ZIGBASE_FIELD_CRYPTO fake crypto (default: on in Debug, off in release)") orelse (optimize == .Debug);
-    build_options.addOption(bool, "dev_mode", dev_mode);
     // Opt-in vector search (#157; Postgres pgvector port #159). OFF by default: the default build
     // does NOT compile or link the sqlite-vec amalgamation, and every vector code path folds to
     // comptime-dead — the shipped binary is byte-for-byte unaffected. `-Dvector=true` enables vector
@@ -49,21 +95,18 @@ pub fn build(b: *std.Build) void {
     // is a server EXTENSION (no C to compile here); the target PG must have it available (e.g. the
     // `pgvector/pgvector:pgNN` image). One flag keeps the opt-in symmetric across backends.
     const vector = b.option(bool, "vector", "Compile in opt-in vector search — sqlite-vec on SQLite, pgvector on Postgres (default: off)") orelse false;
-    build_options.addOption(bool, "vector", vector);
     // Opt-in pure-Zig PostgreSQL backend (#159). OFF by default: when false, the entire
     // src/backend/postgres/ subtree is comptime-unreachable (gated in src/root.zig and, in
     // PR-1b, db.zig), so the default build links zero new symbols and is byte-identical.
     // The driver is pure Zig std (TLS via std.crypto.tls.Client, SCRAM via std.crypto) — no
     // C/libpq/OpenSSL to compile, so unlike -Dvector there is no extra C source to add here.
     const postgres = b.option(bool, "postgres", "Compile in the opt-in pure-Zig PostgreSQL wire-protocol backend (default: off)") orelse false;
-    build_options.addOption(bool, "postgres", postgres);
     // Opt-in S3-compatible storage backend (SP3 Theme D §D). OFF by default: when false,
     // src/files/s3.zig is comptime-unreachable (conditional @import in framework.zig /
     // root.zig — the db.zig:27 postgres pattern), so the default build compiles zero S3
     // code. Pure Zig (the shared http_client + the aws/sigv4 signer, both of which the
     // default build already ships via SES) — no extra C sources.
     const s3 = b.option(bool, "s3", "Compile in the opt-in S3-compatible storage backend (default: off)") orelse false;
-    build_options.addOption(bool, "s3", s3);
     // SQLite FTS5 full-text search (#157). ON by default — it's a core feature, not an
     // experiment. `-Dfts5=false` is the opt-OUT for lean custom builds that never declare a
     // `.searchable` field: it drops `-DSQLITE_ENABLE_FTS5` from the SQLite C build (~250-400 KB
@@ -73,7 +116,6 @@ pub fn build(b: *std.Build) void {
     // runtime 500 on first search). Postgres full-text search (tsvector/GIN) is a server-native
     // feature and is NOT gated by this flag.
     const fts5 = b.option(bool, "fts5", "Compile SQLite FTS5 full-text search into the binary (default true; -Dfts5=false for lean builds without .searchable fields)") orelse true;
-    build_options.addOption(bool, "fts5", fts5);
 
     // --- Vendored/native component version transparency (#282) ---------------------
     // Single-source the pinned versions of the vendored/native dependencies at CONFIGURE
@@ -85,16 +127,25 @@ pub fn build(b: *std.Build) void {
     // ships bundled inside the pinned zap and has no in-tree header, so it is a curated const
     // tied to the zap pin — bump it when re-pinning zap. See docs/security-advisories.md and
     // docs/security-audit.md ("Dependency version transparency & supply-chain auditing").
-    build_options.addOption([]const u8, "sqlite_version", readCDefineStr(b, "vendor/sqlite/sqlite3.h", "SQLITE_VERSION"));
-    build_options.addOption([]const u8, "sqlite_source_id", readCDefineStr(b, "vendor/sqlite/sqlite3.h", "SQLITE_SOURCE_ID"));
-    build_options.addOption([]const u8, "sqlite_vec_version", readCDefineStr(b, "vendor/sqlite-vec/sqlite-vec.h", "SQLITE_VEC_VERSION"));
-    build_options.addOption([]const u8, "zap_version", "0.10.6"); // curated: matches the zap pin in build.zig.zon
-    build_options.addOption([]const u8, "zap_commit", zapPinnedCommit());
-    build_options.addOption([]const u8, "facil_version", "0.7.4"); // curated: facil.io bundled inside the pinned zap (bump on zap re-pin)
+    const option_values: BuildOptionValues = .{
+        .version = @import("build.zig.zon").version,
+        .min_zig_version = @import("build.zig.zon").minimum_zig_version,
+        .commit = commit,
+        .dev_mode = dev_mode,
+        .internal_api = false,
+        .vector = vector,
+        .postgres = postgres,
+        .s3 = s3,
+        .fts5 = fts5,
+        .sqlite_version = readCDefineStr(b, "vendor/sqlite/sqlite3.h", "SQLITE_VERSION"),
+        .sqlite_source_id = readCDefineStr(b, "vendor/sqlite/sqlite3.h", "SQLITE_SOURCE_ID"),
+        .sqlite_vec_version = readCDefineStr(b, "vendor/sqlite-vec/sqlite-vec.h", "SQLITE_VEC_VERSION"),
+        .zap_version = "0.10.6", // curated: matches the zap pin in build.zig.zon
+        .zap_commit = zapPinnedCommit(),
+        .facil_version = "0.7.4", // curated: facil.io bundled inside the pinned zap (bump on zap re-pin)
+    };
+    const build_options = createBuildOptions(b, option_values);
 
-    zigbase_mod.addOptions("build_options", build_options);
-
-    zigbase_mod.addIncludePath(b.path("vendor/sqlite"));
     const sqlite_base_flags = [_][]const u8{
         "-DSQLITE_THREADSAFE=1",
         "-DSQLITE_DQS=0",
@@ -117,22 +168,8 @@ pub fn build(b: *std.Build) void {
         &(sqlite_base_flags ++ [_][]const u8{"-DSQLITE_ENABLE_FTS5"})
     else
         &sqlite_base_flags;
-    zigbase_mod.addCSourceFile(.{
-        .file = b.path("vendor/sqlite/sqlite3.c"),
-        .flags = sqlite_flags,
-    });
-    // Opt-in vector search: compile the sqlite-vec amalgamation STATICALLY into the same module
-    // (SQLITE_CORE => it includes our vendored sqlite3.h and links against the in-tree SQLite;
-    // SQLITE_VEC_STATIC => no dllexport shims). Only when -Dvector=true, so the default build is
-    // untouched. db.zig calls sqlite3_vec_init on each connection (gated on build_options.vector).
-    if (vector) {
-        zigbase_mod.addIncludePath(b.path("vendor/sqlite-vec"));
-        zigbase_mod.addCSourceFile(.{
-            .file = b.path("vendor/sqlite-vec/sqlite-vec.c"),
-            .flags = &.{ "-DSQLITE_CORE", "-DSQLITE_VEC_STATIC" },
-        });
-    }
-    zigbase_mod.addImport("zap", zap.module("zap"));
+    // Opt-in vector search compiles sqlite-vec statically into each ZigBase module.
+    configureZigbaseModule(b, zigbase_mod, build_options, zap.module("zap"), sqlite_flags, vector);
 
     // The shipped binary: a thin consumer of the library module.
     const exe_mod = b.createModule(.{
@@ -171,13 +208,31 @@ pub fn build(b: *std.Build) void {
     audit_step.dependOn(&audit_cmd.step);
 
     // --- bench: allocation + timing harness (report-only; see the allocator-ownership spec)
+    // Benchmarks have an independent optimization mode: ReleaseFast by default,
+    // overridable with -Dbench-optimize=Debug|ReleaseSafe|ReleaseFast|ReleaseSmall.
+    // Their private ZigBase module enables only the internal benchmark API surface;
+    // dev-only clock, entropy, capture, and fake-crypto seams remain compiled out so
+    // measured record paths match the production shape.
+    const bench_optimize = b.option(std.builtin.OptimizeMode, "bench-optimize", "Optimization mode for `zig build bench` (default: ReleaseFast)") orelse .ReleaseFast;
+    var bench_option_values = option_values;
+    bench_option_values.dev_mode = false;
+    bench_option_values.internal_api = true;
+    const bench_build_options = createBuildOptions(b, bench_option_values);
+    const bench_zap = b.dependency("zap", .{ .target = target, .optimize = bench_optimize });
+    const bench_zigbase_mod = b.createModule(.{
+        .root_source_file = b.path("src/root.zig"),
+        .target = target,
+        .optimize = bench_optimize,
+        .link_libc = true,
+    });
+    configureZigbaseModule(b, bench_zigbase_mod, bench_build_options, bench_zap.module("zap"), sqlite_flags, vector);
     const bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/main.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = bench_optimize,
         .link_libc = true,
     });
-    bench_mod.addImport("zigbase", zigbase_mod);
+    bench_mod.addImport("zigbase", bench_zigbase_mod);
     const bench_exe = b.addExecutable(.{ .name = "zigbase-bench", .root_module = bench_mod });
     const bench_run = b.addRunArtifact(bench_exe);
     if (b.args) |args| bench_run.addArgs(args);

@@ -4,4 +4,4 @@
 
 ### Internal
 
-- Added bounded coverage-guided fuzz targets for filter, query-string, PostgreSQL connection-string, and WebAuthn parsers.
+- Added bounded coverage-guided fuzz targets for filter, query-string, PostgreSQL connection-string, and WebAuthn parsers, and corrected optimized-mode configuration in the benchmark harness.
