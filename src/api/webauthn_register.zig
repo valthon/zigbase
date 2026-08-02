@@ -412,14 +412,7 @@ test "webauthn_register finish: stores credential and returns 204" {
         defer env.pool.releaseWriter();
         const cred_store = CredentialStore{ .conn = w2 };
         const cred = (try cred_store.getByCredentialId(alloc, cred_id_b64)).?;
-        defer {
-            alloc.free(cred.id);
-            alloc.free(cred.collection_ref);
-            alloc.free(cred.record_ref);
-            alloc.free(cred.credential_id);
-            alloc.free(cred.public_key);
-            alloc.free(cred.aaguid);
-        }
+        defer cred.deinit(alloc);
         // SECURITY: record_ref must be the authed user id, not anything from the body.
         try std.testing.expectEqualStrings(rid, cred.record_ref);
         try std.testing.expectEqualStrings("wrusers3", cred.collection_ref);

@@ -1046,7 +1046,7 @@ pub fn applyMultipart(ctx: *http.RequestCtx) error{OutOfMemory}!?http.Response {
     if (!std.mem.startsWith(u8, ctx.content_type, "multipart/form-data")) return null;
     // Hand-rolled parser over the raw body: facil.io's param parsing type-guesses
     // multipart values (text "123" -> int), so it must never see this body.
-    const ex = files_multipart.parse(ctx.allocator.a, ctx.content_type, ctx.body) catch |e| switch (e) {
+    const ex = files_multipart.parse(ctx.allocator, ctx.content_type, ctx.body) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         error.BadMultipart => return try ApiError.badRequest("Invalid multipart body.").toResponse(ctx.allocator.a),
     };

@@ -169,6 +169,8 @@ jobs:
         run: mise exec zig@0.16.0 -- zig fmt --check src build.zig
       - name: Unit tests
         run: mise exec zig@0.16.0 -- zig build test --summary all
+      - name: Compile fuzz harnesses
+        run: mise exec zig@0.16.0 -- zig build fuzz-compile --summary all
       - name: "Unit tests (prod gate: -Ddev-mode=false)"
         run: mise exec zig@0.16.0 -- zig build test --summary all -Ddev-mode=false
       # Lean-build gate (R2-6): -Dfts5=false must still COMPILE — the whole point is that FTS5 (and

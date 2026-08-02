@@ -53,7 +53,28 @@ for rev in "$A" "$B"; do
 
   created_worktrees+=("$wt")
   git_quiet worktree add --detach "$wt" "$rev"
-  ( cd "$wt" && "${ZIG[@]}" build bench -- --json ) > "$json"
+  # Pin ReleaseFast explicitly for meaningful, comparable timings. Revisions that
+  # expose -Ddev-mode also need it for the bench-only `zigbase.internal` surface;
+  # older releases predate that option and hard-error if an unknown -D flag is passed.
+  if ! build_help="$(cd "$wt" && "${ZIG[@]}" build -h 2>&1)"; then
+    printf 'error: revision %s failed to configure with Zig 0.16.0:\n%s\n' "$rev" "$build_help" >&2
+    exit 1
+  fi
+  if ! grep -q '^[[:space:]]*bench[[:space:]]' <<< "$build_help"; then
+    printf 'error: revision %s predates the benchmark harness (requires 1fb8873 or newer)\n' "$rev" >&2
+    exit 2
+  fi
+  if grep -q -- '-Dbench-optimize' <<< "$build_help"; then
+    bench_flags=(-Dbench-optimize=ReleaseFast)
+  else
+    bench_flags=(-Doptimize=ReleaseFast)
+    # Older harnesses gate module access on dev_mode. Newer revisions expose a
+    # benchmark-only internal_api and therefore keep production seams compiled out.
+    if grep -q -- '-Ddev-mode' <<< "$build_help"; then
+      bench_flags+=(-Ddev-mode=true)
+    fi
+  fi
+  ( cd "$wt" && "${ZIG[@]}" build bench "${bench_flags[@]}" -- --json ) > "$json"
   git_quiet worktree remove --force "$wt"
   # It's already gone; leaving it in created_worktrees is harmless — the
   # trap's removal is best-effort (errors suppressed) and a second attempt

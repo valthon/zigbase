@@ -1,0 +1,41 @@
+name: Parser fuzzing
+
+on:
+  schedule:
+    # Nightly, off the hour to avoid the hosted-runner cron stampede.
+    - cron: "31 4 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: parser-fuzz-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  parsers:
+    name: Attacker-controlled parser surfaces
+    runs-on: ubuntu-latest
+    # 10M executions per target can approach the old 20-minute cap on a 4-vCPU
+    # hosted runner. Keep enough headroom for cold builds and corpus slowdown so
+    # successful runs save their accumulated cache instead of timing out.
+    timeout-minutes: 90
+    env:
+      ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-global
+      ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/.zig-local
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v4
+      - name: Cache Zig build artifacts
+        uses: actions/cache@v5
+        with:
+          path: |
+            ${{ github.workspace }}/.zig-global
+            ${{ github.workspace }}/.zig-local
+          key: parser-fuzz-${{ runner.os }}-zig0.16.0-${{ hashFiles('src/fuzz_*.zig', 'src/query/**', 'src/auth/webauthn/**', 'src/backend/postgres/connstr.zig', 'build.zig', 'build.zig.zon') }}
+          restore-keys: parser-fuzz-${{ runner.os }}-zig0.16.0-
+      - name: Run bounded coverage-guided campaigns
+        # 100x the original per-target budget; the job timeout includes headroom
+        # for hosted-runner throughput, cold compilation, and corpus growth.
+        run: mise exec zig@0.16.0 -- zig build fuzz --fuzz=10M --summary all
