@@ -1,0 +1,10 @@
+.{
+    .name = .zigbase_issue_261_repro,
+    .version = "0.0.0",
+    .fingerprint = 0x1fab23c305087e37,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .zigbase = .{ .path = "../.." },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src" },
+}

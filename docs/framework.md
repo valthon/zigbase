@@ -4609,16 +4609,31 @@ build; not gated), e.g. to test key-rotation or envelope-format behavior end-to-
 
 ### Troubleshooting: `zig build test` prints `failed command: …--listen=-`
 
-If `zig build test` in your project reports a failed step like `failed command:
-…/test …--listen=-` **but the same test binary run standalone passes** (`All N tests
-passed`, exit 0), the failure is not in your app or the harness — it is an upstream
-race in **Zig 0.16's build runner**, not zigbase. `zig build test` runs the test
-binary in server mode (`--listen=-`) and the runner polls the child's stdout/stderr;
-the harness boots a real app (a few tens of ms of sqlite/migrations/provisioning), and
-the process's exit-time output can land in a window where the runner mis-reads the
-child's normal EOF as a crash and restarts it — printing that line, and occasionally
-failing (exit 1) under CPU load. It is intermittent by nature (it often silently
-retries to exit 0 when the machine is idle).
+Zig 0.16 can print a scary `failed command: …/test …--listen=-` block for a test
+process that **passed and exited 0**. Check the final `Build Summary` and shell exit
+status before treating that line as a failure:
+
+```sh
+zig build test --summary all
+echo "$?"
+```
+
+The known zigbase case is deterministic and diagnostic-only. The server-mode runner
+receives the passing test result, sends its normal exit request, and observes the child
+exit with code 0. At process exit, vendored facil.io writes a single newline to stderr.
+Zig preserves that byte as warning output but also prints the still-populated
+`result_failed_command`, even though the command succeeded. A minimal Zig+C test whose
+only special behavior is writing `"\n"` from a C destructor reproduces it without
+zigbase, app boot, SQLite, threads, or CPU load.
+
+Building with `-Dcpu=baseline` does not change this diagnostic: native and baseline
+builds both pass and print it. This differs from a reusable binary built on one CI host
+and run on another, where native CPU instructions really can cause `SIGILL`.
+
+If the final build status is nonzero, the child was terminated by a signal, or a real
+test failure is reported, treat that as a separate failure and capture the complete
+`--summary all` output and process wait status. Those outcomes are not explained by the
+benign newline case above.
 
 **Workaround — use a `.simple`-mode test runner** so the build system checks the
 child's exit code instead of the server-protocol stdio stream:
@@ -4633,9 +4648,10 @@ const t = b.addTest(.{
 b.step("test", "run tests").dependOn(&b.addRunArtifact(t).step);
 ```
 
-This still fails the build on a genuine test failure (it rides the exit code) and
-sidesteps the runner race entirely. Tracked upstream against Zig's build runner;
-revisit if a future Zig release fixes the `--listen` protocol path.
+This still fails the build on a genuine test failure (it rides the exit code) and avoids
+the misleading server-mode diagnostic. The repository's complete reproduction,
+instrumentation patch, stress matrix, and candidate Zig fix live in
+`diagnostics/issue-261/`.
 
 ## Compile-time build flags
 
