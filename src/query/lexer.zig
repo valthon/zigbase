@@ -113,8 +113,13 @@ pub fn lex(alloc: std.mem.Allocator, input: []const u8) LexError![]Token {
                     }
                 }
                 if (j >= input.len) return error.UnterminatedString;
-                const text = if (has_escape) try unescape(alloc, input[start..j]) else input[start..j];
+                var owned_text: ?[]const u8 = if (has_escape) try unescape(alloc, input[start..j]) else null;
+                errdefer if (owned_text) |text| alloc.free(text);
+                const text = owned_text orelse input[start..j];
                 try toks.append(alloc, .{ .kind = .string, .text = text });
+                // `toks` owns escaped text after append; disarm the local cleanup so a
+                // later fallible statement added to this scope cannot double-free it.
+                owned_text = null;
                 i = j + 1;
             },
             else => {
@@ -232,6 +237,20 @@ test "lex rejects malformed input" {
     try std.testing.expectError(error.UnexpectedChar, lex(a, "x = -"));
     // A stray character outside the grammar.
     try std.testing.expectError(error.UnexpectedChar, lex(a, "a = %"));
+}
+
+fn lexAllocationFailureCase(a: std.mem.Allocator) !void {
+    const input = "first = 'escaped\\nvalue' && second = 'another\\tvalue'";
+    const toks = try lex(a, input);
+    defer freeTokens(a, input, toks);
+}
+
+test "lex is leak-free at every allocation failure point" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        lexAllocationFailureCase,
+        .{},
+    );
 }
 
 test "lex unescapes backslash escapes in string literals" {

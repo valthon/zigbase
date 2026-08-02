@@ -39,6 +39,15 @@ fn isServerManagedField(name: []const u8) bool {
         std.mem.eql(u8, name, "tokenKey") or std.mem.eql(u8, name, "verified");
 }
 
+/// Insert a borrowed JSON value under an owned copy of `key`. Until `put`
+/// succeeds the map cannot see the key allocation, so guard that handoff here
+/// rather than repeating an easy-to-miss OOM edge at every caller.
+fn putBorrowedField(alloc: std.mem.Allocator, out: *std.json.ObjectMap, key: []const u8, value: std.json.Value) std.mem.Allocator.Error!void {
+    const owned_key = try alloc.dupe(u8, key);
+    errdefer alloc.free(owned_key);
+    try out.put(alloc, owned_key, value);
+}
+
 /// Given the request data for an auth-collection record, return a copy with `passwordHash`,
 /// `tokenKey`, and `verified` populated (plaintext `password` removed). Hashes the `password`.
 /// `min_len` is the collection's minPasswordLength.
@@ -46,16 +55,21 @@ pub fn applyCreate(io: std.Io, alloc: std.mem.Allocator, data: std.json.Value, m
     if (data != .object) return error.PasswordTooShort;
     const pw = (data.object.get("password")) orelse return error.PasswordTooShort;
     if (pw != .string or pw.string.len < min_len) return error.PasswordTooShort;
-    const phc = try crypto.hashPassword(io, alloc, pw.string);
-    const tk = try crypto.genToken(io, alloc, 32);
+    var phc: ?[]const u8 = try crypto.hashPassword(io, alloc, pw.string);
+    errdefer if (phc) |p| alloc.free(p);
+    var tk: ?[]const u8 = try crypto.genToken(io, alloc, 32);
+    errdefer if (tk) |t| alloc.free(t);
     var out: std.json.ObjectMap = .empty;
+    errdefer freeProvisioned(alloc, .{ .object = out });
     var it = data.object.iterator();
     while (it.next()) |e| {
         if (isServerManagedField(e.key_ptr.*)) continue; // never copy server-managed credential fields
-        try out.put(alloc, try alloc.dupe(u8, e.key_ptr.*), e.value_ptr.*);
+        try putBorrowedField(alloc, &out, e.key_ptr.*, e.value_ptr.*);
     }
-    try out.put(alloc, "passwordHash", .{ .string = phc });
-    try out.put(alloc, "tokenKey", .{ .string = tk });
+    try out.put(alloc, "passwordHash", .{ .string = phc.? });
+    phc = null;
+    try out.put(alloc, "tokenKey", .{ .string = tk.? });
+    tk = null;
     try out.put(alloc, "verified", .{ .bool = false }); // never trust a client-supplied verified flag
     return .{ .object = out };
 }
@@ -86,7 +100,7 @@ pub fn applyProvision(io: std.Io, alloc: std.mem.Allocator, data: std.json.Value
     var it = data.object.iterator();
     while (it.next()) |e| {
         if (isServerManagedField(e.key_ptr.*)) continue; // never copy server-managed credential fields
-        try out.put(alloc, try alloc.dupe(u8, e.key_ptr.*), e.value_ptr.*);
+        try putBorrowedField(alloc, &out, e.key_ptr.*, e.value_ptr.*);
     }
     // Once a cred string is in `out`, `out` owns it (freeProvisioned frees it). Null the
     // local so the per-string errdefer above won't ALSO free it on a later error — running
@@ -128,17 +142,22 @@ pub fn applyUpdate(io: std.Io, alloc: std.mem.Allocator, data: std.json.Value, m
     if (data != .object) return data;
     // Always return a stripped copy: client-supplied server-managed fields are never written.
     var out: std.json.ObjectMap = .empty;
+    errdefer freeProvisioned(alloc, .{ .object = out });
     var it = data.object.iterator();
     while (it.next()) |e| {
         if (isServerManagedField(e.key_ptr.*)) continue;
-        try out.put(alloc, try alloc.dupe(u8, e.key_ptr.*), e.value_ptr.*);
+        try putBorrowedField(alloc, &out, e.key_ptr.*, e.value_ptr.*);
     }
     if (data.object.get("password")) |pw| {
         if (pw != .string or pw.string.len < min_len) return error.PasswordTooShort;
-        const phc = try crypto.hashPassword(io, alloc, pw.string);
-        const tk = try crypto.genToken(io, alloc, 32);
-        try out.put(alloc, "passwordHash", .{ .string = phc });
-        try out.put(alloc, "tokenKey", .{ .string = tk }); // rotate, invalidating existing tokens
+        var phc: ?[]const u8 = try crypto.hashPassword(io, alloc, pw.string);
+        errdefer if (phc) |p| alloc.free(p);
+        var tk: ?[]const u8 = try crypto.genToken(io, alloc, 32);
+        errdefer if (tk) |t| alloc.free(t);
+        try out.put(alloc, "passwordHash", .{ .string = phc.? });
+        phc = null;
+        try out.put(alloc, "tokenKey", .{ .string = tk.? }); // rotate, invalidating existing tokens
+        tk = null;
     }
     // `verified` is never written here; it changes only via confirm-verification.
     return .{ .object = out };
@@ -325,6 +344,68 @@ test "applyCreate strips client passwordHash/tokenKey (forces server values)" {
     try std.testing.expect(!std.mem.eql(u8, out.object.get("passwordHash").?.string, "$argon2id$evil"));
     try std.testing.expect(!std.mem.eql(u8, out.object.get("tokenKey").?.string, "evil"));
     try std.testing.expectEqual(false, out.object.get("verified").?.bool);
+}
+
+test "applyUpdate with a too-short password leaks nothing" {
+    const a = std.testing.allocator;
+    var data: std.json.ObjectMap = .empty;
+    defer data.deinit(a);
+    try data.put(a, "displayName", .{ .string = "someone" });
+    try data.put(a, "password", .{ .string = "short" });
+    try std.testing.expectError(error.PasswordTooShort, applyUpdate(std.testing.io, a, .{ .object = data }, 8));
+}
+
+fn applyCreateAllocationFailureCase(a: std.mem.Allocator) !void {
+    var data: std.json.ObjectMap = .empty;
+    defer data.deinit(a);
+    try data.put(a, "email", .{ .string = "oom@example.test" });
+    try data.put(a, "displayName", .{ .string = "OOM probe" });
+    try data.put(a, "password", .{ .string = "longenough" });
+    const out = try applyCreate(std.testing.io, a, .{ .object = data }, 8);
+    defer freeProvisioned(a, out);
+}
+
+test "applyCreate is leak-free at every allocation failure point" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        applyCreateAllocationFailureCase,
+        .{},
+    );
+}
+
+fn applyProvisionAllocationFailureCase(a: std.mem.Allocator) !void {
+    var data: std.json.ObjectMap = .empty;
+    defer data.deinit(a);
+    try data.put(a, "email", .{ .string = "oom@example.test" });
+    try data.put(a, "displayName", .{ .string = "OOM probe" });
+    try data.put(a, "password", .{ .string = "longenough" });
+    const out = try applyProvision(std.testing.io, a, .{ .object = data }, 8);
+    defer freeProvisioned(a, out);
+}
+
+test "applyProvision is leak-free at every allocation failure point" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        applyProvisionAllocationFailureCase,
+        .{},
+    );
+}
+
+fn applyUpdateAllocationFailureCase(a: std.mem.Allocator) !void {
+    var data: std.json.ObjectMap = .empty;
+    defer data.deinit(a);
+    try data.put(a, "displayName", .{ .string = "OOM probe" });
+    try data.put(a, "password", .{ .string = "longenough" });
+    const out = try applyUpdate(std.testing.io, a, .{ .object = data }, 8);
+    defer freeProvisioned(a, out);
+}
+
+test "applyUpdate is leak-free at every allocation failure point" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        applyUpdateAllocationFailureCase,
+        .{},
+    );
 }
 
 /// Free the owned strings shared by `Authed`/`Verified` (contract-2). `record` is a

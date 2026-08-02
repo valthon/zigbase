@@ -26,6 +26,15 @@ pub const Credential = struct {
     alg: i64,
     sign_count: u32,
     aaguid: []const u8,
+
+    pub fn deinit(self: Credential, alloc: std.mem.Allocator) void {
+        alloc.free(self.id);
+        alloc.free(self.collection_ref);
+        alloc.free(self.record_ref);
+        alloc.free(self.credential_id);
+        alloc.free(self.public_key);
+        alloc.free(self.aaguid);
+    }
 };
 
 /// Thin data-access layer over the `_webauthnCredentials` table (created by migration 0008).
@@ -84,15 +93,27 @@ pub const CredentialStore = struct {
         defer st.finalize();
         try st.bindText(1, credential_id_b64);
         if (!try st.step()) return null;
+        const id = try alloc.dupe(u8, st.columnText(0));
+        errdefer alloc.free(id);
+        const collection_ref = try alloc.dupe(u8, st.columnText(1));
+        errdefer alloc.free(collection_ref);
+        const record_ref = try alloc.dupe(u8, st.columnText(2));
+        errdefer alloc.free(record_ref);
+        const credential_id = try alloc.dupe(u8, st.columnText(3));
+        errdefer alloc.free(credential_id);
+        const public_key = try alloc.dupe(u8, st.columnText(4));
+        errdefer alloc.free(public_key);
+        const aaguid = try alloc.dupe(u8, st.columnText(7));
+        errdefer alloc.free(aaguid);
         return .{
-            .id = try alloc.dupe(u8, st.columnText(0)),
-            .collection_ref = try alloc.dupe(u8, st.columnText(1)),
-            .record_ref = try alloc.dupe(u8, st.columnText(2)),
-            .credential_id = try alloc.dupe(u8, st.columnText(3)),
-            .public_key = try alloc.dupe(u8, st.columnText(4)),
+            .id = id,
+            .collection_ref = collection_ref,
+            .record_ref = record_ref,
+            .credential_id = credential_id,
+            .public_key = public_key,
             .alg = st.columnInt(5),
-            .sign_count = @intCast(st.columnInt(6)),
-            .aaguid = try alloc.dupe(u8, st.columnText(7)),
+            .sign_count = std.math.cast(u32, st.columnInt(6)) orelse return error.InvalidSignCount,
+            .aaguid = aaguid,
         };
     }
 
@@ -162,14 +183,7 @@ test "CredentialStore: insert / getByCredentialId / existsCredentialId / updateS
     const maybe = try store.getByCredentialId(alloc, "cred_b64url");
     try std.testing.expect(maybe != null);
     const cred = maybe.?;
-    defer {
-        alloc.free(cred.id);
-        alloc.free(cred.collection_ref);
-        alloc.free(cred.record_ref);
-        alloc.free(cred.credential_id);
-        alloc.free(cred.public_key);
-        alloc.free(cred.aaguid);
-    }
+    defer cred.deinit(alloc);
     try std.testing.expectEqualStrings("users", cred.collection_ref);
     try std.testing.expectEqualStrings("rec001", cred.record_ref);
     try std.testing.expectEqualStrings("pubkey_b64", cred.public_key);
@@ -183,14 +197,7 @@ test "CredentialStore: insert / getByCredentialId / existsCredentialId / updateS
     // --- updateSignCount updates the counter ---
     try store.updateSignCount("cred_b64url", 5);
     const after = (try store.getByCredentialId(alloc, "cred_b64url")).?;
-    defer {
-        alloc.free(after.id);
-        alloc.free(after.collection_ref);
-        alloc.free(after.record_ref);
-        alloc.free(after.credential_id);
-        alloc.free(after.public_key);
-        alloc.free(after.aaguid);
-    }
+    defer after.deinit(alloc);
     try std.testing.expectEqual(@as(u32, 5), after.sign_count);
 
     // --- second insert with same credentialId must fail (UNIQUE constraint) ---
@@ -207,4 +214,14 @@ test "CredentialStore: getByCredentialId returns null for unknown id" {
     const store = CredentialStore{ .conn = &d };
     const result = try store.getByCredentialId(std.testing.allocator, "nonexistent");
     try std.testing.expect(result == null);
+}
+
+test "CredentialStore: invalid persisted signCount returns an error instead of panicking" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try migrations.run(&d);
+    const store = CredentialStore{ .conn = &d };
+    try store.insert(std.testing.allocator, std.testing.io, "users", "rec001", "cred", "key", -7, 0, "", "");
+    try d.exec("UPDATE \"_webauthnCredentials\" SET \"signCount\"=-1 WHERE \"credentialId\"='cred';");
+    try std.testing.expectError(error.InvalidSignCount, store.getByCredentialId(std.testing.allocator, "cred"));
 }
