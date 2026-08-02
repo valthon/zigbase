@@ -1,5 +1,6 @@
 const std = @import("std");
 const http = @import("../http.zig");
+const RequestArena = @import("../request_arena.zig").RequestArena;
 
 pub const Extracted = struct { form_fields: std.json.Value, files: []const http.UploadedFile };
 
@@ -187,8 +188,12 @@ fn nextDelimiter(body: []const u8, delim: []const u8, from: usize) ?Delim {
 /// (typical uploads are a handful of fields + a few files) yet bounds the worst case.
 pub const max_parts = 1024;
 
-/// Field values and file bytes borrow from `body`; names are duped into `alloc`.
-pub fn parse(alloc: std.mem.Allocator, content_type: []const u8, body: []const u8) ParseError!Extracted {
+/// Field values and file bytes borrow from `body`; escaped disposition names and
+/// the object/array backings form an interlinked graph that lives exactly as long
+/// as the request. Requiring `RequestArena` makes that contract explicit and
+/// prevents a general-purpose allocator from being passed accidentally.
+pub fn parse(arena: RequestArena, content_type: []const u8, body: []const u8) ParseError!Extracted {
+    const alloc = arena.a;
     var fields: std.json.ObjectMap = .empty;
     var files: std.ArrayList(http.UploadedFile) = .empty;
 
@@ -242,7 +247,7 @@ const t = std.testing;
 const ct = "multipart/form-data; boundary=XBOUND";
 
 fn parseBody(a: std.mem.Allocator, body: []const u8) !Extracted {
-    return parse(a, ct, body);
+    return parse(RequestArena.forTest(a), ct, body);
 }
 
 test "parse: scalar-looking text values stay verbatim strings" {
@@ -351,7 +356,7 @@ test "parse: quoted boundary in the content-type header" {
     const body = "--q1=z\r\n" ++
         "Content-Disposition: form-data; name=\"x\"\r\n\r\nv\r\n" ++
         "--q1=z--\r\n";
-    const ex = try parse(a, "multipart/form-data; boundary=\"q1=z\"", body);
+    const ex = try parse(RequestArena.forTest(a), "multipart/form-data; boundary=\"q1=z\"", body);
     try t.expectEqualStrings("v", ex.form_fields.object.get("x").?.string);
 }
 
@@ -370,7 +375,7 @@ test "parse: whitespace around '=' in the boundary parameter is tolerated" {
         "multipart/form-data; boundary =\"bnd\"",
         "multipart/form-data; charset=utf-8; boundary = bnd",
     }) |hdr| {
-        const ex = try parse(a, hdr, body);
+        const ex = try parse(RequestArena.forTest(a), hdr, body);
         try t.expectEqualStrings("v", ex.form_fields.object.get("x").?.string);
     }
 }
@@ -409,7 +414,7 @@ test "parse: missing boundary or malformed body errors" {
     var arena = std.heap.ArenaAllocator.init(t.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    try t.expectError(error.BadMultipart, parse(a, "multipart/form-data", "--x\r\n"));
+    try t.expectError(error.BadMultipart, parse(RequestArena.forTest(a), "multipart/form-data", "--x\r\n"));
     try t.expectError(error.BadMultipart, parseBody(a, "no delimiter here"));
     // part started but never terminated
     try t.expectError(error.BadMultipart, parseBody(a, "--XBOUND\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\nv"));
