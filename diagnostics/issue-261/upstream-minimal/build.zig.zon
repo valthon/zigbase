@@ -1,0 +1,8 @@
+.{
+    .name = .zig_test_stderr_diagnostic_repro,
+    .version = "0.0.0",
+    .fingerprint = 0x333008b7d0ec5d8e,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{},
+    .paths = .{ "build.zig", "build.zig.zon", "test.zig", "newline_destructor.c" },
+}

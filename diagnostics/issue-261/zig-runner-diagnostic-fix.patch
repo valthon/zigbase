@@ -1,0 +1,12 @@
+diff --git a/std/Build/Step/Run.zig b/std/Build/Step/Run.zig
+--- a/std/Build/Step/Run.zig
++++ b/std/Build/Step/Run.zig
+@@ -1746 +1746,4 @@
+-                run.step.result_stderr = stderr_owned;
++                run.step.result_stderr = if (std.mem.trim(u8, stderr_owned, &std.ascii.whitespace).len == 0)
++                    ""
++                else
++                    stderr_owned;
+@@ -1754,0 +1758,2 @@
++                options.gpa.free(run.step.result_failed_command.?);
++                run.step.result_failed_command = null;
