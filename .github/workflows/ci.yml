@@ -81,6 +81,14 @@ jobs:
         run: mise exec zig@0.16.0 -- zig build minimal-server
       - name: Build full gating fixture (positive control; also the browser suite's analytics-enabled fixture)
         run: mise exec zig@0.16.0 -- zig build full-fixture -Dcpu=baseline
+      # Fourth gating reference for check-gating.sh: the SAME zigbase binary rebuilt
+      # with -Ddev-tools=false, to a separate --prefix so it doesn't clobber the
+      # default one just built above. Proves init/agents-md/typegen (src/scaffold*.zig,
+      # src/codegen/**) actually disappear from a consumer's own custom build — NOT a
+      # published artifact; every GitHub release / Docker image / npm package we ship
+      # builds at the default (-Ddev-tools on).
+      - name: Build zigbase binary without dev-tools (custom-build proof; not a published artifact)
+        run: mise exec zig@0.16.0 -- zig build -Dcpu=baseline -Ddev-tools=false -p zig-out-devtools-off
       - name: Gating invariant (absent-symbols check)
         run: ./scripts/check-gating.sh
       - name: Allocator ownership contracts (ratchet)
@@ -216,6 +224,13 @@ jobs:
         run: mise exec zig@0.16.0 -- zig build fuzz-compile --summary all
       - name: "Unit tests (prod gate: -Ddev-mode=false)"
         run: mise exec zig@0.16.0 -- zig build test --summary all -Ddev-mode=false
+      # Lean custom-build gate: -Ddev-tools=false must still compile AND pass the full
+      # suite — proves the stripped configuration (no init/agents-md/typegen; see
+      # src/devtools.zig) doesn't rot silently. NOT how we build our own published
+      # artifacts (those stay at the default, dev-tools on); this is the configuration
+      # a consumer opts into for their own custom build.
+      - name: "Unit tests (custom-build gate: -Ddev-tools=false)"
+        run: mise exec zig@0.16.0 -- zig build test --summary all -Ddev-tools=false
       # Lean-build gate (R2-6): -Dfts5=false must still COMPILE — the whole point is that FTS5 (and
       # SQLite's -DSQLITE_ENABLE_FTS5) folds out of a build that never declares a `.searchable`
       # field. Build-only, not a full test run: a handful of pre-existing fixtures (policy.zig,

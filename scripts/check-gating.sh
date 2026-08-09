@@ -23,6 +23,15 @@ LEAN=zig-out/bin/minimal-server
 [ -x "$FULL2" ] || { echo "build $FULL2 first (zig build full-fixture)"; exit 2; }
 [ -x "$LEAN" ] || { echo "build $LEAN first (zig build minimal-server)"; exit 2; }
 
+# Fourth reference: the SAME zigbase binary rebuilt with -Ddev-tools=false. This is a
+# different axis from the three above — a build.zig -D flag (a whole separate compile),
+# not an App()-level comptime cfg key toggled within one binary — so it can't reuse the
+# FULL/LEAN diff above and gets its own pair + pattern set. Proves `init`/`agents-md`/
+# `typegen` (src/scaffold*.zig, src/codegen/**) actually disappear rather than just
+# becoming dead-but-still-linked code; see src/devtools.zig.
+DEVTOOLS_OFF=zig-out-devtools-off/bin/zigbase
+[ -x "$DEVTOOLS_OFF" ] || { echo "build $DEVTOOLS_OFF first (zig build -Ddev-tools=false -p zig-out-devtools-off)"; exit 2; }
+
 # subsystem -> symbol substring expected in AT LEAST ONE full binary, and in
 # NEITHER binary should it appear in the lean one.
 # (spellings verified against nm --defined-only output during R2-7; Debug builds
@@ -63,5 +72,30 @@ for p in "${PATTERNS[@]}"; do
     fail=1
   fi
 done
-[ "$fail" -eq 0 ] && echo "gating invariant OK (${#PATTERNS[@]} patterns)"
+
+# -Ddev-tools=false: init/agents-md/typegen's whole subtree (scaffold + codegen) must be
+# gone. Namespaced past the module name (a trailing "." into the real decl path, same
+# rule as PATTERNS above) so this can't false-positive on an unrelated identifier that
+# merely contains "scaffold" or "codegen" as a substring.
+DEVTOOLS_PATTERNS=(
+  "scaffold\."   # src/scaffold.zig + src/scaffold/** (init, agents-md)
+  "codegen\."    # src/codegen/** (typegen — ~24 files, the largest of the three) — the
+                 # dot is escaped (unlike PATTERNS above): "codegen"/"scaffold" alone are
+                 # common enough substrings elsewhere (e.g. sqlite3ExprCodeGeneratedColumn)
+                 # to false-LEAK on the plain-dot-as-wildcard behavior grep BRE gives "."
+)
+for p in "${DEVTOOLS_PATTERNS[@]}"; do
+  full_n=$(nm --defined-only "$FULL" | grep -c -i -- "$p" || true)
+  off_n=$(nm --defined-only "$DEVTOOLS_OFF" | grep -c -i -- "$p" || true)
+  if [ "$full_n" -eq 0 ]; then
+    echo "DRIFT: dev-tools pattern '$p' matches nothing in the default (-Ddev-tools=true) $FULL — update the pattern"; fail=1
+  fi
+  if [ "$off_n" -ne 0 ]; then
+    echo "LEAK: '$p' found $off_n symbol(s) in the -Ddev-tools=false binary:"
+    nm --defined-only "$DEVTOOLS_OFF" | grep -i -- "$p" | head -5
+    fail=1
+  fi
+done
+
+[ "$fail" -eq 0 ] && echo "gating invariant OK (${#PATTERNS[@]} + ${#DEVTOOLS_PATTERNS[@]} patterns)"
 exit $fail

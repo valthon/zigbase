@@ -1,5 +1,6 @@
 const std = @import("std");
 const logging = @import("logging.zig");
+const devtools = @import("devtools.zig");
 
 pub const ServeArgs = struct {
     http_host: ?[]const u8 = null,
@@ -220,7 +221,7 @@ fn isHelpFlag(a: []const u8) bool {
     return std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "-h");
 }
 
-pub const ParseError = error{ UnknownCommand, UnknownFlag, MissingValue, BadValue, ConflictingFlags };
+pub const ParseError = error{ UnknownCommand, UnknownFlag, MissingValue, BadValue, ConflictingFlags, DevToolsDisabled };
 
 /// Comptime-derived parser switches. `serve_static` is true only in the default
 /// static-files mode — in .disabled/.dir/.embedded the flag is rejected as unknown.
@@ -498,6 +499,11 @@ pub fn parse(args: []const []const u8, popts: ParseOpts) ParseError!Command {
         return .{ .superuser_create = sa };
     }
     if (std.mem.eql(u8, args[0], "typegen")) {
+        // Pure dev-time codegen (schema in, client source out) — never needed by a
+        // deployed server. See src/devtools.zig. Checked first so the rest of this
+        // block (and the codegen/** it eventually reaches in framework.zig) folds to
+        // comptime-dead code in a `-Ddev-tools=false` build.
+        if (!devtools.enabled) return ParseError.DevToolsDisabled;
         var ta = TypegenArgs{};
         var i: usize = 1;
         while (i < args.len) : (i += 1) {
@@ -565,6 +571,10 @@ pub fn parse(args: []const []const u8, popts: ParseOpts) ParseError!Command {
         return .{ .doctor = da };
     }
     if (std.mem.eql(u8, args[0], "init")) {
+        // Pure dev-time scaffolding — never needed by a deployed server. See
+        // src/devtools.zig; checked first so the rest of this block folds to
+        // comptime-dead code in a `-Ddev-tools=false` build.
+        if (!devtools.enabled) return ParseError.DevToolsDisabled;
         var ia = InitArgs{};
         var i: usize = 1;
         while (i < args.len) : (i += 1) {
@@ -588,6 +598,10 @@ pub fn parse(args: []const []const u8, popts: ParseOpts) ParseError!Command {
         return .{ .init = ia };
     }
     if (std.mem.eql(u8, args[0], "agents-md")) {
+        // Pure dev-time scaffolding — never needed by a deployed server. See
+        // src/devtools.zig; checked first so the rest of this block folds to
+        // comptime-dead code in a `-Ddev-tools=false` build.
+        if (!devtools.enabled) return ParseError.DevToolsDisabled;
         var aa = AgentsMdArgs{};
         var i: usize = 1;
         while (i < args.len) : (i += 1) {
@@ -1158,6 +1172,7 @@ test "doctor parses --production/--json/--data-dir and routes --help" {
 }
 
 test "parse typegen: data-dir + out + flags" {
+    if (!devtools.enabled) return error.SkipZigTest;
     const args = [_][]const u8{ "typegen", "--data-dir", "./zb_data", "--out", "c.ts", "--client-name", "Api", "--check" };
     const cmd = try parse(&args, .{ .serve_static = true });
     try std.testing.expect(cmd == .typegen);
@@ -1168,6 +1183,7 @@ test "parse typegen: data-dir + out + flags" {
 }
 
 test "parse typegen: url + admin creds" {
+    if (!devtools.enabled) return error.SkipZigTest;
     const args = [_][]const u8{ "typegen", "--url", "http://x", "--admin-email", "a@b.c", "--admin-password", "pw", "--out", "c.ts" };
     const cmd = try parse(&args, .{ .serve_static = true });
     try std.testing.expectEqualStrings("http://x", cmd.typegen.url.?);
@@ -1175,6 +1191,7 @@ test "parse typegen: url + admin creds" {
 }
 
 test "parse typegen: missing flag value errors" {
+    if (!devtools.enabled) return error.SkipZigTest;
     const args = [_][]const u8{ "typegen", "--out" };
     try std.testing.expectError(ParseError.MissingValue, parse(&args, .{ .serve_static = true }));
 }
@@ -1242,6 +1259,7 @@ test "explain-code rejects a second positional and unknown flags; --help routes"
 }
 
 test "init defaults to box mode in the current directory" {
+    if (!devtools.enabled) return error.SkipZigTest;
     const c = try parse(&.{"init"}, .{});
     try std.testing.expectEqual(InitMode.box, c.init.mode);
     try std.testing.expectEqualStrings(".", c.init.dir);
@@ -1249,6 +1267,7 @@ test "init defaults to box mode in the current directory" {
 }
 
 test "init accepts --framework, --dir and --name" {
+    if (!devtools.enabled) return error.SkipZigTest;
     const c = try parse(&.{ "init", "--framework", "--dir", "myapp", "--name", "my_app" }, .{});
     try std.testing.expectEqual(InitMode.framework, c.init.mode);
     try std.testing.expectEqualStrings("myapp", c.init.dir);
@@ -1256,12 +1275,14 @@ test "init accepts --framework, --dir and --name" {
 }
 
 test "init rejects unknown flags and routes --help" {
+    if (!devtools.enabled) return error.SkipZigTest;
     try std.testing.expectError(ParseError.UnknownFlag, parse(&.{ "init", "--force" }, .{}));
     try std.testing.expectError(ParseError.MissingValue, parse(&.{ "init", "--dir" }, .{}));
     try std.testing.expectEqual(HelpTopic.init, (try parse(&.{ "init", "--help" }, .{})).help);
 }
 
 test "agents-md leaves the mode unset so the caller can infer it" {
+    if (!devtools.enabled) return error.SkipZigTest;
     const c = try parse(&.{"agents-md"}, .{});
     try std.testing.expect(c.agents_md.mode == null);
     try std.testing.expectEqualStrings(".", c.agents_md.dir);
@@ -1271,4 +1292,14 @@ test "agents-md leaves the mode unset so the caller can infer it" {
     try std.testing.expectEqual(InitMode.framework, forced.agents_md.mode.?);
     try std.testing.expect(forced.agents_md.to_stdout);
     try std.testing.expectEqual(HelpTopic.agents_md, (try parse(&.{ "agents-md", "--help" }, .{})).help);
+}
+
+test "init/agents-md/typegen are rejected with DevToolsDisabled under -Ddev-tools=false" {
+    // Meaningful only in the stripped configuration; the default (`-Ddev-tools=true`,
+    // which every published binary uses) is covered by the per-verb tests above.
+    if (devtools.enabled) return error.SkipZigTest;
+    try std.testing.expectError(ParseError.DevToolsDisabled, parse(&.{"init"}, .{}));
+    try std.testing.expectError(ParseError.DevToolsDisabled, parse(&.{ "init", "--help" }, .{}));
+    try std.testing.expectError(ParseError.DevToolsDisabled, parse(&.{"agents-md"}, .{}));
+    try std.testing.expectError(ParseError.DevToolsDisabled, parse(&.{"typegen"}, .{}));
 }

@@ -179,7 +179,10 @@ temp dir and a free port, printing one JSON object; `doctor` runs preflight chec
 `migrate-db` copies an existing SQLite database into a
 PostgreSQL target. `typegen` emits a typed SDK for a running (`--url`) or offline
 (`--data-dir`) server — `--lang` picks the target language, `--check` verifies the output is
-up to date without writing (run `zigbase typegen --help` for the full flag set). `rewrap`
+up to date without writing (run `zigbase typegen --help` for the full flag set). `init`,
+`agents-md`, and `typegen` are pure dev-time surfaces (scaffolding + codegen) compiled in by
+default (`-Ddev-tools`, on) — every binary we publish has them; `-Ddev-tools=false` is an
+opt-out for your own custom build that never needs them. `rewrap`
 rotates field-encryption keys (`--dry-run` reports without rewriting), and `vapid-keygen`
 prints a fresh Web Push VAPID keypair. `explain-code` looks up a frozen API error code
 (the `code` field in every `{status,code,message,data}` error response) with no args to

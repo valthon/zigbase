@@ -9,6 +9,7 @@ const config = @import("config.zig");
 const cli = @import("cli.zig");
 const logging = @import("logging.zig");
 const scaffold = @import("scaffold.zig");
+const devtools = @import("devtools.zig");
 const server = @import("server.zig");
 const serve_control = @import("serve_control.zig");
 const serve_session = @import("serve_session.zig");
@@ -1883,6 +1884,15 @@ fn runCliImpl(init: std.process.Init, dispatch: *const events.Dispatch, jobs: []
         .serve_static = std.meta.activeTag(opts.static_mode) == .default,
         .static_cache_control = std.meta.activeTag(opts.static_mode) != .disabled,
     }) catch |err| {
+        if (err == cli.ParseError.DevToolsDisabled) {
+            // Distinguishable from a plain usage error (docs the caller — often an
+            // agent that read a doc written for the default, dev-tools-on binary —
+            // straight at the fix) instead of falling into the generic "argument
+            // error: UnknownCommand" + full-usage-dump path below.
+            const verb = if (args.len >= 2) args[1] else "?";
+            std.log.err("zigbase {s}: {s}", .{ verb, devtools.disabled_note });
+            std.process.exit(1);
+        }
         std.log.err("argument error: {s}", .{@errorName(err)});
         printUsage(init.io, std.Io.File.stderr(), std.meta.activeTag(opts.static_mode) == .default, std.meta.activeTag(opts.static_mode) != .disabled);
         // Carried defect fix (SP-1 Task 9, independently also SP-3): a usage error
@@ -2078,6 +2088,15 @@ fn runCliImpl(init: std.process.Init, dispatch: *const events.Dispatch, jobs: []
         .init => |ia| try initImpl(allocator, init.io, ia),
         .agents_md => |aa| try agentsMdImpl(allocator, init.io, aa),
         .typegen => |ta| {
+            if (!devtools.enabled) {
+                // Unreachable via the CLI in practice: cli.parse rejects `typegen`
+                // with ParseError.DevToolsDisabled before dispatch ever reaches
+                // here in a `-Ddev-tools=false` build. Kept only so this arm's
+                // analyzed body never references codegen/typegen_cli.zig (and the
+                // ~24-file codegen/** subtree behind it) in a stripped binary.
+                std.log.err("zigbase typegen: {s}", .{devtools.disabled_note});
+                std.process.exit(1);
+            }
             if (opts.enable_typegen) {
                 const tgen = @import("codegen/typegen_cli.zig");
                 var arena_state = std.heap.ArenaAllocator.init(init.gpa);
@@ -2154,9 +2173,14 @@ fn printUsage(io: std.Io, file: std.Io.File, show_serve_static: bool, show_stati
         \\  explain-code        Explain a frozen API error code, or list them all. Add --json for one JSON object.
         \\
     , .{});
-    emit(io, file,
+    // init/agents-md/typegen are pure development-time surfaces (see src/devtools.zig); a
+    // `-Ddev-tools=false` binary doesn't compile them in, so help must not advertise
+    // them there. Every published zigbase artifact builds at the default (dev-tools
+    // on), so this only ever hides these lines for a consumer's own custom build.
+    if (devtools.enabled) emit(io, file,
         \\  init                Scaffold a starting-point project (--box or --framework).
         \\  agents-md           Write AGENTS.md + CLAUDE.md for an existing project.
+        \\  typegen             Generate a typed client from the collection schema (see `zigbase typegen --help`).
         \\
     , .{});
     emit(io, file,
@@ -4830,81 +4854,99 @@ fn printReport(io: std.Io, rep: scaffold.Report) void {
 }
 
 fn initImpl(allocator: std.mem.Allocator, io: std.Io, ia: cli.InitArgs) !void {
-    const mode: scaffold.Mode = switch (ia.mode) {
-        .box => .box,
-        .framework => .framework,
-    };
-    const rep = try scaffold.run(allocator, io, .{ .mode = mode, .dir = ia.dir, .name = ia.name });
-    defer scaffold.freeReport(allocator, rep);
+    if (devtools.enabled) {
+        const mode: scaffold.Mode = switch (ia.mode) {
+            .box => .box,
+            .framework => .framework,
+        };
+        const rep = try scaffold.run(allocator, io, .{ .mode = mode, .dir = ia.dir, .name = ia.name });
+        defer scaffold.freeReport(allocator, rep);
 
-    emit(io, std.Io.File.stdout(), "zigbase init: {s} mode in {s}\n\n", .{ @tagName(ia.mode), ia.dir });
-    printReport(io, rep);
-    if (rep.skipped > 0) emit(io, std.Io.File.stdout(),
-        \\
-        \\{d} file(s) already existed and were left untouched. init never overwrites.
-        \\
-    , .{rep.skipped});
+        emit(io, std.Io.File.stdout(), "zigbase init: {s} mode in {s}\n\n", .{ @tagName(ia.mode), ia.dir });
+        printReport(io, rep);
+        if (rep.skipped > 0) emit(io, std.Io.File.stdout(),
+            \\
+            \\{d} file(s) already existed and were left untouched. init never overwrites.
+            \\
+        , .{rep.skipped});
 
-    switch (mode) {
-        .box => emit(io, std.Io.File.stdout(),
-            \\
-            \\NEXT:
-            \\  cd {s}
-            \\  docker compose up -d
-            \\  docker compose exec zigbase /zigbase superuser create \
-            \\    --email you@example.com --password 'change-me-please' --data-dir /data
-            \\  docker compose exec zigbase /zigbase schema apply /schema/collections.json
-            \\
-            \\Before you ship:
-            \\  docker compose exec zigbase /zigbase doctor --production --data-dir /data
-            \\
-            \\Read AGENTS.md before you ship. Blank access rules mean LOCKED, not public.
-            \\
-        , .{ia.dir}),
-        .framework => emit(io, std.Io.File.stdout(),
-            \\
-            \\NEXT:
-            \\  cd {s}
-            \\  zig fetch --save git+https://github.com/valthon/zigbase
-            \\  zig build test
-            \\  zig build run -- serve --insecure-cookies
-            \\
-            \\`zig fetch --save` writes the dependency URL AND its content hash into
-            \\build.zig.zon. Do not hand-write either.
-            \\
-            \\Before you ship:
-            \\  zig build run -- doctor --production
-            \\
-            \\Read AGENTS.md before you ship. Blank access rules mean LOCKED, not public.
-            \\
-        , .{ia.dir}),
+        switch (mode) {
+            .box => emit(io, std.Io.File.stdout(),
+                \\
+                \\NEXT:
+                \\  cd {s}
+                \\  docker compose up -d
+                \\  docker compose exec zigbase /zigbase superuser create \
+                \\    --email you@example.com --password 'change-me-please' --data-dir /data
+                \\  docker compose exec zigbase /zigbase schema apply /schema/collections.json
+                \\
+                \\Before you ship:
+                \\  docker compose exec zigbase /zigbase doctor --production --data-dir /data
+                \\
+                \\Read AGENTS.md before you ship. Blank access rules mean LOCKED, not public.
+                \\
+            , .{ia.dir}),
+            .framework => emit(io, std.Io.File.stdout(),
+                \\
+                \\NEXT:
+                \\  cd {s}
+                \\  zig fetch --save git+https://github.com/valthon/zigbase
+                \\  zig build test
+                \\  zig build run -- serve --insecure-cookies
+                \\
+                \\`zig fetch --save` writes the dependency URL AND its content hash into
+                \\build.zig.zon. Do not hand-write either.
+                \\
+                \\Before you ship:
+                \\  zig build run -- doctor --production
+                \\
+                \\Read AGENTS.md before you ship. Blank access rules mean LOCKED, not public.
+                \\
+            , .{ia.dir}),
+        }
+    } else {
+        // Unreachable via the CLI in practice: cli.parse rejects `init` with
+        // ParseError.DevToolsDisabled before dispatch ever reaches here in a
+        // `-Ddev-tools=false` build. Kept only so this branch's analyzed body
+        // never references scaffold.zig (and scaffold/**) in a stripped binary.
+        emit(io, std.Io.File.stderr(), "zigbase init: {s}\n", .{devtools.disabled_note});
+        std.process.exit(1);
     }
 }
 
 fn agentsMdImpl(allocator: std.mem.Allocator, io: std.Io, aa: cli.AgentsMdArgs) !void {
-    const mode: ?scaffold.Mode = if (aa.mode) |m| switch (m) {
-        .box => .box,
-        .framework => .framework,
-    } else null;
+    if (devtools.enabled) {
+        const mode: ?scaffold.Mode = if (aa.mode) |m| switch (m) {
+            .box => .box,
+            .framework => .framework,
+        } else null;
 
-    if (aa.to_stdout) {
-        const resolved = mode orelse blk: {
-            var d = std.Io.Dir.cwd().openDir(io, aa.dir, .{}) catch break :blk scaffold.Mode.box;
-            defer d.close(io);
-            break :blk scaffold.detectMode(io, d);
-        };
-        emit(io, std.Io.File.stdout(), "{s}", .{scaffold.agentsMdText(resolved)});
-        return;
+        if (aa.to_stdout) {
+            const resolved = mode orelse blk: {
+                var d = std.Io.Dir.cwd().openDir(io, aa.dir, .{}) catch break :blk scaffold.Mode.box;
+                defer d.close(io);
+                break :blk scaffold.detectMode(io, d);
+            };
+            emit(io, std.Io.File.stdout(), "{s}", .{scaffold.agentsMdText(resolved)});
+            return;
+        }
+
+        const rep = try scaffold.agentsMd(allocator, io, .{ .mode = mode, .dir = aa.dir });
+        defer scaffold.freeReport(allocator, rep);
+        printReport(io, rep);
+        if (rep.skipped > 0) emit(io, std.Io.File.stdout(),
+            \\
+            \\Nothing was overwritten. Delete the file(s) first, or use --stdout and diff.
+            \\
+        , .{});
+    } else {
+        // Unreachable via the CLI in practice: cli.parse rejects `agents-md`
+        // with ParseError.DevToolsDisabled before dispatch ever reaches here
+        // in a `-Ddev-tools=false` build. Kept only so this branch's analyzed
+        // body never references scaffold.zig (and scaffold/**) in a stripped binary.
+        emit(io, std.Io.File.stderr(), "zigbase agents-md: {s}\n", .{devtools.disabled_note});
+        std.process.exit(1);
     }
-
-    const rep = try scaffold.agentsMd(allocator, io, .{ .mode = mode, .dir = aa.dir });
-    defer scaffold.freeReport(allocator, rep);
-    printReport(io, rep);
-    if (rep.skipped > 0) emit(io, std.Io.File.stdout(),
-        \\
-        \\Nothing was overwritten. Delete the file(s) first, or use --stdout and diff.
-        \\
-    , .{});
 }
 
 fn superuserCreateImpl(allocator: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map, sa: cli.SuperuserArgs) !void {

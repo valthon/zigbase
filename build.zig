@@ -5,6 +5,7 @@ const BuildOptionValues = struct {
     min_zig_version: []const u8,
     commit: []const u8,
     dev_mode: bool,
+    dev_tools: bool,
     internal_api: bool,
     vector: bool,
     postgres: bool,
@@ -86,6 +87,18 @@ pub fn build(b: *std.Build) void {
     // override code folds to comptime-dead. Override with -Ddev-mode=true to build a
     // debuggable binary that still honors the dev-only env vars (e2e dev).
     const dev_mode = b.option(bool, "dev-mode", "Compile in the dev-only, never-in-prod seams: ZIGBASE_FAKE_NOW clock, ZIGBASE_FAKE_SEED entropy, test-capture, and ZIGBASE_FIELD_CRYPTO fake crypto (default: on in Debug, off in release)") orelse (optimize == .Debug);
+    // Development-time CLI verbs: `init`, `agents-md`, `typegen`. ON by default — every
+    // official artifact we publish (GitHub release tarballs, the Docker image, the
+    // @zigbase/server npm packages) builds at this default and ships all three.
+    // `-Ddev-tools=false` is an OPT-OUT offered to a consumer
+    // compiling their OWN binary for their OWN deployment: none of the three verbs has
+    // operational or runtime value on a deployed server (they're pure scaffolding + codegen),
+    // so a custom build that never needs them can shed src/scaffold*.zig and src/codegen/**
+    // (~24 files — typegen alone is the largest dev-only surface in the binary) by comptime-
+    // eliding the whole subtree (see src/devtools.zig). A stripped binary still parses the
+    // verb names, but returns an actionable "rebuild with -Ddev-tools=true" error instead of
+    // a bare UnknownCommand.
+    const dev_tools = b.option(bool, "dev-tools", "Compile in the development-time CLI verbs: init, agents-md, typegen (default: on; -Ddev-tools=false strips them from a custom build)") orelse true;
     // Opt-in vector search (#157; Postgres pgvector port #159). OFF by default: the default build
     // does NOT compile or link the sqlite-vec amalgamation, and every vector code path folds to
     // comptime-dead — the shipped binary is byte-for-byte unaffected. `-Dvector=true` enables vector
@@ -132,6 +145,7 @@ pub fn build(b: *std.Build) void {
         .min_zig_version = @import("build.zig.zon").minimum_zig_version,
         .commit = commit,
         .dev_mode = dev_mode,
+        .dev_tools = dev_tools,
         .internal_api = false,
         .vector = vector,
         .postgres = postgres,

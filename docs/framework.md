@@ -214,6 +214,14 @@ subcommand, which generates a typed TypeScript client from the server's live sch
 introspection). It is `false` by default so that production binaries carry no codegen code or
 dependencies.
 
+This is a **different axis** from the `-Ddev-tools` build flag above: `.enable_typegen` is an
+`App(.{...})`-level comptime key that a *consumer's own binary* opts into (independent per
+build target — e.g. off in your main server, on in a dedicated codegen build); `-Ddev-tools`
+is a `build.zig` flag that governs whether `init`/`agents-md`/`typegen` compile into the CLI
+**at all**, regardless of `.enable_typegen`. A binary needs both `-Ddev-tools=true` (the
+default) *and* `.enable_typegen = true` for `typegen` to actually run; either one off makes it
+unavailable, each with its own actionable error.
+
 ```zig
 // client-generation build target — NOT your production binary
 zigbase.App(.{
@@ -4760,6 +4768,7 @@ code to comptime-dead when off, so a build that doesn't need a feature doesn't p
 | `-Dvector` | off | Opt-in nearest-neighbor `?vector=` KNN search — sqlite-vec on SQLite, pgvector on Postgres. → [docs/search.md](./search.md#vector-search-opt-in) |
 | `-Dpostgres` | off | Opt-in pure-Zig PostgreSQL wire-protocol backend, alongside the default SQLite one. → [docs/postgres.md](./postgres.md) |
 | `-Ddev-mode` | on in `Debug`, off in release | The dev-only, never-in-prod seams: `ZIGBASE_FAKE_NOW` / `ZIGBASE_FAKE_SEED` (§14 above), test-capture, and fake field-crypto; the release script forces it off for shipped binaries. |
+| `-Ddev-tools` | **on** | The `init`/`agents-md`/`typegen` CLI verbs (scaffolding + schema-to-client codegen — `src/scaffold*.zig` + `src/codegen/**`, ~24 files, none of it needed by a *deployed* server). **Every official artifact we publish builds at this default** — GitHub release tarballs, the Docker image, and the `@zigbase/server` npm packages all ship with the three verbs in. `-Ddev-tools=false` is an opt-out for a consumer compiling their **own** binary for their **own** deployment who wants to shed the ~490 KiB behind it; the stripped binary still recognizes the verb names but exits non-zero with a "rebuild with -Ddev-tools=true" message instead of running them. Distinct from `.enable_typegen` below — see §3b. |
 | `-Dstrip` | on except in `Debug` | Strip debug info from the binary (~7 MiB vs ~24 MiB unstripped in a release build). |
 
 ## Version transparency & dependency auditing

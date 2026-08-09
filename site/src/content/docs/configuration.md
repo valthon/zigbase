@@ -92,6 +92,18 @@ Write `AGENTS.md` + `CLAUDE.md` for a project that already exists.
 | `--box` / `--framework` | Force a content set. Omit to infer: a `build.zig.zon` in the directory means framework. |
 | `--stdout` | Print `AGENTS.md` instead of writing it (diff-friendly). |
 
+### Build flag: `-Ddev-tools`
+
+`init`, `agents-md`, and `typegen` are pure development-time surfaces (scaffolding +
+schema-to-client codegen) that a deployed server never needs, so they're gated behind a
+build flag: `-Ddev-tools`, **on by default**. Every artifact we publish — the GitHub
+release tarballs, the Docker image, and the `@zigbase/server` npm packages — builds at
+this default and ships all three commands. `-Ddev-tools=false` is an **opt-out offered to
+a consumer compiling their own binary for their own deployment**: it drops `init`,
+`agents-md`, and `typegen` (and the scaffolding/codegen code behind them) from the build
+entirely. A binary built that way still recognizes the command names, but exits non-zero
+with a message pointing back at `-Ddev-tools=true` instead of running them.
+
 ## Environment variables
 
 | Env var | Flag | Default | Purpose |
