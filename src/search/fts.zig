@@ -99,12 +99,25 @@ comptime {
         @compileError("pg_ts_config is interpolated into a single-quoted SQL literal and must not contain a quote or backslash");
 }
 
-/// True iff `col` has at least one valid, searchable column AND a valid table identifier — i.e.
-/// `ensureIndex` will provision an FTS5 index and `build` can compose a MATCH predicate for it.
-pub fn isSearchable(col: schema.Collection) bool {
-    if (!schema.isValidIdentifier(col.name)) return false;
+/// True iff `col` DECLARES at least one indexable searchable field — i.e. the schema asks for
+/// full-text search — regardless of whether the engine can actually provision an index for the
+/// collection. Split out of `isSearchable` deliberately: conflating "the schema asks for search"
+/// with "the engine will serve it" is what let the provisioner skip a collection in complete
+/// silence. `ensureIndex` needs the first question to decide whether a skip is worth reporting.
+fn hasSearchableField(col: schema.Collection) bool {
     for (col.fields) |f| if (f.searchable and schema.isSearchableType(f.fieldType()) and schema.isValidIdentifier(f.name) and !f.encrypted) return true;
     return false;
+}
+
+/// True iff `col` has at least one valid, searchable column AND a valid table identifier — i.e.
+/// `ensureIndex` will provision an FTS5 index and `build` can compose a MATCH predicate for it.
+///
+/// The table-identifier half is why `records.list` answers `?search=` on a `_`-prefixed system
+/// collection with `error.NotSearchable` (loud) instead of quietly dropping the MATCH predicate and
+/// returning every row — so this gate must keep failing closed here.
+pub fn isSearchable(col: schema.Collection) bool {
+    if (!schema.isValidIdentifier(col.name)) return false;
+    return hasSearchableField(col);
 }
 
 /// The searchable column names of `col` (valid identifiers, text/editor, non-encrypted), on
@@ -277,6 +290,26 @@ pub const EnsureIndexError = error{SearchDisabled} ||
 /// missing (e.g. after an additive table rebuild dropped them). Called from `provision.ensureCollection`
 /// at startup — NOT a numbered migration. Identifiers are gated through `schema.isValidIdentifier`.
 pub fn ensureIndex(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection) EnsureIndexError!void {
+    // ONE identifier gate for both backends (the per-backend impls below therefore need none). A
+    // `_`-prefixed engine-owned name fails `isValidIdentifier`, and the provisioner does not index
+    // such a collection — correct, because the read path already refuses `?search=` on it with
+    // `error.NotSearchable` rather than silently serving unfiltered rows.
+    //
+    // What was wrong is that the skip was SILENT even when the schema asked for search: a migration
+    // that seeded a searchable system collection would leave `?search=` failing with nothing in the
+    // logs pointing at the cause. Skipping a collection with nothing to index stays quiet (every
+    // system collection today), but skipping one that DECLARED searchable fields now says so.
+    if (!schema.isValidIdentifier(col.name)) {
+        if (hasSearchableField(col)) std.log.warn(
+            "search: collection '{s}' declares searchable field(s) but was SKIPPED by the full-text " ++
+                "provisioner: its name is not a valid identifier (a leading '_' marks an engine-owned " ++
+                "collection, which the search provisioner does not index). No index exists for it, so " ++
+                "?search= on '{s}' will fail with NotSearchable. To make it searchable, rename the " ++
+                "collection to start with a letter; to silence this, drop .searchable from its fields.",
+            .{ col.name, col.name },
+        );
+        return;
+    }
     // Backend split: the FTS5 external-content vtable + sync triggers + sqlite_master probes below
     // are SQLite-only. Postgres provisions a STORED `tsvector` generated column + GIN index instead
     // (same `?search=` read surface, lowered by `buildPostgres`). Both are idempotent and called
@@ -294,7 +327,7 @@ pub fn ensureIndex(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection) 
 }
 
 fn ensureIndexSqliteImpl(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection) !void {
-    if (!schema.isValidIdentifier(col.name)) return;
+    // Identifier gate: `ensureIndex` (the only caller) already applied it, loudly.
     // Self-freeing (contract 1): every allocation here is scratch — the FTS5 table name, the
     // searchable-column list, the existence/columns/triggers probes, and the CREATE VIRTUAL TABLE /
     // CREATE TRIGGER / rebuild DDL strings — all consumed by `w.exec`/`w.prepare` (SQLite copies the
@@ -357,7 +390,7 @@ fn ensureIndexSqliteImpl(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collec
 /// that gate, never from user input. Search-path-aware (`to_regclass`) so it targets the
 /// collection's table in the active schema.
 fn ensureIndexPg(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection) !void {
-    if (!schema.isValidIdentifier(col.name)) return;
+    // Identifier gate: `ensureIndex` (the only caller) already applied it, loudly.
     // These provisioning temporaries are explicitly freed (the SQL strings are copied by
     // `prepare`/`exec`, and `bindText` dupes its arg, so freeing after the call is safe). In the
     // startup `applySpecs` path the caller's allocator is an arena reclaimed wholesale, so the
@@ -624,6 +657,38 @@ test "sanitize quotes tokens, preserves operators, drops dangling ones" {
 
 test "fts5 flag: enabled reflects build_options (default true in the test build)" {
     try std.testing.expect(enabled == build_options.fts5);
+}
+
+test "a searchable '_'-named collection is reported, not silently skipped" {
+    // `isSearchable` answers "will the engine serve search here?" and must keep failing closed on a
+    // `_`-prefixed (engine-owned) name — that is what makes `records.list` reject `?search=` with
+    // NotSearchable instead of quietly returning unfiltered rows. What must NOT be conflated with it
+    // is "does the schema ASK for search?", which is exactly the case `ensureIndex` now reports
+    // instead of skipping in silence. Pin the two apart: collapsing `hasSearchableField` back into
+    // the name gate makes this test red.
+    const searchable = [_]schema.Field{.{ .id = "f1", .name = "title", .searchable = true, .options = .{ .text = .{} } }};
+    const sys = schema.Collection{ .id = "_probe________", .name = "_probe", .system = true, .fields = &searchable };
+    try std.testing.expect(hasSearchableField(sys)); // the schema asks for search…
+    try std.testing.expect(!isSearchable(sys)); // …but the engine will not serve it (fail closed)
+
+    // A `_` collection with nothing to index is the ordinary case (every system collection today):
+    // both answers are false, so the skip stays quiet and startup logs are not spammed.
+    const plain = [_]schema.Field{.{ .id = "f1", .name = "title", .options = .{ .text = .{} } }};
+    const quiet = schema.Collection{ .id = "_quiet________", .name = "_quiet", .system = true, .fields = &plain };
+    try std.testing.expect(!hasSearchableField(quiet));
+    try std.testing.expect(!isSearchable(quiet));
+
+    // A normal searchable collection is unchanged: both true.
+    const ok = schema.Collection{ .id = "articles______", .name = "articles", .fields = &searchable };
+    try std.testing.expect(hasSearchableField(ok));
+    try std.testing.expect(isSearchable(ok));
+
+    // And the skip is a clean no-op, not an error: provisioning a searchable `_` collection whose
+    // table does not even exist must not fail startup.
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try migrations.run(&d);
+    try ensureIndex(std.testing.allocator, &d, sys);
 }
 
 test "ensureIndex provisions FTS5, triggers keep it in sync, MATCH search returns rows" {

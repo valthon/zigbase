@@ -787,3 +787,22 @@ instead of quietly returning every tenant's rows. Regression tests: "scopeApplie
 never fall open on a name the charset gate rejects" (which also pins that the superuser /
 cross-tenant / tenancy-disabled bypasses still suppress scoping, so the fix cannot degenerate into
 "always applies") and "scopePredicate escapes an embedded quote instead of emitting it raw".
+
+### Note — where a charset gate is the right tool, and where it is not
+
+`schema.isValidIdentifier` rejects a leading underscore, which is exactly what keeps `_`-prefixed
+names an engine-owned, migration-only set: it belongs on **user-supplied** names at creation time
+(`schema.zig`, `provision.zig`, `import.zig`, `analytics/config.zig`). Applied *downstream* to a
+name that already passed creation, the same check does not add safety — it can only make an
+engine-owned collection take an unintended branch, and every such branch found so far degraded
+silently: a phantom "record not found" (`records.getAtRest`), a dropped TTL predicate
+(`records.get`/`list`/`gcExpiredRecords`), and the tenancy fail-open above. Downstream sites
+therefore **escape** (`ddl.quoteIdent`) rather than gate.
+
+Two sites deliberately keep a downstream gate because failing closed there is the correct answer,
+and they are the precedent to match: `authz/abilities.zig` emits a constant-false predicate, and
+`search/fts.zig`'s `isSearchable` returns false so `records.list` answers `?search=` on such a
+collection with `error.NotSearchable` — loud — instead of dropping the MATCH predicate and
+returning unfiltered rows. The FTS provisioner's matching skip now also **reports itself** when a
+collection actually declared searchable fields, so it can no longer be silent about work it
+declined to do.
