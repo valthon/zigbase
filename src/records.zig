@@ -117,7 +117,9 @@ pub fn guardPasses(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection, 
     defer scratch.deinit();
     const sa = scratch.allocator();
     const js = try guardJoinsSql(sa, g.joins);
-    const sql = try std.fmt.allocPrintSentinel(sa, "SELECT 1 FROM \"{s}\"{s} WHERE \"{s}\".\"id\"=?1 AND ({s});", .{ col.name, js, col.name, g.where_sql }, 0);
+    const qcol = try ddl.quoteIdent(sa, col.name);
+    defer sa.free(qcol); // copied into `sql`; free the temporary (a no-op on the arena, correct off it)
+    const sql = try std.fmt.allocPrintSentinel(sa, "SELECT 1 FROM {s}{s} WHERE {s}.\"id\"=?1 AND ({s});", .{ qcol, js, qcol, g.where_sql }, 0);
     var st = try prep(sa, w, sql);
     defer st.finalize();
     try st.bindText(1, rid);
@@ -304,8 +306,16 @@ fn rowToObjectAtRest(alloc: std.mem.Allocator, stmt: *db.Stmt, col: schema.Colle
 pub fn getAtRest(alloc: std.mem.Allocator, r: *db.Db, col: schema.Collection, id: []const u8) !?std.json.Value {
     const cols = try columnList(alloc, col);
     defer alloc.free(cols);
-    if (!schema.isValidIdentifier(col.name)) return null; // identifier gate before interpolation
-    const sql = try std.fmt.allocPrintSentinel(alloc, "SELECT {s} FROM \"{s}\" WHERE \"id\" = ?1;", .{ cols, col.name }, 0);
+    // The table name is ESCAPED (`ddl.quoteIdent`, as `columnList` already does for the columns),
+    // not charset-gated: `schema.isValidIdentifier` rejects the leading underscore every system
+    // collection carries (`_superusers`, `_memberships`, …), and gating here turned such a
+    // collection into a phantom "record not found" on the realtime delete-authz snapshot path.
+    // Escaping is the stronger interpolation guarantee; the charset gate stays where it belongs —
+    // on USER-supplied names at creation time (schema.zig / provision.zig), which is what keeps
+    // `_`-prefixed collections a migration-only, engine-owned set.
+    const tbl = try ddl.quoteIdent(alloc, col.name);
+    defer alloc.free(tbl);
+    const sql = try std.fmt.allocPrintSentinel(alloc, "SELECT {s} FROM {s} WHERE \"id\" = ?1;", .{ cols, tbl }, 0);
     defer alloc.free(sql);
     var st = try prep(alloc, r, sql);
     defer st.finalize();
@@ -322,19 +332,24 @@ pub fn get(alloc: std.mem.Allocator, r: *db.Db, col: schema.Collection, id: []co
     // only) compare correctly as instants, not lexically. The three-clause OR matches the
     // GC's fail-safe: NULL ttl → no expiry (always shown); strftime(tf) IS NULL means an
     // unparseable value → fail-safe, keep visible (same as GC which won't delete garbage).
-    // Security: identifiers gated through isValidIdentifier before interpolation.
+    // Security: every interpolated identifier is ESCAPED through `ddl.quoteIdent` (same as
+    // `columnList` does for the column list). It previously gated them through
+    // `schema.isValidIdentifier` instead, but only on the TTL branch — the fallthrough
+    // interpolated the very same names ungated, so the stated invariant was not actually
+    // enforced, and the gate's only real effect was to silently DROP the TTL predicate for a
+    // `_`-prefixed (system) collection. Escaping enforces it on BOTH branches.
     const dialect = db.dbDialect(r);
+    const tbl = try ddl.quoteIdent(alloc, col.name);
+    defer alloc.free(tbl);
     const sql = blk: {
         if (col.options.ttl_field) |tf| {
-            if (schema.isValidIdentifier(col.name) and schema.isValidIdentifier(tf)) {
-                const qtf = try std.fmt.allocPrint(alloc, "\"{s}\"", .{tf});
-                defer alloc.free(qtf);
-                const ttl_pred = try dialect.ttlVisiblePredicate(alloc, qtf);
-                defer alloc.free(ttl_pred);
-                break :blk try std.fmt.allocPrintSentinel(alloc, "SELECT {s} FROM \"{s}\" WHERE \"id\" = ?1 AND ({s});", .{ cols, col.name, ttl_pred }, 0);
-            }
+            const qtf = try ddl.quoteIdent(alloc, tf);
+            defer alloc.free(qtf);
+            const ttl_pred = try dialect.ttlVisiblePredicate(alloc, qtf);
+            defer alloc.free(ttl_pred);
+            break :blk try std.fmt.allocPrintSentinel(alloc, "SELECT {s} FROM {s} WHERE \"id\" = ?1 AND ({s});", .{ cols, tbl, ttl_pred }, 0);
         }
-        break :blk try std.fmt.allocPrintSentinel(alloc, "SELECT {s} FROM \"{s}\" WHERE \"id\" = ?1;", .{ cols, col.name }, 0);
+        break :blk try std.fmt.allocPrintSentinel(alloc, "SELECT {s} FROM {s} WHERE \"id\" = ?1;", .{ cols, tbl }, 0);
     };
     defer alloc.free(sql);
     var st = try prep(alloc, r, sql);
@@ -519,7 +534,9 @@ fn validateFieldValue(alloc: std.mem.Allocator, conn: *db.Db, f: schema.Field, v
                 else => &.{},
             };
             for (items) |it| if (it == .string) {
-                const q = try std.fmt.allocPrintSentinel(sa, "SELECT 1 FROM \"{s}\" WHERE \"id\" = ?1;", .{tcol.name}, 0);
+                const qtarget = try ddl.quoteIdent(sa, tcol.name);
+                defer sa.free(qtarget);
+                const q = try std.fmt.allocPrintSentinel(sa, "SELECT 1 FROM {s} WHERE \"id\" = ?1;", .{qtarget}, 0);
                 var st = try prep(sa, conn, q);
                 defer st.finalize();
                 try st.bindText(1, it.string);
@@ -890,7 +907,9 @@ pub fn createInTxnOpts(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, col: sch
         }
     }
 
-    const sql = try std.fmt.allocPrintSentinel(sa, "INSERT INTO \"{s}\" ({s}) VALUES ({s}) RETURNING {s};", .{ col.name, cols.items, vals.items, rcols }, 0);
+    const qcol = try ddl.quoteIdent(sa, col.name);
+    defer sa.free(qcol);
+    const sql = try std.fmt.allocPrintSentinel(sa, "INSERT INTO {s} ({s}) VALUES ({s}) RETURNING {s};", .{ qcol, cols.items, vals.items, rcols }, 0);
     var st = try prep(sa, w, sql);
     defer st.finalize();
     try st.bindText(1, id_slice);
@@ -1119,7 +1138,9 @@ fn assembleListResult(d: *db.Db, a: std.mem.Allocator, col: schema.Collection) !
     }
     const cols = try columnList(a, col);
     defer a.free(cols);
-    const sql = try std.fmt.allocPrintSentinel(a, "SELECT {s} FROM \"{s}\" ORDER BY \"id\";", .{ cols, col.name }, 0);
+    const qcol = try ddl.quoteIdent(a, col.name);
+    defer a.free(qcol);
+    const sql = try std.fmt.allocPrintSentinel(a, "SELECT {s} FROM {s} ORDER BY \"id\";", .{ cols, qcol }, 0);
     defer a.free(sql);
     var st = try prep(a, d, sql);
     defer st.finalize();
@@ -1714,13 +1735,13 @@ pub fn updateInTxn(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection, 
     for (col.fields) |f| {
         if (f.fieldType() == .autodate) {
             if (f.options.autodate.onUpdate) {
-                try sets.appendSlice(sa, try std.fmt.allocPrint(sa, ",\"{s}\"={s}", .{ f.name, now_iso }));
+                try sets.appendSlice(sa, try std.fmt.allocPrint(sa, ",{s}={s}", .{ try ddl.quoteIdent(sa, f.name), now_iso }));
             }
             continue;
         }
         const provided = data.object.get(f.name) orelse continue; // partial: only provided fields
         try validateFieldValue(alloc, w, f, provided, &errs);
-        try sets.appendSlice(sa, try std.fmt.allocPrint(sa, ",\"{s}\"=?{d}", .{ f.name, next }));
+        try sets.appendSlice(sa, try std.fmt.allocPrint(sa, ",{s}=?{d}", .{ try ddl.quoteIdent(sa, f.name), next }));
         try binds.append(sa, .{ .idx = @intCast(next), .field = f, .value = provided });
         next += 1;
     }
@@ -1731,7 +1752,9 @@ pub fn updateInTxn(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection, 
 
     const rcols = try columnList(sa, col);
 
-    const sql = try std.fmt.allocPrintSentinel(sa, "UPDATE \"{s}\" SET {s} WHERE \"id\"=?1 RETURNING {s};", .{ col.name, sets.items, rcols }, 0);
+    const qcol = try ddl.quoteIdent(sa, col.name);
+    defer sa.free(qcol);
+    const sql = try std.fmt.allocPrintSentinel(sa, "UPDATE {s} SET {s} WHERE \"id\"=?1 RETURNING {s};", .{ qcol, sets.items, rcols }, 0);
     var st = try prep(sa, w, sql);
     defer st.finalize();
     try st.bindText(1, id);
@@ -1755,7 +1778,9 @@ pub fn delete(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection, id: [
 /// Delete a record on `w` WITHOUT opening a transaction. The caller must already
 /// be inside one (or accept autocommit). Returns true if a row was deleted.
 pub fn deleteInTxn(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection, id: []const u8) RecordError!bool {
-    const sql = try std.fmt.allocPrintSentinel(alloc, "DELETE FROM \"{s}\" WHERE \"id\"=?1 RETURNING \"id\";", .{col.name}, 0);
+    const qcol = try ddl.quoteIdent(alloc, col.name);
+    defer alloc.free(qcol);
+    const sql = try std.fmt.allocPrintSentinel(alloc, "DELETE FROM {s} WHERE \"id\"=?1 RETURNING \"id\";", .{qcol}, 0);
     defer alloc.free(sql);
     var st = try prep(alloc, w, sql);
     defer st.finalize();
@@ -1858,6 +1883,76 @@ test "delete removes the row; 404 on missing" {
     try d.exec("INSERT INTO posts (id,created,updated,title,price) VALUES ('r1','t','t','x',1);");
     try std.testing.expect(try delete(a, &d, col, "r1"));
     try std.testing.expect(!try delete(a, &d, col, "r1"));
+}
+
+test "every record statement ESCAPES the collection identifier (embedded-quote round-trip)" {
+    // The discriminating test for the quoteIdent sweep. Every interpolation of an engine-owned
+    // identifier in this file is escaped rather than wrapped in bare `\"…\"`, which is
+    // byte-identical for every name that can exist today — so a botched conversion (a dropped
+    // quote, a wrong argument) would NOT show up on ordinary names. A name containing a `"` is the
+    // one input that tells the two apart: escaped it round-trips, raw it produces malformed SQL or
+    // closes the identifier early. Driving full CRUD + list + count + cursor through such a name
+    // exercises the INSERT / UPDATE / DELETE / SELECT-page / COUNT / base-column / ORDER-BY /
+    // cursor-column sites at once.
+    //
+    // Such a collection cannot be CREATED (the name gates reject it) — it is constructed here
+    // precisely because it is the only probe that can distinguish escaping from raw interpolation.
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try migrations.run(&d);
+    // SQLite escapes an embedded double quote by doubling it — the same rule `ddl.quoteIdent` uses.
+    try d.exec("CREATE TABLE \"we\"\"ird\" (\"id\" TEXT PRIMARY KEY, \"created\" TEXT, \"updated\" TEXT, \"ti\"\"tle\" TEXT);");
+
+    const fields = [_]schema.Field{.{ .id = "f1", .name = "ti\"tle", .options = .{ .text = .{} } }};
+    const col = schema.Collection{ .id = "weird_________", .name = "we\"ird", .fields = &fields };
+
+    // create → INSERT … RETURNING
+    var obj: std.json.ObjectMap = .empty;
+    defer obj.deinit(a);
+    try obj.put(a, "ti\"tle", .{ .string = "first" });
+    const created = try create(a, io, &d, col, .{ .object = obj });
+    defer freeRecord(a, created);
+    const rid = try a.dupe(u8, created.object.get("id").?.string);
+    defer a.free(rid);
+    try std.testing.expectEqualStrings("first", created.object.get("ti\"tle").?.string);
+
+    // get → SELECT … WHERE id
+    const got = (try get(a, &d, col, rid)).?;
+    defer freeRecord(a, got);
+    try std.testing.expectEqualStrings("first", got.object.get("ti\"tle").?.string);
+
+    // update → UPDATE … RETURNING
+    var upd: std.json.ObjectMap = .empty;
+    defer upd.deinit(a);
+    try upd.put(a, "ti\"tle", .{ .string = "second" });
+    const updated = (try update(a, &d, col, rid, .{ .object = upd })).?;
+    defer freeRecord(a, updated);
+    try std.testing.expectEqualStrings("second", updated.object.get("ti\"tle").?.string);
+
+    // list → base column list + FROM + COUNT + default ORDER BY
+    {
+        var r = try list(a, &d, col, .{});
+        defer r.deinit(a);
+        try std.testing.expectEqual(@as(?i64, 1), r.totalItems);
+        try std.testing.expectEqual(@as(usize, 1), r.items.len);
+        try std.testing.expectEqualStrings("second", r.items[0].object.get("ti\"tle").?.string);
+    }
+
+    // cursor list → the keyset page SQL + the qualified cursor columns
+    {
+        var r = try list(a, &d, col, .{ .cursorMode = true, .perPage = 1 });
+        defer r.deinit(a);
+        try std.testing.expectEqual(@as(usize, 1), r.items.len);
+    }
+
+    // guardPasses → SELECT 1 FROM <col> WHERE <col>.id = ?
+    try std.testing.expect(try guardPasses(a, &d, col, rid, .{ .where_sql = "1=1", .params = &.{}, .joins = &.{} }));
+
+    // delete → DELETE … RETURNING
+    try std.testing.expect(try delete(a, &d, col, rid));
+    try std.testing.expect(!try delete(a, &d, col, rid));
 }
 
 test "createInTxn inserts without opening its own transaction" {
@@ -1969,12 +2064,26 @@ pub const ListResult = struct {
     }
 };
 
+/// `"<collection>"."<column>"` with BOTH identifiers escaped, owned by `alloc`. The two quoted
+/// fragments are scratch: their bytes are copied into the result and the temporaries are freed on
+/// every path (including the second `quoteIdent` failing), so this is leak-correct off a raw
+/// allocator, not only under a request arena.
+fn qualifiedCol(alloc: std.mem.Allocator, collection: []const u8, column: []const u8) ![]u8 {
+    const qc = try ddl.quoteIdent(alloc, collection);
+    defer alloc.free(qc);
+    const qf = try ddl.quoteIdent(alloc, column);
+    defer alloc.free(qf);
+    return std.fmt.allocPrint(alloc, "{s}.{s}", .{ qc, qf });
+}
+
 fn baseColumnList(alloc: std.mem.Allocator, col: schema.Collection) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(alloc);
-    try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, "\"{s}\".\"id\",\"{s}\".\"created\",\"{s}\".\"updated\"", .{ col.name, col.name, col.name }));
+    const qcol = try ddl.quoteIdent(alloc, col.name);
+    defer alloc.free(qcol); // copied into `out` below; free the temporary
+    try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, "{s}.\"id\",{s}.\"created\",{s}.\"updated\"", .{ qcol, qcol, qcol }));
     for (col.fields) |f| {
-        try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, ",\"{s}\".{s}", .{ col.name, try ddl.quoteIdent(alloc, f.name) }));
+        try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, ",{s}.{s}", .{ qcol, try ddl.quoteIdent(alloc, f.name) }));
     }
     return out.toOwnedSlice(alloc);
 }
@@ -1991,7 +2100,7 @@ fn effectiveSortTerms(alloc: std.mem.Allocator, col: schema.Collection, base_ter
     } else {
         // No client sort -> default ORDER BY created DESC.
         try out.append(alloc, .{
-            .col_sql = try std.fmt.allocPrint(alloc, "\"{s}\".\"created\"", .{col.name}),
+            .col_sql = try qualifiedCol(alloc, col.name, "created"),
             .field = null,
             .desc = true,
             .path = "created",
@@ -2001,7 +2110,7 @@ fn effectiveSortTerms(alloc: std.mem.Allocator, col: schema.Collection, base_ter
     const already_id = base_terms.len > 0 and std.mem.eql(u8, base_terms[base_terms.len - 1].path, "id");
     if (!already_id) {
         try out.append(alloc, .{
-            .col_sql = try std.fmt.allocPrint(alloc, "\"{s}\".\"id\"", .{col.name}),
+            .col_sql = try qualifiedCol(alloc, col.name, "id"),
             .field = null,
             .desc = last_desc,
             .path = "id",
@@ -2191,6 +2300,71 @@ test "ttl read-exclusion: get returns null for expired, row for future+null, non
     try expectVisible(a, &d, pcol, "p1", true);
 }
 
+test "ttl read-exclusion: get applies the filter to a system ('_'-prefixed) collection too" {
+    // The physical `_`-prefixed system tables are the only collections whose name fails
+    // `schema.isValidIdentifier` (it requires an alphabetic first byte). `get` must not silently
+    // DROP its TTL predicate for them — that would serve expired rows from a collection whose
+    // whole point is expiry. The collection is hand-assembled because the creation paths reject a
+    // `_` name by design (schema.zig / provision.zig) — a migration is the only way such a row
+    // exists, which is exactly the case under test.
+    const a = std.testing.allocator;
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try migrations.run(&d);
+    try d.exec(
+        \\CREATE TABLE "_ttlprobe" ("id" TEXT PRIMARY KEY, "created" TEXT, "updated" TEXT,
+        \\  "token" TEXT, "expires_at" TEXT);
+    );
+    try d.exec("INSERT INTO \"_ttlprobe\" VALUES ('past','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','a','2000-01-01T00:00:00Z');");
+    try d.exec("INSERT INTO \"_ttlprobe\" VALUES ('future','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','b','2999-01-01T00:00:00Z');");
+    try d.exec("INSERT INTO \"_ttlprobe\" VALUES ('never','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','c',NULL);");
+
+    const fields = [_]schema.Field{
+        .{ .id = "f1", .name = "token", .options = .{ .text = .{} } },
+        .{ .id = "f2", .name = "expires_at", .options = .{ .date = .{} } },
+    };
+    // Borrowed literals throughout (no `deinit`: it would free static pointers).
+    const col = schema.Collection{
+        .id = "_ttlprobe_____",
+        .name = "_ttlprobe",
+        .system = true,
+        .fields = &fields,
+        .options = .{ .ttl_field = "expires_at" },
+    };
+
+    try expectVisible(a, &d, col, "past", false);
+    try expectVisible(a, &d, col, "future", true);
+    try expectVisible(a, &d, col, "never", true);
+}
+
+test "getAtRest reads a system ('_'-prefixed) collection instead of reporting a phantom not-found" {
+    // `getAtRest` backs the realtime delete-authz snapshot (ws.prepareDelete). A `_`-prefixed
+    // system collection — `_superusers` here, but equally `_memberships`/`_invitations`/`_events`,
+    // all of which are addressable through the records API — must read back like any other, not
+    // read as "no such record" because its name fails `schema.isValidIdentifier`.
+    const a = std.testing.allocator;
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try migrations.run(&d);
+    try d.exec(
+        \\INSERT INTO "_superusers" ("id","created","updated","email","username","passwordHash","tokenKey","verified")
+        \\  VALUES ('su1','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','root@example.com','','','sutk',1);
+    );
+    const col = (try collections.get(a, &d, "_superusers")).?;
+    defer col.deinit(a);
+
+    const maybe = try getAtRest(a, &d, col, "su1");
+    try std.testing.expect(maybe != null);
+    const snap = maybe.?;
+    defer freeRecord(a, snap);
+    try std.testing.expectEqualStrings("su1", snap.object.get("id").?.string);
+    try std.testing.expectEqualStrings("root@example.com", snap.object.get("email").?.string);
+    // Hidden system fields stay out of the snapshot (unchanged behaviour).
+    try std.testing.expect(snap.object.get("passwordHash") == null);
+    // A genuinely absent id still reads as not-found.
+    try std.testing.expect((try getAtRest(a, &d, col, "nope")) == null);
+}
+
 test "ttl read-exclusion: list excludes expired, includes future+null, non-ttl unaffected" {
     var d = try db.Db.openMemory();
     defer d.close();
@@ -2236,6 +2410,77 @@ test "ttl read-exclusion: list excludes expired, includes future+null, non-ttl u
     var pr = try list(a, &d, pcol, .{});
     defer pr.deinit(a);
     try std.testing.expectEqual(@as(?i64, 1), pr.totalItems);
+}
+
+test "ttl read-exclusion: list applies the filter to a system ('_'-prefixed) collection too" {
+    // Companion to the `get` case above: `get` and `list` must agree about which rows a TTL
+    // collection has. A `_` name fails `schema.isValidIdentifier`, and gating the predicate on it
+    // made `list` serve rows `get` hides.
+    var d = try db.Db.openMemory();
+    defer d.close();
+    const a = std.testing.allocator;
+    try migrations.run(&d);
+    try d.exec(
+        \\CREATE TABLE "_ttlprobe" ("id" TEXT PRIMARY KEY, "created" TEXT, "updated" TEXT,
+        \\  "token" TEXT, "expires_at" TEXT);
+    );
+    try d.exec("INSERT INTO \"_ttlprobe\" VALUES ('past','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','a','2000-01-01T00:00:00Z');");
+    try d.exec("INSERT INTO \"_ttlprobe\" VALUES ('future','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','b','2999-01-01T00:00:00Z');");
+    try d.exec("INSERT INTO \"_ttlprobe\" VALUES ('never','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','c',NULL);");
+
+    const fields = [_]schema.Field{
+        .{ .id = "f1", .name = "token", .options = .{ .text = .{} } },
+        .{ .id = "f2", .name = "expires_at", .options = .{ .date = .{} } },
+    };
+    const col = schema.Collection{
+        .id = "_ttlprobe_____",
+        .name = "_ttlprobe",
+        .system = true,
+        .fields = &fields,
+        .options = .{ .ttl_field = "expires_at" },
+    };
+
+    var r = try list(a, &d, col, .{});
+    defer r.deinit(a);
+    try std.testing.expectEqual(@as(?i64, 2), r.totalItems);
+    try std.testing.expectEqual(@as(usize, 2), r.items.len);
+    for (r.items) |item| {
+        const id_val = item.object.get("id") orelse continue;
+        try std.testing.expect(!std.mem.eql(u8, id_val.string, "past"));
+    }
+}
+
+test "gcExpiredRecords reaps a system ('_'-prefixed) collection's expired rows" {
+    // The third path over the same predicate. `get`/`list` hiding an expired row while the GC
+    // never reaps it would leave the row live forever — invisible but present, and still counted
+    // by anything reading the table directly. All three must agree.
+    const a = std.testing.allocator;
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try migrations.run(&d);
+    try d.exec(
+        \\CREATE TABLE "_ttlprobe" ("id" TEXT PRIMARY KEY, "created" TEXT, "updated" TEXT,
+        \\  "token" TEXT, "expires_at" TEXT);
+    );
+    // The sweep enumerates `_collections`, so the collection must be a real metadata row — which
+    // is exactly how the engine's own `_`-prefixed collections come into being (a migration seed).
+    try d.exec(
+        \\INSERT INTO "_collections"
+        \\  ("id","name","type","system","schema","indexes","options","listRule","viewRule","createRule","updateRule","deleteRule","created","updated")
+        \\ VALUES ('_ttlprobe_____','_ttlprobe','base',1,
+        \\  '[{"id":"f1","name":"token","type":"text","options":{}},{"id":"f2","name":"expires_at","type":"date","options":{}}]',
+        \\  '[]','{"ttl":{"field":"expires_at"}}',NULL,NULL,NULL,NULL,NULL,datetime('now'),datetime('now'));
+    );
+    try d.exec("INSERT INTO \"_ttlprobe\" VALUES ('past','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','a','2000-01-01T00:00:00Z');");
+    try d.exec("INSERT INTO \"_ttlprobe\" VALUES ('future','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','b','2999-01-01T00:00:00Z');");
+    try d.exec("INSERT INTO \"_ttlprobe\" VALUES ('never','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','c',NULL);");
+
+    try std.testing.expectEqual(@as(usize, 1), try gcExpiredRecords(a, &d));
+
+    var st = try d.prepare("SELECT COUNT(*) FROM \"_ttlprobe\";");
+    defer st.finalize();
+    _ = try st.step();
+    try std.testing.expectEqual(@as(i64, 2), st.columnInt(0));
 }
 
 test "ttl read-exclusion: composes with user filter (both predicates ANDed)" {
@@ -2449,11 +2694,15 @@ test "gcExpiredRecords is resilient: a drifted collection does not abort the swe
 /// number of rows deleted. Safe to call periodically (the framework-internal
 /// `_ttl_gc` job) or once at startup. Collections without a ttl_field are untouched.
 ///
-/// Security: both the collection name and the ttl_field name are gated through
-/// `schema.isValidIdentifier` before interpolation (the query-string threat model
-/// in docs/security-audit.md requires every interpolated identifier be validated).
-/// The comptime `.collections` path already guarantees valid names, but a
-/// hand-crafted `_collections` row must not be trusted.
+/// Security: both the collection name and the ttl_field name are ESCAPED through
+/// `ddl.quoteIdent` before interpolation (the threat model in docs/security-audit.md
+/// requires every interpolated identifier be gated or escaped). The comptime
+/// `.collections` path already guarantees valid names, and a hand-crafted
+/// `_collections` row is not trusted — but escaping rather than charset-gating is
+/// what lets the sweep reap the `_`-prefixed system collections, whose leading
+/// underscore `schema.isValidIdentifier` rejects by design. A name that survives
+/// escaping but matches no table still fails at `prepare`, which the per-collection
+/// resilience below logs and skips.
 ///
 /// Both sides of the comparison are normalized to a canonical UTC instant via
 /// `strftime('%Y-%m-%dT%H:%M:%SZ', x)` BEFORE comparing. This matters because a
@@ -2477,11 +2726,9 @@ pub fn gcExpiredRecords(alloc: std.mem.Allocator, w: *db.Db) !usize {
     var total: usize = 0;
     for (cols) |col| {
         const tf = col.options.ttl_field orelse continue;
-        if (!schema.isValidIdentifier(col.name)) continue;
-        if (!schema.isValidIdentifier(tf)) continue;
-        const qtf = try std.fmt.allocPrint(a, "\"{s}\"", .{tf});
+        const qtf = try ddl.quoteIdent(a, tf);
         const expired = try db.dbDialect(w).ttlExpiredDeletePredicate(a, qtf);
-        const sql = try std.fmt.allocPrintSentinel(a, "DELETE FROM \"{s}\" WHERE {s};", .{ col.name, expired }, 0);
+        const sql = try std.fmt.allocPrintSentinel(a, "DELETE FROM {s} WHERE {s};", .{ try ddl.quoteIdent(a, col.name), expired }, 0);
         // Resilient per-collection: a single drifted collection (e.g. the table was
         // dropped but its `_collections` metadata remains) must not abort the whole
         // sweep and silence GC for every later collection. Log and skip to the next.
@@ -2746,16 +2993,16 @@ pub fn list(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, q: L
     //   3. strftime(col) > now    → genuine future instant → visible
     // strftime normalises both sides so non-canonical forms (offsets, space, date-only)
     // compare as instants, not lexically. Table-qualified because JOINs may be present.
-    // Security: both col.name and tf validated through isValidIdentifier (GC pattern).
+    // Security: both identifiers are ESCAPED through `ddl.quoteIdent` (same as `get` and the GC).
+    // They were charset-gated on `schema.isValidIdentifier` instead, which silently DROPPED the
+    // predicate for a `_`-prefixed (system) collection — making `list` serve rows `get` hides.
     if (col.options.ttl_field) |tf| {
-        if (schema.isValidIdentifier(col.name) and schema.isValidIdentifier(tf)) {
-            const qtf = try std.fmt.allocPrint(sa, "\"{s}\".\"{s}\"", .{ col.name, tf });
-            const ttl_pred = try dialect.ttlVisiblePredicate(sa, qtf);
-            where_sql = if (where_sql.len > 0)
-                try std.fmt.allocPrint(sa, "({s}) AND ({s})", .{ where_sql, ttl_pred })
-            else
-                ttl_pred;
-        }
+        const qtf = try std.fmt.allocPrint(sa, "{s}.{s}", .{ try ddl.quoteIdent(sa, col.name), try ddl.quoteIdent(sa, tf) });
+        const ttl_pred = try dialect.ttlVisiblePredicate(sa, qtf);
+        where_sql = if (where_sql.len > 0)
+            try std.fmt.allocPrint(sa, "({s}) AND ({s})", .{ where_sql, ttl_pred })
+        else
+            ttl_pred;
     }
 
     // Tenant scoping (#156): AND the bound `"<col>"."<tenant_field>" = ?` predicate so a list of a
@@ -2781,8 +3028,11 @@ pub fn list(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, q: L
     const base_terms = if (q.sort) |sstr| (if (sstr.len > 0) try sort.compileTerms(sa, &j, sstr) else &.{}) else &.{};
     var offset_order_sql: []const u8 = if (base_terms.len > 0)
         try sort.orderByFromTerms(sa, base_terms, dialect)
-    else
-        try std.fmt.allocPrint(sa, "\"{s}\".\"created\" DESC{s}", .{ col.name, dialect.nullsOrder(.desc) });
+    else blk: {
+        const qcol = try ddl.quoteIdent(sa, col.name);
+        defer sa.free(qcol);
+        break :blk try std.fmt.allocPrint(sa, "{s}.\"created\" DESC{s}", .{ qcol, dialect.nullsOrder(.desc) });
+    };
     // Search/vector relevance leads the OFFSET ordering: bm25 `rank` (FTS) and/or nearest-neighbor
     // distance (vector), with any client sort kept as the tiebreaker. Cursor mode keeps the keyset
     // order (the MATCH/where predicate still scopes the page; vector cursors are rejected above).
@@ -2856,7 +3106,9 @@ pub fn list(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, q: L
         // going backward; we re-reverse the page into forward order after fetch.
         const fetch_order = if (forward) order_sql else try reversedOrderBy(sa, eff_terms, dialect);
 
-        const page_sql = try std.fmt.allocPrintSentinel(sa, "SELECT {s} FROM \"{s}\"{s}{s} ORDER BY {s} LIMIT ?;", .{ bcols, col.name, joins_sql.items, win_where, fetch_order }, 0);
+        const qcol = try ddl.quoteIdent(sa, col.name);
+        defer sa.free(qcol);
+        const page_sql = try std.fmt.allocPrintSentinel(sa, "SELECT {s} FROM {s}{s}{s} ORDER BY {s} LIMIT ?;", .{ bcols, qcol, joins_sql.items, win_where, fetch_order }, 0);
         var pst = try prep(sa, conn, page_sql);
         defer pst.finalize();
         var idx = try bindParams(&pst, params, 1);
@@ -2949,7 +3201,9 @@ pub fn list(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, q: L
     const total = try countTotal(sa, conn, col, joins_sql.items, where_clause, params);
     const page: u32 = if (q.page == 0) 1 else q.page;
     const offset: i64 = @as(i64, (page - 1)) * @as(i64, per);
-    const page_sql = try std.fmt.allocPrintSentinel(sa, "SELECT {s} FROM \"{s}\"{s}{s} ORDER BY {s} LIMIT ? OFFSET ?;", .{ bcols, col.name, joins_sql.items, where_clause, offset_order_sql }, 0);
+    const qcol_page = try ddl.quoteIdent(sa, col.name);
+    defer sa.free(qcol_page);
+    const page_sql = try std.fmt.allocPrintSentinel(sa, "SELECT {s} FROM {s}{s}{s} ORDER BY {s} LIMIT ? OFFSET ?;", .{ bcols, qcol_page, joins_sql.items, where_clause, offset_order_sql }, 0);
     var pst = try prep(sa, conn, page_sql);
     defer pst.finalize();
     var after = try bindParams(&pst, params, 1);
@@ -2988,7 +3242,9 @@ pub fn list(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, q: L
 }
 
 fn countTotal(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, joins: []const u8, where_clause: []const u8, params: []const compiler.Param) !i64 {
-    const count_sql = try std.fmt.allocPrintSentinel(alloc, "SELECT COUNT(*) FROM \"{s}\"{s}{s};", .{ col.name, joins, where_clause }, 0);
+    const qcol_count = try ddl.quoteIdent(alloc, col.name);
+    defer alloc.free(qcol_count);
+    const count_sql = try std.fmt.allocPrintSentinel(alloc, "SELECT COUNT(*) FROM {s}{s}{s};", .{ qcol_count, joins, where_clause }, 0);
     var cst = try prep(alloc, conn, count_sql);
     defer cst.finalize();
     _ = try bindParams(&cst, params, 1);

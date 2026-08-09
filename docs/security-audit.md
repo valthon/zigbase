@@ -20,9 +20,14 @@ hardening, PR B). The rest are written up as recommendations. Several items in
 ## Executive summary
 
 The query/SQL layer is genuinely strong: every value reaching SQLite is bound as a parameter,
-and every interpolated identifier (table/column/index/alias name) is gated through
+and every interpolated identifier (table/column/index/alias name) is either gated through
 `schema.isValidIdentifier` (letters/digits/underscore, must start with a letter) *before* it can
-reach DDL or a join. The offline `zigbase import` subcommand introduces no new threat surface: it
+reach DDL or a join, or escaped through `ddl.quoteIdent`. The charset gate is the discipline for
+**user-supplied** names — it is applied at collection/field creation, which is what keeps the
+`_`-prefixed system names (`_superusers`, `_memberships`, …) an engine-owned, migration-only set.
+Engine-owned names that the gate itself rejects (exactly those `_` names) are escaped instead, so
+the read path serves them correctly rather than degrading silently. The offline `zigbase import`
+subcommand introduces no new threat surface: it
 writes through the same record engine as the HTTP path (identical validation, defaults, and
 `.encrypted` at-rest envelope), its `--collection`/`--upsert-key` identifiers pass the same
 `isValidIdentifier` gate before interpolation while row values bind as parameters, and its
