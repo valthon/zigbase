@@ -119,6 +119,16 @@ pub const ImportArgs = struct {
     batch_size: usize = 500,
     /// Positional NDJSON file path (required); `-` reads stdin.
     file: ?[]const u8 = null,
+    /// Validate + execute every row, then roll back. Writes nothing.
+    dry_run: bool = false,
+    /// Skip failing rows instead of aborting; the exit code becomes 3 if any were skipped.
+    continue_on_error: bool = false,
+    /// NDJSON file for per-row failures.
+    error_log: ?[]const u8 = null,
+    /// Progress line every N rows to stderr (0 = off).
+    progress: usize = 0,
+    /// Emit the summary as one JSON object on stdout.
+    json: bool = false,
 };
 
 /// `explain-code [CODE] [--json]`: print the long form for one frozen error code,
@@ -376,6 +386,20 @@ pub fn parse(args: []const []const u8, popts: ParseOpts) ParseError!Command {
                 if (i >= args.len) return ParseError.MissingValue;
                 ia.batch_size = std.fmt.parseInt(usize, args[i], 10) catch return ParseError.BadValue;
                 if (ia.batch_size == 0) return ParseError.BadValue;
+            } else if (std.mem.eql(u8, a, "--dry-run")) {
+                ia.dry_run = true;
+            } else if (std.mem.eql(u8, a, "--continue-on-error")) {
+                ia.continue_on_error = true;
+            } else if (std.mem.eql(u8, a, "--error-log")) {
+                i += 1;
+                if (i >= args.len) return ParseError.MissingValue;
+                ia.error_log = args[i];
+            } else if (std.mem.eql(u8, a, "--progress")) {
+                i += 1;
+                if (i >= args.len) return ParseError.MissingValue;
+                ia.progress = std.fmt.parseInt(usize, args[i], 10) catch return ParseError.BadValue;
+            } else if (std.mem.eql(u8, a, "--json")) {
+                ia.json = true;
             } else if (std.mem.eql(u8, a, "-") or !std.mem.startsWith(u8, a, "-")) {
                 // Positional NDJSON file path (`-` = stdin). Only one is allowed.
                 if (ia.file != null) return ParseError.BadValue;
@@ -796,6 +820,21 @@ test "import rejects unknown flags, missing values, bad + zero batch size, and a
     try std.testing.expectError(ParseError.BadValue, parse(&.{ "import", "--batch-size", "abc", "f" }, .{}));
     try std.testing.expectError(ParseError.BadValue, parse(&.{ "import", "--batch-size", "0", "f" }, .{}));
     try std.testing.expectError(ParseError.BadValue, parse(&.{ "import", "a.ndjson", "b.ndjson" }, .{}));
+}
+
+test "import parses the hardening flags" {
+    const cmd = try parse(&.{
+        "import",      "--collection", "posts",      "--dry-run", "--continue-on-error",
+        "--error-log", "errs.ndjson",  "--progress", "1000",      "--json",
+        "in.ndjson",
+    }, .{});
+    try std.testing.expect(cmd.import.dry_run);
+    try std.testing.expect(cmd.import.continue_on_error);
+    try std.testing.expectEqualStrings("errs.ndjson", cmd.import.error_log.?);
+    try std.testing.expectEqual(@as(usize, 1000), cmd.import.progress);
+    try std.testing.expect(cmd.import.json);
+    try std.testing.expectError(ParseError.MissingValue, parse(&.{ "import", "--error-log" }, .{}));
+    try std.testing.expectError(ParseError.BadValue, parse(&.{ "import", "--progress", "x", "f" }, .{}));
 }
 
 test "schema dump parses --out/--json/--data-dir" {

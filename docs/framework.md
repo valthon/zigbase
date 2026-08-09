@@ -3733,6 +3733,12 @@ zigbase import --collection users --upsert-key email --data-dir ./zb_data users.
 
 # Read NDJSON from stdin with a file path of `-`.
 cat dump.ndjson | zigbase import --collection posts --data-dir ./zb_data -
+
+# Rehearse a 500k-row migration without writing anything, then run it for real, tolerating
+# a handful of bad rows and keeping a machine-readable record of what happened.
+zigbase import --collection posts --dry-run --data-dir ./zb_data seed.ndjson
+zigbase import --collection posts --continue-on-error --error-log errs.ndjson \
+    --progress 10000 --json --data-dir ./zb_data seed.ndjson
 ```
 
 | Flag | Meaning |
@@ -3741,7 +3747,17 @@ cat dump.ndjson | zigbase import --collection posts --data-dir ./zb_data -
 | `--upsert-key FIELD` | Match each row on `FIELD`; UPDATE if present, else create. `FIELD` must be a scalar, **non-encrypted**, existing field; a unique constraint is recommended (a non-unique key logs a warning). |
 | `--batch-size N` | Rows per transaction (default `500`; must be ≥ 1). |
 | `--data-dir PATH` | Data directory (also `ZIGBASE_DATA_DIR`, default `./zb_data`). |
+| `--dry-run` | Validate and execute every row through the full engine, then roll back instead of committing. Nothing is written; the summary reports what a fresh import would do. Because nothing commits, an `--upsert-key` lookup never sees rows "created" earlier in the same dry run. |
+| `--continue-on-error` | Skip a failing row (wrapped in its own `SAVEPOINT`) instead of aborting the whole import. The good rows in that batch still commit. |
+| `--error-log FILE` | NDJSON sink for per-row failures, one object per line: `{"line":N,"code":"…","detail":"…"}`. Truncated up front so a re-run never appends to a stale log. |
+| `--progress N` | Print a progress line to stderr every `N` rows read (`0` = off, the default). |
+| `--json` | Print the run summary as one JSON object on stdout (snake_case keys: `zigbase_import`, `collection`, `dry_run`, `created`, `updated`, `failed`, `total`, `error_log`). |
 | `<file.ndjson>` | Positional NDJSON path; `-` reads stdin. |
+
+**Exit codes.** `0` — every row imported. `1` — the import failed outright (bad input, refused
+operation, DB error); batches committed before the failure persist. `3` — the import *completed*
+but skipped one or more rows under `--continue-on-error`: a lossy import is never reported as a
+success, so a driving script or agent must treat `3` as "needs a look," not "done."
 
 **Through-engine guarantees.** Import performs the SAME full boot as `serve` (minus the socket):
 system migrations run, your comptime `.collections` are provisioned (so the target collection is
@@ -3752,13 +3768,24 @@ required — plaintext is never written, and a missing key fails closed), and, f
 collection, the credential transforms (**password hashing**, `tokenKey` generation,
 `verified=false` — a client-supplied `verified` is never trusted).
 
-**Streaming + batching + fail-fast.** Lines are read one at a time (the whole file is never
-slurped; a single record line must fit a 1 MiB buffer). Rows commit in batches of `--batch-size`.
-A bad row — malformed JSON, a validation failure, or a duplicate id — **fails fast**: the
-in-flight (uncommitted) batch is rolled back and the error names the offending 1-based line.
-Batches committed **before** the failure persist, so a large import that trips near the end is a
-resumable checkpoint (fix the file and re-run, ideally with `--upsert-key`). Blank lines are
-skipped. On completion it logs `created`, `updated`, and `total` counts.
+**Streaming + batching + fail-fast (the default).** Lines are read one at a time (the whole file
+is never slurped; a single record line must fit a 1 MiB buffer). Rows commit in batches of
+`--batch-size`. A bad row — malformed JSON, a validation failure, or a duplicate id — **fails
+fast**: the in-flight (uncommitted) batch is rolled back and the error names the offending
+1-based line. Batches committed **before** the failure persist, so a large import that trips near
+the end is a resumable checkpoint (fix the file and re-run, ideally with `--upsert-key`). Blank
+lines are skipped. On completion it logs `created`, `updated`, `total`, and `failed` counts (and,
+with `--json`, the same numbers as one JSON object on stdout).
+
+**Migration-scale imports (`--continue-on-error`).** One bad row out of half a million is not
+worth aborting a 40-minute import over. With `--continue-on-error`, each row runs inside its own
+`SAVEPOINT`: a failure rolls back only that row (not the batch it's part of) and is recorded —
+to `--error-log` as NDJSON, and always in the final `failed` count — while every good row still
+commits. The exit code becomes `3` (not `0`) whenever `failed > 0`, so a lossy import can never
+be mistaken for a clean one. `--progress N` prints a heartbeat every `N` rows so a long run isn't
+a black box, and `--dry-run` rehearses the whole thing (full validation, defaults, encryption,
+auth transforms — everything except the final commit) so you can find every bad row before
+touching real data.
 
 **Id preservation (import-only).** By default each row's own `id` is **preserved** — essential
 for migrations, because relations reference records by id and an exported dataset must keep those
@@ -3780,8 +3807,11 @@ const report = try zigbase.Import.run(app, writer, io, &reader, .{
     .upsert_key = "slug",   // optional
     .batch_size = 500,
     .preserve_ids = true,
+    .continue_on_error = true,  // optional: skip bad rows instead of aborting (see below)
 });
-std.log.info("imported {d} ({d} new, {d} updated)", .{ report.total, report.created, report.updated });
+std.log.info("imported {d} ({d} new, {d} updated, {d} skipped)", .{
+    report.total, report.created, report.updated, report.failed,
+});
 ```
 
 See `examples/golfsim/seed/` for a worked seeding example (hosts + the simulators that reference

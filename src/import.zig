@@ -50,10 +50,33 @@ pub const Options = struct {
     batch_size: usize = 500,
     /// Preserve each row's own `id` when present (relation integrity across a dataset).
     preserve_ids: bool = true,
+    /// Validate and execute every row, then ROLL BACK each batch instead of committing.
+    /// Nothing is written. Note: because nothing commits, an `--upsert-key` lookup never
+    /// sees rows created earlier in the same dry run — a dry run reports what a FRESH
+    /// import would do.
+    dry_run: bool = false,
+    /// Record the failure and keep going instead of aborting. Each row is wrapped in a
+    /// SAVEPOINT so a failed row leaves the in-flight batch intact.
+    continue_on_error: bool = false,
+    /// NDJSON sink for per-row failures: one object per line,
+    /// `{"line":N,"code":"Validation","detail":"title: … (validation_required)"}`.
+    error_log: ?*std.Io.Writer = null,
+    /// Write a human progress line to `progress` every N rows (0 = off).
+    progress_every: usize = 0,
+    progress: ?*std.Io.Writer = null,
+    /// Field names to drop from every row before importing. The manifest runner uses this
+    /// to hold back relation values it will patch in a second pass.
+    strip_fields: []const []const u8 = &.{},
 };
 
 /// Row counts reported at completion.
-pub const Report = struct { created: usize = 0, updated: usize = 0, total: usize = 0 };
+pub const Report = struct {
+    created: usize = 0,
+    updated: usize = 0,
+    /// Rows that failed and were skipped (only ever non-zero under `continue_on_error`).
+    failed: usize = 0,
+    total: usize = 0,
+};
 
 /// The 1-based line number of the row that caused the most recent `run` failure (0 when the
 /// failure was not row-specific, e.g. a config/collection error). Mirrors `records.last_errors`:
@@ -217,6 +240,68 @@ fn importRow(app: *App, w: *db.Db, io: std.Io, a: std.mem.Allocator, col: schema
     return .created;
 }
 
+/// Write one NDJSON finding. Never fails the import: a full or broken sink loses the
+/// finding, not the data — the counters in the Report remain authoritative. `detail` is run
+/// through `std.json.fmt` (which itself emits the surrounding quotes and escapes) so a quote
+/// or newline in a validation message cannot corrupt the NDJSON line.
+fn logFinding(opts: Options, line_no: usize, code: []const u8, detail: []const u8) void {
+    const sink = opts.error_log orelse return;
+    sink.print(
+        "{{\"line\":{d},\"code\":\"{s}\",\"detail\":{f}}}\n",
+        .{ line_no, code, std.json.fmt(detail, .{}) },
+    ) catch {};
+}
+
+/// Print a progress line to `opts.progress` every `opts.progress_every` rows. `seen` is the
+/// 1-based line number just processed (blank lines included, matching how `line_no` is
+/// counted in `run`).
+fn tickProgress(opts: Options, seen: usize) void {
+    if (opts.progress_every == 0) return;
+    if (seen % opts.progress_every != 0) return;
+    const sink = opts.progress orelse return;
+    sink.print("import: {d} rows read\n", .{seen}) catch {};
+    sink.flush() catch {};
+}
+
+/// Close the currently open batch transaction. A dry run executes everything and throws it
+/// away, so validation, defaults, the encryption envelope and the auth transforms are all
+/// exercised for real — only the commit is skipped.
+fn closeBatch(w: *db.Db, opts: Options) !void {
+    if (opts.dry_run) try w.rollback() else try w.commit();
+}
+
+/// Parse one NDJSON line and import it. Split out of `run` so the malformed-JSON and the
+/// engine-error paths share one savepoint/finding/counter treatment.
+fn importOneRow(
+    app: *App,
+    w: *db.Db,
+    io: std.Io,
+    a: std.mem.Allocator,
+    col: schema.Collection,
+    line: []const u8,
+    opts: Options,
+    lookups: *Lookups,
+) !RowOutcome {
+    var parsed = std.json.parseFromSliceLeaky(std.json.Value, a, line, .{}) catch
+        return ImportError.MalformedJson;
+    if (parsed != .object) return ImportError.RowNotObject;
+    // Drop the caller's held-back keys before the engine (validation, defaults, encryption)
+    // ever sees them. No allocator needed: removal only unlinks the entry, it doesn't free.
+    for (opts.strip_fields) |name| _ = parsed.object.swapRemove(name);
+    return importRow(app, w, io, a, col, parsed, opts, lookups);
+}
+
+/// Capture the failing field detail while `records.last_errors` is still valid — it points
+/// into the row arena, which this row's scope is about to reset. Empty for anything but
+/// `error.Validation`.
+fn captureDetail(e: anyerror) []const u8 {
+    if (e != error.Validation) return "";
+    const errs = records.last_errors orelse return "";
+    if (errs.len == 0) return "";
+    const ve = errs[0];
+    return std.fmt.bufPrint(&last_error_detail_buf, "{s}: {s} ({s})", .{ ve.field, ve.message, ve.code }) catch "";
+}
+
 /// Stream NDJSON from `reader` into `opts.collection` on writer `w`. Returns the row counts.
 /// See the file header for the streaming/batch/txn/id/upsert contract.
 pub fn run(app: *App, w: *db.Db, io: std.Io, reader: *std.Io.Reader, opts: Options) !Report {
@@ -295,39 +380,38 @@ pub fn run(app: *App, w: *db.Db, io: std.Io, reader: *std.Io.Reader, opts: Optio
         _ = row_arena.reset(.retain_capacity);
         const a = row_arena.allocator();
 
-        const parsed = std.json.parseFromSliceLeaky(std.json.Value, a, line, .{}) catch {
-            last_error_line = line_no;
-            return ImportError.MalformedJson;
-        };
-        if (parsed != .object) {
-            last_error_line = line_no;
-            return ImportError.RowNotObject;
-        }
+        // SAVEPOINT isolates one row inside the open batch transaction, so a bad row does
+        // not cost the good rows already in it. Portable spelling (SQLite + Postgres).
+        // Only paid when continue_on_error is set.
+        if (opts.continue_on_error) try w.exec("SAVEPOINT zb_row;");
 
-        const outcome = importRow(app, w, io, a, col, parsed, opts, &lookups) catch |e| {
+        const outcome = importOneRow(app, w, io, a, col, line, opts, &lookups) catch |e| {
             last_error_line = line_no;
             // Capture the failing field detail NOW, while records.last_errors is still valid
             // (it points into `a` = row_arena, which this function's defer will free).
-            last_error_detail = "";
-            if (e == error.Validation) {
-                if (records.last_errors) |errs| {
-                    if (errs.len > 0) {
-                        const ve = errs[0];
-                        last_error_detail = std.fmt.bufPrint(&last_error_detail_buf, "{s}: {s} ({s})", .{ ve.field, ve.message, ve.code }) catch "";
-                    }
-                }
+            last_error_detail = captureDetail(e);
+            if (!opts.continue_on_error) {
+                logFinding(opts, line_no, @errorName(e), last_error_detail);
+                return e;
             }
-            return e;
+            w.exec("ROLLBACK TO SAVEPOINT zb_row;") catch |re| return re;
+            w.exec("RELEASE SAVEPOINT zb_row;") catch |re| return re;
+            logFinding(opts, line_no, @errorName(e), last_error_detail);
+            report.failed += 1;
+            tickProgress(opts, line_no);
+            continue;
         };
+        if (opts.continue_on_error) try w.exec("RELEASE SAVEPOINT zb_row;");
         switch (outcome) {
             .created => report.created += 1,
             .updated => report.updated += 1,
         }
         report.total += 1;
         in_batch += 1;
+        tickProgress(opts, line_no);
 
         if (in_batch >= opts.batch_size) {
-            try w.commit();
+            try closeBatch(w, opts);
             batch_open = false; // txn closed; if the begin below fails, errdefer must NOT roll back
             in_batch = 0;
             try w.begin();
@@ -335,7 +419,7 @@ pub fn run(app: *App, w: *db.Db, io: std.Io, reader: *std.Io.Reader, opts: Optio
         }
     }
 
-    try w.commit();
+    try closeBatch(w, opts);
     batch_open = false;
     return report;
 }
@@ -355,8 +439,9 @@ fn testApp(alloc: std.mem.Allocator, io: std.Io) App {
 fn seedPosts(d: *db.Db, a: std.mem.Allocator, io: std.Io) !schema.Collection {
     try migrations.run(d);
     const fields = [_]schema.Field{
-        .{ .id = "f1", .name = "title", .options = .{ .text = .{} } },
+        .{ .id = "f1", .name = "title", .required = true, .options = .{ .text = .{} } },
         .{ .id = "f2", .name = "slug", .unique = true, .options = .{ .text = .{} } },
+        .{ .id = "f3", .name = "body", .options = .{ .text = .{} } },
     };
     return collections.create(a, io, d, .{ .id = "", .name = "posts", .fields = &fields });
 }
@@ -704,4 +789,173 @@ test "import: auth collection hashes the password (never stored plaintext)" {
     try std.testing.expect(std.mem.indexOf(u8, hash, "supersecret") == null);
     try std.testing.expect(st.columnText(1).len > 0); // tokenKey generated
     try std.testing.expectEqual(@as(i64, 0), st.columnInt(2)); // verified forced false
+}
+
+test "import: dry run validates every row and writes nothing" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const posts_col = try seedPosts(&d, a, io);
+    defer posts_col.deinit(a);
+    var app = testApp(std.testing.allocator, io);
+
+    const rep = try runNdjson(&app, &d, io,
+        \\{"title":"a"}
+        \\{"title":"b"}
+        \\
+    , .{ .collection = "posts", .dry_run = true });
+    try std.testing.expectEqual(@as(usize, 2), rep.created);
+    try std.testing.expectEqual(@as(usize, 0), rep.failed);
+
+    var st = try d.prepare("SELECT COUNT(*) FROM posts;");
+    defer st.finalize();
+    try std.testing.expect(try st.step());
+    try std.testing.expectEqual(@as(i64, 0), st.columnInt(0)); // nothing committed
+}
+
+test "import: dry run still fails fast on a bad row" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const posts_col = try seedPosts(&d, a, io);
+    defer posts_col.deinit(a);
+    var app = testApp(std.testing.allocator, io);
+
+    try std.testing.expectError(ImportError.MalformedJson, runNdjson(&app, &d, io,
+        \\{"title":"a"}
+        \\not json
+        \\
+    , .{ .collection = "posts", .dry_run = true }));
+}
+
+test "import: continue-on-error skips bad rows, keeps good ones, and logs NDJSON findings" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const posts_col = try seedPosts(&d, a, io);
+    defer posts_col.deinit(a);
+    var app = testApp(std.testing.allocator, io);
+
+    var buf: [4096]u8 = undefined;
+    var sink = std.Io.Writer.fixed(&buf);
+
+    const rep = try runNdjson(&app, &d, io,
+        \\{"title":"good1"}
+        \\not json
+        \\{"title":"good2"}
+        \\{"nope":"missing required title"}
+        \\{"title":"good3"}
+        \\
+    , .{ .collection = "posts", .continue_on_error = true, .error_log = &sink });
+
+    try std.testing.expectEqual(@as(usize, 3), rep.created);
+    try std.testing.expectEqual(@as(usize, 2), rep.failed);
+    try std.testing.expectEqual(@as(usize, 3), rep.total);
+
+    var st = try d.prepare("SELECT COUNT(*) FROM posts;");
+    defer st.finalize();
+    try std.testing.expect(try st.step());
+    try std.testing.expectEqual(@as(i64, 3), st.columnInt(0)); // the good rows COMMITTED
+
+    const findings = sink.buffered();
+    var lines = std.mem.tokenizeScalar(u8, findings, '\n');
+    const first = lines.next().?;
+    try std.testing.expect(std.mem.indexOf(u8, first, "\"line\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "MalformedJson") != null);
+    const second = lines.next().?;
+    try std.testing.expect(std.mem.indexOf(u8, second, "\"line\":4") != null);
+    try std.testing.expect(std.mem.indexOf(u8, second, "validation_required") != null);
+    try std.testing.expect(lines.next() == null);
+}
+
+test "import: continue-on-error rolls back only the failing row, not its batch" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const posts_col = try seedPosts(&d, a, io);
+    defer posts_col.deinit(a);
+    var app = testApp(std.testing.allocator, io);
+
+    // batch_size 10 keeps all five rows in ONE transaction: proof the savepoint (not the
+    // batch boundary) is what isolates the failure.
+    const rep = try runNdjson(&app, &d, io,
+        \\{"id":"dupdupdupdup001","title":"first"}
+        \\{"id":"dupdupdupdup001","title":"duplicate id"}
+        \\{"title":"after the failure"}
+        \\
+    , .{ .collection = "posts", .batch_size = 10, .continue_on_error = true });
+    try std.testing.expectEqual(@as(usize, 2), rep.created);
+    try std.testing.expectEqual(@as(usize, 1), rep.failed);
+}
+
+test "import: progress lines are emitted every N rows" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const posts_col = try seedPosts(&d, a, io);
+    defer posts_col.deinit(a);
+    var app = testApp(std.testing.allocator, io);
+
+    var buf: [1024]u8 = undefined;
+    var sink = std.Io.Writer.fixed(&buf);
+    _ = try runNdjson(&app, &d, io,
+        \\{"title":"1"}
+        \\{"title":"2"}
+        \\{"title":"3"}
+        \\{"title":"4"}
+        \\{"title":"5"}
+        \\
+    , .{ .collection = "posts", .progress_every = 2, .progress = &sink });
+    // Rows 2 and 4 tick; the final total is reported by the CLI, not here.
+    var lines = std.mem.tokenizeScalar(u8, sink.buffered(), '\n');
+    try std.testing.expect(std.mem.indexOf(u8, lines.next().?, "2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, lines.next().?, "4") != null);
+    try std.testing.expect(lines.next() == null);
+}
+
+test "import: 20k rows stay leak-free and memory-bounded" {
+    // Scale guard. `std.testing.allocator` fails the test on any leak, and the per-row arena
+    // is reset with .retain_capacity, so a per-row allocation that escaped the arena would
+    // show up here as unbounded growth or a leak — neither is visible at 3 rows.
+    var d = try db.Db.openMemory();
+    defer d.close();
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const posts_col = try seedPosts(&d, a, io);
+    defer posts_col.deinit(a);
+    var app = testApp(std.testing.allocator, io);
+
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(std.testing.allocator);
+    for (0..20_000) |i|
+        try body.print(std.testing.allocator, "{{\"title\":\"row {d}\"}}\n", .{i});
+
+    var reader = std.Io.Reader.fixed(body.items);
+    const rep = try run(&app, &d, io, &reader, .{ .collection = "posts", .batch_size = 1000 });
+    try std.testing.expectEqual(@as(usize, 20_000), rep.created);
+}
+
+test "import: strip_fields drops the named keys before the engine sees them" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const posts_col = try seedPosts(&d, a, io);
+    defer posts_col.deinit(a);
+    var app = testApp(std.testing.allocator, io);
+
+    const rep = try runNdjson(&app, &d, io,
+        \\{"title":"t","body":"dropped"}
+        \\
+    , .{ .collection = "posts", .strip_fields = &.{"body"} });
+    try std.testing.expectEqual(@as(usize, 1), rep.created);
+    var st = try d.prepare("SELECT \"body\" FROM \"posts\";");
+    defer st.finalize();
+    try std.testing.expect(try st.step());
+    try std.testing.expectEqual(@as(usize, 0), st.columnText(0).len);
 }

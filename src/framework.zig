@@ -2631,6 +2631,16 @@ fn printImportUsage(io: std.Io, file: std.Io.File) void {
         \\                     existing field; a unique constraint is recommended.
         \\  --batch-size N     Rows per transaction (default 500; must be >= 1).
         \\  --data-dir PATH    SQLite db + file storage directory. [env ZIGBASE_DATA_DIR, default ./zb_data]
+        \\  --dry-run          Validate + execute every row, then roll back — no record data
+        \\                     is written. NOT a true no-op: booting to import still runs
+        \\                     system migrations and comptime collection provisioning, which
+        \\                     write, same as any other startup.
+        \\                     (An --upsert-key lookup sees no rows created in the same dry run.)
+        \\  --continue-on-error  Skip a failing row instead of aborting. Exit code becomes 3 if any
+        \\                     row was skipped — a lossy import is never reported as success.
+        \\  --error-log FILE   NDJSON sink for per-row failures: {{"line":N,"code":…,"detail":…}}.
+        \\  --progress N       Print a progress line to stderr every N rows (0 = off).
+        \\  --json             Print the summary as one JSON object on stdout.
         \\
         \\WHAT IT DOES:
         \\  Streams an NDJSON file (one JSON object per line) into the collection THROUGH THE
@@ -2648,10 +2658,17 @@ fn printImportUsage(io: std.Io, file: std.Io.File) void {
         \\
         \\  Blank lines are skipped. A single record line must fit the 1 MiB line buffer.
         \\
+        \\EXIT CODES:
+        \\  0  every row imported
+        \\  1  the import failed (fatal error; batches committed before it persist)
+        \\  3  the import completed but skipped rows (--continue-on-error)
+        \\
         \\EXAMPLES:
         \\  zigbase import --collection posts --data-dir ./zb_data seed.ndjson
         \\  zigbase import --collection users --upsert-key email users.ndjson
         \\  cat dump.ndjson | zigbase import --collection posts -
+        \\  zigbase import --collection posts --continue-on-error --error-log errs.ndjson \
+        \\    --progress 1000 --json seed.ndjson
         \\
     , .{});
 }
@@ -3537,10 +3554,35 @@ fn importImpl(
     const w = holder.pool.acquireWriter();
     defer holder.pool.releaseWriter();
 
+    // Findings sink: created/truncated up front so a re-run never appends to a stale log.
+    var err_file: ?std.Io.File = null;
+    defer if (err_file) |f| f.close(io);
+    var err_buf: [8192]u8 = undefined;
+    var err_writer: ?std.Io.File.Writer = null;
+    if (ia.error_log) |path| {
+        if (std.fs.path.dirname(path)) |dir| std.Io.Dir.cwd().createDirPath(io, dir) catch {};
+        const f = try std.Io.Dir.cwd().createFile(io, path, .{});
+        err_file = f;
+        err_writer = f.writer(io, &err_buf);
+    }
+    // Flush on every exit path, including a fail-fast `run()` error below (which returns
+    // early via `reportImportError`) — otherwise the one finding logged right before that
+    // error would sit in the buffer and never reach disk, the opposite of what an
+    // --error-log is for. A broken/full sink loses the finding, never the import result
+    // (matches `logFinding`'s own best-effort contract), so this is caught, not `try`'d.
+    defer if (err_writer) |*ew| ew.interface.flush() catch {};
+    var prog_buf: [256]u8 = undefined;
+    var prog_writer = std.Io.File.stderr().writer(io, &prog_buf);
+
     const run_opts = import_mod.Options{
         .collection = collection,
         .upsert_key = ia.upsert_key,
         .batch_size = ia.batch_size,
+        .dry_run = ia.dry_run,
+        .continue_on_error = ia.continue_on_error,
+        .error_log = if (err_writer) |*ew| &ew.interface else null,
+        .progress_every = ia.progress,
+        .progress = if (ia.progress > 0) &prog_writer.interface else null,
     };
 
     // A generous heap line buffer (a single NDJSON record must fit it). Heap, not stack — 1 MiB.
@@ -3561,7 +3603,47 @@ fn importImpl(
             break :blk import_mod.run(&holder.app, w, io, &fr.interface, run_opts) catch |e| return reportImportError(collection, e);
         }
     };
-    std.log.info("import complete: {d} created, {d} updated, {d} total (collection '{s}')", .{ report.created, report.updated, report.total, collection });
+
+    if (ia.json) {
+        var arena_state = std.heap.ArenaAllocator.init(allocator);
+        defer arena_state.deinit();
+        const a = arena_state.allocator();
+        var root: std.json.ObjectMap = .empty;
+        // Stdout is the settled snake_case convention for everything this command PRINTS.
+        try root.put(a, "zigbase_import", .{ .integer = 1 });
+        try root.put(a, "collection", .{ .string = collection });
+        try root.put(a, "dry_run", .{ .bool = ia.dry_run });
+        try root.put(a, "created", .{ .integer = @intCast(report.created) });
+        try root.put(a, "updated", .{ .integer = @intCast(report.updated) });
+        try root.put(a, "failed", .{ .integer = @intCast(report.failed) });
+        try root.put(a, "total", .{ .integer = @intCast(report.total) });
+        try root.put(a, "error_log", if (ia.error_log) |p| .{ .string = p } else .null);
+        const body = try std.json.Stringify.valueAlloc(a, std.json.Value{ .object = root }, .{});
+        var out_buf: [4096]u8 = undefined;
+        var out = std.Io.File.stdout().writer(io, &out_buf);
+        try out.interface.writeAll(body);
+        try out.interface.writeAll("\n");
+        try out.interface.flush();
+    }
+    // Keeps the pre-existing "N created, M updated, K total" substring intact (the browser
+    // suite greps for it) by appending the new `failed` count after `total` rather than
+    // splicing it into the middle.
+    std.log.info("import {s}: {d} created, {d} updated, {d} total, {d} failed (collection '{s}')", .{
+        if (ia.dry_run) "dry-run complete (nothing written)" else "complete",
+        report.created,
+        report.updated,
+        report.total,
+        report.failed,
+        collection,
+    });
+    // A lossy import is NOT a success. Exit 3 so an agent cannot mistake it for one. Flush the
+    // findings sink explicitly first: `std.process.exit` does not run deferred cleanup (unlike
+    // a normal `return`, which is why the fatal-error path above stays correct via the defer
+    // above), so without this the NDJSON findings would sit in the buffer and vanish.
+    if (report.failed > 0) {
+        if (err_writer) |*ew| ew.interface.flush() catch {};
+        std.process.exit(3);
+    }
 }
 
 /// Present an `import.run` failure at the CLI boundary (the library itself emits no `.err`
