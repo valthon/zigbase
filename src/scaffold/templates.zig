@@ -118,8 +118,8 @@ pub const box_readme =
     \\Idempotent — re-applying an already-applied document reports `applied: []`.
     \\`schema/collections.json` (bind-mounted read-only at `/schema`) is the source
     \\of truth for a fresh environment. If you change the schema through the admin
-    \\UI, update that file too — and if a server is already running against this
-    \\data dir, restart it afterward (see AGENTS.md).
+    \\UI, update that file too. A running server picks an applied change up on its
+    \\own within about five seconds (see AGENTS.md).
     \\
     \\## Talk to it from a frontend
     \\

@@ -1,3 +1,0 @@
-### Features
-
-- **`GET /api/meta`** — a public, unauthenticated capability probe reporting the running version and commit, which optional route groups this binary carries (admin, OAuth2, WebAuthn, magic link, tenancy, analytics, senders, mail webhook/unsubscribe), which build flags are on (Postgres, S3, vector, dev mode), whether collection metadata is frozen, where the public feature-state route is mounted, and the upload size limit. Tools no longer have to infer frozen mode by string-matching a 403. It exposes only facts an anonymous client could already establish by probing — never a config value, path, or credential — and it is deliberately separate from `/api/health` (liveness) and `/api/state` (per-subject feature flags).

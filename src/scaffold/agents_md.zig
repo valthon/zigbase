@@ -152,9 +152,10 @@ const box_traps =
     \\schema back out in the same document shape — or the next fresh environment will
     \\not match this one.
     \\
-    \\If a server is already running against this data dir, restart it after applying:
-    \\its in-process collection cache has no TTL and isn't invalidated by a separate
-    \\`schema apply` process. See
+    \\A server already running against this data dir picks the change up on its own
+    \\within about five seconds (it polls a schema-generation marker and then drops its
+    \\collection cache). Requests in that window still see the old schema, so restart it
+    \\if the change must be visible immediately. See
     \\<https://valthon.github.io/zigbase/docs/migration-tools> §2/§7 for the mechanism.
     \\
     \\

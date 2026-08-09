@@ -140,18 +140,17 @@ there is no separate migration-only code path that could disagree with what `POS
   needs the field to be optional first.
 - **Refused under `.collections_frozen`** — an app that comptime-locks its schema refuses
   `apply` outright, before touching anything.
-- **Against a live SQLite-backed server, restart it after applying.** A non-frozen SQLite
-  deployment keeps an in-process, unbounded (no TTL) cache of parsed collection metadata,
-  including *negative* lookups ("no such collection") — see `src/colcache.zig`. The only
-  invalidation is the three REST collections DDL handlers running invalidate() **in the
-  same process**; `schema apply` is a separate CLI process, so its writes never reach a
-  running server's cache. The server keeps serving its cached view — stale metadata for an
-  existing collection, or a continued 404 for a brand-new one it already looked up before
-  it existed (e.g. via an earlier request, or realtime's per-event custom-topic lookup) —
-  with no error and no warning, until restarted. Postgres deployments and
-  `.collections_frozen` apps (which refuse `apply` outright, above) are unaffected: apply
-  any time; restart afterwards to guarantee the server sees changes to a collection it has
-  already looked up.
+- **A live server picks the change up on its own, within about five seconds.** A server keeps
+  an in-process cache of parsed collection metadata, including *negative* lookups ("no such
+  collection") — see `src/colcache.zig` — and `schema apply` is a separate CLI process, so it
+  cannot invalidate that cache directly. Instead, every engine write to `_collections` bumps a
+  one-row `_schema_state` generation marker inside its own transaction, and the server runs a
+  background observer that polls the marker and drops the cache when it moves. The practical
+  effect: apply any time, against a running server, and it takes effect there without a
+  restart — but requests landing in the polling window still see the pre-change view, so a
+  cutover that must be seen immediately should still restart the server. This applies equally
+  to SQLite and Postgres, and runs under `.collections_frozen` too (which refuses `apply`
+  itself, above, but not a rolling-deploy migration from another instance).
 - **Every access rule in the document is syntax-checked first, and one bad rule refuses the
   whole apply.** Before any write derived from the document happens, all five rule fields of
   every collection the document declares are run through the filter lexer and parser (the
@@ -654,10 +653,9 @@ zigbase schema apply schema.json --dry-run --data-dir ./zb_data
 zigbase schema apply schema.json --data-dir ./zb_data
 zigbase schema check-rules --data-dir ./zb_data
 
-# 2a. If a server is already running against this data dir (SQLite, non-frozen), restart
-#     it now. Its in-process collection cache has no TTL and isn't invalidated by a
-#     separate `schema apply` process — see §7 — so it can keep serving stale or
-#     not-found metadata for what you just applied until it restarts.
+# 2a. A server already running against this data dir picks the change up on its own within
+#     about five seconds (it polls the `_schema_state` marker — see §7). Requests in that
+#     window still see the old view; restart it if the cutover must be seen immediately.
 
 # 3. Bring user accounts over first, without a mass password reset. Relation values
 #    validate their target exists, and a single relation carries a real foreign key, so
@@ -694,9 +692,10 @@ zigbase schema dump --out schema.json --data-dir ./zb_data
   you meant.
 - **Collection rename is not supported by the engine** (`collections.update` preserves
   the stored name), so a renamed collection in a document reads as create + untracked.
-- **`schema apply` against a live SQLite-backed server does not, by itself, make the
-  server see the change** — restart it afterwards (see §2's apply semantics for the
-  mechanism: an in-process, un-invalidated collection cache).
+- **A live server sees another process's schema change within about five seconds, not
+  instantly** — it polls the `_schema_state` generation marker and then drops its
+  collection cache (see §2's apply semantics for the mechanism). Requests in that window
+  still see the pre-change view; restart the server if the cutover must be seen at once.
 - **`import --manifest`'s deferred relation values (cycles, self-relations) require the
   source row to carry its own `id`** — the patch pass matches purely by id, and a
   **required** field on a cycle back-edge or self-relation is refused up front

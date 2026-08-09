@@ -2543,10 +2543,10 @@ fn printSchemaUsage(io: std.Io, file: std.Io.File) void {
         \\  "untracked" and left alone (--prune deletes them instead). Refused when the app
         \\  sets `.collections_frozen`.
         \\
-        \\  Against a live SQLite-backed server, restart it afterwards: the server caches
-        \\  parsed collection metadata in-process with no TTL, invalidated only by its own
-        \\  REST create/update/delete handlers, so it can keep serving a stale or
-        \\  not-found view of a collection it already looked up until it restarts.
+        \\  A server already running against this data dir picks the change up on its own
+        \\  within about five seconds: it polls the `_schema_state` generation marker this
+        \\  apply bumps, then drops its collection cache. Requests landing in that window
+        \\  still see the pre-change view, so restart it if the cutover must be immediate.
         \\
         \\  RULE SYNTAX GATE: before anything is written, every access rule the document
         \\  declares is run through the filter lexer + parser. If any one of them fails to
