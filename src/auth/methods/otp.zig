@@ -67,7 +67,7 @@ fn initiateImpl(ctx: *anyopaque, ac: *AuthCtx) anyerror!InitiateResult {
 
     // Rate-limit check
     if (try ac.rateLimit("otp", email)) |_|
-        return InitiateResult{ .status = 429, .body = "{\"message\":\"Too many requests.\"}" };
+        return InitiateResult{ .status = 429, .body = "{\"status\":429,\"code\":\"too_many_requests\",\"message\":\"Too many requests.\",\"data\":{}}" };
 
     // Read opts (default length=6, ttl_s=300)
     const length: u8 = if (ac.collection.options.auth.methods.otp) |o| o.length else 6;

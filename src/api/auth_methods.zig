@@ -18,6 +18,7 @@ const events = @import("../events.zig");
 const registry_mod = @import("../auth/registry.zig");
 const method_mod = @import("../auth/method.zig");
 const ApiError = @import("error.zig").ApiError;
+const codes = @import("../error_codes.zig");
 const auth = @import("auth.zig");
 const records = @import("../records.zig");
 const ratelimit = @import("../ratelimit.zig");
@@ -148,7 +149,20 @@ fn dispatch(ctx: *http.RequestCtx, phase: DispatchPhase) anyerror!http.Response 
             // 7b. Map Resolution.
             switch (resolution) {
                 .fail => |f| {
-                    return (ApiError{ .status = f.status, .message = f.message }).toResponse(ctx.allocator.a);
+                    // f.status is chosen dynamically by whichever auth-method vtable produced
+                    // this Resolution (password/otp/magic_link/webauthn/oauth2) and carries no
+                    // code of its own — derive one from the status, same as route_types.zig's
+                    // jsonError does for typed routes.
+                    const derived = codes.forStatus(f.status);
+                    // `internal` promises in the frozen registry that no detail is
+                    // leaked, so a 5xx must NOT forward the method's own message —
+                    // that text is written for operators, not for an anonymous caller.
+                    // Log it (the operator still needs it) and answer generically.
+                    if (derived == .internal) {
+                        std.log.err("auth method failed with {d}: {s}", .{ f.status, f.message });
+                        return ApiError.internal().toResponse(ctx.allocator.a);
+                    }
+                    return (ApiError{ .status = f.status, .code = codes.s(derived), .message = f.message }).toResponse(ctx.allocator.a);
                 },
                 .record => |rid| {
                     const auth_tag: events.AuthMethod = if (std.mem.eql(u8, slug, "password"))
@@ -175,7 +189,7 @@ fn dispatch(ctx: *http.RequestCtx, phase: DispatchPhase) anyerror!http.Response 
                     // Optional verification gate: refuse to mint a session for a record
                     // whose `verified` field is not true (when the collection requires it).
                     if (col.options.auth.require_verified and !auth.recordVerified(rec))
-                        return (ApiError{ .status = 403, .message = "Email not verified." }).toResponse(ctx.allocator.a);
+                        return ApiError.withCode(403, .email_not_verified, "Email not verified.").toResponse(ctx.allocator.a);
 
                     // Transactional login: the beforeAuthSuccess hook's side-writes commit
                     // atomically with session issuance; an aborting hook rolls everything

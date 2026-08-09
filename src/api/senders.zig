@@ -26,10 +26,10 @@ const db = @import("../db.zig");
 const Scope = struct { account: []const u8, is_superuser: bool };
 
 fn unauthorized(ctx: *http.RequestCtx) !http.Response {
-    return (ApiError{ .status = 401, .message = "Authentication required." }).toResponse(ctx.allocator.a);
+    return ApiError.withCode(401, .unauthorized, "Authentication required.").toResponse(ctx.allocator.a);
 }
 fn forbidden(ctx: *http.RequestCtx) !http.Response {
-    return (ApiError{ .status = 403, .message = "Not a member of this account." }).toResponse(ctx.allocator.a);
+    return ApiError.withCode(403, .forbidden, "Not a member of this account.").toResponse(ctx.allocator.a);
 }
 
 /// Resolve the account this request may manage senders for. Returns null + a stashed response on a
@@ -132,7 +132,7 @@ pub fn create(ctx: *http.RequestCtx) anyerror!http.Response {
     const req = senders.requestVerification(app.io, ctx.allocator.a, w, scope.account, email) catch |e| switch (e) {
         error.InvalidSenderEmail => return ApiError.badRequest("Invalid sender email.").toResponse(ctx.allocator.a),
         // Rate-limited (I3): a (re)send was requested again within the window — do not re-issue/email.
-        error.VerificationThrottled => return (ApiError{ .status = 429, .message = "Verification email already sent recently; try again later." }).toResponse(ctx.allocator.a),
+        error.VerificationThrottled => return ApiError.withCode(429, .too_many_requests, "Verification email already sent recently; try again later.").toResponse(ctx.allocator.a),
         else => return e,
     };
 

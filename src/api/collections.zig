@@ -11,6 +11,7 @@ const crypto = @import("../crypto.zig");
 const jwt = @import("../jwt.zig");
 const ApiError = @import("error.zig").ApiError;
 const FieldError = @import("error.zig").FieldError;
+const codes = @import("../error_codes.zig");
 const secrets = @import("../oauth/secrets.zig");
 const oauth_api = @import("oauth.zig");
 const field_policy = @import("../field_policy.zig");
@@ -57,7 +58,7 @@ fn requireSuperuser(ctx: *http.RequestCtx) !?http.Response {
     if (isSuperuser(ctx)) return null;
     // Building the 403 body allocates (JSON on the request arena), so OutOfMemory is reachable —
     // propagate it to the server's 500 backstop rather than `catch unreachable` (#29).
-    return try (ApiError{ .status = 403, .message = "Forbidden." }).toResponse(ctx.allocator.a);
+    return try ApiError.forbidden().toResponse(ctx.allocator.a);
 }
 
 /// Frozen-collection-metadata mode (issue #234): when `app.collections_frozen` is set the
@@ -65,7 +66,11 @@ fn requireSuperuser(ctx: *http.RequestCtx) !?http.Response {
 /// `.migrations` + a redeploy). Returns a 403 response to short-circuit; null when not frozen.
 fn rejectIfFrozen(ctx: *http.RequestCtx, app: *app_mod.App) !?http.Response {
     if (!app.collections_frozen) return null;
-    return try (ApiError{ .status = 403, .message = "Collections are frozen (`.collections_frozen`); schema changes require a migration and a redeploy." }).toResponse(ctx.allocator.a);
+    return try ApiError.withCode(
+        403,
+        .collections_frozen,
+        "Collections are frozen (`.collections_frozen`); schema changes require a migration and a redeploy.",
+    ).toResponse(ctx.allocator.a);
 }
 
 fn validationResponse(ctx: *http.RequestCtx) !http.Response {
@@ -272,7 +277,11 @@ test "collections_frozen 403s the runtime DDL endpoints without mutating collect
         cctx.authorization = auth_hdr;
         const res = try create(&cctx);
         try std.testing.expectEqual(@as(u16, 403), res.status);
-        try std.testing.expect(std.mem.indexOf(u8, res.body, "collections_frozen") != null);
+        // Discriminating: the machine code, not an incidental substring of the message.
+        const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, res.body, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings("collections_frozen", parsed.value.object.get("code").?.string);
+        try std.testing.expectEqual(@as(i64, 403), parsed.value.object.get("status").?.integer);
     }
     {
         const body =
@@ -333,7 +342,7 @@ test "runtime API mirrors the comptime encryption guards (the bypass fix)" {
         cctx.authorization = auth_hdr;
         const res = try create(&cctx);
         try std.testing.expectEqual(@as(u16, 400), res.status);
-        try std.testing.expect(std.mem.indexOf(u8, res.body, "validation_encrypted_type") != null);
+        try std.testing.expect(std.mem.indexOf(u8, res.body, codes.s(.validation_encrypted_type)) != null);
         // Nothing stored: the collection does not exist.
         var gctx = ctxFor(env, RequestArena.from(&arena), .GET, "/api/collections/nums", "", &.{.{ .key = "idOrName", .value = "nums" }});
         gctx.authorization = auth_hdr;
@@ -349,7 +358,7 @@ test "runtime API mirrors the comptime encryption guards (the bypass fix)" {
         cctx.authorization = auth_hdr;
         const res = try create(&cctx);
         try std.testing.expectEqual(@as(u16, 400), res.status);
-        try std.testing.expect(std.mem.indexOf(u8, res.body, "validation_encrypted_unique") != null);
+        try std.testing.expect(std.mem.indexOf(u8, res.body, codes.s(.validation_encrypted_unique)) != null);
     }
 
     // (3) An index over an encrypted field is rejected.
@@ -361,7 +370,7 @@ test "runtime API mirrors the comptime encryption guards (the bypass fix)" {
         cctx.authorization = auth_hdr;
         const res = try create(&cctx);
         try std.testing.expectEqual(@as(u16, 400), res.status);
-        try std.testing.expect(std.mem.indexOf(u8, res.body, "validation_encrypted_index") != null);
+        try std.testing.expect(std.mem.indexOf(u8, res.body, codes.s(.validation_encrypted_index)) != null);
     }
 }
 
@@ -375,7 +384,7 @@ test "create with invalid name returns 400 with field errors" {
     cctx.authorization = try std.fmt.allocPrint(a, "Bearer {s}", .{try env.superuserToken(a)});
     const res = try create(&cctx);
     try std.testing.expectEqual(@as(u16, 400), res.status);
-    try std.testing.expect(std.mem.indexOf(u8, res.body, "validation_invalid_name") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.body, codes.s(.validation_invalid_name)) != null);
 }
 
 test "enabled oauth2 provider with no client secret is rejected at save" {

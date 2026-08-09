@@ -15,6 +15,7 @@ const expand_mod = @import("query/expand.zig");
 const http_client = @import("http_client.zig");
 const captcha_mod = @import("captcha.zig");
 const error_mod = @import("api/error.zig");
+const error_codes = @import("error_codes.zig");
 const http_mod = @import("http.zig");
 const auth_helpers = @import("auth_helpers.zig");
 const api_auth = @import("api/auth.zig");
@@ -40,10 +41,10 @@ const report_reporter = @import("report/reporter.zig");
 
 /// Allocation-free last-resort 500 for the error path when even rendering the error envelope
 /// fails (OOM). Byte-for-byte the envelope `ApiError.internal().renderBody` produces, so a client
-/// or SDK parsing the `{code,message,data}` shape sees the same body it would on any other 500.
+/// or SDK parsing the `{status,code,message,data}` shape sees the same body it would on any other 500.
 const static_internal_response = http_mod.Response{
     .status = 500,
-    .body = "{\"code\":500,\"message\":\"Something went wrong.\",\"data\":{}}",
+    .body = "{\"status\":500,\"code\":\"internal\",\"message\":\"Something went wrong.\",\"data\":{}}",
 };
 
 pub const Ctx = struct {
@@ -491,8 +492,8 @@ pub const Ctx = struct {
     ///
     /// ```zig
     /// const r = try ctx.verifyCaptcha(.recaptcha_v3, token);
-    /// if (!r.ok) return ctx.jsonError(403, "captcha_required");
-    /// if (r.score) |score| if (score < 0.5) return ctx.jsonError(403, "suspicious_request");
+    /// if (!r.ok) return ctx.jsonError(403, "captcha_required", "Captcha required.");
+    /// if (r.score) |score| if (score < 0.5) return ctx.jsonError(403, "suspicious_request", "Suspicious request.");
     /// ```
     pub fn verifyCaptcha(self: *Ctx, provider: captcha_mod.Provider, token: []const u8) !captcha_mod.Result {
         if (self.app.captcha_secret.len == 0) return .{ .ok = true };
@@ -612,8 +613,10 @@ pub const Ctx = struct {
     pub const FailError = error{Handled};
 
     /// Stash a custom status+message error and return error.Handled for propagation.
+    /// `code` is derived from `status` (`error_codes.forStatus`) since this call carries no
+    /// code of its own — the same derivation `route_types.zig`'s typed-route path uses.
     pub fn fail(self: *Ctx, status: u16, message: []const u8) FailError {
-        self.handled = .{ .status = status, .message = message };
+        self.handled = .{ .status = status, .code = error_codes.s(error_codes.forStatus(status)), .message = message };
         return error.Handled;
     }
 
@@ -707,14 +710,13 @@ pub const Ctx = struct {
         return .{ .status = status, .content_type = "application/json", .body = body };
     }
 
-    /// Build a JSON error response shaped `{"error":"<code>"}` (#138). NOTE: this is a
-    /// deliberately terse shape distinct from the framework's `{code,message,data}`
-    /// envelope (`ctx.errorResponse`) — use it for machine-readable code-only errors.
-    pub fn jsonError(self: *Ctx, status: u16, code: []const u8) !http_mod.Response {
-        var obj: std.json.ObjectMap = .empty;
-        try obj.put(self.arena.a, "error", .{ .string = code });
-        const body = try std.json.Stringify.valueAlloc(self.arena.a, std.json.Value{ .object = obj }, .{});
-        return .{ .status = status, .content_type = "application/json", .body = body };
+    /// Build the canonical error envelope with a caller-supplied machine `code`
+    /// (#138 / SP-1). Use this when the handler has a more specific code than the
+    /// status implies, e.g. `ctx.jsonError(403, "captcha_required", "Captcha required.")`.
+    /// `code` is NOT validated against ZigBase's frozen ledger — it is your vocabulary,
+    /// and ZigBase never assigns meaning to a code it did not register.
+    pub fn jsonError(self: *Ctx, status: u16, code: []const u8, message: []const u8) !http_mod.Response {
+        return (error_mod.ApiError{ .status = status, .code = code, .message = message }).toResponse(self.arena.a);
     }
 
     /// Build an HTML response (`text/html; charset=utf-8`). `body` must outlive the handler
@@ -2090,11 +2092,23 @@ test "errorResponse maps known errors to status codes, unknown to 500" {
     try std.testing.expectEqual(@as(u16, 401), ctx.errorResponse(error.Unauthorized).status);
     try std.testing.expectEqual(@as(u16, 500), ctx.errorResponse(error.SomethingWeird).status);
 
-    // ctx.fail stashes a custom message that errorResponse(error.Handled) renders.
+    // ctx.fail stashes a custom message that errorResponse(error.Handled) renders. The code is
+    // derived from status (422 has no specific mapping, so it falls back to "internal" — see
+    // the next case for a status that DOES have a specific code).
     const e = ctx.fail(422, "nope");
     try std.testing.expectError(error.Handled, @as(error{Handled}!void, e));
     const r = ctx.errorResponse(error.Handled);
     try std.testing.expectEqual(@as(u16, 422), r.status);
+
+    // A status error_codes DOES map (403) must not silently ship "internal" — this is the
+    // exact regression the {status,code,message,data} unification must not reintroduce.
+    const e2 = ctx.fail(403, "nope");
+    try std.testing.expectError(error.Handled, @as(error{Handled}!void, e2));
+    const r2 = ctx.errorResponse(error.Handled);
+    try std.testing.expectEqualStrings(
+        "{\"status\":403,\"code\":\"forbidden\",\"message\":\"nope\",\"data\":{}}",
+        r2.body,
+    );
 }
 
 test "ctx.records expand nests the related record under \"expand\"" {
@@ -2278,11 +2292,13 @@ test "#138 ctx response builders: shapes + content-types" {
     try std.testing.expectEqualStrings("application/json", j.content_type);
     try std.testing.expectEqualStrings("{\"ok\":true,\"n\":7}", j.body);
 
-    // jsonError: {"error":"<code>"} (#138 shape, distinct from the {code,message} envelope).
-    const e = try ctx.jsonError(400, "bad_token");
+    // jsonError: the canonical envelope carrying a consumer-defined machine code.
+    const e = try ctx.jsonError(400, "bad_token", "The token is not valid.");
     try std.testing.expectEqual(@as(u16, 400), e.status);
-    try std.testing.expectEqualStrings("application/json", e.content_type);
-    try std.testing.expectEqualStrings("{\"error\":\"bad_token\"}", e.body);
+    try std.testing.expectEqualStrings(
+        "{\"status\":400,\"code\":\"bad_token\",\"message\":\"The token is not valid.\",\"data\":{}}",
+        e.body,
+    );
 
     // html: text/html passthrough body.
     const h = ctx.html(200, "<h1>hi</h1>");

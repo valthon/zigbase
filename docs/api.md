@@ -21,19 +21,36 @@ server actually implements.
 - **Error envelope:** every error response is a JSON object of the shape:
 
   ```json
-  { "code": 404, "message": "Not found.", "data": {} }
+  { "status": 404, "code": "not_found", "message": "Not found.", "data": {} }
   ```
 
-  `code` mirrors the HTTP status. For validation failures (`400`), `data` maps each
-  offending field to `{ "code": "...", "message": "..." }`:
+  `status` is the HTTP status. `code` is a **frozen machine string** — it never changes
+  meaning once shipped, and it is what your client should branch on. `message` is human
+  text and is **not contract**: it may be reworded in any release, so never match on it.
+  Run `zigbase explain-code` to list every code, or `zigbase explain-code <CODE>` for the
+  long form. Key order is stable and part of the contract.
+
+  For validation failures (`400`, `code: "validation_failed"`), `data` maps each offending
+  field to its own frozen `{ "code": …, "message": … }`:
 
   ```json
   {
-    "code": 400,
+    "status": 400,
+    "code": "validation_failed",
     "message": "Failed to validate the request.",
     "data": { "name": { "code": "validation_invalid_name", "message": "Invalid." } }
   }
   ```
+
+  This is the **only** error shape for the JSON API. Typed (`rpc.*`) routes, auth-method
+  endpoints, and custom routes all emit it; the older bare `{"message": …}` and
+  `{"error": …}` bodies are gone.
+
+  Two deliberate non-JSON exceptions exist, both outside the JSON API surface, and a
+  client that blindly parses every non-2xx body must tolerate them: a **416 Range Not
+  Satisfiable** from a file download carries an empty body with a `Content-Range`
+  header (the range headers *are* the response), and a static-file **404** returns
+  `text/plain` because static assets are browser-facing, not API responses.
 
 ### Authentication transport
 

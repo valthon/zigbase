@@ -79,7 +79,7 @@ pub fn begin(ctx: *http.RequestCtx) anyerror!http.Response {
 
     // Authenticate the caller.
     const user_id = (try requireAuthed(ctx, w)) orelse
-        return (ApiError{ .status = 401, .message = "Not authenticated." }).toResponse(ctx.allocator.a);
+        return ApiError.withCode(401, .unauthorized, "Not authenticated.").toResponse(ctx.allocator.a);
 
     // Load the collection + webauthn opts.
     const load = (try loadWebAuthnCollection(ctx, w)) orelse
@@ -163,7 +163,7 @@ pub fn finish(ctx: *http.RequestCtx) anyerror!http.Response {
         defer app.pool.releaseWriter();
 
         user_id = (try requireAuthed(ctx, w)) orelse
-            return (ApiError{ .status = 401, .message = "Not authenticated." }).toResponse(ctx.allocator.a);
+            return ApiError.withCode(401, .unauthorized, "Not authenticated.").toResponse(ctx.allocator.a);
 
         const load = (try loadWebAuthnCollection(ctx, w)) orelse
             return (ApiError.notFound()).toResponse(ctx.allocator.a);
@@ -180,7 +180,7 @@ pub fn finish(ctx: *http.RequestCtx) anyerror!http.Response {
         // by this registration take() that passes "webauthn_reg", and vice versa.
         const cs = ChallengeStore{ .conn = w };
         challenge_raw_bytes = (try cs.take(ctx.allocator.a, ceremony_id, "webauthn_reg")) orelse {
-            return (ApiError{ .status = 400, .message = "Invalid or expired ceremony." }).toResponse(ctx.allocator.a);
+            return (ApiError.badRequest("Invalid or expired ceremony.")).toResponse(ctx.allocator.a);
         };
     } // writer released — verifyRegistration below runs OFF the lock.
 
@@ -201,7 +201,7 @@ pub fn finish(ctx: *http.RequestCtx) anyerror!http.Response {
         att_obj_bytes,
         wa_opts.require_uv,
     ) catch {
-        return (ApiError{ .status = 400, .message = "Registration verification failed." }).toResponse(ctx.allocator.a);
+        return (ApiError.badRequest("Registration verification failed.")).toResponse(ctx.allocator.a);
     };
 
     // Base64url-encode the credential id, COSE public key, and AAGUID for storage.
@@ -217,7 +217,7 @@ pub fn finish(ctx: *http.RequestCtx) anyerror!http.Response {
         const cred_store = CredentialStore{ .conn = w };
         // SECURITY REQUIREMENT 3: check uniqueness BEFORE insert (insert also enforces UNIQUE).
         if (try cred_store.existsCredentialId(cred_id_b64)) {
-            return (ApiError{ .status = 409, .message = "Credential already registered." }).toResponse(ctx.allocator.a);
+            return (ApiError.conflict("Credential already registered.")).toResponse(ctx.allocator.a);
         }
 
         // Insert the credential. record_ref = authed user id (never body-supplied). The pre-check
@@ -236,7 +236,7 @@ pub fn finish(ctx: *http.RequestCtx) anyerror!http.Response {
             aaguid_b64,
             "", // transports: not parsed from body in v1
         ) catch |e| switch (e) {
-            error.Constraint => return (ApiError{ .status = 409, .message = "Credential already registered." }).toResponse(ctx.allocator.a),
+            error.Constraint => return (ApiError.conflict("Credential already registered.")).toResponse(ctx.allocator.a),
             else => return e,
         };
     }

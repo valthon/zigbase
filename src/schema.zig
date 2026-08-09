@@ -2,6 +2,7 @@ const std = @import("std");
 const regex = @import("regex.zig");
 const datetime = @import("datetime.zig");
 const dialect = @import("sql/dialect.zig");
+const codes = @import("error_codes.zig");
 
 pub const NumberMode = enum { float, int, fixed };
 
@@ -938,24 +939,24 @@ pub fn hasSearchableField(c: Collection) bool {
 /// Appends any validation problems to `errors`. Self-sizing; messages/codes are static or borrowed from `c`.
 pub fn validate(alloc: std.mem.Allocator, c: Collection, errors: *std.ArrayList(ValidationError)) std.mem.Allocator.Error!void {
     if (!isValidIdentifier(c.name))
-        try errors.append(alloc, .{ .field = "name", .code = "validation_invalid_name", .message = "Name must start with a letter and contain only letters, digits, and underscores." });
+        try errors.append(alloc, .{ .field = "name", .code = codes.s(.validation_invalid_name), .message = "Name must start with a letter and contain only letters, digits, and underscores." });
     // `_fts` is reserved: a searchable collection `posts` provisions an FTS5 shadow table named
     // `posts_fts`, so a user collection literally named `<x>_fts` could collide with `<x>`'s index
     // (CREATE VIRTUAL TABLE over an existing base table errors). Reserve the suffix outright (#157).
     if (std.mem.endsWith(u8, c.name, fts_suffix))
-        try errors.append(alloc, .{ .field = "name", .code = "validation_reserved_suffix", .message = "Collection name may not end with '_fts' (reserved for full-text search index tables)." });
+        try errors.append(alloc, .{ .field = "name", .code = codes.s(.validation_reserved_suffix), .message = "Collection name may not end with '_fts' (reserved for full-text search index tables)." });
 
     for (c.fields, 0..) |f, i| {
         if (!isValidIdentifier(f.name)) {
-            try errors.append(alloc, .{ .field = f.name, .code = "validation_invalid_name", .message = "Invalid field name." });
+            try errors.append(alloc, .{ .field = f.name, .code = codes.s(.validation_invalid_name), .message = "Invalid field name." });
             continue;
         }
         if (isSystemFieldName(f.name)) {
-            try errors.append(alloc, .{ .field = f.name, .code = "validation_reserved_name", .message = "Field name is reserved." });
+            try errors.append(alloc, .{ .field = f.name, .code = codes.s(.validation_reserved_name), .message = "Field name is reserved." });
         }
         for (c.fields[0..i]) |g| {
             if (std.ascii.eqlIgnoreCase(f.name, g.name))
-                try errors.append(alloc, .{ .field = f.name, .code = "validation_duplicate_name", .message = "Duplicate field name." });
+                try errors.append(alloc, .{ .field = f.name, .code = codes.s(.validation_duplicate_name), .message = "Duplicate field name." });
         }
         // At-rest encryption constraints (Theme B1). The comptime `.collections` path
         // enforces these with @compileError; the runtime collections API (superuser
@@ -964,18 +965,18 @@ pub fn validate(alloc: std.mem.Allocator, c: Collection, errors: *std.ArrayList(
         // encrypts the text/editor/json branches).
         if (f.encrypted) {
             if (!isEncryptableType(f.fieldType()))
-                try errors.append(alloc, .{ .field = f.name, .code = "validation_encrypted_type", .message = "Only text, editor, and json fields can be encrypted." });
+                try errors.append(alloc, .{ .field = f.name, .code = codes.s(.validation_encrypted_type), .message = "Only text, editor, and json fields can be encrypted." });
             if (f.unique)
-                try errors.append(alloc, .{ .field = f.name, .code = "validation_encrypted_unique", .message = "An encrypted field cannot be unique." });
+                try errors.append(alloc, .{ .field = f.name, .code = codes.s(.validation_encrypted_unique), .message = "An encrypted field cannot be unique." });
         }
         // Full-text search constraints (#157): only free-text types can be searchable, and an
         // encrypted field can never be (its stored bytes are per-row-nonce ciphertext). The
         // comptime `.collections` path enforces these with @compileError; the runtime API mirrors.
         if (f.searchable) {
             if (!isSearchableType(f.fieldType()))
-                try errors.append(alloc, .{ .field = f.name, .code = "validation_searchable_type", .message = "Only text and editor fields can be searchable." });
+                try errors.append(alloc, .{ .field = f.name, .code = codes.s(.validation_searchable_type), .message = "Only text and editor fields can be searchable." });
             if (f.encrypted)
-                try errors.append(alloc, .{ .field = f.name, .code = "validation_searchable_encrypted", .message = "An encrypted field cannot be searchable." });
+                try errors.append(alloc, .{ .field = f.name, .code = codes.s(.validation_searchable_encrypted), .message = "An encrypted field cannot be searchable." });
         }
         switch (f.options) {
             .text => |o| if (o.pattern) |pat| {
@@ -983,44 +984,44 @@ pub fn validate(alloc: std.mem.Allocator, c: Collection, errors: *std.ArrayList(
                     prog.deinit(alloc);
                 } else |err| {
                     if (err == error.OutOfMemory) return error.OutOfMemory;
-                    try errors.append(alloc, .{ .field = f.name, .code = "validation_pattern", .message = "Field pattern is not a valid regular expression." });
+                    try errors.append(alloc, .{ .field = f.name, .code = codes.s(.validation_pattern), .message = "Field pattern is not a valid regular expression." });
                 }
             },
             .date => |o| {
                 var min_secs: ?i64 = null;
                 var max_secs: ?i64 = null;
                 if (o.min) |mn| {
-                    if (datetime.parse(mn)) |s| min_secs = s else |_| try errors.append(alloc, .{ .field = f.name, .code = "validation_date", .message = "Date min is not a valid date." });
+                    if (datetime.parse(mn)) |s| min_secs = s else |_| try errors.append(alloc, .{ .field = f.name, .code = codes.s(.validation_date), .message = "Date min is not a valid date." });
                 }
                 if (o.max) |mx| {
-                    if (datetime.parse(mx)) |s| max_secs = s else |_| try errors.append(alloc, .{ .field = f.name, .code = "validation_date", .message = "Date max is not a valid date." });
+                    if (datetime.parse(mx)) |s| max_secs = s else |_| try errors.append(alloc, .{ .field = f.name, .code = codes.s(.validation_date), .message = "Date max is not a valid date." });
                 }
                 // Reject an unsatisfiable range: with both bounds enforced, min > max
                 // would make every value fail, so the field could never accept input.
                 if (min_secs) |lo| if (max_secs) |hi| if (lo > hi)
-                    try errors.append(alloc, .{ .field = f.name, .code = "validation_date", .message = "Date min must not be after max." });
+                    try errors.append(alloc, .{ .field = f.name, .code = codes.s(.validation_date), .message = "Date min must not be after max." });
             },
             .select => |o| if (o.values.len == 0)
-                try errors.append(alloc, .{ .field = f.name, .code = "validation_required", .message = "select requires at least one value." }),
+                try errors.append(alloc, .{ .field = f.name, .code = codes.s(.validation_required), .message = "select requires at least one value." }),
             .number => |o| if (o.mode == .fixed and (o.scale == null or o.scale.? < 1 or o.scale.? > 8))
-                try errors.append(alloc, .{ .field = f.name, .code = "validation_invalid_scale", .message = "fixed number requires scale 1..8." }),
+                try errors.append(alloc, .{ .field = f.name, .code = codes.s(.validation_invalid_scale), .message = "fixed number requires scale 1..8." }),
             .relation => |o| if (o.targetCollectionId.len == 0)
-                try errors.append(alloc, .{ .field = f.name, .code = "validation_required", .message = "relation requires targetCollectionId." }),
+                try errors.append(alloc, .{ .field = f.name, .code = codes.s(.validation_required), .message = "relation requires targetCollectionId." }),
             else => {},
         }
     }
 
     for (c.indexes) |idx| {
         if (!isValidIdentifier(idx.name))
-            try errors.append(alloc, .{ .field = idx.name, .code = "validation_invalid_name", .message = "Invalid index name." });
+            try errors.append(alloc, .{ .field = idx.name, .code = codes.s(.validation_invalid_name), .message = "Invalid index name." });
         for (idx.fields) |fname| {
             if (!isValidIdentifier(fname))
-                try errors.append(alloc, .{ .field = fname, .code = "validation_invalid_name", .message = "Invalid index field name." });
+                try errors.append(alloc, .{ .field = fname, .code = codes.s(.validation_invalid_name), .message = "Invalid index field name." });
             // An encrypted column holds per-row-nonce ciphertext, so an index over it
             // is useless (every row's stored bytes differ). Reject rather than build a
             // dead index. (Comptime path enforces this with @compileError.)
             if (fieldByName(c, fname)) |fl| if (fl.encrypted)
-                try errors.append(alloc, .{ .field = fname, .code = "validation_encrypted_index", .message = "Cannot index an encrypted field." });
+                try errors.append(alloc, .{ .field = fname, .code = codes.s(.validation_encrypted_index), .message = "Cannot index an encrypted field." });
         }
     }
 
@@ -1028,7 +1029,7 @@ pub fn validate(alloc: std.mem.Allocator, c: Collection, errors: *std.ArrayList(
     if (c.type == .auth) {
         for (c.options.auth.identityFields) |idf| {
             if (!isValidIdentifier(idf))
-                try errors.append(alloc, .{ .field = "identityFields", .code = "validation_invalid_identity_field", .message = "Identity field must be a valid identifier." });
+                try errors.append(alloc, .{ .field = "identityFields", .code = codes.s(.validation_invalid_identity_field), .message = "Identity field must be a valid identifier." });
         }
     }
 
@@ -1046,7 +1047,7 @@ pub fn validate(alloc: std.mem.Allocator, c: Collection, errors: *std.ArrayList(
         const f = fieldByName(c, tf);
         const ok = isValidIdentifier(tf) and f != null and f.?.storageClass() == .text;
         if (!ok)
-            try errors.append(alloc, .{ .field = "tenant_field", .code = "validation_invalid_tenant_field", .message = "tenant_field must be a valid identifier naming an existing TEXT-storage field (it holds an account id)." });
+            try errors.append(alloc, .{ .field = "tenant_field", .code = codes.s(.validation_invalid_tenant_field), .message = "tenant_field must be a valid identifier naming an existing TEXT-storage field (it holds an account id)." });
     }
     if (c.options.ttl_field) |tf| {
         // Must be date/autodate: the TTL GC compares it via SQLite strftime, which interprets a
@@ -1054,7 +1055,7 @@ pub fn validate(alloc: std.mem.Allocator, c: Collection, errors: *std.ArrayList(
         const f = fieldByName(c, tf);
         const ok = isValidIdentifier(tf) and f != null and (f.?.fieldType() == .date or f.?.fieldType() == .autodate);
         if (!ok)
-            try errors.append(alloc, .{ .field = "ttl_field", .code = "validation_invalid_ttl_field", .message = "ttl_field must be a valid identifier naming an existing date/autodate field." });
+            try errors.append(alloc, .{ .field = "ttl_field", .code = codes.s(.validation_invalid_ttl_field), .message = "ttl_field must be a valid identifier naming an existing date/autodate field." });
     }
 }
 
@@ -1579,14 +1580,14 @@ test "validate reserves the _fts collection-name suffix (#157 shadow-table colli
     var errs = try collectErrors(.{ .id = "c1", .name = "posts_fts", .fields = &fields });
     defer errs.deinit(std.testing.allocator);
     var saw = false;
-    for (errs.items) |e| if (std.mem.eql(u8, e.code, "validation_reserved_suffix")) {
+    for (errs.items) |e| if (std.mem.eql(u8, e.code, codes.s(.validation_reserved_suffix))) {
         saw = true;
     };
     try std.testing.expect(saw);
     // A normal name is unaffected.
     var ok = try collectErrors(.{ .id = "c2", .name = "posts", .fields = &fields });
     defer ok.deinit(std.testing.allocator);
-    for (ok.items) |e| try std.testing.expect(!std.mem.eql(u8, e.code, "validation_reserved_suffix"));
+    for (ok.items) |e| try std.testing.expect(!std.mem.eql(u8, e.code, codes.s(.validation_reserved_suffix)));
 }
 
 test "sqlType mapping" {
@@ -1652,8 +1653,8 @@ test "searchable field flag round-trips through fieldsToJson/fieldsFromJson" {
     var saw_type = false;
     var saw_enc = false;
     for (errs.items) |e| {
-        if (std.mem.eql(u8, e.code, "validation_searchable_type")) saw_type = true;
-        if (std.mem.eql(u8, e.code, "validation_searchable_encrypted")) saw_enc = true;
+        if (std.mem.eql(u8, e.code, codes.s(.validation_searchable_type))) saw_type = true;
+        if (std.mem.eql(u8, e.code, codes.s(.validation_searchable_encrypted))) saw_enc = true;
     }
     try std.testing.expect(saw_type);
     try std.testing.expect(saw_enc);
@@ -1861,7 +1862,7 @@ test "validate rejects an auth collection with a non-identifier identity field" 
     };
     try validate(a, c, &errs);
     var found = false;
-    for (errs.items) |e| if (std.mem.eql(u8, e.code, "validation_invalid_identity_field")) {
+    for (errs.items) |e| if (std.mem.eql(u8, e.code, codes.s(.validation_invalid_identity_field))) {
         found = true;
     };
     try std.testing.expect(found);
@@ -1879,7 +1880,7 @@ test "validate accepts an auth collection with valid identity fields" {
         .options = .{ .auth = .{ .identityFields = &.{ "email", "username" } } },
     };
     try validate(a, c, &errs);
-    for (errs.items) |e| try std.testing.expect(!std.mem.eql(u8, e.code, "validation_invalid_identity_field"));
+    for (errs.items) |e| try std.testing.expect(!std.mem.eql(u8, e.code, codes.s(.validation_invalid_identity_field)));
 }
 
 test "validate rejects a tenant_field that is not a valid identifier or names no field" {
@@ -1896,7 +1897,7 @@ test "validate rejects a tenant_field that is not a valid identifier or names no
         const c = Collection{ .id = "c", .name = "posts", .fields = &fields, .options = .{ .tenant_field = "acc-ount" } };
         try validate(a, c, &errs);
         var found = false;
-        for (errs.items) |e| if (std.mem.eql(u8, e.code, "validation_invalid_tenant_field")) {
+        for (errs.items) |e| if (std.mem.eql(u8, e.code, codes.s(.validation_invalid_tenant_field))) {
             found = true;
         };
         try std.testing.expect(found);
@@ -1908,7 +1909,7 @@ test "validate rejects a tenant_field that is not a valid identifier or names no
         const c = Collection{ .id = "c", .name = "posts", .fields = &fields, .options = .{ .tenant_field = "nonexistent" } };
         try validate(a, c, &errs);
         var found = false;
-        for (errs.items) |e| if (std.mem.eql(u8, e.code, "validation_invalid_tenant_field")) {
+        for (errs.items) |e| if (std.mem.eql(u8, e.code, codes.s(.validation_invalid_tenant_field))) {
             found = true;
         };
         try std.testing.expect(found);
@@ -1922,7 +1923,7 @@ test "validate rejects a tenant_field that is not a valid identifier or names no
         const c = Collection{ .id = "c", .name = "posts", .fields = &num_fields, .options = .{ .tenant_field = "count" } };
         try validate(a, c, &errs);
         var found = false;
-        for (errs.items) |e| if (std.mem.eql(u8, e.code, "validation_invalid_tenant_field")) {
+        for (errs.items) |e| if (std.mem.eql(u8, e.code, codes.s(.validation_invalid_tenant_field))) {
             found = true;
         };
         try std.testing.expect(found);
@@ -1933,7 +1934,7 @@ test "validate rejects a tenant_field that is not a valid identifier or names no
         defer errs.deinit(a);
         const c = Collection{ .id = "c", .name = "posts", .fields = &fields, .options = .{ .tenant_field = "account" } };
         try validate(a, c, &errs);
-        for (errs.items) |e| try std.testing.expect(!std.mem.eql(u8, e.code, "validation_invalid_tenant_field"));
+        for (errs.items) |e| try std.testing.expect(!std.mem.eql(u8, e.code, codes.s(.validation_invalid_tenant_field)));
     }
 }
 
@@ -1953,7 +1954,7 @@ test "validate rejects a ttl_field that is not a valid identifier, names no fiel
         const c = Collection{ .id = "c", .name = "posts", .fields = &fields, .options = .{ .ttl_field = "exp-ires" } };
         try validate(a, c, &errs);
         var found = false;
-        for (errs.items) |e| if (std.mem.eql(u8, e.code, "validation_invalid_ttl_field")) {
+        for (errs.items) |e| if (std.mem.eql(u8, e.code, codes.s(.validation_invalid_ttl_field))) {
             found = true;
         };
         try std.testing.expect(found);
@@ -1965,7 +1966,7 @@ test "validate rejects a ttl_field that is not a valid identifier, names no fiel
         const c = Collection{ .id = "c", .name = "posts", .fields = &fields, .options = .{ .ttl_field = "nonexistent" } };
         try validate(a, c, &errs);
         var found = false;
-        for (errs.items) |e| if (std.mem.eql(u8, e.code, "validation_invalid_ttl_field")) {
+        for (errs.items) |e| if (std.mem.eql(u8, e.code, codes.s(.validation_invalid_ttl_field))) {
             found = true;
         };
         try std.testing.expect(found);
@@ -1977,7 +1978,7 @@ test "validate rejects a ttl_field that is not a valid identifier, names no fiel
         const c = Collection{ .id = "c", .name = "posts", .fields = &fields, .options = .{ .ttl_field = "name" } };
         try validate(a, c, &errs);
         var found = false;
-        for (errs.items) |e| if (std.mem.eql(u8, e.code, "validation_invalid_ttl_field")) {
+        for (errs.items) |e| if (std.mem.eql(u8, e.code, codes.s(.validation_invalid_ttl_field))) {
             found = true;
         };
         try std.testing.expect(found);
@@ -1988,7 +1989,7 @@ test "validate rejects a ttl_field that is not a valid identifier, names no fiel
         defer errs.deinit(a);
         const c = Collection{ .id = "c", .name = "posts", .fields = &fields, .options = .{ .ttl_field = "expires" } };
         try validate(a, c, &errs);
-        for (errs.items) |e| try std.testing.expect(!std.mem.eql(u8, e.code, "validation_invalid_ttl_field"));
+        for (errs.items) |e| try std.testing.expect(!std.mem.eql(u8, e.code, codes.s(.validation_invalid_ttl_field)));
     }
 }
 
@@ -2020,8 +2021,8 @@ test "validate rejects an uncompilable pattern and an unparseable date bound" {
     var saw_pattern = false;
     var saw_date = false;
     for (errs.items) |e| {
-        if (std.mem.eql(u8, e.code, "validation_pattern")) saw_pattern = true;
-        if (std.mem.eql(u8, e.code, "validation_date")) saw_date = true;
+        if (std.mem.eql(u8, e.code, codes.s(.validation_pattern))) saw_pattern = true;
+        if (std.mem.eql(u8, e.code, codes.s(.validation_date))) saw_date = true;
     }
     try std.testing.expect(saw_pattern);
     try std.testing.expect(saw_date);
@@ -2037,7 +2038,7 @@ test "validate rejects a date field whose min is after max" {
     try validate(std.testing.allocator, c, &errs);
     var saw_date = false;
     for (errs.items) |e| {
-        if (std.mem.eql(u8, e.code, "validation_date")) saw_date = true;
+        if (std.mem.eql(u8, e.code, codes.s(.validation_date))) saw_date = true;
     }
     try std.testing.expect(saw_date);
 }

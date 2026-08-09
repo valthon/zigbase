@@ -10,9 +10,9 @@ pub fn get(ctx: *http.RequestCtx) anyerror!http.Response {
     var r = try app.pool.acquireReader();
     defer app.pool.releaseReader(&r);
     const a = (auth.authenticate(app.io, ctx.allocator.a, app, ctx, &r) catch null) orelse
-        return (ApiError{ .status = 401, .message = "Authentication required." }).toResponse(ctx.allocator.a);
+        return ApiError.withCode(401, .unauthorized, "Authentication required.").toResponse(ctx.allocator.a);
     if (!a.is_superuser)
-        return (ApiError{ .status = 403, .message = "Superuser only." }).toResponse(ctx.allocator.a);
+        return ApiError.withCode(403, .forbidden, "Superuser only.").toResponse(ctx.allocator.a);
 
     var root: std.json.ObjectMap = .empty;
     try root.put(ctx.allocator.a, "require_verified_sender", .{ .bool = app.mail.require_verified_sender });

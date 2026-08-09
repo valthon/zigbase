@@ -469,8 +469,11 @@ literal is fine.
 
 - `ctx.json(status, value)` — serialize any JSON-encodable value (incl. a `std.json.Value`)
   into an `application/json` response.
-- `ctx.jsonError(status, code)` — a terse `{"error":"<code>"}` JSON body (distinct from the
-  framework's `{code,message,data}` envelope; use `ctx.errorResponse` for that one).
+- `ctx.jsonError(status, code, message)` — the canonical `{status,code,message,data}`
+  envelope with a caller-supplied machine `code` (unvalidated against ZigBase's frozen
+  ledger — it's your vocabulary). You can also name ZigBase's own registry via the public
+  re-exports `zigbase.error_codes` / `zigbase.ErrorCode` (e.g. `zigbase.error_codes.s(.not_found)`)
+  when a custom route wants to emit one of the frozen codes instead of inventing its own.
 - `ctx.html(status, body)` — a `text/html; charset=utf-8` response.
 - `ctx.redirect(status, location)` — a redirect with a `Location` header.
 - `ctx.notFound()` — the canonical `404 Not found.` envelope.
@@ -1357,9 +1360,9 @@ fn submitHandler(ctx: *zigbase.Ctx) anyerror!http.Response {
     // for a JSON/form POST, read `ctx.request.?.body` / `ctx.request.?.form_fields`.
     const token = (try ctx.query()).get("captcha") orelse "";
     const r = try ctx.verifyCaptcha(.recaptcha_v3, token);
-    if (!r.ok) return ctx.jsonError(403, "captcha_required");
+    if (!r.ok) return ctx.jsonError(403, "captcha_required", "Captcha required.");
     // reCAPTCHA v3: score 0.0 (bot) → 1.0 (human); block suspicious traffic.
-    if (r.score) |score| if (score < 0.5) return ctx.jsonError(403, "suspicious_request");
+    if (r.score) |score| if (score < 0.5) return ctx.jsonError(403, "suspicious_request", "Suspicious request.");
     // ... proceed with the submission ...
 }
 ```
@@ -1398,7 +1401,7 @@ non-verdict (an error) and decide fail-open vs fail-closed: `error.TransportFail
 ```zig
 const r = ctx.verifyCaptcha(.turnstile, token) catch |e| {
     std.log.warn("captcha provider unreachable: {s}", .{@errorName(e)});
-    // fail-open: proceed; or return ctx.jsonError(503, "captcha_unavailable") to fail-closed
+    // fail-open: proceed; or return ctx.jsonError(503, "captcha_unavailable", "Captcha unavailable.") to fail-closed
     return process(ctx);
 };
 ```

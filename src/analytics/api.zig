@@ -143,7 +143,7 @@ pub fn events(ctx: *http.RequestCtx) anyerror!http.Response {
     defer app.pool.releaseReader(&reader);
 
     const scope = (try resolveScope(ctx, app, &reader)) orelse
-        return (ApiError{ .status = 401, .message = "Authentication required." }).toResponse(ctx.allocator.a);
+        return ApiError.withCode(401, .unauthorized, "Authentication required.").toResponse(ctx.allocator.a);
 
     var b = Bound{ .alloc = ctx.allocator.a };
 
@@ -170,7 +170,7 @@ pub fn events(ctx: *http.RequestCtx) anyerror!http.Response {
     // an OR rather than a SQLite row-value comparison for portability.
     if (qp.get("cursor")) |raw| if (raw.len > 0) {
         const cur = parseCursor(raw) orelse
-            return (ApiError{ .status = 400, .message = "Invalid cursor." }).toResponse(ctx.allocator.a);
+            return ApiError.badRequest("Invalid cursor.").toResponse(ctx.allocator.a);
         const n1 = b.params.items.len + 1;
         try b.conds.append(ctx.allocator.a, try std.fmt.allocPrint(ctx.allocator.a, "(\"occurred_at\" < ?{d} OR (\"occurred_at\" = ?{d} AND \"id\" < ?{d}))", .{ n1, n1 + 1, n1 + 2 }));
         try b.params.append(ctx.allocator.a, cur.occurred_at);
@@ -230,7 +230,7 @@ pub fn rollups(ctx: *http.RequestCtx) anyerror!http.Response {
     // AUTHENTICATE FIRST: an anonymous caller always gets 401, BEFORE the registry lookup — otherwise
     // 404 (undeclared) vs 401 (declared) would be a name-enumeration oracle for unauthenticated users.
     const scope = (try resolveScope(ctx, app, &reader)) orelse
-        return (ApiError{ .status = 401, .message = "Authentication required." }).toResponse(ctx.allocator.a);
+        return ApiError.withCode(401, .unauthorized, "Authentication required.").toResponse(ctx.allocator.a);
 
     // The rollup must be DECLARED (and `name` a safe identifier) — else 404 (no table-name oracle).
     const reg = analytics.registryFromApp(app) orelse return ApiError.notFound().toResponse(ctx.allocator.a);
@@ -245,7 +245,7 @@ pub fn rollups(ctx: *http.RequestCtx) anyerror!http.Response {
     } else {
         // A non-account-grouped rollup is a cross-tenant aggregate; tenancy-disabled apps have no
         // per-account separation either. Either way a non-superuser must not read it. Fail closed.
-        return (ApiError{ .status = 403, .message = "Forbidden." }).toResponse(ctx.allocator.a);
+        return ApiError.forbidden().toResponse(ctx.allocator.a);
     }
 
     const qp = params_mod.parse(ctx.allocator.a, ctx.query) catch params_mod.Params{ .pairs = &.{} };

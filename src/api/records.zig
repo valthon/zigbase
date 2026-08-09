@@ -126,7 +126,7 @@ fn buildContext(ctx: *http.RequestCtx, conn: *db.Db, data: ?std.json.Value) requ
 }
 
 fn forbidden(ctx: *http.RequestCtx) !http.Response {
-    return (ApiError{ .status = 403, .message = "Forbidden." }).toResponse(ctx.allocator.a);
+    return ApiError.forbidden().toResponse(ctx.allocator.a);
 }
 
 fn hookRejected(ctx: *http.RequestCtx) anyerror!http.Response {
@@ -271,7 +271,9 @@ fn prepareRecordData(ctx: *http.RequestCtx, col: schema.Collection, existing: ?s
     // JSON bodies (form_fields == null) are never coerced.
     const coerced = if (ctx.form_fields != null) try records.coerceFormFields(ctx.allocator.a, col, raw) else raw;
     const all = file_plan.planAllFileFields(app.io, ctx.allocator.a, col, coerced, ctx.files, existing) catch |e| switch (e) {
-        error.TooLarge => return .{ .resp = try (ApiError{ .status = 413, .message = "File too large." }).toResponse(ctx.allocator.a) },
+        // 413 carries its OWN registered code: the caller fixes this by sending less
+        // data, so it must never be indistinguishable from a server fault (`internal`).
+        error.TooLarge => return .{ .resp = try ApiError.withCode(413, .payload_too_large, "File too large.").toResponse(ctx.allocator.a) },
         error.TooMany => return .{ .resp = try ApiError.badRequest("Too many files for the field.").toResponse(ctx.allocator.a) },
         error.BadMimeType => return .{ .resp = try ApiError.badRequest("File type not allowed.").toResponse(ctx.allocator.a) },
         error.OutOfMemory => return e,

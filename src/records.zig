@@ -18,6 +18,7 @@ const pagination = @import("pagination.zig");
 const regex = @import("regex.zig");
 const datetime = @import("datetime.zig");
 const field_policy = @import("field_policy.zig");
+const codes = @import("error_codes.zig");
 const tenancy = @import("tenancy/tenancy.zig");
 const abilities = @import("authz/abilities.zig");
 const fts = @import("search/fts.zig");
@@ -366,19 +367,19 @@ fn countValues(v: std.json.Value) usize {
 
 fn convCode(e: anyerror) []const u8 {
     return switch (e) {
-        error.TooPrecise => "validation_too_precise",
-        error.TypeMismatch => "validation_type",
-        error.Overflow => "validation_overflow",
-        error.BadNumber => "validation_number",
-        else => "validation_value",
+        error.TooPrecise => codes.s(.validation_too_precise),
+        error.TypeMismatch => codes.s(.validation_type),
+        error.Overflow => codes.s(.validation_overflow),
+        error.BadNumber => codes.s(.validation_number),
+        else => codes.s(.validation_value),
     };
 }
 
 fn appendMinMax(alloc: std.mem.Allocator, errs: *std.ArrayList(schema.ValidationError), field: []const u8, x: f64, min: ?f64, max: ?f64) !void {
     if (min) |mn| if (x < mn)
-        try errs.append(alloc, .{ .field = field, .code = "validation_min", .message = "Value is below the minimum." });
+        try errs.append(alloc, .{ .field = field, .code = codes.s(.validation_min), .message = "Value is below the minimum." });
     if (max) |mx| if (x > mx)
-        try errs.append(alloc, .{ .field = field, .code = "validation_max", .message = "Value is above the maximum." });
+        try errs.append(alloc, .{ .field = field, .code = codes.s(.validation_max), .message = "Value is above the maximum." });
 }
 
 /// Validate text/number min/max constraints, select membership/count, relation
@@ -392,9 +393,9 @@ fn validateFieldValue(alloc: std.mem.Allocator, conn: *db.Db, f: schema.Field, v
             // min/max are documented as length in unicode codepoints (docs/fields.md).
             const n = std.unicode.utf8CountCodepoints(v.string) catch v.string.len;
             if (o.min) |mn| if (n < mn)
-                try errs.append(alloc, .{ .field = f.name, .code = "validation_min", .message = "Value is too short." });
+                try errs.append(alloc, .{ .field = f.name, .code = codes.s(.validation_min), .message = "Value is too short." });
             if (o.max) |mx| if (n > mx)
-                try errs.append(alloc, .{ .field = f.name, .code = "validation_max", .message = "Value is too long." });
+                try errs.append(alloc, .{ .field = f.name, .code = codes.s(.validation_max), .message = "Value is too long." });
             if (o.pattern) |pat| {
                 // Compile per-write (patterns are small). Fail closed: a stored
                 // pattern that won't compile rejects the write rather than silently
@@ -404,10 +405,10 @@ fn validateFieldValue(alloc: std.mem.Allocator, conn: *db.Db, f: schema.Field, v
                 if (regex.compile(alloc, pat)) |prog| {
                     defer prog.deinit(alloc);
                     if (!regex.matches(prog, v.string))
-                        try errs.append(alloc, .{ .field = f.name, .code = "validation_pattern", .message = "Value does not match the required pattern." });
+                        try errs.append(alloc, .{ .field = f.name, .code = codes.s(.validation_pattern), .message = "Value does not match the required pattern." });
                 } else |err| {
                     if (err == error.OutOfMemory) return error.OutOfMemory;
-                    try errs.append(alloc, .{ .field = f.name, .code = "validation_pattern", .message = "Field pattern is invalid." });
+                    try errs.append(alloc, .{ .field = f.name, .code = codes.s(.validation_pattern), .message = "Field pattern is invalid." });
                 }
             }
         },
@@ -428,29 +429,29 @@ fn validateFieldValue(alloc: std.mem.Allocator, conn: *db.Db, f: schema.Field, v
             };
             const at = std.mem.indexOfScalar(u8, s, '@');
             if (bad or at == null or at.? == 0 or at.? == s.len - 1 or std.mem.indexOfScalarPos(u8, s, at.? + 1, '@') != null)
-                try errs.append(alloc, .{ .field = f.name, .code = "validation_invalid_email", .message = "Invalid email address." });
+                try errs.append(alloc, .{ .field = f.name, .code = codes.s(.validation_invalid_email), .message = "Invalid email address." });
         },
         // Date values are normalized to UTC seconds for a sound comparison across
         // mixed formats (e.g. "2026-06-10 08:00:00" vs "2026-06-10T08:00:00Z").
         // A non-empty value must parse (rejects garbage like "25:99:99").
         .date => |o| if (v == .string and v.string.len > 0) {
             const secs = datetime.parse(v.string) catch {
-                try errs.append(alloc, .{ .field = f.name, .code = "validation_date", .message = "Invalid date." });
+                try errs.append(alloc, .{ .field = f.name, .code = codes.s(.validation_date), .message = "Invalid date." });
                 return;
             };
             if (o.min) |mn| {
                 const b = datetime.parse(mn) catch {
-                    try errs.append(alloc, .{ .field = f.name, .code = "validation_date", .message = "Invalid date bound." });
+                    try errs.append(alloc, .{ .field = f.name, .code = codes.s(.validation_date), .message = "Invalid date bound." });
                     return;
                 };
-                if (secs < b) try errs.append(alloc, .{ .field = f.name, .code = "validation_min", .message = "Date is before the minimum." });
+                if (secs < b) try errs.append(alloc, .{ .field = f.name, .code = codes.s(.validation_min), .message = "Date is before the minimum." });
             }
             if (o.max) |mx| {
                 const b = datetime.parse(mx) catch {
-                    try errs.append(alloc, .{ .field = f.name, .code = "validation_date", .message = "Invalid date bound." });
+                    try errs.append(alloc, .{ .field = f.name, .code = codes.s(.validation_date), .message = "Invalid date bound." });
                     return;
                 };
-                if (secs > b) try errs.append(alloc, .{ .field = f.name, .code = "validation_max", .message = "Date is after the maximum." });
+                if (secs > b) try errs.append(alloc, .{ .field = f.name, .code = codes.s(.validation_max), .message = "Date is after the maximum." });
             }
         },
         .number => |o| if (o.mode == .float) {
@@ -477,7 +478,7 @@ fn validateFieldValue(alloc: std.mem.Allocator, conn: *db.Db, f: schema.Field, v
         },
         .select => |o| {
             if (countValues(v) > o.maxSelect) {
-                try errs.append(alloc, .{ .field = f.name, .code = "validation_select", .message = "Too many values." });
+                try errs.append(alloc, .{ .field = f.name, .code = codes.s(.validation_select), .message = "Too many values." });
                 return; // reject on count; skip the per-value scan so an over-limit array can't drive unbounded work
             }
             const items: []const std.json.Value = switch (v) {
@@ -493,12 +494,12 @@ fn validateFieldValue(alloc: std.mem.Allocator, conn: *db.Db, f: schema.Field, v
                         break;
                     }
                 }
-                if (!ok) try errs.append(alloc, .{ .field = f.name, .code = "validation_select", .message = "Value not in the allowed set." });
+                if (!ok) try errs.append(alloc, .{ .field = f.name, .code = codes.s(.validation_select), .message = "Value not in the allowed set." });
             };
         },
         .relation => |o| {
             if (countValues(v) > o.maxSelect) {
-                try errs.append(alloc, .{ .field = f.name, .code = "validation_relation", .message = "Too many relations." });
+                try errs.append(alloc, .{ .field = f.name, .code = codes.s(.validation_relation), .message = "Too many relations." });
                 return; // reject on count BEFORE the per-element existence SELECTs, so an over-limit
                 // array can't drive N writer-lock queries from already-invalid input
             }
@@ -509,7 +510,7 @@ fn validateFieldValue(alloc: std.mem.Allocator, conn: *db.Db, f: schema.Field, v
             defer scratch.deinit();
             const sa = scratch.allocator();
             const tcol = (try collections.get(sa, conn, o.targetCollectionId)) orelse {
-                try errs.append(alloc, .{ .field = f.name, .code = "validation_relation", .message = "Relation target missing." });
+                try errs.append(alloc, .{ .field = f.name, .code = codes.s(.validation_relation), .message = "Relation target missing." });
                 return;
             };
             const items: []const std.json.Value = switch (v) {
@@ -523,7 +524,7 @@ fn validateFieldValue(alloc: std.mem.Allocator, conn: *db.Db, f: schema.Field, v
                 defer st.finalize();
                 try st.bindText(1, it.string);
                 if (!try st.step())
-                    try errs.append(alloc, .{ .field = f.name, .code = "validation_not_found", .message = "Referenced record not found." });
+                    try errs.append(alloc, .{ .field = f.name, .code = codes.s(.validation_not_found), .message = "Referenced record not found." });
             };
         },
         else => {},
@@ -856,7 +857,7 @@ pub fn createInTxnOpts(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, col: sch
             continue;
         }
         if (f.required and (provided == null or isEmpty(provided.?))) {
-            try errs.append(alloc, .{ .field = f.name, .code = "validation_required", .message = "Missing required value." });
+            try errs.append(alloc, .{ .field = f.name, .code = codes.s(.validation_required), .message = "Missing required value." });
             continue;
         }
         if (provided) |pv| {
@@ -1416,11 +1417,11 @@ test "over-maxSelect relation short-circuits before the per-element existence ch
     defer data.deinit(a);
     try data.put(a, "refs", .{ .array = refs });
     try std.testing.expectError(error.Validation, create(a, std.testing.io, &d, col, .{ .object = data }));
-    try expectFieldCode("refs", "validation_relation"); // the over-count error is present
+    try expectFieldCode("refs", codes.s(.validation_relation)); // the over-count error is present
     const errs = last_errors orelse return error.TestExpectedEqual;
     for (errs) |e| {
         // A per-element existence error would prove the loop ran despite the over-count input.
-        if (std.mem.eql(u8, e.code, "validation_not_found")) return error.TestUnexpectedResult;
+        if (std.mem.eql(u8, e.code, codes.s(.validation_not_found))) return error.TestUnexpectedResult;
     }
     freeLastErrors(a);
 }
@@ -1523,8 +1524,8 @@ test "text min/max enforce unicode codepoint counts" {
     defer d.close();
     const col = try seedConstrained(&d, a);
     defer col.deinit(a);
-    try expectRejected(a, createOne(a, &d, col, "title", .{ .string = "a" }), "title", "validation_min");
-    try expectRejected(a, createOne(a, &d, col, "title", .{ .string = "abcdef" }), "title", "validation_max");
+    try expectRejected(a, createOne(a, &d, col, "title", .{ .string = "a" }), "title", codes.s(.validation_min));
+    try expectRejected(a, createOne(a, &d, col, "title", .{ .string = "abcdef" }), "title", codes.s(.validation_max));
     // "héllo" is 5 codepoints but 6 bytes: max=5 must count codepoints, not bytes
     freeRecord(a, try createOne(a, &d, col, "title", .{ .string = "héllo" }));
     freeRecord(a, try createOne(a, &d, col, "title", .{ .string = "ab" }));
@@ -1540,7 +1541,7 @@ test "email field rejects control chars (CRLF/NUL) and obviously-bogus addresses
     defer col.deinit(a);
 
     // CRLF injection attempt (would inject a Bcc header on outbound SMTP) is rejected.
-    try expectRejected(a, createOne(a, &d, col, "contact", .{ .string = "victim@x.io\r\nBcc: spam@evil.com" }), "contact", "validation_invalid_email");
+    try expectRejected(a, createOne(a, &d, col, "contact", .{ .string = "victim@x.io\r\nBcc: spam@evil.com" }), "contact", codes.s(.validation_invalid_email));
     // A bare newline, a space, and a NUL are each rejected.
     try expectValidation(a, createOne(a, &d, col, "contact", .{ .string = "a@b.io\nx" }));
     try expectValidation(a, createOne(a, &d, col, "contact", .{ .string = "a b@x.io" }));
@@ -1576,9 +1577,9 @@ test "fixed-mode number min/max compare the decimal value" {
     defer d.close();
     const col = try seedConstrained(&d, a);
     defer col.deinit(a);
-    try expectRejected(a, createOne(a, &d, col, "price", .{ .string = "-1" }), "price", "validation_min");
-    try expectRejected(a, createOne(a, &d, col, "price", .{ .string = "-0.01" }), "price", "validation_min");
-    try expectRejected(a, createOne(a, &d, col, "price", .{ .string = "100.01" }), "price", "validation_max");
+    try expectRejected(a, createOne(a, &d, col, "price", .{ .string = "-1" }), "price", codes.s(.validation_min));
+    try expectRejected(a, createOne(a, &d, col, "price", .{ .string = "-0.01" }), "price", codes.s(.validation_min));
+    try expectRejected(a, createOne(a, &d, col, "price", .{ .string = "100.01" }), "price", codes.s(.validation_max));
     freeRecord(a, try createOne(a, &d, col, "price", .{ .string = "0" }));
     freeRecord(a, try createOne(a, &d, col, "price", .{ .string = "100.00" }));
     freeRecord(a, try createOne(a, &d, col, "price", .{ .string = "45.00" }));
@@ -1590,8 +1591,8 @@ test "int-mode number min/max" {
     defer d.close();
     const col = try seedConstrained(&d, a);
     defer col.deinit(a);
-    try expectRejected(a, createOne(a, &d, col, "seats", .{ .string = "0" }), "seats", "validation_min");
-    try expectRejected(a, createOne(a, &d, col, "seats", .{ .string = "9" }), "seats", "validation_max");
+    try expectRejected(a, createOne(a, &d, col, "seats", .{ .string = "0" }), "seats", codes.s(.validation_min));
+    try expectRejected(a, createOne(a, &d, col, "seats", .{ .string = "9" }), "seats", codes.s(.validation_max));
     freeRecord(a, try createOne(a, &d, col, "seats", .{ .string = "1" }));
     freeRecord(a, try createOne(a, &d, col, "seats", .{ .string = "8" }));
 }
@@ -1637,9 +1638,9 @@ test "float-mode number min/max (float and integer JSON values)" {
     defer d.close();
     const col = try seedConstrained(&d, a);
     defer col.deinit(a);
-    try expectRejected(a, createOne(a, &d, col, "ratio", .{ .float = -0.5 }), "ratio", "validation_min");
-    try expectRejected(a, createOne(a, &d, col, "ratio", .{ .float = 1.5 }), "ratio", "validation_max");
-    try expectRejected(a, createOne(a, &d, col, "ratio", .{ .integer = 2 }), "ratio", "validation_max");
+    try expectRejected(a, createOne(a, &d, col, "ratio", .{ .float = -0.5 }), "ratio", codes.s(.validation_min));
+    try expectRejected(a, createOne(a, &d, col, "ratio", .{ .float = 1.5 }), "ratio", codes.s(.validation_max));
+    try expectRejected(a, createOne(a, &d, col, "ratio", .{ .integer = 2 }), "ratio", codes.s(.validation_max));
     freeRecord(a, try createOne(a, &d, col, "ratio", .{ .float = 0.5 }));
     freeRecord(a, try createOne(a, &d, col, "ratio", .{ .integer = 1 }));
 }
@@ -1651,10 +1652,10 @@ test "date values are validated and min/max enforced" {
     const col = try seedConstrained(&d, a); // "when": min 2026-01-01, max 2026-12-31
     defer col.deinit(a);
     // garbage is rejected
-    try expectRejected(a, createOne(a, &d, col, "when", .{ .string = "2026-06-10 25:99:99" }), "when", "validation_date");
+    try expectRejected(a, createOne(a, &d, col, "when", .{ .string = "2026-06-10 25:99:99" }), "when", codes.s(.validation_date));
     // below min / above max rejected, across mixed formats
-    try expectRejected(a, createOne(a, &d, col, "when", .{ .string = "2025-12-31 23:59:59" }), "when", "validation_min");
-    try expectRejected(a, createOne(a, &d, col, "when", .{ .string = "2027-01-01T00:00:00Z" }), "when", "validation_max");
+    try expectRejected(a, createOne(a, &d, col, "when", .{ .string = "2025-12-31 23:59:59" }), "when", codes.s(.validation_min));
+    try expectRejected(a, createOne(a, &d, col, "when", .{ .string = "2027-01-01T00:00:00Z" }), "when", codes.s(.validation_max));
     // an in-range value in the canonical stored form is accepted
     freeRecord(a, try createOne(a, &d, col, "when", .{ .string = "2026-06-10T08:00:00Z" }));
 }
@@ -1665,7 +1666,7 @@ test "text pattern is enforced" {
     defer d.close();
     const col = try seedConstrained(&d, a);
     defer col.deinit(a);
-    try expectRejected(a, createOne(a, &d, col, "slug", .{ .string = "Has Spaces" }), "slug", "validation_pattern");
+    try expectRejected(a, createOne(a, &d, col, "slug", .{ .string = "Has Spaces" }), "slug", codes.s(.validation_pattern));
     freeRecord(a, try createOne(a, &d, col, "slug", .{ .string = "ok-slug-1" }));
 }
 
@@ -1681,7 +1682,7 @@ test "update enforces the same constraints" {
     var data: std.json.ObjectMap = .empty;
     defer data.deinit(a);
     try data.put(a, "price", .{ .string = "-1" });
-    try expectRejected(a, update(a, &d, col, rid, .{ .object = data }), "price", "validation_min");
+    try expectRejected(a, update(a, &d, col, rid, .{ .object = data }), "price", codes.s(.validation_min));
 }
 
 pub fn update(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection, id: []const u8, data: std.json.Value) RecordError!?std.json.Value {

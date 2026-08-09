@@ -4,6 +4,8 @@
 //! subset; the framework imports it at comptime to validate + build thunks).
 const std = @import("std");
 const RequestArena = @import("request_arena.zig").RequestArena;
+const ApiError = @import("api/error.zig").ApiError;
+const codes = @import("error_codes.zig");
 
 /// A captured path param (mirrors http.Param so route_types stays http-free for unit tests).
 pub const Param = struct { key: []const u8, value: []const u8 };
@@ -237,17 +239,23 @@ pub fn makeThunk(comptime handler: anytype) @import("events.zig").RouteHandler {
     return Thunk.run;
 }
 
-/// 400 with a JSON `{"message": ...}` body; falls back to a static body if alloc fails.
+/// 400 with the canonical error envelope; falls back to a static body if alloc fails.
 fn badRequest(a: std.mem.Allocator, msg: []const u8) @import("http.zig").Response {
-    return jsonError(a, 400, msg) catch .{ .status = 400, .body = "{\"message\":\"Bad request.\"}" };
+    return jsonError(a, 400, msg) catch .{
+        .status = 400,
+        .body = "{\"status\":400,\"code\":\"bad_request\",\"message\":\"Bad request.\",\"data\":{}}",
+    };
 }
 
-/// Build `{"message": <json-escaped message>}` at `status`. Uses `std.json.fmt` with the
-/// `{f}` format spec (Zig 0.16: `std.json.fmt` returns a value with a `format` method;
-/// `{f}` invokes that method to emit properly JSON-escaped output).
+/// Typed routes render the SAME envelope as every other endpoint (SP-1): the second,
+/// bare `{"message":…}` shape is gone. The code is derived from the status, since a
+/// typed handler's `req.fail(status, message)` carries no code of its own.
 fn jsonError(a: std.mem.Allocator, status: u16, message: []const u8) !@import("http.zig").Response {
-    const body = try std.fmt.allocPrint(a, "{{\"message\":{f}}}", .{std.json.fmt(message, .{})});
-    return .{ .status = status, .body = body };
+    return (ApiError{
+        .status = status,
+        .code = codes.s(codes.forStatus(status)),
+        .message = message,
+    }).toResponse(a);
 }
 
 /// Minimal query (`a=1&b=hi`) parser into a flat struct of string/int/bool fields.
@@ -549,4 +557,17 @@ test "makeThunk: RouteError -> status; req.fail -> custom status+message" {
     defer a.free(resp.body); // the jsonError body is owned on the forTest allocator
     try testing.expectEqual(@as(u16, 404), resp.status);
     try testing.expect(std.mem.indexOf(u8, resp.body, "Booking not found") != null);
+}
+
+test "typed-route errors render the canonical envelope, not a bare message" {
+    // `jsonError` is contract-1 (plain Allocator) and returns a single owned body, so
+    // this runs under the raw leak detector rather than an arena that would mask a leak.
+    const a = std.testing.allocator;
+    const resp = try jsonError(a, 404, "Booking not found");
+    defer a.free(resp.body);
+    try std.testing.expectEqual(@as(u16, 404), resp.status);
+    try std.testing.expectEqualStrings(
+        "{\"status\":404,\"code\":\"not_found\",\"message\":\"Booking not found\",\"data\":{}}",
+        resp.body,
+    );
 }

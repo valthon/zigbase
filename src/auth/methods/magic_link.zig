@@ -44,7 +44,7 @@ fn initiateImpl(ctx: *anyopaque, ac: *AuthCtx) anyerror!InitiateResult {
 
     // Rate-limit check
     if (try ac.rateLimit("magic_link", email)) |_|
-        return InitiateResult{ .status = 429, .body = "{\"message\":\"Too many requests.\"}" };
+        return InitiateResult{ .status = 429, .body = "{\"status\":429,\"code\":\"too_many_requests\",\"message\":\"Too many requests.\",\"data\":{}}" };
 
     const ml_opts = ac.collection.options.auth.methods.magic_link;
     const auto_create: bool = if (ml_opts) |ml| ml.auto_create else false;

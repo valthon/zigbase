@@ -315,7 +315,7 @@ pub fn Server(comptime gates: Gates) type {
                 // stage 2). Its only escaping errors are the OOM-while-building-an-error-Response
                 // paths that historically wrote this exact raw 500 envelope inline and returned.
                 break :blk route(&ctx) catch {
-                    sendRawEnvelope(r, 500, "{\"code\":500,\"message\":\"Something went wrong.\",\"data\":{}}");
+                    sendRawEnvelope(r, 500, "{\"status\":500,\"code\":\"internal\",\"message\":\"Something went wrong.\",\"data\":{}}");
                     return;
                 };
             };
@@ -346,13 +346,13 @@ pub fn Server(comptime gates: Gates) type {
                     r.setHeader("content-type", resp.content_type) catch {};
                     sendFileRange(r, self.app.io, f.path, f.offset, len) catch {
                         // Open failure => the existing 404 raw envelope (unchanged semantics).
-                        sendRawEnvelope(r, 404, "{\"code\":404,\"message\":\"Not found.\",\"data\":{}}");
+                        sendRawEnvelope(r, 404, "{\"status\":404,\"code\":\"not_found\",\"message\":\"Not found.\",\"data\":{}}");
                     };
                 } else {
                     // Wholesale facil.io delegation (dir-mode static): mime, ETag, 304,
                     // `.gz` sidecar, Range are ALL facil.io's (§A.3) — byte-identical to today.
                     r.sendFile(f.path) catch {
-                        sendRawEnvelope(r, 404, "{\"code\":404,\"message\":\"Not found.\",\"data\":{}}");
+                        sendRawEnvelope(r, 404, "{\"status\":404,\"code\":\"not_found\",\"message\":\"Not found.\",\"data\":{}}");
                     };
                 }
                 return;
@@ -474,7 +474,7 @@ fn setZapStatus(r: zap.Request, status: u16) void {
 }
 
 fn forbiddenResp(ctx: *http.RequestCtx) !http.Response {
-    return (ApiError{ .status = 403, .message = "Forbidden." }).toResponse(ctx.allocator.a);
+    return ApiError.forbidden().toResponse(ctx.allocator.a);
 }
 
 /// Merge a Ctx's deferred `pending_cookies`/`pending_headers` onto a handler's Response.
@@ -604,7 +604,7 @@ fn guardRateLimit(cx: *Ctx, ctx: *http.RequestCtx, rt: events.RuntimeRoute) !?ht
     };
     if (limiter.allowCustom(key, clock.nowUnix(app.io), c.max, c.window_s)) return null;
     const retry = try std.fmt.allocPrint(ctx.allocator.a, "{d}", .{c.window_s});
-    var resp = try (ApiError{ .status = 429, .message = "Too many requests. Try again later." }).toResponse(ctx.allocator.a);
+    var resp = try ApiError.withCode(429, .too_many_requests, "Too many requests. Try again later.").toResponse(ctx.allocator.a);
     resp.extra_headers = try ctx.allocator.a.dupe(http.Header, &.{.{ .name = "Retry-After", .value = retry }});
     return resp;
 }
@@ -637,7 +637,7 @@ fn dispatchCustom(ctx: *http.RequestCtx) anyerror!?http.Response {
             const authed = if (reader) |*r| (auth.authenticate(app.io, ctx.allocator.a, app, ctx, r) catch null) else null;
             switch (rt.auth) {
                 .public => {},
-                .authed => if (authed == null) return try (ApiError{ .status = 401, .message = "Not authenticated." }).toResponse(ctx.allocator.a),
+                .authed => if (authed == null) return try ApiError.withCode(401, .unauthorized, "Not authenticated.").toResponse(ctx.allocator.a),
                 .superuser => if (authed == null or !authed.?.is_superuser) return try forbiddenResp(ctx),
             }
             // #243: collection-scoped `.authed` gate. A non-null `authed_collection` implies the
@@ -653,7 +653,7 @@ fn dispatchCustom(ctx: *http.RequestCtx) anyerror!?http.Response {
                 // `auth == .authed` (so the no-token 401 already fired above), but `RuntimeRoute`
                 // is public — a hand-built route pairing `.authed_collection` with a non-`.authed`
                 // level must deny, not panic on a null principal. Reuse the SAME 401 (no oracle).
-                const u = authed orelse return try (ApiError{ .status = 401, .message = "Not authenticated." }).toResponse(ctx.allocator.a);
+                const u = authed orelse return try ApiError.withCode(401, .unauthorized, "Not authenticated.").toResponse(ctx.allocator.a);
                 const uid: []const u8 = switch (u.record) {
                     .object => |o| if (o.get("id")) |v| (switch (v) {
                         .string => |sv| sv,
@@ -664,7 +664,7 @@ fn dispatchCustom(ctx: *http.RequestCtx) anyerror!?http.Response {
                 const collection_ok = std.mem.eql(u8, u.collection, gate.collection) and uid.len > 0;
                 const super_ok = u.is_superuser and gate.allow_superuser and uid.len > 0;
                 if (!(collection_ok or super_ok))
-                    return try (ApiError{ .status = 401, .message = "Not authenticated." }).toResponse(ctx.allocator.a);
+                    return try ApiError.withCode(401, .unauthorized, "Not authenticated.").toResponse(ctx.allocator.a);
             }
             var rctx = request.RequestContext{
                 .auth = if (authed) |a| a.record else null,

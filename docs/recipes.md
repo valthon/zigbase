@@ -1050,9 +1050,9 @@ it fails:
 fn submitHandler(ctx: *zigbase.Ctx) anyerror!zigbase.http.Response {
     const token = (try ctx.query()).get("captcha") orelse "";
     const r = try ctx.verifyCaptcha(.recaptcha_v3, token);
-    if (!r.ok) return ctx.jsonError(403, "captcha_required");
+    if (!r.ok) return ctx.jsonError(403, "captcha_required", "Captcha required.");
     // reCAPTCHA v3: score 0.0 (bot) → 1.0 (human); block suspicious traffic.
-    if (r.score) |score| if (score < 0.5) return ctx.jsonError(403, "suspicious_request");
+    if (r.score) |score| if (score < 0.5) return ctx.jsonError(403, "suspicious_request", "Suspicious request.");
     // ... proceed with the submission ...
 }
 ```
@@ -1064,7 +1064,7 @@ catch it to choose fail-open vs fail-closed:
 ```zig
 const r = ctx.verifyCaptcha(.turnstile, token) catch |e| {
     std.log.warn("captcha provider unreachable: {s}", .{@errorName(e)});
-    // fail-open: proceed; or return ctx.jsonError(503, "captcha_unavailable") to fail-closed
+    // fail-open: proceed; or return ctx.jsonError(503, "captcha_unavailable", "Captcha unavailable.") to fail-closed
     return process(ctx);
 };
 ```

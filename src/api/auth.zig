@@ -76,7 +76,7 @@ pub fn rateLimited(ctx: *http.RequestCtx, scope: []const u8, ident: []const u8) 
     else
         try std.fmt.allocPrint(ctx.allocator.a, "{s}:ident:{s}", .{ scope, ident });
     if (limiter.allow(key, wallNowUnix(app.io))) return null;
-    return try (ApiError{ .status = 429, .message = "Too many requests. Try again later." }).toResponse(ctx.allocator.a);
+    return try ApiError.withCode(429, .too_many_requests, "Too many requests. Try again later.").toResponse(ctx.allocator.a);
 }
 
 /// Per-method variant of `rateLimited`: enforces a method-specific `max`/`window_s`
@@ -95,7 +95,7 @@ pub fn rateLimitedCustom(ctx: *http.RequestCtx, scope: []const u8, ident: []cons
     else
         try std.fmt.allocPrint(ctx.allocator.a, "{s}:ident:{s}", .{ scope, ident });
     if (limiter.allowCustom(key, wallNowUnix(app.io), max, window_s)) return null;
-    return try (ApiError{ .status = 429, .message = "Too many requests. Try again later." }).toResponse(ctx.allocator.a);
+    return try ApiError.withCode(429, .too_many_requests, "Too many requests. Try again later.").toResponse(ctx.allocator.a);
 }
 
 /// SQL `now` for framework token logic (iat/exp, consumed-token expiry), honoring the
@@ -715,7 +715,7 @@ pub fn authWithPassword(ctx: *http.RequestCtx) anyerror!http.Response {
         return ApiError.notFound().toResponse(ctx.allocator.a);
     // Optional verification gate: refuse to mint a session for an unverified record.
     if (col.options.auth.require_verified and !recordVerified(rec))
-        return (ApiError{ .status = 403, .message = "Email not verified." }).toResponse(ctx.allocator.a);
+        return ApiError.withCode(403, .email_not_verified, "Email not verified.").toResponse(ctx.allocator.a);
     // Issuance (three paths):
     //  1. HOOK path (#80, 0.10.0): a registered `beforeAuthSuccess` runs inside a write
     //     transaction so its side-writes commit atomically with issuance and an abort blocks
@@ -780,10 +780,10 @@ pub fn authRefresh(ctx: *http.RequestCtx) anyerror!http.Response {
     const w = app.pool.acquireWriter();
     defer app.pool.releaseWriter();
     const authed = (try auth.authenticate(app.io, ctx.allocator.a, app, ctx, w)) orelse
-        return (ApiError{ .status = 401, .message = "Not authenticated." }).toResponse(ctx.allocator.a);
+        return ApiError.withCode(401, .unauthorized, "Not authenticated.").toResponse(ctx.allocator.a);
     const col_name = ctx.param("col") orelse return ApiError.notFound().toResponse(ctx.allocator.a);
     if (!std.mem.eql(u8, authed.collection, col_name))
-        return (ApiError{ .status = 401, .message = "Not authenticated." }).toResponse(ctx.allocator.a);
+        return ApiError.withCode(401, .unauthorized, "Not authenticated.").toResponse(ctx.allocator.a);
 
     const rid = authed.record.object.get("id").?.string;
 
@@ -821,7 +821,7 @@ pub fn authRefresh(ctx: *http.RequestCtx) anyerror!http.Response {
     const issued = issueSessionNoEmit(ctx, w, col_name, rid) catch |err| switch (err) {
         error.NotFound => {
             w.rollback() catch {};
-            return (ApiError{ .status = 401, .message = "Not authenticated." }).toResponse(ctx.allocator.a);
+            return ApiError.withCode(401, .unauthorized, "Not authenticated.").toResponse(ctx.allocator.a);
         },
         else => return err, // errdefer rolls back
     };
@@ -2631,4 +2631,47 @@ test "#80 onAuth reports .refresh (not .password) on auth-refresh" {
     refresh.authorization = bearer;
     try std.testing.expectEqual(@as(u16, 200), (try authRefresh(&refresh)).status);
     try std.testing.expectEqual(events.AuthMethod.refresh, Tag.seen.?);
+}
+
+test "login on a require_verified collection reports email_not_verified, not a bare forbidden" {
+    // The point of a bespoke code: an unverified account is a DISTINCT, actionable state
+    // (switch to the verify-email flow), not a flat denial. A client must be able to tell
+    // it from `forbidden` without matching on message text — the coupling that
+    // examples/golfsim's frontend used to carry.
+    var env = try TestEnv.initAuth("verifgate");
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // A second auth collection that gates on verification; initAuth's own collection
+    // leaves require_verified at its default of false.
+    {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        _ = try collections.create(a, std.testing.io, w, .{
+            .id = "",
+            .name = "verifgate2",
+            .type = .auth,
+            .fields = &[_]schema.Field{.{ .id = "vg1", .name = "bio", .options = .{ .text = .{} } }},
+            .options = .{ .auth = .{ .require_verified = true } },
+            .listRule = "",
+            .viewRule = "",
+            .createRule = "",
+            .updateRule = "",
+            .deleteRule = "",
+        });
+    }
+    try env.createUser(a, "verifgate2", "unverified@x.io", "password123");
+
+    const p = [_]http.Param{.{ .key = "col", .value = "verifgate2" }};
+    var login = env.ctx(RequestArena.from(&arena), .POST, "{\"identity\":\"unverified@x.io\",\"password\":\"password123\"}", &p);
+    const res = try authWithPassword(&login);
+    try std.testing.expectEqual(@as(u16, 403), res.status);
+
+    // Parse the body rather than substring-matching: the `code` field IS the contract.
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, res.body, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("email_not_verified", parsed.value.object.get("code").?.string);
+    try std.testing.expectEqual(@as(i64, 403), parsed.value.object.get("status").?.integer);
 }
