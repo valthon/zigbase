@@ -19,6 +19,7 @@ const db = @import("db.zig");
 const crypto = @import("crypto.zig");
 const id_gen = @import("id.zig");
 const scheduler = @import("scheduler.zig");
+const schema_gen = @import("schema_gen.zig");
 const schedule = @import("schedule.zig");
 const clock = @import("clock.zig");
 const entropy_mod = @import("entropy.zig");
@@ -4771,6 +4772,19 @@ fn serveImpl(
         s.stop();
         s.deinit();
     };
+    // Schema-generation observer: polls the `_schema_state` marker and drops the collection cache
+    // when another process (a `zigbase migrate`/`import` against the same data dir, or another
+    // instance) changed collection metadata. Gated on the cache existing, which makes it an exact
+    // no-op wherever no cache is installed. It DOES run under `.collections_frozen`: frozen mode
+    // is precisely the multi-instance deployment where a rolling-deploy migration on another
+    // instance silently violates frozen mode's "metadata never changes after boot" premise, so
+    // noticing is more valuable there, not less.
+    var schema_watcher: ?schema_gen.Watcher = if (app.col_cache) |cc|
+        .{ .io = app.io, .pool = app.pool, .cache = cc }
+    else
+        null;
+    if (schema_watcher) |*sw| try sw.start();
+    defer if (schema_watcher) |*sw| sw.stop();
     try srv.listen();
 }
 

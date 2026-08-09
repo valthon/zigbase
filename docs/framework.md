@@ -1744,6 +1744,35 @@ rollback on any callback error, and `error.NestedTransaction` if the Ctx is alre
 bound. Reach for `ctx.tx` when the callback needs no external data; reach for
 `ctx.txWith` the moment it does.
 
+### `ctx.markSchemaChanged()` — announce a hand-written metadata change
+
+ZigBase caches parsed collection definitions, and a background observer drops that cache
+whenever collection metadata changes — including changes made by a **different process**
+(a `zigbase migrate`, `zigbase import`, or another instance sharing the database). It
+notices via a schema-generation marker that every engine write to `_collections`
+(`create` / `update` / `delete` / rule updates) bumps inside its own transaction.
+
+You never need to think about this **unless you write collection metadata yourself**.
+`ctx.records().queryAs()` runs unrestricted SQL on the transaction's writer, so a hook or
+custom route *can* do this:
+
+```zig
+_ = try t.records().queryAs(struct {}, "UPDATE \"_collections\" SET \"listRule\" = ?1 WHERE \"name\" = ?2;", .{ "@request.auth.id != \"\"", "posts" });
+try t.markSchemaChanged(); // ← without this, the OLD rule keeps being enforced
+```
+
+That write is invisible to the engine, so without the call the stale definition — **including
+a stale access rule** — keeps being enforced until the process restarts. Call it in the same
+transaction as the write; the marker then commits or rolls back with it.
+
+Detection is deliberately manual. `PRAGMA schema_version` would catch a raw `DROP`/`ALTER`
+but not a rule-only `UPDATE` — partial coverage for substantial complexity, which is worse
+than one explicit call on the rare path that needs it.
+
+> The observer polls every 5 seconds, so a cross-process metadata change is picked up within
+> that window. It is not a configuration knob: there is no config key and no environment
+> variable for it.
+
 ### `ctx.kv()` — built-in key/value settings store
 
 Not every piece of mutable server state deserves its own collection. For small,
@@ -3482,12 +3511,25 @@ and applies the **minimal safe change set** (running it twice is a clean no-op):
 - A field present in the spec but missing from the live collection is **added**,
   rebuilding the table while **preserving existing data** (the new column is null
   for old rows).
+- A changed **access rule** (`.list_rule` / `.view_rule` / `.create_rule` /
+  `.update_rule` / `.delete_rule`) is **re-applied to the live collection**. This is a
+  metadata-only write — no table rebuild, no data copy — so tightening a rule in code
+  and redeploying really does tighten it in the running server. A rule left **unset**
+  (`null`) in the literal means "unspecified: leave whatever is live alone"; to lock a
+  rule explicitly, spell it `""` (blank and unset are the same rule at evaluation time
+  — superusers only — so switching between them is not treated as a change).
 - A **non-additive** change — a field rename, drop, or type/storage-class change —
   is **detected, logged, and SKIPPED** (never applied, so no data loss). Relation
   targets must reference a known collection (a comptime collection or a pre-existing
   live one such as `_superusers`); an unknown target is a startup error.
 
 For the changes auto-migration won't do, use the `.migrations` escape hatch.
+
+> **`.indexes` changes on an existing collection are not yet re-applied.** Adding or
+> removing an entry in a live collection's `.indexes` only takes effect if that same
+> startup also adds a field (which rebuilds the table). Use an explicit `.migrations`
+> entry with raw `CREATE INDEX` / `DROP INDEX` to change indexes on a collection that
+> already exists.
 
 ### Explicit migrations (`.migrations`)
 

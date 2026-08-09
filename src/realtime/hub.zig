@@ -11,6 +11,7 @@ const collections = @import("../collections.zig");
 const colcache = @import("../colcache.zig");
 const records = @import("../records.zig");
 const migrations = @import("../migrations.zig");
+const schema_gen = @import("../schema_gen.zig");
 const auth = @import("../auth.zig");
 const protocol = @import("protocol.zig");
 const connection = @import("connection.zig");
@@ -394,6 +395,15 @@ fn snapshotSandbox(io: std.Io, col: schema.Collection, snapshot: std.json.Value)
     // `_collections` (conservative deny) because user collections were never present in the sandbox.
     try tmp.exec(migrations.collections_table_sql);
     try tmp.exec(migrations.collections_options_column_sql);
+    // `collections.create` below bumps the schema-generation marker inside its transaction, so
+    // the sandbox needs that table too. The bump is deliberately STRICT — it propagates rather
+    // than tolerating a missing table — because a "table missing -> skip" fallback would mask a
+    // real misconfiguration on the production path, where an unbumped marker means every serving
+    // process runs blind to schema changes. So seed it here rather than weakening the bump.
+    // (This sandbox is built in the LIVE SERVING PROCESS, once per delete-event delivery: if the
+    // marker table were absent, every delete-event authorization would fail.)
+    try tmp.exec(migrations.schema_state_table_sql);
+    try tmp.exec(migrations.schema_state_seed_sql);
     // Recreate the collection table (fresh id; we never persist relation FKs, so an isolated
     // schema is enough to evaluate column/macro comparisons).
     var spec = col;
@@ -989,17 +999,45 @@ test "F4: delete frame carries the private authz snapshot (stripped before clien
     // WS.write, so the client never sees the snapshot — covered by the hub authz tests above.)
 }
 
-test "R1-3: delete sandbox schema is minimal — 2 DDLs, not the migration suite" {
+test "R1-3: delete sandbox schema is minimal — 4 DDLs, not the migration suite" {
     var tmp = try db.Db.openMemory();
     defer tmp.close();
     try tmp.exec(migrations.collections_table_sql);
     try tmp.exec(migrations.collections_options_column_sql);
+    try tmp.exec(migrations.schema_state_table_sql);
+    try tmp.exec(migrations.schema_state_seed_sql);
     var st = try tmp.prepare("SELECT COUNT(*) FROM sqlite_master WHERE type='table';");
     defer st.finalize();
     try std.testing.expect(try st.step());
-    // Exactly the _collections registry. This pins the per-subscriber-per-delete cost:
-    // the full suite (migrations.run) creates dozens of tables; the sandbox needs one.
-    try std.testing.expectEqual(@as(i64, 1), st.columnInt(0));
+    // The _collections registry plus the schema-generation marker that collections.create bumps.
+    // This pins the per-subscriber-per-delete cost: the full suite (migrations.run) creates
+    // dozens of tables; the sandbox needs two.
+    try std.testing.expectEqual(@as(i64, 2), st.columnInt(0));
+}
+
+test "R1-3: the delete sandbox can actually run collections.create (marker table seeded)" {
+    // THE REGRESSION THIS EXISTS FOR: the sandbox is hand-seeded with a minimal schema and is
+    // built in the LIVE SERVING PROCESS on every delete-event delivery. `collections.create`
+    // bumps `_schema_state` inside its transaction, so if the sandbox ever stops seeding that
+    // table, EVERY delete-event authorization breaks — while `zig build test` stays green,
+    // because nothing else exercises this hand-rolled schema. Assert the real call succeeds.
+    const a = std.testing.allocator;
+    var tmp = try db.Db.openMemory();
+    defer tmp.close();
+    try tmp.exec(migrations.collections_table_sql);
+    try tmp.exec(migrations.collections_options_column_sql);
+    try tmp.exec(migrations.schema_state_table_sql);
+    try tmp.exec(migrations.schema_state_seed_sql);
+
+    const created = try collections.create(a, std.testing.io, &tmp, .{
+        .id = "",
+        .name = "notes",
+        .fields = &[_]schema.Field{.{ .id = "f_owner", .name = "owner", .options = .{ .text = .{} } }},
+    });
+    created.deinit(a);
+
+    // ...and the bump really landed in the sandbox (proving the marker is wired, not merely present).
+    try std.testing.expectEqual(@as(i64, 1), try schema_gen.read(&tmp));
 }
 
 test "F5: anonymous subscribe allowed only on @public; gated collections require auth" {

@@ -28,6 +28,7 @@ const migrations = @import("migrations.zig");
 const collections = @import("collections.zig");
 const ddl = @import("ddl.zig");
 const schema = @import("schema.zig");
+const schema_gen = @import("schema_gen.zig");
 const analytics = @import("analytics/analytics.zig"); // tests only (rollup-watermark reset)
 
 pub const Options = struct {
@@ -123,15 +124,12 @@ pub fn run(gpa: std.mem.Allocator, source: *db.Db, target: *db.Db, opts: Options
     // already loaded this transaction. (The superuser path disables FK triggers, so it never has
     // pending events, but clearing up front is correct — and cheaper — for both.)
     for (order) |tname| {
-        if (std.mem.eql(u8, tname, "_migrations")) continue;
+        if (skipTable(tname)) continue;
         try clearTarget(a, source, target, tname);
     }
 
     for (order) |tname| {
-        // Never copy the `_migrations` ledger: the target already applied its OWN migrations during
-        // provisioning. Overwriting it with the source's ledger would desync the recorded version
-        // from the physical schema if the source binary is older. Leave the target ledger intact.
-        if (std.mem.eql(u8, tname, "_migrations")) continue;
+        if (skipTable(tname)) continue;
         const n = try copyTable(a, source, target, tname);
         // Dupe into a local with its own errdefer BEFORE appending: if `append` fails (OOM growing
         // the list), the name is in neither `reports.items` (so the outer errdefer can't free it)
@@ -157,11 +155,33 @@ pub fn run(gpa: std.mem.Allocator, source: *db.Db, target: *db.Db, opts: Options
         return e;
     };
 
+    // The load replaced `_collections` wholesale, so any process serving this target has a cache
+    // describing a database that no longer exists. Bump AFTER the commit: the marker is excluded
+    // from the copy (see `skipTable`), so this advances the TARGET's own counter and is therefore
+    // guaranteed to differ from what an observer last saw — which a copied source value would not
+    // be. Post-commit is also the honest ordering: the load is done, so the invalidation is not
+    // conditional on anything that could still roll back.
+    try schema_gen.bump(target);
+
     return .{
         .tables = try reports.toOwnedSlice(gpa),
         .collections_provisioned = collections_provisioned,
         .total_rows = total,
     };
+}
+
+/// Tables the load never clears or copies, because they describe the TARGET database itself
+/// rather than the source's data:
+///   - `_migrations`: the target applied its OWN migrations during provisioning. Overwriting the
+///     ledger with the source's would desync the recorded version from the physical schema if the
+///     source binary is older.
+///   - `_schema_state`: the schema-generation marker is this database's cache-coherence lineage.
+///     Copying the source's counter would make the target's value jump arbitrarily — possibly
+///     BACKWARDS, and possibly landing on a value an observer had already seen, which would hide
+///     the very invalidation the load needs to trigger. `run` bumps the target's own counter after
+///     the load instead.
+fn skipTable(name: []const u8) bool {
+    return std.mem.eql(u8, name, "_migrations") or std.mem.eql(u8, name, "_schema_state");
 }
 
 /// Reset the analytics rollup watermarks on `target` so each rollup recomputes from the target's

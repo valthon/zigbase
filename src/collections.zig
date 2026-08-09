@@ -4,6 +4,7 @@ const schema = @import("schema.zig");
 const migrations = @import("migrations.zig");
 const ddl = @import("ddl.zig");
 const id = @import("id.zig");
+const schema_gen = @import("schema_gen.zig");
 
 /// The JSON parse helpers in schema.zig return the inferred error set of
 /// std.json.parseFromSlice, which is wider than schema.ParseError. Capture it so
@@ -75,6 +76,7 @@ pub fn create(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, def: schema.Colle
         }
     }
     try insertRow(sa, w, col);
+    try schema_gen.bump(w); // inside the tx: a rolled-back create must not advertise a change
     try w.commit();
 
     // Return a fully-owned reload on `alloc`. The just-persisted row round-trips through
@@ -299,6 +301,7 @@ pub fn update(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, id_or_name: []con
         }
     }
     try updateRow(sa, w, newc.id, newc); // persist user fields only
+    try schema_gen.bump(w); // inside the tx: a rolled-back rebuild must not advertise a change
     try w.commit();
     if (sqlite_rebuild) {
         try w.exec("PRAGMA foreign_keys=ON;");
@@ -332,6 +335,100 @@ fn updateRow(alloc: std.mem.Allocator, w: *db.Db, col_id: []const u8, col: schem
     _ = try st.step();
 }
 
+/// The five per-collection access rules as a standalone value, so a rule-only change can be
+/// compared and persisted without dragging a whole `schema.Collection` (and its physical
+/// schema) along.
+pub const Rules = struct {
+    list: ?[]const u8 = null,
+    view: ?[]const u8 = null,
+    create: ?[]const u8 = null,
+    update: ?[]const u8 = null,
+    delete: ?[]const u8 = null,
+
+    pub fn from(col: schema.Collection) Rules {
+        return .{
+            .list = col.listRule,
+            .view = col.viewRule,
+            .create = col.createRule,
+            .update = col.updateRule,
+            .delete = col.deleteRule,
+        };
+    }
+
+    /// Overlay these rules onto `col`'s rule fields, leaving everything else untouched.
+    pub fn applyTo(self: Rules, col: *schema.Collection) void {
+        col.listRule = self.list;
+        col.viewRule = self.view;
+        col.createRule = self.create;
+        col.updateRule = self.update;
+        col.deleteRule = self.delete;
+    }
+
+    /// True if both sides express the SAME five rules.
+    ///
+    /// `null` and `""` are the same rule — both mean Locked, superusers only (see rules.zig) —
+    /// but they PERSIST distinctly: `bindOptText` writes SQL NULL for one and an empty string
+    /// for the other. Comparing them literally would make a schema that spells a rule `""`
+    /// against a live NULL (or vice versa) look changed forever, rewriting the row on every boot.
+    pub fn eql(self: Rules, other: Rules) bool {
+        return ruleEql(self.list, other.list) and
+            ruleEql(self.view, other.view) and
+            ruleEql(self.create, other.create) and
+            ruleEql(self.update, other.update) and
+            ruleEql(self.delete, other.delete);
+    }
+};
+
+fn ruleEql(a: ?[]const u8, b: ?[]const u8) bool {
+    return std.mem.eql(u8, a orelse "", b orelse "");
+}
+
+/// Persist ONLY the five access-rule columns (plus `updated`) of an existing collection.
+///
+/// The metadata-only counterpart to `update()`. An access rule has no physical-schema
+/// consequence whatsoever, but `update()` unconditionally runs `ddl.rebuildPlan`, which has no
+/// no-op path: it always emits CREATE "<t>__new" + INSERT…SELECT (a full copy of every row) +
+/// DROP TABLE + RENAME, re-creating only the indexes it knows about. Routing a rule change
+/// through it would copy the entire table during boot provisioning and destroy any index the
+/// plan does not re-create. This writes the rules and nothing else.
+///
+/// `col_id` must be a collection id (not a name). Callers that only have a name should resolve
+/// it via `get` first.
+pub fn updateRules(alloc: std.mem.Allocator, w: *db.Db, col_id: []const u8, rules: Rules) EngineError!void {
+    // Nothing escapes this call — only the SQL text and its renumbered copy are allocated — so a
+    // child arena makes it leak-correct under a raw (non-arena) allocator with no errdefer needed.
+    var scratch = std.heap.ArenaAllocator.init(alloc);
+    defer scratch.deinit();
+    const sa = scratch.allocator();
+
+    const d = db.dbDialect(w);
+    // Mixed-case identifiers are quoted for the same reason as insertRow/updateRow: migration
+    // 0001 created them quoted, and Postgres folds unquoted identifiers to lowercase.
+    const raw = try std.fmt.allocPrint(sa,
+        \\UPDATE "_collections" SET "listRule"=?2, "viewRule"=?3, "createRule"=?4,
+        \\ "updateRule"=?5, "deleteRule"=?6, "updated"={s} WHERE "id"=?1;
+    , .{d.nowTextExpr()});
+    // The rule write and its generation bump must land together: a committed rule change that
+    // did not bump would leave every serving process enforcing the OLD rule out of its cache,
+    // which is precisely the staleness this marker exists to prevent. One transaction, so the
+    // two either both happen or neither does.
+    try w.begin();
+    errdefer w.rollback() catch {};
+    {
+        var st = try w.prepare(try d.renumberPlaceholders(sa, raw));
+        defer st.finalize();
+        try st.bindText(1, col_id);
+        try bindOptText(&st, 2, rules.list);
+        try bindOptText(&st, 3, rules.view);
+        try bindOptText(&st, 4, rules.create);
+        try bindOptText(&st, 5, rules.update);
+        try bindOptText(&st, 6, rules.delete);
+        _ = try st.step();
+    } // finalize the statement BEFORE commit — SQLite will not commit with a live statement
+    try schema_gen.bump(w);
+    try w.commit();
+}
+
 pub fn delete(alloc: std.mem.Allocator, w: *db.Db, id_or_name: []const u8) EngineError!void {
     // delete() returns nothing, so every allocation here is scratch — the target/collection loads
     // and the DROP/DELETE SQL. Reclaim them via a child arena so the call is leak-correct under
@@ -357,6 +454,7 @@ pub fn delete(alloc: std.mem.Allocator, w: *db.Db, id_or_name: []const u8) Engin
     defer st.finalize();
     try st.bindText(1, target.id);
     _ = try st.step();
+    try schema_gen.bump(w); // inside the tx: a rolled-back delete must not advertise a change
     try w.commit();
 }
 

@@ -18,6 +18,7 @@ const schema = @import("schema.zig");
 const collections = @import("collections.zig");
 const db = @import("db.zig");
 const ddl = @import("ddl.zig");
+const schema_gen = @import("schema_gen.zig");
 const rules = @import("rules.zig");
 const regex = @import("regex.zig");
 const datetime = @import("datetime.zig");
@@ -1087,6 +1088,19 @@ pub fn ensureCollection(
     };
     if (ttl_differs) changed = true;
 
+    // Access rules: a rule-only comptime change carries NO physical-schema consequence, so it
+    // must not be gated behind `changed` (which only tracks field additions and the ttl_field) —
+    // and it must not go through collections.update either, whose unconditional table rebuild
+    // would copy every row and drop unknown indexes just to tighten a rule. Persist it with the
+    // metadata-only writer instead. This matters for security: policy.zig enforces the rules on
+    // the collection loaded out of _collections, so a developer who TIGHTENS a rule in code and
+    // redeploys would otherwise keep enforcing the old, looser rule indefinitely.
+    const merged_rules = mergeRules(spec, live);
+    if (!changed and !merged_rules.eql(collections.Rules.from(live))) {
+        try collections.updateRules(alloc, w, live.id, merged_rules);
+        std.log.info("provision: collection '{s}' access rules updated", .{spec.name});
+    }
+
     if (!changed) return; // idempotent no-op
 
     // Additive auto-migration: rebuild the table with the union of live + new
@@ -1104,11 +1118,7 @@ pub fn ensureCollection(
     var newdef = live;
     newdef.fields = merged.items;
     newdef.indexes = spec.indexes;
-    newdef.listRule = spec.listRule orelse live.listRule;
-    newdef.viewRule = spec.viewRule orelse live.viewRule;
-    newdef.createRule = spec.createRule orelse live.createRule;
-    newdef.updateRule = spec.updateRule orelse live.updateRule;
-    newdef.deleteRule = spec.deleteRule orelse live.deleteRule;
+    merged_rules.applyTo(&newdef);
     // Carry the (possibly newly-set) ttl_field; keep the rest of live.options
     // (e.g. persisted OAuth secrets) untouched by NOT copying spec.options wholesale.
     newdef.options.ttl_field = spec.options.ttl_field;
@@ -1117,6 +1127,22 @@ pub fn ensureCollection(
     // The additive rebuild drops triggers tied to the old table; re-ensure the FTS index so its
     // sync triggers (and any newly-searchable column) are restored.
     try ensureSearchIndex(alloc, w, spec);
+}
+
+/// `spec`'s access rules overlaid on `live`'s: a `null` spec rule means "unspecified —
+/// inherit whatever is live", NEVER "clear the rule". (An explicitly-locked rule is spelled
+/// `""`, which is a value and does override.)
+///
+/// The single source of truth for the merge, shared by the rule-only persist path and the
+/// additive-rebuild path in `ensureCollection`, so the two can never drift apart.
+fn mergeRules(spec: schema.Collection, live: schema.Collection) collections.Rules {
+    return .{
+        .list = spec.listRule orelse live.listRule,
+        .view = spec.viewRule orelse live.viewRule,
+        .create = spec.createRule orelse live.createRule,
+        .update = spec.updateRule orelse live.updateRule,
+        .delete = spec.deleteRule orelse live.deleteRule,
+    };
 }
 
 /// Return a copy of `col` where each single-relation field's targetCollectionId
@@ -1203,6 +1229,17 @@ pub fn runMigrations(
             try fwd(&mig);
             try recordMigration(&mig, name);
         }
+        // A consumer migration runs arbitrary raw SQL and may create/alter/drop collections
+        // without going through the collections.zig primitives, so nothing has bumped the marker.
+        // Bump per applied migration — deliberately conservative: we cannot tell whether a given
+        // migration touched collection metadata, and an unnecessary bump costs one cache reload
+        // while a missed one serves stale metadata until restart.
+        //
+        // Outside the migration's own transaction on purpose: the `.transactional = false` arm has
+        // no transaction to join, and the bump must behave identically on both arms. A migration
+        // that committed but whose bump then fails surfaces the error to the caller (startup
+        // fails loudly) rather than silently leaving the marker behind.
+        try schema_gen.bump(w);
         std.log.info("provision: applied migration '{s}'", .{m.id});
     }
 }
@@ -1532,6 +1569,12 @@ pub fn rollbackMigrations(
             try w.commit();
         }
 
+        // Same reasoning as the forward path: a reversal runs raw SQL that can reshape collections
+        // without touching the collections.zig primitives. Bump per reversed migration, outside
+        // the (optional) transaction so both the transactional and non-transactional arms behave
+        // identically. A rollback that moves the counter is still a CHANGE — the observer's
+        // predicate is `!=`, not `>`, precisely so a value moving is always noticed.
+        try schema_gen.bump(w);
         std.log.info("migrate rollback: reversed migration '{s}'", .{id});
         // Dupe into a guarded local BEFORE appending, so a failing `append` frees the dupe rather
         // than leaking it (the function-scoped errdefer only covers ids already in `reversed`).
@@ -1892,6 +1935,109 @@ test "applySpecs persists a ttl_field added to an existing collection (then GC r
     defer st.finalize();
     _ = try st.step();
     try std.testing.expectEqual(@as(i64, 0), st.columnInt(0));
+}
+
+test "applySpecs persists a TIGHTENED access rule on an existing collection" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try migrations.run(&d);
+    const a = std.testing.allocator;
+
+    const fields = [_]schema.Field{.{ .id = "f_title", .name = "title", .options = .{ .text = .{} } }};
+    // v1 is wide open.
+    const s1 = [_]schema.Collection{
+        .{ .id = "", .name = "posts", .fields = &fields, .listRule = "@public", .viewRule = "@public" },
+    };
+    try applySpecs(a, std.testing.io, &d, &s1);
+
+    // v2 tightens both rules and changes NOTHING else — the exact shape of a developer
+    // closing a hole in their comptime `.collections` literal and redeploying.
+    const tightened = "@request.auth.id != \"\"";
+    const s2 = [_]schema.Collection{
+        .{ .id = "", .name = "posts", .fields = &fields, .listRule = tightened, .viewRule = tightened },
+    };
+    try applySpecs(a, std.testing.io, &d, &s2);
+
+    // policy.zig enforces from the collection loaded out of _collections, NOT from the
+    // comptime literal — so the persisted ROW is what has to change.
+    const live = (try collections.get(a, &d, "posts")).?;
+    defer live.deinit(a);
+    try std.testing.expectEqualStrings(tightened, live.listRule.?);
+    try std.testing.expectEqualStrings(tightened, live.viewRule.?);
+    // The metadata-only write must leave the rest of the row alone.
+    try std.testing.expect(schema.fieldByName(live, "title") != null);
+    try std.testing.expect(live.createRule == null);
+}
+
+test "applySpecs persists a rule change WITHOUT rebuilding the physical table" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try migrations.run(&d);
+    const a = std.testing.allocator;
+
+    const fields = [_]schema.Field{.{ .id = "f_title", .name = "title", .options = .{ .text = .{} } }};
+    const s1 = [_]schema.Collection{.{ .id = "", .name = "posts", .fields = &fields, .listRule = "@public" }};
+    try applySpecs(a, std.testing.io, &d, &s1);
+    try d.exec("INSERT INTO \"posts\" (\"id\",\"created\",\"updated\",\"title\") VALUES ('p1','','','hello');");
+
+    // A hand-made index the provisioner knows nothing about. `collections.update` always runs
+    // ddl.rebuildPlan (CREATE "posts__new" + INSERT…SELECT the whole table + DROP TABLE +
+    // RENAME), which re-creates only the indexes IT knows about — so this index's survival is
+    // the probe that a rule-only change ran no DDL at all.
+    try d.exec("CREATE INDEX \"idx_probe_title\" ON \"posts\" (\"title\");");
+
+    const s2 = [_]schema.Collection{
+        .{ .id = "", .name = "posts", .fields = &fields, .listRule = "@request.auth.id != \"\"" },
+    };
+    try applySpecs(a, std.testing.io, &d, &s2);
+
+    const live = (try collections.get(a, &d, "posts")).?;
+    defer live.deinit(a);
+    try std.testing.expectEqualStrings("@request.auth.id != \"\"", live.listRule.?);
+
+    var idx = try d.prepare("SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_probe_title';");
+    defer idx.finalize();
+    _ = try idx.step();
+    try std.testing.expectEqual(@as(i64, 1), idx.columnInt(0));
+
+    // and the row is still there (a rebuild would have copied it, but a DROP-less path proves
+    // the cheap route was taken rather than the expensive-but-correct one)
+    var rows = try d.prepare("SELECT COUNT(*) FROM \"posts\";");
+    defer rows.finalize();
+    _ = try rows.step();
+    try std.testing.expectEqual(@as(i64, 1), rows.columnInt(0));
+}
+
+test "applySpecs does not rewrite _collections when the rules are unchanged (null == empty)" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try migrations.run(&d);
+    const a = std.testing.allocator;
+
+    const fields = [_]schema.Field{.{ .id = "f_title", .name = "title", .options = .{ .text = .{} } }};
+    // v1 leaves every rule unspecified — persisted as SQL NULL.
+    const s1 = [_]schema.Collection{.{ .id = "", .name = "posts", .fields = &fields }};
+    try applySpecs(a, std.testing.io, &d, &s1);
+    try d.exec("UPDATE \"_collections\" SET \"updated\"='SENTINEL' WHERE \"name\"='posts';");
+
+    // v2 spells every rule "" — the SAME rule as null (both mean Locked: superusers only), but
+    // persisted DISTINCTLY by bindOptText. A differ comparing them literally would rewrite the
+    // row on every single boot.
+    const s2 = [_]schema.Collection{.{
+        .id = "",
+        .name = "posts",
+        .fields = &fields,
+        .listRule = "",
+        .viewRule = "",
+        .createRule = "",
+        .updateRule = "",
+        .deleteRule = "",
+    }};
+    try applySpecs(a, std.testing.io, &d, &s2);
+
+    const live = (try collections.get(a, &d, "posts")).?;
+    defer live.deinit(a);
+    try std.testing.expectEqualStrings("SENTINEL", live.updated);
 }
 
 test "applySpecs logs+skips a destructive type change (does not destroy data)" {

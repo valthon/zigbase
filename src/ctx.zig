@@ -11,6 +11,7 @@ const migrations = @import("migrations.zig");
 const collections = @import("collections.zig");
 const schema = @import("schema.zig");
 const policy = @import("policy.zig");
+const schema_gen = @import("schema_gen.zig");
 const expand_mod = @import("query/expand.zig");
 const http_client = @import("http_client.zig");
 const captcha_mod = @import("captcha.zig");
@@ -151,6 +152,27 @@ pub const Ctx = struct {
     /// Returns a Records namespace bound to this Ctx for read operations.
     pub fn records(self: *Ctx) Records {
         return .{ .ctx = self };
+    }
+
+    /// Announce that you changed collection METADATA with hand-written SQL, so every serving
+    /// process drops its cached collection definitions.
+    ///
+    /// You do NOT need this for anything that goes through the engine: `collections.create` /
+    /// `update` / `delete` / `updateRules` bump the schema-generation marker themselves, inside
+    /// their own transactions. This is the escape hatch for the one path the engine cannot see —
+    /// `ctx.records().queryAs()` (and friends) run unrestricted SQL on the bound writer, so a hook
+    /// or custom route CAN `UPDATE "_collections" SET "listRule" = …` directly. Such a write is
+    /// invisible to the cache: the stale definition (including a stale ACCESS RULE) keeps being
+    /// enforced until the process restarts.
+    ///
+    /// Call it in the same transaction as the write. Detection is deliberately not automatic:
+    /// `PRAGMA schema_version` would catch a raw DROP/ALTER but NOT a rule-only UPDATE — partial
+    /// coverage for real complexity, which is worse than an explicit call.
+    pub fn markSchemaChanged(self: *Ctx) !void {
+        if (self.bound_conn) |c| return schema_gen.bump(c);
+        const w = self.app.pool.acquireWriter();
+        defer self.app.pool.releaseWriter();
+        return schema_gen.bump(w);
     }
 
     /// Authorize `action` on a specific record (#155) through the SAME composed policy the REST
@@ -1472,6 +1494,12 @@ pub const Tx = struct {
     /// put into records inside the callback.
     pub fn arena(self: *Tx) std.mem.Allocator {
         return self.inner.arena.a;
+    }
+
+    /// See `Ctx.markSchemaChanged`. Inside a `tx` this bumps on the transaction's own bound
+    /// connection, so the marker commits or rolls back with the rest of the transaction.
+    pub fn markSchemaChanged(self: *Tx) !void {
+        return self.inner.markSchemaChanged();
     }
 };
 
