@@ -5,6 +5,18 @@ Every recorded change adds a small **fragment** file in this directory instead o
 a new version section in `CHANGELOG.md` and deletes them. (The published mirror
 `site/src/content/docs/changelog.md` is a generated artifact — see [At release](#at-release).)
 
+> ⚠️ **`scripts/assemble-changelog.sh` is NOT a validator — it is DESTRUCTIVE.** Running it
+> rewrites `CHANGELOG.md` (inserting a new version block) **and `git rm`s every fragment in
+> this directory**, including fragments belonging to other people's open PRs. It is a
+> **release-time tool only**; see [At release](#at-release). Its name reads like a check, so
+> it is easy to run "just to see if my fragment parses" — don't.
+>
+> **To check a fragment instead:** confirm every `### <Section>` heading in your file is on
+> the [recognized sections](#recognized-sections) list (any other heading fails the release
+> build) and that each heading is followed by Markdown bullet lines. That is the whole
+> contract — there is nothing else to validate. If you ran the assembler by accident, undo it
+> with `git restore --staged --worktree CHANGELOG.md changelog.d/`.
+
 This exists so parallel PRs never touch the same lines of `CHANGELOG.md` and never
 conflict on it. Two PRs each adding their own fragment file merge cleanly; two PRs each
 appending to the shared `## [Unreleased]` block do not.
@@ -91,4 +103,6 @@ The assembled block matters beyond the repo: the `v*` release workflow extracts 
 `scripts/extract-release-notes.sh` and uses it as the GitHub release body, so it is what
 consumers read on the release page. Review it for internal consistency before merging.
 
-Do not run the assembler in a feature PR — only add your fragment.
+Do not run the assembler in a feature PR — only add your fragment. It consumes (`git rm`s)
+every fragment in the directory, not just yours, so running it outside a release PR destroys
+other open PRs' fragments as well as rewriting `CHANGELOG.md`.
