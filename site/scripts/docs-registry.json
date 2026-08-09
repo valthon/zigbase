@@ -110,6 +110,16 @@
     }
   },
   {
+    "canonical": "docs/observability.md",
+    "mirror": "observability.md",
+    "frontmatter": {
+      "title": "Observability & machine-readable output",
+      "description": "Structured logging, the frozen error-code registry, JSON CLI output, and capability discovery — the contracts tools and agents build on.",
+      "order": 5,
+      "group": "reference"
+    }
+  },
+  {
     "canonical": "docs/postgres.md",
     "mirror": "postgres.md",
     "frontmatter": {

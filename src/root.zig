@@ -42,6 +42,10 @@ pub const RouteError = @import("route_types.zig").RouteError;
 pub const RouteAuthGuard = events.RouteAuthGuard;
 pub const PathSecretGuard = events.PathSecretGuard;
 pub const RateLimitKeyFn = events.RateLimitKeyFn;
+/// The frozen error-code registry (`code` in the API error envelope and in each
+/// `data.<field>` entry). Match on these; never on `message`.
+pub const error_codes = @import("error_codes.zig");
+pub const ErrorCode = error_codes.Code;
 
 // ---- Plugin / schema / migration consumer types ---------------------------
 // Types an external consumer must be able to NAME to write a custom storage or
@@ -521,6 +525,7 @@ test {
     _ = @import("captcha.zig");
     _ = @import("webhook.zig");
     _ = @import("request_arena.zig");
+    _ = @import("error_codes.zig");
     // Opt-in pure-Zig PostgreSQL backend (#159). The `build_options.postgres` condition is
     // comptime-known, so when it is false (the default) these `@import`s are never analyzed —
     // the driver compiles to nothing and the default build stays byte-identical.

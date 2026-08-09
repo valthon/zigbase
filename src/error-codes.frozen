@@ -1,0 +1,60 @@
+# Frozen error-code registry (SP-1). THIS FILE IS THE STABILITY CONTRACT.
+#
+# A code, once shipped, is permanent. Agents and SDKs switch on these strings;
+# the `message` field is NOT contract and may be reworded at any time.
+#
+#  * To ADD a code: add the enum field in src/error_codes.zig AND append a line
+#    to ACTIVE, keeping the section alphabetical.
+#  * To STOP emitting a code: MOVE its line from ACTIVE to RETIRED and delete
+#    the enum field. The line never disappears.
+#  * NEVER reuse a retired name for a different meaning, and NEVER rename a
+#    code — that is a removal plus an addition, and consumers break silently.
+#
+# The `test "error_codes: …"` blocks in src/error_codes.zig enforce agreement
+# between this file and the enum AS THE TREE STANDS; they cannot see history, so
+# scripts/check-error-code-ledger.sh diffs this file against the base branch in CI
+# and is what actually catches a code being deleted from both at once.
+# `zigbase explain-code` is the human/agent-facing view.
+
+[ACTIVE]
+bad_request
+collections_frozen
+conflict
+email_not_verified
+forbidden
+gone
+internal
+not_found
+payload_too_large
+too_many_requests
+unauthorized
+validation_date
+validation_duplicate_name
+validation_encrypted_index
+validation_encrypted_type
+validation_encrypted_unique
+validation_failed
+validation_invalid_email
+validation_invalid_identity_field
+validation_invalid_name
+validation_invalid_scale
+validation_invalid_tenant_field
+validation_invalid_ttl_field
+validation_max
+validation_min
+validation_not_found
+validation_number
+validation_overflow
+validation_pattern
+validation_relation
+validation_required
+validation_reserved_name
+validation_reserved_suffix
+validation_searchable_encrypted
+validation_searchable_type
+validation_select
+validation_too_precise
+validation_type
+validation_value
+
+[RETIRED]

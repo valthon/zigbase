@@ -55,6 +55,7 @@ export const sidebar: SidebarGroup[] = [
       { slug: 'fields', label: 'Fields' },
       { slug: 'known-limitations', label: 'Known limitations' },
       { slug: 'changelog', label: 'Changelog' },
+      { slug: 'observability', label: 'Observability' },
     ],
   },
 ];

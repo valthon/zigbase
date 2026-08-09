@@ -71,6 +71,16 @@ jobs:
         run: ./scripts/check-gating.sh
       - name: Allocator ownership contracts (ratchet)
         run: ./scripts/check-allocator-contracts.sh
+      - name: Error-code ledger is append-only
+        # actions/checkout leaves a depth-1 clone: HEAD (the PR merge commit) has
+        # no reachable ancestry, so a bare fetch of the base ref alone leaves
+        # `git merge-base origin/main HEAD` with disjoint histories and the check
+        # dies before it can diff anything. Fetch main's full history AND deepen
+        # HEAD's own line far enough to reach the fork point.
+        run: |
+          git fetch --no-tags origin main
+          git fetch --no-tags --deepen=200 origin
+          ./scripts/check-error-code-ledger.sh origin/main
       - name: Dating client snapshot is fresh
         run: mise exec zig@0.16.0 -- zig build gen-dating-client-check
       - name: Dating runtime client snapshot is fresh
