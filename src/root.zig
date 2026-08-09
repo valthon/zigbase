@@ -367,6 +367,8 @@ test {
     _ = @import("migrations.zig");
     _ = @import("migrator.zig");
     _ = @import("schema_dump.zig");
+    _ = @import("schema_doc.zig");
+    _ = @import("schema_diff.zig");
     _ = @import("rules.zig");
     _ = @import("policy.zig");
     _ = @import("tenancy/roles.zig");
@@ -451,6 +453,7 @@ test {
     _ = @import("provision.zig");
     _ = @import("doctor.zig");
     _ = @import("doctor_run.zig");
+    _ = @import("rules_lint.zig");
     _ = @import("dumpload.zig");
     _ = @import("records_hooks_test.zig");
     _ = @import("schedule.zig");

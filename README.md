@@ -118,9 +118,9 @@ pub fn main(init: std.process.Init) !void {
 ```
 
 `runCli` gives your binary the same commands as the stock server — `serve`, `migrate`,
-`migrate-db`, `import`, `superuser create`, `rewrap`, `vapid-keygen`, `explain-code`,
-`version`, and `help` (plus `typegen` when built with `.enable_typegen = true`). Beyond
-hooks, `App(.{...})` also accepts a comptime
+`migrate-db`, `import`, `schema`, `superuser create`, `rewrap`, `vapid-keygen`,
+`explain-code`, `version`, and `help` (plus `typegen` when built with
+`.enable_typegen = true`). Beyond hooks, `App(.{...})` also accepts a comptime
 **schema** (`.collections` + `.migrations`, provisioned at startup with additive
 auto-migration), **pluggable backends** (`.storage` / `.mailer`), and **footprint
 levers** (`.pools`). See [docs/framework.md](docs/framework.md) and the worked
@@ -140,7 +140,10 @@ zigbase serve [--http-host H] [--http-port N] [--data-dir PATH] [--serve-static 
 zigbase serve stop | status [--json] | logs [--follow] [--data-dir PATH]
 zigbase migrate [status | rollback [N] | dump [--out FILE]] [--data-dir PATH]
 zigbase migrate-db --from SQLITE_PATH --to POSTGRES_URL [--force]
-zigbase import --collection NAME [--upsert-key FIELD] [--batch-size N] [--data-dir PATH] <file.ndjson>
+zigbase schema [dump [--json] [--out FILE] | apply FILE [--dry-run] [--allow-destructive] [--prune]] [--data-dir PATH]
+zigbase import [--collection NAME [--upsert-key FIELD] <file.ndjson> | --manifest FILE]
+               [--legacy-hashes ALG] [--dry-run] [--continue-on-error] [--error-log FILE]
+               [--progress N] [--batch-size N] [--json] [--data-dir PATH]
 zigbase superuser create --email E --password P [--data-dir PATH]
 zigbase typegen [--data-dir PATH | --url URL] [--out FILE] [--lang L] [--check] [...]
 zigbase rewrap [--data-dir PATH] [--dry-run]
@@ -179,6 +182,18 @@ wrong, in dev); `--json` emits NDJSON findings. See [docs/serve.md](docs/serve.m
 engine — validation, defaults, the `.encrypted` envelope, and auth password hashing all
 apply — with optional `--upsert-key` idempotency and source-id preservation. See
 [docs/framework.md](docs/framework.md) → "Offline bulk import".
+
+`schema` is the declarative half: `schema dump` writes the canonical JSON collection
+model and `schema apply` executes the difference between a document and the live schema
+through the same path the REST collections API uses — refusing the whole document, before
+writing anything, if any access rule in it fails to parse. `schema check-rules` lints access-rule
+expressions — which nothing validates when they are *written*, so a malformed rule otherwise
+ships silently and fails closed (500) on the first request — through the real rule pipeline,
+emitting `doctor`-shaped NDJSON findings and exiting `0`/`2`/`1` clean/warnings-only/error.
+Given a document it is a **syntax**-depth check; run against a data dir it is **full** depth
+and also resolves field and relation names. Together with `import --manifest` and
+`import --legacy-hashes` they are the machinery behind
+[docs/migration-tools.md](docs/migration-tools.md).
 
 Running `zigbase` with no recognised command prints usage.
 

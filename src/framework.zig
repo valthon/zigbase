@@ -31,7 +31,14 @@ const provision = @import("provision.zig");
 const oauth_client = @import("oauth/client.zig");
 const migrator = @import("migrator.zig");
 const schema_dump = @import("schema_dump.zig");
+const schema_doc = @import("schema_doc.zig");
+const schema_diff = @import("schema_diff.zig");
 const schema = @import("schema.zig");
+// Named `collections_mod` (not `collections`): `App(cfg)` declares its own `pub const
+// collections` (the lowered comptime collection list), and that name is ambiguous with a
+// same-named file-level decl from inside the struct.
+const collections_mod = @import("collections.zig");
+const collections_api = @import("api/collections.zig");
 const ratelimit = @import("ratelimit.zig");
 const pagination = @import("pagination.zig");
 const registry = @import("auth/registry.zig");
@@ -41,6 +48,7 @@ const import_mod = @import("import.zig");
 const features = @import("features.zig");
 const doctor = @import("doctor.zig");
 const doctor_run = @import("doctor_run.zig");
+const rules_lint = @import("rules_lint.zig");
 const ctx_mod = @import("ctx.zig");
 const queue = @import("queue/queue.zig");
 const error_codes = @import("error_codes.zig");
@@ -1893,6 +1901,7 @@ fn runCliImpl(init: std.process.Init, dispatch: *const events.Dispatch, jobs: []
             .migrate_db => printMigrateDbUsage(init.io, std.Io.File.stdout()),
             .vapid_keygen => printVapidKeygenUsage(init.io, std.Io.File.stdout()),
             .import => printImportUsage(init.io, std.Io.File.stdout()),
+            .schema => printSchemaUsage(init.io, std.Io.File.stdout()),
             .explain_code => printExplainCodeUsage(init.io, std.Io.File.stdout()),
             .serve_control => printServeControlUsage(init.io, std.Io.File.stdout()),
             .doctor => printDoctorUsage(init.io, std.Io.File.stdout()),
@@ -2051,6 +2060,11 @@ fn runCliImpl(init: std.process.Init, dispatch: *const events.Dispatch, jobs: []
             .rollback => try migrateRollbackImpl(allocator, init.io, init.environ_map, ma, schema_migrations),
             .dump => try migrateDumpImpl(allocator, init.io, init.environ_map, ma),
         },
+        .schema => |sa| switch (sa.action) {
+            .dump => try schemaDumpImpl(allocator, init.io, init.environ_map, sa),
+            .apply => try schemaApplyImpl(allocator, init.io, init.environ_map, sa, dispatch, jobs, pool_size, schema_collections, schema_migrations, opts),
+            .check_rules => try schemaCheckRulesImpl(allocator, init.io, init.environ_map, sa),
+        },
         .rewrap => |ra| try rewrapImpl(allocator, init.io, init.environ_map, ra),
         .import => |ia| try importImpl(allocator, init.io, init.environ_map, ia, dispatch, jobs, pool_size, schema_collections, schema_migrations, opts),
         .migrate_db => |ma| try migrateDbImpl(allocator, init.io, ma),
@@ -2127,6 +2141,8 @@ fn printUsage(io: std.Io, file: std.Io.File, show_serve_static: bool, show_stati
         \\  rewrap              Re-encrypt all encrypted fields under the primary key (key rotation).
         \\  migrate-db          Copy an existing SQLite instance into PostgreSQL (requires -Dpostgres).
         \\  import              Bulk-import NDJSON records offline (through the engine: validation + encryption).
+        \\  schema              Dump the collection model as JSON, apply a schema document, or
+        \\                      `check-rules` to lint access-rule expressions before they ship.
         \\  superuser create    Create an admin (superuser) account.
         \\  vapid-keygen        Generate a VAPID (Web Push) keypair for ctx.push().
         \\  explain-code        Explain a frozen API error code, or list them all. Add --json for one JSON object.
@@ -2457,6 +2473,107 @@ fn printMigrateUsage(io: std.Io, file: std.Io.File) void {
         \\  zigbase migrate rollback 3 --data-dir ./zb_data
         \\  zigbase migrate dump --data-dir ./zb_data
         \\  zigbase migrate dump --out db/structure.sql --data-dir ./zb_data
+        \\
+    , .{});
+}
+
+fn printSchemaUsage(io: std.Io, file: std.Io.File) void {
+    emit(io, file,
+        \\zigbase schema — declarative schema: dump the live collection model, apply a document,
+        \\lint access rules.
+        \\
+        \\USAGE:
+        \\  zigbase schema dump  [--json] [--out FILE] [--data-dir PATH]
+        \\  zigbase schema apply <schema.json> [--dry-run] [--allow-destructive] [--prune]
+        \\                       [--data-dir PATH]
+        \\  zigbase schema check-rules [schema.json] [--json] [--data-dir PATH]
+        \\
+        \\DUMP:
+        \\  Writes a canonical JSON document describing every NON-SYSTEM collection: fields
+        \\  (with their stable ids), indexes, access rules, and collection options. It is
+        \\  deterministic (collections name-sorted, stable key order) so it diffs cleanly in
+        \\  git. Collection ids are omitted (they are instance-local) and OAuth client secrets
+        \\  are REDACTED — the document is not a secrets backup. Output goes to stdout unless
+        \\  --out is given. --json is accepted (symmetry with `import --json`) and ignored —
+        \\  the dumped document is already the one JSON object printed.
+        \\
+        \\APPLY:
+        \\  Diffs the document against the live schema and executes the difference through the
+        \\  same validation + DDL path as the REST collections API. Only collections named in
+        \\  the document are touched; live collections absent from it are reported as
+        \\  "untracked" and left alone (--prune deletes them instead). Refused when the app
+        \\  sets `.collections_frozen`.
+        \\
+        \\  Against a live SQLite-backed server, restart it afterwards: the server caches
+        \\  parsed collection metadata in-process with no TTL, invalidated only by its own
+        \\  REST create/update/delete handlers, so it can keep serving a stale or
+        \\  not-found view of a collection it already looked up until it restarts.
+        \\
+        \\  RULE SYNTAX GATE: before anything is written, every access rule the document
+        \\  declares is run through the filter lexer + parser. If any one of them fails to
+        \\  parse, the WHOLE document is refused — nothing is written, the offending
+        \\  collection/rule/error code is printed on stderr, and the exit is 1 (in --dry-run
+        \\  too, and ahead of the destructive check, so an unparseable document exits 1 even
+        \\  when it is also destructive). There is no flag to skip it. It is syntax ONLY:
+        \\  field and relation names are NOT resolved, because a rule may legitimately name a
+        \\  field this same apply is about to add. `@public` is NOT reported here either —
+        \\  that judgment lives in `check-rules`, whose exit 2 means "needs judgment", and
+        \\  apply's exit 2 is frozen as "dry-run found destructive changes".
+        \\
+        \\  --dry-run             Print the plan and apply no schema change. NOT a true no-op:
+        \\                        booting to compute the plan still runs system migrations
+        \\                        and comptime collection provisioning, which write.
+        \\  --allow-destructive   Permit drops and retypes (refused otherwise).
+        \\  --prune               Delete live collections absent from the document.
+        \\                        Requires --allow-destructive.
+        \\  --json                Accepted, ignored (stdout is already one JSON object).
+        \\
+        \\CHECK-RULES:
+        \\  Lints the five access rules (listRule/viewRule/createRule/updateRule/deleteRule)
+        \\  of every non-system collection through the REAL rule pipeline. Nothing validates
+        \\  a rule when it is written — the first parse happens at request time, where a
+        \\  malformed rule fails CLOSED (500). This is the preflight for that.
+        \\
+        \\  TWO MODES, TWO DEPTHS:
+        \\    no FILE          LIVE mode, depth "full". Every rule is compiled against the
+        \\                     database at --data-dir through the same entry point a request
+        \\                     uses, so unknown fields and bad relation traversals are caught
+        \\                     as well as syntax.
+        \\    FILE             DOCUMENT mode, depth "syntax". Lexer + parser ONLY. Resolving a
+        \\                     field or relation name needs a live schema and a connection,
+        \\                     which a document does not carry, so a rule naming a field that
+        \\                     does not exist passes here. The summary always says which depth
+        \\                     ran; do not read a clean "syntax" run as a clean bill of health.
+        \\
+        \\  Blank rules (null or "") mean Locked (superusers only) and are never reported.
+        \\  A rule of exactly "@public" is reported as a WARNING — it is the one allow-all,
+        \\  and opening a collection to everyone is a judgment a human should confirm. (This
+        \\  deliberately overlaps `doctor`'s public-rules-enumerated check, at a different
+        \\  lifecycle stage: doctor asks what a running server exposes, check-rules asks what
+        \\  a document or schema is about to expose.)
+        \\
+        \\  Output is NDJSON on stdout — one object per finding, then exactly one summary
+        \\  object whose first key is "summary" — same shape as `doctor`. Clean rules emit
+        \\  no line at all; the summary's rules_checked carries the coverage. --json is
+        \\  accepted and ignored (NDJSON is the only format).
+        \\
+        \\EXIT CODES (dump / apply):
+        \\  0  success, or --dry-run with no destructive changes
+        \\  1  the command failed (bad document, an unparseable access rule, refused
+        \\     operation, DB error)
+        \\  2  --dry-run found DESTRUCTIVE changes (needs --allow-destructive)
+        \\
+        \\EXIT CODES (check-rules):
+        \\  0  no findings
+        \\  1  at least one rule failed to parse or compile
+        \\  2  no errors, but at least one warning (an "@public" rule)
+        \\
+        \\EXAMPLES:
+        \\  zigbase schema dump --out db/schema.json --data-dir ./zb_data
+        \\  zigbase schema apply db/schema.json --dry-run
+        \\  zigbase schema apply db/schema.json --allow-destructive
+        \\  zigbase schema check-rules db/schema.json        # offline, syntax depth
+        \\  zigbase schema check-rules --data-dir ./zb_data  # live, full depth
         \\
     , .{});
 }
@@ -2855,6 +2972,445 @@ fn migrateDumpImpl(allocator: std.mem.Allocator, io: std.Io, environ: *const std
         try wr.interface.writeAll(sql);
         try wr.interface.flush();
     }
+}
+
+/// `zigbase schema dump [--json] [--out <file>]`: write the canonical JSON schema document
+/// for every non-system collection. Mirrors `migrateDumpImpl`'s read-only pool-open. Unlike
+/// `migrate dump` (a dialect-native structure.sql snapshot of the PHYSICAL database), this
+/// is the LOGICAL collection model — the artifact `schema apply` consumes.
+fn schemaDumpImpl(allocator: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map, sa: cli.SchemaArgs) !void {
+    const cfg = try loadCfg(environ, .{ .data_dir = sa.data_dir });
+    var pool = try openPoolSelect(allocator, io, cfg, .{}, environ);
+    defer pool.deinit();
+    const w = pool.acquireWriter();
+    defer pool.releaseWriter();
+
+    const doc = try schema_doc.dump(allocator, w);
+    defer allocator.free(doc);
+
+    if (sa.out) |path| {
+        if (std.fs.path.dirname(path)) |dir| std.Io.Dir.cwd().createDirPath(io, dir) catch {};
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = doc });
+        // Progress goes to stderr so stdout stays a clean JSON channel.
+        std.log.info("schema document written to {s} ({d} bytes)", .{ path, doc.len });
+    } else {
+        var buf: [4096]u8 = undefined;
+        var wr = std.Io.File.stdout().writer(io, &buf);
+        try wr.interface.writeAll(doc);
+        try wr.interface.flush();
+    }
+}
+
+/// `zigbase schema check-rules [FILE] [--data-dir PATH]`: lint access-rule expressions.
+///
+/// Closes a real gap: nothing validates a rule when it is WRITTEN. `schema.parseCollectionInput`
+/// takes the five rule fields as opaque strings and `collections.create`/`update` bind them
+/// straight into `_collections`; the first parse happens at request time, where a parse failure
+/// fails closed (500). A typo therefore ships silently and breaks the first request.
+///
+/// Two modes, two depths — see `rules_lint.zig`:
+///   * no FILE  -> LIVE, `"depth":"full"`. Opens the pool exactly as `schemaDumpImpl` does
+///     (read-only intent; it never boots the app or provisions) and runs every rule through
+///     `rules.compileGuard`, the request path's own entry point. Catches unknown fields and
+///     bad relation traversals as well as syntax.
+///   * a FILE   -> DOCUMENT, `"depth":"syntax"`. Lexer + parser only: resolving a field name
+///     needs a live schema and a connection, which a document does not carry.
+///
+/// Output is NDJSON on stdout (findings, then exactly one summary), matching `doctor`; the
+/// exit code is doctor's mapping (1 error / 2 warnings-only / 0 clean). `--json` is accepted
+/// and ignored, as on `dump` and `apply`.
+fn schemaCheckRulesImpl(allocator: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map, sa: cli.SchemaArgs) !void {
+    // Scoped so the arena and (in live mode) the pool are torn down BEFORE the exit —
+    // `std.process.exit` does not run deferred code.
+    const code = blk: {
+        var arena_state = std.heap.ArenaAllocator.init(allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        if (sa.file) |file| {
+            const bytes = std.Io.Dir.cwd().readFileAlloc(io, file, arena, .limited(64 << 20)) catch |e| {
+                std.log.err("schema check-rules: cannot read '{s}': {s}", .{ file, @errorName(e) });
+                return e;
+            };
+            const doc = schema_doc.parse(arena, bytes) catch |e| {
+                std.log.err("schema check-rules: '{s}' is not a valid schema document: {s}", .{ file, @errorName(e) });
+                return e;
+            };
+            const report = try rules_lint.checkDocument(arena, doc);
+            const summary = rules_lint.summarize(report, .syntax);
+            rules_lint.render(io, arena, report.findings, summary);
+            // Progress/interpretation on stderr only; stdout stays a clean NDJSON channel.
+            std.log.info("schema check-rules: {d} rule(s) across {d} collection(s), SYNTAX depth only — field and relation names are not resolved offline; re-run without a FILE against a data dir for the full check", .{ summary.rules_checked, summary.collections });
+            break :blk rules_lint.exitCode(summary);
+        }
+
+        const cfg = try loadCfg(environ, .{ .data_dir = sa.data_dir });
+        var pool = try openPoolSelect(allocator, io, cfg, .{}, environ);
+        defer pool.deinit();
+        const w = pool.acquireWriter();
+        defer pool.releaseWriter();
+
+        const live = try collections_mod.list(arena, w);
+        const report = try rules_lint.checkLive(arena, w, live);
+        const summary = rules_lint.summarize(report, .full);
+        rules_lint.render(io, arena, report.findings, summary);
+        std.log.info("schema check-rules: {d} rule(s) across {d} collection(s) at FULL depth", .{ summary.rules_checked, summary.collections });
+        break :blk rules_lint.exitCode(summary);
+    };
+    std.process.exit(code);
+}
+
+/// `zigbase schema apply <schema.json> [--dry-run] [--allow-destructive] [--prune]`.
+///
+/// Boots the FULL application offline via `bootApp` (migrations + comptime provisioning +
+/// field-cipher stamping) so the live schema it diffs against is the one `serve` would see,
+/// then executes the difference through `collections.create/update/delete` — the exact
+/// functions `src/api/collections.zig` calls. There is no second DDL implementation.
+///
+/// Every access rule in the document is syntax-checked (via `rules_lint.checkDocument`) before
+/// any write derived from the document happens; one unparseable rule refuses the whole apply.
+/// The gate, and why it is syntax-only, is documented at the gate itself below.
+///
+/// Refused when the app sets `.collections_frozen`: frozen means this deployment's schema is
+/// owned by the comptime `.collections` + `.migrations`, and a CLI write would silently
+/// diverge from that source at the next boot (provisioning would fight it).
+///
+/// NOT atomic across collections — `collections.create`/`update` each open their own
+/// transaction and cannot join an outer one. Each collection is therefore all-or-nothing on
+/// its own, and the emitted `applied` list names exactly which ones landed before a failure.
+fn schemaApplyImpl(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    environ: *const std.process.Environ.Map,
+    sa_args: cli.SchemaArgs,
+    dispatch: *const events.Dispatch,
+    jobs: []const scheduler.RuntimeJob,
+    pool_size: usize,
+    schema_collections: []const schema.Collection,
+    schema_migrations: []const provision.Migration,
+    comptime opts: ServeOpts,
+) !void {
+    const file = sa_args.file orelse {
+        std.log.err("schema apply: a <schema.json> path is required", .{});
+        return error.MissingSchemaFile;
+    };
+    if (sa_args.prune and !sa_args.allow_destructive) {
+        std.log.err("schema apply: --prune deletes collections and requires --allow-destructive", .{});
+        return error.DestructiveRefused;
+    }
+
+    const cfg = try loadCfg(environ, .{ .data_dir = sa_args.data_dir });
+    const holder = try bootApp(allocator, io, cfg, dispatch, jobs, pool_size, schema_collections, schema_migrations, opts, environ);
+    defer holder.deinit();
+
+    if (holder.app.collections_frozen) {
+        std.log.err("schema apply: collections are frozen (`.collections_frozen`); change the comptime `.collections` / add a `.migrations` entry and redeploy", .{});
+        return error.CollectionsFrozen;
+    }
+
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, file, a, .limited(64 << 20)) catch |e| {
+        std.log.err("schema apply: cannot read '{s}': {s}", .{ file, @errorName(e) });
+        return e;
+    };
+    const doc = schema_doc.parse(a, bytes) catch |e| {
+        std.log.err("schema apply: '{s}' is not a valid schema document: {s}", .{ file, @errorName(e) });
+        return e;
+    };
+
+    // ---- Rule syntax gate -------------------------------------------------------------
+    // Every access rule the document declares is parsed BEFORE a single write derived from
+    // the document happens. Nothing else in the engine validates a rule at write time:
+    // `schema.parseCollectionInput` decodes the five rule fields as opaque strings and
+    // `collections.create`/`update` bind them straight into `_collections`. The first thing
+    // that parses a rule is the request that has to evaluate it — where a parse failure
+    // fails CLOSED (500, and on a write the write never runs). `apply` is the last
+    // chokepoint before a typo becomes a production outage, so a document with an
+    // unparseable rule is refused WHOLE: nothing is written, not even the collections whose
+    // rules are fine.
+    //
+    // WHY SYNTAX ONLY — this deliberately runs `checkDocument` (lexer + parser) and reports
+    // nothing but hard parse errors:
+    //
+    //   * Exit code 2 is frozen as "dry-run found destructive changes". Emitting `@public`
+    //     warnings or full-resolution findings from `apply` would force them onto exit 2,
+    //     and an agent branching on 2 must never have to disambiguate "you opened a
+    //     collection to the public" from "destructive schema change pending". Overloading a
+    //     frozen exit code to save a flag is a bad trade.
+    //   * Full field resolution would false-positive on rules that are correct in the
+    //     document's own terms: a rule referencing a field added later in the same apply, or
+    //     a relation created in pass 2, resolves against a live schema that does not exist
+    //     yet. A linter that cries wolf during apply gets suppressed, and a suppressed
+    //     linter protects nothing.
+    //   * Judgment-shaped findings therefore live in `schema check-rules`, where exit 2
+    //     already means "needs judgment" and where the operator asked for an opinion.
+    //
+    // There is no flag and no opt-out: an unparseable rule is not a judgment call, it is a
+    // document that cannot mean anything.
+    {
+        // Scratch only. The report, its findings buffer, and every token/AST the checker
+        // builds live and die on this arena; the finding strings are static literals or
+        // borrowed from `doc`, so nothing that survives the block is owned by it. The
+        // refusal path returns an error rather than calling `std.process.exit`, so this
+        // `defer` — and the caller's `arena_state`/`holder` teardown — actually run.
+        var lint_arena = std.heap.ArenaAllocator.init(allocator);
+        defer lint_arena.deinit();
+        const report = try rules_lint.checkDocument(lint_arena.allocator(), doc);
+
+        var bad: usize = 0;
+        for (report.findings) |f| {
+            // Errors only. `checkDocument` also emits one "PublicRule" WARNING per `@public`
+            // rule; `apply` stays silent about those on purpose (see above).
+            if (!std.mem.eql(u8, f.severity, "error")) continue;
+            bad += 1;
+            // stderr, like every other pre-plan refusal here (`--prune` without
+            // `--allow-destructive`, `.collections_frozen`, an unreadable or invalid
+            // document): there is no plan yet, so there is no `emitApplyJson` object to
+            // attach this to, and stdout stays a clean JSON channel.
+            std.log.err("schema apply: collection '{s}' {s} does not parse: {s} ({s})", .{ f.collection, f.rule, f.message, f.code });
+        }
+        if (bad > 0) {
+            std.log.err("schema apply: {d} unparseable access rule(s) in '{s}'; the whole document is refused and nothing was written", .{ bad, file });
+            return error.InvalidRule;
+        }
+    }
+
+    const w = holder.pool.acquireWriter();
+    defer holder.pool.releaseWriter();
+
+    const all_live = try collections_mod.list(a, w);
+    var live: std.ArrayList(schema.Collection) = .empty;
+    for (all_live) |c| if (!c.system) try live.append(a, c);
+
+    var plan = try schema_diff.compute(allocator, live.items, doc, .{ .prune = sa_args.prune });
+    defer plan.deinit();
+
+    // A dry run reports and stops. Exit 2 (not 1) when destructive changes are present: the
+    // command SUCCEEDED, it just found something a human or an agent must decide about.
+    if (sa_args.dry_run) {
+        try emitApplyJson(allocator, io, plan, doc, sa_args, &.{});
+        if (plan.hasDestructive()) {
+            std.log.warn("schema apply --dry-run: {d} destructive change(s); re-run with --allow-destructive to execute", .{countDestructive(plan)});
+            std.process.exit(2);
+        }
+        return;
+    }
+
+    if (plan.hasDestructive() and !sa_args.allow_destructive) {
+        try emitApplyJson(allocator, io, plan, doc, sa_args, &.{});
+        std.log.err("schema apply: {d} destructive change(s) refused; pass --allow-destructive to execute them", .{countDestructive(plan)});
+        return error.DestructiveRefused;
+    }
+
+    var applied: std.ArrayList([]const u8) = .empty;
+    // Report what DID land even when a later collection fails, so a partial apply is
+    // diagnosable rather than mysterious.
+    errdefer emitApplyJson(allocator, io, plan, doc, sa_args, applied.items) catch {};
+
+    // Pass 1 — creates and updates, in dependency order, with cycle back-edges omitted.
+    for (plan.order) |idx| {
+        const want = doc[idx];
+        const existing = try collections_mod.get(a, w, want.name);
+
+        // A collection the diff found nothing to do for is already converged: skip the
+        // write entirely. `collections_mod.update` -> `ddl.rebuildPlan` always does a full
+        // SQLite table rebuild and bumps `_collections.updated`, even when the incoming def
+        // is byte-for-byte what's live — calling it unconditionally would make re-applying
+        // an already-converged document rebuild every table every time. `create_collection`
+        // changes don't gate here; they're handled by the `existing == null` branch below.
+        if (existing != null and !hasPendingChange(plan, want.name)) continue;
+
+        var def = want;
+
+        // Break relation cycles: create without the back-edge field, add it in pass 2.
+        var deferred_here: std.ArrayList([]const u8) = .empty;
+        for (want.fields) |f| {
+            if (f.options == .relation and plan.isDeferred(want.name, f.name))
+                try deferred_here.append(a, f.name);
+        }
+        if (deferred_here.items.len > 0 and existing == null)
+            def = try schema_diff.withoutFields(a, want, deferred_here.items);
+
+        if (schema.hasEncryptedField(def) and db.poolFieldCipher(&holder.pool) == null) {
+            std.log.err("schema apply: collection '{s}' declares an encrypted field but ZIGBASE_FIELD_KEY is unset", .{def.name});
+            return error.FieldKeyRequired;
+        }
+        // One rule for OAuth secrets, shared with the REST handlers: an empty incoming
+        // secret preserves the stored one (the document redacts them).
+        collections_api.mergeOAuthConfig(holder.app.io, a, holder.app.jwt_secret, &def, existing) catch |e| return reportOAuthError(def.name, e);
+
+        if (existing) |_| {
+            _ = collections_mod.update(a, holder.app.io, w, want.name, def) catch |e| return reportCollectionError(want.name, e);
+        } else {
+            _ = collections_mod.create(a, holder.app.io, w, def) catch |e| return reportCollectionError(want.name, e);
+        }
+        try applied.append(a, want.name);
+    }
+
+    // Pass 2 — add the relation fields held back to break a cycle. Every target now exists.
+    //
+    // Gated per collection on whether the LIVE row is still missing a deferred field:
+    // `plan.deferred` is structural (derived from the document's relation graph, not the
+    // diff), so a converged cyclic pair still has a non-empty `plan.deferred` on every
+    // re-apply. Without this gate, `update` (-> `ddl.rebuildPlan`, a full table rebuild +
+    // `_collections.updated` bump) would fire for the back-edge collection on every re-run
+    // even when nothing changed. A field that already exists live and differs structurally
+    // from the document was already caught by `schema_diff.compute` (it diffs every field
+    // by name/id regardless of deferred status) and already rewritten by Pass 1's
+    // unconditional-on-`existing`-def update (Pass 1 only omits deferred fields when
+    // CREATING, i.e. `existing == null`) — so this pass's only job is filling in a field
+    // that plan.order intentionally left out when the collection didn't exist yet.
+    if (plan.deferred.len > 0) {
+        for (plan.order) |idx| {
+            const want = doc[idx];
+            const existing = try collections_mod.get(a, w, want.name);
+
+            var needs_backfill = false;
+            for (want.fields) |f| {
+                if (f.options != .relation or !plan.isDeferred(want.name, f.name)) continue;
+                const live_has_field = if (existing) |e| fieldPresent(e.fields, f.name) else false;
+                if (!live_has_field) needs_backfill = true;
+            }
+            if (!needs_backfill) continue;
+
+            var def = want;
+            collections_api.mergeOAuthConfig(holder.app.io, a, holder.app.jwt_secret, &def, existing) catch |e| return reportOAuthError(def.name, e);
+            _ = collections_mod.update(a, holder.app.io, w, want.name, def) catch |e| return reportCollectionError(want.name, e);
+        }
+    }
+
+    // Pass 3 — prune, last, so a dropped collection can never be a live relation target of
+    // something still being created (`collections_mod.delete` refuses that anyway, with Conflict).
+    for (plan.changes) |c| {
+        if (c.kind != .drop_collection) continue;
+        collections_mod.delete(a, w, c.collection) catch |e| return reportCollectionError(c.collection, e);
+        try applied.append(a, c.collection);
+    }
+
+    if (holder.app.col_cache) |cc| cc.invalidate();
+    try emitApplyJson(allocator, io, plan, doc, sa_args, applied.items);
+    std.log.info("schema apply: {d} change(s) across {d} collection(s)", .{ plan.changes.len, applied.items.len });
+}
+
+fn countDestructive(plan: schema_diff.Plan) usize {
+    var n: usize = 0;
+    for (plan.changes) |c| if (schema_diff.isDestructive(c.kind)) {
+        n += 1;
+    };
+    return n;
+}
+
+/// True when `plan.changes` names at least one change for `name` other than
+/// `create_collection` — i.e. an EXISTING collection has something Pass 1 must actually
+/// write. `create_collection` never gates this: it's handled by Pass 1's `existing == null`
+/// branch regardless of this helper.
+fn hasPendingChange(plan: schema_diff.Plan, name: []const u8) bool {
+    for (plan.changes) |c| {
+        if (c.kind == .create_collection) continue;
+        if (std.mem.eql(u8, c.collection, name)) return true;
+    }
+    return false;
+}
+
+/// True when `fields` already has a field named `name` — existence only, by name. Pass 2
+/// uses this to decide whether a deferred back-edge field still needs to be created; any
+/// STRUCTURAL difference in an already-present field is `schema_diff.compute`'s and Pass
+/// 1's job, not this pass's.
+fn fieldPresent(fields: []const schema.Field, name: []const u8) bool {
+    for (fields) |f| if (std.mem.eql(u8, f.name, name)) return true;
+    return false;
+}
+
+/// Present a `collections_mod.create/update/delete` failure, surfacing the engine's own
+/// field-level validation details (the same `last_errors` the REST layer renders) instead
+/// of a bare error name. `last_errors` is allocated on the SAME arena the caller passed as
+/// `collections_mod.create`/`update`'s `alloc` (this function's caller always passes the
+/// request-scoped arena, never the raw GPA) — it is reclaimed wholesale when that arena is
+/// torn down, so this only resets the threadlocal, it never frees the slice itself (freeing
+/// arena memory through a different allocator would be a mismatched-free bug).
+fn reportCollectionError(name: []const u8, e: anyerror) anyerror {
+    if (e == error.Validation) {
+        if (collections_mod.last_errors) |errs| {
+            defer collections_mod.last_errors = null;
+            for (errs) |ve|
+                std.log.err("schema apply: collection '{s}' field '{s}': {s} ({s})", .{ name, ve.field, ve.message, ve.code });
+            return e;
+        }
+    }
+    std.log.err("schema apply: collection '{s}' failed: {s}", .{ name, @errorName(e) });
+    return e;
+}
+
+/// Present a `mergeOAuthConfig` failure at the CLI boundary (the REST handlers render a 400;
+/// the CLI has no response to render, so it logs and fails the run instead).
+fn reportOAuthError(name: []const u8, e: collections_api.OAuthPrepError) anyerror {
+    if (e == error.BadOAuthConfig)
+        std.log.err("schema apply: collection '{s}' has an invalid OAuth2 provider config (endpoints must be https, and an enabled provider needs a client secret)", .{name})
+    else
+        std.log.err("schema apply: collection '{s}' OAuth2 config failed: {s}", .{ name, @errorName(e) });
+    return e;
+}
+
+/// The single JSON object on stdout. Emitted for dry runs, successful applies, and partial
+/// applies alike, so an agent parses exactly one shape.
+fn emitApplyJson(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    plan: schema_diff.Plan,
+    doc: []const schema.Collection,
+    args: cli.SchemaArgs,
+    applied: []const []const u8,
+) !void {
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    var changes: std.json.Array = .init(a);
+    for (plan.changes) |c| {
+        var o: std.json.ObjectMap = .empty;
+        try o.put(a, "kind", .{ .string = @tagName(c.kind) });
+        try o.put(a, "collection", .{ .string = c.collection });
+        try o.put(a, "field", if (c.field) |f| .{ .string = f } else .null);
+        try o.put(a, "detail", .{ .string = c.detail });
+        try changes.append(.{ .object = o });
+    }
+    var untracked: std.json.Array = .init(a);
+    for (plan.untracked) |u| try untracked.append(.{ .string = u });
+    var deferred: std.json.Array = .init(a);
+    for (plan.deferred) |d| {
+        var o: std.json.ObjectMap = .empty;
+        try o.put(a, "collection", .{ .string = d.collection });
+        try o.put(a, "field", .{ .string = d.field });
+        try deferred.append(.{ .object = o });
+    }
+    var applied_arr: std.json.Array = .init(a);
+    for (applied) |n| try applied_arr.append(.{ .string = n });
+    var order_arr: std.json.Array = .init(a);
+    for (plan.order) |i| try order_arr.append(.{ .string = doc[i].name });
+
+    // Stdout is the settled snake_case convention for everything this command PRINTS (the
+    // schema document FILE format stays camelCase — see schema_doc.zig). Do not mix styles.
+    var root: std.json.ObjectMap = .empty;
+    try root.put(a, "zigbase_schema_apply", .{ .integer = 1 });
+    try root.put(a, "dry_run", .{ .bool = args.dry_run });
+    try root.put(a, "allow_destructive", .{ .bool = args.allow_destructive });
+    try root.put(a, "destructive", .{ .bool = plan.hasDestructive() });
+    try root.put(a, "changes", .{ .array = changes });
+    try root.put(a, "untracked", .{ .array = untracked });
+    try root.put(a, "deferred_relations", .{ .array = deferred });
+    try root.put(a, "applied", .{ .array = applied_arr });
+    try root.put(a, "apply_order", .{ .array = order_arr });
+
+    const body = try std.json.Stringify.valueAlloc(a, std.json.Value{ .object = root }, .{});
+    var buf: [4096]u8 = undefined;
+    var wr = std.Io.File.stdout().writer(io, &buf);
+    try wr.interface.writeAll(body);
+    try wr.interface.writeAll("\n");
+    // Flush BEFORE any std.process.exit — an unflushed buffer is a silently empty stdout.
+    try wr.interface.flush();
 }
 
 /// `zigbase migrate rollback [N]`: reverse the N most-recently-applied consumer migrations (newest

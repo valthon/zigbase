@@ -16,6 +16,10 @@ ZigBase v0.12.0 is an early release. The gaps below are known and tracked for fu
 
 ## Schema / migrations
 - **Comptime auto-migration is additive-only.** Startup provisioning of a comptime `.collections` schema creates missing collections and adds new fields, preserving data. **Non-additive changes (rename, drop, or type-change a field) are detected, logged, and skipped** — they require an explicit `.migrations` entry.
+- **`schema apply` is not atomic across collections** (each `collections.create`/`update` opens its own transaction); the emitted `applied` list names what landed before a failure.
+- **`schema apply` syntax-checks access rules but does not resolve their field references.** It refuses a document carrying an unparseable rule (nothing is written), but a rule that parses while naming a field or relation the collection does not have still applies — and then fails closed at evaluation time (500). The REST collections API validates neither. Run `zigbase schema check-rules --data-dir PATH` against the applied instance for the full check, and exercise every rule once via the replay harness before cutover.
+- **`schema apply` against a live, non-frozen SQLite-backed server needs a restart to take effect there.** The server caches parsed collection metadata in-process (`src/colcache.zig`), with no TTL and no cross-process invalidation — only its own REST collections create/update/delete handlers invalidate it. `schema apply` runs as a separate CLI process, so its changes never reach a running server's cache: the server keeps serving its cached view — including a cached *not-found* for a collection that didn't exist the last time it was looked up — with no error, until restarted. Postgres deployments and `.collections_frozen` apps (which refuse `apply` outright) are unaffected. See [docs/migration-tools.md](docs/migration-tools.md).
+- **Collection rename is not supported by the engine** (`collections.update` preserves the stored name), so a renamed collection in a document reads as create + untracked.
 
 ## Scheduler
 - **Single-process only** — jobs run in the serving process; there is no distributed coordination.

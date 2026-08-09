@@ -150,6 +150,16 @@
     }
   },
   {
+    "canonical": "docs/migration-tools.md",
+    "mirror": "migration-tools.md",
+    "frontmatter": {
+      "title": "Migration tools",
+      "description": "Declarative schema dump/apply, scaled NDJSON import with relation ordering, legacy password-hash import with rehash-on-login, and the parity-replay harness.",
+      "order": 10,
+      "group": "guides"
+    }
+  },
+  {
     "canonical": "docs/realtime-broadcast.md",
     "mirror": "realtime-broadcast.md",
     "frontmatter": {

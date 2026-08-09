@@ -16,14 +16,20 @@ const secrets = @import("../oauth/secrets.zig");
 const oauth_api = @import("oauth.zig");
 const field_policy = @import("../field_policy.zig");
 
-/// Encrypt any plaintext clientSecret, validate provider endpoints (resolvable + https), and
-/// (on update) preserve a stored secret when the incoming one is empty. Mutates `def.options`.
-fn prepareOAuthConfig(ctx: *http.RequestCtx, def: *schema.Collection, existing: ?schema.Collection) !void {
-    const app = ctx.app.?;
+pub const OAuthPrepError = error{BadOAuthConfig} || std.mem.Allocator.Error;
+
+/// Merge OAuth2 provider config from `def` with any stored secrets in `existing`: an EMPTY
+/// incoming clientSecret preserves the stored one (secrets are redacted on read, so a
+/// read-modify-write round trip must not blank them). Also encrypts a fresh plaintext secret
+/// and validates provider endpoints (resolvable + https). Mutates `def.options.auth.oauth2` in
+/// place using `alloc`. No HTTP dependency — shared by the REST handlers and `zigbase schema
+/// apply` so both obey one rule. Callers that have a request context should use
+/// `prepareOAuthConfig`.
+pub fn mergeOAuthConfig(io: std.Io, alloc: std.mem.Allocator, jwt_secret: []const u8, def: *schema.Collection, existing: ?schema.Collection) OAuthPrepError!void {
     if (def.type != .auth) return;
     const provs = def.options.auth.oauth2.providers;
     if (provs.len == 0) return;
-    const out = try ctx.allocator.a.alloc(schema.OAuth2Provider, provs.len);
+    const out = try alloc.alloc(schema.OAuth2Provider, provs.len);
     for (provs, 0..) |p, i| {
         var np = p;
         if (oauth_api.resolveProvider(np) == null) return error.BadOAuthConfig;
@@ -38,11 +44,22 @@ fn prepareOAuthConfig(ctx: *http.RequestCtx, def: *schema.Collection, existing: 
             }
             if (np.clientSecret.len == 0 and np.enabled) return error.BadOAuthConfig;
         } else if (!secrets.isEncrypted(np.clientSecret)) {
-            np.clientSecret = try secrets.encryptSecret(app.io, ctx.allocator.a, app.jwt_secret, np.clientSecret);
+            np.clientSecret = try secrets.encryptSecret(io, alloc, jwt_secret, np.clientSecret);
         }
         out[i] = np;
     }
     def.options.auth.oauth2.providers = out;
+}
+
+/// HTTP wrapper around `mergeOAuthConfig`: on a config error, render the 400 the handlers
+/// already return. Returns the response to short-circuit with, or null to continue.
+pub fn prepareOAuthConfig(ctx: *http.RequestCtx, def: *schema.Collection, existing: ?schema.Collection) !?http.Response {
+    const app = ctx.app.?;
+    mergeOAuthConfig(app.io, ctx.allocator.a, app.jwt_secret, def, existing) catch |e| switch (e) {
+        error.BadOAuthConfig => return try ApiError.badRequest("Invalid OAuth2 provider config (endpoints must be https).").toResponse(ctx.allocator.a),
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+    return null;
 }
 
 /// True if the request carries a valid superuser token. Uses a short-lived reader connection.
@@ -111,8 +128,7 @@ pub fn create(ctx: *http.RequestCtx) anyerror!http.Response {
     const w = app.pool.acquireWriter();
     defer app.pool.releaseWriter();
     var def_mut = def;
-    prepareOAuthConfig(ctx, &def_mut, null) catch
-        return ApiError.badRequest("Invalid OAuth2 provider config (endpoints must be https).").toResponse(ctx.allocator.a);
+    if (try prepareOAuthConfig(ctx, &def_mut, null)) |resp| return resp;
     const created = collections.create(ctx.allocator.a, app.io, w, def_mut) catch |e| switch (e) {
         error.Validation => return validationResponse(ctx),
         // The pre-check (`get() != null`) catches the common duplicate; error.Constraint covers a
@@ -147,8 +163,7 @@ pub fn update(ctx: *http.RequestCtx) anyerror!http.Response {
     defer app.pool.releaseWriter();
     const existing = collections.get(ctx.allocator.a, w, key) catch null;
     var def_mut = def;
-    prepareOAuthConfig(ctx, &def_mut, existing) catch
-        return ApiError.badRequest("Invalid OAuth2 provider config (endpoints must be https).").toResponse(ctx.allocator.a);
+    if (try prepareOAuthConfig(ctx, &def_mut, existing)) |resp| return resp;
     const updated = collections.update(ctx.allocator.a, app.io, w, key, def_mut) catch |e| switch (e) {
         error.NotFound => return ApiError.notFound().toResponse(ctx.allocator.a),
         error.Validation => return validationResponse(ctx),

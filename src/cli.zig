@@ -134,8 +134,26 @@ pub const VersionArgs = struct {
     json: bool = false,
 };
 
+/// `schema`: the declarative-schema surface. `dump` writes the canonical JSON document for
+/// every non-system collection; `apply` diffs a document against the live schema and
+/// executes the difference through the same engine path the REST collections API uses;
+/// `check_rules` (spelled `check-rules`) lints access-rule expressions, which nothing else
+/// validates at write time.
+pub const SchemaAction = enum { dump, apply, check_rules };
+
+pub const SchemaArgs = struct {
+    data_dir: ?[]const u8 = null,
+    action: SchemaAction = .dump,
+    out: ?[]const u8 = null,
+    json: bool = false,
+    file: ?[]const u8 = null,
+    dry_run: bool = false,
+    allow_destructive: bool = false,
+    prune: bool = false,
+};
+
 /// Identifies which command a per-command `--help` request targets.
-pub const HelpTopic = enum { top, serve, serve_control, migrate, superuser_create, typegen, rewrap, migrate_db, vapid_keygen, import, explain_code, doctor };
+pub const HelpTopic = enum { top, serve, serve_control, migrate, superuser_create, typegen, rewrap, migrate_db, vapid_keygen, import, schema, explain_code, doctor };
 
 pub const Command = union(enum) {
     /// `help`/`--help`/`-h`/no-args -> top-level usage; `<cmd> --help` -> that command's usage.
@@ -151,6 +169,7 @@ pub const Command = union(enum) {
     /// `vapid-keygen` -> generate a fresh VAPID (Web Push) keypair, print it, and exit.
     vapid_keygen: void,
     import: ImportArgs,
+    schema: SchemaArgs,
     explain_code: ExplainCodeArgs,
     /// `serve stop|status|logs` -> manage an existing `serve` session.
     serve_control: ServeControlArgs,
@@ -286,6 +305,52 @@ pub fn parse(args: []const []const u8, popts: ParseOpts) ParseError!Command {
             } else return ParseError.UnknownFlag;
         }
         return .{ .explain_code = ea };
+    }
+    if (std.mem.eql(u8, args[0], "schema")) {
+        var sa = SchemaArgs{};
+        var i: usize = 1;
+        // Optional leading subcommand: `schema dump` (the default), `schema apply <file>`,
+        // or `schema check-rules [file]`.
+        if (i < args.len and !std.mem.startsWith(u8, args[i], "-")) {
+            if (std.mem.eql(u8, args[i], "dump")) {
+                sa.action = .dump;
+                i += 1;
+            } else if (std.mem.eql(u8, args[i], "apply")) {
+                sa.action = .apply;
+                i += 1;
+            } else if (std.mem.eql(u8, args[i], "check-rules")) {
+                sa.action = .check_rules;
+                i += 1;
+            } else return ParseError.UnknownCommand;
+        }
+        while (i < args.len) : (i += 1) {
+            const a = args[i];
+            if (isHelpFlag(a)) {
+                return .{ .help = .schema };
+            } else if (std.mem.eql(u8, a, "--data-dir")) {
+                i += 1;
+                if (i >= args.len) return ParseError.MissingValue;
+                sa.data_dir = args[i];
+            } else if (std.mem.eql(u8, a, "--json")) {
+                sa.json = true;
+            } else if (sa.action == .dump and std.mem.eql(u8, a, "--out")) {
+                i += 1;
+                if (i >= args.len) return ParseError.MissingValue;
+                sa.out = args[i];
+            } else if (sa.action == .apply and std.mem.eql(u8, a, "--dry-run")) {
+                sa.dry_run = true;
+            } else if (sa.action == .apply and std.mem.eql(u8, a, "--allow-destructive")) {
+                sa.allow_destructive = true;
+            } else if (sa.action == .apply and std.mem.eql(u8, a, "--prune")) {
+                sa.prune = true;
+            } else if (!std.mem.startsWith(u8, a, "-")) {
+                // Positional document path — `apply` (required) and `check-rules` (optional:
+                // its presence is what selects document mode over live mode). Exactly one.
+                if ((sa.action != .apply and sa.action != .check_rules) or sa.file != null) return ParseError.BadValue;
+                sa.file = a;
+            } else return ParseError.UnknownFlag;
+        }
+        return .{ .schema = sa };
     }
     if (std.mem.eql(u8, args[0], "import")) {
         var ia = ImportArgs{};
@@ -731,6 +796,67 @@ test "import rejects unknown flags, missing values, bad + zero batch size, and a
     try std.testing.expectError(ParseError.BadValue, parse(&.{ "import", "--batch-size", "abc", "f" }, .{}));
     try std.testing.expectError(ParseError.BadValue, parse(&.{ "import", "--batch-size", "0", "f" }, .{}));
     try std.testing.expectError(ParseError.BadValue, parse(&.{ "import", "a.ndjson", "b.ndjson" }, .{}));
+}
+
+test "schema dump parses --out/--json/--data-dir" {
+    const cmd = try parse(&.{ "schema", "dump", "--json", "--out", "db/schema.json", "--data-dir", "/tmp/zb" }, .{});
+    try std.testing.expect(std.meta.activeTag(cmd) == .schema);
+    try std.testing.expectEqual(SchemaAction.dump, cmd.schema.action);
+    try std.testing.expect(cmd.schema.json);
+    try std.testing.expectEqualStrings("db/schema.json", cmd.schema.out.?);
+    try std.testing.expectEqualStrings("/tmp/zb", cmd.schema.data_dir.?);
+}
+
+test "schema defaults to dump and rejects a positional file on dump" {
+    const bare = try parse(&.{"schema"}, .{});
+    try std.testing.expectEqual(SchemaAction.dump, bare.schema.action);
+    try std.testing.expectEqual(@as(?[]const u8, null), bare.schema.out);
+    try std.testing.expectError(ParseError.BadValue, parse(&.{ "schema", "dump", "s.json" }, .{}));
+}
+
+test "schema apply parses the positional document + its flags" {
+    const cmd = try parse(&.{ "schema", "apply", "schema.json", "--dry-run", "--allow-destructive", "--prune" }, .{});
+    try std.testing.expectEqual(SchemaAction.apply, cmd.schema.action);
+    try std.testing.expectEqualStrings("schema.json", cmd.schema.file.?);
+    try std.testing.expect(cmd.schema.dry_run);
+    try std.testing.expect(cmd.schema.allow_destructive);
+    try std.testing.expect(cmd.schema.prune);
+}
+
+test "schema rejects a second positional, cross-action flags, and a bad subcommand" {
+    try std.testing.expectError(ParseError.BadValue, parse(&.{ "schema", "apply", "a.json", "b.json" }, .{}));
+    try std.testing.expectError(ParseError.UnknownFlag, parse(&.{ "schema", "dump", "--dry-run" }, .{}));
+    try std.testing.expectError(ParseError.UnknownFlag, parse(&.{ "schema", "apply", "a.json", "--out", "x" }, .{}));
+    try std.testing.expectError(ParseError.UnknownCommand, parse(&.{ "schema", "frobnicate" }, .{}));
+    try std.testing.expectError(ParseError.MissingValue, parse(&.{ "schema", "dump", "--out" }, .{}));
+}
+
+test "schema check-rules: the optional positional is what selects document mode" {
+    // No positional -> LIVE mode (full depth, against --data-dir).
+    const live = try parse(&.{ "schema", "check-rules", "--data-dir", "/tmp/zb" }, .{});
+    try std.testing.expectEqual(SchemaAction.check_rules, live.schema.action);
+    try std.testing.expectEqual(@as(?[]const u8, null), live.schema.file);
+    try std.testing.expectEqualStrings("/tmp/zb", live.schema.data_dir.?);
+
+    // A positional -> DOCUMENT mode (syntax depth). `--json` is accepted and ignored.
+    const docmode = try parse(&.{ "schema", "check-rules", "schema.json", "--json" }, .{});
+    try std.testing.expectEqual(SchemaAction.check_rules, docmode.schema.action);
+    try std.testing.expectEqualStrings("schema.json", docmode.schema.file.?);
+    try std.testing.expect(docmode.schema.json);
+}
+
+test "schema check-rules rejects a second positional and every other action's flags" {
+    try std.testing.expectError(ParseError.BadValue, parse(&.{ "schema", "check-rules", "a.json", "b.json" }, .{}));
+    try std.testing.expectError(ParseError.UnknownFlag, parse(&.{ "schema", "check-rules", "--out", "x" }, .{}));
+    try std.testing.expectError(ParseError.UnknownFlag, parse(&.{ "schema", "check-rules", "--dry-run" }, .{}));
+    try std.testing.expectError(ParseError.UnknownFlag, parse(&.{ "schema", "check-rules", "a.json", "--prune" }, .{}));
+    try std.testing.expectError(ParseError.UnknownFlag, parse(&.{ "schema", "check-rules", "--allow-destructive" }, .{}));
+}
+
+test "schema --help routes to its help topic" {
+    try std.testing.expectEqual(HelpTopic.schema, (try parse(&.{ "schema", "--help" }, .{})).help);
+    try std.testing.expectEqual(HelpTopic.schema, (try parse(&.{ "schema", "apply", "-h" }, .{})).help);
+    try std.testing.expectEqual(HelpTopic.schema, (try parse(&.{ "schema", "check-rules", "--help" }, .{})).help);
 }
 
 test "unknown command errors" {
