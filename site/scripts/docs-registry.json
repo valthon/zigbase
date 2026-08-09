@@ -20,6 +20,16 @@
     }
   },
   {
+    "canonical": "docs/agents.md",
+    "mirror": "agents.md",
+    "frontmatter": {
+      "title": "For coding agents",
+      "description": "The ~2k-token entry point for AI agents working with ZigBase — what it is, the traps that bite, the response shapes you can rely on, and which guide to load next.",
+      "order": 4,
+      "group": "getting-started"
+    }
+  },
+  {
     "canonical": "docs/abilities.md",
     "mirror": "abilities.md",
     "frontmatter": {

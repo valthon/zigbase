@@ -8,6 +8,7 @@ const events = @import("events.zig");
 const config = @import("config.zig");
 const cli = @import("cli.zig");
 const logging = @import("logging.zig");
+const scaffold = @import("scaffold.zig");
 const server = @import("server.zig");
 const serve_control = @import("serve_control.zig");
 const serve_session = @import("serve_session.zig");
@@ -1906,6 +1907,8 @@ fn runCliImpl(init: std.process.Init, dispatch: *const events.Dispatch, jobs: []
             .explain_code => printExplainCodeUsage(init.io, std.Io.File.stdout()),
             .serve_control => printServeControlUsage(init.io, std.Io.File.stdout()),
             .doctor => printDoctorUsage(init.io, std.Io.File.stdout()),
+            .init => printInitUsage(init.io, std.Io.File.stdout()),
+            .agents_md => printAgentsMdUsage(init.io, std.Io.File.stdout()),
         },
         .version => |va| if (va.json) printVersionJson(init.io, std.Io.File.stdout()) else printVersion(init.io, std.Io.File.stdout()),
         .serve => |sa_in| {
@@ -2072,6 +2075,8 @@ fn runCliImpl(init: std.process.Init, dispatch: *const events.Dispatch, jobs: []
         .superuser_create => |sa| try superuserCreateImpl(allocator, init.io, init.environ_map, sa),
         .vapid_keygen => try vapidKeygenImpl(allocator, init.io),
         .explain_code => |ea| explainCodeImpl(init.io, ea),
+        .init => |ia| try initImpl(allocator, init.io, ia),
+        .agents_md => |aa| try agentsMdImpl(allocator, init.io, aa),
         .typegen => |ta| {
             if (opts.enable_typegen) {
                 const tgen = @import("codegen/typegen_cli.zig");
@@ -2147,6 +2152,14 @@ fn printUsage(io: std.Io, file: std.Io.File, show_serve_static: bool, show_stati
         \\  superuser create    Create an admin (superuser) account.
         \\  vapid-keygen        Generate a VAPID (Web Push) keypair for ctx.push().
         \\  explain-code        Explain a frozen API error code, or list them all. Add --json for one JSON object.
+        \\
+    , .{});
+    emit(io, file,
+        \\  init                Scaffold a starting-point project (--box or --framework).
+        \\  agents-md           Write AGENTS.md + CLAUDE.md for an existing project.
+        \\
+    , .{});
+    emit(io, file,
         \\  help                Show this help. Also: --help, -h, or no arguments.
         \\  version             Print version + build provenance. Also: --version, -V. Add --json for one JSON object.
         \\
@@ -2791,6 +2804,60 @@ fn printExplainCodeUsage(io: std.Io, file: std.Io.File) void {
         \\A CODE ZigBase never registered exits 1 (`--json` still prints one object, with
         \\`"known":false`); a consumer route may legitimately emit its own strings via
         \\ctx.jsonError, so this is not a ZigBase bug report.
+        \\
+    , .{});
+}
+
+fn printInitUsage(io: std.Io, file: std.Io.File) void {
+    emit(io, file,
+        \\zigbase init — scaffold a starting-point project.
+        \\
+        \\USAGE:
+        \\  zigbase init [--box | --framework] [--dir PATH] [--name NAME]
+        \\
+        \\MODES:
+        \\  --box         (default) No Zig toolchain. Emits docker-compose.yml, a
+        \\                schema/collections.json starting point (apply it with
+        \\                `zigbase schema apply`), AGENTS.md + CLAUDE.md, .gitignore,
+        \\                and a README.
+        \\  --framework   A Zig package that embeds ZigBase as a library. Emits
+        \\                build.zig (wired with zigbase.addTo + zigbase.addTest),
+        \\                build.zig.zon, src/main.zig with a comptime schema and
+        \\                in-process tests, AGENTS.md + CLAUDE.md, .gitignore, README.
+        \\
+        \\FLAGS:
+        \\  --dir PATH    Target directory, created if missing. [default .]
+        \\  --name NAME   Package/executable name (framework mode).
+        \\                [default: the directory name, sanitized]
+        \\
+        \\Existing files are NEVER overwritten — they are reported as skipped and left
+        \\alone. There is no --force.
+        \\
+        \\In framework mode, run `zig fetch --save git+https://github.com/valthon/zigbase`
+        \\afterwards: that is what writes the dependency URL and its content hash into
+        \\build.zig.zon.
+        \\
+    , .{});
+}
+
+fn printAgentsMdUsage(io: std.Io, file: std.Io.File) void {
+    emit(io, file,
+        \\zigbase agents-md — write AGENTS.md + CLAUDE.md for an existing project.
+        \\
+        \\USAGE:
+        \\  zigbase agents-md [--box | --framework] [--dir PATH] [--stdout]
+        \\
+        \\FLAGS:
+        \\  --dir PATH    Target directory. [default .]
+        \\  --box         Force the no-Zig content set.
+        \\  --framework   Force the library-embedding content set.
+        \\  --stdout      Print AGENTS.md instead of writing it (diff-friendly).
+        \\
+        \\With neither mode flag, the mode is inferred: a build.zig.zon in the target
+        \\directory means framework, otherwise box.
+        \\
+        \\Existing files are never overwritten. To refresh one, delete it (or diff
+        \\against --stdout) first.
         \\
     , .{});
 }
@@ -4752,6 +4819,92 @@ fn explainCodeImpl(io: std.Io, ea: cli.ExplainCodeArgs) void {
     } else {
         emit(io, out, "{s}\n{s}\n\n{s}\n", .{ error_codes.s(code), i.summary, i.explanation });
     }
+}
+
+/// Print a scaffold report: one line per file, then the next commands to run.
+fn printReport(io: std.Io, rep: scaffold.Report) void {
+    for (rep.entries) |e| switch (e.outcome) {
+        .created => emit(io, std.Io.File.stdout(), "  created  {s}\n", .{e.path}),
+        .skipped => emit(io, std.Io.File.stdout(), "  skipped  {s} (already exists)\n", .{e.path}),
+    };
+}
+
+fn initImpl(allocator: std.mem.Allocator, io: std.Io, ia: cli.InitArgs) !void {
+    const mode: scaffold.Mode = switch (ia.mode) {
+        .box => .box,
+        .framework => .framework,
+    };
+    const rep = try scaffold.run(allocator, io, .{ .mode = mode, .dir = ia.dir, .name = ia.name });
+    defer scaffold.freeReport(allocator, rep);
+
+    emit(io, std.Io.File.stdout(), "zigbase init: {s} mode in {s}\n\n", .{ @tagName(ia.mode), ia.dir });
+    printReport(io, rep);
+    if (rep.skipped > 0) emit(io, std.Io.File.stdout(),
+        \\
+        \\{d} file(s) already existed and were left untouched. init never overwrites.
+        \\
+    , .{rep.skipped});
+
+    switch (mode) {
+        .box => emit(io, std.Io.File.stdout(),
+            \\
+            \\NEXT:
+            \\  cd {s}
+            \\  docker compose up -d
+            \\  docker compose exec zigbase /zigbase superuser create \
+            \\    --email you@example.com --password 'change-me-please' --data-dir /data
+            \\  docker compose exec zigbase /zigbase schema apply /schema/collections.json
+            \\
+            \\Before you ship:
+            \\  docker compose exec zigbase /zigbase doctor --production --data-dir /data
+            \\
+            \\Read AGENTS.md before you ship. Blank access rules mean LOCKED, not public.
+            \\
+        , .{ia.dir}),
+        .framework => emit(io, std.Io.File.stdout(),
+            \\
+            \\NEXT:
+            \\  cd {s}
+            \\  zig fetch --save git+https://github.com/valthon/zigbase
+            \\  zig build test
+            \\  zig build run -- serve --insecure-cookies
+            \\
+            \\`zig fetch --save` writes the dependency URL AND its content hash into
+            \\build.zig.zon. Do not hand-write either.
+            \\
+            \\Before you ship:
+            \\  zig build run -- doctor --production
+            \\
+            \\Read AGENTS.md before you ship. Blank access rules mean LOCKED, not public.
+            \\
+        , .{ia.dir}),
+    }
+}
+
+fn agentsMdImpl(allocator: std.mem.Allocator, io: std.Io, aa: cli.AgentsMdArgs) !void {
+    const mode: ?scaffold.Mode = if (aa.mode) |m| switch (m) {
+        .box => .box,
+        .framework => .framework,
+    } else null;
+
+    if (aa.to_stdout) {
+        const resolved = mode orelse blk: {
+            var d = std.Io.Dir.cwd().openDir(io, aa.dir, .{}) catch break :blk scaffold.Mode.box;
+            defer d.close(io);
+            break :blk scaffold.detectMode(io, d);
+        };
+        emit(io, std.Io.File.stdout(), "{s}", .{scaffold.agentsMdText(resolved)});
+        return;
+    }
+
+    const rep = try scaffold.agentsMd(allocator, io, .{ .mode = mode, .dir = aa.dir });
+    defer scaffold.freeReport(allocator, rep);
+    printReport(io, rep);
+    if (rep.skipped > 0) emit(io, std.Io.File.stdout(),
+        \\
+        \\Nothing was overwritten. Delete the file(s) first, or use --stdout and diff.
+        \\
+    , .{});
 }
 
 fn superuserCreateImpl(allocator: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map, sa: cli.SuperuserArgs) !void {

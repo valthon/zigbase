@@ -167,8 +167,27 @@ pub const SchemaArgs = struct {
     prune: bool = false,
 };
 
+pub const InitMode = enum { box, framework };
+
+/// `init` — scaffold a starting-point project. Exclusive-create only; there is no
+/// --force, so re-running is always safe.
+pub const InitArgs = struct {
+    mode: InitMode = .box,
+    dir: []const u8 = ".",
+    /// Package/executable name (framework mode). Null = derive from `dir`.
+    name: ?[]const u8 = null,
+};
+
+/// `agents-md` — (re)write AGENTS.md + CLAUDE.md into an existing project.
+pub const AgentsMdArgs = struct {
+    /// Null = infer from the directory (a build.zig.zon means framework mode).
+    mode: ?InitMode = null,
+    dir: []const u8 = ".",
+    to_stdout: bool = false,
+};
+
 /// Identifies which command a per-command `--help` request targets.
-pub const HelpTopic = enum { top, serve, serve_control, migrate, superuser_create, typegen, rewrap, migrate_db, vapid_keygen, import, schema, explain_code, doctor };
+pub const HelpTopic = enum { top, serve, serve_control, migrate, superuser_create, typegen, rewrap, migrate_db, vapid_keygen, import, schema, explain_code, doctor, init, agents_md };
 
 pub const Command = union(enum) {
     /// `help`/`--help`/`-h`/no-args -> top-level usage; `<cmd> --help` -> that command's usage.
@@ -190,6 +209,10 @@ pub const Command = union(enum) {
     serve_control: ServeControlArgs,
     /// `doctor` -> preflight checks over config/data-dir/schema.
     doctor: DoctorArgs,
+    /// `init` -> scaffold a project into a directory and exit.
+    init: InitArgs,
+    /// `agents-md` -> write AGENTS.md + CLAUDE.md for an existing project and exit.
+    agents_md: AgentsMdArgs,
 };
 
 /// True when an arg is a help flag (`--help` or `-h`).
@@ -540,6 +563,50 @@ pub fn parse(args: []const []const u8, popts: ParseOpts) ParseError!Command {
             } else return ParseError.UnknownFlag;
         }
         return .{ .doctor = da };
+    }
+    if (std.mem.eql(u8, args[0], "init")) {
+        var ia = InitArgs{};
+        var i: usize = 1;
+        while (i < args.len) : (i += 1) {
+            const a = args[i];
+            if (isHelpFlag(a)) {
+                return .{ .help = .init };
+            } else if (std.mem.eql(u8, a, "--box")) {
+                ia.mode = .box;
+            } else if (std.mem.eql(u8, a, "--framework")) {
+                ia.mode = .framework;
+            } else if (std.mem.eql(u8, a, "--dir")) {
+                i += 1;
+                if (i >= args.len) return ParseError.MissingValue;
+                ia.dir = args[i];
+            } else if (std.mem.eql(u8, a, "--name")) {
+                i += 1;
+                if (i >= args.len) return ParseError.MissingValue;
+                ia.name = args[i];
+            } else return ParseError.UnknownFlag;
+        }
+        return .{ .init = ia };
+    }
+    if (std.mem.eql(u8, args[0], "agents-md")) {
+        var aa = AgentsMdArgs{};
+        var i: usize = 1;
+        while (i < args.len) : (i += 1) {
+            const a = args[i];
+            if (isHelpFlag(a)) {
+                return .{ .help = .agents_md };
+            } else if (std.mem.eql(u8, a, "--box")) {
+                aa.mode = .box;
+            } else if (std.mem.eql(u8, a, "--framework")) {
+                aa.mode = .framework;
+            } else if (std.mem.eql(u8, a, "--stdout")) {
+                aa.to_stdout = true;
+            } else if (std.mem.eql(u8, a, "--dir")) {
+                i += 1;
+                if (i >= args.len) return ParseError.MissingValue;
+                aa.dir = args[i];
+            } else return ParseError.UnknownFlag;
+        }
+        return .{ .agents_md = aa };
     }
     if (!std.mem.eql(u8, args[0], "serve")) return ParseError.UnknownCommand;
 
@@ -1172,4 +1239,36 @@ test "explain-code rejects a second positional and unknown flags; --help routes"
     try std.testing.expectError(ParseError.BadValue, parse(&.{ "explain-code", "a", "b" }, .{}));
     try std.testing.expectError(ParseError.UnknownFlag, parse(&.{ "explain-code", "--nope" }, .{}));
     try std.testing.expectEqual(HelpTopic.explain_code, (try parse(&.{ "explain-code", "--help" }, .{})).help);
+}
+
+test "init defaults to box mode in the current directory" {
+    const c = try parse(&.{"init"}, .{});
+    try std.testing.expectEqual(InitMode.box, c.init.mode);
+    try std.testing.expectEqualStrings(".", c.init.dir);
+    try std.testing.expect(c.init.name == null);
+}
+
+test "init accepts --framework, --dir and --name" {
+    const c = try parse(&.{ "init", "--framework", "--dir", "myapp", "--name", "my_app" }, .{});
+    try std.testing.expectEqual(InitMode.framework, c.init.mode);
+    try std.testing.expectEqualStrings("myapp", c.init.dir);
+    try std.testing.expectEqualStrings("my_app", c.init.name.?);
+}
+
+test "init rejects unknown flags and routes --help" {
+    try std.testing.expectError(ParseError.UnknownFlag, parse(&.{ "init", "--force" }, .{}));
+    try std.testing.expectError(ParseError.MissingValue, parse(&.{ "init", "--dir" }, .{}));
+    try std.testing.expectEqual(HelpTopic.init, (try parse(&.{ "init", "--help" }, .{})).help);
+}
+
+test "agents-md leaves the mode unset so the caller can infer it" {
+    const c = try parse(&.{"agents-md"}, .{});
+    try std.testing.expect(c.agents_md.mode == null);
+    try std.testing.expectEqualStrings(".", c.agents_md.dir);
+    try std.testing.expect(!c.agents_md.to_stdout);
+
+    const forced = try parse(&.{ "agents-md", "--framework", "--stdout" }, .{});
+    try std.testing.expectEqual(InitMode.framework, forced.agents_md.mode.?);
+    try std.testing.expect(forced.agents_md.to_stdout);
+    try std.testing.expectEqual(HelpTopic.agents_md, (try parse(&.{ "agents-md", "--help" }, .{})).help);
 }

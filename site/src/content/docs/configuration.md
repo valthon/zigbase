@@ -66,6 +66,32 @@ Running `zigbase` with no recognised command prints usage.
 - **`superuser create`** — create a superuser (required before managing collections).
 - **`help`** — print usage.
 
+### `zigbase init`
+
+Scaffold a starting-point project. Never overwrites: existing files are
+reported as skipped and left alone, and there is no `--force`.
+
+| Flag | Meaning |
+| --- | --- |
+| `--box` | *(default)* No Zig toolchain — `docker-compose.yml`, a schema starting point (apply it with `zigbase schema apply`), `AGENTS.md` + `CLAUDE.md`, `.gitignore`, `README.md`. |
+| `--framework` | A Zig package embedding ZigBase — `build.zig` (wired with `zigbase.addTo` + `zigbase.addTest`), `build.zig.zon`, `src/main.zig` with a comptime schema and in-process tests, plus the same agent files. |
+| `--dir PATH` | Target directory, created if missing. Default `.` |
+| `--name NAME` | Package/executable name (framework mode). Default: the directory name, sanitized into a Zig identifier. |
+
+In framework mode, run `zig fetch --save git+https://github.com/valthon/zigbase`
+afterwards — that is what writes the dependency URL and its content hash into
+`build.zig.zon`.
+
+### `zigbase agents-md`
+
+Write `AGENTS.md` + `CLAUDE.md` for a project that already exists.
+
+| Flag | Meaning |
+| --- | --- |
+| `--dir PATH` | Target directory. Default `.` |
+| `--box` / `--framework` | Force a content set. Omit to infer: a `build.zig.zon` in the directory means framework. |
+| `--stdout` | Print `AGENTS.md` instead of writing it (diff-friendly). |
+
 ## Environment variables
 
 | Env var | Flag | Default | Purpose |

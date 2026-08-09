@@ -53,20 +53,50 @@ explicit `zigbase.Config`, skipping CLI parsing.)
 
 ## 2. Add the dependency
 
+The fastest path is to scaffold — it writes a `build.zig` already wired with
+the helpers below, a `build.zig.zon`, a `src/main.zig` with a comptime schema
+and in-process tests, and an `AGENTS.md`:
+
+```sh
+npx zigbase init --framework --dir myapp && cd myapp
+zig fetch --save git+https://github.com/valthon/zigbase
+```
+
+To wire it by hand instead:
+
 ```sh
 zig fetch --save git+https://github.com/valthon/zigbase
 ```
 
+`zig fetch --save` writes both the dependency URL and its content hash into
+`build.zig.zon`. Never hand-write either, and never copy the relative
+`.path = "../.."` form out of this repository's `examples/` — that only
+resolves inside this repo.
+
 In your `build.zig`:
 
 ```zig
-const zb = b.dependency("zigbase", .{ .target = target, .optimize = optimize });
-exe_mod.addImport("zigbase", zb.module("zigbase"));
-// exe_mod must link libc: zigbase carries the SQLite C source and zap transitively.
+const zigbase = @import("zigbase"); // the dependency's own build.zig
+
+const dep = b.dependency("zigbase", .{ .target = target, .optimize = optimize });
+zigbase.addTo(dep, exe_mod);
 ```
 
-Your `exe_mod` must be created with `.link_libc = true` (the `zigbase` module
-itself is built with `link_libc` and the bundled SQLite amalgamation + zap).
+zigbase requires libc — it carries the bundled SQLite amalgamation and zap
+transitively. `addTo` adds the `"zigbase"` import **and** sets `link_libc` on
+your module in one call, so your build never depends on remembering either.
+Wiring it by hand works too, but then `.link_libc = true` on your module is
+yours to remember:
+
+```zig
+const exe_mod = b.createModule(.{
+    .root_source_file = b.path("src/main.zig"),
+    .target = target,
+    .optimize = optimize,
+    .link_libc = true, // required; addTo sets this for you
+});
+exe_mod.addImport("zigbase", dep.module("zigbase"));
+```
 
 zigbase is pinned to a single Zig minor series (currently **0.16.0**, see
 `build.zig.zon`'s `minimum_zig_version` and `mise.toml`). Building against an

@@ -545,6 +545,9 @@ test {
     _ = @import("request_arena.zig");
     _ = @import("error_codes.zig");
     _ = @import("logging.zig");
+    _ = @import("scaffold/agents_md.zig");
+    _ = @import("scaffold/templates.zig");
+    _ = @import("scaffold.zig");
     // Opt-in pure-Zig PostgreSQL backend (#159). The `build_options.postgres` condition is
     // comptime-known, so when it is false (the default) these `@import`s are never analyzed —
     // the driver compiles to nothing and the default build stays byte-identical.

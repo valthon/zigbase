@@ -17,6 +17,7 @@ export const sidebar: SidebarGroup[] = [
       { slug: 'overview', label: 'Overview' },
       { slug: 'quick-start', label: 'Quick start' },
       { slug: 'tutorial', label: 'Tutorial' },
+      { slug: 'agents', label: 'For coding agents' },
     ],
   },
   {

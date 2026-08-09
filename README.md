@@ -26,6 +26,8 @@ curl http://127.0.0.1:8090/api/health           # {"status":"ok","backend":"sqli
 curl http://127.0.0.1:8090/api/meta             # public, unauthenticated capability probe (build/config facts + endpoint map)
 ```
 
+Or start from a scaffold, with no install at all: `npx zigbase init`.
+
 The default bind is `127.0.0.1:8090` (loopback only). To expose ZigBase on all
 interfaces, pass `--http-host 0.0.0.0` (front it with a firewall / reverse proxy).
 On first `serve` with no `ZIGBASE_JWT_SECRET`, a strong random secret is generated and
@@ -85,18 +87,29 @@ See [docs/docker.md](docs/docker.md) for the data-volume/non-root/healthcheck de
 
 ## Build an app on ZigBase (use it as a library)
 
-Fetch ZigBase as a dependency:
+Scaffold a project — `build.zig` already wired, a comptime schema, in-process
+tests, and an `AGENTS.md`:
+
+```sh
+npx zigbase init --framework --dir myapp && cd myapp
+zig fetch --save git+https://github.com/valthon/zigbase
+zig build test
+```
+
+Or wire it into an existing package yourself:
 
 ```sh
 zig fetch --save git+https://github.com/valthon/zigbase
 ```
 
-Wire the module into your `build.zig` (ZigBase links libc):
-
 ```zig
-const zb = b.dependency("zigbase", .{ .target = target, .optimize = optimize });
-exe_mod.addImport("zigbase", zb.module("zigbase"));
-exe_mod.link_libc = true;
+const zigbase = @import("zigbase"); // the dependency's build.zig
+
+const dep = b.dependency("zigbase", .{ .target = target, .optimize = optimize });
+zigbase.addTo(dep, exe_mod); // adds the import and wires the libc requirement — one call, nothing to remember
+
+const tests = zigbase.addTest(b, dep, .{ .root_module = exe_mod });
+b.step("test", "Run tests").dependOn(&b.addRunArtifact(tests).step);
 ```
 
 Then build your own backend on top of it — here a `beforeCreate` hook on the `posts`
