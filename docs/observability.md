@@ -190,3 +190,56 @@ ledger and the enum honest with each other, and the CI guard keeps history hones
 > nothing has to guess which rule applies: if it appears as an error envelope's
 > `code` it is `snake_case`, and if it appears as a doctor check id it is
 > `dash-case`.
+
+## Machine-readable CLI output
+
+Selected commands accept `--json` for output an agent or script can parse instead
+of the human-oriented text form. Two conventions apply program-wide, across every
+sub-project that adds such a command:
+
+1. **One object, one stream — and exactly two stdout shapes.** A command's `--json`
+   stdout is *either* a **single result object** (e.g. `{"zigbase":"0.12.0",…}`) or
+   a **findings stream** (NDJSON, one finding per line, terminated by exactly one
+   summary object) — never a mix, and never a bare array (a list is wrapped, e.g.
+   `{"codes":[…]}`). In both shapes, prose, warnings, progress, and log records go
+   to **stderr** — stdout under `--json` carries only the contract shape.
+2. **Exit codes are meaningful, and the scheme is frozen program-wide:**
+   - **`0`** — success, or the thing being reported is OK (including a dry run
+     whose findings need no judgment).
+   - **`1`** — the command failed, **or** it reported a not-OK condition the
+     caller must act on: a usage error (a bad flag), a refused operation, an I/O
+     or DB error, a status report showing something outstanding.
+   - **`2`** — the command **ran correctly and found a condition requiring
+     human judgment** — not that the tool broke. An agent must be able to tell
+     "escalate this" (`2`) apart from "the tool itself failed" (`1`).
+   - **`3`** — the command completed but **lost data or skipped work** (e.g. an
+     import that continued past errors and dropped rows).
+
+   A command that only *reports* (never mutates) still uses this scheme, so it can
+   gate a shell script or an agent's next step on the exit code alone.
+
+CLI JSON is `snake_case` — a deliberate split from the REST API's `camelCase`
+(`GET /api/health` already ships `sqliteVec`); the two planes never mix keys within
+one object. Structured log records (`--log-format json`, e.g. `duration_ms` on an
+access line) are `snake_case` too, matching the CLI plane rather than the REST one —
+so SP-3's `serve logs --json` lands consistent with everything else that machine-reads
+process output.
+
+### Which commands support `--json`
+
+| Command | Stdout shape | Exit codes |
+|---|---|---|
+| `zigbase version --json` | Single object: `{"zigbase","commit","build","target","zig","components":{"sqlite","sqlite_source_id","sqlite_vec","sqlite_vec_linked","zap","zap_commit","facil"}}` — the same `build_options` source of truth as the text `version` output and `GET /api/health`'s `versions`, so the three can never disagree. | `0` always (a report, not a check). |
+| `zigbase migrate status --json` | Single object: `{"migrations":[{"id","applied","applied_at"}],"orphaned":[{"id","applied_at"}],"summary":{"declared","applied","pending","orphaned"},"ok"}`. `ok` is the machine form of the exit code: `true` exactly when `pending == 0 and orphaned == 0`. | **`0`** when nothing is pending or orphaned; **`1`** otherwise — in *both* text and JSON mode, so `migrate status` doubles as a deploy gate: `zigbase migrate status || zigbase migrate`. |
+| `zigbase explain-code [CODE] --json` | A known code: `{"code","known":true,"summary","explanation"}`. An unknown code: `{"code","known":false}`. No code (list all): `{"codes":[{"code","summary"}, …]}`. See [Error codes](#error-codes) above. | **`0`** for a known code or the listing; **`1`** for an unknown code. |
+
+Every row above follows convention 1 (exactly one object on stdout under `--json`; prose and
+warnings go to stderr) and convention 2 (the frozen exit-code scheme). One corollary of
+convention 2 that is easy to miss: it isn't only about `--json` output. **Every** usage error —
+an unrecognized command, an unknown flag, a bad flag value — exits `1` program-wide, with or
+without `--json`, because `1` is defined as "the command failed *or* reported a not-OK condition
+the caller must act on," and a rejected invocation is the simplest case of that.
+
+SP-3's `doctor` and `serve status`, and SP-5's `schema dump`/`schema apply` and a JSON `import`
+summary, follow these same two conventions and the table above will grow to list them as they
+ship.

@@ -117,8 +117,9 @@ pub fn main(init: std.process.Init) !void {
 ```
 
 `runCli` gives your binary the same commands as the stock server — `serve`, `migrate`,
-`migrate-db`, `import`, `superuser create`, `rewrap`, `vapid-keygen`, `version`, and `help`
-(plus `typegen` when built with `.enable_typegen = true`). Beyond hooks, `App(.{...})` also accepts a comptime
+`migrate-db`, `import`, `superuser create`, `rewrap`, `vapid-keygen`, `explain-code`,
+`version`, and `help` (plus `typegen` when built with `.enable_typegen = true`). Beyond
+hooks, `App(.{...})` also accepts a comptime
 **schema** (`.collections` + `.migrations`, provisioned at startup with additive
 auto-migration), **pluggable backends** (`.storage` / `.mailer`), and **footprint
 levers** (`.pools`). See [docs/framework.md](docs/framework.md) and the worked
@@ -141,6 +142,7 @@ zigbase superuser create --email E --password P [--data-dir PATH]
 zigbase typegen [--data-dir PATH | --url URL] [--out FILE] [--lang L] [--check] [...]
 zigbase rewrap [--data-dir PATH] [--dry-run]
 zigbase vapid-keygen
+zigbase explain-code [CODE] [--json]
 zigbase version
 zigbase help
 ```
@@ -152,7 +154,10 @@ PostgreSQL target. `typegen` emits a typed SDK for a running (`--url`) or offlin
 (`--data-dir`) server — `--lang` picks the target language, `--check` verifies the output is
 up to date without writing (run `zigbase typegen --help` for the full flag set). `rewrap`
 rotates field-encryption keys (`--dry-run` reports without rewriting), and `vapid-keygen`
-prints a fresh Web Push VAPID keypair.
+prints a fresh Web Push VAPID keypair. `explain-code` looks up a frozen API error code
+(the `code` field in every `{status,code,message,data}` error response) with no args to
+list them all, or `zigbase explain-code <CODE>` (`--json` for machine-readable output) for
+one. See [docs/api.md → Conventions](docs/api.md#conventions).
 
 `import` bulk-loads NDJSON records **offline (no running server)** through the record
 engine — validation, defaults, the `.encrypted` envelope, and auth password hashing all

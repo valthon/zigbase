@@ -39,6 +39,7 @@ const import_mod = @import("import.zig");
 const features = @import("features.zig");
 const ctx_mod = @import("ctx.zig");
 const queue = @import("queue/queue.zig");
+const error_codes = @import("error_codes.zig");
 const queue_config = @import("queue/config.zig");
 const queue_durable = @import("queue/durable.zig");
 const queue_memory = @import("queue/memory.zig");
@@ -1869,7 +1870,10 @@ fn runCliImpl(init: std.process.Init, dispatch: *const events.Dispatch, jobs: []
     }) catch |err| {
         std.log.err("argument error: {s}", .{@errorName(err)});
         printUsage(init.io, std.Io.File.stderr(), std.meta.activeTag(opts.static_mode) == .default, std.meta.activeTag(opts.static_mode) != .disabled);
-        return;
+        // Carried defect fix (SP-1 Task 9): a usage error (bad flag/value/unknown command) must
+        // exit 1 per the frozen CLI exit-code scheme (docs/observability.md convention 2) — this
+        // used to fall through and return normally, exiting 0 on a rejected invocation.
+        std.process.exit(1);
     };
 
     switch (cmd) {
@@ -1883,8 +1887,9 @@ fn runCliImpl(init: std.process.Init, dispatch: *const events.Dispatch, jobs: []
             .migrate_db => printMigrateDbUsage(init.io, std.Io.File.stdout()),
             .vapid_keygen => printVapidKeygenUsage(init.io, std.Io.File.stdout()),
             .import => printImportUsage(init.io, std.Io.File.stdout()),
+            .explain_code => printExplainCodeUsage(init.io, std.Io.File.stdout()),
         },
-        .version => printVersion(init.io, std.Io.File.stdout()),
+        .version => |va| if (va.json) printVersionJson(init.io, std.Io.File.stdout()) else printVersion(init.io, std.Io.File.stdout()),
         .serve => |sa| {
             const cfg = try loadCfg(init.environ_map, sa);
             try serveImpl(allocator, init.io, cfg, dispatch, jobs, pool_size, schema_collections, schema_migrations, opts, init.environ_map);
@@ -1900,6 +1905,7 @@ fn runCliImpl(init: std.process.Init, dispatch: *const events.Dispatch, jobs: []
         .migrate_db => |ma| try migrateDbImpl(allocator, init.io, ma),
         .superuser_create => |sa| try superuserCreateImpl(allocator, init.io, init.environ_map, sa),
         .vapid_keygen => try vapidKeygenImpl(allocator, init.io),
+        .explain_code => |ea| explainCodeImpl(init.io, ea),
         .typegen => |ta| {
             if (opts.enable_typegen) {
                 const tgen = @import("codegen/typegen_cli.zig");
@@ -1965,8 +1971,9 @@ fn printUsage(io: std.Io, file: std.Io.File, show_serve_static: bool, show_stati
         \\  import              Bulk-import NDJSON records offline (through the engine: validation + encryption).
         \\  superuser create    Create an admin (superuser) account.
         \\  vapid-keygen        Generate a VAPID (Web Push) keypair for ctx.push().
+        \\  explain-code        Explain a frozen API error code, or list them all. Add --json for one JSON object.
         \\  help                Show this help. Also: --help, -h, or no arguments.
-        \\  version             Print version + build provenance. Also: --version, -V.
+        \\  version             Print version + build provenance. Also: --version, -V. Add --json for one JSON object.
         \\
         \\  Per-command help is available via `zigbase <command> --help`, e.g.
         \\  `zigbase serve --help` or `zigbase superuser create --help`.
@@ -2142,6 +2149,29 @@ fn printVersion(io: std.Io, file: std.Io.File) void {
     });
 }
 
+/// `zigbase version --json` (SP-1). Exactly one object on stdout; same build_options
+/// source of truth as `printVersion` and `GET /api/health`'s `versions`, so the three
+/// can never disagree. Key order is contract.
+fn printVersionJson(io: std.Io, file: std.Io.File) void {
+    emit(io, file, "{{\"zigbase\":{f},\"commit\":{f},\"build\":\"{s}\",\"target\":\"{s}-{s}-{s}\",\"zig\":{f}," ++
+        "\"components\":{{\"sqlite\":{f},\"sqlite_source_id\":{f},\"sqlite_vec\":{f},\"sqlite_vec_linked\":{}," ++ "\"zap\":{f},\"zap_commit\":{f},\"facil\":{f}}}}}\n", .{
+        std.json.fmt(build_options.version, .{}),
+        std.json.fmt(build_options.commit, .{}),
+        @tagName(builtin.mode),
+        @tagName(builtin.target.cpu.arch),
+        @tagName(builtin.target.os.tag),
+        @tagName(builtin.target.abi),
+        std.json.fmt(builtin.zig_version_string, .{}),
+        std.json.fmt(build_options.sqlite_version, .{}),
+        std.json.fmt(build_options.sqlite_source_id, .{}),
+        std.json.fmt(build_options.sqlite_vec_version, .{}),
+        build_options.vector,
+        std.json.fmt(build_options.zap_version, .{}),
+        std.json.fmt(build_options.zap_commit, .{}),
+        std.json.fmt(build_options.facil_version, .{}),
+    });
+}
+
 fn printServeUsage(io: std.Io, file: std.Io.File, show_serve_static: bool, show_static_cache_control: bool) void {
     emit(io, file,
         \\zigbase serve — start the HTTP server (REST API + WebSocket + admin UI at /_/).
@@ -2209,6 +2239,10 @@ fn printMigrateUsage(io: std.Io, file: std.Io.File) void {
         \\FLAGS:
         \\  --data-dir PATH  SQLite db + file storage directory. [env ZIGBASE_DATA_DIR, default ./zb_data]
         \\  --out FILE       (dump only) Write the SQL to FILE instead of stdout; parent dirs are created.
+        \\  --json           (status only) Emit one JSON object on stdout instead of the text report.
+        \\
+        \\  `migrate status` exits 1 when any migration is pending or orphaned, so it can
+        \\  gate a deploy: `zigbase migrate status || zigbase migrate`.
         \\
         \\WHAT IT DOES:
         \\  `migrate` applies pending SYSTEM migrations and then the app's comptime `.migrations`
@@ -2361,6 +2395,24 @@ fn printVapidKeygenUsage(io: std.Io, file: std.Io.File) void {
     , .{});
 }
 
+fn printExplainCodeUsage(io: std.Io, file: std.Io.File) void {
+    emit(io, file,
+        \\zigbase explain-code [CODE] [--json] — explain a frozen API error code.
+        \\
+        \\USAGE:
+        \\  zigbase explain-code                list every registered code, one per line.
+        \\  zigbase explain-code CODE           print CODE's summary + long-form explanation.
+        \\  zigbase explain-code [CODE] --json  emit the same information as one JSON object.
+        \\
+        \\CODE is the wire string ZigBase puts in an envelope's `code` (or a field error's
+        \\`data.<field>.code`) — e.g. `validation_required`, `not_found`, `collections_frozen`.
+        \\A CODE ZigBase never registered exits 1 (`--json` still prints one object, with
+        \\`"known":false`); a consumer route may legitimately emit its own strings via
+        \\ctx.jsonError, so this is not a ZigBase bug report.
+        \\
+    , .{});
+}
+
 fn loadCfg(environ: *const std.process.Environ.Map, sa: cli.ServeArgs) !config.Config {
     var diag: config.LoadDiag = .{};
     var cfg = config.Config.loadDiag(config.EnvGetter{ .environ = environ }, &diag) catch |e| switch (e) {
@@ -2499,19 +2551,52 @@ fn migrateStatusImpl(allocator: std.mem.Allocator, io: std.Io, environ: *const s
     const status = try provision.migrationStatus(arena.allocator(), w, schema_migrations);
 
     const out = std.Io.File.stdout();
-    emit(io, out, "Consumer migrations ({d} declared):\n", .{schema_migrations.len});
-    if (schema_migrations.len == 0) emit(io, out, "  (none declared)\n", .{});
-    for (status.declared) |e| {
+    if (ma.json) {
+        migrateStatusJson(io, out, status);
+    } else {
+        emit(io, out, "Consumer migrations ({d} declared):\n", .{schema_migrations.len});
+        if (schema_migrations.len == 0) emit(io, out, "  (none declared)\n", .{});
+        for (status.declared) |e| {
+            if (e.applied_at) |at|
+                emit(io, out, "  {s}  applied (at {s})\n", .{ e.id, at })
+            else
+                emit(io, out, "  {s}  pending\n", .{e.id});
+        }
+        if (status.orphaned.len > 0) {
+            emit(io, out, "\nOrphaned (in ledger, not in binary):\n", .{});
+            for (status.orphaned) |o| emit(io, out, "  {s}  applied (at {s})\n", .{ o.name, o.applied_at });
+        }
+        emit(io, out, "\n{d} applied, {d} pending, {d} orphaned\n", .{ status.applied_count, status.pending_count, status.orphaned.len });
+    }
+
+    // Exit 1 when the database is not up to date, so `migrate status` can gate a
+    // deploy script. `ok` in the JSON body carries the same signal. `emit` flushes
+    // on every call, so nothing is buffered when `std.process.exit` skips the
+    // deferred `arena`/`pool` cleanup below.
+    if (status.pending_count != 0 or status.orphaned.len != 0) std.process.exit(1);
+}
+
+/// `zigbase migrate status --json`. One object, stdout only; the text renderer's
+/// prose stays on the text path so the two never interleave.
+fn migrateStatusJson(io: std.Io, out: std.Io.File, status: provision.MigrationStatus) void {
+    emit(io, out, "{{\"migrations\":[", .{});
+    for (status.declared, 0..) |e, i| {
+        if (i > 0) emit(io, out, ",", .{});
         if (e.applied_at) |at|
-            emit(io, out, "  {s}  applied (at {s})\n", .{ e.id, at })
+            emit(io, out, "{{\"id\":{f},\"applied\":true,\"applied_at\":{f}}}", .{ std.json.fmt(e.id, .{}), std.json.fmt(at, .{}) })
         else
-            emit(io, out, "  {s}  pending\n", .{e.id});
+            emit(io, out, "{{\"id\":{f},\"applied\":false,\"applied_at\":null}}", .{std.json.fmt(e.id, .{})});
     }
-    if (status.orphaned.len > 0) {
-        emit(io, out, "\nOrphaned (in ledger, not in binary):\n", .{});
-        for (status.orphaned) |o| emit(io, out, "  {s}  applied (at {s})\n", .{ o.name, o.applied_at });
+    emit(io, out, "],\"orphaned\":[", .{});
+    for (status.orphaned, 0..) |o, i| {
+        if (i > 0) emit(io, out, ",", .{});
+        emit(io, out, "{{\"id\":{f},\"applied_at\":{f}}}", .{ std.json.fmt(o.name, .{}), std.json.fmt(o.applied_at, .{}) });
     }
-    emit(io, out, "\n{d} applied, {d} pending, {d} orphaned\n", .{ status.applied_count, status.pending_count, status.orphaned.len });
+    emit(io, out, "],\"summary\":{{\"declared\":{d},\"applied\":{d},\"pending\":{d},\"orphaned\":{d}}},\"ok\":{}}}\n", .{
+        status.declared.len,                                    status.applied_count,
+        status.pending_count,                                   status.orphaned.len,
+        status.pending_count == 0 and status.orphaned.len == 0,
+    });
 }
 
 /// `zigbase migrate dump [--out <file>]`: introspect the LIVE database and write a canonical,
@@ -3540,6 +3625,57 @@ fn vapidKeygenImpl(allocator: std.mem.Allocator, io: std.Io) !void {
         \\secret — anyone with it can send notifications as you.
         \\
     , .{ kp.public_b64, kp.private_b64 });
+}
+
+/// `zigbase explain-code [CODE] [--json]` (SP-1). Exactly ONE JSON object reaches
+/// stdout under `--json`; prose diagnostics go to stderr. Exit 0 when the code is
+/// registered (or when listing), 1 when it is not.
+fn explainCodeImpl(io: std.Io, ea: cli.ExplainCodeArgs) void {
+    const out = std.Io.File.stdout();
+
+    const code_str = ea.code orelse {
+        if (ea.json) {
+            emit(io, out, "{{\"codes\":[", .{});
+            inline for (@typeInfo(error_codes.Code).@"enum".fields, 0..) |field, idx| {
+                const c: error_codes.Code = @enumFromInt(field.value);
+                emit(io, out, "{s}{{\"code\":{f},\"summary\":{f}}}", .{
+                    if (idx == 0) "" else ",",
+                    std.json.fmt(error_codes.s(c), .{}),
+                    std.json.fmt(error_codes.info(c).summary, .{}),
+                });
+            }
+            emit(io, out, "]}}\n", .{});
+        } else {
+            inline for (@typeInfo(error_codes.Code).@"enum".fields) |field| {
+                const c: error_codes.Code = @enumFromInt(field.value);
+                emit(io, out, "{s}\t{s}\n", .{ error_codes.s(c), error_codes.info(c).summary });
+            }
+        }
+        return;
+    };
+
+    const code = error_codes.parse(code_str) orelse {
+        if (ea.json) {
+            emit(io, out, "{{\"code\":{f},\"known\":false}}\n", .{std.json.fmt(code_str, .{})});
+        } else {
+            emit(io, std.Io.File.stderr(), "unknown error code '{s}'\n\n" ++
+                "ZigBase never registered this code. If a consumer route produced it\n" ++
+                "(ctx.jsonError takes an arbitrary string), ask that application.\n" ++
+                "Run `zigbase explain-code` with no argument to list every ZigBase code.\n", .{code_str});
+        }
+        std.process.exit(1);
+    };
+
+    const i = error_codes.info(code);
+    if (ea.json) {
+        emit(io, out, "{{\"code\":{f},\"known\":true,\"summary\":{f},\"explanation\":{f}}}\n", .{
+            std.json.fmt(error_codes.s(code), .{}),
+            std.json.fmt(i.summary, .{}),
+            std.json.fmt(i.explanation, .{}),
+        });
+    } else {
+        emit(io, out, "{s}\n{s}\n\n{s}\n", .{ error_codes.s(code), i.summary, i.explanation });
+    }
 }
 
 fn superuserCreateImpl(allocator: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map, sa: cli.SuperuserArgs) !void {

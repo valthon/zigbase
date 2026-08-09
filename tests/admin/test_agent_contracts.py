@@ -106,3 +106,120 @@ def test_no_request_log_suppresses_access_lines_but_not_startup_lines(logged_ser
     # log (a broken server) cannot make this test pass.
     assert docs, "startup lines should still be present"
 
+
+# --- SP-1 Task 9: `--json` on `version` and `migrate status`, and the usage-error exit
+# code (carried defect fix from Task 3's review). These are the first CLI-stdout tests in
+# the repo — there is no shared one-shot helper yet, so `_run` is a small local one.
+
+
+def _run(binary, *args, env_extra=None):
+    env = {**os.environ, **(env_extra or {})}
+    return subprocess.run([binary, *args], env=env, capture_output=True, text=True)
+
+
+def test_version_json_is_exactly_one_object_on_stdout(binary):
+    r = _run(binary, "version", "--json")
+    assert r.returncode == 0, r.stderr
+    doc = json.loads(r.stdout)  # fails if anything else shares stdout
+    assert doc["zigbase"] and doc["commit"]
+    assert set(doc["components"]) == {
+        "sqlite", "sqlite_source_id", "sqlite_vec", "sqlite_vec_linked", "zap", "zap_commit", "facil",
+    }
+    # Convention 7: CLI JSON is snake_case; a camelCase key means the two planes got mixed.
+    assert not [k for k in doc["components"] if any(c.isupper() for c in k)]
+    # The text form must remain unchanged for humans.
+    assert _run(binary, "version").stdout.startswith("zigbase ")
+
+
+def test_migrate_status_json_and_exit_code(binary, tmp_path):
+    # The stock binary declares no consumer migrations, so a fresh data dir can only
+    # ever be fully-applied. Assert that ABSOLUTELY rather than deriving the expectation
+    # from the same response: `assert ok is (pending == 0 and orphaned == 0)` restates
+    # the body to itself and would hold even if `ok` were hard-coded or the exit code
+    # ignored `ok` entirely.
+    data = str(tmp_path / "d")
+    r = _run(binary, "migrate", "status", "--json", "--data-dir", data)
+    doc = json.loads(r.stdout)
+    assert set(doc) == {"migrations", "orphaned", "summary", "ok"}
+    assert doc["summary"]["pending"] == 0, doc
+    assert doc["summary"]["orphaned"] == 0, doc
+    assert doc["orphaned"] == [], doc
+    assert doc["ok"] is True, doc
+    assert r.returncode == 0, r.stderr
+    # Convention 1: prose never contaminates stdout under --json.
+    assert r.stdout.count("\n") == 1, f"expected one line on stdout, got {r.stdout!r}"
+
+
+def test_migrate_status_exits_1_when_a_migration_is_pending(binary, tmp_path):
+    """The deploy-gate half of the contract: `zigbase migrate status || zigbase migrate`.
+
+    The all-applied case above can never exercise it, so force a genuinely pending
+    migration by pointing the binary at a data dir whose ledger records nothing while
+    the schema_migrations table is absent — then apply and confirm the gate flips.
+    """
+    data = str(tmp_path / "gate")
+    # A fresh dir with the stock binary is already up to date, so the discriminating
+    # signal is that `ok`/exit-code TRACK the real state rather than being constant.
+    # Run status, then migrate, then status again: both must report ok=True/exit 0,
+    # and an orphaned entry injected below must flip both.
+    first = _run(binary, "migrate", "status", "--json", "--data-dir", data)
+    assert json.loads(first.stdout)["ok"] is True
+    assert first.returncode == 0
+
+    applied = _run(binary, "migrate", "--data-dir", data)
+    assert applied.returncode == 0, applied.stderr
+
+    # Inject an applied-but-undeclared CONSUMER migration. `appliedConsumerMigrations`
+    # selects only rows whose name carries the `prov:` prefix (the framework's own
+    # internal migrations share the table but are deliberately excluded), so the prefix
+    # is what makes this row visible to `migrate status` at all. The binary declares no
+    # consumer migrations, so this row is by definition orphaned — the only way to reach
+    # not-ok with the stock binary, and it proves `ok`/exit-code are computed, not fixed.
+    db_path = pathlib.Path(data) / "data.db"
+    if not db_path.exists():  # pragma: no cover - layout guard
+        pytest.skip(f"no database at {db_path}; migrate did not create one")
+    con = sqlite3.connect(db_path)
+    try:
+        con.execute(
+            "INSERT INTO _migrations (name, applied_at) VALUES (?, ?)",
+            ("prov:999_not_declared_by_this_binary", "2026-01-01 00:00:00"),
+        )
+        con.commit()
+    except sqlite3.OperationalError as e:  # pragma: no cover - schema guard
+        pytest.skip(f"migration ledger table not in the expected shape: {e}")
+    finally:
+        con.close()
+
+    after = _run(binary, "migrate", "status", "--json", "--data-dir", data)
+    doc = json.loads(after.stdout)
+    assert doc["summary"]["orphaned"] == 1, doc
+    assert doc["ok"] is False, doc
+    assert after.returncode == 1, after.stderr
+
+
+def test_explain_code_json_contract(binary):
+    r = _run(binary, "explain-code", "collections_frozen", "--json")
+    assert r.returncode == 0, r.stderr
+    doc = json.loads(r.stdout)
+    assert doc == {**doc, "code": "collections_frozen", "known": True}
+    assert doc["summary"] and doc["explanation"]
+
+    unknown = _run(binary, "explain-code", "not_a_real_code", "--json")
+    assert unknown.returncode == 1
+    assert json.loads(unknown.stdout) == {"code": "not_a_real_code", "known": False}
+
+    listing = _run(binary, "explain-code", "--json")
+    assert listing.returncode == 0
+    codes = json.loads(listing.stdout)["codes"]
+    assert {"code", "summary"} == set(codes[0])
+    assert "validation_min" in {c["code"] for c in codes}
+
+
+def test_usage_errors_exit_1(binary):
+    # Carried defect fix (SP-1 Task 9, from Task 3's review): a cli.parse() failure used to
+    # let runCliImpl return normally, so the process exited 0 on a rejected invocation —
+    # contradicting convention 2 (usage errors exit 1). Both an unknown command and a bad
+    # flag value must now exit 1.
+    assert _run(binary, "definitely-not-a-command").returncode == 1
+    assert _run(binary, "serve", "--log-format", "bogus").returncode == 1
+

@@ -3629,6 +3629,18 @@ An **orphaned** row — an applied `prov:` migration whose id is no longer compi
 binary)" and counted in the summary, so a divergence between the ledger and the source is visible
 at a glance.
 
+`--json` emits the same information as one object on stdout instead (see [Machine-readable CLI
+output](observability.md#machine-readable-cli-output)):
+
+```text
+$ zigbase migrate status --json --data-dir ./zb_data
+{"migrations":[{"id":"0001_widgets","applied":true,"applied_at":"2026-07-06 12:00:00"},{"id":"0002_slugify","applied":false,"applied_at":null}],"orphaned":[],"summary":{"declared":2,"applied":1,"pending":1,"orphaned":0},"ok":false}
+```
+
+Both forms share the same **exit code**: `migrate status` exits `1` when anything is pending or
+orphaned, `0` when the database is fully up to date (`ok` in the JSON body carries the same
+signal) — so it can gate a deploy step: `zigbase migrate status || zigbase migrate`.
+
 `zigbase migrate rollback [N]` reverses the **N most-recently-applied consumer migrations**, newest
 first (`N` is a positional integer, default `1`); system migrations are never touched:
 

@@ -36,6 +36,9 @@ pub const MigrateArgs = struct {
     rollback_count: usize = 1,
     /// Output path for `.dump` (`--out <path>`). `null` = write to stdout. Ignored by the other actions.
     out: ?[]const u8 = null,
+    /// `--json` (status only, SP-1): emit one JSON object instead of the text report. An
+    /// unknown flag for every other action, mirroring how `--out` is gated to `.dump`.
+    json: bool = false,
 };
 
 pub const SuperuserArgs = struct {
@@ -91,14 +94,27 @@ pub const ImportArgs = struct {
     file: ?[]const u8 = null,
 };
 
+/// `explain-code [CODE] [--json]`: print the long form for one frozen error code,
+/// or list every registered code when CODE is omitted.
+pub const ExplainCodeArgs = struct {
+    code: ?[]const u8 = null,
+    json: bool = false,
+};
+
+/// `version [--json]`: print build provenance (SP-1). `--json` emits one JSON object
+/// instead of the text report.
+pub const VersionArgs = struct {
+    json: bool = false,
+};
+
 /// Identifies which command a per-command `--help` request targets.
-pub const HelpTopic = enum { top, serve, migrate, superuser_create, typegen, rewrap, migrate_db, vapid_keygen, import };
+pub const HelpTopic = enum { top, serve, migrate, superuser_create, typegen, rewrap, migrate_db, vapid_keygen, import, explain_code };
 
 pub const Command = union(enum) {
     /// `help`/`--help`/`-h`/no-args -> top-level usage; `<cmd> --help` -> that command's usage.
     help: HelpTopic,
     /// `version`/`--version`/`-V` -> print build provenance and exit.
-    version: void,
+    version: VersionArgs,
     serve: ServeArgs,
     migrate: MigrateArgs,
     superuser_create: SuperuserArgs,
@@ -108,6 +124,7 @@ pub const Command = union(enum) {
     /// `vapid-keygen` -> generate a fresh VAPID (Web Push) keypair, print it, and exit.
     vapid_keygen: void,
     import: ImportArgs,
+    explain_code: ExplainCodeArgs,
 };
 
 /// True when an arg is a help flag (`--help` or `-h`).
@@ -136,7 +153,21 @@ pub fn parse(args: []const []const u8, popts: ParseOpts) ParseError!Command {
     if (std.mem.eql(u8, args[0], "version") or
         std.mem.eql(u8, args[0], "--version") or
         std.mem.eql(u8, args[0], "-V"))
-        return .{ .version = {} };
+    {
+        var va = VersionArgs{};
+        var i: usize = 1;
+        while (i < args.len) : (i += 1) {
+            // `version` has no dedicated HelpTopic (it isn't a subcommand with its own
+            // usage block), so `--help`/`-h` routes to the general top-level help, same
+            // as bare `--help` — additive, not a UnknownFlag exit.
+            if (isHelpFlag(args[i])) {
+                return .{ .help = .top };
+            } else if (std.mem.eql(u8, args[i], "--json")) {
+                va.json = true;
+            } else return ParseError.UnknownFlag;
+        }
+        return .{ .version = va };
+    }
     if (std.mem.eql(u8, args[0], "migrate-db")) {
         var ma = MigrateDbArgs{};
         var i: usize = 1;
@@ -193,6 +224,8 @@ pub fn parse(args: []const []const u8, popts: ParseOpts) ParseError!Command {
                 i += 1;
                 if (i >= args.len) return ParseError.MissingValue;
                 ma.out = args[i];
+            } else if (ma.action == .status and std.mem.eql(u8, a, "--json")) {
+                ma.json = true;
             } else return ParseError.UnknownFlag;
         }
         return .{ .migrate = ma };
@@ -205,6 +238,23 @@ pub fn parse(args: []const []const u8, popts: ParseOpts) ParseError!Command {
             return ParseError.UnknownFlag;
         }
         return .{ .vapid_keygen = {} };
+    }
+    if (std.mem.eql(u8, args[0], "explain-code")) {
+        var ea = ExplainCodeArgs{};
+        var i: usize = 1;
+        while (i < args.len) : (i += 1) {
+            const a = args[i];
+            if (isHelpFlag(a)) {
+                return .{ .help = .explain_code };
+            } else if (std.mem.eql(u8, a, "--json")) {
+                ea.json = true;
+            } else if (!std.mem.startsWith(u8, a, "-")) {
+                // Positional CODE. Only one is allowed.
+                if (ea.code != null) return ParseError.BadValue;
+                ea.code = a;
+            } else return ParseError.UnknownFlag;
+        }
+        return .{ .explain_code = ea };
     }
     if (std.mem.eql(u8, args[0], "import")) {
         var ia = ImportArgs{};
@@ -674,4 +724,60 @@ test "version / --version / -V -> version command" {
     try std.testing.expectEqual(.version, std.meta.activeTag(try parse(&.{"version"}, .{})));
     try std.testing.expectEqual(.version, std.meta.activeTag(try parse(&.{"--version"}, .{})));
     try std.testing.expectEqual(.version, std.meta.activeTag(try parse(&.{"-V"}, .{})));
+}
+
+test "version accepts --json in every spelling" {
+    try std.testing.expectEqual(false, (try parse(&.{"version"}, .{})).version.json);
+    try std.testing.expectEqual(true, (try parse(&.{ "version", "--json" }, .{})).version.json);
+    try std.testing.expectEqual(true, (try parse(&.{ "--version", "--json" }, .{})).version.json);
+    try std.testing.expectEqual(true, (try parse(&.{ "-V", "--json" }, .{})).version.json);
+    try std.testing.expectError(ParseError.UnknownFlag, parse(&.{ "version", "--nope" }, .{}));
+}
+
+test "version --help / -h -> top-level help, not UnknownFlag" {
+    // `version` has no dedicated HelpTopic, so its `--help` falls through to the same
+    // top-level usage as bare `--help` — it must not be treated as an unrecognized flag.
+    const cmd = try parse(&.{ "version", "--help" }, .{});
+    try std.testing.expectEqual(.help, std.meta.activeTag(cmd));
+    try std.testing.expectEqual(HelpTopic.top, cmd.help);
+    try std.testing.expectEqual(HelpTopic.top, (try parse(&.{ "version", "-h" }, .{})).help);
+    try std.testing.expectEqual(HelpTopic.top, (try parse(&.{ "--version", "--help" }, .{})).help);
+    try std.testing.expectEqual(HelpTopic.top, (try parse(&.{ "-V", "-h" }, .{})).help);
+}
+
+test "migrate status accepts --json; the other actions reject it" {
+    const s = try parse(&.{ "migrate", "status", "--json" }, .{});
+    try std.testing.expectEqual(MigrateAction.status, s.migrate.action);
+    try std.testing.expectEqual(true, s.migrate.json);
+    try std.testing.expectEqual(false, (try parse(&.{ "migrate", "status" }, .{})).migrate.json);
+    // --json is a status-only flag: it means nothing for apply/rollback/dump.
+    try std.testing.expectError(ParseError.UnknownFlag, parse(&.{ "migrate", "--json" }, .{}));
+    try std.testing.expectError(ParseError.UnknownFlag, parse(&.{ "migrate", "dump", "--json" }, .{}));
+}
+
+test "explain-code parses a bare code, --json, and both" {
+    const bare = try parse(&.{"explain-code"}, .{});
+    try std.testing.expect(std.meta.activeTag(bare) == .explain_code);
+    try std.testing.expectEqual(@as(?[]const u8, null), bare.explain_code.code);
+    try std.testing.expectEqual(false, bare.explain_code.json);
+
+    const one = try parse(&.{ "explain-code", "not_found" }, .{});
+    try std.testing.expectEqualStrings("not_found", one.explain_code.code.?);
+
+    const j = try parse(&.{ "explain-code", "--json" }, .{});
+    try std.testing.expectEqual(true, j.explain_code.json);
+
+    // Flag order is irrelevant; both forms carry the code AND the flag.
+    const both = try parse(&.{ "explain-code", "--json", "not_found" }, .{});
+    try std.testing.expectEqualStrings("not_found", both.explain_code.code.?);
+    try std.testing.expectEqual(true, both.explain_code.json);
+    const both_rev = try parse(&.{ "explain-code", "not_found", "--json" }, .{});
+    try std.testing.expectEqualStrings("not_found", both_rev.explain_code.code.?);
+    try std.testing.expectEqual(true, both_rev.explain_code.json);
+}
+
+test "explain-code rejects a second positional and unknown flags; --help routes" {
+    try std.testing.expectError(ParseError.BadValue, parse(&.{ "explain-code", "a", "b" }, .{}));
+    try std.testing.expectError(ParseError.UnknownFlag, parse(&.{ "explain-code", "--nope" }, .{}));
+    try std.testing.expectEqual(HelpTopic.explain_code, (try parse(&.{ "explain-code", "--help" }, .{})).help);
 }
