@@ -705,6 +705,13 @@ const Backend = zigbase.App(.{
         },
 });
 
+/// Structured logging: this routes every std.log call through the same JSON-capable
+/// encoder as request logging. Access lines and --log-format/--log-level work either
+/// way; omitting this line just leaves std.log output in Zig's default format, mixed
+/// with JSON access lines under --log-format=json. Every ZigBase consumer needs it in
+/// its own root, because `std_options` is resolved from the root source file.
+pub const std_options = zigbase.std_options;
+
 pub fn main(init: std.process.Init) !void {
     return Backend.runCli(init);
 }

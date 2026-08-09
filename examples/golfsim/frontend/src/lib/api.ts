@@ -100,7 +100,9 @@ export async function login(email: string, password: string): Promise<void> {
     const err = await r.json().catch(() => null);
     const msg = err?.message ?? `HTTP ${r.status}`;
     // Surface the unverified case distinctly so the UI can switch to the verify step.
-    if (r.status === 403 && msg.includes('not verified')) throw new EmailNotVerifiedError(email);
+    // Match on the frozen machine `code`, never on the message text: message wording is
+    // explicitly not part of the API contract and can be reworded in any release.
+    if (err?.code === 'email_not_verified') throw new EmailNotVerifiedError(email);
     throw new Error(msg);
   }
   const out = await r.json();

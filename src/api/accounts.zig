@@ -27,7 +27,7 @@ pub fn activate(ctx: *http.RequestCtx) anyerror!http.Response {
     defer app.pool.releaseReader(&r);
 
     const a = (auth.authenticate(app.io, ctx.allocator.a, app, ctx, &r) catch null) orelse
-        return (ApiError{ .status = 401, .message = "Authentication required." }).toResponse(ctx.allocator.a);
+        return ApiError.withCode(401, .unauthorized, "Authentication required.").toResponse(ctx.allocator.a);
     // Superusers are not account members; they operate cross-tenant and don't activate a scope.
     if (a.is_superuser) return forbidden(ctx);
     if (a.record != .object) return forbidden(ctx);
@@ -63,5 +63,5 @@ pub fn activate(ctx: *http.RequestCtx) anyerror!http.Response {
 }
 
 fn forbidden(ctx: *http.RequestCtx) !http.Response {
-    return (ApiError{ .status = 403, .message = "Not a member of this account." }).toResponse(ctx.allocator.a);
+    return ApiError.withCode(403, .forbidden, "Not a member of this account.").toResponse(ctx.allocator.a);
 }

@@ -19,6 +19,15 @@ coroutines-first, `suspend fun` API (JDK 17+).
 
 ### Added
 
+- `ZigbaseException.code` — the error envelope's frozen machine code (`not_found`,
+  `validation_failed`, `email_not_verified`, …). Branch on this instead of matching
+  `message` text, whose wording is explicitly not part of the API contract. It is empty
+  when the server sent no code (a non-JSON body, or a response from something that isn't
+  ZigBase); an integer `code` from a pre-unification server is ignored rather than
+  surfaced. Additive — no existing field changed.
+
+### Added
+
 - **Records.** `CollectionService` CRUD (`getList`, `getOne`, `getFirstListItem`, `create`,
   `update`, `delete`) with offset pagination, and native server-side cursor (keyset)
   pagination (`getPage`, `iterate` — a `Flow<ZbRecord>` — and `getFullList`, which abort with

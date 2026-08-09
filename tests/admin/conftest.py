@@ -5,6 +5,30 @@ from _bin import resolve_binary
 REPO = pathlib.Path(__file__).resolve().parents[2]
 ZIG = ["mise", "exec", "zig@0.16.0", "--", "zig"]
 
+# SUITE-WIDE foreground pin. Every server this suite spawns — the fixtures
+# below, but also the ~25 inline `{**os.environ, ...}` spawns in
+# test_static_files / test_scheduler / test_import / test_file_range /
+# test_mail_unsubscribe, and the example-app fixture binaries (dating-server,
+# blog, import-fixture) — is a FOREGROUND child the test terminates itself.
+#
+# `serve` auto-backgrounds when it detects an AI-agent environment
+# (CLAUDECODE etc., see serve_control.detectAgent). Under an agent-driven run
+# that turns every one of those spawns into: parent exits after readiness ->
+# the fixture's terminate() hits an already-dead pid -> the real, detached
+# server survives the test. That is how a single suite run stranded ~85 servers
+# holding ports and fds, which in turn starved later tests of resources.
+#
+# Setting it here (module import = every xdist worker, before any spawn) covers
+# every present AND future spawn site in this suite, instead of relying on ~25
+# call sites each remembering the pin. The individual fixtures below still pass
+# it explicitly, which is redundant but documents the requirement where the
+# process is actually created. CI runners set no agent vars, so this is a no-op
+# there; it only matters for local/agent-driven runs.
+#
+# Assigned, not setdefault: no test in this suite wants a backgrounded server,
+# so an inherited ZIGBASE_SERVE_BACKGROUND=1 would be a mistake to honor.
+os.environ["ZIGBASE_SERVE_BACKGROUND"] = "0"
+
 def _free_port():
     s = socket.socket(); s.bind(("127.0.0.1", 0)); p = s.getsockname()[1]; s.close(); return p
 
@@ -46,7 +70,13 @@ def server(binary, request):
     shutil.copytree(_su_template_for(binary), data, dirs_exist_ok=True)
     port = _free_port()
     extra_env = getattr(request, "param", None) or {}
-    env = {**os.environ, "ZIGBASE_DATA_DIR": data, "ZIGBASE_HTTP_PORT": str(port), **extra_env}
+    env = {**os.environ, "ZIGBASE_DATA_DIR": data, "ZIGBASE_HTTP_PORT": str(port),
+           # The harness owns this process as a FOREGROUND child (terminate() in the
+           # finally). Without the pin, running the suite from inside an AI-agent
+           # session (CLAUDECODE etc.) would trigger serve's auto-backgrounding: the
+           # parent exits after readiness, terminate() hits the dead parent, and the
+           # detached child leaks past the test.
+           "ZIGBASE_SERVE_BACKGROUND": "0", **extra_env}
     # Plain-HTTP local test server: opt out of Secure cookies (default-on) so the
     # browser stores the auth/CSRF cookies over http://; the default loopback bind
     # and auto-generated JWT secret are exactly what we want.
@@ -132,7 +162,9 @@ def auth2_server(auth2_binary):
     data = tempfile.mkdtemp(prefix="zb_auth2_")
     shutil.copytree(_su_template_for(auth2_binary), data, dirs_exist_ok=True)
     port = _free_port()
-    env = {**os.environ, "ZIGBASE_DATA_DIR": data, "ZIGBASE_HTTP_PORT": str(port)}
+    # Foreground pin: see the server fixture's comment on ZIGBASE_SERVE_BACKGROUND.
+    env = {**os.environ, "ZIGBASE_DATA_DIR": data, "ZIGBASE_HTTP_PORT": str(port),
+           "ZIGBASE_SERVE_BACKGROUND": "0"}
     log_path = os.path.join(data, "server.log")
     with open(log_path, "wb") as log:
         proc = subprocess.Popen([auth2_binary, "serve", "--insecure-cookies"], env=env,

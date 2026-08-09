@@ -125,12 +125,12 @@ pub fn webhook_handler(ctx: *http.RequestCtx) anyerror!http.Response {
 
     // Replay-freshness (M5): reject a stale/invalid timestamp before doing any work.
     if (!timestampFresh(ts, clock.nowUnix(app.io))) {
-        return (ApiError{ .status = 401, .message = "Stale or invalid webhook timestamp." }).toResponse(ctx.allocator.a);
+        return ApiError.withCode(401, .unauthorized, "Stale or invalid webhook timestamp.").toResponse(ctx.allocator.a);
     }
 
     // Verify the shared-secret signature over ts+provider+account+body (constant-time). Fail closed.
     if (!verifySignature(ctx.allocator.a, secret, ts, provider_name, account, ctx.body, sig)) {
-        return (ApiError{ .status = 401, .message = "Invalid webhook signature." }).toResponse(ctx.allocator.a);
+        return ApiError.withCode(401, .unauthorized, "Invalid webhook signature.").toResponse(ctx.allocator.a);
     }
 
     const w = app.pool.acquireWriter();

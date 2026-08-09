@@ -17,6 +17,7 @@ export const sidebar: SidebarGroup[] = [
       { slug: 'overview', label: 'Overview' },
       { slug: 'quick-start', label: 'Quick start' },
       { slug: 'tutorial', label: 'Tutorial' },
+      { slug: 'agents', label: 'For coding agents' },
     ],
   },
   {
@@ -25,12 +26,15 @@ export const sidebar: SidebarGroup[] = [
     entries: [
       { slug: 'recipes', label: 'Recipes' },
       { slug: 'framework', label: 'Framework' },
+      { slug: 'testing', label: 'Testing' },
       { slug: 'typescript-sdk', label: 'TypeScript SDK' },
       { slug: 'dart-sdk', label: 'Dart SDK' },
       { slug: 'python-sdk', label: 'Python SDK' },
       { slug: 'kotlin-sdk', label: 'Kotlin SDK' },
       { slug: 'configuration', label: 'Configuration' },
       { slug: 'docker', label: 'Docker' },
+      { slug: 'serve', label: 'Running the server' },
+      { slug: 'migration-tools', label: 'Migration tools' },
     ],
   },
   {
@@ -55,6 +59,7 @@ export const sidebar: SidebarGroup[] = [
       { slug: 'fields', label: 'Fields' },
       { slug: 'known-limitations', label: 'Known limitations' },
       { slug: 'changelog', label: 'Changelog' },
+      { slug: 'observability', label: 'Observability' },
     ],
   },
 ];

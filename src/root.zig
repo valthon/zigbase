@@ -42,6 +42,10 @@ pub const RouteError = @import("route_types.zig").RouteError;
 pub const RouteAuthGuard = events.RouteAuthGuard;
 pub const PathSecretGuard = events.PathSecretGuard;
 pub const RateLimitKeyFn = events.RateLimitKeyFn;
+/// The frozen error-code registry (`code` in the API error envelope and in each
+/// `data.<field>` entry). Match on these; never on `message`.
+pub const error_codes = @import("error_codes.zig");
+pub const ErrorCode = error_codes.Code;
 
 // ---- Plugin / schema / migration consumer types ---------------------------
 // Types an external consumer must be able to NAME to write a custom storage or
@@ -242,6 +246,15 @@ pub const HttpResponse = @import("http_client.zig").HttpResponse;
 pub const HttpRequestOptions = @import("http_client.zig").RequestOptions;
 pub const HttpPostOptions = @import("http_client.zig").PostOptions;
 
+// ---- Structured logging ----------------------------------------------------
+// A consumer binary opts in from its own root: `pub const std_options = zigbase.std_options;`.
+// This routes every `std.log` call through the same encoder as request logging. Access
+// lines and `--log-format`/`--log-level` work either way (the server logs them directly);
+// omitting the line just leaves std.log output in Zig's default format, mixed with JSON
+// access lines under `--log-format json`.
+pub const logging = @import("logging.zig");
+pub const std_options = logging.std_options;
+
 // ---- Dev-only test-mode capture (#96) -------------------------------------
 // Assert what the framework SENT in e2e/integration tests: an in-memory mail outbox
 // (`testcapture.mail`) and outbound `ctx.http()` capture + canned-response mocking
@@ -335,6 +348,8 @@ test {
     _ = @import("ratelimit.zig");
     _ = @import("regex.zig");
     _ = @import("cli.zig");
+    _ = @import("serve_session.zig");
+    _ = @import("serve_control.zig");
     _ = @import("datetime.zig");
     _ = @import("db.zig");
     _ = @import("sql/param_sink.zig");
@@ -352,6 +367,8 @@ test {
     _ = @import("migrations.zig");
     _ = @import("migrator.zig");
     _ = @import("schema_dump.zig");
+    _ = @import("schema_doc.zig");
+    _ = @import("schema_diff.zig");
     _ = @import("rules.zig");
     _ = @import("policy.zig");
     _ = @import("tenancy/roles.zig");
@@ -368,6 +385,7 @@ test {
     _ = @import("field_policy.zig");
     _ = @import("rewrap.zig");
     _ = @import("import.zig");
+    _ = @import("import_manifest.zig");
     _ = @import("jwt.zig");
     _ = @import("push/encrypt.zig");
     _ = @import("push/vapid.zig");
@@ -381,6 +399,7 @@ test {
     _ = @import("static_files.zig");
     _ = @import("api/error.zig");
     _ = @import("api/health.zig");
+    _ = @import("api/meta.zig");
     _ = @import("api/collections.zig");
     _ = @import("api/records.zig");
     _ = @import("api/realtime.zig");
@@ -433,6 +452,9 @@ test {
     _ = @import("report/send.zig");
     _ = @import("framework.zig");
     _ = @import("provision.zig");
+    _ = @import("doctor.zig");
+    _ = @import("doctor_run.zig");
+    _ = @import("rules_lint.zig");
     _ = @import("dumpload.zig");
     _ = @import("records_hooks_test.zig");
     _ = @import("schedule.zig");
@@ -521,6 +543,11 @@ test {
     _ = @import("captcha.zig");
     _ = @import("webhook.zig");
     _ = @import("request_arena.zig");
+    _ = @import("error_codes.zig");
+    _ = @import("logging.zig");
+    _ = @import("scaffold/agents_md.zig");
+    _ = @import("scaffold/templates.zig");
+    _ = @import("scaffold.zig");
     // Opt-in pure-Zig PostgreSQL backend (#159). The `build_options.postgres` condition is
     // comptime-known, so when it is false (the default) these `@import`s are never analyzed —
     // the driver compiles to nothing and the default build stays byte-identical.

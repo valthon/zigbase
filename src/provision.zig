@@ -1113,7 +1113,13 @@ pub fn ensureCollection(
 /// Return a copy of `col` where each single-relation field's targetCollectionId
 /// (a target NAME on input) is replaced by the live target collection's id, so the
 /// persisted metadata matches what the runtime API produces. Errors clearly if the
-/// target is missing.
+/// target is missing — EXCEPT a self-relation (`targetCollectionId == col.name`) on a
+/// collection that does not exist live yet: it is being created by THIS `ensureCollection`
+/// call, so there is no id to resolve to (a chicken-and-egg the id generation inside
+/// `collections.create` cannot avoid). Left as the bare name in that one case; `collections.get`'s
+/// `WHERE id = ?1 OR name = ?1` treats a name exactly like an id, so this is functionally
+/// identical to the resolved-id form once the collection exists (and is exactly why the
+/// manifest importer's `manifestCollections` already normalizes id-or-name — see import_manifest.zig).
 fn resolveTargets(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection) ProvisionError!schema.Collection {
     var any = false;
     for (col.fields) |f| if (f.options == .relation) {
@@ -1126,13 +1132,16 @@ fn resolveTargets(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection) P
         fields[i] = f;
         switch (f.options) {
             .relation => |r| {
-                const target = (try collections.get(alloc, w, r.targetCollectionId)) orelse {
+                if (try collections.get(alloc, w, r.targetCollectionId)) |target| {
+                    var nr = r;
+                    nr.targetCollectionId = target.id;
+                    fields[i].options = .{ .relation = nr };
+                } else if (!std.mem.eql(u8, r.targetCollectionId, col.name)) {
                     std.log.warn("provision: relation target '{s}' not found while provisioning '{s}' — refusing to provision", .{ r.targetCollectionId, col.name });
                     return error.RelationTargetMissing;
-                };
-                var nr = r;
-                nr.targetCollectionId = target.id;
-                fields[i].options = .{ .relation = nr };
+                }
+                // else: self-relation on a not-yet-created collection — leave `fields[i]` as
+                // copied above (targetCollectionId stays the name).
             },
             else => {},
         }
@@ -1911,6 +1920,52 @@ test "applySpecs rejects an unknown relation target" {
     const lf = [_]schema.Field{.{ .id = "f_o", .name = "owner", .options = .{ .relation = .{ .targetCollectionId = "ghosts", .maxSelect = 1 } } }};
     const specs = [_]schema.Collection{.{ .id = "", .name = "listings", .fields = &lf }};
     try std.testing.expectError(error.UnknownRelationTarget, applySpecs(a, std.testing.io, &d, &specs));
+}
+
+test "applySpecs provisions a self-relation; idempotent re-provision is a no-op" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try migrations.run(&d);
+    const a = std.testing.allocator;
+
+    // Self-relation: authors.mentor -> authors (a field referencing its own collection).
+    const af = [_]schema.Field{
+        .{ .id = "f_nm", .name = "name", .options = .{ .text = .{} } },
+        .{ .id = "f_mentor", .name = "mentor", .options = .{ .relation = .{ .targetCollectionId = "authors", .maxSelect = 1 } } },
+    };
+    const specs = [_]schema.Collection{
+        .{ .id = "", .name = "authors", .fields = &af },
+    };
+
+    // First provision: self-relation on a newly created collection must succeed.
+    try applySpecs(a, std.testing.io, &d, &specs);
+
+    const authors = (try collections.get(a, &d, "authors")).?;
+    defer authors.deinit(a);
+    // The relation field survives and references the collection (by name or id — both are valid).
+    const mentor = schema.fieldByName(authors, "mentor").?;
+    // Self-relations store the target as the collection name or id (both resolve correctly via collections.get).
+    try std.testing.expect(
+        std.mem.eql(u8, mentor.options.relation.targetCollectionId, authors.name) or
+            std.mem.eql(u8, mentor.options.relation.targetCollectionId, authors.id),
+    );
+
+    // Physical FK works: insert a row, then a row referencing it via self-relation.
+    try d.exec("INSERT INTO \"authors\" (\"id\",\"created\",\"updated\",\"name\") VALUES ('a1','','','Ada');");
+    try d.exec("INSERT INTO \"authors\" (\"id\",\"created\",\"updated\",\"name\",\"mentor\") VALUES ('a2','','','Grace','a1');");
+
+    // Re-provision: clean no-op (no error, no duplicate collection).
+    try applySpecs(a, std.testing.io, &d, &specs);
+    const all = try collections.list(a, &d);
+    defer {
+        for (all) |c| c.deinit(a);
+        a.free(all);
+    }
+    var authors_count: usize = 0;
+    for (all) |c| if (std.mem.eql(u8, c.name, "authors")) {
+        authors_count += 1;
+    };
+    try std.testing.expectEqual(@as(usize, 1), authors_count);
 }
 
 test "buildOptions accepts a valid comptime pattern and date bounds" {

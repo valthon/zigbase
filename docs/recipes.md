@@ -1050,9 +1050,9 @@ it fails:
 fn submitHandler(ctx: *zigbase.Ctx) anyerror!zigbase.http.Response {
     const token = (try ctx.query()).get("captcha") orelse "";
     const r = try ctx.verifyCaptcha(.recaptcha_v3, token);
-    if (!r.ok) return ctx.jsonError(403, "captcha_required");
+    if (!r.ok) return ctx.jsonError(403, "captcha_required", "Captcha required.");
     // reCAPTCHA v3: score 0.0 (bot) → 1.0 (human); block suspicious traffic.
-    if (r.score) |score| if (score < 0.5) return ctx.jsonError(403, "suspicious_request");
+    if (r.score) |score| if (score < 0.5) return ctx.jsonError(403, "suspicious_request", "Suspicious request.");
     // ... proceed with the submission ...
 }
 ```
@@ -1064,7 +1064,7 @@ catch it to choose fail-open vs fail-closed:
 ```zig
 const r = ctx.verifyCaptcha(.turnstile, token) catch |e| {
     std.log.warn("captcha provider unreachable: {s}", .{@errorName(e)});
-    // fail-open: proceed; or return ctx.jsonError(503, "captcha_unavailable") to fail-closed
+    // fail-open: proceed; or return ctx.jsonError(503, "captcha_unavailable", "Captcha unavailable.") to fail-closed
     return process(ctx);
 };
 ```
@@ -1078,11 +1078,68 @@ without a real provider.
 
 Full option table: [ctx.verifyCaptcha reference](framework.md#ctxverifycaptcha--captcha-verification-140).
 
-## Recipe: deterministic tests (frozen clock, seeded IDs, captured mail/HTTP)
+## Recipe: testing an app (in-process, deterministic)
 
-Dev builds expose three determinism seams (all compiled out of release binaries). Freeze the
-clock and seed the entropy source from the environment so two runs produce byte-for-byte
-identical timestamps, IDs, and tokens:
+Most tests belong **in-process**: `zigbase.testing` boots your app against a
+throwaway data directory and injects requests through the real router, access
+rules, auth, and hooks — no socket, no port, milliseconds per test.
+
+Wire the step once (`zigbase init --framework` does this for you):
+
+```zig
+// build.zig
+const zigbase = @import("zigbase");
+// ... after zigbase.addTo(dep, app_mod) ...
+const tests = zigbase.addTest(b, dep, .{ .root_module = app_mod });
+b.step("test", "Run tests").dependOn(&b.addRunArtifact(tests).step);
+```
+
+Then write tests against the real endpoints:
+
+```zig
+test "only published posts are listed publicly" {
+    var t = try zigbase.testing.start(App, .{});
+    defer t.deinit();
+
+    _ = try t.createRecord("posts", .{ .title = "Draft", .published = false });
+    _ = try t.createRecord("posts", .{ .title = "Live", .published = true });
+
+    const r = try t.request(.GET, "/api/collections/posts/records", .{});
+    const page = try r.json(struct { items: []struct { title: []const u8 } });
+    try std.testing.expectEqual(@as(usize, 1), page.items.len);
+}
+```
+
+**Determinism is a `start` option, not an environment variable.** Freeze the
+clock and seed the PRNG so IDs, timestamps, and tokens repeat byte-for-byte, and
+capture outbound mail with a harness-owned mailbox:
+
+```zig
+test "the verification email is sent" {
+    var t = try zigbase.testing.start(App, .{
+        .fake_now_unix = 1_800_000_000, // every "now", including SQL 'now'
+        .fake_seed = 12345,             // reproducible record ids and tokens
+    });
+    defer t.deinit();
+
+    const mail = try t.captureMail(); // install BEFORE the request that sends
+
+    _ = try t.request(.POST, "/api/collections/users/request-verification",
+        .{ .json = .{ .email = "user@example.com" } });
+
+    try std.testing.expectEqual(@as(usize, 1), mail.messages.items.len);
+    try std.testing.expectEqualStrings("user@example.com", mail.messages.items[0].to);
+}
+```
+
+`captureMail` returns a mailbox owned by the harness, so parallel tests do not
+share it.
+
+### When you are testing a spawned server instead
+
+For end-to-end runs against a real `serve` process — a client SDK, a frontend,
+the socket layer — the same determinism seams are exposed as environment
+variables, and `zigbase.testcapture` is the process-global capture API:
 
 ```sh
 ZIGBASE_FAKE_NOW="2029-03-07T16:00:00Z" \
@@ -1090,26 +1147,20 @@ ZIGBASE_FAKE_SEED=12345 \
   ./myserver serve --data-dir ./zb_data --insecure-cookies
 ```
 
-`ZIGBASE_FAKE_NOW` freezes every framework "now" **and** consumer SQL `'now'` /
-`CURRENT_TIMESTAMP` / `DEFAULT CURRENT_TIMESTAMP`; `ZIGBASE_FAKE_SEED` makes record IDs and
-tokens reproducible. In Zig tests, capture outbound mail and HTTP without touching the network
-via `zigbase.testcapture`:
-
 ```zig
 const tc = zigbase.testcapture;
-tc.mail.enable(true);     // capture + suppress real delivery
-defer tc.mail.reset();
-// ... trigger a magic-link / verification flow ...
-const link_email = tc.mail.find("sign in").?;   // assert against captured mail
-
 tc.http.enable(true);     // block un-mocked URLs (no real network)
 defer tc.http.reset();
 tc.http.mock("api.stripe.com", .{ .status = 200, .body = "{\"paid\":true}" });
-// ... trigger a route/hook that calls ctx.http() ...
 ```
 
-See [framework.md §14](framework.md#14-test--dev-mode-determinism-seams) and the
-testcapture section for `mail.entries()` / `http.requests()` and the full API.
+These are process-global mutable flags — fine for a single spawned server,
+wrong for parallel in-process tests. Prefer the `StartOptions` above whenever
+you are in-process.
+
+Full guide: [testing.md](testing.md). Full API:
+[framework.md §15](framework.md#15-testing-your-app-zigbasetesting) and
+[§14](framework.md#14-test--dev-mode-determinism-seams).
 
 ## See also
 

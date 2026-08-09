@@ -732,8 +732,8 @@ fn isoFromEpoch(alloc: std.mem.Allocator, secs: i64) ![]u8 {
     // SIGNED integers (e.g. "+2030-+6-..."), which datetime validators then reject. All six
     // fields are non-negative for an in-range instant. (Mirrors datetime.formatUtc.)
     return std.fmt.allocPrint(alloc, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z", .{
-        @as(u64, @intCast(year)),   @as(u64, @intCast(month)),  @as(u64, @intCast(day)),
-        @as(u64, @intCast(hour)),   @as(u64, @intCast(minute)), @as(u64, @intCast(second)),
+        @as(u64, @intCast(year)), @as(u64, @intCast(month)),  @as(u64, @intCast(day)),
+        @as(u64, @intCast(hour)), @as(u64, @intCast(minute)), @as(u64, @intCast(second)),
     });
 }
 
@@ -805,230 +805,739 @@ fn seedConfig(ctx: *zigbase.Ctx, ev: *zigbase.events.LifecycleEvent) anyerror!vo
 // App wiring
 // ---------------------------------------------------------------------------
 pub const App = zigbase.App(.{
-        .hooks = .{
-            .bookings = .{ .beforeCreate = prepareBooking },
-            .reviews = .{ .beforeCreate = prepareReview },
-            .holds = .{ .beforeCreate = prepareHold },
+    .hooks = .{
+        .bookings = .{ .beforeCreate = prepareBooking },
+        .reviews = .{ .beforeCreate = prepareReview },
+        .holds = .{ .beforeCreate = prepareHold },
+    },
+    // #80: increment a per-user login counter on every successful login, transactionally with the session.
+    .beforeAuthSuccess = bumpLoginCount,
+    // Auth config group (E3): lifecycle hooks + session model live under one `.auth` key.
+    // #98: seed loginCount=0 on registration (in the create txn).
+    // #99 per-device sessions (`.session = .{ .store = .table }`): every login records a
+    // row in the internal `_sessions` table, enabling the `listActiveSessions` /
+    // `revoke(id)` per-device surface below (and installing the periodic session-GC
+    // sweep). The default `.epoch` mode keeps only a token-epoch counter and has no
+    // per-session inventory.
+    .auth = .{
+        .hooks = .{ .beforeRegister = seedNewUser },
+        .session = .{ .store = .table },
+    },
+    // Seed mutable config (the booking webhook URL) from the environment into KV at boot.
+    .onBootstrap = seedConfig,
+    // Declared feature flags (#88/#128): only DECLARED flags resolve. `bookings_frozen`
+    // is the operator kill switch (default off) for booking confirmation; `promo_banner`
+    // is a public-facing toggle read via `GET /api/golfsim/flags/:name`. Flip either with
+    // the typed `App.setFlag` or the superuser settings API (`PUT /api/settings/flag:<name>`).
+    .flags = .{
+        .bookings_frozen = false,
+        .promo_banner = false,
+    },
+    .routes = .{
+        .{ .method = .POST, .path = "/api/bookings/:id/confirm", .handler = confirmBooking, .auth = .authed },
+        .{ .method = .POST, .path = "/api/bookings/:id/cancel", .handler = cancelBooking, .auth = .authed },
+        .{ .method = .GET, .path = "/api/listings/:id/availability", .handler = listingAvailability, .auth = .authed },
+        // Atomic hold->booking convert (ctx.tx): create booking + delete hold together.
+        .{ .method = .POST, .path = "/api/holds/:id/convert", .handler = convertHold, .auth = .authed },
+        // Session management (#99) — per-device, via ctx.auth().
+        .{ .method = .POST, .path = "/api/golfsim/logout-everywhere", .handler = logoutEverywhere, .auth = .authed },
+        .{ .method = .GET, .path = "/api/golfsim/sessions", .handler = activeDevices, .auth = .authed },
+        .{ .method = .POST, .path = "/api/golfsim/sessions/:id/revoke", .handler = revokeDevice, .auth = .authed },
+        .{ .method = .GET, .path = "/api/golfsim/health", .handler = health, .auth = .public },
+        // #86: custom one-line logout via ctx.auth().clearSession().
+        .{ .method = .POST, .path = "/api/golfsim/logout", .handler = logout, .auth = .public },
+        // Untyped raw-response route (text/calendar) — see `calendarFeed`. Not in `zb.rpc.*`.
+        .{ .method = .GET, .path = "/api/golfsim/calendar.ics", .handler = calendarFeed, .auth = .public },
+        // Public read of a single feature flag — see `flagStatus`. Untyped (raw JSON).
+        .{ .method = .GET, .path = "/api/golfsim/flags/:name", .handler = flagStatus, .auth = .public },
+    },
+    .pools = .{ .jobs = 2 },
+    .cron = .{
+        .{
+            .name = "expire-holds",
+            .schedule = zigbase.schedule.Schedule{ .interval = .{ .minutes = 15 } },
+            .handler = expireHolds,
         },
-        // #80: increment a per-user login counter on every successful login, transactionally with the session.
-        .beforeAuthSuccess = bumpLoginCount,
-        // Auth config group (E3): lifecycle hooks + session model live under one `.auth` key.
-        // #98: seed loginCount=0 on registration (in the create txn).
-        // #99 per-device sessions (`.session = .{ .store = .table }`): every login records a
-        // row in the internal `_sessions` table, enabling the `listActiveSessions` /
-        // `revoke(id)` per-device surface below (and installing the periodic session-GC
-        // sweep). The default `.epoch` mode keeps only a token-epoch counter and has no
-        // per-session inventory.
-        .auth = .{
-            .hooks = .{ .beforeRegister = seedNewUser },
-            .session = .{ .store = .table },
-        },
-        // Seed mutable config (the booking webhook URL) from the environment into KV at boot.
-        .onBootstrap = seedConfig,
-        // Declared feature flags (#88/#128): only DECLARED flags resolve. `bookings_frozen`
-        // is the operator kill switch (default off) for booking confirmation; `promo_banner`
-        // is a public-facing toggle read via `GET /api/golfsim/flags/:name`. Flip either with
-        // the typed `App.setFlag` or the superuser settings API (`PUT /api/settings/flag:<name>`).
-        .flags = .{
-            .bookings_frozen = false,
-            .promo_banner = false,
-        },
-        .routes = .{
-            .{ .method = .POST, .path = "/api/bookings/:id/confirm", .handler = confirmBooking, .auth = .authed },
-            .{ .method = .POST, .path = "/api/bookings/:id/cancel", .handler = cancelBooking, .auth = .authed },
-            .{ .method = .GET, .path = "/api/listings/:id/availability", .handler = listingAvailability, .auth = .authed },
-            // Atomic hold->booking convert (ctx.tx): create booking + delete hold together.
-            .{ .method = .POST, .path = "/api/holds/:id/convert", .handler = convertHold, .auth = .authed },
-            // Session management (#99) — per-device, via ctx.auth().
-            .{ .method = .POST, .path = "/api/golfsim/logout-everywhere", .handler = logoutEverywhere, .auth = .authed },
-            .{ .method = .GET, .path = "/api/golfsim/sessions", .handler = activeDevices, .auth = .authed },
-            .{ .method = .POST, .path = "/api/golfsim/sessions/:id/revoke", .handler = revokeDevice, .auth = .authed },
-            .{ .method = .GET, .path = "/api/golfsim/health", .handler = health, .auth = .public },
-            // #86: custom one-line logout via ctx.auth().clearSession().
-            .{ .method = .POST, .path = "/api/golfsim/logout", .handler = logout, .auth = .public },
-            // Untyped raw-response route (text/calendar) — see `calendarFeed`. Not in `zb.rpc.*`.
-            .{ .method = .GET, .path = "/api/golfsim/calendar.ics", .handler = calendarFeed, .auth = .public },
-            // Public read of a single feature flag — see `flagStatus`. Untyped (raw JSON).
-            .{ .method = .GET, .path = "/api/golfsim/flags/:name", .handler = flagStatus, .auth = .public },
-        },
-        .pools = .{ .jobs = 2 },
-        .cron = .{
-            .{
-                .name = "expire-holds",
-                .schedule = zigbase.schedule.Schedule{ .interval = .{ .minutes = 15 } },
-                .handler = expireHolds,
+    },
+    // Fires after every successful file upload (e.g. a listing photo).
+    .onFileUpload = logFileUpload,
+    // Pagination: both modes on with the default STATELESS cursor tokens (no secret, CDN-
+    // friendly, byte-compatible with the SDK's client-synthesized cursors). To force every
+    // list to use keyset paging, set `.offset = false` (then `page`/`perPage` are rejected
+    // with a 400 and clients must walk via `cursor`).
+    .pagination = .{
+        .offset = true,
+        .cursor = true,
+        .cursor_token = .stateless,
+    },
+    // Comptime-hardcoded static dir: the Astro frontend in frontend/dist is
+    // served at the root path, no flag needed (and --serve-static is rejected).
+    .static_files = .{ .dir = "frontend/dist" },
+    // The schema the hooks/route/cron reference, provisioned at startup.
+    // Mirrors the runtime-provisioning recipe in docs/recipes.md.
+    .collections = .{
+        .users = .{
+            .type = .auth,
+            .fields = .{
+                .{ .name = "name", .type = .text, .max = 100 },
+                // Incremented by the beforeAuthSuccess hook on every login (#80).
+                .{ .name = "loginCount", .type = .number },
             },
-        },
-        // Fires after every successful file upload (e.g. a listing photo).
-        .onFileUpload = logFileUpload,
-        // Pagination: both modes on with the default STATELESS cursor tokens (no secret, CDN-
-        // friendly, byte-compatible with the SDK's client-synthesized cursors). To force every
-        // list to use keyset paging, set `.offset = false` (then `page`/`perPage` are rejected
-        // with a 400 and clients must walk via `cursor`).
-        .pagination = .{
-            .offset = true,
-            .cursor = true,
-            .cursor_token = .stateless,
-        },
-        // Comptime-hardcoded static dir: the Astro frontend in frontend/dist is
-        // served at the root path, no flag needed (and --serve-static is rejected).
-        .static_files = .{ .dir = "frontend/dist" },
-        // The schema the hooks/route/cron reference, provisioned at startup.
-        // Mirrors the runtime-provisioning recipe in docs/recipes.md.
-        .collections = .{
-            .users = .{
-                .type = .auth,
-                .fields = .{
-                    .{ .name = "name", .type = .text, .max = 100 },
-                    // Incremented by the beforeAuthSuccess hook on every login (#80).
-                    .{ .name = "loginCount", .type = .number },
+            // require_verified: guests must verify their email before a session is minted.
+            // Justified for a booking/payments app — unverified accounts cannot hold slots.
+            // OTP offers a one-step passwordless login convenience for existing, verified accounts.
+            // First-time onboarding: password signup + email verification (see Auth.tsx).
+            // NOTE: .password = .{} must be explicit — specifying .methods at all opts OUT of the
+            // implicit password default. Omitting it would disable /auth-with-password entirely.
+            .auth = .{
+                .require_verified = true,
+                .methods = .{
+                    .password = .{}, // keep password login (required for post-verify signin)
+                    .otp = .{ .auto_create = false }, // OTP for existing, verified accounts only
                 },
-                // require_verified: guests must verify their email before a session is minted.
-                // Justified for a booking/payments app — unverified accounts cannot hold slots.
-                // OTP offers a one-step passwordless login convenience for existing, verified accounts.
-                // First-time onboarding: password signup + email verification (see Auth.tsx).
-                // NOTE: .password = .{} must be explicit — specifying .methods at all opts OUT of the
-                // implicit password default. Omitting it would disable /auth-with-password entirely.
-                .auth = .{
-                    .require_verified = true,
-                    .methods = .{
-                        .password = .{}, // keep password login (required for post-verify signin)
-                        .otp = .{ .auto_create = false }, // OTP for existing, verified accounts only
-                    },
-                    // OAuth2: "Sign in with Google" — client credentials are sourced from env
-                    // at provision time (ZIGBASE_OAUTH_GOOGLE_CLIENT_ID / _SECRET).
-                    // Google-verified accounts are created with verified=true so they can
-                    // book immediately without a separate email-verification step.
-                    // See README.md "Auth & onboarding > OAuth2" for setup instructions.
-                    .oauth2 = .{
-                        .enabled = true,
-                        .providers = .{
-                            .{
-                                .name = "google",
-                                // clientId/clientSecret left empty here; the framework
-                                // injects ZIGBASE_OAUTH_GOOGLE_CLIENT_ID/SECRET at provision.
-                                .redirectUrls = .{"http://localhost:8090/api/oauth2/google/callback"},
-                                .enabled = true,
-                            },
+                // OAuth2: "Sign in with Google" — client credentials are sourced from env
+                // at provision time (ZIGBASE_OAUTH_GOOGLE_CLIENT_ID / _SECRET).
+                // Google-verified accounts are created with verified=true so they can
+                // book immediately without a separate email-verification step.
+                // See README.md "Auth & onboarding > OAuth2" for setup instructions.
+                .oauth2 = .{
+                    .enabled = true,
+                    .providers = .{
+                        .{
+                            .name = "google",
+                            // clientId/clientSecret left empty here; the framework
+                            // injects ZIGBASE_OAUTH_GOOGLE_CLIENT_ID/SECRET at provision.
+                            .redirectUrls = .{"http://localhost:8090/api/oauth2/google/callback"},
+                            .enabled = true,
                         },
                     },
                 },
-                // Public profiles + open signup: "@public" is the explicit allow-all sentinel
-                // (empty "" is now LOCKED, not public).
-                .rules = .{ .list = "@public", .view = "@public", .create = "@public", .update = "@request.auth.id = id", .delete = "@request.auth.id = id" },
-                // NOCASE unique index on email: prevents Bob@x.com and bob@x.com from being
-                // treated as distinct accounts (doubly important with require_verified since
-                // a collision would block both from verifying).
-                .indexes = .{
-                    .{ .name = "idx_users_email_nocase", .fields = .{"email"}, .unique = true, .collation = .nocase },
-                },
             },
-            .simulators = .{
-                .fields = .{
-                    .{ .name = "label", .type = .text, .required = true, .max = 120 },
-                    .{ .name = "owner", .type = .relation, .target = "users", .required = true, .cascadeDelete = true },
-                },
-                // NOTE: any authed user can create a simulator (become a host) — deliberately
-                // simple for a demo; restrict with a role/claim check in a real app.
-                // Anyone may browse the directory of simulators ("@public" list/view);
-                // create/update/delete stay owner-scoped.
-                .rules = .{ .list = "@public", .view = "@public", .create = "@request.auth.id != \"\"", .update = "@request.auth.id = owner", .delete = "@request.auth.id = owner" },
-            },
-            .listings = .{
-                .fields = .{
-                    .{ .name = "title", .type = .text, .required = true, .max = 140 },
-                    .{ .name = "price_per_hour", .type = .number, .required = true },
-                    .{ .name = "status", .type = .select, .required = true, .values = .{ "draft", "published", "archived" } },
-                    .{ .name = "simulator", .type = .relation, .target = "simulators", .required = true, .cascadeDelete = true },
-                    // Up to six listing photos; uploaded via multipart on record create/update
-                    // and served from GET /api/files/listings/:id/:name.
-                    .{ .name = "photos", .type = .file, .maxSelect = 6, .maxSize = 5242880, .mimeTypes = .{ "image/png", "image/jpeg", "image/webp" } },
-                },
-                .rules = .{
-                    .list = "status = \"published\"",
-                    .view = "status = \"published\" || @request.auth.id = simulator.owner",
-                    .create = "@request.auth.id != \"\"",
-                    .update = "@request.auth.id = simulator.owner",
-                    .delete = "@request.auth.id = simulator.owner",
-                },
-            },
-            .bookings = .{
-                .fields = .{
-                    .{ .name = "listing", .type = .relation, .target = "listings", .required = true, .cascadeDelete = true },
-                    .{ .name = "guest", .type = .relation, .target = "users", .required = true, .cascadeDelete = true },
-                    .{ .name = "starts_at", .type = .date, .required = true },
-                    .{ .name = "ends_at", .type = .date, .required = true },
-                    .{ .name = "price_total", .type = .number },
-                    .{ .name = "status", .type = .select, .values = .{ "pending", "confirmed", "cancelled" } },
-                },
-                .rules = .{
-                    .list = "@request.auth.id = guest || @request.auth.id = listing.simulator.owner",
-                    .view = "@request.auth.id = guest || @request.auth.id = listing.simulator.owner",
-                    .create = "@request.auth.id != \"\"",
-                    .update = "@request.auth.id = listing.simulator.owner",
-                    .delete = "@request.auth.id = guest",
-                },
-                // Partial composite index backing the overlap check (prepareBooking) and
-                // availability route (listingAvailability). Only active (non-cancelled)
-                // bookings are indexed: shrinks the index and makes availability queries
-                // O(active bookings per listing) rather than O(all bookings per listing).
-                .indexes = .{
-                    .{
-                        .name = "idx_bookings_listing_time_active",
-                        .fields = .{ "listing", "starts_at" },
-                        .where = "status != 'cancelled'",
-                    },
-                },
-            },
-            // The FIFTH comptime collection (a sixth, `holds`, follows). Provisioning
-            // this many collections / fields
-            // exceeds Zig's *default* comptime branch quota inside the framework's
-            // `.collections` lowering; ZigBase raises its own quota (see
-            // provision.buildCollections), so a rich schema like this lowers cleanly.
-            .reviews = .{
-                .fields = .{
-                    .{ .name = "booking", .type = .relation, .target = "bookings", .required = true, .cascadeDelete = true },
-                    .{ .name = "author", .type = .relation, .target = "users", .required = true, .cascadeDelete = true },
-                    .{ .name = "rating", .type = .number, .mode = .int, .min = 1, .max = 5 },
-                    .{ .name = "body", .type = .text, .max = 2000 },
-                },
-                // Reviews are public to read; the prepareReview hook enforces that only
-                // the booking's guest (after a confirmed session) may create one, and
-                // an author may edit/delete only their own review.
-                .rules = .{
-                    // Reviews are public to read ("@public"); the prepareReview hook still gates
-                    // creation. (Empty "" would now LOCK these, not make them public.)
-                    .list = "@public",
-                    .view = "@public",
-                    .create = "@request.auth.id != \"\"",
-                    .update = "@request.auth.id = author",
-                    .delete = "@request.auth.id = author",
-                },
-            },
-            // A SIXTH collection demonstrating TTL records (`.ttl_field`). A "hold" is an
-            // ephemeral soft-reservation a guest places while paying; it must auto-expire if
-            // not converted to a booking. Declaring `.ttl_field = "expires_at"` lets the
-            // framework's internal `_ttl_gc` job delete expired holds automatically (once at
-            // startup, then every 5 minutes) — no cron of our own. `expires_at` is a `date`
-            // (ISO-8601 UTC) the `prepareHold` beforeCreate hook stamps SERVER-SIDE to now+15m
-            // (any client-supplied value is ignored), so a caller can't pin a hold forever.
-            .holds = .{
-                .fields = .{
-                    .{ .name = "listing", .type = .relation, .target = "listings", .required = true, .cascadeDelete = true },
-                    .{ .name = "guest", .type = .relation, .target = "users", .required = true, .cascadeDelete = true },
-                    .{ .name = "expires_at", .type = .date, .required = true },
-                },
-                .rules = .{
-                    .list = "@request.auth.id = guest",
-                    .view = "@request.auth.id = guest",
-                    .create = "@request.auth.id != \"\"",
-                    .delete = "@request.auth.id = guest",
-                },
-                .ttl_field = "expires_at",
+            // Public profiles + open signup: "@public" is the explicit allow-all sentinel
+            // (empty "" is now LOCKED, not public).
+            .rules = .{ .list = "@public", .view = "@public", .create = "@public", .update = "@request.auth.id = id", .delete = "@request.auth.id = id" },
+            // NOCASE unique index on email: prevents Bob@x.com and bob@x.com from being
+            // treated as distinct accounts (doubly important with require_verified since
+            // a collision would block both from verifying).
+            .indexes = .{
+                .{ .name = "idx_users_email_nocase", .fields = .{"email"}, .unique = true, .collation = .nocase },
             },
         },
+        .simulators = .{
+            .fields = .{
+                .{ .name = "label", .type = .text, .required = true, .max = 120 },
+                .{ .name = "owner", .type = .relation, .target = "users", .required = true, .cascadeDelete = true },
+            },
+            // NOTE: any authed user can create a simulator (become a host) — deliberately
+            // simple for a demo; restrict with a role/claim check in a real app.
+            // Anyone may browse the directory of simulators ("@public" list/view);
+            // create/update/delete stay owner-scoped.
+            .rules = .{ .list = "@public", .view = "@public", .create = "@request.auth.id != \"\"", .update = "@request.auth.id = owner", .delete = "@request.auth.id = owner" },
+        },
+        .listings = .{
+            .fields = .{
+                .{ .name = "title", .type = .text, .required = true, .max = 140 },
+                .{ .name = "price_per_hour", .type = .number, .required = true },
+                .{ .name = "status", .type = .select, .required = true, .values = .{ "draft", "published", "archived" } },
+                .{ .name = "simulator", .type = .relation, .target = "simulators", .required = true, .cascadeDelete = true },
+                // Up to six listing photos; uploaded via multipart on record create/update
+                // and served from GET /api/files/listings/:id/:name.
+                .{ .name = "photos", .type = .file, .maxSelect = 6, .maxSize = 5242880, .mimeTypes = .{ "image/png", "image/jpeg", "image/webp" } },
+            },
+            .rules = .{
+                .list = "status = \"published\"",
+                .view = "status = \"published\" || @request.auth.id = simulator.owner",
+                .create = "@request.auth.id != \"\"",
+                .update = "@request.auth.id = simulator.owner",
+                .delete = "@request.auth.id = simulator.owner",
+            },
+        },
+        .bookings = .{
+            .fields = .{
+                .{ .name = "listing", .type = .relation, .target = "listings", .required = true, .cascadeDelete = true },
+                .{ .name = "guest", .type = .relation, .target = "users", .required = true, .cascadeDelete = true },
+                .{ .name = "starts_at", .type = .date, .required = true },
+                .{ .name = "ends_at", .type = .date, .required = true },
+                .{ .name = "price_total", .type = .number },
+                .{ .name = "status", .type = .select, .values = .{ "pending", "confirmed", "cancelled" } },
+            },
+            .rules = .{
+                .list = "@request.auth.id = guest || @request.auth.id = listing.simulator.owner",
+                .view = "@request.auth.id = guest || @request.auth.id = listing.simulator.owner",
+                .create = "@request.auth.id != \"\"",
+                .update = "@request.auth.id = listing.simulator.owner",
+                .delete = "@request.auth.id = guest",
+            },
+            // Partial composite index backing the overlap check (prepareBooking) and
+            // availability route (listingAvailability). Only active (non-cancelled)
+            // bookings are indexed: shrinks the index and makes availability queries
+            // O(active bookings per listing) rather than O(all bookings per listing).
+            .indexes = .{
+                .{
+                    .name = "idx_bookings_listing_time_active",
+                    .fields = .{ "listing", "starts_at" },
+                    .where = "status != 'cancelled'",
+                },
+            },
+        },
+        // The FIFTH comptime collection (a sixth, `holds`, follows). Provisioning
+        // this many collections / fields
+        // exceeds Zig's *default* comptime branch quota inside the framework's
+        // `.collections` lowering; ZigBase raises its own quota (see
+        // provision.buildCollections), so a rich schema like this lowers cleanly.
+        .reviews = .{
+            .fields = .{
+                .{ .name = "booking", .type = .relation, .target = "bookings", .required = true, .cascadeDelete = true },
+                .{ .name = "author", .type = .relation, .target = "users", .required = true, .cascadeDelete = true },
+                .{ .name = "rating", .type = .number, .mode = .int, .min = 1, .max = 5 },
+                .{ .name = "body", .type = .text, .max = 2000 },
+            },
+            // Reviews are public to read; the prepareReview hook enforces that only
+            // the booking's guest (after a confirmed session) may create one, and
+            // an author may edit/delete only their own review.
+            .rules = .{
+                // Reviews are public to read ("@public"); the prepareReview hook still gates
+                // creation. (Empty "" would now LOCK these, not make them public.)
+                .list = "@public",
+                .view = "@public",
+                .create = "@request.auth.id != \"\"",
+                .update = "@request.auth.id = author",
+                .delete = "@request.auth.id = author",
+            },
+        },
+        // A SIXTH collection demonstrating TTL records (`.ttl_field`). A "hold" is an
+        // ephemeral soft-reservation a guest places while paying; it must auto-expire if
+        // not converted to a booking. Declaring `.ttl_field = "expires_at"` lets the
+        // framework's internal `_ttl_gc` job delete expired holds automatically (once at
+        // startup, then every 5 minutes) — no cron of our own. `expires_at` is a `date`
+        // (ISO-8601 UTC) the `prepareHold` beforeCreate hook stamps SERVER-SIDE to now+15m
+        // (any client-supplied value is ignored), so a caller can't pin a hold forever.
+        .holds = .{
+            .fields = .{
+                .{ .name = "listing", .type = .relation, .target = "listings", .required = true, .cascadeDelete = true },
+                .{ .name = "guest", .type = .relation, .target = "users", .required = true, .cascadeDelete = true },
+                .{ .name = "expires_at", .type = .date, .required = true },
+            },
+            .rules = .{
+                .list = "@request.auth.id = guest",
+                .view = "@request.auth.id = guest",
+                .create = "@request.auth.id != \"\"",
+                .delete = "@request.auth.id = guest",
+            },
+            .ttl_field = "expires_at",
+        },
+    },
 });
+
+/// Structured logging: this routes every std.log call through the same JSON-capable
+/// encoder as request logging. Access lines and --log-format/--log-level work either
+/// way; omitting this line just leaves std.log output in Zig's default format, mixed
+/// with JSON access lines under --log-format=json. Every ZigBase consumer needs it in
+/// its own root, because `std_options` is resolved from the root source file.
+pub const std_options = zigbase.std_options;
 
 pub fn main(init: std.process.Init) !void {
     return App.runCli(init);
+}
+
+// ---------------------------------------------------------------------------
+// In-process tests. `zigbase.testing` boots this app against a throwaway data dir
+// and injects requests through the REAL router, access rules, auth, and hooks —
+// no socket, no port. Run with `zig build test`.
+//
+// The vitest suite under test/ is a different surface: it drives the GENERATED
+// TYPED CLIENT (clients/typescript/zbase.gen.ts) against a spawned golfsim binary
+// over HTTP — that is a TypeScript artifact and needs a TypeScript consumer, so it
+// stays there. See README.md's "Two test surfaces, on purpose" section.
+//
+// Where most of these tests need only an AUTHENTICATED caller, they mint a session
+// directly (`t.mintSession`) rather than running the real login endpoint — faster,
+// and the login path itself isn't what's under test there (see docs/testing.md).
+// The two tests that DO exercise the real login path (require_verified, and the
+// per-device session tests, which need a `_sessions` row a mint-only token can't
+// produce) sign up + verify + `t.loginPassword` instead.
+
+/// Extract the single-use token from a captured verification-email body. The body format is
+/// `"Verify your email (<collection>). Your verification token:\n\n<TOKEN>\n"` (see
+/// `requestEmailToken`'s `body_fmt` in src/api/auth.zig). Returns null if the marker is absent.
+fn extractMailToken(body: []const u8) ?[]const u8 {
+    const marker = "Your verification token:\n\n";
+    const idx = std.mem.indexOf(u8, body, marker) orelse return null;
+    const rest = body[idx + marker.len ..];
+    const end = std.mem.indexOfScalar(u8, rest, '\n') orelse rest.len;
+    return rest[0..end];
+}
+
+/// Sign up, verify (via the captured verification email), and password-login a user through the
+/// REAL endpoints. `mailbox` must already be installed (`t.captureMail()`) before calling this —
+/// with no worker pool installed under `zigbase.testing`, `request-verification`'s token mail
+/// runs INLINE and synchronously (see queue/memory.zig's no-pool fallback), so the mail is
+/// captured before this returns; no polling needed. Returns the "Bearer <tok>" from the real
+/// `auth-with-password` endpoint (full fidelity: this is the ONLY way to get a token that
+/// satisfies `.auth.session.store = .table`'s per-device session bookkeeping — `t.mintSession`
+/// mints a JWT directly and never writes a `_sessions` row).
+fn signUpVerifiedUser(t: *zigbase.testing.Harness(App), mailbox: *zigbase.CaptureMailer, email: []const u8, password: []const u8) ![]const u8 {
+    const created = try t.request(.POST, "/api/collections/users/records", .{
+        .json = .{ .email = email, .password = password, .passwordConfirm = password, .name = email },
+    });
+    try std.testing.expectEqual(@as(u16, 201), created.status);
+
+    const before = mailbox.messages.items.len;
+    const req_verify = try t.request(.POST, "/api/collections/users/request-verification", .{ .json = .{ .email = email } });
+    try std.testing.expectEqual(@as(u16, 204), req_verify.status);
+    try std.testing.expectEqual(before + 1, mailbox.messages.items.len);
+    const token = extractMailToken(mailbox.messages.items[before].text) orelse return error.NoVerificationToken;
+
+    const confirm = try t.request(.POST, "/api/collections/users/confirm-verification", .{ .json = .{ .token = token } });
+    try std.testing.expectEqual(@as(u16, 204), confirm.status);
+
+    return t.loginPassword("users", email, password);
+}
+
+/// Create a `users` row directly (bypassing hooks/rules — fine for a fixture) and mint an
+/// authenticated bearer for it. `require_verified` only gates the LOGIN endpoints, not record
+/// creation or `mintSession`, so this is enough to act as an authenticated caller.
+fn setupGuest(t: *zigbase.testing.Harness(App), email: []const u8) !struct { id: []const u8, token: []const u8 } {
+    const guest = try t.createRecord("users", .{ .email = email, .password = "throwaway-pass-1" });
+    const id = guest.object.get("id").?.string;
+    const token = try t.mintSession("users", id);
+    return .{ .id = id, .token = token };
+}
+
+/// A host, one of their simulators, and one PUBLISHED listing on it (price_per_hour as given).
+const HostSetup = struct {
+    host_token: []const u8,
+    sim_id: []const u8,
+    listing_id: []const u8,
+};
+
+fn setupPublishedListing(t: *zigbase.testing.Harness(App), price_per_hour: f64) !HostSetup {
+    const host = try t.createRecord("users", .{ .email = "host@golf.app", .password = "throwaway-pass-1" });
+    const host_id = host.object.get("id").?.string;
+    const host_token = try t.mintSession("users", host_id);
+
+    const sim = try t.request(.POST, "/api/collections/simulators/records", .{
+        .json = .{ .label = "Bay 1", .owner = host_id },
+        .auth = host_token,
+    });
+    try std.testing.expectEqual(@as(u16, 201), sim.status);
+    const sim_id = (try sim.json(struct { id: []const u8 })).id;
+
+    const listing = try t.request(.POST, "/api/collections/listings/records", .{
+        .json = .{ .title = "Prime tee time", .price_per_hour = price_per_hour, .status = "published", .simulator = sim_id },
+        .auth = host_token,
+    });
+    try std.testing.expectEqual(@as(u16, 201), listing.status);
+    const listing_id = (try listing.json(struct { id: []const u8 })).id;
+
+    return .{ .host_token = host_token, .sim_id = sim_id, .listing_id = listing_id };
+}
+
+test "password login is gated by require_verified until the account confirms its email" {
+    var t = try zigbase.testing.start(App, .{});
+    defer t.deinit();
+    const mailbox = try t.captureMail();
+
+    const email = "verify-me@golf.app";
+    const password = "verifypass123";
+    const created = try t.request(.POST, "/api/collections/users/records", .{
+        .json = .{ .email = email, .password = password, .passwordConfirm = password, .name = "Verifier" },
+    });
+    try std.testing.expectEqual(@as(u16, 201), created.status);
+
+    // Unverified: the real login endpoint is gated closed (403), not merely a wrong-credential 400.
+    try std.testing.expectError(error.LoginFailed, t.loginPassword("users", email, password));
+    const unverified = try t.request(.POST, "/api/collections/users/auth-with-password", .{
+        .json = .{ .identity = email, .password = password },
+    });
+    try std.testing.expectEqual(@as(u16, 403), unverified.status);
+
+    const before = mailbox.messages.items.len;
+    const req_verify = try t.request(.POST, "/api/collections/users/request-verification", .{ .json = .{ .email = email } });
+    try std.testing.expectEqual(@as(u16, 204), req_verify.status);
+    try std.testing.expectEqual(before + 1, mailbox.messages.items.len);
+    const token = extractMailToken(mailbox.messages.items[before].text) orelse return error.NoVerificationToken;
+
+    const confirm = try t.request(.POST, "/api/collections/users/confirm-verification", .{ .json = .{ .token = token } });
+    try std.testing.expectEqual(@as(u16, 204), confirm.status);
+
+    // Verified: the same credentials now succeed against the real endpoint.
+    _ = try t.loginPassword("users", email, password);
+}
+
+test "prepareBooking computes price_total, forces status to pending, and stamps the guest server-side" {
+    var t = try zigbase.testing.start(App, .{});
+    defer t.deinit();
+
+    const setup = try setupPublishedListing(&t, 40);
+    const guest = try setupGuest(&t, "booking-guest@golf.app");
+
+    const created = try t.request(.POST, "/api/collections/bookings/records", .{
+        .json = .{ .listing = setup.listing_id, .starts_at = "2030-01-01 10:00:00.000Z", .ends_at = "2030-01-01 11:00:00.000Z" },
+        .auth = guest.token,
+    });
+    try std.testing.expectEqual(@as(u16, 201), created.status);
+    const rec = try created.json(struct { status: []const u8, guest: []const u8, price_total: f64 });
+    // A client can never pre-confirm: every new booking starts life as a pending hold, even
+    // though the client didn't send a status at all here.
+    try std.testing.expectEqualStrings("pending", rec.status);
+    // Server-authoritative: stamped from the caller's identity, never trusted from the client
+    // (we never sent a `guest` field in the request body above).
+    try std.testing.expectEqualStrings(guest.id, rec.guest);
+    // 1 hour * $40/hr, computed server-side.
+    try std.testing.expectEqual(@as(f64, 40), rec.price_total);
+}
+
+test "prepareBooking rejects an overlapping window, an unpublished listing, and an unknown listing" {
+    var t = try zigbase.testing.start(App, .{});
+    defer t.deinit();
+
+    const setup = try setupPublishedListing(&t, 40);
+    const guest = try setupGuest(&t, "overlap-guest@golf.app");
+
+    const first = try t.request(.POST, "/api/collections/bookings/records", .{
+        .json = .{ .listing = setup.listing_id, .starts_at = "2030-02-01 10:00:00.000Z", .ends_at = "2030-02-01 12:00:00.000Z" },
+        .auth = guest.token,
+    });
+    try std.testing.expectEqual(@as(u16, 201), first.status);
+
+    // Overlaps [10:00, 12:00) at [11:00, 13:00) on the SAME listing -> rejected.
+    const overlapping = try t.request(.POST, "/api/collections/bookings/records", .{
+        .json = .{ .listing = setup.listing_id, .starts_at = "2030-02-01 11:00:00.000Z", .ends_at = "2030-02-01 13:00:00.000Z" },
+        .auth = guest.token,
+    });
+    try std.testing.expectEqual(@as(u16, 400), overlapping.status);
+
+    // A back-to-back, non-overlapping window on the same listing is fine.
+    const adjacent = try t.request(.POST, "/api/collections/bookings/records", .{
+        .json = .{ .listing = setup.listing_id, .starts_at = "2030-02-01 12:00:00.000Z", .ends_at = "2030-02-01 13:00:00.000Z" },
+        .auth = guest.token,
+    });
+    try std.testing.expectEqual(@as(u16, 201), adjacent.status);
+
+    // A draft (unpublished) listing cannot be booked.
+    const draft_listing = try t.request(.POST, "/api/collections/listings/records", .{
+        .json = .{ .title = "Not live yet", .price_per_hour = 40, .status = "draft", .simulator = setup.sim_id },
+        .auth = setup.host_token,
+    });
+    try std.testing.expectEqual(@as(u16, 201), draft_listing.status);
+    const draft_id = (try draft_listing.json(struct { id: []const u8 })).id;
+    const unbookable = try t.request(.POST, "/api/collections/bookings/records", .{
+        .json = .{ .listing = draft_id, .starts_at = "2030-02-02 10:00:00.000Z", .ends_at = "2030-02-02 11:00:00.000Z" },
+        .auth = guest.token,
+    });
+    try std.testing.expectEqual(@as(u16, 400), unbookable.status);
+
+    // A listing id that doesn't exist at all.
+    const unknown_listing = try t.request(.POST, "/api/collections/bookings/records", .{
+        .json = .{ .listing = "doesnotexist00000000000", .starts_at = "2030-02-03 10:00:00.000Z", .ends_at = "2030-02-03 11:00:00.000Z" },
+        .auth = guest.token,
+    });
+    try std.testing.expectEqual(@as(u16, 400), unknown_listing.status);
+}
+
+test "confirmBooking is owner-only and gated by the bookings_frozen feature flag" {
+    var t = try zigbase.testing.start(App, .{});
+    defer t.deinit();
+
+    const setup = try setupPublishedListing(&t, 50);
+    const guest = try setupGuest(&t, "confirm-guest@golf.app");
+    const stranger = try setupGuest(&t, "confirm-stranger@golf.app");
+
+    const created = try t.request(.POST, "/api/collections/bookings/records", .{
+        .json = .{ .listing = setup.listing_id, .starts_at = "2030-04-01 10:00:00.000Z", .ends_at = "2030-04-01 11:00:00.000Z" },
+        .auth = guest.token,
+    });
+    const booking_id = (try created.json(struct { id: []const u8 })).id;
+    var buf: [128]u8 = undefined;
+    const confirm_path = try std.fmt.bufPrint(&buf, "/api/bookings/{s}/confirm", .{booking_id});
+
+    // Neither the guest nor an unrelated caller owns the listing's simulator.
+    const forbidden = try t.request(.POST, confirm_path, .{ .auth = stranger.token });
+    try std.testing.expectEqual(@as(u16, 403), forbidden.status);
+
+    const missing = try t.request(.POST, "/api/bookings/doesnotexist00000000000/confirm", .{ .auth = setup.host_token });
+    try std.testing.expectEqual(@as(u16, 404), missing.status);
+
+    // The owner (multi-hop: booking -> listing -> simulator -> owner) confirms successfully.
+    const confirmed = try t.request(.POST, confirm_path, .{ .auth = setup.host_token });
+    try std.testing.expectEqual(@as(u16, 200), confirmed.status);
+    try std.testing.expectEqualStrings("confirmed", (try confirmed.json(struct { status: []const u8 })).status);
+
+    // SURPRISE (worth documenting): confirmBooking also offloads a booking-confirmation webhook
+    // via `ctx.app.submit` (see notifyBookingConfirmed). Under `zigbase.testing`, `bootForTest`
+    // never starts the background worker pool (src/framework.zig: "the scheduler/memory-pool are
+    // NOT started"), so `ctx.app.submit` returns `error.SchedulerUnavailable` — which
+    // `notifyBookingConfirmed` swallows (log + return). Confirming still succeeds here exactly as
+    // asserted above; the webhook firing itself is NOT observable in-process and stays covered
+    // only by the spawned-server suite (test/golfsim.determinism.e2e.test.ts).
+
+    // The kill switch: a superuser freezes confirmations via the settings API (no redeploy).
+    _ = try t.createSuperuser("flagadmin@golf.app", "adminpass123456");
+    const admin = try t.loginSuperuser("flagadmin@golf.app", "adminpass123456");
+    const set_flag = try t.request(.PUT, "/api/settings/flag:bookings_frozen", .{ .json = .{ .value = "true" }, .auth = admin });
+    try std.testing.expectEqual(@as(u16, 200), set_flag.status);
+
+    const created2 = try t.request(.POST, "/api/collections/bookings/records", .{
+        .json = .{ .listing = setup.listing_id, .starts_at = "2030-04-02 10:00:00.000Z", .ends_at = "2030-04-02 11:00:00.000Z" },
+        .auth = guest.token,
+    });
+    const booking2_id = (try created2.json(struct { id: []const u8 })).id;
+    var buf2: [128]u8 = undefined;
+    const confirm_path2 = try std.fmt.bufPrint(&buf2, "/api/bookings/{s}/confirm", .{booking2_id});
+    const frozen = try t.request(.POST, confirm_path2, .{ .auth = setup.host_token });
+    try std.testing.expectEqual(@as(u16, 503), frozen.status);
+}
+
+test "cancelBooking is guest-only" {
+    var t = try zigbase.testing.start(App, .{});
+    defer t.deinit();
+
+    const setup = try setupPublishedListing(&t, 30);
+    const guest = try setupGuest(&t, "cancel-guest@golf.app");
+    const stranger = try setupGuest(&t, "cancel-stranger@golf.app");
+
+    const created = try t.request(.POST, "/api/collections/bookings/records", .{
+        .json = .{ .listing = setup.listing_id, .starts_at = "2030-05-01 10:00:00.000Z", .ends_at = "2030-05-01 11:00:00.000Z" },
+        .auth = guest.token,
+    });
+    const booking_id = (try created.json(struct { id: []const u8 })).id;
+    var buf: [128]u8 = undefined;
+    const cancel_path = try std.fmt.bufPrint(&buf, "/api/bookings/{s}/cancel", .{booking_id});
+
+    const forbidden = try t.request(.POST, cancel_path, .{ .auth = stranger.token });
+    try std.testing.expectEqual(@as(u16, 403), forbidden.status);
+    // Even the listing's OWNER cannot cancel a guest's booking through this route — only the
+    // guest can; confirmBooking is the owner's lever.
+    const owner_forbidden = try t.request(.POST, cancel_path, .{ .auth = setup.host_token });
+    try std.testing.expectEqual(@as(u16, 403), owner_forbidden.status);
+
+    const cancelled = try t.request(.POST, cancel_path, .{ .auth = guest.token });
+    try std.testing.expectEqual(@as(u16, 200), cancelled.status);
+    try std.testing.expectEqualStrings("cancelled", (try cancelled.json(struct { status: []const u8 })).status);
+}
+
+test "listingAvailability lists only non-cancelled bookings for a listing" {
+    var t = try zigbase.testing.start(App, .{});
+    defer t.deinit();
+
+    const setup = try setupPublishedListing(&t, 20);
+    const guest = try setupGuest(&t, "avail-guest@golf.app");
+
+    const kept = try t.request(.POST, "/api/collections/bookings/records", .{
+        .json = .{ .listing = setup.listing_id, .starts_at = "2030-06-01 10:00:00.000Z", .ends_at = "2030-06-01 11:00:00.000Z" },
+        .auth = guest.token,
+    });
+    const kept_id = (try kept.json(struct { id: []const u8 })).id;
+
+    const dropped = try t.request(.POST, "/api/collections/bookings/records", .{
+        .json = .{ .listing = setup.listing_id, .starts_at = "2030-06-02 10:00:00.000Z", .ends_at = "2030-06-02 11:00:00.000Z" },
+        .auth = guest.token,
+    });
+    const dropped_id = (try dropped.json(struct { id: []const u8 })).id;
+    var buf: [128]u8 = undefined;
+    const cancel_path = try std.fmt.bufPrint(&buf, "/api/bookings/{s}/cancel", .{dropped_id});
+    const cancelled = try t.request(.POST, cancel_path, .{ .auth = guest.token });
+    try std.testing.expectEqual(@as(u16, 200), cancelled.status);
+
+    var buf2: [128]u8 = undefined;
+    const avail_path = try std.fmt.bufPrint(&buf2, "/api/listings/{s}/availability", .{setup.listing_id});
+    const avail = try t.request(.GET, avail_path, .{ .auth = guest.token });
+    try std.testing.expectEqual(@as(u16, 200), avail.status);
+    const page = try avail.json(struct { items: []struct { id: []const u8 } });
+    try std.testing.expectEqual(@as(usize, 1), page.items.len);
+    try std.testing.expectEqualStrings(kept_id, page.items[0].id);
+}
+
+test "prepareReview only lets the booking's own guest review it, and only once it is confirmed; reviews are public to read" {
+    var t = try zigbase.testing.start(App, .{});
+    defer t.deinit();
+
+    const setup = try setupPublishedListing(&t, 60);
+    const guest = try setupGuest(&t, "review-guest@golf.app");
+    const stranger = try setupGuest(&t, "review-stranger@golf.app");
+
+    const created = try t.request(.POST, "/api/collections/bookings/records", .{
+        .json = .{ .listing = setup.listing_id, .starts_at = "2030-07-01 10:00:00.000Z", .ends_at = "2030-07-01 11:00:00.000Z" },
+        .auth = guest.token,
+    });
+    const booking_id = (try created.json(struct { id: []const u8 })).id;
+
+    // Gate 2: a still-pending booking (not yet confirmed) cannot be reviewed.
+    const too_early = try t.request(.POST, "/api/collections/reviews/records", .{
+        .json = .{ .booking = booking_id, .rating = 5, .body = "premature" },
+        .auth = guest.token,
+    });
+    try std.testing.expectEqual(@as(u16, 400), too_early.status);
+
+    var buf: [128]u8 = undefined;
+    const confirm_path = try std.fmt.bufPrint(&buf, "/api/bookings/{s}/confirm", .{booking_id});
+    const confirmed = try t.request(.POST, confirm_path, .{ .auth = setup.host_token });
+    try std.testing.expectEqual(@as(u16, 200), confirmed.status);
+
+    // Gate 1: only the booking's own guest may review it.
+    const not_yours = try t.request(.POST, "/api/collections/reviews/records", .{
+        .json = .{ .booking = booking_id, .rating = 1, .body = "not mine" },
+        .auth = stranger.token,
+    });
+    try std.testing.expectEqual(@as(u16, 400), not_yours.status);
+
+    const review = try t.request(.POST, "/api/collections/reviews/records", .{
+        .json = .{ .booking = booking_id, .rating = 5, .body = "Great round." },
+        .auth = guest.token,
+    });
+    try std.testing.expectEqual(@as(u16, 201), review.status);
+    const rec = try review.json(struct { author: []const u8, rating: i64 });
+    // Stamped server-side from the caller's identity — we never sent `author` above.
+    try std.testing.expectEqualStrings(guest.id, rec.author);
+    try std.testing.expectEqual(@as(i64, 5), rec.rating);
+
+    // Reviews are `@public` to read, even anonymously.
+    const anon = try t.request(.GET, "/api/collections/reviews/records", .{});
+    try std.testing.expectEqual(@as(u16, 200), anon.status);
+    const page = try anon.json(struct { items: []struct { body: []const u8 } });
+    try std.testing.expectEqual(@as(usize, 1), page.items.len);
+    try std.testing.expectEqualStrings("Great round.", page.items[0].body);
+}
+
+test "per-device sessions: two logins register two sessions; revoke one, then logout everywhere" {
+    var t = try zigbase.testing.start(App, .{});
+    defer t.deinit();
+    const mailbox = try t.captureMail();
+
+    const email = "sessions@golf.app";
+    const password = "sessionspass123";
+    const c1 = try signUpVerifiedUser(&t, mailbox, email, password);
+    _ = try t.loginPassword("users", email, password); // a second device/session for the same user
+
+    const Session = struct { id: []const u8, is_current: bool };
+    const listed = try t.request(.GET, "/api/golfsim/sessions", .{ .auth = c1 });
+    try std.testing.expectEqual(@as(u16, 200), listed.status);
+    const page = try listed.json(struct { items: []Session });
+    try std.testing.expectEqual(@as(usize, 2), page.items.len);
+    var current_count: usize = 0;
+    var other_id: ?[]const u8 = null;
+    for (page.items) |s| {
+        if (s.is_current) current_count += 1 else other_id = s.id;
+    }
+    try std.testing.expectEqual(@as(usize, 1), current_count);
+
+    var buf: [128]u8 = undefined;
+    const revoke_path = try std.fmt.bufPrint(&buf, "/api/golfsim/sessions/{s}/revoke", .{other_id.?});
+    const revoked = try t.request(.POST, revoke_path, .{ .auth = c1 });
+    try std.testing.expectEqual(@as(u16, 200), revoked.status);
+
+    const after_revoke = try t.request(.GET, "/api/golfsim/sessions", .{ .auth = c1 });
+    const after_page = try after_revoke.json(struct { items: []Session });
+    try std.testing.expectEqual(@as(usize, 1), after_page.items.len);
+    try std.testing.expect(after_page.items[0].is_current);
+
+    // "Log out everywhere" bumps the token epoch — even c1's own current token stops verifying.
+    const logout_all = try t.request(.POST, "/api/golfsim/logout-everywhere", .{ .auth = c1 });
+    try std.testing.expectEqual(@as(u16, 204), logout_all.status);
+
+    const now_rejected = try t.request(.GET, "/api/golfsim/sessions", .{ .auth = c1 });
+    try std.testing.expectEqual(@as(u16, 401), now_rejected.status);
+}
+
+test "ctx.txWith converts a hold into a booking atomically (POST /api/holds/:id/convert)" {
+    var t = try zigbase.testing.start(App, .{});
+    defer t.deinit();
+
+    const setup = try setupPublishedListing(&t, 50);
+    const guest = try setupGuest(&t, "convert-guest@golf.app");
+
+    const hold = try t.request(.POST, "/api/collections/holds/records", .{
+        .json = .{ .listing = setup.listing_id },
+        .auth = guest.token,
+    });
+    try std.testing.expectEqual(@as(u16, 201), hold.status);
+    const hold_id = (try hold.json(struct { id: []const u8 })).id;
+
+    var buf: [128]u8 = undefined;
+    const convert_path = try std.fmt.bufPrint(&buf, "/api/holds/{s}/convert", .{hold_id});
+    const converted = try t.request(.POST, convert_path, .{
+        .json = .{ .starts_at = "2030-08-01 09:00:00.000Z", .ends_at = "2030-08-01 10:00:00.000Z" },
+        .auth = guest.token,
+    });
+    try std.testing.expectEqual(@as(u16, 200), converted.status);
+    const booking = try converted.json(struct { status: []const u8, price_total: f64 });
+    try std.testing.expectEqualStrings("pending", booking.status);
+    try std.testing.expectEqual(@as(f64, 50), booking.price_total); // 1h * $50/hr, priced server-side
+
+    // Both writes committed together: the hold no longer exists.
+    var buf2: [128]u8 = undefined;
+    const hold_get_path = try std.fmt.bufPrint(&buf2, "/api/collections/holds/records/{s}", .{hold_id});
+    const gone = try t.request(.GET, hold_get_path, .{ .auth = guest.token });
+    try std.testing.expectEqual(@as(u16, 404), gone.status);
+}
+
+test "prepareHold stamps expires_at from the frozen clock (fake_now_unix)" {
+    // 2030-06-15T12:00:00Z. prepareHold reads "now" from the DATABASE clock (dbNowUnix), which
+    // ZIGBASE_FAKE_NOW shadows on a spawned server and `.fake_now_unix` shadows here.
+    var t = try zigbase.testing.start(App, .{ .fake_now_unix = 1_907_755_200 });
+    defer t.deinit();
+
+    const setup = try setupPublishedListing(&t, 25);
+    const guest = try setupGuest(&t, "hold-guest@golf.app");
+
+    const hold = try t.request(.POST, "/api/collections/holds/records", .{
+        .json = .{ .listing = setup.listing_id },
+        .auth = guest.token,
+    });
+    try std.testing.expectEqual(@as(u16, 201), hold.status);
+    const expires_at = (try hold.json(struct { expires_at: []const u8 })).expires_at;
+    // hold_ttl_seconds = 15 * 60; frozen now + 15m.
+    try std.testing.expectEqualStrings("2030-06-15T12:15:00Z", expires_at);
+}
+
+/// Runs a tiny fixed scenario against a FRESH harness and returns two values that are only
+/// stable across independent boots when BOTH determinism seams are engaged: `.id` (drawn from
+/// the seeded id-generation PRNG, entropy.zig) and `.expires_at` (derived by `prepareHold` from
+/// the frozen DATABASE clock, dbNowUnix). Both are duped onto `std.testing.allocator`, so the
+/// caller owns and must free them (the harness they were read from is already torn down).
+fn runDeterministicScenario(seed: u64, now_unix: i64) !struct { id: []const u8, expires_at: []const u8 } {
+    var t = try zigbase.testing.start(App, .{ .fake_seed = seed, .fake_now_unix = now_unix });
+    defer t.deinit();
+
+    const created = try t.createRecord("users", .{ .email = "det@golf.app", .password = "determinist-pass-1" });
+    const id = created.object.get("id").?.string;
+    const token = try t.mintSession("users", id);
+
+    const setup = try setupPublishedListing(&t, 10);
+    const hold = try t.request(.POST, "/api/collections/holds/records", .{
+        .json = .{ .listing = setup.listing_id },
+        .auth = token,
+    });
+    try std.testing.expectEqual(@as(u16, 201), hold.status);
+    const expires_at = (try hold.json(struct { expires_at: []const u8 })).expires_at;
+
+    return .{
+        .id = try std.testing.allocator.dupe(u8, id),
+        .expires_at = try std.testing.allocator.dupe(u8, expires_at),
+    };
+}
+
+test "fake_seed and fake_now_unix make generated ids and hook-derived timestamps reproducible across independent boots" {
+    // This is the seam that motivated converting this suite: a spawned-server e2e test freezes
+    // determinism via ZIGBASE_FAKE_NOW / ZIGBASE_FAKE_SEED env vars; `zigbase.testing.StartOptions`
+    // exposes the SAME seams as `.fake_now_unix` / `.fake_seed`, with no process/env involved.
+    const seed: u64 = 424242;
+    const now_unix: i64 = 1_907_755_200; // 2030-06-15T12:00:00Z
+
+    const first = try runDeterministicScenario(seed, now_unix);
+    defer std.testing.allocator.free(first.id);
+    defer std.testing.allocator.free(first.expires_at);
+
+    const second = try runDeterministicScenario(seed, now_unix);
+    defer std.testing.allocator.free(second.id);
+    defer std.testing.allocator.free(second.expires_at);
+
+    // `.fake_seed` reseeds the id-generation PRNG to the same initial state on each boot, so a
+    // fresh `users` record gets the SAME generated id both times — a real CSPRNG never would.
+    try std.testing.expectEqualStrings(first.id, second.id);
+    // `.fake_now_unix` freezes the database clock identically on each boot, so a hook-derived
+    // timestamp (prepareHold's expires_at) is byte-identical across the two independent runs.
+    try std.testing.expectEqualStrings(first.expires_at, second.expires_at);
+    try std.testing.expectEqualStrings("2030-06-15T12:15:00Z", first.expires_at);
 }

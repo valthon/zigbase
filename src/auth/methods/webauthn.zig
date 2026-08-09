@@ -14,6 +14,18 @@ const authenticate_mod = @import("../webauthn/authenticate.zig");
 const client_data = @import("../webauthn/client_data.zig");
 const api_auth = @import("../../api/auth.zig");
 
+/// The canonical `internal` envelope, byte-identical to `ApiError.internal().renderBody`.
+/// Server-side misconfiguration is reported to the operator through the log; the response
+/// stays generic because the frozen registry documents `internal` as leaking no detail.
+const generic_internal_body = "{\"status\":500,\"code\":\"internal\",\"message\":\"Something went wrong.\",\"data\":{}}";
+
+/// Report a server-side WebAuthn misconfiguration. `warn` under the test runner, which
+/// counts a raw `std.log.err` as a failed test — the same accommodation `tls_trust.zig`'s
+/// `logMisconfig` makes, and the negative-config tests below deliberately exercise this path.
+fn logMisconfig(comptime fmt: []const u8, args: anytype) void {
+    if (@import("builtin").is_test) std.log.warn(fmt, args) else std.log.err(fmt, args);
+}
+
 // ---------------------------------------------------------------------------
 // WebAuthnMethod — passkey login via the AuthMethod contract
 // ---------------------------------------------------------------------------
@@ -57,14 +69,20 @@ fn b64urlDecode(alloc: std.mem.Allocator, encoded: []const u8) ![]u8 {
 fn initiateImpl(ctx: *anyopaque, ac: *AuthCtx) anyerror!InitiateResult {
     _ = @as(*WebAuthnMethod, @ptrCast(@alignCast(ctx)));
 
-    // Require webauthn config on the collection.
+    // Require webauthn config on the collection. The misconfiguration detail goes to the
+    // LOG, never to the response: `internal` promises in the frozen registry that no
+    // detail is leaked, and the caller here is unauthenticated — it must not learn this
+    // collection's WebAuthn configuration state. The operator needs the detail; the
+    // anonymous client gets the generic body every other 500 returns.
     const wa_opts = ac.collection.options.auth.methods.webauthn orelse {
-        return InitiateResult{ .status = 500, .body = "{\"message\":\"WebAuthn not configured for this collection.\"}" };
+        logMisconfig("WebAuthn initiate on collection '{s}': no webauthn config on the collection", .{ac.collection.name});
+        return InitiateResult{ .status = 500, .body = generic_internal_body };
     };
 
     // Guard: reject mis-configured webauthn (empty rp_id or origin).
     if (wa_opts.rp_id.len == 0 or wa_opts.origin.len == 0) {
-        return InitiateResult{ .status = 500, .body = "{\"message\":\"WebAuthn is enabled but not configured (rp_id and origin are required).\"}" };
+        logMisconfig("WebAuthn initiate on collection '{s}': enabled but rp_id/origin are empty", .{ac.collection.name});
+        return InitiateResult{ .status = 500, .body = generic_internal_body };
     }
 
     // Parse optional identity from body (usernameless flow supported).

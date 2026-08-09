@@ -53,8 +53,22 @@ jobs:
         run: mise exec zig@0.16.0 -- zig build -Dcpu=baseline
       - name: Build blog example consumer (dependency-graph proof)
         run: cd examples/blog && mise exec zig@0.16.0 -- zig build -Dcpu=baseline
+      # The examples are also the reference for how a consumer tests their app,
+      # so blog's in-process suite runs in CI rather than only compiling.
+      - name: Blog example in-process tests (zigbase.testing)
+        run: cd examples/blog && mise exec zig@0.16.0 -- zig build test --summary all
       - name: Build golfsim example consumer (realistic app)
         run: cd examples/golfsim && mise exec zig@0.16.0 -- zig build -Dcpu=baseline
+      # golfsim's `.static_files` dir is comptime-hardcoded (not --serve-static), so the app
+      # — including zigbase.testing's socketless boot below — refuses to boot at all unless
+      # frontend/dist already exists. Build it first (mirrors harness.ts's ensureFrontend()).
+      - name: Golfsim example in-process tests (zigbase.testing)
+        run: |
+          cd examples/golfsim/frontend
+          mise exec node@24 -- npm ci --no-audit --no-fund
+          mise exec node@24 -- npm run build
+          cd ../
+          mise exec zig@0.16.0 -- zig build test --summary all
       - name: Build dating-server (e2e fixture binary)
         run: mise exec zig@0.16.0 -- zig build dating-server -Dcpu=baseline
       - name: Build auth2-server (e2e fixture binary)
@@ -67,10 +81,47 @@ jobs:
         run: mise exec zig@0.16.0 -- zig build minimal-server
       - name: Build full gating fixture (positive control; also the browser suite's analytics-enabled fixture)
         run: mise exec zig@0.16.0 -- zig build full-fixture -Dcpu=baseline
+      # Fourth gating reference for check-gating.sh: the SAME zigbase binary rebuilt
+      # with -Ddev-tools=false, to a separate --prefix so it doesn't clobber the
+      # default one just built above. Proves init/agents-md/typegen (src/scaffold*.zig,
+      # src/codegen/**) actually disappear from a consumer's own custom build — NOT a
+      # published artifact; every GitHub release / Docker image / npm package we ship
+      # builds at the default (-Ddev-tools on).
+      - name: Build zigbase binary without dev-tools (custom-build proof; not a published artifact)
+        run: mise exec zig@0.16.0 -- zig build -Dcpu=baseline -Ddev-tools=false -p zig-out-devtools-off
       - name: Gating invariant (absent-symbols check)
         run: ./scripts/check-gating.sh
       - name: Allocator ownership contracts (ratchet)
         run: ./scripts/check-allocator-contracts.sh
+      - name: Error-code ledger is append-only
+        # actions/checkout leaves a depth-1 clone: HEAD (the PR merge commit) has
+        # no reachable ancestry, so a bare fetch of the base ref alone leaves
+        # `git merge-base origin/main HEAD` with disjoint histories and the check
+        # dies before it can diff anything. Fetch main's full history AND deepen
+        # HEAD's own line far enough to reach the fork point. The doctor-ledger
+        # step below reuses the deepened clone this one already produced.
+        run: |
+          git fetch --no-tags origin main
+          git fetch --no-tags --deepen=200 origin
+          ./scripts/check-error-code-ledger.sh origin/main
+      - name: Doctor check-id ledger is append-only
+        # actions/checkout leaves a depth-1 clone: HEAD (the PR merge commit) has
+        # no reachable ancestry, so a bare fetch of the base ref alone leaves
+        # `git merge-base origin/main HEAD` with disjoint histories and the check
+        # dies before it can diff anything. Fetch main's full history AND deepen
+        # HEAD's own line far enough to reach the fork point.
+        #
+        # Deliberately repeats the fetch that a neighbouring ledger step also
+        # performs, rather than relying on that step having run first: on an
+        # already-deepened clone the repeat costs about a second, whereas the
+        # deduplicated form would make THIS guard's correctness depend on another
+        # step's presence and ordering — a silent breakage nobody would predict
+        # when editing that other step. This check exists precisely to not be
+        # silently defeated (it already died once, invisibly, in a shallow clone).
+        run: |
+          git fetch --no-tags origin main
+          git fetch --no-tags --deepen=200 origin
+          ./scripts/check-doctor-ledger.sh origin/main
       - name: Dating client snapshot is fresh
         run: mise exec zig@0.16.0 -- zig build gen-dating-client-check
       - name: Dating runtime client snapshot is fresh
@@ -173,6 +224,13 @@ jobs:
         run: mise exec zig@0.16.0 -- zig build fuzz-compile --summary all
       - name: "Unit tests (prod gate: -Ddev-mode=false)"
         run: mise exec zig@0.16.0 -- zig build test --summary all -Ddev-mode=false
+      # Lean custom-build gate: -Ddev-tools=false must still compile AND pass the full
+      # suite — proves the stripped configuration (no init/agents-md/typegen; see
+      # src/devtools.zig) doesn't rot silently. NOT how we build our own published
+      # artifacts (those stay at the default, dev-tools on); this is the configuration
+      # a consumer opts into for their own custom build.
+      - name: "Unit tests (custom-build gate: -Ddev-tools=false)"
+        run: mise exec zig@0.16.0 -- zig build test --summary all -Ddev-tools=false
       # Lean-build gate (R2-6): -Dfts5=false must still COMPILE — the whole point is that FTS5 (and
       # SQLite's -DSQLITE_ENABLE_FTS5) folds out of a build that never declares a `.searchable`
       # field. Build-only, not a full test run: a handful of pre-existing fixtures (policy.zig,
@@ -410,6 +468,14 @@ jobs:
         # free port + tempdir, so the harness is parallel-safe). Keep tests/smtp
         # serial below — it binds a real fixed TLS port.
         run: mise exec python@3.13 -- python -m pytest tests/admin -q -n auto
+      - name: Server lifecycle + doctor CLI e2e
+        # Serial on purpose: these tests assert on timing (the readiness
+        # handshake, the child-death path, the TERM/KILL escalation) and on
+        # process-table state, which -n auto makes flaky for reasons unrelated
+        # to the code. No browser or Playwright involvement.
+        run: mise exec python@3.13 -- python -m pytest tests/cli -q
+      - name: Replay-harness unit tests
+        run: mise exec python@3.13 -- python -m pytest tests/tools -q
       - name: Live SMTP-over-TLS (STARTTLS) delivery test
         run: mise exec python@3.13 -- python -m pytest tests/smtp -q
 

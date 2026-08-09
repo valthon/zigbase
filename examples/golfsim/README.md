@@ -14,8 +14,12 @@ library*: multi-collection relations with cascadeDelete, invariant-enforcing hoo
 (double-booking prevention), access rules with relation traversal, file uploads,
 WebSocket realtime, per-device session management (`ctx.auth()`), atomic multi-write
 transactions (`ctx.tx()`), outbound webhooks (`ctx.http()`), and multiple custom
-business routes — all with a working Astro + React frontend, plus a deterministic e2e
-suite that freezes time (`ZIGBASE_FAKE_NOW`) and captures the outbound webhook.
+business routes — all with a working Astro + React frontend. That business logic is
+covered by an in-process Zig test suite (`zig build test`, [`zigbase.testing`](../../docs/testing.md)),
+including a determinism test that freezes time and seeds id generation
+(`.fake_now_unix` / `.fake_seed`); a separate vitest e2e suite drives the **generated
+typed client** against a real spawned server and its worker pool, which the outbound
+webhook needs. See ["Two test surfaces, on purpose"](#two-test-surfaces-on-purpose).
 
 Everything else (HTTP API, SQLite storage, auth, file storage, the admin UI, the
 CLI) comes straight from the framework via the public `zigbase.*` exports.
@@ -433,21 +437,26 @@ npm install && npm run typecheck && npm run test:e2e
 ```
 
 The e2e suite (`test/`) drives the generated typed client (`clients/typescript/zbase.gen.ts`)
-against a live `golfsim` binary — covering CRUD, filtering, auth, realtime, and the
-session-management routes (`golfsim.e2e.test.ts`), plus the determinism seam, `ctx.tx`,
-and `ctx.http` (`golfsim.determinism.e2e.test.ts`) — all with full TypeScript
-type-checking via `vitest`.
+against a live `golfsim` binary — covering typed CRUD, filtering, expand, auth, realtime,
+and typed custom-route RPC including the session-management routes (`golfsim.e2e.test.ts`),
+plus `ctx.http()`'s webhook offload (`golfsim.determinism.e2e.test.ts`) — all with full
+TypeScript type-checking via `vitest`. See ["Two test surfaces, on purpose"](#two-test-surfaces-on-purpose)
+below for what moved to the in-process Zig suite and why the webhook test could not follow.
 
 ### Determinism e2e — frozen time + captured webhook
 
 `test/golfsim.determinism.e2e.test.ts` starts a golfsim server with `ZIGBASE_FAKE_NOW`
 set (so the whole process clock is frozen) and `GOLFSIM_BOOKING_WEBHOOK_URL` pointed at
-an in-process Node capture server, then asserts:
-
-- A hold's server-stamped `expires_at` equals the frozen instant + 15 min (the
-  `ZIGBASE_FAKE_NOW` seam reaches consumer hook code via the DB clock).
-- `POST /api/holds/:id/convert` creates the booking **and** deletes the hold atomically.
-- Confirming a booking POSTs the `booking.confirmed` webhook to the capture server.
+an in-process Node capture server, then asserts that confirming a booking POSTs the
+`booking.confirmed` webhook (`ctx.http()`, offloaded via `ctx.app.submit`) to the capture
+server. The frozen-clock hold-expiry assertion and the `ctx.tx` hold-into-booking
+conversion that used to live here moved to the in-process Zig suite (`zig build test`),
+which reproduces both more precisely (byte-exact `expires_at`, and a determinism test that
+proves `.fake_now_unix` + `.fake_seed` give identical output across two independent boots)
+with no server process or port. The webhook test could NOT move: it needs `ctx.app.submit`'s
+background worker pool, which `zigbase.testing`'s socketless boot deliberately never starts
+(see the "Two test surfaces" section below) — so `ctx.app.submit` always returns
+`error.SchedulerUnavailable` in-process, and the webhook offload silently no-ops there.
 
 The determinism seam (`ZIGBASE_FAKE_NOW`, test-capture) is compiled in only on a
 `dev_mode` build — the default Debug build the harness produces — and is comptime-
@@ -473,6 +482,56 @@ const health = await zb.rpc.golfsimHealth();
 ```
 
 `unknown` outputs correspond to `std.json.Value` in Zig — cast to your concrete type for field access. The e2e test (`test/golfsim.e2e.test.ts`) exercises `bookingsConfirm` live through this surface.
+
+---
+
+## Two test surfaces, on purpose
+
+```sh
+mise exec zig@0.16.0 -- zig build test              # in-process, no socket
+cd frontend && npm install && npm run build && cd .. # the app needs frontend/dist to boot at all
+mise exec node@24 -- npm install && npm run test:e2e # real server, real generated client
+```
+
+`zig build test` uses [`zigbase.testing`](../../docs/testing.md): it boots this app
+against a throwaway data directory and injects requests through the real router, access
+rules, auth, and hooks — no port, no background threads, milliseconds per test. It covers
+the business logic that makes golfsim "the hard parts" example: `prepareBooking`'s
+computed `price_total`, forced `status = "pending"`, server-stamped `guest`, and
+double-booking rejection; `prepareReview`'s ownership + confirmed-only gate;
+`confirmBooking`'s multi-hop owner check and the `bookings_frozen` kill switch;
+`cancelBooking`'s guest-only guard; `listingAvailability`'s cancelled-booking filter;
+`prepareHold`'s frozen-clock TTL stamp; the `POST /api/holds/:id/convert` atomic
+`ctx.txWith` conversion; per-device sessions (list/revoke/logout-everywhere); and the
+`require_verified` login gate. It also proves reproducibility directly: booting the same
+app twice with the same `.fake_seed` + `.fake_now_unix` produces byte-identical generated
+ids and hook-derived timestamps — the in-process equivalent of the `ZIGBASE_FAKE_NOW` /
+`ZIGBASE_FAKE_SEED` env vars a spawned server reads. **This is how you should test your
+own app's business logic.**
+
+Because `.static_files = .{ .dir = "frontend/dist" }` is comptime-hardcoded (not the
+`--serve-static` flag blog uses), golfsim's app refuses to boot — including the
+socketless boot `zig build test` uses — unless `frontend/dist` already exists. Build the
+frontend once before running the in-process suite (see the command above); CI does the
+same right before its `zig build test` step.
+
+The vitest suite (`test/`) covers what an in-process test structurally cannot, and now
+covers ONLY that: it spawns the real binary and drives the **generated typed client**
+(`clients/typescript/zbase.gen.ts`) over a real HTTP + WebSocket socket, so it's the only
+surface that exercises the codegen output itself — typed `zb.db.<collection>.*` CRUD,
+typed `expand`, and typed `zb.rpc.*` custom-route calls including the session-management
+RPCs — plus one thing the in-process harness structurally cannot observe: the
+booking-confirmation webhook. `confirmBooking` offloads that webhook via
+`ctx.app.submit` onto the background worker pool, and `zigbase.testing`'s socketless
+`bootForTest` deliberately never starts that pool (it boots just far enough to route a
+request, not to serve) — so under `zig build test`, `ctx.app.submit` always returns
+`error.SchedulerUnavailable`, which the route swallows (logged, not surfaced), and the
+webhook silently never fires. Verifying it actually POSTs needs a real spawned server
+with a real worker pool, which is exactly what `golfsim.determinism.e2e.test.ts` now
+exists to do — everything else that file used to cover (the frozen-clock hold-expiry
+stamp, the atomic hold→booking conversion) moved to the in-process suite, which
+reproduces both more precisely and without a port. Keep both suites; neither implies
+the other.
 
 ---
 

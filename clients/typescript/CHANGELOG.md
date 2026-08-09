@@ -6,6 +6,15 @@ on [Keep a Changelog](https://keepachangelog.com/), and this package adheres to
 
 ## [Unreleased]
 
+### Added
+
+- `ZigbaseError.code` — the error envelope's frozen machine code (`"not_found"`,
+  `"validation_failed"`, `"email_not_verified"`, …). Branch on this instead of matching
+  `message` text, whose wording is explicitly not part of the API contract. It is `""`
+  when the server sent no code (a non-JSON body, or a response from something that isn't
+  ZigBase); an integer `code` from a pre-unification server is ignored rather than
+  surfaced. Additive — no existing field changed.
+
 ### Security
 
 - **Realtime connections are now de-authed on logout.** Previously, clearing the

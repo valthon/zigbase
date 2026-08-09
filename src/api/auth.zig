@@ -76,7 +76,7 @@ pub fn rateLimited(ctx: *http.RequestCtx, scope: []const u8, ident: []const u8) 
     else
         try std.fmt.allocPrint(ctx.allocator.a, "{s}:ident:{s}", .{ scope, ident });
     if (limiter.allow(key, wallNowUnix(app.io))) return null;
-    return try (ApiError{ .status = 429, .message = "Too many requests. Try again later." }).toResponse(ctx.allocator.a);
+    return try ApiError.withCode(429, .too_many_requests, "Too many requests. Try again later.").toResponse(ctx.allocator.a);
 }
 
 /// Per-method variant of `rateLimited`: enforces a method-specific `max`/`window_s`
@@ -95,7 +95,7 @@ pub fn rateLimitedCustom(ctx: *http.RequestCtx, scope: []const u8, ident: []cons
     else
         try std.fmt.allocPrint(ctx.allocator.a, "{s}:ident:{s}", .{ scope, ident });
     if (limiter.allowCustom(key, wallNowUnix(app.io), max, window_s)) return null;
-    return try (ApiError{ .status = 429, .message = "Too many requests. Try again later." }).toResponse(ctx.allocator.a);
+    return try ApiError.withCode(429, .too_many_requests, "Too many requests. Try again later.").toResponse(ctx.allocator.a);
 }
 
 /// SQL `now` for framework token logic (iat/exp, consumed-token expiry), honoring the
@@ -199,6 +199,7 @@ test "findByIdentity: a .nocase email index makes the SQLite lookup case-insensi
 
 pub fn passwordHashFor(alloc: std.mem.Allocator, conn: *db.Db, table: []const u8, rid: []const u8) !?[]const u8 {
     const sql = try std.fmt.allocPrintSentinel(alloc, "SELECT \"passwordHash\" FROM \"{s}\" WHERE \"id\" = ?1;", .{table}, 0);
+    defer alloc.free(sql);
     var st = try prep(conn, sql);
     defer st.finalize();
     try st.bindText(1, rid);
@@ -206,8 +207,76 @@ pub fn passwordHashFor(alloc: std.mem.Allocator, conn: *db.Db, table: []const u8
     return try alloc.dupe(u8, st.columnText(0));
 }
 
+/// Verify `password` against the stored value, and — when that value is a TAGGED legacy
+/// hash and the verification SUCCEEDS — replace it with a fresh argon2id hash before
+/// returning. Returns whether the password was correct; an upgrade failure is logged and
+/// swallowed, because a transient write problem must never turn a valid login into a
+/// rejected one.
+///
+/// The upgrade is the ONLY write on the login path and takes the writer for the duration of
+/// a single UPDATE — never across the argon2 verify, which stays on the reader.
+pub fn verifyPasswordUpgrading(
+    app: *@import("../app.zig").App,
+    alloc: std.mem.Allocator,
+    table: []const u8,
+    rid: []const u8,
+    stored: []const u8,
+    password: []const u8,
+) bool {
+    if (!crypto.isLegacyHash(stored)) return crypto.verifyPassword(app.io, alloc, stored, password);
+    if (!crypto.verifyLegacy(stored, password)) return false;
+
+    // Verified. Upgrade to argon2id — best effort: a failed write must never turn a valid
+    // login into a rejected one, so every error below is logged and swallowed. The user
+    // simply stays on the legacy hash until their next login.
+    upgradeHash(app, alloc, table, rid, stored, password) catch |e|
+        std.log.warn("legacy password upgrade failed for {s}/{s}: {s}", .{ table, rid, @errorName(e) });
+    return true;
+}
+
+/// Rewrite `table`/`rid`'s `passwordHash` from the (already-verified) legacy `stored` value to
+/// a fresh argon2id hash of `password`. Guards the UPDATE on the old value so two concurrent
+/// upgrades — or an upgrade racing an unrelated password change — cannot clobber each other;
+/// the loser's UPDATE simply matches zero rows and is a silent no-op.
+fn upgradeHash(
+    app: *@import("../app.zig").App,
+    alloc: std.mem.Allocator,
+    table: []const u8,
+    rid: []const u8,
+    stored: []const u8,
+    password: []const u8,
+) !void {
+    // Every collection name came from `_collections` and passed validation on creation;
+    // re-check before interpolating, per the repo's identifier discipline.
+    if (!schema.isValidIdentifier(table)) return error.InvalidIdentifier;
+    const phc = try crypto.hashPassword(app.io, alloc, password);
+    defer alloc.free(phc);
+    const sql = try std.fmt.allocPrintSentinel(
+        alloc,
+        "UPDATE \"{s}\" SET \"passwordHash\" = ?1 WHERE \"id\" = ?2 AND \"passwordHash\" = ?3;",
+        .{table},
+        0,
+    );
+    defer alloc.free(sql);
+
+    // The writer is held for ONE statement — never across the (deliberately slow) verify
+    // above, which ran on a pooled reader so it could not serialize all writes.
+    const w = app.pool.acquireWriter();
+    defer app.pool.releaseWriter();
+    var st = try prep(w, sql);
+    defer st.finalize();
+    try st.bindText(1, phc);
+    try st.bindText(2, rid);
+    // Guarding on the OLD value makes the upgrade idempotent under concurrency: two
+    // simultaneous logins cannot both write, and a password change that landed in between
+    // is not clobbered by this stale rehash.
+    try st.bindText(3, stored);
+    _ = try st.step();
+}
+
 pub fn tokenKeyFor(alloc: std.mem.Allocator, conn: *db.Db, table: []const u8, rid: []const u8) !?[]const u8 {
     const sql = try std.fmt.allocPrintSentinel(alloc, "SELECT \"tokenKey\" FROM \"{s}\" WHERE \"id\" = ?1;", .{table}, 0);
+    defer alloc.free(sql);
     var st = try prep(conn, sql);
     defer st.finalize();
     try st.bindText(1, rid);
@@ -223,6 +292,7 @@ pub const KeyEpoch = struct { token_key: []const u8, epoch: i64 };
 /// own epoch SELECT, it takes the epoch from here. NULL epoch reads as 0 (back-compat).
 pub fn tokenKeyAndEpochFor(alloc: std.mem.Allocator, conn: *db.Db, table: []const u8, rid: []const u8) !?KeyEpoch {
     const sql = try std.fmt.allocPrintSentinel(alloc, "SELECT \"tokenKey\", COALESCE(\"token_epoch\", 0) FROM \"{s}\" WHERE \"id\" = ?1;", .{table}, 0);
+    defer alloc.free(sql);
     var st = try prep(conn, sql);
     defer st.finalize();
     try st.bindText(1, rid);
@@ -236,6 +306,7 @@ pub fn tokenKeyAndEpochFor(alloc: std.mem.Allocator, conn: *db.Db, table: []cons
 /// row exists.
 pub fn tokenEpochFor(alloc: std.mem.Allocator, conn: *db.Db, table: []const u8, rid: []const u8) !?i64 {
     const sql = try std.fmt.allocPrintSentinel(alloc, "SELECT COALESCE(\"token_epoch\", 0) FROM \"{s}\" WHERE \"id\" = ?1;", .{table}, 0);
+    defer alloc.free(sql);
     var st = try prep(conn, sql);
     defer st.finalize();
     try st.bindText(1, rid);
@@ -248,6 +319,7 @@ pub fn tokenEpochFor(alloc: std.mem.Allocator, conn: *db.Db, table: []const u8, 
 /// run under the writer lock. `table` is the physical auth table. Returns the new epoch.
 pub fn bumpTokenEpoch(alloc: std.mem.Allocator, conn: *db.Db, table: []const u8, rid: []const u8) !i64 {
     const sql = try std.fmt.allocPrintSentinel(alloc, "UPDATE \"{s}\" SET \"token_epoch\" = COALESCE(\"token_epoch\", 0) + 1 WHERE \"id\" = ?1;", .{table}, 0);
+    defer alloc.free(sql);
     var st = try prep(conn, sql);
     defer st.finalize();
     try st.bindText(1, rid);
@@ -708,14 +780,14 @@ pub fn authWithPassword(ctx: *http.RequestCtx) anyerror!http.Response {
         crypto.dummyVerify(app.io, ctx.allocator.a);
         return ApiError.badRequest("Invalid credentials.").toResponse(ctx.allocator.a);
     };
-    if (!crypto.verifyPassword(app.io, ctx.allocator.a, phc, password))
+    if (!verifyPasswordUpgrading(app, ctx.allocator.a, col.name, rid, phc, password))
         return ApiError.badRequest("Invalid credentials.").toResponse(ctx.allocator.a);
 
     const rec = (try records.get(ctx.allocator.a, &r, col, rid)) orelse
         return ApiError.notFound().toResponse(ctx.allocator.a);
     // Optional verification gate: refuse to mint a session for an unverified record.
     if (col.options.auth.require_verified and !recordVerified(rec))
-        return (ApiError{ .status = 403, .message = "Email not verified." }).toResponse(ctx.allocator.a);
+        return ApiError.withCode(403, .email_not_verified, "Email not verified.").toResponse(ctx.allocator.a);
     // Issuance (three paths):
     //  1. HOOK path (#80, 0.10.0): a registered `beforeAuthSuccess` runs inside a write
     //     transaction so its side-writes commit atomically with issuance and an abort blocks
@@ -780,10 +852,10 @@ pub fn authRefresh(ctx: *http.RequestCtx) anyerror!http.Response {
     const w = app.pool.acquireWriter();
     defer app.pool.releaseWriter();
     const authed = (try auth.authenticate(app.io, ctx.allocator.a, app, ctx, w)) orelse
-        return (ApiError{ .status = 401, .message = "Not authenticated." }).toResponse(ctx.allocator.a);
+        return ApiError.withCode(401, .unauthorized, "Not authenticated.").toResponse(ctx.allocator.a);
     const col_name = ctx.param("col") orelse return ApiError.notFound().toResponse(ctx.allocator.a);
     if (!std.mem.eql(u8, authed.collection, col_name))
-        return (ApiError{ .status = 401, .message = "Not authenticated." }).toResponse(ctx.allocator.a);
+        return ApiError.withCode(401, .unauthorized, "Not authenticated.").toResponse(ctx.allocator.a);
 
     const rid = authed.record.object.get("id").?.string;
 
@@ -821,7 +893,7 @@ pub fn authRefresh(ctx: *http.RequestCtx) anyerror!http.Response {
     const issued = issueSessionNoEmit(ctx, w, col_name, rid) catch |err| switch (err) {
         error.NotFound => {
             w.rollback() catch {};
-            return (ApiError{ .status = 401, .message = "Not authenticated." }).toResponse(ctx.allocator.a);
+            return ApiError.withCode(401, .unauthorized, "Not authenticated.").toResponse(ctx.allocator.a);
         },
         else => return err, // errdefer rolls back
     };
@@ -2237,6 +2309,122 @@ fn loginToken(env: *TestEnv, a: RequestArena, col: []const u8, identity: []const
     return parsed.value.object.get("token").?.string;
 }
 
+/// Create an auth record via the normal path (so identity/tokenKey/etc. are populated the
+/// way production data is), then force its `passwordHash` column to `stored` — the seam a
+/// legacy-hash test needs, since `createUser`/`applyCreate` always argon2-hashes. Returns
+/// the record id. The placeholder password passed to `createUser` is immediately overwritten
+/// and never used to authenticate.
+fn seedAuthRecord(env: *TestEnv, a: std.mem.Allocator, col_name: []const u8, email: []const u8, stored: []const u8) ![]const u8 {
+    try env.createUser(a, col_name, email, "placeholder-unused-1");
+    const w = env.pool.acquireWriter();
+    defer env.pool.releaseWriter();
+    const col = (try collections.get(a, w, col_name)).?;
+    const rid = (try findByIdentity(a, w, col, email)).?;
+    const sql = try std.fmt.allocPrintSentinel(a, "UPDATE \"{s}\" SET \"passwordHash\" = ?1 WHERE \"id\" = ?2;", .{col.name}, 0);
+    var st = try prep(w, sql);
+    defer st.finalize();
+    try st.bindText(1, stored);
+    try st.bindText(2, rid);
+    _ = try st.step();
+    return rid;
+}
+
+/// Read a record's current `passwordHash` (owned by `a`), via a pooled reader.
+fn readHash(a: std.mem.Allocator, env: *TestEnv, col_name: []const u8, rid: []const u8) !?[]const u8 {
+    var r = try env.pool.acquireReader();
+    defer env.pool.releaseReader(&r);
+    return passwordHashFor(a, &r, col_name, rid);
+}
+
+/// Seed `col_name`'s existing auth collection with a fresh record (via the normal create
+/// path, so identity/tokenKey/etc. are populated the way production data is), then force
+/// its `passwordHash` column to `stored` — the seam a legacy-hash test needs, since
+/// `createUser`/`applyCreate` always argon2-hashes. Everything intermediate (the fetched
+/// collection, the provisioned/created JSON graphs, the UPDATE SQL) is freed here; only the
+/// returned record id is left for the caller to free. Unlike `TestEnv.createUser` /
+/// `seedAuthRecord`, this is leak-clean under a bare `std.testing.allocator` — it exists
+/// for the two `verifyPasswordUpgrading` tests below, which (unlike the file's other auth
+/// tests) drive `verifyPasswordUpgrading` directly rather than through a `RequestArena`, so
+/// they leak-check for real instead of masking behind an arena.
+fn seedRawHash(env: *TestEnv, a: std.mem.Allocator, col_name: []const u8, email: []const u8, stored: []const u8) ![]const u8 {
+    const w = env.pool.acquireWriter();
+    defer env.pool.releaseWriter();
+
+    const col = (try collections.get(a, w, col_name)).?;
+    defer col.deinit(a);
+
+    var data: std.json.ObjectMap = .empty;
+    defer data.deinit(a);
+    try data.put(a, "email", .{ .string = email });
+    try data.put(a, "password", .{ .string = "placeholder-unused-1" });
+    const prepared = try auth.applyCreate(env.app.io, a, .{ .object = data }, col.options.auth.minPasswordLength);
+    defer auth.freeProvisioned(a, prepared);
+    const rec = try records.create(a, env.app.io, w, col, prepared);
+    defer records.freeRecord(a, rec);
+    const rid = try a.dupe(u8, rec.object.get("id").?.string);
+    errdefer a.free(rid);
+
+    const sql = try std.fmt.allocPrintSentinel(a, "UPDATE \"{s}\" SET \"passwordHash\" = ?1 WHERE \"id\" = ?2;", .{col.name}, 0);
+    defer a.free(sql);
+    var st = try prep(w, sql);
+    defer st.finalize();
+    try st.bindText(1, stored);
+    try st.bindText(2, rid);
+    _ = try st.step();
+    return rid;
+}
+
+test "verifyPasswordUpgrading verifies a legacy hash and rewrites it as argon2id" {
+    // Not a handler test (no RequestArena/Response graph) — drives verifyPasswordUpgrading
+    // directly, so it runs on the bare leak-checked allocator (contract-4 does not apply).
+    const a = std.testing.allocator;
+    var env = try TestEnv.initAuth("users");
+    defer env.deinit();
+
+    const bc = "$2b$04$gKLlzqBYq6vyAUzUTYq/f.2na5B02QSMuFv75B374EKmX3m3Kt1UG"; // "abc"
+    const tagged = try crypto.wrapLegacy(a, "bcrypt", bc);
+    defer a.free(tagged);
+    const rid = try seedRawHash(env, a, "users", "ada@example.com", tagged);
+    defer a.free(rid);
+
+    // Wrong password: no upgrade, no write.
+    try std.testing.expect(!verifyPasswordUpgrading(&env.app, a, "users", rid, tagged, "wrong"));
+    const still_tagged = (try readHash(a, env, "users", rid)).?;
+    defer a.free(still_tagged);
+    try std.testing.expectEqualStrings(tagged, still_tagged);
+
+    // Right password: verified AND upgraded, in place.
+    try std.testing.expect(verifyPasswordUpgrading(&env.app, a, "users", rid, tagged, "abc"));
+    const after = (try readHash(a, env, "users", rid)).?;
+    defer a.free(after);
+    try std.testing.expect(std.mem.startsWith(u8, after, "$argon2"));
+    try std.testing.expect(!crypto.isLegacyHash(after));
+
+    // The upgraded hash verifies the same password, and the legacy value is never restored.
+    try std.testing.expect(verifyPasswordUpgrading(&env.app, a, "users", rid, after, "abc"));
+    const twice = (try readHash(a, env, "users", rid)).?;
+    defer a.free(twice);
+    try std.testing.expectEqualStrings(after, twice);
+}
+
+test "verifyPasswordUpgrading leaves an argon2 hash untouched" {
+    // Not a handler test (no RequestArena/Response graph) — drives verifyPasswordUpgrading
+    // directly, so it runs on the bare leak-checked allocator (contract-4 does not apply).
+    const a = std.testing.allocator;
+    var env = try TestEnv.initAuth("users");
+    defer env.deinit();
+
+    const phc = try crypto.hashPassword(env.app.io, a, "hunter22");
+    defer a.free(phc);
+    const rid = try seedRawHash(env, a, "users", "grace@example.com", phc);
+    defer a.free(rid);
+
+    try std.testing.expect(verifyPasswordUpgrading(&env.app, a, "users", rid, phc, "hunter22"));
+    const after = (try readHash(a, env, "users", rid)).?;
+    defer a.free(after);
+    try std.testing.expectEqualStrings(phc, after); // byte-identical: no pointless rehash
+}
+
 test "#98 refresh: before/after refresh hooks fire on a valid refresh" {
     var env = try TestEnv.initAuth("refreshu");
     defer env.deinit();
@@ -2554,6 +2742,26 @@ test "#80 hook-free epoch login never acquires the writer" {
     try std.testing.expectEqual(before, env.pool.writer_acquires); // reader-only login
 }
 
+test "#80/legacy-upgrade: a hook-free epoch login over a legacy hash acquires the writer EXACTLY once" {
+    var env = try TestEnv.initAuth("lg4");
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const bc = "$2b$04$gKLlzqBYq6vyAUzUTYq/f.2na5B02QSMuFv75B374EKmX3m3Kt1UG"; // "abc"
+    const tagged = try crypto.wrapLegacy(a, "bcrypt", bc);
+    _ = try seedAuthRecord(env, a, "lg4", "u@x.io", tagged);
+
+    // env.app.dispatch == null and session_store == .epoch (defaults): the fast path — but
+    // now the stored hash is legacy, so the upgrade's single UPDATE is the only write.
+    const before = env.pool.writer_acquires;
+    const p = [_]http.Param{.{ .key = "col", .value = "lg4" }};
+    var login = env.ctx(RequestArena.from(&arena), .POST, "{\"identity\":\"u@x.io\",\"password\":\"abc\"}", &p);
+    try std.testing.expectEqual(@as(u16, 200), (try authWithPassword(&login)).status);
+    try std.testing.expectEqual(before + 1, env.pool.writer_acquires); // exactly one write: the upgrade
+}
+
 test "#80 authRefresh: before_refresh then beforeAuthSuccess(.refresh) in ONE txn; seam abort rolls back both" {
     var env = try TestEnv.initAuth("rf1");
     defer env.deinit();
@@ -2631,4 +2839,47 @@ test "#80 onAuth reports .refresh (not .password) on auth-refresh" {
     refresh.authorization = bearer;
     try std.testing.expectEqual(@as(u16, 200), (try authRefresh(&refresh)).status);
     try std.testing.expectEqual(events.AuthMethod.refresh, Tag.seen.?);
+}
+
+test "login on a require_verified collection reports email_not_verified, not a bare forbidden" {
+    // The point of a bespoke code: an unverified account is a DISTINCT, actionable state
+    // (switch to the verify-email flow), not a flat denial. A client must be able to tell
+    // it from `forbidden` without matching on message text — the coupling that
+    // examples/golfsim's frontend used to carry.
+    var env = try TestEnv.initAuth("verifgate");
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // A second auth collection that gates on verification; initAuth's own collection
+    // leaves require_verified at its default of false.
+    {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        _ = try collections.create(a, std.testing.io, w, .{
+            .id = "",
+            .name = "verifgate2",
+            .type = .auth,
+            .fields = &[_]schema.Field{.{ .id = "vg1", .name = "bio", .options = .{ .text = .{} } }},
+            .options = .{ .auth = .{ .require_verified = true } },
+            .listRule = "",
+            .viewRule = "",
+            .createRule = "",
+            .updateRule = "",
+            .deleteRule = "",
+        });
+    }
+    try env.createUser(a, "verifgate2", "unverified@x.io", "password123");
+
+    const p = [_]http.Param{.{ .key = "col", .value = "verifgate2" }};
+    var login = env.ctx(RequestArena.from(&arena), .POST, "{\"identity\":\"unverified@x.io\",\"password\":\"password123\"}", &p);
+    const res = try authWithPassword(&login);
+    try std.testing.expectEqual(@as(u16, 403), res.status);
+
+    // Parse the body rather than substring-matching: the `code` field IS the contract.
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, res.body, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("email_not_verified", parsed.value.object.get("code").?.string);
+    try std.testing.expectEqual(@as(i64, 403), parsed.value.object.get("status").?.integer);
 }

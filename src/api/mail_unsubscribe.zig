@@ -46,7 +46,7 @@ fn handle(ctx: *http.RequestCtx, mutate: bool) anyerror!http.Response {
     if (app.rate_limiter) |rl| {
         const key = try std.fmt.allocPrint(ctx.allocator.a, "mail_unsub:ip:{s}", .{ctx.remote_ip});
         if (!rl.allowCustom(key, clock.nowUnix(app.io), rate_max, rate_window_s)) {
-            return (ApiError{ .status = 429, .message = "Too many requests. Try again later." }).toResponse(ctx.allocator.a);
+            return ApiError.withCode(429, .too_many_requests, "Too many requests. Try again later.").toResponse(ctx.allocator.a);
         }
     }
 

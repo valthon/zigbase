@@ -53,20 +53,50 @@ explicit `zigbase.Config`, skipping CLI parsing.)
 
 ## 2. Add the dependency
 
+The fastest path is to scaffold — it writes a `build.zig` already wired with
+the helpers below, a `build.zig.zon`, a `src/main.zig` with a comptime schema
+and in-process tests, and an `AGENTS.md`:
+
+```sh
+npx zigbase init --framework --dir myapp && cd myapp
+zig fetch --save git+https://github.com/valthon/zigbase
+```
+
+To wire it by hand instead:
+
 ```sh
 zig fetch --save git+https://github.com/valthon/zigbase
 ```
 
+`zig fetch --save` writes both the dependency URL and its content hash into
+`build.zig.zon`. Never hand-write either, and never copy the relative
+`.path = "../.."` form out of this repository's `examples/` — that only
+resolves inside this repo.
+
 In your `build.zig`:
 
 ```zig
-const zb = b.dependency("zigbase", .{ .target = target, .optimize = optimize });
-exe_mod.addImport("zigbase", zb.module("zigbase"));
-// exe_mod must link libc: zigbase carries the SQLite C source and zap transitively.
+const zigbase = @import("zigbase"); // the dependency's own build.zig
+
+const dep = b.dependency("zigbase", .{ .target = target, .optimize = optimize });
+zigbase.addTo(dep, exe_mod);
 ```
 
-Your `exe_mod` must be created with `.link_libc = true` (the `zigbase` module
-itself is built with `link_libc` and the bundled SQLite amalgamation + zap).
+zigbase requires libc — it carries the bundled SQLite amalgamation and zap
+transitively. `addTo` adds the `"zigbase"` import **and** sets `link_libc` on
+your module in one call, so your build never depends on remembering either.
+Wiring it by hand works too, but then `.link_libc = true` on your module is
+yours to remember:
+
+```zig
+const exe_mod = b.createModule(.{
+    .root_source_file = b.path("src/main.zig"),
+    .target = target,
+    .optimize = optimize,
+    .link_libc = true, // required; addTo sets this for you
+});
+exe_mod.addImport("zigbase", dep.module("zigbase"));
+```
 
 zigbase is pinned to a single Zig minor series (currently **0.16.0**, see
 `build.zig.zon`'s `minimum_zig_version` and `mise.toml`). Building against an
@@ -82,10 +112,26 @@ Minimal `src/main.zig`:
 const std = @import("std");
 const zigbase = @import("zigbase");
 
+/// Structured logging: this routes every std.log call through the same JSON-capable
+/// encoder as request logging. Access lines and --log-format/--log-level work either
+/// way; omitting this line just leaves std.log output in Zig's default format, mixed
+/// with JSON access lines under --log-format=json. `std_options` is resolved from the
+/// root source file, so every consumer binary declares this itself.
+pub const std_options = zigbase.std_options;
+
 pub fn main(init: std.process.Init) !void {
     return zigbase.App(.{}).runCli(init); // no extensions = the stock server
 }
 ```
+
+`std_options` is a Zig language feature resolved from your program's **root**
+source file — it cannot be inherited from the `zigbase` module, so every consumer
+binary (including all three `examples/*`) declares that one line itself. Omitting it
+does *not* disable `--log-format`/`--log-level` or request logging — those are applied
+directly by the server regardless. It means any `std.log` call (from your own code or
+ZigBase internals) keeps rendering in Zig's default ANSI, timestamp-free format, so
+under `--log-format=json` you get a mixed stream: JSON access lines interleaved with
+un-encoded std.log lines.
 
 ## 3. The `App(.{...})` config keys
 
@@ -167,6 +213,14 @@ Setting `.enable_typegen = true` in the `App(.{ … })` literal gates in the `ty
 subcommand, which generates a typed TypeScript client from the server's live schema (runtime
 introspection). It is `false` by default so that production binaries carry no codegen code or
 dependencies.
+
+This is a **different axis** from the `-Ddev-tools` build flag above: `.enable_typegen` is an
+`App(.{...})`-level comptime key that a *consumer's own binary* opts into (independent per
+build target — e.g. off in your main server, on in a dedicated codegen build); `-Ddev-tools`
+is a `build.zig` flag that governs whether `init`/`agents-md`/`typegen` compile into the CLI
+**at all**, regardless of `.enable_typegen`. A binary needs both `-Ddev-tools=true` (the
+default) *and* `.enable_typegen = true` for `typegen` to actually run; either one off makes it
+unavailable, each with its own actionable error.
 
 ```zig
 // client-generation build target — NOT your production binary
@@ -469,8 +523,11 @@ literal is fine.
 
 - `ctx.json(status, value)` — serialize any JSON-encodable value (incl. a `std.json.Value`)
   into an `application/json` response.
-- `ctx.jsonError(status, code)` — a terse `{"error":"<code>"}` JSON body (distinct from the
-  framework's `{code,message,data}` envelope; use `ctx.errorResponse` for that one).
+- `ctx.jsonError(status, code, message)` — the canonical `{status,code,message,data}`
+  envelope with a caller-supplied machine `code` (unvalidated against ZigBase's frozen
+  ledger — it's your vocabulary). You can also name ZigBase's own registry via the public
+  re-exports `zigbase.error_codes` / `zigbase.ErrorCode` (e.g. `zigbase.error_codes.s(.not_found)`)
+  when a custom route wants to emit one of the frozen codes instead of inventing its own.
 - `ctx.html(status, body)` — a `text/html; charset=utf-8` response.
 - `ctx.redirect(status, location)` — a redirect with a `Location` header.
 - `ctx.notFound()` — the canonical `404 Not found.` envelope.
@@ -1357,9 +1414,9 @@ fn submitHandler(ctx: *zigbase.Ctx) anyerror!http.Response {
     // for a JSON/form POST, read `ctx.request.?.body` / `ctx.request.?.form_fields`.
     const token = (try ctx.query()).get("captcha") orelse "";
     const r = try ctx.verifyCaptcha(.recaptcha_v3, token);
-    if (!r.ok) return ctx.jsonError(403, "captcha_required");
+    if (!r.ok) return ctx.jsonError(403, "captcha_required", "Captcha required.");
     // reCAPTCHA v3: score 0.0 (bot) → 1.0 (human); block suspicious traffic.
-    if (r.score) |score| if (score < 0.5) return ctx.jsonError(403, "suspicious_request");
+    if (r.score) |score| if (score < 0.5) return ctx.jsonError(403, "suspicious_request", "Suspicious request.");
     // ... proceed with the submission ...
 }
 ```
@@ -1398,7 +1455,7 @@ non-verdict (an error) and decide fail-open vs fail-closed: `error.TransportFail
 ```zig
 const r = ctx.verifyCaptcha(.turnstile, token) catch |e| {
     std.log.warn("captcha provider unreachable: {s}", .{@errorName(e)});
-    // fail-open: proceed; or return ctx.jsonError(503, "captcha_unavailable") to fail-closed
+    // fail-open: proceed; or return ctx.jsonError(503, "captcha_unavailable", "Captcha unavailable.") to fail-closed
     return process(ctx);
 };
 ```
@@ -3610,6 +3667,18 @@ An **orphaned** row — an applied `prov:` migration whose id is no longer compi
 binary)" and counted in the summary, so a divergence between the ledger and the source is visible
 at a glance.
 
+`--json` emits the same information as one object on stdout instead (see [Machine-readable CLI
+output](observability.md#machine-readable-cli-output)):
+
+```text
+$ zigbase migrate status --json --data-dir ./zb_data
+{"migrations":[{"id":"0001_widgets","applied":true,"applied_at":"2026-07-06 12:00:00"},{"id":"0002_slugify","applied":false,"applied_at":null}],"orphaned":[],"summary":{"declared":2,"applied":1,"pending":1,"orphaned":0},"ok":false}
+```
+
+Both forms share the same **exit code**: `migrate status` exits `1` when anything is pending or
+orphaned, `0` when the database is fully up to date (`ok` in the JSON body carries the same
+signal) — so it can gate a deploy step: `zigbase migrate status || zigbase migrate`.
+
 `zigbase migrate rollback [N]` reverses the **N most-recently-applied consumer migrations**, newest
 first (`N` is a positional integer, default `1`); system migrations are never touched:
 
@@ -3674,6 +3743,18 @@ generated output, not authoritative configuration.
 > cleanly, but a hand-rolled schema using `serial`/`enum`/extension columns or those SQLite objects
 > may not re-run into a bare database.
 
+#### Preflight checks (`zigbase doctor`)
+
+`zigbase doctor [--production] [--json] [--data-dir PATH]` runs nine checks over a deployment —
+JWT-secret persistence, every `@public` access rule (enumerated by name), cookie security, bind
+address, reverse-proxy coherence, mailer configuration, pending/orphaned migrations, data-dir
+writability, and legacy password hashes still pending re-hash.
+
+See [serve.md → `zigbase doctor`](serve.md#8-zigbase-doctor) for the full worked example (prose
+and NDJSON output, captured from a real run), the per-check severity table, exit codes, both
+deploy-gate idioms, and `doctor`'s database-mutation contract (it only ever creates the
+`_migrations` ledger table if absent — the same write `migrate status` already makes).
+
 #### Offline bulk import (`zigbase import`)
 
 `zigbase import` bulk-loads records from an **NDJSON** file (one JSON object per line) into a
@@ -3690,6 +3771,12 @@ zigbase import --collection users --upsert-key email --data-dir ./zb_data users.
 
 # Read NDJSON from stdin with a file path of `-`.
 cat dump.ndjson | zigbase import --collection posts --data-dir ./zb_data -
+
+# Rehearse a 500k-row migration without writing anything, then run it for real, tolerating
+# a handful of bad rows and keeping a machine-readable record of what happened.
+zigbase import --collection posts --dry-run --data-dir ./zb_data seed.ndjson
+zigbase import --collection posts --continue-on-error --error-log errs.ndjson \
+    --progress 10000 --json --data-dir ./zb_data seed.ndjson
 ```
 
 | Flag | Meaning |
@@ -3698,7 +3785,17 @@ cat dump.ndjson | zigbase import --collection posts --data-dir ./zb_data -
 | `--upsert-key FIELD` | Match each row on `FIELD`; UPDATE if present, else create. `FIELD` must be a scalar, **non-encrypted**, existing field; a unique constraint is recommended (a non-unique key logs a warning). |
 | `--batch-size N` | Rows per transaction (default `500`; must be ≥ 1). |
 | `--data-dir PATH` | Data directory (also `ZIGBASE_DATA_DIR`, default `./zb_data`). |
+| `--dry-run` | Validate and execute every row through the full engine, then roll back instead of committing. Nothing is written; the summary reports what a fresh import would do. Because nothing commits, an `--upsert-key` lookup never sees rows "created" earlier in the same dry run. |
+| `--continue-on-error` | Skip a failing row (wrapped in its own `SAVEPOINT`) instead of aborting the whole import. The good rows in that batch still commit. |
+| `--error-log FILE` | NDJSON sink for per-row failures, one object per line: `{"line":N,"code":"…","detail":"…"}`. Truncated up front so a re-run never appends to a stale log. |
+| `--progress N` | Print a progress line to stderr every `N` rows read (`0` = off, the default). |
+| `--json` | Print the run summary as one JSON object on stdout (snake_case keys: `zigbase_import`, `collection`, `dry_run`, `created`, `updated`, `failed`, `total`, `error_log`). |
 | `<file.ndjson>` | Positional NDJSON path; `-` reads stdin. |
+
+**Exit codes.** `0` — every row imported. `1` — the import failed outright (bad input, refused
+operation, DB error); batches committed before the failure persist. `3` — the import *completed*
+but skipped one or more rows under `--continue-on-error`: a lossy import is never reported as a
+success, so a driving script or agent must treat `3` as "needs a look," not "done."
 
 **Through-engine guarantees.** Import performs the SAME full boot as `serve` (minus the socket):
 system migrations run, your comptime `.collections` are provisioned (so the target collection is
@@ -3709,13 +3806,24 @@ required — plaintext is never written, and a missing key fails closed), and, f
 collection, the credential transforms (**password hashing**, `tokenKey` generation,
 `verified=false` — a client-supplied `verified` is never trusted).
 
-**Streaming + batching + fail-fast.** Lines are read one at a time (the whole file is never
-slurped; a single record line must fit a 1 MiB buffer). Rows commit in batches of `--batch-size`.
-A bad row — malformed JSON, a validation failure, or a duplicate id — **fails fast**: the
-in-flight (uncommitted) batch is rolled back and the error names the offending 1-based line.
-Batches committed **before** the failure persist, so a large import that trips near the end is a
-resumable checkpoint (fix the file and re-run, ideally with `--upsert-key`). Blank lines are
-skipped. On completion it logs `created`, `updated`, and `total` counts.
+**Streaming + batching + fail-fast (the default).** Lines are read one at a time (the whole file
+is never slurped; a single record line must fit a 1 MiB buffer). Rows commit in batches of
+`--batch-size`. A bad row — malformed JSON, a validation failure, or a duplicate id — **fails
+fast**: the in-flight (uncommitted) batch is rolled back and the error names the offending
+1-based line. Batches committed **before** the failure persist, so a large import that trips near
+the end is a resumable checkpoint (fix the file and re-run, ideally with `--upsert-key`). Blank
+lines are skipped. On completion it logs `created`, `updated`, `total`, and `failed` counts (and,
+with `--json`, the same numbers as one JSON object on stdout).
+
+**Migration-scale imports (`--continue-on-error`).** One bad row out of half a million is not
+worth aborting a 40-minute import over. With `--continue-on-error`, each row runs inside its own
+`SAVEPOINT`: a failure rolls back only that row (not the batch it's part of) and is recorded —
+to `--error-log` as NDJSON, and always in the final `failed` count — while every good row still
+commits. The exit code becomes `3` (not `0`) whenever `failed > 0`, so a lossy import can never
+be mistaken for a clean one. `--progress N` prints a heartbeat every `N` rows so a long run isn't
+a black box, and `--dry-run` rehearses the whole thing (full validation, defaults, encryption,
+auth transforms — everything except the final commit) so you can find every bad row before
+touching real data.
 
 **Id preservation (import-only).** By default each row's own `id` is **preserved** — essential
 for migrations, because relations reference records by id and an exported dataset must keep those
@@ -3737,8 +3845,11 @@ const report = try zigbase.Import.run(app, writer, io, &reader, .{
     .upsert_key = "slug",   // optional
     .batch_size = 500,
     .preserve_ids = true,
+    .continue_on_error = true,  // optional: skip bad rows instead of aborting (see below)
 });
-std.log.info("imported {d} ({d} new, {d} updated)", .{ report.total, report.created, report.updated });
+std.log.info("imported {d} ({d} new, {d} updated, {d} skipped)", .{
+    report.total, report.created, report.updated, report.failed,
+});
 ```
 
 See `examples/golfsim/seed/` for a worked seeding example (hosts + the simulators that reference
@@ -4055,6 +4166,16 @@ When the framework catches an error, your `onError` handler (if any) runs
 (`[phase] err_name: message`). `ErrorEvent` carries `app`,
 `ctx` (optional), `err`, `phase` (`request` / `before_hook` / `after_hook` /
 `cron` / `job` / `file_serve` / `webhook` / `app`), and `message`. The backstop never propagates.
+
+This includes a **built-in** handler's own failures, not just your routes': an error
+escaping the built-in route table, the feature-state route, or custom-route dispatch
+itself (pool acquisition, `authenticate`) is logged and delivered to `onError` exactly
+like a consumer-route error, instead of surfacing as a silent, unexplained 500. Because
+no principal has been resolved yet at that layer (built-in handlers authenticate
+internally), the `RequestContext` on `ev.ctx` carries only `method` — every other field
+is its zero value. A static-file *read* failure is the one exception: it is logged at
+`warn` and still answers 404, since a browser-facing static miss is not a server
+incident.
 
 **Report your own errors: `ctx.reportError`.** Route a swallowed-but-notable error
 from your own code — a hook, job, cron, or handler — through the *same* backstop the
@@ -4607,35 +4728,34 @@ compiled in only on a dev-mode build (`zig build test`, the default harness buil
 for the production-safety gate. Pass `.field_key` to boot with real crypto instead (works in every
 build; not gated), e.g. to test key-rotation or envelope-format behavior end-to-end.
 
-### Troubleshooting: `zig build test` prints `failed command: …--listen=-`
-
-If `zig build test` in your project reports a failed step like `failed command:
-…/test …--listen=-` **but the same test binary run standalone passes** (`All N tests
-passed`, exit 0), the failure is not in your app or the harness — it is an upstream
-race in **Zig 0.16's build runner**, not zigbase. `zig build test` runs the test
-binary in server mode (`--listen=-`) and the runner polls the child's stdout/stderr;
-the harness boots a real app (a few tens of ms of sqlite/migrations/provisioning), and
-the process's exit-time output can land in a window where the runner mis-reads the
-child's normal EOF as a crash and restarts it — printing that line, and occasionally
-failing (exit 1) under CPU load. It is intermittent by nature (it often silently
-retries to exit 0 when the machine is idle).
-
-**Workaround — use a `.simple`-mode test runner** so the build system checks the
-child's exit code instead of the server-protocol stdio stream:
+### Wiring the test step (`zigbase.addTest`)
 
 ```zig
-// build.zig — copy Zig 0.16's lib/compiler/test_runner.zig into your project as
-// e.g. simple_runner.zig, then wire the test artifact with it in .simple mode:
-const t = b.addTest(.{
-    .root_module = mod,
-    .test_runner = .{ .path = b.path("simple_runner.zig"), .mode = .simple },
-});
-b.step("test", "run tests").dependOn(&b.addRunArtifact(t).step);
+// build.zig
+const zigbase = @import("zigbase");
+const tests = zigbase.addTest(b, dep, .{ .root_module = app_mod });
+b.step("test", "Run tests").dependOn(&b.addRunArtifact(tests).step);
 ```
 
-This still fails the build on a genuine test failure (it rides the exit code) and
-sidesteps the runner race entirely. Tracked upstream against Zig's build runner;
-revisit if a future Zig release fixes the `--listen` protocol path.
+Pass the **same** module you passed to `addTo`: rooting a second module at
+`src/main.zig` would place one file in two modules, which Zig rejects.
+
+`addTest` wires a `.simple`-mode test runner that ZigBase ships
+(`src/simple_runner.zig`, resolved out of the dependency — you do not vendor
+anything). That matters for two reasons:
+
+- **It sidesteps an upstream Zig 0.16 build-runner race.** `zig build test`
+  otherwise runs the test binary in server mode (`--listen=-`) and polls its
+  stdio; an app booted by the harness does real work at process exit (closing
+  sqlite, removing a tempdir), and the runner can mis-read that normal exit as a
+  crash — printing `failed command: …--listen=-` and intermittently failing the
+  build under load. A `.simple` runner reports through its exit code instead, so
+  the race cannot occur.
+- **It fails the build on a leak.** Each test runs under a fresh
+  `std.testing.allocator` whose leak check runs on teardown.
+
+If you are not using `addTest`, that `--listen=-` line on an otherwise-passing
+suite is the race, not a bug in your app.
 
 ## Compile-time build flags
 
@@ -4648,6 +4768,7 @@ code to comptime-dead when off, so a build that doesn't need a feature doesn't p
 | `-Dvector` | off | Opt-in nearest-neighbor `?vector=` KNN search — sqlite-vec on SQLite, pgvector on Postgres. → [docs/search.md](./search.md#vector-search-opt-in) |
 | `-Dpostgres` | off | Opt-in pure-Zig PostgreSQL wire-protocol backend, alongside the default SQLite one. → [docs/postgres.md](./postgres.md) |
 | `-Ddev-mode` | on in `Debug`, off in release | The dev-only, never-in-prod seams: `ZIGBASE_FAKE_NOW` / `ZIGBASE_FAKE_SEED` (§14 above), test-capture, and fake field-crypto; the release script forces it off for shipped binaries. |
+| `-Ddev-tools` | **on** | The `init`/`agents-md`/`typegen` CLI verbs (scaffolding + schema-to-client codegen — `src/scaffold*.zig` + `src/codegen/**`, ~24 files, none of it needed by a *deployed* server). **Every official artifact we publish builds at this default** — GitHub release tarballs, the Docker image, and the `@zigbase/server` npm packages all ship with the three verbs in. `-Ddev-tools=false` is an opt-out for a consumer compiling their **own** binary for their **own** deployment who wants to shed the ~490 KiB behind it; the stripped binary still recognizes the verb names but exits non-zero with a "rebuild with -Ddev-tools=true" message instead of running them. Distinct from `.enable_typegen` below — see §3b. |
 | `-Dstrip` | on except in `Debug` | Strip debug info from the binary (~7 MiB vs ~24 MiB unstripped in a release build). |
 
 ## Version transparency & dependency auditing

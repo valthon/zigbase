@@ -11,18 +11,25 @@ const crypto = @import("../crypto.zig");
 const jwt = @import("../jwt.zig");
 const ApiError = @import("error.zig").ApiError;
 const FieldError = @import("error.zig").FieldError;
+const codes = @import("../error_codes.zig");
 const secrets = @import("../oauth/secrets.zig");
 const oauth_api = @import("oauth.zig");
 const field_policy = @import("../field_policy.zig");
 
-/// Encrypt any plaintext clientSecret, validate provider endpoints (resolvable + https), and
-/// (on update) preserve a stored secret when the incoming one is empty. Mutates `def.options`.
-fn prepareOAuthConfig(ctx: *http.RequestCtx, def: *schema.Collection, existing: ?schema.Collection) !void {
-    const app = ctx.app.?;
+pub const OAuthPrepError = error{BadOAuthConfig} || std.mem.Allocator.Error;
+
+/// Merge OAuth2 provider config from `def` with any stored secrets in `existing`: an EMPTY
+/// incoming clientSecret preserves the stored one (secrets are redacted on read, so a
+/// read-modify-write round trip must not blank them). Also encrypts a fresh plaintext secret
+/// and validates provider endpoints (resolvable + https). Mutates `def.options.auth.oauth2` in
+/// place using `alloc`. No HTTP dependency — shared by the REST handlers and `zigbase schema
+/// apply` so both obey one rule. Callers that have a request context should use
+/// `prepareOAuthConfig`.
+pub fn mergeOAuthConfig(io: std.Io, alloc: std.mem.Allocator, jwt_secret: []const u8, def: *schema.Collection, existing: ?schema.Collection) OAuthPrepError!void {
     if (def.type != .auth) return;
     const provs = def.options.auth.oauth2.providers;
     if (provs.len == 0) return;
-    const out = try ctx.allocator.a.alloc(schema.OAuth2Provider, provs.len);
+    const out = try alloc.alloc(schema.OAuth2Provider, provs.len);
     for (provs, 0..) |p, i| {
         var np = p;
         if (oauth_api.resolveProvider(np) == null) return error.BadOAuthConfig;
@@ -37,11 +44,22 @@ fn prepareOAuthConfig(ctx: *http.RequestCtx, def: *schema.Collection, existing: 
             }
             if (np.clientSecret.len == 0 and np.enabled) return error.BadOAuthConfig;
         } else if (!secrets.isEncrypted(np.clientSecret)) {
-            np.clientSecret = try secrets.encryptSecret(app.io, ctx.allocator.a, app.jwt_secret, np.clientSecret);
+            np.clientSecret = try secrets.encryptSecret(io, alloc, jwt_secret, np.clientSecret);
         }
         out[i] = np;
     }
     def.options.auth.oauth2.providers = out;
+}
+
+/// HTTP wrapper around `mergeOAuthConfig`: on a config error, render the 400 the handlers
+/// already return. Returns the response to short-circuit with, or null to continue.
+pub fn prepareOAuthConfig(ctx: *http.RequestCtx, def: *schema.Collection, existing: ?schema.Collection) !?http.Response {
+    const app = ctx.app.?;
+    mergeOAuthConfig(app.io, ctx.allocator.a, app.jwt_secret, def, existing) catch |e| switch (e) {
+        error.BadOAuthConfig => return try ApiError.badRequest("Invalid OAuth2 provider config (endpoints must be https).").toResponse(ctx.allocator.a),
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+    return null;
 }
 
 /// True if the request carries a valid superuser token. Uses a short-lived reader connection.
@@ -57,7 +75,7 @@ fn requireSuperuser(ctx: *http.RequestCtx) !?http.Response {
     if (isSuperuser(ctx)) return null;
     // Building the 403 body allocates (JSON on the request arena), so OutOfMemory is reachable —
     // propagate it to the server's 500 backstop rather than `catch unreachable` (#29).
-    return try (ApiError{ .status = 403, .message = "Forbidden." }).toResponse(ctx.allocator.a);
+    return try ApiError.forbidden().toResponse(ctx.allocator.a);
 }
 
 /// Frozen-collection-metadata mode (issue #234): when `app.collections_frozen` is set the
@@ -65,7 +83,11 @@ fn requireSuperuser(ctx: *http.RequestCtx) !?http.Response {
 /// `.migrations` + a redeploy). Returns a 403 response to short-circuit; null when not frozen.
 fn rejectIfFrozen(ctx: *http.RequestCtx, app: *app_mod.App) !?http.Response {
     if (!app.collections_frozen) return null;
-    return try (ApiError{ .status = 403, .message = "Collections are frozen (`.collections_frozen`); schema changes require a migration and a redeploy." }).toResponse(ctx.allocator.a);
+    return try ApiError.withCode(
+        403,
+        .collections_frozen,
+        "Collections are frozen (`.collections_frozen`); schema changes require a migration and a redeploy.",
+    ).toResponse(ctx.allocator.a);
 }
 
 fn validationResponse(ctx: *http.RequestCtx) !http.Response {
@@ -106,8 +128,7 @@ pub fn create(ctx: *http.RequestCtx) anyerror!http.Response {
     const w = app.pool.acquireWriter();
     defer app.pool.releaseWriter();
     var def_mut = def;
-    prepareOAuthConfig(ctx, &def_mut, null) catch
-        return ApiError.badRequest("Invalid OAuth2 provider config (endpoints must be https).").toResponse(ctx.allocator.a);
+    if (try prepareOAuthConfig(ctx, &def_mut, null)) |resp| return resp;
     const created = collections.create(ctx.allocator.a, app.io, w, def_mut) catch |e| switch (e) {
         error.Validation => return validationResponse(ctx),
         // The pre-check (`get() != null`) catches the common duplicate; error.Constraint covers a
@@ -142,8 +163,7 @@ pub fn update(ctx: *http.RequestCtx) anyerror!http.Response {
     defer app.pool.releaseWriter();
     const existing = collections.get(ctx.allocator.a, w, key) catch null;
     var def_mut = def;
-    prepareOAuthConfig(ctx, &def_mut, existing) catch
-        return ApiError.badRequest("Invalid OAuth2 provider config (endpoints must be https).").toResponse(ctx.allocator.a);
+    if (try prepareOAuthConfig(ctx, &def_mut, existing)) |resp| return resp;
     const updated = collections.update(ctx.allocator.a, app.io, w, key, def_mut) catch |e| switch (e) {
         error.NotFound => return ApiError.notFound().toResponse(ctx.allocator.a),
         error.Validation => return validationResponse(ctx),
@@ -272,7 +292,11 @@ test "collections_frozen 403s the runtime DDL endpoints without mutating collect
         cctx.authorization = auth_hdr;
         const res = try create(&cctx);
         try std.testing.expectEqual(@as(u16, 403), res.status);
-        try std.testing.expect(std.mem.indexOf(u8, res.body, "collections_frozen") != null);
+        // Discriminating: the machine code, not an incidental substring of the message.
+        const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, res.body, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings("collections_frozen", parsed.value.object.get("code").?.string);
+        try std.testing.expectEqual(@as(i64, 403), parsed.value.object.get("status").?.integer);
     }
     {
         const body =
@@ -333,7 +357,7 @@ test "runtime API mirrors the comptime encryption guards (the bypass fix)" {
         cctx.authorization = auth_hdr;
         const res = try create(&cctx);
         try std.testing.expectEqual(@as(u16, 400), res.status);
-        try std.testing.expect(std.mem.indexOf(u8, res.body, "validation_encrypted_type") != null);
+        try std.testing.expect(std.mem.indexOf(u8, res.body, codes.s(.validation_encrypted_type)) != null);
         // Nothing stored: the collection does not exist.
         var gctx = ctxFor(env, RequestArena.from(&arena), .GET, "/api/collections/nums", "", &.{.{ .key = "idOrName", .value = "nums" }});
         gctx.authorization = auth_hdr;
@@ -349,7 +373,7 @@ test "runtime API mirrors the comptime encryption guards (the bypass fix)" {
         cctx.authorization = auth_hdr;
         const res = try create(&cctx);
         try std.testing.expectEqual(@as(u16, 400), res.status);
-        try std.testing.expect(std.mem.indexOf(u8, res.body, "validation_encrypted_unique") != null);
+        try std.testing.expect(std.mem.indexOf(u8, res.body, codes.s(.validation_encrypted_unique)) != null);
     }
 
     // (3) An index over an encrypted field is rejected.
@@ -361,7 +385,7 @@ test "runtime API mirrors the comptime encryption guards (the bypass fix)" {
         cctx.authorization = auth_hdr;
         const res = try create(&cctx);
         try std.testing.expectEqual(@as(u16, 400), res.status);
-        try std.testing.expect(std.mem.indexOf(u8, res.body, "validation_encrypted_index") != null);
+        try std.testing.expect(std.mem.indexOf(u8, res.body, codes.s(.validation_encrypted_index)) != null);
     }
 }
 
@@ -375,7 +399,7 @@ test "create with invalid name returns 400 with field errors" {
     cctx.authorization = try std.fmt.allocPrint(a, "Bearer {s}", .{try env.superuserToken(a)});
     const res = try create(&cctx);
     try std.testing.expectEqual(@as(u16, 400), res.status);
-    try std.testing.expect(std.mem.indexOf(u8, res.body, "validation_invalid_name") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.body, codes.s(.validation_invalid_name)) != null);
 }
 
 test "enabled oauth2 provider with no client secret is rejected at save" {

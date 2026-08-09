@@ -170,7 +170,7 @@ pub fn consume(ctx: *http.RequestCtx) anyerror!http.Response {
     // record when the collection requires it (parity with `complete`).
     if (col.options.auth.require_verified and !auth.recordVerified(rec)) {
         w.rollback() catch {};
-        return (ApiError{ .status = 403, .message = "Email not verified." }).toResponse(ctx.allocator.a);
+        return ApiError.withCode(403, .email_not_verified, "Email not verified.").toResponse(ctx.allocator.a);
     }
 
     if (try auth.fireBeforeAuthSuccess(ctx, w, col.name, claims.id, .magic_link, rec)) |resp| {

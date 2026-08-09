@@ -26,7 +26,7 @@ fn requireSuperuser(ctx: *http.RequestCtx) !?http.Response {
     if (isSuperuser(ctx)) return null;
     // Building the 403 body allocates (JSON on the request arena), so OutOfMemory is reachable
     // here — propagate it to the server's 500 backstop rather than `catch unreachable` (#29).
-    return try (ApiError{ .status = 403, .message = "Forbidden." }).toResponse(ctx.allocator.a);
+    return try ApiError.forbidden().toResponse(ctx.allocator.a);
 }
 
 fn dataOnWriter(ctx: *http.RequestCtx) Data {

@@ -5,6 +5,7 @@ const http = @import("http.zig");
 const app_mod = @import("app.zig");
 const router = @import("router.zig");
 const health = @import("api/health.zig");
+const meta = @import("api/meta.zig");
 const collections_api = @import("api/collections.zig");
 const records_api = @import("api/records.zig");
 const accounts_api = @import("api/accounts.zig");
@@ -34,6 +35,7 @@ const ApiError = @import("api/error.zig").ApiError;
 const auth = @import("auth.zig");
 const events = @import("events.zig");
 const request = @import("request.zig");
+const logging = @import("logging.zig");
 const Ctx = @import("ctx.zig").Ctx;
 const crypto = @import("crypto.zig");
 const clock = @import("clock.zig");
@@ -41,6 +43,10 @@ const tenancy = @import("tenancy/tenancy.zig");
 
 fn healthHandler(ctx: *http.RequestCtx) anyerror!http.Response {
     return health.handle(ctx);
+}
+
+fn metaHandler(ctx: *http.RequestCtx) anyerror!http.Response {
+    return meta.handle(ctx);
 }
 
 /// Comptime gates for the built-in route table + admin SPA (R2-2/R2-3). Every
@@ -99,6 +105,14 @@ fn replaceStaticMaxAge(_: ?*anyopaque) callconv(.c) void {
 /// `Server(gates).instance` — it reads this module-level global instead.
 pub var active_app: ?*app_mod.App = null;
 
+/// A `Server.on_listening` callback bound to its context. Pairing them in one
+/// struct is what makes "callback without context" impossible to express; see
+/// the field's doc comment.
+pub const OnListening = struct {
+    call: *const fn (ctx: *anyopaque) void,
+    ctx: *anyopaque,
+};
+
 pub fn Server(comptime gates: Gates) type {
     return struct {
         const Self = @This();
@@ -107,6 +121,7 @@ pub fn Server(comptime gates: Gates) type {
         pub const routes: []const router.Route = blk: {
             var t: []const router.Route = &.{
                 .{ .method = .GET, .pattern = "/api/health", .handler = healthHandler },
+                .{ .method = .GET, .pattern = "/api/meta", .handler = metaHandler },
                 .{ .method = .GET, .pattern = "/api/collections", .handler = collections_api.list },
                 .{ .method = .POST, .pattern = "/api/collections", .handler = collections_api.create },
                 .{ .method = .GET, .pattern = "/api/collections/:idOrName", .handler = collections_api.get },
@@ -208,6 +223,24 @@ pub fn Server(comptime gates: Gates) type {
         host: [:0]const u8,
         port: u16,
 
+        /// Fired ONCE, on the serving thread, after the listening socket is
+        /// bound and immediately before the reactor starts. This is the only
+        /// point at which "the port is claimed but nothing is answering yet"
+        /// is observable, which is exactly when `serveImpl` must launch its
+        /// readiness verifier — `zap.start` below never returns.
+        ///
+        /// Null for every embedding that does not opt in (`App.run`, the
+        /// `zigbase.testing` harness). The callback must not block: it runs on
+        /// the thread that is about to become the reactor.
+        ///
+        /// The function and its context are ONE optional struct rather than two
+        /// independent optional fields, so "callback set, context missing" is
+        /// unrepresentable. As two fields it was merely asserted — the call site
+        /// force-unwrapped the context, and a future caller setting only the
+        /// callback would have crashed there with a bare unwrap panic and no
+        /// hint about which invariant it broke.
+        on_listening: ?OnListening = null,
+
         pub var instance: ?*Self = null;
 
         pub fn listen(self: *Self) !void {
@@ -224,6 +257,7 @@ pub fn Server(comptime gates: Gates) type {
             // #159, PR-6b: on Postgres, fan realtime across app instances via LISTEN/NOTIFY. A no-op
             // on SQLite (single-process) — self-gated, so no backend branch is needed here.
             realtime_ws.startRemoteListener(self.app);
+            if (self.on_listening) |cb| cb.call(cb.ctx);
             zap.start(.{ .threads = 4, .workers = 1 });
         }
 
@@ -244,7 +278,8 @@ pub fn Server(comptime gates: Gates) type {
                     return admin.serve(ctx);
             }
             // Built-in API routes win over custom routes.
-            const builtin = router.tryDispatch(routes, ctx) catch {
+            const builtin = router.tryDispatch(routes, ctx) catch |e| {
+                reportRouteError(ctx, app, e, "built-in route");
                 return try ApiError.internal().toResponse(ctx.allocator.a);
             };
             if (builtin) |hit| return hit;
@@ -257,10 +292,20 @@ pub fn Server(comptime gates: Gates) type {
                     !std.mem.eql(u8, fp, "/api/state") and
                     std.mem.eql(u8, ctx.path, fp))
                 {
-                    return state_api.handle(ctx) catch try ApiError.internal().toResponse(ctx.allocator.a);
+                    return state_api.handle(ctx) catch |e| {
+                        reportRouteError(ctx, app, e, "feature-state route");
+                        return try ApiError.internal().toResponse(ctx.allocator.a);
+                    };
                 }
             }
-            if (dispatchCustom(ctx) catch null) |hit| return hit;
+            // dispatchCustom's OWN failures (pool acquisition, authenticate) are server
+            // errors — swallowing them here silently fell through to static/404, serving
+            // the wrong status. A handler's error is already handled inside dispatchCustom.
+            const custom = dispatchCustom(ctx) catch |e| {
+                reportRouteError(ctx, app, e, "custom route dispatch");
+                return try ApiError.internal().toResponse(ctx.allocator.a);
+            };
+            if (custom) |hit| return hit;
             // The whole /api namespace stays JSON — including the bare "/api" path
             // (mirrors the exact-"/_" handling in the admin guard above).
             if (std.meta.activeTag(app.static_source) != .none and
@@ -268,12 +313,27 @@ pub fn Server(comptime gates: Gates) type {
                 !std.mem.startsWith(u8, ctx.path, "/api/") and
                 !std.mem.eql(u8, ctx.path, "/api"))
             {
-                if (static_files.serve(app.io, ctx, app.static_source, .{
+                const served = static_files.serve(app.io, ctx, app.static_source, .{
                     .routes = app.static_routes,
                     .spa_roots = app.spa_roots,
                     .spa_marker_enabled = app.spa_marker_enabled,
                     .cache_control = app.static_cache_control,
-                }) catch null) |hit| return hit;
+                }) catch |e| blk: {
+                    // `static_files.serve` converts every filesystem miss and unreadable
+                    // file to `null` internally, so the only error that can escape it is
+                    // OOM — a genuine server fault, not a browser-facing miss. Reporting
+                    // it as a 404 would be the silent-500 hole this stream just closed,
+                    // one layer down: the operator would see a "missing file" that is
+                    // really a failing server. Raise the incident and answer 500.
+                    if (e == error.OutOfMemory) {
+                        reportRouteError(ctx, app, e, "static file serve");
+                        return try ApiError.internal().toResponse(ctx.allocator.a);
+                    }
+                    // Any future non-OOM error stays a diagnosable, non-incident miss.
+                    std.log.warn("static file serve failed for {s}: {s}", .{ ctx.path, @errorName(e) });
+                    break :blk null;
+                };
+                if (served) |hit| return hit;
                 // Plain-text 404, deliberately NOT the JSON ApiError envelope: static misses are browser-facing, not API responses.
                 return http.Response{ .status = 404, .body = "not found", .content_type = "text/plain; charset=utf-8" };
             }
@@ -282,6 +342,7 @@ pub fn Server(comptime gates: Gates) type {
 
         fn onRequest(r: zap.Request) !void {
             const self = Self.instance.?;
+            const started_ns = std.Io.Timestamp.now(self.app.io, .awake).nanoseconds;
             var arena = std.heap.ArenaAllocator.init(self.app.allocator);
             defer arena.deinit();
             var ctx = http.RequestCtx{
@@ -292,6 +353,35 @@ pub fn Server(comptime gates: Gates) type {
                 .allocator = RequestArena.from(&arena),
                 .app = self.app,
             };
+            // Access log. A `defer` (not a call at the bottom) because onRequest has
+            // multiple `return` points — the raw-500 escape, both sendFile branches, and
+            // the normal fall-through — and every one of them must produce exactly one
+            // line. `logged_status` is what actually went on the wire, so a sendFile
+            // failure that downgrades a 200 to a 404 is logged as the 404 the client saw.
+            //
+            // `ctx.path` is a slice into facil.io's own request buffer (`r.path`), which
+            // facil.io is free to recycle the instant the response finishes (`sendBody`/
+            // `sendFile`/`sendRawEnvelope` all end the request) — reading it lazily from
+            // inside the deferred block, AFTER the response has gone out, previously read
+            // back a reused/zeroed buffer (observed as NUL bytes in practice). Duplicate it
+            // into the request arena now, while `r`'s buffer is still guaranteed live, and
+            // log that stable copy instead. The defer body itself stays allocation-free —
+            // `logging.request` formats into a stack buffer — this dupe happens up front.
+            // On OOM, fall back to a STATIC placeholder rather than to `ctx.path` itself:
+            // reusing the borrowed slice is precisely the use-after-recycle this dupe
+            // exists to prevent, so the fallback must not reintroduce it. "-" is the
+            // conventional access-log stand-in for a field that could not be captured.
+            const logged_path = ctx.allocator.a.dupe(u8, ctx.path) catch "-";
+            var logged_status: u16 = 0;
+            defer {
+                const elapsed_ns = std.Io.Timestamp.now(self.app.io, .awake).nanoseconds - started_ns;
+                logging.request(.{
+                    .method = @tagName(ctx.method),
+                    .path = logged_path,
+                    .status = logged_status,
+                    .duration_ms = @intCast(@max(0, @divTrunc(elapsed_ns, std.time.ns_per_ms))),
+                });
+            }
             ctx.authorization = r.getHeader("authorization") orelse "";
             ctx.cookie_header = r.getHeader("cookie") orelse "";
             ctx.csrf_token = r.getHeader("x-csrf-token") orelse "";
@@ -308,18 +398,28 @@ pub fn Server(comptime gates: Gates) type {
             ctx.raw_header_ctx = &zap_req;
             ctx.raw_header_fn = zapHeaderLookup;
             ctx.raw_header_set_fn = zapHeaderSet;
-            const multipart_err = try applyMultipart(&ctx);
+            // OOM here used to propagate straight out of `onRequest`, which means zap
+            // logs an uncaught error and NEVER writes a response — the client sees a
+            // dropped connection and the access line records status 0, a status nothing
+            // ever sent. Answer with the same raw 500 envelope every other escape uses.
+            const multipart_err = applyMultipart(&ctx) catch {
+                sendRawEnvelope(r, 500, "{\"status\":500,\"code\":\"internal\",\"message\":\"Something went wrong.\",\"data\":{}}");
+                logged_status = 500;
+                return;
+            };
             const resp = blk: {
                 if (multipart_err) |er| break :blk er;
                 // The full routing/fallback chain lives in the socketless `route` seam (#239
                 // stage 2). Its only escaping errors are the OOM-while-building-an-error-Response
                 // paths that historically wrote this exact raw 500 envelope inline and returned.
                 break :blk route(&ctx) catch {
-                    sendRawEnvelope(r, 500, "{\"code\":500,\"message\":\"Something went wrong.\",\"data\":{}}");
+                    sendRawEnvelope(r, 500, "{\"status\":500,\"code\":\"internal\",\"message\":\"Something went wrong.\",\"data\":{}}");
+                    logged_status = 500;
                     return;
                 };
             };
             setZapStatus(r, resp.status);
+            logged_status = resp.status;
             for (resp.cookies) |c| {
                 r.setCookie(.{
                     .name = c.name,
@@ -346,13 +446,15 @@ pub fn Server(comptime gates: Gates) type {
                     r.setHeader("content-type", resp.content_type) catch {};
                     sendFileRange(r, self.app.io, f.path, f.offset, len) catch {
                         // Open failure => the existing 404 raw envelope (unchanged semantics).
-                        sendRawEnvelope(r, 404, "{\"code\":404,\"message\":\"Not found.\",\"data\":{}}");
+                        sendRawEnvelope(r, 404, "{\"status\":404,\"code\":\"not_found\",\"message\":\"Not found.\",\"data\":{}}");
+                        logged_status = 404;
                     };
                 } else {
                     // Wholesale facil.io delegation (dir-mode static): mime, ETag, 304,
                     // `.gz` sidecar, Range are ALL facil.io's (§A.3) — byte-identical to today.
                     r.sendFile(f.path) catch {
-                        sendRawEnvelope(r, 404, "{\"code\":404,\"message\":\"Not found.\",\"data\":{}}");
+                        sendRawEnvelope(r, 404, "{\"status\":404,\"code\":\"not_found\",\"message\":\"Not found.\",\"data\":{}}");
+                        logged_status = 404;
                     };
                 }
                 return;
@@ -474,7 +576,44 @@ fn setZapStatus(r: zap.Request, status: u16) void {
 }
 
 fn forbiddenResp(ctx: *http.RequestCtx) !http.Response {
-    return (ApiError{ .status = 403, .message = "Forbidden." }).toResponse(ctx.allocator.a);
+    return ApiError.forbidden().toResponse(ctx.allocator.a);
+}
+
+/// Report an error escaping a BUILT-IN routing path. Consumer-route handler errors
+/// already take this route in `dispatchCustom` (:702-713); these paths used to swallow
+/// theirs entirely, producing an unexplained 500 with no log line, no `onError`, and no
+/// Sentry event. `origin` names which path failed so an operator can tell a built-in
+/// handler failure from a feature-state one.
+///
+/// The `RequestContext` carries only the method: at this layer no principal has been
+/// resolved (built-in handlers authenticate internally), and a fabricated one would be
+/// worse than an honest blank.
+///
+/// Logs at `.err` in production; under the test runner (`builtin.is_test`) the identical
+/// message logs at `.warn` instead — Zig's test runner counts every `.err`-level log as a
+/// test failure regardless of any custom `logFn` (the runner's own `std_options`, not
+/// `logging.std_options`, own the compilation: only a CONSUMER binary that sets
+/// `pub const std_options = zigbase.std_options;` in its own root routes through
+/// `logging.sink`), so a test that deliberately forces this path would fail on the log
+/// alone even with correct assertions. Same pattern as `backend/postgres/tls_trust.zig`'s
+/// `logMisconfig`.
+fn reportRouteError(ctx: *http.RequestCtx, app: *app_mod.App, err: anyerror, origin: []const u8) void {
+    // Named via @import here (not a module-level `const builtin`) because `route()`
+    // already has a local variable named `builtin` (the built-in-route dispatch
+    // result) that a top-level decl of the same name would collide with.
+    if (@import("builtin").is_test)
+        std.log.warn("{s} failed for {s} {s}: {s}", .{ origin, @tagName(ctx.method), ctx.path, @errorName(err) })
+    else
+        std.log.err("{s} failed for {s} {s}: {s}", .{ origin, @tagName(ctx.method), ctx.path, @errorName(err) });
+    var rctx = request.RequestContext{ .method = @tagName(ctx.method) };
+    var ev = events.ErrorEvent{
+        .app = app,
+        .ctx = &rctx,
+        .err = err,
+        .phase = .request,
+        .message = @errorName(err),
+    };
+    events.dispatchError(app, app.dispatch, &ev);
 }
 
 /// Merge a Ctx's deferred `pending_cookies`/`pending_headers` onto a handler's Response.
@@ -604,7 +743,7 @@ fn guardRateLimit(cx: *Ctx, ctx: *http.RequestCtx, rt: events.RuntimeRoute) !?ht
     };
     if (limiter.allowCustom(key, clock.nowUnix(app.io), c.max, c.window_s)) return null;
     const retry = try std.fmt.allocPrint(ctx.allocator.a, "{d}", .{c.window_s});
-    var resp = try (ApiError{ .status = 429, .message = "Too many requests. Try again later." }).toResponse(ctx.allocator.a);
+    var resp = try ApiError.withCode(429, .too_many_requests, "Too many requests. Try again later.").toResponse(ctx.allocator.a);
     resp.extra_headers = try ctx.allocator.a.dupe(http.Header, &.{.{ .name = "Retry-After", .value = retry }});
     return resp;
 }
@@ -637,7 +776,7 @@ fn dispatchCustom(ctx: *http.RequestCtx) anyerror!?http.Response {
             const authed = if (reader) |*r| (auth.authenticate(app.io, ctx.allocator.a, app, ctx, r) catch null) else null;
             switch (rt.auth) {
                 .public => {},
-                .authed => if (authed == null) return try (ApiError{ .status = 401, .message = "Not authenticated." }).toResponse(ctx.allocator.a),
+                .authed => if (authed == null) return try ApiError.withCode(401, .unauthorized, "Not authenticated.").toResponse(ctx.allocator.a),
                 .superuser => if (authed == null or !authed.?.is_superuser) return try forbiddenResp(ctx),
             }
             // #243: collection-scoped `.authed` gate. A non-null `authed_collection` implies the
@@ -653,7 +792,7 @@ fn dispatchCustom(ctx: *http.RequestCtx) anyerror!?http.Response {
                 // `auth == .authed` (so the no-token 401 already fired above), but `RuntimeRoute`
                 // is public — a hand-built route pairing `.authed_collection` with a non-`.authed`
                 // level must deny, not panic on a null principal. Reuse the SAME 401 (no oracle).
-                const u = authed orelse return try (ApiError{ .status = 401, .message = "Not authenticated." }).toResponse(ctx.allocator.a);
+                const u = authed orelse return try ApiError.withCode(401, .unauthorized, "Not authenticated.").toResponse(ctx.allocator.a);
                 const uid: []const u8 = switch (u.record) {
                     .object => |o| if (o.get("id")) |v| (switch (v) {
                         .string => |sv| sv,
@@ -664,7 +803,7 @@ fn dispatchCustom(ctx: *http.RequestCtx) anyerror!?http.Response {
                 const collection_ok = std.mem.eql(u8, u.collection, gate.collection) and uid.len > 0;
                 const super_ok = u.is_superuser and gate.allow_superuser and uid.len > 0;
                 if (!(collection_ok or super_ok))
-                    return try (ApiError{ .status = 401, .message = "Not authenticated." }).toResponse(ctx.allocator.a);
+                    return try ApiError.withCode(401, .unauthorized, "Not authenticated.").toResponse(ctx.allocator.a);
             }
             var rctx = request.RequestContext{
                 .auth = if (authed) |a| a.record else null,
@@ -785,6 +924,72 @@ test "dispatchCustom: deliberate 4xx is NOT reported to onError; genuine 5xx is"
     const boom = (try dispatchCustom(&boom_ctx)).?;
     try std.testing.expectEqual(@as(u16, 500), boom.status);
     try std.testing.expectEqual(@as(usize, 1), H.on_error_calls);
+}
+
+test "route: a failing BUILT-IN handler is reported to onError, not silently 500ed" {
+    const db = @import("db.zig");
+    const App = app_mod.App;
+    const report_log = @import("report/log.zig");
+
+    const H = struct {
+        var on_error_calls: usize = 0;
+        fn onErr(ev: *events.ErrorEvent) void {
+            _ = ev;
+            on_error_calls += 1;
+        }
+    };
+
+    const ga = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", ga);
+    defer ga.free(dir_path);
+    const db_path = try std.fmt.allocPrintSentinel(ga, "{s}/test.db", .{dir_path}, 0);
+    defer ga.free(db_path);
+    var pool = try db.Pool.init(ga, std.testing.io, db_path);
+    defer pool.deinit();
+
+    const dispatch = events.Dispatch{ .on_error = H.onErr };
+
+    // Silence dispatchError's log fallback: the test runner counts std.log.err as a
+    // failure. (`logging.sink` is NOT the mechanism here — this compilation's
+    // `std_options` are owned by Zig's own test runner, not `logging.std_options`, so
+    // `logging.sink` only intercepts code that calls `logging.logFn`/`logging.request`
+    // directly; `reportRouteError`'s own log line instead downgrades err->warn under
+    // `builtin.is_test`, same as `backend/postgres/tls_trust.zig`'s `logMisconfig`.)
+    report_log.log_sink = struct {
+        fn sink(_: []const u8) void {}
+    }.sink;
+    defer report_log.log_sink = null;
+
+    // NEGATIVE CONTROL first: a healthy request must NOT raise an incident. Without
+    // this, a test that fires onError unconditionally would still pass below.
+    {
+        H.on_error_calls = 0;
+        var arena = std.heap.ArenaAllocator.init(ga);
+        defer arena.deinit();
+        var app = App{ .allocator = arena.allocator(), .io = std.testing.io, .pool = &pool, .dispatch = &dispatch };
+        var ctx = http.RequestCtx{ .method = .GET, .path = "/api/health", .allocator = RequestArena.from(&arena), .app = &app };
+        const resp = try Server(.{}).route(&ctx);
+        try std.testing.expectEqual(@as(u16, 200), resp.status);
+        try std.testing.expectEqual(@as(usize, 0), H.on_error_calls);
+    }
+
+    // Now the real thing: starve the request arena so the built-in handler fails.
+    // tryDispatch propagates the error into route()'s catch at server.zig:247.
+    {
+        H.on_error_calls = 0;
+        var failing = std.testing.FailingAllocator.init(ga, .{ .fail_index = 0 });
+        var arena = std.heap.ArenaAllocator.init(failing.allocator());
+        defer arena.deinit();
+        var app = App{ .allocator = ga, .io = std.testing.io, .pool = &pool, .dispatch = &dispatch };
+        var ctx = http.RequestCtx{ .method = .GET, .path = "/api/health", .allocator = RequestArena.from(&arena), .app = &app };
+        // Rendering the 500 envelope needs the same starved arena, so route() surfaces
+        // the error to onRequest (which writes the static raw envelope). Either outcome
+        // is acceptable — what must NOT happen is silence.
+        _ = Server(.{}).route(&ctx) catch {};
+        try std.testing.expectEqual(@as(usize, 1), H.on_error_calls);
+    }
 }
 
 test "dispatchCustom: a credential-less public request resolves without acquiring a reader (#231)" {

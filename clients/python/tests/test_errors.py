@@ -31,11 +31,37 @@ class TestZigbaseError:
 
 class TestParseErrorResponse:
     def test_parses_a_zigbase_error_response_body(self) -> None:
-        body = json.dumps({"code": 403, "message": "Forbidden.", "data": {}})
+        body = json.dumps({"status": 403, "code": "forbidden", "message": "Forbidden.", "data": {}})
         err = parse_error_response(403, body, "http://x/api/y")
         assert err.status == 403
         assert err.message == "Forbidden."
         assert err.data == {}
+        # The frozen machine code must survive the transport.
+        assert err.code == "forbidden"
+
+    def test_exposes_a_bespoke_code_so_callers_never_match_on_message(self) -> None:
+        body = json.dumps(
+            {
+                "status": 403,
+                "code": "email_not_verified",
+                "message": "Email not verified.",
+                "data": {},
+            }
+        )
+        err = parse_error_response(403, body, "http://x/api/y")
+        # Same status as a plain `forbidden`; only `code` tells them apart.
+        assert err.status == 403
+        assert err.code == "email_not_verified"
+
+    def test_ignores_a_non_string_code(self) -> None:
+        # Pre-unification servers put the integer HTTP status in `code`.
+        body = json.dumps({"code": 403, "message": "Forbidden."})
+        err = parse_error_response(403, body, "http://x/api/y")
+        assert err.code == ""
+
+    def test_code_is_empty_when_body_is_not_json(self) -> None:
+        err = parse_error_response(502, "oops", "http://x/api/y")
+        assert err.code == ""
 
     def test_parses_field_level_error_data(self) -> None:
         body = json.dumps(

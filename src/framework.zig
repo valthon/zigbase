@@ -7,7 +7,12 @@ const app_mod = @import("app.zig");
 const events = @import("events.zig");
 const config = @import("config.zig");
 const cli = @import("cli.zig");
+const logging = @import("logging.zig");
+const scaffold = @import("scaffold.zig");
+const devtools = @import("devtools.zig");
 const server = @import("server.zig");
+const serve_control = @import("serve_control.zig");
+const serve_session = @import("serve_session.zig");
 const migrations = @import("migrations.zig");
 const files_storage = @import("files/storage.zig");
 const db = @import("db.zig");
@@ -28,16 +33,28 @@ const provision = @import("provision.zig");
 const oauth_client = @import("oauth/client.zig");
 const migrator = @import("migrator.zig");
 const schema_dump = @import("schema_dump.zig");
+const schema_doc = @import("schema_doc.zig");
+const schema_diff = @import("schema_diff.zig");
 const schema = @import("schema.zig");
+// Named `collections_mod` (not `collections`): `App(cfg)` declares its own `pub const
+// collections` (the lowered comptime collection list), and that name is ambiguous with a
+// same-named file-level decl from inside the struct.
+const collections_mod = @import("collections.zig");
+const collections_api = @import("api/collections.zig");
 const ratelimit = @import("ratelimit.zig");
 const pagination = @import("pagination.zig");
 const registry = @import("auth/registry.zig");
 const field_policy = @import("field_policy.zig");
 const rewrap = @import("rewrap.zig");
 const import_mod = @import("import.zig");
+const import_manifest = @import("import_manifest.zig");
 const features = @import("features.zig");
+const doctor = @import("doctor.zig");
+const doctor_run = @import("doctor_run.zig");
+const rules_lint = @import("rules_lint.zig");
 const ctx_mod = @import("ctx.zig");
 const queue = @import("queue/queue.zig");
+const error_codes = @import("error_codes.zig");
 const queue_config = @import("queue/config.zig");
 const queue_durable = @import("queue/durable.zig");
 const queue_memory = @import("queue/memory.zig");
@@ -1628,7 +1645,13 @@ pub fn App(comptime cfg: anytype) type {
 
         /// Start the HTTP server directly with an explicit config (no CLI parsing).
         pub fn run(init: std.process.Init, cfg_runtime: config.Config) !void {
-            return serveImpl(init.gpa, init.io, cfg_runtime, &dispatch, jobs, job_pool_size, collections, provision_migrations, Opts, init.environ_map);
+            // This path never touches `loadCfg`, which is where the CLI installs the
+            // resolved logging config — so apply it here, or an embedding consumer's
+            // `cfg.log_format`/`log_level`/`log_requests` would be silently ignored.
+            // Exactly one `logging.apply` per entry point: CLI in `loadCfg`, embedded here.
+            logging.apply(cfg_runtime.log_format, cfg_runtime.log_level, cfg_runtime.log_requests);
+            // Untracked: session management lives in the CLI `.serve` arm only.
+            return serveImpl(init.gpa, init.io, cfg_runtime, &dispatch, jobs, job_pool_size, collections, provision_migrations, Opts, init.environ_map, null);
         }
 
         // ---- In-process test harness seams (#239 stage 3) ----------------------------
@@ -1842,6 +1865,12 @@ pub const ServeOpts = struct {
 
 /// Zig 0.16 entry point body: parse argv from `init.minimal.args` and dispatch.
 fn runCliImpl(init: std.process.Init, dispatch: *const events.Dispatch, jobs: []const scheduler.RuntimeJob, pool_size: usize, schema_collections: []const schema.Collection, schema_migrations: []const provision.Migration, comptime opts: ServeOpts) !void {
+    // Boot-ordering chicken-and-egg (docs/observability.md "Log output"): a bad
+    // ZIGBASE_LOG_FORMAT/LEVEL must be reported BY the logger it configures. This
+    // pre-pass reads only those two vars and silently ignores an invalid value —
+    // the real, fail-fast validation happens moments later in Config.loadDiag,
+    // which produces the actionable error. Exactly one validation path.
+    logging.preinstallFromEnv(init.environ_map);
     const allocator = init.gpa;
     const arena = init.arena.allocator();
 
@@ -1855,9 +1884,22 @@ fn runCliImpl(init: std.process.Init, dispatch: *const events.Dispatch, jobs: []
         .serve_static = std.meta.activeTag(opts.static_mode) == .default,
         .static_cache_control = std.meta.activeTag(opts.static_mode) != .disabled,
     }) catch |err| {
+        if (err == cli.ParseError.DevToolsDisabled) {
+            // Distinguishable from a plain usage error (docs the caller — often an
+            // agent that read a doc written for the default, dev-tools-on binary —
+            // straight at the fix) instead of falling into the generic "argument
+            // error: UnknownCommand" + full-usage-dump path below.
+            const verb = if (args.len >= 2) args[1] else "?";
+            std.log.err("zigbase {s}: {s}", .{ verb, devtools.disabled_note });
+            std.process.exit(1);
+        }
         std.log.err("argument error: {s}", .{@errorName(err)});
         printUsage(init.io, std.Io.File.stderr(), std.meta.activeTag(opts.static_mode) == .default, std.meta.activeTag(opts.static_mode) != .disabled);
-        return;
+        // Carried defect fix (SP-1 Task 9, independently also SP-3): a usage error
+        // (bad flag/value/unknown command) must exit 1 per the frozen CLI exit-code
+        // scheme (docs/observability.md convention 2) — this used to fall through
+        // and return normally, exiting 0 on a rejected invocation.
+        std.process.exit(1);
     };
 
     switch (cmd) {
@@ -1871,24 +1913,190 @@ fn runCliImpl(init: std.process.Init, dispatch: *const events.Dispatch, jobs: []
             .migrate_db => printMigrateDbUsage(init.io, std.Io.File.stdout()),
             .vapid_keygen => printVapidKeygenUsage(init.io, std.Io.File.stdout()),
             .import => printImportUsage(init.io, std.Io.File.stdout()),
+            .schema => printSchemaUsage(init.io, std.Io.File.stdout()),
+            .explain_code => printExplainCodeUsage(init.io, std.Io.File.stdout()),
+            .serve_control => printServeControlUsage(init.io, std.Io.File.stdout()),
+            .doctor => printDoctorUsage(init.io, std.Io.File.stdout()),
+            .init => printInitUsage(init.io, std.Io.File.stdout()),
+            .agents_md => printAgentsMdUsage(init.io, std.Io.File.stdout()),
         },
-        .version => printVersion(init.io, std.Io.File.stdout()),
-        .serve => |sa| {
+        .version => |va| if (va.json) printVersionJson(init.io, std.Io.File.stdout()) else printVersion(init.io, std.Io.File.stdout()),
+        .serve => |sa_in| {
+            var sa = sa_in;
+            // --ephemeral fills in ONLY what the user did not specify. This one
+            // rule is what makes it compose with --background: the parent
+            // resolves both, re-execs the child with them explicit, and the
+            // child (seeing them set) allocates nothing.
+            //
+            // `ephemeral_dir` tracks CLEANUP OWNERSHIP, which is not quite the
+            // same question as "did THIS invocation just allocate it": a
+            // `--background` child receives its data dir explicitly via a
+            // forwarded `--data-dir` (see below), so from the child's own
+            // parse it looks exactly like a user-supplied path. It is
+            // distinguished from a REAL user `--data-dir` (which must never be
+            // deleted, even with `--ephemeral` also set) by the same
+            // `ephemeral_prefix` trust boundary `sweepOrphan`/
+            // `removeEphemeralDir` already use cross-process to tell "ours"
+            // from "someone's real data" — a name no human would pick.
+            var ephemeral_dir: ?[]const u8 = null;
+            if (sa.ephemeral) {
+                if (sa.data_dir == null) {
+                    const d = try serve_control.makeEphemeralDir(init.io, arena, init.environ_map);
+                    ephemeral_dir = d;
+                    sa.data_dir = d;
+                } else if (std.mem.indexOf(u8, sa.data_dir.?, serve_control.ephemeral_prefix) != null) {
+                    ephemeral_dir = sa.data_dir;
+                }
+                if (sa.http_port == null) {
+                    sa.http_port = try serve_control.pickFreePort(init.io, sa.http_host orelse "127.0.0.1");
+                }
+            }
+            // Registered FIRST so LIFO runs it LAST: after serveImpl returns,
+            // after session.shutdown() has removed serve.json and dropped the
+            // flock, and after holder.deinit() closed the pool. Unreachable on
+            // the --background PARENT's path below, because background()
+            // never returns — the CHILD process runs this same arm again (see
+            // the forwarded --data-dir below) and registers its OWN copy of
+            // this defer, which is what actually deletes the dir.
+            defer if (ephemeral_dir) |d| serve_control.removeEphemeralDir(init.io, d);
+
             const cfg = try loadCfg(init.environ_map, sa);
-            try serveImpl(allocator, init.io, cfg, dispatch, jobs, pool_size, schema_collections, schema_migrations, opts, init.environ_map);
+            // The data dir must exist before the lock file can be created in it.
+            ensureDataDir(init.io, cfg.data_dir);
+            const data_dir_abs = try std.Io.Dir.cwd().realPathFileAlloc(init.io, cfg.data_dir, arena);
+
+            // `--background` (explicit, agent-detected, or opted out of) is
+            // decided BEFORE `--ignore-lock` is consulted: an agent-detected
+            // background run still honors an explicit `--ignore-lock` (see
+            // `decideBackground`'s precedence), so this must run first.
+            const decision = serve_control.decideBackground(
+                sa.background,
+                init.environ_map.contains(serve_control.background_child_env),
+                sa.ignore_lock,
+                init.environ_map,
+            );
+            if (decision.background) {
+                if (decision.detected_provider) |p| {
+                    std.debug.print(
+                        "serve: {s} environment detected — starting in the background (set {s}=0 to disable)\n",
+                        .{ p, serve_control.background_optout_env },
+                    );
+                }
+                var child_env = try init.environ_map.clone(arena);
+                // A freshly allocated ephemeral dir exists only in THIS
+                // process's `sa`, not in the user's original argv — the
+                // re-exec'd child must receive it explicitly via --data-dir,
+                // or (by the composition rule above) it would independently
+                // allocate a DIFFERENT tempdir of its own, and this process's
+                // readiness poll — which watches THIS resolved data_dir_abs
+                // for serve.json — would never see the child's serve.json
+                // appear there. The picked --http-port needs no such
+                // forwarding: nothing downstream of this branch uses this
+                // process's own pick, and the child reports whatever port IT
+                // actually bound in its own serve.json.
+                var bg_args: std.ArrayListUnmanaged([]const u8) = .empty;
+                try bg_args.appendSlice(arena, args[1..]);
+                if (ephemeral_dir) |d| {
+                    try bg_args.append(arena, "--data-dir");
+                    try bg_args.append(arena, d);
+                }
+                // `ephemeral_dir`, again: non-null only when THIS process
+                // owns the tempdir (freshly allocated it, or it already bore
+                // our own naming prefix), never for a real user `--data-dir`.
+                // On a failed handoff (the child never becomes ready) this
+                // process — not the child — is the one that deletes it; see
+                // `background`'s doc comment for why that's a NEW leak surface
+                // Task 7 introduced, not the same case as an external
+                // `kill -9` of a RUNNING server.
+                serve_control.background(init.io, allocator, sa, data_dir_abs, ephemeral_dir, bg_args.items, &child_env);
+                // unreachable: background() never returns
+            }
+
+            if (sa.ignore_lock) {
+                std.log.warn("serve: --ignore-lock: this instance is UNTRACKED (no {s}/{s} is written; 'zigbase serve status/stop/logs' will not find it)", .{ data_dir_abs, serve_session.data_name });
+                try serveImpl(allocator, init.io, cfg, dispatch, jobs, pool_size, schema_collections, schema_migrations, opts, init.environ_map, null);
+                return;
+            }
+
+            // A refused start is an OPERATIONAL condition, not a program fault,
+            // so both failure arms below exit with the failure code rather than
+            // propagating an error. Returning one made `main` print Zig's
+            // generic `error: …` trailer plus a source-annotated stack trace on
+            // top of the actionable message — noise that also injects non-JSON
+            // lines into a `--log-format json` stream, which no amount of
+            // logging configuration can fix because it comes from the runtime,
+            // not the log system. Mirrors the parse-error path and the control
+            // verbs, where the exit code IS the contract.
+            //
+            // `std.process.exit` skips deferred cleanup, so the ephemeral
+            // tempdir (if this invocation owns one) is removed explicitly in
+            // each arm; the registered defer simply never runs.
+            var session = switch (try serve_control.openSession(init.io, allocator, .{
+                .data_dir_abs = data_dir_abs,
+                .host = cfg.http_host,
+                .port = cfg.http_port,
+                // Derived from the recursion guard, NOT from sa.background: by
+                // the time a backgrounded server actually runs it IS the child,
+                // and filterBackgroundArgs already stripped --background from
+                // its argv. Conflating the two env vars is precisely what
+                // corrupts this field in Astro's implementation.
+                .background = init.environ_map.contains(serve_control.background_child_env),
+                .ephemeral = sa.ephemeral,
+            })) {
+                .opened => |s| s,
+                .held => {
+                    std.log.err("refusing to start: another zigbase serve session already owns the data dir '{s}'. Inspect it with `zigbase serve status`, stop it with `zigbase serve stop`, or start an untracked instance with `zigbase serve --ignore-lock`.", .{data_dir_abs});
+                    if (ephemeral_dir) |d| serve_control.removeEphemeralDir(init.io, d);
+                    std.process.exit(1);
+                },
+                // Distinct from `.held` on purpose: there is no session here to
+                // inspect or stop, so naming one would send an operator chasing
+                // a process that does not exist. The cause is the data dir
+                // itself, and so is the remedy.
+                .unavailable => |e| {
+                    std.log.err("refusing to start: cannot create the session lock file '{s}/{s}': {s}. The data dir must exist and be writable by this user — a read-only mount, wrong ownership, or a stray directory of that name are the usual causes. To run without session tracking entirely, pass `zigbase serve --ignore-lock`.", .{ data_dir_abs, serve_session.lock_name, @errorName(e) });
+                    if (ephemeral_dir) |d| serve_control.removeEphemeralDir(init.io, d);
+                    std.process.exit(1);
+                },
+            };
+            defer session.shutdown();
+            try serveImpl(allocator, init.io, cfg, dispatch, jobs, pool_size, schema_collections, schema_migrations, opts, init.environ_map, &session);
         },
+        .serve_control => |ca| try serveControlImpl(allocator, init.io, init.environ_map, ca),
+        // schema_migrations is threaded from the start, even though the Task 3
+        // stub ignores it: Task 9's real doctor needs the binary's compiled-in
+        // `.migrations` to judge the migrations check, and settling the call
+        // shape now means this dispatch line is written once.
+        .doctor => |da| try doctorImpl(allocator, init.io, init.environ_map, da, schema_migrations),
         .migrate => |ma| switch (ma.action) {
             .apply => try migrateImpl(allocator, init.io, init.environ_map, ma, schema_migrations),
             .status => try migrateStatusImpl(allocator, init.io, init.environ_map, ma, schema_migrations),
             .rollback => try migrateRollbackImpl(allocator, init.io, init.environ_map, ma, schema_migrations),
             .dump => try migrateDumpImpl(allocator, init.io, init.environ_map, ma),
         },
+        .schema => |sa| switch (sa.action) {
+            .dump => try schemaDumpImpl(allocator, init.io, init.environ_map, sa),
+            .apply => try schemaApplyImpl(allocator, init.io, init.environ_map, sa, dispatch, jobs, pool_size, schema_collections, schema_migrations, opts),
+            .check_rules => try schemaCheckRulesImpl(allocator, init.io, init.environ_map, sa),
+        },
         .rewrap => |ra| try rewrapImpl(allocator, init.io, init.environ_map, ra),
         .import => |ia| try importImpl(allocator, init.io, init.environ_map, ia, dispatch, jobs, pool_size, schema_collections, schema_migrations, opts),
         .migrate_db => |ma| try migrateDbImpl(allocator, init.io, ma),
         .superuser_create => |sa| try superuserCreateImpl(allocator, init.io, init.environ_map, sa),
         .vapid_keygen => try vapidKeygenImpl(allocator, init.io),
+        .explain_code => |ea| explainCodeImpl(init.io, ea),
+        .init => |ia| try initImpl(allocator, init.io, ia),
+        .agents_md => |aa| try agentsMdImpl(allocator, init.io, aa),
         .typegen => |ta| {
+            if (!devtools.enabled) {
+                // Unreachable via the CLI in practice: cli.parse rejects `typegen`
+                // with ParseError.DevToolsDisabled before dispatch ever reaches
+                // here in a `-Ddev-tools=false` build. Kept only so this arm's
+                // analyzed body never references codegen/typegen_cli.zig (and the
+                // ~24-file codegen/** subtree behind it) in a stripped binary.
+                std.log.err("zigbase typegen: {s}", .{devtools.disabled_note});
+                std.process.exit(1);
+            }
             if (opts.enable_typegen) {
                 const tgen = @import("codegen/typegen_cli.zig");
                 var arena_state = std.heap.ArenaAllocator.init(init.gpa);
@@ -1914,7 +2122,12 @@ fn runCliImpl(init: std.process.Init, dispatch: *const events.Dispatch, jobs: []
                 });
             } else {
                 std.log.err("typegen: this binary was not built with .enable_typegen = true", .{});
-                return;
+                // Same swallowed-failure shape the parse-error catch above had:
+                // a bare `return;` here would exit 0 despite refusing to run.
+                // `return error.X` matches this arm's own idiom two branches up
+                // (MissingOut / BadLang) and — like those — yields a non-zero
+                // exit via the top-level `!void` main's normal error handling.
+                return error.TypegenNotEnabled;
             }
         },
     }
@@ -1947,14 +2160,32 @@ fn printUsage(io: std.Io, file: std.Io.File, show_serve_static: bool, show_stati
         \\
         \\COMMANDS:
         \\  serve               Start the HTTP server (REST + WebSocket + admin UI at /_/).
+        \\  serve stop|status|logs   Manage a background `serve` session (see `zigbase serve status --help`).
+        \\  doctor              Preflight checks; --production escalates, --json emits NDJSON. Exits 1 on any error.
         \\  migrate             Apply database migrations, then exit. `status` reports; `rollback [N]` reverses; `dump` dumps the live schema.
         \\  rewrap              Re-encrypt all encrypted fields under the primary key (key rotation).
         \\  migrate-db          Copy an existing SQLite instance into PostgreSQL (requires -Dpostgres).
         \\  import              Bulk-import NDJSON records offline (through the engine: validation + encryption).
+        \\  schema              Dump the collection model as JSON, apply a schema document, or
+        \\                      `check-rules` to lint access-rule expressions before they ship.
         \\  superuser create    Create an admin (superuser) account.
         \\  vapid-keygen        Generate a VAPID (Web Push) keypair for ctx.push().
+        \\  explain-code        Explain a frozen API error code, or list them all. Add --json for one JSON object.
+        \\
+    , .{});
+    // init/agents-md/typegen are pure development-time surfaces (see src/devtools.zig); a
+    // `-Ddev-tools=false` binary doesn't compile them in, so help must not advertise
+    // them there. Every published zigbase artifact builds at the default (dev-tools
+    // on), so this only ever hides these lines for a consumer's own custom build.
+    if (devtools.enabled) emit(io, file,
+        \\  init                Scaffold a starting-point project (--box or --framework).
+        \\  agents-md           Write AGENTS.md + CLAUDE.md for an existing project.
+        \\  typegen             Generate a typed client from the collection schema (see `zigbase typegen --help`).
+        \\
+    , .{});
+    emit(io, file,
         \\  help                Show this help. Also: --help, -h, or no arguments.
-        \\  version             Print version + build provenance. Also: --version, -V.
+        \\  version             Print version + build provenance. Also: --version, -V. Add --json for one JSON object.
         \\
         \\  Per-command help is available via `zigbase <command> --help`, e.g.
         \\  `zigbase serve --help` or `zigbase superuser create --help`.
@@ -1974,6 +2205,10 @@ fn printUsage(io: std.Io, file: std.Io.File, show_serve_static: bool, show_stati
         \\                      0 = inherit the 40s listener timeout. [env ZIGBASE_SSE_HEARTBEAT_SECONDS]
         \\  --realtime-outbound-hwm N  Disconnect a slow WS/SSE consumer once its queued outbound
         \\                      frames exceed N (serve only). 0 disables. [env ZIGBASE_REALTIME_OUTBOUND_HWM]
+        \\  --log-format F      text|json (serve only). json emits one JSON object per line on
+        \\                      stderr. [env ZIGBASE_LOG_FORMAT, default text]
+        \\  --log-level L       debug|info|warn|error (serve only). [env ZIGBASE_LOG_LEVEL, default info]
+        \\  --no-request-log    Suppress per-request access lines (serve only). [env ZIGBASE_LOG_REQUESTS]
         \\
     , .{});
     if (show_serve_static) emit(io, file,
@@ -2002,6 +2237,9 @@ fn printUsage(io: std.Io, file: std.Io.File, show_serve_static: bool, show_stati
         \\                           false only for plain-HTTP local dev. [default true]
         \\  ZIGBASE_TRUST_PROXY       Trust X-Forwarded-For/X-Real-IP (true/1). Set ONLY behind a
         \\                           trusted reverse proxy.          [default false]
+        \\  ZIGBASE_SERVE_BACKGROUND  Set 1 to force `serve` into the background; any other value
+        \\                           disables the auto-backgrounding a detected AI-agent
+        \\                           environment triggers.           [default: auto-detect]
         \\  ZIGBASE_SENTRY_DSN        Sentry DSN for error reporting; empty logs errors to stderr.
         \\                           [default empty]
         \\  ZIGBASE_REALTIME_ORIGINS  CSV of allowed WebSocket Origins. Empty DENIES cross-origin
@@ -2060,6 +2298,9 @@ fn printUsage(io: std.Io, file: std.Io.File, show_serve_static: bool, show_stati
         \\                           browser applicationServerKey. Generate with `zigbase vapid-keygen`.
         \\  ZIGBASE_VAPID_PRIVATE_KEY Web Push VAPID private key (base64url) — SECRET. Both keys unset
         \\                           → ctx.push() is a no-op. [default: off]
+        \\  ZIGBASE_LOG_FORMAT          text|json — log line encoding (json = one object per line). Default text.
+        \\  ZIGBASE_LOG_LEVEL           debug|info|warn|error — minimum severity. Default info.
+        \\  ZIGBASE_LOG_REQUESTS        true|false — per-request access lines. Default true.
         \\
         \\EXAMPLES:
         \\  # Create the first superuser (admin) account:
@@ -2076,6 +2317,15 @@ fn printUsage(io: std.Io, file: std.Io.File, show_serve_static: bool, show_stati
         \\
         \\  # Apply pending migrations and exit:
         \\  zigbase migrate --data-dir ./zb_data
+        \\
+        \\  # Start detached and use it immediately (exits 0 only once it answers):
+        \\  zigbase serve --background --data-dir ./zb_data && zigbase serve status --json --data-dir ./zb_data
+        \\
+        \\  # A throwaway backend for a test run — one JSON line, then it is yours:
+        \\  zigbase serve --background --ephemeral
+        \\
+        \\  # Preflight before shipping:
+        \\  zigbase doctor --production --data-dir /var/lib/zigbase
         \\
         \\After `serve` starts, open http://127.0.0.1:8090/_/ for the admin UI.
         \\More docs: README.md, docs/api.md, docs/framework.md, docs/tutorial.md.
@@ -2123,6 +2373,29 @@ fn printVersion(io: std.Io, file: std.Io.File) void {
     });
 }
 
+/// `zigbase version --json` (SP-1). Exactly one object on stdout; same build_options
+/// source of truth as `printVersion` and `GET /api/health`'s `versions`, so the three
+/// can never disagree. Key order is contract.
+fn printVersionJson(io: std.Io, file: std.Io.File) void {
+    emit(io, file, "{{\"zigbase\":{f},\"commit\":{f},\"build\":\"{s}\",\"target\":\"{s}-{s}-{s}\",\"zig\":{f}," ++
+        "\"components\":{{\"sqlite\":{f},\"sqlite_source_id\":{f},\"sqlite_vec\":{f},\"sqlite_vec_linked\":{}," ++ "\"zap\":{f},\"zap_commit\":{f},\"facil\":{f}}}}}\n", .{
+        std.json.fmt(build_options.version, .{}),
+        std.json.fmt(build_options.commit, .{}),
+        @tagName(builtin.mode),
+        @tagName(builtin.target.cpu.arch),
+        @tagName(builtin.target.os.tag),
+        @tagName(builtin.target.abi),
+        std.json.fmt(builtin.zig_version_string, .{}),
+        std.json.fmt(build_options.sqlite_version, .{}),
+        std.json.fmt(build_options.sqlite_source_id, .{}),
+        std.json.fmt(build_options.sqlite_vec_version, .{}),
+        build_options.vector,
+        std.json.fmt(build_options.zap_version, .{}),
+        std.json.fmt(build_options.zap_commit, .{}),
+        std.json.fmt(build_options.facil_version, .{}),
+    });
+}
+
 fn printServeUsage(io: std.Io, file: std.Io.File, show_serve_static: bool, show_static_cache_control: bool) void {
     emit(io, file,
         \\zigbase serve — start the HTTP server (REST API + WebSocket + admin UI at /_/).
@@ -2130,7 +2403,9 @@ fn printServeUsage(io: std.Io, file: std.Io.File, show_serve_static: bool, show_
         \\USAGE:
         \\  zigbase serve [--http-host H] [--http-port N] [--data-dir PATH]
         \\                [--insecure-cookies] [--trust-proxy] [--realtime-origins CSV]
-        \\                [--sse-heartbeat-seconds N] [--realtime-outbound-hwm N]{s}
+        \\                [--sse-heartbeat-seconds N] [--realtime-outbound-hwm N]
+        \\                [--log-format F] [--log-level L] [--no-request-log]{s}
+        \\                [--background] [--ephemeral] [--ignore-lock] [--force]
         \\
         \\FLAGS:
         \\  --http-host H    Address to bind; loopback by default. Pass 0.0.0.0 for all
@@ -2144,6 +2419,25 @@ fn printServeUsage(io: std.Io, file: std.Io.File, show_serve_static: bool, show_
         \\                         listener timeout. [env ZIGBASE_SSE_HEARTBEAT_SECONDS]
         \\  --realtime-outbound-hwm N  Disconnect a slow WS/SSE consumer past N queued outbound
         \\                         frames; 0 disables. [env ZIGBASE_REALTIME_OUTBOUND_HWM]
+        \\  --log-format F      text|json. json emits one JSON object per line on stderr.
+        \\  --log-level L       debug|info|warn|error. Default info.
+        \\  --no-request-log    Suppress the per-request access lines.
+        \\
+        \\  The three logging knobs also work as ZIGBASE_LOG_FORMAT / ZIGBASE_LOG_LEVEL /
+        \\  ZIGBASE_LOG_REQUESTS, which apply to every subcommand (these flags are serve-only).
+        \\
+        \\  --background     Detach into a new process group; write output to
+        \\                   <data-dir>/serve.log and exit 0 once the server answers.
+        \\                   Automatic in a detected AI-agent environment.
+        \\                   [env ZIGBASE_SERVE_BACKGROUND]
+        \\  --ephemeral      Use a fresh temp data dir and a free port (only for whichever
+        \\                   of --data-dir/--http-port you did not pass), and print
+        \\                   {{"url","port","data_dir","pid"}} on stdout when ready.
+        \\  --ignore-lock    Start an UNTRACKED instance: take no session lock and write no
+        \\                   serve.json. Invisible to `serve status/stop/logs`.
+        \\                   Cannot be combined with --background.
+        \\  --force          --background only: stop an existing session first instead of
+        \\                   reporting it and exiting 0.
         \\
     , .{if (show_serve_static) " [--serve-static DIR]" else ""});
     if (show_serve_static) emit(io, file,
@@ -2183,6 +2477,10 @@ fn printMigrateUsage(io: std.Io, file: std.Io.File) void {
         \\FLAGS:
         \\  --data-dir PATH  SQLite db + file storage directory. [env ZIGBASE_DATA_DIR, default ./zb_data]
         \\  --out FILE       (dump only) Write the SQL to FILE instead of stdout; parent dirs are created.
+        \\  --json           (status only) Emit one JSON object on stdout instead of the text report.
+        \\
+        \\  `migrate status` exits 1 when any migration is pending or orphaned, so it can
+        \\  gate a deploy: `zigbase migrate status || zigbase migrate`.
         \\
         \\WHAT IT DOES:
         \\  `migrate` applies pending SYSTEM migrations and then the app's comptime `.migrations`
@@ -2213,6 +2511,107 @@ fn printMigrateUsage(io: std.Io, file: std.Io.File) void {
         \\  zigbase migrate rollback 3 --data-dir ./zb_data
         \\  zigbase migrate dump --data-dir ./zb_data
         \\  zigbase migrate dump --out db/structure.sql --data-dir ./zb_data
+        \\
+    , .{});
+}
+
+fn printSchemaUsage(io: std.Io, file: std.Io.File) void {
+    emit(io, file,
+        \\zigbase schema — declarative schema: dump the live collection model, apply a document,
+        \\lint access rules.
+        \\
+        \\USAGE:
+        \\  zigbase schema dump  [--json] [--out FILE] [--data-dir PATH]
+        \\  zigbase schema apply <schema.json> [--dry-run] [--allow-destructive] [--prune]
+        \\                       [--data-dir PATH]
+        \\  zigbase schema check-rules [schema.json] [--json] [--data-dir PATH]
+        \\
+        \\DUMP:
+        \\  Writes a canonical JSON document describing every NON-SYSTEM collection: fields
+        \\  (with their stable ids), indexes, access rules, and collection options. It is
+        \\  deterministic (collections name-sorted, stable key order) so it diffs cleanly in
+        \\  git. Collection ids are omitted (they are instance-local) and OAuth client secrets
+        \\  are REDACTED — the document is not a secrets backup. Output goes to stdout unless
+        \\  --out is given. --json is accepted (symmetry with `import --json`) and ignored —
+        \\  the dumped document is already the one JSON object printed.
+        \\
+        \\APPLY:
+        \\  Diffs the document against the live schema and executes the difference through the
+        \\  same validation + DDL path as the REST collections API. Only collections named in
+        \\  the document are touched; live collections absent from it are reported as
+        \\  "untracked" and left alone (--prune deletes them instead). Refused when the app
+        \\  sets `.collections_frozen`.
+        \\
+        \\  Against a live SQLite-backed server, restart it afterwards: the server caches
+        \\  parsed collection metadata in-process with no TTL, invalidated only by its own
+        \\  REST create/update/delete handlers, so it can keep serving a stale or
+        \\  not-found view of a collection it already looked up until it restarts.
+        \\
+        \\  RULE SYNTAX GATE: before anything is written, every access rule the document
+        \\  declares is run through the filter lexer + parser. If any one of them fails to
+        \\  parse, the WHOLE document is refused — nothing is written, the offending
+        \\  collection/rule/error code is printed on stderr, and the exit is 1 (in --dry-run
+        \\  too, and ahead of the destructive check, so an unparseable document exits 1 even
+        \\  when it is also destructive). There is no flag to skip it. It is syntax ONLY:
+        \\  field and relation names are NOT resolved, because a rule may legitimately name a
+        \\  field this same apply is about to add. `@public` is NOT reported here either —
+        \\  that judgment lives in `check-rules`, whose exit 2 means "needs judgment", and
+        \\  apply's exit 2 is frozen as "dry-run found destructive changes".
+        \\
+        \\  --dry-run             Print the plan and apply no schema change. NOT a true no-op:
+        \\                        booting to compute the plan still runs system migrations
+        \\                        and comptime collection provisioning, which write.
+        \\  --allow-destructive   Permit drops and retypes (refused otherwise).
+        \\  --prune               Delete live collections absent from the document.
+        \\                        Requires --allow-destructive.
+        \\  --json                Accepted, ignored (stdout is already one JSON object).
+        \\
+        \\CHECK-RULES:
+        \\  Lints the five access rules (listRule/viewRule/createRule/updateRule/deleteRule)
+        \\  of every non-system collection through the REAL rule pipeline. Nothing validates
+        \\  a rule when it is written — the first parse happens at request time, where a
+        \\  malformed rule fails CLOSED (500). This is the preflight for that.
+        \\
+        \\  TWO MODES, TWO DEPTHS:
+        \\    no FILE          LIVE mode, depth "full". Every rule is compiled against the
+        \\                     database at --data-dir through the same entry point a request
+        \\                     uses, so unknown fields and bad relation traversals are caught
+        \\                     as well as syntax.
+        \\    FILE             DOCUMENT mode, depth "syntax". Lexer + parser ONLY. Resolving a
+        \\                     field or relation name needs a live schema and a connection,
+        \\                     which a document does not carry, so a rule naming a field that
+        \\                     does not exist passes here. The summary always says which depth
+        \\                     ran; do not read a clean "syntax" run as a clean bill of health.
+        \\
+        \\  Blank rules (null or "") mean Locked (superusers only) and are never reported.
+        \\  A rule of exactly "@public" is reported as a WARNING — it is the one allow-all,
+        \\  and opening a collection to everyone is a judgment a human should confirm. (This
+        \\  deliberately overlaps `doctor`'s public-rules-enumerated check, at a different
+        \\  lifecycle stage: doctor asks what a running server exposes, check-rules asks what
+        \\  a document or schema is about to expose.)
+        \\
+        \\  Output is NDJSON on stdout — one object per finding, then exactly one summary
+        \\  object whose first key is "summary" — same shape as `doctor`. Clean rules emit
+        \\  no line at all; the summary's rules_checked carries the coverage. --json is
+        \\  accepted and ignored (NDJSON is the only format).
+        \\
+        \\EXIT CODES (dump / apply):
+        \\  0  success, or --dry-run with no destructive changes
+        \\  1  the command failed (bad document, an unparseable access rule, refused
+        \\     operation, DB error)
+        \\  2  --dry-run found DESTRUCTIVE changes (needs --allow-destructive)
+        \\
+        \\EXIT CODES (check-rules):
+        \\  0  no findings
+        \\  1  at least one rule failed to parse or compile
+        \\  2  no errors, but at least one warning (an "@public" rule)
+        \\
+        \\EXAMPLES:
+        \\  zigbase schema dump --out db/schema.json --data-dir ./zb_data
+        \\  zigbase schema apply db/schema.json --dry-run
+        \\  zigbase schema apply db/schema.json --allow-destructive
+        \\  zigbase schema check-rules db/schema.json        # offline, syntax depth
+        \\  zigbase schema check-rules --data-dir ./zb_data  # live, full depth
         \\
     , .{});
 }
@@ -2270,6 +2669,35 @@ fn printImportUsage(io: std.Io, file: std.Io.File) void {
         \\                     existing field; a unique constraint is recommended.
         \\  --batch-size N     Rows per transaction (default 500; must be >= 1).
         \\  --data-dir PATH    SQLite db + file storage directory. [env ZIGBASE_DATA_DIR, default ./zb_data]
+        \\  --dry-run          Validate + execute every row, then roll back — no record data
+        \\                     is written. NOT a true no-op: booting to import still runs
+        \\                     system migrations and comptime collection provisioning, which
+        \\                     write, same as any other startup.
+        \\                     (An --upsert-key lookup sees no rows created in the same dry run.)
+        \\  --continue-on-error  Skip a failing row instead of aborting. Exit code becomes 3 if any
+        \\                     row was skipped — a lossy import is never reported as success.
+        \\  --error-log FILE   NDJSON sink for per-row failures: {{"line":N,"code":…,"detail":…}}.
+        \\  --progress N       Print a progress line to stderr every N rows (0 = off).
+        \\  --json             Print the summary as one JSON object on stdout.
+        \\  --manifest FILE    Load several collections in relation order from a manifest:
+        \\                     {{"zigbaseImportManifest":1,"collections":[
+        \\                       {{"collection":"authors","file":"authors.ndjson"}},
+        \\                       {{"collection":"posts","file":"posts.ndjson","upsertKey":"slug"}}]}}
+        \\                     File paths resolve against the MANIFEST's directory. Relation cycles
+        \\                     and self-relations are loaded with the offending values stripped and
+        \\                     patched afterwards by record id (those rows must carry their own id).
+        \\                     Excludes --collection/--upsert-key and the positional file.
+        \\  --legacy-hashes ALG  Import each row's `passwordHash` as a SOURCE hash produced by ALG
+        \\                     (currently: bcrypt) instead of ignoring it. The value is stored tagged
+        \\                     as $zblegacy$ALG$<hash> and is replaced with argon2id on the user's
+        \\                     first successful login. Requires an auth collection, refuses
+        \\                     _superusers, and requires every row to carry its own `id`. Under this
+        \\                     flag a row's `verified` flag is carried over too. A row carrying BOTH
+        \\                     `password` and `passwordHash` is refused. CREATE-ONLY: it cannot be
+        \\                     combined with --upsert-key (nor with a manifest entry's `upsertKey`),
+        \\                     because an updated row would land with no credential installed.
+        \\                     The flag applies uniformly to EVERY manifest entry, so a legacy-hash
+        \\                     import must be its own single-collection run.
         \\
         \\WHAT IT DOES:
         \\  Streams an NDJSON file (one JSON object per line) into the collection THROUGH THE
@@ -2287,10 +2715,61 @@ fn printImportUsage(io: std.Io, file: std.Io.File) void {
         \\
         \\  Blank lines are skipped. A single record line must fit the 1 MiB line buffer.
         \\
+        \\EXIT CODES:
+        \\  0  every row imported
+        \\  1  the import failed (fatal error; batches committed before it persist)
+        \\  3  the import completed but skipped rows (--continue-on-error)
+        \\
         \\EXAMPLES:
         \\  zigbase import --collection posts --data-dir ./zb_data seed.ndjson
         \\  zigbase import --collection users --upsert-key email users.ndjson
         \\  cat dump.ndjson | zigbase import --collection posts -
+        \\  zigbase import --collection posts --continue-on-error --error-log errs.ndjson \
+        \\    --progress 1000 --json seed.ndjson
+        \\
+    , .{});
+}
+
+fn printServeControlUsage(io: std.Io, file: std.Io.File) void {
+    emit(io, file,
+        \\zigbase serve stop|status|logs — manage a background `zigbase serve` session.
+        \\
+        \\USAGE:
+        \\  zigbase serve stop   [--data-dir PATH]            Stop the session owning this data dir.
+        \\  zigbase serve status [--json] [--data-dir PATH]   Report the session; exit 0 running, 1 not.
+        \\  zigbase serve logs   [--json] [--follow|-f] [--data-dir P]
+        \\                                                   Print (and optionally tail) serve.log.
+        \\
+        \\  `logs --json` keeps only the NDJSON records, dropping the plain-text lines
+        \\  facil.io writes into serve.log itself — so `serve logs --json | jq` works on a
+        \\  real log file. Start the session with --log-format json for records to exist.
+        \\
+        \\Each verb resolves its session from the data dir, exactly like `serve` itself
+        \\[env ZIGBASE_DATA_DIR, default ./zb_data]. See docs/serve.md for the JSON contract.
+        \\
+    , .{});
+}
+
+fn printDoctorUsage(io: std.Io, file: std.Io.File) void {
+    emit(io, file,
+        \\zigbase doctor — preflight checks over this deployment's config, data dir, and schema.
+        \\
+        \\USAGE:
+        \\  zigbase doctor [--production] [--json] [--data-dir PATH]
+        \\
+        \\FLAGS:
+        \\  --production   Judge the config as a PRODUCTION deployment: several warnings
+        \\                 become errors (see docs/serve.md for the per-check table).
+        \\  --json         NDJSON findings on stdout, one per line, then one summary object.
+        \\  --data-dir PATH  [env ZIGBASE_DATA_DIR, default ./zb_data]
+        \\
+        \\EXIT CODES:
+        \\  0  fully clean — no errors, no warnings
+        \\  1  at least one error-severity finding
+        \\  2  ran correctly, warnings only (something needs judgment)
+        \\
+        \\  Strict deploy gate:    zigbase doctor --production && deploy
+        \\  Tolerant deploy gate:  zigbase doctor --production; case $? in 0|2) deploy ;; esac
         \\
     , .{});
 }
@@ -2335,8 +2814,98 @@ fn printVapidKeygenUsage(io: std.Io, file: std.Io.File) void {
     , .{});
 }
 
+fn printExplainCodeUsage(io: std.Io, file: std.Io.File) void {
+    emit(io, file,
+        \\zigbase explain-code [CODE] [--json] — explain a frozen API error code.
+        \\
+        \\USAGE:
+        \\  zigbase explain-code                list every registered code, one per line.
+        \\  zigbase explain-code CODE           print CODE's summary + long-form explanation.
+        \\  zigbase explain-code [CODE] --json  emit the same information as one JSON object.
+        \\
+        \\CODE is the wire string ZigBase puts in an envelope's `code` (or a field error's
+        \\`data.<field>.code`) — e.g. `validation_required`, `not_found`, `collections_frozen`.
+        \\A CODE ZigBase never registered exits 1 (`--json` still prints one object, with
+        \\`"known":false`); a consumer route may legitimately emit its own strings via
+        \\ctx.jsonError, so this is not a ZigBase bug report.
+        \\
+    , .{});
+}
+
+fn printInitUsage(io: std.Io, file: std.Io.File) void {
+    emit(io, file,
+        \\zigbase init — scaffold a starting-point project.
+        \\
+        \\USAGE:
+        \\  zigbase init [--box | --framework] [--dir PATH] [--name NAME]
+        \\
+        \\MODES:
+        \\  --box         (default) No Zig toolchain. Emits docker-compose.yml, a
+        \\                schema/collections.json starting point (apply it with
+        \\                `zigbase schema apply`), AGENTS.md + CLAUDE.md, .gitignore,
+        \\                and a README.
+        \\  --framework   A Zig package that embeds ZigBase as a library. Emits
+        \\                build.zig (wired with zigbase.addTo + zigbase.addTest),
+        \\                build.zig.zon, src/main.zig with a comptime schema and
+        \\                in-process tests, AGENTS.md + CLAUDE.md, .gitignore, README.
+        \\
+        \\FLAGS:
+        \\  --dir PATH    Target directory, created if missing. [default .]
+        \\  --name NAME   Package/executable name (framework mode).
+        \\                [default: the directory name, sanitized]
+        \\
+        \\Existing files are NEVER overwritten — they are reported as skipped and left
+        \\alone. There is no --force.
+        \\
+        \\In framework mode, run `zig fetch --save git+https://github.com/valthon/zigbase`
+        \\afterwards: that is what writes the dependency URL and its content hash into
+        \\build.zig.zon.
+        \\
+    , .{});
+}
+
+fn printAgentsMdUsage(io: std.Io, file: std.Io.File) void {
+    emit(io, file,
+        \\zigbase agents-md — write AGENTS.md + CLAUDE.md for an existing project.
+        \\
+        \\USAGE:
+        \\  zigbase agents-md [--box | --framework] [--dir PATH] [--stdout]
+        \\
+        \\FLAGS:
+        \\  --dir PATH    Target directory. [default .]
+        \\  --box         Force the no-Zig content set.
+        \\  --framework   Force the library-embedding content set.
+        \\  --stdout      Print AGENTS.md instead of writing it (diff-friendly).
+        \\
+        \\With neither mode flag, the mode is inferred: a build.zig.zon in the target
+        \\directory means framework, otherwise box.
+        \\
+        \\Existing files are never overwritten. To refresh one, delete it (or diff
+        \\against --stdout) first.
+        \\
+    , .{});
+}
+
 fn loadCfg(environ: *const std.process.Environ.Map, sa: cli.ServeArgs) !config.Config {
-    var cfg = try config.Config.load(config.EnvGetter{ .environ = environ });
+    var diag: config.LoadDiag = .{};
+    var cfg = config.Config.loadDiag(config.EnvGetter{ .environ = environ }, &diag) catch |e| switch (e) {
+        error.InvalidEnvValue => {
+            std.log.err(
+                "invalid value for {s}: '{s}' — expected {s}. Fix the variable (or unset it to use the default) and start again.",
+                .{ diag.var_name, diag.value, diag.expected },
+            );
+            // EXIT rather than return the error. Propagating it to `main` makes Zig
+            // print its own `error: InvalidEnvValue` line plus a source-annotated
+            // stack trace through std.fmt's parseInt internals — thirty lines of
+            // noise on top of the one actionable sentence above, which is the whole
+            // point of this diagnostic. There is nothing for a caller to recover
+            // from: a malformed knob is fatal by design (fail fast at boot).
+            // `logging.write` flushes stderr on every record, so the message is
+            // already out before this call skips the deferred cleanup.
+            // Exit 1 = "bad input", per the CLI exit-code scheme.
+            std.process.exit(1);
+        },
+    };
     if (sa.http_host) |v| cfg.http_host = v;
     if (sa.http_port) |v| cfg.http_port = v;
     if (sa.data_dir) |v| cfg.data_dir = v;
@@ -2348,6 +2917,25 @@ fn loadCfg(environ: *const std.process.Environ.Map, sa: cli.ServeArgs) !config.C
     if (sa.realtime_origins) |v| cfg.realtime_allowed_origins = v;
     if (sa.sse_heartbeat_seconds) |v| cfg.sse_heartbeat_seconds = v;
     if (sa.realtime_outbound_hwm) |v| cfg.realtime_outbound_hwm = v;
+    // The `.?` is safe only because cli.parse already validated the spelling
+    // (logging.parseFormat/parseLevel) at parse time — an invalid value never
+    // reaches here as a ServeArgs field.
+    if (sa.log_format) |v| cfg.log_format = logging.parseFormat(v).?;
+    if (sa.log_level) |v| cfg.log_level = logging.parseLevel(v).?;
+    if (sa.log_requests) |v| cfg.log_requests = v;
+
+    // Install the FULLY resolved logging config (env, then flags) here — the single
+    // `logging.apply` on every command path — before anything below is logged. It used
+    // to live at the top of `serveImpl`, which was too late: `warnUnknownVars` runs
+    // next, and under `--log-format json` (a flag, with no matching env var) its
+    // warning was still formatted by the env-only pre-pass, dropping a plain-text line
+    // into a stream the docs promise is NDJSON, unsuppressable by `--log-level`.
+    // Still ordered before `bootApp`/the pool opens, which is the guarantee that
+    // matters — just one frame earlier.
+    logging.apply(cfg.log_format, cfg.log_level, cfg.log_requests);
+    // Warn AFTER the logger is configured, so the warning honors --log-format and
+    // --log-level like every other record.
+    config.warnUnknownVars(environ);
     return cfg;
 }
 
@@ -2379,7 +2967,10 @@ fn openPool(allocator: std.mem.Allocator, io: std.Io, cfg: config.Config, option
 /// data path is unchanged (the warning only fires for a `postgres://` value in a non-PG build).
 /// This is why the default build is no longer byte-for-byte identical to pre-#159 — by design;
 /// behavioral equivalence of the SQLite path is asserted by `db.chooseBackend`'s tests instead.
-fn openPoolSelect(allocator: std.mem.Allocator, io: std.Io, cfg: config.Config, options: db.PoolOptions, environ: *const std.process.Environ.Map) !db.Pool {
+/// `pub` (rather than the `fn` every other CLI-impl helper here is) because
+/// `doctor_run.gather` — a different file, opening the same pool the same
+/// way for the same reason `migrateStatusImpl` does — needs it too.
+pub fn openPoolSelect(allocator: std.mem.Allocator, io: std.Io, cfg: config.Config, options: db.PoolOptions, environ: *const std.process.Environ.Map) !db.Pool {
     const getter = config.EnvGetter{ .environ = environ };
     const db_url = getter.get("ZIGBASE_DB_URL");
     switch (db.chooseBackend(db_url)) {
@@ -2436,19 +3027,52 @@ fn migrateStatusImpl(allocator: std.mem.Allocator, io: std.Io, environ: *const s
     const status = try provision.migrationStatus(arena.allocator(), w, schema_migrations);
 
     const out = std.Io.File.stdout();
-    emit(io, out, "Consumer migrations ({d} declared):\n", .{schema_migrations.len});
-    if (schema_migrations.len == 0) emit(io, out, "  (none declared)\n", .{});
-    for (status.declared) |e| {
+    if (ma.json) {
+        migrateStatusJson(io, out, status);
+    } else {
+        emit(io, out, "Consumer migrations ({d} declared):\n", .{schema_migrations.len});
+        if (schema_migrations.len == 0) emit(io, out, "  (none declared)\n", .{});
+        for (status.declared) |e| {
+            if (e.applied_at) |at|
+                emit(io, out, "  {s}  applied (at {s})\n", .{ e.id, at })
+            else
+                emit(io, out, "  {s}  pending\n", .{e.id});
+        }
+        if (status.orphaned.len > 0) {
+            emit(io, out, "\nOrphaned (in ledger, not in binary):\n", .{});
+            for (status.orphaned) |o| emit(io, out, "  {s}  applied (at {s})\n", .{ o.name, o.applied_at });
+        }
+        emit(io, out, "\n{d} applied, {d} pending, {d} orphaned\n", .{ status.applied_count, status.pending_count, status.orphaned.len });
+    }
+
+    // Exit 1 when the database is not up to date, so `migrate status` can gate a
+    // deploy script. `ok` in the JSON body carries the same signal. `emit` flushes
+    // on every call, so nothing is buffered when `std.process.exit` skips the
+    // deferred `arena`/`pool` cleanup below.
+    if (status.pending_count != 0 or status.orphaned.len != 0) std.process.exit(1);
+}
+
+/// `zigbase migrate status --json`. One object, stdout only; the text renderer's
+/// prose stays on the text path so the two never interleave.
+fn migrateStatusJson(io: std.Io, out: std.Io.File, status: provision.MigrationStatus) void {
+    emit(io, out, "{{\"migrations\":[", .{});
+    for (status.declared, 0..) |e, i| {
+        if (i > 0) emit(io, out, ",", .{});
         if (e.applied_at) |at|
-            emit(io, out, "  {s}  applied (at {s})\n", .{ e.id, at })
+            emit(io, out, "{{\"id\":{f},\"applied\":true,\"applied_at\":{f}}}", .{ std.json.fmt(e.id, .{}), std.json.fmt(at, .{}) })
         else
-            emit(io, out, "  {s}  pending\n", .{e.id});
+            emit(io, out, "{{\"id\":{f},\"applied\":false,\"applied_at\":null}}", .{std.json.fmt(e.id, .{})});
     }
-    if (status.orphaned.len > 0) {
-        emit(io, out, "\nOrphaned (in ledger, not in binary):\n", .{});
-        for (status.orphaned) |o| emit(io, out, "  {s}  applied (at {s})\n", .{ o.name, o.applied_at });
+    emit(io, out, "],\"orphaned\":[", .{});
+    for (status.orphaned, 0..) |o, i| {
+        if (i > 0) emit(io, out, ",", .{});
+        emit(io, out, "{{\"id\":{f},\"applied_at\":{f}}}", .{ std.json.fmt(o.name, .{}), std.json.fmt(o.applied_at, .{}) });
     }
-    emit(io, out, "\n{d} applied, {d} pending, {d} orphaned\n", .{ status.applied_count, status.pending_count, status.orphaned.len });
+    emit(io, out, "],\"summary\":{{\"declared\":{d},\"applied\":{d},\"pending\":{d},\"orphaned\":{d}}},\"ok\":{}}}\n", .{
+        status.declared.len,                                    status.applied_count,
+        status.pending_count,                                   status.orphaned.len,
+        status.pending_count == 0 and status.orphaned.len == 0,
+    });
 }
 
 /// `zigbase migrate dump [--out <file>]`: introspect the LIVE database and write a canonical,
@@ -2476,6 +3100,445 @@ fn migrateDumpImpl(allocator: std.mem.Allocator, io: std.Io, environ: *const std
         try wr.interface.writeAll(sql);
         try wr.interface.flush();
     }
+}
+
+/// `zigbase schema dump [--json] [--out <file>]`: write the canonical JSON schema document
+/// for every non-system collection. Mirrors `migrateDumpImpl`'s read-only pool-open. Unlike
+/// `migrate dump` (a dialect-native structure.sql snapshot of the PHYSICAL database), this
+/// is the LOGICAL collection model — the artifact `schema apply` consumes.
+fn schemaDumpImpl(allocator: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map, sa: cli.SchemaArgs) !void {
+    const cfg = try loadCfg(environ, .{ .data_dir = sa.data_dir });
+    var pool = try openPoolSelect(allocator, io, cfg, .{}, environ);
+    defer pool.deinit();
+    const w = pool.acquireWriter();
+    defer pool.releaseWriter();
+
+    const doc = try schema_doc.dump(allocator, w);
+    defer allocator.free(doc);
+
+    if (sa.out) |path| {
+        if (std.fs.path.dirname(path)) |dir| std.Io.Dir.cwd().createDirPath(io, dir) catch {};
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = doc });
+        // Progress goes to stderr so stdout stays a clean JSON channel.
+        std.log.info("schema document written to {s} ({d} bytes)", .{ path, doc.len });
+    } else {
+        var buf: [4096]u8 = undefined;
+        var wr = std.Io.File.stdout().writer(io, &buf);
+        try wr.interface.writeAll(doc);
+        try wr.interface.flush();
+    }
+}
+
+/// `zigbase schema check-rules [FILE] [--data-dir PATH]`: lint access-rule expressions.
+///
+/// Closes a real gap: nothing validates a rule when it is WRITTEN. `schema.parseCollectionInput`
+/// takes the five rule fields as opaque strings and `collections.create`/`update` bind them
+/// straight into `_collections`; the first parse happens at request time, where a parse failure
+/// fails closed (500). A typo therefore ships silently and breaks the first request.
+///
+/// Two modes, two depths — see `rules_lint.zig`:
+///   * no FILE  -> LIVE, `"depth":"full"`. Opens the pool exactly as `schemaDumpImpl` does
+///     (read-only intent; it never boots the app or provisions) and runs every rule through
+///     `rules.compileGuard`, the request path's own entry point. Catches unknown fields and
+///     bad relation traversals as well as syntax.
+///   * a FILE   -> DOCUMENT, `"depth":"syntax"`. Lexer + parser only: resolving a field name
+///     needs a live schema and a connection, which a document does not carry.
+///
+/// Output is NDJSON on stdout (findings, then exactly one summary), matching `doctor`; the
+/// exit code is doctor's mapping (1 error / 2 warnings-only / 0 clean). `--json` is accepted
+/// and ignored, as on `dump` and `apply`.
+fn schemaCheckRulesImpl(allocator: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map, sa: cli.SchemaArgs) !void {
+    // Scoped so the arena and (in live mode) the pool are torn down BEFORE the exit —
+    // `std.process.exit` does not run deferred code.
+    const code = blk: {
+        var arena_state = std.heap.ArenaAllocator.init(allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        if (sa.file) |file| {
+            const bytes = std.Io.Dir.cwd().readFileAlloc(io, file, arena, .limited(64 << 20)) catch |e| {
+                std.log.err("schema check-rules: cannot read '{s}': {s}", .{ file, @errorName(e) });
+                return e;
+            };
+            const doc = schema_doc.parse(arena, bytes) catch |e| {
+                std.log.err("schema check-rules: '{s}' is not a valid schema document: {s}", .{ file, @errorName(e) });
+                return e;
+            };
+            const report = try rules_lint.checkDocument(arena, doc);
+            const summary = rules_lint.summarize(report, .syntax);
+            rules_lint.render(io, arena, report.findings, summary);
+            // Progress/interpretation on stderr only; stdout stays a clean NDJSON channel.
+            std.log.info("schema check-rules: {d} rule(s) across {d} collection(s), SYNTAX depth only — field and relation names are not resolved offline; re-run without a FILE against a data dir for the full check", .{ summary.rules_checked, summary.collections });
+            break :blk rules_lint.exitCode(summary);
+        }
+
+        const cfg = try loadCfg(environ, .{ .data_dir = sa.data_dir });
+        var pool = try openPoolSelect(allocator, io, cfg, .{}, environ);
+        defer pool.deinit();
+        const w = pool.acquireWriter();
+        defer pool.releaseWriter();
+
+        const live = try collections_mod.list(arena, w);
+        const report = try rules_lint.checkLive(arena, w, live);
+        const summary = rules_lint.summarize(report, .full);
+        rules_lint.render(io, arena, report.findings, summary);
+        std.log.info("schema check-rules: {d} rule(s) across {d} collection(s) at FULL depth", .{ summary.rules_checked, summary.collections });
+        break :blk rules_lint.exitCode(summary);
+    };
+    std.process.exit(code);
+}
+
+/// `zigbase schema apply <schema.json> [--dry-run] [--allow-destructive] [--prune]`.
+///
+/// Boots the FULL application offline via `bootApp` (migrations + comptime provisioning +
+/// field-cipher stamping) so the live schema it diffs against is the one `serve` would see,
+/// then executes the difference through `collections.create/update/delete` — the exact
+/// functions `src/api/collections.zig` calls. There is no second DDL implementation.
+///
+/// Every access rule in the document is syntax-checked (via `rules_lint.checkDocument`) before
+/// any write derived from the document happens; one unparseable rule refuses the whole apply.
+/// The gate, and why it is syntax-only, is documented at the gate itself below.
+///
+/// Refused when the app sets `.collections_frozen`: frozen means this deployment's schema is
+/// owned by the comptime `.collections` + `.migrations`, and a CLI write would silently
+/// diverge from that source at the next boot (provisioning would fight it).
+///
+/// NOT atomic across collections — `collections.create`/`update` each open their own
+/// transaction and cannot join an outer one. Each collection is therefore all-or-nothing on
+/// its own, and the emitted `applied` list names exactly which ones landed before a failure.
+fn schemaApplyImpl(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    environ: *const std.process.Environ.Map,
+    sa_args: cli.SchemaArgs,
+    dispatch: *const events.Dispatch,
+    jobs: []const scheduler.RuntimeJob,
+    pool_size: usize,
+    schema_collections: []const schema.Collection,
+    schema_migrations: []const provision.Migration,
+    comptime opts: ServeOpts,
+) !void {
+    const file = sa_args.file orelse {
+        std.log.err("schema apply: a <schema.json> path is required", .{});
+        return error.MissingSchemaFile;
+    };
+    if (sa_args.prune and !sa_args.allow_destructive) {
+        std.log.err("schema apply: --prune deletes collections and requires --allow-destructive", .{});
+        return error.DestructiveRefused;
+    }
+
+    const cfg = try loadCfg(environ, .{ .data_dir = sa_args.data_dir });
+    const holder = try bootApp(allocator, io, cfg, dispatch, jobs, pool_size, schema_collections, schema_migrations, opts, environ);
+    defer holder.deinit();
+
+    if (holder.app.collections_frozen) {
+        std.log.err("schema apply: collections are frozen (`.collections_frozen`); change the comptime `.collections` / add a `.migrations` entry and redeploy", .{});
+        return error.CollectionsFrozen;
+    }
+
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, file, a, .limited(64 << 20)) catch |e| {
+        std.log.err("schema apply: cannot read '{s}': {s}", .{ file, @errorName(e) });
+        return e;
+    };
+    const doc = schema_doc.parse(a, bytes) catch |e| {
+        std.log.err("schema apply: '{s}' is not a valid schema document: {s}", .{ file, @errorName(e) });
+        return e;
+    };
+
+    // ---- Rule syntax gate -------------------------------------------------------------
+    // Every access rule the document declares is parsed BEFORE a single write derived from
+    // the document happens. Nothing else in the engine validates a rule at write time:
+    // `schema.parseCollectionInput` decodes the five rule fields as opaque strings and
+    // `collections.create`/`update` bind them straight into `_collections`. The first thing
+    // that parses a rule is the request that has to evaluate it — where a parse failure
+    // fails CLOSED (500, and on a write the write never runs). `apply` is the last
+    // chokepoint before a typo becomes a production outage, so a document with an
+    // unparseable rule is refused WHOLE: nothing is written, not even the collections whose
+    // rules are fine.
+    //
+    // WHY SYNTAX ONLY — this deliberately runs `checkDocument` (lexer + parser) and reports
+    // nothing but hard parse errors:
+    //
+    //   * Exit code 2 is frozen as "dry-run found destructive changes". Emitting `@public`
+    //     warnings or full-resolution findings from `apply` would force them onto exit 2,
+    //     and an agent branching on 2 must never have to disambiguate "you opened a
+    //     collection to the public" from "destructive schema change pending". Overloading a
+    //     frozen exit code to save a flag is a bad trade.
+    //   * Full field resolution would false-positive on rules that are correct in the
+    //     document's own terms: a rule referencing a field added later in the same apply, or
+    //     a relation created in pass 2, resolves against a live schema that does not exist
+    //     yet. A linter that cries wolf during apply gets suppressed, and a suppressed
+    //     linter protects nothing.
+    //   * Judgment-shaped findings therefore live in `schema check-rules`, where exit 2
+    //     already means "needs judgment" and where the operator asked for an opinion.
+    //
+    // There is no flag and no opt-out: an unparseable rule is not a judgment call, it is a
+    // document that cannot mean anything.
+    {
+        // Scratch only. The report, its findings buffer, and every token/AST the checker
+        // builds live and die on this arena; the finding strings are static literals or
+        // borrowed from `doc`, so nothing that survives the block is owned by it. The
+        // refusal path returns an error rather than calling `std.process.exit`, so this
+        // `defer` — and the caller's `arena_state`/`holder` teardown — actually run.
+        var lint_arena = std.heap.ArenaAllocator.init(allocator);
+        defer lint_arena.deinit();
+        const report = try rules_lint.checkDocument(lint_arena.allocator(), doc);
+
+        var bad: usize = 0;
+        for (report.findings) |f| {
+            // Errors only. `checkDocument` also emits one "PublicRule" WARNING per `@public`
+            // rule; `apply` stays silent about those on purpose (see above).
+            if (!std.mem.eql(u8, f.severity, "error")) continue;
+            bad += 1;
+            // stderr, like every other pre-plan refusal here (`--prune` without
+            // `--allow-destructive`, `.collections_frozen`, an unreadable or invalid
+            // document): there is no plan yet, so there is no `emitApplyJson` object to
+            // attach this to, and stdout stays a clean JSON channel.
+            std.log.err("schema apply: collection '{s}' {s} does not parse: {s} ({s})", .{ f.collection, f.rule, f.message, f.code });
+        }
+        if (bad > 0) {
+            std.log.err("schema apply: {d} unparseable access rule(s) in '{s}'; the whole document is refused and nothing was written", .{ bad, file });
+            return error.InvalidRule;
+        }
+    }
+
+    const w = holder.pool.acquireWriter();
+    defer holder.pool.releaseWriter();
+
+    const all_live = try collections_mod.list(a, w);
+    var live: std.ArrayList(schema.Collection) = .empty;
+    for (all_live) |c| if (!c.system) try live.append(a, c);
+
+    var plan = try schema_diff.compute(allocator, live.items, doc, .{ .prune = sa_args.prune });
+    defer plan.deinit();
+
+    // A dry run reports and stops. Exit 2 (not 1) when destructive changes are present: the
+    // command SUCCEEDED, it just found something a human or an agent must decide about.
+    if (sa_args.dry_run) {
+        try emitApplyJson(allocator, io, plan, doc, sa_args, &.{});
+        if (plan.hasDestructive()) {
+            std.log.warn("schema apply --dry-run: {d} destructive change(s); re-run with --allow-destructive to execute", .{countDestructive(plan)});
+            std.process.exit(2);
+        }
+        return;
+    }
+
+    if (plan.hasDestructive() and !sa_args.allow_destructive) {
+        try emitApplyJson(allocator, io, plan, doc, sa_args, &.{});
+        std.log.err("schema apply: {d} destructive change(s) refused; pass --allow-destructive to execute them", .{countDestructive(plan)});
+        return error.DestructiveRefused;
+    }
+
+    var applied: std.ArrayList([]const u8) = .empty;
+    // Report what DID land even when a later collection fails, so a partial apply is
+    // diagnosable rather than mysterious.
+    errdefer emitApplyJson(allocator, io, plan, doc, sa_args, applied.items) catch {};
+
+    // Pass 1 — creates and updates, in dependency order, with cycle back-edges omitted.
+    for (plan.order) |idx| {
+        const want = doc[idx];
+        const existing = try collections_mod.get(a, w, want.name);
+
+        // A collection the diff found nothing to do for is already converged: skip the
+        // write entirely. `collections_mod.update` -> `ddl.rebuildPlan` always does a full
+        // SQLite table rebuild and bumps `_collections.updated`, even when the incoming def
+        // is byte-for-byte what's live — calling it unconditionally would make re-applying
+        // an already-converged document rebuild every table every time. `create_collection`
+        // changes don't gate here; they're handled by the `existing == null` branch below.
+        if (existing != null and !hasPendingChange(plan, want.name)) continue;
+
+        var def = want;
+
+        // Break relation cycles: create without the back-edge field, add it in pass 2.
+        var deferred_here: std.ArrayList([]const u8) = .empty;
+        for (want.fields) |f| {
+            if (f.options == .relation and plan.isDeferred(want.name, f.name))
+                try deferred_here.append(a, f.name);
+        }
+        if (deferred_here.items.len > 0 and existing == null)
+            def = try schema_diff.withoutFields(a, want, deferred_here.items);
+
+        if (schema.hasEncryptedField(def) and db.poolFieldCipher(&holder.pool) == null) {
+            std.log.err("schema apply: collection '{s}' declares an encrypted field but ZIGBASE_FIELD_KEY is unset", .{def.name});
+            return error.FieldKeyRequired;
+        }
+        // One rule for OAuth secrets, shared with the REST handlers: an empty incoming
+        // secret preserves the stored one (the document redacts them).
+        collections_api.mergeOAuthConfig(holder.app.io, a, holder.app.jwt_secret, &def, existing) catch |e| return reportOAuthError(def.name, e);
+
+        if (existing) |_| {
+            _ = collections_mod.update(a, holder.app.io, w, want.name, def) catch |e| return reportCollectionError(want.name, e);
+        } else {
+            _ = collections_mod.create(a, holder.app.io, w, def) catch |e| return reportCollectionError(want.name, e);
+        }
+        try applied.append(a, want.name);
+    }
+
+    // Pass 2 — add the relation fields held back to break a cycle. Every target now exists.
+    //
+    // Gated per collection on whether the LIVE row is still missing a deferred field:
+    // `plan.deferred` is structural (derived from the document's relation graph, not the
+    // diff), so a converged cyclic pair still has a non-empty `plan.deferred` on every
+    // re-apply. Without this gate, `update` (-> `ddl.rebuildPlan`, a full table rebuild +
+    // `_collections.updated` bump) would fire for the back-edge collection on every re-run
+    // even when nothing changed. A field that already exists live and differs structurally
+    // from the document was already caught by `schema_diff.compute` (it diffs every field
+    // by name/id regardless of deferred status) and already rewritten by Pass 1's
+    // unconditional-on-`existing`-def update (Pass 1 only omits deferred fields when
+    // CREATING, i.e. `existing == null`) — so this pass's only job is filling in a field
+    // that plan.order intentionally left out when the collection didn't exist yet.
+    if (plan.deferred.len > 0) {
+        for (plan.order) |idx| {
+            const want = doc[idx];
+            const existing = try collections_mod.get(a, w, want.name);
+
+            var needs_backfill = false;
+            for (want.fields) |f| {
+                if (f.options != .relation or !plan.isDeferred(want.name, f.name)) continue;
+                const live_has_field = if (existing) |e| fieldPresent(e.fields, f.name) else false;
+                if (!live_has_field) needs_backfill = true;
+            }
+            if (!needs_backfill) continue;
+
+            var def = want;
+            collections_api.mergeOAuthConfig(holder.app.io, a, holder.app.jwt_secret, &def, existing) catch |e| return reportOAuthError(def.name, e);
+            _ = collections_mod.update(a, holder.app.io, w, want.name, def) catch |e| return reportCollectionError(want.name, e);
+        }
+    }
+
+    // Pass 3 — prune, last, so a dropped collection can never be a live relation target of
+    // something still being created (`collections_mod.delete` refuses that anyway, with Conflict).
+    for (plan.changes) |c| {
+        if (c.kind != .drop_collection) continue;
+        collections_mod.delete(a, w, c.collection) catch |e| return reportCollectionError(c.collection, e);
+        try applied.append(a, c.collection);
+    }
+
+    if (holder.app.col_cache) |cc| cc.invalidate();
+    try emitApplyJson(allocator, io, plan, doc, sa_args, applied.items);
+    std.log.info("schema apply: {d} change(s) across {d} collection(s)", .{ plan.changes.len, applied.items.len });
+}
+
+fn countDestructive(plan: schema_diff.Plan) usize {
+    var n: usize = 0;
+    for (plan.changes) |c| if (schema_diff.isDestructive(c.kind)) {
+        n += 1;
+    };
+    return n;
+}
+
+/// True when `plan.changes` names at least one change for `name` other than
+/// `create_collection` — i.e. an EXISTING collection has something Pass 1 must actually
+/// write. `create_collection` never gates this: it's handled by Pass 1's `existing == null`
+/// branch regardless of this helper.
+fn hasPendingChange(plan: schema_diff.Plan, name: []const u8) bool {
+    for (plan.changes) |c| {
+        if (c.kind == .create_collection) continue;
+        if (std.mem.eql(u8, c.collection, name)) return true;
+    }
+    return false;
+}
+
+/// True when `fields` already has a field named `name` — existence only, by name. Pass 2
+/// uses this to decide whether a deferred back-edge field still needs to be created; any
+/// STRUCTURAL difference in an already-present field is `schema_diff.compute`'s and Pass
+/// 1's job, not this pass's.
+fn fieldPresent(fields: []const schema.Field, name: []const u8) bool {
+    for (fields) |f| if (std.mem.eql(u8, f.name, name)) return true;
+    return false;
+}
+
+/// Present a `collections_mod.create/update/delete` failure, surfacing the engine's own
+/// field-level validation details (the same `last_errors` the REST layer renders) instead
+/// of a bare error name. `last_errors` is allocated on the SAME arena the caller passed as
+/// `collections_mod.create`/`update`'s `alloc` (this function's caller always passes the
+/// request-scoped arena, never the raw GPA) — it is reclaimed wholesale when that arena is
+/// torn down, so this only resets the threadlocal, it never frees the slice itself (freeing
+/// arena memory through a different allocator would be a mismatched-free bug).
+fn reportCollectionError(name: []const u8, e: anyerror) anyerror {
+    if (e == error.Validation) {
+        if (collections_mod.last_errors) |errs| {
+            defer collections_mod.last_errors = null;
+            for (errs) |ve|
+                std.log.err("schema apply: collection '{s}' field '{s}': {s} ({s})", .{ name, ve.field, ve.message, ve.code });
+            return e;
+        }
+    }
+    std.log.err("schema apply: collection '{s}' failed: {s}", .{ name, @errorName(e) });
+    return e;
+}
+
+/// Present a `mergeOAuthConfig` failure at the CLI boundary (the REST handlers render a 400;
+/// the CLI has no response to render, so it logs and fails the run instead).
+fn reportOAuthError(name: []const u8, e: collections_api.OAuthPrepError) anyerror {
+    if (e == error.BadOAuthConfig)
+        std.log.err("schema apply: collection '{s}' has an invalid OAuth2 provider config (endpoints must be https, and an enabled provider needs a client secret)", .{name})
+    else
+        std.log.err("schema apply: collection '{s}' OAuth2 config failed: {s}", .{ name, @errorName(e) });
+    return e;
+}
+
+/// The single JSON object on stdout. Emitted for dry runs, successful applies, and partial
+/// applies alike, so an agent parses exactly one shape.
+fn emitApplyJson(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    plan: schema_diff.Plan,
+    doc: []const schema.Collection,
+    args: cli.SchemaArgs,
+    applied: []const []const u8,
+) !void {
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    var changes: std.json.Array = .init(a);
+    for (plan.changes) |c| {
+        var o: std.json.ObjectMap = .empty;
+        try o.put(a, "kind", .{ .string = @tagName(c.kind) });
+        try o.put(a, "collection", .{ .string = c.collection });
+        try o.put(a, "field", if (c.field) |f| .{ .string = f } else .null);
+        try o.put(a, "detail", .{ .string = c.detail });
+        try changes.append(.{ .object = o });
+    }
+    var untracked: std.json.Array = .init(a);
+    for (plan.untracked) |u| try untracked.append(.{ .string = u });
+    var deferred: std.json.Array = .init(a);
+    for (plan.deferred) |d| {
+        var o: std.json.ObjectMap = .empty;
+        try o.put(a, "collection", .{ .string = d.collection });
+        try o.put(a, "field", .{ .string = d.field });
+        try deferred.append(.{ .object = o });
+    }
+    var applied_arr: std.json.Array = .init(a);
+    for (applied) |n| try applied_arr.append(.{ .string = n });
+    var order_arr: std.json.Array = .init(a);
+    for (plan.order) |i| try order_arr.append(.{ .string = doc[i].name });
+
+    // Stdout is the settled snake_case convention for everything this command PRINTS (the
+    // schema document FILE format stays camelCase — see schema_doc.zig). Do not mix styles.
+    var root: std.json.ObjectMap = .empty;
+    try root.put(a, "zigbase_schema_apply", .{ .integer = 1 });
+    try root.put(a, "dry_run", .{ .bool = args.dry_run });
+    try root.put(a, "allow_destructive", .{ .bool = args.allow_destructive });
+    try root.put(a, "destructive", .{ .bool = plan.hasDestructive() });
+    try root.put(a, "changes", .{ .array = changes });
+    try root.put(a, "untracked", .{ .array = untracked });
+    try root.put(a, "deferred_relations", .{ .array = deferred });
+    try root.put(a, "applied", .{ .array = applied_arr });
+    try root.put(a, "apply_order", .{ .array = order_arr });
+
+    const body = try std.json.Stringify.valueAlloc(a, std.json.Value{ .object = root }, .{});
+    var buf: [4096]u8 = undefined;
+    var wr = std.Io.File.stdout().writer(io, &buf);
+    try wr.interface.writeAll(body);
+    try wr.interface.writeAll("\n");
+    // Flush BEFORE any std.process.exit — an unflushed buffer is a silently empty stdout.
+    try wr.interface.flush();
 }
 
 /// `zigbase migrate rollback [N]`: reverse the N most-recently-applied consumer migrations (newest
@@ -2585,6 +3648,7 @@ fn importImpl(
     schema_migrations: []const provision.Migration,
     comptime opts: ServeOpts,
 ) !void {
+    if (ia.manifest) |mpath| return importManifestImpl(allocator, io, environ, ia, mpath, dispatch, jobs, pool_size, schema_collections, schema_migrations, opts);
     const collection = ia.collection orelse {
         std.log.err("import: --collection <name> is required", .{});
         return error.MissingCollection;
@@ -2602,10 +3666,36 @@ fn importImpl(
     const w = holder.pool.acquireWriter();
     defer holder.pool.releaseWriter();
 
+    // Findings sink: created/truncated up front so a re-run never appends to a stale log.
+    var err_file: ?std.Io.File = null;
+    defer if (err_file) |f| f.close(io);
+    var err_buf: [8192]u8 = undefined;
+    var err_writer: ?std.Io.File.Writer = null;
+    if (ia.error_log) |path| {
+        if (std.fs.path.dirname(path)) |dir| std.Io.Dir.cwd().createDirPath(io, dir) catch {};
+        const f = try std.Io.Dir.cwd().createFile(io, path, .{});
+        err_file = f;
+        err_writer = f.writer(io, &err_buf);
+    }
+    // Flush on every exit path, including a fail-fast `run()` error below (which returns
+    // early via `reportImportError`) — otherwise the one finding logged right before that
+    // error would sit in the buffer and never reach disk, the opposite of what an
+    // --error-log is for. A broken/full sink loses the finding, never the import result
+    // (matches `logFinding`'s own best-effort contract), so this is caught, not `try`'d.
+    defer if (err_writer) |*ew| ew.interface.flush() catch {};
+    var prog_buf: [256]u8 = undefined;
+    var prog_writer = std.Io.File.stderr().writer(io, &prog_buf);
+
     const run_opts = import_mod.Options{
         .collection = collection,
         .upsert_key = ia.upsert_key,
         .batch_size = ia.batch_size,
+        .dry_run = ia.dry_run,
+        .continue_on_error = ia.continue_on_error,
+        .error_log = if (err_writer) |*ew| &ew.interface else null,
+        .progress_every = ia.progress,
+        .progress = if (ia.progress > 0) &prog_writer.interface else null,
+        .legacy_hash_algorithm = ia.legacy_hashes,
     };
 
     // A generous heap line buffer (a single NDJSON record must fit it). Heap, not stack — 1 MiB.
@@ -2626,7 +3716,157 @@ fn importImpl(
             break :blk import_mod.run(&holder.app, w, io, &fr.interface, run_opts) catch |e| return reportImportError(collection, e);
         }
     };
-    std.log.info("import complete: {d} created, {d} updated, {d} total (collection '{s}')", .{ report.created, report.updated, report.total, collection });
+
+    if (ia.json) {
+        var arena_state = std.heap.ArenaAllocator.init(allocator);
+        defer arena_state.deinit();
+        const a = arena_state.allocator();
+        var root: std.json.ObjectMap = .empty;
+        // Stdout is the settled snake_case convention for everything this command PRINTS.
+        try root.put(a, "zigbase_import", .{ .integer = 1 });
+        try root.put(a, "collection", .{ .string = collection });
+        try root.put(a, "dry_run", .{ .bool = ia.dry_run });
+        try root.put(a, "created", .{ .integer = @intCast(report.created) });
+        try root.put(a, "updated", .{ .integer = @intCast(report.updated) });
+        try root.put(a, "failed", .{ .integer = @intCast(report.failed) });
+        try root.put(a, "total", .{ .integer = @intCast(report.total) });
+        try root.put(a, "error_log", if (ia.error_log) |p| .{ .string = p } else .null);
+        const body = try std.json.Stringify.valueAlloc(a, std.json.Value{ .object = root }, .{});
+        var out_buf: [4096]u8 = undefined;
+        var out = std.Io.File.stdout().writer(io, &out_buf);
+        try out.interface.writeAll(body);
+        try out.interface.writeAll("\n");
+        try out.interface.flush();
+    }
+    // Keeps the pre-existing "N created, M updated, K total" substring intact (the browser
+    // suite greps for it) by appending the new `failed` count after `total` rather than
+    // splicing it into the middle.
+    std.log.info("import {s}: {d} created, {d} updated, {d} total, {d} failed (collection '{s}')", .{
+        if (ia.dry_run) "dry-run complete (nothing written)" else "complete",
+        report.created,
+        report.updated,
+        report.total,
+        report.failed,
+        collection,
+    });
+    // A lossy import is NOT a success. Exit 3 so an agent cannot mistake it for one. Flush the
+    // findings sink explicitly first: `std.process.exit` does not run deferred cleanup (unlike
+    // a normal `return`, which is why the fatal-error path above stays correct via the defer
+    // above), so without this the NDJSON findings would sit in the buffer and vanish.
+    if (report.failed > 0) {
+        if (err_writer) |*ew| ew.interface.flush() catch {};
+        std.process.exit(3);
+    }
+}
+
+/// `zigbase import --manifest <m.json>`: load several collections in relation order,
+/// deferring the values that cannot be ordered (cycles, self-relations). Relative `file`
+/// paths in the manifest resolve against the MANIFEST's directory, not the cwd, so a
+/// migration bundle is relocatable. Repeats `importImpl`'s boot + writer-acquire + sink
+/// setup, then delegates to `import_manifest.run`, which drives `import.run` per collection —
+/// there is no forked import logic.
+fn importManifestImpl(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    environ: *const std.process.Environ.Map,
+    ia: cli.ImportArgs,
+    mpath: []const u8,
+    dispatch: *const events.Dispatch,
+    jobs: []const scheduler.RuntimeJob,
+    pool_size: usize,
+    schema_collections: []const schema.Collection,
+    schema_migrations: []const provision.Migration,
+    comptime opts: ServeOpts,
+) !void {
+    const cfg = try loadCfg(environ, .{ .data_dir = ia.data_dir });
+    const holder = try bootApp(allocator, io, cfg, dispatch, jobs, pool_size, schema_collections, schema_migrations, opts, environ);
+    defer holder.deinit();
+
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, mpath, a, .limited(8 << 20)) catch |e| {
+        std.log.err("import: cannot read manifest '{s}': {s}", .{ mpath, @errorName(e) });
+        return e;
+    };
+    var manifest = import_manifest.parseManifest(a, bytes) catch |e| {
+        std.log.err("import: '{s}' is not a valid import manifest: {s}", .{ mpath, @errorName(e) });
+        return e;
+    };
+    defer manifest.deinit();
+
+    const base_dir = std.fs.path.dirname(mpath) orelse ".";
+
+    // Same sinks as the single-collection path (Task 6).
+    var err_file: ?std.Io.File = null;
+    defer if (err_file) |f| f.close(io);
+    var err_buf: [8192]u8 = undefined;
+    var err_writer: ?std.Io.File.Writer = null;
+    if (ia.error_log) |path| {
+        if (std.fs.path.dirname(path)) |dir| std.Io.Dir.cwd().createDirPath(io, dir) catch {};
+        const f = try std.Io.Dir.cwd().createFile(io, path, .{});
+        err_file = f;
+        err_writer = f.writer(io, &err_buf);
+    }
+    // Flush on every exit path, including a fail-fast `run()` error below (mirrors
+    // `importImpl`'s own findings-sink discipline).
+    defer if (err_writer) |*ew| ew.interface.flush() catch {};
+    var prog_buf: [256]u8 = undefined;
+    var prog_writer = std.Io.File.stderr().writer(io, &prog_buf);
+
+    const w = holder.pool.acquireWriter();
+    defer holder.pool.releaseWriter();
+
+    const report = import_manifest.run(&holder.app, w, io, allocator, manifest, .{
+        .base_dir = base_dir,
+        .import = .{
+            .collection = "", // supplied per entry
+            .batch_size = ia.batch_size,
+            .dry_run = ia.dry_run,
+            .continue_on_error = ia.continue_on_error,
+            .error_log = if (err_writer) |*ew| &ew.interface else null,
+            .progress_every = ia.progress,
+            .progress = if (ia.progress > 0) &prog_writer.interface else null,
+            .legacy_hash_algorithm = ia.legacy_hashes,
+        },
+    }) catch |e| {
+        std.log.err("import manifest '{s}' failed: {s}", .{ mpath, @errorName(e) });
+        return e;
+    };
+    defer allocator.free(report.entries);
+
+    if (ia.json) {
+        var cols: std.json.Array = .init(a);
+        for (report.entries) |er| {
+            var o: std.json.ObjectMap = .empty;
+            try o.put(a, "collection", .{ .string = er.collection });
+            try o.put(a, "created", .{ .integer = @intCast(er.created) });
+            try o.put(a, "updated", .{ .integer = @intCast(er.updated) });
+            try o.put(a, "failed", .{ .integer = @intCast(er.failed) });
+            try cols.append(.{ .object = o });
+        }
+        var root: std.json.ObjectMap = .empty;
+        try root.put(a, "zigbase_import_manifest", .{ .integer = 1 });
+        try root.put(a, "manifest", .{ .string = mpath });
+        try root.put(a, "dry_run", .{ .bool = ia.dry_run });
+        try root.put(a, "patched", .{ .integer = @intCast(report.patched) });
+        try root.put(a, "failed", .{ .integer = @intCast(report.failed) });
+        try root.put(a, "collections", .{ .array = cols });
+        const body = try std.json.Stringify.valueAlloc(a, std.json.Value{ .object = root }, .{});
+        var out_buf: [4096]u8 = undefined;
+        var out = std.Io.File.stdout().writer(io, &out_buf);
+        try out.interface.writeAll(body);
+        try out.interface.writeAll("\n");
+        try out.interface.flush();
+    }
+    std.log.info("import manifest complete: {d} collection(s), {d} deferred relation(s) patched, {d} failed", .{
+        report.entries.len, report.patched, report.failed,
+    });
+    if (report.failed > 0) {
+        if (err_writer) |*ew| ew.interface.flush() catch {};
+        std.process.exit(3);
+    }
 }
 
 /// Present an `import.run` failure at the CLI boundary (the library itself emits no `.err`
@@ -2738,6 +3978,60 @@ fn printMigrateDbUsage(io: std.Io, file: std.Io.File) void {
         \\    --to "postgres://user:pass@db.example.com:5432/zigbase?sslmode=require"
         \\
     , .{});
+}
+
+/// `zigbase serve stop|status|logs` — resolve the data dir exactly as `serve`
+/// does, then hand off to the control plane, which owns the exit code.
+fn serveControlImpl(allocator: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map, ca: cli.ServeControlArgs) !void {
+    const cfg = try loadCfg(environ, .{ .data_dir = ca.data_dir });
+    // A missing data dir means "no session", not a hard error — resolve against
+    // cwd so the verbs still report truthfully instead of failing to start.
+    const abs = std.Io.Dir.cwd().realPathFileAlloc(io, cfg.data_dir, allocator) catch {
+        if (ca.verb == .status) {
+            var buf: [64]u8 = undefined;
+            var fw = std.Io.File.stdout().writerStreaming(io, &buf);
+            fw.interface.writeAll(if (ca.json)
+                serve_control.status_json_none
+            else
+                "No zigbase serve session is running.\n") catch {};
+            fw.interface.flush() catch {};
+            std.process.exit(1);
+        }
+        std.log.err("serve {s}: no such data dir '{s}'", .{ @tagName(ca.verb), cfg.data_dir });
+        return error.NoDataDir;
+    };
+    defer allocator.free(abs);
+    const verb: serve_control.Verb = switch (ca.verb) {
+        .stop => .stop,
+        .status => .status,
+        .logs => .logs,
+    };
+    serve_control.runVerb(io, allocator, verb, abs, ca.json, ca.follow);
+}
+
+/// `zigbase doctor [--production] [--json] [--data-dir PATH]`.
+///
+/// Reads config from env exactly as `serve` would, probes the data dir, and
+/// opens the database read-mostly (it does create the `_migrations` ledger if
+/// absent — the same write `migrate status` performs, and nothing else).
+/// `schema_migrations` is the binary's compiled-in `.migrations`: without it,
+/// the migrations check would report a clean bill of health for a binary that
+/// has pending work.
+///
+/// One arena for the whole call: `doctor_run.gather`, `doctor.evaluate`, and
+/// `doctor_run.renderToSlice` are all Contract 4 against it, so nothing below
+/// is freed individually — the arena's `deinit()` is the only cleanup.
+fn doctorImpl(allocator: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map, da: cli.DoctorArgs, schema_migrations: []const provision.Migration) !void {
+    const cfg = try loadCfg(environ, .{ .data_dir = da.data_dir });
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const facts = doctor_run.gather(arena, io, cfg, environ, schema_migrations);
+    const findings = try doctor.evaluate(arena, facts, da.production);
+    const summary = doctor.summarize(findings, da.production);
+    doctor_run.render(io, arena, findings, summary, da.json);
+    std.process.exit(doctor_run.exitCode(summary));
 }
 
 /// Minimum acceptable length for an operator-provided JWT secret.
@@ -3248,6 +4542,7 @@ fn bootApp(
         .spa_roots = holder.spa_roots,
         .spa_marker_enabled = opts.enable_spa_marker,
         .collections_frozen = opts.collections_frozen,
+        .gates = opts.gates,
         .pagination = .{
             .offset_enabled = opts.pagination.offset,
             .cursor_enabled = opts.pagination.cursor,
@@ -3380,7 +4675,29 @@ fn bootApp(
     return holder;
 }
 
-fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg_in: config.Config, dispatch: *const events.Dispatch, jobs: []const scheduler.RuntimeJob, pool_size: usize, schema_collections: []const schema.Collection, schema_migrations: []const provision.Migration, comptime opts: ServeOpts, environ: *const std.process.Environ.Map) !void {
+fn serveImpl(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cfg_in: config.Config,
+    dispatch: *const events.Dispatch,
+    jobs: []const scheduler.RuntimeJob,
+    pool_size: usize,
+    schema_collections: []const schema.Collection,
+    schema_migrations: []const provision.Migration,
+    comptime opts: ServeOpts,
+    environ: *const std.process.Environ.Map,
+    /// The tracked session, or null for an untracked run (`--ignore-lock`, or
+    /// `App.run`'s explicit-config embedding entry). Borrowed: the caller owns
+    /// it and calls `shutdown` after this returns.
+    session: ?*serve_control.Session,
+) !void {
+    // NOTE: the logging config is already installed — `loadCfg` applies it as soon as
+    // env and flags are merged (one `logging.apply` per run, no double-install), which
+    // is still before any worker thread exists or the db pool opens, so provisioning
+    // and migration output inside `bootApp` uses it exactly as before. It is also now
+    // early enough to cover the CLI arm's own pre-boot records (the `--ignore-lock`
+    // notice, the duplicate-session refusal), which never reach this function.
+    //
     // Boot the full application (everything before the socket bind), then fire onBeforeServe,
     // start the scheduler + background pool, and listen. `holder` OWNS the pool / storage /
     // mailer / registry / caches the App points into; its deinit runs LAST (LIFO), after the
@@ -3435,6 +4752,9 @@ fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg_in: config.Config, di
     defer allocator.free(host_z);
     const Srv = server.Server(opts.gates);
     var srv = Srv{ .app = app, .host = host_z, .port = cfg.http_port };
+    if (session) |s| {
+        srv.on_listening = .{ .call = serve_control.Session.onListening, .ctx = s };
+    }
     // Bounded background pool for memory-queue jobs + app.submit (R1-2). Worker threads
     // spawn lazily on first use (zero overhead when unused) and stop() drains + joins.
     // Its defer is registered BEFORE the scheduler's, so (LIFO) the scheduler stops FIRST
@@ -3472,6 +4792,161 @@ fn vapidKeygenImpl(allocator: std.mem.Allocator, io: std.Io) !void {
         \\secret — anyone with it can send notifications as you.
         \\
     , .{ kp.public_b64, kp.private_b64 });
+}
+
+/// `zigbase explain-code [CODE] [--json]` (SP-1). Exactly ONE JSON object reaches
+/// stdout under `--json`; prose diagnostics go to stderr. Exit 0 when the code is
+/// registered (or when listing), 1 when it is not.
+fn explainCodeImpl(io: std.Io, ea: cli.ExplainCodeArgs) void {
+    const out = std.Io.File.stdout();
+
+    const code_str = ea.code orelse {
+        if (ea.json) {
+            emit(io, out, "{{\"codes\":[", .{});
+            inline for (@typeInfo(error_codes.Code).@"enum".fields, 0..) |field, idx| {
+                const c: error_codes.Code = @enumFromInt(field.value);
+                emit(io, out, "{s}{{\"code\":{f},\"summary\":{f}}}", .{
+                    if (idx == 0) "" else ",",
+                    std.json.fmt(error_codes.s(c), .{}),
+                    std.json.fmt(error_codes.info(c).summary, .{}),
+                });
+            }
+            emit(io, out, "]}}\n", .{});
+        } else {
+            inline for (@typeInfo(error_codes.Code).@"enum".fields) |field| {
+                const c: error_codes.Code = @enumFromInt(field.value);
+                emit(io, out, "{s}\t{s}\n", .{ error_codes.s(c), error_codes.info(c).summary });
+            }
+        }
+        return;
+    };
+
+    const code = error_codes.parse(code_str) orelse {
+        if (ea.json) {
+            emit(io, out, "{{\"code\":{f},\"known\":false}}\n", .{std.json.fmt(code_str, .{})});
+        } else {
+            emit(io, std.Io.File.stderr(), "unknown error code '{s}'\n\n" ++
+                "ZigBase never registered this code. If a consumer route produced it\n" ++
+                "(ctx.jsonError takes an arbitrary string), ask that application.\n" ++
+                "Run `zigbase explain-code` with no argument to list every ZigBase code.\n", .{code_str});
+        }
+        std.process.exit(1);
+    };
+
+    const i = error_codes.info(code);
+    if (ea.json) {
+        emit(io, out, "{{\"code\":{f},\"known\":true,\"summary\":{f},\"explanation\":{f}}}\n", .{
+            std.json.fmt(error_codes.s(code), .{}),
+            std.json.fmt(i.summary, .{}),
+            std.json.fmt(i.explanation, .{}),
+        });
+    } else {
+        emit(io, out, "{s}\n{s}\n\n{s}\n", .{ error_codes.s(code), i.summary, i.explanation });
+    }
+}
+
+/// Print a scaffold report: one line per file, then the next commands to run.
+fn printReport(io: std.Io, rep: scaffold.Report) void {
+    for (rep.entries) |e| switch (e.outcome) {
+        .created => emit(io, std.Io.File.stdout(), "  created  {s}\n", .{e.path}),
+        .skipped => emit(io, std.Io.File.stdout(), "  skipped  {s} (already exists)\n", .{e.path}),
+    };
+}
+
+fn initImpl(allocator: std.mem.Allocator, io: std.Io, ia: cli.InitArgs) !void {
+    if (devtools.enabled) {
+        const mode: scaffold.Mode = switch (ia.mode) {
+            .box => .box,
+            .framework => .framework,
+        };
+        const rep = try scaffold.run(allocator, io, .{ .mode = mode, .dir = ia.dir, .name = ia.name });
+        defer scaffold.freeReport(allocator, rep);
+
+        emit(io, std.Io.File.stdout(), "zigbase init: {s} mode in {s}\n\n", .{ @tagName(ia.mode), ia.dir });
+        printReport(io, rep);
+        if (rep.skipped > 0) emit(io, std.Io.File.stdout(),
+            \\
+            \\{d} file(s) already existed and were left untouched. init never overwrites.
+            \\
+        , .{rep.skipped});
+
+        switch (mode) {
+            .box => emit(io, std.Io.File.stdout(),
+                \\
+                \\NEXT:
+                \\  cd {s}
+                \\  docker compose up -d
+                \\  docker compose exec zigbase /zigbase superuser create \
+                \\    --email you@example.com --password 'change-me-please' --data-dir /data
+                \\  docker compose exec zigbase /zigbase schema apply /schema/collections.json
+                \\
+                \\Before you ship:
+                \\  docker compose exec zigbase /zigbase doctor --production --data-dir /data
+                \\
+                \\Read AGENTS.md before you ship. Blank access rules mean LOCKED, not public.
+                \\
+            , .{ia.dir}),
+            .framework => emit(io, std.Io.File.stdout(),
+                \\
+                \\NEXT:
+                \\  cd {s}
+                \\  zig fetch --save git+https://github.com/valthon/zigbase
+                \\  zig build test
+                \\  zig build run -- serve --insecure-cookies
+                \\
+                \\`zig fetch --save` writes the dependency URL AND its content hash into
+                \\build.zig.zon. Do not hand-write either.
+                \\
+                \\Before you ship:
+                \\  zig build run -- doctor --production
+                \\
+                \\Read AGENTS.md before you ship. Blank access rules mean LOCKED, not public.
+                \\
+            , .{ia.dir}),
+        }
+    } else {
+        // Unreachable via the CLI in practice: cli.parse rejects `init` with
+        // ParseError.DevToolsDisabled before dispatch ever reaches here in a
+        // `-Ddev-tools=false` build. Kept only so this branch's analyzed body
+        // never references scaffold.zig (and scaffold/**) in a stripped binary.
+        emit(io, std.Io.File.stderr(), "zigbase init: {s}\n", .{devtools.disabled_note});
+        std.process.exit(1);
+    }
+}
+
+fn agentsMdImpl(allocator: std.mem.Allocator, io: std.Io, aa: cli.AgentsMdArgs) !void {
+    if (devtools.enabled) {
+        const mode: ?scaffold.Mode = if (aa.mode) |m| switch (m) {
+            .box => .box,
+            .framework => .framework,
+        } else null;
+
+        if (aa.to_stdout) {
+            const resolved = mode orelse blk: {
+                var d = std.Io.Dir.cwd().openDir(io, aa.dir, .{}) catch break :blk scaffold.Mode.box;
+                defer d.close(io);
+                break :blk scaffold.detectMode(io, d);
+            };
+            emit(io, std.Io.File.stdout(), "{s}", .{scaffold.agentsMdText(resolved)});
+            return;
+        }
+
+        const rep = try scaffold.agentsMd(allocator, io, .{ .mode = mode, .dir = aa.dir });
+        defer scaffold.freeReport(allocator, rep);
+        printReport(io, rep);
+        if (rep.skipped > 0) emit(io, std.Io.File.stdout(),
+            \\
+            \\Nothing was overwritten. Delete the file(s) first, or use --stdout and diff.
+            \\
+        , .{});
+    } else {
+        // Unreachable via the CLI in practice: cli.parse rejects `agents-md`
+        // with ParseError.DevToolsDisabled before dispatch ever reaches here
+        // in a `-Ddev-tools=false` build. Kept only so this branch's analyzed
+        // body never references scaffold.zig (and scaffold/**) in a stripped binary.
+        emit(io, std.Io.File.stderr(), "zigbase agents-md: {s}\n", .{devtools.disabled_note});
+        std.process.exit(1);
+    }
 }
 
 fn superuserCreateImpl(allocator: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map, sa: cli.SuperuserArgs) !void {

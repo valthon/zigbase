@@ -2,15 +2,29 @@ import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { createServer, type Server } from "node:http";
 import { AddressInfo } from "node:net";
 import { startGolfsim, type GolfServer } from "./harness.js";
-import { createClient, type Booking, type Hold } from "../clients/typescript/zbase.gen.js";
+import { createClient } from "../clients/typescript/zbase.gen.js";
 
 // The whole process clock is frozen to this instant via ZIGBASE_FAKE_NOW. The seam is
-// compiled in only on a dev-mode build (the default Debug build the harness produces),
-// so every framework + consumer `'now'` (token exp, SQLite `unixepoch('now')`, autodate
-// columns) resolves to this fixed point. golfsim's prepareHold hook reads "now" from the
-// DB clock, so a hold's expires_at becomes deterministic: FROZEN + 15 minutes.
+// compiled in only on a dev-mode build (the default Debug build the harness produces), so
+// every framework + consumer `'now'` (token exp, SQLite `unixepoch('now')`, autodate columns)
+// resolves to this fixed point.
+//
+// NOTE: golfsim's src/main.zig `test {}` block (`zig build test`, in-process, no socket) now
+// covers the DIRECT effects of this seam faithfully and more precisely than a spawned server
+// can — e.g. it asserts a hold's frozen `expires_at` byte-for-byte, proves `.fake_now_unix` +
+// `.fake_seed` reproduce identical output across two independent boots, and exercises
+// `POST /api/holds/:id/convert` (ctx.txWith) atomically converting a hold into a booking. Those
+// two scenarios used to be spawned-server tests here; they were removed once the in-process
+// suite reproduced them faithfully (see examples/golfsim/README.md's "Two test surfaces" note).
+//
+// What CANNOT move in-process: `ctx.app.submit` (the booking-webhook offload below) requires a
+// running background worker pool, which `zigbase.testing`'s `bootForTest` deliberately does NOT
+// start (it boots the app far enough to route requests, not to serve). Under the in-process
+// harness `ctx.app.submit` always returns `error.SchedulerUnavailable`, which
+// `notifyBookingConfirmed` swallows — so the webhook silently never fires there. Verifying it
+// actually fires needs a REAL spawned server with a REAL worker pool, which is exactly what
+// this file provides.
 const FROZEN = "2030-06-15T12:00:00Z";
-const FROZEN_PLUS_15M = "2030-06-15T12:15:00"; // expires_at = now + hold_ttl_seconds
 
 // In-process capture server for the outbound booking-confirmation webhook (ctx.http()).
 // golfsim POSTs here when a booking is confirmed; we record the request to assert on it.
@@ -62,47 +76,7 @@ async function signIn(email: string) {
   return { zb, user };
 }
 
-describe("golfsim determinism seam + ctx.tx + ctx.http (frozen clock)", () => {
-  it("ZIGBASE_FAKE_NOW freezes a hold's server-stamped expires_at", async () => {
-    const { zb: host, user: hostUser } = await signIn("det-host@golf.app");
-    const sim = await host.db.simulators.create({ label: "Frozen Bay", owner: hostUser.id });
-    const listing = await host.db.listings.create({
-      title: "Deterministic tee time", price_per_hour: 50, status: "published", simulator: sim.id,
-    });
-
-    const { zb: guest, user: guestUser } = await signIn("det-guest@golf.app");
-    // prepareHold stamps expires_at = now + 15m using the DB clock; under FAKE_NOW that is
-    // a fixed instant, NOT wall-clock 2026 — proving the seam reaches consumer hook code.
-    // @ts-expect-error expires_at is required in the schema but stamped server-side by prepareHold.
-    const hold = (await guest.db.holds.create({ listing: listing.id, guest: guestUser.id })) as Hold;
-    expect(hold.expires_at).toContain("2030-06-15");
-    expect(hold.expires_at).toContain("12:15:00");
-    expect(hold.expires_at.startsWith(FROZEN_PLUS_15M)).toBe(true);
-  });
-
-  it("ctx.tx converts a hold into a booking atomically (booking created, hold deleted)", async () => {
-    const { zb: host, user: hostUser } = await signIn("tx-host@golf.app");
-    const sim = await host.db.simulators.create({ label: "Tx Bay", owner: hostUser.id });
-    const listing = await host.db.listings.create({
-      title: "Convertible slot", price_per_hour: 50, status: "published", simulator: sim.id,
-    });
-
-    const { zb: guest, user: guestUser } = await signIn("tx-guest@golf.app");
-    // @ts-expect-error expires_at is required in the schema but stamped server-side by prepareHold.
-    const hold = await guest.db.holds.create({ listing: listing.id, guest: guestUser.id });
-
-    // POST /api/holds/:id/convert runs the booking-create + hold-delete in one ctx.tx.
-    const booking = (await guest.rpc.holdsConvert(
-      { id: hold.id },
-      { starts_at: "2030-06-20 09:00:00.000Z", ends_at: "2030-06-20 10:00:00.000Z" },
-    )) as Booking;
-    expect(booking.status).toBe("pending");
-    expect(booking.price_total).toBe(50); // 1h * 50/hr, computed server-side
-
-    // The hold no longer exists — both writes committed together.
-    await expect(guest.db.holds.getOne(hold.id)).rejects.toThrow();
-  });
-
+describe("golfsim ctx.http() webhook offload (frozen clock, real spawned server)", () => {
   it("ctx.http() fires a booking-confirmation webhook on confirm", async () => {
     const { zb: host, user: hostUser } = await signIn("hook-host@golf.app");
     const sim = await host.db.simulators.create({ label: "Hook Bay", owner: hostUser.id });
@@ -119,6 +93,8 @@ describe("golfsim determinism seam + ctx.tx + ctx.http (frozen clock)", () => {
     const before = captured.length;
     // The host confirms; confirmBooking OFFLOADS the webhook to the background worker pool
     // (ctx.app.submit), so the POST arrives shortly AFTER the confirm response — poll for it.
+    // This offload only actually runs a job here because THIS is a real spawned server with a
+    // real worker pool — see the file header for why `zigbase.testing` can't observe this.
     await host.rpc.bookingsConfirm({ id: booking.id });
 
     const ours = await poll(() => captured.slice(before).find((c) => c.body.includes(booking.id)), 2000);

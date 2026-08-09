@@ -19,13 +19,20 @@ pub var log_sink: ?*const fn (message: []const u8) void = null;
 ///   - otherwise                    → `[phase] err_name: message`
 /// A pathologically long line is truncated to `buf` (best-effort — this is a log line).
 pub fn formatLine(buf: []u8, r: Report) []const u8 {
-    const out = if (r.err_name.len == 0)
-        std.fmt.bufPrint(buf, "[{s}] {s}", .{ r.phase, r.message })
+    // Write through the fixed writer directly so a truncated line is the bytes actually
+    // written (`buffered()`), never the buffer's unwritten tail. The former `catch buf`
+    // returned the WHOLE buffer on NoSpaceLeft, i.e. uninitialized stack bytes as log
+    // text — harmless with today's saturating drain, but only by coincidence.
+    // Mirrors `logging.formatInto`; see the rationale there.
+    var w: std.Io.Writer = .fixed(buf);
+    const res = if (r.err_name.len == 0)
+        w.print("[{s}] {s}", .{ r.phase, r.message })
     else if (r.message.len == 0 or std.mem.eql(u8, r.message, r.err_name))
-        std.fmt.bufPrint(buf, "[{s}] {s}", .{ r.phase, r.err_name })
+        w.print("[{s}] {s}", .{ r.phase, r.err_name })
     else
-        std.fmt.bufPrint(buf, "[{s}] {s}: {s}", .{ r.phase, r.err_name, r.message });
-    return out catch buf; // NoSpaceLeft: return the (truncated) full buffer, best-effort.
+        w.print("[{s}] {s}: {s}", .{ r.phase, r.err_name, r.message });
+    res catch {}; // NoSpaceLeft: emit the truncated prefix, best-effort.
+    return w.buffered();
 }
 
 /// Emit the structured backstop line for `r`. Honors `log_sink` in tests, else `std.log.err`.

@@ -143,7 +143,7 @@ def test_sse_stream_and_uplink_end_to_end(server, page):
         "{}"
     ).encode())
     assert b" 404 " in bogus, f"unknown clientId should 404, got {bogus!r}"
-    assert b'{"code":404,"message":"Not found.","data":{}}' in bogus, f"non-oracle 404 body, got {bogus!r}"
+    assert b'{"status":404,"code":"not_found","message":"Not found.","data":{}}' in bogus, f"non-oracle 404 body, got {bogus!r}"
 
     # 4. Delivery leg: a superuser feature-override broadcasts the signal frame on __features, which
     #    must arrive on the SSE stream we subscribed in step 2 -> the full stream+uplink+delivery loop.

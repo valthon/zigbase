@@ -312,12 +312,12 @@ pub fn unlinkProvider(ctx: *http.RequestCtx) anyerror!http.Response {
     if (col.type != .auth) return ApiError.notFound().toResponse(ctx.allocator.a);
 
     const authed = (auth.authenticate(app.io, ctx.allocator.a, app, ctx, w) catch null) orelse
-        return (ApiError{ .status = 403, .message = "Forbidden." }).toResponse(ctx.allocator.a);
+        return ApiError.forbidden().toResponse(ctx.allocator.a);
     const is_self = std.mem.eql(u8, authed.collection, col.name) and std.mem.eql(u8, authed.record.object.get("id").?.string, rid);
-    if (!authed.is_superuser and !is_self) return (ApiError{ .status = 403, .message = "Forbidden." }).toResponse(ctx.allocator.a);
+    if (!authed.is_superuser and !is_self) return ApiError.forbidden().toResponse(ctx.allocator.a);
 
     if ((try linkCount(ctx.allocator.a, w, col.name, rid)) <= 1 and !(try passwordIsSet(ctx.allocator.a, w, col.name, rid)))
-        return (ApiError{ .status = 400, .message = "Cannot remove the last credential." }).toResponse(ctx.allocator.a);
+        return ApiError.badRequest("Cannot remove the last credential.").toResponse(ctx.allocator.a);
 
     var st = try prep(w, "DELETE FROM \"_externalAuths\" WHERE \"collectionRef\"=?1 AND \"recordRef\"=?2 AND \"provider\"=?3 RETURNING \"id\";");
     defer st.finalize();

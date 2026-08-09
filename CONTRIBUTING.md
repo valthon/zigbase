@@ -139,6 +139,21 @@ surface and the unit-test root. This is easy to forget and silently skips your t
 
 ### 2. Python / Playwright browser suite
 
+**Before running this, rebuild.** The suite shells out to whatever binary is already sitting in
+`zig-out/bin/` — if the tree has moved since your last `zig build` (a rebase, a stash, a branch
+switch, or just time passing while you edited), that binary can be stale without anything telling
+you so; the symptom is a coherent subset of tests failing (e.g. one file's worth) while everything
+else passes, which reads like a real regression until you check the artifact. The suite also needs
+two fixture binaries that a plain `zig build` does not produce:
+
+```sh
+zig build                                 # refresh zig-out/bin/zigbase
+zig build features-fixture full-fixture   # fixtures test_features.py / test_logs.py need
+```
+
+See ["Traps: a spawned-server suite tests whatever is on disk"](docs/testing.md#traps-a-spawned-server-suite-tests-whatever-is-on-disk)
+for the failure shapes this avoids.
+
 ```sh
 python -m pytest tests/admin -q -n auto              # whole suite, parallel
 python -m pytest tests/admin/test_schema.py::test_edit_rules_lock_toggle -q   # one test
@@ -165,6 +180,20 @@ the `browser` CI job then caught — end-to-end behavior is only exercised here.
 
 ```sh
 zig fmt --check src build.zig     # formatting gate
+```
+
+**Before running `check-gating.sh`, build its four reference binaries.** A plain `zig build`
+only produces one of them; the other three are separate steps the script does not build for you —
+run without them, it fails fast with an actionable `exit 2` naming the missing binary rather than
+silently passing:
+
+```sh
+zig build                                             # zig-out/bin/zigbase
+zig build full-fixture minimal-server                 # the other two gating-invariant fixtures
+zig build -Ddev-tools=false -p zig-out-devtools-off    # dev-tools-off reference build
+```
+
+```sh
 ./scripts/check-gating.sh         # optional subsystems must be comptime-gated (absent-symbols check)
 ./scripts/check-allocator-contracts.sh   # allocator ownership-contract ratchet
 zig build audit                   # pinned dependency versions vs. docs/security-advisories.md

@@ -14,10 +14,11 @@ const REGISTRY = JSON.parse(readFileSync(join(siteDir, 'scripts/docs-registry.js
 // pages) — a link to one of these resolves to `./<route>`; anything else in the
 // repo becomes a GitHub URL.
 const PUBLISHED = new Set([
-  'abilities', 'analytics', 'api', 'changelog', 'configuration', 'dart-sdk',
+  'abilities', 'agents', 'analytics', 'api', 'changelog', 'configuration', 'dart-sdk',
   'docker', 'email', 'fields', 'framework', 'jobs-and-webhooks', 'known-limitations',
-  'kotlin-sdk', 'overview', 'postgres', 'python-sdk', 'quick-start', 'realtime-broadcast',
-  'recipes', 'search', 'tenancy', 'tutorial', 'typescript-sdk',
+  'kotlin-sdk', 'migration-tools', 'observability', 'overview', 'postgres', 'python-sdk',
+  'quick-start', 'realtime-broadcast', 'recipes', 'search', 'serve', 'tenancy', 'testing',
+  'tutorial', 'typescript-sdk',
 ]);
 // Root canonicals linked by UPPER_CASE basename → their route.
 const ROOT_ROUTE = new Map([['CHANGELOG', 'changelog'], ['KNOWN_LIMITATIONS', 'known-limitations']]);

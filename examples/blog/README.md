@@ -254,11 +254,22 @@ await zb.collection("posts").delete(post.id);
 For a fully-typed client, see golfsim (comptime-generated) and the
 [TypeScript SDK docs](../../docs/typescript-sdk.md).
 
-To run the committed e2e test:
+## Two test surfaces, on purpose
 
 ```sh
-mise exec node@24 -- npm install && npm run test:e2e
+mise exec zig@0.16.0 -- zig build test            # in-process, no socket
+mise exec node@24 -- npm install && npm run test:e2e   # real server, real SDK
 ```
+
+`zig build test` uses [`zigbase.testing`](../../docs/testing.md): it boots this
+app against a throwaway data directory and injects requests through the real
+router, access rules, auth, and hooks — no port, no background threads, and
+milliseconds per test. **This is how you should test your own app's behavior.**
+
+The vitest suite covers what an in-process test structurally cannot: it spawns
+the real binary and drives the `@zigbase/client` TypeScript SDK over HTTP, so it
+exercises the socket server and the SDK wire format. Keep both; neither implies
+the other.
 
 ## Frontend (Astro + React islands)
 

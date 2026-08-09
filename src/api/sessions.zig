@@ -22,7 +22,7 @@ const session = @import("../session.zig");
 const ApiError = @import("error.zig").ApiError;
 
 fn notAuthed(ctx: *http.RequestCtx) !http.Response {
-    return (ApiError{ .status = 401, .message = "Not authenticated." }).toResponse(ctx.allocator.a);
+    return ApiError.withCode(401, .unauthorized, "Not authenticated.").toResponse(ctx.allocator.a);
 }
 
 /// Authenticate + require `:col` to match the caller's collection (parity with authRefresh:

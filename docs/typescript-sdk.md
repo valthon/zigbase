@@ -1043,8 +1043,8 @@ createClient(url, { fetch: customFetch, WebSocket: customWS });
 
 ## Error handling
 
-Every non-2xx response rejects with a `ZigbaseError` carrying `status`, `message`, `url`, and
-per-field validation errors in `data`:
+Every non-2xx response rejects with a `ZigbaseError` carrying `status`, `code`, `message`,
+`url`, and per-field validation errors in `data`:
 
 ```ts
 import { isZigbaseError } from "@zigbase/client";
@@ -1058,6 +1058,26 @@ try {
   }
 }
 ```
+
+**Branch on `code`, never on `message`.** `code` is the frozen machine string from the
+[error-code registry](observability.md#error-codes) — it never changes meaning once
+shipped. `message` is human text and may be reworded in any release, so matching on it is
+a silent breakage waiting to happen:
+
+```ts
+try {
+  await zb.collection("users").authWithPassword(email, password);
+} catch (err) {
+  if (isZigbaseError(err) && err.code === "email_not_verified") {
+    // A distinct, actionable state — not a flat denial. Send them to the verify flow.
+    showVerifyEmailStep(email);
+  }
+}
+```
+
+`code` is `""` when the server sent no code — a non-JSON body, or a response from
+something that isn't ZigBase (a proxy's own 502 page). Run `zigbase explain-code` to list
+every registered code, or `zigbase explain-code <CODE>` for the long form.
 
 ## Field projection — `fields`
 

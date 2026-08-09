@@ -20,6 +20,16 @@
     }
   },
   {
+    "canonical": "docs/agents.md",
+    "mirror": "agents.md",
+    "frontmatter": {
+      "title": "For coding agents",
+      "description": "The ~2k-token entry point for AI agents working with ZigBase — what it is, the traps that bite, the response shapes you can rely on, and which guide to load next.",
+      "order": 4,
+      "group": "getting-started"
+    }
+  },
+  {
     "canonical": "docs/abilities.md",
     "mirror": "abilities.md",
     "frontmatter": {
@@ -110,6 +120,16 @@
     }
   },
   {
+    "canonical": "docs/observability.md",
+    "mirror": "observability.md",
+    "frontmatter": {
+      "title": "Observability & machine-readable output",
+      "description": "Structured logging, the frozen error-code registry, JSON CLI output, and capability discovery — the contracts tools and agents build on.",
+      "order": 5,
+      "group": "reference"
+    }
+  },
+  {
     "canonical": "docs/postgres.md",
     "mirror": "postgres.md",
     "frontmatter": {
@@ -136,6 +156,16 @@
       "title": "Kotlin SDK",
       "description": "The official zigbase Kotlin client — a coroutine-first ZigbaseClient over Ktor for auth, records, offset + cursor pagination, and files. Realtime and a typed tier follow.",
       "order": 8,
+      "group": "guides"
+    }
+  },
+  {
+    "canonical": "docs/migration-tools.md",
+    "mirror": "migration-tools.md",
+    "frontmatter": {
+      "title": "Migration tools",
+      "description": "Declarative schema dump/apply, scaled NDJSON import with relation ordering, legacy password-hash import with rehash-on-login, and the parity-replay harness.",
+      "order": 10,
       "group": "guides"
     }
   },
@@ -170,6 +200,16 @@
     }
   },
   {
+    "canonical": "docs/serve.md",
+    "mirror": "serve.md",
+    "frontmatter": {
+      "title": "Running the server",
+      "description": "Foreground and background serve sessions, the stop/status/logs control verbs, ephemeral instances, and the doctor preflight.",
+      "order": 9,
+      "group": "guides"
+    }
+  },
+  {
     "canonical": "docs/tenancy.md",
     "mirror": "tenancy.md",
     "frontmatter": {
@@ -177,6 +217,16 @@
       "description": "Account-scoped collections — enabling tenancy, tenant_field, accounts/memberships/invitations, roles, and the @request.account rule macros.",
       "order": 2,
       "group": "features"
+    }
+  },
+  {
+    "canonical": "docs/testing.md",
+    "mirror": "testing.md",
+    "frontmatter": {
+      "title": "Testing",
+      "description": "Test a ZigBase app in-process with zigbase.testing — the build wiring, a worked test, the auth seams, and what an in-process test structurally cannot cover.",
+      "order": 3,
+      "group": "guides"
     }
   },
   {

@@ -586,11 +586,11 @@ pub fn token(ctx: *http.RequestCtx) anyerror!http.Response {
     const w = app.pool.acquireWriter();
     defer app.pool.releaseWriter();
     const authed = (try auth.authenticate(app.io, ctx.allocator.a, app, ctx, w)) orelse
-        return (ApiError{ .status = 401, .message = "Not authenticated." }).toResponse(ctx.allocator.a);
+        return ApiError.withCode(401, .unauthorized, "Not authenticated.").toResponse(ctx.allocator.a);
     const rid = authed.record.object.get("id").?.string;
     const table = if (authed.is_superuser) "_superusers" else authed.collection;
     const tk = (try auth_api.tokenKeyFor(ctx.allocator.a, w, table, rid)) orelse
-        return (ApiError{ .status = 401, .message = "Not authenticated." }).toResponse(ctx.allocator.a);
+        return ApiError.withCode(401, .unauthorized, "Not authenticated.").toResponse(ctx.allocator.a);
     const now = try auth.nowUnixPub(w);
     const key = crypto.deriveKey(app.jwt_secret, tk);
     const claims = jwt.Claims{ .id = rid, .collection = authed.collection, .type = .file, .iat = now, .exp = now + app.file_token_ttl_s };

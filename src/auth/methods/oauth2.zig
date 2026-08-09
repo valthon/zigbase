@@ -41,23 +41,23 @@ fn initiateImpl(ctx: *anyopaque, ac: *AuthCtx) anyerror!InitiateResult {
 
     // Parse provider from body.
     const parsed = std.json.parseFromSlice(std.json.Value, ac.ctx.allocator.a, ac.ctx.body, .{}) catch {
-        return InitiateResult{ .status = 400, .body = "{\"message\":\"provider is required.\"}" };
+        return InitiateResult{ .status = 400, .body = "{\"status\":400,\"code\":\"bad_request\",\"message\":\"provider is required.\",\"data\":{}}" };
     };
     if (parsed.value != .object) {
-        return InitiateResult{ .status = 400, .body = "{\"message\":\"provider is required.\"}" };
+        return InitiateResult{ .status = 400, .body = "{\"status\":400,\"code\":\"bad_request\",\"message\":\"provider is required.\",\"data\":{}}" };
     }
     const provider_name = strField(parsed.value, "provider") orelse {
-        return InitiateResult{ .status = 400, .body = "{\"message\":\"provider is required.\"}" };
+        return InitiateResult{ .status = 400, .body = "{\"status\":400,\"code\":\"bad_request\",\"message\":\"provider is required.\",\"data\":{}}" };
     };
 
     // Look up the provider config.
     const cfg = oauth.findProviderConfig(ac.collection, provider_name) orelse {
-        return InitiateResult{ .status = 404, .body = "{\"message\":\"Provider not found.\"}" };
+        return InitiateResult{ .status = 404, .body = "{\"status\":404,\"code\":\"not_found\",\"message\":\"Provider not found.\",\"data\":{}}" };
     };
 
     // Resolve the provider endpoints.
     const provider = oauth.resolveProvider(cfg) orelse {
-        return InitiateResult{ .status = 400, .body = "{\"message\":\"Provider misconfigured.\"}" };
+        return InitiateResult{ .status = 400, .body = "{\"status\":400,\"code\":\"bad_request\",\"message\":\"Provider misconfigured.\",\"data\":{}}" };
     };
 
     // Optionally mint server-side state (scoped writer — released immediately).

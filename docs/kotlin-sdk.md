@@ -673,8 +673,8 @@ oversight — matching the Python/TypeScript/Dart SDKs.
 
 ## Error handling
 
-Every non-2xx response throws `ZigbaseException`, carrying `status`, `message`, `url`, and
-per-field validation errors in `data` (`Map<String, FieldError>`):
+Every non-2xx response throws `ZigbaseException`, carrying `status`, `code`, `message`,
+`url`, and per-field validation errors in `data` (`Map<String, FieldError>`):
 
 ```kotlin
 import io.github.valthon.zigbase.errors.ZigbaseException
@@ -687,6 +687,24 @@ try {
     }
 }
 ```
+
+**Branch on `code`, never on `message`.** `code` is the frozen machine string from the
+[error-code registry](observability.md#error-codes) — it never changes meaning once
+shipped, whereas `message` is human text that may be reworded in any release:
+
+```kotlin
+try {
+    users.authWithPassword(email, password)
+} catch (e: ZigbaseException) {
+    if (e.code == "email_not_verified") {
+        // A distinct, actionable state — not a flat denial.
+        showVerifyEmailStep(email)
+    }
+}
+```
+
+`code` is empty when the server sent no code — a non-JSON body, or a response from
+something that isn't ZigBase (a proxy's own error page).
 
 `status = 0` is reserved for a client-side protocol violation with no real HTTP response
 behind it — currently, only a non-advancing cursor page (see

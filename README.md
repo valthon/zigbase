@@ -23,7 +23,10 @@ zig build                                        # -> zig-out/bin/zigbase   (or:
 ./zig-out/bin/zigbase serve --insecure-cookies --data-dir ./zb_data
 # open http://127.0.0.1:8090/_/  (admin UI) and sign in as the superuser
 curl http://127.0.0.1:8090/api/health           # {"status":"ok","backend":"sqlite","versions":{...}}
+curl http://127.0.0.1:8090/api/meta             # public, unauthenticated capability probe (build/config facts + endpoint map)
 ```
+
+Or start from a scaffold, with no install at all: `npx zigbase init`.
 
 The default bind is `127.0.0.1:8090` (loopback only). To expose ZigBase on all
 interfaces, pass `--http-host 0.0.0.0` (front it with a firewall / reverse proxy).
@@ -84,18 +87,29 @@ See [docs/docker.md](docs/docker.md) for the data-volume/non-root/healthcheck de
 
 ## Build an app on ZigBase (use it as a library)
 
-Fetch ZigBase as a dependency:
+Scaffold a project — `build.zig` already wired, a comptime schema, in-process
+tests, and an `AGENTS.md`:
+
+```sh
+npx zigbase init --framework --dir myapp && cd myapp
+zig fetch --save git+https://github.com/valthon/zigbase
+zig build test
+```
+
+Or wire it into an existing package yourself:
 
 ```sh
 zig fetch --save git+https://github.com/valthon/zigbase
 ```
 
-Wire the module into your `build.zig` (ZigBase links libc):
-
 ```zig
-const zb = b.dependency("zigbase", .{ .target = target, .optimize = optimize });
-exe_mod.addImport("zigbase", zb.module("zigbase"));
-exe_mod.link_libc = true;
+const zigbase = @import("zigbase"); // the dependency's build.zig
+
+const dep = b.dependency("zigbase", .{ .target = target, .optimize = optimize });
+zigbase.addTo(dep, exe_mod); // adds the import and wires the libc requirement — one call, nothing to remember
+
+const tests = zigbase.addTest(b, dep, .{ .root_module = exe_mod });
+b.step("test", "Run tests").dependOn(&b.addRunArtifact(tests).step);
 ```
 
 Then build your own backend on top of it — here a `beforeCreate` hook on the `posts`
@@ -117,8 +131,9 @@ pub fn main(init: std.process.Init) !void {
 ```
 
 `runCli` gives your binary the same commands as the stock server — `serve`, `migrate`,
-`migrate-db`, `import`, `superuser create`, `rewrap`, `vapid-keygen`, `version`, and `help`
-(plus `typegen` when built with `.enable_typegen = true`). Beyond hooks, `App(.{...})` also accepts a comptime
+`migrate-db`, `import`, `schema`, `superuser create`, `rewrap`, `vapid-keygen`,
+`explain-code`, `version`, and `help` (plus `typegen` when built with
+`.enable_typegen = true`). Beyond hooks, `App(.{...})` also accepts a comptime
 **schema** (`.collections` + `.migrations`, provisioned at startup with additive
 auto-migration), **pluggable backends** (`.storage` / `.mailer`), and **footprint
 levers** (`.pools`). See [docs/framework.md](docs/framework.md) and the worked
@@ -134,30 +149,67 @@ an Astro + React frontend demonstrating a different static-files mode.
 ```
 zigbase serve [--http-host H] [--http-port N] [--data-dir PATH] [--serve-static DIR]
               [--insecure-cookies] [--trust-proxy] [--realtime-origins CSV]
+              [--background] [--ephemeral] [--ignore-lock] [--force]
+zigbase serve stop | status [--json] | logs [--follow] [--data-dir PATH]
 zigbase migrate [status | rollback [N] | dump [--out FILE]] [--data-dir PATH]
 zigbase migrate-db --from SQLITE_PATH --to POSTGRES_URL [--force]
-zigbase import --collection NAME [--upsert-key FIELD] [--batch-size N] [--data-dir PATH] <file.ndjson>
+zigbase schema [dump [--json] [--out FILE] | apply FILE [--dry-run] [--allow-destructive] [--prune]] [--data-dir PATH]
+zigbase import [--collection NAME [--upsert-key FIELD] <file.ndjson> | --manifest FILE]
+               [--legacy-hashes ALG] [--dry-run] [--continue-on-error] [--error-log FILE]
+               [--progress N] [--batch-size N] [--json] [--data-dir PATH]
 zigbase superuser create --email E --password P [--data-dir PATH]
 zigbase typegen [--data-dir PATH | --url URL] [--out FILE] [--lang L] [--check] [...]
 zigbase rewrap [--data-dir PATH] [--dry-run]
+zigbase doctor [--production] [--json] [--data-dir PATH]
 zigbase vapid-keygen
+zigbase explain-code [CODE] [--json]
 zigbase version
 zigbase help
 ```
 
 `migrate` defaults to applying pending migrations; `status` reports the ledger without
 changing anything, `rollback [N]` reverses the last N applied, and `dump` writes the live
-schema as a canonical migration. `migrate-db` copies an existing SQLite database into a
+schema as a canonical migration.
+
+`serve --background` detaches and exits 0 only once the server answers; `serve
+stop|status|logs` manage that session; `serve --ephemeral` starts a throwaway server on a
+temp dir and a free port, printing one JSON object; `doctor` runs preflight checks and exits
+`1` on any error, `2` on warnings only, `0` when fully clean. See [docs/serve.md](docs/serve.md).
+
+`migrate-db` copies an existing SQLite database into a
 PostgreSQL target. `typegen` emits a typed SDK for a running (`--url`) or offline
 (`--data-dir`) server — `--lang` picks the target language, `--check` verifies the output is
-up to date without writing (run `zigbase typegen --help` for the full flag set). `rewrap`
+up to date without writing (run `zigbase typegen --help` for the full flag set). `init`,
+`agents-md`, and `typegen` are pure dev-time surfaces (scaffolding + codegen) compiled in by
+default (`-Ddev-tools`, on) — every binary we publish has them; `-Ddev-tools=false` is an
+opt-out for your own custom build that never needs them. `rewrap`
 rotates field-encryption keys (`--dry-run` reports without rewriting), and `vapid-keygen`
-prints a fresh Web Push VAPID keypair.
+prints a fresh Web Push VAPID keypair. `explain-code` looks up a frozen API error code
+(the `code` field in every `{status,code,message,data}` error response) with no args to
+list them all, or `zigbase explain-code <CODE>` (`--json` for machine-readable output) for
+one. See [docs/api.md → Conventions](docs/api.md#conventions). `doctor` runs nine preflight
+checks over a deployment (JWT-secret persistence, `@public` rules, cookie/host/proxy/mailer
+config, migrations, data-dir writability, legacy password hashes) and exits `0`/`2`/`1`
+clean/warnings-only/error so
+it can gate a deploy (`--production` escalates the checks that are only risky, not always
+wrong, in dev); `--json` emits NDJSON findings. See [docs/serve.md](docs/serve.md).
 
 `import` bulk-loads NDJSON records **offline (no running server)** through the record
 engine — validation, defaults, the `.encrypted` envelope, and auth password hashing all
 apply — with optional `--upsert-key` idempotency and source-id preservation. See
 [docs/framework.md](docs/framework.md) → "Offline bulk import".
+
+`schema` is the declarative half: `schema dump` writes the canonical JSON collection
+model and `schema apply` executes the difference between a document and the live schema
+through the same path the REST collections API uses — refusing the whole document, before
+writing anything, if any access rule in it fails to parse. `schema check-rules` lints access-rule
+expressions — which nothing validates when they are *written*, so a malformed rule otherwise
+ships silently and fails closed (500) on the first request — through the real rule pipeline,
+emitting `doctor`-shaped NDJSON findings and exiting `0`/`2`/`1` clean/warnings-only/error.
+Given a document it is a **syntax**-depth check; run against a data dir it is **full** depth
+and also resolves field and relation names. Together with `import --manifest` and
+`import --legacy-hashes` they are the machinery behind
+[docs/migration-tools.md](docs/migration-tools.md).
 
 Running `zigbase` with no recognised command prints usage.
 
@@ -179,6 +231,7 @@ environment variables, then `serve` command-line flags (where a flag exists).
 | `ZIGBASE_FIELD_CRYPTO` | — | `real` | **dev builds only** (`-Ddev-mode`, on by default in Debug): set `fake` to store `.encrypted` fields as readable `fake:<key>:<value>` instead of AES-GCM — useful for eyeballing values while debugging. Compiled out of release binaries; never read there. See [docs/fields.md](docs/fields.md) |
 | `ZIGBASE_COOKIE_SECURE` | `--insecure-cookies` (sets `false`) | `true` | mark auth cookies `Secure`. On by default; opt out for plain-HTTP local dev |
 | `ZIGBASE_TRUST_PROXY` | `--trust-proxy` (sets `true`) | `false` | trust `X-Forwarded-For`/`X-Real-IP` for client-IP / rate-limit keying (set only behind a trusted reverse proxy) |
+| `ZIGBASE_SERVE_BACKGROUND` | — | _unset_ | `1` forces `serve` to run in the background; any other value disables the automatic backgrounding that a detected AI-agent environment would otherwise trigger. See [docs/serve.md](docs/serve.md) |
 | `ZIGBASE_AUTH_TOKEN_TTL` | — | `1209600` (14 days) | auth token lifetime, seconds |
 | `ZIGBASE_VERIFICATION_TTL` | — | `604800` (7 days) | email-verification token lifetime, seconds |
 | `ZIGBASE_PASSWORD_RESET_TTL` | — | `3600` (1 hour) | password-reset token lifetime, seconds |
@@ -217,6 +270,9 @@ environment variables, then `serve` command-line flags (where a flag exists).
 | `ZIGBASE_S3_CACHE_MAX_BYTES` | — | `1073741824` (1 GiB) | spool-cache size cap; eviction reclaims down to a 3/4 low-water mark |
 | `ZIGBASE_VAPID_PUBLIC_KEY` | — | `""` | Web Push VAPID public key (base64url) for `ctx.push()`; also the browser `applicationServerKey`. Generate a pair with `zigbase vapid-keygen` |
 | `ZIGBASE_VAPID_PRIVATE_KEY` | — | `""` | Web Push VAPID private key (base64url) — **secret**. Both keys unset → `ctx.push()` is a no-op |
+| `ZIGBASE_LOG_FORMAT` | `--log-format` | `text` | log encoding: `text` or `json` (one JSON object per line on stderr) |
+| `ZIGBASE_LOG_LEVEL` | `--log-level` | `info` | minimum severity: `debug`, `info`, `warn`, `error` |
+| `ZIGBASE_LOG_REQUESTS` | `--no-request-log` | `true` | emit a per-request access line (method, path, status, duration) |
 
 > Email delivery: with `ZIGBASE_SMTP_HOST` set, verification and password-reset tokens
 > are **emailed** over the configured SMTP transport. Without it (the default), they are
@@ -285,6 +341,7 @@ examples/
 - [docs/recipes.md](docs/recipes.md) — task recipes: ship a frontend in the binary, schema provisioning (curl), signup, owner/relation access rules, hooks, custom routes, DB access in cron
 - [docs/api.md](docs/api.md) — HTTP API reference (collections, records, query, rules, auth, oauth2, realtime, files, static files, admin)
 - [docs/framework.md](docs/framework.md) — embedding ZigBase: hooks, routes, jobs, static-file modes
+- [docs/serve.md](docs/serve.md) — running the server: background sessions, `stop`/`status`/`logs`, ephemeral instances, and the `doctor` preflight
 - [docs/typescript-sdk.md](docs/typescript-sdk.md) — the official `@zigbase/client` TypeScript SDK: auth, records, offset + cursor pagination, files, realtime + live store
 - [docs/dart-sdk.md](docs/dart-sdk.md) — the official `zigbase_client` Dart SDK: auth, records, offset + cursor pagination, files, and realtime, for the Dart VM, Flutter, and Flutter web
 - [docs/python-sdk.md](docs/python-sdk.md) — the official `zigbase` Python SDK: sync and async clients for auth, records, offset + cursor pagination, and files

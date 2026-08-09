@@ -93,7 +93,11 @@ def s3_server():
     subprocess.run([str(binary), "superuser", "create", "--email", "admin@x.io",
                     "--password", "adminpassword", "--data-dir", data], check=True)
     port = _free_port()
-    env = {**os.environ, **_s3_env(), "ZIGBASE_JWT_SECRET": "test-secret-not-default-0123456789abcdef"}
+    # ZIGBASE_SERVE_BACKGROUND=0: keep serve a FOREGROUND child so terminate()
+    # in the finally actually stops it (an inherited agent env like CLAUDECODE
+    # would otherwise auto-background it and leak the detached child).
+    env = {**os.environ, **_s3_env(), "ZIGBASE_JWT_SECRET": "test-secret-not-default-0123456789abcdef",
+           "ZIGBASE_SERVE_BACKGROUND": "0"}
     proc = subprocess.Popen(
         [str(binary), "serve", "--insecure-cookies", "--http-port", str(port), "--data-dir", data],
         env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -164,7 +168,10 @@ def test_s3_bad_credentials_refuses_to_start():
     try:
         port = _free_port()
         env = {**os.environ, **_s3_env(ZIGBASE_S3_SECRET_ACCESS_KEY="wrong-secret"),
-               "ZIGBASE_JWT_SECRET": "test-secret-not-default-0123456789abcdef"}
+               "ZIGBASE_JWT_SECRET": "test-secret-not-default-0123456789abcdef",
+               # Foreground pin: this test reads the FAILING process's own stderr;
+               # auto-backgrounding would bury it in <data-dir>/serve.log instead.
+               "ZIGBASE_SERVE_BACKGROUND": "0"}
         proc = subprocess.Popen(
             [str(binary), "serve", "--insecure-cookies", "--http-port", str(port), "--data-dir", data],
             env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)

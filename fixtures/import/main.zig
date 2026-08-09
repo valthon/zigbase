@@ -2,6 +2,10 @@
 //! give the `zigbase import` browser test something real to import into through a genuine
 //! boot: an auth collection with a password (to prove password hashing) and a base collection
 //! with an `.encrypted` field (to prove the at-rest envelope is applied and decrypts on read).
+//! `authors`/`posts` add a relation graph (`posts.author` -> `authors`, plus the self-relation
+//! `authors.mentor` -> `authors`) for the `--manifest` (SP-5 task 8) end-to-end: out-of-order
+//! collection loading and the deferred-patch pass need at least one cross-collection relation
+//! and one self-relation to actually exercise.
 //! Kept minimal — a test fixture, not an example.
 const std = @import("std");
 const zigbase = @import("zigbase");
@@ -25,6 +29,22 @@ pub const App = zigbase.App(.{
                 .{ .name = "code", .type = .text, .required = true, .unique = true },
                 .{ .name = "secret", .type = .text, .encrypted = true },
                 .{ .name = "note", .type = .text },
+            },
+            .rules = .{ .list = "@public", .view = "@public" },
+        },
+        // Relation graph for the manifest e2e: `posts.author` -> `authors`, plus a
+        // self-relation on `authors.mentor` so the deferred-patch path is exercised.
+        .authors = .{
+            .fields = .{
+                .{ .name = "nom", .type = .text, .required = true },
+                .{ .name = "mentor", .type = .relation, .target = "authors" },
+            },
+            .rules = .{ .list = "@public", .view = "@public" },
+        },
+        .posts = .{
+            .fields = .{
+                .{ .name = "title", .type = .text, .required = true },
+                .{ .name = "author", .type = .relation, .target = "authors" },
             },
             .rules = .{ .list = "@public", .view = "@public" },
         },

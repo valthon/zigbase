@@ -1,4 +1,5 @@
 zig-out/
+zig-out-devtools-off/
 zig-cache/
 .zig-cache/
 zig-pkg/

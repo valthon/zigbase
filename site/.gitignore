@@ -5,6 +5,7 @@ dist/
 # Generated from canonical docs by scripts/gen-docs-mirror.mjs — do not commit.
 src/content/docs/changelog.md
 src/content/docs/known-limitations.md
+src/content/docs/agents.md
 src/content/docs/abilities.md
 src/content/docs/analytics.md
 src/content/docs/api.md
@@ -15,10 +16,18 @@ src/content/docs/fields.md
 src/content/docs/framework.md
 src/content/docs/jobs-and-webhooks.md
 src/content/docs/kotlin-sdk.md
+src/content/docs/migration-tools.md
+src/content/docs/observability.md
 src/content/docs/postgres.md
 src/content/docs/python-sdk.md
 src/content/docs/realtime-broadcast.md
 src/content/docs/recipes.md
 src/content/docs/search.md
+src/content/docs/serve.md
 src/content/docs/tenancy.md
+src/content/docs/testing.md
 src/content/docs/typescript-sdk.md
+
+# Generated from docs-registry.json by scripts/gen-llms-txt.mjs — do not commit.
+public/llms.txt
+public/docs-index.json

@@ -1,4 +1,6 @@
 const std = @import("std");
+const logging = @import("logging.zig");
+const devtools = @import("devtools.zig");
 
 pub const ServeArgs = struct {
     http_host: ?[]const u8 = null,
@@ -12,6 +14,38 @@ pub const ServeArgs = struct {
     realtime_origins: ?[]const u8 = null, // --realtime-origins CSV => allowed WS Origins
     sse_heartbeat_seconds: ?u16 = null, // --sse-heartbeat-seconds N => SSE ping interval (0 = inherit listener timeout)
     realtime_outbound_hwm: ?u32 = null, // --realtime-outbound-hwm N => slow-consumer disconnect bound in frames (0 disables); issue #203
+    // Logging knobs (serve only; the env vars ZIGBASE_LOG_FORMAT/LEVEL/REQUESTS apply
+    // to every subcommand — see docs/observability.md). null = leave the config default.
+    log_format: ?[]const u8 = null, // --log-format text|json
+    log_level: ?[]const u8 = null, // --log-level debug|info|warn|error
+    log_requests: ?bool = null, // --no-request-log => false
+    /// Detach: re-exec self in its own process group, wait for readiness, exit 0.
+    background: bool = false,
+    /// Tempdir data dir + random free port; print one JSON object when ready.
+    ephemeral: bool = false,
+    /// Start an UNTRACKED instance: take no flock, write no serve.json.
+    ignore_lock: bool = false,
+    /// --background only: stop an existing session first instead of being idempotent.
+    force: bool = false,
+};
+
+pub const ServeControlVerb = enum { stop, status, logs };
+
+pub const ServeControlArgs = struct {
+    verb: ServeControlVerb,
+    data_dir: ?[]const u8 = null,
+    /// `status` only.
+    json: bool = false,
+    /// `logs` only.
+    follow: bool = false,
+};
+
+pub const DoctorArgs = struct {
+    data_dir: ?[]const u8 = null,
+    /// Escalate severities for a production deployment.
+    production: bool = false,
+    /// NDJSON findings on stdout + one summary object.
+    json: bool = false,
 };
 
 /// `migrate` runs one of four actions: `apply` (the default — apply pending system + consumer
@@ -30,6 +64,9 @@ pub const MigrateArgs = struct {
     rollback_count: usize = 1,
     /// Output path for `.dump` (`--out <path>`). `null` = write to stdout. Ignored by the other actions.
     out: ?[]const u8 = null,
+    /// `--json` (status only, SP-1): emit one JSON object instead of the text report. An
+    /// unknown flag for every other action, mirroring how `--out` is gated to `.dump`.
+    json: bool = false,
 };
 
 pub const SuperuserArgs = struct {
@@ -83,16 +120,81 @@ pub const ImportArgs = struct {
     batch_size: usize = 500,
     /// Positional NDJSON file path (required); `-` reads stdin.
     file: ?[]const u8 = null,
+    /// Validate + execute every row, then roll back. Writes nothing.
+    dry_run: bool = false,
+    /// Skip failing rows instead of aborting; the exit code becomes 3 if any were skipped.
+    continue_on_error: bool = false,
+    /// NDJSON file for per-row failures.
+    error_log: ?[]const u8 = null,
+    /// Progress line every N rows to stderr (0 = off).
+    progress: usize = 0,
+    /// Emit the summary as one JSON object on stdout.
+    json: bool = false,
+    /// Multi-collection manifest path. Mutually exclusive with --collection/--upsert-key
+    /// and the positional file, which it supplies instead.
+    manifest: ?[]const u8 = null,
+    /// Import source password hashes tagged with this algorithm (currently `bcrypt` only).
+    legacy_hashes: ?[]const u8 = null,
+};
+
+/// `explain-code [CODE] [--json]`: print the long form for one frozen error code,
+/// or list every registered code when CODE is omitted.
+pub const ExplainCodeArgs = struct {
+    code: ?[]const u8 = null,
+    json: bool = false,
+};
+
+/// `version [--json]`: print build provenance (SP-1). `--json` emits one JSON object
+/// instead of the text report.
+pub const VersionArgs = struct {
+    json: bool = false,
+};
+
+/// `schema`: the declarative-schema surface. `dump` writes the canonical JSON document for
+/// every non-system collection; `apply` diffs a document against the live schema and
+/// executes the difference through the same engine path the REST collections API uses;
+/// `check_rules` (spelled `check-rules`) lints access-rule expressions, which nothing else
+/// validates at write time.
+pub const SchemaAction = enum { dump, apply, check_rules };
+
+pub const SchemaArgs = struct {
+    data_dir: ?[]const u8 = null,
+    action: SchemaAction = .dump,
+    out: ?[]const u8 = null,
+    json: bool = false,
+    file: ?[]const u8 = null,
+    dry_run: bool = false,
+    allow_destructive: bool = false,
+    prune: bool = false,
+};
+
+pub const InitMode = enum { box, framework };
+
+/// `init` — scaffold a starting-point project. Exclusive-create only; there is no
+/// --force, so re-running is always safe.
+pub const InitArgs = struct {
+    mode: InitMode = .box,
+    dir: []const u8 = ".",
+    /// Package/executable name (framework mode). Null = derive from `dir`.
+    name: ?[]const u8 = null,
+};
+
+/// `agents-md` — (re)write AGENTS.md + CLAUDE.md into an existing project.
+pub const AgentsMdArgs = struct {
+    /// Null = infer from the directory (a build.zig.zon means framework mode).
+    mode: ?InitMode = null,
+    dir: []const u8 = ".",
+    to_stdout: bool = false,
 };
 
 /// Identifies which command a per-command `--help` request targets.
-pub const HelpTopic = enum { top, serve, migrate, superuser_create, typegen, rewrap, migrate_db, vapid_keygen, import };
+pub const HelpTopic = enum { top, serve, serve_control, migrate, superuser_create, typegen, rewrap, migrate_db, vapid_keygen, import, schema, explain_code, doctor, init, agents_md };
 
 pub const Command = union(enum) {
     /// `help`/`--help`/`-h`/no-args -> top-level usage; `<cmd> --help` -> that command's usage.
     help: HelpTopic,
     /// `version`/`--version`/`-V` -> print build provenance and exit.
-    version: void,
+    version: VersionArgs,
     serve: ServeArgs,
     migrate: MigrateArgs,
     superuser_create: SuperuserArgs,
@@ -102,6 +204,16 @@ pub const Command = union(enum) {
     /// `vapid-keygen` -> generate a fresh VAPID (Web Push) keypair, print it, and exit.
     vapid_keygen: void,
     import: ImportArgs,
+    schema: SchemaArgs,
+    explain_code: ExplainCodeArgs,
+    /// `serve stop|status|logs` -> manage an existing `serve` session.
+    serve_control: ServeControlArgs,
+    /// `doctor` -> preflight checks over config/data-dir/schema.
+    doctor: DoctorArgs,
+    /// `init` -> scaffold a project into a directory and exit.
+    init: InitArgs,
+    /// `agents-md` -> write AGENTS.md + CLAUDE.md for an existing project and exit.
+    agents_md: AgentsMdArgs,
 };
 
 /// True when an arg is a help flag (`--help` or `-h`).
@@ -109,7 +221,7 @@ fn isHelpFlag(a: []const u8) bool {
     return std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "-h");
 }
 
-pub const ParseError = error{ UnknownCommand, UnknownFlag, MissingValue, BadValue };
+pub const ParseError = error{ UnknownCommand, UnknownFlag, MissingValue, BadValue, ConflictingFlags, DevToolsDisabled };
 
 /// Comptime-derived parser switches. `serve_static` is true only in the default
 /// static-files mode — in .disabled/.dir/.embedded the flag is rejected as unknown.
@@ -130,7 +242,21 @@ pub fn parse(args: []const []const u8, popts: ParseOpts) ParseError!Command {
     if (std.mem.eql(u8, args[0], "version") or
         std.mem.eql(u8, args[0], "--version") or
         std.mem.eql(u8, args[0], "-V"))
-        return .{ .version = {} };
+    {
+        var va = VersionArgs{};
+        var i: usize = 1;
+        while (i < args.len) : (i += 1) {
+            // `version` has no dedicated HelpTopic (it isn't a subcommand with its own
+            // usage block), so `--help`/`-h` routes to the general top-level help, same
+            // as bare `--help` — additive, not a UnknownFlag exit.
+            if (isHelpFlag(args[i])) {
+                return .{ .help = .top };
+            } else if (std.mem.eql(u8, args[i], "--json")) {
+                va.json = true;
+            } else return ParseError.UnknownFlag;
+        }
+        return .{ .version = va };
+    }
     if (std.mem.eql(u8, args[0], "migrate-db")) {
         var ma = MigrateDbArgs{};
         var i: usize = 1;
@@ -187,6 +313,8 @@ pub fn parse(args: []const []const u8, popts: ParseOpts) ParseError!Command {
                 i += 1;
                 if (i >= args.len) return ParseError.MissingValue;
                 ma.out = args[i];
+            } else if (ma.action == .status and std.mem.eql(u8, a, "--json")) {
+                ma.json = true;
             } else return ParseError.UnknownFlag;
         }
         return .{ .migrate = ma };
@@ -199,6 +327,69 @@ pub fn parse(args: []const []const u8, popts: ParseOpts) ParseError!Command {
             return ParseError.UnknownFlag;
         }
         return .{ .vapid_keygen = {} };
+    }
+    if (std.mem.eql(u8, args[0], "explain-code")) {
+        var ea = ExplainCodeArgs{};
+        var i: usize = 1;
+        while (i < args.len) : (i += 1) {
+            const a = args[i];
+            if (isHelpFlag(a)) {
+                return .{ .help = .explain_code };
+            } else if (std.mem.eql(u8, a, "--json")) {
+                ea.json = true;
+            } else if (!std.mem.startsWith(u8, a, "-")) {
+                // Positional CODE. Only one is allowed.
+                if (ea.code != null) return ParseError.BadValue;
+                ea.code = a;
+            } else return ParseError.UnknownFlag;
+        }
+        return .{ .explain_code = ea };
+    }
+    if (std.mem.eql(u8, args[0], "schema")) {
+        var sa = SchemaArgs{};
+        var i: usize = 1;
+        // Optional leading subcommand: `schema dump` (the default), `schema apply <file>`,
+        // or `schema check-rules [file]`.
+        if (i < args.len and !std.mem.startsWith(u8, args[i], "-")) {
+            if (std.mem.eql(u8, args[i], "dump")) {
+                sa.action = .dump;
+                i += 1;
+            } else if (std.mem.eql(u8, args[i], "apply")) {
+                sa.action = .apply;
+                i += 1;
+            } else if (std.mem.eql(u8, args[i], "check-rules")) {
+                sa.action = .check_rules;
+                i += 1;
+            } else return ParseError.UnknownCommand;
+        }
+        while (i < args.len) : (i += 1) {
+            const a = args[i];
+            if (isHelpFlag(a)) {
+                return .{ .help = .schema };
+            } else if (std.mem.eql(u8, a, "--data-dir")) {
+                i += 1;
+                if (i >= args.len) return ParseError.MissingValue;
+                sa.data_dir = args[i];
+            } else if (std.mem.eql(u8, a, "--json")) {
+                sa.json = true;
+            } else if (sa.action == .dump and std.mem.eql(u8, a, "--out")) {
+                i += 1;
+                if (i >= args.len) return ParseError.MissingValue;
+                sa.out = args[i];
+            } else if (sa.action == .apply and std.mem.eql(u8, a, "--dry-run")) {
+                sa.dry_run = true;
+            } else if (sa.action == .apply and std.mem.eql(u8, a, "--allow-destructive")) {
+                sa.allow_destructive = true;
+            } else if (sa.action == .apply and std.mem.eql(u8, a, "--prune")) {
+                sa.prune = true;
+            } else if (!std.mem.startsWith(u8, a, "-")) {
+                // Positional document path — `apply` (required) and `check-rules` (optional:
+                // its presence is what selects document mode over live mode). Exactly one.
+                if ((sa.action != .apply and sa.action != .check_rules) or sa.file != null) return ParseError.BadValue;
+                sa.file = a;
+            } else return ParseError.UnknownFlag;
+        }
+        return .{ .schema = sa };
     }
     if (std.mem.eql(u8, args[0], "import")) {
         var ia = ImportArgs{};
@@ -224,12 +415,44 @@ pub fn parse(args: []const []const u8, popts: ParseOpts) ParseError!Command {
                 if (i >= args.len) return ParseError.MissingValue;
                 ia.batch_size = std.fmt.parseInt(usize, args[i], 10) catch return ParseError.BadValue;
                 if (ia.batch_size == 0) return ParseError.BadValue;
+            } else if (std.mem.eql(u8, a, "--dry-run")) {
+                ia.dry_run = true;
+            } else if (std.mem.eql(u8, a, "--continue-on-error")) {
+                ia.continue_on_error = true;
+            } else if (std.mem.eql(u8, a, "--error-log")) {
+                i += 1;
+                if (i >= args.len) return ParseError.MissingValue;
+                ia.error_log = args[i];
+            } else if (std.mem.eql(u8, a, "--progress")) {
+                i += 1;
+                if (i >= args.len) return ParseError.MissingValue;
+                ia.progress = std.fmt.parseInt(usize, args[i], 10) catch return ParseError.BadValue;
+            } else if (std.mem.eql(u8, a, "--json")) {
+                ia.json = true;
+            } else if (std.mem.eql(u8, a, "--manifest")) {
+                i += 1;
+                if (i >= args.len) return ParseError.MissingValue;
+                ia.manifest = args[i];
+            } else if (std.mem.eql(u8, a, "--legacy-hashes")) {
+                i += 1;
+                if (i >= args.len) return ParseError.MissingValue;
+                ia.legacy_hashes = args[i];
             } else if (std.mem.eql(u8, a, "-") or !std.mem.startsWith(u8, a, "-")) {
                 // Positional NDJSON file path (`-` = stdin). Only one is allowed.
                 if (ia.file != null) return ParseError.BadValue;
                 ia.file = a;
             } else return ParseError.UnknownFlag;
         }
+        // --manifest supplies the collection, the upsert key and the file; combining them
+        // would leave two sources of truth for the same thing.
+        if (ia.manifest != null and (ia.collection != null or ia.upsert_key != null or ia.file != null))
+            return ParseError.BadValue;
+        // Legacy credential import is CREATE-ONLY: the upsert branch updates a matched row and
+        // never installs the credential, so accepting both would silently discard every matched
+        // row's password. Refused here as a usage error; `import.run` refuses it again at
+        // runtime for the library/manifest paths this parser never sees.
+        if (ia.legacy_hashes != null and ia.upsert_key != null)
+            return ParseError.BadValue;
         return .{ .import = ia };
     }
     if (std.mem.eql(u8, args[0], "rewrap")) {
@@ -276,6 +499,11 @@ pub fn parse(args: []const []const u8, popts: ParseOpts) ParseError!Command {
         return .{ .superuser_create = sa };
     }
     if (std.mem.eql(u8, args[0], "typegen")) {
+        // Pure dev-time codegen (schema in, client source out) — never needed by a
+        // deployed server. See src/devtools.zig. Checked first so the rest of this
+        // block (and the codegen/** it eventually reaches in framework.zig) folds to
+        // comptime-dead code in a `-Ddev-tools=false` build.
+        if (!devtools.enabled) return ParseError.DevToolsDisabled;
         var ta = TypegenArgs{};
         var i: usize = 1;
         while (i < args.len) : (i += 1) {
@@ -323,7 +551,115 @@ pub fn parse(args: []const []const u8, popts: ParseOpts) ParseError!Command {
         }
         return .{ .typegen = ta };
     }
+    if (std.mem.eql(u8, args[0], "doctor")) {
+        var da = DoctorArgs{};
+        var i: usize = 1;
+        while (i < args.len) : (i += 1) {
+            const a = args[i];
+            if (isHelpFlag(a)) {
+                return .{ .help = .doctor };
+            } else if (std.mem.eql(u8, a, "--data-dir")) {
+                i += 1;
+                if (i >= args.len) return ParseError.MissingValue;
+                da.data_dir = args[i];
+            } else if (std.mem.eql(u8, a, "--production")) {
+                da.production = true;
+            } else if (std.mem.eql(u8, a, "--json")) {
+                da.json = true;
+            } else return ParseError.UnknownFlag;
+        }
+        return .{ .doctor = da };
+    }
+    if (std.mem.eql(u8, args[0], "init")) {
+        // Pure dev-time scaffolding — never needed by a deployed server. See
+        // src/devtools.zig; checked first so the rest of this block folds to
+        // comptime-dead code in a `-Ddev-tools=false` build.
+        if (!devtools.enabled) return ParseError.DevToolsDisabled;
+        var ia = InitArgs{};
+        var i: usize = 1;
+        while (i < args.len) : (i += 1) {
+            const a = args[i];
+            if (isHelpFlag(a)) {
+                return .{ .help = .init };
+            } else if (std.mem.eql(u8, a, "--box")) {
+                ia.mode = .box;
+            } else if (std.mem.eql(u8, a, "--framework")) {
+                ia.mode = .framework;
+            } else if (std.mem.eql(u8, a, "--dir")) {
+                i += 1;
+                if (i >= args.len) return ParseError.MissingValue;
+                ia.dir = args[i];
+            } else if (std.mem.eql(u8, a, "--name")) {
+                i += 1;
+                if (i >= args.len) return ParseError.MissingValue;
+                ia.name = args[i];
+            } else return ParseError.UnknownFlag;
+        }
+        return .{ .init = ia };
+    }
+    if (std.mem.eql(u8, args[0], "agents-md")) {
+        // Pure dev-time scaffolding — never needed by a deployed server. See
+        // src/devtools.zig; checked first so the rest of this block folds to
+        // comptime-dead code in a `-Ddev-tools=false` build.
+        if (!devtools.enabled) return ParseError.DevToolsDisabled;
+        var aa = AgentsMdArgs{};
+        var i: usize = 1;
+        while (i < args.len) : (i += 1) {
+            const a = args[i];
+            if (isHelpFlag(a)) {
+                return .{ .help = .agents_md };
+            } else if (std.mem.eql(u8, a, "--box")) {
+                aa.mode = .box;
+            } else if (std.mem.eql(u8, a, "--framework")) {
+                aa.mode = .framework;
+            } else if (std.mem.eql(u8, a, "--stdout")) {
+                aa.to_stdout = true;
+            } else if (std.mem.eql(u8, a, "--dir")) {
+                i += 1;
+                if (i >= args.len) return ParseError.MissingValue;
+                aa.dir = args[i];
+            } else return ParseError.UnknownFlag;
+        }
+        return .{ .agents_md = aa };
+    }
     if (!std.mem.eql(u8, args[0], "serve")) return ParseError.UnknownCommand;
+
+    // Optional leading control verb: `serve stop|status|logs`. Anything else
+    // non-flag in that position is not a verb (mirrors `migrate status`).
+    if (args.len >= 2 and !std.mem.startsWith(u8, args[1], "-")) {
+        const verb: ServeControlVerb =
+            if (std.mem.eql(u8, args[1], "stop"))
+                .stop
+            else if (std.mem.eql(u8, args[1], "status"))
+                .status
+            else if (std.mem.eql(u8, args[1], "logs"))
+                .logs
+            else
+                return ParseError.UnknownCommand;
+        var ca = ServeControlArgs{ .verb = verb };
+        var ci: usize = 2;
+        while (ci < args.len) : (ci += 1) {
+            const a = args[ci];
+            if (isHelpFlag(a)) {
+                // `-h` is a help flag everywhere in this parser; `-f` is the
+                // logs short flag, checked separately below so the two never collide.
+                return .{ .help = .serve_control };
+            } else if (std.mem.eql(u8, a, "--data-dir")) {
+                ci += 1;
+                if (ci >= args.len) return ParseError.MissingValue;
+                ca.data_dir = args[ci];
+            } else if ((verb == .status or verb == .logs) and std.mem.eql(u8, a, "--json")) {
+                // `status --json`: one JSON object describing the session.
+                // `logs --json`: keep only the NDJSON records, dropping the
+                // plain-text lines facil.io writes into serve.log from C.
+                // Still rejected on `stop`, which has no output to shape.
+                ca.json = true;
+            } else if (verb == .logs and (std.mem.eql(u8, a, "--follow") or std.mem.eql(u8, a, "-f"))) {
+                ca.follow = true;
+            } else return ParseError.UnknownFlag;
+        }
+        return .{ .serve_control = ca };
+    }
 
     var sa = ServeArgs{};
     var i: usize = 1;
@@ -367,10 +703,32 @@ pub fn parse(args: []const []const u8, popts: ParseOpts) ParseError!Command {
             i += 1;
             if (i >= args.len) return ParseError.MissingValue;
             sa.realtime_outbound_hwm = std.fmt.parseInt(u32, args[i], 10) catch return ParseError.BadValue;
+        } else if (std.mem.eql(u8, a, "--log-format")) {
+            i += 1;
+            if (i >= args.len) return ParseError.MissingValue;
+            if (logging.parseFormat(args[i]) == null) return ParseError.BadValue;
+            sa.log_format = args[i];
+        } else if (std.mem.eql(u8, a, "--log-level")) {
+            i += 1;
+            if (i >= args.len) return ParseError.MissingValue;
+            if (logging.parseLevel(args[i]) == null) return ParseError.BadValue;
+            sa.log_level = args[i];
+        } else if (std.mem.eql(u8, a, "--no-request-log")) {
+            sa.log_requests = false;
+        } else if (std.mem.eql(u8, a, "--background")) {
+            sa.background = true;
+        } else if (std.mem.eql(u8, a, "--ephemeral")) {
+            sa.ephemeral = true;
+        } else if (std.mem.eql(u8, a, "--ignore-lock")) {
+            sa.ignore_lock = true;
+        } else if (std.mem.eql(u8, a, "--force")) {
+            sa.force = true;
         } else {
             return ParseError.UnknownFlag;
         }
     }
+    // Checked AFTER the loop so the two flags conflict in either order.
+    if (sa.background and sa.ignore_lock) return ParseError.ConflictingFlags;
     return .{ .serve = sa };
 }
 
@@ -380,6 +738,20 @@ test "no args -> top-level help" {
     const cmd = try parse(&.{}, .{});
     try std.testing.expect(std.meta.activeTag(cmd) == .help);
     try std.testing.expectEqual(HelpTopic.top, cmd.help);
+}
+
+test "serve parses the logging flags; bad values are rejected at parse time" {
+    const c = try parse(&.{ "serve", "--log-format", "json", "--log-level", "warn", "--no-request-log" }, .{});
+    try std.testing.expectEqualStrings("json", c.serve.log_format.?);
+    try std.testing.expectEqualStrings("warn", c.serve.log_level.?);
+    try std.testing.expectEqual(@as(?bool, false), c.serve.log_requests);
+    // Absent flags stay null so the env/default still wins.
+    const bare = try parse(&.{"serve"}, .{});
+    try std.testing.expectEqual(@as(?[]const u8, null), bare.serve.log_format);
+    try std.testing.expectEqual(@as(?bool, null), bare.serve.log_requests);
+    try std.testing.expectError(ParseError.BadValue, parse(&.{ "serve", "--log-format", "ndjson" }, .{}));
+    try std.testing.expectError(ParseError.BadValue, parse(&.{ "serve", "--log-level", "trace" }, .{}));
+    try std.testing.expectError(ParseError.MissingValue, parse(&.{ "serve", "--log-format" }, .{}));
 }
 
 test "--help and -h and help -> top-level help" {
@@ -554,6 +926,102 @@ test "import rejects unknown flags, missing values, bad + zero batch size, and a
     try std.testing.expectError(ParseError.BadValue, parse(&.{ "import", "a.ndjson", "b.ndjson" }, .{}));
 }
 
+test "import parses the hardening flags" {
+    const cmd = try parse(&.{
+        "import",      "--collection", "posts",      "--dry-run", "--continue-on-error",
+        "--error-log", "errs.ndjson",  "--progress", "1000",      "--json",
+        "in.ndjson",
+    }, .{});
+    try std.testing.expect(cmd.import.dry_run);
+    try std.testing.expect(cmd.import.continue_on_error);
+    try std.testing.expectEqualStrings("errs.ndjson", cmd.import.error_log.?);
+    try std.testing.expectEqual(@as(usize, 1000), cmd.import.progress);
+    try std.testing.expect(cmd.import.json);
+    try std.testing.expectError(ParseError.MissingValue, parse(&.{ "import", "--error-log" }, .{}));
+    try std.testing.expectError(ParseError.BadValue, parse(&.{ "import", "--progress", "x", "f" }, .{}));
+}
+
+test "import --legacy-hashes parses and requires a value" {
+    const cmd = try parse(&.{ "import", "--collection", "users", "--legacy-hashes", "bcrypt", "u.ndjson" }, .{});
+    try std.testing.expectEqualStrings("bcrypt", cmd.import.legacy_hashes.?);
+    try std.testing.expectError(ParseError.MissingValue, parse(&.{ "import", "--legacy-hashes" }, .{}));
+    // Create-only: an upsert key would update matched rows WITHOUT installing the credential.
+    try std.testing.expectError(ParseError.BadValue, parse(
+        &.{ "import", "--collection", "users", "--legacy-hashes", "bcrypt", "--upsert-key", "email", "u.ndjson" },
+        .{},
+    ));
+}
+
+test "import --manifest parses and excludes the single-collection flags" {
+    const cmd = try parse(&.{ "import", "--manifest", "m.json", "--json" }, .{});
+    try std.testing.expectEqualStrings("m.json", cmd.import.manifest.?);
+    try std.testing.expect(cmd.import.json);
+    try std.testing.expectError(ParseError.BadValue, parse(&.{ "import", "--manifest", "m.json", "--collection", "x" }, .{}));
+    try std.testing.expectError(ParseError.BadValue, parse(&.{ "import", "--manifest", "m.json", "f.ndjson" }, .{}));
+    try std.testing.expectError(ParseError.MissingValue, parse(&.{ "import", "--manifest" }, .{}));
+}
+
+test "schema dump parses --out/--json/--data-dir" {
+    const cmd = try parse(&.{ "schema", "dump", "--json", "--out", "db/schema.json", "--data-dir", "/tmp/zb" }, .{});
+    try std.testing.expect(std.meta.activeTag(cmd) == .schema);
+    try std.testing.expectEqual(SchemaAction.dump, cmd.schema.action);
+    try std.testing.expect(cmd.schema.json);
+    try std.testing.expectEqualStrings("db/schema.json", cmd.schema.out.?);
+    try std.testing.expectEqualStrings("/tmp/zb", cmd.schema.data_dir.?);
+}
+
+test "schema defaults to dump and rejects a positional file on dump" {
+    const bare = try parse(&.{"schema"}, .{});
+    try std.testing.expectEqual(SchemaAction.dump, bare.schema.action);
+    try std.testing.expectEqual(@as(?[]const u8, null), bare.schema.out);
+    try std.testing.expectError(ParseError.BadValue, parse(&.{ "schema", "dump", "s.json" }, .{}));
+}
+
+test "schema apply parses the positional document + its flags" {
+    const cmd = try parse(&.{ "schema", "apply", "schema.json", "--dry-run", "--allow-destructive", "--prune" }, .{});
+    try std.testing.expectEqual(SchemaAction.apply, cmd.schema.action);
+    try std.testing.expectEqualStrings("schema.json", cmd.schema.file.?);
+    try std.testing.expect(cmd.schema.dry_run);
+    try std.testing.expect(cmd.schema.allow_destructive);
+    try std.testing.expect(cmd.schema.prune);
+}
+
+test "schema rejects a second positional, cross-action flags, and a bad subcommand" {
+    try std.testing.expectError(ParseError.BadValue, parse(&.{ "schema", "apply", "a.json", "b.json" }, .{}));
+    try std.testing.expectError(ParseError.UnknownFlag, parse(&.{ "schema", "dump", "--dry-run" }, .{}));
+    try std.testing.expectError(ParseError.UnknownFlag, parse(&.{ "schema", "apply", "a.json", "--out", "x" }, .{}));
+    try std.testing.expectError(ParseError.UnknownCommand, parse(&.{ "schema", "frobnicate" }, .{}));
+    try std.testing.expectError(ParseError.MissingValue, parse(&.{ "schema", "dump", "--out" }, .{}));
+}
+
+test "schema check-rules: the optional positional is what selects document mode" {
+    // No positional -> LIVE mode (full depth, against --data-dir).
+    const live = try parse(&.{ "schema", "check-rules", "--data-dir", "/tmp/zb" }, .{});
+    try std.testing.expectEqual(SchemaAction.check_rules, live.schema.action);
+    try std.testing.expectEqual(@as(?[]const u8, null), live.schema.file);
+    try std.testing.expectEqualStrings("/tmp/zb", live.schema.data_dir.?);
+
+    // A positional -> DOCUMENT mode (syntax depth). `--json` is accepted and ignored.
+    const docmode = try parse(&.{ "schema", "check-rules", "schema.json", "--json" }, .{});
+    try std.testing.expectEqual(SchemaAction.check_rules, docmode.schema.action);
+    try std.testing.expectEqualStrings("schema.json", docmode.schema.file.?);
+    try std.testing.expect(docmode.schema.json);
+}
+
+test "schema check-rules rejects a second positional and every other action's flags" {
+    try std.testing.expectError(ParseError.BadValue, parse(&.{ "schema", "check-rules", "a.json", "b.json" }, .{}));
+    try std.testing.expectError(ParseError.UnknownFlag, parse(&.{ "schema", "check-rules", "--out", "x" }, .{}));
+    try std.testing.expectError(ParseError.UnknownFlag, parse(&.{ "schema", "check-rules", "--dry-run" }, .{}));
+    try std.testing.expectError(ParseError.UnknownFlag, parse(&.{ "schema", "check-rules", "a.json", "--prune" }, .{}));
+    try std.testing.expectError(ParseError.UnknownFlag, parse(&.{ "schema", "check-rules", "--allow-destructive" }, .{}));
+}
+
+test "schema --help routes to its help topic" {
+    try std.testing.expectEqual(HelpTopic.schema, (try parse(&.{ "schema", "--help" }, .{})).help);
+    try std.testing.expectEqual(HelpTopic.schema, (try parse(&.{ "schema", "apply", "-h" }, .{})).help);
+    try std.testing.expectEqual(HelpTopic.schema, (try parse(&.{ "schema", "check-rules", "--help" }, .{})).help);
+}
+
 test "unknown command errors" {
     try std.testing.expectError(ParseError.UnknownCommand, parse(&.{"frobnicate"}, .{}));
 }
@@ -616,7 +1084,95 @@ test "--static-cache-control parses, requires a value, and is gated by ParseOpts
     ));
 }
 
+test "serve parses the four session-mode flags" {
+    const c = try parse(&.{ "serve", "--background", "--ephemeral", "--force" }, .{});
+    try std.testing.expect(c.serve.background);
+    try std.testing.expect(c.serve.ephemeral);
+    try std.testing.expect(c.serve.force);
+    try std.testing.expect(!c.serve.ignore_lock);
+
+    const d = try parse(&.{"serve"}, .{});
+    try std.testing.expect(!d.serve.background);
+    try std.testing.expect(!d.serve.ephemeral);
+    try std.testing.expect(!d.serve.force);
+    try std.testing.expect(!d.serve.ignore_lock);
+}
+
+test "serve --ignore-lock parses alone but conflicts with --background" {
+    const c = try parse(&.{ "serve", "--ignore-lock" }, .{});
+    try std.testing.expect(c.serve.ignore_lock);
+    // An untracked instance writes no lockfile, so --background's readiness
+    // handshake would have nothing to poll. Refuse the pair up front.
+    try std.testing.expectError(ParseError.ConflictingFlags, parse(&.{ "serve", "--background", "--ignore-lock" }, .{}));
+    try std.testing.expectError(ParseError.ConflictingFlags, parse(&.{ "serve", "--ignore-lock", "--background" }, .{}));
+}
+
+test "serve stop/status/logs parse to the control verbs" {
+    const stop = try parse(&.{ "serve", "stop" }, .{});
+    try std.testing.expect(std.meta.activeTag(stop) == .serve_control);
+    try std.testing.expectEqual(ServeControlVerb.stop, stop.serve_control.verb);
+
+    const status = try parse(&.{ "serve", "status", "--json", "--data-dir", "/tmp/zb" }, .{});
+    try std.testing.expectEqual(ServeControlVerb.status, status.serve_control.verb);
+    try std.testing.expect(status.serve_control.json);
+    try std.testing.expectEqualStrings("/tmp/zb", status.serve_control.data_dir.?);
+
+    const logs = try parse(&.{ "serve", "logs", "--follow" }, .{});
+    try std.testing.expectEqual(ServeControlVerb.logs, logs.serve_control.verb);
+    try std.testing.expect(logs.serve_control.follow);
+    const logs_short = try parse(&.{ "serve", "logs", "-f" }, .{});
+    try std.testing.expect(logs_short.serve_control.follow);
+
+    // `logs --json` filters serve.log down to its NDJSON records; it composes
+    // with --follow so a tail stays machine-readable too.
+    const logs_json = try parse(&.{ "serve", "logs", "--json" }, .{});
+    try std.testing.expectEqual(ServeControlVerb.logs, logs_json.serve_control.verb);
+    try std.testing.expect(logs_json.serve_control.json);
+    try std.testing.expect(!logs_json.serve_control.follow);
+    const logs_both = try parse(&.{ "serve", "logs", "--json", "--follow" }, .{});
+    try std.testing.expect(logs_both.serve_control.json and logs_both.serve_control.follow);
+}
+
+test "serve control verbs reject flags that belong to another verb" {
+    // --json shapes OUTPUT, so it is accepted by the two verbs that produce
+    // some (status, logs) and rejected by `stop`, which produces none.
+    // --follow/-f is logs-only. Silently ignoring a misplaced flag would let a
+    // caller believe it took effect.
+    try std.testing.expectError(ParseError.UnknownFlag, parse(&.{ "serve", "stop", "--json" }, .{}));
+    try std.testing.expectError(ParseError.UnknownFlag, parse(&.{ "serve", "status", "--follow" }, .{}));
+    try std.testing.expectError(ParseError.UnknownFlag, parse(&.{ "serve", "stop", "-f" }, .{}));
+    // Server flags are not control-verb flags either.
+    try std.testing.expectError(ParseError.UnknownFlag, parse(&.{ "serve", "status", "--http-port", "1" }, .{}));
+    try std.testing.expectError(ParseError.UnknownCommand, parse(&.{ "serve", "bogus" }, .{}));
+    try std.testing.expectError(ParseError.MissingValue, parse(&.{ "serve", "status", "--data-dir" }, .{}));
+}
+
+test "serve control --help routes to the serve_control help topic" {
+    try std.testing.expectEqual(HelpTopic.serve_control, (try parse(&.{ "serve", "status", "--help" }, .{})).help);
+    try std.testing.expectEqual(HelpTopic.serve_control, (try parse(&.{ "serve", "stop", "-h" }, .{})).help);
+    try std.testing.expectEqual(HelpTopic.serve_control, (try parse(&.{ "serve", "logs", "--help" }, .{})).help);
+    // A bare `serve --help` still routes to the SERVE topic, not the control one.
+    try std.testing.expectEqual(HelpTopic.serve, (try parse(&.{ "serve", "--help" }, .{})).help);
+}
+
+test "doctor parses --production/--json/--data-dir and routes --help" {
+    const bare = try parse(&.{"doctor"}, .{});
+    try std.testing.expect(std.meta.activeTag(bare) == .doctor);
+    try std.testing.expect(!bare.doctor.production);
+    try std.testing.expect(!bare.doctor.json);
+
+    const full = try parse(&.{ "doctor", "--production", "--json", "--data-dir", "/var/zb" }, .{});
+    try std.testing.expect(full.doctor.production);
+    try std.testing.expect(full.doctor.json);
+    try std.testing.expectEqualStrings("/var/zb", full.doctor.data_dir.?);
+
+    try std.testing.expectEqual(HelpTopic.doctor, (try parse(&.{ "doctor", "--help" }, .{})).help);
+    try std.testing.expectError(ParseError.UnknownFlag, parse(&.{ "doctor", "--nope" }, .{}));
+    try std.testing.expectError(ParseError.MissingValue, parse(&.{ "doctor", "--data-dir" }, .{}));
+}
+
 test "parse typegen: data-dir + out + flags" {
+    if (!devtools.enabled) return error.SkipZigTest;
     const args = [_][]const u8{ "typegen", "--data-dir", "./zb_data", "--out", "c.ts", "--client-name", "Api", "--check" };
     const cmd = try parse(&args, .{ .serve_static = true });
     try std.testing.expect(cmd == .typegen);
@@ -627,6 +1183,7 @@ test "parse typegen: data-dir + out + flags" {
 }
 
 test "parse typegen: url + admin creds" {
+    if (!devtools.enabled) return error.SkipZigTest;
     const args = [_][]const u8{ "typegen", "--url", "http://x", "--admin-email", "a@b.c", "--admin-password", "pw", "--out", "c.ts" };
     const cmd = try parse(&args, .{ .serve_static = true });
     try std.testing.expectEqualStrings("http://x", cmd.typegen.url.?);
@@ -634,6 +1191,7 @@ test "parse typegen: url + admin creds" {
 }
 
 test "parse typegen: missing flag value errors" {
+    if (!devtools.enabled) return error.SkipZigTest;
     const args = [_][]const u8{ "typegen", "--out" };
     try std.testing.expectError(ParseError.MissingValue, parse(&args, .{ .serve_static = true }));
 }
@@ -642,4 +1200,106 @@ test "version / --version / -V -> version command" {
     try std.testing.expectEqual(.version, std.meta.activeTag(try parse(&.{"version"}, .{})));
     try std.testing.expectEqual(.version, std.meta.activeTag(try parse(&.{"--version"}, .{})));
     try std.testing.expectEqual(.version, std.meta.activeTag(try parse(&.{"-V"}, .{})));
+}
+
+test "version accepts --json in every spelling" {
+    try std.testing.expectEqual(false, (try parse(&.{"version"}, .{})).version.json);
+    try std.testing.expectEqual(true, (try parse(&.{ "version", "--json" }, .{})).version.json);
+    try std.testing.expectEqual(true, (try parse(&.{ "--version", "--json" }, .{})).version.json);
+    try std.testing.expectEqual(true, (try parse(&.{ "-V", "--json" }, .{})).version.json);
+    try std.testing.expectError(ParseError.UnknownFlag, parse(&.{ "version", "--nope" }, .{}));
+}
+
+test "version --help / -h -> top-level help, not UnknownFlag" {
+    // `version` has no dedicated HelpTopic, so its `--help` falls through to the same
+    // top-level usage as bare `--help` — it must not be treated as an unrecognized flag.
+    const cmd = try parse(&.{ "version", "--help" }, .{});
+    try std.testing.expectEqual(.help, std.meta.activeTag(cmd));
+    try std.testing.expectEqual(HelpTopic.top, cmd.help);
+    try std.testing.expectEqual(HelpTopic.top, (try parse(&.{ "version", "-h" }, .{})).help);
+    try std.testing.expectEqual(HelpTopic.top, (try parse(&.{ "--version", "--help" }, .{})).help);
+    try std.testing.expectEqual(HelpTopic.top, (try parse(&.{ "-V", "-h" }, .{})).help);
+}
+
+test "migrate status accepts --json; the other actions reject it" {
+    const s = try parse(&.{ "migrate", "status", "--json" }, .{});
+    try std.testing.expectEqual(MigrateAction.status, s.migrate.action);
+    try std.testing.expectEqual(true, s.migrate.json);
+    try std.testing.expectEqual(false, (try parse(&.{ "migrate", "status" }, .{})).migrate.json);
+    // --json is a status-only flag: it means nothing for apply/rollback/dump.
+    try std.testing.expectError(ParseError.UnknownFlag, parse(&.{ "migrate", "--json" }, .{}));
+    try std.testing.expectError(ParseError.UnknownFlag, parse(&.{ "migrate", "dump", "--json" }, .{}));
+}
+
+test "explain-code parses a bare code, --json, and both" {
+    const bare = try parse(&.{"explain-code"}, .{});
+    try std.testing.expect(std.meta.activeTag(bare) == .explain_code);
+    try std.testing.expectEqual(@as(?[]const u8, null), bare.explain_code.code);
+    try std.testing.expectEqual(false, bare.explain_code.json);
+
+    const one = try parse(&.{ "explain-code", "not_found" }, .{});
+    try std.testing.expectEqualStrings("not_found", one.explain_code.code.?);
+
+    const j = try parse(&.{ "explain-code", "--json" }, .{});
+    try std.testing.expectEqual(true, j.explain_code.json);
+
+    // Flag order is irrelevant; both forms carry the code AND the flag.
+    const both = try parse(&.{ "explain-code", "--json", "not_found" }, .{});
+    try std.testing.expectEqualStrings("not_found", both.explain_code.code.?);
+    try std.testing.expectEqual(true, both.explain_code.json);
+    const both_rev = try parse(&.{ "explain-code", "not_found", "--json" }, .{});
+    try std.testing.expectEqualStrings("not_found", both_rev.explain_code.code.?);
+    try std.testing.expectEqual(true, both_rev.explain_code.json);
+}
+
+test "explain-code rejects a second positional and unknown flags; --help routes" {
+    try std.testing.expectError(ParseError.BadValue, parse(&.{ "explain-code", "a", "b" }, .{}));
+    try std.testing.expectError(ParseError.UnknownFlag, parse(&.{ "explain-code", "--nope" }, .{}));
+    try std.testing.expectEqual(HelpTopic.explain_code, (try parse(&.{ "explain-code", "--help" }, .{})).help);
+}
+
+test "init defaults to box mode in the current directory" {
+    if (!devtools.enabled) return error.SkipZigTest;
+    const c = try parse(&.{"init"}, .{});
+    try std.testing.expectEqual(InitMode.box, c.init.mode);
+    try std.testing.expectEqualStrings(".", c.init.dir);
+    try std.testing.expect(c.init.name == null);
+}
+
+test "init accepts --framework, --dir and --name" {
+    if (!devtools.enabled) return error.SkipZigTest;
+    const c = try parse(&.{ "init", "--framework", "--dir", "myapp", "--name", "my_app" }, .{});
+    try std.testing.expectEqual(InitMode.framework, c.init.mode);
+    try std.testing.expectEqualStrings("myapp", c.init.dir);
+    try std.testing.expectEqualStrings("my_app", c.init.name.?);
+}
+
+test "init rejects unknown flags and routes --help" {
+    if (!devtools.enabled) return error.SkipZigTest;
+    try std.testing.expectError(ParseError.UnknownFlag, parse(&.{ "init", "--force" }, .{}));
+    try std.testing.expectError(ParseError.MissingValue, parse(&.{ "init", "--dir" }, .{}));
+    try std.testing.expectEqual(HelpTopic.init, (try parse(&.{ "init", "--help" }, .{})).help);
+}
+
+test "agents-md leaves the mode unset so the caller can infer it" {
+    if (!devtools.enabled) return error.SkipZigTest;
+    const c = try parse(&.{"agents-md"}, .{});
+    try std.testing.expect(c.agents_md.mode == null);
+    try std.testing.expectEqualStrings(".", c.agents_md.dir);
+    try std.testing.expect(!c.agents_md.to_stdout);
+
+    const forced = try parse(&.{ "agents-md", "--framework", "--stdout" }, .{});
+    try std.testing.expectEqual(InitMode.framework, forced.agents_md.mode.?);
+    try std.testing.expect(forced.agents_md.to_stdout);
+    try std.testing.expectEqual(HelpTopic.agents_md, (try parse(&.{ "agents-md", "--help" }, .{})).help);
+}
+
+test "init/agents-md/typegen are rejected with DevToolsDisabled under -Ddev-tools=false" {
+    // Meaningful only in the stripped configuration; the default (`-Ddev-tools=true`,
+    // which every published binary uses) is covered by the per-verb tests above.
+    if (devtools.enabled) return error.SkipZigTest;
+    try std.testing.expectError(ParseError.DevToolsDisabled, parse(&.{"init"}, .{}));
+    try std.testing.expectError(ParseError.DevToolsDisabled, parse(&.{ "init", "--help" }, .{}));
+    try std.testing.expectError(ParseError.DevToolsDisabled, parse(&.{"agents-md"}, .{}));
+    try std.testing.expectError(ParseError.DevToolsDisabled, parse(&.{"typegen"}, .{}));
 }

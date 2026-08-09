@@ -21,19 +21,36 @@ server actually implements.
 - **Error envelope:** every error response is a JSON object of the shape:
 
   ```json
-  { "code": 404, "message": "Not found.", "data": {} }
+  { "status": 404, "code": "not_found", "message": "Not found.", "data": {} }
   ```
 
-  `code` mirrors the HTTP status. For validation failures (`400`), `data` maps each
-  offending field to `{ "code": "...", "message": "..." }`:
+  `status` is the HTTP status. `code` is a **frozen machine string** — it never changes
+  meaning once shipped, and it is what your client should branch on. `message` is human
+  text and is **not contract**: it may be reworded in any release, so never match on it.
+  Run `zigbase explain-code` to list every code, or `zigbase explain-code <CODE>` for the
+  long form. Key order is stable and part of the contract.
+
+  For validation failures (`400`, `code: "validation_failed"`), `data` maps each offending
+  field to its own frozen `{ "code": …, "message": … }`:
 
   ```json
   {
-    "code": 400,
+    "status": 400,
+    "code": "validation_failed",
     "message": "Failed to validate the request.",
     "data": { "name": { "code": "validation_invalid_name", "message": "Invalid." } }
   }
   ```
+
+  This is the **only** error shape for the JSON API. Typed (`rpc.*`) routes, auth-method
+  endpoints, and custom routes all emit it; the older bare `{"message": …}` and
+  `{"error": …}` bodies are gone.
+
+  Two deliberate non-JSON exceptions exist, both outside the JSON API surface, and a
+  client that blindly parses every non-2xx body must tolerate them: a **416 Range Not
+  Satisfiable** from a file download carries an empty body with a `Content-Range`
+  header (the range headers *are* the response), and a static-file **404** returns
+  `text/plain` because static assets are browser-facing, not API responses.
 
 ### Authentication transport
 
@@ -1082,6 +1099,10 @@ so this unauthenticated, caller-supplied-`subject` endpoint never storms the wri
 TypeScript SDK exposes this as `zb.flags.resolveAll(subject)` — see
 [TypeScript SDK → Typed feature state](typescript-sdk.md#typed-feature-state--zbflags).
 
+To discover where this route is currently mounted (or that it's disabled) without
+guessing, read `endpoints.state` on [`GET /api/meta`](#meta) — it carries the remapped
+path, or `null` when disabled.
+
 ---
 
 ## Analytics
@@ -1413,6 +1434,107 @@ configured outbound high-water-mark). `401` unauthenticated, `403` non-superuser
 
 ---
 
+## Meta
+
+| Method | Path | Description |
+|---|---|---|
+| GET | `/api/meta` | Public, unauthenticated capability probe. No auth. |
+
+```json
+{
+  "zigbase": "0.12.0",
+  "commit": "087ca67",
+  "api": 1,
+  "capabilities": {
+    "admin": true,
+    "analytics": true,
+    "collectionsFrozen": false,
+    "devMode": false,
+    "magicLink": true,
+    "mailUnsubscribe": true,
+    "mailWebhook": true,
+    "oauth2": true,
+    "postgres": false,
+    "s3": false,
+    "senders": true,
+    "tenancy": true,
+    "vector": false,
+    "webauthn": true
+  },
+  "endpoints": {
+    "health": "/api/health",
+    "state": "/api/state",
+    "realtimeSse": "/api/realtime/sse"
+  },
+  "limits": {
+    "maxUploadSize": 52428800
+  }
+}
+```
+
+`/api/meta` reports process-constant build-and-config facts with **no database access and
+no subject** — it is deliberately separate from [`/api/health`](#health) (a liveness probe
+hit on a tight interval, kept small) and [`/api/state`](#feature-state-public) (the
+per-subject, DB-backed feature-flag projection). Its `endpoints` object cross-links the
+other two rather than duplicating their contract.
+
+`zigbase` and `commit` are the same `build_options`-sourced values as `GET /api/health`'s
+`versions.zigbase`/`versions.commit` — the two can never disagree, since they come from one
+source of truth.
+
+`api` is the **meta-contract version**, starting at `1`. It is bumped only when a field is
+**removed or changes meaning**; adding a field is backwards-compatible and does not bump it.
+A consumer that only reads known keys is forward-compatible with new capabilities.
+
+`capabilities` is an object of booleans, one per optional route group or build flag this
+binary carries:
+
+| Key | Meaning |
+|---|---|
+| `admin` | The admin SPA + its API surface (`/_/`) is mounted. |
+| `analytics` | The analytics event-capture + rollup API is mounted. |
+| `collectionsFrozen` | This deployment was built with `App(.{ .collections_frozen = true })`: runtime collection DDL (`POST`/`PATCH`/`DELETE /api/collections`) is categorically disabled — schema evolves via `.migrations` + a redeploy. |
+| `devMode` | The binary was built with `-Ddev-mode` (dev-only seams: fake clock, fake entropy, fake field crypto). **Must never be true in production.** |
+| `magicLink` | The passwordless magic-link auth method route group is mounted. |
+| `mailUnsubscribe` | The public one-click unsubscribe route (RFC 8058) is mounted. |
+| `mailWebhook` | The mail bounce/complaint webhook route is mounted. |
+| `oauth2` | The OAuth2+PKCE auth method route group is mounted. |
+| `postgres` | The binary was compiled with `-Dpostgres` (the pure-Zig PostgreSQL backend is linked in). |
+| `s3` | The binary was compiled with `-Ds3` (the S3-compatible storage backend is linked in). |
+| `senders` | The verified-senders email route group is mounted. |
+| `tenancy` | Multi-tenancy is configured (`App(.{ .tenancy = ... })`). |
+| `vector` | The binary was compiled with `-Dvector` (vector search — sqlite-vec / pgvector). |
+| `webauthn` | The WebAuthn/passkey auth method route group is mounted. |
+
+**The headline use case:** to find out whether runtime schema changes are possible, read
+`capabilities.collectionsFrozen`; **never string-match the 403** a frozen deployment returns
+from `/api/collections`. That 403's `message` text is explicitly not contract (see
+[Error codes](observability.md#error-codes)) — the boolean here is.
+
+`endpoints` cross-links the other two process-level endpoints so a client never has to
+hardcode their paths: `health` is always `/api/health`; `realtimeSse` is always
+`/api/realtime/sse`; `state` is the mount for the [Feature state (public)](#feature-state-public)
+endpoint — it is the configured (possibly remapped) path, or **`null`** when that route is
+disabled (`.features = .{ .public_route = .disabled }`), which is genuinely undiscoverable
+any other way.
+
+`limits.maxUploadSize` is the configured max upload size in bytes (`app.max_upload_size`,
+default `50 << 20` = 50 MiB) — already discoverable by uploading past the limit, so exposing
+it directly just saves the round trip.
+
+**Security invariant:** almost every field in this response is a fact an unauthenticated
+client could already establish by probing — each capability corresponds to a route group
+that already answers `404` or `200` anonymously. `devMode` is the one deliberate exception:
+it gates no route, so it is not independently probe-discoverable; it stays because a dev
+build shouldn't be public-facing in the first place, so advertising it is judged acceptable
+and useful. `/api/meta` **never** exposes a config value, filesystem path, hostname,
+connection string, or credential; it follows the same rule as `GET /api/health`.
+
+See also: [Health](#health) (liveness + component versions) and
+[Feature state (public)](#feature-state-public) (per-subject resolved flags/experiments).
+
+---
+
 ## Health
 
 | Method | Path | Description |
@@ -1444,6 +1566,10 @@ server over HTTP, the same values as `--version` and the boot log. Since the end
 unauthenticated, treat these as publicly disclosed. See
 [framework.md § Version transparency](framework.md#version-transparency--dependency-auditing) for
 the full list.
+
+For build-and-config facts (which optional route groups this binary carries, whether
+collections are frozen, the upload limit) rather than a liveness check, see
+[Meta](#meta) — kept separate so this liveness probe stays cheap on a tight poll interval.
 
 ---
 

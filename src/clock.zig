@@ -116,6 +116,16 @@ pub fn nowUnix(io: std.Io) i64 {
     return @intCast(@divTrunc(ts.nanoseconds, std.time.ns_per_s));
 }
 
+/// Wall-clock seconds without a `std.Io`. `std.Options.logFn` receives no `io`, and a
+/// log line still needs a timestamp — so this reads the host clock directly (the
+/// framework links libc and only targets Linux/macOS). It honors the same frozen
+/// override as `nowUnix`, which is what makes log output deterministic under
+/// `ZIGBASE_FAKE_NOW` in tests.
+pub fn nowUnixNoIo() i64 {
+    if (frozenUnix()) |v| return v;
+    return wallSeconds();
+}
+
 /// Host wall-clock seconds via libc `clock_gettime(CLOCK_REALTIME)`. The framework links libc
 /// and only targets Linux/macOS, so this is always available and needs no `std.Io`. Used by the
 /// SQL-`now` path to skip a SQLite roundtrip (see `sqlNowUnix`).

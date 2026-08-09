@@ -578,8 +578,8 @@ Membership of a record in a filtered live list is decided with a two-tier strate
 
 ## Error handling
 
-Every non-2xx response throws a `ZigbaseException` carrying `status`, `message`, `url`, and
-per-field validation errors in `data` (`Map<String, FieldError>`):
+Every non-2xx response throws a `ZigbaseException` carrying `status`, `code`, `message`,
+`url`, and per-field validation errors in `data` (`Map<String, FieldError>`):
 
 ```dart
 try {
@@ -590,6 +590,24 @@ try {
   }
 }
 ```
+
+**Branch on `code`, never on `message`.** `code` is the frozen machine string from the
+[error-code registry](observability.md#error-codes) — it never changes meaning once
+shipped, whereas `message` is human text that may be reworded in any release:
+
+```dart
+try {
+  await users.authWithPassword(email, password);
+} on ZigbaseException catch (e) {
+  if (e.code == 'email_not_verified') {
+    // A distinct, actionable state — not a flat denial.
+    showVerifyEmailStep(email);
+  }
+}
+```
+
+`code` is empty when the server sent no code — a non-JSON body, or a response from
+something that isn't ZigBase (a proxy's own error page).
 
 ## Auto-cancellation — `requestKey`
 
