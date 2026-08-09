@@ -457,7 +457,7 @@ pub fn update(ctx: *http.RequestCtx) anyerror!http.Response {
                         crypto.dummyVerify(app.io, ctx.allocator.a);
                         return ApiError.badRequest("Invalid credentials.").toResponse(ctx.allocator.a);
                     }
-                    if (!crypto.verifyPassword(app.io, ctx.allocator.a, phc.?, opw.?))
+                    if (!api_auth.verifyPasswordUpgrading(app, ctx.allocator.a, gcol.name, grid, phc.?, opw.?))
                         return ApiError.badRequest("Invalid credentials.").toResponse(ctx.allocator.a);
                 }
             }
@@ -1964,6 +1964,36 @@ test "F1 PATCH+password: owner with correct oldPassword -> 200, hash replaced, t
     defer env.pool.releaseReader(&r);
     const old_tok = uctx.bearerToken().?;
     try std.testing.expect(auth.verifyToken(a, &env.app, &r, old_tok) == null);
+}
+
+test "F1 PATCH+password: a legacy-tagged oldPassword hash is ACCEPTED (an imported user can change their own password)" {
+    var env = try F1Env.init(null);
+    defer env.deinit();
+    const a = env.arena.allocator();
+    const rid = try env.createUser("legacy@x.io", "placeholder-unused-1");
+    const bearer = try env.mintOwnerBearer(rid);
+
+    // Overwrite the stored hash with a tagged legacy value, exactly as `zigbase import
+    // --legacy-hashes` would leave it.
+    const bc = "$2b$04$gKLlzqBYq6vyAUzUTYq/f.2na5B02QSMuFv75B374EKmX3m3Kt1UG"; // "abc"
+    const tagged = try crypto.wrapLegacy(a, "bcrypt", bc);
+    {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        var st = try w.prepare("UPDATE \"users\" SET \"passwordHash\" = ?1 WHERE \"id\" = ?2;");
+        defer st.finalize();
+        try st.bindText(1, tagged);
+        try st.bindText(2, rid);
+        _ = try st.step();
+    }
+
+    var uctx = patchCtx(env, RequestArena.from(&env.arena), rid, bearer, "{\"password\":\"newpassword1\",\"oldPassword\":\"abc\"}");
+    const res = try update(&uctx);
+    try std.testing.expectEqual(@as(u16, 200), res.status);
+
+    const new_hash = try env.passwordHash(rid);
+    try std.testing.expect(!crypto.isLegacyHash(new_hash));
+    try std.testing.expect(crypto.verifyPassword(std.testing.io, a, new_hash, "newpassword1"));
 }
 
 test "F1 PATCH+password: wrong and missing oldPassword -> login-identical 400, nothing changed" {

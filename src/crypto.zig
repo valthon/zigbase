@@ -4,6 +4,7 @@ const id = @import("id.zig");
 const entropy = @import("entropy.zig");
 
 const argon2 = std.crypto.pwhash.argon2;
+const bcrypt = std.crypto.pwhash.bcrypt;
 const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
 
 /// Argon2id cost parameters. Production uses `interactive_2id` (64 MiB, t=2) for real
@@ -49,6 +50,104 @@ else
 pub fn dummyVerify(io: std.Io, alloc: std.mem.Allocator) void {
     _ = verifyPassword(io, alloc, dummy_password_hash, "zigbase-login-timing-dummy-mismatch");
 }
+
+// ---------------------------------------------------------------------------
+// Legacy (imported) password hashes.
+//
+// A credential migrated from another backend is stored in the ordinary `passwordHash`
+// column, tagged: `$zblegacy$<alg>$<original-hash>`. The tag — not the hash's own prefix —
+// selects the verifier, so an untagged foreign hash matches nothing and fails CLOSED.
+// The ONLY writer of a tagged value is the offline `zigbase import --legacy-hashes` seam;
+// the login path replaces it with argon2id on the first successful verification and never
+// writes one back. See docs/migration-tools.md.
+// ---------------------------------------------------------------------------
+
+/// Marker for an imported, not-yet-upgraded credential: `$zblegacy$<alg>$<original-hash>`.
+/// Stored in the ordinary `passwordHash` column. An UNTAGGED foreign hash is never
+/// accepted — no verifier matches it, so it fails closed.
+pub const legacy_prefix = "$zblegacy$";
+
+/// The complete algorithm allowlist. Append-only, and only after a security review.
+pub const legacy_algorithms = [_][]const u8{"bcrypt"};
+
+pub const LegacyError = error{ UnsupportedAlgorithm, MalformedLegacyHash };
+
+pub const LegacyHash = struct { algorithm: []const u8, hash: []const u8 };
+
+pub fn isLegacyHash(stored: []const u8) bool {
+    return std.mem.startsWith(u8, stored, legacy_prefix);
+}
+
+fn isAllowedAlgorithm(alg: []const u8) bool {
+    for (legacy_algorithms) |a| if (std.mem.eql(u8, a, alg)) return true;
+    return false;
+}
+
+/// A bcrypt crypt-format hash: exactly 60 bytes, `$2<v>$<cc>$<22-char salt><31-char hash>`.
+/// `$2x$` is REFUSED: it marks the deliberately-preserved crypt_blowfish 8-bit bug, which
+/// this implementation does not reproduce, so accepting it would silently fail to verify
+/// any password containing a high-bit byte.
+fn isBcryptHash(h: []const u8) bool {
+    if (h.len != bcrypt.hash_length) return false; // 60
+    if (h[0] != '$' or h[1] != '2' or h[3] != '$' or h[6] != '$') return false;
+    switch (h[2]) {
+        'a', 'b', 'y' => {},
+        else => return false,
+    }
+    if (!std.ascii.isDigit(h[4]) or !std.ascii.isDigit(h[5])) return false;
+    return true;
+}
+
+/// Split a tagged value. Borrows from `stored`.
+pub fn parseLegacy(stored: []const u8) LegacyError!LegacyHash {
+    if (!isLegacyHash(stored)) return LegacyError.MalformedLegacyHash;
+    const rest = stored[legacy_prefix.len..];
+    const sep = std.mem.indexOfScalar(u8, rest, '$') orelse return LegacyError.MalformedLegacyHash;
+    const alg = rest[0..sep];
+    const hash = rest[sep + 1 ..];
+    if (!isAllowedAlgorithm(alg)) return LegacyError.UnsupportedAlgorithm;
+    if (hash.len == 0) return LegacyError.MalformedLegacyHash;
+    return .{ .algorithm = alg, .hash = hash };
+}
+
+/// Validate `algorithm` against the allowlist AND `hash` against that algorithm's format,
+/// then build the tagged value. Owned result on `alloc`.
+pub fn wrapLegacy(alloc: std.mem.Allocator, algorithm: []const u8, hash: []const u8) (LegacyError || std.mem.Allocator.Error)![]u8 {
+    if (!isAllowedAlgorithm(algorithm)) return LegacyError.UnsupportedAlgorithm;
+    // Validate the hash against the algorithm at IMPORT time, so a malformed credential is
+    // rejected while an operator is watching rather than at some user's next login.
+    if (std.mem.eql(u8, algorithm, "bcrypt") and !isBcryptHash(hash)) return LegacyError.MalformedLegacyHash;
+    return std.fmt.allocPrint(alloc, "{s}{s}${s}", .{ legacy_prefix, algorithm, hash });
+}
+
+/// Verify a password against a TAGGED legacy hash. Returns false — never an error — on any
+/// mismatch, unknown algorithm or malformed hash, matching `verifyPassword`'s contract so
+/// no caller can accidentally treat "broken hash" as "authenticated".
+pub fn verifyLegacy(stored: []const u8, password: []const u8) bool {
+    const parsed = parseLegacy(stored) catch return false;
+    if (!std.mem.eql(u8, parsed.algorithm, "bcrypt")) return false;
+    if (!isBcryptHash(parsed.hash)) return false;
+
+    // `bcrypt.strVerify` recomputes the whole 60-byte string with a hardcoded `b` version
+    // byte and compares it in full, so a stored `$2a$`/`$2y$` mismatches at byte 2 even for
+    // the RIGHT password. `$2a`/`$2b`/`$2y` denote the same KDF here, so normalize to `b`.
+    var buf: [bcrypt.hash_length]u8 = undefined;
+    @memcpy(&buf, parsed.hash);
+    buf[2] = 'b';
+
+    // `silently_truncate_password = true` matches every mainstream implementation (PHP, Go,
+    // Node, Python), which ignore bytes past 72. The Zig default pre-hashes instead, which
+    // would lock out every user with a password longer than that.
+    bcrypt.strVerify(&buf, password, .{ .silently_truncate_password = true }) catch return false;
+    return true;
+}
+
+// Timing note: `bcrypt.strVerify`'s final comparison is `mem.eql`, which is exactly what the
+// argon2 path already in production uses (`std/crypto/argon2.zig`). This introduces no new
+// timing property. The one accepted residual is that bcrypt and argon2id have different
+// verify costs, so response timing can distinguish a not-yet-migrated account from a
+// migrated one; it cannot distinguish an existing account from a non-existent one, because
+// `dummyVerify` still covers the unknown-identity path.
 
 /// Constant-time byte-slice equality. Returns true only if both slices have the same
 /// length AND every byte is identical.
@@ -161,4 +260,89 @@ test "dummy login-timing hash is a well-formed argon2id PHC string" {
     try std.testing.expect(verifyPassword(std.testing.io, a, dummy_password_hash, "zigbase-login-timing-dummy"));
     // ... and dummyVerify (which uses a deliberately-mismatched plaintext) just runs the work.
     dummyVerify(std.testing.io, a);
+}
+
+/// Produce a cost-4 bcrypt hash in the 60-char crypt format — test scaffolding only, so the
+/// truncation test does not depend on a hardcoded vector.
+fn bcryptHashForTest(alloc: std.mem.Allocator, password: []const u8) ![]u8 {
+    var buf: [bcrypt.hash_length]u8 = undefined;
+    const s = try bcrypt.strHash(password, .{
+        .params = .{ .rounds_log = 4, .silently_truncate_password = true },
+        .encoding = .crypt,
+    }, &buf, std.testing.io);
+    return alloc.dupe(u8, s);
+}
+
+test "legacy tag round-trips and rejects everything outside the allowlist" {
+    const a = std.testing.allocator;
+    const bc = "$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy";
+
+    const tagged = try wrapLegacy(a, "bcrypt", bc);
+    defer a.free(tagged);
+    try std.testing.expectEqualStrings("$zblegacy$bcrypt$" ++ bc, tagged);
+    try std.testing.expect(isLegacyHash(tagged));
+    try std.testing.expect(!isLegacyHash(dummy_password_hash)); // an argon2 PHC is not legacy
+
+    const parsed = try parseLegacy(tagged);
+    try std.testing.expectEqualStrings("bcrypt", parsed.algorithm);
+    try std.testing.expectEqualStrings(bc, parsed.hash);
+
+    // Allowlist: only what is on it, by TAG, never inferred from the hash itself.
+    try std.testing.expectError(LegacyError.UnsupportedAlgorithm, wrapLegacy(a, "md5", bc));
+    try std.testing.expectError(LegacyError.UnsupportedAlgorithm, wrapLegacy(a, "scrypt", bc));
+    try std.testing.expectError(LegacyError.UnsupportedAlgorithm, wrapLegacy(a, "", bc));
+    // Format: wrong length, wrong framing, single-digit cost, and the buggy $2x variant.
+    try std.testing.expectError(LegacyError.MalformedLegacyHash, wrapLegacy(a, "bcrypt", "$2a$10$short"));
+    try std.testing.expectError(LegacyError.MalformedLegacyHash, wrapLegacy(a, "bcrypt", bc[0..59]));
+    try std.testing.expectError(LegacyError.MalformedLegacyHash, wrapLegacy(a, "bcrypt", "$2x$" ++ bc[4..]));
+    try std.testing.expectError(LegacyError.MalformedLegacyHash, wrapLegacy(a, "bcrypt", "$argon2id$v=19$m=8,t=1,p=1$aaaa$bbbb"));
+    try std.testing.expectError(LegacyError.MalformedLegacyHash, parseLegacy("$zblegacy$bcrypt"));
+    try std.testing.expectError(LegacyError.UnsupportedAlgorithm, parseLegacy("$zblegacy$md5$x"));
+}
+
+test "verifyLegacy accepts $2a/$2b/$2y bcrypt hashes of the same password" {
+    // "abc" hashed at cost 4 by a reference implementation, presented under each version
+    // byte. All three denote the same KDF; Zig's strVerify only accepts `b`, so the
+    // implementation must normalize. Regenerate with:
+    //   python3 -c 'import bcrypt;print(bcrypt.hashpw(b"abc",bcrypt.gensalt(4)).decode())'
+    const b2b = "$2b$04$gKLlzqBYq6vyAUzUTYq/f.2na5B02QSMuFv75B374EKmX3m3Kt1UG";
+    const a = std.testing.allocator;
+    inline for (.{ "a", "b", "y" }) |ver| {
+        var buf: [60]u8 = undefined;
+        @memcpy(&buf, b2b);
+        buf[2] = ver[0];
+        const tagged = try wrapLegacy(a, "bcrypt", &buf);
+        defer a.free(tagged);
+        try std.testing.expect(verifyLegacy(tagged, "abc"));
+        try std.testing.expect(!verifyLegacy(tagged, "abd"));
+        try std.testing.expect(!verifyLegacy(tagged, ""));
+    }
+}
+
+test "verifyLegacy truncates at 72 bytes the way every other bcrypt does" {
+    // Reference implementations ignore bytes past 72. Zig's default instead HMAC-pre-hashes
+    // a long password, which would lock out any user whose password exceeds 72 bytes.
+    const a = std.testing.allocator;
+    const base = "x" ** 72;
+    const long = base ++ "IGNORED-BY-EVERY-OTHER-BCRYPT";
+    const h = try bcryptHashForTest(a, base); // helper below
+    defer a.free(h);
+    const tagged = try wrapLegacy(a, "bcrypt", h);
+    defer a.free(tagged);
+    try std.testing.expect(verifyLegacy(tagged, base));
+    try std.testing.expect(verifyLegacy(tagged, long));
+}
+
+test "verifyLegacy fails closed on garbage, and verifyPassword never accepts a legacy value" {
+    const a = std.testing.allocator;
+    try std.testing.expect(!verifyLegacy("$zblegacy$bcrypt$not-a-hash", "abc"));
+    try std.testing.expect(!verifyLegacy("$zblegacy$md5$whatever", "abc"));
+    try std.testing.expect(!verifyLegacy("not tagged at all", "abc"));
+    // The argon2 verifier must never authenticate a tagged legacy value, so a caller that
+    // forgets to branch fails CLOSED rather than open.
+    const bc = "$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy";
+    const tagged = try wrapLegacy(a, "bcrypt", bc);
+    defer a.free(tagged);
+    try std.testing.expect(!verifyPassword(std.testing.io, a, tagged, "abc"));
+    try std.testing.expect(!verifyPassword(std.testing.io, a, bc, "abc"));
 }

@@ -34,6 +34,7 @@ const schema = @import("schema.zig");
 const collections = @import("collections.zig");
 const records = @import("records.zig");
 const auth = @import("auth.zig");
+const crypto = @import("crypto.zig");
 const param_sink = @import("sql/param_sink.zig");
 const app_mod = @import("app.zig");
 
@@ -67,6 +68,10 @@ pub const Options = struct {
     /// Field names to drop from every row before importing. The manifest runner uses this
     /// to hold back relation values it will patch in a second pass.
     strip_fields: []const []const u8 = &.{},
+    /// Enable the legacy-credential seam for this run, tagging each row's `passwordHash`
+    /// with this algorithm. Only values in `crypto.legacy_algorithms` are accepted.
+    /// Requires an auth collection; refuses `_superusers`.
+    legacy_hash_algorithm: ?[]const u8 = null,
 };
 
 /// Row counts reported at completion.
@@ -112,6 +117,12 @@ pub const ImportError = error{
     DuplicateId,
     RowVanishedMidImport,
     LineTooLong,
+    LegacyRequiresAuthCollection,
+    LegacySuperuserRefused,
+    LegacyRowMissingId,
+    LegacyHashConflict,
+    LegacyRequiresPreservedIds,
+    LegacyRequiresCreateOnly,
 };
 
 /// Renumber `?N` placeholders for the active backend before preparing (SQLite verbatim,
@@ -194,6 +205,57 @@ fn createRow(app: *App, w: *db.Db, io: std.Io, a: std.mem.Allocator, col: schema
     _ = try records.createInTxnOpts(a, io, w, col, prepped, opts);
 }
 
+/// Install an imported credential. Runs INSIDE the row's transaction, right after the
+/// record is created, so the row and its credential commit or roll back together.
+///
+/// This is the ONLY writer of a `$zblegacy$` value anywhere in the codebase. The HTTP path
+/// cannot reach it: `auth.isServerManagedField` strips `passwordHash`/`verified` from every
+/// client payload, and that strip is unchanged.
+fn applyLegacyCredential(
+    w: *db.Db,
+    a: std.mem.Allocator,
+    col: schema.Collection,
+    data: std.json.Value,
+    algorithm: []const u8,
+) !void {
+    const idv = data.object.get("id") orelse return ImportError.LegacyRowMissingId;
+    if (idv != .string or idv.string.len == 0) return ImportError.LegacyRowMissingId;
+    if (data.object.get("password") != null and data.object.get("passwordHash") != null)
+        return ImportError.LegacyHashConflict;
+
+    var tagged: ?[]const u8 = null;
+    if (data.object.get("passwordHash")) |hv| {
+        if (hv != .string or hv.string.len == 0) return crypto.LegacyError.MalformedLegacyHash;
+        // Validates the algorithm allowlist AND the hash format; a bad credential is
+        // rejected while an operator is watching, not at some user's next login.
+        tagged = try crypto.wrapLegacy(a, algorithm, hv.string);
+    }
+    var verified: ?bool = null;
+    if (data.object.get("verified")) |vv| {
+        if (vv == .bool) verified = vv.bool;
+    }
+    if (tagged == null and verified == null) return;
+
+    // `col.name` came from `_collections` and passed `schema.isValidIdentifier` on creation;
+    // re-check before interpolating, per the repo's identifier discipline.
+    if (!schema.isValidIdentifier(col.name)) return ImportError.InvalidCollectionName;
+    const sql = try std.fmt.allocPrintSentinel(
+        a,
+        "UPDATE \"{s}\" SET \"passwordHash\" = COALESCE(?2, \"passwordHash\"), \"verified\" = COALESCE(?3, \"verified\") WHERE \"id\" = ?1;",
+        .{col.name},
+        0,
+    );
+    // Routed through `prep` (not a bare `w.prepare`) so the `?N` placeholders are renumbered
+    // for the active backend (SQLite verbatim, Postgres `$n`) — matches every other
+    // statement in this file.
+    var st = try prep(a, w, sql);
+    defer st.finalize();
+    try st.bindText(1, idv.string);
+    if (tagged) |t| try st.bindText(2, t) else try st.bindNull(2);
+    if (verified) |v| try st.bindInt(3, if (v) 1 else 0) else try st.bindNull(3);
+    _ = try st.step();
+}
+
 /// The two per-run reused lookup statements, prepared ONCE (after the collection + upsert key are
 /// resolved) and reused for every row via reset/re-bind — avoiding an N+1 prepare per row. Exactly
 /// one is non-null: `upsert` when `--upsert-key` is set, `dup_check` when preserving ids without a
@@ -237,6 +299,7 @@ fn importRow(app: *App, w: *db.Db, io: std.Io, a: std.mem.Allocator, col: schema
         }
     }
     try createRow(app, w, io, a, col, data, opts.preserve_ids);
+    if (opts.legacy_hash_algorithm) |alg| try applyLegacyCredential(w, a, col, data, alg);
     return .created;
 }
 
@@ -319,8 +382,43 @@ pub fn run(app: *App, w: *db.Db, io: std.Io, reader: *std.Io.Reader, opts: Optio
     last_error_line = 0; // reset; set to the offending 1-based line on a row failure.
     last_error_detail = "";
 
+    // Validate the legacy-hash mode's collection-independent checks BEFORE the identifier
+    // gate below: `_superusers` (like every system table) starts with `_` and so never
+    // passes `schema.isValidIdentifier`, which would otherwise mask this refusal behind a
+    // generic `InvalidCollectionName`. A misconfigured run must fail before it writes
+    // anything, so this all runs before any row is read.
+    if (opts.legacy_hash_algorithm) |alg| {
+        // The superuser table is created by `zigbase superuser create` with a real password;
+        // there is no migration story for it, and it is the highest-value target.
+        if (std.mem.eql(u8, opts.collection, "_superusers")) return ImportError.LegacySuperuserRefused;
+        // Fail on an unknown algorithm here rather than per row.
+        if (!blk: {
+            for (crypto.legacy_algorithms) |a| if (std.mem.eql(u8, a, alg)) break :blk true;
+            break :blk false;
+        }) return crypto.LegacyError.UnsupportedAlgorithm;
+        // Legacy credential installation is CREATE-ONLY: `importRow`'s upsert branch returns
+        // as soon as the matched row is updated, so a matched row would be written with NO
+        // credential at all — a silent, security-relevant loss (exit 0, no warning). Refuse
+        // the combination up front rather than half-performing it. This also covers a
+        // manifest run: `import_manifest.run` copies the run-level Options and sets
+        // `upsert_key` per entry, so an entry carrying `upsertKey` under a run-level
+        // `--legacy-hashes` lands here on that entry's own `import.run`.
+        if (opts.upsert_key != null) {
+            last_error_detail = "legacy credential import is create-only; run it as a separate create-only import (no --upsert-key / no manifest `upsertKey`)";
+            return ImportError.LegacyRequiresCreateOnly;
+        }
+    }
+
     if (!schema.isValidIdentifier(opts.collection)) return ImportError.InvalidCollectionName;
     const col = (try collections.get(ca, w, opts.collection)) orelse return ImportError.UnknownCollection;
+
+    if (opts.legacy_hash_algorithm != null and col.type != .auth)
+        return ImportError.LegacyRequiresAuthCollection;
+
+    if (opts.legacy_hash_algorithm != null and !opts.preserve_ids) {
+        last_error_detail = "legacy credential import requires preserve_ids=true — the credential row is matched by its source id";
+        return ImportError.LegacyRequiresPreservedIds;
+    }
 
     // Prepare the per-run lookup statement(s) ONCE — reused for every row (reset + re-bind) so a
     // large import doesn't re-format + re-`prepare` a statement per row (an N+1 that ~doubles DB
@@ -939,6 +1037,160 @@ test "import: 20k rows stay leak-free and memory-bounded" {
     var reader = std.Io.Reader.fixed(body.items);
     const rep = try run(&app, &d, io, &reader, .{ .collection = "posts", .batch_size = 1000 });
     try std.testing.expectEqual(@as(usize, 20_000), rep.created);
+}
+
+test "import: --legacy-hashes stores a tagged hash, honors verified, and never stores plaintext" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    try migrations.run(&d);
+    const members = try collections.create(a, io, &d, .{
+        .id = "",
+        .name = "members",
+        .type = .auth,
+        .fields = &.{.{ .id = "", .name = "nom", .options = .{ .text = .{} } }},
+    });
+    defer members.deinit(a);
+    var app = testApp(std.testing.allocator, io);
+
+    const bc = "$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy";
+    const rep = try runNdjson(&app, &d, io, "{\"id\":\"member000000001\",\"email\":\"ada@example.com\",\"nom\":\"Ada\"," ++
+        "\"passwordHash\":\"" ++ bc ++ "\",\"verified\":true}\n", .{ .collection = "members", .legacy_hash_algorithm = "bcrypt" });
+    try std.testing.expectEqual(@as(usize, 1), rep.created);
+
+    var st = try d.prepare("SELECT \"passwordHash\", \"verified\", \"tokenKey\" FROM \"members\" WHERE \"id\"='member000000001';");
+    defer st.finalize();
+    try std.testing.expect(try st.step());
+    try std.testing.expectEqualStrings("$zblegacy$bcrypt$" ++ bc, st.columnText(0));
+    try std.testing.expectEqual(@as(i64, 1), st.columnInt(1)); // verified carried over
+    try std.testing.expect(st.columnText(2).len > 0); // tokenKey still provisioned
+}
+
+test "import: --legacy-hashes refuses a base collection, _superusers, an id-less row, and a bad hash" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const posts_col = try seedPosts(&d, a, io); // also runs migrations, seeding `_superusers`
+    defer posts_col.deinit(a);
+    var app = testApp(std.testing.allocator, io);
+
+    const bc = "$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy";
+    // A base collection has no credentials to import into.
+    try std.testing.expectError(ImportError.LegacyRequiresAuthCollection, runNdjson(&app, &d, io, "{\"id\":\"x00000000000001\",\"title\":\"t\"}\n", .{ .collection = "posts", .legacy_hash_algorithm = "bcrypt" }));
+
+    const members = try collections.create(a, io, &d, .{
+        .id = "",
+        .name = "members",
+        .type = .auth,
+        .fields = &.{},
+    });
+    defer members.deinit(a);
+
+    // No id: nothing to key the credential UPDATE on.
+    try std.testing.expectError(ImportError.LegacyRowMissingId, runNdjson(&app, &d, io, "{\"email\":\"a@b.c\",\"passwordHash\":\"" ++ bc ++ "\"}\n", .{ .collection = "members", .legacy_hash_algorithm = "bcrypt" }));
+    // Plaintext AND a source hash in one row: ambiguous, so refused rather than guessed.
+    try std.testing.expectError(ImportError.LegacyHashConflict, runNdjson(&app, &d, io, "{\"id\":\"m00000000000001\",\"email\":\"a@b.c\",\"password\":\"plaintext1\",\"passwordHash\":\"" ++ bc ++ "\"}\n", .{ .collection = "members", .legacy_hash_algorithm = "bcrypt" }));
+    // A malformed or non-allowlisted hash is caught at IMPORT time, not at some login.
+    try std.testing.expectError(crypto.LegacyError.MalformedLegacyHash, runNdjson(&app, &d, io, "{\"id\":\"m00000000000002\",\"email\":\"c@d.e\",\"passwordHash\":\"nope\"}\n", .{ .collection = "members", .legacy_hash_algorithm = "bcrypt" }));
+    try std.testing.expectError(crypto.LegacyError.UnsupportedAlgorithm, runNdjson(&app, &d, io, "{\"id\":\"m00000000000003\",\"email\":\"e@f.g\",\"passwordHash\":\"" ++ bc ++ "\"}\n", .{ .collection = "members", .legacy_hash_algorithm = "md5" }));
+    // The highest-value target is never importable.
+    try std.testing.expectError(ImportError.LegacySuperuserRefused, runNdjson(&app, &d, io, "{\"id\":\"s00000000000001\",\"email\":\"root@x.io\",\"passwordHash\":\"" ++ bc ++ "\"}\n", .{ .collection = "_superusers", .legacy_hash_algorithm = "bcrypt" }));
+}
+
+test "import: WITHOUT --legacy-hashes a passwordHash in the row is silently ignored" {
+    // The pre-existing strip must not weaken: an ordinary import can never install a
+    // credential, no matter what the file claims.
+    var d = try db.Db.openMemory();
+    defer d.close();
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    try migrations.run(&d);
+    const members = try collections.create(a, io, &d, .{
+        .id = "",
+        .name = "members",
+        .type = .auth,
+        .fields = &.{},
+    });
+    defer members.deinit(a);
+    var app = testApp(std.testing.allocator, io);
+
+    _ = try runNdjson(&app, &d, io, "{\"id\":\"m00000000000009\",\"email\":\"a@b.c\",\"passwordHash\":\"$2a$10$whatever\",\"verified\":true}\n", .{ .collection = "members" });
+    var st = try d.prepare("SELECT \"passwordHash\", \"verified\" FROM \"members\" WHERE \"id\"='m00000000000009';");
+    defer st.finalize();
+    try std.testing.expect(try st.step());
+    try std.testing.expectEqual(@as(usize, 0), st.columnText(0).len);
+    try std.testing.expectEqual(@as(i64, 0), st.columnInt(1));
+}
+
+test "import: --legacy-hashes with preserve_ids=false is rejected before any write" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    try migrations.run(&d);
+    const members = try collections.create(a, io, &d, .{
+        .id = "",
+        .name = "members",
+        .type = .auth,
+        .fields = &.{},
+    });
+    defer members.deinit(a);
+    var app = testApp(std.testing.allocator, io);
+
+    const bc = "$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy";
+    // This combination is rejected at validation time, before any row is read or written.
+    try std.testing.expectError(
+        ImportError.LegacyRequiresPreservedIds,
+        runNdjson(&app, &d, io, "{\"id\":\"m00000000000001\",\"email\":\"a@b.c\",\"passwordHash\":\"" ++ bc ++ "\"}\n", .{
+            .collection = "members",
+            .legacy_hash_algorithm = "bcrypt",
+            .preserve_ids = false,
+        }),
+    );
+    // Verify nothing was written to the collection.
+    var st = try d.prepare("SELECT COUNT(*) FROM \"members\";");
+    defer st.finalize();
+    try std.testing.expect(try st.step());
+    try std.testing.expectEqual(@as(i64, 0), st.columnInt(0));
+}
+
+test "import: --legacy-hashes with an upsert key is rejected before any write" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    try migrations.run(&d);
+    const members = try collections.create(a, io, &d, .{
+        .id = "",
+        .name = "members",
+        .type = .auth,
+        .fields = &.{},
+    });
+    defer members.deinit(a);
+    var app = testApp(std.testing.allocator, io);
+
+    const bc = "$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy";
+    // `importRow`'s upsert branch returns `.updated` BEFORE `applyLegacyCredential` runs, so
+    // a matched row would land with no credential at all and the run would still exit 0.
+    // The combination must be refused up front, with its own distinct error.
+    try std.testing.expectError(
+        ImportError.LegacyRequiresCreateOnly,
+        runNdjson(&app, &d, io, "{\"id\":\"m00000000000001\",\"email\":\"a@b.c\",\"passwordHash\":\"" ++ bc ++ "\"}\n", .{
+            .collection = "members",
+            .legacy_hash_algorithm = "bcrypt",
+            .upsert_key = "email",
+        }),
+    );
+    try std.testing.expect(std.mem.indexOf(u8, last_error_detail, "create-only") != null);
+
+    // Nothing was written — not even the row that would have been created had the refusal
+    // come later (the check runs before the first line is read).
+    var st = try d.prepare("SELECT COUNT(*) FROM \"members\";");
+    defer st.finalize();
+    try std.testing.expect(try st.step());
+    try std.testing.expectEqual(@as(i64, 0), st.columnInt(0));
 }
 
 test "import: strip_fields drops the named keys before the engine sees them" {

@@ -2650,6 +2650,17 @@ fn printImportUsage(io: std.Io, file: std.Io.File) void {
         \\                     and self-relations are loaded with the offending values stripped and
         \\                     patched afterwards by record id (those rows must carry their own id).
         \\                     Excludes --collection/--upsert-key and the positional file.
+        \\  --legacy-hashes ALG  Import each row's `passwordHash` as a SOURCE hash produced by ALG
+        \\                     (currently: bcrypt) instead of ignoring it. The value is stored tagged
+        \\                     as $zblegacy$ALG$<hash> and is replaced with argon2id on the user's
+        \\                     first successful login. Requires an auth collection, refuses
+        \\                     _superusers, and requires every row to carry its own `id`. Under this
+        \\                     flag a row's `verified` flag is carried over too. A row carrying BOTH
+        \\                     `password` and `passwordHash` is refused. CREATE-ONLY: it cannot be
+        \\                     combined with --upsert-key (nor with a manifest entry's `upsertKey`),
+        \\                     because an updated row would land with no credential installed.
+        \\                     The flag applies uniformly to EVERY manifest entry, so a legacy-hash
+        \\                     import must be its own single-collection run.
         \\
         \\WHAT IT DOES:
         \\  Streams an NDJSON file (one JSON object per line) into the collection THROUGH THE
@@ -3593,6 +3604,7 @@ fn importImpl(
         .error_log = if (err_writer) |*ew| &ew.interface else null,
         .progress_every = ia.progress,
         .progress = if (ia.progress > 0) &prog_writer.interface else null,
+        .legacy_hash_algorithm = ia.legacy_hashes,
     };
 
     // A generous heap line buffer (a single NDJSON record must fit it). Heap, not stack — 1 MiB.
@@ -3725,6 +3737,7 @@ fn importManifestImpl(
             .error_log = if (err_writer) |*ew| &ew.interface else null,
             .progress_every = ia.progress,
             .progress = if (ia.progress > 0) &prog_writer.interface else null,
+            .legacy_hash_algorithm = ia.legacy_hashes,
         },
     }) catch |e| {
         std.log.err("import manifest '{s}' failed: {s}", .{ mpath, @errorName(e) });

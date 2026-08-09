@@ -132,6 +132,8 @@ pub const ImportArgs = struct {
     /// Multi-collection manifest path. Mutually exclusive with --collection/--upsert-key
     /// and the positional file, which it supplies instead.
     manifest: ?[]const u8 = null,
+    /// Import source password hashes tagged with this algorithm (currently `bcrypt` only).
+    legacy_hashes: ?[]const u8 = null,
 };
 
 /// `explain-code [CODE] [--json]`: print the long form for one frozen error code,
@@ -407,6 +409,10 @@ pub fn parse(args: []const []const u8, popts: ParseOpts) ParseError!Command {
                 i += 1;
                 if (i >= args.len) return ParseError.MissingValue;
                 ia.manifest = args[i];
+            } else if (std.mem.eql(u8, a, "--legacy-hashes")) {
+                i += 1;
+                if (i >= args.len) return ParseError.MissingValue;
+                ia.legacy_hashes = args[i];
             } else if (std.mem.eql(u8, a, "-") or !std.mem.startsWith(u8, a, "-")) {
                 // Positional NDJSON file path (`-` = stdin). Only one is allowed.
                 if (ia.file != null) return ParseError.BadValue;
@@ -416,6 +422,12 @@ pub fn parse(args: []const []const u8, popts: ParseOpts) ParseError!Command {
         // --manifest supplies the collection, the upsert key and the file; combining them
         // would leave two sources of truth for the same thing.
         if (ia.manifest != null and (ia.collection != null or ia.upsert_key != null or ia.file != null))
+            return ParseError.BadValue;
+        // Legacy credential import is CREATE-ONLY: the upsert branch updates a matched row and
+        // never installs the credential, so accepting both would silently discard every matched
+        // row's password. Refused here as a usage error; `import.run` refuses it again at
+        // runtime for the library/manifest paths this parser never sees.
+        if (ia.legacy_hashes != null and ia.upsert_key != null)
             return ParseError.BadValue;
         return .{ .import = ia };
     }
@@ -846,6 +858,17 @@ test "import parses the hardening flags" {
     try std.testing.expect(cmd.import.json);
     try std.testing.expectError(ParseError.MissingValue, parse(&.{ "import", "--error-log" }, .{}));
     try std.testing.expectError(ParseError.BadValue, parse(&.{ "import", "--progress", "x", "f" }, .{}));
+}
+
+test "import --legacy-hashes parses and requires a value" {
+    const cmd = try parse(&.{ "import", "--collection", "users", "--legacy-hashes", "bcrypt", "u.ndjson" }, .{});
+    try std.testing.expectEqualStrings("bcrypt", cmd.import.legacy_hashes.?);
+    try std.testing.expectError(ParseError.MissingValue, parse(&.{ "import", "--legacy-hashes" }, .{}));
+    // Create-only: an upsert key would update matched rows WITHOUT installing the credential.
+    try std.testing.expectError(ParseError.BadValue, parse(
+        &.{ "import", "--collection", "users", "--legacy-hashes", "bcrypt", "--upsert-key", "email", "u.ndjson" },
+        .{},
+    ));
 }
 
 test "import --manifest parses and excludes the single-collection flags" {

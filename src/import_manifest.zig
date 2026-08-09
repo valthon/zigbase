@@ -730,3 +730,53 @@ test "run: continue_on_error survives a phase-1-failed row that also carried a d
     try std.testing.expect(try st.step());
     try std.testing.expectEqual(@as(i64, 1), st.columnInt(0));
 }
+
+test "run: a manifest entry's upsertKey cannot smuggle past the create-only legacy rule" {
+    // `run`'s phase-1 loop copies the run-level Options and sets `o.upsert_key = e.upsert_key`
+    // per entry (see the `for (order) |i|` loop above), so a manifest entry carrying
+    // `upsertKey` under a run-level `--legacy-hashes` composes into exactly the shape
+    // `import.run`'s pre-flight check refuses: `importRow`'s upsert branch would return
+    // `.updated` BEFORE the credential is applied, silently leaving a matched row with no
+    // password at all. `import.zig` already pins the single-collection call directly; this
+    // pins the composition specifically through the manifest path, where the upsert key
+    // arrives indirectly via the entry rather than as a caller-supplied `Options` field.
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try migrations.run(&d);
+    var app = import.testApp(a, io);
+
+    const members = try collections.create(a, io, &d, .{
+        .id = "",
+        .name = "members",
+        .type = .auth,
+        .fields = &.{},
+    });
+    defer members.deinit(a);
+
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    const bc = "$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy";
+    try dir.dir.writeFile(io, .{ .sub_path = "members.ndjson", .data = "{\"id\":\"m00000000000001\",\"email\":\"a@b.c\",\"passwordHash\":\"" ++ bc ++ "\"}\n" });
+    const base = try dir.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(base);
+
+    var m = try parseManifest(a,
+        \\{"zigbaseImportManifest":1,"collections":[{"collection":"members","file":"members.ndjson","upsertKey":"email"}]}
+    );
+    defer m.deinit();
+
+    try std.testing.expectError(
+        import.ImportError.LegacyRequiresCreateOnly,
+        run(&app, &d, io, a, m, .{ .base_dir = base, .import = .{ .collection = "", .legacy_hash_algorithm = "bcrypt" } }),
+    );
+    try std.testing.expect(std.mem.indexOf(u8, import.last_error_detail, "create-only") != null);
+
+    // Nothing was written — not even the row that would have landed had the refusal come
+    // later than it does (the check runs before the entry's file is even opened).
+    var st = try d.prepare("SELECT COUNT(*) FROM \"members\";");
+    defer st.finalize();
+    try std.testing.expect(try st.step());
+    try std.testing.expectEqual(@as(i64, 0), st.columnInt(0));
+}

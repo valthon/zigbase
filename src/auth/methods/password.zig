@@ -74,8 +74,8 @@ fn completeImpl(ctx: *anyopaque, ac: *AuthCtx) anyerror!Resolution {
         return Resolution{ .fail = .{ .status = 400, .message = "Invalid credentials." } };
     };
 
-    // Verify password
-    if (!crypto.verifyPassword(ac.app.io, ac.ctx.allocator.a, phc, password)) {
+    // Verify password (transparently upgrading a legacy-imported hash to argon2id on success)
+    if (!api_auth.verifyPasswordUpgrading(ac.app, ac.ctx.allocator.a, ac.collection.name, rid, phc, password)) {
         return Resolution{ .fail = .{ .status = 400, .message = "Invalid credentials." } };
     }
 
@@ -146,6 +146,68 @@ test "PasswordMethod: correct password resolves to record id, wrong password is 
         .fail => |f| try std.testing.expectEqual(@as(u16, 400), f.status),
         .record => return error.TestFailed,
     }
+}
+
+test "PasswordMethod: a legacy-tagged hash verifies and is upgraded to argon2id" {
+    const http = @import("../../http.zig");
+    const collections = @import("../../collections.zig");
+
+    var env = try api_auth.TestEnv.initAuth("members2");
+    defer env.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try env.createUser(a, "members2", "legacy@x.io", "placeholder-unused-1");
+
+    const col = blk: {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        break :blk (try collections.get(a, w, "members2")).?;
+    };
+
+    const rid = blk: {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        break :blk (try api_auth.findByIdentity(a, w, col, "legacy@x.io")).?;
+    };
+
+    // Overwrite the stored hash with a tagged legacy value, exactly as `zigbase import
+    // --legacy-hashes` would leave it.
+    const bc = "$2b$04$gKLlzqBYq6vyAUzUTYq/f.2na5B02QSMuFv75B374EKmX3m3Kt1UG"; // "abc"
+    const tagged = try crypto.wrapLegacy(a, "bcrypt", bc);
+    {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        var st = try w.prepare("UPDATE \"members2\" SET \"passwordHash\" = ?1 WHERE \"id\" = ?2;");
+        defer st.finalize();
+        try st.bindText(1, tagged);
+        try st.bindText(2, rid);
+        _ = try st.step();
+    }
+
+    var req = env.ctx(RequestArena.from(&arena), .POST, "{\"identity\":\"legacy@x.io\",\"password\":\"abc\"}", &[_]http.Param{});
+    var ac = AuthCtx{ .app = &env.app, .ctx = &req, .collection = col, .config = .null };
+
+    var m = try PasswordMethod.create(std.testing.allocator, std.testing.io, .{});
+    const am = m.method();
+    const res = try am.vtable.complete(am.ctx, &ac);
+    switch (res) {
+        .record => |got_rid| try std.testing.expectEqualStrings(rid, got_rid),
+        .fail => |f| {
+            std.debug.print("Expected .record but got .fail: status={d} msg={s}\n", .{ f.status, f.message });
+            return error.TestFailed;
+        },
+    }
+
+    const after = blk: {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        break :blk (try api_auth.passwordHashFor(a, w, "members2", rid)).?;
+    };
+    try std.testing.expect(!crypto.isLegacyHash(after));
+    try std.testing.expect(std.mem.startsWith(u8, after, "$argon2"));
 }
 
 test "PasswordMethod: missing identity/password fields returns .fail 400" {
