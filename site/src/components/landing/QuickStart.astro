@@ -4,6 +4,14 @@ import CodeTabs from '../CodeTabs.astro';
 import CopyButton from '../CopyButton.astro';
 import { ZIGBASE_VERSION, ZIGBASE_VERSION_TAG, REPO_URL } from '../../config/site';
 
+const npxCode = `# Scaffold a project — docker-compose, a schema document, AGENTS.md.
+# No Zig toolchain, no install step.
+npx zigbase init
+
+# Or just run the server (fetches the prebuilt binary for your platform)
+npx zigbase serve --insecure-cookies --data-dir ./zb_data
+# open http://127.0.0.1:8090/_/  (admin UI)`;
+
 const downloadCode = `# Download the prebuilt Linux binary
 curl -L ${REPO_URL}/releases/download/${ZIGBASE_VERSION_TAG}/zigbase-${ZIGBASE_VERSION}-x86_64-linux-musl.tar.gz | tar xz
 
@@ -42,16 +50,24 @@ pub fn main(init: std.process.Init) !void {
   <div class="container">
     <header class="quickstart__head">
       <h2>Quick start</h2>
-      <p>Grab a binary, build from source, or embed it as a library.</p>
+      <p>Scaffold with npx, grab a binary, build from source, or embed it as a library.</p>
     </header>
 
     <CodeTabs
       tabs={[
+        { id: 'npx', label: 'npx — no toolchain' },
         { id: 'download', label: 'Download a binary' },
         { id: 'source', label: 'Build from source' },
         { id: 'library', label: 'Use as a library' },
       ]}
     >
+      <Fragment slot="npx">
+        <div class="quickstart__panel">
+          <Code code={npxCode} lang="bash" />
+          <CopyButton class="quickstart__copy" />
+        </div>
+      </Fragment>
+
       <Fragment slot="download">
         <div class="quickstart__panel">
           <Code code={downloadCode} lang="bash" />

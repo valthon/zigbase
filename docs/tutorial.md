@@ -262,12 +262,12 @@ const zigbase = @import("zigbase");
 fn confirmBooking(ctx: *zigbase.Ctx) anyerror!zigbase.http.Response {
     const a = ctx.arena.a;
     const id = ctx.request.?.param("id") orelse
-        return .{ .status = 404, .body = "{\"code\":404,\"message\":\"Not found.\",\"data\":{}}" };
+        return ctx.jsonError(404, "not_found", "Not found.");
 
     var patch: std.json.ObjectMap = .empty;
     try patch.put(a, "status", .{ .string = "confirmed" });
     const updated = (try ctx.records().update("bookings", id, .{ .object = patch })) orelse
-        return .{ .status = 404, .body = "{\"code\":404,\"message\":\"Not found.\",\"data\":{}}" };
+        return ctx.jsonError(404, "not_found", "Not found.");
 
     return .{ .status = 200, .body = try std.json.Stringify.valueAlloc(a, updated, .{}) };
 }

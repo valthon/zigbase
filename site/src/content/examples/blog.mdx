@@ -94,11 +94,13 @@ zig fetch --save git+https://github.com/valthon/zigbase
 Wire the module into your `build.zig`:
 
 ```zig
-const zigbase = b.dependency("zigbase", .{ .target = target, .optimize = optimize });
-exe_mod.addImport("zigbase", zigbase.module("zigbase"));
+const zigbase = @import("zigbase");
+const zb = b.dependency("zigbase", .{ .target = target, .optimize = optimize });
+zigbase.addTo(zb, exe_mod);
 ```
 
-Your executable module must `.link_libc = true` (SQLite needs libc).
+`addTo` adds the import **and** sets `.link_libc = true` (SQLite needs libc), so the
+two can't drift apart.
 
 ## Frontend (Astro + React islands)
 

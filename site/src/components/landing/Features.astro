@@ -14,6 +14,25 @@ import FeatureCard from '../FeatureCard.astro';
       Embedded SQLite by default. Build with <code>-Dpostgres</code> and point <code>ZIGBASE_DB_URL</code> at a <code>postgres://</code> URL — same app, same API. <code>zigbase migrate-db</code> copies an existing instance across, schema and data.
     </FeatureCard>
 
+    <FeatureCard title="Built for coding agents">
+      <svg slot="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+        <rect x="3" y="4" width="18" height="16" rx="2" />
+        <path d="M7 9.5l3 2.5-3 2.5" />
+        <path d="M13 15h4" />
+      </svg>
+      Scaffold a project with <code>npx zigbase init</code> — a generated <code>AGENTS.md</code> included. <code>serve</code> backgrounds itself when it detects an agent shell, the CLI speaks <code>--json</code>, error codes are a frozen registry you can look up with <code>zigbase explain-code</code>, and any instance answers <code>GET /api/meta</code>.
+    </FeatureCard>
+
+    <FeatureCard title="Migrate an existing app">
+      <svg slot="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+        <ellipse cx="6" cy="5.5" rx="4" ry="2" />
+        <path d="M2 5.5v6c0 1.1 1.79 2 4 2s4-.9 4-2v-6" />
+        <path d="M13 12h7" />
+        <path d="M17.5 8.5L21 12l-3.5 3.5" />
+      </svg>
+      Declarative <code>schema dump</code>/<code>apply</code>, whole-dataset <code>import --manifest</code> that loads in relation order, and <code>--legacy-hashes bcrypt</code> so existing users keep their passwords — transparently rehashed to argon2id on first login. A parity-replay harness proves the cutover before you make it.
+    </FeatureCard>
+
     <FeatureCard title="Collections & schema">
       <svg slot="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
         <ellipse cx="12" cy="5" rx="8" ry="3" />
@@ -129,12 +148,12 @@ import FeatureCard from '../FeatureCard.astro';
       Ship your frontend from the same binary — point a flag at a folder, or embed it at compile time.
     </FeatureCard>
 
-    <FeatureCard title="Typed TypeScript SDK">
+    <FeatureCard title="Typed client SDKs">
       <svg slot="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
         <path d="M4 6h16M4 12h10M4 18h7" />
         <path d="M16 16l3 3 5-6" transform="translate(-2 -3)" />
       </svg>
-      Generate a fully-typed client from your Zig schema — records, realtime, files, and typed custom-route RPC. No Zig source? Bootstrap types from any running instance with <code>npx @zigbase/typegen</code>.
+      Official TypeScript, Dart, Python, and Kotlin SDKs. Generate a fully-typed client from your Zig schema — records, realtime, files, and typed custom-route RPC. No Zig source? Bootstrap types from any running instance with <code>npx @zigbase/typegen</code>.
     </FeatureCard>
 
     <FeatureCard title="Session management">

@@ -42,9 +42,27 @@ const rows: Row[] = [
     firebase: 'Managed',
   },
   {
+    dimension: 'Migrating in',
+    zigbase:
+      'Declarative <code>schema apply</code>, whole-dataset <code>import --manifest</code> in relation order, <strong>bcrypt password import</strong> (rehashed to argon2id on first login), parity-replay harness',
+    pocketbase: 'Collection JSON import/export; JS/Go migrations',
+    trailbase: 'SQL migrations',
+    supabase: 'CLI dump/restore; the wider Postgres ecosystem',
+    firebase: 'Managed import/export',
+  },
+  {
+    dimension: 'Agent operability',
+    zigbase:
+      '<code>init</code> scaffolding with a generated <code>AGENTS.md</code>, self-backgrounding <code>serve</code>, <code>--json</code> CLI output, frozen error codes + <code>explain-code</code>, <code>/api/meta</code> probe, published <code>llms.txt</code>',
+    pocketbase: '—',
+    trailbase: '—',
+    supabase: 'MCP server; AI assistant (hosted)',
+    firebase: 'Gemini in Firebase (hosted)',
+  },
+  {
     dimension: 'SPA hosting',
     zigbase:
-      'Zero-config <code>.spa</code> marker fallback for client-routed apps, plus comptime <code>static_routes</code> match&rarr;serve maps in custom builds (new in v0.10)',
+      'Zero-config <code>.spa</code> marker fallback for client-routed apps, plus comptime <code>static_routes</code> match&rarr;serve maps in custom builds',
     pocketbase:
       'Built-in <code>--indexFallback</code> on the static handler (default on)',
     trailbase: 'Built-in <code>--spa</code> flag on <code>--public-dir</code> serving',
@@ -176,7 +194,7 @@ const rows: Row[] = [
   <main class="container cmp">
     <header class="cmp__head">
       <h1 class="cmp__title">How ZigBase compares</h1>
-      <p class="cmp__meta">Last reviewed: July 2026</p>
+      <p class="cmp__meta">Last reviewed: August 2026</p>
       <p class="cmp__stance">
         This comparison is maintained by the ZigBase project. We've tried to
         be fair; corrections welcome via
@@ -230,7 +248,10 @@ const rows: Row[] = [
       <p>
         <strong>Choose ZigBase if</strong> you want one self-hosted binary, a
         typed compiled extension surface, and a SQLite→Postgres scale path
-        without a rewrite — and you're on Linux or macOS.
+        without a rewrite — and you're on Linux or macOS. Also if you're
+        pointing a coding agent at your backend, or moving an existing app
+        onto one: the CLI, error codes, and migration tooling are built to be
+        driven rather than clicked through.
       </p>
       <p>
         <strong>Choose PocketBase if</strong> you want Windows support or a JS
