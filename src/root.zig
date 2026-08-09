@@ -246,6 +246,15 @@ pub const HttpResponse = @import("http_client.zig").HttpResponse;
 pub const HttpRequestOptions = @import("http_client.zig").RequestOptions;
 pub const HttpPostOptions = @import("http_client.zig").PostOptions;
 
+// ---- Structured logging ----------------------------------------------------
+// A consumer binary opts in from its own root: `pub const std_options = zigbase.std_options;`.
+// This routes every `std.log` call through the same encoder as request logging. Access
+// lines and `--log-format`/`--log-level` work either way (the server logs them directly);
+// omitting the line just leaves std.log output in Zig's default format, mixed with JSON
+// access lines under `--log-format json`.
+pub const logging = @import("logging.zig");
+pub const std_options = logging.std_options;
+
 // ---- Dev-only test-mode capture (#96) -------------------------------------
 // Assert what the framework SENT in e2e/integration tests: an in-memory mail outbox
 // (`testcapture.mail`) and outbound `ctx.http()` capture + canned-response mocking
@@ -526,6 +535,7 @@ test {
     _ = @import("webhook.zig");
     _ = @import("request_arena.zig");
     _ = @import("error_codes.zig");
+    _ = @import("logging.zig");
     // Opt-in pure-Zig PostgreSQL backend (#159). The `build_options.postgres` condition is
     // comptime-known, so when it is false (the default) these `@import`s are never analyzed —
     // the driver compiles to nothing and the default build stays byte-identical.

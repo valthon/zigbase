@@ -1,6 +1,13 @@
 const std = @import("std");
 const zigbase = @import("zigbase");
 
+/// Opt the shipped binary into the framework's timestamped, leveled, JSON-capable
+/// log core (`src/logging.zig`) for every `std.log` call. Access lines and their
+/// `--log-format`/`--log-level` behavior work either way (the server logs them
+/// directly); omitting this line just leaves std.log output in Zig's default
+/// (ANSI, timestamp-free) format, mixed with JSON access lines under `--log-format json`.
+pub const std_options = zigbase.std_options;
+
 /// The shipped binary: the framework with the `typegen` subcommand compiled in.
 /// One binary serves both the GitHub release tarballs and the @zigbase/server
 /// npm packages. `enable_typegen` stays a framework option for embedders who

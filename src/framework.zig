@@ -7,6 +7,7 @@ const app_mod = @import("app.zig");
 const events = @import("events.zig");
 const config = @import("config.zig");
 const cli = @import("cli.zig");
+const logging = @import("logging.zig");
 const server = @import("server.zig");
 const migrations = @import("migrations.zig");
 const files_storage = @import("files/storage.zig");
@@ -1628,6 +1629,11 @@ pub fn App(comptime cfg: anytype) type {
 
         /// Start the HTTP server directly with an explicit config (no CLI parsing).
         pub fn run(init: std.process.Init, cfg_runtime: config.Config) !void {
+            // This path never touches `loadCfg`, which is where the CLI installs the
+            // resolved logging config — so apply it here, or an embedding consumer's
+            // `cfg.log_format`/`log_level`/`log_requests` would be silently ignored.
+            // Exactly one `logging.apply` per entry point: CLI in `loadCfg`, embedded here.
+            logging.apply(cfg_runtime.log_format, cfg_runtime.log_level, cfg_runtime.log_requests);
             return serveImpl(init.gpa, init.io, cfg_runtime, &dispatch, jobs, job_pool_size, collections, provision_migrations, Opts, init.environ_map);
         }
 
@@ -1842,6 +1848,12 @@ pub const ServeOpts = struct {
 
 /// Zig 0.16 entry point body: parse argv from `init.minimal.args` and dispatch.
 fn runCliImpl(init: std.process.Init, dispatch: *const events.Dispatch, jobs: []const scheduler.RuntimeJob, pool_size: usize, schema_collections: []const schema.Collection, schema_migrations: []const provision.Migration, comptime opts: ServeOpts) !void {
+    // Boot-ordering chicken-and-egg (docs/observability.md "Log output"): a bad
+    // ZIGBASE_LOG_FORMAT/LEVEL must be reported BY the logger it configures. This
+    // pre-pass reads only those two vars and silently ignores an invalid value —
+    // the real, fail-fast validation happens moments later in Config.loadDiag,
+    // which produces the actionable error. Exactly one validation path.
+    logging.preinstallFromEnv(init.environ_map);
     const allocator = init.gpa;
     const arena = init.arena.allocator();
 
@@ -1974,6 +1986,10 @@ fn printUsage(io: std.Io, file: std.Io.File, show_serve_static: bool, show_stati
         \\                      0 = inherit the 40s listener timeout. [env ZIGBASE_SSE_HEARTBEAT_SECONDS]
         \\  --realtime-outbound-hwm N  Disconnect a slow WS/SSE consumer once its queued outbound
         \\                      frames exceed N (serve only). 0 disables. [env ZIGBASE_REALTIME_OUTBOUND_HWM]
+        \\  --log-format F      text|json (serve only). json emits one JSON object per line on
+        \\                      stderr. [env ZIGBASE_LOG_FORMAT, default text]
+        \\  --log-level L       debug|info|warn|error (serve only). [env ZIGBASE_LOG_LEVEL, default info]
+        \\  --no-request-log    Suppress per-request access lines (serve only). [env ZIGBASE_LOG_REQUESTS]
         \\
     , .{});
     if (show_serve_static) emit(io, file,
@@ -2060,6 +2076,9 @@ fn printUsage(io: std.Io, file: std.Io.File, show_serve_static: bool, show_stati
         \\                           browser applicationServerKey. Generate with `zigbase vapid-keygen`.
         \\  ZIGBASE_VAPID_PRIVATE_KEY Web Push VAPID private key (base64url) — SECRET. Both keys unset
         \\                           → ctx.push() is a no-op. [default: off]
+        \\  ZIGBASE_LOG_FORMAT          text|json — log line encoding (json = one object per line). Default text.
+        \\  ZIGBASE_LOG_LEVEL           debug|info|warn|error — minimum severity. Default info.
+        \\  ZIGBASE_LOG_REQUESTS        true|false — per-request access lines. Default true.
         \\
         \\EXAMPLES:
         \\  # Create the first superuser (admin) account:
@@ -2130,7 +2149,8 @@ fn printServeUsage(io: std.Io, file: std.Io.File, show_serve_static: bool, show_
         \\USAGE:
         \\  zigbase serve [--http-host H] [--http-port N] [--data-dir PATH]
         \\                [--insecure-cookies] [--trust-proxy] [--realtime-origins CSV]
-        \\                [--sse-heartbeat-seconds N] [--realtime-outbound-hwm N]{s}
+        \\                [--sse-heartbeat-seconds N] [--realtime-outbound-hwm N]
+        \\                [--log-format F] [--log-level L] [--no-request-log]{s}
         \\
         \\FLAGS:
         \\  --http-host H    Address to bind; loopback by default. Pass 0.0.0.0 for all
@@ -2144,6 +2164,12 @@ fn printServeUsage(io: std.Io, file: std.Io.File, show_serve_static: bool, show_
         \\                         listener timeout. [env ZIGBASE_SSE_HEARTBEAT_SECONDS]
         \\  --realtime-outbound-hwm N  Disconnect a slow WS/SSE consumer past N queued outbound
         \\                         frames; 0 disables. [env ZIGBASE_REALTIME_OUTBOUND_HWM]
+        \\  --log-format F      text|json. json emits one JSON object per line on stderr.
+        \\  --log-level L       debug|info|warn|error. Default info.
+        \\  --no-request-log    Suppress the per-request access lines.
+        \\
+        \\  The three logging knobs also work as ZIGBASE_LOG_FORMAT / ZIGBASE_LOG_LEVEL /
+        \\  ZIGBASE_LOG_REQUESTS, which apply to every subcommand (these flags are serve-only).
         \\
     , .{if (show_serve_static) " [--serve-static DIR]" else ""});
     if (show_serve_static) emit(io, file,
@@ -2349,6 +2375,8 @@ fn loadCfg(environ: *const std.process.Environ.Map, sa: cli.ServeArgs) !config.C
             // noise on top of the one actionable sentence above, which is the whole
             // point of this diagnostic. There is nothing for a caller to recover
             // from: a malformed knob is fatal by design (fail fast at boot).
+            // `logging.write` flushes stderr on every record, so the message is
+            // already out before this call skips the deferred cleanup.
             // Exit 1 = "bad input", per the CLI exit-code scheme.
             std.process.exit(1);
         },
@@ -2364,6 +2392,24 @@ fn loadCfg(environ: *const std.process.Environ.Map, sa: cli.ServeArgs) !config.C
     if (sa.realtime_origins) |v| cfg.realtime_allowed_origins = v;
     if (sa.sse_heartbeat_seconds) |v| cfg.sse_heartbeat_seconds = v;
     if (sa.realtime_outbound_hwm) |v| cfg.realtime_outbound_hwm = v;
+    // The `.?` is safe only because cli.parse already validated the spelling
+    // (logging.parseFormat/parseLevel) at parse time — an invalid value never
+    // reaches here as a ServeArgs field.
+    if (sa.log_format) |v| cfg.log_format = logging.parseFormat(v).?;
+    if (sa.log_level) |v| cfg.log_level = logging.parseLevel(v).?;
+    if (sa.log_requests) |v| cfg.log_requests = v;
+
+    // Install the FULLY resolved logging config (env, then flags) here — the single
+    // `logging.apply` on every command path — before anything below is logged. It used
+    // to live at the top of `serveImpl`, which was too late: `warnUnknownVars` runs
+    // next, and under `--log-format json` (a flag, with no matching env var) its
+    // warning was still formatted by the env-only pre-pass, dropping a plain-text line
+    // into a stream the docs promise is NDJSON, unsuppressable by `--log-level`.
+    // Still ordered before `bootApp`/the pool opens, which is the guarantee that
+    // matters — just one frame earlier.
+    logging.apply(cfg.log_format, cfg.log_level, cfg.log_requests);
+    // Warn AFTER the logger is configured, so the warning honors --log-format and
+    // --log-level like every other record.
     config.warnUnknownVars(environ);
     return cfg;
 }
@@ -3398,6 +3444,11 @@ fn bootApp(
 }
 
 fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg_in: config.Config, dispatch: *const events.Dispatch, jobs: []const scheduler.RuntimeJob, pool_size: usize, schema_collections: []const schema.Collection, schema_migrations: []const provision.Migration, comptime opts: ServeOpts, environ: *const std.process.Environ.Map) !void {
+    // NOTE: the logging config is already installed — `loadCfg` applies it as soon as
+    // env and flags are merged (one `logging.apply` per run, no double-install), which
+    // is still before any worker thread exists or the db pool opens, so provisioning
+    // and migration output inside `bootApp` uses it exactly as before.
+    //
     // Boot the full application (everything before the socket bind), then fire onBeforeServe,
     // start the scheduler + background pool, and listen. `holder` OWNS the pool / storage /
     // mailer / registry / caches the App points into; its deinit runs LAST (LIFO), after the

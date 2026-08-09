@@ -34,6 +34,7 @@ const ApiError = @import("api/error.zig").ApiError;
 const auth = @import("auth.zig");
 const events = @import("events.zig");
 const request = @import("request.zig");
+const logging = @import("logging.zig");
 const Ctx = @import("ctx.zig").Ctx;
 const crypto = @import("crypto.zig");
 const clock = @import("clock.zig");
@@ -308,6 +309,7 @@ pub fn Server(comptime gates: Gates) type {
 
         fn onRequest(r: zap.Request) !void {
             const self = Self.instance.?;
+            const started_ns = std.Io.Timestamp.now(self.app.io, .awake).nanoseconds;
             var arena = std.heap.ArenaAllocator.init(self.app.allocator);
             defer arena.deinit();
             var ctx = http.RequestCtx{
@@ -318,6 +320,35 @@ pub fn Server(comptime gates: Gates) type {
                 .allocator = RequestArena.from(&arena),
                 .app = self.app,
             };
+            // Access log. A `defer` (not a call at the bottom) because onRequest has
+            // multiple `return` points — the raw-500 escape, both sendFile branches, and
+            // the normal fall-through — and every one of them must produce exactly one
+            // line. `logged_status` is what actually went on the wire, so a sendFile
+            // failure that downgrades a 200 to a 404 is logged as the 404 the client saw.
+            //
+            // `ctx.path` is a slice into facil.io's own request buffer (`r.path`), which
+            // facil.io is free to recycle the instant the response finishes (`sendBody`/
+            // `sendFile`/`sendRawEnvelope` all end the request) — reading it lazily from
+            // inside the deferred block, AFTER the response has gone out, previously read
+            // back a reused/zeroed buffer (observed as NUL bytes in practice). Duplicate it
+            // into the request arena now, while `r`'s buffer is still guaranteed live, and
+            // log that stable copy instead. The defer body itself stays allocation-free —
+            // `logging.request` formats into a stack buffer — this dupe happens up front.
+            // On OOM, fall back to a STATIC placeholder rather than to `ctx.path` itself:
+            // reusing the borrowed slice is precisely the use-after-recycle this dupe
+            // exists to prevent, so the fallback must not reintroduce it. "-" is the
+            // conventional access-log stand-in for a field that could not be captured.
+            const logged_path = ctx.allocator.a.dupe(u8, ctx.path) catch "-";
+            var logged_status: u16 = 0;
+            defer {
+                const elapsed_ns = std.Io.Timestamp.now(self.app.io, .awake).nanoseconds - started_ns;
+                logging.request(.{
+                    .method = @tagName(ctx.method),
+                    .path = logged_path,
+                    .status = logged_status,
+                    .duration_ms = @intCast(@max(0, @divTrunc(elapsed_ns, std.time.ns_per_ms))),
+                });
+            }
             ctx.authorization = r.getHeader("authorization") orelse "";
             ctx.cookie_header = r.getHeader("cookie") orelse "";
             ctx.csrf_token = r.getHeader("x-csrf-token") orelse "";
@@ -334,7 +365,15 @@ pub fn Server(comptime gates: Gates) type {
             ctx.raw_header_ctx = &zap_req;
             ctx.raw_header_fn = zapHeaderLookup;
             ctx.raw_header_set_fn = zapHeaderSet;
-            const multipart_err = try applyMultipart(&ctx);
+            // OOM here used to propagate straight out of `onRequest`, which means zap
+            // logs an uncaught error and NEVER writes a response — the client sees a
+            // dropped connection and the access line records status 0, a status nothing
+            // ever sent. Answer with the same raw 500 envelope every other escape uses.
+            const multipart_err = applyMultipart(&ctx) catch {
+                sendRawEnvelope(r, 500, "{\"status\":500,\"code\":\"internal\",\"message\":\"Something went wrong.\",\"data\":{}}");
+                logged_status = 500;
+                return;
+            };
             const resp = blk: {
                 if (multipart_err) |er| break :blk er;
                 // The full routing/fallback chain lives in the socketless `route` seam (#239
@@ -342,10 +381,12 @@ pub fn Server(comptime gates: Gates) type {
                 // paths that historically wrote this exact raw 500 envelope inline and returned.
                 break :blk route(&ctx) catch {
                     sendRawEnvelope(r, 500, "{\"status\":500,\"code\":\"internal\",\"message\":\"Something went wrong.\",\"data\":{}}");
+                    logged_status = 500;
                     return;
                 };
             };
             setZapStatus(r, resp.status);
+            logged_status = resp.status;
             for (resp.cookies) |c| {
                 r.setCookie(.{
                     .name = c.name,
@@ -373,12 +414,14 @@ pub fn Server(comptime gates: Gates) type {
                     sendFileRange(r, self.app.io, f.path, f.offset, len) catch {
                         // Open failure => the existing 404 raw envelope (unchanged semantics).
                         sendRawEnvelope(r, 404, "{\"status\":404,\"code\":\"not_found\",\"message\":\"Not found.\",\"data\":{}}");
+                        logged_status = 404;
                     };
                 } else {
                     // Wholesale facil.io delegation (dir-mode static): mime, ETag, 304,
                     // `.gz` sidecar, Range are ALL facil.io's (§A.3) — byte-identical to today.
                     r.sendFile(f.path) catch {
                         sendRawEnvelope(r, 404, "{\"status\":404,\"code\":\"not_found\",\"message\":\"Not found.\",\"data\":{}}");
+                        logged_status = 404;
                     };
                 }
                 return;

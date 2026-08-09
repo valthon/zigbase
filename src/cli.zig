@@ -1,4 +1,5 @@
 const std = @import("std");
+const logging = @import("logging.zig");
 
 pub const ServeArgs = struct {
     http_host: ?[]const u8 = null,
@@ -12,6 +13,11 @@ pub const ServeArgs = struct {
     realtime_origins: ?[]const u8 = null, // --realtime-origins CSV => allowed WS Origins
     sse_heartbeat_seconds: ?u16 = null, // --sse-heartbeat-seconds N => SSE ping interval (0 = inherit listener timeout)
     realtime_outbound_hwm: ?u32 = null, // --realtime-outbound-hwm N => slow-consumer disconnect bound in frames (0 disables); issue #203
+    // Logging knobs (serve only; the env vars ZIGBASE_LOG_FORMAT/LEVEL/REQUESTS apply
+    // to every subcommand — see docs/observability.md). null = leave the config default.
+    log_format: ?[]const u8 = null, // --log-format text|json
+    log_level: ?[]const u8 = null, // --log-level debug|info|warn|error
+    log_requests: ?bool = null, // --no-request-log => false
 };
 
 /// `migrate` runs one of four actions: `apply` (the default — apply pending system + consumer
@@ -367,6 +373,18 @@ pub fn parse(args: []const []const u8, popts: ParseOpts) ParseError!Command {
             i += 1;
             if (i >= args.len) return ParseError.MissingValue;
             sa.realtime_outbound_hwm = std.fmt.parseInt(u32, args[i], 10) catch return ParseError.BadValue;
+        } else if (std.mem.eql(u8, a, "--log-format")) {
+            i += 1;
+            if (i >= args.len) return ParseError.MissingValue;
+            if (logging.parseFormat(args[i]) == null) return ParseError.BadValue;
+            sa.log_format = args[i];
+        } else if (std.mem.eql(u8, a, "--log-level")) {
+            i += 1;
+            if (i >= args.len) return ParseError.MissingValue;
+            if (logging.parseLevel(args[i]) == null) return ParseError.BadValue;
+            sa.log_level = args[i];
+        } else if (std.mem.eql(u8, a, "--no-request-log")) {
+            sa.log_requests = false;
         } else {
             return ParseError.UnknownFlag;
         }
@@ -380,6 +398,20 @@ test "no args -> top-level help" {
     const cmd = try parse(&.{}, .{});
     try std.testing.expect(std.meta.activeTag(cmd) == .help);
     try std.testing.expectEqual(HelpTopic.top, cmd.help);
+}
+
+test "serve parses the logging flags; bad values are rejected at parse time" {
+    const c = try parse(&.{ "serve", "--log-format", "json", "--log-level", "warn", "--no-request-log" }, .{});
+    try std.testing.expectEqualStrings("json", c.serve.log_format.?);
+    try std.testing.expectEqualStrings("warn", c.serve.log_level.?);
+    try std.testing.expectEqual(@as(?bool, false), c.serve.log_requests);
+    // Absent flags stay null so the env/default still wins.
+    const bare = try parse(&.{"serve"}, .{});
+    try std.testing.expectEqual(@as(?[]const u8, null), bare.serve.log_format);
+    try std.testing.expectEqual(@as(?bool, null), bare.serve.log_requests);
+    try std.testing.expectError(ParseError.BadValue, parse(&.{ "serve", "--log-format", "ndjson" }, .{}));
+    try std.testing.expectError(ParseError.BadValue, parse(&.{ "serve", "--log-level", "trace" }, .{}));
+    try std.testing.expectError(ParseError.MissingValue, parse(&.{ "serve", "--log-format" }, .{}));
 }
 
 test "--help and -h and help -> top-level help" {

@@ -82,10 +82,26 @@ Minimal `src/main.zig`:
 const std = @import("std");
 const zigbase = @import("zigbase");
 
+/// Structured logging: this routes every std.log call through the same JSON-capable
+/// encoder as request logging. Access lines and --log-format/--log-level work either
+/// way; omitting this line just leaves std.log output in Zig's default format, mixed
+/// with JSON access lines under --log-format=json. `std_options` is resolved from the
+/// root source file, so every consumer binary declares this itself.
+pub const std_options = zigbase.std_options;
+
 pub fn main(init: std.process.Init) !void {
     return zigbase.App(.{}).runCli(init); // no extensions = the stock server
 }
 ```
+
+`std_options` is a Zig language feature resolved from your program's **root**
+source file — it cannot be inherited from the `zigbase` module, so every consumer
+binary (including all three `examples/*`) declares that one line itself. Omitting it
+does *not* disable `--log-format`/`--log-level` or request logging — those are applied
+directly by the server regardless. It means any `std.log` call (from your own code or
+ZigBase internals) keeps rendering in Zig's default ANSI, timestamp-free format, so
+under `--log-format=json` you get a mixed stream: JSON access lines interleaved with
+un-encoded std.log lines.
 
 ## 3. The `App(.{...})` config keys
 

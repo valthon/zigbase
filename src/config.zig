@@ -2,6 +2,7 @@ const std = @import("std");
 const clock = @import("clock.zig");
 const entropy = @import("entropy.zig");
 const field_policy = @import("field_policy.zig");
+const logging = @import("logging.zig");
 
 /// SMTP transport security mode (config-driven).
 ///   none     — plaintext SMTP (MailHog / local relays; current behavior).
@@ -200,6 +201,17 @@ pub const Config = struct {
     // `dev_mode` is false, so a prod binary ignores the env var entirely. `.real` = AES-GCM.
     field_crypto: field_policy.Mode = .real,
 
+    // Log line encoding. `text` (default) is human-first; `json` emits one JSON
+    // object per line on stderr — the machine-readable stream agents consume.
+    // Env: ZIGBASE_LOG_FORMAT. Flag (serve only): --log-format.
+    log_format: logging.Format = .text,
+    // Minimum severity that is emitted. Env: ZIGBASE_LOG_LEVEL; flag --log-level.
+    log_level: std.log.Level = .info,
+    // Per-request access lines (method, path, status, duration). On by default;
+    // turn off on a high-traffic deployment that ships access logs from its proxy.
+    // Env: ZIGBASE_LOG_REQUESTS; flag --no-request-log.
+    log_requests: bool = true,
+
     /// Resolve `auto` to a concrete TLS mode from the port:
     ///   465 → implicit (SMTPS), 587 → starttls, anything else → none.
     /// `none`/`starttls`/`implicit` are returned unchanged.
@@ -266,6 +278,12 @@ pub const Config = struct {
         if (getter.get("ZIGBASE_TWILIO_ACCOUNT_SID")) |v| cfg.twilio_account_sid = v;
         if (getter.get("ZIGBASE_TWILIO_AUTH_TOKEN")) |v| cfg.twilio_auth_token = v;
         if (getter.get("ZIGBASE_TWILIO_FROM")) |v| cfg.twilio_from = v;
+        if (getter.get("ZIGBASE_LOG_FORMAT")) |v| cfg.log_format = try envEnum(logging.Format, "ZIGBASE_LOG_FORMAT", v, "text|json", diag);
+        if (getter.get("ZIGBASE_LOG_LEVEL")) |v| cfg.log_level = logging.parseLevel(v) orelse {
+            diag.* = .{ .var_name = "ZIGBASE_LOG_LEVEL", .value = v, .expected = "debug|info|warn|error" };
+            return error.InvalidEnvValue;
+        };
+        if (getter.get("ZIGBASE_LOG_REQUESTS")) |v| cfg.log_requests = try envBool("ZIGBASE_LOG_REQUESTS", v, diag);
         // Dev-only frozen clock. resolveFromEnv is comptime-gated off on a prod build, so this
         // is always null there regardless of the env var.
         cfg.fake_now_unix = clock.resolveFromEnv(getter.get(clock.env_var));
@@ -311,6 +329,9 @@ pub const known_vars = [_][]const u8{
     "ZIGBASE_HTTP_HOST",
     "ZIGBASE_HTTP_PORT",
     "ZIGBASE_JWT_SECRET",
+    "ZIGBASE_LOG_FORMAT",
+    "ZIGBASE_LOG_LEVEL",
+    "ZIGBASE_LOG_REQUESTS",
     "ZIGBASE_MAX_UPLOAD_SIZE",
     "ZIGBASE_OAUTH_STATE_SERVER",
     "ZIGBASE_OAUTH_STATE_TTL",
@@ -732,6 +753,55 @@ test "known_vars is sorted, deduplicated, and covers every consumer knob" {
     try std.testing.expect(isKnown("ZIGBASE_HTTP_PORT"));
     try std.testing.expect(isKnown("ZIGBASE_SMTP_TLS"));
     try std.testing.expect(isKnown("ZIGBASE_VAPID_PRIVATE_KEY"));
+}
+
+test "log knobs default to text/info/on and parse from env" {
+    const G0 = struct {
+        fn get(_: @This(), _: []const u8) ?[]const u8 {
+            return null;
+        }
+    };
+    const d = try Config.load(G0{});
+    try std.testing.expectEqual(logging.Format.text, d.log_format);
+    try std.testing.expectEqual(std.log.Level.info, d.log_level);
+    try std.testing.expectEqual(true, d.log_requests);
+
+    const G1 = struct {
+        fn get(_: @This(), key: []const u8) ?[]const u8 {
+            if (std.mem.eql(u8, key, "ZIGBASE_LOG_FORMAT")) return "json";
+            if (std.mem.eql(u8, key, "ZIGBASE_LOG_LEVEL")) return "warn";
+            if (std.mem.eql(u8, key, "ZIGBASE_LOG_REQUESTS")) return "false";
+            return null;
+        }
+    };
+    const c = try Config.load(G1{});
+    try std.testing.expectEqual(logging.Format.json, c.log_format);
+    try std.testing.expectEqual(std.log.Level.warn, c.log_level);
+    try std.testing.expectEqual(false, c.log_requests);
+}
+
+test "a bad log format or level fails fast with the accepted choices" {
+    const GF = struct {
+        fn get(_: @This(), key: []const u8) ?[]const u8 {
+            if (std.mem.eql(u8, key, "ZIGBASE_LOG_FORMAT")) return "ndjson";
+            return null;
+        }
+    };
+    var diag: LoadDiag = .{};
+    try std.testing.expectError(LoadError.InvalidEnvValue, Config.loadDiag(GF{}, &diag));
+    try std.testing.expectEqualStrings("ZIGBASE_LOG_FORMAT", diag.var_name);
+    try std.testing.expectEqualStrings("text|json", diag.expected);
+
+    const GL = struct {
+        fn get(_: @This(), key: []const u8) ?[]const u8 {
+            if (std.mem.eql(u8, key, "ZIGBASE_LOG_LEVEL")) return "trace";
+            return null;
+        }
+    };
+    diag = .{};
+    try std.testing.expectError(LoadError.InvalidEnvValue, Config.loadDiag(GL{}, &diag));
+    try std.testing.expectEqualStrings("ZIGBASE_LOG_LEVEL", diag.var_name);
+    try std.testing.expectEqualStrings("debug|info|warn|error", diag.expected);
 }
 
 test "isKnown accepts the templated families and rejects a typo" {
