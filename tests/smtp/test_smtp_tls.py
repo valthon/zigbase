@@ -25,6 +25,7 @@ import ssl
 import subprocess
 import tempfile
 import time
+import urllib.error
 import urllib.request
 
 import pytest
@@ -38,12 +39,28 @@ SUPERUSER_EMAIL = "admin@smtp-test.local"
 SUPERUSER_PASSWORD = "adminpassword"
 
 
-def _free_port():
-    s = socket.socket()
-    s.bind(("127.0.0.1", 0))
-    p = s.getsockname()[1]
-    s.close()
-    return p
+def _free_ports(n):
+    """Reserve `n` DISTINCT loopback ports.
+
+    Every socket is held open until all `n` ports have been chosen, then they are
+    closed together. Choosing them one at a time — bind(0), read the number, close,
+    repeat — hands the port straight back to the ephemeral pool, so two back-to-back
+    calls can legitimately return the SAME number. When that happened here, the SMTP
+    server and the HTTP server were pointed at one port: aiosmtpd bound it, zigbase's
+    bind failed, and the test's POST reached the SMTP listener, surfacing three steps
+    later as `BadStatusLine: 220 ... Python SMTP`. Holding the sockets removes the
+    duplicate outright rather than making it rarer.
+    """
+    socks = []
+    try:
+        for _ in range(n):
+            s = socket.socket()
+            s.bind(("127.0.0.1", 0))
+            socks.append(s)
+        return [s.getsockname()[1] for s in socks]
+    finally:
+        for s in socks:
+            s.close()
 
 
 @pytest.fixture(scope="session")
@@ -109,6 +126,7 @@ def _start_smtp_server(handler, port, cert, key):
 
 
 def _wait_port(port, timeout=20):
+    """Wait until something accepts TCP on `port` (used for the SMTP listener)."""
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
@@ -119,10 +137,31 @@ def _wait_port(port, timeout=20):
     return False
 
 
+def _wait_http(port, timeout=20):
+    """Wait until `port` answers HTTP — not merely accepts a TCP connection.
+
+    A bare connect is satisfied by ANY listener, so when the HTTP and SMTP roles
+    collided on one port this guard passed while zigbase had in fact failed to bind,
+    and the real problem only surfaced later as an unexplained `BadStatusLine`.
+    Requiring an HTTP status line makes the guard fail at the point of failure.
+    An HTTP error response still proves an HTTP server is listening.
+    """
+    deadline = time.time() + timeout
+    url = f"http://127.0.0.1:{port}/api/health"
+    while time.time() < deadline:
+        try:
+            with urllib.request.urlopen(url, timeout=0.5):
+                return True
+        except urllib.error.HTTPError:
+            return True
+        except Exception:
+            time.sleep(0.1)
+    return False
+
+
 def test_smtp_starttls_delivery(binary):
     handler = CaptureHandler()
-    smtp_port = _free_port()
-    http_port = _free_port()
+    smtp_port, http_port = _free_ports(2)
     data = tempfile.mkdtemp(prefix="zb_smtp_")
     certdir = tempfile.mkdtemp(prefix="zb_smtp_cert_")
     controller = None
@@ -167,7 +206,7 @@ def test_smtp_starttls_delivery(binary):
             "ZIGBASE_RATE_LIMIT_MAX": "1000",
         }
         proc = subprocess.Popen([binary, "serve"], env=env)
-        assert _wait_port(http_port), "zigbase serve did not come up"
+        assert _wait_http(http_port), "zigbase serve did not answer HTTP"
 
         # 3) Trigger a real send: request a password reset for the superuser's
         #    email. The email EXISTS, so the handler reaches deliverToken ->
