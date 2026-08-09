@@ -127,6 +127,60 @@ A green `zig build test` says nothing about:
 Cover those with a spawned server. `examples/blog` does both and its README
 says which is which.
 
+## Traps: a spawned-server suite tests whatever is on disk
+
+A spawned-server suite (Python, or your own language — see below) shells out
+to a binary that has to already exist. Neither the harness nor the failure
+message tells you when that binary is **missing** or was built from a
+**different version of your tree** than the one you're testing — both surface
+as confusing failures that look like product defects.
+
+**Stale artifact — the binary predates your tree.** The binary your suite
+drives isn't kept in sync with your source automatically. Any workflow that
+changes the tree between builds — a rebase, a stash, a branch switch, an
+interactive-rebase stop, a history cleanup pass — can leave a binary missing
+code the tests now expect. The tell is the *shape* of the failure: a coherent
+subset fails — typically every test tied to one feature — while everything
+else passes cleanly. A real product defect rarely takes out exactly one
+feature's whole test file and leaves every neighbor green. ZigBase's own CLI
+suite has hit this concretely: a run where `test_doctor.py`'s 7 tests failed
+and the other 16 CLI tests (`test_serve_lifecycle.py` +
+`test_serve_ephemeral.py`) all passed looked alarming, but it meant the binary
+predated `doctor` landing in the tree, not that `doctor` was broken. The
+danger isn't carelessness — a coherent-sounding cause ("release builds must
+break the CLI") arrives early and stops the search, and it explains the
+symptom well enough that it never feels like a guess. Reading the actual list
+of failing tests, not just a `tail -1` summary line, is what makes the
+one-file shape hard to miss. When you see it, ask the binary before you
+suspect the code: `zigbase help` (or your app's equivalent) shows a missing
+command instantly. Fix: rebuild before you test, every time you've touched
+the tree since the last build:
+
+```sh
+zig build
+```
+
+Positive result worth knowing on its own: a properly built
+`zig build -Ddev-mode=false` binary passes ZigBase's own `tests/cli` 23/23 —
+a prod-mode build does not break the CLI, not even `--ephemeral`, whose
+random-suffix generator is the one CLI feature wired to the dev-mode-gated
+fake-entropy seam
+([framework.md §14](framework.md#14-test--dev-mode-determinism-seams)). If
+you're staring at CLI failures after a flag-varied build, that's not it —
+look for staleness instead.
+
+If you're working on ZigBase itself rather than an app built on it, there is
+a second, related instance: some of the repo's own browser-suite fixtures are
+separate `zig build <name>` steps that a plain `zig build` never produces,
+so a fresh checkout's local run reports a batch of setup errors that CI
+doesn't. See [CONTRIBUTING.md](../CONTRIBUTING.md) for the exact build steps
+that suite needs.
+
+Both instances are the same class: **a spawned-server suite tests whatever
+artifacts already exist on disk, and nothing tells you when one is missing or
+no longer matches your source.** Before believing such a failure is a product
+defect, check which artifacts are on disk and how and when they were built.
+
 ## Testing without Zig
 
 If ZigBase is a backend-in-a-box for you — no `build.zig` anywhere — the test
