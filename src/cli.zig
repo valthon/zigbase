@@ -129,6 +129,9 @@ pub const ImportArgs = struct {
     progress: usize = 0,
     /// Emit the summary as one JSON object on stdout.
     json: bool = false,
+    /// Multi-collection manifest path. Mutually exclusive with --collection/--upsert-key
+    /// and the positional file, which it supplies instead.
+    manifest: ?[]const u8 = null,
 };
 
 /// `explain-code [CODE] [--json]`: print the long form for one frozen error code,
@@ -400,12 +403,20 @@ pub fn parse(args: []const []const u8, popts: ParseOpts) ParseError!Command {
                 ia.progress = std.fmt.parseInt(usize, args[i], 10) catch return ParseError.BadValue;
             } else if (std.mem.eql(u8, a, "--json")) {
                 ia.json = true;
+            } else if (std.mem.eql(u8, a, "--manifest")) {
+                i += 1;
+                if (i >= args.len) return ParseError.MissingValue;
+                ia.manifest = args[i];
             } else if (std.mem.eql(u8, a, "-") or !std.mem.startsWith(u8, a, "-")) {
                 // Positional NDJSON file path (`-` = stdin). Only one is allowed.
                 if (ia.file != null) return ParseError.BadValue;
                 ia.file = a;
             } else return ParseError.UnknownFlag;
         }
+        // --manifest supplies the collection, the upsert key and the file; combining them
+        // would leave two sources of truth for the same thing.
+        if (ia.manifest != null and (ia.collection != null or ia.upsert_key != null or ia.file != null))
+            return ParseError.BadValue;
         return .{ .import = ia };
     }
     if (std.mem.eql(u8, args[0], "rewrap")) {
@@ -835,6 +846,15 @@ test "import parses the hardening flags" {
     try std.testing.expect(cmd.import.json);
     try std.testing.expectError(ParseError.MissingValue, parse(&.{ "import", "--error-log" }, .{}));
     try std.testing.expectError(ParseError.BadValue, parse(&.{ "import", "--progress", "x", "f" }, .{}));
+}
+
+test "import --manifest parses and excludes the single-collection flags" {
+    const cmd = try parse(&.{ "import", "--manifest", "m.json", "--json" }, .{});
+    try std.testing.expectEqualStrings("m.json", cmd.import.manifest.?);
+    try std.testing.expect(cmd.import.json);
+    try std.testing.expectError(ParseError.BadValue, parse(&.{ "import", "--manifest", "m.json", "--collection", "x" }, .{}));
+    try std.testing.expectError(ParseError.BadValue, parse(&.{ "import", "--manifest", "m.json", "f.ndjson" }, .{}));
+    try std.testing.expectError(ParseError.MissingValue, parse(&.{ "import", "--manifest" }, .{}));
 }
 
 test "schema dump parses --out/--json/--data-dir" {

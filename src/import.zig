@@ -432,7 +432,8 @@ const field_policy = @import("field_policy.zig");
 
 /// Build a minimal App wrapping a pool-less writer for tests (mirrors data.zig's test setup:
 /// only `.allocator` is read by import.run). The connection is passed separately to run().
-fn testApp(alloc: std.mem.Allocator, io: std.Io) App {
+/// Public: the manifest runner's own tests (`src/import_manifest.zig`) need the same fixture.
+pub fn testApp(alloc: std.mem.Allocator, io: std.Io) App {
     return App{ .allocator = alloc, .io = io, .pool = undefined };
 }
 

@@ -45,6 +45,7 @@ const registry = @import("auth/registry.zig");
 const field_policy = @import("field_policy.zig");
 const rewrap = @import("rewrap.zig");
 const import_mod = @import("import.zig");
+const import_manifest = @import("import_manifest.zig");
 const features = @import("features.zig");
 const doctor = @import("doctor.zig");
 const doctor_run = @import("doctor_run.zig");
@@ -2641,6 +2642,14 @@ fn printImportUsage(io: std.Io, file: std.Io.File) void {
         \\  --error-log FILE   NDJSON sink for per-row failures: {{"line":N,"code":…,"detail":…}}.
         \\  --progress N       Print a progress line to stderr every N rows (0 = off).
         \\  --json             Print the summary as one JSON object on stdout.
+        \\  --manifest FILE    Load several collections in relation order from a manifest:
+        \\                     {{"zigbaseImportManifest":1,"collections":[
+        \\                       {{"collection":"authors","file":"authors.ndjson"}},
+        \\                       {{"collection":"posts","file":"posts.ndjson","upsertKey":"slug"}}]}}
+        \\                     File paths resolve against the MANIFEST's directory. Relation cycles
+        \\                     and self-relations are loaded with the offending values stripped and
+        \\                     patched afterwards by record id (those rows must carry their own id).
+        \\                     Excludes --collection/--upsert-key and the positional file.
         \\
         \\WHAT IT DOES:
         \\  Streams an NDJSON file (one JSON object per line) into the collection THROUGH THE
@@ -3537,6 +3546,7 @@ fn importImpl(
     schema_migrations: []const provision.Migration,
     comptime opts: ServeOpts,
 ) !void {
+    if (ia.manifest) |mpath| return importManifestImpl(allocator, io, environ, ia, mpath, dispatch, jobs, pool_size, schema_collections, schema_migrations, opts);
     const collection = ia.collection orelse {
         std.log.err("import: --collection <name> is required", .{});
         return error.MissingCollection;
@@ -3640,6 +3650,115 @@ fn importImpl(
     // findings sink explicitly first: `std.process.exit` does not run deferred cleanup (unlike
     // a normal `return`, which is why the fatal-error path above stays correct via the defer
     // above), so without this the NDJSON findings would sit in the buffer and vanish.
+    if (report.failed > 0) {
+        if (err_writer) |*ew| ew.interface.flush() catch {};
+        std.process.exit(3);
+    }
+}
+
+/// `zigbase import --manifest <m.json>`: load several collections in relation order,
+/// deferring the values that cannot be ordered (cycles, self-relations). Relative `file`
+/// paths in the manifest resolve against the MANIFEST's directory, not the cwd, so a
+/// migration bundle is relocatable. Repeats `importImpl`'s boot + writer-acquire + sink
+/// setup, then delegates to `import_manifest.run`, which drives `import.run` per collection —
+/// there is no forked import logic.
+fn importManifestImpl(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    environ: *const std.process.Environ.Map,
+    ia: cli.ImportArgs,
+    mpath: []const u8,
+    dispatch: *const events.Dispatch,
+    jobs: []const scheduler.RuntimeJob,
+    pool_size: usize,
+    schema_collections: []const schema.Collection,
+    schema_migrations: []const provision.Migration,
+    comptime opts: ServeOpts,
+) !void {
+    const cfg = try loadCfg(environ, .{ .data_dir = ia.data_dir });
+    const holder = try bootApp(allocator, io, cfg, dispatch, jobs, pool_size, schema_collections, schema_migrations, opts, environ);
+    defer holder.deinit();
+
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, mpath, a, .limited(8 << 20)) catch |e| {
+        std.log.err("import: cannot read manifest '{s}': {s}", .{ mpath, @errorName(e) });
+        return e;
+    };
+    var manifest = import_manifest.parseManifest(a, bytes) catch |e| {
+        std.log.err("import: '{s}' is not a valid import manifest: {s}", .{ mpath, @errorName(e) });
+        return e;
+    };
+    defer manifest.deinit();
+
+    const base_dir = std.fs.path.dirname(mpath) orelse ".";
+
+    // Same sinks as the single-collection path (Task 6).
+    var err_file: ?std.Io.File = null;
+    defer if (err_file) |f| f.close(io);
+    var err_buf: [8192]u8 = undefined;
+    var err_writer: ?std.Io.File.Writer = null;
+    if (ia.error_log) |path| {
+        if (std.fs.path.dirname(path)) |dir| std.Io.Dir.cwd().createDirPath(io, dir) catch {};
+        const f = try std.Io.Dir.cwd().createFile(io, path, .{});
+        err_file = f;
+        err_writer = f.writer(io, &err_buf);
+    }
+    // Flush on every exit path, including a fail-fast `run()` error below (mirrors
+    // `importImpl`'s own findings-sink discipline).
+    defer if (err_writer) |*ew| ew.interface.flush() catch {};
+    var prog_buf: [256]u8 = undefined;
+    var prog_writer = std.Io.File.stderr().writer(io, &prog_buf);
+
+    const w = holder.pool.acquireWriter();
+    defer holder.pool.releaseWriter();
+
+    const report = import_manifest.run(&holder.app, w, io, allocator, manifest, .{
+        .base_dir = base_dir,
+        .import = .{
+            .collection = "", // supplied per entry
+            .batch_size = ia.batch_size,
+            .dry_run = ia.dry_run,
+            .continue_on_error = ia.continue_on_error,
+            .error_log = if (err_writer) |*ew| &ew.interface else null,
+            .progress_every = ia.progress,
+            .progress = if (ia.progress > 0) &prog_writer.interface else null,
+        },
+    }) catch |e| {
+        std.log.err("import manifest '{s}' failed: {s}", .{ mpath, @errorName(e) });
+        return e;
+    };
+    defer allocator.free(report.entries);
+
+    if (ia.json) {
+        var cols: std.json.Array = .init(a);
+        for (report.entries) |er| {
+            var o: std.json.ObjectMap = .empty;
+            try o.put(a, "collection", .{ .string = er.collection });
+            try o.put(a, "created", .{ .integer = @intCast(er.created) });
+            try o.put(a, "updated", .{ .integer = @intCast(er.updated) });
+            try o.put(a, "failed", .{ .integer = @intCast(er.failed) });
+            try cols.append(.{ .object = o });
+        }
+        var root: std.json.ObjectMap = .empty;
+        try root.put(a, "zigbase_import_manifest", .{ .integer = 1 });
+        try root.put(a, "manifest", .{ .string = mpath });
+        try root.put(a, "dry_run", .{ .bool = ia.dry_run });
+        try root.put(a, "patched", .{ .integer = @intCast(report.patched) });
+        try root.put(a, "failed", .{ .integer = @intCast(report.failed) });
+        try root.put(a, "collections", .{ .array = cols });
+        const body = try std.json.Stringify.valueAlloc(a, std.json.Value{ .object = root }, .{});
+        var out_buf: [4096]u8 = undefined;
+        var out = std.Io.File.stdout().writer(io, &out_buf);
+        try out.interface.writeAll(body);
+        try out.interface.writeAll("\n");
+        try out.interface.flush();
+    }
+    std.log.info("import manifest complete: {d} collection(s), {d} deferred relation(s) patched, {d} failed", .{
+        report.entries.len, report.patched, report.failed,
+    });
     if (report.failed > 0) {
         if (err_writer) |*ew| ew.interface.flush() catch {};
         std.process.exit(3);

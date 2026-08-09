@@ -385,6 +385,7 @@ test {
     _ = @import("field_policy.zig");
     _ = @import("rewrap.zig");
     _ = @import("import.zig");
+    _ = @import("import_manifest.zig");
     _ = @import("jwt.zig");
     _ = @import("push/encrypt.zig");
     _ = @import("push/vapid.zig");
