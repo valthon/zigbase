@@ -2336,7 +2336,23 @@ fn printVapidKeygenUsage(io: std.Io, file: std.Io.File) void {
 }
 
 fn loadCfg(environ: *const std.process.Environ.Map, sa: cli.ServeArgs) !config.Config {
-    var cfg = try config.Config.load(config.EnvGetter{ .environ = environ });
+    var diag: config.LoadDiag = .{};
+    var cfg = config.Config.loadDiag(config.EnvGetter{ .environ = environ }, &diag) catch |e| switch (e) {
+        error.InvalidEnvValue => {
+            std.log.err(
+                "invalid value for {s}: '{s}' — expected {s}. Fix the variable (or unset it to use the default) and start again.",
+                .{ diag.var_name, diag.value, diag.expected },
+            );
+            // EXIT rather than return the error. Propagating it to `main` makes Zig
+            // print its own `error: InvalidEnvValue` line plus a source-annotated
+            // stack trace through std.fmt's parseInt internals — thirty lines of
+            // noise on top of the one actionable sentence above, which is the whole
+            // point of this diagnostic. There is nothing for a caller to recover
+            // from: a malformed knob is fatal by design (fail fast at boot).
+            // Exit 1 = "bad input", per the CLI exit-code scheme.
+            std.process.exit(1);
+        },
+    };
     if (sa.http_host) |v| cfg.http_host = v;
     if (sa.http_port) |v| cfg.http_port = v;
     if (sa.data_dir) |v| cfg.data_dir = v;
@@ -2348,6 +2364,7 @@ fn loadCfg(environ: *const std.process.Environ.Map, sa: cli.ServeArgs) !config.C
     if (sa.realtime_origins) |v| cfg.realtime_allowed_origins = v;
     if (sa.sse_heartbeat_seconds) |v| cfg.sse_heartbeat_seconds = v;
     if (sa.realtime_outbound_hwm) |v| cfg.realtime_outbound_hwm = v;
+    config.warnUnknownVars(environ);
     return cfg;
 }
 

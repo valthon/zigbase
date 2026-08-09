@@ -30,6 +30,25 @@ ENV_ALLOWLIST = {
     # templated ZIGBASE_FIELD_KEY_V<n> pattern (built via std.fmt at runtime, not
     # a string literal); the <n> spelling is documented in README/help below.
     "ZIGBASE_FIELD_KEY_V1", "ZIGBASE_FIELD_KEY_V2",
+    # config.isKnown() matches two templated families by shape (std.mem.startsWith),
+    # not by literal name, so it holds their bare PREFIX as a string constant — that
+    # prefix incidentally matches this file's ZIGBASE_[A-Z0-9_]+ regex even though it
+    # is not itself an env var. The real, user-facing spellings (ZIGBASE_FIELD_KEY_V<n>,
+    # ZIGBASE_OAUTH_<PROVIDER>_CLIENT_ID/_CLIENT_SECRET) are documented in README/help.
+    "ZIGBASE_FIELD_KEY_V", "ZIGBASE_OAUTH_",
+    # config.zig's own "isKnown accepts the templated families and rejects a typo" unit
+    # test: ZIGBASE_OAUTH_GITHUB_CLIENT_SECRET exercises the shape match (same reasoning
+    # as the GOOGLE pair above); ZIGBASE_HTTP_PORTS / ZIGBASE_TRUST_PROXIES /
+    # ZIGBASE_OAUTH_GOOGLE_SECRET are deliberate near-miss typos the test asserts are
+    # correctly REJECTED by isKnown — none of the three is a real knob.
+    "ZIGBASE_OAUTH_GITHUB_CLIENT_SECRET",
+    "ZIGBASE_HTTP_PORTS", "ZIGBASE_TRUST_PROXIES", "ZIGBASE_OAUTH_GOOGLE_SECRET",
+    # Pre-registered in config.known_external_vars ahead of SP-3, which introduces the
+    # `zigbase serve --background` feature these two names actually control (see the
+    # CROSS-PROJECT comment on known_external_vars in src/config.zig). Until SP-3 lands
+    # the real behavior and its own README/help docs, documenting them here would be
+    # premature. Remove this allowlist entry and add real docs when SP-3 merges.
+    "ZIGBASE_SERVE_BACKGROUND", "ZIGBASE_SERVE_BACKGROUND_CHILD",
 }
 
 def _code_env_vars():
@@ -43,6 +62,21 @@ def test_env_vars_documented_in_readme():
     readme = (REPO / "README.md").read_text()
     missing = sorted(n for n in _code_env_vars() if n not in readme)
     assert not missing, f"env vars referenced in src/ but missing from the README env table: {missing}"
+
+def test_env_vars_are_registered_in_config_known_vars():
+    """Every ZIGBASE_* knob in the code must be registered as known — either read
+    directly by Config.loadDiag (config.known_vars) or consumed outside Config, e.g.
+    ZIGBASE_DB_URL read by framework.openPoolSelect (config.known_external_vars) — or
+    the unknown-variable warning fires on a legitimate setting."""
+    src = (REPO / "src" / "config.zig").read_text()
+    m = re.search(r"pub const known_vars = \[_\]\[\]const u8\{(.*?)\n\};", src, re.S)
+    assert m, "known_vars not found in src/config.zig — did it move or get renamed?"
+    known = set(re.findall(r'"(ZIGBASE_[A-Z0-9_]+)"', m.group(1)))
+    m2 = re.search(r"pub const known_external_vars = \[_\]\[\]const u8\{(.*?)\n\};", src, re.S)
+    assert m2, "known_external_vars not found in src/config.zig — did it move or get renamed?"
+    known |= set(re.findall(r'"(ZIGBASE_[A-Z0-9_]+)"', m2.group(1)))
+    missing = sorted(n for n in _code_env_vars() if n not in known)
+    assert not missing, f"env vars missing from config.known_vars/known_external_vars: {missing}"
 
 def test_env_vars_listed_in_top_level_help():
     fw = (REPO / "src" / "framework.zig").read_text()

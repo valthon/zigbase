@@ -12,6 +12,44 @@ const field_policy = @import("field_policy.zig");
 ///   auto     — infer from port: 465 → implicit, 587 → starttls, else → none.
 pub const SmtpTls = enum { none, starttls, implicit, auto };
 
+/// Detail about the single env var that failed to parse. Filled by `loadDiag` on
+/// `error.InvalidEnvValue`. It rides an out-param rather than a log call because
+/// `Config.load` is a pure loader driven by a stub getter in tests — this keeps the
+/// exact operator-facing wording unit-testable.
+pub const LoadDiag = struct {
+    var_name: []const u8 = "",
+    value: []const u8 = "",
+    /// Human description of the accepted values, e.g. "u16 (decimal integer)" or
+    /// "true|false|1|0". Rendered verbatim into the startup error.
+    expected: []const u8 = "",
+};
+
+pub const LoadError = error{InvalidEnvValue};
+
+fn envInt(comptime T: type, name: []const u8, v: []const u8, diag: *LoadDiag) LoadError!T {
+    return std.fmt.parseInt(T, v, 10) catch {
+        diag.* = .{ .var_name = name, .value = v, .expected = @typeName(T) ++ " (decimal integer)" };
+        return error.InvalidEnvValue;
+    };
+}
+
+/// Booleans accept exactly `true`, `false`, `1`, `0`. Anything else is a startup
+/// error — the old "not exactly 'true' or '1' means false" rule silently discarded
+/// `yes`, `TRUE`, and typos, which on a knob like ZIGBASE_TRUST_PROXY is a security bug.
+fn envBool(name: []const u8, v: []const u8, diag: *LoadDiag) LoadError!bool {
+    if (std.mem.eql(u8, v, "true") or std.mem.eql(u8, v, "1")) return true;
+    if (std.mem.eql(u8, v, "false") or std.mem.eql(u8, v, "0")) return false;
+    diag.* = .{ .var_name = name, .value = v, .expected = "true|false|1|0" };
+    return error.InvalidEnvValue;
+}
+
+fn envEnum(comptime T: type, name: []const u8, v: []const u8, comptime choices: []const u8, diag: *LoadDiag) LoadError!T {
+    return std.meta.stringToEnum(T, v) orelse {
+        diag.* = .{ .var_name = name, .value = v, .expected = choices };
+        return error.InvalidEnvValue;
+    };
+}
+
 pub const Config = struct {
     // Secure-by-default bind: loopback only. The server only listens on all
     // interfaces when explicitly opted in (`--http-host 0.0.0.0` / ZIGBASE_HTTP_HOST).
@@ -176,25 +214,28 @@ pub const Config = struct {
 
     /// Pure loader: applies overrides from a getter, which is any value with a
     /// `get(key) ?[]const u8` method (env in prod via `EnvGetter`, a stub in tests).
-    pub fn load(getter: anytype) !Config {
+    /// On a bad value, returns `error.InvalidEnvValue` and fills `diag` with which
+    /// variable, what value, and what was expected — see `load` for the common case
+    /// that discards the diagnostic.
+    pub fn loadDiag(getter: anytype, diag: *LoadDiag) LoadError!Config {
         var cfg = Config{};
         if (getter.get("ZIGBASE_HTTP_HOST")) |v| cfg.http_host = v;
-        if (getter.get("ZIGBASE_HTTP_PORT")) |v| cfg.http_port = try std.fmt.parseInt(u16, v, 10);
+        if (getter.get("ZIGBASE_HTTP_PORT")) |v| cfg.http_port = try envInt(u16, "ZIGBASE_HTTP_PORT", v, diag);
         if (getter.get("ZIGBASE_DATA_DIR")) |v| cfg.data_dir = v;
         if (getter.get("ZIGBASE_PUBLIC_URL")) |v| cfg.public_url = v;
         if (getter.get("ZIGBASE_JWT_SECRET")) |v| cfg.jwt_secret = v;
         if (getter.get("ZIGBASE_FIELD_KEY")) |v| cfg.field_key = v;
-        if (getter.get("ZIGBASE_FIELD_KEY_GENERATION")) |v| cfg.field_key_generation = try std.fmt.parseInt(u16, v, 10);
-        if (getter.get("ZIGBASE_COOKIE_SECURE")) |v| cfg.cookie_secure = std.mem.eql(u8, v, "true") or std.mem.eql(u8, v, "1");
-        if (getter.get("ZIGBASE_AUTH_TOKEN_TTL")) |v| cfg.auth_token_ttl_s = try std.fmt.parseInt(i64, v, 10);
-        if (getter.get("ZIGBASE_VERIFICATION_TTL")) |v| cfg.verification_ttl_s = try std.fmt.parseInt(i64, v, 10);
-        if (getter.get("ZIGBASE_PASSWORD_RESET_TTL")) |v| cfg.password_reset_ttl_s = try std.fmt.parseInt(i64, v, 10);
+        if (getter.get("ZIGBASE_FIELD_KEY_GENERATION")) |v| cfg.field_key_generation = try envInt(u16, "ZIGBASE_FIELD_KEY_GENERATION", v, diag);
+        if (getter.get("ZIGBASE_COOKIE_SECURE")) |v| cfg.cookie_secure = try envBool("ZIGBASE_COOKIE_SECURE", v, diag);
+        if (getter.get("ZIGBASE_AUTH_TOKEN_TTL")) |v| cfg.auth_token_ttl_s = try envInt(i64, "ZIGBASE_AUTH_TOKEN_TTL", v, diag);
+        if (getter.get("ZIGBASE_VERIFICATION_TTL")) |v| cfg.verification_ttl_s = try envInt(i64, "ZIGBASE_VERIFICATION_TTL", v, diag);
+        if (getter.get("ZIGBASE_PASSWORD_RESET_TTL")) |v| cfg.password_reset_ttl_s = try envInt(i64, "ZIGBASE_PASSWORD_RESET_TTL", v, diag);
         if (getter.get("ZIGBASE_REALTIME_ORIGINS")) |v| cfg.realtime_allowed_origins = v;
-        if (getter.get("ZIGBASE_SSE_HEARTBEAT_SECONDS")) |v| cfg.sse_heartbeat_seconds = try std.fmt.parseInt(u16, v, 10);
-        if (getter.get("ZIGBASE_REALTIME_OUTBOUND_HWM")) |v| cfg.realtime_outbound_hwm = try std.fmt.parseInt(u32, v, 10);
-        if (getter.get("ZIGBASE_TRUST_PROXY")) |v| cfg.trust_proxy = std.mem.eql(u8, v, "true") or std.mem.eql(u8, v, "1");
-        if (getter.get("ZIGBASE_MAX_UPLOAD_SIZE")) |v| cfg.max_upload_size = try std.fmt.parseInt(u64, v, 10);
-        if (getter.get("ZIGBASE_FILE_TOKEN_TTL")) |v| cfg.file_token_ttl_s = try std.fmt.parseInt(i64, v, 10);
+        if (getter.get("ZIGBASE_SSE_HEARTBEAT_SECONDS")) |v| cfg.sse_heartbeat_seconds = try envInt(u16, "ZIGBASE_SSE_HEARTBEAT_SECONDS", v, diag);
+        if (getter.get("ZIGBASE_REALTIME_OUTBOUND_HWM")) |v| cfg.realtime_outbound_hwm = try envInt(u32, "ZIGBASE_REALTIME_OUTBOUND_HWM", v, diag);
+        if (getter.get("ZIGBASE_TRUST_PROXY")) |v| cfg.trust_proxy = try envBool("ZIGBASE_TRUST_PROXY", v, diag);
+        if (getter.get("ZIGBASE_MAX_UPLOAD_SIZE")) |v| cfg.max_upload_size = try envInt(u64, "ZIGBASE_MAX_UPLOAD_SIZE", v, diag);
+        if (getter.get("ZIGBASE_FILE_TOKEN_TTL")) |v| cfg.file_token_ttl_s = try envInt(i64, "ZIGBASE_FILE_TOKEN_TTL", v, diag);
         if (getter.get("ZIGBASE_SENTRY_DSN")) |v| cfg.sentry_dsn = v;
         if (getter.get("ZIGBASE_STATIC_CACHE_CONTROL")) |v| cfg.static_cache_control = v;
         if (getter.get("ZIGBASE_S3_BUCKET")) |v| cfg.s3_bucket = v;
@@ -202,25 +243,23 @@ pub const Config = struct {
         if (getter.get("ZIGBASE_S3_ENDPOINT")) |v| cfg.s3_endpoint = v;
         if (getter.get("ZIGBASE_S3_ACCESS_KEY_ID")) |v| cfg.s3_access_key_id = v;
         if (getter.get("ZIGBASE_S3_SECRET_ACCESS_KEY")) |v| cfg.s3_secret_access_key = v;
-        if (getter.get("ZIGBASE_S3_FORCE_PATH_STYLE")) |v| cfg.s3_force_path_style = std.mem.eql(u8, v, "true") or std.mem.eql(u8, v, "1");
+        if (getter.get("ZIGBASE_S3_FORCE_PATH_STYLE")) |v| cfg.s3_force_path_style = try envBool("ZIGBASE_S3_FORCE_PATH_STYLE", v, diag);
         if (getter.get("ZIGBASE_S3_KEY_PREFIX")) |v| cfg.s3_key_prefix = v;
         if (getter.get("ZIGBASE_S3_CACHE_DIR")) |v| cfg.s3_cache_dir = v;
-        if (getter.get("ZIGBASE_S3_CACHE_MAX_BYTES")) |v| cfg.s3_cache_max_bytes = try std.fmt.parseInt(u64, v, 10);
+        if (getter.get("ZIGBASE_S3_CACHE_MAX_BYTES")) |v| cfg.s3_cache_max_bytes = try envInt(u64, "ZIGBASE_S3_CACHE_MAX_BYTES", v, diag);
         if (getter.get("ZIGBASE_UNSUBSCRIBE_BASE_URL")) |v| cfg.unsubscribe_base_url = v;
-        if (getter.get("ZIGBASE_RATE_LIMIT_MAX")) |v| cfg.rate_limit_max = try std.fmt.parseInt(u32, v, 10);
-        if (getter.get("ZIGBASE_RATE_LIMIT_WINDOW")) |v| cfg.rate_limit_window_s = try std.fmt.parseInt(i64, v, 10);
-        if (getter.get("ZIGBASE_OAUTH_STATE_SERVER")) |v| cfg.oauth_state_server = std.mem.eql(u8, v, "true") or std.mem.eql(u8, v, "1");
-        if (getter.get("ZIGBASE_OAUTH_STATE_TTL")) |v| cfg.oauth_state_ttl_s = try std.fmt.parseInt(i64, v, 10);
+        if (getter.get("ZIGBASE_RATE_LIMIT_MAX")) |v| cfg.rate_limit_max = try envInt(u32, "ZIGBASE_RATE_LIMIT_MAX", v, diag);
+        if (getter.get("ZIGBASE_RATE_LIMIT_WINDOW")) |v| cfg.rate_limit_window_s = try envInt(i64, "ZIGBASE_RATE_LIMIT_WINDOW", v, diag);
+        if (getter.get("ZIGBASE_OAUTH_STATE_SERVER")) |v| cfg.oauth_state_server = try envBool("ZIGBASE_OAUTH_STATE_SERVER", v, diag);
+        if (getter.get("ZIGBASE_OAUTH_STATE_TTL")) |v| cfg.oauth_state_ttl_s = try envInt(i64, "ZIGBASE_OAUTH_STATE_TTL", v, diag);
         if (getter.get("ZIGBASE_SMTP_HOST")) |v| cfg.smtp_host = v;
-        if (getter.get("ZIGBASE_SMTP_PORT")) |v| cfg.smtp_port = try std.fmt.parseInt(u16, v, 10);
+        if (getter.get("ZIGBASE_SMTP_PORT")) |v| cfg.smtp_port = try envInt(u16, "ZIGBASE_SMTP_PORT", v, diag);
         if (getter.get("ZIGBASE_SMTP_USERNAME")) |v| cfg.smtp_username = v;
         if (getter.get("ZIGBASE_SMTP_PASSWORD")) |v| cfg.smtp_password = v;
         if (getter.get("ZIGBASE_SMTP_FROM")) |v| cfg.smtp_from = v;
-        if (getter.get("ZIGBASE_SMTP_TLS")) |v| {
-            if (std.mem.eql(u8, v, "none")) cfg.smtp_tls = .none else if (std.mem.eql(u8, v, "starttls")) cfg.smtp_tls = .starttls else if (std.mem.eql(u8, v, "implicit")) cfg.smtp_tls = .implicit else if (std.mem.eql(u8, v, "auto")) cfg.smtp_tls = .auto else return error.InvalidSmtpTls;
-        }
+        if (getter.get("ZIGBASE_SMTP_TLS")) |v| cfg.smtp_tls = try envEnum(SmtpTls, "ZIGBASE_SMTP_TLS", v, "none|starttls|implicit|auto", diag);
         if (getter.get("ZIGBASE_SMTP_INSECURE")) |v|
-            cfg.smtp_insecure_skip_verify = std.mem.eql(u8, v, "true") or std.mem.eql(u8, v, "1");
+            cfg.smtp_insecure_skip_verify = try envBool("ZIGBASE_SMTP_INSECURE", v, diag);
         if (getter.get("ZIGBASE_SENDMAIL_COMMAND")) |v| cfg.sendmail_command = v;
         if (getter.get("ZIGBASE_VAPID_PUBLIC_KEY")) |v| cfg.vapid_public_key = v;
         if (getter.get("ZIGBASE_VAPID_PRIVATE_KEY")) |v| cfg.vapid_private_key = v;
@@ -236,6 +275,13 @@ pub const Config = struct {
         cfg.field_crypto = field_policy.resolveModeFromEnv(getter.get(field_policy.env_var));
         return cfg;
     }
+
+    /// Back-compat wrapper: same signature as before, diagnostic discarded. Boot uses
+    /// `loadDiag` so it can print which variable was wrong.
+    pub fn load(getter: anytype) !Config {
+        var diag: LoadDiag = .{};
+        return loadDiag(getter, &diag);
+    }
 };
 
 /// Production env getter: reads the process environment via Zig 0.16's pure-Zig
@@ -248,6 +294,115 @@ pub const EnvGetter = struct {
         return self.environ.get(key);
     }
 };
+
+/// Every ZIGBASE_* variable `loadDiag` reads, alphabetically. The single source of
+/// truth for "is this name a real knob"; `tests/admin/test_docs_parity.py` cross-checks
+/// it against the string literals actually present in src/, so it cannot drift.
+pub const known_vars = [_][]const u8{
+    "ZIGBASE_AUTH_TOKEN_TTL",
+    "ZIGBASE_COOKIE_SECURE",
+    "ZIGBASE_DATA_DIR",
+    "ZIGBASE_FAKE_NOW",
+    "ZIGBASE_FAKE_SEED",
+    "ZIGBASE_FIELD_CRYPTO",
+    "ZIGBASE_FIELD_KEY",
+    "ZIGBASE_FIELD_KEY_GENERATION",
+    "ZIGBASE_FILE_TOKEN_TTL",
+    "ZIGBASE_HTTP_HOST",
+    "ZIGBASE_HTTP_PORT",
+    "ZIGBASE_JWT_SECRET",
+    "ZIGBASE_MAX_UPLOAD_SIZE",
+    "ZIGBASE_OAUTH_STATE_SERVER",
+    "ZIGBASE_OAUTH_STATE_TTL",
+    "ZIGBASE_PASSWORD_RESET_TTL",
+    "ZIGBASE_PUBLIC_URL",
+    "ZIGBASE_RATE_LIMIT_MAX",
+    "ZIGBASE_RATE_LIMIT_WINDOW",
+    "ZIGBASE_REALTIME_ORIGINS",
+    "ZIGBASE_REALTIME_OUTBOUND_HWM",
+    "ZIGBASE_S3_ACCESS_KEY_ID",
+    "ZIGBASE_S3_BUCKET",
+    "ZIGBASE_S3_CACHE_DIR",
+    "ZIGBASE_S3_CACHE_MAX_BYTES",
+    "ZIGBASE_S3_ENDPOINT",
+    "ZIGBASE_S3_FORCE_PATH_STYLE",
+    "ZIGBASE_S3_KEY_PREFIX",
+    "ZIGBASE_S3_REGION",
+    "ZIGBASE_S3_SECRET_ACCESS_KEY",
+    "ZIGBASE_SENDMAIL_COMMAND",
+    "ZIGBASE_SENTRY_DSN",
+    "ZIGBASE_SMTP_FROM",
+    "ZIGBASE_SMTP_HOST",
+    "ZIGBASE_SMTP_INSECURE",
+    "ZIGBASE_SMTP_PASSWORD",
+    "ZIGBASE_SMTP_PORT",
+    "ZIGBASE_SMTP_TLS",
+    "ZIGBASE_SMTP_USERNAME",
+    "ZIGBASE_SSE_HEARTBEAT_SECONDS",
+    "ZIGBASE_STATIC_CACHE_CONTROL",
+    "ZIGBASE_TRUST_PROXY",
+    "ZIGBASE_TWILIO_ACCOUNT_SID",
+    "ZIGBASE_TWILIO_AUTH_TOKEN",
+    "ZIGBASE_TWILIO_FROM",
+    "ZIGBASE_UNSUBSCRIBE_BASE_URL",
+    "ZIGBASE_VAPID_PRIVATE_KEY",
+    "ZIGBASE_VAPID_PUBLIC_KEY",
+    "ZIGBASE_VERIFICATION_TTL",
+};
+
+/// Every ZIGBASE_* variable that is a real knob but is NOT read by `loadDiag`, because it
+/// is consumed outside `Config`. Kept separate from `known_vars` so the docs-parity test
+/// (which cross-checks `known_vars` against what `loadDiag` reads) stays exact.
+///
+/// ZIGBASE_DB_URL: read directly by `framework.openPoolSelect` (its own `EnvGetter` over
+/// the same `environ`), not through `Config.load` — the postgres-vs-sqlite backend choice
+/// happens before/around config loading (#159).
+///
+/// CROSS-PROJECT: SP-3 introduces `ZIGBASE_SERVE_BACKGROUND` (user-facing) and
+/// `ZIGBASE_SERVE_BACKGROUND_CHILD` (internal recursion guard), both read by
+/// `src/serve_control.zig`, never by `Config`. Without them here, every
+/// `zigbase serve --background` would print a spurious "unknown environment variable"
+/// warning — this warning firing on ZigBase's own variables is exactly the failure mode
+/// that trains operators to ignore it.
+pub const known_external_vars = [_][]const u8{
+    "ZIGBASE_DB_URL",
+    "ZIGBASE_SERVE_BACKGROUND",
+    "ZIGBASE_SERVE_BACKGROUND_CHILD",
+    // The repo's own test-harness variables (tests/admin, tests/postgres): never read by
+    // `Config`, but a harness-launched server must not warn on its own environment.
+    "ZIGBASE_TEST_BINARY",
+    "ZIGBASE_PG_TEST_URL",
+};
+
+/// True when `name` is a knob ZigBase understands. Two families are matched by shape
+/// rather than by literal, because their names are built with `std.fmt` at runtime and
+/// so can never be listed: the field-key generations (`ZIGBASE_FIELD_KEY_V<n>`) and the
+/// per-provider OAuth credentials (`ZIGBASE_OAUTH_<PROVIDER>_CLIENT_ID`/`_CLIENT_SECRET`).
+pub fn isKnown(name: []const u8) bool {
+    for (known_vars) |k| {
+        if (std.mem.eql(u8, name, k)) return true;
+    }
+    for (known_external_vars) |k| {
+        if (std.mem.eql(u8, name, k)) return true;
+    }
+    if (std.mem.startsWith(u8, name, "ZIGBASE_FIELD_KEY_V") and name.len > "ZIGBASE_FIELD_KEY_V".len) return true;
+    if (std.mem.startsWith(u8, name, "ZIGBASE_OAUTH_") and
+        (std.mem.endsWith(u8, name, "_CLIENT_ID") or std.mem.endsWith(u8, name, "_CLIENT_SECRET"))) return true;
+    return false;
+}
+
+/// Warn once per unrecognized `ZIGBASE_*` variable in the environment. A WARNING, not
+/// an error: the repo's own harnesses set ZIGBASE_TEST_BINARY / ZIGBASE_PG_TEST_URL, and
+/// operators legitimately keep their own ZIGBASE_-prefixed values around, so failing
+/// here would break working setups to catch a typo. The value is NEVER logged — an
+/// unknown name could well be a secret.
+pub fn warnUnknownVars(environ: *const std.process.Environ.Map) void {
+    for (environ.keys()) |name| {
+        if (!std.mem.startsWith(u8, name, "ZIGBASE_")) continue;
+        if (isKnown(name)) continue;
+        std.log.warn("unknown environment variable {s} is set and will be ignored (run `zigbase --help` for the supported list)", .{name});
+    }
+}
 
 test "defaults apply when getter returns null" {
     const G = struct {
@@ -510,4 +665,85 @@ test "sse heartbeat defaults 0 (inherit listener timeout), overridable via env" 
         }
     };
     try std.testing.expectEqual(@as(u16, 2), (try Config.load(G1{})).sse_heartbeat_seconds);
+}
+
+test "a bad integer env value names the variable, the value, and what was expected" {
+    const G = struct {
+        fn get(_: @This(), key: []const u8) ?[]const u8 {
+            if (std.mem.eql(u8, key, "ZIGBASE_HTTP_PORT")) return "eighty";
+            return null;
+        }
+    };
+    var diag: LoadDiag = .{};
+    try std.testing.expectError(LoadError.InvalidEnvValue, Config.loadDiag(G{}, &diag));
+    try std.testing.expectEqualStrings("ZIGBASE_HTTP_PORT", diag.var_name);
+    try std.testing.expectEqualStrings("eighty", diag.value);
+    try std.testing.expect(diag.expected.len > 0);
+}
+
+test "a bad boolean env value FAILS instead of silently meaning false" {
+    // Regression guard: `ZIGBASE_TRUST_PROXY=yes` used to parse as false, silently
+    // leaving a security knob unapplied. It must now abort boot.
+    const G = struct {
+        fn get(_: @This(), key: []const u8) ?[]const u8 {
+            if (std.mem.eql(u8, key, "ZIGBASE_TRUST_PROXY")) return "yes";
+            return null;
+        }
+    };
+    var diag: LoadDiag = .{};
+    try std.testing.expectError(LoadError.InvalidEnvValue, Config.loadDiag(G{}, &diag));
+    try std.testing.expectEqualStrings("ZIGBASE_TRUST_PROXY", diag.var_name);
+    try std.testing.expectEqualStrings("yes", diag.value);
+    try std.testing.expectEqualStrings("true|false|1|0", diag.expected);
+}
+
+test "the documented boolean spellings all parse" {
+    inline for (.{ .{ "true", true }, .{ "1", true }, .{ "false", false }, .{ "0", false } }) |case| {
+        const G = struct {
+            var raw: []const u8 = "";
+            fn get(_: @This(), key: []const u8) ?[]const u8 {
+                if (std.mem.eql(u8, key, "ZIGBASE_TRUST_PROXY")) return raw;
+                return null;
+            }
+        };
+        G.raw = case[0];
+        try std.testing.expectEqual(case[1], (try Config.load(G{})).trust_proxy);
+    }
+}
+
+test "a bad enum env value names the variable and lists the choices" {
+    const G = struct {
+        fn get(_: @This(), key: []const u8) ?[]const u8 {
+            if (std.mem.eql(u8, key, "ZIGBASE_SMTP_TLS")) return "ssl";
+            return null;
+        }
+    };
+    var diag: LoadDiag = .{};
+    try std.testing.expectError(LoadError.InvalidEnvValue, Config.loadDiag(G{}, &diag));
+    try std.testing.expectEqualStrings("ZIGBASE_SMTP_TLS", diag.var_name);
+    try std.testing.expectEqualStrings("none|starttls|implicit|auto", diag.expected);
+}
+
+test "known_vars is sorted, deduplicated, and covers every consumer knob" {
+    for (known_vars[1..], 1..) |name, i| {
+        try std.testing.expect(std.mem.order(u8, known_vars[i - 1], name) == .lt);
+    }
+    // Spot-check both ends and a middle entry so a truncated list fails loudly.
+    try std.testing.expect(isKnown("ZIGBASE_HTTP_PORT"));
+    try std.testing.expect(isKnown("ZIGBASE_SMTP_TLS"));
+    try std.testing.expect(isKnown("ZIGBASE_VAPID_PRIVATE_KEY"));
+}
+
+test "isKnown accepts the templated families and rejects a typo" {
+    // These names are built with std.fmt at runtime, so they can never appear in
+    // known_vars literally — they are matched by shape.
+    try std.testing.expect(isKnown("ZIGBASE_FIELD_KEY_V2"));
+    try std.testing.expect(isKnown("ZIGBASE_OAUTH_GOOGLE_CLIENT_ID"));
+    try std.testing.expect(isKnown("ZIGBASE_OAUTH_GITHUB_CLIENT_SECRET"));
+    // A near-miss must NOT be swallowed — catching this typo is the whole point.
+    try std.testing.expect(!isKnown("ZIGBASE_HTTP_PORTS"));
+    try std.testing.expect(!isKnown("ZIGBASE_TRUST_PROXIES"));
+    try std.testing.expect(!isKnown("ZIGBASE_OAUTH_GOOGLE_SECRET"));
+    // Non-ZIGBASE names are never our business.
+    try std.testing.expect(!isKnown("PATH"));
 }
