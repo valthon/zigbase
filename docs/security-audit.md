@@ -767,7 +767,23 @@ the misconfiguration is refused at the boundary with an actionable error, so the
 Regression test: "validate rejects a tenant_field that is not a valid identifier or names no
 field" covers the invalid-identifier, dangling-reference, and valid-control cases.
 
-**Residual.** `scopeApplies` still *structurally* fails open on an invalid identifier; that
-branch is now unreachable via both configuration paths. Converting it to a constant-false
-(fail-closed) predicate for parity with `abilities` is optional defense-in-depth, tracked
-separately.
+**Residual (CLOSED).** Two things were understated here. First, `scopeApplies` did not only fail
+open on a bad `tenant_field`: it gated **`col.name`** through the same charset check, and
+`schema.isValidIdentifier` requires an alphabetic first byte, so **every `_`-prefixed system
+collection** (`_superusers`, `_memberships`, `_invitations`, `_events`, …) took that fail-open
+branch too. That is a second route into the residual, reachable without any misconfiguration at
+all — it needed only a system collection to become tenant-owned. Second, "unreachable via both
+configuration paths" described the *inputs*, not the sink, so the fail-open shape itself survived
+any future change that made such a collection tenant-owned.
+
+Both are now removed rather than merely unreachable. Tenant-ownership is decided by the schema
+alone (`tenant_field != null`); `scopeApplies` no longer consults `isValidIdentifier`, so no
+identifier shape can widen scope. `scopePredicate` **escapes** the identifiers through
+`ddl.quoteIdent` instead of gating them, which is the stronger guarantee (an embedded quote is
+escaped, not rejected) and is what lets a `_`-prefixed collection be scoped correctly. A
+`tenant_field` naming no column — still rejected by `schema.validate`, so reachable only by writing
+`_collections` directly — now yields a predicate that fails at `prepare`: the request errors
+instead of quietly returning every tenant's rows. Regression tests: "scopeApplies/scopePredicate
+never fall open on a name the charset gate rejects" (which also pins that the superuser /
+cross-tenant / tenancy-disabled bypasses still suppress scoping, so the fix cannot degenerate into
+"always applies") and "scopePredicate escapes an embedded quote instead of emitting it raw".

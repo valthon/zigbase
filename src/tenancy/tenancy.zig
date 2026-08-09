@@ -18,6 +18,7 @@
 const std = @import("std");
 const RequestArena = @import("../request_arena.zig").RequestArena;
 const schema = @import("../schema.zig");
+const ddl = @import("../ddl.zig");
 const request = @import("../request.zig");
 const compiler = @import("../query/compiler.zig");
 const db = @import("../db.zig");
@@ -64,23 +65,39 @@ pub const Scoped = struct {
 /// enabled, the principal is not a superuser (superusers bypass tenancy), and the collection is
 /// tenant-owned. `policy.decide` uses this to force a per-row `check` even when the access rule
 /// alone would `allow`, so a tenant-owned collection is never served un-scoped.
+///
+/// Tenant-ownership is decided by the SCHEMA ALONE (`tenant_field != null`). It deliberately does
+/// NOT consult `schema.isValidIdentifier`: this predicate is the sink audit finding F18 called out
+/// as structurally FAIL-OPEN, because a charset-gate failure here reads as "not tenant-owned" and
+/// drops both the forced per-row check and the bound predicate — serving the collection un-scoped
+/// across every tenant. An identifier problem must never be able to widen scope, so the identifier
+/// is escaped where it is interpolated (`scopePredicate`) rather than gated here.
 pub fn scopeApplies(col: schema.Collection, rctx: *const request.RequestContext) bool {
     if (rctx.is_superuser) return false; // superuser bypass (consistent with rules.decide)
     if (rctx.cross_tenant) return false; // explicit superuser/admin tooling override
     if (!rctx.tenancy_enabled) return false;
-    const tf = col.options.tenant_field orelse return false;
-    return schema.isValidIdentifier(col.name) and schema.isValidIdentifier(tf);
+    return col.options.tenant_field != null;
 }
 
 /// Build the tenant-scope predicate for `col` under `rctx`, or null when scoping does not apply
 /// (no tenancy / superuser / not tenant-owned). The bound param is the request's active
 /// `account_id` (which is "" when no membership resolved — so a tenant-owned collection shows NO
-/// real-tenant rows, fail closed). Identifiers are gated through `schema.isValidIdentifier`; the
-/// account id is BOUND (`?`), never interpolated.
+/// real-tenant rows, fail closed). Identifiers are ESCAPED through `ddl.quoteIdent`; the account id
+/// is BOUND (`?`), never interpolated.
+///
+/// Escaping rather than charset-gating is what makes the fail-open branch unreachable BY
+/// CONSTRUCTION: there is no longer an identifier shape that silently yields "no predicate". A
+/// `tenant_field` naming no column (rejected by `schema.validate`, so only reachable by writing
+/// `_collections` directly) now produces a predicate that fails at `prepare` — the request errors
+/// instead of quietly returning every tenant's rows.
 pub fn scopePredicate(alloc: std.mem.Allocator, col: schema.Collection, rctx: *const request.RequestContext) std.mem.Allocator.Error!?Scoped {
     if (!scopeApplies(col, rctx)) return null;
     const tf = col.options.tenant_field.?;
-    const sql = try std.fmt.allocPrint(alloc, "\"{s}\".\"{s}\" = ?", .{ col.name, tf });
+    const qcol = try ddl.quoteIdent(alloc, col.name);
+    defer alloc.free(qcol);
+    const qtf = try ddl.quoteIdent(alloc, tf);
+    defer alloc.free(qtf);
+    const sql = try std.fmt.allocPrint(alloc, "{s}.{s} = ?", .{ qcol, qtf });
     return .{ .sql = sql, .param = .{ .text = rctx.account_id } };
 }
 
@@ -313,6 +330,53 @@ test "scopePredicate: null unless enabled + tenant-owned + non-superuser" {
         try std.testing.expectEqualStrings("\"posts\".\"account\" = ?", sp.sql);
         try std.testing.expectEqualStrings("acc1", sp.param.text);
     }
+}
+
+test "scopeApplies/scopePredicate never fall open on a name the charset gate rejects" {
+    // F18's documented residual. `scopeApplies` used to end in
+    // `… and isValidIdentifier(col.name) and isValidIdentifier(tf)`, so a tenant-owned collection
+    // whose name the charset gate rejects reported "tenant scoping does not apply" — dropping BOTH
+    // the forced per-row check (policy.decide) and the bound predicate, and serving the collection
+    // un-scoped across every tenant. `_`-prefixed system collections are exactly the names that
+    // gate rejects, so the residual had a second route into it beyond a bad `tenant_field`.
+    // Tenant-ownership is now decided by the schema alone; the identifier is ESCAPED, not gated.
+    const a = std.testing.allocator;
+    const fields = [_]schema.Field{.{ .id = "f1", .name = "account", .options = .{ .text = .{} } }};
+    const col = schema.Collection{
+        .id = "_tenantprobe__",
+        .name = "_tenantprobe",
+        .system = true,
+        .fields = &fields,
+        .options = .{ .tenant_field = "account" },
+    };
+    const rctx = request.RequestContext{ .tenancy_enabled = true, .account_id = "acc1" };
+
+    // The collection IS tenant-owned: scoping applies, so policy.decide still forces a per-row check.
+    try std.testing.expect(scopeApplies(col, &rctx));
+    const sp = (try scopePredicate(a, col, &rctx)).?;
+    defer a.free(sp.sql);
+    try std.testing.expectEqualStrings("\"_tenantprobe\".\"account\" = ?", sp.sql);
+    try std.testing.expectEqualStrings("acc1", sp.param.text);
+
+    // The bypasses that SHOULD suppress scoping still do — this must not become "always applies".
+    const su = request.RequestContext{ .tenancy_enabled = true, .is_superuser = true, .account_id = "acc1" };
+    try std.testing.expect(!scopeApplies(col, &su));
+    const xt = request.RequestContext{ .tenancy_enabled = true, .cross_tenant = true, .account_id = "acc1" };
+    try std.testing.expect(!scopeApplies(col, &xt));
+    const off = request.RequestContext{ .tenancy_enabled = false, .account_id = "acc1" };
+    try std.testing.expect(!scopeApplies(col, &off));
+}
+
+test "scopePredicate escapes an embedded quote instead of emitting it raw" {
+    // Escaping is what replaced the charset gate, so pin that it actually escapes: a `"` in an
+    // identifier must be doubled, never passed through to close the quoted identifier early.
+    const a = std.testing.allocator;
+    const fields = [_]schema.Field{.{ .id = "f1", .name = "ac\"ct", .options = .{ .text = .{} } }};
+    const col = schema.Collection{ .id = "c", .name = "po\"sts", .fields = &fields, .options = .{ .tenant_field = "ac\"ct" } };
+    const rctx = request.RequestContext{ .tenancy_enabled = true, .account_id = "acc1" };
+    const sp = (try scopePredicate(a, col, &rctx)).?;
+    defer a.free(sp.sql);
+    try std.testing.expectEqualStrings("\"po\"\"sts\".\"ac\"\"ct\" = ?", sp.sql);
 }
 
 test "resolve: only active memberships; requested account must be a member" {
