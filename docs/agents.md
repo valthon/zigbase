@@ -81,8 +81,8 @@ zigbase schema dump [--out FILE] [--data-dir PATH]
 zigbase schema apply FILE [--dry-run] [--allow-destructive] [--prune]
 zigbase superuser create --email … --password …
 zigbase explain-code [CODE] [--json]
-zigbase init [--box|--framework] [--dir PATH]
-zigbase agents-md [--stdout]
+zigbase init [--box|--framework] [--dir PATH] [--name NAME]
+zigbase agents-md [--box|--framework] [--dir PATH] [--stdout]
 zigbase version
 zigbase help                # and `zigbase <command> --help`
 ```
