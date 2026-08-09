@@ -23,10 +23,17 @@ data class FieldError(
  * the HTTP status; `0` is reserved as a client-side sentinel denoting a
  * protocol violation detected locally (e.g. a non-advancing realtime or
  * pagination cursor) rather than an actual server response.
+ *
+ * [code] is the envelope's frozen machine code (`not_found`, `validation_failed`,
+ * `email_not_verified`, …) — branch on it, never on [message], whose wording is
+ * explicitly not part of the API contract and may change in any release. It is
+ * empty when the server sent no code: a non-JSON body, or a response from
+ * something that isn't ZigBase (a proxy's own error page).
  */
 class ZigbaseException(
     val status: Int,
     override val message: String,
+    val code: String = "",
     val data: Map<String, FieldError> = emptyMap(),
     val url: String,
 ) : Exception(message) {
@@ -56,6 +63,7 @@ fun parseErrorResponse(
     reasonPhrase: String? = null,
 ): ZigbaseException {
     var message = if (!reasonPhrase.isNullOrBlank()) reasonPhrase else "Request failed with status $status"
+    var code = ""
     var data: Map<String, FieldError> = emptyMap()
 
     try {
@@ -64,6 +72,13 @@ fun parseErrorResponse(
         val rawMessage = root["message"]
         if (rawMessage is JsonPrimitive && rawMessage.isString) {
             message = rawMessage.content
+        }
+
+        // Only a STRING code is the machine code. Pre-unification servers put the
+        // integer HTTP status here, so a number must never surface as a code.
+        val rawCode = root["code"]
+        if (rawCode is JsonPrimitive && rawCode.isString) {
+            code = rawCode.content
         }
 
         val rawData = root["data"]
@@ -83,5 +98,5 @@ fun parseErrorResponse(
         // Non-JSON (or non-object) body; keep the fallback message.
     }
 
-    return ZigbaseException(status = status, message = message, data = data, url = url)
+    return ZigbaseException(status = status, message = message, code = code, data = data, url = url)
 }

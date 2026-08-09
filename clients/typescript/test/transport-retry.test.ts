@@ -14,7 +14,7 @@ describe("Transport retries", () => {
     let calls = 0;
     const fetchMock = vi.fn(async () => {
       calls += 1;
-      if (calls <= 2) return jsonResponse({ code: 429, message: "slow down" }, 429, { "Retry-After": "0" });
+      if (calls <= 2) return jsonResponse({ status: 429, code: "too_many_requests", message: "slow down" }, 429, { "Retry-After": "0" });
       return jsonResponse({ ok: true });
     }) as unknown as typeof fetch;
     const t = new Transport({
@@ -37,7 +37,7 @@ describe("Transport retries", () => {
       calls += 1;
       // Always 429 until the last allowed attempt, so we capture a high attempt
       // count whose uncapped delay (2**attempt * 200) would exceed the cap.
-      if (calls <= 20) return jsonResponse({ code: 429, message: "slow down" }, 429);
+      if (calls <= 20) return jsonResponse({ status: 429, code: "too_many_requests", message: "slow down" }, 429);
       return jsonResponse({ ok: true });
     }) as unknown as typeof fetch;
     const t = new Transport({
@@ -73,7 +73,7 @@ describe("Transport retries", () => {
       store.save("fresh.tok", { id: "u1" });
     });
     const fetchMock = vi.fn(async () =>
-      refreshed ? jsonResponse({ ok: true }) : jsonResponse({ code: 401, message: "expired" }, 401),
+      refreshed ? jsonResponse({ ok: true }) : jsonResponse({ status: 401, code: "unauthorized", message: "expired" }, 401),
     ) as unknown as typeof fetch;
     const t = new Transport({
       baseUrl: "http://api.test",
@@ -113,7 +113,7 @@ describe("Transport retries", () => {
       calls += 1;
       // Hold the auth-refresh response open until both waiters have joined.
       if (url.includes("auth-refresh")) await refreshGate;
-      return jsonResponse({ code: 401, message: "expired" }, 401);
+      return jsonResponse({ status: 401, code: "unauthorized", message: "expired" }, 401);
     }) as unknown as typeof fetch;
 
     let t!: Transport;
@@ -155,7 +155,7 @@ describe("Transport retries", () => {
       throw new Error("refresh broke");
     });
     const fetchMock = vi.fn(async () =>
-      jsonResponse({ code: 401, message: "expired" }, 401),
+      jsonResponse({ status: 401, code: "unauthorized", message: "expired" }, 401),
     ) as unknown as typeof fetch;
     const t = new Transport({
       baseUrl: "http://api.test",
@@ -190,7 +190,7 @@ describe("Transport retries", () => {
     let calls = 0;
     const fetchMock = vi.fn(async () => {
       calls += 1;
-      if (calls === 1) return jsonResponse({ code: 401, message: "expired" }, 401);
+      if (calls === 1) return jsonResponse({ status: 401, code: "unauthorized", message: "expired" }, 401);
       return jsonResponse({ ok: true });
     }) as unknown as typeof fetch;
     const refresh = vi.fn(async () => {

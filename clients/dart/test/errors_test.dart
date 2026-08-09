@@ -46,12 +46,43 @@ void main() {
 
   group('parseErrorResponse', () {
     test('parses a zigbase error response body', () {
-      final body = jsonEncode(
-          {'code': 403, 'message': 'Forbidden.', 'data': <String, dynamic>{}});
+      final body = jsonEncode({
+        'status': 403,
+        'code': 'forbidden',
+        'message': 'Forbidden.',
+        'data': <String, dynamic>{}
+      });
       final err = parseErrorResponse(403, body, 'http://x/api/y');
       expect(err.status, 403);
       expect(err.message, 'Forbidden.');
       expect(err.data, isEmpty);
+      // The frozen machine code must survive the transport.
+      expect(err.code, 'forbidden');
+    });
+
+    test('exposes a bespoke code so callers never match on message text', () {
+      final body = jsonEncode({
+        'status': 403,
+        'code': 'email_not_verified',
+        'message': 'Email not verified.',
+        'data': <String, dynamic>{}
+      });
+      final err = parseErrorResponse(403, body, 'http://x/api/y');
+      // Same status as a plain `forbidden`; only `code` tells them apart.
+      expect(err.status, 403);
+      expect(err.code, 'email_not_verified');
+    });
+
+    test('ignores a non-string code', () {
+      // Pre-unification servers put the integer HTTP status in `code`.
+      final body = jsonEncode({'code': 403, 'message': 'Forbidden.'});
+      final err = parseErrorResponse(403, body, 'http://x/api/y');
+      expect(err.code, '');
+    });
+
+    test('code is empty when the body is not JSON', () {
+      final err = parseErrorResponse(502, 'oops', 'http://x/api/y');
+      expect(err.code, '');
     });
 
     test('parses field-level error data', () {

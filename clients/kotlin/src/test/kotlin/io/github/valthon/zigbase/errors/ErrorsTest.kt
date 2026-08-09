@@ -37,11 +37,37 @@ class ZigbaseExceptionTest {
 class ParseErrorResponseTest {
     @Test
     fun `parses a zigbase error response body`() {
-        val body = """{"code":403,"message":"Forbidden.","data":{}}"""
+        val body = """{"status":403,"code":"forbidden","message":"Forbidden.","data":{}}"""
         val err = parseErrorResponse(403, body, "http://x/api/y")
         assertEquals(403, err.status)
         assertEquals("Forbidden.", err.message)
         assertTrue(err.data.isEmpty())
+        // The frozen machine code must survive the transport.
+        assertEquals("forbidden", err.code)
+    }
+
+    @Test
+    fun `exposes a bespoke code so callers never match on message text`() {
+        val body =
+            """{"status":403,"code":"email_not_verified","message":"Email not verified.","data":{}}"""
+        val err = parseErrorResponse(403, body, "http://x/api/y")
+        // Same status as a plain `forbidden`; only `code` tells them apart.
+        assertEquals(403, err.status)
+        assertEquals("email_not_verified", err.code)
+    }
+
+    @Test
+    fun `ignores a non-string code`() {
+        // Pre-unification servers put the integer HTTP status in `code`.
+        val body = """{"code":403,"message":"Forbidden."}"""
+        val err = parseErrorResponse(403, body, "http://x/api/y")
+        assertEquals("", err.code)
+    }
+
+    @Test
+    fun `code is empty when the body is not JSON`() {
+        val err = parseErrorResponse(502, "oops", "http://x/api/y")
+        assertEquals("", err.code)
     }
 
     @Test

@@ -27,9 +27,16 @@ class ZigbaseError(Exception):
     ``status`` is the HTTP status; ``0`` denotes a client-side protocol
     violation (e.g. a non-advancing realtime/pagination cursor) rather than
     a response from the server.
+
+    ``code`` is the envelope's frozen machine code (``"not_found"``,
+    ``"validation_failed"``, ``"email_not_verified"``, …) — branch on it, never on
+    ``message``, whose wording is explicitly not part of the API contract. It is
+    ``""`` when the server sent no code (a non-JSON body, or a response from
+    something that isn't ZigBase, such as a proxy's own error page).
     """
 
     status: int
+    code: str
     message: str
     data: dict[str, FieldError]
     url: str
@@ -39,11 +46,13 @@ class ZigbaseError(Exception):
         *,
         status: int,
         message: str,
+        code: str = "",
         data: dict[str, FieldError] | None = None,
         url: str,
     ) -> None:
         super().__init__(message)
         self.status = status
+        self.code = code
         self.message = message
         self.data = data if data is not None else {}
         self.url = url
@@ -66,6 +75,7 @@ def parse_error_response(
     "Request failed with status {status}" message.
     """
     message = reason_phrase if reason_phrase else f"Request failed with status {status}"
+    code = ""
     data: dict[str, FieldError] = {}
 
     try:
@@ -74,6 +84,12 @@ def parse_error_response(
             raw_message = decoded.get("message")
             if isinstance(raw_message, str):
                 message = raw_message
+
+            # Only a STRING code is the machine code. Pre-unification servers put the
+            # integer HTTP status here, so a number must never surface as a code.
+            raw_code = decoded.get("code")
+            if isinstance(raw_code, str):
+                code = raw_code
 
             raw_data = decoded.get("data")
             if isinstance(raw_data, dict):
@@ -90,7 +106,7 @@ def parse_error_response(
     except (json.JSONDecodeError, TypeError, ValueError):
         pass
 
-    return ZigbaseError(status=status, message=message, data=data, url=url)
+    return ZigbaseError(status=status, code=code, message=message, data=data, url=url)
 
 
 __all__ = ["FieldError", "ZigbaseError", "parse_error_response"]

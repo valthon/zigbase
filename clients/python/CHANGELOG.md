@@ -18,6 +18,15 @@ Initial development of the official Python client for ZigBase — a behavioral p
 
 ### Added
 
+- `ZigbaseError.code` — the error envelope's frozen machine code (`"not_found"`,
+  `"validation_failed"`, `"email_not_verified"`, …). Branch on this instead of matching
+  `message` text, whose wording is explicitly not part of the API contract. It is `""`
+  when the server sent no code (a non-JSON body, or a response from something that isn't
+  ZigBase); an integer `code` from a pre-unification server is ignored rather than
+  surfaced. Additive — no existing field changed.
+
+### Added
+
 - **Records.** `CollectionService`/`AsyncCollectionService` CRUD (`get_list`, `get_one`,
   `get_first_list_item`, `create`, `update`, `delete`) with offset pagination, and native
   server-side cursor (keyset) pagination (`get_page`, `iterate`, `get_full_list` — which

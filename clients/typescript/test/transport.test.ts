@@ -83,7 +83,7 @@ describe("Transport", () => {
 
   it("throws ZigbaseError on non-2xx", async () => {
     const fetchMock = vi.fn(async () =>
-      jsonResponse({ code: 403, message: "Nope.", data: {} }, 403),
+      jsonResponse({ status: 403, code: "forbidden", message: "Nope.", data: {} }, 403),
     ) as unknown as typeof fetch;
     await expect(makeTransport(fetchMock).send("/api/x")).rejects.toSatisfy(isZigbaseError);
   });

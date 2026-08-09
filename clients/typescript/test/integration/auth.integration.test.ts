@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { startServer, superuserToken, createCollection, type TestServer } from "./harness.js";
-import { createClient } from "../../src/index.js";
+import { createClient, isZigbaseError, type ZigbaseError } from "../../src/index.js";
 
 let server: TestServer;
 
@@ -47,5 +47,24 @@ describe("auth (live backend)", () => {
     await expect(
       zb.collection("members").authWithPassword("m@test.local", "wrong"),
     ).rejects.toMatchObject({ status: expect.any(Number) });
+  });
+
+  it("carries the frozen machine code end-to-end from a real server", async () => {
+    // The unit tests parse a hand-written body; this proves the code survives an
+    // actual round-trip through the running binary, which is what makes `code`
+    // usable as a branch target instead of the message text.
+    const zb = createClient(server.url);
+    let caught: unknown;
+    try {
+      await zb.collection("members").authWithPassword("m@test.local", "wrong");
+    } catch (e) {
+      caught = e;
+    }
+    expect(isZigbaseError(caught)).toBe(true);
+    const err = caught as ZigbaseError;
+    expect(err.code).toBeTruthy();
+    // Whatever the server chose, it must be a registered snake_case machine code —
+    // never the integer status the pre-unification envelope used to put here.
+    expect(err.code).toMatch(/^[a-z][a-z0-9_]*$/);
   });
 });

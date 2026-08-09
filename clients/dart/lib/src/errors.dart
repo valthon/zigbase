@@ -12,6 +12,14 @@ class FieldError {
 /// Thrown when the ZigBase API responds with a non-2xx status.
 class ZigbaseException implements Exception {
   final int status;
+
+  /// The envelope's frozen machine code (`not_found`, `validation_failed`,
+  /// `email_not_verified`, …) — branch on this, never on [message], whose wording
+  /// is explicitly not part of the API contract and may change in any release.
+  ///
+  /// Empty when the server sent no code: a non-JSON body, or a response from
+  /// something that isn't ZigBase (a proxy's own error page).
+  final String code;
   final String message;
   final Map<String, FieldError> data;
   final String url;
@@ -19,6 +27,7 @@ class ZigbaseException implements Exception {
   ZigbaseException({
     required this.status,
     required this.message,
+    this.code = '',
     this.data = const {},
     required this.url,
   });
@@ -53,12 +62,18 @@ ZigbaseException parseErrorResponse(
       ? reasonPhrase
       : 'Request failed with status $status';
   Map<String, FieldError> data = const {};
+  String code = '';
 
   try {
     final decoded = jsonDecode(bodyText);
     if (decoded is Map) {
       final msg = decoded['message'];
       if (msg is String) message = msg;
+
+      // Only a STRING code is the machine code. Pre-unification servers put the
+      // integer HTTP status here, so a number must never surface as a code.
+      final rawTopCode = decoded['code'];
+      if (rawTopCode is String) code = rawTopCode;
 
       final rawData = decoded['data'];
       if (rawData is Map) {
@@ -83,5 +98,5 @@ ZigbaseException parseErrorResponse(
   }
 
   return ZigbaseException(
-      status: status, message: message, data: data, url: url);
+      status: status, message: message, code: code, data: data, url: url);
 }

@@ -627,8 +627,8 @@ accepted behavior, not an oversight.
 
 ## Error handling
 
-Every non-2xx response raises `ZigbaseError`, carrying `status`, `message`, `url`, and
-per-field validation errors in `data` (`dict[str, FieldError]`):
+Every non-2xx response raises `ZigbaseError`, carrying `status`, `code`, `message`, `url`,
+and per-field validation errors in `data` (`dict[str, FieldError]`):
 
 ```python
 from zigbase import ZigbaseError
@@ -639,6 +639,23 @@ except ZigbaseError as e:
     if e.status == 400:
         print(e.data["title"].message)  # field-level error
 ```
+
+**Branch on `code`, never on `message`.** `code` is the frozen machine string from the
+[error-code registry](observability.md#error-codes) — it never changes meaning once
+shipped, whereas `message` is human text that may be reworded in any release:
+
+```python
+try:
+    users.auth_with_password(email, password)
+except ZigbaseError as e:
+    if e.code == "email_not_verified":
+        # A distinct, actionable state — not a flat denial.
+        show_verify_email_step(email)
+```
+
+`code` is `""` when the server sent no code — a non-JSON body, or a response from
+something that isn't ZigBase (a proxy's own error page). Run `zigbase explain-code` to
+list every registered code.
 
 `status=0` is reserved for a client-side protocol violation with no real HTTP response
 behind it — currently, only a non-advancing cursor page (see
