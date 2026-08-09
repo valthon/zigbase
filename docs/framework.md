@@ -3482,12 +3482,25 @@ and applies the **minimal safe change set** (running it twice is a clean no-op):
 - A field present in the spec but missing from the live collection is **added**,
   rebuilding the table while **preserving existing data** (the new column is null
   for old rows).
+- A changed **access rule** (`.list_rule` / `.view_rule` / `.create_rule` /
+  `.update_rule` / `.delete_rule`) is **re-applied to the live collection**. This is a
+  metadata-only write — no table rebuild, no data copy — so tightening a rule in code
+  and redeploying really does tighten it in the running server. A rule left **unset**
+  (`null`) in the literal means "unspecified: leave whatever is live alone"; to lock a
+  rule explicitly, spell it `""` (blank and unset are the same rule at evaluation time
+  — superusers only — so switching between them is not treated as a change).
 - A **non-additive** change — a field rename, drop, or type/storage-class change —
   is **detected, logged, and SKIPPED** (never applied, so no data loss). Relation
   targets must reference a known collection (a comptime collection or a pre-existing
   live one such as `_superusers`); an unknown target is a startup error.
 
 For the changes auto-migration won't do, use the `.migrations` escape hatch.
+
+> **`.indexes` changes on an existing collection are not yet re-applied.** Adding or
+> removing an entry in a live collection's `.indexes` only takes effect if that same
+> startup also adds a field (which rebuilds the table). Use an explicit `.migrations`
+> entry with raw `CREATE INDEX` / `DROP INDEX` to change indexes on a collection that
+> already exists.
 
 ### Explicit migrations (`.migrations`)
 
