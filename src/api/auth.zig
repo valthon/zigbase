@@ -114,7 +114,7 @@ pub fn nowUnix(conn: *db.Db) db.DbError!i64 {
 /// exists in exactly one place.
 fn findByField(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, field: []const u8, value: []const u8) !?[]const u8 {
     const d = db.dbDialect(conn);
-    const col_quoted = try std.fmt.allocPrint(alloc, "\"{s}\"", .{field});
+    const col_quoted = try ddl.quoteIdent(alloc, field);
     defer alloc.free(col_quoted);
     const ci = ddl.isNocaseField(col, field);
     // `lhs`/`rhs` are freshly allocated ONLY on the `ci` arm (nocaseEqOperand allocates on both
@@ -124,7 +124,9 @@ fn findByField(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, f
     defer if (ci) alloc.free(lhs);
     const rhs = if (ci) try d.nocaseEqOperand(alloc, "?1") else "?1";
     defer if (ci) alloc.free(rhs);
-    const sql = try std.fmt.allocPrintSentinel(alloc, "SELECT \"id\" FROM \"{s}\" WHERE {s} = {s} AND \"{s}\" != '' LIMIT 1;", .{ col.name, lhs, rhs, field }, 0);
+    const qtbl = try ddl.quoteIdent(alloc, col.name);
+    defer alloc.free(qtbl);
+    const sql = try std.fmt.allocPrintSentinel(alloc, "SELECT \"id\" FROM {s} WHERE {s} = {s} AND {s} != '' LIMIT 1;", .{ qtbl, lhs, rhs, col_quoted }, 0);
     defer alloc.free(sql);
     var st = try prep(conn, sql);
     defer st.finalize();
@@ -198,7 +200,9 @@ test "findByIdentity: a .nocase email index makes the SQLite lookup case-insensi
 }
 
 pub fn passwordHashFor(alloc: std.mem.Allocator, conn: *db.Db, table: []const u8, rid: []const u8) !?[]const u8 {
-    const sql = try std.fmt.allocPrintSentinel(alloc, "SELECT \"passwordHash\" FROM \"{s}\" WHERE \"id\" = ?1;", .{table}, 0);
+    const qtbl = try ddl.quoteIdent(alloc, table);
+    defer alloc.free(qtbl);
+    const sql = try std.fmt.allocPrintSentinel(alloc, "SELECT \"passwordHash\" FROM {s} WHERE \"id\" = ?1;", .{qtbl}, 0);
     defer alloc.free(sql);
     var st = try prep(conn, sql);
     defer st.finalize();
@@ -275,7 +279,9 @@ fn upgradeHash(
 }
 
 pub fn tokenKeyFor(alloc: std.mem.Allocator, conn: *db.Db, table: []const u8, rid: []const u8) !?[]const u8 {
-    const sql = try std.fmt.allocPrintSentinel(alloc, "SELECT \"tokenKey\" FROM \"{s}\" WHERE \"id\" = ?1;", .{table}, 0);
+    const qtbl = try ddl.quoteIdent(alloc, table);
+    defer alloc.free(qtbl);
+    const sql = try std.fmt.allocPrintSentinel(alloc, "SELECT \"tokenKey\" FROM {s} WHERE \"id\" = ?1;", .{qtbl}, 0);
     defer alloc.free(sql);
     var st = try prep(conn, sql);
     defer st.finalize();
@@ -291,7 +297,9 @@ pub const KeyEpoch = struct { token_key: []const u8, epoch: i64 };
 /// column. This is what keeps epoch-mode login zero-new-query: `issue()` no longer runs its
 /// own epoch SELECT, it takes the epoch from here. NULL epoch reads as 0 (back-compat).
 pub fn tokenKeyAndEpochFor(alloc: std.mem.Allocator, conn: *db.Db, table: []const u8, rid: []const u8) !?KeyEpoch {
-    const sql = try std.fmt.allocPrintSentinel(alloc, "SELECT \"tokenKey\", COALESCE(\"token_epoch\", 0) FROM \"{s}\" WHERE \"id\" = ?1;", .{table}, 0);
+    const qtbl = try ddl.quoteIdent(alloc, table);
+    defer alloc.free(qtbl);
+    const sql = try std.fmt.allocPrintSentinel(alloc, "SELECT \"tokenKey\", COALESCE(\"token_epoch\", 0) FROM {s} WHERE \"id\" = ?1;", .{qtbl}, 0);
     defer alloc.free(sql);
     var st = try prep(conn, sql);
     defer st.finalize();
@@ -305,7 +313,9 @@ pub fn tokenKeyAndEpochFor(alloc: std.mem.Allocator, conn: *db.Db, table: []cons
 /// physical auth table (collection name, or "_superusers"). Returns null only when no such
 /// row exists.
 pub fn tokenEpochFor(alloc: std.mem.Allocator, conn: *db.Db, table: []const u8, rid: []const u8) !?i64 {
-    const sql = try std.fmt.allocPrintSentinel(alloc, "SELECT COALESCE(\"token_epoch\", 0) FROM \"{s}\" WHERE \"id\" = ?1;", .{table}, 0);
+    const qtbl = try ddl.quoteIdent(alloc, table);
+    defer alloc.free(qtbl);
+    const sql = try std.fmt.allocPrintSentinel(alloc, "SELECT COALESCE(\"token_epoch\", 0) FROM {s} WHERE \"id\" = ?1;", .{qtbl}, 0);
     defer alloc.free(sql);
     var st = try prep(conn, sql);
     defer st.finalize();
@@ -318,7 +328,9 @@ pub fn tokenEpochFor(alloc: std.mem.Allocator, conn: *db.Db, table: []const u8, 
 /// for the principal ("revoke all sessions"/"log out everywhere", #99 Variant A). Must
 /// run under the writer lock. `table` is the physical auth table. Returns the new epoch.
 pub fn bumpTokenEpoch(alloc: std.mem.Allocator, conn: *db.Db, table: []const u8, rid: []const u8) !i64 {
-    const sql = try std.fmt.allocPrintSentinel(alloc, "UPDATE \"{s}\" SET \"token_epoch\" = COALESCE(\"token_epoch\", 0) + 1 WHERE \"id\" = ?1;", .{table}, 0);
+    const qtbl = try ddl.quoteIdent(alloc, table);
+    defer alloc.free(qtbl);
+    const sql = try std.fmt.allocPrintSentinel(alloc, "UPDATE {s} SET \"token_epoch\" = COALESCE(\"token_epoch\", 0) + 1 WHERE \"id\" = ?1;", .{qtbl}, 0);
     defer alloc.free(sql);
     var st = try prep(conn, sql);
     defer st.finalize();
@@ -1167,7 +1179,7 @@ pub fn confirmVerification(ctx: *http.RequestCtx) anyerror!http.Response {
     // Single-use (F7): redeeming the same token twice fails here even within the TTL.
     consumeToken(w, claims) catch
         return ApiError.badRequest("Invalid or expired token.").toResponse(ctx.allocator.a);
-    const sql = try std.fmt.allocPrintSentinel(ctx.allocator.a, "UPDATE \"{s}\" SET \"verified\" = 1 WHERE \"id\" = ?1;", .{col.name}, 0);
+    const sql = try std.fmt.allocPrintSentinel(ctx.allocator.a, "UPDATE {s} SET \"verified\" = 1 WHERE \"id\" = ?1;", .{try ddl.quoteIdent(ctx.allocator.a, col.name)}, 0);
     var st = try prep(w, sql);
     defer st.finalize();
     try st.bindText(1, claims.id);
@@ -1363,7 +1375,8 @@ pub const TestEnv = struct {
         defer self.pool.releaseWriter();
         const col = (collections.get(a, w, col_name) catch return false).?;
         const rid = (findByIdentity(a, w, col, email) catch return false) orelse return false;
-        const sql = std.fmt.allocPrintSentinel(a, "SELECT \"verified\" FROM \"{s}\" WHERE \"id\" = ?1;", .{col.name}, 0) catch return false;
+        const qtbl = ddl.quoteIdent(a, col.name) catch return false;
+        const sql = std.fmt.allocPrintSentinel(a, "SELECT \"verified\" FROM {s} WHERE \"id\" = ?1;", .{qtbl}, 0) catch return false;
         var st = w.prepare(sql) catch return false;
         defer st.finalize();
         st.bindText(1, rid) catch return false;
@@ -2291,7 +2304,9 @@ fn createBasePosts(env: *TestEnv, a: std.mem.Allocator) !void {
 fn countTable(env: *TestEnv, table: []const u8) !i64 {
     const w = env.pool.acquireWriter();
     defer env.pool.releaseWriter();
-    const sql = try std.fmt.allocPrintSentinel(std.testing.allocator, "SELECT COUNT(*) FROM \"{s}\";", .{table}, 0);
+    const qtbl = try ddl.quoteIdent(std.testing.allocator, table);
+    defer std.testing.allocator.free(qtbl);
+    const sql = try std.fmt.allocPrintSentinel(std.testing.allocator, "SELECT COUNT(*) FROM {s};", .{qtbl}, 0);
     defer std.testing.allocator.free(sql);
     var st = try w.prepare(sql);
     defer st.finalize();

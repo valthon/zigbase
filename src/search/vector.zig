@@ -38,6 +38,7 @@
 const std = @import("std");
 const build_options = @import("build_options");
 const schema = @import("../schema.zig");
+const ddl = @import("../ddl.zig");
 const compiler = @import("../query/compiler.zig");
 const db = @import("../db.zig");
 
@@ -110,25 +111,32 @@ pub fn build(alloc: std.mem.Allocator, dialect: db.Dialect, col: schema.Collecti
     // The WHERE fragment ("has an embedding") is identical on both backends; only the distance
     // ORDER-BY expression differs. The single bound `?` (the query embedding) is renumbered to `$n`
     // on Postgres by the records.list ParamSink pass.
-    const where_sql = try std.fmt.allocPrint(alloc, "\"{s}\".\"{s}\" IS NOT NULL", .{ col.name, field });
+    // Escaped identifier fragments are scratch: their bytes are copied into the fragments below,
+    // and both are freed on every path (including an OOM in the second allocPrint) so this is
+    // leak-correct off a raw allocator, not only under the request arena.
+    const qcol = try ddl.quoteIdent(alloc, col.name);
+    defer alloc.free(qcol);
+    const qfield = try ddl.quoteIdent(alloc, field);
+    defer alloc.free(qfield);
+    const where_sql = try std.fmt.allocPrint(alloc, "{s}.{s} IS NOT NULL", .{ qcol, qfield });
     errdefer alloc.free(where_sql); // free the first fragment if the second allocPrint OOMs
     const order_sql = switch (dialect.kind) {
         // sqlite-vec scalar distance functions over the JSON-array column.
-        .sqlite => try std.fmt.allocPrint(alloc, "{s}(\"{s}\".\"{s}\", ?)", .{
+        .sqlite => try std.fmt.allocPrint(alloc, "{s}({s}.{s}, ?)", .{
             switch (metric) {
                 .cosine => "vec_distance_cosine",
                 .l2 => "vec_distance_L2",
             },
-            col.name,
-            field,
+            qcol,
+            qfield,
         }),
         // pgvector: cast the stored column + the bound embedding to `vector` (text→type I/O cast)
         // and order by the native KNN operator (`<=>` cosine distance, `<->` L2). Smaller = nearer,
         // so ASC ordering yields nearest-first. `?::vector` renumbers to `$n::vector` (the `:` after
         // `?` is not a digit, so the ParamSink treats it as the anonymous placeholder).
-        .postgres => try std.fmt.allocPrint(alloc, "(\"{s}\".\"{s}\")::vector {s} ?::vector", .{
-            col.name,
-            field,
+        .postgres => try std.fmt.allocPrint(alloc, "({s}.{s})::vector {s} ?::vector", .{
+            qcol,
+            qfield,
             switch (metric) {
                 .cosine => "<=>",
                 .l2 => "<->",

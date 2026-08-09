@@ -54,7 +54,7 @@ pub const Joiner = struct {
     pub fn resolve(self: *Joiner, path: []const u8) JoinError!ColumnRef {
         const sa = self.scratch.allocator();
         var cur_col = self.base;
-        var cur_alias: []const u8 = try std.fmt.allocPrint(sa, "\"{s}\"", .{self.base.name});
+        var cur_alias: []const u8 = try ddl.quoteIdent(sa, self.base.name);
         var prefix_buf: std.ArrayList(u8) = .empty;
 
         var it = std.mem.splitScalar(u8, path, '.');
@@ -77,7 +77,7 @@ pub const Joiner = struct {
                     if (fl.encrypted) return error.EncryptedField;
                     if (fl.hidden and !self.allow_hidden) return error.HiddenField;
                 }
-                const ref = try std.fmt.allocPrint(sa, "{s}.\"{s}\"", .{ cur_alias, seg });
+                const ref = try std.fmt.allocPrint(sa, "{s}.{s}", .{ cur_alias, try ddl.quoteIdent(sa, seg) });
                 return .{ .sql = ref, .field = field, .nocase = ddl.isNocaseField(cur_col, seg) };
             }
             const rf = schema.fieldByName(cur_col, seg) orelse return error.UnknownField;
@@ -100,7 +100,7 @@ pub const Joiner = struct {
                 const target = (try collections.get(sa, self.conn, rf.options.relation.targetCollectionId)) orelse return error.UnknownField;
                 self.counter += 1;
                 const alias = try std.fmt.allocPrint(sa, "j{d}", .{self.counter});
-                const join = try std.fmt.allocPrint(sa, "LEFT JOIN \"{s}\" AS {s} ON {s}.\"{s}\" = {s}.\"id\"", .{ target.name, alias, cur_alias, seg, alias });
+                const join = try std.fmt.allocPrint(sa, "LEFT JOIN {s} AS {s} ON {s}.{s} = {s}.\"id\"", .{ try ddl.quoteIdent(sa, target.name), alias, cur_alias, try ddl.quoteIdent(sa, seg), alias });
                 try self.joins.append(self.alloc, join);
                 try self.seen.append(self.alloc, .{ .prefix = try sa.dupe(u8, prefix), .alias = alias, .col = target });
                 cur_alias = alias;
@@ -143,6 +143,75 @@ test "joiner rejects traversal through non-relation and multi-relation fields" {
     try std.testing.expectError(error.NotARelation, j.resolve("title.x"));
     // Traversing THROUGH a multi-value relation is unsupported.
     try std.testing.expectError(error.MultiRelationTraversal, j.resolve("tags.name"));
+}
+
+test "joiner: a user path segment is MEMBERSHIP-checked, and every identifier is escaped" {
+    // What actually protects this layer is not a charset gate — nothing here calls
+    // `schema.isValidIdentifier`. A user-supplied `?filter=`/`?sort=` path segment reaches
+    // interpolation only after `schema.fieldByName` matched it BYTE-FOR-BYTE against a field of the
+    // collection (or `isSystemCol` matched one of three literals), so the string interpolated is a
+    // schema-owned name, never arbitrary client text. That is strictly stronger than a charset
+    // check, and this test pins it: an unknown segment is rejected rather than reaching SQL.
+    const migrations = @import("../migrations.zig");
+    var d = try db.Db.openMemory();
+    defer d.close();
+    const a = std.testing.allocator;
+    try migrations.run(&d);
+    const fields = [_]schema.Field{.{ .id = "f1", .name = "title", .options = .{ .text = .{} } }};
+    const posts = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "posts", .fields = &fields });
+    defer posts.deinit(a);
+    var j = Joiner.init(a, &d, posts);
+    defer j.deinit();
+
+    // Membership: anything not naming a real field (or a system column) never reaches SQL.
+    try std.testing.expectError(error.UnknownField, j.resolve("nope"));
+    try std.testing.expectError(error.UnknownField, j.resolve("title\" OR 1=1 --"));
+    // A real field resolves, fully qualified and quoted on both halves.
+    const ref = try j.resolve("title");
+    try std.testing.expectEqualStrings("\"posts\".\"title\"", ref.sql);
+    const sys = try j.resolve("id");
+    try std.testing.expectEqualStrings("\"posts\".\"id\"", sys.sql);
+}
+
+test "joiner escapes an embedded quote in collection and field identifiers" {
+    // The discriminating probe for the escaping sweep: identifiers are byte-identical under raw
+    // `"…"` interpolation and under `ddl.quoteIdent` for every name that can be CREATED, so only a
+    // name containing a `"` can tell the two apart. Such a collection is hand-built (creation
+    // rejects the name) and its metadata row inserted directly, which is the only way one exists.
+    const migrations = @import("../migrations.zig");
+    var d = try db.Db.openMemory();
+    defer d.close();
+    const a = std.testing.allocator;
+    try migrations.run(&d);
+    // Relation TARGET: `collections.get` loads it by id from `_collections`, so it must be a row.
+    try d.exec(
+        \\INSERT INTO "_collections"
+        \\  ("id","name","type","system","schema","indexes","options","listRule","viewRule","createRule","updateRule","deleteRule","created","updated")
+        \\ VALUES ('weird_target__','we"ird','base',0,
+        \\  '[{"id":"tf1","name":"na\"me","type":"text","options":{}}]',
+        \\  '[]','{}',NULL,NULL,NULL,NULL,NULL,datetime('now'),datetime('now'));
+    );
+    const pf = [_]schema.Field{
+        .{ .id = "f1", .name = "ti\"tle", .options = .{ .text = .{} } },
+        .{ .id = "f2", .name = "au\"thor", .options = .{ .relation = .{ .targetCollectionId = "weird_target__", .maxSelect = 1 } } },
+    };
+    const posts = schema.Collection{ .id = "po\"sts________", .name = "po\"sts", .fields = &pf };
+
+    var j = Joiner.init(a, &d, posts);
+    defer j.deinit();
+
+    // Leaf on the base collection: both halves escaped (`"` doubled), not passed through raw.
+    const leaf = try j.resolve("ti\"tle");
+    try std.testing.expectEqualStrings("\"po\"\"sts\".\"ti\"\"tle\"", leaf.sql);
+
+    // Traversal: the JOIN's target table, the ON-clause foreign key, and the alias are all escaped.
+    const joined = try j.resolve("au\"thor.na\"me");
+    try std.testing.expectEqualStrings("j1.\"na\"\"me\"", joined.sql);
+    try std.testing.expectEqual(@as(usize, 1), j.joins.items.len);
+    try std.testing.expectEqualStrings(
+        "LEFT JOIN \"we\"\"ird\" AS j1 ON \"po\"\"sts\".\"au\"\"thor\" = j1.\"id\"",
+        j.joins.items[0],
+    );
 }
 
 test "joiner rejects filtering/sorting on an encrypted field" {

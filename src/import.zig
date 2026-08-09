@@ -36,6 +36,7 @@ const records = @import("records.zig");
 const auth = @import("auth.zig");
 const crypto = @import("crypto.zig");
 const param_sink = @import("sql/param_sink.zig");
+const ddl = @import("ddl.zig");
 const app_mod = @import("app.zig");
 
 pub const App = app_mod.App;
@@ -436,10 +437,10 @@ pub fn run(app: *App, w: *db.Db, io: std.Io, reader: *std.Io.Reader, opts: Optio
             // Operational heads-up (warn is not counted as a test-failing error log).
             std.log.warn("import: --upsert-key '{s}' is not backed by a unique constraint; a non-unique key may update the wrong row", .{key});
         }
-        const sql = try std.fmt.allocPrintSentinel(ca, "SELECT \"id\" FROM \"{s}\" WHERE \"{s}\"=?1 LIMIT 1;", .{ col.name, key }, 0);
+        const sql = try std.fmt.allocPrintSentinel(ca, "SELECT \"id\" FROM {s} WHERE {s}=?1 LIMIT 1;", .{ try ddl.quoteIdent(ca, col.name), try ddl.quoteIdent(ca, key) }, 0);
         lookups.upsert = try prep(ca, w, sql);
     } else if (opts.preserve_ids) {
-        const sql = try std.fmt.allocPrintSentinel(ca, "SELECT 1 FROM \"{s}\" WHERE \"id\"=?1 LIMIT 1;", .{col.name}, 0);
+        const sql = try std.fmt.allocPrintSentinel(ca, "SELECT 1 FROM {s} WHERE \"id\"=?1 LIMIT 1;", .{try ddl.quoteIdent(ca, col.name)}, 0);
         lookups.dup_check = try prep(ca, w, sql);
     }
 

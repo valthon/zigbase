@@ -19,15 +19,15 @@ hardening, PR B). The rest are written up as recommendations. Several items in
 
 ## Executive summary
 
-The query/SQL layer is genuinely strong: every value reaching SQLite is bound as a parameter,
-and every interpolated identifier (table/column/index/alias name) is either gated through
-`schema.isValidIdentifier` (letters/digits/underscore, must start with a letter) *before* it can
-reach DDL or a join, or escaped through `ddl.quoteIdent`. The charset gate is the discipline for
-**user-supplied** names — it is applied at collection/field creation, which is what keeps the
-`_`-prefixed system names (`_superusers`, `_memberships`, …) an engine-owned, migration-only set.
-Engine-owned names that the gate itself rejects (exactly those `_` names) are escaped instead, so
-the read path serves them correctly rather than degrading silently. The offline `zigbase import`
-subcommand introduces no new threat surface: it
+The query/SQL layer is genuinely strong: every value reaching SQLite is bound as a parameter, and
+no interpolated identifier (table/column/index/alias name) is ever raw client text. **How** that is
+guaranteed differs by layer, and this summary previously described only one of the three
+mechanisms — see "Identifier handling: three mechanisms" below, which corrects it. In short:
+user-supplied names are charset-gated by `schema.isValidIdentifier` at *creation*; a
+`?filter=`/`?sort=` path segment is **membership-checked against the collection schema** before it
+reaches a join; and engine-owned names (including the `_`-prefixed system collections, which the
+charset gate rejects by design) are **escaped** with `ddl.quoteIdent` at the point of
+interpolation. The offline `zigbase import` subcommand introduces no new threat surface: it
 writes through the same record engine as the HTTP path (identical validation, defaults, and
 `.encrypted` at-rest envelope), its `--collection`/`--upsert-key` identifiers pass the same
 `isValidIdentifier` gate before interpolation while row values bind as parameters, and its
@@ -75,6 +75,46 @@ filenames are sanitized; the static root percent-decodes the request path single
 never recursively — so double-encoding cannot smuggle a `..`) **before** rejecting `..`/backslash/NUL
 lexically, so encoded traversal (`%2e%2e`/`%2f`/`%00`/`%5c`) decodes and is then rejected fail-closed
 while percent-encoded filenames stay servable; the F10 symlink guard runs afterward on the resolved path.
+
+---
+
+## Identifier handling: three mechanisms (correction)
+
+An earlier version of this audit — and the architecture note in `CLAUDE.md` that points at it —
+stated that **every** interpolated identifier is "gated through `schema.isValidIdentifier` before
+interpolation". That is not what the code does, and stating it that way was misleading in a
+document people reason about injection risk from: the query layer (`src/query/joiner.zig`) calls
+`isValidIdentifier` **nowhere**. The layer is nonetheless safe — by a *different and stronger*
+mechanism. The accurate rule is three-part:
+
+1. **User-supplied names are charset-gated at creation.** A collection or field name arriving over
+   the API passes `schema.isValidIdentifier` (letters/digits/underscore, must start with a letter)
+   in `schema.zig` / `provision.zig` / `import.zig` / `analytics/config.zig` before it can ever be
+   persisted. Rejecting a leading `_` there is what keeps `_`-prefixed names an engine-owned,
+   migration-only set.
+
+2. **A `?filter=`/`?sort=` path segment is membership-checked, not charset-checked.** In
+   `joiner.resolve`, a segment reaches SQL only after `schema.fieldByName` matched it
+   **byte-for-byte** (`std.mem.eql`) against a field of the collection being queried, or
+   `isSystemCol` matched one of exactly three literals (`id`, `created`, `updated`). Anything else
+   returns `error.UnknownField` before any string is built. So the text interpolated is a
+   *schema-owned name*, never client input — a whitelist by identity, which is strictly stronger
+   than a charset predicate. (Traversal segments get the same treatment, plus relation/hidden/
+   encrypted checks.) Regression test: "joiner: a user path segment is MEMBERSHIP-checked, and
+   every identifier is escaped".
+
+3. **Engine-owned names are escaped at interpolation.** Collection/column names read back from
+   `_collections` — including the `_`-prefixed system collections, which mechanism 1 *rejects* by
+   design — go through `ddl.quoteIdent`, which doubles any embedded `"`. This is the only mechanism
+   that works for the `_` names, and applying mechanism 1 to them instead is what produced the
+   silent-degradation bugs recorded elsewhere in this document (a phantom "record not found", a
+   dropped TTL predicate, the F18 tenancy fail-open).
+
+The three compose: nothing reaches an identifier position that is not either a schema-owned name or
+an escaped one, and values are bound as parameters throughout. Where a downstream refusal is the
+right answer rather than escaping, it must fail **closed and loudly** — `authz/abilities.zig`
+(constant-false predicate) and `search/fts.zig` (`error.NotSearchable`, with the provisioner now
+logging any index it declines to build) are the two such sites.
 
 ---
 

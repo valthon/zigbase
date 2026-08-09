@@ -352,7 +352,7 @@ pub fn delete(alloc: std.mem.Allocator, w: *db.Db, id_or_name: []const u8) Engin
     }
     try w.begin();
     errdefer w.rollback() catch {};
-    try w.exec(try std.fmt.allocPrintSentinel(sa, "DROP TABLE \"{s}\";", .{target.name}, 0));
+    try w.exec(try std.fmt.allocPrintSentinel(sa, "DROP TABLE {s};", .{try ddl.quoteIdent(sa, target.name)}, 0));
     var st = try w.prepare(try db.dbDialect(w).renumberPlaceholders(sa, "DELETE FROM \"_collections\" WHERE \"id\" = ?1;"));
     defer st.finalize();
     try st.bindText(1, target.id);

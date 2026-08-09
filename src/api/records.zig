@@ -8,6 +8,7 @@ const collections = @import("../collections.zig");
 const colcache = @import("../colcache.zig");
 const schema = @import("../schema.zig");
 const records = @import("../records.zig");
+const ddl = @import("../ddl.zig");
 const ApiError = @import("error.zig").ApiError;
 const FieldError = @import("error.zig").FieldError;
 const params_mod = @import("../query/params.zig");
@@ -1656,7 +1657,9 @@ fn auditThenRejectHook(ctx: *Ctx, ev: *events.RecordEvent) anyerror!void {
 fn countRows(env: *TestEnv, table: []const u8) !i64 {
     var r = try env.pool.acquireReader();
     defer env.pool.releaseReader(&r);
-    const sql = try std.fmt.allocPrintSentinel(std.testing.allocator, "SELECT COUNT(*) FROM \"{s}\";", .{table}, 0);
+    const qtbl = try ddl.quoteIdent(std.testing.allocator, table);
+    defer std.testing.allocator.free(qtbl);
+    const sql = try std.fmt.allocPrintSentinel(std.testing.allocator, "SELECT COUNT(*) FROM {s};", .{qtbl}, 0);
     defer std.testing.allocator.free(sql);
     var st = try r.prepare(sql);
     defer st.finalize();

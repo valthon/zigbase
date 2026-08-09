@@ -1,0 +1,3 @@
+### Internal
+
+- Every SQL identifier the engine interpolates is now escaped through `ddl.quoteIdent` instead of being wrapped in bare quotes and relying on an upstream charset gate — across `ddl.zig` (which defined the helper and mostly did not use it), `query/joiner.zig`, `api/auth.zig`, `api/oauth.zig`, `rules.zig`, `realtime/hub.zig`, `migrator.zig`, `provision.zig`, `import.zig`, `collections.zig`, `search/vector.zig`, and `analytics/api.zig`. The emitted SQL is byte-identical for every name that can exist, so this is a consistency and defence-in-depth change rather than a behaviour change; composite index/constraint names are assembled and then escaped as one unit so a `CREATE` and its later `DROP` agree on the name.

@@ -361,15 +361,21 @@ pub const Migrator = struct {
     /// DEFERRABLE for the cycle-load path and doesn't fit the DSL's custom name + ref_column opts.
     fn addForeignKeySqlPg(a: std.mem.Allocator, table: []const u8, name: []const u8, column: []const u8, ref_table: []const u8, ref_column: []const u8, cascade: bool) ![]u8 {
         const on_delete = if (cascade) " ON DELETE CASCADE" else "";
+        var scratch = std.heap.ArenaAllocator.init(a);
+        defer scratch.deinit();
+        const sa = scratch.allocator();
         return std.fmt.allocPrint(
             a,
-            "ALTER TABLE \"{s}\" ADD CONSTRAINT \"{s}\" FOREIGN KEY (\"{s}\") REFERENCES \"{s}\" (\"{s}\"){s};",
-            .{ table, name, column, ref_table, ref_column, on_delete },
+            "ALTER TABLE {s} ADD CONSTRAINT {s} FOREIGN KEY ({s}) REFERENCES {s} ({s}){s};",
+            .{ try ddl.quoteIdent(sa, table), try ddl.quoteIdent(sa, name), try ddl.quoteIdent(sa, column), try ddl.quoteIdent(sa, ref_table), try ddl.quoteIdent(sa, ref_column), on_delete },
         );
     }
 
     fn dropConstraintSqlPg(a: std.mem.Allocator, table: []const u8, name: []const u8) ![]u8 {
-        return std.fmt.allocPrint(a, "ALTER TABLE \"{s}\" DROP CONSTRAINT IF EXISTS \"{s}\";", .{ table, name });
+        var scratch = std.heap.ArenaAllocator.init(a);
+        defer scratch.deinit();
+        const sa = scratch.allocator();
+        return std.fmt.allocPrint(a, "ALTER TABLE {s} DROP CONSTRAINT IF EXISTS {s};", .{ try ddl.quoteIdent(sa, table), try ddl.quoteIdent(sa, name) });
     }
 
     /// SQLite guard for `addForeignKey`: SQLite has no `ALTER TABLE ADD/DROP CONSTRAINT` (adding an
@@ -500,7 +506,7 @@ test "raw picks the dialect statement; direction defaults forward" {
 /// failure means the relation is absent. (openMemory is SQLite, so these run on SQLite; the PG
 /// path is covered by the live PG harness.)
 fn tableExists(m: *Migrator, name: []const u8) !bool {
-    const sql = try std.fmt.allocPrintSentinel(m.arena, "SELECT 1 FROM \"{s}\" LIMIT 0;", .{name}, 0);
+    const sql = try std.fmt.allocPrintSentinel(m.arena, "SELECT 1 FROM {s} LIMIT 0;", .{try ddl.quoteIdent(m.arena, name)}, 0);
     var st = m.prepare(sql) catch return false;
     st.finalize();
     return true;
@@ -556,7 +562,7 @@ test "dropTable without .was is not reversible" {
 
 /// True when `col` exists on `table` (probe a SELECT of just that column).
 fn columnExists(m: *Migrator, table: []const u8, col: []const u8) !bool {
-    const sql = try std.fmt.allocPrintSentinel(m.arena, "SELECT \"{s}\" FROM \"{s}\" LIMIT 0;", .{ col, table }, 0);
+    const sql = try std.fmt.allocPrintSentinel(m.arena, "SELECT {s} FROM {s} LIMIT 0;", .{ try ddl.quoteIdent(m.arena, col), try ddl.quoteIdent(m.arena, table) }, 0);
     var st = m.prepare(sql) catch return false;
     st.finalize();
     return true;

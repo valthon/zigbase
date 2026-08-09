@@ -4,6 +4,7 @@ const http = @import("../http.zig");
 const db = @import("../db.zig");
 const schema = @import("../schema.zig");
 const collections = @import("../collections.zig");
+const ddl = @import("../ddl.zig");
 const providers = @import("../oauth/providers.zig");
 const ApiError = @import("error.zig").ApiError;
 const records = @import("../records.zig");
@@ -292,7 +293,9 @@ fn linkCount(alloc: std.mem.Allocator, conn: *db.Db, collection_ref: []const u8,
 }
 
 fn passwordIsSet(alloc: std.mem.Allocator, conn: *db.Db, table: []const u8, rid: []const u8) !bool {
-    const sql = try std.fmt.allocPrintSentinel(alloc, "SELECT \"passwordHash\" FROM \"{s}\" WHERE \"id\"=?1;", .{table}, 0);
+    const qtbl = try ddl.quoteIdent(alloc, table);
+    defer alloc.free(qtbl);
+    const sql = try std.fmt.allocPrintSentinel(alloc, "SELECT \"passwordHash\" FROM {s} WHERE \"id\"=?1;", .{qtbl}, 0);
     var st = try prep(conn, sql);
     defer st.finalize();
     try st.bindText(1, rid);

@@ -1,0 +1,3 @@
+### Fixes
+
+- Corrected the documented identifier-safety model. `CLAUDE.md` and `docs/security-audit.md` both stated that every interpolated SQL identifier is gated through `schema.isValidIdentifier` — which the query layer never calls. The guarantee is real but is three mechanisms, not one: user-supplied names are charset-gated at creation; `?filter=`/`?sort=` path segments are membership-checked against the collection schema (an exact-name whitelist, stronger than a charset check); and engine-owned names are escaped at interpolation. Both documents now describe what the code actually does, so a reader assessing injection risk is not reasoning from an inaccurate model.
