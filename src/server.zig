@@ -244,7 +244,8 @@ pub fn Server(comptime gates: Gates) type {
                     return admin.serve(ctx);
             }
             // Built-in API routes win over custom routes.
-            const builtin = router.tryDispatch(routes, ctx) catch {
+            const builtin = router.tryDispatch(routes, ctx) catch |e| {
+                reportRouteError(ctx, app, e, "built-in route");
                 return try ApiError.internal().toResponse(ctx.allocator.a);
             };
             if (builtin) |hit| return hit;
@@ -257,10 +258,20 @@ pub fn Server(comptime gates: Gates) type {
                     !std.mem.eql(u8, fp, "/api/state") and
                     std.mem.eql(u8, ctx.path, fp))
                 {
-                    return state_api.handle(ctx) catch try ApiError.internal().toResponse(ctx.allocator.a);
+                    return state_api.handle(ctx) catch |e| {
+                        reportRouteError(ctx, app, e, "feature-state route");
+                        return try ApiError.internal().toResponse(ctx.allocator.a);
+                    };
                 }
             }
-            if (dispatchCustom(ctx) catch null) |hit| return hit;
+            // dispatchCustom's OWN failures (pool acquisition, authenticate) are server
+            // errors — swallowing them here silently fell through to static/404, serving
+            // the wrong status. A handler's error is already handled inside dispatchCustom.
+            const custom = dispatchCustom(ctx) catch |e| {
+                reportRouteError(ctx, app, e, "custom route dispatch");
+                return try ApiError.internal().toResponse(ctx.allocator.a);
+            };
+            if (custom) |hit| return hit;
             // The whole /api namespace stays JSON — including the bare "/api" path
             // (mirrors the exact-"/_" handling in the admin guard above).
             if (std.meta.activeTag(app.static_source) != .none and
@@ -268,12 +279,27 @@ pub fn Server(comptime gates: Gates) type {
                 !std.mem.startsWith(u8, ctx.path, "/api/") and
                 !std.mem.eql(u8, ctx.path, "/api"))
             {
-                if (static_files.serve(app.io, ctx, app.static_source, .{
+                const served = static_files.serve(app.io, ctx, app.static_source, .{
                     .routes = app.static_routes,
                     .spa_roots = app.spa_roots,
                     .spa_marker_enabled = app.spa_marker_enabled,
                     .cache_control = app.static_cache_control,
-                }) catch null) |hit| return hit;
+                }) catch |e| blk: {
+                    // `static_files.serve` converts every filesystem miss and unreadable
+                    // file to `null` internally, so the only error that can escape it is
+                    // OOM — a genuine server fault, not a browser-facing miss. Reporting
+                    // it as a 404 would be the silent-500 hole this stream just closed,
+                    // one layer down: the operator would see a "missing file" that is
+                    // really a failing server. Raise the incident and answer 500.
+                    if (e == error.OutOfMemory) {
+                        reportRouteError(ctx, app, e, "static file serve");
+                        return try ApiError.internal().toResponse(ctx.allocator.a);
+                    }
+                    // Any future non-OOM error stays a diagnosable, non-incident miss.
+                    std.log.warn("static file serve failed for {s}: {s}", .{ ctx.path, @errorName(e) });
+                    break :blk null;
+                };
+                if (served) |hit| return hit;
                 // Plain-text 404, deliberately NOT the JSON ApiError envelope: static misses are browser-facing, not API responses.
                 return http.Response{ .status = 404, .body = "not found", .content_type = "text/plain; charset=utf-8" };
             }
@@ -475,6 +501,43 @@ fn setZapStatus(r: zap.Request, status: u16) void {
 
 fn forbiddenResp(ctx: *http.RequestCtx) !http.Response {
     return ApiError.forbidden().toResponse(ctx.allocator.a);
+}
+
+/// Report an error escaping a BUILT-IN routing path. Consumer-route handler errors
+/// already take this route in `dispatchCustom` (:702-713); these paths used to swallow
+/// theirs entirely, producing an unexplained 500 with no log line, no `onError`, and no
+/// Sentry event. `origin` names which path failed so an operator can tell a built-in
+/// handler failure from a feature-state one.
+///
+/// The `RequestContext` carries only the method: at this layer no principal has been
+/// resolved (built-in handlers authenticate internally), and a fabricated one would be
+/// worse than an honest blank.
+///
+/// Logs at `.err` in production; under the test runner (`builtin.is_test`) the identical
+/// message logs at `.warn` instead — Zig's test runner counts every `.err`-level log as a
+/// test failure regardless of any custom `logFn` (the runner's own `std_options`, not
+/// `logging.std_options`, own the compilation: only a CONSUMER binary that sets
+/// `pub const std_options = zigbase.std_options;` in its own root routes through
+/// `logging.sink`), so a test that deliberately forces this path would fail on the log
+/// alone even with correct assertions. Same pattern as `backend/postgres/tls_trust.zig`'s
+/// `logMisconfig`.
+fn reportRouteError(ctx: *http.RequestCtx, app: *app_mod.App, err: anyerror, origin: []const u8) void {
+    // Named via @import here (not a module-level `const builtin`) because `route()`
+    // already has a local variable named `builtin` (the built-in-route dispatch
+    // result) that a top-level decl of the same name would collide with.
+    if (@import("builtin").is_test)
+        std.log.warn("{s} failed for {s} {s}: {s}", .{ origin, @tagName(ctx.method), ctx.path, @errorName(err) })
+    else
+        std.log.err("{s} failed for {s} {s}: {s}", .{ origin, @tagName(ctx.method), ctx.path, @errorName(err) });
+    var rctx = request.RequestContext{ .method = @tagName(ctx.method) };
+    var ev = events.ErrorEvent{
+        .app = app,
+        .ctx = &rctx,
+        .err = err,
+        .phase = .request,
+        .message = @errorName(err),
+    };
+    events.dispatchError(app, app.dispatch, &ev);
 }
 
 /// Merge a Ctx's deferred `pending_cookies`/`pending_headers` onto a handler's Response.
@@ -785,6 +848,72 @@ test "dispatchCustom: deliberate 4xx is NOT reported to onError; genuine 5xx is"
     const boom = (try dispatchCustom(&boom_ctx)).?;
     try std.testing.expectEqual(@as(u16, 500), boom.status);
     try std.testing.expectEqual(@as(usize, 1), H.on_error_calls);
+}
+
+test "route: a failing BUILT-IN handler is reported to onError, not silently 500ed" {
+    const db = @import("db.zig");
+    const App = app_mod.App;
+    const report_log = @import("report/log.zig");
+
+    const H = struct {
+        var on_error_calls: usize = 0;
+        fn onErr(ev: *events.ErrorEvent) void {
+            _ = ev;
+            on_error_calls += 1;
+        }
+    };
+
+    const ga = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", ga);
+    defer ga.free(dir_path);
+    const db_path = try std.fmt.allocPrintSentinel(ga, "{s}/test.db", .{dir_path}, 0);
+    defer ga.free(db_path);
+    var pool = try db.Pool.init(ga, std.testing.io, db_path);
+    defer pool.deinit();
+
+    const dispatch = events.Dispatch{ .on_error = H.onErr };
+
+    // Silence dispatchError's log fallback: the test runner counts std.log.err as a
+    // failure. (`logging.sink` is NOT the mechanism here — this compilation's
+    // `std_options` are owned by Zig's own test runner, not `logging.std_options`, so
+    // `logging.sink` only intercepts code that calls `logging.logFn`/`logging.request`
+    // directly; `reportRouteError`'s own log line instead downgrades err->warn under
+    // `builtin.is_test`, same as `backend/postgres/tls_trust.zig`'s `logMisconfig`.)
+    report_log.log_sink = struct {
+        fn sink(_: []const u8) void {}
+    }.sink;
+    defer report_log.log_sink = null;
+
+    // NEGATIVE CONTROL first: a healthy request must NOT raise an incident. Without
+    // this, a test that fires onError unconditionally would still pass below.
+    {
+        H.on_error_calls = 0;
+        var arena = std.heap.ArenaAllocator.init(ga);
+        defer arena.deinit();
+        var app = App{ .allocator = arena.allocator(), .io = std.testing.io, .pool = &pool, .dispatch = &dispatch };
+        var ctx = http.RequestCtx{ .method = .GET, .path = "/api/health", .allocator = RequestArena.from(&arena), .app = &app };
+        const resp = try Server(.{}).route(&ctx);
+        try std.testing.expectEqual(@as(u16, 200), resp.status);
+        try std.testing.expectEqual(@as(usize, 0), H.on_error_calls);
+    }
+
+    // Now the real thing: starve the request arena so the built-in handler fails.
+    // tryDispatch propagates the error into route()'s catch at server.zig:247.
+    {
+        H.on_error_calls = 0;
+        var failing = std.testing.FailingAllocator.init(ga, .{ .fail_index = 0 });
+        var arena = std.heap.ArenaAllocator.init(failing.allocator());
+        defer arena.deinit();
+        var app = App{ .allocator = ga, .io = std.testing.io, .pool = &pool, .dispatch = &dispatch };
+        var ctx = http.RequestCtx{ .method = .GET, .path = "/api/health", .allocator = RequestArena.from(&arena), .app = &app };
+        // Rendering the 500 envelope needs the same starved arena, so route() surfaces
+        // the error to onRequest (which writes the static raw envelope). Either outcome
+        // is acceptable — what must NOT happen is silence.
+        _ = Server(.{}).route(&ctx) catch {};
+        try std.testing.expectEqual(@as(usize, 1), H.on_error_calls);
+    }
 }
 
 test "dispatchCustom: a credential-less public request resolves without acquiring a reader (#231)" {

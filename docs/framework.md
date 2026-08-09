@@ -4059,6 +4059,16 @@ When the framework catches an error, your `onError` handler (if any) runs
 `ctx` (optional), `err`, `phase` (`request` / `before_hook` / `after_hook` /
 `cron` / `job` / `file_serve` / `webhook` / `app`), and `message`. The backstop never propagates.
 
+This includes a **built-in** handler's own failures, not just your routes': an error
+escaping the built-in route table, the feature-state route, or custom-route dispatch
+itself (pool acquisition, `authenticate`) is logged and delivered to `onError` exactly
+like a consumer-route error, instead of surfacing as a silent, unexplained 500. Because
+no principal has been resolved yet at that layer (built-in handlers authenticate
+internally), the `RequestContext` on `ev.ctx` carries only `method` — every other field
+is its zero value. A static-file *read* failure is the one exception: it is logged at
+`warn` and still answers 404, since a browser-facing static miss is not a server
+incident.
+
 **Report your own errors: `ctx.reportError`.** Route a swallowed-but-notable error
 from your own code — a hook, job, cron, or handler — through the *same* backstop the
 framework uses for its own caught errors:
