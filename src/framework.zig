@@ -3396,6 +3396,7 @@ fn bootApp(
         .spa_roots = holder.spa_roots,
         .spa_marker_enabled = opts.enable_spa_marker,
         .collections_frozen = opts.collections_frozen,
+        .gates = opts.gates,
         .pagination = .{
             .offset_enabled = opts.pagination.offset,
             .cursor_enabled = opts.pagination.cursor,

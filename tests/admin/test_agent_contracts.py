@@ -223,3 +223,27 @@ def test_usage_errors_exit_1(binary):
     assert _run(binary, "definitely-not-a-command").returncode == 1
     assert _run(binary, "serve", "--log-format", "bogus").returncode == 1
 
+
+# --- SP-1 Task 10: `GET /api/meta`, the public capability probe.
+
+
+def test_api_meta_is_public_and_reports_capabilities(logged_server):
+    status, body = logged_server.get("/api/meta")
+    assert status == 200, body  # no Authorization header — the endpoint is public
+    doc = json.loads(body)
+    assert list(doc) == ["zigbase", "commit", "api", "capabilities", "endpoints", "limits"]
+    assert doc["api"] == 1
+    assert doc["capabilities"]["collectionsFrozen"] is False
+    assert doc["endpoints"]["state"] == "/api/state"
+    assert doc["limits"]["maxUploadSize"] > 0
+    # It must never carry deployment config.
+    for leak in ("jwt", "secret", "data_dir", "dataDir", "password"):
+        assert leak not in body.lower(), f"/api/meta leaked {leak}: {body}"
+
+
+def test_api_meta_agrees_with_health_on_version(logged_server):
+    meta = json.loads(logged_server.get("/api/meta")[1])
+    health = json.loads(logged_server.get("/api/health")[1])
+    # One source of truth (build_options) feeds both; a mismatch means one drifted.
+    assert meta["zigbase"] == health["versions"]["zigbase"]
+    assert meta["commit"] == health["versions"]["commit"]

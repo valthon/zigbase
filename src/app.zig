@@ -201,6 +201,11 @@ pub const App = struct {
     /// where it is otherwise skipped for cross-instance-DDL safety) and the runtime collection
     /// create/update/delete endpoints return 403 (schema evolves via `.migrations` + redeploy).
     collections_frozen: bool = false,
+    /// Comptime route gates (server.Gates), mirrored onto the runtime App so
+    /// `GET /api/meta` can report which optional route groups this binary carries.
+    /// A plain struct of bools — no fn pointers — so it does not affect the gating
+    /// invariant (`scripts/check-gating.sh`) or Zig's lazy analysis.
+    gates: @import("server.zig").Gates = .{},
     /// The feature-flag / experiment override cache (feature_cache.zig), installed by
     /// serveImpl for BOTH backends (#230). Unlike col_cache, it is safe on Postgres:
     /// same-instance override writes invalidate it instantly and a snapshot self-heals

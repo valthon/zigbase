@@ -243,3 +243,32 @@ the caller must act on," and a rejected invocation is the simplest case of that.
 SP-3's `doctor` and `serve status`, and SP-5's `schema dump`/`schema apply` and a JSON `import`
 summary, follow these same two conventions and the table above will grow to list them as they
 ship.
+
+## Capability discovery
+
+Three process-level endpoints answer three different questions, deliberately kept apart
+rather than merged into one "status" blob:
+
+| Endpoint | Question it answers | DB access | Subject |
+|---|---|---|---|
+| `GET /api/health` | "Is the process up, and what backend/versions is it running?" | No | None — a liveness probe hit on a tight interval, kept small. |
+| `GET /api/meta` | "What can this binary do, and is it configured a certain way?" | No | None — process-constant for the lifetime of the running binary. |
+| `GET /api/state?subject=` | "What flags/experiments does *this* caller resolve to?" | Yes | Per-subject — a pooled reader, DB-backed. |
+
+`GET /api/meta` is the capability probe (see [the API reference § Meta](api.md#meta) for the
+full response shape and the per-capability table): baked-in version + commit, which optional
+route groups this binary carries (`capabilities.admin`, `.oauth2`, `.webauthn`, …), which
+build flags are on (`.postgres`, `.s3`, `.vector`, `.devMode`), whether collection metadata
+is frozen (`.collectionsFrozen`), where the public feature-state route is mounted
+(`endpoints.state`), and the configured upload-size limit (`limits.maxUploadSize`). It is
+public and unauthenticated, and exposes only facts an anonymous client could already
+establish by probing — each capability boolean corresponds to a route group that already
+responds distinctly (404 vs 200) to an anonymous request, `collectionsFrozen` is already
+readable from the 403 the runtime DDL endpoints return, and `maxUploadSize` is already
+discoverable by uploading past the limit. Never a config value, path, hostname, connection
+string, or credential.
+
+```
+$ curl -s http://localhost:8090/api/meta | jq .capabilities.collectionsFrozen
+false
+```

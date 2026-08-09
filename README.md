@@ -23,6 +23,7 @@ zig build                                        # -> zig-out/bin/zigbase   (or:
 ./zig-out/bin/zigbase serve --insecure-cookies --data-dir ./zb_data
 # open http://127.0.0.1:8090/_/  (admin UI) and sign in as the superuser
 curl http://127.0.0.1:8090/api/health           # {"status":"ok","backend":"sqlite","versions":{...}}
+curl http://127.0.0.1:8090/api/meta             # public, unauthenticated capability probe (build/config facts + endpoint map)
 ```
 
 The default bind is `127.0.0.1:8090` (loopback only). To expose ZigBase on all

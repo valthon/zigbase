@@ -394,6 +394,7 @@ test {
     _ = @import("static_files.zig");
     _ = @import("api/error.zig");
     _ = @import("api/health.zig");
+    _ = @import("api/meta.zig");
     _ = @import("api/collections.zig");
     _ = @import("api/records.zig");
     _ = @import("api/realtime.zig");

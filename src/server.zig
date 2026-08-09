@@ -5,6 +5,7 @@ const http = @import("http.zig");
 const app_mod = @import("app.zig");
 const router = @import("router.zig");
 const health = @import("api/health.zig");
+const meta = @import("api/meta.zig");
 const collections_api = @import("api/collections.zig");
 const records_api = @import("api/records.zig");
 const accounts_api = @import("api/accounts.zig");
@@ -42,6 +43,10 @@ const tenancy = @import("tenancy/tenancy.zig");
 
 fn healthHandler(ctx: *http.RequestCtx) anyerror!http.Response {
     return health.handle(ctx);
+}
+
+fn metaHandler(ctx: *http.RequestCtx) anyerror!http.Response {
+    return meta.handle(ctx);
 }
 
 /// Comptime gates for the built-in route table + admin SPA (R2-2/R2-3). Every
@@ -108,6 +113,7 @@ pub fn Server(comptime gates: Gates) type {
         pub const routes: []const router.Route = blk: {
             var t: []const router.Route = &.{
                 .{ .method = .GET, .pattern = "/api/health", .handler = healthHandler },
+                .{ .method = .GET, .pattern = "/api/meta", .handler = metaHandler },
                 .{ .method = .GET, .pattern = "/api/collections", .handler = collections_api.list },
                 .{ .method = .POST, .pattern = "/api/collections", .handler = collections_api.create },
                 .{ .method = .GET, .pattern = "/api/collections/:idOrName", .handler = collections_api.get },
