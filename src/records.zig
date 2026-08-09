@@ -116,7 +116,9 @@ pub fn guardPasses(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection, 
     defer scratch.deinit();
     const sa = scratch.allocator();
     const js = try guardJoinsSql(sa, g.joins);
-    const sql = try std.fmt.allocPrintSentinel(sa, "SELECT 1 FROM \"{s}\"{s} WHERE \"{s}\".\"id\"=?1 AND ({s});", .{ col.name, js, col.name, g.where_sql }, 0);
+    const qcol = try ddl.quoteIdent(sa, col.name);
+    defer sa.free(qcol); // copied into `sql`; free the temporary (a no-op on the arena, correct off it)
+    const sql = try std.fmt.allocPrintSentinel(sa, "SELECT 1 FROM {s}{s} WHERE {s}.\"id\"=?1 AND ({s});", .{ qcol, js, qcol, g.where_sql }, 0);
     var st = try prep(sa, w, sql);
     defer st.finalize();
     try st.bindText(1, rid);
@@ -531,7 +533,9 @@ fn validateFieldValue(alloc: std.mem.Allocator, conn: *db.Db, f: schema.Field, v
                 else => &.{},
             };
             for (items) |it| if (it == .string) {
-                const q = try std.fmt.allocPrintSentinel(sa, "SELECT 1 FROM \"{s}\" WHERE \"id\" = ?1;", .{tcol.name}, 0);
+                const qtarget = try ddl.quoteIdent(sa, tcol.name);
+                defer sa.free(qtarget);
+                const q = try std.fmt.allocPrintSentinel(sa, "SELECT 1 FROM {s} WHERE \"id\" = ?1;", .{qtarget}, 0);
                 var st = try prep(sa, conn, q);
                 defer st.finalize();
                 try st.bindText(1, it.string);
@@ -902,7 +906,9 @@ pub fn createInTxnOpts(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, col: sch
         }
     }
 
-    const sql = try std.fmt.allocPrintSentinel(sa, "INSERT INTO \"{s}\" ({s}) VALUES ({s}) RETURNING {s};", .{ col.name, cols.items, vals.items, rcols }, 0);
+    const qcol = try ddl.quoteIdent(sa, col.name);
+    defer sa.free(qcol);
+    const sql = try std.fmt.allocPrintSentinel(sa, "INSERT INTO {s} ({s}) VALUES ({s}) RETURNING {s};", .{ qcol, cols.items, vals.items, rcols }, 0);
     var st = try prep(sa, w, sql);
     defer st.finalize();
     try st.bindText(1, id_slice);
@@ -1131,7 +1137,9 @@ fn assembleListResult(d: *db.Db, a: std.mem.Allocator, col: schema.Collection) !
     }
     const cols = try columnList(a, col);
     defer a.free(cols);
-    const sql = try std.fmt.allocPrintSentinel(a, "SELECT {s} FROM \"{s}\" ORDER BY \"id\";", .{ cols, col.name }, 0);
+    const qcol = try ddl.quoteIdent(a, col.name);
+    defer a.free(qcol);
+    const sql = try std.fmt.allocPrintSentinel(a, "SELECT {s} FROM {s} ORDER BY \"id\";", .{ cols, qcol }, 0);
     defer a.free(sql);
     var st = try prep(a, d, sql);
     defer st.finalize();
@@ -1726,13 +1734,13 @@ pub fn updateInTxn(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection, 
     for (col.fields) |f| {
         if (f.fieldType() == .autodate) {
             if (f.options.autodate.onUpdate) {
-                try sets.appendSlice(sa, try std.fmt.allocPrint(sa, ",\"{s}\"={s}", .{ f.name, now_iso }));
+                try sets.appendSlice(sa, try std.fmt.allocPrint(sa, ",{s}={s}", .{ try ddl.quoteIdent(sa, f.name), now_iso }));
             }
             continue;
         }
         const provided = data.object.get(f.name) orelse continue; // partial: only provided fields
         try validateFieldValue(alloc, w, f, provided, &errs);
-        try sets.appendSlice(sa, try std.fmt.allocPrint(sa, ",\"{s}\"=?{d}", .{ f.name, next }));
+        try sets.appendSlice(sa, try std.fmt.allocPrint(sa, ",{s}=?{d}", .{ try ddl.quoteIdent(sa, f.name), next }));
         try binds.append(sa, .{ .idx = @intCast(next), .field = f, .value = provided });
         next += 1;
     }
@@ -1743,7 +1751,9 @@ pub fn updateInTxn(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection, 
 
     const rcols = try columnList(sa, col);
 
-    const sql = try std.fmt.allocPrintSentinel(sa, "UPDATE \"{s}\" SET {s} WHERE \"id\"=?1 RETURNING {s};", .{ col.name, sets.items, rcols }, 0);
+    const qcol = try ddl.quoteIdent(sa, col.name);
+    defer sa.free(qcol);
+    const sql = try std.fmt.allocPrintSentinel(sa, "UPDATE {s} SET {s} WHERE \"id\"=?1 RETURNING {s};", .{ qcol, sets.items, rcols }, 0);
     var st = try prep(sa, w, sql);
     defer st.finalize();
     try st.bindText(1, id);
@@ -1767,7 +1777,9 @@ pub fn delete(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection, id: [
 /// Delete a record on `w` WITHOUT opening a transaction. The caller must already
 /// be inside one (or accept autocommit). Returns true if a row was deleted.
 pub fn deleteInTxn(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection, id: []const u8) RecordError!bool {
-    const sql = try std.fmt.allocPrintSentinel(alloc, "DELETE FROM \"{s}\" WHERE \"id\"=?1 RETURNING \"id\";", .{col.name}, 0);
+    const qcol = try ddl.quoteIdent(alloc, col.name);
+    defer alloc.free(qcol);
+    const sql = try std.fmt.allocPrintSentinel(alloc, "DELETE FROM {s} WHERE \"id\"=?1 RETURNING \"id\";", .{qcol}, 0);
     defer alloc.free(sql);
     var st = try prep(alloc, w, sql);
     defer st.finalize();
@@ -1870,6 +1882,76 @@ test "delete removes the row; 404 on missing" {
     try d.exec("INSERT INTO posts (id,created,updated,title,price) VALUES ('r1','t','t','x',1);");
     try std.testing.expect(try delete(a, &d, col, "r1"));
     try std.testing.expect(!try delete(a, &d, col, "r1"));
+}
+
+test "every record statement ESCAPES the collection identifier (embedded-quote round-trip)" {
+    // The discriminating test for the quoteIdent sweep. Every interpolation of an engine-owned
+    // identifier in this file is escaped rather than wrapped in bare `\"…\"`, which is
+    // byte-identical for every name that can exist today — so a botched conversion (a dropped
+    // quote, a wrong argument) would NOT show up on ordinary names. A name containing a `"` is the
+    // one input that tells the two apart: escaped it round-trips, raw it produces malformed SQL or
+    // closes the identifier early. Driving full CRUD + list + count + cursor through such a name
+    // exercises the INSERT / UPDATE / DELETE / SELECT-page / COUNT / base-column / ORDER-BY /
+    // cursor-column sites at once.
+    //
+    // Such a collection cannot be CREATED (the name gates reject it) — it is constructed here
+    // precisely because it is the only probe that can distinguish escaping from raw interpolation.
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try migrations.run(&d);
+    // SQLite escapes an embedded double quote by doubling it — the same rule `ddl.quoteIdent` uses.
+    try d.exec("CREATE TABLE \"we\"\"ird\" (\"id\" TEXT PRIMARY KEY, \"created\" TEXT, \"updated\" TEXT, \"ti\"\"tle\" TEXT);");
+
+    const fields = [_]schema.Field{.{ .id = "f1", .name = "ti\"tle", .options = .{ .text = .{} } }};
+    const col = schema.Collection{ .id = "weird_________", .name = "we\"ird", .fields = &fields };
+
+    // create → INSERT … RETURNING
+    var obj: std.json.ObjectMap = .empty;
+    defer obj.deinit(a);
+    try obj.put(a, "ti\"tle", .{ .string = "first" });
+    const created = try create(a, io, &d, col, .{ .object = obj });
+    defer freeRecord(a, created);
+    const rid = try a.dupe(u8, created.object.get("id").?.string);
+    defer a.free(rid);
+    try std.testing.expectEqualStrings("first", created.object.get("ti\"tle").?.string);
+
+    // get → SELECT … WHERE id
+    const got = (try get(a, &d, col, rid)).?;
+    defer freeRecord(a, got);
+    try std.testing.expectEqualStrings("first", got.object.get("ti\"tle").?.string);
+
+    // update → UPDATE … RETURNING
+    var upd: std.json.ObjectMap = .empty;
+    defer upd.deinit(a);
+    try upd.put(a, "ti\"tle", .{ .string = "second" });
+    const updated = (try update(a, &d, col, rid, .{ .object = upd })).?;
+    defer freeRecord(a, updated);
+    try std.testing.expectEqualStrings("second", updated.object.get("ti\"tle").?.string);
+
+    // list → base column list + FROM + COUNT + default ORDER BY
+    {
+        var r = try list(a, &d, col, .{});
+        defer r.deinit(a);
+        try std.testing.expectEqual(@as(?i64, 1), r.totalItems);
+        try std.testing.expectEqual(@as(usize, 1), r.items.len);
+        try std.testing.expectEqualStrings("second", r.items[0].object.get("ti\"tle").?.string);
+    }
+
+    // cursor list → the keyset page SQL + the qualified cursor columns
+    {
+        var r = try list(a, &d, col, .{ .cursorMode = true, .perPage = 1 });
+        defer r.deinit(a);
+        try std.testing.expectEqual(@as(usize, 1), r.items.len);
+    }
+
+    // guardPasses → SELECT 1 FROM <col> WHERE <col>.id = ?
+    try std.testing.expect(try guardPasses(a, &d, col, rid, .{ .where_sql = "1=1", .params = &.{}, .joins = &.{} }));
+
+    // delete → DELETE … RETURNING
+    try std.testing.expect(try delete(a, &d, col, rid));
+    try std.testing.expect(!try delete(a, &d, col, rid));
 }
 
 test "createInTxn inserts without opening its own transaction" {
@@ -1981,12 +2063,26 @@ pub const ListResult = struct {
     }
 };
 
+/// `"<collection>"."<column>"` with BOTH identifiers escaped, owned by `alloc`. The two quoted
+/// fragments are scratch: their bytes are copied into the result and the temporaries are freed on
+/// every path (including the second `quoteIdent` failing), so this is leak-correct off a raw
+/// allocator, not only under a request arena.
+fn qualifiedCol(alloc: std.mem.Allocator, collection: []const u8, column: []const u8) ![]u8 {
+    const qc = try ddl.quoteIdent(alloc, collection);
+    defer alloc.free(qc);
+    const qf = try ddl.quoteIdent(alloc, column);
+    defer alloc.free(qf);
+    return std.fmt.allocPrint(alloc, "{s}.{s}", .{ qc, qf });
+}
+
 fn baseColumnList(alloc: std.mem.Allocator, col: schema.Collection) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(alloc);
-    try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, "\"{s}\".\"id\",\"{s}\".\"created\",\"{s}\".\"updated\"", .{ col.name, col.name, col.name }));
+    const qcol = try ddl.quoteIdent(alloc, col.name);
+    defer alloc.free(qcol); // copied into `out` below; free the temporary
+    try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, "{s}.\"id\",{s}.\"created\",{s}.\"updated\"", .{ qcol, qcol, qcol }));
     for (col.fields) |f| {
-        try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, ",\"{s}\".{s}", .{ col.name, try ddl.quoteIdent(alloc, f.name) }));
+        try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, ",{s}.{s}", .{ qcol, try ddl.quoteIdent(alloc, f.name) }));
     }
     return out.toOwnedSlice(alloc);
 }
@@ -2003,7 +2099,7 @@ fn effectiveSortTerms(alloc: std.mem.Allocator, col: schema.Collection, base_ter
     } else {
         // No client sort -> default ORDER BY created DESC.
         try out.append(alloc, .{
-            .col_sql = try std.fmt.allocPrint(alloc, "\"{s}\".\"created\"", .{col.name}),
+            .col_sql = try qualifiedCol(alloc, col.name, "created"),
             .field = null,
             .desc = true,
             .path = "created",
@@ -2013,7 +2109,7 @@ fn effectiveSortTerms(alloc: std.mem.Allocator, col: schema.Collection, base_ter
     const already_id = base_terms.len > 0 and std.mem.eql(u8, base_terms[base_terms.len - 1].path, "id");
     if (!already_id) {
         try out.append(alloc, .{
-            .col_sql = try std.fmt.allocPrint(alloc, "\"{s}\".\"id\"", .{col.name}),
+            .col_sql = try qualifiedCol(alloc, col.name, "id"),
             .field = null,
             .desc = last_desc,
             .path = "id",
@@ -2931,8 +3027,11 @@ pub fn list(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, q: L
     const base_terms = if (q.sort) |sstr| (if (sstr.len > 0) try sort.compileTerms(sa, &j, sstr) else &.{}) else &.{};
     var offset_order_sql: []const u8 = if (base_terms.len > 0)
         try sort.orderByFromTerms(sa, base_terms, dialect)
-    else
-        try std.fmt.allocPrint(sa, "\"{s}\".\"created\" DESC{s}", .{ col.name, dialect.nullsOrder(.desc) });
+    else blk: {
+        const qcol = try ddl.quoteIdent(sa, col.name);
+        defer sa.free(qcol);
+        break :blk try std.fmt.allocPrint(sa, "{s}.\"created\" DESC{s}", .{ qcol, dialect.nullsOrder(.desc) });
+    };
     // Search/vector relevance leads the OFFSET ordering: bm25 `rank` (FTS) and/or nearest-neighbor
     // distance (vector), with any client sort kept as the tiebreaker. Cursor mode keeps the keyset
     // order (the MATCH/where predicate still scopes the page; vector cursors are rejected above).
@@ -3006,7 +3105,9 @@ pub fn list(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, q: L
         // going backward; we re-reverse the page into forward order after fetch.
         const fetch_order = if (forward) order_sql else try reversedOrderBy(sa, eff_terms, dialect);
 
-        const page_sql = try std.fmt.allocPrintSentinel(sa, "SELECT {s} FROM \"{s}\"{s}{s} ORDER BY {s} LIMIT ?;", .{ bcols, col.name, joins_sql.items, win_where, fetch_order }, 0);
+        const qcol = try ddl.quoteIdent(sa, col.name);
+        defer sa.free(qcol);
+        const page_sql = try std.fmt.allocPrintSentinel(sa, "SELECT {s} FROM {s}{s}{s} ORDER BY {s} LIMIT ?;", .{ bcols, qcol, joins_sql.items, win_where, fetch_order }, 0);
         var pst = try prep(sa, conn, page_sql);
         defer pst.finalize();
         var idx = try bindParams(&pst, params, 1);
@@ -3099,7 +3200,9 @@ pub fn list(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, q: L
     const total = try countTotal(sa, conn, col, joins_sql.items, where_clause, params);
     const page: u32 = if (q.page == 0) 1 else q.page;
     const offset: i64 = @as(i64, (page - 1)) * @as(i64, per);
-    const page_sql = try std.fmt.allocPrintSentinel(sa, "SELECT {s} FROM \"{s}\"{s}{s} ORDER BY {s} LIMIT ? OFFSET ?;", .{ bcols, col.name, joins_sql.items, where_clause, offset_order_sql }, 0);
+    const qcol_page = try ddl.quoteIdent(sa, col.name);
+    defer sa.free(qcol_page);
+    const page_sql = try std.fmt.allocPrintSentinel(sa, "SELECT {s} FROM {s}{s}{s} ORDER BY {s} LIMIT ? OFFSET ?;", .{ bcols, qcol_page, joins_sql.items, where_clause, offset_order_sql }, 0);
     var pst = try prep(sa, conn, page_sql);
     defer pst.finalize();
     var after = try bindParams(&pst, params, 1);
@@ -3138,7 +3241,9 @@ pub fn list(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, q: L
 }
 
 fn countTotal(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, joins: []const u8, where_clause: []const u8, params: []const compiler.Param) !i64 {
-    const count_sql = try std.fmt.allocPrintSentinel(alloc, "SELECT COUNT(*) FROM \"{s}\"{s}{s};", .{ col.name, joins, where_clause }, 0);
+    const qcol_count = try ddl.quoteIdent(alloc, col.name);
+    defer alloc.free(qcol_count);
+    const count_sql = try std.fmt.allocPrintSentinel(alloc, "SELECT COUNT(*) FROM {s}{s}{s};", .{ qcol_count, joins, where_clause }, 0);
     var cst = try prep(alloc, conn, count_sql);
     defer cst.finalize();
     _ = try bindParams(&cst, params, 1);
