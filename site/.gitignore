@@ -27,3 +27,7 @@ src/content/docs/serve.md
 src/content/docs/tenancy.md
 src/content/docs/testing.md
 src/content/docs/typescript-sdk.md
+
+# Generated from docs-registry.json by scripts/gen-llms-txt.mjs — do not commit.
+public/llms.txt
+public/docs-index.json

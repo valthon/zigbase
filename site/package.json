@@ -5,9 +5,10 @@
   "private": true,
   "scripts": {
     "gen:docs": "node scripts/gen-docs-mirror.mjs",
-    "predev": "node scripts/gen-docs-mirror.mjs",
+    "gen:llms": "node scripts/gen-llms-txt.mjs",
+    "predev": "node scripts/gen-docs-mirror.mjs && node scripts/gen-llms-txt.mjs",
     "dev": "astro dev",
-    "prebuild": "node scripts/gen-docs-mirror.mjs",
+    "prebuild": "node scripts/gen-docs-mirror.mjs && node scripts/gen-llms-txt.mjs",
     "build": "astro build",
     "preview": "astro preview",
     "check": "astro check"
