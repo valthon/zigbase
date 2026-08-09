@@ -1,6 +1,7 @@
 const std = @import("std");
 const db = @import("db.zig");
 const Migrator = @import("migrator.zig").Migrator;
+const schema_gen = @import("schema_gen.zig");
 
 /// A system migration. `up` receives a `*Migrator` carrying the active SQL `Dialect`, so the SAME
 /// migration code emits backend-correct SQL on SQLite and Postgres (#159, PR-2). Bodies use
@@ -621,6 +622,30 @@ fn init_0021_rt_broadcasts(m: *Migrator) db.DbError!void {
     try m.exec("CREATE INDEX IF NOT EXISTS \"idx_rt_broadcasts_created\" ON \"_rt_broadcasts\" (\"created\");");
 }
 
+/// The one-row schema-generation marker. Every public writer of `_collections` bumps
+/// `generation` inside its OWN transaction, so the bump commits or rolls back atomically with
+/// the DDL it accompanies. Any process sharing the data dir can then detect that collection
+/// metadata changed — which is what lets a running server notice a `zigbase migrate`/`import`
+/// (or another instance's write) instead of serving stale cached metadata until restart.
+///
+/// Exported so the realtime hub's throwaway `:memory:` authz sandbox can seed it: that sandbox
+/// calls `collections.create`, which bumps, so the table must exist there too.
+pub const schema_state_table_sql =
+    \\CREATE TABLE IF NOT EXISTS "_schema_state" ("id" INTEGER PRIMARY KEY, "generation" INTEGER NOT NULL DEFAULT 0);
+;
+
+/// Seed the single marker row. `INSERT ... SELECT ... WHERE NOT EXISTS` is idempotent on both
+/// backends without an `ON CONFLICT` dialect split, and guarantees the row exists so readers
+/// never have to distinguish "no row" from "generation 0".
+pub const schema_state_seed_sql =
+    \\INSERT INTO "_schema_state" ("id","generation") SELECT 1, 0 WHERE NOT EXISTS (SELECT 1 FROM "_schema_state" WHERE "id" = 1);
+;
+
+fn init_0022_schema_state(m: *Migrator) db.DbError!void {
+    try m.exec(schema_state_table_sql);
+    try m.exec(schema_state_seed_sql);
+}
+
 pub const all = [_]Migration{
     .{ .name = "0001_init", .up = init_0001 },
     .{ .name = "0002_auth", .up = init_0002 },
@@ -643,6 +668,7 @@ pub const all = [_]Migration{
     .{ .name = "0019_bulk_mail", .up = init_0019_bulk_mail },
     .{ .name = "0020_sessions_seq", .up = init_0020_sessions_seq },
     .{ .name = "0021_rt_broadcasts", .up = init_0021_rt_broadcasts },
+    .{ .name = "0022_schema_state", .up = init_0022_schema_state },
 };
 
 /// Create the `_migrations` ledger table if it is absent (idempotent). The auto-increment PK
@@ -669,6 +695,7 @@ pub fn run(w: *db.Db) db.DbError!void {
 
     try ensureLedger(w);
 
+    var applied_any = false;
     for (all) |mig| {
         if (try isApplied(&m, mig.name)) continue;
         try w.begin();
@@ -676,7 +703,18 @@ pub fn run(w: *db.Db) db.DbError!void {
         try mig.up(&m);
         try recordApplied(&m, mig.name);
         try w.commit();
+        applied_any = true;
     }
+
+    // A system migration can create or reshape collections, and it bypasses the collections.zig
+    // primitives entirely (it runs raw DDL through the Migrator), so nothing has bumped the
+    // marker. Bump once if anything was applied — conservatively, since we do not try to
+    // classify which migrations touched collection metadata. Skipped when nothing ran, so the
+    // overwhelmingly common "already up to date" startup does not invalidate every cache.
+    //
+    // Deliberately AFTER the loop rather than inside each transaction: 0022 CREATEs the marker
+    // table itself, so a bump inside its own transaction would have to special-case ordering.
+    if (applied_any) try schema_gen.bump(w);
 }
 
 fn isApplied(m: *Migrator, name: []const u8) db.DbError!bool {
@@ -782,6 +820,11 @@ test "0010 backfills token_epoch onto a pre-existing user auth table" {
     defer d.close();
     // Simulate an OLD database: the migrations table is current up to 0009 but a user auth
     // collection's physical table predates the token_epoch column.
+    //
+    // NOTE: this list pins a HISTORICAL ledger state — it is NOT a mirror of `all`. Do NOT
+    // append newly-added migrations to it: a name listed here is recorded as already applied,
+    // so `run` below SKIPS it and whatever it creates never exists (verified: adding
+    // "0022_schema_state" here leaves `_schema_state` absent after `run`).
     try d.exec(
         \\CREATE TABLE "_migrations" ("id" INTEGER PRIMARY KEY AUTOINCREMENT, "name" TEXT UNIQUE NOT NULL, "applied_at" TEXT NOT NULL);
     );
@@ -818,6 +861,8 @@ test "0010 backfills token_epoch onto a pre-existing user auth table" {
 test "0010 backfills a long-named (251+ char) auth table — no fixed-buffer length cap" {
     var d = try db.Db.openMemory();
     defer d.close();
+    // A HISTORICAL ledger state, not a mirror of `all` — see the note in the 0010 backfill test
+    // above. Never append newly-added migrations here.
     try d.exec(
         \\CREATE TABLE "_migrations" ("id" INTEGER PRIMARY KEY AUTOINCREMENT, "name" TEXT UNIQUE NOT NULL, "applied_at" TEXT NOT NULL);
     );

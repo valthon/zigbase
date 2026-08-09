@@ -4,6 +4,7 @@ const schema = @import("schema.zig");
 const migrations = @import("migrations.zig");
 const ddl = @import("ddl.zig");
 const id = @import("id.zig");
+const schema_gen = @import("schema_gen.zig");
 
 /// The JSON parse helpers in schema.zig return the inferred error set of
 /// std.json.parseFromSlice, which is wider than schema.ParseError. Capture it so
@@ -75,6 +76,7 @@ pub fn create(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, def: schema.Colle
         }
     }
     try insertRow(sa, w, col);
+    try schema_gen.bump(w); // inside the tx: a rolled-back create must not advertise a change
     try w.commit();
 
     // Return a fully-owned reload on `alloc`. The just-persisted row round-trips through
@@ -299,6 +301,7 @@ pub fn update(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, id_or_name: []con
         }
     }
     try updateRow(sa, w, newc.id, newc); // persist user fields only
+    try schema_gen.bump(w); // inside the tx: a rolled-back rebuild must not advertise a change
     try w.commit();
     if (sqlite_rebuild) {
         try w.exec("PRAGMA foreign_keys=ON;");
@@ -405,15 +408,25 @@ pub fn updateRules(alloc: std.mem.Allocator, w: *db.Db, col_id: []const u8, rule
         \\UPDATE "_collections" SET "listRule"=?2, "viewRule"=?3, "createRule"=?4,
         \\ "updateRule"=?5, "deleteRule"=?6, "updated"={s} WHERE "id"=?1;
     , .{d.nowTextExpr()});
-    var st = try w.prepare(try d.renumberPlaceholders(sa, raw));
-    defer st.finalize();
-    try st.bindText(1, col_id);
-    try bindOptText(&st, 2, rules.list);
-    try bindOptText(&st, 3, rules.view);
-    try bindOptText(&st, 4, rules.create);
-    try bindOptText(&st, 5, rules.update);
-    try bindOptText(&st, 6, rules.delete);
-    _ = try st.step();
+    // The rule write and its generation bump must land together: a committed rule change that
+    // did not bump would leave every serving process enforcing the OLD rule out of its cache,
+    // which is precisely the staleness this marker exists to prevent. One transaction, so the
+    // two either both happen or neither does.
+    try w.begin();
+    errdefer w.rollback() catch {};
+    {
+        var st = try w.prepare(try d.renumberPlaceholders(sa, raw));
+        defer st.finalize();
+        try st.bindText(1, col_id);
+        try bindOptText(&st, 2, rules.list);
+        try bindOptText(&st, 3, rules.view);
+        try bindOptText(&st, 4, rules.create);
+        try bindOptText(&st, 5, rules.update);
+        try bindOptText(&st, 6, rules.delete);
+        _ = try st.step();
+    } // finalize the statement BEFORE commit — SQLite will not commit with a live statement
+    try schema_gen.bump(w);
+    try w.commit();
 }
 
 pub fn delete(alloc: std.mem.Allocator, w: *db.Db, id_or_name: []const u8) EngineError!void {
@@ -441,6 +454,7 @@ pub fn delete(alloc: std.mem.Allocator, w: *db.Db, id_or_name: []const u8) Engin
     defer st.finalize();
     try st.bindText(1, target.id);
     _ = try st.step();
+    try schema_gen.bump(w); // inside the tx: a rolled-back delete must not advertise a change
     try w.commit();
 }
 

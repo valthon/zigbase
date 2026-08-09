@@ -18,6 +18,7 @@ const schema = @import("schema.zig");
 const collections = @import("collections.zig");
 const db = @import("db.zig");
 const ddl = @import("ddl.zig");
+const schema_gen = @import("schema_gen.zig");
 const rules = @import("rules.zig");
 const regex = @import("regex.zig");
 const datetime = @import("datetime.zig");
@@ -1228,6 +1229,17 @@ pub fn runMigrations(
             try fwd(&mig);
             try recordMigration(&mig, name);
         }
+        // A consumer migration runs arbitrary raw SQL and may create/alter/drop collections
+        // without going through the collections.zig primitives, so nothing has bumped the marker.
+        // Bump per applied migration — deliberately conservative: we cannot tell whether a given
+        // migration touched collection metadata, and an unnecessary bump costs one cache reload
+        // while a missed one serves stale metadata until restart.
+        //
+        // Outside the migration's own transaction on purpose: the `.transactional = false` arm has
+        // no transaction to join, and the bump must behave identically on both arms. A migration
+        // that committed but whose bump then fails surfaces the error to the caller (startup
+        // fails loudly) rather than silently leaving the marker behind.
+        try schema_gen.bump(w);
         std.log.info("provision: applied migration '{s}'", .{m.id});
     }
 }
@@ -1557,6 +1569,12 @@ pub fn rollbackMigrations(
             try w.commit();
         }
 
+        // Same reasoning as the forward path: a reversal runs raw SQL that can reshape collections
+        // without touching the collections.zig primitives. Bump per reversed migration, outside
+        // the (optional) transaction so both the transactional and non-transactional arms behave
+        // identically. A rollback that moves the counter is still a CHANGE — the observer's
+        // predicate is `!=`, not `>`, precisely so a value moving is always noticed.
+        try schema_gen.bump(w);
         std.log.info("migrate rollback: reversed migration '{s}'", .{id});
         // Dupe into a guarded local BEFORE appending, so a failing `append` frees the dupe rather
         // than leaking it (the function-scoped errdefer only covers ids already in `reversed`).
