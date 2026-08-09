@@ -754,3 +754,43 @@ pub fn embedStaticDir(b: *std.Build, dir_rel: []const u8) *std.Build.Module {
     const manifest = wf.add("static_assets.zig", src.items);
     return b.createModule(.{ .root_source_file = manifest });
 }
+
+/// Wire the `zigbase` module into a consumer module, and set everything the module
+/// requires — today that is `link_libc`, because zigbase carries the SQLite C
+/// amalgamation and zap transitively. Forgetting `link_libc` by hand is the classic
+/// first-build failure; going through this helper makes it unrepresentable.
+///
+///     const zigbase = @import("zigbase");           // the dependency's build.zig
+///     const dep = b.dependency("zigbase", .{ .target = target, .optimize = optimize });
+///     zigbase.addTo(dep, exe_mod);
+pub fn addTo(dep: *std.Build.Dependency, mod: *std.Build.Module) void {
+    mod.link_libc = true;
+    mod.addImport("zigbase", dep.module("zigbase"));
+}
+
+pub const TestOptions = struct {
+    /// The module under test. Pass the SAME module you passed to `addTo` — rooting a
+    /// second module at the same file puts one file in two modules, which Zig rejects.
+    root_module: *std.Build.Module,
+    name: []const u8 = "test",
+    filters: []const []const u8 = &.{},
+};
+
+/// A test artifact for a consumer app, wired with ZigBase's `.simple`-mode runner.
+///
+/// The runner matters: `zig build test` otherwise runs the test binary in server mode
+/// (`--listen=-`), and an app booted by `zigbase.testing` does enough work at process
+/// exit that Zig 0.16's build runner can mis-read a normal exit as a crash. `.simple`
+/// mode rides the exit code instead. The runner also fails the build on a leaked
+/// allocation.
+///
+///     const tests = zigbase.addTest(b, dep, .{ .root_module = app_mod });
+///     b.step("test", "run tests").dependOn(&b.addRunArtifact(tests).step);
+pub fn addTest(b: *std.Build, dep: *std.Build.Dependency, opts: TestOptions) *std.Build.Step.Compile {
+    return b.addTest(.{
+        .name = opts.name,
+        .root_module = opts.root_module,
+        .filters = opts.filters,
+        .test_runner = .{ .path = dep.path("src/simple_runner.zig"), .mode = .simple },
+    });
+}
