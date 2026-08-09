@@ -4,6 +4,9 @@ import Nav from '../components/Nav.astro';
 import Footer from '../components/Footer.astro';
 import { ZIGBASE_VERSION, ZIGBASE_VERSION_TAG, REPO_URL, TARGETS } from '../config/site';
 
+// BASE_URL is '/zigbase' (no trailing slash) — normalise to trailing slash.
+const base = import.meta.env.BASE_URL.replace(/\/?$/, '/');
+
 const REL = ZIGBASE_VERSION_TAG;
 const ASSET_BASE = `${REPO_URL}/releases/download/${REL}`;
 const releasePage = `${REPO_URL}/releases/tag/${REL}`;
@@ -92,7 +95,7 @@ const binaries = TARGETS.map((t) => ({
       <p class="dl__links">
         <code>latest</code>, <code>{'{'}X.Y.Z{'}'}</code>, and rolling <code>{'{'}X.Y{'}'}</code>/<code>{'{'}X{'}'}</code>
         tags are published to <a href="https://github.com/valthon/zigbase/pkgs/container/zigbase" target="_blank" rel="noopener noreferrer">ghcr.io/valthon/zigbase</a>.
-        See the <a href="/docs/docker">Docker guide</a> for the data-volume and non-root-user details.
+        See the <a href={base + 'docs/docker'}>Docker guide</a> for the data-volume and non-root-user details.
       </p>
     </section>
 

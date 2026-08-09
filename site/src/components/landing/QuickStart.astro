@@ -9,22 +9,23 @@ curl -L ${REPO_URL}/releases/download/${ZIGBASE_VERSION_TAG}/zigbase-${ZIGBASE_V
 
 # Create a superuser, then serve
 ./zigbase superuser create --email you@example.com --password "<a strong password>" --data-dir ./zb_data
-ZIGBASE_JWT_SECRET="$(head -c 32 /dev/urandom | base64)" ./zigbase serve --data-dir ./zb_data
-# open http://127.0.0.1:8090/_/  (admin UI)`;
+# --insecure-cookies: local dev is plain HTTP, and auth cookies are Secure by default.
+./zigbase serve --insecure-cookies --data-dir ./zb_data
+# open http://127.0.0.1:8090/_/  (admin UI) — a JWT secret is generated under ./zb_data`;
 
 const sourceCode = `mise install          # installs Zig 0.16.0 (pinned in mise.toml)
 zig build             # -> zig-out/bin/zigbase
 
 ./zig-out/bin/zigbase superuser create --email you@example.com --password "<a strong password>" --data-dir ./zb_data
-ZIGBASE_JWT_SECRET="$(head -c 32 /dev/urandom | base64)" ./zig-out/bin/zigbase serve --data-dir ./zb_data
+./zig-out/bin/zigbase serve --insecure-cookies --data-dir ./zb_data
 # curl http://127.0.0.1:8090/api/health   ->  {"status":"ok"}`;
 
 const libFetch = `zig fetch --save git+https://github.com/valthon/zigbase`;
 
-const libBuild = `// build.zig — ZigBase links libc
+const libBuild = `// build.zig — one call adds the import and wires libc
+const zigbase = @import("zigbase");
 const zb = b.dependency("zigbase", .{ .target = target, .optimize = optimize });
-exe_mod.addImport("zigbase", zb.module("zigbase"));
-exe_mod.link_libc = true;`;
+zigbase.addTo(zb, exe_mod);`;
 
 const libMain = `// src/main.zig
 const std = @import("std");
