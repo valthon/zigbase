@@ -220,6 +220,16 @@
     }
   },
   {
+    "canonical": "docs/testing.md",
+    "mirror": "testing.md",
+    "frontmatter": {
+      "title": "Testing",
+      "description": "Test a ZigBase app in-process with zigbase.testing — the build wiring, a worked test, the auth seams, and what an in-process test structurally cannot cover.",
+      "order": 3,
+      "group": "guides"
+    }
+  },
+  {
     "canonical": "docs/typescript-sdk.md",
     "mirror": "typescript-sdk.md",
     "frontmatter": {

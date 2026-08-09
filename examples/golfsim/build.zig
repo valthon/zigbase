@@ -11,14 +11,23 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
-        .link_libc = true,
     });
-    exe_mod.addImport("zigbase", zigbase.module("zigbase"));
+    // Adds the import AND sets link_libc, which zigbase requires.
+    zigbase_build.addTo(zigbase, exe_mod);
+
     const exe = b.addExecutable(.{ .name = "golfsim", .root_module = exe_mod });
     b.installArtifact(exe);
 
+    // In-process tests through the real pipeline. Reuses exe_mod on purpose:
+    // a second module rooted at src/main.zig would put one file in two modules.
+    const tests = zigbase_build.addTest(b, zigbase, .{ .root_module = exe_mod });
+    const run_tests = b.addRunArtifact(tests);
+    b.step("test", "Run the golfsim example's in-process tests").dependOn(&run_tests.step);
+
     // --- codegen: golfsim's typed client (Plan 2) ---
-    // app_mod's root is the same main.zig that defines `pub const App` at module scope.
+    // app_mod's root is the same main.zig that defines `pub const App` at module scope. A
+    // separate module object is safe here because gen_exe (below) is its own Step.Compile,
+    // disjoint from `exe`/`tests` above -- not the same "test artifact reuse" hazard.
     const app_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,

@@ -53,8 +53,22 @@ jobs:
         run: mise exec zig@0.16.0 -- zig build -Dcpu=baseline
       - name: Build blog example consumer (dependency-graph proof)
         run: cd examples/blog && mise exec zig@0.16.0 -- zig build -Dcpu=baseline
+      # The examples are also the reference for how a consumer tests their app,
+      # so blog's in-process suite runs in CI rather than only compiling.
+      - name: Blog example in-process tests (zigbase.testing)
+        run: cd examples/blog && mise exec zig@0.16.0 -- zig build test --summary all
       - name: Build golfsim example consumer (realistic app)
         run: cd examples/golfsim && mise exec zig@0.16.0 -- zig build -Dcpu=baseline
+      # golfsim's `.static_files` dir is comptime-hardcoded (not --serve-static), so the app
+      # — including zigbase.testing's socketless boot below — refuses to boot at all unless
+      # frontend/dist already exists. Build it first (mirrors harness.ts's ensureFrontend()).
+      - name: Golfsim example in-process tests (zigbase.testing)
+        run: |
+          cd examples/golfsim/frontend
+          mise exec node@24 -- npm ci --no-audit --no-fund
+          mise exec node@24 -- npm run build
+          cd ../
+          mise exec zig@0.16.0 -- zig build test --summary all
       - name: Build dating-server (e2e fixture binary)
         run: mise exec zig@0.16.0 -- zig build dating-server -Dcpu=baseline
       - name: Build auth2-server (e2e fixture binary)

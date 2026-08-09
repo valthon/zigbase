@@ -166,82 +166,156 @@ fn heartbeat(ctx: *zigbase.Ctx, ev: *zigbase.events.JobEvent) anyerror!void {
 /// its own root, because `std_options` is resolved from the root source file.
 pub const std_options = zigbase.std_options;
 
-pub fn main(init: std.process.Init) !void {
-    return zigbase.App(.{
-        .hooks = .{
-            .posts = .{
-                .beforeCreate = postsBeforeCreate,
-                .beforeUpdate = computeReadingTime,
+/// The application. Hoisted to a `pub const` (rather than inlined into `main`)
+/// so the test block below can boot it in-process — an `App(.{...})` literal
+/// inside `main` is unreachable from a test.
+pub const App = zigbase.App(.{
+    .hooks = .{
+        .posts = .{
+            .beforeCreate = postsBeforeCreate,
+            .beforeUpdate = computeReadingTime,
+        },
+    },
+    .routes = .{
+        .{ .method = .GET, .path = "/api/blog/ping", .handler = ping, .auth = .public },
+        .{ .method = .GET, .path = "/api/blog/posts/:slug", .handler = getPostBySlug, .auth = .public },
+    },
+    .pools = .{ .jobs = 2 },
+    .cron = .{
+        .{ .name = "heartbeat", .schedule = zigbase.schedule.Schedule{ .interval = .hourly }, .handler = heartbeat },
+    },
+    // Pagination: keep BOTH modes enabled (offset for the admin tables, cursor for the public
+    // infinite-scroll feed). Use HMAC-SIGNED cursor tokens so a hand-crafted/tampered cursor is
+    // rejected with a clear 400 — the MAC is keyed by the server's JWT secret, no extra config.
+    // (Swap .signed for .stateless — the default, SDK-byte-compatible — or .stateful — opaque
+    // ids stored server-side with a TTL — to change the token format.)
+    .pagination = .{
+        .offset = true,
+        .cursor = true,
+        .cursor_token = .signed,
+    },
+    // Provisioned at startup (additive auto-migration): an auth collection with
+    // open signup, and public posts readable only when published.
+    .collections = .{
+        .users = .{
+            .type = .auth,
+            .fields = .{
+                .{ .name = "name", .type = .text, .max = 100 },
             },
-        },
-        .routes = .{
-            .{ .method = .GET, .path = "/api/blog/ping", .handler = ping, .auth = .public },
-            .{ .method = .GET, .path = "/api/blog/posts/:slug", .handler = getPostBySlug, .auth = .public },
-        },
-        .pools = .{ .jobs = 2 },
-        .cron = .{
-            .{ .name = "heartbeat", .schedule = zigbase.schedule.Schedule{ .interval = .hourly }, .handler = heartbeat },
-        },
-        // Pagination: keep BOTH modes enabled (offset for the admin tables, cursor for the public
-        // infinite-scroll feed). Use HMAC-SIGNED cursor tokens so a hand-crafted/tampered cursor is
-        // rejected with a clear 400 — the MAC is keyed by the server's JWT secret, no extra config.
-        // (Swap .signed for .stateless — the default, SDK-byte-compatible — or .stateful — opaque
-        // ids stored server-side with a TTL — to change the token format.)
-        .pagination = .{
-            .offset = true,
-            .cursor = true,
-            .cursor_token = .signed,
-        },
-        // Provisioned at startup (additive auto-migration): an auth collection with
-        // open signup, and public posts readable only when published.
-        .collections = .{
-            .users = .{
-                .type = .auth,
-                .fields = .{
-                    .{ .name = "name", .type = .text, .max = 100 },
-                },
-                // Public profiles + open signup: list/view/create are intentionally allow-all
-                // (the explicit "@public" sentinel; an empty string is now LOCKED, not public).
-                .rules = .{ .list = "@public", .view = "@public", .create = "@public", .update = "@request.auth.id = id", .delete = "@request.auth.id = id" },
-                // Built-in magic-link login: POST initiate -> link emailed (or logged in dev) ->
-                // GET consume sets session cookie + redirects to "/". No password required.
-                // auto_create = true: a first-time visitor signing in gets an account automatically.
-                // Set ZIGBASE_PUBLIC_URL=http://blog.test/ (fake; override to your host to click
-                // the link) so the emailed link is a real clickable URL instead of a raw token.
-                .auth = .{
-                    .methods = .{
-                        .magic_link = .{
-                            .ttl_s = 3600,
-                            .auto_create = true,
-                            .redirect_default = "/",
-                        },
+            // Public profiles + open signup: list/view/create are intentionally allow-all
+            // (the explicit "@public" sentinel; an empty string is now LOCKED, not public).
+            .rules = .{ .list = "@public", .view = "@public", .create = "@public", .update = "@request.auth.id = id", .delete = "@request.auth.id = id" },
+            // Built-in magic-link login: POST initiate -> link emailed (or logged in dev) ->
+            // GET consume sets session cookie + redirects to "/". No password required.
+            // auto_create = true: a first-time visitor signing in gets an account automatically.
+            // Set ZIGBASE_PUBLIC_URL=http://blog.test/ (fake; override to your host to click
+            // the link) so the emailed link is a real clickable URL instead of a raw token.
+            .auth = .{
+                .methods = .{
+                    .magic_link = .{
+                        .ttl_s = 3600,
+                        .auto_create = true,
+                        .redirect_default = "/",
                     },
                 },
-                // NOCASE unique index on email: prevents duplicate accounts differing only in
-                // case (e.g. Bob@x.com and bob@x.com would otherwise be two separate users).
-                .indexes = .{
-                    .{ .name = "users_email_nocase", .fields = .{"email"}, .unique = true, .collation = .nocase },
-                },
             },
-            .posts = .{
-                .fields = .{
-                    .{ .name = "title", .type = .text, .required = true, .max = 200 },
-                    .{ .name = "slug", .type = .text, .max = 220 },
-                    .{ .name = "body", .type = .text, .max = 20000 },
-                    .{ .name = "status", .type = .select, .values = .{ "draft", "published" } },
-                    .{ .name = "author", .type = .relation, .target = "users", .maxSelect = 1, .cascadeDelete = false },
-                    .{ .name = "updated_at", .type = .autodate, .onCreate = true, .onUpdate = true },
-                    .{ .name = "reading_time", .type = .number, .mode = .int },
-                },
-                // Authors can edit and delete only their own posts.
-                .rules = .{
-                    .list = "status = 'published'",
-                    .view = "status = 'published'",
-                    .create = "@request.auth.id != ''",
-                    .update = "@request.auth.id = author",
-                    .delete = "@request.auth.id = author",
-                },
+            // NOCASE unique index on email: prevents duplicate accounts differing only in
+            // case (e.g. Bob@x.com and bob@x.com would otherwise be two separate users).
+            .indexes = .{
+                .{ .name = "users_email_nocase", .fields = .{"email"}, .unique = true, .collation = .nocase },
             },
         },
-    }).runCli(init);
+        .posts = .{
+            .fields = .{
+                .{ .name = "title", .type = .text, .required = true, .max = 200 },
+                .{ .name = "slug", .type = .text, .max = 220 },
+                .{ .name = "body", .type = .text, .max = 20000 },
+                .{ .name = "status", .type = .select, .values = .{ "draft", "published" } },
+                .{ .name = "author", .type = .relation, .target = "users", .maxSelect = 1, .cascadeDelete = false },
+                .{ .name = "updated_at", .type = .autodate, .onCreate = true, .onUpdate = true },
+                .{ .name = "reading_time", .type = .number, .mode = .int },
+            },
+            // Authors can edit and delete only their own posts.
+            .rules = .{
+                .list = "status = 'published'",
+                .view = "status = 'published'",
+                .create = "@request.auth.id != ''",
+                .update = "@request.auth.id = author",
+                .delete = "@request.auth.id = author",
+            },
+        },
+    },
+});
+
+pub fn main(init: std.process.Init) !void {
+    return App.runCli(init);
+}
+
+// ---------------------------------------------------------------------------
+// In-process tests. `zigbase.testing` boots this app against a throwaway data dir
+// and injects requests through the REAL router, access rules, auth, and hooks —
+// no socket, no port. Run with `zig build test`.
+//
+// The vitest suite under test/ is a different surface: it drives @zigbase/client
+// against a spawned server over HTTP. Neither replaces the other.
+
+test "the posts list rule hides drafts from the public" {
+    var t = try zigbase.testing.start(App, .{});
+    defer t.deinit();
+
+    _ = try t.createRecord("posts", .{ .title = "Draft", .status = "draft" });
+    _ = try t.createRecord("posts", .{ .title = "Live", .status = "published" });
+
+    const r = try t.request(.GET, "/api/collections/posts/records", .{});
+    try std.testing.expectEqual(@as(u16, 200), r.status);
+    const page = try r.json(struct { items: []struct { title: []const u8 } });
+    try std.testing.expectEqual(@as(usize, 1), page.items.len);
+    try std.testing.expectEqualStrings("Live", page.items[0].title);
+}
+
+test "beforeCreate derives the slug, the author, and the reading time" {
+    var t = try zigbase.testing.start(App, .{});
+    defer t.deinit();
+
+    _ = try t.createRecord("users", .{ .email = "writer@example.com", .password = "hunter2xyz" });
+    const token = try t.loginPassword("users", "writer@example.com", "hunter2xyz");
+
+    const created = try t.request(.POST, "/api/collections/posts/records", .{
+        .json = .{ .title = "Hello There World", .body = "one two three four five", .status = "published" },
+        .auth = token,
+    });
+    try std.testing.expectEqual(@as(u16, 201), created.status);
+    const rec = try created.json(struct {
+        slug: []const u8,
+        author: []const u8,
+        // computeReadingTime stamps this as a JSON STRING (e.g. "1"), not a number —
+        // std.json's int parsing accepts that string-coerced-to-int form transparently.
+        reading_time: i64,
+    });
+    try std.testing.expectEqualStrings("hello-there-world", rec.slug);
+    try std.testing.expect(rec.author.len > 0); // setAuthor stamped the caller
+    try std.testing.expect(rec.reading_time >= 1);
+}
+
+test "the ping route is public and the by-slug route only serves published posts" {
+    var t = try zigbase.testing.start(App, .{});
+    defer t.deinit();
+
+    const ping_r = try t.request(.GET, "/api/blog/ping", .{});
+    try std.testing.expectEqual(@as(u16, 200), ping_r.status);
+    try std.testing.expect((try ping_r.json(struct { pong: bool })).pong);
+
+    _ = try t.createRecord("posts", .{ .title = "Secret", .slug = "secret", .status = "draft" });
+    const miss = try t.request(.GET, "/api/blog/posts/secret", .{});
+    try std.testing.expectEqual(@as(u16, 404), miss.status);
+}
+
+test "creating a post requires authentication" {
+    var t = try zigbase.testing.start(App, .{});
+    defer t.deinit();
+
+    const r = try t.request(.POST, "/api/collections/posts/records", .{
+        .json = .{ .title = "Anonymous" },
+    });
+    try std.testing.expect(r.status == 401 or r.status == 403);
 }

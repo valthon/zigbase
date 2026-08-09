@@ -26,6 +26,7 @@ export const sidebar: SidebarGroup[] = [
     entries: [
       { slug: 'recipes', label: 'Recipes' },
       { slug: 'framework', label: 'Framework' },
+      { slug: 'testing', label: 'Testing' },
       { slug: 'typescript-sdk', label: 'TypeScript SDK' },
       { slug: 'dart-sdk', label: 'Dart SDK' },
       { slug: 'python-sdk', label: 'Python SDK' },

@@ -17,7 +17,7 @@ const PUBLISHED = new Set([
   'abilities', 'agents', 'analytics', 'api', 'changelog', 'configuration', 'dart-sdk',
   'docker', 'email', 'fields', 'framework', 'jobs-and-webhooks', 'known-limitations',
   'kotlin-sdk', 'migration-tools', 'observability', 'overview', 'postgres', 'python-sdk',
-  'quick-start', 'realtime-broadcast', 'recipes', 'search', 'serve', 'tenancy',
+  'quick-start', 'realtime-broadcast', 'recipes', 'search', 'serve', 'tenancy', 'testing',
   'tutorial', 'typescript-sdk',
 ]);
 // Root canonicals linked by UPPER_CASE basename → their route.
