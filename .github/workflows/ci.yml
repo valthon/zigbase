@@ -445,6 +445,8 @@ jobs:
         # process-table state, which -n auto makes flaky for reasons unrelated
         # to the code. No browser or Playwright involvement.
         run: mise exec python@3.13 -- python -m pytest tests/cli -q
+      - name: Replay-harness unit tests
+        run: mise exec python@3.13 -- python -m pytest tests/tools -q
       - name: Live SMTP-over-TLS (STARTTLS) delivery test
         run: mise exec python@3.13 -- python -m pytest tests/smtp -q
 
