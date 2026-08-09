@@ -43,12 +43,15 @@ ENV_ALLOWLIST = {
     # correctly REJECTED by isKnown — none of the three is a real knob.
     "ZIGBASE_OAUTH_GITHUB_CLIENT_SECRET",
     "ZIGBASE_HTTP_PORTS", "ZIGBASE_TRUST_PROXIES", "ZIGBASE_OAUTH_GOOGLE_SECRET",
-    # Pre-registered in config.known_external_vars ahead of SP-3, which introduces the
-    # `zigbase serve --background` feature these two names actually control (see the
-    # CROSS-PROJECT comment on known_external_vars in src/config.zig). Until SP-3 lands
-    # the real behavior and its own README/help docs, documenting them here would be
-    # premature. Remove this allowlist entry and add real docs when SP-3 merges.
-    "ZIGBASE_SERVE_BACKGROUND", "ZIGBASE_SERVE_BACKGROUND_CHILD",
+    # Internal recursion guard set by `serve --background` on the re-exec'd
+    # child so it runs the plain foreground path (src/serve_control.zig). The
+    # USER-facing knob is ZIGBASE_SERVE_BACKGROUND, which IS in the README and
+    # help tables (SP-3 landed the real behavior and docs, superseding SP-1's
+    # temporary pre-registration of both names here). Note the substring trap
+    # that makes this direction the only correct one: documenting only
+    # "..._CHILD" would falsely satisfy the parity check for
+    # "ZIGBASE_SERVE_BACKGROUND" too. Documented in docs/serve.md.
+    "ZIGBASE_SERVE_BACKGROUND_CHILD",
 }
 
 def _code_env_vars():

@@ -25,6 +25,9 @@ So a flag overrides the matching environment variable, which overrides the defau
 ```text
 zigbase serve [--http-host H] [--http-port N] [--data-dir PATH] [--serve-static DIR]
               [--insecure-cookies] [--trust-proxy] [--realtime-origins CSV]
+              [--background] [--ephemeral] [--ignore-lock] [--force]
+zigbase serve stop | status [--json] | logs [--follow] [--data-dir PATH]
+zigbase doctor [--production] [--json] [--data-dir PATH]
 zigbase migrate [--data-dir PATH]
 zigbase superuser create --email E --password P [--data-dir PATH]
 zigbase version
@@ -45,6 +48,20 @@ Running `zigbase` with no recognised command prints usage.
   startup only fails fast if a marker has no `index.html`. Real files and
   `/api`/admin paths always win. See
   [Framework → Static files](./framework#13-serve-a-frontend-static-files).
+  `--background` detaches into its own process group and exits `0` only once the server
+  answers its own `/api/health`; `--ephemeral` starts a throwaway server on a fresh temp
+  data dir and a free port, printing one JSON line when ready; `--ignore-lock` starts an
+  untracked instance (no session lock, invisible to `serve status/stop/logs`). A second
+  `serve` on the same data dir is refused unless `--ignore-lock` is passed. See
+  [Running the server](./serve) for the full session/control-verb contract.
+- **`serve stop | status | logs`** — manage a background `serve` session via its
+  `serve.lock`/`serve.json` session files. `status --json`/`logs --follow` for scripting.
+  See [Running the server → Control verbs](./serve#2-control-verbs).
+- **`doctor`** — run the eight frozen preflight checks over this deployment's config,
+  data dir, and schema; `--production` escalates the checks that matter more in a real
+  deployment; `--json` emits NDJSON findings plus a summary object. Exits `0` fully
+  clean, `1` on any error, `2` on warnings only. See
+  [Running the server → `zigbase doctor`](./serve#8-zigbase-doctor).
 - **`migrate`** — run schema migrations against the data directory and exit.
 - **`superuser create`** — create a superuser (required before managing collections).
 - **`help`** — print usage.
@@ -71,6 +88,7 @@ Running `zigbase` with no recognised command prints usage.
 | `ZIGBASE_PASSWORD_RESET_TTL` | — | `3600` (1 hour) | password-reset token lifetime, seconds |
 | `ZIGBASE_REALTIME_ORIGINS` | `--realtime-origins` | `""` (deny cross-origin) | CSV of allowed WebSocket `Origin`s. Empty denies cross-origin browser upgrades; same-origin upgrades are always allowed |
 | `ZIGBASE_REALTIME_OUTBOUND_HWM` | `--realtime-outbound-hwm` | `1024` (frames) | slow-consumer outbound high-water-mark: max queued outbound frames per realtime (WS/SSE) connection before the server disconnects the peer (bounds memory under a stalled/slow reader). `0` disables the bound |
+| `ZIGBASE_SERVE_BACKGROUND` | `--background` | _auto-detect_ | `1` forces `serve` into the background; any other value (including empty) disables the automatic backgrounding that a detected AI-agent environment (`CLAUDECODE`, `CODEX_THREAD_ID`, `GEMINI_CLI`, ...) would otherwise trigger. See [Running the server → Agent auto-detection](./serve#5-agent-auto-detection) |
 | `ZIGBASE_MAX_UPLOAD_SIZE` | — | `52428800` (50 MiB) | max request body size, bytes |
 | `ZIGBASE_FILE_TOKEN_TTL` | — | `120` (2 min) | file-access token lifetime, seconds |
 | `ZIGBASE_SENTRY_DSN` | — | `""` (log to stderr) | set to enable Sentry error reporting |

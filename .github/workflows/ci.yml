@@ -420,6 +420,12 @@ jobs:
         # free port + tempdir, so the harness is parallel-safe). Keep tests/smtp
         # serial below — it binds a real fixed TLS port.
         run: mise exec python@3.13 -- python -m pytest tests/admin -q -n auto
+      - name: Server lifecycle CLI e2e
+        # Serial on purpose: these tests assert on timing (the readiness
+        # handshake, the child-death path, the TERM/KILL escalation) and on
+        # process-table state, which -n auto makes flaky for reasons unrelated
+        # to the code. No browser or Playwright involvement.
+        run: mise exec python@3.13 -- python -m pytest tests/cli -q
       - name: Live SMTP-over-TLS (STARTTLS) delivery test
         run: mise exec python@3.13 -- python -m pytest tests/smtp -q
 

@@ -18,6 +18,25 @@ pub const ServeArgs = struct {
     log_format: ?[]const u8 = null, // --log-format text|json
     log_level: ?[]const u8 = null, // --log-level debug|info|warn|error
     log_requests: ?bool = null, // --no-request-log => false
+    /// Detach: re-exec self in its own process group, wait for readiness, exit 0.
+    background: bool = false,
+    /// Tempdir data dir + random free port; print one JSON object when ready.
+    ephemeral: bool = false,
+    /// Start an UNTRACKED instance: take no flock, write no serve.json.
+    ignore_lock: bool = false,
+    /// --background only: stop an existing session first instead of being idempotent.
+    force: bool = false,
+};
+
+pub const ServeControlVerb = enum { stop, status, logs };
+
+pub const ServeControlArgs = struct {
+    verb: ServeControlVerb,
+    data_dir: ?[]const u8 = null,
+    /// `status` only.
+    json: bool = false,
+    /// `logs` only.
+    follow: bool = false,
 };
 
 /// `migrate` runs one of four actions: `apply` (the default — apply pending system + consumer
@@ -108,7 +127,7 @@ pub const VersionArgs = struct {
 };
 
 /// Identifies which command a per-command `--help` request targets.
-pub const HelpTopic = enum { top, serve, migrate, superuser_create, typegen, rewrap, migrate_db, vapid_keygen, import, explain_code };
+pub const HelpTopic = enum { top, serve, serve_control, migrate, superuser_create, typegen, rewrap, migrate_db, vapid_keygen, import, explain_code };
 
 pub const Command = union(enum) {
     /// `help`/`--help`/`-h`/no-args -> top-level usage; `<cmd> --help` -> that command's usage.
@@ -125,6 +144,8 @@ pub const Command = union(enum) {
     vapid_keygen: void,
     import: ImportArgs,
     explain_code: ExplainCodeArgs,
+    /// `serve stop|status|logs` -> manage an existing `serve` session.
+    serve_control: ServeControlArgs,
 };
 
 /// True when an arg is a help flag (`--help` or `-h`).
@@ -132,7 +153,7 @@ fn isHelpFlag(a: []const u8) bool {
     return std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "-h");
 }
 
-pub const ParseError = error{ UnknownCommand, UnknownFlag, MissingValue, BadValue };
+pub const ParseError = error{ UnknownCommand, UnknownFlag, MissingValue, BadValue, ConflictingFlags };
 
 /// Comptime-derived parser switches. `serve_static` is true only in the default
 /// static-files mode — in .disabled/.dir/.embedded the flag is rejected as unknown.
@@ -381,6 +402,43 @@ pub fn parse(args: []const []const u8, popts: ParseOpts) ParseError!Command {
     }
     if (!std.mem.eql(u8, args[0], "serve")) return ParseError.UnknownCommand;
 
+    // Optional leading control verb: `serve stop|status|logs`. Anything else
+    // non-flag in that position is not a verb (mirrors `migrate status`).
+    if (args.len >= 2 and !std.mem.startsWith(u8, args[1], "-")) {
+        const verb: ServeControlVerb =
+            if (std.mem.eql(u8, args[1], "stop"))
+                .stop
+            else if (std.mem.eql(u8, args[1], "status"))
+                .status
+            else if (std.mem.eql(u8, args[1], "logs"))
+                .logs
+            else
+                return ParseError.UnknownCommand;
+        var ca = ServeControlArgs{ .verb = verb };
+        var ci: usize = 2;
+        while (ci < args.len) : (ci += 1) {
+            const a = args[ci];
+            if (isHelpFlag(a)) {
+                // `-h` is a help flag everywhere in this parser; `-f` is the
+                // logs short flag, checked separately below so the two never collide.
+                return .{ .help = .serve_control };
+            } else if (std.mem.eql(u8, a, "--data-dir")) {
+                ci += 1;
+                if (ci >= args.len) return ParseError.MissingValue;
+                ca.data_dir = args[ci];
+            } else if ((verb == .status or verb == .logs) and std.mem.eql(u8, a, "--json")) {
+                // `status --json`: one JSON object describing the session.
+                // `logs --json`: keep only the NDJSON records, dropping the
+                // plain-text lines facil.io writes into serve.log from C.
+                // Still rejected on `stop`, which has no output to shape.
+                ca.json = true;
+            } else if (verb == .logs and (std.mem.eql(u8, a, "--follow") or std.mem.eql(u8, a, "-f"))) {
+                ca.follow = true;
+            } else return ParseError.UnknownFlag;
+        }
+        return .{ .serve_control = ca };
+    }
+
     var sa = ServeArgs{};
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -435,10 +493,20 @@ pub fn parse(args: []const []const u8, popts: ParseOpts) ParseError!Command {
             sa.log_level = args[i];
         } else if (std.mem.eql(u8, a, "--no-request-log")) {
             sa.log_requests = false;
+        } else if (std.mem.eql(u8, a, "--background")) {
+            sa.background = true;
+        } else if (std.mem.eql(u8, a, "--ephemeral")) {
+            sa.ephemeral = true;
+        } else if (std.mem.eql(u8, a, "--ignore-lock")) {
+            sa.ignore_lock = true;
+        } else if (std.mem.eql(u8, a, "--force")) {
+            sa.force = true;
         } else {
             return ParseError.UnknownFlag;
         }
     }
+    // Checked AFTER the loop so the two flags conflict in either order.
+    if (sa.background and sa.ignore_lock) return ParseError.ConflictingFlags;
     return .{ .serve = sa };
 }
 
@@ -696,6 +764,77 @@ test "--static-cache-control parses, requires a value, and is gated by ParseOpts
         &.{ "serve", "--static-cache-control", "x" },
         .{ .static_cache_control = false },
     ));
+}
+
+test "serve parses the four session-mode flags" {
+    const c = try parse(&.{ "serve", "--background", "--ephemeral", "--force" }, .{});
+    try std.testing.expect(c.serve.background);
+    try std.testing.expect(c.serve.ephemeral);
+    try std.testing.expect(c.serve.force);
+    try std.testing.expect(!c.serve.ignore_lock);
+
+    const d = try parse(&.{"serve"}, .{});
+    try std.testing.expect(!d.serve.background);
+    try std.testing.expect(!d.serve.ephemeral);
+    try std.testing.expect(!d.serve.force);
+    try std.testing.expect(!d.serve.ignore_lock);
+}
+
+test "serve --ignore-lock parses alone but conflicts with --background" {
+    const c = try parse(&.{ "serve", "--ignore-lock" }, .{});
+    try std.testing.expect(c.serve.ignore_lock);
+    // An untracked instance writes no lockfile, so --background's readiness
+    // handshake would have nothing to poll. Refuse the pair up front.
+    try std.testing.expectError(ParseError.ConflictingFlags, parse(&.{ "serve", "--background", "--ignore-lock" }, .{}));
+    try std.testing.expectError(ParseError.ConflictingFlags, parse(&.{ "serve", "--ignore-lock", "--background" }, .{}));
+}
+
+test "serve stop/status/logs parse to the control verbs" {
+    const stop = try parse(&.{ "serve", "stop" }, .{});
+    try std.testing.expect(std.meta.activeTag(stop) == .serve_control);
+    try std.testing.expectEqual(ServeControlVerb.stop, stop.serve_control.verb);
+
+    const status = try parse(&.{ "serve", "status", "--json", "--data-dir", "/tmp/zb" }, .{});
+    try std.testing.expectEqual(ServeControlVerb.status, status.serve_control.verb);
+    try std.testing.expect(status.serve_control.json);
+    try std.testing.expectEqualStrings("/tmp/zb", status.serve_control.data_dir.?);
+
+    const logs = try parse(&.{ "serve", "logs", "--follow" }, .{});
+    try std.testing.expectEqual(ServeControlVerb.logs, logs.serve_control.verb);
+    try std.testing.expect(logs.serve_control.follow);
+    const logs_short = try parse(&.{ "serve", "logs", "-f" }, .{});
+    try std.testing.expect(logs_short.serve_control.follow);
+
+    // `logs --json` filters serve.log down to its NDJSON records; it composes
+    // with --follow so a tail stays machine-readable too.
+    const logs_json = try parse(&.{ "serve", "logs", "--json" }, .{});
+    try std.testing.expectEqual(ServeControlVerb.logs, logs_json.serve_control.verb);
+    try std.testing.expect(logs_json.serve_control.json);
+    try std.testing.expect(!logs_json.serve_control.follow);
+    const logs_both = try parse(&.{ "serve", "logs", "--json", "--follow" }, .{});
+    try std.testing.expect(logs_both.serve_control.json and logs_both.serve_control.follow);
+}
+
+test "serve control verbs reject flags that belong to another verb" {
+    // --json shapes OUTPUT, so it is accepted by the two verbs that produce
+    // some (status, logs) and rejected by `stop`, which produces none.
+    // --follow/-f is logs-only. Silently ignoring a misplaced flag would let a
+    // caller believe it took effect.
+    try std.testing.expectError(ParseError.UnknownFlag, parse(&.{ "serve", "stop", "--json" }, .{}));
+    try std.testing.expectError(ParseError.UnknownFlag, parse(&.{ "serve", "status", "--follow" }, .{}));
+    try std.testing.expectError(ParseError.UnknownFlag, parse(&.{ "serve", "stop", "-f" }, .{}));
+    // Server flags are not control-verb flags either.
+    try std.testing.expectError(ParseError.UnknownFlag, parse(&.{ "serve", "status", "--http-port", "1" }, .{}));
+    try std.testing.expectError(ParseError.UnknownCommand, parse(&.{ "serve", "bogus" }, .{}));
+    try std.testing.expectError(ParseError.MissingValue, parse(&.{ "serve", "status", "--data-dir" }, .{}));
+}
+
+test "serve control --help routes to the serve_control help topic" {
+    try std.testing.expectEqual(HelpTopic.serve_control, (try parse(&.{ "serve", "status", "--help" }, .{})).help);
+    try std.testing.expectEqual(HelpTopic.serve_control, (try parse(&.{ "serve", "stop", "-h" }, .{})).help);
+    try std.testing.expectEqual(HelpTopic.serve_control, (try parse(&.{ "serve", "logs", "--help" }, .{})).help);
+    // A bare `serve --help` still routes to the SERVE topic, not the control one.
+    try std.testing.expectEqual(HelpTopic.serve, (try parse(&.{ "serve", "--help" }, .{})).help);
 }
 
 test "parse typegen: data-dir + out + flags" {

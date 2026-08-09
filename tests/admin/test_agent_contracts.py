@@ -42,7 +42,13 @@ def logged_server(binary, request):
     data = tempfile.mkdtemp(prefix="zb_logged_")
     port = _free_port()
     log_path = pathlib.Path(data) / "server.log"
-    env = {**os.environ, "ZIGBASE_DATA_DIR": data, "ZIGBASE_HTTP_PORT": str(port)}
+    # Foreground pin: this fixture asserts on the log file its own redirect
+    # captures, so serve must NOT auto-background itself when the suite runs
+    # inside an AI-agent session (CLAUDECODE etc.) — backgrounding would route
+    # the request log to <data-dir>/serve.log and leak the detached child past
+    # terminate(). See tests/admin/conftest.py's server fixture for the same pin.
+    env = {**os.environ, "ZIGBASE_DATA_DIR": data, "ZIGBASE_HTTP_PORT": str(port),
+           "ZIGBASE_SERVE_BACKGROUND": "0"}
     with open(log_path, "w") as log:
         proc = subprocess.Popen(
             [binary, "serve", "--insecure-cookies", *flags],

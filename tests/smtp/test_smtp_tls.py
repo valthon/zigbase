@@ -147,6 +147,10 @@ def test_smtp_starttls_delivery(binary):
         )
         env = {
             **os.environ,
+            # Foreground pin: keep serve a foreground child so terminate() stops it
+            # (an inherited agent env like CLAUDECODE would otherwise auto-background
+            # it and leak the detached child past the test).
+            "ZIGBASE_SERVE_BACKGROUND": "0",
             # >= 32 bytes: the server now refuses a shorter operator-provided secret.
             "ZIGBASE_JWT_SECRET": "test-secret-not-default-0123456789abcdef",
             "ZIGBASE_DATA_DIR": data,

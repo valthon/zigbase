@@ -105,6 +105,14 @@ fn replaceStaticMaxAge(_: ?*anyopaque) callconv(.c) void {
 /// `Server(gates).instance` — it reads this module-level global instead.
 pub var active_app: ?*app_mod.App = null;
 
+/// A `Server.on_listening` callback bound to its context. Pairing them in one
+/// struct is what makes "callback without context" impossible to express; see
+/// the field's doc comment.
+pub const OnListening = struct {
+    call: *const fn (ctx: *anyopaque) void,
+    ctx: *anyopaque,
+};
+
 pub fn Server(comptime gates: Gates) type {
     return struct {
         const Self = @This();
@@ -215,6 +223,24 @@ pub fn Server(comptime gates: Gates) type {
         host: [:0]const u8,
         port: u16,
 
+        /// Fired ONCE, on the serving thread, after the listening socket is
+        /// bound and immediately before the reactor starts. This is the only
+        /// point at which "the port is claimed but nothing is answering yet"
+        /// is observable, which is exactly when `serveImpl` must launch its
+        /// readiness verifier — `zap.start` below never returns.
+        ///
+        /// Null for every embedding that does not opt in (`App.run`, the
+        /// `zigbase.testing` harness). The callback must not block: it runs on
+        /// the thread that is about to become the reactor.
+        ///
+        /// The function and its context are ONE optional struct rather than two
+        /// independent optional fields, so "callback set, context missing" is
+        /// unrepresentable. As two fields it was merely asserted — the call site
+        /// force-unwrapped the context, and a future caller setting only the
+        /// callback would have crashed there with a bare unwrap panic and no
+        /// hint about which invariant it broke.
+        on_listening: ?OnListening = null,
+
         pub var instance: ?*Self = null;
 
         pub fn listen(self: *Self) !void {
@@ -231,6 +257,7 @@ pub fn Server(comptime gates: Gates) type {
             // #159, PR-6b: on Postgres, fan realtime across app instances via LISTEN/NOTIFY. A no-op
             // on SQLite (single-process) — self-gated, so no backend branch is needed here.
             realtime_ws.startRemoteListener(self.app);
+            if (self.on_listening) |cb| cb.call(cb.ctx);
             zap.start(.{ .threads = 4, .workers = 1 });
         }
 

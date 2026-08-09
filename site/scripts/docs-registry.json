@@ -180,6 +180,16 @@
     }
   },
   {
+    "canonical": "docs/serve.md",
+    "mirror": "serve.md",
+    "frontmatter": {
+      "title": "Running the server",
+      "description": "Foreground and background serve sessions, the stop/status/logs control verbs, ephemeral instances, and the doctor preflight.",
+      "order": 9,
+      "group": "guides"
+    }
+  },
+  {
     "canonical": "docs/tenancy.md",
     "mirror": "tenancy.md",
     "frontmatter": {

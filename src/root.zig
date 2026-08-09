@@ -348,6 +348,8 @@ test {
     _ = @import("ratelimit.zig");
     _ = @import("regex.zig");
     _ = @import("cli.zig");
+    _ = @import("serve_session.zig");
+    _ = @import("serve_control.zig");
     _ = @import("datetime.zig");
     _ = @import("db.zig");
     _ = @import("sql/param_sink.zig");

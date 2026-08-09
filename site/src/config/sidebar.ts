@@ -31,6 +31,7 @@ export const sidebar: SidebarGroup[] = [
       { slug: 'kotlin-sdk', label: 'Kotlin SDK' },
       { slug: 'configuration', label: 'Configuration' },
       { slug: 'docker', label: 'Docker' },
+      { slug: 'serve', label: 'Running the server' },
     ],
   },
   {

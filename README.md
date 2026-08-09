@@ -136,6 +136,8 @@ an Astro + React frontend demonstrating a different static-files mode.
 ```
 zigbase serve [--http-host H] [--http-port N] [--data-dir PATH] [--serve-static DIR]
               [--insecure-cookies] [--trust-proxy] [--realtime-origins CSV]
+              [--background] [--ephemeral] [--ignore-lock] [--force]
+zigbase serve stop | status [--json] | logs [--follow] [--data-dir PATH]
 zigbase migrate [status | rollback [N] | dump [--out FILE]] [--data-dir PATH]
 zigbase migrate-db --from SQLITE_PATH --to POSTGRES_URL [--force]
 zigbase import --collection NAME [--upsert-key FIELD] [--batch-size N] [--data-dir PATH] <file.ndjson>
@@ -150,7 +152,13 @@ zigbase help
 
 `migrate` defaults to applying pending migrations; `status` reports the ledger without
 changing anything, `rollback [N]` reverses the last N applied, and `dump` writes the live
-schema as a canonical migration. `migrate-db` copies an existing SQLite database into a
+schema as a canonical migration.
+
+`serve --background` detaches and exits 0 only once the server answers; `serve
+stop|status|logs` manage that session; `serve --ephemeral` starts a throwaway server on a
+temp dir and a free port, printing one JSON object. See [docs/serve.md](docs/serve.md).
+
+`migrate-db` copies an existing SQLite database into a
 PostgreSQL target. `typegen` emits a typed SDK for a running (`--url`) or offline
 (`--data-dir`) server — `--lang` picks the target language, `--check` verifies the output is
 up to date without writing (run `zigbase typegen --help` for the full flag set). `rewrap`
@@ -185,6 +193,7 @@ environment variables, then `serve` command-line flags (where a flag exists).
 | `ZIGBASE_FIELD_CRYPTO` | — | `real` | **dev builds only** (`-Ddev-mode`, on by default in Debug): set `fake` to store `.encrypted` fields as readable `fake:<key>:<value>` instead of AES-GCM — useful for eyeballing values while debugging. Compiled out of release binaries; never read there. See [docs/fields.md](docs/fields.md) |
 | `ZIGBASE_COOKIE_SECURE` | `--insecure-cookies` (sets `false`) | `true` | mark auth cookies `Secure`. On by default; opt out for plain-HTTP local dev |
 | `ZIGBASE_TRUST_PROXY` | `--trust-proxy` (sets `true`) | `false` | trust `X-Forwarded-For`/`X-Real-IP` for client-IP / rate-limit keying (set only behind a trusted reverse proxy) |
+| `ZIGBASE_SERVE_BACKGROUND` | — | _unset_ | `1` forces `serve` to run in the background; any other value disables the automatic backgrounding that a detected AI-agent environment would otherwise trigger. See [docs/serve.md](docs/serve.md) |
 | `ZIGBASE_AUTH_TOKEN_TTL` | — | `1209600` (14 days) | auth token lifetime, seconds |
 | `ZIGBASE_VERIFICATION_TTL` | — | `604800` (7 days) | email-verification token lifetime, seconds |
 | `ZIGBASE_PASSWORD_RESET_TTL` | — | `3600` (1 hour) | password-reset token lifetime, seconds |
@@ -294,6 +303,7 @@ examples/
 - [docs/recipes.md](docs/recipes.md) — task recipes: ship a frontend in the binary, schema provisioning (curl), signup, owner/relation access rules, hooks, custom routes, DB access in cron
 - [docs/api.md](docs/api.md) — HTTP API reference (collections, records, query, rules, auth, oauth2, realtime, files, static files, admin)
 - [docs/framework.md](docs/framework.md) — embedding ZigBase: hooks, routes, jobs, static-file modes
+- [docs/serve.md](docs/serve.md) — running the server: background sessions, `stop`/`status`/`logs`, and ephemeral instances
 - [docs/typescript-sdk.md](docs/typescript-sdk.md) — the official `@zigbase/client` TypeScript SDK: auth, records, offset + cursor pagination, files, realtime + live store
 - [docs/dart-sdk.md](docs/dart-sdk.md) — the official `zigbase_client` Dart SDK: auth, records, offset + cursor pagination, files, and realtime, for the Dart VM, Flutter, and Flutter web
 - [docs/python-sdk.md](docs/python-sdk.md) — the official `zigbase` Python SDK: sync and async clients for auth, records, offset + cursor pagination, and files

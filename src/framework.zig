@@ -9,6 +9,8 @@ const config = @import("config.zig");
 const cli = @import("cli.zig");
 const logging = @import("logging.zig");
 const server = @import("server.zig");
+const serve_control = @import("serve_control.zig");
+const serve_session = @import("serve_session.zig");
 const migrations = @import("migrations.zig");
 const files_storage = @import("files/storage.zig");
 const db = @import("db.zig");
@@ -1635,7 +1637,8 @@ pub fn App(comptime cfg: anytype) type {
             // `cfg.log_format`/`log_level`/`log_requests` would be silently ignored.
             // Exactly one `logging.apply` per entry point: CLI in `loadCfg`, embedded here.
             logging.apply(cfg_runtime.log_format, cfg_runtime.log_level, cfg_runtime.log_requests);
-            return serveImpl(init.gpa, init.io, cfg_runtime, &dispatch, jobs, job_pool_size, collections, provision_migrations, Opts, init.environ_map);
+            // Untracked: session management lives in the CLI `.serve` arm only.
+            return serveImpl(init.gpa, init.io, cfg_runtime, &dispatch, jobs, job_pool_size, collections, provision_migrations, Opts, init.environ_map, null);
         }
 
         // ---- In-process test harness seams (#239 stage 3) ----------------------------
@@ -1870,9 +1873,10 @@ fn runCliImpl(init: std.process.Init, dispatch: *const events.Dispatch, jobs: []
     }) catch |err| {
         std.log.err("argument error: {s}", .{@errorName(err)});
         printUsage(init.io, std.Io.File.stderr(), std.meta.activeTag(opts.static_mode) == .default, std.meta.activeTag(opts.static_mode) != .disabled);
-        // Carried defect fix (SP-1 Task 9): a usage error (bad flag/value/unknown command) must
-        // exit 1 per the frozen CLI exit-code scheme (docs/observability.md convention 2) — this
-        // used to fall through and return normally, exiting 0 on a rejected invocation.
+        // Carried defect fix (SP-1 Task 9, independently also SP-3): a usage error
+        // (bad flag/value/unknown command) must exit 1 per the frozen CLI exit-code
+        // scheme (docs/observability.md convention 2) — this used to fall through
+        // and return normally, exiting 0 on a rejected invocation.
         std.process.exit(1);
     };
 
@@ -1888,12 +1892,151 @@ fn runCliImpl(init: std.process.Init, dispatch: *const events.Dispatch, jobs: []
             .vapid_keygen => printVapidKeygenUsage(init.io, std.Io.File.stdout()),
             .import => printImportUsage(init.io, std.Io.File.stdout()),
             .explain_code => printExplainCodeUsage(init.io, std.Io.File.stdout()),
+            .serve_control => printServeControlUsage(init.io, std.Io.File.stdout()),
         },
         .version => |va| if (va.json) printVersionJson(init.io, std.Io.File.stdout()) else printVersion(init.io, std.Io.File.stdout()),
-        .serve => |sa| {
+        .serve => |sa_in| {
+            var sa = sa_in;
+            // --ephemeral fills in ONLY what the user did not specify. This one
+            // rule is what makes it compose with --background: the parent
+            // resolves both, re-execs the child with them explicit, and the
+            // child (seeing them set) allocates nothing.
+            //
+            // `ephemeral_dir` tracks CLEANUP OWNERSHIP, which is not quite the
+            // same question as "did THIS invocation just allocate it": a
+            // `--background` child receives its data dir explicitly via a
+            // forwarded `--data-dir` (see below), so from the child's own
+            // parse it looks exactly like a user-supplied path. It is
+            // distinguished from a REAL user `--data-dir` (which must never be
+            // deleted, even with `--ephemeral` also set) by the same
+            // `ephemeral_prefix` trust boundary `sweepOrphan`/
+            // `removeEphemeralDir` already use cross-process to tell "ours"
+            // from "someone's real data" — a name no human would pick.
+            var ephemeral_dir: ?[]const u8 = null;
+            if (sa.ephemeral) {
+                if (sa.data_dir == null) {
+                    const d = try serve_control.makeEphemeralDir(init.io, arena, init.environ_map);
+                    ephemeral_dir = d;
+                    sa.data_dir = d;
+                } else if (std.mem.indexOf(u8, sa.data_dir.?, serve_control.ephemeral_prefix) != null) {
+                    ephemeral_dir = sa.data_dir;
+                }
+                if (sa.http_port == null) {
+                    sa.http_port = try serve_control.pickFreePort(init.io, sa.http_host orelse "127.0.0.1");
+                }
+            }
+            // Registered FIRST so LIFO runs it LAST: after serveImpl returns,
+            // after session.shutdown() has removed serve.json and dropped the
+            // flock, and after holder.deinit() closed the pool. Unreachable on
+            // the --background PARENT's path below, because background()
+            // never returns — the CHILD process runs this same arm again (see
+            // the forwarded --data-dir below) and registers its OWN copy of
+            // this defer, which is what actually deletes the dir.
+            defer if (ephemeral_dir) |d| serve_control.removeEphemeralDir(init.io, d);
+
             const cfg = try loadCfg(init.environ_map, sa);
-            try serveImpl(allocator, init.io, cfg, dispatch, jobs, pool_size, schema_collections, schema_migrations, opts, init.environ_map);
+            // The data dir must exist before the lock file can be created in it.
+            ensureDataDir(init.io, cfg.data_dir);
+            const data_dir_abs = try std.Io.Dir.cwd().realPathFileAlloc(init.io, cfg.data_dir, arena);
+
+            // `--background` (explicit, agent-detected, or opted out of) is
+            // decided BEFORE `--ignore-lock` is consulted: an agent-detected
+            // background run still honors an explicit `--ignore-lock` (see
+            // `decideBackground`'s precedence), so this must run first.
+            const decision = serve_control.decideBackground(
+                sa.background,
+                init.environ_map.contains(serve_control.background_child_env),
+                sa.ignore_lock,
+                init.environ_map,
+            );
+            if (decision.background) {
+                if (decision.detected_provider) |p| {
+                    std.debug.print(
+                        "serve: {s} environment detected — starting in the background (set {s}=0 to disable)\n",
+                        .{ p, serve_control.background_optout_env },
+                    );
+                }
+                var child_env = try init.environ_map.clone(arena);
+                // A freshly allocated ephemeral dir exists only in THIS
+                // process's `sa`, not in the user's original argv — the
+                // re-exec'd child must receive it explicitly via --data-dir,
+                // or (by the composition rule above) it would independently
+                // allocate a DIFFERENT tempdir of its own, and this process's
+                // readiness poll — which watches THIS resolved data_dir_abs
+                // for serve.json — would never see the child's serve.json
+                // appear there. The picked --http-port needs no such
+                // forwarding: nothing downstream of this branch uses this
+                // process's own pick, and the child reports whatever port IT
+                // actually bound in its own serve.json.
+                var bg_args: std.ArrayListUnmanaged([]const u8) = .empty;
+                try bg_args.appendSlice(arena, args[1..]);
+                if (ephemeral_dir) |d| {
+                    try bg_args.append(arena, "--data-dir");
+                    try bg_args.append(arena, d);
+                }
+                // `ephemeral_dir`, again: non-null only when THIS process
+                // owns the tempdir (freshly allocated it, or it already bore
+                // our own naming prefix), never for a real user `--data-dir`.
+                // On a failed handoff (the child never becomes ready) this
+                // process — not the child — is the one that deletes it; see
+                // `background`'s doc comment for why that's a NEW leak surface
+                // Task 7 introduced, not the same case as an external
+                // `kill -9` of a RUNNING server.
+                serve_control.background(init.io, allocator, sa, data_dir_abs, ephemeral_dir, bg_args.items, &child_env);
+                // unreachable: background() never returns
+            }
+
+            if (sa.ignore_lock) {
+                std.log.warn("serve: --ignore-lock: this instance is UNTRACKED (no {s}/{s} is written; 'zigbase serve status/stop/logs' will not find it)", .{ data_dir_abs, serve_session.data_name });
+                try serveImpl(allocator, init.io, cfg, dispatch, jobs, pool_size, schema_collections, schema_migrations, opts, init.environ_map, null);
+                return;
+            }
+
+            // A refused start is an OPERATIONAL condition, not a program fault,
+            // so both failure arms below exit with the failure code rather than
+            // propagating an error. Returning one made `main` print Zig's
+            // generic `error: …` trailer plus a source-annotated stack trace on
+            // top of the actionable message — noise that also injects non-JSON
+            // lines into a `--log-format json` stream, which no amount of
+            // logging configuration can fix because it comes from the runtime,
+            // not the log system. Mirrors the parse-error path and the control
+            // verbs, where the exit code IS the contract.
+            //
+            // `std.process.exit` skips deferred cleanup, so the ephemeral
+            // tempdir (if this invocation owns one) is removed explicitly in
+            // each arm; the registered defer simply never runs.
+            var session = switch (try serve_control.openSession(init.io, allocator, .{
+                .data_dir_abs = data_dir_abs,
+                .host = cfg.http_host,
+                .port = cfg.http_port,
+                // Derived from the recursion guard, NOT from sa.background: by
+                // the time a backgrounded server actually runs it IS the child,
+                // and filterBackgroundArgs already stripped --background from
+                // its argv. Conflating the two env vars is precisely what
+                // corrupts this field in Astro's implementation.
+                .background = init.environ_map.contains(serve_control.background_child_env),
+                .ephemeral = sa.ephemeral,
+            })) {
+                .opened => |s| s,
+                .held => {
+                    std.log.err("refusing to start: another zigbase serve session already owns the data dir '{s}'. Inspect it with `zigbase serve status`, stop it with `zigbase serve stop`, or start an untracked instance with `zigbase serve --ignore-lock`.", .{data_dir_abs});
+                    if (ephemeral_dir) |d| serve_control.removeEphemeralDir(init.io, d);
+                    std.process.exit(1);
+                },
+                // Distinct from `.held` on purpose: there is no session here to
+                // inspect or stop, so naming one would send an operator chasing
+                // a process that does not exist. The cause is the data dir
+                // itself, and so is the remedy.
+                .unavailable => |e| {
+                    std.log.err("refusing to start: cannot create the session lock file '{s}/{s}': {s}. The data dir must exist and be writable by this user — a read-only mount, wrong ownership, or a stray directory of that name are the usual causes. To run without session tracking entirely, pass `zigbase serve --ignore-lock`.", .{ data_dir_abs, serve_session.lock_name, @errorName(e) });
+                    if (ephemeral_dir) |d| serve_control.removeEphemeralDir(init.io, d);
+                    std.process.exit(1);
+                },
+            };
+            defer session.shutdown();
+            try serveImpl(allocator, init.io, cfg, dispatch, jobs, pool_size, schema_collections, schema_migrations, opts, init.environ_map, &session);
         },
+        .serve_control => |ca| try serveControlImpl(allocator, init.io, init.environ_map, ca),
         .migrate => |ma| switch (ma.action) {
             .apply => try migrateImpl(allocator, init.io, init.environ_map, ma, schema_migrations),
             .status => try migrateStatusImpl(allocator, init.io, init.environ_map, ma, schema_migrations),
@@ -1932,7 +2075,12 @@ fn runCliImpl(init: std.process.Init, dispatch: *const events.Dispatch, jobs: []
                 });
             } else {
                 std.log.err("typegen: this binary was not built with .enable_typegen = true", .{});
-                return;
+                // Same swallowed-failure shape the parse-error catch above had:
+                // a bare `return;` here would exit 0 despite refusing to run.
+                // `return error.X` matches this arm's own idiom two branches up
+                // (MissingOut / BadLang) and — like those — yields a non-zero
+                // exit via the top-level `!void` main's normal error handling.
+                return error.TypegenNotEnabled;
             }
         },
     }
@@ -1965,6 +2113,7 @@ fn printUsage(io: std.Io, file: std.Io.File, show_serve_static: bool, show_stati
         \\
         \\COMMANDS:
         \\  serve               Start the HTTP server (REST + WebSocket + admin UI at /_/).
+        \\  serve stop|status|logs   Manage a background `serve` session (see `zigbase serve status --help`).
         \\  migrate             Apply database migrations, then exit. `status` reports; `rollback [N]` reverses; `dump` dumps the live schema.
         \\  rewrap              Re-encrypt all encrypted fields under the primary key (key rotation).
         \\  migrate-db          Copy an existing SQLite instance into PostgreSQL (requires -Dpostgres).
@@ -2025,6 +2174,9 @@ fn printUsage(io: std.Io, file: std.Io.File, show_serve_static: bool, show_stati
         \\                           false only for plain-HTTP local dev. [default true]
         \\  ZIGBASE_TRUST_PROXY       Trust X-Forwarded-For/X-Real-IP (true/1). Set ONLY behind a
         \\                           trusted reverse proxy.          [default false]
+        \\  ZIGBASE_SERVE_BACKGROUND  Set 1 to force `serve` into the background; any other value
+        \\                           disables the auto-backgrounding a detected AI-agent
+        \\                           environment triggers.           [default: auto-detect]
         \\  ZIGBASE_SENTRY_DSN        Sentry DSN for error reporting; empty logs errors to stderr.
         \\                           [default empty]
         \\  ZIGBASE_REALTIME_ORIGINS  CSV of allowed WebSocket Origins. Empty DENIES cross-origin
@@ -2102,6 +2254,12 @@ fn printUsage(io: std.Io, file: std.Io.File, show_serve_static: bool, show_stati
         \\
         \\  # Apply pending migrations and exit:
         \\  zigbase migrate --data-dir ./zb_data
+        \\
+        \\  # Start detached and use it immediately (exits 0 only once it answers):
+        \\  zigbase serve --background --data-dir ./zb_data && zigbase serve status --json --data-dir ./zb_data
+        \\
+        \\  # A throwaway backend for a test run — one JSON line, then it is yours:
+        \\  zigbase serve --background --ephemeral
         \\
         \\After `serve` starts, open http://127.0.0.1:8090/_/ for the admin UI.
         \\More docs: README.md, docs/api.md, docs/framework.md, docs/tutorial.md.
@@ -2181,6 +2339,7 @@ fn printServeUsage(io: std.Io, file: std.Io.File, show_serve_static: bool, show_
         \\                [--insecure-cookies] [--trust-proxy] [--realtime-origins CSV]
         \\                [--sse-heartbeat-seconds N] [--realtime-outbound-hwm N]
         \\                [--log-format F] [--log-level L] [--no-request-log]{s}
+        \\                [--background] [--ephemeral] [--ignore-lock] [--force]
         \\
         \\FLAGS:
         \\  --http-host H    Address to bind; loopback by default. Pass 0.0.0.0 for all
@@ -2200,6 +2359,19 @@ fn printServeUsage(io: std.Io, file: std.Io.File, show_serve_static: bool, show_
         \\
         \\  The three logging knobs also work as ZIGBASE_LOG_FORMAT / ZIGBASE_LOG_LEVEL /
         \\  ZIGBASE_LOG_REQUESTS, which apply to every subcommand (these flags are serve-only).
+        \\
+        \\  --background     Detach into a new process group; write output to
+        \\                   <data-dir>/serve.log and exit 0 once the server answers.
+        \\                   Automatic in a detected AI-agent environment.
+        \\                   [env ZIGBASE_SERVE_BACKGROUND]
+        \\  --ephemeral      Use a fresh temp data dir and a free port (only for whichever
+        \\                   of --data-dir/--http-port you did not pass), and print
+        \\                   {{"url","port","data_dir","pid"}} on stdout when ready.
+        \\  --ignore-lock    Start an UNTRACKED instance: take no session lock and write no
+        \\                   serve.json. Invisible to `serve status/stop/logs`.
+        \\                   Cannot be combined with --background.
+        \\  --force          --background only: stop an existing session first instead of
+        \\                   reporting it and exiting 0.
         \\
     , .{if (show_serve_static) " [--serve-static DIR]" else ""});
     if (show_serve_static) emit(io, file,
@@ -2351,6 +2523,26 @@ fn printImportUsage(io: std.Io, file: std.Io.File) void {
         \\  zigbase import --collection posts --data-dir ./zb_data seed.ndjson
         \\  zigbase import --collection users --upsert-key email users.ndjson
         \\  cat dump.ndjson | zigbase import --collection posts -
+        \\
+    , .{});
+}
+
+fn printServeControlUsage(io: std.Io, file: std.Io.File) void {
+    emit(io, file,
+        \\zigbase serve stop|status|logs — manage a background `zigbase serve` session.
+        \\
+        \\USAGE:
+        \\  zigbase serve stop   [--data-dir PATH]            Stop the session owning this data dir.
+        \\  zigbase serve status [--json] [--data-dir PATH]   Report the session; exit 0 running, 1 not.
+        \\  zigbase serve logs   [--json] [--follow|-f] [--data-dir P]
+        \\                                                   Print (and optionally tail) serve.log.
+        \\
+        \\  `logs --json` keeps only the NDJSON records, dropping the plain-text lines
+        \\  facil.io writes into serve.log itself — so `serve logs --json | jq` works on a
+        \\  real log file. Start the session with --log-format json for records to exist.
+        \\
+        \\Each verb resolves its session from the data dir, exactly like `serve` itself
+        \\[env ZIGBASE_DATA_DIR, default ./zb_data]. See docs/serve.md for the JSON contract.
         \\
     , .{});
 }
@@ -2886,6 +3078,35 @@ fn printMigrateDbUsage(io: std.Io, file: std.Io.File) void {
         \\    --to "postgres://user:pass@db.example.com:5432/zigbase?sslmode=require"
         \\
     , .{});
+}
+
+/// `zigbase serve stop|status|logs` — resolve the data dir exactly as `serve`
+/// does, then hand off to the control plane, which owns the exit code.
+fn serveControlImpl(allocator: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map, ca: cli.ServeControlArgs) !void {
+    const cfg = try loadCfg(environ, .{ .data_dir = ca.data_dir });
+    // A missing data dir means "no session", not a hard error — resolve against
+    // cwd so the verbs still report truthfully instead of failing to start.
+    const abs = std.Io.Dir.cwd().realPathFileAlloc(io, cfg.data_dir, allocator) catch {
+        if (ca.verb == .status) {
+            var buf: [64]u8 = undefined;
+            var fw = std.Io.File.stdout().writerStreaming(io, &buf);
+            fw.interface.writeAll(if (ca.json)
+                serve_control.status_json_none
+            else
+                "No zigbase serve session is running.\n") catch {};
+            fw.interface.flush() catch {};
+            std.process.exit(1);
+        }
+        std.log.err("serve {s}: no such data dir '{s}'", .{ @tagName(ca.verb), cfg.data_dir });
+        return error.NoDataDir;
+    };
+    defer allocator.free(abs);
+    const verb: serve_control.Verb = switch (ca.verb) {
+        .stop => .stop,
+        .status => .status,
+        .logs => .logs,
+    };
+    serve_control.runVerb(io, allocator, verb, abs, ca.json, ca.follow);
 }
 
 /// Minimum acceptable length for an operator-provided JWT secret.
@@ -3529,11 +3750,28 @@ fn bootApp(
     return holder;
 }
 
-fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg_in: config.Config, dispatch: *const events.Dispatch, jobs: []const scheduler.RuntimeJob, pool_size: usize, schema_collections: []const schema.Collection, schema_migrations: []const provision.Migration, comptime opts: ServeOpts, environ: *const std.process.Environ.Map) !void {
+fn serveImpl(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cfg_in: config.Config,
+    dispatch: *const events.Dispatch,
+    jobs: []const scheduler.RuntimeJob,
+    pool_size: usize,
+    schema_collections: []const schema.Collection,
+    schema_migrations: []const provision.Migration,
+    comptime opts: ServeOpts,
+    environ: *const std.process.Environ.Map,
+    /// The tracked session, or null for an untracked run (`--ignore-lock`, or
+    /// `App.run`'s explicit-config embedding entry). Borrowed: the caller owns
+    /// it and calls `shutdown` after this returns.
+    session: ?*serve_control.Session,
+) !void {
     // NOTE: the logging config is already installed — `loadCfg` applies it as soon as
     // env and flags are merged (one `logging.apply` per run, no double-install), which
     // is still before any worker thread exists or the db pool opens, so provisioning
-    // and migration output inside `bootApp` uses it exactly as before.
+    // and migration output inside `bootApp` uses it exactly as before. It is also now
+    // early enough to cover the CLI arm's own pre-boot records (the `--ignore-lock`
+    // notice, the duplicate-session refusal), which never reach this function.
     //
     // Boot the full application (everything before the socket bind), then fire onBeforeServe,
     // start the scheduler + background pool, and listen. `holder` OWNS the pool / storage /
@@ -3589,6 +3827,9 @@ fn serveImpl(allocator: std.mem.Allocator, io: std.Io, cfg_in: config.Config, di
     defer allocator.free(host_z);
     const Srv = server.Server(opts.gates);
     var srv = Srv{ .app = app, .host = host_z, .port = cfg.http_port };
+    if (session) |s| {
+        srv.on_listening = .{ .call = serve_control.Session.onListening, .ctx = s };
+    }
     // Bounded background pool for memory-queue jobs + app.submit (R1-2). Worker threads
     // spawn lazily on first use (zero overhead when unused) and stop() drains + joins.
     // Its defer is registered BEFORE the scheduler's, so (LIFO) the scheduler stops FIRST
