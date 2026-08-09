@@ -57,7 +57,7 @@ Running `zigbase` with no recognised command prints usage.
 - **`serve stop | status | logs`** — manage a background `serve` session via its
   `serve.lock`/`serve.json` session files. `status --json`/`logs --follow` for scripting.
   See [Running the server → Control verbs](./serve#2-control-verbs).
-- **`doctor`** — run the eight frozen preflight checks over this deployment's config,
+- **`doctor`** — run the nine frozen preflight checks over this deployment's config,
   data dir, and schema; `--production` escalates the checks that matter more in a real
   deployment; `--json` emits NDJSON findings plus a summary object. Exits `0` fully
   clean, `1` on any error, `2` on warnings only. See
@@ -127,6 +127,9 @@ with a message pointing back at `-Ddev-tools=true` instead of running them.
 | `ZIGBASE_REALTIME_ORIGINS` | `--realtime-origins` | `""` (deny cross-origin) | CSV of allowed WebSocket `Origin`s. Empty denies cross-origin browser upgrades; same-origin upgrades are always allowed |
 | `ZIGBASE_REALTIME_OUTBOUND_HWM` | `--realtime-outbound-hwm` | `1024` (frames) | slow-consumer outbound high-water-mark: max queued outbound frames per realtime (WS/SSE) connection before the server disconnects the peer (bounds memory under a stalled/slow reader). `0` disables the bound |
 | `ZIGBASE_SERVE_BACKGROUND` | `--background` | _auto-detect_ | `1` forces `serve` into the background; any other value (including empty) disables the automatic backgrounding that a detected AI-agent environment (`CLAUDECODE`, `CODEX_THREAD_ID`, `GEMINI_CLI`, ...) would otherwise trigger. See [Running the server → Agent auto-detection](./serve#5-agent-auto-detection) |
+| `ZIGBASE_LOG_FORMAT` | `--log-format` | `text` | log stream encoding: `text` or `json` (one JSON object per line on stderr). The env var applies to every subcommand; the flag is `serve`-only. See [Observability](./observability) |
+| `ZIGBASE_LOG_LEVEL` | `--log-level` | `info` | minimum log severity: `debug`, `info`, `warn`, `error` |
+| `ZIGBASE_LOG_REQUESTS` | `--no-request-log` (sets `false`) | `true` | per-request access lines (method, path, status, duration); turn off when a reverse proxy already ships access logs |
 | `ZIGBASE_MAX_UPLOAD_SIZE` | — | `52428800` (50 MiB) | max request body size, bytes |
 | `ZIGBASE_FILE_TOKEN_TTL` | — | `120` (2 min) | file-access token lifetime, seconds |
 | `ZIGBASE_SENTRY_DSN` | — | `""` (log to stderr) | set to enable Sentry error reporting |

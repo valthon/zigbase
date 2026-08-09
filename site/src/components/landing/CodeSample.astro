@@ -16,8 +16,8 @@ fn slugify(ctx: *zigbase.Ctx, ev: *zigbase.RecordEvent) anyerror!void {
         else => return,
     } else return;
 
-    // Mutations MUST allocate with ev.arena (owns ev.record).
-    const buf = try ev.arena.alloc(u8, title.len);
+    // Mutations MUST allocate with ev.arena.a (owns ev.record).
+    const buf = try ev.arena.a.alloc(u8, title.len);
     var len: usize = 0;
     var in_run = false;
     for (title) |ch| {
@@ -32,7 +32,7 @@ fn slugify(ctx: *zigbase.Ctx, ev: *zigbase.RecordEvent) anyerror!void {
         }
     }
     if (len > 0 and buf[len - 1] == '-') len -= 1;
-    try ev.record.object.put(ev.arena, "slug", .{ .string = buf[0..len] });
+    try ev.record.object.put(ev.arena.a, "slug", .{ .string = buf[0..len] });
 }
 
 pub fn main(init: std.process.Init) !void {

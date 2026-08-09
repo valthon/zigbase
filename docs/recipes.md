@@ -521,7 +521,7 @@ const zigbase = @import("zigbase");
 fn confirmBooking(ctx: *zigbase.Ctx) anyerror!zigbase.http.Response {
     const a = ctx.arena.a; // the request arena's allocator
     const id = ctx.request.?.param("id") orelse
-        return .{ .status = 404, .body = "{\"code\":404,\"message\":\"Not found.\",\"data\":{}}" };
+        return ctx.jsonError(404, "not_found", "Not found.");
 
     // DB access via the capability object — ctx.records() manages the pooled
     // connection itself (no manual acquireWriter / Data wiring).
@@ -529,7 +529,7 @@ fn confirmBooking(ctx: *zigbase.Ctx) anyerror!zigbase.http.Response {
 
     // Load the booking (null = unknown collection OR missing record).
     const booking = (try records.get("bookings", id, .{})) orelse
-        return .{ .status = 404, .body = "{\"code\":404,\"message\":\"Not found.\",\"data\":{}}" };
+        return ctx.jsonError(404, "not_found", "Not found.");
 
     // Authorize: only the host who owns the booked listing's simulator may confirm.
     // (ctx.user() is the authenticated identity; .auth = .authed on the route spec
@@ -537,13 +537,13 @@ fn confirmBooking(ctx: *zigbase.Ctx) anyerror!zigbase.http.Response {
     const uid = if (ctx.user()) |u| u.id else "";
     _ = booking; // (look up listing.simulator.owner via records.get and compare to uid)
     if (uid.len == 0)
-        return .{ .status = 403, .body = "{\"code\":403,\"message\":\"Forbidden.\",\"data\":{}}" };
+        return ctx.jsonError(403, "forbidden", "Forbidden.");
 
     // Mutate: set status = "confirmed".
     var patch: std.json.ObjectMap = .empty;
     try patch.put(a, "status", .{ .string = "confirmed" });
     const updated = (try records.update("bookings", id, .{ .object = patch })) orelse
-        return .{ .status = 404, .body = "{\"code\":404,\"message\":\"Not found.\",\"data\":{}}" };
+        return ctx.jsonError(404, "not_found", "Not found.");
 
     return .{ .status = 200, .body = try std.json.Stringify.valueAlloc(a, updated, .{}) };
 }

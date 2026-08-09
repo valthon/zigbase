@@ -109,8 +109,11 @@ the schema editor. Create the three collections in order:
   </Fragment>
   <Fragment slot="cli">
 
-There is no schema-file import — you create collections by calling `POST /api/collections`
-as the superuser. Relation fields point at their target by **collection id** (the `id`
+This path drives the REST collections API directly — the same calls the admin UI makes —
+by calling `POST /api/collections` as the superuser. (If you'd rather not hand-script the
+auth dance, `zigbase schema apply schema.json` applies a declarative schema document
+offline; see [Migration tools](./migration-tools). This tutorial walks the API so you see
+every moving part.) Relation fields point at their target by **collection id** (the `id`
 from the create response, **not** the name — see
 [the relation gotcha](./fields#relation)), so you must create targets first and **capture
 each returned id**.
@@ -389,14 +392,14 @@ const std = @import("std");
 const zigbase = @import("zigbase");
 
 fn confirmBooking(ctx: *zigbase.Ctx) anyerror!zigbase.http.Response {
-    const a = ctx.arena;
+    const a = ctx.arena.a; // the request arena's allocator
     const id = ctx.request.?.param("id") orelse
-        return .{ .status = 404, .body = "{\"code\":404,\"message\":\"Not found.\",\"data\":{}}" };
+        return ctx.jsonError(404, "not_found", "Not found.");
 
     var patch: std.json.ObjectMap = .empty;
     try patch.put(a, "status", .{ .string = "confirmed" });
     const updated = (try ctx.records().update("bookings", id, .{ .object = patch })) orelse
-        return .{ .status = 404, .body = "{\"code\":404,\"message\":\"Not found.\",\"data\":{}}" };
+        return ctx.jsonError(404, "not_found", "Not found.");
 
     return .{ .status = 200, .body = try std.json.Stringify.valueAlloc(a, updated, .{}) };
 }

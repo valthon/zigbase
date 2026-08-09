@@ -7,12 +7,20 @@ const points = [
     body: 'A single statically-linked executable with no runtime dependencies — copy it to a server and run it.',
   },
   {
+    title: 'An agent can drive it end-to-end',
+    body: 'zigbase init scaffolds a project (with a generated AGENTS.md), serve backgrounds itself when it detects an agent environment and reports readiness, the CLI emits machine-readable --json, and every error carries a frozen code an agent can look up with zigbase explain-code. A coding agent can build, run, and debug a backend without waiting on a human.',
+  },
+  {
     title: 'Embedded database, real database',
     body: 'All data in one SQLite file with WAL by default — easy to back up, easy to reason about. The same code runs on PostgreSQL (opt-in) when you outgrow one box.',
   },
   {
     title: 'A scale path, not a rewrite',
     body: 'zigbase migrate-db moves an existing SQLite instance to Postgres — schema and data, ids and timestamps preserved, encrypted-field envelopes byte-for-byte.',
+  },
+  {
+    title: 'Bring your existing app',
+    body: 'Apply a declarative schema document, load a whole dataset with import --manifest (relation order handled for you, cycles included), and carry users across with their existing bcrypt passwords — rehashed to argon2id the first time each one logs in. A parity-replay harness records your old backend and diffs the new one, so you prove the cutover instead of hoping.',
   },
   {
     title: 'Comptime framework',

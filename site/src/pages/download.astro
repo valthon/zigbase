@@ -4,6 +4,9 @@ import Nav from '../components/Nav.astro';
 import Footer from '../components/Footer.astro';
 import { ZIGBASE_VERSION, ZIGBASE_VERSION_TAG, REPO_URL, TARGETS } from '../config/site';
 
+// BASE_URL is '/zigbase' (no trailing slash) — normalise to trailing slash.
+const base = import.meta.env.BASE_URL.replace(/\/?$/, '/');
+
 const REL = ZIGBASE_VERSION_TAG;
 const ASSET_BASE = `${REPO_URL}/releases/download/${REL}`;
 const releasePage = `${REPO_URL}/releases/tag/${REL}`;
@@ -82,6 +85,21 @@ const binaries = TARGETS.map((t) => ({
       </aside>
     </section>
 
+    <section class="dl__section" aria-labelledby="npm">
+      <h2 id="npm">npm / npx</h2>
+      <p>
+        The server is published to npm as <code>zigbase</code> — an alias pinning
+        <code>@zigbase/server</code>, which carries the platform binaries. <code>npx</code>
+        fetches the right prebuilt binary for your machine, so there's nothing to install:
+      </p>
+      <pre class="dl__code"><code>npx zigbase init                  # scaffold a project (compose file, schema, AGENTS.md)
+npx zigbase serve --data-dir ./zb_data</code></pre>
+      <p class="dl__links">
+        <code>@zigbase/server</code> stays the canonical package to depend on; installing
+        both is harmless.
+      </p>
+    </section>
+
     <section class="dl__section" aria-labelledby="docker">
       <h2 id="docker">Docker</h2>
       <p>
@@ -92,7 +110,7 @@ const binaries = TARGETS.map((t) => ({
       <p class="dl__links">
         <code>latest</code>, <code>{'{'}X.Y.Z{'}'}</code>, and rolling <code>{'{'}X.Y{'}'}</code>/<code>{'{'}X{'}'}</code>
         tags are published to <a href="https://github.com/valthon/zigbase/pkgs/container/zigbase" target="_blank" rel="noopener noreferrer">ghcr.io/valthon/zigbase</a>.
-        See the <a href="/docs/docker">Docker guide</a> for the data-volume and non-root-user details.
+        See the <a href={base + 'docs/docker'}>Docker guide</a> for the data-volume and non-root-user details.
       </p>
     </section>
 
@@ -118,10 +136,13 @@ zig build                    # -&gt; zig-out/bin/zigbase
         Build your own backend on top of ZigBase. Fetch it as a dependency:
       </p>
       <pre class="dl__code"><code>zig fetch --save git+https://github.com/valthon/zigbase</code></pre>
-      <p>Wire the module into your <code>build.zig</code> (ZigBase links libc):</p>
-      <pre class="dl__code"><code>const zb = b.dependency("zigbase", .&#123; .target = target, .optimize = optimize &#125;);
-exe_mod.addImport("zigbase", zb.module("zigbase"));
-exe_mod.link_libc = true;</code></pre>
+      <p>
+        Wire the module into your <code>build.zig</code> — <code>addTo</code> adds the
+        import and sets <code>link_libc</code> together, so the two can't drift apart:
+      </p>
+      <pre class="dl__code"><code>const zigbase = @import("zigbase");
+const zb = b.dependency("zigbase", .&#123; .target = target, .optimize = optimize &#125;);
+zigbase.addTo(zb, exe_mod);</code></pre>
     </section>
   </main>
 

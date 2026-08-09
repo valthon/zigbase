@@ -503,7 +503,7 @@ contexts). Dereference it to reach the raw request data — a `*http.RequestCtx`
 fn confirm(ctx: *zigbase.Ctx) anyerror!zigbase.http.Response {
     const req = ctx.request.?;
     const id = req.param("id") orelse
-        return .{ .status = 404, .body = "{\"code\":404,\"message\":\"Not found.\"}" };
+        return ctx.jsonError(404, "not_found", "Not found.");
     const body = try std.fmt.allocPrint(ctx.arena.a, "{{\"id\":\"{s}\"}}", .{id});
     return .{ .status = 200, .body = body }; // body lives in the request arena
 }

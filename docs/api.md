@@ -1442,7 +1442,7 @@ configured outbound high-water-mark). `401` unauthenticated, `403` non-superuser
 
 ```json
 {
-  "zigbase": "0.12.0",
+  "zigbase": "0.13.0",
   "commit": "087ca67",
   "api": 1,
   "capabilities": {

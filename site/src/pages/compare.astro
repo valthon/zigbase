@@ -42,9 +42,27 @@ const rows: Row[] = [
     firebase: 'Managed',
   },
   {
+    dimension: 'Migrating in',
+    zigbase:
+      'Declarative <code>schema apply</code>, whole-dataset <code>import --manifest</code> in relation order, <strong>bcrypt password import</strong> (rehashed to argon2id on first login), parity-replay harness',
+    pocketbase: 'Collection <em>schema</em> JSON import/export; JS/Go migrations',
+    trailbase: 'SQL migrations',
+    supabase: 'CLI dump/restore; the wider Postgres ecosystem',
+    firebase: 'Managed import/export',
+  },
+  {
+    dimension: 'Agent operability',
+    zigbase:
+      '<code>init</code> scaffolding with a generated <code>AGENTS.md</code>, self-backgrounding <code>serve</code>, <code>--json</code> CLI output, frozen error codes + <code>explain-code</code>, <code>/api/meta</code> probe, published <code>llms.txt</code>',
+    pocketbase: '—',
+    trailbase: '—',
+    supabase: 'MCP server; AI assistant (hosted)',
+    firebase: 'MCP server (CLI); Gemini in Firebase (hosted)',
+  },
+  {
     dimension: 'SPA hosting',
     zigbase:
-      'Zero-config <code>.spa</code> marker fallback for client-routed apps, plus comptime <code>static_routes</code> match&rarr;serve maps in custom builds (new in v0.10)',
+      'Zero-config <code>.spa</code> marker fallback for client-routed apps, plus comptime <code>static_routes</code> match&rarr;serve maps in custom builds',
     pocketbase:
       'Built-in <code>--indexFallback</code> on the static handler (default on)',
     trailbase: 'Built-in <code>--spa</code> flag on <code>--public-dir</code> serving',
@@ -87,7 +105,7 @@ const rows: Row[] = [
     dimension: 'Search',
     zigbase: 'Built-in FTS (+ opt-in vector)',
     pocketbase: 'Filter queries only — no built-in full-text index',
-    trailbase: 'Untethered SQLite — FTS5/<code>sqlite-vec</code> available as extensions, not a first-party feature',
+    trailbase: 'Vector search built-in (bundled <code>sqlite-vec</code>); no first-party full-text feature',
     supabase: 'PG FTS + pgvector',
     firebase: '<strong>Text search requires Firestore Enterprise edition</strong>; no native search on standard tier',
   },
@@ -95,7 +113,7 @@ const rows: Row[] = [
     dimension: 'Jobs/queues',
     zigbase: 'Built-in durable queues, retries, webhooks',
     pocketbase: 'Cron (<code>cronAdd</code>) only — no built-in queue',
-    trailbase: 'None yet — a message-queue system is on the roadmap',
+    trailbase: 'Cron jobs (incl. via WASM components) — no queue yet (on roadmap)',
     supabase: 'pg_cron + Queues (built on <code>pgmq</code>)',
     firebase: 'Cloud Tasks/Scheduler',
   },
@@ -103,7 +121,7 @@ const rows: Row[] = [
     dimension: 'Email',
     zigbase: 'Built-in templates + SES/Postmark/SMTP, suppression',
     pocketbase: 'SMTP (self-configured)',
-    trailbase: '— (no built-in email/SMTP integration documented)',
+    trailbase: 'Auth emails: sendmail by default, configurable SMTP',
     supabase:
       'Built-in sender capped at 2 msg/hour; <strong>custom SMTP required for production</strong>',
     firebase: 'Via extensions (e.g. Trigger Email + a 3rd-party SMTP provider)',
@@ -126,7 +144,7 @@ const rows: Row[] = [
   },
   {
     dimension: 'Client SDKs',
-    zigbase: 'TypeScript (typed codegen)',
+    zigbase: 'TypeScript, Dart, Python, Kotlin — each with typed codegen from your schema',
     pocketbase: 'JavaScript + Dart',
     trailbase: 'JS/TS, Dart, Rust, C#/.NET, Swift, Kotlin, Go, Python',
     supabase: 'Many',
@@ -144,14 +162,14 @@ const rows: Row[] = [
     dimension: 'Maturity',
     zigbase: `<strong>Pre-1.0</strong> (${ZIGBASE_VERSION_TAG})`,
     pocketbase: 'Pre-1.0 (v0.39.x)',
-    trailbase: '<strong>Alpha</strong>, pre-1.0 (v0.30.x)',
+    trailbase: '<strong>Alpha</strong>, pre-1.0 (v0.32.x)',
     supabase: 'GA hosted',
     firebase: 'GA',
   },
   {
     dimension: 'Resource footprint',
     zigbase: 'Single ~7 MB binary, ~29 MB RSS idle, zero external services (measured, ReleaseSafe)',
-    pocketbase: 'Single Go binary (~11-12 MB per release build), zero external services',
+    pocketbase: 'Single Go binary (~31 MB; ~12 MB zipped), zero external services',
     trailbase: 'Single Rust binary, zero external services',
     supabase: 'Self-host: multi-service Docker Compose (Postgres, Auth, Storage, Realtime, PostgREST, Studio, Kong, and more — 13 containers)',
     firebase: 'n/a — fully hosted, no footprint to operate',
@@ -176,7 +194,7 @@ const rows: Row[] = [
   <main class="container cmp">
     <header class="cmp__head">
       <h1 class="cmp__title">How ZigBase compares</h1>
-      <p class="cmp__meta">Last reviewed: July 2026</p>
+      <p class="cmp__meta">Last reviewed: August 2026</p>
       <p class="cmp__stance">
         This comparison is maintained by the ZigBase project. We've tried to
         be fair; corrections welcome via
@@ -230,7 +248,10 @@ const rows: Row[] = [
       <p>
         <strong>Choose ZigBase if</strong> you want one self-hosted binary, a
         typed compiled extension surface, and a SQLite→Postgres scale path
-        without a rewrite — and you're on Linux or macOS.
+        without a rewrite — and you're on Linux or macOS. Also if you're
+        pointing a coding agent at your backend, or moving an existing app
+        onto one: the CLI, error codes, and migration tooling are built to be
+        driven rather than clicked through.
       </p>
       <p>
         <strong>Choose PocketBase if</strong> you want Windows support or a JS
