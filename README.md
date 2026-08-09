@@ -144,6 +144,7 @@ zigbase import --collection NAME [--upsert-key FIELD] [--batch-size N] [--data-d
 zigbase superuser create --email E --password P [--data-dir PATH]
 zigbase typegen [--data-dir PATH | --url URL] [--out FILE] [--lang L] [--check] [...]
 zigbase rewrap [--data-dir PATH] [--dry-run]
+zigbase doctor [--production] [--json] [--data-dir PATH]
 zigbase vapid-keygen
 zigbase explain-code [CODE] [--json]
 zigbase version
@@ -156,7 +157,8 @@ schema as a canonical migration.
 
 `serve --background` detaches and exits 0 only once the server answers; `serve
 stop|status|logs` manage that session; `serve --ephemeral` starts a throwaway server on a
-temp dir and a free port, printing one JSON object. See [docs/serve.md](docs/serve.md).
+temp dir and a free port, printing one JSON object; `doctor` runs preflight checks and exits
+`1` on any error, `2` on warnings only, `0` when fully clean. See [docs/serve.md](docs/serve.md).
 
 `migrate-db` copies an existing SQLite database into a
 PostgreSQL target. `typegen` emits a typed SDK for a running (`--url`) or offline
@@ -166,7 +168,12 @@ rotates field-encryption keys (`--dry-run` reports without rewriting), and `vapi
 prints a fresh Web Push VAPID keypair. `explain-code` looks up a frozen API error code
 (the `code` field in every `{status,code,message,data}` error response) with no args to
 list them all, or `zigbase explain-code <CODE>` (`--json` for machine-readable output) for
-one. See [docs/api.md → Conventions](docs/api.md#conventions).
+one. See [docs/api.md → Conventions](docs/api.md#conventions). `doctor` runs nine preflight
+checks over a deployment (JWT-secret persistence, `@public` rules, cookie/host/proxy/mailer
+config, migrations, data-dir writability, legacy password hashes) and exits `0`/`2`/`1`
+clean/warnings-only/error so
+it can gate a deploy (`--production` escalates the checks that are only risky, not always
+wrong, in dev); `--json` emits NDJSON findings. See [docs/serve.md](docs/serve.md).
 
 `import` bulk-loads NDJSON records **offline (no running server)** through the record
 engine — validation, defaults, the `.encrypted` envelope, and auth password hashing all
@@ -303,7 +310,7 @@ examples/
 - [docs/recipes.md](docs/recipes.md) — task recipes: ship a frontend in the binary, schema provisioning (curl), signup, owner/relation access rules, hooks, custom routes, DB access in cron
 - [docs/api.md](docs/api.md) — HTTP API reference (collections, records, query, rules, auth, oauth2, realtime, files, static files, admin)
 - [docs/framework.md](docs/framework.md) — embedding ZigBase: hooks, routes, jobs, static-file modes
-- [docs/serve.md](docs/serve.md) — running the server: background sessions, `stop`/`status`/`logs`, and ephemeral instances
+- [docs/serve.md](docs/serve.md) — running the server: background sessions, `stop`/`status`/`logs`, ephemeral instances, and the `doctor` preflight
 - [docs/typescript-sdk.md](docs/typescript-sdk.md) — the official `@zigbase/client` TypeScript SDK: auth, records, offset + cursor pagination, files, realtime + live store
 - [docs/dart-sdk.md](docs/dart-sdk.md) — the official `zigbase_client` Dart SDK: auth, records, offset + cursor pagination, files, and realtime, for the Dart VM, Flutter, and Flutter web
 - [docs/python-sdk.md](docs/python-sdk.md) — the official `zigbase` Python SDK: sync and async clients for auth, records, offset + cursor pagination, and files

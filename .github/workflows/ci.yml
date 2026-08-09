@@ -76,11 +76,30 @@ jobs:
         # no reachable ancestry, so a bare fetch of the base ref alone leaves
         # `git merge-base origin/main HEAD` with disjoint histories and the check
         # dies before it can diff anything. Fetch main's full history AND deepen
-        # HEAD's own line far enough to reach the fork point.
+        # HEAD's own line far enough to reach the fork point. The doctor-ledger
+        # step below reuses the deepened clone this one already produced.
         run: |
           git fetch --no-tags origin main
           git fetch --no-tags --deepen=200 origin
           ./scripts/check-error-code-ledger.sh origin/main
+      - name: Doctor check-id ledger is append-only
+        # actions/checkout leaves a depth-1 clone: HEAD (the PR merge commit) has
+        # no reachable ancestry, so a bare fetch of the base ref alone leaves
+        # `git merge-base origin/main HEAD` with disjoint histories and the check
+        # dies before it can diff anything. Fetch main's full history AND deepen
+        # HEAD's own line far enough to reach the fork point.
+        #
+        # Deliberately repeats the fetch that a neighbouring ledger step also
+        # performs, rather than relying on that step having run first: on an
+        # already-deepened clone the repeat costs about a second, whereas the
+        # deduplicated form would make THIS guard's correctness depend on another
+        # step's presence and ordering — a silent breakage nobody would predict
+        # when editing that other step. This check exists precisely to not be
+        # silently defeated (it already died once, invisibly, in a shallow clone).
+        run: |
+          git fetch --no-tags origin main
+          git fetch --no-tags --deepen=200 origin
+          ./scripts/check-doctor-ledger.sh origin/main
       - name: Dating client snapshot is fresh
         run: mise exec zig@0.16.0 -- zig build gen-dating-client-check
       - name: Dating runtime client snapshot is fresh
@@ -420,7 +439,7 @@ jobs:
         # free port + tempdir, so the harness is parallel-safe). Keep tests/smtp
         # serial below — it binds a real fixed TLS port.
         run: mise exec python@3.13 -- python -m pytest tests/admin -q -n auto
-      - name: Server lifecycle CLI e2e
+      - name: Server lifecycle + doctor CLI e2e
         # Serial on purpose: these tests assert on timing (the readiness
         # handshake, the child-death path, the TERM/KILL escalation) and on
         # process-table state, which -n auto makes flaky for reasons unrelated

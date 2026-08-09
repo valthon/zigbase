@@ -449,6 +449,8 @@ test {
     _ = @import("report/send.zig");
     _ = @import("framework.zig");
     _ = @import("provision.zig");
+    _ = @import("doctor.zig");
+    _ = @import("doctor_run.zig");
     _ = @import("dumpload.zig");
     _ = @import("records_hooks_test.zig");
     _ = @import("schedule.zig");

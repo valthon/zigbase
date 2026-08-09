@@ -39,6 +39,8 @@ const field_policy = @import("field_policy.zig");
 const rewrap = @import("rewrap.zig");
 const import_mod = @import("import.zig");
 const features = @import("features.zig");
+const doctor = @import("doctor.zig");
+const doctor_run = @import("doctor_run.zig");
 const ctx_mod = @import("ctx.zig");
 const queue = @import("queue/queue.zig");
 const error_codes = @import("error_codes.zig");
@@ -1893,6 +1895,7 @@ fn runCliImpl(init: std.process.Init, dispatch: *const events.Dispatch, jobs: []
             .import => printImportUsage(init.io, std.Io.File.stdout()),
             .explain_code => printExplainCodeUsage(init.io, std.Io.File.stdout()),
             .serve_control => printServeControlUsage(init.io, std.Io.File.stdout()),
+            .doctor => printDoctorUsage(init.io, std.Io.File.stdout()),
         },
         .version => |va| if (va.json) printVersionJson(init.io, std.Io.File.stdout()) else printVersion(init.io, std.Io.File.stdout()),
         .serve => |sa_in| {
@@ -2037,6 +2040,11 @@ fn runCliImpl(init: std.process.Init, dispatch: *const events.Dispatch, jobs: []
             try serveImpl(allocator, init.io, cfg, dispatch, jobs, pool_size, schema_collections, schema_migrations, opts, init.environ_map, &session);
         },
         .serve_control => |ca| try serveControlImpl(allocator, init.io, init.environ_map, ca),
+        // schema_migrations is threaded from the start, even though the Task 3
+        // stub ignores it: Task 9's real doctor needs the binary's compiled-in
+        // `.migrations` to judge the migrations check, and settling the call
+        // shape now means this dispatch line is written once.
+        .doctor => |da| try doctorImpl(allocator, init.io, init.environ_map, da, schema_migrations),
         .migrate => |ma| switch (ma.action) {
             .apply => try migrateImpl(allocator, init.io, init.environ_map, ma, schema_migrations),
             .status => try migrateStatusImpl(allocator, init.io, init.environ_map, ma, schema_migrations),
@@ -2114,6 +2122,7 @@ fn printUsage(io: std.Io, file: std.Io.File, show_serve_static: bool, show_stati
         \\COMMANDS:
         \\  serve               Start the HTTP server (REST + WebSocket + admin UI at /_/).
         \\  serve stop|status|logs   Manage a background `serve` session (see `zigbase serve status --help`).
+        \\  doctor              Preflight checks; --production escalates, --json emits NDJSON. Exits 1 on any error.
         \\  migrate             Apply database migrations, then exit. `status` reports; `rollback [N]` reverses; `dump` dumps the live schema.
         \\  rewrap              Re-encrypt all encrypted fields under the primary key (key rotation).
         \\  migrate-db          Copy an existing SQLite instance into PostgreSQL (requires -Dpostgres).
@@ -2260,6 +2269,9 @@ fn printUsage(io: std.Io, file: std.Io.File, show_serve_static: bool, show_stati
         \\
         \\  # A throwaway backend for a test run — one JSON line, then it is yours:
         \\  zigbase serve --background --ephemeral
+        \\
+        \\  # Preflight before shipping:
+        \\  zigbase doctor --production --data-dir /var/lib/zigbase
         \\
         \\After `serve` starts, open http://127.0.0.1:8090/_/ for the admin UI.
         \\More docs: README.md, docs/api.md, docs/framework.md, docs/tutorial.md.
@@ -2547,6 +2559,30 @@ fn printServeControlUsage(io: std.Io, file: std.Io.File) void {
     , .{});
 }
 
+fn printDoctorUsage(io: std.Io, file: std.Io.File) void {
+    emit(io, file,
+        \\zigbase doctor — preflight checks over this deployment's config, data dir, and schema.
+        \\
+        \\USAGE:
+        \\  zigbase doctor [--production] [--json] [--data-dir PATH]
+        \\
+        \\FLAGS:
+        \\  --production   Judge the config as a PRODUCTION deployment: several warnings
+        \\                 become errors (see docs/serve.md for the per-check table).
+        \\  --json         NDJSON findings on stdout, one per line, then one summary object.
+        \\  --data-dir PATH  [env ZIGBASE_DATA_DIR, default ./zb_data]
+        \\
+        \\EXIT CODES:
+        \\  0  fully clean — no errors, no warnings
+        \\  1  at least one error-severity finding
+        \\  2  ran correctly, warnings only (something needs judgment)
+        \\
+        \\  Strict deploy gate:    zigbase doctor --production && deploy
+        \\  Tolerant deploy gate:  zigbase doctor --production; case $? in 0|2) deploy ;; esac
+        \\
+    , .{});
+}
+
 fn printSuperuserUsage(io: std.Io, file: std.Io.File) void {
     emit(io, file,
         \\zigbase superuser create — create an admin (superuser) account.
@@ -2686,7 +2722,10 @@ fn openPool(allocator: std.mem.Allocator, io: std.Io, cfg: config.Config, option
 /// data path is unchanged (the warning only fires for a `postgres://` value in a non-PG build).
 /// This is why the default build is no longer byte-for-byte identical to pre-#159 — by design;
 /// behavioral equivalence of the SQLite path is asserted by `db.chooseBackend`'s tests instead.
-fn openPoolSelect(allocator: std.mem.Allocator, io: std.Io, cfg: config.Config, options: db.PoolOptions, environ: *const std.process.Environ.Map) !db.Pool {
+/// `pub` (rather than the `fn` every other CLI-impl helper here is) because
+/// `doctor_run.gather` — a different file, opening the same pool the same
+/// way for the same reason `migrateStatusImpl` does — needs it too.
+pub fn openPoolSelect(allocator: std.mem.Allocator, io: std.Io, cfg: config.Config, options: db.PoolOptions, environ: *const std.process.Environ.Map) !db.Pool {
     const getter = config.EnvGetter{ .environ = environ };
     const db_url = getter.get("ZIGBASE_DB_URL");
     switch (db.chooseBackend(db_url)) {
@@ -3107,6 +3146,31 @@ fn serveControlImpl(allocator: std.mem.Allocator, io: std.Io, environ: *const st
         .logs => .logs,
     };
     serve_control.runVerb(io, allocator, verb, abs, ca.json, ca.follow);
+}
+
+/// `zigbase doctor [--production] [--json] [--data-dir PATH]`.
+///
+/// Reads config from env exactly as `serve` would, probes the data dir, and
+/// opens the database read-mostly (it does create the `_migrations` ledger if
+/// absent — the same write `migrate status` performs, and nothing else).
+/// `schema_migrations` is the binary's compiled-in `.migrations`: without it,
+/// the migrations check would report a clean bill of health for a binary that
+/// has pending work.
+///
+/// One arena for the whole call: `doctor_run.gather`, `doctor.evaluate`, and
+/// `doctor_run.renderToSlice` are all Contract 4 against it, so nothing below
+/// is freed individually — the arena's `deinit()` is the only cleanup.
+fn doctorImpl(allocator: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map, da: cli.DoctorArgs, schema_migrations: []const provision.Migration) !void {
+    const cfg = try loadCfg(environ, .{ .data_dir = da.data_dir });
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const facts = doctor_run.gather(arena, io, cfg, environ, schema_migrations);
+    const findings = try doctor.evaluate(arena, facts, da.production);
+    const summary = doctor.summarize(findings, da.production);
+    doctor_run.render(io, arena, findings, summary, da.json);
+    std.process.exit(doctor_run.exitCode(summary));
 }
 
 /// Minimum acceptable length for an operator-provided JWT secret.

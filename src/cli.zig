@@ -39,6 +39,14 @@ pub const ServeControlArgs = struct {
     follow: bool = false,
 };
 
+pub const DoctorArgs = struct {
+    data_dir: ?[]const u8 = null,
+    /// Escalate severities for a production deployment.
+    production: bool = false,
+    /// NDJSON findings on stdout + one summary object.
+    json: bool = false,
+};
+
 /// `migrate` runs one of four actions: `apply` (the default — apply pending system + consumer
 /// migrations), `status` (`migrate status` — read the ledger and report applied/pending/orphaned
 /// consumer migrations without changing anything), `rollback` (`migrate rollback [N]` — reverse
@@ -127,7 +135,7 @@ pub const VersionArgs = struct {
 };
 
 /// Identifies which command a per-command `--help` request targets.
-pub const HelpTopic = enum { top, serve, serve_control, migrate, superuser_create, typegen, rewrap, migrate_db, vapid_keygen, import, explain_code };
+pub const HelpTopic = enum { top, serve, serve_control, migrate, superuser_create, typegen, rewrap, migrate_db, vapid_keygen, import, explain_code, doctor };
 
 pub const Command = union(enum) {
     /// `help`/`--help`/`-h`/no-args -> top-level usage; `<cmd> --help` -> that command's usage.
@@ -146,6 +154,8 @@ pub const Command = union(enum) {
     explain_code: ExplainCodeArgs,
     /// `serve stop|status|logs` -> manage an existing `serve` session.
     serve_control: ServeControlArgs,
+    /// `doctor` -> preflight checks over config/data-dir/schema.
+    doctor: DoctorArgs,
 };
 
 /// True when an arg is a help flag (`--help` or `-h`).
@@ -399,6 +409,25 @@ pub fn parse(args: []const []const u8, popts: ParseOpts) ParseError!Command {
             } else return ParseError.UnknownFlag;
         }
         return .{ .typegen = ta };
+    }
+    if (std.mem.eql(u8, args[0], "doctor")) {
+        var da = DoctorArgs{};
+        var i: usize = 1;
+        while (i < args.len) : (i += 1) {
+            const a = args[i];
+            if (isHelpFlag(a)) {
+                return .{ .help = .doctor };
+            } else if (std.mem.eql(u8, a, "--data-dir")) {
+                i += 1;
+                if (i >= args.len) return ParseError.MissingValue;
+                da.data_dir = args[i];
+            } else if (std.mem.eql(u8, a, "--production")) {
+                da.production = true;
+            } else if (std.mem.eql(u8, a, "--json")) {
+                da.json = true;
+            } else return ParseError.UnknownFlag;
+        }
+        return .{ .doctor = da };
     }
     if (!std.mem.eql(u8, args[0], "serve")) return ParseError.UnknownCommand;
 
@@ -835,6 +864,22 @@ test "serve control --help routes to the serve_control help topic" {
     try std.testing.expectEqual(HelpTopic.serve_control, (try parse(&.{ "serve", "logs", "--help" }, .{})).help);
     // A bare `serve --help` still routes to the SERVE topic, not the control one.
     try std.testing.expectEqual(HelpTopic.serve, (try parse(&.{ "serve", "--help" }, .{})).help);
+}
+
+test "doctor parses --production/--json/--data-dir and routes --help" {
+    const bare = try parse(&.{"doctor"}, .{});
+    try std.testing.expect(std.meta.activeTag(bare) == .doctor);
+    try std.testing.expect(!bare.doctor.production);
+    try std.testing.expect(!bare.doctor.json);
+
+    const full = try parse(&.{ "doctor", "--production", "--json", "--data-dir", "/var/zb" }, .{});
+    try std.testing.expect(full.doctor.production);
+    try std.testing.expect(full.doctor.json);
+    try std.testing.expectEqualStrings("/var/zb", full.doctor.data_dir.?);
+
+    try std.testing.expectEqual(HelpTopic.doctor, (try parse(&.{ "doctor", "--help" }, .{})).help);
+    try std.testing.expectError(ParseError.UnknownFlag, parse(&.{ "doctor", "--nope" }, .{}));
+    try std.testing.expectError(ParseError.MissingValue, parse(&.{ "doctor", "--data-dir" }, .{}));
 }
 
 test "parse typegen: data-dir + out + flags" {

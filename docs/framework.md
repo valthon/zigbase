@@ -3705,6 +3705,18 @@ generated output, not authoritative configuration.
 > cleanly, but a hand-rolled schema using `serial`/`enum`/extension columns or those SQLite objects
 > may not re-run into a bare database.
 
+#### Preflight checks (`zigbase doctor`)
+
+`zigbase doctor [--production] [--json] [--data-dir PATH]` runs nine checks over a deployment —
+JWT-secret persistence, every `@public` access rule (enumerated by name), cookie security, bind
+address, reverse-proxy coherence, mailer configuration, pending/orphaned migrations, data-dir
+writability, and legacy password hashes still pending re-hash.
+
+See [serve.md → `zigbase doctor`](serve.md#8-zigbase-doctor) for the full worked example (prose
+and NDJSON output, captured from a real run), the per-check severity table, exit codes, both
+deploy-gate idioms, and `doctor`'s database-mutation contract (it only ever creates the
+`_migrations` ledger table if absent — the same write `migrate status` already makes).
+
 #### Offline bulk import (`zigbase import`)
 
 `zigbase import` bulk-loads records from an **NDJSON** file (one JSON object per line) into a

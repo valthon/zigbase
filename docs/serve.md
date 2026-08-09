@@ -1,11 +1,11 @@
 > 📖 This documentation is also published, web-native, at <https://valthon.github.io/zigbase/docs/serve> — the site is the canonical reading experience.
 
-# Running the server: background sessions and control verbs
+# Running the server: background sessions, control verbs, and `doctor`
 
 `zigbase serve` normally blocks in the foreground for as long as it runs. This page covers
 everything around that: detaching it into the background, the `stop`/`status`/`logs` verbs
 that manage a detached session, the on-disk session contract those verbs read, throwaway
-and `--ephemeral` instances for test backends.
+`--ephemeral` instances for test backends, and the `zigbase doctor` preflight command.
 
 ## 1. Foreground vs background
 
@@ -313,8 +313,100 @@ parent exits the moment the JSON line is available.
    nothing runs periodically to look for orphans on its own — if nothing ever inspects that
    data dir again, the tempdir sits until the OS's own `/tmp` cleanup (or a human) removes it.
 
+## 8. `zigbase doctor`
 
-## 8. Out of scope
+`zigbase doctor [--production] [--json] [--data-dir PATH]` runs nine fixed, ordered checks
+over a deployment and reports one finding per check (or per `@public` rule, for the rules
+check) plus a summary.
+
+| # | Check id | What it reads | Default severity | `--production` severity |
+|---|---|---|---|---|
+| 1 | `jwt-secret-persisted` | `ZIGBASE_JWT_SECRET` length; `<data-dir>/.jwt_secret`'s length + file mode | short env secret → **error**; nothing set/persisted → **warn**; persisted but not mode `0600` → **warn** | short env secret → **error** (unchanged); nothing persisted → **error**; wrong mode → **error** |
+| 2 | `public-rules-enumerated` | every collection's list/view/create/update/delete rule, for the `@public` sentinel (one finding per rule, named `<collection>.<op>Rule`) | read rule (`list`/`view`) `@public` → **warn**; write rule (`create`/`update`/`delete`) `@public` → **warn** | read rule → **warn** (unchanged, a public blog is legitimate); write rule → **error** |
+| 3 | `insecure-cookies-off` | whether cookies are `Secure` | not secure → **warn** | not secure → **error** |
+| 4 | `host-binding` | `http_host` | wildcard bind (`0.0.0.0`/`::`/`[::]`) → **warn**; loopback → **ok** | wildcard bind → **ok**; loopback → **warn** |
+| 5 | `trust-proxy-consistency` | `trust_proxy`, `http_host`, `public_url` | `trust_proxy` on + wildcard bind → **warn**; `https` `public_url` + loopback bind + `trust_proxy` off → **warn** (both modes) | `trust_proxy` on + wildcard bind → **error**; the `public_url`/loopback case stays **warn** |
+| 6 | `mailer-configured` | `sendmail_command`, `smtp_host`, `smtp_username`, resolved SMTP TLS | nothing configured → **warn**; SMTP AUTH resolving to no transport security → **warn** | nothing configured → **error**; cleartext SMTP AUTH → **error** |
+| 7 | `migrations-applied` | the `_migrations` ledger vs. the binary's compiled `.migrations` | pending → **error** (both modes); orphaned (applied, no longer declared) → **warn** (both modes) | same as default |
+| 8 | `data-dir-writable` | a throwaway probe file written then deleted under the data dir | not writable → **error** (both modes) | same as default |
+| 9 | `legacy-password-hashes` | count of auth-collection records whose `passwordHash` still matches `$zblegacy$%`, summed across every auth collection (including `_superusers`) | any count > 0 → **warn** (both modes) | same as default — legacy hashes are a normal, self-healing transitional state (each one re-hashes on its account's next successful login), never a misconfiguration, so this never escalates |
+
+A DB-backed check (2, 7, or 9) that cannot open the database reports **`skipped`** instead of
+a false `ok` or `error` — a check that could not run is reported, not scored either way.
+
+Prose output — here `ZIGBASE_HTTP_HOST=0.0.0.0` is the one thing this deployment gets flagged
+for (a wildcard bind, harmless and even expected in a container, but worth a second look on a
+bare-metal dev box); everything else about it is clean, so `host-binding` is the only
+non-`ok` line and the summary reads "1 warning":
+
+```sh
+$ ZIGBASE_JWT_SECRET=a-strong-development-only-secret-key-value \
+  ZIGBASE_SMTP_HOST=smtp.example.com ZIGBASE_HTTP_HOST=0.0.0.0 \
+  zigbase doctor --data-dir ./zb_data
+ok       jwt-secret-persisted: JWT secret supplied via ZIGBASE_JWT_SECRET
+ok       public-rules-enumerated: no @public rules
+ok       insecure-cookies-off: cookies are Secure
+warn     host-binding: http_host '0.0.0.0' is a wildcard bind
+ok       trust-proxy-consistency: trust_proxy is consistent with http_host and public_url
+ok       mailer-configured: mailer configured
+ok       migrations-applied: all declared migrations applied
+ok       data-dir-writable: data dir './zb_data' is writable
+ok       legacy-password-hashes: no legacy password hashes
+9 checks, 0 errors, 1 warning, 0 skipped
+```
+
+`--json` instead: one compact object per finding, then exactly one summary object carrying
+`"summary":true` — a **content** discriminator (not a positional one), so a consumer reading
+the stream lazily can identify the summary without waiting for EOF (same deployment as above):
+
+```sh
+$ ZIGBASE_JWT_SECRET=a-strong-development-only-secret-key-value \
+  ZIGBASE_SMTP_HOST=smtp.example.com ZIGBASE_HTTP_HOST=0.0.0.0 \
+  zigbase doctor --json --data-dir ./zb_data
+{"check":"jwt-secret-persisted","severity":"ok","subject":null,"message":"JWT secret supplied via ZIGBASE_JWT_SECRET"}
+{"check":"public-rules-enumerated","severity":"ok","subject":null,"message":"no @public rules"}
+{"check":"insecure-cookies-off","severity":"ok","subject":null,"message":"cookies are Secure"}
+{"check":"host-binding","severity":"warn","subject":null,"message":"http_host '0.0.0.0' is a wildcard bind"}
+{"check":"trust-proxy-consistency","severity":"ok","subject":null,"message":"trust_proxy is consistent with http_host and public_url"}
+{"check":"mailer-configured","severity":"ok","subject":null,"message":"mailer configured"}
+{"check":"migrations-applied","severity":"ok","subject":null,"message":"all declared migrations applied"}
+{"check":"data-dir-writable","severity":"ok","subject":null,"message":"data dir './zb_data' is writable"}
+{"check":"legacy-password-hashes","severity":"ok","subject":null,"message":"no legacy password hashes"}
+{"summary":true,"production":false,"checks":9,"errors":0,"warnings":1,"skipped":0}
+```
+
+**Check ids never change. Match on the id, never on the message text — messages are free to
+improve.**
+
+**Database mutation:** `doctor` opens the database read-mostly to check public rules,
+migration status, and legacy password hashes; the *one* write it performs is creating the
+`_migrations` ledger table if it is missing — the same write `migrate status` already makes
+on a fresh database. It changes nothing else, and it never fails outright: an unopenable
+database or an unwritable data dir is reported as a finding (`skipped` on the three
+DB-backed checks, `error` on `data-dir-writable`), not a crash.
+
+### Exit codes
+
+| Exit | Meaning |
+|---|---|
+| `0` | fully clean — no error- or warning-severity findings |
+| `1` | at least one error-severity finding |
+| `2` | ran correctly, **warnings only** (something needs judgment, but nothing is broken) |
+
+A `skipped` finding never scores by itself — it doesn't push the exit code toward either 1 or 2.
+
+```sh
+zigbase doctor --production && deploy                              # strict: warnings block
+zigbase doctor --production; case $? in 0|2) deploy ;; esac        # tolerant: warnings report only
+```
+
+Write the tolerant gate as the `case` above, never as `test $? -ne 1`. `-ne 1` reads as
+"anything but an error", but it would also proceed on a usage error or any future exit code
+the program-wide `0`–`3` scheme adds later — treating a code `doctor` never promised as
+success. Enumerating the two codes that actually mean "no errors" is the only spelling that
+stays correct as the scheme grows.
+
+## 9. Out of scope
 
 - **No log rotation.** `serve.log` is truncated once, at the start of each `--background`
   session — a long-running session's own log just grows. Put it behind your platform's
@@ -330,7 +422,7 @@ parent exits the moment the JSON line is available.
 ## See also
 
 - [docs/framework.md](framework.md) — embedding ZigBase as a Zig library; `runCli` is what
-  gives a consumer binary this same `serve`/control-verb surface.
+  gives a consumer binary this same `serve`/`doctor`/control-verb surface.
 - [docs/docker.md](docker.md) — the official image, data-volume ownership, and healthchecks
   for deploying a `serve` session as a container instead of `--background`.
 - [KNOWN_LIMITATIONS.md](../KNOWN_LIMITATIONS.md) — current platform and scheduler caveats,

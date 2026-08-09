@@ -1,0 +1,9 @@
+jwt-secret-persisted
+public-rules-enumerated
+insecure-cookies-off
+host-binding
+trust-proxy-consistency
+mailer-configured
+migrations-applied
+data-dir-writable
+legacy-password-hashes
