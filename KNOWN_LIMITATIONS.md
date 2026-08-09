@@ -1,6 +1,6 @@
 # Known Limitations
 
-ZigBase v0.12.0 is an early release. The gaps below are known and tracked for future releases.
+ZigBase v0.13.0 is an early release. The gaps below are known and tracked for future releases.
 
 ## Auth & email
 - **Per-device session list/revoke requires opt-in `.auth.session.store = .table`; the default is still `.epoch`.** The default `App(.{ .auth = .{ .session = .{ .store = .epoch } } })` revokes per **principal** via the token epoch — `revokeAllSessions()` ("log out everywhere"), `refresh()`, `rotate()` — stateless, with zero extra DB work and unchanged token format. Opting into `App(.{ .auth = .{ .session = .{ .store = .table } } })` adds a server-side `_sessions` store enabling per-device list/revoke, at the cost of **one extra read per authenticated request** (the documented trade-off; flipping the default awaits real-world perf data). The surface now spans three layers, all gated the same way: the `ctx.auth()` verbs (`listActiveSessions()` / `revoke(sessionId)`), the REST endpoints (`GET`/`DELETE /api/collections/:col/auth/sessions[/:sid]`), and the TypeScript SDK (`listSessions()` / `revokeSession(id)`). In `.epoch` mode, `ctx.auth()` returns `error.SessionStoreNotEnabled` and the REST/SDK surface returns a non-oracle `404`.

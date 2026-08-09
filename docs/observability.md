@@ -198,7 +198,7 @@ of the human-oriented text form. Two conventions apply program-wide, across ever
 sub-project that adds such a command:
 
 1. **One object, one stream — and exactly two stdout shapes.** A command's `--json`
-   stdout is *either* a **single result object** (e.g. `{"zigbase":"0.12.0",…}`) or
+   stdout is *either* a **single result object** (e.g. `{"zigbase":"0.13.0",…}`) or
    a **findings stream** (NDJSON, one finding per line, terminated by exactly one
    summary object) — never a mix, and never a bare array (a list is wrapped, e.g.
    `{"codes":[…]}`). In both shapes, prose, warnings, progress, and log records go
