@@ -2,6 +2,7 @@ const std = @import("std");
 const RequestArena = @import("../request_arena.zig").RequestArena;
 const db = @import("../db.zig");
 const schema = @import("../schema.zig");
+const ddl = @import("../ddl.zig");
 const rules = @import("../rules.zig");
 const policy = @import("../policy.zig");
 const tenancy = @import("../tenancy/tenancy.zig");
@@ -420,13 +421,13 @@ fn snapshotSandbox(io: std.Io, col: schema.Collection, snapshot: std.json.Value)
             else => continue, // null/object/array: leave column NULL
         }
         try cols_sql.append(aa, ',');
-        try cols_sql.appendSlice(aa, try std.fmt.allocPrint(aa, "\"{s}\"", .{name}));
+        try cols_sql.appendSlice(aa, try ddl.quoteIdent(aa, name));
         try ph_sql.append(aa, ',');
         try ph_sql.appendSlice(aa, try std.fmt.allocPrint(aa, "?{d}", .{n}));
         try binds.append(aa, .{ .v = e.value_ptr.* });
         n += 1;
     }
-    const sql = try std.fmt.allocPrintSentinel(aa, "INSERT INTO \"{s}\" ({s}) VALUES ({s});", .{ col.name, cols_sql.items, ph_sql.items }, 0);
+    const sql = try std.fmt.allocPrintSentinel(aa, "INSERT INTO {s} ({s}) VALUES ({s});", .{ try ddl.quoteIdent(aa, col.name), cols_sql.items, ph_sql.items }, 0);
     var st = try tmp.prepare(sql);
     defer st.finalize();
     try st.bindText(1, snapshot.object.get("id").?.string);

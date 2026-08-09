@@ -28,6 +28,7 @@ const RequestArena = @import("../request_arena.zig").RequestArena;
 const http = @import("../http.zig");
 const app_mod = @import("../app.zig");
 const db = @import("../db.zig");
+const ddl = @import("../ddl.zig");
 const auth = @import("../auth.zig");
 const tenancy = @import("../tenancy/tenancy.zig");
 const params_mod = @import("../query/params.zig");
@@ -255,8 +256,8 @@ pub fn rollups(ctx: *http.RequestCtx) anyerror!http.Response {
     const table = analytics.summaryTable(ctx.allocator.a, name) catch
         return ApiError.notFound().toResponse(ctx.allocator.a);
     const where = try b.whereClause();
-    const sql = try std.fmt.allocPrintSentinel(ctx.allocator.a, "SELECT \"bucket\",\"account\",\"actor\",\"value\",\"computed_at\" FROM \"{s}\"{s} " ++
-        "ORDER BY \"bucket\" DESC, \"account\", \"actor\";", .{ table, where }, 0);
+    const sql = try std.fmt.allocPrintSentinel(ctx.allocator.a, "SELECT \"bucket\",\"account\",\"actor\",\"value\",\"computed_at\" FROM {s}{s} " ++
+        "ORDER BY \"bucket\" DESC, \"account\", \"actor\";", .{ try ddl.quoteIdent(ctx.allocator.a, table), where }, 0);
 
     // The summary table is created lazily on the first rollup run; until then, return an empty set.
     var st = reader.prepare(sql) catch return emptyItems(ctx);

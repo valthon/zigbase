@@ -17,6 +17,7 @@ const std = @import("std");
 const schema = @import("schema.zig");
 const collections = @import("collections.zig");
 const db = @import("db.zig");
+const ddl = @import("ddl.zig");
 const rules = @import("rules.zig");
 const regex = @import("regex.zig");
 const datetime = @import("datetime.zig");
@@ -66,10 +67,18 @@ fn warnTenantOwned(col: schema.Collection) void {
 fn ensureTenantIndex(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection) ProvisionError!void {
     const tf = col.options.tenant_field orelse return;
     if (!schema.isValidIdentifier(col.name) or !schema.isValidIdentifier(tf)) return;
+    // Bound + freed rather than nested inside the allocPrint: `alloc` here is the caller's
+    // allocator, not an arena (the `sql` free below says so), so a nested temporary would leak.
+    const qidx = try ddl.quoteComposite(alloc, "idx_{s}_{s}_tenant", .{ col.name, tf });
+    defer alloc.free(qidx);
+    const qtbl = try ddl.quoteIdent(alloc, col.name);
+    defer alloc.free(qtbl);
+    const qtf = try ddl.quoteIdent(alloc, tf);
+    defer alloc.free(qtf);
     const sql = try std.fmt.allocPrintSentinel(
         alloc,
-        "CREATE INDEX IF NOT EXISTS \"idx_{s}_{s}_tenant\" ON \"{s}\" (\"{s}\");",
-        .{ col.name, tf, col.name, tf },
+        "CREATE INDEX IF NOT EXISTS {s} ON {s} ({s});",
+        .{ qidx, qtbl, qtf },
         0,
     );
     defer alloc.free(sql);
@@ -2261,7 +2270,9 @@ test "migrationStatus: empty declared set with no ledger rows is all-zero" {
 // --- rollback (B2) test helpers ---
 
 fn tableExistsDb(d: *db.Db, alloc: std.mem.Allocator, name: []const u8) !bool {
-    const sql = try std.fmt.allocPrintSentinel(alloc, "SELECT 1 FROM \"{s}\" LIMIT 0;", .{name}, 0);
+    const qtbl = try ddl.quoteIdent(alloc, name);
+    defer alloc.free(qtbl);
+    const sql = try std.fmt.allocPrintSentinel(alloc, "SELECT 1 FROM {s} LIMIT 0;", .{qtbl}, 0);
     defer alloc.free(sql);
     var st = d.prepare(sql) catch return false;
     st.finalize();
