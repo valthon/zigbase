@@ -1,6 +1,7 @@
 // @ts-check
 import { defineConfig } from 'astro/config';
 import mdx from '@astrojs/mdx';
+import sitemap from '@astrojs/sitemap';
 import { rehypeHeadingIds } from '@astrojs/markdown-remark';
 import rehypeAutolinkHeadings from 'rehype-autolink-headings';
 
@@ -9,7 +10,13 @@ export default defineConfig({
   site: 'https://valthon.github.io',
   // @astrojs/mdx inherits the `markdown` config below (rehype heading ids +
   // autolink anchors, Shiki dual themes) by default — keep it integration-first.
-  integrations: [mdx()],
+  // /docs is a meta-refresh redirect page to /docs/overview and is noindexed
+  // (see src/pages/docs/index.astro) — keep it out of the sitemap so it doesn't
+  // send GSC contradictory signals (a noindexed page listed for indexing).
+  integrations: [
+    mdx(),
+    sitemap({ filter: (page) => page !== 'https://valthon.github.io/zigbase/docs' }),
+  ],
   base: '/zigbase',
   trailingSlash: 'never',
   build: {

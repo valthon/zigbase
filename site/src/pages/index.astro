@@ -12,9 +12,26 @@ import AdminShowcase from '../components/landing/AdminShowcase.astro';
 import ExamplesShowcase from '../components/landing/ExamplesShowcase.astro';
 import SdkShowcase from '../components/landing/SdkShowcase.astro';
 import WhyZigBase from '../components/landing/WhyZigBase.astro';
+
+// SoftwareApplication structured data for the landing page. The description
+// mirrors the default meta description in Base.astro — keep them in sync.
+const structuredData = {
+  '@context': 'https://schema.org',
+  '@type': 'SoftwareApplication',
+  name: 'ZigBase',
+  description:
+    'ZigBase is an open-source, single-binary backend — collections, auth, realtime, search, multi-tenancy, jobs, email, admin UI — on SQLite or PostgreSQL, and an embeddable Zig framework.',
+  url: 'https://valthon.github.io/zigbase',
+  applicationCategory: 'DeveloperApplication',
+  operatingSystem: 'Linux, macOS',
+  license: 'https://www.apache.org/licenses/LICENSE-2.0',
+  offers: { '@type': 'Offer', price: '0', priceCurrency: 'USD' },
+  sameAs: ['https://github.com/valthon/zigbase'],
+};
 ---
 
 <Base>
+  <script is:inline type="application/ld+json" set:html={JSON.stringify(structuredData)} />
   <Nav />
   <main>
     <Hero />

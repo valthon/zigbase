@@ -39,6 +39,7 @@ const ogImage = new URL(`${base}og.png`, Astro.site).href;
     <meta name="description" content={description} />
     <link rel="icon" type="image/svg+xml" href={`${base}favicon.svg`} />
     <link rel="canonical" href={canonicalURL} />
+    <meta name="google-site-verification" content="NibV2pc_Q1_s1duZ69GK0SW5gmFT7rfyp5LKttrsG7Y" />
 
     <!-- Open Graph -->
     <meta property="og:type" content="website" />
@@ -69,6 +70,7 @@ const ogImage = new URL(`${base}og.png`, Astro.site).href;
         } catch (e) {}
       })();
     </script>
+    <slot name="head" />
   </head>
   <body>
     <slot />
