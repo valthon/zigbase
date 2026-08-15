@@ -84,7 +84,7 @@ misconfigured deployment is visible rather than quietly misdirecting data.
 See the full environment-variable reference at
 <https://valthon.github.io/zigbase/docs/configuration#database-backend-experimental>.
 
-## Migrate an existing SQLite instance
+## Move a ZigBase instance from SQLite to PostgreSQL
 
 Once you have a `-Dpostgres` binary, the `migrate-db` subcommand copies an existing SQLite-backed
 instance — schema **and** data — into a fresh PostgreSQL database:

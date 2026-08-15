@@ -112,7 +112,7 @@ the schema editor. Create the three collections in order:
 This path drives the REST collections API directly — the same calls the admin UI makes —
 by calling `POST /api/collections` as the superuser. (If you'd rather not hand-script the
 auth dance, `zigbase schema apply schema.json` applies a declarative schema document
-offline; see [Migration tools](./migration-tools). This tutorial walks the API so you see
+offline; see [Migrating an existing backend to ZigBase](./migration-tools). This tutorial walks the API so you see
 every moving part.) Relation fields point at their target by **collection id** (the `id`
 from the create response, **not** the name — see
 [the relation gotcha](./fields#relation)), so you must create targets first and **capture

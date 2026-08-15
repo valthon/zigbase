@@ -209,7 +209,7 @@ emitting `doctor`-shaped NDJSON findings and exiting `0`/`2`/`1` clean/warnings-
 Given a document it is a **syntax**-depth check; run against a data dir it is **full** depth
 and also resolves field and relation names. Together with `import --manifest` and
 `import --legacy-hashes` they are the machinery behind
-[docs/migration-tools.md](docs/migration-tools.md).
+[migrating an existing backend to ZigBase](docs/migration-tools.md).
 
 Running `zigbase` with no recognised command prints usage.
 
