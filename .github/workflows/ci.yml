@@ -43,7 +43,7 @@ jobs:
           key: npm-${{ runner.os }}-${{ hashFiles('**/package-lock.json') }}
           restore-keys: npm-${{ runner.os }}-
       - name: Build plugins example frontend (embedded into the plugins binary)
-        run: cd examples/plugins/frontend && mise exec node@24 -- npm ci --no-audit --no-fund && mise exec node@24 -- npm run build
+        run: cd examples/plugins/frontend && ./build.sh
       # Shared binaries are built once here and run on OTHER jobs' runners, so they
       # must target a portable CPU — zig's default is -mcpu=native, which can emit
       # instructions a different runner lacks (→ SIGILL on startup). -Dcpu=baseline
@@ -65,8 +65,7 @@ jobs:
       - name: Golfsim example in-process tests (zigbase.testing)
         run: |
           cd examples/golfsim/frontend
-          mise exec node@24 -- npm ci --no-audit --no-fund
-          mise exec node@24 -- npm run build
+          ./build.sh
           cd ../
           mise exec zig@0.16.0 -- zig build test --summary all
       - name: Build dating-server (e2e fixture binary)
@@ -468,6 +467,12 @@ jobs:
         # free port + tempdir, so the harness is parallel-safe). Keep tests/smtp
         # serial below — it binds a real fixed TLS port.
         run: mise exec python@3.13 -- python -m pytest tests/admin -q -n auto
+      - name: Blog Zigapagos browser flow
+        working-directory: examples/blog
+        run: |
+          mise exec node@24 -- npm install
+          mise exec node@24 -- npm run build:frontend
+          mise exec python@3.13 -- python test/frontend.browser.py
       - name: Server lifecycle + doctor CLI e2e
         # Serial on purpose: these tests assert on timing (the readiness
         # handshake, the child-death path, the TERM/KILL escalation) and on
@@ -541,6 +546,32 @@ jobs:
       # (a dead registry / an empty offline cache proves resolution stays local).
       - name: Bare `zigbase` alias install test
         run: cd clients/typescript/npm && mise exec node@24 -- node --test test-alias-install.mjs
+
+  public-site:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - name: Build and verify public site
+        working-directory: site
+        run: |
+          npm run build
+          npm run doctor
+          npm run test:static
+          npm run test:generated
+      - name: Install browser test dependencies
+        working-directory: site
+        run: |
+          python -m pip install --quiet playwright
+          python -m playwright install --with-deps chromium
+      - name: Browser smoke and accessibility tests
+        working-directory: site
+        run: npm run test:browser
 
   dart-sdk:
     runs-on: ubuntu-latest

@@ -1,7 +1,0 @@
-# Served at /zigbase/robots.txt on this GitHub Pages project site, which
-# crawlers won't check (they only read robots.txt at the origin root) — this
-# file is inert here and becomes functional if the site moves to a custom domain.
-User-agent: *
-Allow: /
-
-Sitemap: https://valthon.github.io/zigbase/sitemap-index.xml

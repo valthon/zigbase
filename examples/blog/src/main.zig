@@ -21,7 +21,7 @@
 //!   - GET /api/blog/ping            — public health check
 //!   - GET /api/blog/posts/:slug     — fetch a single published post by slug
 //!
-//! The Astro + React frontend in `frontend/` is served via:
+//! The Zigapagos frontend in `frontend/` is served via:
 //!   --serve-static frontend/dist
 
 const std = @import("std");

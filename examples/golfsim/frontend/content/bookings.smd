@@ -1,0 +1,5 @@
+---
+.title = "My bookings",
+.description = "Manage upcoming GolfSim reservations and share reviews.",
+.layout = "bookings.shtml",
+---

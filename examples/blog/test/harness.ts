@@ -74,7 +74,14 @@ export async function startBlog(): Promise<BlogServer> {
     const su = spawnSync(BIN, ["superuser", "create", "--email", email, "--password", password, "--data-dir", dataDir], { stdio: "inherit" });
     if (su.status !== 0) { try { rmSync(dataDir, { recursive: true, force: true }); } catch { /* ignore */ } throw new Error("superuser create failed"); }
     const port = await freePort();
-    const proc: ChildProcess = spawn(BIN, ["serve", "--http-port", String(port), "--data-dir", dataDir, "--insecure-cookies"], { cwd: EXAMPLE_ROOT, stdio: "inherit" });
+    const proc: ChildProcess = spawn(BIN, [
+      "serve", "--http-port", String(port), "--data-dir", dataDir,
+      "--insecure-cookies", "--serve-static", "frontend/dist",
+    ], {
+      cwd: EXAMPLE_ROOT,
+      stdio: "inherit",
+      env: { ...process.env, ZIGBASE_SERVE_BACKGROUND: "0" },
+    });
     const url = `http://127.0.0.1:${port}`;
     try {
       await waitForHealthOrExit(url, proc, "blog");

@@ -4267,7 +4267,7 @@ guarantee.
 
 Three buildable examples form a ladder:
 [`examples/blog/`](../examples/blog/) is the basic packaging proof (hooks + route +
-cron job + Astro/React frontend served via `--serve-static`),
+cron job + Zigapagos/Preact frontend served via `--serve-static`),
 [`examples/golfsim/`](../examples/golfsim/) is a realistic app (hooks, routes, cron,
 a comptime-hardcoded `.dir` static mode, and a **generated TypeScript typed client** at
 `clients/typescript/zbase.gen.ts` — regenerate with `zig build gen-client`), and

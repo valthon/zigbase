@@ -4,7 +4,10 @@
   "type": "module",
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test:e2e": "vitest run"
+    "build:frontend": "bash frontend/build.sh",
+    "validate:frontend": "cd frontend && ../../../scripts/zigapagos.sh validate --format=json",
+    "doctor:frontend": "cd frontend && ../../../scripts/zigapagos.sh doctor dist --format=json",
+    "test:e2e": "npm run build:frontend && vitest run"
   },
   "devDependencies": {
     "@types/node": "^20.12.0",

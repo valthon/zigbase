@@ -1,0 +1,7 @@
+---
+.title = "ZigBase Blog",
+.description = "A live ZigBase blog example with realtime posts and authentication.",
+.layout = "index.shtml",
+---
+
+# ★ Latest Posts ★

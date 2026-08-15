@@ -68,14 +68,12 @@ export interface GolfServer {
 /**
  * golfsim bakes in `.static_files = .{ .dir = "frontend/dist" }` at comptime, so
  * the server REFUSES to boot unless that dir exists (resolved relative to its
- * working directory). Build the Astro frontend once if it's missing so the e2e is
+ * working directory). Build the Zigapagos frontend once if it's missing so the e2e is
  * self-contained.
  */
 function ensureFrontend(): void {
   if (existsSync(FRONTEND_DIST)) return;
-  const install = spawnSync("mise", ["exec", "node@24", "--", "npm", "install"], { cwd: FRONTEND_ROOT, stdio: "inherit" });
-  if (install.status !== 0) throw new Error("frontend npm install failed");
-  const build = spawnSync("mise", ["exec", "node@24", "--", "npm", "run", "build"], { cwd: FRONTEND_ROOT, stdio: "inherit" });
+  const build = spawnSync("bash", ["build.sh"], { cwd: FRONTEND_ROOT, stdio: "inherit" });
   if (build.status !== 0) throw new Error("frontend build failed");
 }
 
@@ -107,7 +105,7 @@ export async function startGolfsim(opts: StartOptions = {}): Promise<GolfServer>
     const b = spawnSync("mise", ["exec", "zig@0.16.0", "--", "zig", "build"], { cwd: EXAMPLE_ROOT, stdio: "inherit" });
     if (b.status !== 0) throw new Error("golfsim build failed");
   }
-  // The Astro frontend is built unconditionally: the binary serves frontend/dist
+  // The Zigapagos frontend is built unconditionally: the binary serves frontend/dist
   // at runtime regardless of how the binary itself was produced.
   ensureFrontend();
 

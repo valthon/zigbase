@@ -30,6 +30,21 @@ async function host(email: string) {
 }
 
 describe("golfsim generated client (live golfsim server)", () => {
+  it("serves the Zigapagos islands release from the comptime static directory", async () => {
+    const home = await fetch(`${server.url}/`);
+    expect(home.status).toBe(200);
+    expect(home.headers.get("content-type")).toContain("text/html");
+    const homeHtml = await home.text();
+    expect(homeHtml).toContain("Book a golf simulator");
+    expect(homeHtml).toContain("ListingsBrowser.island");
+
+    const bookings = await fetch(`${server.url}/bookings/`);
+    expect(bookings.status).toBe(200);
+    const bookingsHtml = await bookings.text();
+    expect(bookingsHtml).toContain("My bookings");
+    expect(bookingsHtml).toContain("MyBookings.island");
+  });
+
   it("auth + owner-scoped CRUD across simulators/listings, public review read", async () => {
     const { zb, user } = await host("host@golf.app");
 

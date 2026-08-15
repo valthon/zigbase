@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+  <head id="head">
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="description" content="$page.description">
+    <title :text="$page.title"></title>
+    <link rel="stylesheet" href="$site.asset('global.css').link()">
+    <super>
+  </head>
+  <body id="body">
+    <a class="skip-link" href="#main-content">Skip to content</a>
+    <header class="site">
+      <nav aria-label="Primary">
+        <a class="brand" href="$site.page('').link()">~*~ ZigBase Blog ~*~</a>
+        <a href="$site.page('write').link()">✍ Write</a>
+        <a href="/_/">⚙ Admin</a>
+        <island src="components/AuthStatus.island.tsx" client:load></island>
+      </nav>
+    </header>
+
+    <div class="marquee-bar marquee-css" aria-hidden="true">
+      <span>✨ WELCOME TO MY ZIGBASE HOMEPAGE ✨ &nbsp;•&nbsp; SIGN MY GUESTBOOK!
+        &nbsp;•&nbsp; BEST VIEWED IN NETSCAPE NAVIGATOR 4.0
+        &nbsp;•&nbsp; THIS SITE IS POWERED BY A SINGLE ZIG BINARY 🦎
+        &nbsp;•&nbsp; DON'T FORGET TO BOOKMARK!! ✨</span>
+    </div>
+
+    <main id="main-content" tabindex="-1"><super></main>
+
+    <footer class="webring">
+      <div class="ring">
+        <a href="$site.page('').link()">« Prev</a>
+        <span>🌐 The ZigBase Web Ring 🌐</span>
+        <a href="$site.page('').link()">Next »</a>
+      </div>
+      <div class="sig">© 1998 · handcrafted in Notepad · 100% Zig powered</div>
+    </footer>
+  </body>
+</html>

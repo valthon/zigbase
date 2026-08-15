@@ -38,8 +38,8 @@
 //! The six collections (users / simulators / listings / bookings / reviews /
 //! holds — the last demonstrating TTL records via `.ttl_field`) are
 //! provisioned at COMPTIME via `.collections` in the App config — the schema is
-//! set up automatically at startup (additive auto-migration). The Astro + React
-//! frontend in `frontend/` is served at the root path via the comptime-hardcoded
+//! set up automatically at startup (additive auto-migration). The Zigapagos
+//! islands frontend in `frontend/` is served at the root path via the comptime-hardcoded
 //! `.static_files = .{ .dir = "frontend/dist" }` — no `--serve-static` flag
 //! needed (and that flag is rejected as unknown in this mode).
 
@@ -870,7 +870,7 @@ pub const App = zigbase.App(.{
         .cursor = true,
         .cursor_token = .stateless,
     },
-    // Comptime-hardcoded static dir: the Astro frontend in frontend/dist is
+    // Comptime-hardcoded static dir: the Zigapagos release in frontend/dist is
     // served at the root path, no flag needed (and --serve-static is rejected).
     .static_files = .{ .dir = "frontend/dist" },
     // The schema the hooks/route/cron reference, provisioned at startup.

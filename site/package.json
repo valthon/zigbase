@@ -1,28 +1,17 @@
 {
   "name": "zigbase-site",
-  "type": "module",
   "version": "0.1.0",
   "private": true,
+  "type": "module",
   "scripts": {
-    "gen:docs": "node scripts/gen-docs-mirror.mjs",
-    "gen:llms": "node scripts/gen-llms-txt.mjs",
-    "predev": "node scripts/gen-docs-mirror.mjs && node scripts/gen-llms-txt.mjs",
-    "dev": "astro dev",
-    "prebuild": "node scripts/gen-docs-mirror.mjs && node scripts/gen-llms-txt.mjs",
-    "build": "astro build",
-    "preview": "astro preview",
-    "check": "astro check"
-  },
-  "dependencies": {
-    "@astrojs/markdown-remark": "^6.3.0",
-    "@astrojs/mdx": "^4.3.14",
-    "@astrojs/sitemap": "^3.7.3",
-    "astro": "^5.0.0",
-    "rehype-autolink-headings": "^7.1.0",
-    "sharp": "^0.33.0"
-  },
-  "devDependencies": {
-    "@astrojs/check": "^0.9.0",
-    "typescript": "^5.6.0"
+    "generate": "node --experimental-strip-types scripts/gen-content.ts",
+    "validate": "npm run generate && ../scripts/zigapagos.sh validate --format=json",
+    "build": "bash build.sh",
+    "doctor": "../scripts/zigapagos.sh doctor zig-out/site --url-prefix=zigbase --strict --format=json",
+    "dev": "npm run generate && ../scripts/zigapagos.sh dev --site=zig-out/site --watch-dir=content --watch-dir=layouts --watch-dir=assets -- ../scripts/zigapagos.sh release --output=zig-out/site --force",
+    "test:static": "node test/verify-output.mjs",
+    "test:generated": "node test/generated.mjs",
+    "test:browser": "bash test/browser.sh",
+    "test": "npm run build && npm run doctor && npm run test:static && npm run test:generated && npm run test:browser"
   }
 }

@@ -1,0 +1,92 @@
+<extend template="base.shtml">
+<head id="head"></head>
+<main id="main">
+  <div class="docs-shell">
+    <aside class="docs-sidebar" aria-label="Documentation navigation">
+      <label class="docs-search-label" for="docs-filter">Find a guide</label>
+      <input id="docs-filter" class="docs-filter" type="search" placeholder="Filter documentation" autocomplete="off">
+      <nav id="docs-nav" aria-label="Documentation">
+        <p class="docs-group">Getting started</p>
+        <ul>
+          <li><a href="$site.page('docs/overview').link()">Overview</a></li>
+          <li><a href="$site.page('docs/quick-start').link()">Quick start</a></li>
+          <li><a href="$site.page('docs/tutorial').link()">Tutorial</a></li>
+          <li><a href="$site.page('docs/agents').link()">For coding agents</a></li>
+        </ul>
+        <p class="docs-group">Build &amp; operate</p>
+        <ul>
+          <li><a href="$site.page('docs/recipes').link()">Recipes</a></li>
+          <li><a href="$site.page('docs/framework').link()">Framework</a></li>
+          <li><a href="$site.page('docs/testing').link()">Testing</a></li>
+          <li><a href="$site.page('docs/configuration').link()">Configuration</a></li>
+          <li><a href="$site.page('docs/docker').link()">Docker</a></li>
+          <li><a href="$site.page('docs/serve').link()">Running the server</a></li>
+          <li><a href="$site.page('docs/migration-tools').link()">Migration tools</a></li>
+        </ul>
+        <p class="docs-group">Client SDKs</p>
+        <ul>
+          <li><a href="$site.page('docs/typescript-sdk').link()">TypeScript</a></li>
+          <li><a href="$site.page('docs/dart-sdk').link()">Dart</a></li>
+          <li><a href="$site.page('docs/python-sdk').link()">Python</a></li>
+          <li><a href="$site.page('docs/kotlin-sdk').link()">Kotlin</a></li>
+        </ul>
+        <p class="docs-group">Features</p>
+        <ul>
+          <li><a href="$site.page('docs/postgres').link()">PostgreSQL</a></li>
+          <li><a href="$site.page('docs/tenancy').link()">Multi-tenancy</a></li>
+          <li><a href="$site.page('docs/abilities').link()">Relationship abilities</a></li>
+          <li><a href="$site.page('docs/search').link()">Search</a></li>
+          <li><a href="$site.page('docs/analytics').link()">Analytics</a></li>
+          <li><a href="$site.page('docs/email').link()">Email</a></li>
+          <li><a href="$site.page('docs/jobs-and-webhooks').link()">Jobs &amp; webhooks</a></li>
+          <li><a href="$site.page('docs/realtime-broadcast').link()">Realtime broadcast</a></li>
+        </ul>
+        <p class="docs-group">Reference</p>
+        <ul>
+          <li><a href="$site.page('docs/api').link()">API</a></li>
+          <li><a href="$site.page('docs/fields').link()">Fields</a></li>
+          <li><a href="$site.page('docs/observability').link()">Observability</a></li>
+          <li><a href="$site.page('docs/known-limitations').link()">Known limitations</a></li>
+          <li><a href="$site.page('docs/changelog').link()">Changelog</a></li>
+        </ul>
+      </nav>
+      <p id="docs-empty" class="docs-empty" hidden>No matching guides.</p>
+    </aside>
+    <article class="docs-body prose">
+      <p class="content-kicker">Documentation</p>
+      <h1 :text="$page.title"></h1>
+      <p class="docs-description" :text="$page.description"></p>
+      <div :html="$page.content()"></div>
+    </article>
+    <aside class="docs-toc" aria-label="On this page">
+      <p class="docs-group">On this page</p>
+      <div :html="$page.toc()"></div>
+    </aside>
+  </div>
+  <script>
+    (function () {
+      var current = window.location.pathname.replace(/\/$/, '');
+      document.querySelectorAll('#docs-nav a').forEach(function (link) {
+        if (new URL(link.href).pathname.replace(/\/$/, '') === current) link.setAttribute('aria-current', 'page');
+      });
+      var input = document.getElementById('docs-filter');
+      var empty = document.getElementById('docs-empty');
+      if (!input) return;
+      input.addEventListener('input', function () {
+        var query = input.value.trim().toLowerCase();
+        var visible = 0;
+        document.querySelectorAll('#docs-nav li').forEach(function (item) {
+          var show = !query || item.textContent.toLowerCase().includes(query);
+          item.hidden = !show;
+          if (show) visible += 1;
+        });
+        document.querySelectorAll('#docs-nav .docs-group').forEach(function (heading) {
+          var list = heading.nextElementSibling;
+          heading.hidden = !Array.from(list.children).some(function (item) { return !item.hidden; });
+          list.hidden = heading.hidden;
+        });
+        empty.hidden = visible !== 0;
+      });
+    })();
+  </script>
+</main>

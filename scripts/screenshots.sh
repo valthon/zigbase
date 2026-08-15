@@ -4,7 +4,7 @@
 #
 # CAPTURE PATH: REAL UI.
 #   Every shot drives the ACTUAL ZigBase admin SPA (served at /_/) or the real
-#   example frontends (Astro builds served by the example binaries) — never a
+#   example frontends (Zigapagos builds served by the example binaries) — never a
 #   static mock. Shots are 1280x800 desktop viewport with devicePixelRatio 2
 #   (intrinsic 2560x1600 PNGs), color_scheme "light".
 #

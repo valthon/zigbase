@@ -1,0 +1,6 @@
+<extend template="base.shtml">
+<head id="head"></head>
+<main id="main-content">
+  <div :html="$page.content()"></div>
+  <island src="components/Editor.island.tsx" client:load></island>
+</main>

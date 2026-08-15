@@ -197,7 +197,7 @@ code {
 }
 
 /* ── form controls (kept on-theme) ──────────────────── */
-input, textarea {
+input, select, textarea {
   width: 100%;
   padding: 0.5rem 0.6rem;
   margin: 0.25rem 0 0.75rem;
@@ -207,10 +207,18 @@ input, textarea {
   border-radius: 5px;
   font: inherit;
 }
-input:focus, textarea:focus {
-  outline: none;
+input:focus-visible, select:focus-visible, textarea:focus-visible, button:focus-visible, a:focus-visible {
+  outline: 2px solid var(--cyan);
+  outline-offset: 2px;
   border-color: var(--cyan);
-  box-shadow: 0 0 0 1px var(--cyan), 0 0 14px rgba(47, 243, 255, 0.35);
+  box-shadow: 0 0 14px rgba(47, 243, 255, 0.35);
+}
+
+label {
+  display: block;
+  margin-top: 0.5rem;
+  color: var(--fg);
+  font-weight: 700;
 }
 
 button {

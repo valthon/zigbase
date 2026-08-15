@@ -1,0 +1,5 @@
+---
+.title = "Post — ZigBase Blog",
+.description = "Read a published post from the ZigBase blog example.",
+.layout = "post.shtml",
+---

@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+  <head id="head">
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title :text="$page.title"></title>
+    <meta name="description" content="$page.description">
+    <link rel="canonical" href="$site.host_url.addPath($page.link())">
+    <meta name="google-site-verification" content="NibV2pc_Q1_s1duZ69GK0SW5gmFT7rfyp5LKttrsG7Y">
+    <meta property="og:type" content="website">
+    <meta property="og:title" content="$page.title">
+    <meta property="og:description" content="$page.description">
+    <meta property="og:url" content="$site.host_url.addPath($page.link())">
+    <meta property="og:image" content="$site.host_url.addPath($site.asset('og.png').link())">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:image:alt" content="ZigBase — open-source backend in a single binary. SQLite to start, Postgres when you grow.">
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="$page.title">
+    <meta name="twitter:description" content="$page.description">
+    <meta name="twitter:image" content="$site.host_url.addPath($site.asset('og.png').link())">
+    <link rel="icon" type="image/svg+xml" href="$site.asset('favicon.svg').link()">
+    <link rel="stylesheet" href="$site.asset('site.css').link()">
+    <link rel="stylesheet" href="$site.asset('shell.css').link()">
+    <script>
+      try {
+        var savedTheme = localStorage.getItem('zigbase-theme');
+        if (savedTheme === 'light' || savedTheme === 'dark') {
+          document.documentElement.dataset.theme = savedTheme;
+        }
+      } catch (error) {}
+    </script>
+    <super>
+  </head>
+  <body id="body">
+    <a class="skip-link" href="#main">Skip to content</a>
+    <header class="site-nav" id="site-nav">
+      <div class="nav-inner">
+        <a class="nav-brand" href="$site.page('').link()" aria-label="ZigBase home">
+          <img src="$site.asset('logo.svg').link()" alt="" width="28" height="28">
+          <span>ZigBase</span>
+        </a>
+        <nav class="nav-primary" aria-label="Primary">
+          <a href="$site.page('docs').link()">Docs</a>
+          <a href="$site.page('examples').link()">Examples</a>
+          <a href="$site.page('compare').link()">Compare</a>
+          <a href="$site.page('download').link()">Download</a>
+          <a href="https://github.com/valthon/zigbase">GitHub</a>
+        </nav>
+        <button id="theme-toggle" class="theme-toggle" type="button" aria-label="Switch color theme" aria-pressed="false">◐</button>
+      </div>
+    </header>
+    <main id="main">
+      <super>
+    </main>
+    <footer class="site-footer">
+      <div class="footer-inner">
+        <p><strong>ZigBase</strong> is an open-source backend and embeddable Zig framework. Apache-2.0.</p>
+        <p><a href="$site.page('docs/agents').link()">For coding agents</a> · <a href="$site.asset('llms.txt').link()">llms.txt</a> · <a href="https://github.com/valthon/zigbase">Source</a></p>
+        <p class="footer-meta">This site is built with the published Zigapagos v0.4.0 release.</p>
+      </div>
+    </footer>
+    <script>
+      (function () {
+        var button = document.getElementById('theme-toggle');
+        if (!button) return;
+        function currentIsDark() {
+          var explicit = document.documentElement.dataset.theme;
+          return explicit ? explicit === 'dark' : window.matchMedia('(prefers-color-scheme: dark)').matches;
+        }
+        button.setAttribute('aria-pressed', String(currentIsDark()));
+        button.addEventListener('click', function () {
+          var next = currentIsDark() ? 'light' : 'dark';
+          document.documentElement.dataset.theme = next;
+          button.setAttribute('aria-pressed', String(next === 'dark'));
+          try { localStorage.setItem('zigbase-theme', next); } catch (error) {}
+        });
+      })();
+    </script>
+  </body>
+</html>

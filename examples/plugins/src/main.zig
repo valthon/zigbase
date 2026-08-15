@@ -39,7 +39,7 @@
 //!
 //!   7. POOL LEVERS via `.pools` -- reader/job pool sizes + page-cache budget.
 //!
-//!   8. FULLY EMBEDDED STATIC FRONTEND via `embedStaticDir` -- the Astro build
+//!   8. FULLY EMBEDDED STATIC FRONTEND via `embedStaticDir` -- the Zigapagos build
 //!      output in `frontend/dist` is compiled into the binary at build time;
 //!      there is no runtime dependency on the frontend directory.
 //!

@@ -1,0 +1,5 @@
+---
+.title = "Download — ZigBase",
+.description = "Download a prebuilt ZigBase binary for Linux or macOS, build it from source, use Docker, or embed it as a Zig library.",
+.layout = "download.shtml",
+---

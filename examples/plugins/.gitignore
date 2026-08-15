@@ -1,6 +1,6 @@
 node_modules/
 frontend/dist/
-frontend/.astro/
+frontend/.zigapagos-cache/
 .zig-cache/
 zig-out/
 zb_data/

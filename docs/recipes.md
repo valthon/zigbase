@@ -24,10 +24,11 @@ and rule semantics are in [api.md](api.md); the framework hook/route/job APIs ar
 
 ## Recipe: ship your frontend inside the binary
 
-Build any static site (Astro, Vite, plain HTML) into a `dist/` folder, then embed
-it at compile time using the `embedStaticDir` helper exported from zigbase's
-`build.zig`. The built binary serves the frontend from memory — no directory needed
-at runtime.
+Build any static site into an output folder such as `dist/`, then embed it at
+compile time using the `embedStaticDir` helper exported from zigbase's `build.zig`.
+Zigapagos is ZigBase's preferred companion, but output from Astro, Vite, Hugo,
+Eleventy, or plain HTML works equally well. The built binary serves the frontend
+from memory — no directory needed at runtime.
 
 ```zig
 // build.zig
@@ -73,7 +74,7 @@ The three static-files modes — and their trade-offs:
 
 See [examples/blog/](../examples/blog/) (runtime flag), [examples/golfsim/](../examples/golfsim/)
 (hardcoded dir), and [examples/plugins/](../examples/plugins/) (embedded) for working
-Astro + React frontends, one per mode.
+Zigapagos + Preact frontends, one per mode.
 
 ---
 

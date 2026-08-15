@@ -142,7 +142,7 @@ examples: [examples/blog/](examples/blog/) (basic packaging — default
 comptime-hardcoded `.dir` static mode), and [examples/plugins/](examples/plugins/)
 (advanced framework features — custom plugins, comptime schema, typed migrations,
 pool levers — fully embedded static assets via `embedStaticDir`). Each example ships
-an Astro + React frontend demonstrating a different static-files mode.
+a Zigapagos + Preact frontend demonstrating a different static-files mode.
 
 ## CLI
 
@@ -329,7 +329,7 @@ src/
   files/                   local storage + multipart
   admin/                   embedded admin SPA (served at /_/)
 examples/
-  blog/                    basic packaging proof (hook, custom route, cron job, --serve-static Astro frontend)
+  blog/                    basic packaging proof (hook, custom route, cron job, --serve-static Zigapagos frontend)
   golfsim/                 a realistic app built on ZigBase (hooks, routes, cron, comptime .dir static frontend)
   plugins/                 advanced framework features (custom plugins, comptime schema, typed migrations, pools, embedded static frontend)
 ```

@@ -5,6 +5,10 @@ on:
     branches: [main]
     paths:
       - 'site/**'
+      - 'docs/**'
+      - 'CHANGELOG.md'
+      - 'KNOWN_LIMITATIONS.md'
+      - 'scripts/zigapagos.sh'
       - '.github/workflows/pages.yml'
       # The site derives the displayed versions at build time, so a release that
       # only bumps these manifests must still redeploy the site.
@@ -32,15 +36,9 @@ jobs:
         uses: actions/setup-node@v6
         with:
           node-version: 24
-          cache: 'npm'
-          cache-dependency-path: site/package-lock.json
-
-      - name: Install dependencies
-        run: npm ci
-        working-directory: site
 
       - name: Build site
-        run: npm run build
+        run: bash build.sh
         working-directory: site
 
       - name: Configure Pages
@@ -49,7 +47,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v5
         with:
-          path: site/dist
+          path: site/zig-out/site
 
   deploy:
     needs: build

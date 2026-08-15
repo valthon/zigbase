@@ -26,7 +26,7 @@ module into a downstream consumer package.
 | Custom route | `GET /api/blog/posts/:slug` returns one published post |
 | Cron job | Hourly heartbeat log (background scheduling demo) |
 | Realtime WebSocket | `PostList` subscribes to live post create/update/delete events |
-| Static-files mode | `--serve-static frontend/dist` serves the Astro build |
+| Static-files mode | `--serve-static frontend/dist` serves the Zigapagos release |
 | Pagination config | `.pagination = .{ .cursor_token = .signed }` — HMAC-signed cursor tokens for the post feed (offset still on) |
 | Built-in magic-link auth | `users.auth.methods.magic_link` — email-based passwordless login (auto_create, 1 h TTL) |
 | `ZIGBASE_PUBLIC_URL` | Set to `http://blog.test/` (fake) so the emailed link is a full clickable URL; override to your host to actually click it |
@@ -254,11 +254,12 @@ await zb.collection("posts").delete(post.id);
 For a fully-typed client, see golfsim (comptime-generated) and the
 [TypeScript SDK docs](../../docs/typescript-sdk.md).
 
-## Two test surfaces, on purpose
+## Three test surfaces, on purpose
 
 ```sh
 mise exec zig@0.16.0 -- zig build test            # in-process, no socket
 mise exec node@24 -- npm install && npm run test:e2e   # real server, real SDK
+npm run test:browser                                  # real server, real browser
 ```
 
 `zig build test` uses [`zigbase.testing`](../../docs/testing.md): it boots this
@@ -268,18 +269,25 @@ milliseconds per test. **This is how you should test your own app's behavior.**
 
 The vitest suite covers what an in-process test structurally cannot: it spawns
 the real binary and drives the `@zigbase/client` TypeScript SDK over HTTP, so it
-exercises the socket server and the SDK wire format. Keep both; neither implies
-the other.
+exercises the socket server and the SDK wire format. The Playwright flow serves
+the Zigapagos release from `frontend/dist`, signs up, publishes a post, opens its
+detail page, and finds it again in the live post list. Keep all three; none
+implies the others.
 
-## Frontend (Astro + React islands)
+## Frontend (Zigapagos islands)
 
-`frontend/` is an Astro site with React islands: a public post list with live
-updates, post detail, a magic-link login form ("Send magic link" → "Check your
-email"), and a post-write form. The nav displays logged-in state via a small
-`AuthStatus` island after a magic-link consume redirect.
+`frontend/` is a Zigapagos v0.4.0 site with four `@z/runtime` TSX islands: a
+public post list with live updates, post detail, a magic-link login form ("Send
+magic link" → "Check your email"), and a post-write form. The nav displays
+logged-in state via a small `AuthStatus` island after a magic-link consume
+redirect. Static page shells come from SuperMD content and SuperHTML layouts.
 
 ```sh
-cd frontend && npm install && npm run build && cd ..
+cd frontend
+../../../scripts/zigapagos.sh validate --format=json
+./build.sh                   # pinned Zigapagos v0.4.0 -> frontend/dist
+../../../scripts/zigapagos.sh doctor dist --format=json
+cd ..
 mise exec zig@0.16.0 -- zig build
 # --insecure-cookies for plain-HTTP local dev. The frontend is served from this same
 # binary, so the live post-list WebSocket is same-origin and allowed by default; only a
@@ -289,6 +297,12 @@ ZIGBASE_PUBLIC_URL=http://blog.test/ ./zig-out/bin/blog serve --insecure-cookies
 # open http://127.0.0.1:8090/
 # To click the magic-link in local dev: ZIGBASE_PUBLIC_URL=http://127.0.0.1:8090 instead
 ```
+
+`doctor` intentionally reports the `/_/` links as dangling: that admin route is
+provided dynamically by the ZigBase binary and therefore is not present in the
+static output tree. No frontend dependency install is required: the repository
+launcher fetches the exact Zigapagos release through `npx`, and the strict build
+checks the island props while producing the client bundles.
 
 This demonstrates ZigBase's **default static-files mode**: the binary serves
 `frontend/dist` at the root path because you passed `--serve-static`. The other

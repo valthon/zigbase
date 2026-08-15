@@ -1,0 +1,8 @@
+Site {
+    .title = "ZigBase plugins example",
+    .host_url = "http://localhost:8090",
+    .content_dir_path = "content",
+    .layouts_dir_path = "layouts",
+    .assets_dir_path = "src/styles",
+    .deploy_target = "zigbase",
+}

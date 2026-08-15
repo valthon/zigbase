@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState } from '@z/runtime';
 import {
   login,
   signup,
@@ -130,13 +130,13 @@ export default function Auth({ onAuthed }: { onAuthed: () => void }) {
             placeholder="Email"
             type="email"
             value={email}
-            onChange={(e) => setEmail(e.target.value)}
+            onChange={(e) => setEmail(e.currentTarget.value)}
           />
           <input
             placeholder="Password"
             type="password"
             value={password}
-            onChange={(e) => setPassword(e.target.value)}
+            onChange={(e) => setPassword(e.currentTarget.value)}
           />
           <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap' }}>
             <button disabled={busy} onClick={handleLoginPassword}>
@@ -183,13 +183,13 @@ export default function Auth({ onAuthed }: { onAuthed: () => void }) {
             placeholder="Email"
             type="email"
             value={email}
-            onChange={(e) => setEmail(e.target.value)}
+            onChange={(e) => setEmail(e.currentTarget.value)}
           />
           <input
             placeholder="Password (8+ chars)"
             type="password"
             value={password}
-            onChange={(e) => setPassword(e.target.value)}
+            onChange={(e) => setPassword(e.currentTarget.value)}
           />
           <button disabled={busy} onClick={handleSignup}>
             Create account
@@ -217,7 +217,7 @@ export default function Auth({ onAuthed }: { onAuthed: () => void }) {
           <input
             placeholder="Verification token"
             value={verifyToken}
-            onChange={(e) => setVerifyToken(e.target.value)}
+            onChange={(e) => setVerifyToken(e.currentTarget.value)}
           />
           <button disabled={busy} onClick={handleVerify}>
             Verify
@@ -260,7 +260,7 @@ export default function Auth({ onAuthed }: { onAuthed: () => void }) {
             inputMode="numeric"
             maxLength={6}
             value={otpCode}
-            onChange={(e) => setOtpCode(e.target.value)}
+            onChange={(e) => setOtpCode(e.currentTarget.value)}
           />
           <button disabled={busy} onClick={handleOtpComplete}>
             Confirm code

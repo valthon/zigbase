@@ -56,9 +56,7 @@ export interface PluginsServer {
 
 function ensureFrontend(): void {
   if (existsSync(FRONTEND_DIST)) return;
-  const i = spawnSync("mise", ["exec", "node@24", "--", "npm", "install"], { cwd: FRONTEND_ROOT, stdio: "inherit" });
-  if (i.status !== 0) throw new Error("plugins frontend npm install failed");
-  const b = spawnSync("mise", ["exec", "node@24", "--", "npm", "run", "build"], { cwd: FRONTEND_ROOT, stdio: "inherit" });
+  const b = spawnSync("npm", ["run", "build:frontend"], { cwd: EXAMPLE_ROOT, stdio: "inherit" });
   if (b.status !== 0) throw new Error("plugins frontend build failed");
 }
 
