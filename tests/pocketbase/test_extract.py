@@ -593,6 +593,16 @@ def test_bundle_verification_refuses_symlinked_output(pocketbase_snapshot, tmp_p
     with pytest.raises(pb2zb.PocketBaseError, match="missing or unsafe"):
         pb2zb.verify_bundle(out)
 
+    clean = tmp_path / "clean-symlink"
+    pb2zb.extract_bundle(schema, pb_data, decisions, clean)
+    external_directory = tmp_path / "external-directory"
+    external_directory.mkdir()
+    (clean / "unmanifested-link").symlink_to(
+        external_directory, target_is_directory=True
+    )
+    with pytest.raises(pb2zb.PocketBaseError, match="symbolic link"):
+        pb2zb.verify_bundle(clean)
+
 
 def test_extract_refuses_unacknowledged_findings_and_nonempty_output(
     pocketbase_snapshot, tmp_path

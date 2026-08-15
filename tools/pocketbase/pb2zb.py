@@ -13,6 +13,7 @@ import argparse
 import hashlib
 import json
 import math
+import os
 import re
 import shutil
 import sqlite3
@@ -103,6 +104,14 @@ class Decision:
     choice: str
     rationale: str
     artifact: str | None = None
+
+
+@dataclass(frozen=True, order=True)
+class FileReference:
+    source_collection_id: str
+    target_collection: str
+    record_id: str
+    filename: str
 
 
 def _read_json(path: Path, *, limit: int, label: str) -> Any:
@@ -1240,6 +1249,43 @@ def _convert_value(field: dict[str, Any], mapped: dict[str, Any], value: Any) ->
     return value
 
 
+def _validate_stored_filename(filename: Any, label: str) -> str:
+    if (
+        not isinstance(filename, str)
+        or not filename
+        or filename in {".", ".."}
+        or "/" in filename
+        or "\\" in filename
+        or "\x00" in filename
+        or Path(filename).is_absolute()
+    ):
+        raise PocketBaseError(f"{label} contains an unsafe stored filename")
+    return filename
+
+
+def _record_file_references(
+    source_field: dict[str, Any],
+    value: Any,
+    source_collection_id: str,
+    target_collection: str,
+    record_id: str,
+) -> list[FileReference]:
+    if source_field["type"] != "file" or value is None or value == "":
+        return []
+    values = value if isinstance(value, list) else [value]
+    return [
+        FileReference(
+            source_collection_id,
+            target_collection,
+            record_id,
+            _validate_stored_filename(
+                filename, f"file field {target_collection}.{source_field['name']}"
+            ),
+        )
+        for filename in values
+    ]
+
+
 def _source_to_target_fields(
     collection: dict[str, Any],
     collection_names: dict[str, str],
@@ -1285,14 +1331,16 @@ def _write_ndjson_rows(
     connection: sqlite3.Connection,
     destination: Path,
     collection: dict[str, Any],
+    target_collection: str,
     field_pairs: list[tuple[dict[str, Any], dict[str, Any]]],
-) -> int:
+) -> tuple[int, list[FileReference]]:
     columns = _table_columns(connection, str(collection["name"]))
     query, selected = _row_query(collection, [pair[0] for pair in field_pairs], columns)
     try:
         cursor = connection.execute(query)
         destination.parent.mkdir(parents=True, exist_ok=True)
         count = 0
+        file_references: list[FileReference] = []
         with destination.open("w", encoding="utf-8", newline="\n") as output:
             for raw_values in cursor:
                 raw = dict(zip(selected, raw_values, strict=True))
@@ -1330,8 +1378,18 @@ def _write_ndjson_rows(
                         record["username"] = raw["username"]
                     record["verified"] = bool(raw.get("verified"))
                 for source_field, mapped_field in field_pairs:
-                    record[str(mapped_field["name"])] = _convert_value(
+                    converted = _convert_value(
                         source_field, mapped_field, raw.get(str(source_field["name"]))
+                    )
+                    record[str(mapped_field["name"])] = converted
+                    file_references.extend(
+                        _record_file_references(
+                            source_field,
+                            converted,
+                            str(collection["id"]),
+                            target_collection,
+                            record_id,
+                        )
                     )
                 line = json.dumps(
                     record, ensure_ascii=False, sort_keys=True, separators=(",", ":")
@@ -1346,7 +1404,7 @@ def _write_ndjson_rows(
         raise PocketBaseError(
             f"cannot extract rows for collection {collection['name']!r}: {exc}"
         ) from exc
-    return count
+    return count, file_references
 
 
 def _canonical_decisions(
@@ -1412,6 +1470,106 @@ def _copy_replacement_artifacts(
     return copied
 
 
+def _scan_regular_tree(root: Path, label: str) -> set[Path]:
+    if not root.exists():
+        return set()
+    if root.is_symlink() or not root.is_dir():
+        raise PocketBaseError(f"{label} must be a real directory, not a symbolic link")
+    files: set[Path] = set()
+
+    def visit(directory: Path, relative: Path) -> None:
+        try:
+            children = sorted(directory.iterdir(), key=lambda item: item.name)
+        except OSError as exc:
+            raise PocketBaseError(f"cannot inspect {label}: {exc}") from exc
+        for child in children:
+            child_relative = relative / child.name
+            if child.is_symlink():
+                raise PocketBaseError(
+                    f"{label} contains a symbolic link: {child_relative.as_posix()}"
+                )
+            if child.is_dir():
+                visit(child, child_relative)
+            elif child.is_file():
+                files.add(child_relative)
+            else:
+                raise PocketBaseError(
+                    f"{label} contains a non-regular object: {child_relative.as_posix()}"
+                )
+
+    visit(root, Path())
+    return files
+
+
+def _copy_file_bytes(source: Path, destination: Path) -> tuple[int, str]:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    digest = hashlib.sha256()
+    size = 0
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(source, flags)
+        with os.fdopen(descriptor, "rb") as input_file:
+            with destination.open("xb") as output_file:
+                while chunk := input_file.read(1024 * 1024):
+                    output_file.write(chunk)
+                    digest.update(chunk)
+                    size += len(chunk)
+    except OSError as exc:
+        raise PocketBaseError(f"cannot copy PocketBase file {source}: {exc}") from exc
+    return size, digest.hexdigest()
+
+
+def _stage_referenced_files(
+    stage: Path, pb_data: Path, references: list[FileReference]
+) -> tuple[list[dict[str, Any]], list[str]]:
+    storage = pb_data / "storage"
+    available = _scan_regular_tree(storage, "PocketBase storage")
+    referenced_sources: set[Path] = set()
+    destinations: dict[Path, Path] = {}
+    staged_destinations: set[Path] = set()
+    entries: list[dict[str, Any]] = []
+    for reference in sorted(set(references)):
+        source_relative = (
+            Path(reference.source_collection_id)
+            / reference.record_id
+            / reference.filename
+        )
+        if source_relative not in available:
+            raise PocketBaseError(
+                f"referenced PocketBase file is missing: {source_relative.as_posix()}"
+            )
+        destination_relative = (
+            Path("storage")
+            / reference.target_collection
+            / reference.record_id
+            / reference.filename
+        )
+        previous = destinations.setdefault(destination_relative, source_relative)
+        if previous != source_relative:
+            raise PocketBaseError(
+                f"multiple PocketBase files map to {destination_relative.as_posix()}"
+            )
+        if destination_relative in staged_destinations:
+            continue
+        referenced_sources.add(source_relative)
+        staged_destinations.add(destination_relative)
+        size, digest = _copy_file_bytes(
+            storage / source_relative, stage / destination_relative
+        )
+        entries.append(
+            {
+                "sourcePath": source_relative.as_posix(),
+                "path": destination_relative.as_posix(),
+                "bytes": size,
+                "sha256": digest,
+            }
+        )
+    unreferenced = sorted(
+        path.as_posix() for path in available.difference(referenced_sources)
+    )
+    return entries, unreferenced
+
+
 def _prepare_output_directory(out: Path) -> None:
     if out.exists():
         if not out.is_dir() or any(out.iterdir()):
@@ -1465,7 +1623,7 @@ def extract_bundle(
         row_counts: dict[str, int] = {}
         auth_imports: list[dict[str, Any]] = []
         ordinary_entries: list[dict[str, Any]] = []
-        file_references = 0
+        file_references: list[FileReference] = []
         try:
             for collection in sorted(
                 collections, key=lambda item: (str(item["name"]), str(item["id"]))
@@ -1493,9 +1651,14 @@ def extract_bundle(
                     if is_auth
                     else Path("imports") / f"{name}.ndjson"
                 )
-                count = _write_ndjson_rows(
-                    connection, stage_path / relative, collection, pairs
+                count, collection_file_references = _write_ndjson_rows(
+                    connection,
+                    stage_path / relative,
+                    collection,
+                    name,
+                    pairs,
                 )
+                file_references.extend(collection_file_references)
                 row_counts[name] = count
                 if is_auth:
                     auth_imports.append(
@@ -1505,11 +1668,11 @@ def extract_bundle(
                     ordinary_entries.append(
                         {"collection": name, "file": f"{name}.ndjson"}
                     )
-                file_references += sum(
-                    1 for source, _ in pairs if source["type"] == "file"
-                )
         finally:
             connection.close()
+        storage_files, unreferenced_storage = _stage_referenced_files(
+            stage_path, pb_data, file_references
+        )
         manifest = {
             "zigbaseImportManifest": 1,
             "collections": ordinary_entries,
@@ -1532,7 +1695,9 @@ def extract_bundle(
             "rowCounts": dict(sorted(row_counts.items())),
             "authImports": auth_imports,
             "ordinaryManifest": "imports/manifest.json",
-            "fileFieldsPending": file_references,
+            "files": len(storage_files),
+            "storageFiles": storage_files,
+            "unreferencedStorage": unreferenced_storage,
             "replacementArtifacts": replacements,
             "outputs": _output_entries(stage_path),
         }
@@ -1550,6 +1715,10 @@ def extract_bundle(
 
 def verify_bundle(bundle: Path) -> dict[str, Any]:
     manifest_path = bundle / "zigbase-pocketbase-bundle.json"
+    if bundle.is_symlink() or manifest_path.is_symlink():
+        raise PocketBaseError(
+            "PocketBase bundle and its manifest must not be symbolic links"
+        )
     value = _read_json(
         manifest_path, limit=MAX_SCHEMA_BYTES, label="PocketBase bundle manifest"
     )
@@ -1590,13 +1759,198 @@ def verify_bundle(bundle: Path) -> dict[str, Any]:
         ):
             raise PocketBaseError(f"bundle output digest mismatch: {relative}")
     actual = {
-        path.relative_to(bundle).as_posix()
-        for path in bundle.rglob("*")
-        if path.is_file() and path != manifest_path
+        path.as_posix()
+        for path in _scan_regular_tree(bundle, "PocketBase bundle")
+        if path.as_posix() != "zigbase-pocketbase-bundle.json"
     }
     if actual != expected:
         raise PocketBaseError("bundle contains missing or unmanifested files")
     return value
+
+
+def _unsafe_relative_path(relative: str) -> bool:
+    path = Path(relative)
+    return (
+        not relative
+        or path.is_absolute()
+        or ".." in path.parts
+        or "\\" in relative
+        or "\x00" in relative
+    )
+
+
+def _absolute_path_contains_symlink(path: Path) -> bool:
+    absolute = path.absolute()
+    current = Path(absolute.anchor)
+    for part in absolute.parts[1:]:
+        current = current / part
+        if current.is_symlink():
+            return True
+    return False
+
+
+def _file_install_plan(
+    bundle: Path, target_data_dir: Path, manifest: dict[str, Any]
+) -> list[tuple[Path, Path, int, str, bool]]:
+    storage_files = manifest.get("storageFiles")
+    if not isinstance(storage_files, list):
+        raise PocketBaseError("PocketBase bundle storageFiles must be an array")
+    outputs = {
+        entry["path"]: entry
+        for entry in manifest["outputs"]
+        if isinstance(entry, dict) and isinstance(entry.get("path"), str)
+    }
+    bundle_root = bundle.resolve(strict=True)
+    target_absolute = target_data_dir.absolute()
+    if _absolute_path_contains_symlink(target_absolute):
+        raise PocketBaseError("target data directory path contains a symbolic link")
+    target_resolved = target_absolute.resolve()
+    if target_resolved.is_relative_to(bundle_root) or bundle_root.is_relative_to(
+        target_resolved
+    ):
+        raise PocketBaseError("target data directory must not overlap the bundle")
+
+    plan: list[tuple[Path, Path, int, str, bool]] = []
+    destinations: set[Path] = set()
+    for index, entry in enumerate(storage_files):
+        if not isinstance(entry, dict) or set(entry) != {
+            "sourcePath",
+            "path",
+            "bytes",
+            "sha256",
+        }:
+            raise PocketBaseError(f"storage file entry {index} has an invalid shape")
+        relative = entry["path"]
+        size = entry["bytes"]
+        digest = entry["sha256"]
+        if not isinstance(relative, str) or _unsafe_relative_path(relative):
+            raise PocketBaseError(f"storage file entry {index} has an unsafe path")
+        path = Path(relative)
+        if (
+            len(path.parts) != 4
+            or path.parts[0] != "storage"
+            or not IDENTIFIER.fullmatch(path.parts[1])
+            or not POCKETBASE_ID.fullmatch(path.parts[2])
+        ):
+            raise PocketBaseError(f"storage file entry {index} has an unsafe path")
+        _validate_stored_filename(path.parts[3], f"storage file entry {index}")
+        if (
+            not isinstance(size, int)
+            or isinstance(size, bool)
+            or size < 0
+            or not isinstance(digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+        ):
+            raise PocketBaseError(f"storage file entry {index} has invalid metadata")
+        output = outputs.get(relative)
+        if (
+            output is None
+            or output.get("bytes") != size
+            or output.get("sha256") != digest
+        ):
+            raise PocketBaseError(
+                f"storage file entry {index} does not match the verified bundle outputs"
+            )
+        source = bundle_root / path
+        destination = target_resolved / path
+        if destination in destinations:
+            raise PocketBaseError(
+                f"duplicate file installation destination: {relative}"
+            )
+        destinations.add(destination)
+        if _absolute_path_contains_symlink(destination):
+            raise PocketBaseError(f"target path contains a symbolic link: {relative}")
+        current = target_resolved
+        for part in path.parts[:-1]:
+            current = current / part
+            if current.exists() and not current.is_dir():
+                raise PocketBaseError(
+                    f"target directory path is not a directory: {current}"
+                )
+        exists = destination.exists()
+        if exists:
+            if not destination.is_file() or _sha256(destination) != digest:
+                raise PocketBaseError(
+                    f"different file already exists at target: {relative}"
+                )
+            if destination.stat().st_size != size:
+                raise PocketBaseError(
+                    f"different file already exists at target: {relative}"
+                )
+        plan.append((source, destination, size, digest, exists))
+    return plan
+
+
+def _mkdir_restrictive(path: Path) -> None:
+    missing: list[Path] = []
+    current = path
+    while not current.exists():
+        missing.append(current)
+        current = current.parent
+    if current.is_symlink() or not current.is_dir():
+        raise PocketBaseError(f"cannot create target directory beneath {current}")
+    for directory in reversed(missing):
+        try:
+            directory.mkdir(mode=0o700)
+        except FileExistsError:
+            if directory.is_symlink() or not directory.is_dir():
+                raise PocketBaseError(f"unsafe target directory appeared: {directory}")
+
+
+def _install_file_atomic(source: Path, destination: Path, digest: str) -> bool:
+    _mkdir_restrictive(destination.parent)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=".pb2zb-", dir=destination.parent
+    )
+    temporary = Path(temporary_name)
+    descriptor_open = True
+    try:
+        os.fchmod(descriptor, 0o600)
+        copied_digest = hashlib.sha256()
+        source_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        source_descriptor = os.open(source, source_flags)
+        with os.fdopen(source_descriptor, "rb") as input_file:
+            with os.fdopen(descriptor, "wb") as output_file:
+                descriptor_open = False
+                while chunk := input_file.read(1024 * 1024):
+                    output_file.write(chunk)
+                    copied_digest.update(chunk)
+                output_file.flush()
+                os.fsync(output_file.fileno())
+        if copied_digest.hexdigest() != digest:
+            raise PocketBaseError("bundle file changed while it was being installed")
+        try:
+            os.link(temporary, destination, follow_symlinks=False)
+            return True
+        except FileExistsError:
+            if destination.is_symlink() or not destination.is_file():
+                raise PocketBaseError(f"unsafe target appeared: {destination}")
+            if _sha256(destination) != digest:
+                raise PocketBaseError(
+                    f"different file appeared at target: {destination}"
+                )
+            return False
+    except OSError as exc:
+        raise PocketBaseError(f"cannot install file at {destination}: {exc}") from exc
+    finally:
+        if descriptor_open:
+            os.close(descriptor)
+        temporary.unlink(missing_ok=True)
+
+
+def install_files(bundle: Path, target_data_dir: Path) -> dict[str, int]:
+    manifest = verify_bundle(bundle)
+    plan = _file_install_plan(bundle, target_data_dir, manifest)
+    installed = 0
+    reused = 0
+    for source, destination, _size, digest, exists in plan:
+        if exists:
+            reused += 1
+        elif _install_file_atomic(source, destination, digest):
+            installed += 1
+        else:
+            reused += 1
+    return {"files": len(plan), "installed": installed, "reused": reused}
 
 
 def _write_json(path: Path, value: Any) -> None:
@@ -1652,9 +2006,19 @@ def cmd_extract(args: argparse.Namespace) -> int:
                 "out": str(args.out),
                 "collections": manifest["collections"],
                 "rows": manifest["rows"],
-                "file_fields_pending": manifest["fileFieldsPending"],
+                "files": manifest["files"],
             },
             separators=(",", ":"),
+        )
+    )
+    return 0
+
+
+def cmd_install_files(args: argparse.Namespace) -> int:
+    result = install_files(args.bundle, args.target_data_dir)
+    print(
+        json.dumps(
+            {"zigbase_pocketbase_file_install": 1, **result}, separators=(",", ":")
         )
     )
     return 0
@@ -1678,6 +2042,12 @@ def parser() -> argparse.ArgumentParser:
     extract.add_argument("--decisions", type=Path, required=True)
     extract.add_argument("--out", type=Path, required=True)
     extract.set_defaults(handler=cmd_extract)
+    install = commands.add_parser(
+        "install-files", help="install verified bundle files into a ZigBase data dir"
+    )
+    install.add_argument("--bundle", type=Path, required=True)
+    install.add_argument("--target-data-dir", type=Path, required=True)
+    install.set_defaults(handler=cmd_install_files)
     return root
 
 
