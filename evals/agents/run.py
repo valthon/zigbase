@@ -208,7 +208,11 @@ def execute(
         process_exit = completed.exit_code
         timed_out = completed.timed_out
         failures: tuple[EvalFailure, ...] = ()
-        if completed.timed_out:
+        if completed.interrupted:
+            failures = (
+                EvalFailure("agent.interrupted", "agent command was interrupted"),
+            )
+        elif completed.timed_out:
             failures = (
                 EvalFailure(
                     "agent.timeout", "agent command exceeded the scenario timeout"

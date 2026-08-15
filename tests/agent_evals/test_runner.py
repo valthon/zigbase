@@ -1,5 +1,6 @@
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -219,6 +220,44 @@ def test_timeout_still_applies_when_agent_does_not_read_large_stdin(tmp_path):
     )
     assert result.timed_out is True
     assert time.monotonic() - started < 3
+
+
+def test_cli_interrupt_cleans_up_agent_and_emits_stable_result(tmp_path):
+    env = os.environ.copy()
+    env["ZIGBASE_AGENT_COMMAND_JSON"] = json.dumps(
+        [sys.executable, str(FAKE_AGENT), "sleep"]
+    )
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "evals.agents.run",
+            "genesis",
+            "--artifacts-dir",
+            str(tmp_path / "artifacts"),
+        ],
+        cwd=REPO,
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    deadline = time.monotonic() + 5
+    while not list((tmp_path / "artifacts").glob("*/agent.stderr.log")):
+        assert process.poll() is None
+        if time.monotonic() >= deadline:
+            process.kill()
+            pytest.fail("runner did not start the agent before the test deadline")
+        time.sleep(0.05)
+
+    process.send_signal(signal.SIGINT)
+    stdout, stderr = process.communicate(timeout=5)
+
+    assert process.returncode == 1
+    payload = json.loads(stdout)
+    assert payload["failures"][0]["code"] == "agent.interrupted"
+    assert payload["timed_out"] is False
+    assert "Traceback" not in stderr
 
 
 def test_paths_with_spaces_are_literal(tmp_path):

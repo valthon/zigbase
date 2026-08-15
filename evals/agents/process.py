@@ -14,6 +14,7 @@ from pathlib import Path
 class ProcessResult:
     exit_code: int
     timed_out: bool
+    interrupted: bool
     output_truncated: bool
 
 
@@ -58,6 +59,16 @@ def _signal_group(pid: int, sig: signal.Signals) -> None:
         pass
 
 
+def _terminate_group(process: subprocess.Popen[bytes], grace_seconds: int) -> None:
+    """Terminate a runner-owned process group and reap its leader."""
+    _signal_group(process.pid, signal.SIGTERM)
+    try:
+        process.wait(timeout=grace_seconds)
+    except subprocess.TimeoutExpired:
+        _signal_group(process.pid, signal.SIGKILL)
+        process.wait()
+
+
 def run_process(
     argv: list[str],
     *,
@@ -73,6 +84,7 @@ def run_process(
     """Run argv without a shell and clean up its whole process group."""
     budget = _CaptureBudget(max_output_bytes)
     timed_out = False
+    interrupted = False
     with stdout_path.open("wb") as stdout_file, stderr_path.open("wb") as stderr_file:
         process = subprocess.Popen(
             argv,
@@ -108,12 +120,10 @@ def run_process(
             process.wait(timeout=timeout_seconds)
         except subprocess.TimeoutExpired:
             timed_out = True
-            _signal_group(process.pid, signal.SIGTERM)
-            try:
-                process.wait(timeout=term_grace_seconds)
-            except subprocess.TimeoutExpired:
-                _signal_group(process.pid, signal.SIGKILL)
-                process.wait()
+            _terminate_group(process, term_grace_seconds)
+        except KeyboardInterrupt:
+            interrupted = True
+            _terminate_group(process, term_grace_seconds)
         finally:
             # A successful agent may still leave helpers behind. The grader owns
             # Docker resources; arbitrary child processes never outlive the run.
@@ -130,5 +140,6 @@ def run_process(
     return ProcessResult(
         exit_code=process.returncode,
         timed_out=timed_out,
+        interrupted=interrupted,
         output_truncated=budget.truncated,
     )
