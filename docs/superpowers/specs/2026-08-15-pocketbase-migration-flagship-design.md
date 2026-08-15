@@ -185,8 +185,8 @@ executes each auth file as its own create-only import before the relation-ordere
 
 ### D5. Mapping is lossless by default and explicit where it cannot be
 
-Direct field mappings are `text`, `number`, `bool`, `email`, `url`, `editor`, `date`, `autodate`,
-`select`, `json`, `file`, and `relation`. Stable field ids and record ids are preserved. PocketBase
+Direct field mappings are `text`, `number`, `bool`, `email`, `url`, `editor`, `date`, `select`,
+`json`, `file`, and `relation`. Stable field ids and record ids are preserved. PocketBase
 collection ids remain in bundle provenance and source-file lookup, but ZigBase collection ids are
 intentionally instance-local: the target schema omits them and writes relation targets by portable
 collection name, matching the canonical `zigbase schema dump/apply` contract.
@@ -201,6 +201,9 @@ Additional rules:
 - `verified` and email visibility are carried when ZigBase has the corresponding auth field.
 - PocketBase `geoPoint` requires a `json` or `omit` decision. `json` preserves `{lon,lat}` values
   and emits a permanent semantic-loss warning in the bundle.
+- A non-system PocketBase `autodate` requires a decision: map it to `date` to preserve historical
+  values, supply reviewed replacement behavior, or omit it. Mapping it directly to ZigBase
+  `autodate` would regenerate every historical value during import, so it is never automatic.
 - View collections are never emitted as ordinary tables. A decision must point to reviewed ZigBase
   framework code/custom route or to an explicitly materialized base-collection design.
 - Only simple column indexes supported by ZigBase's index model are converted. Expression/collation

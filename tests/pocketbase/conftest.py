@@ -1,7 +1,22 @@
 import json
+import os
 import sqlite3
+from pathlib import Path
 
 import pytest
+
+from tests._bin import resolve_binary
+
+
+REPO = Path(__file__).resolve().parents[2]
+
+
+@pytest.fixture(scope="session")
+def zigbase_binary():
+    override = os.environ.get("ZIGBASE_TEST_BINARY")
+    if override:
+        return Path(override)
+    return resolve_binary("ZIGBASE_TEST_BINARY", REPO, "zigbase")
 
 
 @pytest.fixture
@@ -19,7 +34,11 @@ def pocketbase_snapshot(tmp_path):
                 columns = ["id TEXT PRIMARY KEY", "created TEXT", "updated TEXT"]
                 for field in collection.get("fields", []):
                     if not field.get("system"):
-                        columns.append(f'"{field["name"]}" TEXT')
+                        storage = {
+                            "bool": "INTEGER",
+                            "number": "INTEGER" if field.get("onlyInt") else "REAL",
+                        }.get(field["type"], "TEXT")
+                        columns.append(f'"{field["name"]}" {storage}')
                 if kind == "auth":
                     columns.extend(
                         [

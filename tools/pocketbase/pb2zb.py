@@ -12,9 +12,12 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import re
+import shutil
 import sqlite3
 import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -26,6 +29,9 @@ DECISIONS_VERSION = 1
 MAX_SCHEMA_BYTES = 32 * 1024 * 1024
 MAX_COLLECTIONS = 10_000
 MAX_FIELDS_PER_COLLECTION = 10_000
+MAX_REPLACEMENT_BYTES = 4 * 1024 * 1024
+MAX_NDJSON_LINE_BYTES = 1024 * 1024
+BCRYPT = re.compile(r"^\$2[aby]\$\d\d\$[./A-Za-z0-9]{53}$")
 
 COLLECTION_TYPES = frozenset({"base", "auth", "view"})
 DIRECT_FIELD_TYPES = frozenset(
@@ -47,13 +53,11 @@ DIRECT_FIELD_TYPES = frozenset(
 IDENTIFIER = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
 POCKETBASE_ID = re.compile(r"^[A-Za-z0-9_]+$")
 SIMPLE_INDEX = re.compile(
-    r'^CREATE\s+(?:(UNIQUE)\s+)?INDEX\s+"?[A-Za-z][A-Za-z0-9_]*"?\s+'
+    r'^CREATE\s+(?:(UNIQUE)\s+)?INDEX\s+"?([A-Za-z][A-Za-z0-9_]*)"?\s+'
     r'ON\s+"?([A-Za-z][A-Za-z0-9_]*)"?\s*\(([^)]+)\)\s*$',
     re.IGNORECASE,
 )
-SIMPLE_INDEX_FIELD = re.compile(
-    r'^"?([A-Za-z][A-Za-z0-9_]*)"?(?:\s+(?:ASC|DESC))?$', re.IGNORECASE
-)
+SIMPLE_INDEX_FIELD = re.compile(r'^"?([A-Za-z][A-Za-z0-9_]*)"?$', re.IGNORECASE)
 RULE_KEYS = (
     "listRule",
     "viewRule",
@@ -152,6 +156,8 @@ def load_schema(path: Path) -> list[dict[str, Any]]:
             raise PocketBaseError(f"{where} must be an object")
         collection_id = _required_string(collection, "id", where)
         name = _required_string(collection, "name", where)
+        if "system" in collection and not isinstance(collection["system"], bool):
+            raise PocketBaseError(f"{where}.system must be a boolean")
         if not POCKETBASE_ID.fullmatch(collection_id):
             raise PocketBaseError(f"{where}.id is not a valid PocketBase identifier")
         collection_type = collection.get("type") or "base"
@@ -179,6 +185,11 @@ def load_schema(path: Path) -> list[dict[str, Any]]:
             field_id = _required_string(field, "id", field_where)
             field_name = _required_string(field, "name", field_where)
             _required_string(field, "type", field_where)
+            for boolean_key in ("required", "system", "hidden"):
+                if boolean_key in field and not isinstance(field[boolean_key], bool):
+                    raise PocketBaseError(
+                        f"{field_where}.{boolean_key} must be a boolean"
+                    )
             if not POCKETBASE_ID.fullmatch(field_id):
                 raise PocketBaseError(
                     f"{field_where}.id is not a valid PocketBase identifier"
@@ -221,6 +232,8 @@ def _open_snapshot(pb_data: Path) -> tuple[sqlite3.Connection, Path]:
     database = pb_data / "data.db"
     if not database.is_file():
         raise PocketBaseError(f"PocketBase snapshot is missing {database}")
+    if database.is_symlink():
+        raise PocketBaseError("PocketBase data.db must not be a symbolic link")
     for suffix in ("-wal", "-shm"):
         sidecar = Path(f"{database}{suffix}")
         if sidecar.exists():
@@ -228,7 +241,7 @@ def _open_snapshot(pb_data: Path) -> tuple[sqlite3.Connection, Path]:
                 f"snapshot has SQLite sidecar {sidecar.name}; stop PocketBase and make a consistent backup"
             )
     try:
-        connection = sqlite3.connect(f"file:{database.resolve()}?mode=ro", uri=True)
+        connection = sqlite3.connect(f"{database.resolve().as_uri()}?mode=ro", uri=True)
         connection.execute("PRAGMA query_only=ON")
     except sqlite3.Error as exc:
         raise PocketBaseError(
@@ -294,19 +307,92 @@ def _rule_requires_replacement(rule: str) -> bool:
     return "@collection." in rule or "_via_" in rule or "@request.context" in rule
 
 
-def _simple_index(index: str, collection_name: str, fields: set[str]) -> bool:
+def _parse_simple_index(
+    index: str, collection_name: str, fields: set[str]
+) -> dict[str, Any] | None:
     match = SIMPLE_INDEX.fullmatch(index.strip().rstrip(";"))
-    if not match or match.group(2) != collection_name:
-        return False
-    parts = [part.strip() for part in match.group(3).split(",")]
+    if not match or match.group(3) != collection_name:
+        return None
+    parts = [part.strip() for part in match.group(4).split(",")]
     if not parts:
-        return False
+        return None
     parsed = [SIMPLE_INDEX_FIELD.fullmatch(part) for part in parts]
-    return all(match is not None and match.group(1) in fields for match in parsed)
+    if not all(field is not None and field.group(1) in fields for field in parsed):
+        return None
+    return {
+        "name": match.group(2),
+        "fields": [field.group(1) for field in parsed if field is not None],
+        "unique": match.group(1) is not None,
+    }
 
 
 def _finding_id(*parts: str) -> str:
     return ".".join(part.replace(".", "_") for part in parts)
+
+
+def _has_values(value: Any) -> bool:
+    return isinstance(value, list) and bool(value)
+
+
+def _positive_number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0
+
+
+def _field_option_finding(
+    collection_id: str, field: dict[str, Any], message: str
+) -> Finding:
+    return Finding(
+        _finding_id("field", collection_id, str(field["id"]), "options"),
+        "blocker",
+        "FieldOptionsRequireReplacement",
+        message,
+        ("replacement", "omit"),
+        True,
+    )
+
+
+def _unsupported_field_options(
+    collection_id: str, collection_name: str, field: dict[str, Any]
+) -> Finding | None:
+    field_type = str(field["type"])
+    label = f"Field {collection_name}.{field['name']}"
+    if field.get("primaryKey"):
+        return _field_option_finding(
+            collection_id,
+            field,
+            f"{label} is a custom primary key, which requires replacement.",
+        )
+    if field_type == "text" and field.get("autogeneratePattern"):
+        return _field_option_finding(
+            collection_id,
+            field,
+            f"{label} auto-generates values, which ZigBase fields do not.",
+        )
+    if field_type in {"email", "url"} and (
+        _has_values(field.get("exceptDomains")) or _has_values(field.get("onlyDomains"))
+    ):
+        return _field_option_finding(
+            collection_id,
+            field,
+            f"{label} has domain allow/deny behavior requiring replacement.",
+        )
+    if field_type == "editor" and (
+        bool(field.get("convertURLs")) or _positive_number(field.get("maxSize"))
+    ):
+        return _field_option_finding(
+            collection_id,
+            field,
+            f"{label} has editor conversion/size behavior requiring replacement.",
+        )
+    if field_type == "file" and (
+        bool(field.get("protected")) or _has_values(field.get("thumbs"))
+    ):
+        return _field_option_finding(
+            collection_id,
+            field,
+            f"{label} has protected/thumbnail behavior requiring replacement.",
+        )
+    return None
 
 
 def collect_findings(collections: list[dict[str, Any]], pb_data: Path) -> list[Finding]:
@@ -363,6 +449,38 @@ def collect_findings(collections: list[dict[str, Any]], pb_data: Path) -> list[F
                     ("reviewed",),
                 )
             )
+            for method in ("oauth2", "mfa", "otp"):
+                config = collection.get(method)
+                if isinstance(config, dict) and config.get("enabled") is True:
+                    findings.append(
+                        Finding(
+                            _finding_id(
+                                "collection", collection_id, method, "replacement"
+                            ),
+                            "blocker",
+                            "AuthMethodRequiresReplacement",
+                            f"Auth collection {name!r} enables PocketBase {method}, which requires replacement code/configuration.",
+                            ("replacement",),
+                            True,
+                        )
+                    )
+            password_auth = collection.get("passwordAuth")
+            if (
+                isinstance(password_auth, dict)
+                and password_auth.get("enabled") is False
+            ):
+                findings.append(
+                    Finding(
+                        _finding_id(
+                            "collection", collection_id, "passwordAuth", "replacement"
+                        ),
+                        "blocker",
+                        "DisabledPasswordAuthRequiresReplacement",
+                        f"Auth collection {name!r} disables password login; ZigBase migration must preserve that behavior explicitly.",
+                        ("replacement",),
+                        True,
+                    )
+                )
 
         for field in fields:
             field_id = str(field["id"])
@@ -372,6 +490,19 @@ def collect_findings(collections: list[dict[str, Any]], pb_data: Path) -> list[F
                 continue
             if field_type == "file":
                 has_file_fields = True
+            if field_type == "autodate":
+                findings.append(
+                    Finding(
+                        _finding_id("field", collection_id, field_id, "autodate"),
+                        "decision",
+                        "AutoDateRequiresMapping",
+                        f"Field {name}.{field_name} needs a history-preserving date mapping or replacement behavior.",
+                        ("date", "replacement", "omit"),
+                        True,
+                    )
+                )
+            if option_finding := _unsupported_field_options(collection_id, name, field):
+                findings.append(option_finding)
             if field_type == "geoPoint":
                 findings.append(
                     Finding(
@@ -432,9 +563,7 @@ def collect_findings(collections: list[dict[str, Any]], pb_data: Path) -> list[F
                 )
 
         for index_number, index in enumerate(collection.get("indexes", [])):
-            if not _simple_index(
-                str(index), name, field_names | {"id", "created", "updated"}
-            ):
+            if _parse_simple_index(str(index), name, field_names) is None:
                 index_id = hashlib.sha256(str(index).encode()).hexdigest()[:16]
                 findings.append(
                     Finding(
@@ -563,7 +692,11 @@ def reconcile_decisions(
             raise PocketBaseError(
                 f"decision {decision_id!r} choice must be one of {list(finding.choices)!r}"
             )
-        if finding.requires_artifact and not decision.artifact:
+        if (
+            finding.requires_artifact
+            and decision.choice not in {"omit", "date"}
+            and not decision.artifact
+        ):
             raise PocketBaseError(
                 f"decision {decision_id!r} requires a replacement artifact"
             )
@@ -620,6 +753,852 @@ def build_inventory(schema_path: Path, pb_data: Path) -> dict[str, Any]:
     }
 
 
+def _decision_map(decisions: tuple[Decision, ...]) -> dict[str, Decision]:
+    return {decision.id: decision for decision in decisions}
+
+
+def _path_contains_symlink(root: Path, relative: Path) -> bool:
+    current = root
+    for part in relative.parts:
+        current = current / part
+        if current.is_symlink():
+            return True
+    return False
+
+
+def _safe_artifact_path(decisions_path: Path, decision: Decision) -> Path:
+    if not decision.artifact:
+        raise PocketBaseError(f"decision {decision.id!r} has no replacement artifact")
+    root = decisions_path.parent.resolve()
+    relative = Path(decision.artifact)
+    candidate = (root / relative).resolve()
+    if (
+        not candidate.is_relative_to(root)
+        or not candidate.is_file()
+        or _path_contains_symlink(root, relative)
+    ):
+        raise PocketBaseError(
+            f"decision {decision.id!r} replacement artifact is missing, unsafe, or not a regular file"
+        )
+    if candidate.stat().st_size > MAX_REPLACEMENT_BYTES:
+        raise PocketBaseError(
+            f"decision {decision.id!r} replacement artifact exceeds {MAX_REPLACEMENT_BYTES} bytes"
+        )
+    return candidate
+
+
+def _replacement_value(
+    decisions_path: Path, decision: Decision, expected_kind: str
+) -> Any:
+    path = _safe_artifact_path(decisions_path, decision)
+    value = _read_json(path, limit=MAX_REPLACEMENT_BYTES, label="replacement artifact")
+    if not isinstance(value, dict) or set(value) != {
+        "zigbasePocketBaseReplacement",
+        "finding",
+        "kind",
+        "value",
+    }:
+        raise PocketBaseError(
+            f"replacement artifact for {decision.id!r} has an invalid contract"
+        )
+    if (
+        value["zigbasePocketBaseReplacement"] != 1
+        or value["finding"] != decision.id
+        or value["kind"] != expected_kind
+    ):
+        raise PocketBaseError(
+            f"replacement artifact for {decision.id!r} does not match its finding/kind"
+        )
+    return value["value"]
+
+
+def _positive_int(value: Any, default: int = 0) -> int:
+    if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+        return value
+    return default
+
+
+def _bounded_positive_int(value: Any, default: int, maximum: int, label: str) -> int:
+    result = _positive_int(value, default)
+    if result > maximum:
+        raise PocketBaseError(f"{label} exceeds ZigBase's supported range")
+    return result
+
+
+def _optional_number(value: Any) -> int | float | None:
+    if (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and (not isinstance(value, float) or math.isfinite(value))
+    ):
+        return value
+    return None
+
+
+def _field_options(
+    field: dict[str, Any], collection_names: dict[str, str]
+) -> dict[str, Any]:
+    field_type = str(field["type"])
+    if field_type in {"email", "url", "editor", "bool"}:
+        return {}
+    if field_type == "text":
+        result: dict[str, Any] = {}
+        if minimum := _bounded_positive_int(
+            field.get("min"), 0, 2**32 - 1, f"field {field['name']} min"
+        ):
+            result["min"] = minimum
+        if maximum := _bounded_positive_int(
+            field.get("max"), 0, 2**32 - 1, f"field {field['name']} max"
+        ):
+            result["max"] = maximum
+        if isinstance(field.get("pattern"), str) and field["pattern"]:
+            result["pattern"] = field["pattern"]
+        return result
+    if field_type == "date":
+        return {
+            key: field[key]
+            for key in ("min", "max")
+            if isinstance(field.get(key), str) and field[key]
+        }
+    if field_type == "autodate":
+        return {
+            "onCreate": field.get("onCreate") is not False,
+            "onUpdate": field.get("onUpdate") is True,
+        }
+    if field_type == "number":
+        result = {"mode": "int" if field.get("onlyInt") is True else "float"}
+        for key in ("min", "max"):
+            if (number := _optional_number(field.get(key))) is not None:
+                result[key] = number
+        return result
+    if field_type in {"json", "file"}:
+        result = {}
+        maximum_limit = 2**32 - 1 if field_type == "json" else 2**64 - 1
+        if maximum := _bounded_positive_int(
+            field.get("maxSize"), 0, maximum_limit, f"field {field['name']} maxSize"
+        ):
+            result["maxSize"] = maximum
+        if field_type == "json":
+            return result
+        result["maxSelect"] = _bounded_positive_int(
+            field.get("maxSelect"), 1, 2**32 - 1, f"field {field['name']} maxSelect"
+        )
+        mime_types = field.get("mimeTypes")
+        if isinstance(mime_types, list) and all(
+            isinstance(item, str) for item in mime_types
+        ):
+            if mime_types:
+                result["mimeTypes"] = mime_types
+        return result
+    if field_type == "select":
+        values = field.get("values")
+        if not isinstance(values, list) or not all(
+            isinstance(item, str) for item in values
+        ):
+            raise PocketBaseError(f"select field {field['name']!r} has invalid values")
+        return {
+            "values": values,
+            "maxSelect": _bounded_positive_int(
+                field.get("maxSelect"), 1, 2**32 - 1, f"field {field['name']} maxSelect"
+            ),
+        }
+    if field_type == "relation":
+        raw_options = (
+            field.get("options") if isinstance(field.get("options"), dict) else {}
+        )
+        target = field.get("collectionId") or raw_options.get("collectionId")
+        result = {
+            "targetCollectionId": collection_names[str(target)],
+            "cascadeDelete": field.get("cascadeDelete") is True,
+            "maxSelect": _bounded_positive_int(
+                field.get("maxSelect"), 1, 2**32 - 1, f"field {field['name']} maxSelect"
+            ),
+        }
+        if minimum := _bounded_positive_int(
+            field.get("minSelect"), 0, 2**32 - 1, f"field {field['name']} minSelect"
+        ):
+            result["minSelect"] = minimum
+        return result
+    if field_type == "geoPoint":
+        return {}
+    raise PocketBaseError(f"unsupported field type during extraction: {field_type!r}")
+
+
+def _field_findings(
+    findings: list[Finding], collection_id: str, field_id: str
+) -> list[Finding]:
+    prefix = f"field.{collection_id}.{field_id}."
+    return [finding for finding in findings if finding.id.startswith(prefix)]
+
+
+def _map_field(
+    field: dict[str, Any],
+    collection: dict[str, Any],
+    collection_names: dict[str, str],
+    findings: list[Finding],
+    decisions: dict[str, Decision],
+    decisions_path: Path,
+) -> dict[str, Any] | None:
+    related = _field_findings(findings, str(collection["id"]), str(field["id"]))
+    replacements: list[Any] = []
+    mapped_to_date = False
+    for finding in related:
+        decision = decisions[finding.id]
+        if decision.choice == "omit":
+            return None
+        if decision.choice == "date":
+            mapped_to_date = True
+        if decision.choice == "replacement":
+            replacements.append(_replacement_value(decisions_path, decision, "field"))
+    if replacements:
+        if any(value != replacements[0] for value in replacements[1:]):
+            raise PocketBaseError(
+                f"field {collection['name']}.{field['name']} has conflicting replacement artifacts"
+            )
+        if not isinstance(replacements[0], dict):
+            raise PocketBaseError("field replacement value must be an object")
+        return replacements[0]
+
+    field_type = (
+        "date"
+        if mapped_to_date
+        else "json"
+        if str(field["type"]) == "geoPoint"
+        else str(field["type"])
+    )
+    return {
+        "id": field["id"],
+        "name": field["name"],
+        "required": field.get("required") is True,
+        "unique": False,
+        "encrypted": False,
+        "searchable": False,
+        "hidden": field.get("hidden") is True,
+        "type": field_type,
+        "options": {} if mapped_to_date else _field_options(field, collection_names),
+    }
+
+
+def _map_rule(
+    collection: dict[str, Any],
+    key: str,
+    decisions: dict[str, Decision],
+    decisions_path: Path,
+) -> str | None:
+    rule = collection.get(key)
+    collection_id = str(collection["id"])
+    if rule == "":
+        decision = decisions[_finding_id("rule", collection_id, key, "public")]
+        if decision.choice != "public":
+            raise PocketBaseError(
+                f"public rule decision for {collection['name']}.{key} is invalid"
+            )
+        return "@public"
+    replacement_id = _finding_id("rule", collection_id, key, "replacement")
+    if replacement_id in decisions:
+        value = _replacement_value(decisions_path, decisions[replacement_id], "rule")
+        if value is not None and not isinstance(value, str):
+            raise PocketBaseError("rule replacement value must be a string or null")
+        return value
+    return rule
+
+
+def _auth_options(collection: dict[str, Any]) -> dict[str, Any]:
+    password = collection.get("passwordAuth")
+    password = password if isinstance(password, dict) else {}
+    identities = password.get("identityFields", ["email"])
+    if (
+        not isinstance(identities, list)
+        or not identities
+        or not all(isinstance(item, str) for item in identities)
+    ):
+        raise PocketBaseError(
+            f"auth collection {collection['name']!r} has invalid identityFields"
+        )
+    minimum = password.get("minPasswordLength", 8)
+    if (
+        not isinstance(minimum, int)
+        or isinstance(minimum, bool)
+        or not 1 <= minimum <= 255
+    ):
+        raise PocketBaseError(
+            f"auth collection {collection['name']!r} has invalid minPasswordLength"
+        )
+    return {
+        "auth": {
+            "identityFields": identities,
+            "minPasswordLength": minimum,
+            "require_verified": False,
+        }
+    }
+
+
+def _map_collection(
+    collection: dict[str, Any],
+    collection_names: dict[str, str],
+    findings: list[Finding],
+    decisions: dict[str, Decision],
+    decisions_path: Path,
+) -> dict[str, Any] | None:
+    collection_id = str(collection["id"])
+    system_id = _finding_id("collection", collection_id, "system")
+    if system_id in decisions:
+        return None
+    for suffix in ("identifier", "view"):
+        finding_id = _finding_id("collection", collection_id, suffix)
+        if finding_id not in decisions:
+            continue
+        decision = decisions[finding_id]
+        if decision.choice == "omit":
+            return None
+        value = _replacement_value(decisions_path, decision, "collection")
+        if not isinstance(value, dict):
+            raise PocketBaseError("collection replacement value must be an object")
+        return value
+
+    mapped_fields = [
+        mapped
+        for field in sorted(
+            (
+                field
+                for field in collection.get("fields", [])
+                if not field.get("system")
+            ),
+            key=lambda item: (str(item["name"]), str(item["id"])),
+        )
+        if (
+            mapped := _map_field(
+                field,
+                collection,
+                collection_names,
+                findings,
+                decisions,
+                decisions_path,
+            )
+        )
+        is not None
+    ]
+    field_names = {str(field["name"]) for field in collection.get("fields", [])}
+    indexes: list[dict[str, Any]] = []
+    for index in collection.get("indexes", []):
+        parsed = _parse_simple_index(
+            str(index),
+            str(collection["name"]),
+            field_names,
+        )
+        if parsed is not None:
+            indexes.append(parsed)
+            continue
+        finding_id = _finding_id(
+            "index",
+            collection_id,
+            hashlib.sha256(str(index).encode()).hexdigest()[:16],
+            "replacement",
+        )
+        decision = decisions[finding_id]
+        if decision.choice == "omit":
+            continue
+        value = _replacement_value(decisions_path, decision, "index")
+        if not isinstance(value, dict):
+            raise PocketBaseError("index replacement value must be an object")
+        indexes.append(value)
+    kind = str(collection.get("type") or "base")
+    return {
+        "name": collection["name"],
+        "type": kind,
+        "fields": mapped_fields,
+        "indexes": sorted(indexes, key=lambda item: str(item.get("name", ""))),
+        "listRule": _map_rule(collection, "listRule", decisions, decisions_path),
+        "viewRule": _map_rule(collection, "viewRule", decisions, decisions_path),
+        "createRule": _map_rule(collection, "createRule", decisions, decisions_path),
+        "updateRule": _map_rule(collection, "updateRule", decisions, decisions_path),
+        "deleteRule": _map_rule(collection, "deleteRule", decisions, decisions_path),
+        "options": _auth_options(collection) if kind == "auth" else {},
+    }
+
+
+def build_schema(
+    collections: list[dict[str, Any]],
+    findings: list[Finding],
+    decisions: tuple[Decision, ...],
+    decisions_path: Path,
+) -> dict[str, Any]:
+    collection_names = {str(item["id"]): str(item["name"]) for item in collections}
+    by_id = _decision_map(decisions)
+    mapped = [
+        result
+        for collection in sorted(
+            collections, key=lambda item: (str(item["name"]), str(item["id"]))
+        )
+        if (
+            result := _map_collection(
+                collection, collection_names, findings, by_id, decisions_path
+            )
+        )
+        is not None
+    ]
+    result = {"zigbaseSchema": 1, "collections": mapped}
+    _validate_target_schema_links(result)
+    return result
+
+
+def _validate_target_schema_links(document: dict[str, Any]) -> None:
+    collections = document["collections"]
+    names = [collection.get("name") for collection in collections]
+    if not all(isinstance(name, str) and IDENTIFIER.fullmatch(name) for name in names):
+        raise PocketBaseError("target schema contains an invalid collection name")
+    if len(set(names)) != len(names):
+        raise PocketBaseError("target schema contains duplicate collection names")
+    name_set = set(names)
+    for collection in collections:
+        fields = collection.get("fields")
+        indexes = collection.get("indexes")
+        if not isinstance(fields, list) or not isinstance(indexes, list):
+            raise PocketBaseError(
+                "target schema collection fields/indexes must be arrays"
+            )
+        field_names = [field.get("name") for field in fields if isinstance(field, dict)]
+        if (
+            len(field_names) != len(fields)
+            or not all(
+                isinstance(field_name, str) and IDENTIFIER.fullmatch(field_name)
+                for field_name in field_names
+            )
+            or len(set(field_names)) != len(field_names)
+        ):
+            raise PocketBaseError(
+                f"target collection {collection['name']!r} has invalid or duplicate fields"
+            )
+        for field in fields:
+            if field.get("type") != "relation":
+                continue
+            options = field.get("options")
+            target = (
+                options.get("targetCollectionId") if isinstance(options, dict) else None
+            )
+            if target not in name_set:
+                raise PocketBaseError(
+                    f"target relation {collection['name']}.{field.get('name')} points to an omitted/unknown collection"
+                )
+        for index in indexes:
+            index_fields = index.get("fields") if isinstance(index, dict) else None
+            if not isinstance(index_fields, list) or not all(
+                field in field_names for field in index_fields
+            ):
+                raise PocketBaseError(
+                    f"target collection {collection['name']!r} has an index over an omitted/unknown field"
+                )
+
+
+def _quote_identifier(name: str) -> str:
+    """The only helper allowed to place an exported identifier into SQLite SQL."""
+    return '"' + name.replace('"', '""') + '"'
+
+
+def _decode_json_storage(value: Any, label: str) -> Any:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise PocketBaseError(f"{label} is not JSON text in the PocketBase snapshot")
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise PocketBaseError(f"{label} contains invalid JSON") from exc
+
+
+def _convert_value(field: dict[str, Any], mapped: dict[str, Any], value: Any) -> Any:
+    if value is None:
+        return None
+    field_type = str(field["type"])
+    label = str(field["name"])
+    if field_type == "bool":
+        if value not in (0, 1, False, True):
+            raise PocketBaseError(
+                f"field {label!r} contains a non-boolean SQLite value"
+            )
+        return bool(value)
+    if field_type == "number":
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            raise PocketBaseError(f"field {label!r} contains a non-number SQLite value")
+        return value
+    if field_type in {"json", "geoPoint"}:
+        return _decode_json_storage(value, f"field {label!r}")
+    if (
+        field_type in {"select", "relation", "file"}
+        and _positive_int(field.get("maxSelect"), 1) > 1
+    ):
+        decoded = _decode_json_storage(value, f"field {label!r}")
+        if not isinstance(decoded, list):
+            raise PocketBaseError(f"multi-value field {label!r} is not a JSON array")
+        return decoded
+    if field_type not in DIRECT_FIELD_TYPES and field_type != "geoPoint":
+        raise PocketBaseError(
+            f"field {label!r} needs an external row-value transform before extraction"
+        )
+    if not isinstance(value, str):
+        raise PocketBaseError(f"field {label!r} contains a non-string SQLite value")
+    return value
+
+
+def _source_to_target_fields(
+    collection: dict[str, Any],
+    collection_names: dict[str, str],
+    findings: list[Finding],
+    decisions: dict[str, Decision],
+    decisions_path: Path,
+) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+    pairs: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    for field in collection.get("fields", []):
+        if field.get("system"):
+            continue
+        mapped = _map_field(
+            field, collection, collection_names, findings, decisions, decisions_path
+        )
+        if mapped is not None:
+            pairs.append((field, mapped))
+    return pairs
+
+
+def _row_query(
+    collection: dict[str, Any], source_fields: list[dict[str, Any]], columns: set[str]
+) -> tuple[str, list[str]]:
+    selected = ["id", "created", "updated"]
+    if (collection.get("type") or "base") == "auth":
+        selected.extend(
+            name
+            for name in ("email", "username", "verified", "passwordHash")
+            if name in columns
+        )
+    selected.extend(str(field["name"]) for field in source_fields)
+    selected = list(dict.fromkeys(selected))
+    sql = (
+        "SELECT "
+        + ",".join(_quote_identifier(name) for name in selected)
+        + " FROM "
+        + _quote_identifier(str(collection["name"]))
+        + ' ORDER BY "id"'
+    )
+    return sql, selected
+
+
+def _write_ndjson_rows(
+    connection: sqlite3.Connection,
+    destination: Path,
+    collection: dict[str, Any],
+    field_pairs: list[tuple[dict[str, Any], dict[str, Any]]],
+) -> int:
+    columns = _table_columns(connection, str(collection["name"]))
+    query, selected = _row_query(collection, [pair[0] for pair in field_pairs], columns)
+    try:
+        cursor = connection.execute(query)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        count = 0
+        with destination.open("w", encoding="utf-8", newline="\n") as output:
+            for raw_values in cursor:
+                raw = dict(zip(selected, raw_values, strict=True))
+                record_id = raw.get("id")
+                if not isinstance(record_id, str) or not POCKETBASE_ID.fullmatch(
+                    record_id
+                ):
+                    raise PocketBaseError(
+                        f"collection {collection['name']!r} has an invalid record id"
+                    )
+                record: dict[str, Any] = {
+                    "id": record_id,
+                    "created": raw.get("created"),
+                    "updated": raw.get("updated"),
+                }
+                if not all(
+                    isinstance(record[key], str) and record[key]
+                    for key in ("created", "updated")
+                ):
+                    raise PocketBaseError(
+                        f"record {collection['name']}.{record_id} has missing source timestamps"
+                    )
+                if (collection.get("type") or "base") == "auth":
+                    password_hash = raw.get("passwordHash")
+                    if not isinstance(password_hash, str) or not BCRYPT.fullmatch(
+                        password_hash
+                    ):
+                        raise PocketBaseError(
+                            f"auth record {collection['name']}.{record_id} has no supported bcrypt credential"
+                        )
+                    record["passwordHash"] = password_hash
+                    if isinstance(raw.get("email"), str):
+                        record["email"] = raw["email"]
+                    if isinstance(raw.get("username"), str) and raw["username"]:
+                        record["username"] = raw["username"]
+                    record["verified"] = bool(raw.get("verified"))
+                for source_field, mapped_field in field_pairs:
+                    record[str(mapped_field["name"])] = _convert_value(
+                        source_field, mapped_field, raw.get(str(source_field["name"]))
+                    )
+                line = json.dumps(
+                    record, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+                )
+                if len(line.encode()) > MAX_NDJSON_LINE_BYTES:
+                    raise PocketBaseError(
+                        f"record {collection['name']}.{record_id} exceeds the ZigBase NDJSON line limit"
+                    )
+                output.write(line + "\n")
+                count += 1
+    except (OSError, sqlite3.Error) as exc:
+        raise PocketBaseError(
+            f"cannot extract rows for collection {collection['name']!r}: {exc}"
+        ) from exc
+    return count
+
+
+def _canonical_decisions(
+    decisions: tuple[Decision, ...], bundled_artifacts: dict[str, str]
+) -> dict[str, Any]:
+    values: list[dict[str, Any]] = []
+    for decision in sorted(decisions, key=lambda item: item.id):
+        value = {
+            "id": decision.id,
+            "choice": decision.choice,
+            "rationale": decision.rationale,
+        }
+        if decision.artifact:
+            value["artifact"] = bundled_artifacts[decision.id]
+        values.append(value)
+    return {
+        "zigbasePocketBaseDecisions": DECISIONS_VERSION,
+        "sourceVersion": SOURCE_VERSION,
+        "decisions": values,
+    }
+
+
+def _write_canonical_json(path: Path, value: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(value, indent=2, ensure_ascii=False, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _output_entries(root: Path) -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = []
+    for path in sorted(item for item in root.rglob("*") if item.is_file()):
+        if path.name == "zigbase-pocketbase-bundle.json":
+            continue
+        entries.append(
+            {
+                "path": path.relative_to(root).as_posix(),
+                "bytes": path.stat().st_size,
+                "sha256": _sha256(path),
+            }
+        )
+    return entries
+
+
+def _copy_replacement_artifacts(
+    stage: Path, decisions_path: Path, decisions: tuple[Decision, ...]
+) -> list[dict[str, Any]]:
+    copied: list[dict[str, Any]] = []
+    for decision in sorted(decisions, key=lambda item: item.id):
+        if not decision.artifact:
+            continue
+        source = _safe_artifact_path(decisions_path, decision)
+        digest = _sha256(source)
+        safe_name = re.sub(r"[^A-Za-z0-9_.-]", "_", source.name)
+        relative = Path("replacements") / f"{digest[:16]}-{safe_name}"
+        target = stage / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, target, follow_symlinks=False)
+        copied.append(
+            {"finding": decision.id, "path": relative.as_posix(), "sha256": digest}
+        )
+    return copied
+
+
+def _prepare_output_directory(out: Path) -> None:
+    if out.exists():
+        if not out.is_dir() or any(out.iterdir()):
+            raise PocketBaseError(
+                f"bundle output must not exist or must be an empty directory: {out}"
+            )
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+
+def extract_bundle(
+    schema_path: Path, pb_data: Path, decisions_path: Path, out: Path
+) -> dict[str, Any]:
+    _ensure_output_outside_sources(out, schema_path, pb_data)
+    if out.resolve() == decisions_path.resolve():
+        raise PocketBaseError("bundle output must not overwrite the decisions document")
+    _prepare_output_directory(out)
+    collections = load_schema(schema_path)
+    inventory = build_inventory(schema_path, pb_data)
+    findings = [
+        Finding(
+            value["id"],
+            value["severity"],
+            value["code"],
+            value["message"],
+            tuple(value.get("choices", [])),
+            bool(value.get("requiresArtifact")),
+        )
+        for value in inventory["findings"]
+    ]
+    _, decisions = load_decisions(decisions_path)
+    reconcile_decisions(findings, decisions)
+    target_schema = build_schema(collections, findings, decisions, decisions_path)
+    decision_by_id = _decision_map(decisions)
+    collection_names = {str(item["id"]): str(item["name"]) for item in collections}
+
+    stage_path = Path(tempfile.mkdtemp(prefix=".pb2zb-", dir=out.parent))
+    try:
+        _write_canonical_json(stage_path / "inventory.json", inventory)
+        _write_canonical_json(stage_path / "schema.json", target_schema)
+        replacements = _copy_replacement_artifacts(
+            stage_path, decisions_path, decisions
+        )
+        _write_canonical_json(
+            stage_path / "decisions.json",
+            _canonical_decisions(
+                decisions, {entry["finding"]: entry["path"] for entry in replacements}
+            ),
+        )
+
+        connection, database = _open_snapshot(pb_data)
+        row_counts: dict[str, int] = {}
+        auth_imports: list[dict[str, Any]] = []
+        ordinary_entries: list[dict[str, Any]] = []
+        file_references = 0
+        try:
+            for collection in sorted(
+                collections, key=lambda item: (str(item["name"]), str(item["id"]))
+            ):
+                target = _map_collection(
+                    collection,
+                    collection_names,
+                    findings,
+                    decision_by_id,
+                    decisions_path,
+                )
+                if target is None:
+                    continue
+                pairs = _source_to_target_fields(
+                    collection,
+                    collection_names,
+                    findings,
+                    decision_by_id,
+                    decisions_path,
+                )
+                name = str(target["name"])
+                is_auth = (collection.get("type") or "base") == "auth"
+                relative = (
+                    Path("imports") / "auth" / f"{name}.ndjson"
+                    if is_auth
+                    else Path("imports") / f"{name}.ndjson"
+                )
+                count = _write_ndjson_rows(
+                    connection, stage_path / relative, collection, pairs
+                )
+                row_counts[name] = count
+                if is_auth:
+                    auth_imports.append(
+                        {"collection": name, "file": relative.as_posix(), "rows": count}
+                    )
+                else:
+                    ordinary_entries.append(
+                        {"collection": name, "file": f"{name}.ndjson"}
+                    )
+                file_references += sum(
+                    1 for source, _ in pairs if source["type"] == "file"
+                )
+        finally:
+            connection.close()
+        manifest = {
+            "zigbaseImportManifest": 1,
+            "collections": ordinary_entries,
+        }
+        _write_canonical_json(stage_path / "imports" / "manifest.json", manifest)
+        if inventory["schemaSha256"] != _sha256(schema_path) or inventory[
+            "databaseSha256"
+        ] != _sha256(database):
+            raise PocketBaseError(
+                "PocketBase source changed during extraction; retry from a stopped snapshot"
+            )
+        root_manifest = {
+            "zigbasePocketBaseBundle": 1,
+            "sourceVersion": SOURCE_VERSION,
+            "schemaSha256": inventory["schemaSha256"],
+            "databaseSha256": inventory["databaseSha256"],
+            "decisionsSha256": _sha256(decisions_path),
+            "collections": len(target_schema["collections"]),
+            "rows": sum(row_counts.values()),
+            "rowCounts": dict(sorted(row_counts.items())),
+            "authImports": auth_imports,
+            "ordinaryManifest": "imports/manifest.json",
+            "fileFieldsPending": file_references,
+            "replacementArtifacts": replacements,
+            "outputs": _output_entries(stage_path),
+        }
+        _write_canonical_json(
+            stage_path / "zigbase-pocketbase-bundle.json", root_manifest
+        )
+        if out.exists():
+            out.rmdir()
+        stage_path.replace(out)
+    except Exception:
+        shutil.rmtree(stage_path, ignore_errors=True)
+        raise
+    return root_manifest
+
+
+def verify_bundle(bundle: Path) -> dict[str, Any]:
+    manifest_path = bundle / "zigbase-pocketbase-bundle.json"
+    value = _read_json(
+        manifest_path, limit=MAX_SCHEMA_BYTES, label="PocketBase bundle manifest"
+    )
+    if not isinstance(value, dict) or value.get("zigbasePocketBaseBundle") != 1:
+        raise PocketBaseError("unsupported or invalid PocketBase bundle manifest")
+    outputs = value.get("outputs")
+    if not isinstance(outputs, list):
+        raise PocketBaseError("PocketBase bundle manifest outputs must be an array")
+    expected: set[str] = set()
+    root = bundle.resolve(strict=True)
+    for index, entry in enumerate(outputs):
+        if not isinstance(entry, dict) or set(entry) != {"path", "bytes", "sha256"}:
+            raise PocketBaseError(f"bundle output entry {index} has an invalid shape")
+        relative = entry["path"]
+        if not isinstance(relative, str) or not relative:
+            raise PocketBaseError(f"bundle output entry {index} has an invalid path")
+        path = Path(relative)
+        if (
+            path.is_absolute()
+            or ".." in path.parts
+            or "\\" in relative
+            or "\x00" in relative
+        ):
+            raise PocketBaseError(f"bundle output entry {index} has an unsafe path")
+        if relative in expected:
+            raise PocketBaseError(f"bundle output path is duplicated: {relative}")
+        expected.add(relative)
+        target = (root / path).resolve()
+        if (
+            not target.is_relative_to(root)
+            or not target.is_file()
+            or _path_contains_symlink(root, path)
+        ):
+            raise PocketBaseError(f"bundle output is missing or unsafe: {relative}")
+        if (
+            target.stat().st_size != entry["bytes"]
+            or _sha256(target) != entry["sha256"]
+        ):
+            raise PocketBaseError(f"bundle output digest mismatch: {relative}")
+    actual = {
+        path.relative_to(bundle).as_posix()
+        for path in bundle.rglob("*")
+        if path.is_file() and path != manifest_path
+    }
+    if actual != expected:
+        raise PocketBaseError("bundle contains missing or unmanifested files")
+    return value
+
+
 def _write_json(path: Path, value: Any) -> None:
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -664,6 +1643,23 @@ def cmd_inventory(args: argparse.Namespace) -> int:
     return 2 if summary["decisions"] or summary["blockers"] else 0
 
 
+def cmd_extract(args: argparse.Namespace) -> int:
+    manifest = extract_bundle(args.schema, args.pb_data, args.decisions, args.out)
+    print(
+        json.dumps(
+            {
+                "zigbase_pocketbase_bundle": 1,
+                "out": str(args.out),
+                "collections": manifest["collections"],
+                "rows": manifest["rows"],
+                "file_fields_pending": manifest["fileFieldsPending"],
+            },
+            separators=(",", ":"),
+        )
+    )
+    return 0
+
+
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(description=__doc__)
     commands = root.add_subparsers(dest="command", required=True)
@@ -674,6 +1670,14 @@ def parser() -> argparse.ArgumentParser:
     inventory.add_argument("--pb-data", type=Path, required=True)
     inventory.add_argument("--out", type=Path, required=True)
     inventory.set_defaults(handler=cmd_inventory)
+    extract = commands.add_parser(
+        "extract", help="extract a reviewed ZigBase migration bundle"
+    )
+    extract.add_argument("--schema", type=Path, required=True)
+    extract.add_argument("--pb-data", type=Path, required=True)
+    extract.add_argument("--decisions", type=Path, required=True)
+    extract.add_argument("--out", type=Path, required=True)
+    extract.set_defaults(handler=cmd_extract)
     return root
 
 
@@ -681,7 +1685,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         args = parser().parse_args(argv)
         return int(args.handler(args))
-    except PocketBaseError as exc:
+    except (PocketBaseError, OSError, sqlite3.Error) as exc:
         print(f"pb2zb: {exc}", file=sys.stderr)
         return 1
 

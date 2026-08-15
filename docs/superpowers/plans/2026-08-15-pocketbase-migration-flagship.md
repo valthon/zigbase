@@ -106,11 +106,13 @@ source-tree hash unchanged before/after.
 - Extend `tools/pocketbase/pb2zb.py` with focused modules only if they improve test isolation.
 - Create `tests/pocketbase/test_extract.py` and fixture builders.
 
-Map the twelve directly supported fields and collection/rule/index metadata into
+Map the directly supported fields and collection/rule/index metadata into
 `zigbaseSchema: 1`. Preserve field/record ids; retain source collection ids in bundle provenance
 and file lookup while allowing the target to generate its intentionally instance-local collection
 ids. Write relation targets by collection name. Require a typed `json` or `omit` decision
 for `geoPoint`; view/custom/rule/index replacements must be exact artifacts named in decisions.
+Require non-system `autodate` to map to history-preserving `date`, a reviewed replacement, or
+omission; never silently regenerate its source values.
 Run generated rules through the shipped `zigbase schema check-rules` in integration tests.
 
 Open SQLite with `mode=ro`; enumerate only schema-matched tables; stream rows ordered by `id` into
