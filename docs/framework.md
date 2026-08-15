@@ -2928,6 +2928,10 @@ try ctx.app.submit("reindex", reindexTask);
 // reindexTask: fn (ctx: *zigbase.Ctx, ev: *zigbase.events.JobEvent) anyerror!void
 ```
 
+`submit` copies the name before returning, so the caller retains ownership of the input
+slice. The task borrows `ev.name` from the queue for that invocation; it must not free or
+retain the slice after returning.
+
 `submit` returns `error.SchedulerUnavailable` when the server is not running (unit tests /
 CLI); while serving it is always available — no scheduler configuration required (0.10.0).
 

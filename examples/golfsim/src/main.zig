@@ -206,25 +206,23 @@ fn confirmBooking(req: *zigbase.Req(void)) zigbase.RouteError!std.json.Value {
 
 /// Offload the booking-confirmation webhook onto the background worker pool so the request
 /// thread is never blocked on an outbound call. `JobTask` is a bare `*const fn(*Ctx, *JobEvent)`
-/// that can't capture, and `submit` does not copy the name, so we hand the booking id to the
-/// job as its `name` on the long-lived `app.allocator` (the job frees it — see `webhookJob`).
+/// that can't capture, so we hand the booking id to the job as its `name`. `submit` copies the
+/// name before returning; the queue owns that copy for the duration of `webhookJob`.
 /// Entirely best-effort: if the scheduler is unavailable we just log and drop the notification.
 fn notifyBookingConfirmed(ctx: *zigbase.Ctx, booking_id: []const u8) void {
-    const id = ctx.app.allocator.dupe(u8, booking_id) catch return;
-    ctx.app.submit(id, webhookJob) catch |err| {
-        ctx.app.allocator.free(id); // submit failed -> nothing will free it; do it here.
+    ctx.app.submit(booking_id, webhookJob) catch |err| {
         std.log.warn("could not offload booking webhook: {s}", .{@errorName(err)});
     };
 }
 
 /// Background job (runs off the request thread) that POSTs the booking-confirmation webhook.
 /// Reads the configured URL from KV and the booking id from `ev.name` (which this app set in
-/// `notifyBookingConfirmed`). Owns and frees `ev.name`. NEVER propagates an error that matters:
+/// `notifyBookingConfirmed`). Borrows the queue-owned `ev.name`; it is valid until this task
+/// returns and must not be freed or retained. NEVER propagates an error that matters:
 /// a webhook is a notification, not part of the booking, so an unreachable endpoint is logged
 /// and swallowed. On a dev build the call is interceptable via `zigbase.testcapture.http`.
 fn webhookJob(ctx: *zigbase.Ctx, ev: *zigbase.events.JobEvent) anyerror!void {
     const booking_id = ev.name;
-    defer ctx.app.allocator.free(booking_id); // we own the name we submitted.
     const url = (ctx.kv().get("booking_webhook_url") catch return) orelse return;
     if (url.len == 0) return;
     const body = std.fmt.allocPrint(

@@ -548,7 +548,8 @@ pub const JobEvent = struct {
 /// Cron/interval/reactive jobs and `app.submit` tasks receive a `*Ctx` (built by
 /// the scheduler per invocation from `app`, anonymous rctx, no request) plus the
 /// event. DB access goes through `ctx.records()`; the ctx lazily checks out a
-/// pooled connection and releases it on `ctx.deinit()`.
+/// pooled connection and releases it on `ctx.deinit()`. For `app.submit`, `name`
+/// is queue-owned and valid only for the task invocation; do not free or retain it.
 pub const JobTask = *const fn (ctx: *Ctx, ev: *JobEvent) anyerror!void;
 
 /// `@compileError` on any route spec missing a required field (`.method`/`.path`/
