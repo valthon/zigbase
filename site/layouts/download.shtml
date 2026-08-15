@@ -1,0 +1,50 @@
+<extend template="base.shtml">
+<head id="head"></head>
+<main id="main">
+ <header class="dl__head"> <p class="dl__eyebrow">Download</p> <h1 class="dl__title">Get ZigBase</h1> <p class="dl__lede">
+Grab a <strong>prebuilt single binary</strong> for your platform, build
+        it <strong>from source</strong> with Zig 0.16, or pull ZigBase in as an
+<strong>embeddable library</strong>. Current release:
+<code>v0.13.0</code>, Apache-2.0.
+</p> </header> <section class="dl__section" aria-labelledby="binaries"> <h2 id="binaries">Release binaries</h2> <p>
+Prebuilt, statically-linked binaries for the
+<a href="https://github.com/valthon/zigbase/releases/tag/v0.13.0" target="_blank" rel="noopener noreferrer">v0.13.0 release</a>.
+        Download, extract, and run — no toolchain required.
+</p> <div class="dl__table-wrap"> <table class="dl__table"> <thead> <tr> <th>Platform</th> <th>Architecture</th> <th>Download</th> </tr> </thead> <tbody> <tr> <td>Linux</td> <td><code>x86_64</code></td> <td> <a href="https://github.com/valthon/zigbase/releases/download/v0.13.0/zigbase-0.13.0-x86_64-linux-musl.tar.gz">zigbase-0.13.0-x86_64-linux-musl.tar.gz</a> </td> </tr><tr> <td>Linux</td> <td><code>aarch64</code></td> <td> <a href="https://github.com/valthon/zigbase/releases/download/v0.13.0/zigbase-0.13.0-aarch64-linux-musl.tar.gz">zigbase-0.13.0-aarch64-linux-musl.tar.gz</a> </td> </tr><tr> <td>macOS</td> <td><code>x86_64</code></td> <td> <a href="https://github.com/valthon/zigbase/releases/download/v0.13.0/zigbase-0.13.0-x86_64-macos.tar.gz">zigbase-0.13.0-x86_64-macos.tar.gz</a> </td> </tr><tr> <td>macOS</td> <td><code>aarch64</code></td> <td> <a href="https://github.com/valthon/zigbase/releases/download/v0.13.0/zigbase-0.13.0-aarch64-macos.tar.gz">zigbase-0.13.0-aarch64-macos.tar.gz</a> </td> </tr> </tbody> </table> </div> <p class="dl__links">
+Verify checksums with
+<a href="https://github.com/valthon/zigbase/releases/download/v0.13.0/SHA256SUMS">SHA256SUMS</a>, or browse the
+<a href="https://github.com/valthon/zigbase/releases/tag/v0.13.0" target="_blank" rel="noopener noreferrer">full release page</a>.
+</p> <aside class="dl__note" role="note"> <p class="dl__note-label">Note — macOS Gatekeeper</p> <p>
+The macOS binaries are <strong>unsigned</strong>. Gatekeeper may block
+          the first run; clear the quarantine attribute after extracting:
+</p> <pre class="dl__code"><code>xattr -dr com.apple.quarantine ./zigbase</code></pre> </aside> </section> <section class="dl__section" aria-labelledby="npm"> <h2 id="npm">npm / npx</h2> <p>
+The server is published to npm as <code>zigbase</code> — an alias pinning
+<code>@zigbase/server</code>, which carries the platform binaries. <code>npx</code>
+fetches the right prebuilt binary for your machine, so there's nothing to install:
+</p> <pre class="dl__code"><code>npx zigbase init                  # scaffold a project (compose file, schema, AGENTS.md)
+npx zigbase serve --data-dir ./zb_data</code></pre> <p class="dl__links"> <code>@zigbase/server</code> stays the canonical package to depend on; installing
+        both is harmless.
+</p> </section> <section class="dl__section" aria-labelledby="docker"> <h2 id="docker">Docker</h2> <p>
+The official image ships the same binary as the release tarballs above — no
+        Windows build required.
+</p> <pre class="dl__code"><code>docker run -d -p 8090:8090 -v zigbase_data:/data ghcr.io/valthon/zigbase:0.13.0</code></pre> <p class="dl__links"> <code>latest</code>, <code>{X.Y.Z}</code>, and rolling <code>{X.Y}</code>/<code>{X}</code>
+tags are published to <a href="https://github.com/valthon/zigbase/pkgs/container/zigbase" target="_blank" rel="noopener noreferrer">ghcr.io/valthon/zigbase</a>.
+        See the <a href="$site.page('docs/docker').link().suffix('')">Docker guide</a> for the data-volume and non-root-user details.
+</p> </section> <section class="dl__section" aria-labelledby="from-source"> <h2 id="from-source">Build from source</h2> <p>
+ZigBase pins <strong>Zig 0.16</strong> via <code>mise.toml</code>.
+        Install the toolchain, then build:
+</p> <pre class="dl__code"><code>mise install                 # installs Zig 0.16.0 (pinned in mise.toml)
+zig build                    # -&gt; zig-out/bin/zigbase
+./zig-out/bin/zigbase serve --data-dir ./zb_data</code></pre> <p>
+The produced binary lives at <code>zig-out/bin/zigbase</code>. If you'd
+        rather not install Zig globally, prefix with
+<code>mise exec zig@0.16.0 -- zig build</code>.
+</p> </section> <section class="dl__section" aria-labelledby="as-library"> <h2 id="as-library">Use as a library</h2> <p>
+Build your own backend on top of ZigBase. Fetch it as a dependency:
+</p> <pre class="dl__code"><code>zig fetch --save git+https://github.com/valthon/zigbase</code></pre> <p>
+Wire the module into your <code>build.zig</code> — <code>addTo</code> adds the
+        import and sets <code>link_libc</code> together, so the two can't drift apart:
+</p> <pre class="dl__code"><code>const zigbase = @import("zigbase");
+const zb = b.dependency("zigbase", .&#123; .target = target, .optimize = optimize &#125;);
+zigbase.addTo(zb, exe_mod);</code></pre> </section>
+</main>

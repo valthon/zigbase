@@ -19,10 +19,6 @@ examples/*/.zig-cache/
 examples/*/data/
 dist/
 
-site/node_modules
-site/dist
-site/.astro
-
 clients/typescript/npm/server-*/zigbase
 clients/typescript/npm/server-*/package.json
 clients/typescript/npm/server-*/README.md

@@ -127,10 +127,9 @@ def _table_keys(md_path):
 
 def test_config_key_table_matches_allowed_tuple():
     allowed = _allowed_keys()
-    # Only the canonical docs/framework.md is checked: the site mirror
-    # (site/src/content/docs/framework.md) is a gitignored build artifact generated
-    # from this canonical by site/scripts/gen-docs-mirror.mjs, so it cannot drift and
-    # is absent from a plain checkout (e.g. CI, which does not build the Astro site).
+    # Only the canonical docs/framework.md is checked: the Zigapagos site mirror
+    # (site/content/docs/framework.smd) is a gitignored build artifact generated
+    # from this canonical by site/scripts/gen-content.ts, so it cannot drift.
     table = _table_keys(REPO / "docs" / "framework.md")
     assert table == allowed, (
         f"config-key table drift in docs/framework.md. missing={sorted(allowed - table)} stale={sorted(table - allowed)}"
@@ -138,13 +137,13 @@ def test_config_key_table_matches_allowed_tuple():
 
 # --- Docs-registry drift (SP-2) -------------------------------------------------
 #
-# Adding a docs/*.md needs FOUR coordinated edits or it silently never publishes:
-# a registry entry, the PUBLISHED set in the mirror generator, a site/.gitignore
-# line, and a sidebar entry. Nothing checked any of them, and the site build does
-# not run on a PR at all (only pages.yml, on push to main), so a miss shipped.
+# Adding a docs/*.md needs a registry entry and a navigation entry. The Zigapagos
+# generator consumes every registry entry for the page, docs index, llms.txt, and
+# sitemap; generated mirrors are covered by one wildcard ignore rule. These tests
+# guard the remaining hand-maintained surfaces and the registry's own integrity.
 
 # Canonical docs that are deliberately NOT published: internal assessments, the
-# advisory/audit records, and the tutorial (published as a site-authored .mdx).
+# advisory/audit records, and the tutorial (published from a site-authored source).
 DOCS_UNPUBLISHED = {
     "dx-assessment.md",
     "ideas.md",
@@ -153,7 +152,7 @@ DOCS_UNPUBLISHED = {
     "tutorial.md",
 }
 
-# Pages authored in site/src/content/docs/ with no docs/ canonical.
+# Pages authored in site/sources/docs/ with no docs/ canonical.
 SITE_AUTHORED_SLUGS = {"overview", "quick-start", "tutorial", "configuration"}
 
 
@@ -161,15 +160,9 @@ def _registry():
     return json.loads((REPO / "site" / "scripts" / "docs-registry.json").read_text())
 
 
-def _published_set():
-    src = (REPO / "site" / "scripts" / "gen-docs-mirror.mjs").read_text()
-    body = src.split("const PUBLISHED = new Set([", 1)[1].split("]);", 1)[0]
-    return set(re.findall(r"'([a-z0-9-]+)'", body))
-
-
 def _sidebar_slugs():
-    src = (REPO / "site" / "src" / "config" / "sidebar.ts").read_text()
-    return set(re.findall(r"slug:\s*'([a-z0-9-]+)'", src))
+    src = (REPO / "site" / "layouts" / "docs.shtml").read_text()
+    return set(re.findall(r"\$site\.page\('docs/([a-z0-9-]+)'\)", src))
 
 
 def test_every_docs_md_is_registered_or_deliberately_unpublished():
@@ -182,31 +175,33 @@ def test_every_docs_md_is_registered_or_deliberately_unpublished():
     missing = on_disk - registered - DOCS_UNPUBLISHED
     assert not missing, (
         f"docs/*.md with no entry in site/scripts/docs-registry.json: {sorted(missing)}. "
-        "Add the entry (plus PUBLISHED, site/.gitignore, and sidebar.ts) or list it "
+        "Add the entry plus a docs.shtml navigation link, or list it "
         "in DOCS_UNPUBLISHED with a reason."
     )
     stale = registered - on_disk
     assert not stale, f"registry entries pointing at files that do not exist: {sorted(stale)}"
 
 
-def test_every_registry_mirror_is_in_the_published_set():
-    slugs = {e["mirror"].removesuffix(".md") for e in _registry()}
-    missing = slugs - _published_set()
-    assert not missing, (
-        f"registered docs absent from PUBLISHED in gen-docs-mirror.mjs: {sorted(missing)}. "
-        "Cross-links to them would silently degrade to GitHub blob URLs."
+def test_registry_entries_have_unique_publishable_metadata():
+    entries = _registry()
+    slugs = [e["mirror"].removesuffix(".md") for e in entries]
+    assert len(slugs) == len(set(slugs)), "duplicate published slug in docs-registry.json"
+    assert all(re.fullmatch(r"[a-z0-9-]+", slug) for slug in slugs), (
+        f"invalid published slug in docs-registry.json: {slugs}"
     )
+    allowed_groups = {"getting-started", "guides", "features", "reference"}
+    invalid = [
+        e["mirror"] for e in entries
+        if set(e.get("frontmatter", {})) != {"title", "description", "order", "group"}
+        or e["frontmatter"]["group"] not in allowed_groups
+    ]
+    assert not invalid, f"registry entries with invalid discovery metadata: {invalid}"
 
 
-def test_every_registry_mirror_is_gitignored():
+def test_generated_registry_mirrors_are_gitignored():
     ignored = set((REPO / "site" / ".gitignore").read_text().split())
-    missing = {
-        e["mirror"] for e in _registry()
-        if f"src/content/docs/{e['mirror']}" not in ignored
-    }
-    assert not missing, (
-        f"generated mirrors not listed in site/.gitignore: {sorted(missing)} — "
-        "they would be committed and then go stale."
+    assert "content/docs/*.smd" in ignored, (
+        "site/.gitignore must ignore every generated Zigapagos docs mirror"
     )
 
 
@@ -221,19 +216,18 @@ def test_sidebar_and_registry_agree():
 
 # --- Site-authored page registration drift (5th/6th surfaces) -------------------
 #
-# The four tests above guard the docs/*.md -> registry -> PUBLISHED -> gitignore ->
-# sidebar chain. But the SITE-AUTHORED pages (no docs/ canonical; source lives
-# directly under site/src/content/docs/) are registered in two OTHER hand-maintained
-# lists that neither those tests nor the registry touch:
-#   - SITE_AUTHORED in site/scripts/gen-llms-txt.mjs: a page missing here silently
-#     vanishes from the published llms.txt and docs-index.json.
+# The tests above guard the docs/*.md -> registry -> generated mirror -> sidebar
+# chain. But the SITE-AUTHORED pages (no docs/ canonical; source lives directly
+# under site/sources/docs/) are registered in two OTHER hand-maintained lists:
+#   - AUTHORED in site/scripts/gen-content.ts: a page missing here silently
+#     vanishes from the site, llms.txt, docs-index.json, and sitemap.
 #   - SITE_AUTHORED_SLUGS above: whitelists sidebar entries with no registry entry
 #     (test_sidebar_and_registry_agree would otherwise call them dead links).
 # A page can drift out of either without any existing test noticing.
 
 def _tracked_site_authored_slugs():
     out = subprocess.run(
-        ["git", "ls-files", "site/src/content/docs/"],
+        ["git", "ls-files", "site/sources/docs/"],
         cwd=REPO, capture_output=True, text=True, check=True,
     ).stdout
     slugs = set()
@@ -246,24 +240,24 @@ def _tracked_site_authored_slugs():
     return slugs
 
 
-def _gen_llms_txt_site_authored_slugs():
-    src = (REPO / "site" / "scripts" / "gen-llms-txt.mjs").read_text()
-    body = src.split("const SITE_AUTHORED = [", 1)[1].split("\n];", 1)[0]
+def _gen_content_site_authored_slugs():
+    src = (REPO / "site" / "scripts" / "gen-content.ts").read_text()
+    body = src.split("const AUTHORED = [", 1)[1].split("\n] as const;", 1)[0]
     return set(re.findall(r"slug:\s*'([a-z0-9-]+)'", body))
 
 
 def test_site_authored_pages_agree_across_registrations():
     tracked = _tracked_site_authored_slugs()
-    llms = _gen_llms_txt_site_authored_slugs()
+    generated = _gen_content_site_authored_slugs()
     test_list = SITE_AUTHORED_SLUGS
 
     problems = []
-    for slug in sorted(tracked | llms | test_list):
+    for slug in sorted(tracked | generated | test_list):
         where = []
         if slug not in tracked:
-            where.append("git-tracked site/src/content/docs/ files")
-        if slug not in llms:
-            where.append("SITE_AUTHORED in site/scripts/gen-llms-txt.mjs")
+            where.append("git-tracked site/sources/docs/ files")
+        if slug not in generated:
+            where.append("AUTHORED in site/scripts/gen-content.ts")
         if slug not in test_list:
             where.append("SITE_AUTHORED_SLUGS in tests/admin/test_docs_parity.py")
         if where:
@@ -271,6 +265,6 @@ def test_site_authored_pages_agree_across_registrations():
 
     assert not problems, (
         "site-authored page registration drift (a page must appear in all three: "
-        "git-tracked files, gen-llms-txt.mjs's SITE_AUTHORED, and this file's "
+        "git-tracked files, gen-content.ts's AUTHORED, and this file's "
         "SITE_AUTHORED_SLUGS):\n" + "\n".join(problems)
     )

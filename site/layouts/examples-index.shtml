@@ -1,0 +1,24 @@
+<extend template="base.shtml">
+<head id="head"></head>
+<main id="main">
+ <header class="ex__head"> <p class="ex__eyebrow">Examples</p> <h1 class="ex__title">Three examples, one ladder</h1> <p class="ex__lede">
+ZigBase ships three buildable example projects that climb from the
+        simplest possible use to the full framework surface: a
+<strong>packaging proof</strong>, then a
+<strong>realistic app</strong>, then the
+<strong>advanced framework</strong> a library integrator configures in
+        code. Each builds against the published <code>zigbase</code> module.
+</p> </header> <ol class="ex__grid"> <li class="ex__card"> <a class="ex__card-link" href="$site.page('examples/blog').link().suffix('')"> <span class="ex__thumb"> <img src="$site.asset('screenshots/example-blog-home.png').link()" alt="The blog example's home page: a dark-themed 'Latest posts' list of post cards" loading="lazy" decoding="async" sizes="(max-width: 960px) 100vw, 400px" fetchpriority="auto" width="2560" height="1600"> </span> <span class="ex__card-body"> <span class="ex__rung"> <span class="ex__step">1</span> Packaging proof </span> <h2 class="ex__card-title">Blog</h2> <p class="ex__card-summary">A minimal app on ZigBase-as-a-library — slugify hook + a Zigapagos frontend served with --serve-static.</p> <span class="ex__cta">
+Read the walkthrough
+<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"> <path d="M5 12h14M13 6l6 6-6 6"></path> </svg> </span> </span> </a> <a class="ex__source" href="https://github.com/valthon/zigbase/tree/main/examples/blog" target="_blank" rel="noopener noreferrer">
+View source on GitHub
+</a> </li><li class="ex__card"> <a class="ex__card-link" href="$site.page('examples/golfsim').link().suffix('')"> <span class="ex__thumb"> <img src="$site.asset('screenshots/example-golfsim-listings.png').link()" alt="The golfsim example's listings page: simulator listings with time pickers and a 'Hold this slot' booking button" loading="lazy" decoding="async" sizes="(max-width: 960px) 100vw, 400px" fetchpriority="auto" width="2560" height="1600"> </span> <span class="ex__card-body"> <span class="ex__rung"> <span class="ex__step">2</span> A realistic app </span> <h2 class="ex__card-title">Golf simulator booking</h2> <p class="ex__card-summary">Airbnb for golf simulators — hooks, a business route, a DB-touching cron, and a Zigapagos frontend via the comptime-hardcoded static dir.</p> <span class="ex__cta">
+Read the walkthrough
+<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"> <path d="M5 12h14M13 6l6 6-6 6"></path> </svg> </span> </span> </a> <a class="ex__source" href="https://github.com/valthon/zigbase/tree/main/examples/golfsim" target="_blank" rel="noopener noreferrer">
+View source on GitHub
+</a> </li><li class="ex__card"> <a class="ex__card-link" href="$site.page('examples/plugins').link().suffix('')"> <span class="ex__thumb"> <img src="$site.asset('screenshots/example-plugins-browser.png').link()" alt="The plugins example's embedded frontend: Authors and Published posts panels served from assets compiled into the binary" loading="lazy" decoding="async" sizes="(max-width: 960px) 100vw, 400px" fetchpriority="auto" width="2560" height="1600"> </span> <span class="ex__card-body"> <span class="ex__rung"> <span class="ex__step">3</span> Advanced framework surface </span> <h2 class="ex__card-title">Plugins &amp; comptime config</h2> <p class="ex__card-summary">The comptime-config surface a framework integrator uses — custom mailer, comptime schema, explicit migration, pool levers, and a fully embedded Zigapagos frontend.</p> <span class="ex__cta">
+Read the walkthrough
+<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"> <path d="M5 12h14M13 6l6 6-6 6"></path> </svg> </span> </span> </a> <a class="ex__source" href="https://github.com/valthon/zigbase/tree/main/examples/plugins" target="_blank" rel="noopener noreferrer">
+View source on GitHub
+</a> </li> </ol>
+</main>

@@ -1,0 +1,5 @@
+---
+.title = "How ZigBase compares — ZigBase",
+.description = "An honest comparison of ZigBase with PocketBase, TrailBase, Supabase, and Firebase — different tools for different constraints.",
+.layout = "compare.shtml",
+---

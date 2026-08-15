@@ -1,0 +1,28 @@
+<extend template="base.shtml">
+<head id="head"></head>
+<main id="main">
+  <section class="hub-hero">
+    <div class="container">
+      <p class="content-kicker">Documentation</p>
+      <h1>Find the shortest path to a working backend.</h1>
+      <p class="lede">Start with a guided path, jump to a feature, or use the complete index. Every canonical guide remains published and linked here.</p>
+      <div class="hub-actions"><a class="btn btn--primary" href="$site.page('docs/quick-start').link()">Run ZigBase</a><a class="btn btn--secondary" href="$site.page('docs/agents').link()">Agent orientation</a></div>
+    </div>
+  </section>
+  <section class="container hub-section" aria-labelledby="paths-title">
+    <h2 id="paths-title">Choose your path</h2>
+    <div class="hub-grid">
+      <a class="hub-card" href="$site.page('docs/overview').link()"><span>01</span><h3>Understand the shape</h3><p>Single binary, REST backend, embedded framework, SQLite to Postgres.</p></a>
+      <a class="hub-card" href="$site.page('docs/tutorial').link()"><span>02</span><h3>Build an app</h3><p>Provision collections, authorize users, upload files, add routes and jobs.</p></a>
+      <a class="hub-card" href="$site.page('docs/framework').link()"><span>03</span><h3>Embed and extend</h3><p>Typed Zig hooks, routes, jobs, schema, plugins, and static hosting.</p></a>
+    </div>
+  </section>
+  <section class="container hub-section" aria-labelledby="all-guides">
+    <h2 id="all-guides">All guides</h2>
+    <div class="guide-columns">
+      <div><h3>Build &amp; operate</h3><a href="$site.page('docs/recipes').link()">Recipes</a><a href="$site.page('docs/testing').link()">Testing</a><a href="$site.page('docs/configuration').link()">Configuration</a><a href="$site.page('docs/docker').link()">Docker</a><a href="$site.page('docs/serve').link()">Running the server</a><a href="$site.page('docs/migration-tools').link()">Migration tools</a></div>
+      <div><h3>Features</h3><a href="$site.page('docs/postgres').link()">PostgreSQL</a><a href="$site.page('docs/tenancy').link()">Multi-tenancy</a><a href="$site.page('docs/abilities').link()">Relationship abilities</a><a href="$site.page('docs/search').link()">Search</a><a href="$site.page('docs/analytics').link()">Analytics</a><a href="$site.page('docs/email').link()">Email</a><a href="$site.page('docs/jobs-and-webhooks').link()">Jobs &amp; webhooks</a><a href="$site.page('docs/realtime-broadcast').link()">Realtime broadcast</a></div>
+      <div><h3>SDKs &amp; reference</h3><a href="$site.page('docs/typescript-sdk').link()">TypeScript SDK</a><a href="$site.page('docs/dart-sdk').link()">Dart SDK</a><a href="$site.page('docs/python-sdk').link()">Python SDK</a><a href="$site.page('docs/kotlin-sdk').link()">Kotlin SDK</a><a href="$site.page('docs/api').link()">API</a><a href="$site.page('docs/fields').link()">Fields</a><a href="$site.page('docs/observability').link()">Observability</a><a href="$site.page('docs/known-limitations').link()">Known limitations</a><a href="$site.page('docs/changelog').link()">Changelog</a></div>
+    </div>
+  </section>
+</main>

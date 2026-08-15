@@ -1,0 +1,21 @@
+<extend template="base.shtml">
+<head id="head"></head>
+<main id="main">
+  <div class="example-shell">
+    <nav class="example-rail" aria-label="Example ladder">
+      <p class="docs-group">Example ladder</p>
+      <ol>
+        <li><a href="$site.page('examples/blog').link()">Blog</a><span>Runtime directory</span></li>
+        <li><a href="$site.page('examples/golfsim').link()">Golf simulator</a><span>Comptime directory</span></li>
+        <li><a href="$site.page('examples/plugins').link()">Plugins</a><span>Embedded assets</span></li>
+      </ol>
+    </nav>
+    <article class="docs-body prose example-body">
+      <p class="content-kicker">Buildable example</p>
+      <h1 :text="$page.title"></h1>
+      <p class="docs-description" :text="$page.description"></p>
+      <div :html="$page.content()"></div>
+    </article>
+    <aside class="docs-toc" aria-label="On this page"><p class="docs-group">On this page</p><div :html="$page.toc()"></div></aside>
+  </div>
+</main>

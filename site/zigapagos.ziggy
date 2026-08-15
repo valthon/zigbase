@@ -1,0 +1,13 @@
+Site {
+    .title = "ZigBase",
+    .host_url = "https://valthon.github.io",
+    .url_path_prefix = "zigbase",
+    .content_dir_path = "content",
+    .layouts_dir_path = "layouts",
+    .assets_dir_path = "assets",
+    .deploy_target = "zigbase",
+    .auto_heading_ids = true,
+    .speculation_rules = true,
+    .asset_fingerprint = true,
+    .static_assets = ["robots.txt", "sitemap.xml", "llms.txt", "docs-index.json", "og.png"],
+}
