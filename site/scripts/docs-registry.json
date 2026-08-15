@@ -30,6 +30,16 @@
     }
   },
   {
+    "canonical": "docs/app-genesis.md",
+    "mirror": "app-genesis.md",
+    "frontmatter": {
+      "title": "Designing an app",
+      "description": "Turn a product idea into a rules-first ZigBase design: trust boundaries, schema shape, relations, hooks and routes, cursor pagination, realtime, and test placement.",
+      "order": 5,
+      "group": "getting-started"
+    }
+  },
+  {
     "canonical": "docs/abilities.md",
     "mirror": "abilities.md",
     "frontmatter": {
@@ -66,6 +76,16 @@
       "title": "Dart SDK",
       "description": "The official zigbase_client Dart SDK — auth, records, offset + cursor pagination, files, and realtime, for the Dart VM, Flutter, and Flutter web.",
       "order": 6,
+      "group": "guides"
+    }
+  },
+  {
+    "canonical": "docs/deployment.md",
+    "mirror": "deployment.md",
+    "frontmatter": {
+      "title": "Deployment",
+      "description": "Run ZigBase in production with systemd, Docker Compose, Fly, or Railway — TLS, durable state, backups, upgrades, rollback, and the doctor ship gate.",
+      "order": 11,
       "group": "guides"
     }
   },

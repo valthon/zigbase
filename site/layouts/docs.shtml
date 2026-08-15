@@ -12,6 +12,7 @@
           <li><a href="$site.page('docs/quick-start').link()">Quick start</a></li>
           <li><a href="$site.page('docs/tutorial').link()">Tutorial</a></li>
           <li><a href="$site.page('docs/agents').link()">For coding agents</a></li>
+          <li><a href="$site.page('docs/app-genesis').link()">Designing an app</a></li>
         </ul>
         <p class="docs-group">Build &amp; operate</p>
         <ul>
@@ -21,6 +22,7 @@
           <li><a href="$site.page('docs/configuration').link()">Configuration</a></li>
           <li><a href="$site.page('docs/docker').link()">Docker</a></li>
           <li><a href="$site.page('docs/serve').link()">Running the server</a></li>
+          <li><a href="$site.page('docs/deployment').link()">Deployment</a></li>
           <li><a href="$site.page('docs/migration-tools').link()">Migration tools</a></li>
         </ul>
         <p class="docs-group">Client SDKs</p>

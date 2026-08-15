@@ -119,6 +119,7 @@ binary from a [release tarball](../README.md#quickstart-run-the-binary) locally 
 
 ## See also
 
+- [Deployment](deployment.md) — production Compose, TLS proxies, Fly/Railway, backups, upgrades, and rollback.
 - [Configuration](https://valthon.github.io/zigbase/docs/configuration) — the full environment-variable reference.
 - The [README's Security section](../README.md#security) — what's safe to change and what
   isn't.

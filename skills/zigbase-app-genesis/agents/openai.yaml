@@ -1,0 +1,4 @@
+interface:
+  display_name: "ZigBase App Genesis"
+  short_description: "Design and ship a secure ZigBase app"
+  default_prompt: "Use $zigbase-app-genesis to turn my product idea into a tested, rules-locked ZigBase app."
