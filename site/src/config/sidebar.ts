@@ -34,7 +34,7 @@ export const sidebar: SidebarGroup[] = [
       { slug: 'configuration', label: 'Configuration' },
       { slug: 'docker', label: 'Docker' },
       { slug: 'serve', label: 'Running the server' },
-      { slug: 'migration-tools', label: 'Migration tools' },
+      { slug: 'migration-tools', label: 'Migrate an existing backend to ZigBase' },
     ],
   },
   {

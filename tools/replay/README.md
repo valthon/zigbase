@@ -3,7 +3,8 @@
 A standalone, stdlib-only Python 3 tool. It is **not** a `zigbase` subcommand: it has to run
 against an **old** backend (PocketBase, Rails, Express, an older ZigBase — anything that speaks
 HTTP/JSON) to record expectations, so it can't assume anything about what it's talking to. For
-the migration workflow this fits into, see [`docs/migration-tools.md`](../../docs/migration-tools.md).
+the re-platforming workflow this fits into, see
+[Migrating an existing backend to ZigBase](../../docs/migration-tools.md).
 
 ## Commands
 

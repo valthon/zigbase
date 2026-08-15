@@ -1,14 +1,22 @@
 > 📖 This documentation is also published, web-native, at <https://valthon.github.io/zigbase/docs/migration-tools> — the site is the canonical reading experience.
 
-# Migration tools
+# Migrating an existing backend to ZigBase
 
-ZigBase ships four pieces of machinery for moving an existing backend onto it: a
+This guide is about **re-platforming an application from another backend or framework**
+onto ZigBase. It is not the SQLite-to-PostgreSQL database-backend guide.
+
+- To move an existing ZigBase instance from SQLite to PostgreSQL, see
+  [PostgreSQL backend](postgres.md#move-a-zigbase-instance-from-sqlite-to-postgresql).
+- To evolve a ZigBase application's own schema over time, see
+  [Explicit migrations](framework.md#explicit-migrations-migrations).
+
+ZigBase ships four pieces of machinery for moving an existing application backend onto it: a
 declarative schema format (`zigbase schema dump`/`apply`/`check-rules`), a scaled NDJSON data pump
 (`zigbase import --manifest`), a legacy-password-hash import with rehash-on-login
 (`zigbase import --legacy-hashes`), and a dependency-free parity-replay harness
 (`tools/replay/zb_replay.py`). This guide covers all four end to end.
 
-## 1. What this is
+## 1. Re-platforming stages
 
 A real migration — PocketBase, Rails, Express, whatever you're moving off of — is a
 sequence of stages:
