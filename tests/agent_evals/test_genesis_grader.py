@@ -378,13 +378,15 @@ def test_compose_evaluation_environment_satisfies_declared_secret_names(tmp_path
         "  ZIGBASE_PUBLIC_URL: https://${APP_DOMAIN:?set domain}\n"
         "  ZIGBASE_SMTP_PASSWORD: ${ZIGBASE_SMTP_PASSWORD:?set password}\n"
         "  ZIGBASE_SMTP_USERNAME: ${SMTP_USERNAME:-sender@example.invalid}\n"
+        "  image: ${GEARSHARE_IMAGE:-gearshare:0.1.0}\n"
     )
 
     environment = _evaluation_environment(compose)
 
     assert environment["APP_DOMAIN"] == "eval.invalid"
     assert environment["ZIGBASE_SMTP_PASSWORD"] == "x" * 64
-    assert environment["SMTP_USERNAME"] == "eval@example.invalid"
+    assert "SMTP_USERNAME" not in environment
+    assert "GEARSHARE_IMAGE" not in environment
 
 
 def test_public_rule_comparison_rejects_stale_extra_and_doctor_errors():

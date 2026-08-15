@@ -23,7 +23,9 @@ from . import GradeReport
 MAX_SOURCE_BYTES = 4 * 1024 * 1024
 MAX_COMMAND_OUTPUT_BYTES = 1024 * 1024
 RULE_OPERATIONS = {"list", "view", "create", "update", "delete"}
-COMPOSE_VARIABLE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)[^}]*\}")
+COMPOSE_VARIABLE = re.compile(
+    r"\$\{([A-Za-z_][A-Za-z0-9_]*)(:\?|\?|:-|-|:\+|\+)?[^}]*\}"
+)
 
 
 @dataclass(frozen=True)
@@ -593,7 +595,9 @@ def _evaluation_environment(compose: Path) -> dict[str, str]:
         raise GradeFailure(
             "deployment.compose_invalid", "Compose file exceeds the grading limit"
         )
-    for name in COMPOSE_VARIABLE.findall(text):
+    for name, operator in COMPOSE_VARIABLE.findall(text):
+        if operator in {":-", "-", ":+", "+"}:
+            continue
         if name in environment:
             continue
         upper = name.upper()
