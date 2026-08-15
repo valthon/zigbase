@@ -286,21 +286,17 @@ an outbound call — instead offload it to the background worker pool with `ctx.
 so the confirm response returns immediately even if the webhook endpoint is slow:
 
 ```zig
-// In the route: offload, don't block. `JobTask` is a bare fn that can't capture and
-// `submit` doesn't copy `name`, so we hand the booking id to the job as its `name` on a
-// long-lived allocator (the job frees it).
+// In the route: offload, don't block. `JobTask` is a bare fn that can't capture, so
+// pass the booking id as its name. `submit` copies it before returning.
 fn notifyBookingConfirmed(ctx: *zigbase.Ctx, booking_id: []const u8) void {
-    const id = ctx.app.allocator.dupe(u8, booking_id) catch return;
-    ctx.app.submit(id, webhookJob) catch |err| {
-        ctx.app.allocator.free(id);
+    ctx.app.submit(booking_id, webhookJob) catch |err| {
         std.log.warn("could not offload booking webhook: {s}", .{@errorName(err)});
     };
 }
 
-// The background job (off the request thread): reads the URL from KV, POSTs via ctx.http().
+// The background job borrows ev.name until it returns; the queue owns and frees it.
 fn webhookJob(ctx: *zigbase.Ctx, ev: *zigbase.events.JobEvent) anyerror!void {
     const booking_id = ev.name;
-    defer ctx.app.allocator.free(booking_id);       // we own the name we submitted
     const url = (ctx.kv().get("booking_webhook_url") catch return) orelse return;
     const body = std.fmt.allocPrint(ctx.arena.a,
         "{{\"event\":\"booking.confirmed\",\"booking\":\"{s}\"}}", .{booking_id}) catch return;

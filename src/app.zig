@@ -221,6 +221,8 @@ pub const App = struct {
     /// crash). Returns error.SchedulerUnavailable when no pool is installed (unit tests /
     /// CLI — the historical error name is kept for compatibility) and error.QueueFull when
     /// the bounded ring is full (reject-not-block; see queue/memory.zig for the policy).
+    /// `name` is copied before this function returns: the caller retains ownership of its
+    /// slice, while the task borrows the queue-owned `JobEvent.name` only for that invocation.
     pub fn submit(self: *App, name: []const u8, task: @import("events.zig").JobTask) !void {
         // `Pool.stop` clears `submit_fn` then `memory_pool`; a submit racing teardown could pass the
         // `submit_fn` gate and then deref a just-nulled `memory_pool` (a TOCTOU null-deref that
