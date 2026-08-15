@@ -97,8 +97,8 @@ class AgentScenario:
 
     @classmethod
     def load(cls, manifest_path: Path) -> "AgentScenario":
-        if manifest_path.is_symlink():
-            raise ScenarioError("scenario manifest must not be a symlink")
+        if manifest_path.is_symlink() or manifest_path.parent.is_symlink():
+            raise ScenarioError("scenario root and manifest must not be symlinks")
         try:
             value = json.loads(manifest_path.read_text())
         except (OSError, json.JSONDecodeError) as exc:

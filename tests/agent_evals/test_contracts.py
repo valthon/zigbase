@@ -138,3 +138,14 @@ def test_scenario_rejects_symlinked_prompt(tmp_path):
     (scenario_dir / "scenario.json").write_text(json.dumps(manifest))
     with pytest.raises(ScenarioError, match="symlinks"):
         AgentScenario.load(scenario_dir / "scenario.json")
+
+
+def test_scenario_rejects_symlinked_root(tmp_path):
+    real = tmp_path / "real"
+    real.mkdir()
+    (real / "prompt.md").write_text("prompt")
+    (real / "scenario.json").write_text(json.dumps(scenario_dict()))
+    linked = tmp_path / "linked"
+    linked.symlink_to(real, target_is_directory=True)
+    with pytest.raises(ScenarioError, match="symlinks"):
+        AgentScenario.load(linked / "scenario.json")
