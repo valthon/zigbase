@@ -283,6 +283,19 @@ def test_genesis_grade_requires_an_intentional_public_read(tmp_path):
     )
 
 
+def test_completion_source_limit_ignores_downloaded_zig_packages(tmp_path):
+    target = workspace(tmp_path)
+    package = target / "zig-pkg" / "dependency"
+    package.mkdir(parents=True)
+    (package / "large.zig").write_text("x" * (5 * 1024 * 1024))
+
+    report = grade_fixture(target, tmp_path / "artifacts", commands=FakeCommands())
+
+    assert not any(
+        failure.code == "completion.source_limit" for failure in report.failures
+    )
+
+
 def test_public_rule_comparison_rejects_stale_extra_and_doctor_errors():
     inventory = frozenset({("equipment", "list")})
     with pytest.raises(GradeFailure, match="missing"):

@@ -59,11 +59,15 @@ Use cursor pagination for changing user-facing lists. Prefer relations plus `exp
 
 Add tests as part of the slice, not after it. Use `zigbase.testing` for schema, rules, auth, hooks, routes, migrations, and deterministic behavior. For each protected operation include at least one allowed actor and one denied actor. Use a spawned server or browser only when the behavior depends on the HTTP transport or browser state.
 
+When the user asks for an application rather than only a backend or API, include the thinnest client-facing journey that proves the product boundary and give it a project-declared integration or browser test command. Keep browser transport tests distinct from in-process authorization tests; neither substitutes for the other.
+
 Run focused tests first, then the repository's broader relevant checks. Do not claim a check passed unless it ran in the current workspace. Reconcile every production-doctor public-rule finding with `security/public-rules.json`; an unreviewed public rule blocks launch.
 
 ## 5. Make deployment reproducible
 
 When launch is in scope, pin the ZigBase version, persist the data directory and JWT secret, keep one SQLite process, terminate TLS in front of ZigBase, configure real email, and run `zigbase doctor --production`. Use PostgreSQL before application replicas. Provide backup, restore-rehearsal, upgrade, rollback, health, and continuous-monitoring steps appropriate to the target platform.
+
+If a production-shaped deployment must also run locally, do not weaken its cookie or public-origin settings for loopback HTTP. Use a separate test-only server profile for insecure local cookies and keep the Compose artifact behind its documented HTTPS termination boundary.
 
 Do not deploy or mutate external infrastructure unless the user authorized it. A local Docker deployment may satisfy a reproducible-deployment requirement when no external target was requested.
 

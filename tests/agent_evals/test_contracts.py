@@ -14,6 +14,7 @@ from evals.agents.scenario import AgentScenario, ScenarioError
 
 REPO = Path(__file__).resolve().parents[2]
 GENESIS = REPO / "evals" / "agents" / "scenarios" / "genesis" / "scenario.json"
+GENESIS_PROMPT = GENESIS.with_name("prompt.md")
 
 
 def result_dict():
@@ -91,6 +92,18 @@ def test_genesis_scenario_loads():
     assert scenario.name == "genesis"
     assert scenario.skills == ("zigbase-app-genesis",)
     assert scenario.graders == ("genesis",)
+
+
+def test_genesis_prompt_states_product_boundaries_exercised_by_the_grader():
+    prompt = GENESIS_PROMPT.read_text().lower()
+    required = (
+        "anonymous visitors can browse",
+        "client or browser integration test",
+        "production-shaped docker compose",
+        "secure cookies enabled",
+        "configure mail delivery",
+    )
+    assert all(boundary in prompt for boundary in required)
 
 
 @pytest.mark.parametrize("mutation", ["missing", "unknown", "future"])

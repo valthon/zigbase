@@ -325,6 +325,7 @@ def _source_text(workspace: Path) -> str:
         ".agents",
         ".git",
         ".zig-cache",
+        "zig-pkg",
         "zig-out",
         "node_modules",
         "zb_data",
