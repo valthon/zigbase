@@ -1,0 +1,10 @@
+services:
+  zigbase:
+    image: ghcr.io/valthon/zigbase:0.13.0
+    volumes:
+      - data:/data
+    environment:
+      ZIGBASE_PUBLIC_URL: https://gear.example.com
+      ZIGBASE_SMTP_HOST: smtp.example.com
+volumes:
+  data:

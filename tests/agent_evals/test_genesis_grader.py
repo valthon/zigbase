@@ -1,0 +1,270 @@
+import json
+import shutil
+from pathlib import Path
+
+import pytest
+
+from evals.agents.graders.genesis import (
+    CommandResult,
+    GradeFailure,
+    compare_public_rules,
+    grade,
+    load_public_inventory,
+    parse_doctor_ndjson,
+)
+
+
+FIXTURES = Path(__file__).parent / "fixtures" / "genesis"
+
+
+def doctor_output(
+    *, duplicate=False, subject="equipment.listRule", errors=0, skipped=0
+):
+    finding = {
+        "check": "public-rules-enumerated",
+        "severity": "warn",
+        "subject": subject,
+        "message": "public",
+    }
+    lines = ["non-json startup log", json.dumps(finding)]
+    if duplicate:
+        lines.append(json.dumps(finding))
+    lines.append(
+        json.dumps(
+            {
+                "summary": True,
+                "production": True,
+                "checks": 9,
+                "errors": errors,
+                "warnings": 1,
+                "skipped": skipped,
+            }
+        )
+    )
+    return "\n".join(lines)
+
+
+def compose_config():
+    return {
+        "services": {
+            "zigbase": {
+                "image": "ghcr.io/valthon/zigbase:0.13.0",
+                "environment": {
+                    "ZIGBASE_PUBLIC_URL": "https://gear.example.com",
+                    "ZIGBASE_SMTP_HOST": "smtp.example.com",
+                },
+                "volumes": [{"type": "volume", "source": "data", "target": "/data"}],
+            }
+        },
+        "volumes": {"data": {}},
+    }
+
+
+class FakeCommands:
+    def __init__(self, *, fail_unit=False, fail_up=False, config=None, doctor=None):
+        self.fail_unit = fail_unit
+        self.fail_up = fail_up
+        self.config = config or compose_config()
+        self.doctor = doctor or doctor_output()
+        self.calls = []
+
+    def run(self, argv, *, cwd, env=None, timeout=300):
+        self.calls.append(argv)
+        if argv[-4:] == ["zig", "build", "test"] or (
+            "zig" in argv and argv[-2:] == ["build", "test"]
+        ):
+            return CommandResult(1 if self.fail_unit else 0)
+        if "config" in argv:
+            return CommandResult(0, json.dumps(self.config))
+        if "up" in argv:
+            return CommandResult(1 if self.fail_up else 0)
+        if "doctor" in argv:
+            return CommandResult(2, self.doctor)
+        if "ps" in argv:
+            return CommandResult(0, "")
+        return CommandResult(0)
+
+
+def workspace(tmp_path, overlay=None):
+    target = tmp_path / "workspace"
+    shutil.copytree(FIXTURES / "positive", target)
+    (target / ".home").mkdir()
+    (target / ".tmp").mkdir()
+    if overlay == "completion_failure":
+        shutil.copy(FIXTURES / overlay / "main.zig", target / "src" / "main.zig")
+    elif overlay == "rules_failure":
+        shutil.copy(
+            FIXTURES / overlay / "public-rules.json",
+            target / "security" / "public-rules.json",
+        )
+    elif overlay == "tests_failure":
+        shutil.copy(FIXTURES / overlay / "package.json", target / "package.json")
+    elif overlay == "deployment_failure":
+        shutil.copy(
+            FIXTURES / overlay / "docker-compose.yml", target / "docker-compose.yml"
+        )
+    return target
+
+
+def healthy(_url, _timeout):
+    return {"ok": True}
+
+
+def grade_fixture(workspace_path, artifacts, **kwargs):
+    return grade(
+        workspace_path,
+        artifacts,
+        http_get=healthy,
+        port_picker=lambda: 18080,
+        **kwargs,
+    )
+
+
+def test_positive_fixture_scores_four_and_always_tears_down(tmp_path):
+    commands = FakeCommands()
+    report = grade_fixture(
+        workspace(tmp_path), tmp_path / "artifacts", commands=commands
+    )
+    assert (
+        report.completion,
+        report.rules_locked,
+        report.tests_green,
+        report.deployed,
+    ) == (
+        True,
+        True,
+        True,
+        True,
+    )
+    assert report.failures == ()
+    assert any("down" in call for call in commands.calls)
+    assert any("ps" in call for call in commands.calls)
+
+
+@pytest.mark.parametrize(
+    ("overlay", "false_grade", "failure_prefix"),
+    [
+        ("completion_failure", "completion", "completion."),
+        ("rules_failure", "rules_locked", "rules."),
+        ("tests_failure", "tests_green", "tests."),
+        ("deployment_failure", "deployed", "deployment."),
+    ],
+)
+def test_one_fixture_failure_per_grade(tmp_path, overlay, false_grade, failure_prefix):
+    commands = FakeCommands()
+    if overlay == "deployment_failure":
+        commands = FakeCommands(
+            config={"services": {"zigbase": {"image": "zigbase:latest"}}}
+        )
+    report = grade_fixture(
+        workspace(tmp_path, overlay),
+        tmp_path / "artifacts",
+        commands=commands,
+    )
+    assert getattr(report, false_grade) is False
+    assert any(failure.code.startswith(failure_prefix) for failure in report.failures)
+
+
+def test_command_failures_are_independent(tmp_path):
+    unit = grade_fixture(
+        workspace(tmp_path),
+        tmp_path / "artifacts",
+        commands=FakeCommands(fail_unit=True),
+    )
+    assert unit.completion is True
+    assert unit.tests_green is False
+    assert unit.deployed is True
+
+
+def test_health_timeout_still_tears_down(tmp_path):
+    commands = FakeCommands()
+
+    def unhealthy(_url, _timeout):
+        raise OSError("not ready")
+
+    report = grade(
+        workspace(tmp_path),
+        tmp_path / "artifacts",
+        commands=commands,
+        http_get=unhealthy,
+        port_picker=lambda: 18080,
+        health_attempts=1,
+    )
+    assert report.deployed is False
+    assert any(
+        failure.code == "deployment.health_timeout" for failure in report.failures
+    )
+    assert any("down" in call for call in commands.calls)
+    assert any("ps" in call for call in commands.calls)
+
+
+def test_doctor_parser_skips_logs_and_rejects_duplicate_or_unknown_subjects():
+    report = parse_doctor_ndjson(doctor_output())
+    assert report.public_rules == frozenset({("equipment", "list")})
+    with pytest.raises(GradeFailure, match="duplicate"):
+        parse_doctor_ndjson(doctor_output(duplicate=True))
+    with pytest.raises(GradeFailure, match="unknown"):
+        parse_doctor_ndjson(doctor_output(subject="equipment.publishRule"))
+
+
+def test_doctor_parser_requires_exactly_one_summary():
+    with pytest.raises(GradeFailure, match="exactly one"):
+        parse_doctor_ndjson("not json")
+    duplicate_summary = json.dumps(
+        {
+            "summary": True,
+            "production": True,
+            "checks": 9,
+            "errors": 0,
+            "warnings": 1,
+            "skipped": 0,
+        }
+    )
+    with pytest.raises(GradeFailure, match="exactly one"):
+        parse_doctor_ndjson(doctor_output() + "\n" + duplicate_summary)
+
+
+def test_inventory_rejects_duplicate_empty_rationale_and_unknown_keys(tmp_path):
+    base = {
+        "collection": "equipment",
+        "operation": "list",
+        "rule": "@public",
+        "rationale": "catalog",
+    }
+    cases = [
+        [base, base],
+        [{**base, "rationale": ""}],
+        [{**base, "extra": True}],
+    ]
+    for rules in cases:
+        path = tmp_path / f"inventory-{len(list(tmp_path.iterdir()))}.json"
+        path.write_text(json.dumps({"zigbasePublicRules": 1, "rules": rules}))
+        with pytest.raises(GradeFailure):
+            load_public_inventory(path)
+
+
+def test_genesis_grade_requires_an_intentional_public_read(tmp_path):
+    target = workspace(tmp_path)
+    (target / "security" / "public-rules.json").write_text(
+        json.dumps({"zigbasePublicRules": 1, "rules": []})
+    )
+    report = grade_fixture(target, tmp_path / "artifacts", commands=FakeCommands())
+    assert report.rules_locked is False
+    assert any(
+        failure.code == "rules.public_read_missing" for failure in report.failures
+    )
+
+
+def test_public_rule_comparison_rejects_stale_extra_and_doctor_errors():
+    inventory = frozenset({("equipment", "list")})
+    with pytest.raises(GradeFailure, match="missing"):
+        compare_public_rules(frozenset(), parse_doctor_ndjson(doctor_output()))
+    with pytest.raises(GradeFailure, match="absent"):
+        compare_public_rules(
+            frozenset({("equipment", "list"), ("members", "view")}),
+            parse_doctor_ndjson(doctor_output()),
+        )
+    with pytest.raises(GradeFailure, match="errors"):
+        compare_public_rules(inventory, parse_doctor_ndjson(doctor_output(errors=1)))
+    with pytest.raises(GradeFailure, match="skipped"):
+        compare_public_rules(inventory, parse_doctor_ndjson(doctor_output(skipped=1)))
