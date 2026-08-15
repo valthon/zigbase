@@ -126,6 +126,11 @@ boundary. Use a superuser for setup, mint a test session, or add the real rule.
 Public access can be correct: published content, open signup, a health-like feed, or a deliberately
 anonymous form. Record each public rule in `security/public-rules.json`:
 
+Production doctor treats exact `@public` create on a non-system auth collection as the supported
+open-signup boundary: it remains an enumerated warning rather than an inescapable error. The
+inventory is the durable acknowledgment. Other anonymous writes, including system-auth creation,
+remain production errors.
+
 ```json
 {
   "zigbasePublicRules": 1,

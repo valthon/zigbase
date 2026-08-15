@@ -31,6 +31,9 @@ pub const RuleFact = struct {
     op: []const u8,
     /// True for a write op — the half that escalates under --production.
     write: bool,
+    /// True only for create on a non-system auth collection: ZigBase's
+    /// documented open-signup mechanism, not an arbitrary public write.
+    auth_signup: bool = false,
 };
 
 /// Everything the checks read. Gathered by doctor_run.zig; a plain struct here
@@ -169,13 +172,17 @@ fn checkPublicRules(arena: std.mem.Allocator, f: Facts, production: bool, out: *
         return append(arena, out, id, .ok, null, "no @public rules", .{});
     }
     for (f.rules) |r| {
-        // Read rules (list/view) stay a warning in every mode: @public on a
-        // read rule is a legitimate, common, deliberate choice (a public
-        // blog). Write rules (create/update/delete) escalate under
-        // --production: an anonymously writable collection almost never is.
-        const sev: Severity = if (production and r.write) .err else .warn;
+        // Reads and open signup stay warnings: both are supported public
+        // product boundaries that still need review. Other public writes
+        // escalate in production. System auth collections never qualify for
+        // the signup exception.
+        const sev: Severity = if (production and r.write and !r.auth_signup) .err else .warn;
         const subject = try std.fmt.allocPrint(arena, "{s}.{s}Rule", .{ r.collection, r.op });
-        try append(arena, out, id, sev, subject, "collection '{s}' is @public for {s}", .{ r.collection, r.op });
+        if (r.auth_signup) {
+            try append(arena, out, id, sev, subject, "auth collection '{s}' allows open signup", .{r.collection});
+        } else {
+            try append(arena, out, id, sev, subject, "collection '{s}' is @public for {s}", .{ r.collection, r.op });
+        }
     }
 }
 
@@ -437,6 +444,23 @@ test "doctor: public rules are enumerated one finding each, writes escalate in p
     const prod_sev = try severitiesFor(arena, try evaluate(arena, f, true), "public-rules-enumerated");
     try std.testing.expectEqualStrings("warn", prod_sev[0]);
     try std.testing.expectEqualStrings("error", prod_sev[1]);
+}
+
+test "doctor: open signup warns while ordinary and system-auth public creates error" {
+    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var f = okFacts();
+    f.rules = &.{
+        .{ .collection = "users", .op = "create", .write = true, .auth_signup = true },
+        .{ .collection = "posts", .op = "create", .write = true },
+        .{ .collection = "_superusers", .op = "create", .write = true },
+    };
+    const severities = try severitiesFor(arena, try evaluate(arena, f, true), "public-rules-enumerated");
+    try std.testing.expectEqualStrings("warn", severities[0]);
+    try std.testing.expectEqualStrings("error", severities[1]);
+    try std.testing.expectEqualStrings("error", severities[2]);
 }
 
 test "doctor: cookie, host-binding, and trust-proxy severities are mode-dependent" {

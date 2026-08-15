@@ -322,7 +322,7 @@ check) plus a summary.
 | # | Check id | What it reads | Default severity | `--production` severity |
 |---|---|---|---|---|
 | 1 | `jwt-secret-persisted` | `ZIGBASE_JWT_SECRET` length; `<data-dir>/.jwt_secret`'s length + file mode | short env secret → **error**; nothing set/persisted → **warn**; persisted but not mode `0600` → **warn** | short env secret → **error** (unchanged); nothing persisted → **error**; wrong mode → **error** |
-| 2 | `public-rules-enumerated` | every collection's list/view/create/update/delete rule, for the `@public` sentinel (one finding per rule, named `<collection>.<op>Rule`) | read rule (`list`/`view`) `@public` → **warn**; write rule (`create`/`update`/`delete`) `@public` → **warn** | read rule → **warn** (unchanged, a public blog is legitimate); write rule → **error** |
+| 2 | `public-rules-enumerated` | every collection's list/view/create/update/delete rule, for the `@public` sentinel (one finding per rule, named `<collection>.<op>Rule`) | read rule (`list`/`view`) `@public` → **warn**; write rule (`create`/`update`/`delete`) `@public` → **warn** | read rule → **warn**; create on a non-system auth collection → **warn** (open signup); other writes → **error** |
 | 3 | `insecure-cookies-off` | whether cookies are `Secure` | not secure → **warn** | not secure → **error** |
 | 4 | `host-binding` | `http_host` | wildcard bind (`0.0.0.0`/`::`/`[::]`) → **warn**; loopback → **ok** | wildcard bind → **ok**; loopback → **warn** |
 | 5 | `trust-proxy-consistency` | `trust_proxy`, `http_host`, `public_url` | `trust_proxy` on + wildcard bind → **warn**; `https` `public_url` + loopback bind + `trust_proxy` off → **warn** (both modes) | `trust_proxy` on + wildcard bind → **error**; the `public_url`/loopback case stays **warn** |
@@ -333,6 +333,12 @@ check) plus a summary.
 
 A DB-backed check (2, 7, or 9) that cannot open the database reports **`skipped`** instead of
 a false `ok` or `error` — a check that could not run is reported, not scored either way.
+
+Open signup is intentionally narrow: exact `@public` on `createRule` for a non-system auth
+collection is the documented registration mechanism, so production doctor warns and enumerates it
+instead of making supported signup undeployable. The same rule on an ordinary collection or a
+system auth collection such as `_superusers` remains an error. Keep the finding in the reviewed
+public-rule inventory; the warning is not a silent exemption.
 
 Prose output — here `ZIGBASE_HTTP_HOST=0.0.0.0` is the one thing this deployment gets flagged
 for (a wildcard bind, harmless and even expected in a container, but worth a second look on a
