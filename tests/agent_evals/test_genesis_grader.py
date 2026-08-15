@@ -8,6 +8,7 @@ from evals.agents.graders.genesis import (
     CommandResult,
     GradeFailure,
     SubprocessCommands,
+    _evaluation_environment,
     compare_public_rules,
     grade,
     inspect_compose,
@@ -64,9 +65,18 @@ def compose_config():
 
 
 class FakeCommands:
-    def __init__(self, *, fail_unit=False, fail_up=False, config=None, doctor=None):
+    def __init__(
+        self,
+        *,
+        fail_unit=False,
+        fail_up=False,
+        fail_config=False,
+        config=None,
+        doctor=None,
+    ):
         self.fail_unit = fail_unit
         self.fail_up = fail_up
+        self.fail_config = fail_config
         self.config = config or compose_config()
         self.doctor = doctor or doctor_output()
         self.calls = []
@@ -78,7 +88,10 @@ class FakeCommands:
         ):
             return CommandResult(1 if self.fail_unit else 0)
         if "config" in argv:
-            return CommandResult(0, json.dumps(self.config))
+            return CommandResult(
+                1 if self.fail_config else 0,
+                "" if self.fail_config else json.dumps(self.config),
+            )
         if "up" in argv:
             return CommandResult(1 if self.fail_up else 0)
         if "doctor" in argv:
@@ -228,6 +241,22 @@ def test_health_timeout_still_tears_down(tmp_path):
     assert any("ps" in call for call in commands.calls)
 
 
+def test_invalid_compose_config_does_not_report_false_teardown_failures(tmp_path):
+    commands = FakeCommands(fail_config=True)
+
+    report = grade_fixture(
+        workspace(tmp_path), tmp_path / "artifacts", commands=commands
+    )
+
+    assert any(
+        failure.code == "deployment.compose_invalid" for failure in report.failures
+    )
+    assert not any(
+        failure.code.startswith("deployment.teardown") for failure in report.failures
+    )
+    assert not any("down" in call or "ps" in call for call in commands.calls)
+
+
 def test_doctor_parser_skips_logs_and_rejects_duplicate_or_unknown_subjects():
     report = parse_doctor_ndjson(doctor_output())
     assert report.public_rules == frozenset({("equipment", "list")})
@@ -338,6 +367,22 @@ def test_compose_finds_application_beside_tls_proxy():
     }
 
     assert inspect_compose(config) == "gearshare"
+
+
+def test_compose_evaluation_environment_satisfies_declared_secret_names(tmp_path):
+    compose = tmp_path / "compose.yaml"
+    compose.write_text(
+        "environment:\n"
+        "  ZIGBASE_PUBLIC_URL: https://${APP_DOMAIN:?set domain}\n"
+        "  ZIGBASE_SMTP_PASSWORD: ${ZIGBASE_SMTP_PASSWORD:?set password}\n"
+        "  ZIGBASE_SMTP_USERNAME: ${SMTP_USERNAME:-sender@example.invalid}\n"
+    )
+
+    environment = _evaluation_environment(compose)
+
+    assert environment["APP_DOMAIN"] == "eval.invalid"
+    assert environment["ZIGBASE_SMTP_PASSWORD"] == "x" * 64
+    assert environment["SMTP_USERNAME"] == "eval@example.invalid"
 
 
 def test_public_rule_comparison_rejects_stale_extra_and_doctor_errors():

@@ -23,6 +23,7 @@ from . import GradeReport
 MAX_SOURCE_BYTES = 4 * 1024 * 1024
 MAX_COMMAND_OUTPUT_BYTES = 1024 * 1024
 RULE_OPERATIONS = {"list", "view", "create", "update", "delete"}
+COMPOSE_VARIABLE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)[^}]*\}")
 
 
 @dataclass(frozen=True)
@@ -581,6 +582,39 @@ def inspect_compose(config: dict[str, Any]) -> str:
     return name
 
 
+def _evaluation_environment(compose: Path) -> dict[str, str]:
+    environment = {
+        "ZIGBASE_JWT_SECRET": "x" * 64,
+        "ZIGBASE_SMTP_HOST": "smtp.example.invalid",
+        "ZIGBASE_PUBLIC_URL": "https://eval.invalid",
+    }
+    text = compose.read_text(errors="replace")
+    if len(text.encode()) > MAX_SOURCE_BYTES:
+        raise GradeFailure(
+            "deployment.compose_invalid", "Compose file exceeds the grading limit"
+        )
+    for name in COMPOSE_VARIABLE.findall(text):
+        if name in environment:
+            continue
+        upper = name.upper()
+        if "DOMAIN" in upper:
+            value = "eval.invalid"
+        elif "URL" in upper:
+            value = "https://eval.invalid"
+        elif any(part in upper for part in ("PASSWORD", "SECRET", "TOKEN", "KEY")):
+            value = "x" * 64
+        elif any(part in upper for part in ("EMAIL", "FROM", "USERNAME")):
+            value = "eval@example.invalid"
+        elif "PORT" in upper:
+            value = "587"
+        elif "TLS" in upper:
+            value = "starttls"
+        else:
+            value = "eval"
+        environment[name] = value
+    return environment
+
+
 def _free_port() -> int:
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
@@ -627,15 +661,13 @@ def run_deployment(
     compose = None
     override = artifacts / "genesis-compose.override.yml"
     base = ["docker", "compose", "-p", project]
-    environment = {
-        "ZIGBASE_JWT_SECRET": "x" * 64,
-        "ZIGBASE_SMTP_HOST": "smtp.example.invalid",
-        "ZIGBASE_PUBLIC_URL": "https://eval.invalid",
-    }
+    environment: dict[str, str] = {}
     doctor = None
     deployed = False
+    cleanup_required = False
     try:
         compose = _compose_file(workspace)
+        environment = _evaluation_environment(compose)
         config_result = commands.run(
             [*base, "-f", str(compose), "config", "--format", "json"],
             cwd=workspace,
@@ -669,8 +701,12 @@ def run_deployment(
             '      ZIGBASE_SMTP_HOST: "smtp.example.invalid"\n'
         )
         stack = [*base, "-f", str(compose), "-f", str(override)]
+        cleanup_required = True
         up = commands.run(
-            [*stack, "up", "-d", "--build"], cwd=workspace, env=environment, timeout=600
+            [*stack, "up", "-d", "--build", service],
+            cwd=workspace,
+            env=environment,
+            timeout=600,
         )
         if up.returncode != 0 or up.timed_out or up.output_truncated:
             raise GradeFailure(
@@ -714,7 +750,7 @@ def run_deployment(
         code = exc.code if isinstance(exc, GradeFailure) else "deployment.error"
         failures.append(_failure(code, str(exc)))
     finally:
-        if compose is not None:
+        if compose is not None and cleanup_required:
             stack = (
                 [*base, "-f", str(compose), "-f", str(override)]
                 if override.exists()
