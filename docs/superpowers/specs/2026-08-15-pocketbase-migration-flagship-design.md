@@ -186,7 +186,10 @@ executes each auth file as its own create-only import before the relation-ordere
 ### D5. Mapping is lossless by default and explicit where it cannot be
 
 Direct field mappings are `text`, `number`, `bool`, `email`, `url`, `editor`, `date`, `autodate`,
-`select`, `json`, `file`, and `relation`. Stable collection/field ids and record ids are preserved.
+`select`, `json`, `file`, and `relation`. Stable field ids and record ids are preserved. PocketBase
+collection ids remain in bundle provenance and source-file lookup, but ZigBase collection ids are
+intentionally instance-local: the target schema omits them and writes relation targets by portable
+collection name, matching the canonical `zigbase schema dump/apply` contract.
 Single and multi relation/select/file values retain their string/JSON-array shapes.
 
 Additional rules:
