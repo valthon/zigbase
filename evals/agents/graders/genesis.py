@@ -439,7 +439,7 @@ def _package_test_script(workspace: Path) -> str:
         raise GradeFailure(
             "tests.package_invalid", f"cannot read package test scripts: {exc}"
         ) from exc
-    for name in ("test:e2e", "test:browser"):
+    for name in ("test:e2e", "test:browser", "test:integration", "test:client"):
         if (
             isinstance(scripts, dict)
             and isinstance(scripts.get(name), str)
@@ -447,7 +447,8 @@ def _package_test_script(workspace: Path) -> str:
         ):
             return name
     raise GradeFailure(
-        "tests.client_missing", "package.json must declare test:e2e or test:browser"
+        "tests.client_missing",
+        "package.json must declare a client, browser, integration, or e2e test",
     )
 
 
@@ -508,13 +509,25 @@ def _compose_service(config: dict[str, Any]) -> tuple[str, dict[str, Any]]:
         )
     if "zigbase" in services:
         name = "zigbase"
-    elif len(services) == 1:
-        name = next(iter(services))
     else:
-        raise GradeFailure(
-            "deployment.compose_invalid",
-            "Compose must name zigbase or contain one service",
-        )
+        candidates = []
+        for candidate, value in services.items():
+            if not isinstance(value, dict):
+                continue
+            environment = value.get("environment", {})
+            if isinstance(environment, dict) and any(
+                str(key).startswith("ZIGBASE_") for key in environment
+            ):
+                candidates.append(candidate)
+        if len(candidates) == 1:
+            name = candidates[0]
+        elif len(services) == 1:
+            name = next(iter(services))
+        else:
+            raise GradeFailure(
+                "deployment.compose_invalid",
+                "Compose must identify one service with ZigBase configuration",
+            )
     service = services[name]
     if not isinstance(service, dict):
         raise GradeFailure(
@@ -761,11 +774,6 @@ def grade(
     rules_locked = False
     try:
         inventory = load_public_inventory(workspace / "security" / "public-rules.json")
-        if not any(operation in {"list", "view"} for _, operation in inventory):
-            raise GradeFailure(
-                "rules.public_read_missing",
-                "Genesis requires at least one inventoried public read",
-            )
         if doctor is None:
             raise GradeFailure(
                 "rules.doctor_missing", "production doctor output is unavailable"

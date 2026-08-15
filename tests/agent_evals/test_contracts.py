@@ -98,10 +98,12 @@ def test_genesis_prompt_states_product_boundaries_exercised_by_the_grader():
     prompt = GENESIS_PROMPT.read_text().lower()
     required = (
         "anonymous visitors can browse",
+        "relation-expanded listing",
         "client or browser integration test",
         "production-shaped docker compose",
         "secure cookies enabled",
         "configure mail delivery",
+        "environment interpolation",
     )
     assert all(boundary in prompt for boundary in required)
 

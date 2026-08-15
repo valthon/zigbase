@@ -10,8 +10,10 @@ from evals.agents.graders.genesis import (
     SubprocessCommands,
     compare_public_rules,
     grade,
+    inspect_compose,
     load_public_inventory,
     parse_doctor_ndjson,
+    run_build_and_tests,
 )
 
 
@@ -271,15 +273,30 @@ def test_inventory_rejects_duplicate_empty_rationale_and_unknown_keys(tmp_path):
             load_public_inventory(path)
 
 
-def test_genesis_grade_requires_an_intentional_public_read(tmp_path):
+def test_rules_grade_accepts_filtered_anonymous_read_without_public_inventory(tmp_path):
     target = workspace(tmp_path)
     (target / "security" / "public-rules.json").write_text(
-        json.dumps({"zigbasePublicRules": 1, "rules": []})
+        json.dumps(
+            {
+                "zigbasePublicRules": 1,
+                "rules": [
+                    {
+                        "collection": "members",
+                        "operation": "create",
+                        "rule": "@public",
+                        "rationale": "open signup",
+                    }
+                ],
+            }
+        )
     )
-    report = grade_fixture(target, tmp_path / "artifacts", commands=FakeCommands())
-    assert report.rules_locked is False
-    assert any(
-        failure.code == "rules.public_read_missing" for failure in report.failures
+    commands = FakeCommands(doctor=doctor_output(subject="members.createRule"))
+
+    report = grade_fixture(target, tmp_path / "artifacts", commands=commands)
+
+    assert report.rules_locked is True
+    assert not any(
+        failure.code.startswith("rules.") for failure in report.failures
     )
 
 
@@ -294,6 +311,33 @@ def test_completion_source_limit_ignores_downloaded_zig_packages(tmp_path):
     assert not any(
         failure.code == "completion.source_limit" for failure in report.failures
     )
+
+
+def test_client_integration_script_is_an_accepted_project_test(tmp_path):
+    target = workspace(tmp_path)
+    (target / "package.json").write_text(
+        json.dumps({"scripts": {"test:integration": "node --test"}})
+    )
+    commands = FakeCommands()
+
+    _, tests_green, failures = run_build_and_tests(target, commands)
+
+    assert tests_green is True
+    assert failures == ()
+    assert ["npm", "run", "test:integration"] in commands.calls
+
+
+def test_compose_finds_application_beside_tls_proxy():
+    config = compose_config()
+    config["services"] = {
+        "gearshare": config["services"].pop("zigbase"),
+        "caddy": {
+            "image": "caddy:2.10.0-alpine",
+            "volumes": [{"type": "volume", "source": "caddy", "target": "/data"}],
+        },
+    }
+
+    assert inspect_compose(config) == "gearshare"
 
 
 def test_public_rule_comparison_rejects_stale_extra_and_doctor_errors():
