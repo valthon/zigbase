@@ -30,7 +30,7 @@ body is also sent on stdin.
 For a Codex CLI configured to load the skill:
 
 ```sh
-export ZIGBASE_AGENT_COMMAND_JSON='["codex","exec","--ephemeral","--sandbox","workspace-write","--approve-for-me","--skip-git-repo-check","-C","{workspace}","-"]'
+export ZIGBASE_AGENT_COMMAND_JSON='["codex","exec","--ephemeral","--approve-for-me","--skip-git-repo-check","-C","{workspace}","-"]'
 python3 -m evals.agents.run genesis --agent codex
 ```
 
