@@ -6,5 +6,10 @@ services:
     environment:
       ZIGBASE_PUBLIC_URL: https://gear.example.com
       ZIGBASE_SMTP_HOST: smtp.example.com
+    networks:
+      - backend
 volumes:
   data:
+networks:
+  backend:
+    internal: true

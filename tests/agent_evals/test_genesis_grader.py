@@ -138,8 +138,9 @@ def grade_fixture(workspace_path, artifacts, **kwargs):
 
 def test_positive_fixture_scores_four_and_always_tears_down(tmp_path):
     commands = FakeCommands()
+    artifacts = tmp_path / "artifacts"
     report = grade_fixture(
-        workspace(tmp_path), tmp_path / "artifacts", commands=commands
+        workspace(tmp_path), artifacts, commands=commands
     )
     assert (
         report.completion,
@@ -155,6 +156,7 @@ def test_positive_fixture_scores_four_and_always_tears_down(tmp_path):
     assert report.failures == ()
     assert any("down" in call for call in commands.calls)
     assert any("ps" in call for call in commands.calls)
+    assert "zigbase_eval" in (artifacts / "genesis-compose.override.yml").read_text()
 
 
 @pytest.mark.parametrize(

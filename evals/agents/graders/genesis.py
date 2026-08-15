@@ -699,6 +699,10 @@ def run_deployment(
             '      ZIGBASE_PUBLIC_URL: "https://eval.invalid"\n'
             '      ZIGBASE_JWT_SECRET: "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"\n'
             '      ZIGBASE_SMTP_HOST: "smtp.example.invalid"\n'
+            "    networks:\n"
+            "      zigbase_eval: {}\n"
+            "networks:\n"
+            "  zigbase_eval: {}\n"
         )
         stack = [*base, "-f", str(compose), "-f", str(override)]
         cleanup_required = True
