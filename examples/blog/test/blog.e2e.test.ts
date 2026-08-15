@@ -12,6 +12,18 @@ afterAll(() => server?.stop());
 interface Post { id: string; title: string; status: string; author: string }
 
 describe("blog — base @zigbase/client (Tier 1: dynamic)", () => {
+  it("serves the Zigapagos release from the runtime static directory", async () => {
+    const home = await fetch(`${server.url}/`);
+    expect(home.status).toBe(200);
+    const html = await home.text();
+    expect(html).toContain("ZigBase Blog");
+    expect(html).toContain("PostList.island");
+
+    const write = await fetch(`${server.url}/write/`);
+    expect(write.status).toBe(200);
+    expect(await write.text()).toContain("Sign in to write");
+  });
+
   it("signs up, authenticates, and does CRUD on posts", async () => {
     const zb = createClient(server.url);
 

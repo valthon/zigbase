@@ -78,7 +78,7 @@ configures in code:
    the warm-reader pool, scheduler worker count, and per-connection SQLite
    page-cache budget.
 
-8. **Fully embedded static frontend** via `embedStaticDir`. The Astro + React
+8. **Fully embedded static frontend** via `embedStaticDir`. The Zigapagos island
    build output in `frontend/dist` is compiled into the binary at build time via
    `.static_files = .{ .embedded = &@import("static_assets").files }` — there is
    no runtime dependency on the `frontend/dist` directory. The frontend shows
@@ -186,7 +186,8 @@ three-tier strategy.
 
 ```sh
 cd examples/plugins
-cd frontend && npm install && npm run build && cd ..
+./frontend/build.sh
+(cd frontend && ../../../scripts/zigapagos.sh doctor dist --format=json)
 mise exec zig@0.16.0 -- zig build
 ./zig-out/bin/plugins help
 # --insecure-cookies: local dev over plain HTTP (auth cookies are Secure by default).
@@ -199,6 +200,11 @@ ZIGBASE_FIELD_KEY=dev-only-field-key \
 ZIGBASE_PUBLIC_URL=http://localhost:8090 ./zig-out/bin/plugins serve --insecure-cookies
 # open http://127.0.0.1:8090/  (admin UI at /_/)
 ```
+
+The frontend has no local Node dependencies. The repository launcher fetches
+the exact Zigapagos v0.4.0 package through `npx`; the build enables its strict
+island-props gate and writes `frontend/dist` for `embedStaticDir`. The root
+package remains only for the example's TypeScript E2E and runtime-typegen tests.
 
 ### Rotating the field-encryption key (`zigbase rewrap`)
 
@@ -221,7 +227,7 @@ prefix); `ZIGBASE_FIELD_KEY_V<M>` supplies a read-only key for an older generati
 [docs/recipes.md](../../docs/recipes.md) ("encrypt a field at rest + key rotation") and
 [docs/framework.md](../../docs/framework.md) for the full rotation playbook.
 
-This demonstrates the **embedded** static-files mode: the Astro frontend is
+This demonstrates the **embedded** static-files mode: the Zigapagos frontend is
 compiled into the binary by `embedStaticDir` in `build.zig`. Delete
 `frontend/dist` after building — the site still serves from the binary.
 `--serve-static` is rejected as an unknown flag because the mode is

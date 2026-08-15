@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="description" content="$page.description">
+    <title :text="$page.title"></title>
+    <link rel="stylesheet" href="$site.asset('global.css').link()">
+  </head>
+  <body>
+    <header class="site">
+      <nav aria-label="Primary">
+        <a class="brand" href="/">GolfSim</a>
+        <a href="/">Listings</a>
+        <a href="/bookings/" aria-current="page">My bookings</a>
+        <a href="/_/">Admin</a>
+      </nav>
+    </header>
+    <main>
+      <h1 :text="$page.title"></h1>
+      <island src="src/components/MyBookings.island.tsx" client:load></island>
+    </main>
+  </body>
+</html>

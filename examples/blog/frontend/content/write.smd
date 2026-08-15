@@ -1,0 +1,10 @@
+---
+.title = "Write — ZigBase Blog",
+.description = "Sign in and publish a post through the ZigBase blog example.",
+.layout = "write.shtml",
+---
+
+# ✍ Write a Post ✍
+
+Publishing exercises the example's `beforeCreate` hook: leave the slug out and
+the server derives it from the title.

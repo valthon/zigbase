@@ -1,0 +1,9 @@
+---
+.title = "ZigBase plugins example",
+.description = "A fully embedded ZigBase frontend exercising plugins, auth, relations, and generated clients.",
+.layout = "index.shtml",
+---
+
+This page, its JavaScript, and its CSS are compiled into the executable through
+`embedStaticDir`. The finished binary has no runtime dependency on the frontend
+build directory.

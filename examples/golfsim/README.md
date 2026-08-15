@@ -14,7 +14,7 @@ library*: multi-collection relations with cascadeDelete, invariant-enforcing hoo
 (double-booking prevention), access rules with relation traversal, file uploads,
 WebSocket realtime, per-device session management (`ctx.auth()`), atomic multi-write
 transactions (`ctx.tx()`), outbound webhooks (`ctx.http()`), and multiple custom
-business routes — all with a working Astro + React frontend. That business logic is
+business routes — all with a working Zigapagos islands frontend. That business logic is
 covered by an in-process Zig test suite (`zig build test`, [`zigbase.testing`](../../docs/testing.md)),
 including a determinism test that freezes time and seeds id generation
 (`.fake_now_unix` / `.fake_seed`); a separate vitest e2e suite drives the **generated
@@ -185,7 +185,7 @@ ws.onopen = () => ws.send(JSON.stringify({ action: 'auth', token }));
 // on { type:"event", topic:"bookings", action, record } → call onEvent
 ```
 
-Returns a cleanup function (calls `ws.close()`) wired into a React `useEffect`
+Returns a cleanup function (calls `ws.close()`) wired into the island's `useEffect`
 teardown.
 
 ---
@@ -383,9 +383,15 @@ For raw SQL on a migration-owned table, acquire the pooled writer directly:
 
 ---
 
-## Frontend (Astro + React)
+## Frontend (Zigapagos v0.4.0 islands)
 
-`frontend/` is an Astro site with React islands:
+`frontend/` is a Zigapagos site with `@z/runtime` islands. The release command is
+pinned through [`scripts/zigapagos.sh`](../../scripts/zigapagos.sh), and its output
+continues to land in `frontend/dist` for the comptime static-directory proof:
+
+`zigapagos doctor` reports the expected dangling-link warnings for `/_/` and the
+Google OAuth authorize route because those paths are supplied dynamically by the
+same ZigBase process rather than emitted into the static tree. It reports no errors.
 
 - **`ListingsBrowser`** — sign in, browse listings with photo gallery, check
   availability (lazy via `/api/listings/:id/availability`), book a slot, upload
@@ -489,7 +495,7 @@ const health = await zb.rpc.golfsimHealth();
 
 ```sh
 mise exec zig@0.16.0 -- zig build test              # in-process, no socket
-cd frontend && npm install && npm run build && cd .. # the app needs frontend/dist to boot at all
+cd frontend && ../../../scripts/zigapagos.sh validate --format=json && ./build.sh && ../../../scripts/zigapagos.sh doctor dist --format=json && cd ..
 mise exec node@24 -- npm install && npm run test:e2e # real server, real generated client
 ```
 
@@ -618,8 +624,12 @@ Two indexes are provisioned at startup via comptime `.indexes`:
 ## Building and running
 
 ```sh
-# 1. Build the frontend
-cd frontend && npm install && npm run build && cd ..
+# 1. Validate and build the pinned Zigapagos v0.4.0 frontend
+cd frontend
+../../../scripts/zigapagos.sh validate --format=json
+./build.sh
+../../../scripts/zigapagos.sh doctor dist --format=json
+cd ..
 
 # 2. Build the backend
 mise exec zig@0.16.0 -- zig build          # -> ./zig-out/bin/golfsim

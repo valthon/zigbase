@@ -11,6 +11,31 @@ beforeAll(async () => { server = await startPlugins(); }, 120_000);
 afterAll(() => server?.stop());
 
 describe("plugins — comptime static_routes SPA fallback (#183)", () => {
+  it("serves the Zigapagos release embedded in the executable at GET /", async () => {
+    const res = await fetch(`${server.url}/`);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type") ?? "").toContain("text/html");
+    const body = await res.text();
+    expect(body).toContain("Everything in one binary");
+    expect(body).toContain("data-z-island");
+    expect(body).toContain("/islands/Browser.island.js");
+  });
+
+  it("keeps the authors, posts, comments, and commenter-auth API flows reachable", async () => {
+    for (const collection of ["authors", "posts", "comments"]) {
+      const res = await fetch(`${server.url}/api/collections/${collection}/records`);
+      expect(res.status, collection).toBe(200);
+      expect((await res.json()) as { items?: unknown[] }).toHaveProperty("items");
+    }
+
+    const login = await fetch(`${server.url}/api/collections/commenters/auth/magic_link/initiate`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ identity: "zigapagos-plugin-test@example.com" }),
+    });
+    expect(login.status).toBe(204);
+  });
+
   it("serves the embedded shell for a deep link under /app/", async () => {
     const res = await fetch(`${server.url}/app/some/deep/client/route`);
     expect(res.status).toBe(200);

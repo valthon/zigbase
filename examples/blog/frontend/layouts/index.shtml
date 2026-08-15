@@ -1,0 +1,25 @@
+<extend template="base.shtml">
+<head id="head"></head>
+<main id="main-content">
+  <div :html="$page.content()"></div>
+
+  <p class="visitor-line">
+    You are visitor&nbsp;
+    <span class="hit-counter">00013847</span>
+    &nbsp;to this rad homepage!
+  </p>
+
+  <div class="badges" aria-label="Site badges">
+    <span class="badge construction"><span class="blink">⚠ UNDER CONSTRUCTION ⚠</span></span>
+    <span class="badge netscape">BEST VIEWED IN<br>NETSCAPE 4.0</span>
+    <span class="badge html">VALID<br>HTML 3.2</span>
+    <span class="badge made">MADE ON<br>A ZIG 🦎</span>
+  </div>
+
+  <p class="muted">
+    Served by the <code>blog</code> binary itself: the Zigapagos release output is
+    handed to <code>--serve-static frontend/dist</code> — ZigBase's default
+    runtime static-files mode.
+  </p>
+  <island src="components/PostList.island.tsx" client:load></island>
+</main>

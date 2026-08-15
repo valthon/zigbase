@@ -1,0 +1,8 @@
+---
+.title = "Book a golf simulator",
+.description = "Browse local simulator bays, check availability, and reserve a tee time.",
+.layout = "listings.shtml",
+---
+
+This frontend ships with the binary's **comptime-hardcoded** static directory
+(`.static_files = .{ .dir = "frontend/dist" }`) — no runtime flag needed.
