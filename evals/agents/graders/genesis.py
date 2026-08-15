@@ -5,13 +5,15 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import socket
+import subprocess
 import urllib.error
 import urllib.request
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
 from ..process import run_process
 from ..result import EvalFailure
@@ -43,10 +45,53 @@ class Commands(Protocol):
     ) -> CommandResult: ...
 
 
+def _resolve_mise_executable(spec: str, relative: str) -> str:
+    """Resolve a pinned mise tool before commands enter the isolated HOME."""
+    mise = shutil.which("mise")
+    if mise is None:
+        conventional = Path.home() / ".local" / "bin" / "mise"
+        if conventional.is_file() and os.access(conventional, os.X_OK):
+            mise = str(conventional)
+    if mise is None:
+        raise OSError("mise is required to resolve the Genesis grader toolchain")
+
+    completed = subprocess.run(
+        [mise, "where", spec],
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=30,
+    )
+    if completed.returncode != 0 or not completed.stdout.strip():
+        detail = completed.stderr.strip() or "tool is not installed"
+        raise OSError(f"cannot resolve {spec} with mise: {detail}")
+    executable = Path(completed.stdout.strip()) / relative
+    if not executable.is_file() or not os.access(executable, os.X_OK):
+        raise OSError(f"mise resolved {spec}, but {relative} is not executable")
+    return str(executable)
+
+
 class SubprocessCommands:
-    def __init__(self, artifacts: Path) -> None:
+    def __init__(
+        self,
+        artifacts: Path,
+        tool_resolver: Callable[[str, str], str] = _resolve_mise_executable,
+    ) -> None:
         self.artifacts = artifacts
         self.index = 0
+        self.tool_resolver = tool_resolver
+        self.tools: dict[str, str] = {}
+
+    def _resolve_command(self, argv: list[str]) -> list[str]:
+        pins = {
+            "zig": ("zig@0.16.0", "zig"),
+            "npm": ("node@24", "bin/npm"),
+        }
+        if argv[0] not in pins:
+            return argv
+        if argv[0] not in self.tools:
+            self.tools[argv[0]] = self.tool_resolver(*pins[argv[0]])
+        return [self.tools[argv[0]], *argv[1:]]
 
     def run(
         self,
@@ -56,6 +101,7 @@ class SubprocessCommands:
         env: dict[str, str] | None = None,
         timeout: int = 300,
     ) -> CommandResult:
+        argv = self._resolve_command(argv)
         self.index += 1
         stem = f"grader-{self.index:02d}-{re.sub(r'[^a-z0-9]+', '-', Path(argv[0]).name.lower())}"
         stdout_path = self.artifacts / f"{stem}.stdout.log"
@@ -63,6 +109,10 @@ class SubprocessCommands:
         child_env = _grader_environment(cwd)
         if env:
             child_env.update(env)
+        if Path(argv[0]).is_absolute():
+            child_env["PATH"] = os.pathsep.join(
+                (str(Path(argv[0]).parent), child_env.get("PATH", ""))
+            )
         result = run_process(
             argv,
             cwd=cwd,
@@ -404,9 +454,7 @@ def run_build_and_tests(
     workspace: Path, commands: Commands
 ) -> tuple[bool, bool, tuple[EvalFailure, ...]]:
     failures = []
-    build = commands.run(
-        ["mise", "exec", "zig@0.16.0", "--", "zig", "build"], cwd=workspace
-    )
+    build = commands.run(["zig", "build"], cwd=workspace)
     completion = (
         build.returncode == 0 and not build.timed_out and not build.output_truncated
     )
@@ -415,9 +463,7 @@ def run_build_and_tests(
             _failure("completion.build_failed", "zig build failed or timed out")
         )
 
-    unit = commands.run(
-        ["mise", "exec", "zig@0.16.0", "--", "zig", "build", "test"], cwd=workspace
-    )
+    unit = commands.run(["zig", "build", "test"], cwd=workspace)
     tests_green = (
         unit.returncode == 0 and not unit.timed_out and not unit.output_truncated
     )

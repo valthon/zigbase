@@ -7,6 +7,7 @@ import pytest
 from evals.agents.graders.genesis import (
     CommandResult,
     GradeFailure,
+    SubprocessCommands,
     compare_public_rules,
     grade,
     load_public_inventory,
@@ -174,6 +175,33 @@ def test_command_failures_are_independent(tmp_path):
     assert unit.completion is True
     assert unit.tests_green is False
     assert unit.deployed is True
+
+
+def test_subprocess_commands_resolve_pinned_tools_before_home_isolation(tmp_path):
+    workspace_path = tmp_path / "workspace"
+    workspace_path.mkdir()
+    (workspace_path / ".home").mkdir()
+    (workspace_path / ".tmp").mkdir()
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir()
+    tool_dir = tmp_path / "trusted-tools"
+    (tool_dir / "bin").mkdir(parents=True)
+    zig = tool_dir / "zig"
+    npm = tool_dir / "bin" / "npm"
+    zig.write_text("#!/bin/sh\nprintf 'zig-direct\\n'\n")
+    npm.write_text("#!/bin/sh\nprintf 'npm-direct\\n'\n")
+    zig.chmod(0o755)
+    npm.chmod(0o755)
+    resolved = []
+
+    def resolver(spec, relative):
+        resolved.append((spec, relative))
+        return str(tool_dir / relative)
+
+    commands = SubprocessCommands(artifacts, tool_resolver=resolver)
+    assert commands.run(["zig", "version"], cwd=workspace_path).stdout == "zig-direct\n"
+    assert commands.run(["npm", "--version"], cwd=workspace_path).stdout == "npm-direct\n"
+    assert resolved == [("zig@0.16.0", "zig"), ("node@24", "bin/npm")]
 
 
 def test_health_timeout_still_tears_down(tmp_path):
