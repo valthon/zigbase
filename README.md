@@ -344,6 +344,7 @@ examples/
 - [docs/framework.md](docs/framework.md) — embedding ZigBase: hooks, routes, jobs, static-file modes
 - [docs/serve.md](docs/serve.md) — running the server: background sessions, `stop`/`status`/`logs`, ephemeral instances, and the `doctor` preflight
 - [docs/deployment.md](docs/deployment.md) — systemd, Docker Compose, reverse-proxy TLS, Fly, Railway, backups, upgrades, and rollback
+- [docs/agent-evals.md](docs/agent-evals.md) — run the provider-neutral Genesis agent evaluation, interpret deterministic grades, and preserve three-run release evidence
 - [docs/typescript-sdk.md](docs/typescript-sdk.md) — the official `@zigbase/client` TypeScript SDK: auth, records, offset + cursor pagination, files, realtime + live store
 - [docs/dart-sdk.md](docs/dart-sdk.md) — the official `zigbase_client` Dart SDK: auth, records, offset + cursor pagination, files, and realtime, for the Dart VM, Flutter, and Flutter web
 - [docs/python-sdk.md](docs/python-sdk.md) — the official `zigbase` Python SDK: sync and async clients for auth, records, offset + cursor pagination, and files

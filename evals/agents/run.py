@@ -17,6 +17,7 @@ import tempfile
 import time
 import uuid
 from collections.abc import Callable, Sequence
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from .graders import GradeReport, grade
@@ -322,9 +323,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             output = resolve_output_path(args.out, args.artifacts_dir)
             output.parent.mkdir(parents=True, exist_ok=True)
             output.write_text(rendered + "\n")
-        except (ResultError, OSError):
+        except (ResultError, OSError) as exc:
             # Stdout remains authoritative when the optional copy cannot be
             # written; never emit a second object or a transcript.
+            result = replace(
+                result,
+                failures=(*result.failures, EvalFailure("harness.output", str(exc))),
+            )
+            rendered = result.to_json()
             exit_code = 1
     print(rendered)
     return exit_code

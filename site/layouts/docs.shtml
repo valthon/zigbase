@@ -48,6 +48,7 @@
           <li><a href="$site.page('docs/api').link()">API</a></li>
           <li><a href="$site.page('docs/fields').link()">Fields</a></li>
           <li><a href="$site.page('docs/observability').link()">Observability</a></li>
+          <li><a href="$site.page('docs/agent-evals').link()">Agent evaluations</a></li>
           <li><a href="$site.page('docs/known-limitations').link()">Known limitations</a></li>
           <li><a href="$site.page('docs/changelog').link()">Changelog</a></li>
         </ul>

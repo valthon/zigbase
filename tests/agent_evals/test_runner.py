@@ -299,3 +299,34 @@ def test_cli_harness_failure_uses_stable_result_contract(tmp_path):
         "failures",
     ]
     assert payload["failures"][0]["code"] == "harness.error"
+
+
+def test_cli_output_escape_fails_closed_in_the_single_result(tmp_path):
+    env = os.environ.copy()
+    env["ZIGBASE_AGENT_COMMAND_JSON"] = json.dumps(
+        [sys.executable, str(FAKE_AGENT), "nonzero"]
+    )
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "evals.agents.run",
+            "genesis",
+            "--artifacts-dir",
+            str(tmp_path / "artifacts"),
+            "--out",
+            "../escaped.json",
+        ],
+        cwd=REPO,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert completed.returncode == 1
+    assert not (tmp_path / "escaped.json").exists()
+    payload = json.loads(completed.stdout)
+    assert [failure["code"] for failure in payload["failures"]] == [
+        "agent.nonzero",
+        "harness.output",
+    ]

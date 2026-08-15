@@ -30,6 +30,16 @@
     }
   },
   {
+    "canonical": "docs/agent-evals.md",
+    "mirror": "agent-evals.md",
+    "frontmatter": {
+      "title": "Agent evaluations",
+      "description": "Run ZigBase's provider-neutral Genesis evaluation, understand deterministic grades, and preserve three-run release evidence without committing transcripts.",
+      "order": 6,
+      "group": "reference"
+    }
+  },
+  {
     "canonical": "docs/app-genesis.md",
     "mirror": "app-genesis.md",
     "frontmatter": {
