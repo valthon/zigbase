@@ -16,7 +16,8 @@ Keep these true on every platform:
    put `serve --background` inside another supervisor.
 2. **Persist the whole data directory.** SQLite's database, uploaded files, and the generated
    `.jwt_secret` live below `ZIGBASE_DATA_DIR`. Losing only the secret logs every user out; losing
-   the rest loses application state.
+   the rest loses application state. A custom non-root image must create `/data` owned by its
+   runtime uid/gid before declaring or mounting the volume; see [docker.md](docker.md).
 3. **Use one SQLite writer process.** A mounted disk is not a replicated database. Run one ZigBase
    instance with SQLite. Move to the PostgreSQL backend before adding application replicas; see
    [postgres.md](postgres.md).

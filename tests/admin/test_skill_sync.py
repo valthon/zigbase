@@ -11,6 +11,7 @@ REFERENCE_NAMES = (
     "agents.md",
     "app-genesis.md",
     "deployment.md",
+    "docker.md",
     "serve.md",
     "testing.md",
 )
@@ -26,6 +27,8 @@ def validate_skill(repo: Path) -> list[str]:
     body = skill_md.read_text()
     if len(body.splitlines()) > 500:
         errors.append("skill.oversized")
+    if "references/docker.md" not in body:
+        errors.append("skill.docker_reference")
     if not body.startswith("---\n") or "\n---\n" not in body[4:]:
         errors.append("skill.frontmatter")
     else:
@@ -87,6 +90,7 @@ def test_app_genesis_skill_is_valid_and_synced():
         ("missing_description", "skill.description"),
         ("oversized", "skill.oversized"),
         ("missing_metadata", "skill.metadata_missing"),
+        ("missing_docker_guidance", "skill.docker_reference"),
     ],
 )
 def test_guard_fails_for_each_supported_drift(tmp_path, mutation, expected):
@@ -115,5 +119,8 @@ def test_guard_fails_for_each_supported_drift(tmp_path, mutation, expected):
         path.write_text(path.read_text() + ("extra\n" * 501))
     elif mutation == "missing_metadata":
         (skill / "agents" / "openai.yaml").unlink()
+    elif mutation == "missing_docker_guidance":
+        path = skill / "SKILL.md"
+        path.write_text(path.read_text().replace("references/docker.md", "references/deployment.md"))
 
     assert expected in validate_skill(subject)

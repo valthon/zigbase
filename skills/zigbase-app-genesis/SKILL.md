@@ -15,7 +15,8 @@ Read only the additional references the task needs:
 
 - `references/testing.md` before creating or changing tests.
 - `references/serve.md` before running, diagnosing, or configuring a server.
-- `references/deployment.md` before producing deployment files or launch advice.
+- `references/deployment.md` and `references/docker.md` before producing deployment files or
+  launch advice. Custom non-root images must create a writable `/data` mountpoint before `USER`.
 
 The copied references are authoritative for this skill. If the repository also contains canonical `docs/` versions, do not silently combine versions that differ; report the mismatch.
 

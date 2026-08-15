@@ -242,6 +242,10 @@ Run the gates in this order so the cheapest and most actionable failures arrive 
 7. verify `/api/health` and `/api/meta` through the same network path clients use; and
 8. stop and restart it, proving the data and JWT secret survive.
 
+For a custom non-root application image, create `/data` with the runtime uid/gid before `USER` and
+before mounting a named volume. Keep `serve` in the foreground. A successful image build or a
+version-only healthcheck does not prove that the mounted data directory is writable or HTTP-ready.
+
 Do not report a queued CI job as green, a successful build as passing browser tests, or a healthy
 process as a production-safe configuration. Report the exact commands run and any gate not run.
 
