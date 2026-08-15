@@ -303,7 +303,7 @@ def _check_snapshot_shape(
         )
         if (collection.get("type") or "base") == "auth":
             expected_columns.update(
-                {"email", "emailVisibility", "verified", "passwordHash", "tokenKey"}
+                {"email", "emailVisibility", "verified", "password", "tokenKey"}
             )
         missing = sorted(expected_columns - columns)
         if missing:
@@ -1312,7 +1312,7 @@ def _row_query(
     if (collection.get("type") or "base") == "auth":
         selected.extend(
             name
-            for name in ("email", "username", "verified", "passwordHash")
+            for name in ("email", "username", "verified", "password")
             if name in columns
         )
     selected.extend(str(field["name"]) for field in source_fields)
@@ -1364,7 +1364,7 @@ def _write_ndjson_rows(
                         f"record {collection['name']}.{record_id} has missing source timestamps"
                     )
                 if (collection.get("type") or "base") == "auth":
-                    password_hash = raw.get("passwordHash")
+                    password_hash = raw.get("password")
                     if not isinstance(password_hash, str) or not BCRYPT.fullmatch(
                         password_hash
                     ):

@@ -45,7 +45,7 @@ def pocketbase_snapshot(tmp_path):
                             "email TEXT",
                             "emailVisibility INTEGER",
                             "verified INTEGER",
-                            "passwordHash TEXT",
+                            "password TEXT",
                             "tokenKey TEXT",
                         ]
                     )
