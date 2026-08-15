@@ -780,3 +780,48 @@ test "run: a manifest entry's upsertKey cannot smuggle past the create-only lega
     try std.testing.expect(try st.step());
     try std.testing.expectEqual(@as(i64, 0), st.columnInt(0));
 }
+
+test "run: manifest forwards source timestamp preservation and rejects entry upserts" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try migrations.run(&d);
+    var app = import.testApp(a, io);
+    const items = try collections.create(a, io, &d, .{
+        .id = "",
+        .name = "items",
+        .fields = &.{.{ .id = "", .name = "slug", .options = .{ .text = .{} } }},
+    });
+    defer items.deinit(a);
+
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    try dir.dir.writeFile(io, .{ .sub_path = "items.ndjson", .data =
+        \\{"id":"itemtime000001","created":"2005-01-02T03:04:05Z","updated":"2006-02-03T04:05:06Z","slug":"one"}
+        \\
+    });
+    const base = try dir.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(base);
+
+    var plain = try parseManifest(a,
+        \\{"zigbaseImportManifest":1,"collections":[{"collection":"items","file":"items.ndjson"}]}
+    );
+    defer plain.deinit();
+    const rep = try run(&app, &d, io, a, plain, .{ .base_dir = base, .import = .{ .collection = "", .preserve_timestamps = true } });
+    defer a.free(rep.entries);
+    var st = try d.prepare("SELECT created, updated FROM items WHERE id='itemtime000001';");
+    defer st.finalize();
+    try std.testing.expect(try st.step());
+    try std.testing.expectEqualStrings("2005-01-02T03:04:05Z", st.columnText(0));
+    try std.testing.expectEqualStrings("2006-02-03T04:05:06Z", st.columnText(1));
+
+    var upsert = try parseManifest(a,
+        \\{"zigbaseImportManifest":1,"collections":[{"collection":"items","file":"items.ndjson","upsertKey":"slug"}]}
+    );
+    defer upsert.deinit();
+    try std.testing.expectError(
+        import.ImportError.TimestampRequiresCreateOnly,
+        run(&app, &d, io, a, upsert, .{ .base_dir = base, .import = .{ .collection = "", .preserve_timestamps = true } }),
+    );
+}

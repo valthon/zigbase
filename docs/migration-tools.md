@@ -436,10 +436,18 @@ backfilled. A **required** field on a cycle back-edge or self-relation is refuse
 - **`--progress N`** — print a heartbeat to stderr every N rows (`0` = off).
 - **`--json`** — print the run summary as one JSON object on stdout instead of (or
   alongside) the human log line: `{"zigbase_import":1,"collection":"...","dry_run":...,
-  "created":N,"updated":N,"failed":N,"total":N,"error_log":"..."}`. `import --manifest`'s
+  "preserve_timestamps":false,"created":N,"updated":N,"failed":N,"total":N,
+  "error_log":"..."}`. `import --manifest`'s
   summary uses the `zigbase_import_manifest` discriminator instead, plus a `collections`
   array of per-entry counts and a `patched` count (rows whose deferred relation value was
   backfilled in the second pass).
+- **`--preserve-timestamps`** — preserve each row's source `created` and `updated` strings
+  after validating them as dates. Every row must carry those two values and a non-empty `id`.
+  This is a create-only migration seam: it requires id preservation and refuses
+  `--upsert-key` (including a manifest entry's `upsertKey`). The record is still created
+  through the normal engine; only those two system columns are replaced inside the same
+  transaction. HTTP, route, hook, and ordinary import writes remain unable to author system
+  timestamps.
 
 ### Exit codes
 
