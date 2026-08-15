@@ -444,6 +444,37 @@ def test_user_autodate_requires_history_preserving_date_decision(
     )
 
 
+def test_conventional_pocketbase_timestamps_are_system_import_seams(
+    pocketbase_snapshot, tmp_path
+):
+    timestamps = [
+        {
+            "id": "created_field_1",
+            "name": "created",
+            "type": "autodate",
+            "onCreate": True,
+            "onUpdate": False,
+            "system": False,
+        },
+        {
+            "id": "updated_field_1",
+            "name": "updated",
+            "type": "autodate",
+            "onCreate": True,
+            "onUpdate": True,
+            "system": False,
+        },
+    ]
+    collection = base_collection(fields=[*timestamps, *base_collection()["fields"]])
+    schema, pb_data = pocketbase_snapshot([collection])
+    assert inventory_findings([collection], pb_data) == []
+    decisions = write_decisions(tmp_path / "decisions.json", [])
+    out = tmp_path / "bundle"
+    pb2zb.extract_bundle(schema, pb_data, decisions, out)
+    fields = json.loads((out / "schema.json").read_text())["collections"][0]["fields"]
+    assert [field["name"] for field in fields] == ["title"]
+
+
 def test_omitting_a_relation_target_refuses_a_dangling_target_schema(
     pocketbase_snapshot, tmp_path
 ):

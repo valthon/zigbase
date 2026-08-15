@@ -33,7 +33,10 @@ def pocketbase_snapshot(tmp_path):
                 kind = collection.get("type") or "base"
                 columns = ["id TEXT PRIMARY KEY", "created TEXT", "updated TEXT"]
                 for field in collection.get("fields", []):
-                    if not field.get("system"):
+                    if not field.get("system") and field.get("name") not in {
+                        "created",
+                        "updated",
+                    }:
                         storage = {
                             "bool": "INTEGER",
                             "number": "INTEGER" if field.get("onlyInt") else "REAL",

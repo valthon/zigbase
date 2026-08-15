@@ -194,8 +194,8 @@ Single and multi relation/select/file values retain their string/JSON-array shap
 
 Additional rules:
 
-- PocketBase system fields already supplied by ZigBase (`id`, `created`, `updated`, auth email,
-  token key, password) are not duplicated as user fields.
+- PocketBase fields already supplied by ZigBase (`id`, the conventional `created`/`updated`
+  autodates, auth email, token key, and password) are not duplicated as user fields.
 - `passwordHash` is emitted only in auth NDJSON; PocketBase token keys and session state are never
   copied.
 - `verified` and email visibility are carried when ZigBase has the corresponding auth field.

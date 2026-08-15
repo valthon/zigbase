@@ -335,6 +335,18 @@ def _parse_simple_index(
     }
 
 
+def _is_pocketbase_auth_system_index(index: str, collection: dict[str, Any]) -> bool:
+    if (collection.get("type") or "base") != "auth":
+        return False
+    normalized = " ".join(index.replace("`", "").replace('"', "").split())
+    collection_id = str(collection["id"])
+    name = str(collection["name"])
+    return normalized in {
+        f"CREATE UNIQUE INDEX idx_tokenKey_{collection_id} ON {name} (tokenKey)",
+        f"CREATE UNIQUE INDEX idx_email_{collection_id} ON {name} (email) WHERE email != ''",
+    }
+
+
 def _finding_id(*parts: str) -> str:
     return ".".join(part.replace(".", "_") for part in parts)
 
@@ -358,6 +370,13 @@ def _field_option_finding(
         ("replacement", "omit"),
         True,
     )
+
+
+def _is_source_timestamp_field(field: dict[str, Any]) -> bool:
+    return field.get("type") == "autodate" and field.get("name") in {
+        "created",
+        "updated",
+    }
 
 
 def _unsupported_field_options(
@@ -497,6 +516,8 @@ def collect_findings(collections: list[dict[str, Any]], pb_data: Path) -> list[F
             field_type = str(field["type"])
             if bool(field.get("system")):
                 continue
+            if _is_source_timestamp_field(field):
+                continue
             if field_type == "file":
                 has_file_fields = True
             if field_type == "autodate":
@@ -572,6 +593,8 @@ def collect_findings(collections: list[dict[str, Any]], pb_data: Path) -> list[F
                 )
 
         for index_number, index in enumerate(collection.get("indexes", [])):
+            if _is_pocketbase_auth_system_index(str(index), collection):
+                continue
             if _parse_simple_index(str(index), name, field_names) is None:
                 index_id = hashlib.sha256(str(index).encode()).hexdigest()[:16]
                 findings.append(
@@ -1071,7 +1094,7 @@ def _map_collection(
             (
                 field
                 for field in collection.get("fields", [])
-                if not field.get("system")
+                if not field.get("system") and not _is_source_timestamp_field(field)
             ),
             key=lambda item: (str(item["name"]), str(item["id"])),
         )
@@ -1090,6 +1113,8 @@ def _map_collection(
     field_names = {str(field["name"]) for field in collection.get("fields", [])}
     indexes: list[dict[str, Any]] = []
     for index in collection.get("indexes", []):
+        if _is_pocketbase_auth_system_index(str(index), collection):
+            continue
         parsed = _parse_simple_index(
             str(index),
             str(collection["name"]),
@@ -1295,7 +1320,7 @@ def _source_to_target_fields(
 ) -> list[tuple[dict[str, Any], dict[str, Any]]]:
     pairs: list[tuple[dict[str, Any], dict[str, Any]]] = []
     for field in collection.get("fields", []):
-        if field.get("system"):
+        if field.get("system") or _is_source_timestamp_field(field):
             continue
         mapped = _map_field(
             field, collection, collection_names, findings, decisions, decisions_path
