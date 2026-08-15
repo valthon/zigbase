@@ -5,9 +5,12 @@ idea into a secure, tested, deployed application. The harness runs a user-suppli
 isolated workspace and grades artifacts and executable behavior. It does not inspect the agent's
 transcript or trust the agent's self-report.
 
-The Genesis scenario is currently an experimental development surface. Deterministic harness tests
-block CI; real-agent runs are opt-in and do not become a release claim until one commit produces
-three consecutive score-4 runs with zero interventions.
+The Genesis flagship passed its release gate on 2026-08-15: commit `3f3224d5` produced three
+consecutive score-4 runs with zero interventions using `codex-cli-0.147-default`. The sanitized
+summaries are preserved under
+[`evals/agents/evidence/genesis/2026-08-15-3f3224d5/`](../evals/agents/evidence/genesis/2026-08-15-3f3224d5/).
+Deterministic harness tests block CI; real-agent runs remain opt-in so model tokens and credentials
+are never required by ordinary builds.
 
 ## Install the skill
 
@@ -108,3 +111,6 @@ or grader and add a deterministic regression test before restarting.
 The flagship criterion is three consecutive results from the same commit where all four booleans
 are true, `score` is 4, `interventions` is 0, and `failures` is empty. Preserve those sanitized
 summaries and record the agent/model identifier supplied to `--agent`.
+
+The first qualifying set is the 2026-08-15 `3f3224d5` evidence linked above. Raw transcripts and
+scenario workspaces were kept out of the repository.

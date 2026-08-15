@@ -15,6 +15,9 @@ from evals.agents.scenario import AgentScenario, ScenarioError
 REPO = Path(__file__).resolve().parents[2]
 GENESIS = REPO / "evals" / "agents" / "scenarios" / "genesis" / "scenario.json"
 GENESIS_PROMPT = GENESIS.with_name("prompt.md")
+GENESIS_EVIDENCE = (
+    REPO / "evals" / "agents" / "evidence" / "genesis" / "2026-08-15-3f3224d5"
+)
 
 
 def result_dict():
@@ -77,6 +80,30 @@ def test_result_rejects_inconsistent_score():
     value["score"] = 3
     with pytest.raises(ResultError, match="score"):
         EvalResult.from_dict(value)
+
+
+def test_first_genesis_release_evidence_is_three_clean_consecutive_runs():
+    files = sorted(GENESIS_EVIDENCE.glob("run-*.json"))
+    assert [path.name for path in files] == ["run-1.json", "run-2.json", "run-3.json"]
+
+    results = [EvalResult.from_json(path.read_text()) for path in files]
+    assert {result.commit for result in results} == {
+        "3f3224d50d2bc8e45b3888011ac118397103cd75"
+    }
+    assert all(
+        result.scenario == "genesis"
+        and result.agent == "codex-cli-0.147-default"
+        and result.agent_exit == 0
+        and not result.timed_out
+        and result.interventions == 0
+        and result.completion
+        and result.rules_locked
+        and result.tests_green
+        and result.deployed
+        and result.score == 4
+        and result.failures == ()
+        for result in results
+    )
 
 
 def test_output_path_stays_below_selected_root(tmp_path):
