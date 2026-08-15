@@ -29,6 +29,7 @@ def scenario(**overrides):
         "name": "runner-test",
         "prompt": "prompt.md",
         "fixture": None,
+        "skills": ["zigbase-app-genesis"],
         "graders": ["genesis"],
         "timeout_seconds": 2,
         "term_grace_seconds": 1,
@@ -51,6 +52,9 @@ def passing_grader(names, workspace, artifacts):
     payload = json.loads((workspace / "agent-result.json").read_text())
     assert payload["stdin"] == "build the test app"
     assert payload["home"] == str(workspace / ".home")
+    assert (
+        workspace / ".agents" / "skills" / "zigbase-app-genesis" / "SKILL.md"
+    ).is_file()
     assert artifacts.is_dir()
     return GradeReport(True, True, True, True)
 
@@ -136,6 +140,24 @@ def test_execute_reports_nonzero_and_timeout(tmp_path, mode, expected_code, time
     assert exit_code == 1
     assert result.timed_out is timed_out
     assert result.failures[0].code == expected_code
+
+
+def test_execute_fails_closed_when_declared_skill_is_missing(tmp_path):
+    root = make_scenario_root(tmp_path)
+    result, exit_code = execute(
+        scenario=scenario(skills=["missing-skill"]),
+        scenario_root=root,
+        command_raw=json.dumps([sys.executable, str(FAKE_AGENT), "success"]),
+        artifacts_root=tmp_path / "artifacts",
+        agent_name="fake",
+        interventions=0,
+        passed_env=[],
+        work_root=tmp_path,
+    )
+    assert exit_code == 1
+    assert result.agent_exit == -1
+    assert result.failures[0].code == "harness.error"
+    assert "missing-skill" in result.failures[0].message
 
 
 def test_execute_caps_combined_output(tmp_path):

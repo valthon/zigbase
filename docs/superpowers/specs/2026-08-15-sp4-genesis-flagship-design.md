@@ -98,7 +98,7 @@ The runner accepts an agent command as a JSON argv array through
 `{workspace}` and `{prompt}`. Example:
 
 ```sh
-export ZIGBASE_AGENT_COMMAND_JSON='["codex","exec","--full-auto","-C","{workspace}","-"]'
+export ZIGBASE_AGENT_COMMAND_JSON='["codex","exec","--ephemeral","--sandbox","workspace-write","--approve-for-me","--skip-git-repo-check","-C","{workspace}","-"]'
 python evals/agents/run.py genesis
 ```
 

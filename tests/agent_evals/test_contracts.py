@@ -89,6 +89,7 @@ def test_output_path_stays_below_selected_root(tmp_path):
 def test_genesis_scenario_loads():
     scenario = AgentScenario.load(GENESIS)
     assert scenario.name == "genesis"
+    assert scenario.skills == ("zigbase-app-genesis",)
     assert scenario.graders == ("genesis",)
 
 

@@ -28,6 +28,7 @@ class AgentScenario:
     name: str
     prompt: str
     fixture: str | None
+    skills: tuple[str, ...]
     graders: tuple[str, ...]
     timeout_seconds: int
     term_grace_seconds: int
@@ -40,6 +41,7 @@ class AgentScenario:
         "name",
         "prompt",
         "fixture",
+        "skills",
         "graders",
         "timeout_seconds",
         "term_grace_seconds",
@@ -64,6 +66,13 @@ class AgentScenario:
         _relative_path(self.prompt, "prompt")
         if self.fixture is not None:
             _relative_path(self.fixture, "fixture")
+        if not isinstance(self.skills, tuple) or not self.skills:
+            raise ScenarioError("skills must be a non-empty array")
+        if len(set(self.skills)) != len(self.skills) or not all(
+            isinstance(name, str) and re.fullmatch(r"[a-z0-9][a-z0-9-]*", name)
+            for name in self.skills
+        ):
+            raise ScenarioError("skills must contain unique lowercase names")
         if not isinstance(self.graders, tuple) or not self.graders:
             raise ScenarioError("graders must be a non-empty array")
         if len(set(self.graders)) != len(self.graders) or not all(
@@ -90,8 +99,11 @@ class AgentScenario:
         if not isinstance(value, dict) or set(value) != set(cls.FIELDS):
             raise ScenarioError(f"scenario fields must be exactly {list(cls.FIELDS)}")
         prepared = dict(value)
-        if not isinstance(prepared["graders"], list):
-            raise ScenarioError("graders must be an array")
+        if not isinstance(prepared["skills"], list) or not isinstance(
+            prepared["graders"], list
+        ):
+            raise ScenarioError("skills and graders must be arrays")
+        prepared["skills"] = tuple(prepared["skills"])
         prepared["graders"] = tuple(prepared["graders"])
         return cls(**prepared)
 

@@ -119,6 +119,20 @@ def copy_fixture(fixture: Path, workspace: Path) -> None:
     shutil.copytree(fixture, workspace, dirs_exist_ok=True)
 
 
+def install_skills(names: Sequence[str], workspace: Path) -> None:
+    destination_root = workspace / ".agents" / "skills"
+    for name in names:
+        source = REPO / "skills" / name
+        if not source.is_dir() or source.is_symlink():
+            raise HarnessError(f"scenario skill is missing or symlinked: {name}")
+        for path in source.rglob("*"):
+            if path.is_symlink():
+                raise HarnessError(
+                    f"scenario skill contains a symlink: {name}/{path.relative_to(source)}"
+                )
+        shutil.copytree(source, destination_root / name)
+
+
 def repository_commit() -> str:
     import subprocess
 
@@ -178,6 +192,7 @@ def execute(
             raise HarnessError("scenario prompt exceeds the runner byte limit")
         if scenario.fixture is not None:
             copy_fixture((scenario_root / scenario.fixture).resolve(), workspace)
+        install_skills(scenario.skills, workspace)
         env = child_environment(workspace, passed_env)
         completed = run_process(
             substitute_command(argv, workspace, prompt),

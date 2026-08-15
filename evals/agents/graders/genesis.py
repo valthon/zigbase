@@ -272,6 +272,7 @@ def _source_text(workspace: Path) -> str:
     pieces = []
     total = 0
     ignored = {
+        ".agents",
         ".git",
         ".zig-cache",
         "zig-out",
