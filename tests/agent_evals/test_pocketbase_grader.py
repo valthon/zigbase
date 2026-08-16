@@ -217,8 +217,12 @@ def test_positive_fixture_scores_four_and_tears_down(tmp_path):
     deployed_doctor = next(
         call for call in commands.calls if "exec" in call and "doctor" in call
     )
-    assert "/usr/local/bin/zigbase" in deployed_doctor
+    assert "/zigbase-eval" in deployed_doctor
     assert "/proc/1/exe" not in deployed_doctor
+    override = (tmp_path / "artifacts" / "pocketbase-compose.override.yml").read_text()
+    assert 'source: "zigbase"' in override
+    assert "target: /zigbase-eval" in override
+    assert "read_only: true" in override
     unittest_index = next(
         index for index, call in enumerate(commands.calls) if "unittest" in call
     )

@@ -453,6 +453,7 @@ def run_deployment(
     commands: Commands,
     port_picker: Callable[[], int] = _free_port,
     *,
+    binary_path: str | None = None,
     behavior_probe: Callable[..., None] = probe_behavior,
     http_request: Callable[..., tuple[int, bytes]] = _request,
     health_attempts: int = 30,
@@ -465,6 +466,7 @@ def run_deployment(
     base = ["docker", "compose", "-p", project]
     override = artifacts / "pocketbase-compose.override.yml"
     try:
+        binary = binary_path or _binary()
         compose = _compose_file(workspace)
         environment = _evaluation_environment(compose)
         config_result = commands.run([*base, "-f", str(compose), "config", "--format", "json"], cwd=workspace, env=environment)
@@ -472,7 +474,7 @@ def run_deployment(
         config = json.loads(config_result.stdout)
         service = inspect_compose(config)
         port = port_picker()
-        override.write_text("services:\n" f"  {service}:\n" "    ports: !override\n" f'      - "127.0.0.1:{port}:8090"\n' "    environment:\n" '      ZIGBASE_HTTP_HOST: "0.0.0.0"\n' '      ZIGBASE_HTTP_PORT: "8090"\n' '      ZIGBASE_DATA_DIR: "/data"\n' '      ZIGBASE_COOKIE_SECURE: "true"\n' '      ZIGBASE_JWT_SECRET: "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"\n' '      ZIGBASE_SMTP_HOST: "smtp.example.invalid"\n')
+        override.write_text("services:\n" f"  {service}:\n" "    ports: !override\n" f'      - "127.0.0.1:{port}:8090"\n' "    volumes:\n" "      - type: bind\n" f"        source: {json.dumps(binary)}\n" "        target: /zigbase-eval\n" "        read_only: true\n" "    environment:\n" '      ZIGBASE_HTTP_HOST: "0.0.0.0"\n' '      ZIGBASE_HTTP_PORT: "8090"\n' '      ZIGBASE_DATA_DIR: "/data"\n' '      ZIGBASE_COOKIE_SECURE: "true"\n' '      ZIGBASE_JWT_SECRET: "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"\n' '      ZIGBASE_SMTP_HOST: "smtp.example.invalid"\n')
         stack = [*base, "-f", str(compose), "-f", str(override)]
         cleanup = True
         _run_ok(commands.run([*stack, "up", "-d", "--build", service], cwd=workspace, env=environment, timeout=600), "deployment.start_failed")
@@ -490,7 +492,7 @@ def run_deployment(
                 "exec",
                 "-T",
                 service,
-                "/usr/local/bin/zigbase",
+                "/zigbase-eval",
                 "doctor",
                 "--production",
                 "--json",
@@ -566,6 +568,7 @@ def grade(
         artifacts,
         commands,
         port_picker=port_picker,
+        binary_path=binary_path,
         behavior_probe=behavior_probe,
         http_request=http_request,
         health_attempts=health_attempts,
