@@ -55,6 +55,15 @@ contract the official image supplies. Before switching to uid/gid `65532`, creat
 that ownership; otherwise a new named volume is mounted as root-owned and ZigBase cannot create
 `data.db`:
 
+Zig does not document an official registry image. Do not guess a builder such as
+`ghcr.io/ziglang/zig:<version>`: a syntactically plausible registry name can still be private or
+nonexistent. Start from a pinned general-purpose Linux builder and download the matching Zig
+release archive from `https://ziglang.org/download/<version>/`, verifying the SHA-256 published in
+Zig's official `download/index.json`, or use an independently maintained builder image only when
+its provenance and immutable digest are explicitly accepted. For Zig 0.16.0 on x86_64 Linux, the
+official archive SHA-256 is
+`70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00`.
+
 ```dockerfile
 RUN install -d -o 65532 -g 65532 /data
 ENV ZIGBASE_DATA_DIR=/data \

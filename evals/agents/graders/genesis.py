@@ -26,6 +26,7 @@ RULE_OPERATIONS = {"list", "view", "create", "update", "delete"}
 COMPOSE_VARIABLE = re.compile(
     r"\$\{([A-Za-z_][A-Za-z0-9_]*)(:\?|\?|:-|-|:\+|\+)?[^}]*\}"
 )
+REQUEST_COLLECTION = re.compile(r"\.(?:requests?|[a-z][a-z0-9_]*_requests?)\b")
 
 
 @dataclass(frozen=True)
@@ -403,7 +404,7 @@ def inspect_completion(workspace: Path) -> tuple[EvalFailure, ...]:
             "equipment/listing model is missing",
         ),
         (
-            ".requests" in text,
+            REQUEST_COLLECTION.search(text) is not None,
             "completion.requests_missing",
             "request workflow is missing",
         ),

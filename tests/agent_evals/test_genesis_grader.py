@@ -157,6 +157,19 @@ def test_positive_fixture_scores_four_and_always_tears_down(tmp_path):
     assert "zigbase_eval" in (artifacts / "genesis-compose.override.yml").read_text()
 
 
+def test_named_request_collection_counts_as_request_workflow(tmp_path):
+    target = workspace(tmp_path)
+    main = target / "src" / "main.zig"
+    main.write_text(main.read_text().replace(".requests =", ".loan_requests ="))
+
+    report = grade_fixture(target, tmp_path / "artifacts", commands=FakeCommands())
+
+    assert report.completion is True
+    assert not any(
+        failure.code == "completion.requests_missing" for failure in report.failures
+    )
+
+
 @pytest.mark.parametrize(
     ("overlay", "false_grade", "failure_prefix"),
     [
