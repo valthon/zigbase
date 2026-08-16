@@ -27,6 +27,7 @@ COMPOSE_VARIABLE = re.compile(
     r"\$\{([A-Za-z_][A-Za-z0-9_]*)(:\?|\?|:-|-|:\+|\+)?[^}]*\}"
 )
 REQUEST_COLLECTION = re.compile(r"\.(?:requests?|[a-z][a-z0-9_]*_requests?)\b")
+REPO = Path(__file__).resolve().parents[3]
 
 
 @dataclass(frozen=True)
@@ -637,7 +638,22 @@ def _evaluation_environment(compose: Path) -> dict[str, str]:
         if name in environment:
             continue
         upper = name.upper()
-        if "DOMAIN" in upper:
+        if name == "ZIGBASE_EVAL_COMMIT":
+            completed = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=REPO,
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=30,
+            )
+            if completed.returncode != 0 or len(completed.stdout.strip()) != 40:
+                raise GradeFailure(
+                    "deployment.commit_unavailable",
+                    "cannot resolve the repository commit for Compose evaluation",
+                )
+            value = completed.stdout.strip()
+        elif "DOMAIN" in upper:
             value = "eval.invalid"
         elif "URL" in upper:
             value = "https://eval.invalid"

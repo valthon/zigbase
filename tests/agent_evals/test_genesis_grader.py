@@ -423,6 +423,7 @@ def test_compose_evaluation_environment_satisfies_declared_secret_names(tmp_path
         "  ZIGBASE_PUBLIC_URL: https://${APP_DOMAIN:?set domain}\n"
         "  ZIGBASE_SMTP_PASSWORD: ${ZIGBASE_SMTP_PASSWORD:?set password}\n"
         "  ZIGBASE_SMTP_USERNAME: ${SMTP_USERNAME:-sender@example.invalid}\n"
+        "  ZIGBASE_EVAL_COMMIT: ${ZIGBASE_EVAL_COMMIT:?set commit}\n"
         "  image: ${GEARSHARE_IMAGE:-gearshare:0.1.0}\n"
     )
 
@@ -430,6 +431,8 @@ def test_compose_evaluation_environment_satisfies_declared_secret_names(tmp_path
 
     assert environment["APP_DOMAIN"] == "eval.invalid"
     assert environment["ZIGBASE_SMTP_PASSWORD"] == "x" * 64
+    assert len(environment["ZIGBASE_EVAL_COMMIT"]) == 40
+    assert set(environment["ZIGBASE_EVAL_COMMIT"]) <= set("0123456789abcdef")
     assert "SMTP_USERNAME" not in environment
     assert "GEARSHARE_IMAGE" not in environment
 
