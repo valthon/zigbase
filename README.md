@@ -349,6 +349,7 @@ examples/
 - [docs/recipes.md](docs/recipes.md) — task recipes: ship a frontend in the binary, schema provisioning (curl), signup, owner/relation access rules, hooks, custom routes, DB access in cron
 - [docs/api.md](docs/api.md) — HTTP API reference (collections, records, query, rules, auth, oauth2, realtime, files, static files, admin)
 - [docs/openapi.md](docs/openapi.md) — deterministic OpenAPI export for collection CRUD and framework consumer routes
+- [docs/zigapagos-pairing.md](docs/zigapagos-pairing.md) — one-origin Zigapagos + ZigBase architecture, dev loop, layered tests, and deployment choices
 - [docs/framework.md](docs/framework.md) — embedding ZigBase: hooks, routes, jobs, static-file modes
 - [docs/serve.md](docs/serve.md) — running the server: background sessions, `stop`/`status`/`logs`, ephemeral instances, and the `doctor` preflight
 - [docs/deployment.md](docs/deployment.md) — systemd, Docker Compose, reverse-proxy TLS, Fly, Railway, backups, upgrades, and rollback

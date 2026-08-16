@@ -288,5 +288,15 @@
       "order": 4,
       "group": "guides"
     }
+  },
+  {
+    "canonical": "docs/zigapagos-pairing.md",
+    "mirror": "zigapagos-pairing.md",
+    "frontmatter": {
+      "title": "Zigapagos + ZigBase full stack",
+      "description": "Pair a ZigBase framework backend with a same-origin Zigapagos frontend, with explicit ownership, dev, test, OpenAPI, public-signup, and deployment contracts.",
+      "order": 5,
+      "group": "guides"
+    }
   }
 ]

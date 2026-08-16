@@ -103,6 +103,7 @@ trust it over any document, including this one.
 | generating or reviewing an HTTP contract | [openapi.md](openapi.md) |
 | writing Zig hooks, routes, jobs, or a comptime schema | [framework.md](framework.md) |
 | writing tests | [testing.md](testing.md) |
+| pairing a Zigapagos frontend with a framework app | [zigapagos-pairing.md](zigapagos-pairing.md) |
 | wiring a frontend | [typescript-sdk.md](typescript-sdk.md) |
 | calling from Python / Dart / Kotlin | [python-sdk.md](python-sdk.md), [dart-sdk.md](dart-sdk.md), [kotlin-sdk.md](kotlin-sdk.md) |
 | deploying | [deployment.md](deployment.md), [docker.md](docker.md) |
