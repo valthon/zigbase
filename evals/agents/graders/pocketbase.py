@@ -36,10 +36,10 @@ REPO = Path(__file__).resolve().parents[3]
 MAX_JSON_BYTES = 4 * 1024 * 1024
 EXPECTED_ROWS = {"members": 1, "posts": 2, "secrets": 1}
 EXPECTED_FIXTURE_MANIFEST_SHA256 = (
-    "62cedaba589f20acde449a7460dca54de30ae114498ce8b41c5866f084dfeeb1"
+    "4570a6a57dda6225f8c1027475ccb9e72ebc59bec79c3c7687d26f6118f9e37e"
 )
 EXPECTED_CONVERTER_SHA256 = (
-    "56d9699ebbfb314fc0676bb33eb51249c11c3561f14fcf765ff9759dbd45e75f"
+    "bf2a8b9d832893b2b25a747495d3a8115e19fe6bc1127aab1b33d267175fec4e"
 )
 EXPECTED_PUBLIC = frozenset(
     {("members", "create"), ("posts", "list"), ("posts", "view")}

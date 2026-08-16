@@ -131,7 +131,7 @@ def test_pocketbase_fixture_migrates_end_to_end(zigbase_binary, tmp_path):
     assert inventory["summary"] == {
         "collections": 3,
         "decisions": 5,
-        "blockers": 1,
+        "blockers": 2,
         "info": 0,
     }
 

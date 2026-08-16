@@ -100,6 +100,14 @@ Important choices include:
 
 - Public rules: confirm `public` only when anonymous access is intended.
 - Auth configuration: review password identity fields and port every enabled non-password method.
+- Auth rules: only `verified = true` maps directly, to ZigBase's `require_verified`; disabled or
+  other PocketBase login rules require an explicit replacement decision.
+- Hidden fields: PocketBase also makes hidden fields non-superuser-write-protected. ZigBase's
+  `hidden` flag only suppresses reads, so each non-system hidden field must be omitted or replaced
+  with a trusted write boundary before self-service updates are enabled.
+- Email visibility: ZigBase does not have PocketBase's per-record `emailVisibility` behavior and
+  serializes auth email to any caller admitted by the collection rules. Any auth collection whose
+  profiles are not strictly owner-scoped requires an explicit privacy review or replacement.
 - Protected files: preserve access through an equivalent collection `viewRule` or trusted route.
 - Custom autodates: map to `date` to preserve history, provide replacement behavior, or omit.
 - `geoPoint`: preserve values as JSON with accepted semantic loss, or omit.

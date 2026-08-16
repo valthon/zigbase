@@ -198,7 +198,9 @@ Additional rules:
   autodates, auth email, token key, and password) are not duplicated as user fields.
 - `passwordHash` is emitted only in auth NDJSON; PocketBase token keys and session state are never
   copied.
-- `verified` and email visibility are carried when ZigBase has the corresponding auth field.
+- `verified` is carried. PocketBase's per-record `emailVisibility` has no ZigBase equivalent, so
+  non-owner profile access requires an explicit privacy decision or replacement rather than a
+  silent mapping.
 - PocketBase `geoPoint` requires a `json` or `omit` decision. `json` preserves `{lon,lat}` values
   and emits a permanent semantic-loss warning in the bundle.
 - A non-system PocketBase `autodate` requires a decision: map it to `date` to preserve historical

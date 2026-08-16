@@ -55,7 +55,7 @@ def pocketbase_snapshot(tmp_path):
                 if kind == "view":
                     connection.execute(
                         f'CREATE VIEW "{name}" AS SELECT '  # noqa: S608 - test-only fixture
-                        "'' AS id, '' AS created, '' AS updated"
+                        "'view00000000001' AS id"
                     )
                 else:
                     connection.execute(
@@ -99,6 +99,7 @@ def base_collection(**overrides):
         "updateRule": None,
         "deleteRule": None,
         "manageRule": None,
+        "authRule": "verified = true",
     }
     value.update(overrides)
     return value

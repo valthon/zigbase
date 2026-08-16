@@ -256,6 +256,165 @@ def test_extract_maps_schema_rows_relations_and_public_rules_deterministically(
     )
 
 
+def test_backtick_index_and_empty_optional_values_preserve_target_semantics(
+    pocketbase_snapshot, tmp_path
+):
+    authors = base_collection(
+        id="authors_collection", name="authors", indexes=[], fields=[]
+    )
+    posts = base_collection(
+        indexes=["CREATE UNIQUE INDEX `idx_posts_title` ON `posts` (`title`)"],
+        fields=[
+            {
+                "id": "title_field",
+                "name": "title",
+                "type": "text",
+                "required": True,
+                "system": False,
+            },
+            {
+                "id": "status_field",
+                "name": "status",
+                "type": "select",
+                "values": ["draft", "published"],
+                "required": False,
+                "system": False,
+            },
+            {
+                "id": "author_field",
+                "name": "author",
+                "type": "relation",
+                "collectionId": "authors_collection",
+                "required": False,
+                "system": False,
+            },
+        ],
+    )
+    schema, pb_data = pocketbase_snapshot([posts, authors])
+    connection = sqlite3.connect(pb_data / "data.db")
+    connection.execute(
+        "INSERT INTO posts VALUES (?,?,?,?,?,?)",
+        (
+            "post0000000001",
+            "2021-01-01 00:00:00Z",
+            "2021-01-02 00:00:00Z",
+            "First",
+            "",
+            "",
+        ),
+    )
+    connection.commit()
+    connection.close()
+    findings = inventory_findings([posts, authors], pb_data)
+    decisions = write_decisions(tmp_path / "decisions.json", findings)
+    out = tmp_path / "bundle"
+    pb2zb.extract_bundle(schema, pb_data, decisions, out)
+    document = json.loads((out / "schema.json").read_text())
+    posts_schema = next(c for c in document["collections"] if c["name"] == "posts")
+    assert posts_schema["indexes"] == [
+        {"fields": ["title"], "name": "idx_posts_title", "unique": True}
+    ]
+    row = json.loads((out / "imports" / "posts.ndjson").read_text())
+    assert row["status"] is None
+    assert row["author"] is None
+
+
+def test_verified_auth_rule_and_password_field_minimum_map_to_auth_options(
+    pocketbase_snapshot, tmp_path
+):
+    members = base_collection(
+        id="members_collection",
+        name="members",
+        type="auth",
+        authRule=" verified = true ",
+        indexes=[],
+        fields=[
+            {
+                "id": "password_field",
+                "name": "password",
+                "type": "password",
+                "min": 14,
+                "hidden": True,
+                "system": True,
+            }
+        ],
+    )
+    schema, pb_data = pocketbase_snapshot([members])
+    decisions = write_decisions(
+        tmp_path / "decisions.json", inventory_findings([members], pb_data)
+    )
+    out = tmp_path / "bundle"
+    pb2zb.extract_bundle(schema, pb_data, decisions, out)
+    document = json.loads((out / "schema.json").read_text())
+    assert document["collections"][0]["options"]["auth"] == {
+        "identityFields": ["email"],
+        "minPasswordLength": 14,
+        "require_verified": True,
+    }
+
+
+def test_materialized_view_without_source_timestamps_can_be_extracted(
+    pocketbase_snapshot, tmp_path
+):
+    view = base_collection(
+        id="summary_collection",
+        name="summary",
+        type="view",
+        fields=[],
+        indexes=[],
+    )
+    schema, pb_data = pocketbase_snapshot([view])
+    replacement = tmp_path / "summary.json"
+    replacement.write_text(
+        json.dumps(
+            {
+                "zigbasePocketBaseReplacement": 1,
+                "finding": "collection.summary_collection.view",
+                "kind": "collection",
+                "value": {
+                    "name": "summary",
+                    "type": "base",
+                    "fields": [],
+                    "indexes": [],
+                    "listRule": None,
+                    "viewRule": None,
+                    "createRule": None,
+                    "updateRule": None,
+                    "deleteRule": None,
+                    "options": {},
+                },
+            }
+        )
+    )
+    findings = inventory_findings([view], pb_data)
+    decisions = write_decisions(
+        tmp_path / "decisions.json",
+        findings,
+        choices={"collection.summary_collection.view": "materialize"},
+        artifacts={"collection.summary_collection.view": replacement.name},
+    )
+    out = tmp_path / "bundle"
+    pb2zb.extract_bundle(schema, pb_data, decisions, out)
+    assert json.loads((out / "imports" / "summary.ndjson").read_text()) == {
+        "id": "view00000000001"
+    }
+
+
+def test_replacement_collection_cannot_reintroduce_a_reserved_field_name():
+    with pytest.raises(pb2zb.PocketBaseError, match="invalid or duplicate fields"):
+        pb2zb._validate_target_schema_links(  # noqa: SLF001 - converter invariant
+            {
+                "collections": [
+                    {
+                        "name": "contacts",
+                        "fields": [{"name": "Email", "type": "text"}],
+                        "indexes": [],
+                    }
+                ]
+            }
+        )
+
+
 def test_extract_separates_auth_rows_and_preserves_only_migratable_credentials(
     pocketbase_snapshot, tmp_path, zigbase_binary
 ):

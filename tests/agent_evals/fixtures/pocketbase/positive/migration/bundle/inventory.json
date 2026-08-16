@@ -35,6 +35,16 @@
     },
     {
       "choices": [
+        "replacement"
+      ],
+      "code": "AuthRuleRequiresReplacement",
+      "id": "collection.members_fixture1.authRule.replacement",
+      "message": "Auth collection 'members' has a disabled or non-verification PocketBase authRule that ZigBase cannot preserve automatically.",
+      "requiresArtifact": true,
+      "severity": "blocker"
+    },
+    {
+      "choices": [
         "replacement",
         "omit"
       ],
@@ -82,10 +92,10 @@
       "severity": "decision"
     }
   ],
-  "schemaSha256": "d4fe72aeb4da894621c62fb3549a093e760811c8fba1a4d59d33db63fd15f209",
+  "schemaSha256": "875dcb8f9655a2e5ae3e8147f3a75c748478878a28f1b5846970d588aacab163",
   "sourceVersion": "0.39.11",
   "summary": {
-    "blockers": 1,
+    "blockers": 2,
     "collections": 3,
     "decisions": 5,
     "info": 0

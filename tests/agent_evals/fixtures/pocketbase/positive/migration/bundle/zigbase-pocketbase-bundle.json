@@ -8,14 +8,14 @@
   ],
   "collections": 3,
   "databaseSha256": "c64d61c7e8bc9bf8ebadb5ea6b79a188f5c05264388eff72d9b30b1209660029",
-  "decisionsSha256": "04666acc331d86f43ca65acb45821351c6bd47ea9b02562914036d111c9a0263",
+  "decisionsSha256": "ac3a0506dc02602ee9a7129438ce66c92f0af528b71f8f4f2053083532a710ca",
   "files": 5,
   "ordinaryManifest": "imports/manifest.json",
   "outputs": [
     {
-      "bytes": 1392,
+      "bytes": 1734,
       "path": "decisions.json",
-      "sha256": "fc515bb36bc7a47825f8e84df42391346dec7b158360cbf6a5433405a6e9e6b4"
+      "sha256": "425fd6aadb80b28a31a95cfd0593fcda6bec5ab439a0a0d2ba071210d63c53ef"
     },
     {
       "bytes": 263,
@@ -38,9 +38,14 @@
       "sha256": "05b5f05d7f47f09a84185ae2d7b9f11aa8b615605fcc48a59f3fe483e9d14fdc"
     },
     {
-      "bytes": 2599,
+      "bytes": 2976,
       "path": "inventory.json",
-      "sha256": "14c183033e0e499b3ba42441e4728e75bd0c0427470575e4e94b854b3b15da2f"
+      "sha256": "8d5fd044c242d3c89e1815c138103dc97d92b72d0fe4e0647f2d18587c2f92ee"
+    },
+    {
+      "bytes": 306,
+      "path": "replacements/53d02f920f5b8061-auth-rule.md",
+      "sha256": "53d02f920f5b80613d3b4725a209b61f91bedeeb3e44b5cad94f6ff7bc987275"
     },
     {
       "bytes": 371,
@@ -80,6 +85,11 @@
   ],
   "replacementArtifacts": [
     {
+      "finding": "collection.members_fixture1.authRule.replacement",
+      "path": "replacements/53d02f920f5b8061-auth-rule.md",
+      "sha256": "53d02f920f5b80613d3b4725a209b61f91bedeeb3e44b5cad94f6ff7bc987275"
+    },
+    {
       "finding": "field.secrets_fixture1.secret_document.options",
       "path": "replacements/dd6f510db97e1118-protected-document.json",
       "sha256": "dd6f510db97e1118ddddb34160576c6e3d5cf1dffc60743bee19215b9b270186"
@@ -91,7 +101,7 @@
     "secrets": 1
   },
   "rows": 4,
-  "schemaSha256": "d4fe72aeb4da894621c62fb3549a093e760811c8fba1a4d59d33db63fd15f209",
+  "schemaSha256": "875dcb8f9655a2e5ae3e8147f3a75c748478878a28f1b5846970d588aacab163",
   "sourceVersion": "0.39.11",
   "storageFiles": [
     {

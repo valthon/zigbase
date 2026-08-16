@@ -55,11 +55,24 @@ DIRECT_FIELD_TYPES = frozenset(
 IDENTIFIER = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
 POCKETBASE_ID = re.compile(r"^[A-Za-z0-9_]+$")
 SIMPLE_INDEX = re.compile(
-    r'^CREATE\s+(?:(UNIQUE)\s+)?INDEX\s+"?([A-Za-z][A-Za-z0-9_]*)"?\s+'
-    r'ON\s+"?([A-Za-z][A-Za-z0-9_]*)"?\s*\(([^)]+)\)\s*$',
+    r'^CREATE\s+(?:(UNIQUE)\s+)?INDEX\s+[`"]?([A-Za-z][A-Za-z0-9_]*)[`"]?\s+'
+    r'ON\s+[`"]?([A-Za-z][A-Za-z0-9_]*)[`"]?\s*\(([^)]+)\)\s*$',
     re.IGNORECASE,
 )
-SIMPLE_INDEX_FIELD = re.compile(r'^"?([A-Za-z][A-Za-z0-9_]*)"?$', re.IGNORECASE)
+SIMPLE_INDEX_FIELD = re.compile(r'^[`"]?([A-Za-z][A-Za-z0-9_]*)[`"]?$', re.IGNORECASE)
+RESERVED_FIELD_NAMES = frozenset(
+    {
+        "id",
+        "created",
+        "updated",
+        "email",
+        "username",
+        "passwordhash",
+        "tokenkey",
+        "verified",
+        "token_epoch",
+    }
+)
 RULE_KEYS = (
     "listRule",
     "viewRule",
@@ -67,6 +80,7 @@ RULE_KEYS = (
     "updateRule",
     "deleteRule",
     "manageRule",
+    "authRule",
 )
 
 
@@ -298,13 +312,14 @@ def _check_snapshot_shape(
                 f"exported collection {name!r} expects a SQLite {expected_kind}, but the snapshot does not match"
             )
         columns = _table_columns(connection, name)
-        expected_columns = {"id", "created", "updated"}
+        kind = collection.get("type") or "base"
+        expected_columns = {"id"}
         expected_columns.update(
             str(field["name"])
             for field in collection.get("fields", [])
-            if not bool(field.get("system"))
+            if not bool(field.get("system")) and kind != "view"
         )
-        if (collection.get("type") or "base") == "auth":
+        if kind == "auth":
             expected_columns.update(
                 {"email", "emailVisibility", "verified", "password", "tokenKey"}
             )
@@ -316,7 +331,25 @@ def _check_snapshot_shape(
 
 
 def _rule_requires_replacement(rule: str) -> bool:
-    return "@collection." in rule or "_via_" in rule or "@request.context" in rule
+    """Conservatively reject PocketBase rule surface ZigBase cannot preserve."""
+    if (
+        "@collection." in rule
+        or "_via_" in rule
+        or re.search(r"@request\.(?:body|query|headers|context)(?:\.|\b)", rule)
+        or re.search(r":[A-Za-z][A-Za-z0-9_]*", rule)
+        or re.search(r"\?(?:=|!=|>|>=|<|<=|~)", rule)
+    ):
+        return True
+    for macro in re.findall(r"@[A-Za-z][A-Za-z0-9_.]*", rule):
+        if macro in {"@request.method", "@request.auth.id"}:
+            continue
+        if macro.startswith("@request.auth.") and macro not in {
+            "@request.auth.collectionName",
+            "@request.auth.verified",
+        }:
+            continue
+        return True
+    return False
 
 
 def _parse_simple_index(
@@ -380,6 +413,25 @@ def _is_source_timestamp_field(field: dict[str, Any]) -> bool:
         "created",
         "updated",
     }
+
+
+def _is_verified_auth_rule(rule: Any) -> bool:
+    return (
+        isinstance(rule, str)
+        and re.fullmatch(r"\s*verified\s*=\s*true\s*", rule, re.IGNORECASE) is not None
+    )
+
+
+def _auth_profiles_are_owner_scoped(collection: dict[str, Any]) -> bool:
+    owner_rules = {
+        "id = @request.auth.id",
+        "@request.auth.id = id",
+    }
+    for key in ("listRule", "viewRule"):
+        rule = collection.get(key)
+        if rule is not None and rule.strip() not in owner_rules:
+            return False
+    return True
 
 
 def _unsupported_field_options(
@@ -512,12 +564,53 @@ def collect_findings(collections: list[dict[str, Any]], pb_data: Path) -> list[F
                         True,
                     )
                 )
+            auth_rule = collection.get("authRule")
+            if not _is_verified_auth_rule(auth_rule):
+                findings.append(
+                    Finding(
+                        _finding_id(
+                            "collection", collection_id, "authRule", "replacement"
+                        ),
+                        "blocker",
+                        "AuthRuleRequiresReplacement",
+                        f"Auth collection {name!r} has a disabled or non-verification PocketBase authRule that ZigBase cannot preserve automatically.",
+                        ("replacement",),
+                        True,
+                    )
+                )
+            if not _auth_profiles_are_owner_scoped(collection):
+                findings.append(
+                    Finding(
+                        _finding_id(
+                            "collection", collection_id, "emailVisibility", "review"
+                        ),
+                        "decision",
+                        "EmailVisibilityRequiresReview",
+                        f"Auth collection {name!r} can expose non-owner profiles, but ZigBase does not preserve PocketBase's per-record emailVisibility behavior.",
+                        ("reviewed",),
+                    )
+                )
 
         for field in fields:
             field_id = str(field["id"])
             field_name = str(field["name"])
             field_type = str(field["type"])
             if bool(field.get("system")):
+                if (
+                    kind == "auth"
+                    and field_name == "email"
+                    and (
+                        _has_values(field.get("exceptDomains"))
+                        or _has_values(field.get("onlyDomains"))
+                    )
+                ):
+                    findings.append(
+                        _field_option_finding(
+                            collection_id,
+                            field,
+                            f"Field {name}.{field_name} has domain allow/deny behavior requiring replacement.",
+                        )
+                    )
                 continue
             if _is_source_timestamp_field(field):
                 continue
@@ -536,6 +629,17 @@ def collect_findings(collections: list[dict[str, Any]], pb_data: Path) -> list[F
                 )
             if option_finding := _unsupported_field_options(collection_id, name, field):
                 findings.append(option_finding)
+            if field.get("hidden") is True:
+                findings.append(
+                    Finding(
+                        _finding_id("field", collection_id, field_id, "hidden"),
+                        "blocker",
+                        "HiddenFieldWriteProtectionRequiresReplacement",
+                        f"Field {name}.{field_name} is PocketBase-hidden and therefore write-protected; ZigBase hidden fields are read-hidden but remain client-writable.",
+                        ("replacement", "omit"),
+                        True,
+                    )
+                )
             if field_type == "geoPoint":
                 findings.append(
                     Finding(
@@ -557,19 +661,24 @@ def collect_findings(collections: list[dict[str, Any]], pb_data: Path) -> list[F
                         True,
                     )
                 )
-            if not IDENTIFIER.fullmatch(field_name):
+            if (
+                not IDENTIFIER.fullmatch(field_name)
+                or field_name.casefold() in RESERVED_FIELD_NAMES
+            ):
                 findings.append(
                     Finding(
                         _finding_id("field", collection_id, field_id, "identifier"),
                         "blocker",
                         "FieldIdentifierRequiresReplacement",
-                        f"Field {name}.{field_name} is not a valid ZigBase identifier.",
+                        f"Field {name}.{field_name} is not a valid ZigBase user-field identifier or uses a reserved system name.",
                         ("replacement", "omit"),
                         True,
                     )
                 )
 
         for key in RULE_KEYS:
+            if key == "authRule":
+                continue
             rule = collection.get(key)
             if rule is None:
                 continue
@@ -1060,7 +1169,15 @@ def _auth_options(collection: dict[str, Any]) -> dict[str, Any]:
         raise PocketBaseError(
             f"auth collection {collection['name']!r} has invalid identityFields"
         )
-    minimum = password.get("minPasswordLength", 8)
+    password_field = next(
+        (
+            field
+            for field in collection.get("fields", [])
+            if field.get("system") is True and field.get("type") == "password"
+        ),
+        None,
+    )
+    minimum = password_field.get("min", 8) if password_field is not None else 8
     if (
         not isinstance(minimum, int)
         or isinstance(minimum, bool)
@@ -1073,7 +1190,7 @@ def _auth_options(collection: dict[str, Any]) -> dict[str, Any]:
         "auth": {
             "identityFields": identities,
             "minPasswordLength": minimum,
-            "require_verified": False,
+            "require_verified": _is_verified_auth_rule(collection.get("authRule")),
         }
     }
 
@@ -1212,6 +1329,11 @@ def _validate_target_schema_links(document: dict[str, Any]) -> None:
                 for field_name in field_names
             )
             or len(set(field_names)) != len(field_names)
+            or any(
+                field_name.casefold() in RESERVED_FIELD_NAMES
+                for field_name in field_names
+                if isinstance(field_name, str)
+            )
         ):
             raise PocketBaseError(
                 f"target collection {collection['name']!r} has invalid or duplicate fields"
@@ -1258,6 +1380,13 @@ def _convert_value(field: dict[str, Any], mapped: dict[str, Any], value: Any) ->
         return None
     field_type = str(field["type"])
     label = str(field["name"])
+    if (
+        value == ""
+        and field_type in {"select", "relation"}
+        and _positive_int(field.get("maxSelect"), 1) == 1
+        and field.get("required") is not True
+    ):
+        return None
     if field_type == "bool":
         if value not in (0, 1, False, True):
             raise PocketBaseError(
@@ -1346,7 +1475,7 @@ def _source_to_target_fields(
 def _row_query(
     collection: dict[str, Any], source_fields: list[dict[str, Any]], columns: set[str]
 ) -> tuple[str, list[str]]:
-    selected = ["id", "created", "updated"]
+    selected = [name for name in ("id", "created", "updated") if name in columns]
     if (collection.get("type") or "base") == "auth":
         selected.extend(
             BCRYPT_DIGEST_COLUMN if name == "password" else name
@@ -1398,18 +1527,15 @@ def _write_ndjson_rows(
                     raise PocketBaseError(
                         f"collection {collection['name']!r} has an invalid record id"
                     )
-                record: dict[str, Any] = {
-                    "id": record_id,
-                    "created": raw.get("created"),
-                    "updated": raw.get("updated"),
-                }
-                if not all(
-                    isinstance(record[key], str) and record[key]
-                    for key in ("created", "updated")
-                ):
-                    raise PocketBaseError(
-                        f"record {collection['name']}.{record_id} has missing source timestamps"
-                    )
+                record: dict[str, Any] = {"id": record_id}
+                for timestamp in ("created", "updated"):
+                    value = raw.get(timestamp)
+                    if value is not None:
+                        if not isinstance(value, str) or not value:
+                            raise PocketBaseError(
+                                f"record {collection['name']}.{record_id} has an invalid source {timestamp} timestamp"
+                            )
+                        record[timestamp] = value
                 if (collection.get("type") or "base") == "auth":
                     password_hash = raw.get(BCRYPT_DIGEST_COLUMN)
                     if not isinstance(password_hash, str) or not BCRYPT.fullmatch(

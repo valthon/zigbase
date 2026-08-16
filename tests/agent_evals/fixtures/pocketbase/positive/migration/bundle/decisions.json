@@ -6,6 +6,12 @@
       "rationale": "Password authentication remains enabled with email identity; unsupported auth methods are disabled."
     },
     {
+      "artifact": "replacements/53d02f920f5b8061-auth-rule.md",
+      "choice": "replacement",
+      "id": "collection.members_fixture1.authRule.replacement",
+      "rationale": "PocketBase permits login without an additional auth rule; the cutover explicitly preserves that behavior and tests unverified-account access policy."
+    },
+    {
       "artifact": "replacements/dd6f510db97e1118-protected-document.json",
       "choice": "replacement",
       "id": "field.secrets_fixture1.secret_document.options",

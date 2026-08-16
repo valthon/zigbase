@@ -2,9 +2,9 @@
   "containsSecrets": false,
   "files": [
     {
-      "bytes": 1375,
+      "bytes": 1700,
       "path": "decisions.json",
-      "sha256": "04666acc331d86f43ca65acb45821351c6bd47ea9b02562914036d111c9a0263"
+      "sha256": "ac3a0506dc02602ee9a7129438ce66c92f0af528b71f8f4f2053083532a710ca"
     },
     {
       "bytes": 3769,
@@ -72,9 +72,14 @@
       "sha256": "caa7aaa65b11b4557d51881a73b8e33db8a486875764981ce9983e4d8a3764bc"
     },
     {
-      "bytes": 9084,
+      "bytes": 9104,
       "path": "pb_schema.json",
-      "sha256": "d4fe72aeb4da894621c62fb3549a093e760811c8fba1a4d59d33db63fd15f209"
+      "sha256": "875dcb8f9655a2e5ae3e8147f3a75c748478878a28f1b5846970d588aacab163"
+    },
+    {
+      "bytes": 306,
+      "path": "replacements/auth-rule.md",
+      "sha256": "53d02f920f5b80613d3b4725a209b61f91bedeeb3e44b5cad94f6ff7bc987275"
     },
     {
       "bytes": 371,

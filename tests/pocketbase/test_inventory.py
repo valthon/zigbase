@@ -293,6 +293,7 @@ def test_auth_and_file_operational_choices_require_review(pocketbase_snapshot):
     findings = pb2zb.build_inventory(schema, pb_data)["findings"]
     assert {finding["code"] for finding in findings} == {
         "AuthCollectionConfigurationRequiresReview",
+        "EmailVisibilityRequiresReview",
         "FileStorageSnapshotRequiresConfirmation",
     }
 
@@ -349,3 +350,85 @@ def test_public_rules_are_durable_review_findings_including_auth_signup(
         ("rule.posts_collection.deleteRule.public", ["public"]),
         ("rule.posts_collection.updateRule.public", ["public"]),
     ]
+
+
+def test_auth_rule_hidden_email_visibility_and_reserved_fields_are_not_silent(
+    pocketbase_snapshot,
+):
+    auth = base_collection(
+        id="members_collection",
+        name="members",
+        type="auth",
+        authRule="banned = false",
+        listRule="@request.auth.id != ''",
+        viewRule="@request.auth.id != ''",
+        indexes=[],
+        fields=[
+            {
+                "id": "role_field",
+                "name": "role",
+                "type": "select",
+                "values": ["member", "admin"],
+                "hidden": True,
+                "system": False,
+            },
+            {
+                "id": "password_field",
+                "name": "password",
+                "type": "password",
+                "min": 14,
+                "hidden": True,
+                "system": True,
+            },
+            {
+                "id": "email_field",
+                "name": "email",
+                "type": "email",
+                "onlyDomains": ["example.test"],
+                "system": True,
+            },
+        ],
+    )
+    ordinary = base_collection(
+        fields=[
+            {
+                "id": "reserved_field",
+                "name": "Email",
+                "type": "text",
+                "system": False,
+            }
+        ],
+        indexes=[],
+    )
+    schema, pb_data = pocketbase_snapshot([auth, ordinary])
+    codes = [
+        finding["code"]
+        for finding in pb2zb.build_inventory(schema, pb_data)["findings"]
+    ]
+    assert "AuthRuleRequiresReplacement" in codes
+    assert "EmailVisibilityRequiresReview" in codes
+    assert "HiddenFieldWriteProtectionRequiresReplacement" in codes
+    assert "FieldOptionsRequireReplacement" in codes
+    assert "FieldIdentifierRequiresReplacement" in codes
+
+
+@pytest.mark.parametrize(
+    "rule",
+    [
+        '@request.body.role = "admin"',
+        "@request.query.preview:isset = true",
+        'tags ?= "public"',
+        "@now > created",
+        '@request.auth.collectionName = "staff"',
+        "@request.auth.verified = true",
+    ],
+)
+def test_pocketbase_only_rule_surface_requires_replacement(pocketbase_snapshot, rule):
+    collection = base_collection(listRule=rule, indexes=[])
+    schema, pb_data = pocketbase_snapshot([collection])
+    findings = pb2zb.build_inventory(schema, pb_data)["findings"]
+    assert any(
+        finding["id"] == "rule.posts_collection.listRule.replacement"
+        and finding["code"] == "PocketBaseRuleRequiresReplacement"
+        for finding in findings
+    )

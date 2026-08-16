@@ -189,7 +189,14 @@ def export_schema(data: Path, destination: Path) -> None:
             "deleteRule": row["deleteRule"],
         }
         options = json.loads(row["options"])
-        for key in ("manageRule", "passwordAuth", "oauth2", "mfa", "otp"):
+        for key in (
+            "authRule",
+            "manageRule",
+            "passwordAuth",
+            "oauth2",
+            "mfa",
+            "otp",
+        ):
             if key in options:
                 value[key] = options[key]
         collections.append(value)
