@@ -13,6 +13,11 @@
     },
     {
       "choice": "public",
+      "id": "rule.members_fixture1.createRule.public",
+      "rationale": "The fixture intentionally supports anonymous account creation and verifies ZigBase open-signup parity."
+    },
+    {
+      "choice": "public",
       "id": "rule.posts_fixture001.listRule.public",
       "rationale": "The fixture intentionally exposes the posts list for anonymous parity checks."
     },

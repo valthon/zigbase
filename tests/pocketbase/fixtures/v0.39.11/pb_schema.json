@@ -1,6 +1,6 @@
 [
   {
-    "createRule": null,
+    "createRule": "",
     "deleteRule": "id = @request.auth.id",
     "fields": [
       {

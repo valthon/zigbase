@@ -7,6 +7,7 @@ migrate((app) => {
     name: "members",
     listRule: "id = @request.auth.id",
     viewRule: "id = @request.auth.id",
+    createRule: "",
     updateRule: "id = @request.auth.id",
     deleteRule: "id = @request.auth.id",
     fields: [

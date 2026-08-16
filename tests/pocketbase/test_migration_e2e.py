@@ -130,7 +130,7 @@ def test_pocketbase_fixture_migrates_end_to_end(zigbase_binary, tmp_path):
     inventory = pb2zb.build_inventory(FIXTURE / "pb_schema.json", FIXTURE / "pb_data")
     assert inventory["summary"] == {
         "collections": 3,
-        "decisions": 4,
+        "decisions": 5,
         "blockers": 1,
         "info": 0,
     }
@@ -158,7 +158,7 @@ def test_pocketbase_fixture_migrates_end_to_end(zigbase_binary, tmp_path):
         f"{line['collection']}.{line['rule']}"
         for line in lint_lines
         if line.get("code") == "PublicRule"
-    } == {"posts.listRule", "posts.viewRule"}
+    } == {"members.createRule", "posts.listRule", "posts.viewRule"}
 
     target = tmp_path / "zb_data"
     applied = run(
@@ -221,7 +221,7 @@ def test_pocketbase_fixture_migrates_end_to_end(zigbase_binary, tmp_path):
     assert doctor_before.returncode == 1
     before_checks = [json.loads(line) for line in doctor_before.stdout.splitlines()]
     assert before_checks[-1]["errors"] == 1
-    assert before_checks[-1]["warnings"] == 4
+    assert before_checks[-1]["warnings"] == 5
     assert (
         next(
             line for line in before_checks if line["check"] == "legacy-password-hashes"
@@ -232,6 +232,19 @@ def test_pocketbase_fixture_migrates_end_to_end(zigbase_binary, tmp_path):
     port = free_port()
     process, log, base = start_server(zigbase_binary, target, port)
     try:
+        status, raw, _ = request(
+            "POST",
+            f"{base}/api/collections/members/records",
+            {
+                "email": "new-member@example.test",
+                "password": "signup-secret",
+                "passwordConfirm": "signup-secret",
+                "name": "New Member",
+            },
+        )
+        assert status == 201
+        assert json.loads(raw)["email"] == "new-member@example.test"
+
         status, raw, _ = request(
             "GET", f"{base}/api/collections/posts/records?sort=id&expand=owner,related"
         )
@@ -310,7 +323,7 @@ def test_pocketbase_fixture_migrates_end_to_end(zigbase_binary, tmp_path):
         line for line in after_checks if line["check"] == "legacy-password-hashes"
     )
     assert legacy["severity"] == "ok"
-    assert after_checks[-1]["warnings"] == 3
+    assert after_checks[-1]["warnings"] == 4
 
     restart_port = free_port()
     process, log, base = start_server(zigbase_binary, target, restart_port)
