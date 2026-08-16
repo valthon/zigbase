@@ -355,7 +355,7 @@ def _client_test_sources(workspace: Path) -> tuple[Path, ...]:
         if (
             "test" in path.stem.lower()
             or "spec" in path.stem.lower()
-            or "tests" in path.parts
+            or any(part in {"test", "tests", "e2e"} for part in path.parts)
         ):
             found.append(path)
     return tuple(found)

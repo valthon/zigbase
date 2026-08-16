@@ -22,6 +22,9 @@ POCKETBASE_EVIDENCE = (
     REPO / "evals" / "agents" / "evidence" / "pocketbase" / "2026-08-16-9a72b656"
 )
 DOCKER_REFERENCE = REPO / "skills" / "zigbase-app-genesis" / "references" / "docker.md"
+GENESIS_REFERENCE = (
+    REPO / "skills" / "zigbase-app-genesis" / "references" / "app-genesis.md"
+)
 
 
 def result_dict():
@@ -157,6 +160,7 @@ def test_genesis_prompt_states_product_boundaries_exercised_by_the_grader():
         "workspace root",
         "framework-mode application",
         "zigbase.testing",
+        "zigbase_eval_commit",
         "not substitutes",
         "client or browser integration test",
         "production-shaped docker compose",
@@ -172,6 +176,13 @@ def test_genesis_docker_reference_requires_a_runtime_compatible_build_target():
     assert "-Dtarget=x86_64-linux-musl" in reference
     assert "no such file or directory" in reference
     assert "real `serve` command" in reference
+
+
+def test_genesis_reference_distinguishes_public_sentinel_from_filtered_access():
+    reference = GENESIS_REFERENCE.read_text()
+    assert "`@public` is a complete rule sentinel" in reference
+    assert "rather than `@public && published = true`" in reference
+    assert "only those exact sentinel rules" in reference
 
 
 @pytest.mark.parametrize("mutation", ["missing", "unknown", "future"])

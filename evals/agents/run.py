@@ -171,6 +171,7 @@ def execute(
 ) -> tuple[EvalResult, int]:
     started = datetime.now(UTC)
     start_clock = time.monotonic()
+    evaluation_commit = repository_commit()
     run_id = (
         f"{scenario.name}-{started.strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:8]}"
     )
@@ -194,6 +195,7 @@ def execute(
             copy_fixture((scenario_root / scenario.fixture).resolve(), workspace)
         install_skills(scenario.skills, workspace)
         env = child_environment(workspace, passed_env)
+        env["ZIGBASE_EVAL_COMMIT"] = evaluation_commit
         completed = run_process(
             substitute_command(argv, workspace, prompt),
             cwd=workspace,
@@ -277,7 +279,7 @@ def execute(
     result = EvalResult(
         zigbaseAgentEval=1,
         scenario=scenario.name,
-        commit=repository_commit(),
+        commit=evaluation_commit,
         agent=agent_name,
         started_at=started.isoformat().replace("+00:00", "Z"),
         duration_ms=round((time.monotonic() - start_clock) * 1000),

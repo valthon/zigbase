@@ -54,6 +54,7 @@ def passing_grader(names, workspace, artifacts):
     payload = json.loads((workspace / "agent-result.json").read_text())
     assert payload["stdin"] == "build the test app"
     assert payload["home"] == str(workspace / ".home")
+    assert len(payload["evaluation_commit"]) == 40
     assert (
         workspace / ".agents" / "skills" / "zigbase-app-genesis" / "SKILL.md"
     ).is_file()
@@ -77,6 +78,7 @@ def test_execute_success_sends_prompt_and_grades(tmp_path):
     assert exit_code == 0
     assert result.score == 4
     assert result.failures == ()
+    assert result.commit == run_module.repository_commit()
 
 
 def test_cleanup_failure_preserves_grade_and_adds_harness_finding(

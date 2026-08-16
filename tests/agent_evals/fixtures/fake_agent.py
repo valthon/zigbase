@@ -18,6 +18,7 @@ if mode == "success":
                 "stdin": sys.stdin.read(),
                 "home": os.environ.get("HOME"),
                 "secret": os.environ.get("FAKE_AGENT_SECRET"),
+                "evaluation_commit": os.environ.get("ZIGBASE_EVAL_COMMIT"),
             }
         )
     )

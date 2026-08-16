@@ -126,6 +126,12 @@ boundary. Use a superuser for setup, mint a test session, or add the real rule.
 Public access can be correct: published content, open signup, a health-like feed, or a deliberately
 anonymous form. Record each public rule in `security/public-rules.json`:
 
+`@public` is a complete rule sentinel, not an expression operand. Use exact `@public` only when the
+operation is unconditionally anonymous. For a filtered anonymous read, write the filter itself—for
+example, `published = true`—rather than `@public && published = true`. Doctor enumerates only exact
+`@public`, so the durable inventory must likewise contain only those exact sentinel rules; do not
+add filtered anonymous rules to it.
+
 Production doctor treats exact `@public` create on a non-system auth collection as the supported
 open-signup boundary: it remains an enumerated warning rather than an inescapable error. The
 inventory is the durable acknowledgment. Other anonymous writes, including system-auth creation,

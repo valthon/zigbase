@@ -9,6 +9,7 @@ from evals.agents.graders.genesis import (
     GradeFailure,
     SubprocessCommands,
     _evaluation_environment,
+    _client_test_sources,
     compare_public_rules,
     grade,
     inspect_compose,
@@ -390,6 +391,15 @@ def test_client_integration_script_is_an_accepted_project_test(tmp_path):
     assert tests_green is True
     assert failures == ()
     assert ["npm", "run", "test:integration"] in commands.calls
+
+
+def test_client_source_in_singular_test_directory_is_discovered(tmp_path):
+    target = tmp_path / "workspace"
+    source = target / "test" / "client-journey.mjs"
+    source.parent.mkdir(parents=True)
+    source.write_text('import assert from "node:assert/strict"; assert.ok(true);')
+
+    assert _client_test_sources(target) == (source,)
 
 
 def test_compose_finds_application_beside_tls_proxy():
