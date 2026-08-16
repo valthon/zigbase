@@ -1,0 +1,37 @@
+{
+  "credentials": {
+    "email": "ada@example.test",
+    "password": "migrated-secret"
+  },
+  "files": {
+    "private": "PRIVATE-DOCUMENT",
+    "public": "PUBLIC-COVER"
+  },
+  "records": {
+    "member": "member000000001",
+    "posts": [
+      "post00000000001",
+      "post00000000002"
+    ],
+    "secret": "secret000000001"
+  },
+  "timestamps": {
+    "member": [
+      "2019-01-01T01:02:03.004Z",
+      "2019-02-01T01:02:03.004Z"
+    ],
+    "post00000000001": [
+      "2020-01-01T01:02:03.004Z",
+      "2020-03-01T01:02:03.004Z"
+    ],
+    "post00000000002": [
+      "2020-02-01T01:02:03.004Z",
+      "2020-02-02T01:02:03.004Z"
+    ],
+    "secret": [
+      "2021-01-01T01:02:03.004Z",
+      "2021-01-02T01:02:03.004Z"
+    ]
+  },
+  "zigbasePocketBaseParity": 1
+}

@@ -1,0 +1,136 @@
+{
+  "authImports": [
+    {
+      "collection": "members",
+      "file": "imports/auth/members.ndjson",
+      "rows": 1
+    }
+  ],
+  "collections": 3,
+  "databaseSha256": "637002469a920389bdfc67d78ad942530c427f4bd1084a55a53e6a71b009d489",
+  "decisionsSha256": "04666acc331d86f43ca65acb45821351c6bd47ea9b02562914036d111c9a0263",
+  "files": 5,
+  "ordinaryManifest": "imports/manifest.json",
+  "outputs": [
+    {
+      "bytes": 1392,
+      "path": "decisions.json",
+      "sha256": "fc515bb36bc7a47825f8e84df42391346dec7b158360cbf6a5433405a6e9e6b4"
+    },
+    {
+      "bytes": 263,
+      "path": "imports/auth/members.ndjson",
+      "sha256": "7e96b0a9e5ac0292071f3e12a03cec2933d581e3c8381a69fde7f8fbea6f0018"
+    },
+    {
+      "bytes": 202,
+      "path": "imports/manifest.json",
+      "sha256": "131f2e22e1bd8488472d5272080a9faa6d8d33662d252d36eeb0045244ff85ee"
+    },
+    {
+      "bytes": 469,
+      "path": "imports/posts.ndjson",
+      "sha256": "9a34c34f84a4ebcd1ec6578862943ad7798a3b8962808a2e867be60d9c96f691"
+    },
+    {
+      "bytes": 157,
+      "path": "imports/secrets.ndjson",
+      "sha256": "be66364f05837fbf6a1c7f9c27f8fe00320d55c5a9a6369aabf79c7937ea1128"
+    },
+    {
+      "bytes": 2599,
+      "path": "inventory.json",
+      "sha256": "2517cf38892d2e3e44afa4720e4e036da0a38892672e4d2f45fee90503ce6491"
+    },
+    {
+      "bytes": 371,
+      "path": "replacements/dd6f510db97e1118-protected-document.json",
+      "sha256": "dd6f510db97e1118ddddb34160576c6e3d5cf1dffc60743bee19215b9b270186"
+    },
+    {
+      "bytes": 4251,
+      "path": "schema.json",
+      "sha256": "eb3a59323864647a77b3ab8f70a8b7a5c0416e68af5bb3603e79606cb12a1a94"
+    },
+    {
+      "bytes": 6,
+      "path": "storage/members/member000000001/avatar_fixture.txt",
+      "sha256": "1f3267003a06dd7d1a7da1c9be19a72bac1d8f4ab0015beb59aed9edac62e527"
+    },
+    {
+      "bytes": 12,
+      "path": "storage/posts/post00000000001/cover_fixture.txt",
+      "sha256": "923724879d26c139773d7ed67207a976c8a7c1204a09d9b57039a63d9a17610d"
+    },
+    {
+      "bytes": 9,
+      "path": "storage/posts/post00000000001/gallery_a_fixture.txt",
+      "sha256": "2e98018dd6dd6e8837cc17dbafd6802a8ebf7f5fbe2a21fcc71f98292d4e7364"
+    },
+    {
+      "bytes": 9,
+      "path": "storage/posts/post00000000001/gallery_b_fixture.txt",
+      "sha256": "19f644c12f84bd8d5a841d150237520b7e66be0ab78f133beef2d71768be9894"
+    },
+    {
+      "bytes": 16,
+      "path": "storage/secrets/secret000000001/secret_fixture.txt",
+      "sha256": "b219f0a0a0e4d84c10e6c645f131ffec4f9d796a943a0451d1cb764a76df77e4"
+    }
+  ],
+  "replacementArtifacts": [
+    {
+      "finding": "field.secrets_fixture1.secret_document.options",
+      "path": "replacements/dd6f510db97e1118-protected-document.json",
+      "sha256": "dd6f510db97e1118ddddb34160576c6e3d5cf1dffc60743bee19215b9b270186"
+    }
+  ],
+  "rowCounts": {
+    "members": 1,
+    "posts": 2,
+    "secrets": 1
+  },
+  "rows": 4,
+  "schemaSha256": "d4fe72aeb4da894621c62fb3549a093e760811c8fba1a4d59d33db63fd15f209",
+  "sourceVersion": "0.39.11",
+  "storageFiles": [
+    {
+      "bytes": 6,
+      "path": "storage/members/member000000001/avatar_fixture.txt",
+      "sha256": "1f3267003a06dd7d1a7da1c9be19a72bac1d8f4ab0015beb59aed9edac62e527",
+      "sourcePath": "members_fixture1/member000000001/avatar_fixture.txt"
+    },
+    {
+      "bytes": 12,
+      "path": "storage/posts/post00000000001/cover_fixture.txt",
+      "sha256": "923724879d26c139773d7ed67207a976c8a7c1204a09d9b57039a63d9a17610d",
+      "sourcePath": "posts_fixture001/post00000000001/cover_fixture.txt"
+    },
+    {
+      "bytes": 9,
+      "path": "storage/posts/post00000000001/gallery_a_fixture.txt",
+      "sha256": "2e98018dd6dd6e8837cc17dbafd6802a8ebf7f5fbe2a21fcc71f98292d4e7364",
+      "sourcePath": "posts_fixture001/post00000000001/gallery_a_fixture.txt"
+    },
+    {
+      "bytes": 9,
+      "path": "storage/posts/post00000000001/gallery_b_fixture.txt",
+      "sha256": "19f644c12f84bd8d5a841d150237520b7e66be0ab78f133beef2d71768be9894",
+      "sourcePath": "posts_fixture001/post00000000001/gallery_b_fixture.txt"
+    },
+    {
+      "bytes": 16,
+      "path": "storage/secrets/secret000000001/secret_fixture.txt",
+      "sha256": "b219f0a0a0e4d84c10e6c645f131ffec4f9d796a943a0451d1cb764a76df77e4",
+      "sourcePath": "secrets_fixture1/secret000000001/secret_fixture.txt"
+    }
+  ],
+  "unreferencedStorage": [
+    "members_fixture1/member000000001/avatar_fixture.txt.attrs",
+    "posts_fixture001/post00000000001/cover_fixture.txt.attrs",
+    "posts_fixture001/post00000000001/gallery_a_fixture.txt.attrs",
+    "posts_fixture001/post00000000001/gallery_b_fixture.txt.attrs",
+    "secrets_fixture1/secret000000001/secret_fixture.txt.attrs"
+  ],
+  "zigbasePocketBaseBundle": 1
+}

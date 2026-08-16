@@ -1,0 +1,1 @@
+{"zigbaseAgentEval":1,"scenario":"pocketbase","commit":"9a72b656b7df8cc732aa249b7ba9f84ddd89dba6","agent":"codex-cli-0.147-default","started_at":"2026-08-16T02:46:58.015128Z","duration_ms":746677,"agent_exit":0,"timed_out":false,"interventions":0,"completion":true,"rules_locked":true,"tests_green":true,"deployed":true,"score":4,"failures":[]}

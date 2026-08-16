@@ -200,6 +200,16 @@
     }
   },
   {
+    "canonical": "docs/migrate-pocketbase.md",
+    "mirror": "migrate-pocketbase.md",
+    "frontmatter": {
+      "title": "Migrate PocketBase to ZigBase",
+      "description": "Migrate a stopped PocketBase 0.39.11 application with durable decisions, preserved users and timestamps, verified files, parity replay, and rollback evidence.",
+      "order": 11,
+      "group": "guides"
+    }
+  },
+  {
     "canonical": "docs/realtime-broadcast.md",
     "mirror": "realtime-broadcast.md",
     "frontmatter": {

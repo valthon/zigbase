@@ -2699,6 +2699,10 @@ fn printImportUsage(io: std.Io, file: std.Io.File) void {
         \\                     because an updated row would land with no credential installed.
         \\                     The flag applies uniformly to EVERY manifest entry, so a legacy-hash
         \\                     import must be its own single-collection run.
+        \\  --preserve-timestamps  Preserve each row's source `created` and `updated` values.
+        \\                     Requires a provided id on every row and is CREATE-ONLY: it cannot
+        \\                     be combined with --upsert-key or a manifest entry's `upsertKey`.
+        \\                     This operator-only seam never applies to HTTP/client writes.
         \\
         \\WHAT IT DOES:
         \\  Streams an NDJSON file (one JSON object per line) into the collection THROUGH THE
@@ -3697,6 +3701,7 @@ fn importImpl(
         .progress_every = ia.progress,
         .progress = if (ia.progress > 0) &prog_writer.interface else null,
         .legacy_hash_algorithm = ia.legacy_hashes,
+        .preserve_timestamps = ia.preserve_timestamps,
     };
 
     // A generous heap line buffer (a single NDJSON record must fit it). Heap, not stack — 1 MiB.
@@ -3727,6 +3732,7 @@ fn importImpl(
         try root.put(a, "zigbase_import", .{ .integer = 1 });
         try root.put(a, "collection", .{ .string = collection });
         try root.put(a, "dry_run", .{ .bool = ia.dry_run });
+        try root.put(a, "preserve_timestamps", .{ .bool = ia.preserve_timestamps });
         try root.put(a, "created", .{ .integer = @intCast(report.created) });
         try root.put(a, "updated", .{ .integer = @intCast(report.updated) });
         try root.put(a, "failed", .{ .integer = @intCast(report.failed) });
@@ -3830,6 +3836,7 @@ fn importManifestImpl(
             .progress_every = ia.progress,
             .progress = if (ia.progress > 0) &prog_writer.interface else null,
             .legacy_hash_algorithm = ia.legacy_hashes,
+            .preserve_timestamps = ia.preserve_timestamps,
         },
     }) catch |e| {
         std.log.err("import manifest '{s}' failed: {s}", .{ mpath, @errorName(e) });
@@ -3851,6 +3858,7 @@ fn importManifestImpl(
         try root.put(a, "zigbase_import_manifest", .{ .integer = 1 });
         try root.put(a, "manifest", .{ .string = mpath });
         try root.put(a, "dry_run", .{ .bool = ia.dry_run });
+        try root.put(a, "preserve_timestamps", .{ .bool = ia.preserve_timestamps });
         try root.put(a, "patched", .{ .integer = @intCast(report.patched) });
         try root.put(a, "failed", .{ .integer = @intCast(report.failed) });
         try root.put(a, "collections", .{ .array = cols });

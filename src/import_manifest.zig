@@ -294,6 +294,11 @@ fn patchDeferred(
 ) ManifestError!PatchOutcome {
     const path = try resolvePath(sa, opts.base_dir, e.file);
     const col = (try collections.get(sa, w, e.collection)) orelse return ManifestError.UnknownCollection;
+    var timestamp_restorer = if (opts.import.preserve_timestamps)
+        try import.TimestampRestorer.init(sa, w, col)
+    else
+        null;
+    defer if (timestamp_restorer) |*restorer| restorer.deinit();
 
     const f = try std.Io.Dir.cwd().openFile(io, path, .{});
     defer f.close(io);
@@ -347,6 +352,7 @@ fn patchDeferred(
             out.failed += 1;
             continue;
         }
+        if (timestamp_restorer) |*restorer| try restorer.apply(parsed);
         out.patched += 1;
     }
     try w.commit();
@@ -557,8 +563,8 @@ test "a self-relation loads in any row order and is patched afterwards" {
     var dir = std.testing.tmpDir(.{});
     defer dir.cleanup();
     try dir.dir.writeFile(io, .{ .sub_path = "tree.ndjson", .data =
-        \\{"id":"treechild00001","label":"child","parent":"treeroot000001"}
-        \\{"id":"treeroot000001","label":"root","parent":null}
+        \\{"id":"treechild00001","created":"2005-01-02T03:04:05Z","updated":"2006-02-03T04:05:06Z","label":"child","parent":"treeroot000001"}
+        \\{"id":"treeroot000001","created":"2007-01-02T03:04:05Z","updated":"2008-02-03T04:05:06Z","label":"root","parent":null}
         \\
     });
     const base = try dir.dir.realPathFileAlloc(io, ".", a);
@@ -569,15 +575,17 @@ test "a self-relation loads in any row order and is patched afterwards" {
     );
     defer m.deinit();
 
-    const rep = try run(&app, &d, io, a, m, .{ .base_dir = base, .import = .{ .collection = "" } });
+    const rep = try run(&app, &d, io, a, m, .{ .base_dir = base, .import = .{ .collection = "", .preserve_timestamps = true } });
     defer a.free(rep.entries);
     try std.testing.expectEqual(@as(usize, 2), rep.entries[0].created);
     try std.testing.expectEqual(@as(usize, 1), rep.patched); // only the child had a parent
 
-    var st = try d.prepare("SELECT \"parent\" FROM \"tree\" WHERE \"id\"='treechild00001';");
+    var st = try d.prepare("SELECT \"parent\", \"created\", \"updated\" FROM \"tree\" WHERE \"id\"='treechild00001';");
     defer st.finalize();
     try std.testing.expect(try st.step());
     try std.testing.expectEqualStrings("treeroot000001", st.columnText(0));
+    try std.testing.expectEqualStrings("2005-01-02T03:04:05Z", st.columnText(1));
+    try std.testing.expectEqualStrings("2006-02-03T04:05:06Z", st.columnText(2));
 }
 
 test "run fails fast with RequiredRelationInCycle instead of drowning every row in validation_required" {
@@ -779,4 +787,49 @@ test "run: a manifest entry's upsertKey cannot smuggle past the create-only lega
     defer st.finalize();
     try std.testing.expect(try st.step());
     try std.testing.expectEqual(@as(i64, 0), st.columnInt(0));
+}
+
+test "run: manifest forwards source timestamp preservation and rejects entry upserts" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try migrations.run(&d);
+    var app = import.testApp(a, io);
+    const items = try collections.create(a, io, &d, .{
+        .id = "",
+        .name = "items",
+        .fields = &.{.{ .id = "", .name = "slug", .options = .{ .text = .{} } }},
+    });
+    defer items.deinit(a);
+
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    try dir.dir.writeFile(io, .{ .sub_path = "items.ndjson", .data =
+        \\{"id":"itemtime000001","created":"2005-01-02T03:04:05Z","updated":"2006-02-03T04:05:06Z","slug":"one"}
+        \\
+    });
+    const base = try dir.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(base);
+
+    var plain = try parseManifest(a,
+        \\{"zigbaseImportManifest":1,"collections":[{"collection":"items","file":"items.ndjson"}]}
+    );
+    defer plain.deinit();
+    const rep = try run(&app, &d, io, a, plain, .{ .base_dir = base, .import = .{ .collection = "", .preserve_timestamps = true } });
+    defer a.free(rep.entries);
+    var st = try d.prepare("SELECT created, updated FROM items WHERE id='itemtime000001';");
+    defer st.finalize();
+    try std.testing.expect(try st.step());
+    try std.testing.expectEqualStrings("2005-01-02T03:04:05Z", st.columnText(0));
+    try std.testing.expectEqualStrings("2006-02-03T04:05:06Z", st.columnText(1));
+
+    var upsert = try parseManifest(a,
+        \\{"zigbaseImportManifest":1,"collections":[{"collection":"items","file":"items.ndjson","upsertKey":"slug"}]}
+    );
+    defer upsert.deinit();
+    try std.testing.expectError(
+        import.ImportError.TimestampRequiresCreateOnly,
+        run(&app, &d, io, a, upsert, .{ .base_dir = base, .import = .{ .collection = "", .preserve_timestamps = true } }),
+    );
 }

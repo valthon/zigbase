@@ -135,6 +135,8 @@ pub const ImportArgs = struct {
     manifest: ?[]const u8 = null,
     /// Import source password hashes tagged with this algorithm (currently `bcrypt` only).
     legacy_hashes: ?[]const u8 = null,
+    /// Preserve source `created` and `updated` values on create-only imports.
+    preserve_timestamps: bool = false,
 };
 
 /// `explain-code [CODE] [--json]`: print the long form for one frozen error code,
@@ -437,6 +439,8 @@ pub fn parse(args: []const []const u8, popts: ParseOpts) ParseError!Command {
                 i += 1;
                 if (i >= args.len) return ParseError.MissingValue;
                 ia.legacy_hashes = args[i];
+            } else if (std.mem.eql(u8, a, "--preserve-timestamps")) {
+                ia.preserve_timestamps = true;
             } else if (std.mem.eql(u8, a, "-") or !std.mem.startsWith(u8, a, "-")) {
                 // Positional NDJSON file path (`-` = stdin). Only one is allowed.
                 if (ia.file != null) return ParseError.BadValue;
@@ -452,6 +456,8 @@ pub fn parse(args: []const []const u8, popts: ParseOpts) ParseError!Command {
         // row's password. Refused here as a usage error; `import.run` refuses it again at
         // runtime for the library/manifest paths this parser never sees.
         if (ia.legacy_hashes != null and ia.upsert_key != null)
+            return ParseError.BadValue;
+        if (ia.preserve_timestamps and ia.upsert_key != null)
             return ParseError.BadValue;
         return .{ .import = ia };
     }
@@ -950,6 +956,18 @@ test "import --legacy-hashes parses and requires a value" {
         &.{ "import", "--collection", "users", "--legacy-hashes", "bcrypt", "--upsert-key", "email", "u.ndjson" },
         .{},
     ));
+}
+
+test "import --preserve-timestamps parses and is create-only" {
+    const cmd = try parse(&.{ "import", "--collection", "posts", "--preserve-timestamps", "p.ndjson" }, .{});
+    try std.testing.expect(cmd.import.preserve_timestamps);
+    try std.testing.expectError(ParseError.BadValue, parse(
+        &.{ "import", "--collection", "posts", "--preserve-timestamps", "--upsert-key", "slug", "p.ndjson" },
+        .{},
+    ));
+    // Manifest entries are checked at runtime because their upsert keys live in the file.
+    const manifest = try parse(&.{ "import", "--manifest", "m.json", "--preserve-timestamps" }, .{});
+    try std.testing.expect(manifest.import.preserve_timestamps);
 }
 
 test "import --manifest parses and excludes the single-collection flags" {

@@ -1,0 +1,18 @@
+{
+  "finding": "field.secrets_fixture1.secret_document.options",
+  "kind": "field",
+  "value": {
+    "encrypted": false,
+    "hidden": false,
+    "id": "secret_document",
+    "name": "document",
+    "options": {
+      "maxSelect": 1
+    },
+    "required": false,
+    "searchable": false,
+    "type": "file",
+    "unique": false
+  },
+  "zigbasePocketBaseReplacement": 1
+}

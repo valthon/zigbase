@@ -18,6 +18,9 @@ GENESIS_PROMPT = GENESIS.with_name("prompt.md")
 GENESIS_EVIDENCE = (
     REPO / "evals" / "agents" / "evidence" / "genesis" / "2026-08-15-3f3224d5"
 )
+POCKETBASE_EVIDENCE = (
+    REPO / "evals" / "agents" / "evidence" / "pocketbase" / "2026-08-16-9a72b656"
+)
 
 
 def result_dict():
@@ -92,6 +95,30 @@ def test_first_genesis_release_evidence_is_three_clean_consecutive_runs():
     }
     assert all(
         result.scenario == "genesis"
+        and result.agent == "codex-cli-0.147-default"
+        and result.agent_exit == 0
+        and not result.timed_out
+        and result.interventions == 0
+        and result.completion
+        and result.rules_locked
+        and result.tests_green
+        and result.deployed
+        and result.score == 4
+        and result.failures == ()
+        for result in results
+    )
+
+
+def test_first_pocketbase_release_evidence_is_three_clean_consecutive_runs():
+    files = sorted(POCKETBASE_EVIDENCE.glob("run-*.json"))
+    assert [path.name for path in files] == ["run-1.json", "run-2.json", "run-3.json"]
+
+    results = [EvalResult.from_json(path.read_text()) for path in files]
+    assert {result.commit for result in results} == {
+        "9a72b656b7df8cc732aa249b7ba9f84ddd89dba6"
+    }
+    assert all(
+        result.scenario == "pocketbase"
         and result.agent == "codex-cli-0.147-default"
         and result.agent_exit == 0
         and not result.timed_out

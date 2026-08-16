@@ -1,0 +1,1 @@
+"""PocketBase migration tool tests."""
