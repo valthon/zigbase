@@ -857,6 +857,14 @@ def run_deployment(
         failures.append(
             _failure(code, "PocketBase migration deployment verification failed")
         )
+        if compose is not None and cleanup:
+            stack = [*base, "-f", str(compose), "-f", str(override)]
+            commands.run(
+                [*stack, "logs", "--no-color", service],
+                cwd=workspace,
+                env=environment,
+                timeout=30,
+            )
     finally:
         if compose is not None and cleanup:
             stack = [*base, "-f", str(compose), "-f", str(override)]

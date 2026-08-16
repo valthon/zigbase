@@ -144,7 +144,7 @@ def grade_fixture(target, artifacts, commands=None, **kwargs):
         behavior_probe=kwargs.pop("behavior_probe", no_probe),
         database_inspector=kwargs.pop("database_inspector", no_database),
         file_installer=install_files,
-        http_request=http_request,
+        http_request=kwargs.pop("http_request", http_request),
         **kwargs,
     )
 
@@ -170,6 +170,9 @@ def test_prompt_requires_open_signup_and_warning_not_error():
         "named durable",
         "survive",
         "down -v --remove-orphans",
+        "owner-filtered list",
+        "empty `items` array",
+        "do not expect `403`",
     ):
         assert boundary in prompt
 
@@ -231,6 +234,29 @@ def test_positive_fixture_scores_four_and_tears_down(tmp_path):
         "ZIGBASE_BINARY": "zigbase",
         "ZIGBASE_EVAL_BINARY": "zigbase",
     }
+
+
+def test_failed_deployment_captures_logs_before_teardown(tmp_path):
+    commands = FakeCommands()
+
+    def unhealthy(_method, _url):
+        return 503, b"{}"
+
+    report = grade_fixture(
+        workspace(tmp_path),
+        tmp_path / "artifacts",
+        commands,
+        http_request=unhealthy,
+        health_attempts=1,
+    )
+
+    assert report.deployed is False
+    assert any(
+        failure.code == "deployment.health_timeout" for failure in report.failures
+    )
+    logs = next(index for index, call in enumerate(commands.calls) if "logs" in call)
+    down = next(index for index, call in enumerate(commands.calls) if "down" in call)
+    assert logs < down
 
 
 @pytest.mark.parametrize(

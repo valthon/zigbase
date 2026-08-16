@@ -213,6 +213,10 @@ rehearsal target with `tools/replay/zb_replay.py`. Include anonymous and authent
 relation expansion, denied owner access, public and protected files, validation failures, and any
 custom endpoint clients depend on.
 
+Keep list filtering distinct from single-record denial in the parity suite. When a collection rule
+hides every row, the list endpoint still returns `200` with an empty `items` array. Exercise a
+denied record endpoint separately and expect the concealed `404`; a filtered list is not a `403`.
+
 Verify a known migrated account twice:
 
 1. a wrong password fails and leaves the legacy hash unchanged;

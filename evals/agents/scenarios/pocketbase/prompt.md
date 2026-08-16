@@ -15,6 +15,11 @@ captured public, owner-scoped, protected-file, and relation-expansion behavior. 
 auth create rule is intentional: anonymous signup must work, while production doctor must enumerate
 `members.createRule` as a warning rather than an error.
 
+Match collection-rule HTTP semantics precisely in the integration boundary: an owner-filtered list
+request succeeds with `200` and an empty `items` array when no rows are visible, while a denied
+single-record request is concealed with `404`. Test both boundaries; do not expect `403` from the
+owner-filtered list.
+
 Create `security/public-rules.json` with exactly this compact reviewed inventory contract:
 
 ```json

@@ -78,6 +78,10 @@ validation failures, and client response boundaries. Prove a wrong password does
 legacy credential, the correct old password logs in and upgrades bcrypt to argon2id, and the login
 still succeeds after restart. Never claim PocketBase sessions survive.
 
+Preserve rule-filtering HTTP semantics in those tests. A list whose rule hides every row still
+returns `200` with an empty `items` array; test a denied single-record request separately and expect
+the concealed `404`. Do not encode a filtered list as a `403` expectation.
+
 ## 5. Gate cutover and preserve rollback
 
 Run production doctor and reconcile exact public-rule warnings with decisions. Resolve genuine
