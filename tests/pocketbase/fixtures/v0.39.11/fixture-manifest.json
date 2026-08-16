@@ -1,0 +1,92 @@
+{
+  "containsSecrets": false,
+  "files": [
+    {
+      "bytes": 1157,
+      "path": "decisions.json",
+      "sha256": "298f241536e477f6c6768ccea1d27446daa44fb9ed36e59758e2ca601c8b6c74"
+    },
+    {
+      "bytes": 3749,
+      "path": "generation/1700000000_fixture.js",
+      "sha256": "7e0f39d5375985674c0e0cc7ebecb45e6bb3e9a9ef741c06ca32dea5a4008d23"
+    },
+    {
+      "bytes": 764,
+      "path": "parity.json",
+      "sha256": "ad96924fe69e5b5f0e6112d9728a893a34604464e959d9ac144cc29d0c1cb28d"
+    },
+    {
+      "bytes": 180224,
+      "path": "pb_data/data.db",
+      "sha256": "918b471eda889f7c08ededf74669ec1ea971457031a48c68c732597ad8ef4746"
+    },
+    {
+      "bytes": 6,
+      "path": "pb_data/storage/members_fixture1/member000000001/avatar_fixture.txt",
+      "sha256": "1f3267003a06dd7d1a7da1c9be19a72bac1d8f4ab0015beb59aed9edac62e527"
+    },
+    {
+      "bytes": 242,
+      "path": "pb_data/storage/members_fixture1/member000000001/avatar_fixture.txt.attrs",
+      "sha256": "da8b6bb571267ad74dc9a5fc981309741e985422b8a190988b243fae9e258d56"
+    },
+    {
+      "bytes": 12,
+      "path": "pb_data/storage/posts_fixture001/post00000000001/cover_fixture.txt",
+      "sha256": "923724879d26c139773d7ed67207a976c8a7c1204a09d9b57039a63d9a17610d"
+    },
+    {
+      "bytes": 241,
+      "path": "pb_data/storage/posts_fixture001/post00000000001/cover_fixture.txt.attrs",
+      "sha256": "05136c188e5fb7ca67d18dc2bd8580b072ec9b0a028f89e5cedbd6c17f265955"
+    },
+    {
+      "bytes": 9,
+      "path": "pb_data/storage/posts_fixture001/post00000000001/gallery_a_fixture.txt",
+      "sha256": "2e98018dd6dd6e8837cc17dbafd6802a8ebf7f5fbe2a21fcc71f98292d4e7364"
+    },
+    {
+      "bytes": 237,
+      "path": "pb_data/storage/posts_fixture001/post00000000001/gallery_a_fixture.txt.attrs",
+      "sha256": "34f0722b3ab518343960839df4fb39fad274535118d4d88db945de686546da7a"
+    },
+    {
+      "bytes": 9,
+      "path": "pb_data/storage/posts_fixture001/post00000000001/gallery_b_fixture.txt",
+      "sha256": "19f644c12f84bd8d5a841d150237520b7e66be0ab78f133beef2d71768be9894"
+    },
+    {
+      "bytes": 237,
+      "path": "pb_data/storage/posts_fixture001/post00000000001/gallery_b_fixture.txt.attrs",
+      "sha256": "30ca436639fec3766ef70b5fffb6aa6d88cdf310685f445c07237220fc932ea2"
+    },
+    {
+      "bytes": 16,
+      "path": "pb_data/storage/secrets_fixture1/secret000000001/secret_fixture.txt",
+      "sha256": "b219f0a0a0e4d84c10e6c645f131ffec4f9d796a943a0451d1cb764a76df77e4"
+    },
+    {
+      "bytes": 242,
+      "path": "pb_data/storage/secrets_fixture1/secret000000001/secret_fixture.txt.attrs",
+      "sha256": "caa7aaa65b11b4557d51881a73b8e33db8a486875764981ce9983e4d8a3764bc"
+    },
+    {
+      "bytes": 9086,
+      "path": "pb_schema.json",
+      "sha256": "d99a9eec56a619930e7b36cbf80638ad72b82e07e8745d736fe517ee280a1141"
+    },
+    {
+      "bytes": 371,
+      "path": "replacements/protected-document.json",
+      "sha256": "dd6f510db97e1118ddddb34160576c6e3d5cf1dffc60743bee19215b9b270186"
+    }
+  ],
+  "knownCredential": "ada@example.test / migrated-secret",
+  "pocketbaseVersion": "0.39.11",
+  "releaseAsset": {
+    "sha256": "08b9fcda0d5fd42cb315dc15a36dfa121c993855bd635f01d347c31b4328ec34",
+    "url": "https://github.com/pocketbase/pocketbase/releases/download/v0.39.11/pocketbase_0.39.11_linux_amd64.zip"
+  },
+  "zigbasePocketBaseFixture": 1
+}

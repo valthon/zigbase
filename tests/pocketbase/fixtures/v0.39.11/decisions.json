@@ -1,0 +1,32 @@
+{
+  "decisions": [
+    {
+      "choice": "reviewed",
+      "id": "collection.members_fixture1.authConfig",
+      "rationale": "Password authentication remains enabled with email identity; unsupported auth methods are disabled."
+    },
+    {
+      "artifact": "replacements/protected-document.json",
+      "choice": "replacement",
+      "id": "field.secrets_fixture1.secret_document.options",
+      "rationale": "ZigBase file authorization follows the owner-scoped collection view rule, preserving protected access."
+    },
+    {
+      "choice": "public",
+      "id": "rule.posts_fixture001.listRule.public",
+      "rationale": "The fixture intentionally exposes the posts list for anonymous parity checks."
+    },
+    {
+      "choice": "public",
+      "id": "rule.posts_fixture001.viewRule.public",
+      "rationale": "The fixture intentionally exposes individual posts and their files."
+    },
+    {
+      "choice": "local-snapshot",
+      "id": "source.file_storage.confirmation",
+      "rationale": "The committed fixture contains a stopped local PocketBase storage snapshot."
+    }
+  ],
+  "sourceVersion": "0.39.11",
+  "zigbasePocketBaseDecisions": 1
+}
