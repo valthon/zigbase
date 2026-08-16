@@ -1,0 +1,4 @@
+interface:
+  display_name: "ZigBase PocketBase Migration"
+  short_description: "Migrate PocketBase apps safely to ZigBase"
+  default_prompt: "Use $zigbase-migrate-pocketbase to migrate my PocketBase app to ZigBase with durable decisions and parity checks."

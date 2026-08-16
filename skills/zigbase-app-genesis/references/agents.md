@@ -105,6 +105,7 @@ trust it over any document, including this one.
 | calling from Python / Dart / Kotlin | [python-sdk.md](python-sdk.md), [dart-sdk.md](dart-sdk.md), [kotlin-sdk.md](kotlin-sdk.md) |
 | deploying | [deployment.md](deployment.md), [docker.md](docker.md) |
 | evaluating an app-building agent | [agent-evals.md](agent-evals.md) |
+| migrating PocketBase 0.39.11 | [migrate-pocketbase.md](migrate-pocketbase.md) |
 | doing per-row authorization | [abilities.md](abilities.md), [tenancy.md](tenancy.md) |
 | adding search | [search.md](search.md) |
 | sending mail, or running background work | [email.md](email.md), [jobs-and-webhooks.md](jobs-and-webhooks.md) |

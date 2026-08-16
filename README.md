@@ -209,7 +209,8 @@ emitting `doctor`-shaped NDJSON findings and exiting `0`/`2`/`1` clean/warnings-
 Given a document it is a **syntax**-depth check; run against a data dir it is **full** depth
 and also resolves field and relation names. Together with `import --manifest` and
 `import --legacy-hashes` they are the machinery behind
-[migrating an existing backend to ZigBase](docs/migration-tools.md).
+[migrating an existing backend to ZigBase](docs/migration-tools.md). PocketBase 0.39.11 has a
+dedicated, decision-driven workflow in [docs/migrate-pocketbase.md](docs/migrate-pocketbase.md).
 
 Running `zigbase` with no recognised command prints usage.
 
