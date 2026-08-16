@@ -9,10 +9,14 @@ The Genesis flagship passed its release gate on 2026-08-15: commit `3f3224d5` pr
 consecutive score-4 runs with zero interventions using `codex-cli-0.147-default`. The sanitized
 summaries are preserved under
 [`evals/agents/evidence/genesis/2026-08-15-3f3224d5/`](../evals/agents/evidence/genesis/2026-08-15-3f3224d5/).
+The immutable tag `agent-eval-genesis-2026-08-15` resolves to the recorded full commit
+`3f3224d50d2bc8e45b3888011ac118397103cd75`.
 The PocketBase migration flagship passed its release gate on 2026-08-16: commit `9a72b656`
 produced three consecutive score-4 runs with zero interventions using the same agent. Its
 sanitized summaries are preserved under
 [`evals/agents/evidence/pocketbase/2026-08-16-9a72b656/`](../evals/agents/evidence/pocketbase/2026-08-16-9a72b656/).
+The immutable tag `agent-eval-pocketbase-2026-08-16` resolves to the recorded full commit
+`9a72b656b7df8cc732aa249b7ba9f84ddd89dba6`.
 Deterministic harness tests block CI; real-agent runs remain opt-in so model tokens and credentials
 are never required by ordinary builds.
 
@@ -174,6 +178,6 @@ The flagship criterion is three consecutive results from the same commit where a
 are true, `score` is 4, `interventions` is 0, and `failures` is empty. Preserve those sanitized
 summaries and record the agent/model identifier supplied to `--agent`.
 
-The first qualifying sets are the 2026-08-15 Genesis `3f3224d5` evidence and the 2026-08-16
-PocketBase `9a72b656` evidence linked above. Raw transcripts and scenario workspaces stay out of
-the repository.
+The first qualifying sets are the tagged 2026-08-15 Genesis `3f3224d5` evidence and tagged
+2026-08-16 PocketBase `9a72b656` evidence linked above. Raw transcripts and scenario workspaces
+stay out of the repository.
