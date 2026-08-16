@@ -35,6 +35,20 @@ EXPRESS_REFERENCE_NAMES = (
     "openapi.md",
     "serve.md",
 )
+LARAVEL_REFERENCE_NAMES = (
+    "agents.md",
+    "deployment.md",
+    "migrate-laravel.md",
+    "migration-tools.md",
+    "openapi.md",
+)
+GO_REFERENCE_NAMES = (
+    "agents.md",
+    "deployment.md",
+    "migrate-go.md",
+    "migration-tools.md",
+    "openapi.md",
+)
 
 
 def validate_skill(repo: Path) -> list[str]:
@@ -312,6 +326,63 @@ def copy_express_subject(tmp_path: Path) -> Path:
     return subject
 
 
+def validate_source_skill(repo: Path, skill_name: str, guide: str, references) -> list[str]:
+    errors = []
+    skill = repo / "skills" / skill_name
+    skill_md = skill / "SKILL.md"
+    if not skill.is_dir() or not skill_md.is_file():
+        return ["skill.missing"]
+    body = skill_md.read_text()
+    if len(body.splitlines()) > 500:
+        errors.append("skill.oversized")
+    if f"references/{guide}" not in body:
+        errors.append("skill.guide_reference")
+    if not body.startswith("---\n") or "\n---\n" not in body[4:]:
+        errors.append("skill.frontmatter")
+    else:
+        frontmatter = body.split("---\n", 2)[1]
+        fields = dict(
+            line.split(":", 1) for line in frontmatter.splitlines() if ":" in line
+        )
+        fields = {key.strip(): value.strip() for key, value in fields.items()}
+        if set(fields) != {"name", "description"}:
+            errors.append("skill.frontmatter_fields")
+        if fields.get("name") != skill_name:
+            errors.append("skill.name")
+        if not fields.get("description"):
+            errors.append("skill.description")
+    metadata = skill / "agents" / "openai.yaml"
+    if not metadata.is_file():
+        errors.append("skill.metadata_missing")
+    elif any(
+        marker not in metadata.read_text()
+        for marker in ("display_name:", "short_description:", f"${skill_name}")
+    ):
+        errors.append("skill.metadata_invalid")
+    expected = {"SKILL.md"} | {f"references/{name}" for name in references}
+    actual = {path.relative_to(skill).as_posix() for path in skill.rglob("*.md")}
+    if actual != expected:
+        errors.append("skill.unexpected_markdown")
+    for name in references:
+        canonical = repo / "docs" / name
+        embedded = skill / "references" / name
+        if not embedded.is_file():
+            errors.append(f"reference.missing:{name}")
+        elif not canonical.is_file() or embedded.read_bytes() != canonical.read_bytes():
+            errors.append(f"reference.drift:{name}")
+    return errors
+
+
+def copy_source_subject(tmp_path: Path, skill_name: str, references) -> Path:
+    subject = tmp_path / "repo"
+    (subject / "docs").mkdir(parents=True)
+    (subject / "skills").mkdir()
+    shutil.copytree(REPO / "skills" / skill_name, subject / "skills" / skill_name)
+    for name in references:
+        shutil.copy(REPO / "docs" / name, subject / "docs" / name)
+    return subject
+
+
 def test_app_genesis_skill_is_valid_and_synced():
     assert validate_skill(REPO) == []
 
@@ -326,6 +397,52 @@ def test_zigapagos_pairing_skill_is_valid_and_synced():
 
 def test_express_migration_skill_is_valid_and_synced():
     assert validate_express_skill(REPO) == []
+
+
+@pytest.mark.parametrize(
+    ("skill_name", "guide", "references"),
+    [
+        ("zigbase-migrate-laravel", "migrate-laravel.md", LARAVEL_REFERENCE_NAMES),
+        ("zigbase-migrate-go", "migrate-go.md", GO_REFERENCE_NAMES),
+    ],
+)
+def test_remaining_source_skills_are_valid_and_synced(skill_name, guide, references):
+    assert validate_source_skill(REPO, skill_name, guide, references) == []
+
+
+@pytest.mark.parametrize(
+    ("skill_name", "guide", "references"),
+    [
+        ("zigbase-migrate-laravel", "migrate-laravel.md", LARAVEL_REFERENCE_NAMES),
+        ("zigbase-migrate-go", "migrate-go.md", GO_REFERENCE_NAMES),
+    ],
+)
+@pytest.mark.parametrize(
+    ("mutation", "expected"),
+    [
+        ("changed_reference", "reference.drift"),
+        ("unexpected_markdown", "skill.unexpected_markdown"),
+        ("wrong_name", "skill.name"),
+        ("bad_metadata", "skill.metadata_invalid"),
+    ],
+)
+def test_remaining_source_skill_guards(
+    tmp_path, skill_name, guide, references, mutation, expected
+):
+    subject = copy_source_subject(tmp_path, skill_name, references)
+    skill = subject / "skills" / skill_name
+    if mutation == "changed_reference":
+        (skill / "references" / guide).write_text("stale\n")
+    elif mutation == "unexpected_markdown":
+        (skill / "README.md").write_text("unexpected\n")
+    elif mutation == "wrong_name":
+        path = skill / "SKILL.md"
+        path.write_text(path.read_text().replace(f"name: {skill_name}", "name: wrong"))
+    elif mutation == "bad_metadata":
+        path = skill / "agents" / "openai.yaml"
+        path.write_text(path.read_text().replace(f"${skill_name}", "$wrong"))
+    errors = validate_source_skill(subject, skill_name, guide, references)
+    assert any(error.startswith(expected) for error in errors)
 
 
 @pytest.mark.parametrize(

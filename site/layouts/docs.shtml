@@ -27,6 +27,8 @@
           <li><a href="$site.page('docs/migration-tools').link()">Migration tools</a></li>
           <li><a href="$site.page('docs/migrate-pocketbase').link()">Migrate PocketBase</a></li>
           <li><a href="$site.page('docs/migrate-express').link()">Migrate Express</a></li>
+          <li><a href="$site.page('docs/migrate-laravel').link()">Migrate Laravel</a></li>
+          <li><a href="$site.page('docs/migrate-go').link()">Migrate Go</a></li>
         </ul>
         <p class="docs-group">Client SDKs</p>
         <ul>

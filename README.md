@@ -355,6 +355,7 @@ examples/
 - [docs/deployment.md](docs/deployment.md) — systemd, Docker Compose, reverse-proxy TLS, Fly, Railway, backups, upgrades, and rollback
 - [docs/agent-evals.md](docs/agent-evals.md) — run the provider-neutral Genesis agent evaluation and inspect the first verified three-run, zero-intervention flagship evidence
 - [docs/migrate-express.md](docs/migrate-express.md) — discovery-driven Express re-platforming with durable endpoint decisions, deterministic import, parity replay, and rehearsed cutover
+- [docs/migrate-laravel.md](docs/migrate-laravel.md) and [docs/migrate-go.md](docs/migrate-go.md) — source-specific Laravel and Go migration workflows on the same evidence-first skeleton
 - [docs/typescript-sdk.md](docs/typescript-sdk.md) — the official `@zigbase/client` TypeScript SDK: auth, records, offset + cursor pagination, files, realtime + live store
 - [docs/dart-sdk.md](docs/dart-sdk.md) — the official `zigbase_client` Dart SDK: auth, records, offset + cursor pagination, files, and realtime, for the Dart VM, Flutter, and Flutter web
 - [docs/python-sdk.md](docs/python-sdk.md) — the official `zigbase` Python SDK: sync and async clients for auth, records, offset + cursor pagination, and files

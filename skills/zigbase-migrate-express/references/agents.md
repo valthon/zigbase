@@ -110,6 +110,8 @@ trust it over any document, including this one.
 | evaluating an app-building agent | [agent-evals.md](agent-evals.md) |
 | migrating PocketBase 0.39.11 | [migrate-pocketbase.md](migrate-pocketbase.md) |
 | re-platforming a Node.js/Express service | [migrate-express.md](migrate-express.md) |
+| re-platforming a Laravel application | [migrate-laravel.md](migrate-laravel.md) |
+| re-platforming a Go web service | [migrate-go.md](migrate-go.md) |
 | doing per-row authorization | [abilities.md](abilities.md), [tenancy.md](tenancy.md) |
 | adding search | [search.md](search.md) |
 | sending mail, or running background work | [email.md](email.md), [jobs-and-webhooks.md](jobs-and-webhooks.md) |

@@ -1,0 +1,4 @@
+interface:
+  display_name: "ZigBase Laravel Migration"
+  short_description: "Re-platform Laravel apps onto ZigBase"
+  default_prompt: "Use $zigbase-migrate-laravel to inventory and re-platform my Laravel backend onto ZigBase with parity evidence."

@@ -220,6 +220,26 @@
     }
   },
   {
+    "canonical": "docs/migrate-laravel.md",
+    "mirror": "migrate-laravel.md",
+    "frontmatter": {
+      "title": "Migrate Laravel to ZigBase",
+      "description": "Re-platform a Laravel backend through route, middleware, Eloquent, policy, auth, queue, and file discovery; deterministic import; parity; and cutover rehearsal.",
+      "order": 13,
+      "group": "guides"
+    }
+  },
+  {
+    "canonical": "docs/migrate-go.md",
+    "mirror": "migrate-go.md",
+    "frontmatter": {
+      "title": "Migrate a Go service to ZigBase",
+      "description": "Re-platform a Go web service through router, middleware, data, transaction, auth, worker, and wire discovery; deterministic import; parity; and cutover rehearsal.",
+      "order": 14,
+      "group": "guides"
+    }
+  },
+  {
     "canonical": "docs/migrate-pocketbase.md",
     "mirror": "migrate-pocketbase.md",
     "frontmatter": {

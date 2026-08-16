@@ -1,0 +1,4 @@
+interface:
+  display_name: "ZigBase Go Migration"
+  short_description: "Re-platform Go web services onto ZigBase"
+  default_prompt: "Use $zigbase-migrate-go to inventory and re-platform my Go web service onto ZigBase with parity evidence."
