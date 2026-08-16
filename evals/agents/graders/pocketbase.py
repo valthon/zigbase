@@ -165,6 +165,34 @@ def _schema_public_rules(schema: dict[str, Any]) -> frozenset[tuple[str, str]]:
     return frozenset(found)
 
 
+def load_reviewed_public_inventory(path: Path) -> frozenset[tuple[str, str]]:
+    """Accept Genesis's rich inventory or the migration report's compact identities."""
+    value = _json(path, "rules.inventory")
+    if not isinstance(value, dict) or set(value) != {"zigbasePublicRules", "rules"}:
+        raise GradeFailure("rules.inventory_invalid", "public-rule inventory fields are invalid")
+    rules = value.get("rules")
+    if value.get("zigbasePublicRules") != 1 or not isinstance(rules, list):
+        raise GradeFailure("rules.inventory_invalid", "public-rule inventory contract is invalid")
+    if not all(isinstance(rule, str) for rule in rules):
+        return load_public_inventory(path)
+    found = set()
+    for rule in rules:
+        pieces = rule.rsplit(".", 1)
+        if len(pieces) != 2 or not pieces[0] or pieces[1] not in {
+            "list",
+            "view",
+            "create",
+            "update",
+            "delete",
+        }:
+            raise GradeFailure("rules.inventory_invalid", "compact public-rule identity is invalid")
+        identity = (pieces[0], pieces[1])
+        if identity in found:
+            raise GradeFailure("rules.inventory_invalid", "compact public-rule identity is duplicated")
+        found.add(identity)
+    return frozenset(found)
+
+
 def inspect_completion(workspace: Path) -> tuple[dict[str, Any] | None, tuple[EvalFailure, ...]]:
     failures: list[EvalFailure] = []
     bundle = workspace / "migration" / "bundle"
@@ -209,7 +237,9 @@ def inspect_completion(workspace: Path) -> tuple[dict[str, Any] | None, tuple[Ev
         if _schema_public_rules(schema) != EXPECTED_PUBLIC:
             raise GradeFailure("rules.bundle_public", "bundle public rules are not the reviewed set")
         _validate_report(workspace)
-        inventory = load_public_inventory(workspace / "security" / "public-rules.json")
+        inventory = load_reviewed_public_inventory(
+            workspace / "security" / "public-rules.json"
+        )
         if inventory != EXPECTED_PUBLIC:
             raise GradeFailure("rules.inventory", "public-rule inventory is not exact")
         if not (workspace / "tests" / "test_migration.py").is_file():

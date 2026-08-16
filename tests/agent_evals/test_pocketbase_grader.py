@@ -281,6 +281,40 @@ def test_public_rule_inventory_drift_is_rejected(tmp_path, mutation):
     assert report.rules_locked is False
 
 
+def test_compact_exact_public_rule_inventory_is_accepted(tmp_path):
+    target = workspace(tmp_path)
+    (target / "security" / "public-rules.json").write_text(
+        json.dumps(
+            {
+                "zigbasePublicRules": 1,
+                "rules": ["members.create", "posts.list", "posts.view"],
+            }
+        )
+    )
+    report = grade_fixture(target, tmp_path / "artifacts")
+    assert report.rules_locked is True
+    assert report.completion is True
+
+
+@pytest.mark.parametrize(
+    "rules",
+    [
+        ["members.create", "members.create"],
+        ["members.publish", "posts.list", "posts.view"],
+        ["members.create", "posts.list", "secrets.view"],
+    ],
+)
+def test_compact_public_rule_inventory_still_rejects_duplicate_invalid_or_drifted(
+    tmp_path, rules
+):
+    target = workspace(tmp_path)
+    (target / "security" / "public-rules.json").write_text(
+        json.dumps({"zigbasePublicRules": 1, "rules": rules})
+    )
+    report = grade_fixture(target, tmp_path / "artifacts")
+    assert report.rules_locked is False
+
+
 @pytest.mark.parametrize("mutation", ["bundle", "source", "missing_file", "decisions"])
 def test_hash_and_decision_tampering_is_rejected_without_leaking_values(tmp_path, mutation):
     target = workspace(tmp_path)
