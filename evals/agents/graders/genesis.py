@@ -343,7 +343,7 @@ def _zig_application_text(workspace: Path) -> str:
 
 
 def _client_test_sources(workspace: Path) -> tuple[Path, ...]:
-    suffixes = {".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"}
+    suffixes = {".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".py"}
     found = []
     for path in workspace.rglob("*"):
         if (
@@ -379,11 +379,6 @@ def inspect_completion(workspace: Path) -> tuple[EvalFailure, ...]:
             workspace / "security" / "public-rules.json",
             "completion.inventory_missing",
             "public-rule inventory is missing",
-        ),
-        (
-            workspace / "package.json",
-            "completion.client_missing",
-            "client test package.json is missing",
         ),
     ]
     for path, code, message in required:
@@ -459,36 +454,46 @@ def inspect_completion(workspace: Path) -> tuple[EvalFailure, ...]:
     return tuple(failures)
 
 
-def _package_test_script(workspace: Path) -> str:
-    try:
-        package = json.loads((workspace / "package.json").read_text())
-        scripts = package["scripts"]
-    except (OSError, json.JSONDecodeError, KeyError, TypeError) as exc:
-        raise GradeFailure(
-            "tests.package_invalid", f"cannot read package test scripts: {exc}"
-        ) from exc
-    for name in (
-        "test:e2e",
-        "test:browser",
-        "test:integration",
-        "test:client",
-        "test:journey",
-    ):
-        if (
-            isinstance(scripts, dict)
-            and isinstance(scripts.get(name), str)
-            and scripts[name].strip()
+def _client_test_command(workspace: Path) -> list[str]:
+    package_path = workspace / "package.json"
+    if package_path.is_file():
+        try:
+            package = json.loads(package_path.read_text())
+            scripts = package["scripts"]
+        except (OSError, json.JSONDecodeError, KeyError, TypeError) as exc:
+            raise GradeFailure(
+                "tests.package_invalid", f"cannot read package test scripts: {exc}"
+            ) from exc
+        for name in (
+            "test:e2e",
+            "test:browser",
+            "test:integration",
+            "test:client",
+            "test:journey",
         ):
-            command = scripts[name].strip()
-            if command in {"true", ":", "exit 0"} or command.endswith("; exit 0"):
-                raise GradeFailure(
-                    "tests.client_invalid",
-                    f"package.json script {name} is a no-op rather than a test runner",
-                )
-            return name
+            if (
+                isinstance(scripts, dict)
+                and isinstance(scripts.get(name), str)
+                and scripts[name].strip()
+            ):
+                command = scripts[name].strip()
+                if command in {"true", ":", "exit 0"} or command.endswith("; exit 0"):
+                    raise GradeFailure(
+                        "tests.client_invalid",
+                        f"package.json script {name} is a no-op rather than a test runner",
+                    )
+                return ["npm", "run", name]
+
+    try:
+        build = (workspace / "build.zig").read_text()
+    except OSError as exc:
+        raise GradeFailure("tests.client_missing", "build.zig is unavailable") from exc
+    for step in ("client-test", "integration-test", "browser-test", "e2e"):
+        if re.search(rf'b\.step\(\s*"{re.escape(step)}"', build):
+            return ["zig", "build", step]
     raise GradeFailure(
         "tests.client_missing",
-        "package.json must declare a client, browser, integration, or e2e test",
+        "package.json or build.zig must declare a client, browser, integration, journey, or e2e test",
     )
 
 
@@ -514,15 +519,18 @@ def run_build_and_tests(
             _failure("tests.unit_failed", "zig build test failed or timed out")
         )
     try:
-        script = _package_test_script(workspace)
+        client_command = _client_test_command(workspace)
     except GradeFailure as exc:
         failures.append(_failure(exc.code, str(exc)))
         tests_green = False
     else:
-        client = commands.run(["npm", "run", script], cwd=workspace)
+        client = commands.run(client_command, cwd=workspace)
         if client.returncode != 0 or client.timed_out or client.output_truncated:
             failures.append(
-                _failure("tests.client_failed", f"npm run {script} failed or timed out")
+                _failure(
+                    "tests.client_failed",
+                    f"{' '.join(client_command)} failed or timed out",
+                )
             )
             tests_green = False
     return completion, tests_green, tuple(failures)
