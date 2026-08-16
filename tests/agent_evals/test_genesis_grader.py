@@ -379,10 +379,11 @@ def test_completion_source_limit_ignores_downloaded_zig_packages(tmp_path):
     )
 
 
-def test_client_integration_script_is_an_accepted_project_test(tmp_path):
+@pytest.mark.parametrize("script", ["test:integration", "test:journey"])
+def test_client_integration_script_is_an_accepted_project_test(tmp_path, script):
     target = workspace(tmp_path)
     (target / "package.json").write_text(
-        json.dumps({"scripts": {"test:integration": "node --test"}})
+        json.dumps({"scripts": {script: "node --test"}})
     )
     commands = FakeCommands()
 
@@ -390,7 +391,7 @@ def test_client_integration_script_is_an_accepted_project_test(tmp_path):
 
     assert tests_green is True
     assert failures == ()
-    assert ["npm", "run", "test:integration"] in commands.calls
+    assert ["npm", "run", script] in commands.calls
 
 
 def test_client_source_in_singular_test_directory_is_discovered(tmp_path):

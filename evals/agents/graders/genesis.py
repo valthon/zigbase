@@ -466,7 +466,13 @@ def _package_test_script(workspace: Path) -> str:
         raise GradeFailure(
             "tests.package_invalid", f"cannot read package test scripts: {exc}"
         ) from exc
-    for name in ("test:e2e", "test:browser", "test:integration", "test:client"):
+    for name in (
+        "test:e2e",
+        "test:browser",
+        "test:integration",
+        "test:client",
+        "test:journey",
+    ):
         if (
             isinstance(scripts, dict)
             and isinstance(scripts.get(name), str)

@@ -161,6 +161,8 @@ def test_genesis_prompt_states_product_boundaries_exercised_by_the_grader():
         "framework-mode application",
         "zigbase.testing",
         "zigbase_eval_commit",
+        '"zigbasepublicrules": 1',
+        "format version",
         "not substitutes",
         "client or browser integration test",
         "production-shaped docker compose",
