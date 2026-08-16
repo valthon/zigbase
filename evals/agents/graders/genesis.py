@@ -488,7 +488,18 @@ def _client_test_command(workspace: Path) -> list[str]:
         build = (workspace / "build.zig").read_text()
     except OSError as exc:
         raise GradeFailure("tests.client_missing", "build.zig is unavailable") from exc
-    for step in ("client-test", "integration-test", "browser-test", "e2e"):
+    for step in (
+        "client-test",
+        "test-client",
+        "integration-test",
+        "test-integration",
+        "browser-test",
+        "test-browser",
+        "e2e",
+        "test-e2e",
+        "journey-test",
+        "test-journey",
+    ):
         if re.search(rf'b\.step\(\s*"{re.escape(step)}"', build):
             return ["zig", "build", step]
     raise GradeFailure(

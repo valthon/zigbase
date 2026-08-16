@@ -403,15 +403,15 @@ def test_client_source_in_singular_test_directory_is_discovered(tmp_path):
     assert _client_test_sources(target) == (source,)
 
 
-def test_python_client_source_and_zig_build_step_are_accepted(tmp_path):
+@pytest.mark.parametrize("step", ["client-test", "test-client", "test-journey"])
+def test_python_client_source_and_zig_build_step_are_accepted(tmp_path, step):
     target = workspace(tmp_path)
     (target / "package.json").unlink()
     source = target / "tests" / "client_journey.py"
     source.write_text("assert True\n")
     build = target / "build.zig"
     build.write_text(
-        build.read_text()
-        + '\nconst client = b.step("client-test", "Run HTTP journey");\n'
+        build.read_text() + f'\nconst client = b.step("{step}", "Run HTTP journey");\n'
     )
     commands = FakeCommands()
 
@@ -419,7 +419,7 @@ def test_python_client_source_and_zig_build_step_are_accepted(tmp_path):
 
     assert tests_green is True
     assert failures == ()
-    assert ["zig", "build", "client-test"] in commands.calls
+    assert ["zig", "build", step] in commands.calls
     assert source in _client_test_sources(target)
 
 
