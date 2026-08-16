@@ -214,6 +214,11 @@ def test_positive_fixture_scores_four_and_tears_down(tmp_path):
     assert any("restart" in call for call in commands.calls)
     assert any("down" in call for call in commands.calls)
     assert any("ps" in call for call in commands.calls)
+    deployed_doctor = next(
+        call for call in commands.calls if "exec" in call and "doctor" in call
+    )
+    assert "/usr/local/bin/zigbase" in deployed_doctor
+    assert "/proc/1/exe" not in deployed_doctor
     unittest_index = next(
         index for index, call in enumerate(commands.calls) if "unittest" in call
     )

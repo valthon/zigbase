@@ -490,7 +490,7 @@ def run_deployment(
                 "exec",
                 "-T",
                 service,
-                "/proc/1/exe",
+                "/usr/local/bin/zigbase",
                 "doctor",
                 "--production",
                 "--json",
