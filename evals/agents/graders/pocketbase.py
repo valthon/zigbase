@@ -408,7 +408,21 @@ def run_rehearsal(
             raise GradeFailure("tests.file_install", "bundle files were not installed exactly")
         parity = _json(workspace / "source" / "parity.json", "tests.parity")
         database_inspector(target, parity, upgraded=False)
-        test_result = commands.run(["python3", "-m", "unittest", "discover", "-s", "tests", "-p", "test_migration.py"], cwd=workspace, env={"ZIGBASE_BINARY": binary}, timeout=300)
+        test_result = commands.run(
+            [
+                "python3",
+                "-m",
+                "unittest",
+                "discover",
+                "-s",
+                "tests",
+                "-p",
+                "test_migration.py",
+            ],
+            cwd=workspace,
+            env={"ZIGBASE_BINARY": binary, "ZIGBASE_EVAL_BINARY": binary},
+            timeout=300,
+        )
         _run_ok(test_result, "tests.client_failed")
         port = port_picker()
         _run_ok(commands.run([binary, "serve", "--background", "--insecure-cookies", "--http-port", str(port), "--data-dir", str(target)], cwd=workspace), "tests.server_start")

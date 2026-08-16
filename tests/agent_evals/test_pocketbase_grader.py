@@ -90,9 +90,11 @@ class FakeCommands:
         self.fail_down = fail_down
         self.timeout_up = timeout_up
         self.calls = []
+        self.environments = []
 
     def run(self, argv, *, cwd, env=None, timeout=300):
         self.calls.append(argv)
+        self.environments.append(env or {})
         if "check-rules" in argv:
             return CommandResult(2, lint_output())
         if "doctor" in argv:
@@ -212,6 +214,13 @@ def test_positive_fixture_scores_four_and_tears_down(tmp_path):
     assert any("restart" in call for call in commands.calls)
     assert any("down" in call for call in commands.calls)
     assert any("ps" in call for call in commands.calls)
+    unittest_index = next(
+        index for index, call in enumerate(commands.calls) if "unittest" in call
+    )
+    assert commands.environments[unittest_index] == {
+        "ZIGBASE_BINARY": "zigbase",
+        "ZIGBASE_EVAL_BINARY": "zigbase",
+    }
 
 
 @pytest.mark.parametrize(
