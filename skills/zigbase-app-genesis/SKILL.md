@@ -31,6 +31,12 @@ Ask only for a missing choice that materially changes the trust boundary or prod
 
 Choose box mode when schema, rules, validation, files, auth, realtime, and SDK composition are enough. Choose framework mode only for trusted server behavior such as session-derived fields, cross-record transitions, atomic side-writes, typed commands, jobs, or custom HTTP semantics.
 
+When the requested boundary requires framework mode, deliver the actual Zig framework source and
+`zigbase.testing` coverage at the repository or requested workspace root. Dependency or network
+unavailability may prevent local execution, but it is not a reason to replace trusted ZigBase
+behavior with JSON-only schema plus policy mocks in another language. Leave the real implementation
+for downstream validation and report the check you could not run.
+
 Write down before implementation:
 
 - collections, field ownership, relations, delete behavior, and indexes;

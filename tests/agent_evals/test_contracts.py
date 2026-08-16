@@ -154,6 +154,10 @@ def test_genesis_prompt_states_product_boundaries_exercised_by_the_grader():
     required = (
         "anonymous visitors can browse",
         "relation-expanded listing",
+        "workspace root",
+        "framework-mode application",
+        "zigbase.testing",
+        "not substitutes",
         "client or browser integration test",
         "production-shaped docker compose",
         "secure cookies enabled",
