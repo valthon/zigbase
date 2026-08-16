@@ -45,6 +45,19 @@ export ZIGBASE_AGENT_COMMAND_JSON='["codex","exec","--ephemeral","--approve-for-
 python3 -m evals.agents.run genesis --agent codex
 ```
 
+For a commit-pinned Genesis release run, resolve the Zig package content hash before entering the
+agent's isolated workspace and pass that non-secret value explicitly:
+
+```sh
+commit="$(git rev-parse HEAD)"
+export ZIGBASE_EVAL_HASH="$(mise exec zig@0.16.0 -- zig fetch "git+https://github.com/valthon/zigbase.git#$commit")"
+python3 -m evals.agents.run genesis --agent codex --pass-env ZIGBASE_EVAL_HASH
+```
+
+The runner itself supplies `ZIGBASE_EVAL_COMMIT`; the explicit hash lets a network-restricted agent
+write a complete immutable `build.zig.zon` without guessing or omitting Zig's required integrity
+field.
+
 Use the same command with `pocketbase` to evaluate an unattended migration from the committed,
 synthetic PocketBase 0.39.11 snapshot:
 
