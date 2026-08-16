@@ -109,6 +109,7 @@ trust it over any document, including this one.
 | deploying | [deployment.md](deployment.md), [docker.md](docker.md) |
 | evaluating an app-building agent | [agent-evals.md](agent-evals.md) |
 | migrating PocketBase 0.39.11 | [migrate-pocketbase.md](migrate-pocketbase.md) |
+| re-platforming a Node.js/Express service | [migrate-express.md](migrate-express.md) |
 | doing per-row authorization | [abilities.md](abilities.md), [tenancy.md](tenancy.md) |
 | adding search | [search.md](search.md) |
 | sending mail, or running background work | [email.md](email.md), [jobs-and-webhooks.md](jobs-and-webhooks.md) |

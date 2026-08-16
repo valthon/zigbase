@@ -26,6 +26,7 @@
           <li><a href="$site.page('docs/deployment').link()">Deployment</a></li>
           <li><a href="$site.page('docs/migration-tools').link()">Migration tools</a></li>
           <li><a href="$site.page('docs/migrate-pocketbase').link()">Migrate PocketBase</a></li>
+          <li><a href="$site.page('docs/migrate-express').link()">Migrate Express</a></li>
         </ul>
         <p class="docs-group">Client SDKs</p>
         <ul>

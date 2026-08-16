@@ -210,6 +210,16 @@
     }
   },
   {
+    "canonical": "docs/migrate-express.md",
+    "mirror": "migrate-express.md",
+    "frontmatter": {
+      "title": "Migrate Express to ZigBase",
+      "description": "Re-platform a Node.js Express service through route, middleware, data, auth, and side-effect discovery; deterministic import; parity replay; and rehearsed cutover.",
+      "order": 12,
+      "group": "guides"
+    }
+  },
+  {
     "canonical": "docs/migrate-pocketbase.md",
     "mirror": "migrate-pocketbase.md",
     "frontmatter": {

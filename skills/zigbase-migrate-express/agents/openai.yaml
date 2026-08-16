@@ -1,0 +1,4 @@
+interface:
+  display_name: "ZigBase Express Migration"
+  short_description: "Re-platform Express services onto ZigBase"
+  default_prompt: "Use $zigbase-migrate-express to inventory and re-platform my Express backend onto ZigBase with parity evidence."
