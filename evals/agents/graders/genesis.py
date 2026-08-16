@@ -699,6 +699,7 @@ def run_deployment(
     doctor = None
     deployed = False
     cleanup_required = False
+    service = None
     try:
         compose = _compose_file(workspace)
         environment = _evaluation_environment(compose)
@@ -787,6 +788,14 @@ def run_deployment(
     except (GradeFailure, OSError, ValueError) as exc:
         code = exc.code if isinstance(exc, GradeFailure) else "deployment.error"
         failures.append(_failure(code, str(exc)))
+        if compose is not None and cleanup_required and service is not None:
+            stack = [*base, "-f", str(compose), "-f", str(override)]
+            commands.run(
+                [*stack, "logs", "--no-color", service],
+                cwd=workspace,
+                env=environment,
+                timeout=30,
+            )
     finally:
         if compose is not None and cleanup_required:
             stack = (

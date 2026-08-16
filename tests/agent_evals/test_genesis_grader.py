@@ -274,6 +274,7 @@ def test_health_timeout_still_tears_down(tmp_path):
     assert any(
         failure.code == "deployment.health_timeout" for failure in report.failures
     )
+    assert any("logs" in call for call in commands.calls)
     assert any("down" in call for call in commands.calls)
     assert any("ps" in call for call in commands.calls)
 

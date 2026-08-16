@@ -21,6 +21,7 @@ GENESIS_EVIDENCE = (
 POCKETBASE_EVIDENCE = (
     REPO / "evals" / "agents" / "evidence" / "pocketbase" / "2026-08-16-9a72b656"
 )
+DOCKER_REFERENCE = REPO / "skills" / "zigbase-app-genesis" / "references" / "docker.md"
 
 
 def result_dict():
@@ -160,6 +161,13 @@ def test_genesis_prompt_states_product_boundaries_exercised_by_the_grader():
         "environment interpolation",
     )
     assert all(boundary in prompt for boundary in required)
+
+
+def test_genesis_docker_reference_requires_a_runtime_compatible_build_target():
+    reference = DOCKER_REFERENCE.read_text()
+    assert "-Dtarget=x86_64-linux-musl" in reference
+    assert "no such file or directory" in reference
+    assert "real `serve` command" in reference
 
 
 @pytest.mark.parametrize("mutation", ["missing", "unknown", "future"])
