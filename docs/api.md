@@ -692,6 +692,10 @@ password must be at least `minPasswordLength` (default 8) — otherwise the crea
 a `400`. After signup, obtain a token via `auth-with-password` above. Full walkthrough:
 [recipes.md → User registration](recipes.md#recipe-user-registration-signup).
 
+`doctor --production` enumerates that non-system auth `createRule` as a warning, not an error:
+open signup is a supported boundary that still requires explicit review. Other public writes and
+public creation on system auth collections remain production errors.
+
 ### Verification & password reset — email delivery
 
 The `request-verification` and `request-password-reset` endpoints mint a token and

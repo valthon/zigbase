@@ -1,0 +1,8 @@
+{
+  "zigbasePublicRules": 1,
+  "rules": [
+    "members.create",
+    "posts.list",
+    "posts.view"
+  ]
+}

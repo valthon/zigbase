@@ -261,6 +261,7 @@ const box_commands =
     \\| `docker compose exec zigbase /zigbase superuser create --email you@example.com --password '…' --data-dir /data` | Create the admin account (needed before `/_/` is usable) |
     \\| `docker compose exec zigbase /zigbase schema apply /schema/collections.json` | Apply the schema (idempotent) |
     \\| `docker compose exec zigbase /zigbase schema check-rules --data-dir /data` | Lint access rules against the live schema — exit 0 clean, 1 a rule failed to parse, **2 warnings only** (every `@public` rule warns, so the starting schema exits 2 by design) |
+    \\| `docker compose exec zigbase /zigbase openapi --data-dir /data --out /data/openapi.json` | Export deterministic collection OpenAPI without starting or mutating the server |
     \\| `curl -s http://127.0.0.1:8090/api/health` | Liveness |
     \\| `curl -s http://127.0.0.1:8090/api/meta` | Capabilities + endpoints this build exposes (public, no auth) |
     \\| `docker compose exec zigbase /zigbase doctor --production --data-dir /data` | Preflight before shipping — exit 0 clean, 1 error, 2 warnings-only |
@@ -284,6 +285,7 @@ const framework_commands =
     \\| `zig build run -- serve --background`, then `zig build run -- serve status` / `serve logs -f` / `serve stop` | A background dev session you can poll instead of blocking a terminal on |
     \\| `zig build run -- explain-code CODE` | Explain an API error `code` |
     \\| `zig build run -- schema dump` | The live collection model, as a schema document |
+    \\| `zig build run -- openapi --out openapi.json` | Live collections plus this binary's declared consumer routes as OpenAPI 3.1.2 JSON |
     \\| `zig build run -- help` | The authoritative flag list — trust it over this file |
     \\
     \\
@@ -296,6 +298,7 @@ const footer =
     \\entry point that tells you which of the longer guides to load. Machine-readable
     \\indexes: <https://valthon.github.io/zigbase/llms.txt> and
     \\<https://valthon.github.io/zigbase/docs-index.json>.
+    \\OpenAPI export: <https://valthon.github.io/zigbase/docs/openapi>.
     \\
     \\Refresh this file by deleting it and running `zigbase agents-md` (it never
     \\overwrites an existing file), or diff it against `zigbase agents-md --stdout`.
@@ -317,6 +320,7 @@ test "box and framework AGENTS.md carry the right traps" {
         "127.0.0.1",
         ".jwt_secret",
         "\"items\"",
+        "openapi",
     }) |needle| {
         try std.testing.expect(std.mem.indexOf(u8, box, needle) != null);
         try std.testing.expect(std.mem.indexOf(u8, fw, needle) != null);
@@ -342,12 +346,12 @@ test "box and framework AGENTS.md carry the right traps" {
 /// temporary ban on then-unshipped SP-1/SP-3/SP-5 surface: those commands ship now,
 /// and "named implies exists" is the invariant that does not go stale.)
 pub const commands_named = [_][]const u8{
-    "serve",              "doctor",         "explain-code",
-    "superuser",          "agents-md",      "help",
-    "migrate",            "schema",         "serve status",
-    "serve stop",         "serve logs",     "superuser create",
-    "schema dump",        "migrate status", "schema apply",
-    "schema check-rules",
+    "serve",       "doctor",             "explain-code",
+    "superuser",   "agents-md",          "help",
+    "migrate",     "schema",             "serve status",
+    "serve stop",  "serve logs",         "superuser create",
+    "schema dump", "migrate status",     "schema apply",
+    "openapi",     "schema check-rules",
 };
 
 /// The two literal prefixes after which a command token is expected: the CLI

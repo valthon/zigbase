@@ -1,0 +1,1 @@
+{"zigbaseAgentEval":1,"scenario":"genesis","commit":"3f3224d50d2bc8e45b3888011ac118397103cd75","agent":"codex-cli-0.147-default","started_at":"2026-08-15T22:18:45.719964Z","duration_ms":1612368,"agent_exit":0,"timed_out":false,"interventions":0,"completion":true,"rules_locked":true,"tests_green":true,"deployed":true,"score":4,"failures":[]}

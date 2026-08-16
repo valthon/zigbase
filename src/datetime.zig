@@ -107,6 +107,17 @@ pub fn formatUtc(unix: i64) [19]u8 {
     return buf;
 }
 
+/// Format UTC seconds-since-epoch as the canonical API timestamp
+/// `YYYY-MM-DDTHH:MM:SSZ`. This shape sorts lexically across native and imported rows.
+pub fn formatIsoUtc(unix: i64) [20]u8 {
+    const stored = formatUtc(unix);
+    var out: [20]u8 = undefined;
+    @memcpy(out[0..19], &stored);
+    out[10] = 'T';
+    out[19] = 'Z';
+    return out;
+}
+
 fn readN(s: []const u8, i: *usize, n: usize) ParseError!i64 {
     if (i.* + n > s.len) return error.InvalidFormat;
     var v: i64 = 0;
@@ -202,6 +213,14 @@ test "formatUtc renders canonical UTC datetime and round-trips through parse" {
     try std.testing.expectEqualStrings("0001-01-01 00:00:00", &formatUtc(try parse("0001-01-01")));
     try std.testing.expectEqualStrings("0000-01-01 00:00:00", &formatUtc(try parse("0000-01-01")));
     try std.testing.expectEqual(try parse("0000-01-01"), try parse(&formatUtc(try parse("0000-01-01"))));
+}
+
+test "formatIsoUtc renders canonical API timestamps" {
+    try std.testing.expectEqualStrings("1970-01-01T00:00:00Z", &formatIsoUtc(0));
+    try std.testing.expectEqual(
+        try parse("2029-03-07T16:00:00Z"),
+        try parse(&formatIsoUtc(1867593600)),
+    );
 }
 
 test "runs at comptime" {

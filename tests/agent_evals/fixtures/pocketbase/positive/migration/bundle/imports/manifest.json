@@ -1,0 +1,13 @@
+{
+  "collections": [
+    {
+      "collection": "posts",
+      "file": "posts.ndjson"
+    },
+    {
+      "collection": "secrets",
+      "file": "secrets.ndjson"
+    }
+  ],
+  "zigbaseImportManifest": 1
+}

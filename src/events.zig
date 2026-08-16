@@ -173,6 +173,9 @@ pub const RealtimeCanSubscribeFn = *const fn (ctx: *Ctx, topic: []const u8) bool
 
 pub const AuthLevel = enum { public, authed, superuser };
 
+pub const SecretParamLocation = enum { path, query, header };
+pub const SecretMismatch = enum { not_found, forbidden };
+
 // ---------------------------------------------------------------------------
 // Declarative route-guard pipeline (#139 path-secret + #142 per-route rate limit).
 //
@@ -192,9 +195,9 @@ pub const PathSecretGuard = struct {
     /// Where the authoritative secret is stored.
     source: SecretSource,
     /// Where to read the submitted secret value from on the request.
-    in: enum { path, query, header } = .path,
+    in: SecretParamLocation = .path,
     /// Response on mismatch: a bare 404 (default, no oracle) or an explicit 403.
-    on_mismatch: enum { not_found, forbidden } = .not_found,
+    on_mismatch: SecretMismatch = .not_found,
 
     /// Where the stored secret is resolved from. `kv`/`settings` read the named key via
     /// `ctx.kv().get` (the `_kv` store — settings are KV entries); `config` is a static
@@ -211,6 +214,14 @@ pub const PathSecretGuard = struct {
 /// future kinds (e.g. an HMAC-signature guard) without changing the route-spec surface.
 pub const RouteAuthGuard = union(enum) {
     path_secret: PathSecretGuard,
+};
+
+/// Export-safe path-secret metadata. It intentionally omits both the configured
+/// secret and the key used to find it in KV/settings.
+pub const PathSecretMeta = struct {
+    param: []const u8,
+    in: SecretParamLocation,
+    on_mismatch: SecretMismatch,
 };
 
 /// A collection-scoped `.authed` gate (#243). `.auth = .{ .authed = "<collection>" }` requires a
@@ -615,6 +626,10 @@ pub const RouteMeta = struct {
     auth: AuthLevel,
     Input: type,
     Output: type,
+    /// Redacted declarative guard metadata for contract generators.
+    path_secret: ?PathSecretMeta = null,
+    /// Collection-scoped principal restriction, when present.
+    authed_collection: ?AuthedCollection = null,
     /// True for untyped `fn(*Ctx) anyerror!http.Response` handlers, which own the
     /// raw response and contribute no typed RPC surface. The TS codegen skips these so it
     /// doesn't emit a client method that would mis-handle their non-JSON responses.
@@ -793,6 +808,7 @@ pub fn routeMeta(comptime specs: anytype) []const RouteMeta {
                 const H = @TypeOf(s.handler);
                 const untyped = isUntypedHandler(H);
                 const override: ?[]const u8 = if (@hasField(@TypeOf(s), "name")) s.name else null;
+                const guard = routeAuthGuard(s);
                 t[i] = .{
                     .method = s.method,
                     .path = s.path,
@@ -805,6 +821,14 @@ pub fn routeMeta(comptime specs: anytype) []const RouteMeta {
                     // and `untyped` flags them out of TS RPC codegen.
                     .Input = if (untyped) void else route_types.HandlerInput(H),
                     .Output = if (untyped) void else route_types.HandlerOutput(H),
+                    .path_secret = if (guard) |g| switch (g) {
+                        .path_secret => |ps| .{
+                            .param = ps.param,
+                            .in = ps.in,
+                            .on_mismatch = ps.on_mismatch,
+                        },
+                    } else null,
+                    .authed_collection = routeAuthedCollection(s),
                     .untyped = untyped,
                 };
             }
@@ -1444,14 +1468,15 @@ test "buildRoutes lowers a path_secret guard: .auth=.public + carried guard (#13
             return .{ .status = 200, .body = "{}" };
         }
     };
-    const table = buildRoutes(.{
+    const specs = .{
         .{ .method = .POST, .path = "/api/hooks/deploy", .handler = H.h, .auth = .{ .path_secret = .{
             .param = "secret",
             .source = .{ .kv = "deploy_secret" },
             .in = .query,
             .on_mismatch = .forbidden,
         } } },
-    });
+    };
+    const table = buildRoutes(specs);
     try std.testing.expectEqual(@as(usize, 1), table.len);
     // A guard-gated route is `.public` at the AuthLevel layer; the secret is the gate.
     try std.testing.expect(table[0].auth == .public);
@@ -1462,6 +1487,11 @@ test "buildRoutes lowers a path_secret guard: .auth=.public + carried guard (#13
     try std.testing.expect(g.path_secret.on_mismatch == .forbidden);
     try std.testing.expect(g.path_secret.source == .kv);
     try std.testing.expectEqualStrings("deploy_secret", g.path_secret.source.kv);
+    const meta = comptime routeMeta(specs);
+    try std.testing.expectEqualStrings("secret", meta[0].path_secret.?.param);
+    try std.testing.expect(meta[0].path_secret.?.in == .query);
+    try std.testing.expect(meta[0].path_secret.?.on_mismatch == .forbidden);
+    try std.testing.expect(!@hasField(PathSecretMeta, "source"));
     // Defaults: rate_limit .default, no key fn.
     try std.testing.expect(table[0].rate_limit == .default);
     try std.testing.expect(table[0].rate_limit_key == null);

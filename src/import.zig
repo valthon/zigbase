@@ -35,6 +35,7 @@ const collections = @import("collections.zig");
 const records = @import("records.zig");
 const auth = @import("auth.zig");
 const crypto = @import("crypto.zig");
+const datetime = @import("datetime.zig");
 const param_sink = @import("sql/param_sink.zig");
 const ddl = @import("ddl.zig");
 const app_mod = @import("app.zig");
@@ -52,6 +53,9 @@ pub const Options = struct {
     batch_size: usize = 500,
     /// Preserve each row's own `id` when present (relation integrity across a dataset).
     preserve_ids: bool = true,
+    /// Preserve each row's source `created` and `updated` system timestamps. Import-only,
+    /// create-only, and requires a provided id; HTTP writes cannot reach this seam.
+    preserve_timestamps: bool = false,
     /// Validate and execute every row, then ROLL BACK each batch instead of committing.
     /// Nothing is written. Note: because nothing commits, an `--upsert-key` lookup never
     /// sees rows created earlier in the same dry run — a dry run reports what a FRESH
@@ -124,6 +128,11 @@ pub const ImportError = error{
     LegacyHashConflict,
     LegacyRequiresPreservedIds,
     LegacyRequiresCreateOnly,
+    TimestampRequiresPreservedIds,
+    TimestampRequiresCreateOnly,
+    TimestampRowMissingId,
+    TimestampMissing,
+    TimestampInvalid,
 };
 
 /// Renumber `?N` placeholders for the active backend before preparing (SQLite verbatim,
@@ -257,23 +266,100 @@ fn applyLegacyCredential(
     _ = try st.step();
 }
 
-/// The two per-run reused lookup statements, prepared ONCE (after the collection + upsert key are
-/// resolved) and reused for every row via reset/re-bind — avoiding an N+1 prepare per row. Exactly
-/// one is non-null: `upsert` when `--upsert-key` is set, `dup_check` when preserving ids without a
-/// key (the duplicate-id precheck). Both read statements are connection-scoped and survive the
-/// batch commit/begin boundaries (they only ever hold a row cursor briefly, between reset calls).
+const SourceTimestamps = struct {
+    id: []const u8,
+    created: [20]u8,
+    updated: [20]u8,
+};
+
+/// Validate the three values needed by the timestamp-preservation seam before the engine
+/// creates anything. Accepted source shapes are normalized to the same UTC `T...Z` form used
+/// by native API rows so text ordering and filtering remain correct after migration.
+fn sourceTimestamps(data: std.json.Value) ImportError!SourceTimestamps {
+    const idv = data.object.get("id") orelse return ImportError.TimestampRowMissingId;
+    if (idv != .string or idv.string.len == 0) return ImportError.TimestampRowMissingId;
+    const created = data.object.get("created") orelse return ImportError.TimestampMissing;
+    const updated = data.object.get("updated") orelse return ImportError.TimestampMissing;
+    if (created != .string or updated != .string or created.string.len == 0 or updated.string.len == 0)
+        return ImportError.TimestampInvalid;
+    const created_unix = datetime.parse(created.string) catch return ImportError.TimestampInvalid;
+    const updated_unix = datetime.parse(updated.string) catch return ImportError.TimestampInvalid;
+    return .{
+        .id = idv.string,
+        .created = datetime.formatIsoUtc(created_unix),
+        .updated = datetime.formatIsoUtc(updated_unix),
+    };
+}
+
+/// Replace only the system timestamps on the row just created by the normal record engine.
+/// The caller's batch transaction/savepoint makes this update atomic with creation and any
+/// legacy credential installation.
+fn applySourceTimestamps(st: *db.Stmt, ts: SourceTimestamps) !void {
+    st.reset();
+    errdefer st.reset();
+    try st.bindText(1, ts.id);
+    try st.bindText(2, &ts.created);
+    try st.bindText(3, &ts.updated);
+    _ = try st.step();
+    st.reset();
+}
+
+/// Reusable timestamp restorer for manifest phase-2 relation patches. Record updates normally
+/// advance `updated`; a timestamp-preserving import must put both source values back after each
+/// deferred patch so cyclic relations do not silently destroy migration history.
+pub const TimestampRestorer = struct {
+    statement: db.Stmt,
+
+    pub fn init(a: std.mem.Allocator, w: *db.Db, col: schema.Collection) !TimestampRestorer {
+        var scratch = std.heap.ArenaAllocator.init(a);
+        defer scratch.deinit();
+        const sa = scratch.allocator();
+        const sql = try std.fmt.allocPrintSentinel(
+            sa,
+            "UPDATE {s} SET \"created\"=?2, \"updated\"=?3 WHERE \"id\"=?1;",
+            .{try ddl.quoteIdent(sa, col.name)},
+            0,
+        );
+        return .{ .statement = try prep(sa, w, sql) };
+    }
+
+    pub fn deinit(self: *TimestampRestorer) void {
+        self.statement.finalize();
+    }
+
+    pub fn apply(self: *TimestampRestorer, data: std.json.Value) !void {
+        try applySourceTimestamps(&self.statement, try sourceTimestamps(data));
+    }
+};
+
+test "TimestampRestorer init releases SQL scratch under a general allocator" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try d.exec("CREATE TABLE notes (id TEXT PRIMARY KEY, created TEXT, updated TEXT);");
+    const col = schema.Collection{ .id = "notes-id", .name = "notes", .fields = &.{} };
+    var restorer = try TimestampRestorer.init(std.testing.allocator, &d, col);
+    defer restorer.deinit();
+}
+
+/// Per-run statements prepared ONCE and reused for every row via reset/re-bind — avoiding an N+1
+/// prepare per row. Exactly one read statement is non-null: `upsert` with `--upsert-key`, or
+/// `dup_check` when preserving ids without a key. `timestamp_update` is independently present when
+/// source timestamps are preserved. All are connection-scoped and reset before batch boundaries.
 const Lookups = struct {
     upsert: ?db.Stmt = null,
     dup_check: ?db.Stmt = null,
+    timestamp_update: ?db.Stmt = null,
 
     fn finalize(self: *Lookups) void {
         if (self.upsert) |*s| s.finalize();
         if (self.dup_check) |*s| s.finalize();
+        if (self.timestamp_update) |*s| s.finalize();
     }
 };
 
 /// Import a single already-parsed JSON object. The caller records the 1-based line on failure.
 fn importRow(app: *App, w: *db.Db, io: std.Io, a: std.mem.Allocator, col: schema.Collection, data: std.json.Value, opts: Options, lookups: *Lookups) !RowOutcome {
+    const timestamps = if (opts.preserve_timestamps) try sourceTimestamps(data) else null;
     if (opts.upsert_key) |key| {
         if (try findExistingId(a, &lookups.upsert.?, key, data)) |existing_id| {
             // Update the matched row's provided fields. Note: an auth `password` on UPDATE is
@@ -301,6 +387,7 @@ fn importRow(app: *App, w: *db.Db, io: std.Io, a: std.mem.Allocator, col: schema
     }
     try createRow(app, w, io, a, col, data, opts.preserve_ids);
     if (opts.legacy_hash_algorithm) |alg| try applyLegacyCredential(w, a, col, data, alg);
+    if (timestamps) |ts| try applySourceTimestamps(&lookups.timestamp_update.?, ts);
     return .created;
 }
 
@@ -374,14 +461,23 @@ pub fn run(app: *App, w: *db.Db, io: std.Io, reader: *std.Io.Reader, opts: Optio
     // batches. Fail with a stable error instead.
     if (opts.batch_size < 1) return ImportError.InvalidBatchSize;
 
+    last_error_line = 0; // reset; set to the offending 1-based line on a row failure.
+    last_error_detail = "";
+
+    if (opts.preserve_timestamps and opts.upsert_key != null) {
+        last_error_detail = "source timestamp preservation is create-only; remove --upsert-key / manifest `upsertKey`";
+        return ImportError.TimestampRequiresCreateOnly;
+    }
+    if (opts.preserve_timestamps and !opts.preserve_ids) {
+        last_error_detail = "source timestamp preservation requires preserve_ids=true and an id on every row";
+        return ImportError.TimestampRequiresPreservedIds;
+    }
+
     // Resolve the target collection ONCE into a run-lived arena (never per row — that would
     // leak collections.get's allocations each row and re-hit the DB).
     var col_arena = std.heap.ArenaAllocator.init(app.allocator);
     defer col_arena.deinit();
     const ca = col_arena.allocator();
-
-    last_error_line = 0; // reset; set to the offending 1-based line on a row failure.
-    last_error_detail = "";
 
     // Validate the legacy-hash mode's collection-independent checks BEFORE the identifier
     // gate below: `_superusers` (like every system table) starts with `_` and so never
@@ -442,6 +538,15 @@ pub fn run(app: *App, w: *db.Db, io: std.Io, reader: *std.Io.Reader, opts: Optio
     } else if (opts.preserve_ids) {
         const sql = try std.fmt.allocPrintSentinel(ca, "SELECT 1 FROM {s} WHERE \"id\"=?1 LIMIT 1;", .{try ddl.quoteIdent(ca, col.name)}, 0);
         lookups.dup_check = try prep(ca, w, sql);
+    }
+    if (opts.preserve_timestamps) {
+        const sql = try std.fmt.allocPrintSentinel(
+            ca,
+            "UPDATE {s} SET \"created\"=?2, \"updated\"=?3 WHERE \"id\"=?1;",
+            .{try ddl.quoteIdent(ca, col.name)},
+            0,
+        );
+        lookups.timestamp_update = try prep(ca, w, sql);
     }
 
     // Per-row scratch arena, reset (retaining capacity) after each row so memory stays bounded
@@ -668,6 +773,192 @@ test "import: id preservation on vs off" {
         _ = try st.step();
         try std.testing.expectEqual(@as(i64, 0), st.columnInt(0));
     }
+}
+
+test "import: source timestamps are canonicalized and ordinary imports still regenerate" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const posts_col = try seedPosts(&d, a, io);
+    defer posts_col.deinit(a);
+    var app = testApp(a, io);
+
+    const source_created = "2001-02-03 04:05:06.789Z";
+    const source_updated = "2002-03-04 05:06:07+01:30";
+    _ = try runNdjson(
+        &app,
+        &d,
+        io,
+        "{\"id\":\"time0001\",\"created\":\"" ++ source_created ++ "\",\"updated\":\"" ++ source_updated ++ "\",\"title\":\"old\",\"slug\":\"old\"}",
+        .{ .collection = "posts", .preserve_timestamps = true },
+    );
+    var preserved = try d.prepare("SELECT created, updated FROM posts WHERE id='time0001';");
+    defer preserved.finalize();
+    _ = try preserved.step();
+    try std.testing.expectEqualStrings("2001-02-03T04:05:06Z", preserved.columnText(0));
+    try std.testing.expectEqualStrings("2002-03-04T03:36:07Z", preserved.columnText(1));
+
+    _ = try runNdjson(
+        &app,
+        &d,
+        io,
+        "{\"id\":\"native01\",\"title\":\"native\",\"slug\":\"native\"}",
+        .{ .collection = "posts" },
+    );
+    try d.exec("UPDATE posts SET created='2001-02-03T04:05:07Z' WHERE id='native01';");
+    var ordered = try d.prepare("SELECT id FROM posts WHERE id IN ('native01','time0001') ORDER BY created DESC;");
+    defer ordered.finalize();
+    _ = try ordered.step();
+    try std.testing.expectEqualStrings("native01", ordered.columnText(0));
+    _ = try ordered.step();
+    try std.testing.expectEqualStrings("time0001", ordered.columnText(0));
+    var filtered = try d.prepare("SELECT COUNT(*) FROM posts WHERE id='time0001' AND created >= '2001-02-03T00:00:00Z';");
+    defer filtered.finalize();
+    _ = try filtered.step();
+    try std.testing.expectEqual(@as(i64, 1), filtered.columnInt(0));
+
+    _ = try runNdjson(
+        &app,
+        &d,
+        io,
+        "{\"id\":\"time0002\",\"created\":\"1999-01-01T00:00:00Z\",\"updated\":\"1999-01-01T00:00:00Z\",\"title\":\"new\",\"slug\":\"new\"}",
+        .{ .collection = "posts" },
+    );
+    var ordinary = try d.prepare("SELECT created, updated FROM posts WHERE id='time0002';");
+    defer ordinary.finalize();
+    _ = try ordinary.step();
+    try std.testing.expect(!std.mem.eql(u8, "1999-01-01T00:00:00Z", ordinary.columnText(0)));
+    try std.testing.expect(!std.mem.eql(u8, "1999-01-01T00:00:00Z", ordinary.columnText(1)));
+
+    const dry = try runNdjson(
+        &app,
+        &d,
+        io,
+        "{\"id\":\"time0003\",\"created\":\"1998-01-01\",\"updated\":\"1998-01-02\",\"title\":\"dry\",\"slug\":\"dry\"}",
+        .{ .collection = "posts", .preserve_timestamps = true, .dry_run = true },
+    );
+    try std.testing.expectEqual(@as(usize, 1), dry.created);
+    var absent = try d.prepare("SELECT COUNT(*) FROM posts WHERE id='time0003';");
+    defer absent.finalize();
+    _ = try absent.step();
+    try std.testing.expectEqual(@as(i64, 0), absent.columnInt(0));
+}
+
+test "import: auth credential and source timestamps are installed atomically" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    try migrations.run(&d);
+    const members = try collections.create(a, io, &d, .{ .id = "", .name = "members", .type = .auth, .fields = &.{} });
+    defer members.deinit(a);
+    var app = testApp(a, io);
+    const bc = "$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy";
+    const row = "{\"id\":\"membertime00001\",\"email\":\"a@b.c\",\"passwordHash\":\"" ++ bc ++ "\",\"verified\":true,\"created\":\"2003-04-05T06:07:08.900Z\",\"updated\":\"2004-05-06T07:08:09Z\"}";
+    _ = try runNdjson(&app, &d, io, row, .{
+        .collection = "members",
+        .legacy_hash_algorithm = "bcrypt",
+        .preserve_timestamps = true,
+    });
+
+    var st = try d.prepare("SELECT passwordHash, verified, created, updated FROM members WHERE id='membertime00001';");
+    defer st.finalize();
+    try std.testing.expect(try st.step());
+    try std.testing.expect(std.mem.startsWith(u8, st.columnText(0), "$zblegacy$bcrypt$"));
+    try std.testing.expectEqual(@as(i64, 1), st.columnInt(1));
+    try std.testing.expectEqualStrings("2003-04-05T06:07:08Z", st.columnText(2));
+    try std.testing.expectEqualStrings("2004-05-06T07:08:09Z", st.columnText(3));
+}
+
+test "import: timestamp preservation validates shape before writing" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const posts_col = try seedPosts(&d, a, io);
+    defer posts_col.deinit(a);
+    var app = testApp(a, io);
+    const opts = Options{ .collection = "posts", .preserve_timestamps = true };
+
+    try std.testing.expectError(ImportError.TimestampRowMissingId, runNdjson(&app, &d, io, "{\"created\":\"2001-01-01\",\"updated\":\"2001-01-01\",\"title\":\"a\",\"slug\":\"a\"}", opts));
+    try std.testing.expectError(ImportError.TimestampMissing, runNdjson(&app, &d, io, "{\"id\":\"time0010\",\"created\":\"2001-01-01\",\"title\":\"a\",\"slug\":\"a\"}", opts));
+    try std.testing.expectError(ImportError.TimestampInvalid, runNdjson(&app, &d, io, "{\"id\":\"time0011\",\"created\":\"yesterday\",\"updated\":\"2001-01-01\",\"title\":\"a\",\"slug\":\"a\"}", opts));
+
+    var st = try d.prepare("SELECT COUNT(*) FROM posts;");
+    defer st.finalize();
+    _ = try st.step();
+    try std.testing.expectEqual(@as(i64, 0), st.columnInt(0));
+}
+
+test "import: timestamp preservation is create-only and requires preserved ids" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const posts_col = try seedPosts(&d, a, io);
+    defer posts_col.deinit(a);
+    var app = testApp(a, io);
+    const row = "{\"id\":\"time0020\",\"created\":\"2001-01-01\",\"updated\":\"2001-01-01\",\"title\":\"a\",\"slug\":\"a\"}";
+    try std.testing.expectError(ImportError.TimestampRequiresCreateOnly, runNdjson(&app, &d, io, row, .{
+        .collection = "posts",
+        .upsert_key = "slug",
+        .preserve_timestamps = true,
+    }));
+    try std.testing.expectError(ImportError.TimestampRequiresPreservedIds, runNdjson(&app, &d, io, row, .{
+        .collection = "posts",
+        .preserve_ids = false,
+        .preserve_timestamps = true,
+    }));
+}
+
+test "import: invalid preserved timestamp rolls back its whole batch" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const posts_col = try seedPosts(&d, a, io);
+    defer posts_col.deinit(a);
+    var app = testApp(a, io);
+    const ndjson =
+        \\{"id":"time0030","created":"2001-01-01","updated":"2001-01-01","title":"a","slug":"a"}
+        \\{"id":"time0031","created":"bad","updated":"2001-01-01","title":"b","slug":"b"}
+    ;
+    try std.testing.expectError(ImportError.TimestampInvalid, runNdjson(&app, &d, io, ndjson, .{
+        .collection = "posts",
+        .preserve_timestamps = true,
+    }));
+    var st = try d.prepare("SELECT COUNT(*) FROM posts;");
+    defer st.finalize();
+    _ = try st.step();
+    try std.testing.expectEqual(@as(i64, 0), st.columnInt(0));
+}
+
+test "import: continue-on-error skips only the row with an invalid source timestamp" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const posts_col = try seedPosts(&d, a, io);
+    defer posts_col.deinit(a);
+    var app = testApp(a, io);
+    const ndjson =
+        \\{"id":"time0040","created":"2001-01-01","updated":"2001-01-02","title":"a","slug":"a"}
+        \\{"id":"time0041","created":"bad","updated":"2001-01-02","title":"b","slug":"b"}
+        \\{"id":"time0042","created":"2001-01-03","updated":"2001-01-04","title":"c","slug":"c"}
+    ;
+    const rep = try runNdjson(&app, &d, io, ndjson, .{
+        .collection = "posts",
+        .preserve_timestamps = true,
+        .continue_on_error = true,
+    });
+    try std.testing.expectEqual(@as(usize, 2), rep.created);
+    try std.testing.expectEqual(@as(usize, 1), rep.failed);
+    try std.testing.expectEqual(@as(usize, 2), rep.total);
+    var st = try d.prepare("SELECT COUNT(*) FROM posts;");
+    defer st.finalize();
+    _ = try st.step();
+    try std.testing.expectEqual(@as(i64, 2), st.columnInt(0));
 }
 
 test "import: duplicate preserved id fails fast and names the line" {

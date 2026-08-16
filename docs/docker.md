@@ -48,6 +48,46 @@ the same thing with a named volume pre-wired.
   you pass to `-p`/`--network` is the real access-control surface here, same as it would
   be for any other containerized server.
 
+### Custom application images
+
+A framework-mode application that builds its own non-root image must reproduce the runtime
+contract the official image supplies. Before switching to uid/gid `65532`, create `/data` with
+that ownership; otherwise a new named volume is mounted as root-owned and ZigBase cannot create
+`data.db`:
+
+Zig does not document an official registry image. Do not guess a builder such as
+`ghcr.io/ziglang/zig:<version>`: a syntactically plausible registry name can still be private or
+nonexistent. Start from a pinned general-purpose Linux builder and download the matching Zig
+release archive from `https://ziglang.org/download/<version>/`, verifying the SHA-256 published in
+Zig's official `download/index.json`, or use an independently maintained builder image only when
+its provenance and immutable digest are explicitly accepted. For Zig 0.16.0 on x86_64 Linux, the
+official archive SHA-256 is
+`70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00`.
+
+The final runtime base and the build target must agree. In particular,
+`gcr.io/distroless/static-debian12:nonroot` has no glibc dynamic loader, so build a static musl
+artifact (for example, `zig build -Dtarget=x86_64-linux-musl -Doptimize=ReleaseSafe`) before
+copying it there. A native glibc build copied into that image exits as
+`exec /path/to/app: no such file or directory` even though the file exists. If you intentionally
+build for glibc, choose a runtime image containing the matching loader instead. Smoke-test the
+assembled image's real `serve` command and HTTP readiness; a `version` healthcheck alone does not
+exercise its loader, writable data directory, or listener.
+
+```dockerfile
+RUN install -d -o 65532 -g 65532 /data
+ENV ZIGBASE_DATA_DIR=/data \
+    ZIGBASE_HTTP_HOST=0.0.0.0 \
+    ZIGBASE_SERVE_BACKGROUND=0
+USER 65532:65532
+VOLUME ["/data"]
+ENTRYPOINT ["/usr/local/bin/my-app"]
+CMD ["serve"]
+```
+
+The explicit foreground setting prevents an inherited coding-agent environment from detaching
+the process inside Docker. Verify the assembled image—not only the build stage—with a named volume,
+an HTTP readiness probe, and `doctor --production`.
+
 ### Bind-mount ownership
 
 ```sh
@@ -119,6 +159,7 @@ binary from a [release tarball](../README.md#quickstart-run-the-binary) locally 
 
 ## See also
 
+- [Deployment](deployment.md) — production Compose, TLS proxies, Fly/Railway, backups, upgrades, and rollback.
 - [Configuration](https://valthon.github.io/zigbase/docs/configuration) — the full environment-variable reference.
 - The [README's Security section](../README.md#security) — what's safe to change and what
   isn't.

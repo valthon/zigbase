@@ -89,11 +89,39 @@ fn gatherPublicRules(arena: std.mem.Allocator, cols: []const schema.Collection) 
         };
         for (pairs) |p| {
             if (rules.isPublic(p.rule)) {
-                try out.append(arena, .{ .collection = c.name, .op = p.op, .write = p.write });
+                const auth_signup = c.type == .auth and
+                    std.mem.eql(u8, p.op, "create") and
+                    !c.system;
+                try out.append(arena, .{
+                    .collection = c.name,
+                    .op = p.op,
+                    .write = p.write,
+                    .auth_signup = auth_signup,
+                });
             }
         }
     }
     return out.toOwnedSlice(arena);
+}
+
+test "doctor gather: only non-system auth create is classified as open signup" {
+    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const cols = [_]schema.Collection{
+        .{ .id = "users", .name = "users", .type = .auth, .fields = &.{}, .createRule = "@public", .updateRule = "@public", .deleteRule = "@public" },
+        .{ .id = "posts", .name = "posts", .fields = &.{}, .createRule = "@public" },
+        .{ .id = "_superusers", .name = "_superusers", .type = .auth, .system = true, .fields = &.{}, .createRule = "@public" },
+    };
+
+    const found = try gatherPublicRules(arena, &cols);
+    try std.testing.expectEqual(@as(usize, 5), found.len);
+    try std.testing.expect(found[0].auth_signup);
+    try std.testing.expect(!found[1].auth_signup);
+    try std.testing.expect(!found[2].auth_signup);
+    try std.testing.expect(!found[3].auth_signup);
+    try std.testing.expect(!found[4].auth_signup);
 }
 
 /// The exact prefix a legacy (pre-migration) password hash still starts with.

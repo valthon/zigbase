@@ -1,0 +1,13 @@
+services:
+  zigbase:
+    image: ghcr.io/valthon/zigbase:0.13.0
+    environment:
+      ZIGBASE_PUBLIC_URL: ${ZIGBASE_PUBLIC_URL:?set public URL}
+      ZIGBASE_SMTP_HOST: ${ZIGBASE_SMTP_HOST:?set SMTP host}
+      ZIGBASE_JWT_SECRET: ${ZIGBASE_JWT_SECRET:?set JWT secret}
+    volumes:
+      - type: volume
+        source: data
+        target: /data
+volumes:
+  data: {}

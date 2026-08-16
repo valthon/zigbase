@@ -16,10 +16,16 @@ declarative schema format (`zigbase schema dump`/`apply`/`check-rules`), a scale
 (`zigbase import --legacy-hashes`), and a dependency-free parity-replay harness
 (`tools/replay/zb_replay.py`). This guide covers all four end to end.
 
+PocketBase 0.39.11 migrations also have a supported offline converter for inventory, durable
+decisions, deterministic extraction, timestamp/password preservation, and local files. Follow
+[Migrate PocketBase 0.39.11 to ZigBase](migrate-pocketbase.md) instead of hand-building the schema
+and NDJSON described here.
+
 ## 1. Re-platforming stages
 
-A real migration — PocketBase, Rails, Express, whatever you're moving off of — is a
-sequence of stages:
+A real migration — Rails, Express, or another backend you're moving off of — is a
+sequence of stages. The supported PocketBase workflow follows the same sequence but automates
+additional stages through its offline converter:
 
 1. **Inventory** — enumerate the source's collections/tables, fields, and relations.
 2. **Schema transplant** — stand up the equivalent shape in ZigBase.
@@ -30,7 +36,7 @@ sequence of stages:
 6. **Replay verification** — prove the new backend answers the same requests the same way.
 7. **Cutover** — flip traffic.
 
-This tooling covers stages 2, 3, 4, and 6 mechanically:
+The generic tooling in this guide covers stages 2, 3, 4, and 6 mechanically:
 
 | Stage | Tool |
 |---|---|
@@ -39,7 +45,8 @@ This tooling covers stages 2, 3, 4, and 6 mechanically:
 | 4. Auth migration | `zigbase import --legacy-hashes` (§4) |
 | 6. Replay verification | `tools/replay/zb_replay.py` (§5) |
 
-Stages 1, 5, and 7 stay **judgment work** — nothing here inventories a foreign schema,
+For backends without a dedicated converter, stages 1, 5, and 7 stay **judgment work** — the
+generic tools here do not inventory a foreign schema,
 decides how a source endpoint's shape maps onto ZigBase's REST/query API, or flips a
 load balancer. This guide's §6 stitches 2/3/4/6 into one worked sequence; §7 lists the
 sharp edges you'll hit doing 1/5/7 by hand.
@@ -436,10 +443,18 @@ backfilled. A **required** field on a cycle back-edge or self-relation is refuse
 - **`--progress N`** — print a heartbeat to stderr every N rows (`0` = off).
 - **`--json`** — print the run summary as one JSON object on stdout instead of (or
   alongside) the human log line: `{"zigbase_import":1,"collection":"...","dry_run":...,
-  "created":N,"updated":N,"failed":N,"total":N,"error_log":"..."}`. `import --manifest`'s
+  "preserve_timestamps":false,"created":N,"updated":N,"failed":N,"total":N,
+  "error_log":"..."}`. `import --manifest`'s
   summary uses the `zigbase_import_manifest` discriminator instead, plus a `collections`
   array of per-entry counts and a `patched` count (rows whose deferred relation value was
   backfilled in the second pass).
+- **`--preserve-timestamps`** — preserve each row's source `created` and `updated` strings
+  after validating them as dates. Every row must carry those two values and a non-empty `id`.
+  This is a create-only migration seam: it requires id preservation and refuses
+  `--upsert-key` (including a manifest entry's `upsertKey`). The record is still created
+  through the normal engine; only those two system columns are replaced inside the same
+  transaction. HTTP, route, hook, and ordinary import writes remain unable to author system
+  timestamps.
 
 ### Exit codes
 

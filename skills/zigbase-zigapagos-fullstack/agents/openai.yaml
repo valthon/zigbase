@@ -1,0 +1,4 @@
+interface:
+  display_name: "ZigBase + Zigapagos Full Stack"
+  short_description: "Build secure ZigBase and Zigapagos applications"
+  default_prompt: "Use $zigbase-zigapagos-fullstack to build and verify a full-stack ZigBase application with a Zigapagos frontend."

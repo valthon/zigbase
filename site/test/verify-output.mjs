@@ -63,5 +63,5 @@ for (const marker of [':focus-visible', 'prefers-reduced-motion', '@media(max-wi
 if (!read('robots.txt').includes('https://valthon.github.io/zigbase/sitemap.xml')) fail('robots sitemap URL drifted');
 if (!read('sitemap.xml').includes(`${htmlFiles.length > 0 ? 'https://valthon.github.io/zigbase/docs/api/' : ''}`)) fail('sitemap missing API route');
 const index = JSON.parse(read('docs-index.json'));
-if (index.docs.length !== 28) fail(`docs index expected 28 docs, found ${index.docs.length}`);
+if (index.docs.length !== 37) fail(`docs index expected 37 docs, found ${index.docs.length}`);
 console.log(`PASS: ${htmlFiles.length} pages, metadata, links, discovery, accessibility contracts`);

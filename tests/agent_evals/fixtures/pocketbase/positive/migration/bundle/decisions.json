@@ -1,0 +1,43 @@
+{
+  "decisions": [
+    {
+      "choice": "reviewed",
+      "id": "collection.members_fixture1.authConfig",
+      "rationale": "Password authentication remains enabled with email identity; unsupported auth methods are disabled."
+    },
+    {
+      "artifact": "replacements/53d02f920f5b8061-auth-rule.md",
+      "choice": "replacement",
+      "id": "collection.members_fixture1.authRule.replacement",
+      "rationale": "PocketBase permits login without an additional auth rule; the cutover explicitly preserves that behavior and tests unverified-account access policy."
+    },
+    {
+      "artifact": "replacements/dd6f510db97e1118-protected-document.json",
+      "choice": "replacement",
+      "id": "field.secrets_fixture1.secret_document.options",
+      "rationale": "ZigBase file authorization follows the owner-scoped collection view rule, preserving protected access."
+    },
+    {
+      "choice": "public",
+      "id": "rule.members_fixture1.createRule.public",
+      "rationale": "The fixture intentionally supports anonymous account creation and verifies ZigBase open-signup parity."
+    },
+    {
+      "choice": "public",
+      "id": "rule.posts_fixture001.listRule.public",
+      "rationale": "The fixture intentionally exposes the posts list for anonymous parity checks."
+    },
+    {
+      "choice": "public",
+      "id": "rule.posts_fixture001.viewRule.public",
+      "rationale": "The fixture intentionally exposes individual posts and their files."
+    },
+    {
+      "choice": "local-snapshot",
+      "id": "source.file_storage.confirmation",
+      "rationale": "The committed fixture contains a stopped local PocketBase storage snapshot."
+    }
+  ],
+  "sourceVersion": "0.39.11",
+  "zigbasePocketBaseDecisions": 1
+}

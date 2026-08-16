@@ -1,0 +1,2 @@
+{"cover":"cover_fixture.txt","created":"2020-01-01 01:02:03.004Z","gallery":["gallery_a_fixture.txt","gallery_b_fixture.txt"],"id":"post00000000001","owner":"member000000001","related":["post00000000002"],"title":"Public first","updated":"2020-03-01 01:02:03.004Z"}
+{"cover":"","created":"2020-02-01 01:02:03.004Z","gallery":[],"id":"post00000000002","owner":"member000000001","related":["post00000000001"],"title":"Public second","updated":"2020-02-02 01:02:03.004Z"}

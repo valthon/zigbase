@@ -14,6 +14,7 @@ that applies, or strike it through / mark `N/A`:
 
 - [ ] **`README.md`** and other top-level docs (`CHANGELOG.md`, `KNOWN_LIMITATIONS.md`) reflect this change.
 - [ ] **`docs/*.md`** (source-of-truth docs) updated.
+- [ ] **`skills/*/references/`** regenerated with `python3 tools/sync_skill_references.py`; `--check` passes.
 - [ ] **`site/content/docs/`** — published SuperMD mirrors are **generated** from canonical `docs/*.md` plus `CHANGELOG.md`/`KNOWN_LIMITATIONS.md`; edit the canonical source and regenerate, never hand-edit a mirror. Site-authored onboarding sources live under `site/sources/docs/`.
 - [ ] **`examples/{blog,golfsim,plugins}`** — code and READMEs updated if behavior, defaults, fields, APIs, or access rules changed (plus the public-site example pages that describe them).
 - [ ] New/changed **CLI flags & env vars** documented in `site/sources/docs/configuration.md`.

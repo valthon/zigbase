@@ -26,6 +26,33 @@ test "sqlite library links and reports a 3.x version" {
     try std.testing.expect(std.mem.startsWith(u8, v, "3."));
 }
 
+test "read-only open inspects an existing database and cannot create or write" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    const path = try std.fmt.allocPrintSentinel(a, "{s}/data.db", .{root}, 0);
+    defer a.free(path);
+    var writer = try Db.open(path);
+    try writer.exec("CREATE TABLE sample (value TEXT); INSERT INTO sample VALUES ('ok');");
+    writer.close();
+
+    var reader = try Db.openReadOnly(path);
+    defer reader.close();
+    var stmt = try reader.prepare("SELECT value FROM sample;");
+    defer stmt.finalize();
+    try std.testing.expect(try stmt.step());
+    try std.testing.expectEqualStrings("ok", stmt.columnText(0));
+    try std.testing.expectError(error.ExecFailed, reader.exec("INSERT INTO sample VALUES ('no');"));
+
+    const missing = try std.fmt.allocPrintSentinel(a, "{s}/missing.db", .{root}, 0);
+    defer a.free(missing);
+    try std.testing.expectError(error.OpenFailed, Db.openReadOnly(missing));
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(io, missing, .{}));
+}
+
 pub const DbError = error{ OpenFailed, ExecFailed, PrepareFailed, BindFailed, StepFailed, Constraint, WalNotEnabled };
 
 pub const Db = struct {
@@ -57,6 +84,22 @@ pub const Db = struct {
         clock_sql.register(conn.handle);
         // Opt-in vector search (#157): register sqlite-vec on every connection so vec_distance_*
         // is available to the reader pool + writer. comptime-folded away in the default build.
+        if (build_options.vector) _ = sqlite3_vec_init(conn.handle, null, null);
+        return conn;
+    }
+
+    /// Open an existing database without write/create capability. Inspection commands use
+    /// this constructor so reading schema metadata cannot create a missing database, change
+    /// journal mode, or write application rows.
+    pub fn openReadOnly(path: [:0]const u8) DbError!Db {
+        var handle: ?*c.sqlite3 = null;
+        const flags = c.SQLITE_OPEN_READONLY | c.SQLITE_OPEN_FULLMUTEX;
+        if (c.sqlite3_open_v2(path.ptr, &handle, flags, clock_vfs.vfsName()) != c.SQLITE_OK) {
+            if (handle) |h| _ = c.sqlite3_close(h);
+            return DbError.OpenFailed;
+        }
+        const conn = Db{ .handle = handle.? };
+        clock_sql.register(conn.handle);
         if (build_options.vector) _ = sqlite3_vec_init(conn.handle, null, null);
         return conn;
     }

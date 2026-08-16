@@ -79,6 +79,7 @@ zigbase doctor [--production] [--json] [--data-dir PATH]
 zigbase migrate [status|rollback N|dump]
 zigbase schema dump [--out FILE] [--data-dir PATH]
 zigbase schema apply FILE [--dry-run] [--allow-destructive] [--prune]
+zigbase openapi [--data-dir PATH] [--out FILE] [--title TEXT] [--api-version VERSION] [--server URL]
 zigbase superuser create --email … --password …
 zigbase explain-code [CODE] [--json]
 zigbase init [--box|--framework] [--dir PATH] [--name NAME]
@@ -96,13 +97,21 @@ trust it over any document, including this one.
 
 | If you are… | Load |
 | --- | --- |
-| designing collections and fields | [fields.md](fields.md), [recipes.md](recipes.md) |
+| turning an idea into an app design | [app-genesis.md](app-genesis.md) |
+| implementing collections and fields | [fields.md](fields.md), [recipes.md](recipes.md) |
 | calling the API | [api.md](api.md) |
+| generating or reviewing an HTTP contract | [openapi.md](openapi.md) |
 | writing Zig hooks, routes, jobs, or a comptime schema | [framework.md](framework.md) |
 | writing tests | [testing.md](testing.md) |
+| pairing a Zigapagos frontend with a framework app | [zigapagos-pairing.md](zigapagos-pairing.md) |
 | wiring a frontend | [typescript-sdk.md](typescript-sdk.md) |
 | calling from Python / Dart / Kotlin | [python-sdk.md](python-sdk.md), [dart-sdk.md](dart-sdk.md), [kotlin-sdk.md](kotlin-sdk.md) |
-| deploying | [docker.md](docker.md) |
+| deploying | [deployment.md](deployment.md), [docker.md](docker.md) |
+| evaluating an app-building agent | [agent-evals.md](agent-evals.md) |
+| migrating PocketBase 0.39.11 | [migrate-pocketbase.md](migrate-pocketbase.md) |
+| re-platforming a Node.js/Express service | [migrate-express.md](migrate-express.md) |
+| re-platforming a Laravel application | [migrate-laravel.md](migrate-laravel.md) |
+| re-platforming a Go web service | [migrate-go.md](migrate-go.md) |
 | doing per-row authorization | [abilities.md](abilities.md), [tenancy.md](tenancy.md) |
 | adding search | [search.md](search.md) |
 | sending mail, or running background work | [email.md](email.md), [jobs-and-webhooks.md](jobs-and-webhooks.md) |

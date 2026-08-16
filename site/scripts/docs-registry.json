@@ -30,6 +30,26 @@
     }
   },
   {
+    "canonical": "docs/agent-evals.md",
+    "mirror": "agent-evals.md",
+    "frontmatter": {
+      "title": "Agent evaluations",
+      "description": "Run ZigBase's provider-neutral Genesis evaluation, understand deterministic grades, and preserve three-run release evidence without committing transcripts.",
+      "order": 6,
+      "group": "reference"
+    }
+  },
+  {
+    "canonical": "docs/app-genesis.md",
+    "mirror": "app-genesis.md",
+    "frontmatter": {
+      "title": "Designing an app",
+      "description": "Turn a product idea into a rules-first ZigBase design: trust boundaries, schema shape, relations, hooks and routes, cursor pagination, realtime, and test placement.",
+      "order": 5,
+      "group": "getting-started"
+    }
+  },
+  {
     "canonical": "docs/abilities.md",
     "mirror": "abilities.md",
     "frontmatter": {
@@ -66,6 +86,16 @@
       "title": "Dart SDK",
       "description": "The official zigbase_client Dart SDK — auth, records, offset + cursor pagination, files, and realtime, for the Dart VM, Flutter, and Flutter web.",
       "order": 6,
+      "group": "guides"
+    }
+  },
+  {
+    "canonical": "docs/deployment.md",
+    "mirror": "deployment.md",
+    "frontmatter": {
+      "title": "Deployment",
+      "description": "Run ZigBase in production with systemd, Docker Compose, Fly, or Railway — TLS, durable state, backups, upgrades, rollback, and the doctor ship gate.",
+      "order": 11,
       "group": "guides"
     }
   },
@@ -130,6 +160,16 @@
     }
   },
   {
+    "canonical": "docs/openapi.md",
+    "mirror": "openapi.md",
+    "frontmatter": {
+      "title": "OpenAPI export",
+      "description": "Export deterministic OpenAPI 3.1.2 JSON for live collection CRUD and framework-declared consumer routes, with honest access and redacted secret metadata.",
+      "order": 6,
+      "group": "reference"
+    }
+  },
+  {
     "canonical": "docs/postgres.md",
     "mirror": "postgres.md",
     "frontmatter": {
@@ -166,6 +206,46 @@
       "title": "Migrate an existing backend to ZigBase",
       "description": "Re-platform an existing Rails, Express, PocketBase, or other backend onto ZigBase with schema transplant, data and password import, and parity replay.",
       "order": 10,
+      "group": "guides"
+    }
+  },
+  {
+    "canonical": "docs/migrate-express.md",
+    "mirror": "migrate-express.md",
+    "frontmatter": {
+      "title": "Migrate Express to ZigBase",
+      "description": "Re-platform a Node.js Express service through route, middleware, data, auth, and side-effect discovery; deterministic import; parity replay; and rehearsed cutover.",
+      "order": 12,
+      "group": "guides"
+    }
+  },
+  {
+    "canonical": "docs/migrate-laravel.md",
+    "mirror": "migrate-laravel.md",
+    "frontmatter": {
+      "title": "Migrate Laravel to ZigBase",
+      "description": "Re-platform a Laravel backend through route, middleware, Eloquent, policy, auth, queue, and file discovery; deterministic import; parity; and cutover rehearsal.",
+      "order": 13,
+      "group": "guides"
+    }
+  },
+  {
+    "canonical": "docs/migrate-go.md",
+    "mirror": "migrate-go.md",
+    "frontmatter": {
+      "title": "Migrate a Go service to ZigBase",
+      "description": "Re-platform a Go web service through router, middleware, data, transaction, auth, worker, and wire discovery; deterministic import; parity; and cutover rehearsal.",
+      "order": 14,
+      "group": "guides"
+    }
+  },
+  {
+    "canonical": "docs/migrate-pocketbase.md",
+    "mirror": "migrate-pocketbase.md",
+    "frontmatter": {
+      "title": "Migrate PocketBase to ZigBase",
+      "description": "Migrate a stopped PocketBase 0.39.11 application with durable decisions, preserved users and timestamps, verified files, parity replay, and rollback evidence.",
+      "order": 11,
       "group": "guides"
     }
   },
@@ -236,6 +316,16 @@
       "title": "TypeScript SDK",
       "description": "The official @zigbase/client TypeScript SDK — auth, records, offset + cursor pagination, files, realtime, and the live store.",
       "order": 4,
+      "group": "guides"
+    }
+  },
+  {
+    "canonical": "docs/zigapagos-pairing.md",
+    "mirror": "zigapagos-pairing.md",
+    "frontmatter": {
+      "title": "Zigapagos + ZigBase full stack",
+      "description": "Pair a ZigBase framework backend with a same-origin Zigapagos frontend, with explicit ownership, dev, test, OpenAPI, public-signup, and deployment contracts.",
+      "order": 5,
       "group": "guides"
     }
   }

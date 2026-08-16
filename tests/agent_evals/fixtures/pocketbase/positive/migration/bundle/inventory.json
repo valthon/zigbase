@@ -1,0 +1,104 @@
+{
+  "collections": [
+    {
+      "fields": 10,
+      "id": "members_fixture1",
+      "indexes": 2,
+      "name": "members",
+      "type": "auth"
+    },
+    {
+      "fields": 8,
+      "id": "posts_fixture001",
+      "indexes": 0,
+      "name": "posts",
+      "type": "base"
+    },
+    {
+      "fields": 5,
+      "id": "secrets_fixture1",
+      "indexes": 0,
+      "name": "secrets",
+      "type": "base"
+    }
+  ],
+  "databaseSha256": "c64d61c7e8bc9bf8ebadb5ea6b79a188f5c05264388eff72d9b30b1209660029",
+  "findings": [
+    {
+      "choices": [
+        "reviewed"
+      ],
+      "code": "AuthCollectionConfigurationRequiresReview",
+      "id": "collection.members_fixture1.authConfig",
+      "message": "Auth collection 'members' needs review of password, OAuth, MFA, OTP, token, and mail-template behavior.",
+      "severity": "decision"
+    },
+    {
+      "choices": [
+        "replacement"
+      ],
+      "code": "AuthRuleRequiresReplacement",
+      "id": "collection.members_fixture1.authRule.replacement",
+      "message": "Auth collection 'members' has a disabled or non-verification PocketBase authRule that ZigBase cannot preserve automatically.",
+      "requiresArtifact": true,
+      "severity": "blocker"
+    },
+    {
+      "choices": [
+        "replacement",
+        "omit"
+      ],
+      "code": "FieldOptionsRequireReplacement",
+      "id": "field.secrets_fixture1.secret_document.options",
+      "message": "Field secrets.document has protected/thumbnail behavior requiring replacement.",
+      "requiresArtifact": true,
+      "severity": "blocker"
+    },
+    {
+      "choices": [
+        "public"
+      ],
+      "code": "PublicRuleRequiresReview",
+      "id": "rule.members_fixture1.createRule.public",
+      "message": "Rule members.createRule allows anonymous access and will map to @public.",
+      "severity": "decision"
+    },
+    {
+      "choices": [
+        "public"
+      ],
+      "code": "PublicRuleRequiresReview",
+      "id": "rule.posts_fixture001.listRule.public",
+      "message": "Rule posts.listRule allows anonymous access and will map to @public.",
+      "severity": "decision"
+    },
+    {
+      "choices": [
+        "public"
+      ],
+      "code": "PublicRuleRequiresReview",
+      "id": "rule.posts_fixture001.viewRule.public",
+      "message": "Rule posts.viewRule allows anonymous access and will map to @public.",
+      "severity": "decision"
+    },
+    {
+      "choices": [
+        "local-snapshot",
+        "materialized-s3"
+      ],
+      "code": "FileStorageSnapshotRequiresConfirmation",
+      "id": "source.file_storage.confirmation",
+      "message": "The public schema export does not prove whether file bytes came from local storage or S3.",
+      "severity": "decision"
+    }
+  ],
+  "schemaSha256": "875dcb8f9655a2e5ae3e8147f3a75c748478878a28f1b5846970d588aacab163",
+  "sourceVersion": "0.39.11",
+  "summary": {
+    "blockers": 2,
+    "collections": 3,
+    "decisions": 5,
+    "info": 0
+  },
+  "zigbasePocketBaseInventory": 1
+}

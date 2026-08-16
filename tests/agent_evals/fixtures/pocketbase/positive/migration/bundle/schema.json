@@ -1,0 +1,171 @@
+{
+  "collections": [
+    {
+      "createRule": "@public",
+      "deleteRule": "id = @request.auth.id",
+      "fields": [
+        {
+          "encrypted": false,
+          "hidden": false,
+          "id": "member_avatar01",
+          "name": "avatar",
+          "options": {
+            "maxSelect": 1
+          },
+          "required": false,
+          "searchable": false,
+          "type": "file",
+          "unique": false
+        },
+        {
+          "encrypted": false,
+          "hidden": false,
+          "id": "member_name_001",
+          "name": "name",
+          "options": {},
+          "required": true,
+          "searchable": false,
+          "type": "text",
+          "unique": false
+        }
+      ],
+      "indexes": [],
+      "listRule": "id = @request.auth.id",
+      "name": "members",
+      "options": {
+        "auth": {
+          "identityFields": [
+            "email"
+          ],
+          "minPasswordLength": 8,
+          "require_verified": false
+        }
+      },
+      "type": "auth",
+      "updateRule": "id = @request.auth.id",
+      "viewRule": "id = @request.auth.id"
+    },
+    {
+      "createRule": "@request.auth.id != ''",
+      "deleteRule": "owner = @request.auth.id",
+      "fields": [
+        {
+          "encrypted": false,
+          "hidden": false,
+          "id": "post_cover_0001",
+          "name": "cover",
+          "options": {
+            "maxSelect": 1
+          },
+          "required": false,
+          "searchable": false,
+          "type": "file",
+          "unique": false
+        },
+        {
+          "encrypted": false,
+          "hidden": false,
+          "id": "post_gallery_01",
+          "name": "gallery",
+          "options": {
+            "maxSelect": 3
+          },
+          "required": false,
+          "searchable": false,
+          "type": "file",
+          "unique": false
+        },
+        {
+          "encrypted": false,
+          "hidden": false,
+          "id": "post_owner_0001",
+          "name": "owner",
+          "options": {
+            "cascadeDelete": false,
+            "maxSelect": 1,
+            "targetCollectionId": "members"
+          },
+          "required": true,
+          "searchable": false,
+          "type": "relation",
+          "unique": false
+        },
+        {
+          "encrypted": false,
+          "hidden": false,
+          "id": "post_related_01",
+          "name": "related",
+          "options": {
+            "cascadeDelete": false,
+            "maxSelect": 3,
+            "targetCollectionId": "posts"
+          },
+          "required": false,
+          "searchable": false,
+          "type": "relation",
+          "unique": false
+        },
+        {
+          "encrypted": false,
+          "hidden": false,
+          "id": "post_title_0001",
+          "name": "title",
+          "options": {},
+          "required": true,
+          "searchable": false,
+          "type": "text",
+          "unique": false
+        }
+      ],
+      "indexes": [],
+      "listRule": "@public",
+      "name": "posts",
+      "options": {},
+      "type": "base",
+      "updateRule": "owner = @request.auth.id",
+      "viewRule": "@public"
+    },
+    {
+      "createRule": "@request.auth.id != ''",
+      "deleteRule": "owner = @request.auth.id",
+      "fields": [
+        {
+          "encrypted": false,
+          "hidden": false,
+          "id": "secret_document",
+          "name": "document",
+          "options": {
+            "maxSelect": 1
+          },
+          "required": false,
+          "searchable": false,
+          "type": "file",
+          "unique": false
+        },
+        {
+          "encrypted": false,
+          "hidden": false,
+          "id": "secret_owner_01",
+          "name": "owner",
+          "options": {
+            "cascadeDelete": false,
+            "maxSelect": 1,
+            "targetCollectionId": "members"
+          },
+          "required": true,
+          "searchable": false,
+          "type": "relation",
+          "unique": false
+        }
+      ],
+      "indexes": [],
+      "listRule": "owner = @request.auth.id",
+      "name": "secrets",
+      "options": {},
+      "type": "base",
+      "updateRule": "owner = @request.auth.id",
+      "viewRule": "owner = @request.auth.id"
+    }
+  ],
+  "zigbaseSchema": 1
+}

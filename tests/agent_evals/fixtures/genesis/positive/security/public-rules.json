@@ -1,0 +1,11 @@
+{
+  "zigbasePublicRules": 1,
+  "rules": [
+    {
+      "collection": "equipment",
+      "operation": "list",
+      "rule": "@public",
+      "rationale": "Available equipment is the public catalog."
+    }
+  ]
+}
