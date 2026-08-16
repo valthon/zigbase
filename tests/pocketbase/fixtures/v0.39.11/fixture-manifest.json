@@ -12,14 +12,14 @@
       "sha256": "110dd4b1aa093ad5e19e40e5282d4b46f9d49043442389c1d1d2ed53cb2af163"
     },
     {
-      "bytes": 764,
+      "bytes": 732,
       "path": "parity.json",
-      "sha256": "ad96924fe69e5b5f0e6112d9728a893a34604464e959d9ac144cc29d0c1cb28d"
+      "sha256": "86d7f840864940caf6941d62dd713c8c70c0b81eb7df1b1d89078f2cb5a6c901"
     },
     {
       "bytes": 180224,
       "path": "pb_data/data.db",
-      "sha256": "637002469a920389bdfc67d78ad942530c427f4bd1084a55a53e6a71b009d489"
+      "sha256": "c64d61c7e8bc9bf8ebadb5ea6b79a188f5c05264388eff72d9b30b1209660029"
     },
     {
       "bytes": 6,

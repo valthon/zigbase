@@ -121,6 +121,8 @@ jobs:
           git fetch --no-tags origin main
           git fetch --no-tags --deepen=200 origin
           ./scripts/check-doctor-ledger.sh origin/main
+      - name: Changelog fragments are valid
+        run: ./scripts/assemble-changelog.sh --dry-run >/dev/null
       - name: Dating client snapshot is fresh
         run: mise exec zig@0.16.0 -- zig build gen-dating-client-check
       - name: Dating runtime client snapshot is fresh

@@ -49,6 +49,41 @@ def tree_bytes(root):
     }
 
 
+def test_wal_snapshot_is_repeatable_and_never_mutates_source(
+    pocketbase_snapshot, tmp_path
+):
+    collections = [base_collection(indexes=[])]
+    schema, pb_data = pocketbase_snapshot(collections)
+    database = pb_data / "data.db"
+    connection = sqlite3.connect(database)
+    assert connection.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+    connection.execute(
+        "INSERT INTO posts VALUES (?,?,?,?)",
+        ("post0000000001", "2021-01-01 00:00:00.123Z", "2021-01-02 00:00:00Z", "First"),
+    )
+    connection.commit()
+    connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    connection.close()
+    assert database.read_bytes()[18:20] == b"\x02\x02"
+
+    findings = inventory_findings(collections, pb_data)
+    decisions = write_decisions(tmp_path / "decisions.json", findings)
+    before = tree_bytes(pb_data)
+
+    first_inventory = pb2zb.build_inventory(schema, pb_data)
+    second_inventory = pb2zb.build_inventory(schema, pb_data)
+    first_bundle = pb2zb.extract_bundle(
+        schema, pb_data, decisions, tmp_path / "bundle-a"
+    )
+    second_bundle = pb2zb.extract_bundle(
+        schema, pb_data, decisions, tmp_path / "bundle-b"
+    )
+
+    assert first_inventory == second_inventory
+    assert first_bundle["databaseSha256"] == second_bundle["databaseSha256"]
+    assert tree_bytes(pb_data) == before
+
+
 def test_extract_maps_schema_rows_relations_and_public_rules_deterministically(
     pocketbase_snapshot, tmp_path, zigbase_binary
 ):
@@ -213,7 +248,7 @@ def test_extract_maps_schema_rows_relations_and_public_rules_deterministically(
     ).fetchone()
     target.close()
     assert migrated == (
-        "2021-01-01T00:00:00.123Z",
+        "2021-01-01T00:00:00Z",
         "2021-01-02T00:00:00Z",
         "author000000001",
         1,

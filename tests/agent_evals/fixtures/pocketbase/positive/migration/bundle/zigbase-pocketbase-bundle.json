@@ -7,7 +7,7 @@
     }
   ],
   "collections": 3,
-  "databaseSha256": "637002469a920389bdfc67d78ad942530c427f4bd1084a55a53e6a71b009d489",
+  "databaseSha256": "c64d61c7e8bc9bf8ebadb5ea6b79a188f5c05264388eff72d9b30b1209660029",
   "decisionsSha256": "04666acc331d86f43ca65acb45821351c6bd47ea9b02562914036d111c9a0263",
   "files": 5,
   "ordinaryManifest": "imports/manifest.json",
@@ -20,7 +20,7 @@
     {
       "bytes": 263,
       "path": "imports/auth/members.ndjson",
-      "sha256": "7e96b0a9e5ac0292071f3e12a03cec2933d581e3c8381a69fde7f8fbea6f0018"
+      "sha256": "10b14c895006b48fa9e87bc623167eee9903cf2f76daa1b3bcc066dd3373b39b"
     },
     {
       "bytes": 202,
@@ -30,17 +30,17 @@
     {
       "bytes": 469,
       "path": "imports/posts.ndjson",
-      "sha256": "9a34c34f84a4ebcd1ec6578862943ad7798a3b8962808a2e867be60d9c96f691"
+      "sha256": "b08595d5e95ed2f46780946cd86a17403610097b431b6113822f58cbe33f0e2d"
     },
     {
       "bytes": 157,
       "path": "imports/secrets.ndjson",
-      "sha256": "be66364f05837fbf6a1c7f9c27f8fe00320d55c5a9a6369aabf79c7937ea1128"
+      "sha256": "05b5f05d7f47f09a84185ae2d7b9f11aa8b615605fcc48a59f3fe483e9d14fdc"
     },
     {
       "bytes": 2599,
       "path": "inventory.json",
-      "sha256": "2517cf38892d2e3e44afa4720e4e036da0a38892672e4d2f45fee90503ce6491"
+      "sha256": "14c183033e0e499b3ba42441e4728e75bd0c0427470575e4e94b854b3b15da2f"
     },
     {
       "bytes": 371,

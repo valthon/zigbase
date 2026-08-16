@@ -117,8 +117,8 @@ def normalize_snapshot(data: Path) -> None:
                 BCRYPT_HASH,
                 FIXED_TOKEN_KEY,
                 "avatar_fixture.txt",
-                "2019-01-01T01:02:03.004Z",
-                "2019-02-01T01:02:03.004Z",
+                "2019-01-01 01:02:03.004Z",
+                "2019-02-01 01:02:03.004Z",
                 "member000000001",
             ),
         )
@@ -130,16 +130,16 @@ def normalize_snapshot(data: Path) -> None:
                     ["gallery_a_fixture.txt", "gallery_b_fixture.txt"],
                     separators=(",", ":"),
                 ),
-                "2020-01-01T01:02:03.004Z",
-                "2020-03-01T01:02:03.004Z",
+                "2020-01-01 01:02:03.004Z",
+                "2020-03-01 01:02:03.004Z",
                 "post00000000001",
             ),
         )
         connection.execute(
             "UPDATE posts SET created=?, updated=? WHERE id=?",
             (
-                "2020-02-01T01:02:03.004Z",
-                "2020-02-02T01:02:03.004Z",
+                "2020-02-01 01:02:03.004Z",
+                "2020-02-02 01:02:03.004Z",
                 "post00000000002",
             ),
         )
@@ -147,16 +147,15 @@ def normalize_snapshot(data: Path) -> None:
             "UPDATE secrets SET document=?, created=?, updated=? WHERE id=?",
             (
                 "secret_fixture.txt",
-                "2021-01-01T01:02:03.004Z",
-                "2021-01-02T01:02:03.004Z",
+                "2021-01-01 01:02:03.004Z",
+                "2021-01-02 01:02:03.004Z",
                 "secret000000001",
             ),
         )
         connection.execute("DELETE FROM _superusers")
         connection.commit()
-        connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        connection.execute("PRAGMA journal_mode=DELETE")
         connection.execute("VACUUM")
+        connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
     finally:
         connection.close()
     (data / "auxiliary.db").unlink(missing_ok=True)

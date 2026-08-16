@@ -1,4 +1,4 @@
-### Added
+### Features
 
 - Add a supported offline PocketBase 0.39.11 migration workflow with durable inventory decisions,
   deterministic schema/auth/data/file bundles, bcrypt rehash-on-login continuity, preserved source

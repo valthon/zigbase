@@ -268,13 +268,13 @@ fn applyLegacyCredential(
 
 const SourceTimestamps = struct {
     id: []const u8,
-    created: []const u8,
-    updated: []const u8,
+    created: [20]u8,
+    updated: [20]u8,
 };
 
 /// Validate the three values needed by the timestamp-preservation seam before the engine
-/// creates anything. The original strings are retained after validation so migration parity
-/// remains byte-observable (including PocketBase's fractional seconds and `Z` suffix).
+/// creates anything. Accepted source shapes are normalized to the same UTC `T...Z` form used
+/// by native API rows so text ordering and filtering remain correct after migration.
 fn sourceTimestamps(data: std.json.Value) ImportError!SourceTimestamps {
     const idv = data.object.get("id") orelse return ImportError.TimestampRowMissingId;
     if (idv != .string or idv.string.len == 0) return ImportError.TimestampRowMissingId;
@@ -282,9 +282,13 @@ fn sourceTimestamps(data: std.json.Value) ImportError!SourceTimestamps {
     const updated = data.object.get("updated") orelse return ImportError.TimestampMissing;
     if (created != .string or updated != .string or created.string.len == 0 or updated.string.len == 0)
         return ImportError.TimestampInvalid;
-    _ = datetime.parse(created.string) catch return ImportError.TimestampInvalid;
-    _ = datetime.parse(updated.string) catch return ImportError.TimestampInvalid;
-    return .{ .id = idv.string, .created = created.string, .updated = updated.string };
+    const created_unix = datetime.parse(created.string) catch return ImportError.TimestampInvalid;
+    const updated_unix = datetime.parse(updated.string) catch return ImportError.TimestampInvalid;
+    return .{
+        .id = idv.string,
+        .created = datetime.formatIsoUtc(created_unix),
+        .updated = datetime.formatIsoUtc(updated_unix),
+    };
 }
 
 /// Replace only the system timestamps on the row just created by the normal record engine.
@@ -294,8 +298,8 @@ fn applySourceTimestamps(st: *db.Stmt, ts: SourceTimestamps) !void {
     st.reset();
     errdefer st.reset();
     try st.bindText(1, ts.id);
-    try st.bindText(2, ts.created);
-    try st.bindText(3, ts.updated);
+    try st.bindText(2, &ts.created);
+    try st.bindText(3, &ts.updated);
     _ = try st.step();
     st.reset();
 }
@@ -759,7 +763,7 @@ test "import: id preservation on vs off" {
     }
 }
 
-test "import: source timestamps are preserved exactly and ordinary imports still regenerate" {
+test "import: source timestamps are canonicalized and ordinary imports still regenerate" {
     var d = try db.Db.openMemory();
     defer d.close();
     const a = std.testing.allocator;
@@ -768,7 +772,7 @@ test "import: source timestamps are preserved exactly and ordinary imports still
     defer posts_col.deinit(a);
     var app = testApp(a, io);
 
-    const source_created = "2001-02-03T04:05:06.789Z";
+    const source_created = "2001-02-03 04:05:06.789Z";
     const source_updated = "2002-03-04 05:06:07+01:30";
     _ = try runNdjson(
         &app,
@@ -780,8 +784,27 @@ test "import: source timestamps are preserved exactly and ordinary imports still
     var preserved = try d.prepare("SELECT created, updated FROM posts WHERE id='time0001';");
     defer preserved.finalize();
     _ = try preserved.step();
-    try std.testing.expectEqualStrings(source_created, preserved.columnText(0));
-    try std.testing.expectEqualStrings(source_updated, preserved.columnText(1));
+    try std.testing.expectEqualStrings("2001-02-03T04:05:06Z", preserved.columnText(0));
+    try std.testing.expectEqualStrings("2002-03-04T03:36:07Z", preserved.columnText(1));
+
+    _ = try runNdjson(
+        &app,
+        &d,
+        io,
+        "{\"id\":\"native01\",\"title\":\"native\",\"slug\":\"native\"}",
+        .{ .collection = "posts" },
+    );
+    try d.exec("UPDATE posts SET created='2001-02-03T04:05:07Z' WHERE id='native01';");
+    var ordered = try d.prepare("SELECT id FROM posts WHERE id IN ('native01','time0001') ORDER BY created DESC;");
+    defer ordered.finalize();
+    _ = try ordered.step();
+    try std.testing.expectEqualStrings("native01", ordered.columnText(0));
+    _ = try ordered.step();
+    try std.testing.expectEqualStrings("time0001", ordered.columnText(0));
+    var filtered = try d.prepare("SELECT COUNT(*) FROM posts WHERE id='time0001' AND created >= '2001-02-03T00:00:00Z';");
+    defer filtered.finalize();
+    _ = try filtered.step();
+    try std.testing.expectEqual(@as(i64, 1), filtered.columnInt(0));
 
     _ = try runNdjson(
         &app,
@@ -832,7 +855,7 @@ test "import: auth credential and source timestamps are installed atomically" {
     try std.testing.expect(try st.step());
     try std.testing.expect(std.mem.startsWith(u8, st.columnText(0), "$zblegacy$bcrypt$"));
     try std.testing.expectEqual(@as(i64, 1), st.columnInt(1));
-    try std.testing.expectEqualStrings("2003-04-05T06:07:08.900Z", st.columnText(2));
+    try std.testing.expectEqualStrings("2003-04-05T06:07:08Z", st.columnText(2));
     try std.testing.expectEqualStrings("2004-05-06T07:08:09Z", st.columnText(3));
 }
 

@@ -251,7 +251,9 @@ def _open_snapshot(pb_data: Path) -> tuple[sqlite3.Connection, Path]:
                 f"snapshot has SQLite sidecar {sidecar.name}; stop PocketBase and make a consistent backup"
             )
     try:
-        connection = sqlite3.connect(f"{database.resolve().as_uri()}?mode=ro", uri=True)
+        connection = sqlite3.connect(
+            f"{database.resolve().as_uri()}?mode=ro&immutable=1", uri=True
+        )
         connection.execute("PRAGMA query_only=ON")
     except sqlite3.Error as exc:
         raise PocketBaseError(
@@ -747,13 +749,14 @@ def reconcile_decisions(
                 )
 
 
-def build_inventory(schema_path: Path, pb_data: Path) -> dict[str, Any]:
-    collections = load_schema(schema_path)
-    connection, database = _open_snapshot(pb_data)
-    try:
-        _check_snapshot_shape(connection, collections)
-    finally:
-        connection.close()
+def _build_inventory(
+    schema_path: Path,
+    pb_data: Path,
+    collections: list[dict[str, Any]],
+    connection: sqlite3.Connection,
+    database: Path,
+) -> dict[str, Any]:
+    _check_snapshot_shape(connection, collections)
     findings = collect_findings(collections, pb_data)
     decisions = sum(finding.severity == "decision" for finding in findings)
     blockers = sum(finding.severity == "blocker" for finding in findings)
@@ -784,6 +787,15 @@ def build_inventory(schema_path: Path, pb_data: Path) -> dict[str, Any]:
             "info": infos,
         },
     }
+
+
+def build_inventory(schema_path: Path, pb_data: Path) -> dict[str, Any]:
+    collections = load_schema(schema_path)
+    connection, database = _open_snapshot(pb_data)
+    try:
+        return _build_inventory(schema_path, pb_data, collections, connection, database)
+    finally:
+        connection.close()
 
 
 def _decision_map(decisions: tuple[Decision, ...]) -> dict[str, Decision]:
@@ -1614,15 +1626,22 @@ def _prepare_output_directory(out: Path) -> None:
     out.parent.mkdir(parents=True, exist_ok=True)
 
 
-def extract_bundle(
-    schema_path: Path, pb_data: Path, decisions_path: Path, out: Path
+def _extract_bundle_from_snapshot(
+    schema_path: Path,
+    pb_data: Path,
+    decisions_path: Path,
+    out: Path,
+    connection: sqlite3.Connection,
+    database: Path,
 ) -> dict[str, Any]:
     _ensure_output_outside_sources(out, schema_path, pb_data)
     if out.resolve() == decisions_path.resolve():
         raise PocketBaseError("bundle output must not overwrite the decisions document")
     _prepare_output_directory(out)
     collections = load_schema(schema_path)
-    inventory = build_inventory(schema_path, pb_data)
+    inventory = _build_inventory(
+        schema_path, pb_data, collections, connection, database
+    )
     findings = [
         Finding(
             value["id"],
@@ -1654,57 +1673,51 @@ def extract_bundle(
             ),
         )
 
-        connection, database = _open_snapshot(pb_data)
         row_counts: dict[str, int] = {}
         auth_imports: list[dict[str, Any]] = []
         ordinary_entries: list[dict[str, Any]] = []
         file_references: list[FileReference] = []
-        try:
-            for collection in sorted(
-                collections, key=lambda item: (str(item["name"]), str(item["id"]))
-            ):
-                target = _map_collection(
-                    collection,
-                    collection_names,
-                    findings,
-                    decision_by_id,
-                    decisions_path,
+        for collection in sorted(
+            collections, key=lambda item: (str(item["name"]), str(item["id"]))
+        ):
+            target = _map_collection(
+                collection,
+                collection_names,
+                findings,
+                decision_by_id,
+                decisions_path,
+            )
+            if target is None:
+                continue
+            pairs = _source_to_target_fields(
+                collection,
+                collection_names,
+                findings,
+                decision_by_id,
+                decisions_path,
+            )
+            name = str(target["name"])
+            is_auth = (collection.get("type") or "base") == "auth"
+            relative = (
+                Path("imports") / "auth" / f"{name}.ndjson"
+                if is_auth
+                else Path("imports") / f"{name}.ndjson"
+            )
+            count, collection_file_references = _write_ndjson_rows(
+                connection,
+                stage_path / relative,
+                collection,
+                name,
+                pairs,
+            )
+            file_references.extend(collection_file_references)
+            row_counts[name] = count
+            if is_auth:
+                auth_imports.append(
+                    {"collection": name, "file": relative.as_posix(), "rows": count}
                 )
-                if target is None:
-                    continue
-                pairs = _source_to_target_fields(
-                    collection,
-                    collection_names,
-                    findings,
-                    decision_by_id,
-                    decisions_path,
-                )
-                name = str(target["name"])
-                is_auth = (collection.get("type") or "base") == "auth"
-                relative = (
-                    Path("imports") / "auth" / f"{name}.ndjson"
-                    if is_auth
-                    else Path("imports") / f"{name}.ndjson"
-                )
-                count, collection_file_references = _write_ndjson_rows(
-                    connection,
-                    stage_path / relative,
-                    collection,
-                    name,
-                    pairs,
-                )
-                file_references.extend(collection_file_references)
-                row_counts[name] = count
-                if is_auth:
-                    auth_imports.append(
-                        {"collection": name, "file": relative.as_posix(), "rows": count}
-                    )
-                else:
-                    ordinary_entries.append(
-                        {"collection": name, "file": f"{name}.ndjson"}
-                    )
-        finally:
-            connection.close()
+            else:
+                ordinary_entries.append({"collection": name, "file": f"{name}.ndjson"})
         storage_files, unreferenced_storage = _stage_referenced_files(
             stage_path, pb_data, file_references
         )
@@ -1746,6 +1759,18 @@ def extract_bundle(
         shutil.rmtree(stage_path, ignore_errors=True)
         raise
     return root_manifest
+
+
+def extract_bundle(
+    schema_path: Path, pb_data: Path, decisions_path: Path, out: Path
+) -> dict[str, Any]:
+    connection, database = _open_snapshot(pb_data)
+    try:
+        return _extract_bundle_from_snapshot(
+            schema_path, pb_data, decisions_path, out, connection, database
+        )
+    finally:
+        connection.close()
 
 
 def verify_bundle(bundle: Path) -> dict[str, Any]:
