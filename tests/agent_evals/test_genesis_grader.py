@@ -192,6 +192,28 @@ def test_command_failures_are_independent(tmp_path):
     assert unit.deployed is True
 
 
+def test_keyword_bait_and_noop_client_script_cannot_score_completion(tmp_path):
+    target = workspace(tmp_path)
+    (target / "src" / "main.zig").write_text(
+        'const equipment = "equipment";\n'
+        'const members = "members";\n'
+        'const requests = "requests";\n'
+        'const cursor = "cursor";\n'
+        'const expand = "expand";\n'
+    )
+    (target / "package.json").write_text(
+        json.dumps({"scripts": {"test:e2e": "exit 0"}})
+    )
+    shutil.rmtree(target / "tests")
+    report = grade_fixture(target, tmp_path / "artifacts", commands=FakeCommands())
+    assert report.completion is False
+    assert report.tests_green is False
+    assert any(
+        failure.code in {"completion.client_test_missing", "tests.client_invalid"}
+        for failure in report.failures
+    )
+
+
 def test_subprocess_commands_resolve_pinned_tools_before_home_isolation(tmp_path):
     workspace_path = tmp_path / "workspace"
     workspace_path.mkdir()

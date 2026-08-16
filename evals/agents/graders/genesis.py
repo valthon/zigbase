@@ -321,39 +321,43 @@ def compare_public_rules(
         )
 
 
-def _source_text(workspace: Path) -> str:
+def _zig_application_text(workspace: Path) -> str:
     pieces = []
     total = 0
-    ignored = {
-        ".agents",
-        ".git",
-        ".zig-cache",
-        "zig-pkg",
-        "zig-out",
-        "node_modules",
-        "zb_data",
-        ".home",
-        ".tmp",
-    }
-    suffixes = {".zig", ".ts", ".tsx", ".js", ".jsx", ".json", ".md"}
-    for path in workspace.rglob("*"):
-        if (
-            path.is_symlink()
-            or any(part in ignored for part in path.parts)
-            or not path.is_file()
-        ):
+    source = workspace / "src"
+    if not source.is_dir():
+        raise GradeFailure("completion.app_missing", "src directory is missing")
+    for path in source.rglob("*.zig"):
+        if path.is_symlink() or not path.is_file():
             continue
-        if path.suffix not in suffixes:
-            continue
-        size = path.stat().st_size
-        total += size
+        total += path.stat().st_size
         if total > MAX_SOURCE_BYTES:
             raise GradeFailure(
                 "completion.source_limit",
-                "project source exceeds the grading byte limit",
+                "Zig application source exceeds the grading limit",
             )
         pieces.append(path.read_text(errors="replace"))
     return "\n".join(pieces).lower()
+
+
+def _client_test_sources(workspace: Path) -> tuple[Path, ...]:
+    suffixes = {".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"}
+    found = []
+    for path in workspace.rglob("*"):
+        if (
+            path.is_symlink()
+            or not path.is_file()
+            or path.suffix not in suffixes
+            or any(part in {"node_modules", ".home", ".tmp"} for part in path.parts)
+        ):
+            continue
+        if (
+            "test" in path.stem.lower()
+            or "spec" in path.stem.lower()
+            or "tests" in path.parts
+        ):
+            found.append(path)
+    return tuple(found)
 
 
 def inspect_completion(workspace: Path) -> tuple[EvalFailure, ...]:
@@ -388,27 +392,28 @@ def inspect_completion(workspace: Path) -> tuple[EvalFailure, ...]:
     except GradeFailure as exc:
         failures.append(_failure("completion.compose_missing", str(exc)))
     try:
-        text = _source_text(workspace)
+        text = _zig_application_text(workspace)
     except GradeFailure as exc:
         return tuple([*failures, _failure(exc.code, str(exc))])
     checks = [
         (
-            ("equipment" in text or "listing" in text or "gear" in text),
+            ".collections" in text
+            and (".equipment" in text or ".listings" in text or ".gear" in text),
             "completion.equipment_missing",
             "equipment/listing model is missing",
         ),
         (
-            "request" in text,
+            ".requests" in text,
             "completion.requests_missing",
             "request workflow is missing",
         ),
         (
-            ("member" in text or "user" in text),
+            ".type = .auth" in text and (".members" in text or ".users" in text),
             "completion.members_missing",
             "member auth model is missing",
         ),
         (
-            (".relation" in text or '"type": "relation"' in text),
+            ".type = .relation" in text,
             "completion.relation_missing",
             "no relation model was found",
         ),
@@ -418,12 +423,12 @@ def inspect_completion(workspace: Path) -> tuple[EvalFailure, ...]:
             "no trusted hook or route was found",
         ),
         (
-            "cursor" in text,
+            "cursor" in text and 'test "' in text,
             "completion.cursor_missing",
             "cursor pagination is not exercised",
         ),
         (
-            "expand" in text,
+            "expand" in text and 'test "' in text,
             "completion.expand_missing",
             "relation expansion is not exercised",
         ),
@@ -431,6 +436,24 @@ def inspect_completion(workspace: Path) -> tuple[EvalFailure, ...]:
     failures.extend(
         _failure(code, message) for passed, code, message in checks if not passed
     )
+    client_tests = _client_test_sources(workspace)
+    if not client_tests:
+        failures.append(
+            _failure(
+                "completion.client_test_missing", "no client test source was found"
+            )
+        )
+    elif not any(
+        marker in path.read_text(errors="replace")
+        for path in client_tests
+        for marker in ("expect(", "assert", "should(")
+    ):
+        failures.append(
+            _failure(
+                "completion.client_test_invalid",
+                "client test source contains no assertion",
+            )
+        )
     return tuple(failures)
 
 
@@ -448,6 +471,12 @@ def _package_test_script(workspace: Path) -> str:
             and isinstance(scripts.get(name), str)
             and scripts[name].strip()
         ):
+            command = scripts[name].strip()
+            if command in {"true", ":", "exit 0"} or command.endswith("; exit 0"):
+                raise GradeFailure(
+                    "tests.client_invalid",
+                    f"package.json script {name} is a no-op rather than a test runner",
+                )
             return name
     raise GradeFailure(
         "tests.client_missing",

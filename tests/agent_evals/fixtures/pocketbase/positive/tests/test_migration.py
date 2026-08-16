@@ -11,10 +11,7 @@ class MigrationBoundaryTest(unittest.TestCase):
         )
         rules = json.loads((root / "security/public-rules.json").read_text())
         self.assertEqual(bundle["rowCounts"], {"members": 1, "posts": 2, "secrets": 1})
-        self.assertIn(
-            ("members", "create"),
-            {(rule["collection"], rule["operation"]) for rule in rules["rules"]},
-        )
+        self.assertIn("members.create", rules["rules"])
 
 
 if __name__ == "__main__":

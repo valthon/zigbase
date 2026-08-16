@@ -27,7 +27,6 @@ from .genesis import (
     _evaluation_environment,
     _wait_http,
     inspect_compose,
-    load_public_inventory,
     parse_doctor_ndjson,
 )
 
@@ -191,7 +190,7 @@ def _schema_public_rules(schema: dict[str, Any]) -> frozenset[tuple[str, str]]:
 
 
 def load_reviewed_public_inventory(path: Path) -> frozenset[tuple[str, str]]:
-    """Accept Genesis's rich inventory or the migration report's compact identities."""
+    """Load the PocketBase scenario's single documented compact inventory contract."""
     value = _json(path, "rules.inventory")
     if not isinstance(value, dict) or set(value) != {"zigbasePublicRules", "rules"}:
         raise GradeFailure(
@@ -203,7 +202,10 @@ def load_reviewed_public_inventory(path: Path) -> frozenset[tuple[str, str]]:
             "rules.inventory_invalid", "public-rule inventory contract is invalid"
         )
     if not all(isinstance(rule, str) for rule in rules):
-        return load_public_inventory(path)
+        raise GradeFailure(
+            "rules.inventory_invalid",
+            "PocketBase public-rule inventory entries must be compact strings",
+        )
     found = set()
     for rule in rules:
         pieces = rule.rsplit(".", 1)
@@ -239,6 +241,10 @@ def inspect_completion(
     manifest: dict[str, Any] | None = None
     try:
         verify_source(workspace / "source")
+    except (GradeFailure, pb2zb.PocketBaseError, OSError, KeyError, TypeError) as exc:
+        code = exc.code if isinstance(exc, GradeFailure) else "source.fixture_invalid"
+        failures.append(_failure(code, "PocketBase source fixture is invalid"))
+    try:
         if (
             _sha256(workspace / "tools" / "pocketbase" / "pb2zb.py")
             != EXPECTED_CONVERTER_SHA256
@@ -246,6 +252,10 @@ def inspect_completion(
             raise GradeFailure(
                 "source.converter_digest", "migration converter is not the pinned tool"
             )
+    except (GradeFailure, OSError) as exc:
+        code = exc.code if isinstance(exc, GradeFailure) else "source.converter_digest"
+        failures.append(_failure(code, "PocketBase migration converter is invalid"))
+    try:
         manifest = pb2zb.verify_bundle(bundle)
         if (
             manifest.get("sourceVersion") != "0.39.11"
@@ -263,6 +273,14 @@ def inspect_completion(
             raise GradeFailure(
                 "completion.bundle_shape", "bundle does not match the pinned source"
             )
+    except (GradeFailure, pb2zb.PocketBaseError, OSError, KeyError, TypeError) as exc:
+        code = (
+            exc.code if isinstance(exc, GradeFailure) else "completion.bundle_invalid"
+        )
+        failures.append(
+            _failure(code, "PocketBase migration bundle is incomplete or invalid")
+        )
+    try:
         bundle_decisions = _json(bundle / "decisions.json", "rules.bundle_decisions")
         source_decisions = _json(
             workspace / "source" / "decisions.json", "rules.source_decisions"
@@ -288,25 +306,39 @@ def inspect_completion(
             raise GradeFailure(
                 "rules.bundle_public", "bundle public rules are not the reviewed set"
             )
+    except (GradeFailure, OSError, KeyError, TypeError) as exc:
+        code = exc.code if isinstance(exc, GradeFailure) else "rules.bundle_invalid"
+        failures.append(_failure(code, "PocketBase bundle rule review is invalid"))
+    try:
         _validate_report(workspace)
+    except (GradeFailure, OSError, KeyError, TypeError) as exc:
+        code = (
+            exc.code if isinstance(exc, GradeFailure) else "completion.report_invalid"
+        )
+        failures.append(_failure(code, "PocketBase migration report is invalid"))
+    try:
         inventory = load_reviewed_public_inventory(
             workspace / "security" / "public-rules.json"
         )
         if inventory != EXPECTED_PUBLIC:
             raise GradeFailure("rules.inventory", "public-rule inventory is not exact")
-        if not (workspace / "tests" / "test_migration.py").is_file():
-            raise GradeFailure(
+    except (GradeFailure, OSError, KeyError, TypeError) as exc:
+        code = exc.code if isinstance(exc, GradeFailure) else "rules.inventory_invalid"
+        failures.append(_failure(code, "PocketBase public-rule inventory is invalid"))
+    if not (workspace / "tests" / "test_migration.py").is_file():
+        failures.append(
+            _failure(
                 "completion.client_test",
                 "declared migration integration test is missing",
             )
+        )
+    try:
         _compose_file(workspace)
-    except (GradeFailure, pb2zb.PocketBaseError, OSError, KeyError, TypeError) as exc:
+    except (GradeFailure, OSError) as exc:
         code = (
-            exc.code if isinstance(exc, GradeFailure) else "completion.bundle_invalid"
+            exc.code if isinstance(exc, GradeFailure) else "completion.compose_missing"
         )
-        failures.append(
-            _failure(code, "PocketBase migration artifacts are incomplete or invalid")
-        )
+        failures.append(_failure(code, "PocketBase deployment definition is missing"))
     return manifest, tuple(failures)
 
 
@@ -751,6 +783,10 @@ def run_deployment(
             '      ZIGBASE_COOKIE_SECURE: "true"\n'
             '      ZIGBASE_JWT_SECRET: "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"\n'
             '      ZIGBASE_SMTP_HOST: "smtp.example.invalid"\n'
+            "    networks:\n"
+            "      zigbase_eval: {}\n"
+            "networks:\n"
+            "  zigbase_eval: {}\n"
         )
         stack = [*base, "-f", str(compose), "-f", str(override)]
         cleanup = True
@@ -887,7 +923,7 @@ def grade(
         and not any(f.code.startswith("rules.") for f in failures)
     )
     completion = manifest is not None and not any(
-        failure.code.startswith(("completion.", "source."))
+        failure.code.startswith(("completion.", "source.", "rules."))
         for failure in completion_failures
     )
     return GradeReport(completion, rules_locked, tests_green, deployed, tuple(failures))

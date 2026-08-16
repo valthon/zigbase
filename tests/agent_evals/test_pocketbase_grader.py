@@ -223,6 +223,7 @@ def test_positive_fixture_scores_four_and_tears_down(tmp_path):
     assert 'source: "zigbase"' in override
     assert "target: /zigbase-eval" in override
     assert "read_only: true" in override
+    assert "zigbase_eval: {}" in override
     unittest_index = next(
         index for index, call in enumerate(commands.calls) if "unittest" in call
     )
@@ -316,6 +317,45 @@ def test_compact_exact_public_rule_inventory_is_accepted(tmp_path):
     report = grade_fixture(target, tmp_path / "artifacts")
     assert report.rules_locked is True
     assert report.completion is True
+
+
+def test_rich_public_rule_inventory_is_rejected_for_pocketbase(tmp_path):
+    target = workspace(tmp_path)
+    (target / "security" / "public-rules.json").write_text(
+        json.dumps(
+            {
+                "zigbasePublicRules": 1,
+                "rules": [
+                    {
+                        "collection": "members",
+                        "operation": "create",
+                        "rule": "@public",
+                        "rationale": "not the documented PocketBase shape",
+                    }
+                ],
+            }
+        )
+    )
+    report = grade_fixture(target, tmp_path / "artifacts")
+    assert report.rules_locked is False
+    assert report.completion is False
+
+
+def test_completion_collects_independent_rule_report_test_and_compose_failures(
+    tmp_path,
+):
+    target = workspace(tmp_path)
+    decisions = target / "migration" / "bundle" / "decisions.json"
+    decisions.write_text(decisions.read_text().replace("reviewed", "stale", 1))
+    (target / "migration" / "report.json").unlink()
+    (target / "tests" / "test_migration.py").unlink()
+    (target / "docker-compose.yml").unlink()
+    _, failures = inspect_completion(target)
+    codes = {failure.code for failure in failures}
+    assert "rules.decisions_drift" in codes
+    assert "completion.report.missing" in codes
+    assert "completion.client_test" in codes
+    assert "deployment.compose_missing" in codes
 
 
 @pytest.mark.parametrize(

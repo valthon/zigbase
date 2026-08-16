@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from evals.agents import run as run_module
 from evals.agents.graders import GradeReport
 from evals.agents.process import run_process
 from evals.agents.run import (
@@ -76,6 +77,31 @@ def test_execute_success_sends_prompt_and_grades(tmp_path):
     assert exit_code == 0
     assert result.score == 4
     assert result.failures == ()
+
+
+def test_cleanup_failure_preserves_grade_and_adds_harness_finding(
+    tmp_path, monkeypatch
+):
+    root = make_scenario_root(tmp_path)
+
+    def fail_cleanup(_workspace):
+        raise PermissionError("workspace remains owned by container uid")
+
+    monkeypatch.setattr(run_module, "cleanup_workspace", fail_cleanup)
+    result, exit_code = execute(
+        scenario=scenario(),
+        scenario_root=root,
+        command_raw=json.dumps([sys.executable, str(FAKE_AGENT), "success", "-"]),
+        artifacts_root=tmp_path / "artifacts",
+        agent_name="fake",
+        interventions=0,
+        passed_env=[],
+        grader=passing_grader,
+        work_root=tmp_path,
+    )
+    assert exit_code == 1
+    assert result.score == 4
+    assert result.failures[-1].code == "harness.cleanup"
 
 
 def test_execute_copies_fixture_before_agent_runs(tmp_path):

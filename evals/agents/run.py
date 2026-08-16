@@ -256,7 +256,17 @@ def execute(
         )
         exit_code = 1
     finally:
-        cleanup_workspace(workspace)
+        try:
+            cleanup_workspace(workspace)
+        except OSError as exc:
+            report = replace(
+                report,
+                failures=(
+                    *report.failures,
+                    EvalFailure("harness.cleanup", str(exc)),
+                ),
+            )
+            exit_code = 1
 
     grades = (
         report.completion,

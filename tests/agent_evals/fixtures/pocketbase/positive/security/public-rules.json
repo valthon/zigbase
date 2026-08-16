@@ -1,23 +1,8 @@
 {
   "zigbasePublicRules": 1,
   "rules": [
-    {
-      "collection": "members",
-      "operation": "create",
-      "rule": "@public",
-      "rationale": "The source application intentionally supports autonomous signup."
-    },
-    {
-      "collection": "posts",
-      "operation": "list",
-      "rule": "@public",
-      "rationale": "The source application exposes its post catalog."
-    },
-    {
-      "collection": "posts",
-      "operation": "view",
-      "rule": "@public",
-      "rationale": "The source application exposes individual posts and public files."
-    }
+    "members.create",
+    "posts.list",
+    "posts.view"
   ]
 }
