@@ -163,6 +163,8 @@ def test_prompt_requires_open_signup_and_warning_not_error():
         "anonymous signup must work",
         "members.createrule",
         "warning rather than an error",
+        "zigbase_eval_binary",
+        "do not substitute the older public release image",
         "named durable",
         "survive",
         "down -v --remove-orphans",

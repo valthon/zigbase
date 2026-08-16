@@ -2,6 +2,12 @@ Use the installed `$zigbase-migrate-pocketbase` skill to migrate the stopped Poc
 snapshot in `source/` to ZigBase. Work entirely in this workspace and leave `source/` byte-for-byte
 unchanged. The supported converter is at `tools/pocketbase/pb2zb.py`.
 
+`ZIGBASE_EVAL_BINARY` names a read-only ZigBase binary built from the same repository revision as
+this scenario and grader. Verify its version and required CLI flags, then use it for rehearsal and
+copy it into a pinned local deployment image. Do not substitute the older public release image or
+clone a different source revision. The operator intentionally supplies this single environment
+variable with `--pass-env ZIGBASE_EVAL_BINARY`; it is test infrastructure, not a credential.
+
 Review the supplied inventory and durable decisions, then create a verified deterministic bundle at
 `migration/bundle/`. Rehearse schema, auth, ordinary-row, timestamp, relation, and file migration.
 Preserve the known user's bcrypt credential for rehash on first successful login. Port and test the

@@ -45,13 +45,19 @@ Use the same command with `pocketbase` to evaluate an unattended migration from 
 synthetic PocketBase 0.39.11 snapshot:
 
 ```sh
-python3 -m evals.agents.run pocketbase --agent codex
+mise exec zig@0.16.0 -- zig build
+ZIGBASE_EVAL_BINARY="$PWD/zig-out/bin/zigbase" \
+  python3 -m evals.agents.run pocketbase --agent codex \
+  --pass-env ZIGBASE_EVAL_BINARY
 ```
 
 That scenario provides only the pinned snapshot, the supported converter, the migration skill,
-and its prompt. It requires a deterministic bundle, exact durable decisions, autonomous public
-signup, owner/file authorization, bcrypt rehash-on-login, historical timestamps, parity evidence,
-and a restartable named-volume Compose deployment. It neither downloads nor runs PocketBase.
+its prompt, and the read-only ZigBase binary built from the scenario's repository revision. The
+agent verifies and copies that binary into its local deployment image; it must not substitute an
+older public image or clone a different source revision. The scenario requires a deterministic
+bundle, exact durable decisions, autonomous public signup, owner/file authorization, bcrypt
+rehash-on-login, historical timestamps, parity evidence, and a restartable named-volume Compose
+deployment. It neither downloads nor runs PocketBase.
 
 Metacharacters are literal argv data. Do not wrap the JSON command in `sh -c`. The scenario caps
 command size, runtime, and captured output.
