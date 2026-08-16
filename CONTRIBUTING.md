@@ -172,6 +172,20 @@ a real server with `--insecure-cookies`, and drives the admin SPA with headless 
 parallel-safe (each server binds its own free port and tempdir), so `-n auto` is fine;
 `tests/smtp` must stay serial because it binds a fixed TLS port.
 
+### 2b. Agent-evaluation harness
+
+The real-agent Genesis run is opt-in, but its contracts, fake agents, negative grader fixtures, and
+skill drift guard are ordinary blocking tests:
+
+```sh
+python -m pytest tests/agent_evals tests/admin/test_skill_sync.py -q
+ZIGBASE_DOCKER_EVAL_TEST=1 python -m pytest tests/agent_evals/test_genesis_docker.py -q
+```
+
+The second command needs a local Docker daemon and exercises the pinned image, health/meta probes,
+production doctor, and teardown. See [docs/agent-evals.md](docs/agent-evals.md) before running a real
+agent; do not commit its raw stdout/stderr transcripts.
+
 **Run the relevant `tests/admin/` test for anything touching the admin UI, secure defaults,
 realtime, or access rules.** A green `zig build test` has repeatedly hidden real regressions that
 the `browser` CI job then caught — end-to-end behavior is only exercised here.

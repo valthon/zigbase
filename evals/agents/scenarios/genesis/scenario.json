@@ -1,0 +1,12 @@
+{
+  "zigbaseAgentScenario": 1,
+  "name": "genesis",
+  "prompt": "prompt.md",
+  "fixture": null,
+  "skills": ["zigbase-app-genesis"],
+  "graders": ["genesis"],
+  "timeout_seconds": 1800,
+  "term_grace_seconds": 10,
+  "max_command_bytes": 16384,
+  "max_output_bytes": 16777216
+}

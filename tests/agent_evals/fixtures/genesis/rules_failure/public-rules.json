@@ -1,0 +1,11 @@
+{
+  "zigbasePublicRules": 1,
+  "rules": [
+    {
+      "collection": "stale",
+      "operation": "view",
+      "rule": "@public",
+      "rationale": "Deliberately stale negative fixture."
+    }
+  ]
+}

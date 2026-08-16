@@ -1,0 +1,5 @@
+services:
+  zigbase:
+    image: ghcr.io/valthon/zigbase:latest
+    environment:
+      ZIGBASE_COOKIE_SECURE: "false"
