@@ -21,7 +21,9 @@ zigbase openapi --data-dir ./zb_data \
 ```
 
 `--out` creates parent directories and atomically replaces an existing artifact. Without it, the
-only stdout output is the JSON document. The output always ends with a newline.
+only stdout output is the JSON document. The output always ends with a newline. If `--api-version`
+is omitted, `info.version` is this ZigBase binary's build version; framework applications should
+pass their own API or release version when that distinction matters to generated clients.
 
 The database must already exist. Export opens SQLite with read-only flags and fails instead of
 creating a missing data directory or database. PostgreSQL export uses `ZIGBASE_DB_URL` when the
@@ -47,9 +49,12 @@ Every non-system collection contributes these literal paths:
 
 Record, create, update, and list components preserve field types and applicable length, pattern,
 numeric, enum, selection-count, relation, file-size, and MIME constraints. Record schemas include
-`id`, `created`, and `updated`. Auth create schemas include write-only `password` and
-`passwordConfirm`. Engine-only credential columns such as `passwordHash` and `tokenKey` are never
-exported. A user-defined hidden field remains visible to contract tooling as `writeOnly: true`.
+`id`, `created`, and `updated`, while leaving properties optional because `?fields=` can project
+them away. Unset non-required fields are nullable. Integer and fixed-decimal record values use
+their actual decimal-string wire form; create/update inputs accept either strings or JSON numbers.
+Auth create/update schemas include the write-only password fields accepted by those endpoints.
+Engine-only credential columns such as `passwordHash` and `tokenKey` are never exported. A
+user-defined hidden field remains visible to contract tooling as `writeOnly: true`.
 
 List operations describe both offset (`page`, `perPage`) and cursor (`cursor`, `limit`) pagination,
 plus filter, sort, search, vector, expand, and field-projection parameters. Responses use the real

@@ -311,13 +311,16 @@ pub const TimestampRestorer = struct {
     statement: db.Stmt,
 
     pub fn init(a: std.mem.Allocator, w: *db.Db, col: schema.Collection) !TimestampRestorer {
+        var scratch = std.heap.ArenaAllocator.init(a);
+        defer scratch.deinit();
+        const sa = scratch.allocator();
         const sql = try std.fmt.allocPrintSentinel(
-            a,
+            sa,
             "UPDATE {s} SET \"created\"=?2, \"updated\"=?3 WHERE \"id\"=?1;",
-            .{try ddl.quoteIdent(a, col.name)},
+            .{try ddl.quoteIdent(sa, col.name)},
             0,
         );
-        return .{ .statement = try prep(a, w, sql) };
+        return .{ .statement = try prep(sa, w, sql) };
     }
 
     pub fn deinit(self: *TimestampRestorer) void {
@@ -328,6 +331,15 @@ pub const TimestampRestorer = struct {
         try applySourceTimestamps(&self.statement, try sourceTimestamps(data));
     }
 };
+
+test "TimestampRestorer init releases SQL scratch under a general allocator" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try d.exec("CREATE TABLE notes (id TEXT PRIMARY KEY, created TEXT, updated TEXT);");
+    const col = schema.Collection{ .id = "notes-id", .name = "notes", .fields = &.{} };
+    var restorer = try TimestampRestorer.init(std.testing.allocator, &d, col);
+    defer restorer.deinit();
+}
 
 /// Per-run statements prepared ONCE and reused for every row via reset/re-bind — avoiding an N+1
 /// prepare per row. Exactly one read statement is non-null: `upsert` with `--upsert-key`, or

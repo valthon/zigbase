@@ -107,7 +107,10 @@ def test_framework_binary_includes_its_comptime_routes(binary, dating_binary, tm
 def test_missing_database_fails_without_creating_it(binary, tmp_path):
     missing = tmp_path / "does-not-exist"
     result = run(binary, "openapi", "--data-dir", missing)
-    assert result.returncode != 0
+    assert result.returncode == 1
+    assert "cannot inspect ZigBase database" in result.stderr
+    assert "FileNotFound" in result.stderr
+    assert "src/framework.zig" not in result.stderr
     assert not missing.exists()
 
 

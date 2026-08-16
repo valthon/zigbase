@@ -129,3 +129,34 @@ def test_manifest_rejects_a_bad_document_and_an_unknown_collection(import_binary
     r2 = subprocess.run([import_binary, "import", "--manifest", unknown, "--data-dir", data_dir],
                         env=env(data_dir), capture_output=True, text=True)
     assert r2.returncode == 1 and "UnknownCollection" in r2.stderr
+
+
+def test_manifest_prints_preflight_timestamp_detail(import_binary, data_dir):
+    write(data_dir, "authors.ndjson", '{"id":"author00000001"}\n')
+    manifest = write(data_dir, "m.json", json.dumps({
+        "zigbaseImportManifest": 1,
+        "collections": [
+            {
+                "collection": "authors",
+                "file": "authors.ndjson",
+                "upsertKey": "nom",
+            }
+        ],
+    }))
+    result = subprocess.run(
+        [
+            import_binary,
+            "import",
+            "--manifest",
+            manifest,
+            "--preserve-timestamps",
+            "--data-dir",
+            data_dir,
+        ],
+        env=env(data_dir),
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 1
+    assert "TimestampRequiresCreateOnly" in result.stderr
+    assert "remove --upsert-key / manifest `upsertKey`" in result.stderr

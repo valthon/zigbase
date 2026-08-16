@@ -3175,7 +3175,12 @@ fn openApiImpl(comptime route_meta: []const events.RouteMeta, allocator: std.mem
 
     // Fail before SQLite's open if the live database does not exist. This makes the
     // no-create guarantee explicit and yields the filesystem's useful FileNotFound error.
-    if (db.chooseBackend(db_url) != .postgres) _ = try std.Io.Dir.cwd().statFile(io, target, .{});
+    if (db.chooseBackend(db_url) != .postgres) {
+        _ = std.Io.Dir.cwd().statFile(io, target, .{}) catch |e| {
+            std.log.err("cannot inspect ZigBase database at {s}: {s}", .{ target, @errorName(e) });
+            std.process.exit(1);
+        };
+    }
     var conn = try db.openInspectionConnection(allocator, io, target);
     defer conn.close();
 
@@ -3903,10 +3908,7 @@ fn importManifestImpl(
             .legacy_hash_algorithm = ia.legacy_hashes,
             .preserve_timestamps = ia.preserve_timestamps,
         },
-    }) catch |e| {
-        std.log.err("import manifest '{s}' failed: {s}", .{ mpath, @errorName(e) });
-        return e;
-    };
+    }) catch |e| return reportImportError(mpath, e);
     defer allocator.free(report.entries);
 
     if (ia.json) {
@@ -3958,7 +3960,10 @@ fn reportImportError(collection: []const u8, e: anyerror) anyerror {
         else
             std.log.err("import into '{s}' failed at line {d}: {s}", .{ collection, line, @errorName(e) });
     } else {
-        std.log.err("import into '{s}' failed: {s}", .{ collection, @errorName(e) });
+        if (detail.len > 0)
+            std.log.err("import into '{s}' failed: {s} — {s}", .{ collection, @errorName(e), detail })
+        else
+            std.log.err("import into '{s}' failed: {s}", .{ collection, @errorName(e) });
     }
     return e;
 }

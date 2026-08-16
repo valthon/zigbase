@@ -78,11 +78,13 @@ fn scalarFieldSchema(alloc: std.mem.Allocator, field: schema.Field, owner: schem
         },
         .bool => try out.put(alloc, "type", .{ .string = "boolean" }),
         .number => |o| {
-            try out.put(alloc, "type", .{ .string = if (o.mode == .int) "integer" else "number" });
+            try out.put(alloc, "type", .{ .string = "number" });
+            try out.put(alloc, "x-zigbase-numberMode", .{ .string = @tagName(o.mode) });
             if (o.min) |v| try addNumber(&out, alloc, "minimum", v);
             if (o.max) |v| try addNumber(&out, alloc, "maximum", v);
             if (o.mode == .fixed) {
                 const scale = o.scale orelse 1;
+                try out.put(alloc, "x-zigbase-scale", .{ .integer = @intCast(scale) });
                 try addNumber(&out, alloc, "multipleOf", std.math.pow(f64, 10, -@as(f64, @floatFromInt(scale))));
             }
         },
@@ -136,6 +138,51 @@ fn fieldSchema(alloc: std.mem.Allocator, field: schema.Field, owner: schema.Coll
 
 const SchemaKind = enum { record, create, update };
 
+fn nullable(alloc: std.mem.Allocator, value: Value) !Value {
+    if (value == .object) {
+        if (value.object.get("type")) |field_type| {
+            if (field_type == .string) {
+                var types = array(alloc);
+                try types.append(.{ .string = field_type.string });
+                try types.append(.{ .string = "null" });
+                var out = value;
+                try out.object.put(alloc, "type", .{ .array = types });
+                return out;
+            }
+        }
+    }
+    var alternatives = array(alloc);
+    try alternatives.append(value);
+    var null_schema = object();
+    try null_schema.put(alloc, "type", .{ .string = "null" });
+    try alternatives.append(.{ .object = null_schema });
+    var out = object();
+    try out.put(alloc, "anyOf", .{ .array = alternatives });
+    return .{ .object = out };
+}
+
+fn collectionFieldSchema(alloc: std.mem.Allocator, field: schema.Field, owner: schema.Collection, all: []const schema.Collection, kind: SchemaKind) !Value {
+    var result = try fieldSchema(alloc, field, owner, all);
+    switch (field.options) {
+        .number => |number| {
+            const mode = number.mode;
+            if (mode == .int or mode == .fixed) {
+                if (kind == .record) {
+                    try result.object.put(alloc, "type", .{ .string = "string" });
+                } else {
+                    var types = array(alloc);
+                    try types.append(.{ .string = "string" });
+                    try types.append(.{ .string = "number" });
+                    try result.object.put(alloc, "type", .{ .array = types });
+                }
+            }
+        },
+        else => {},
+    }
+    if (kind == .record and !field.required) result = try nullable(alloc, result);
+    return result;
+}
+
 fn collectionSchema(alloc: std.mem.Allocator, col: schema.Collection, all: []const schema.Collection, kind: SchemaKind) !Value {
     var properties = object();
     var required = array(alloc);
@@ -146,7 +193,6 @@ fn collectionSchema(alloc: std.mem.Allocator, col: schema.Collection, all: []con
             if (!std.mem.eql(u8, name, "id")) try p.put(alloc, "format", .{ .string = "date-time" });
             try p.put(alloc, "readOnly", .{ .bool = true });
             try properties.put(alloc, name, .{ .object = p });
-            try required.append(.{ .string = name });
         }
     }
     for (col.fields) |field| {
@@ -156,24 +202,25 @@ fn collectionSchema(alloc: std.mem.Allocator, col: schema.Collection, all: []con
         // treat it as a supported write field even when marked writeOnly.
         if (internal) continue;
         if (kind != .record and field.options == .autodate) continue;
-        try properties.put(alloc, field.name, try fieldSchema(alloc, field, col, all));
-        if (field.required and kind != .update) try required.append(.{ .string = field.name });
+        try properties.put(alloc, field.name, try collectionFieldSchema(alloc, field, col, all, kind));
+        if (field.required and kind == .create) try required.append(.{ .string = field.name });
     }
-    if (col.type == .auth and kind == .create) {
-        inline for (&.{ "password", "passwordConfirm" }) |name| {
+    if (col.type == .auth and (kind == .create or kind == .update)) {
+        inline for (&.{ "password", "passwordConfirm", "oldPassword" }) |name| {
             var p = object();
             try p.put(alloc, "type", .{ .string = "string" });
             try p.put(alloc, "format", .{ .string = "password" });
             try p.put(alloc, "writeOnly", .{ .bool = true });
             try properties.put(alloc, name, .{ .object = p });
-            try required.append(.{ .string = name });
+            if (kind == .create and !std.mem.eql(u8, name, "oldPassword"))
+                try required.append(.{ .string = name });
         }
     }
     var out = object();
     try out.put(alloc, "type", .{ .string = "object" });
     try out.put(alloc, "properties", .{ .object = properties });
     if (required.items.len > 0) try out.put(alloc, "required", .{ .array = required });
-    try out.put(alloc, "additionalProperties", .{ .bool = false });
+    if (kind != .record) try out.put(alloc, "additionalProperties", .{ .bool = false });
     return .{ .object = out };
 }
 
@@ -257,6 +304,7 @@ fn jsonResponse(alloc: std.mem.Allocator, status_description: []const u8, schema
 
 fn applyAccess(alloc: std.mem.Allocator, op: *Object, rule: ?[]const u8) !void {
     if (rule) |r| {
+        if (r.len == 0) return applyAccess(alloc, op, null);
         if (std.mem.eql(u8, r, "@public")) {
             try op.put(alloc, "security", .{ .array = array(alloc) });
             try op.put(alloc, "x-zigbase-access", .{ .string = "public" });
@@ -313,6 +361,21 @@ fn queryParameters(alloc: std.mem.Allocator) !Value {
     return .{ .array = params };
 }
 
+fn viewParameters(alloc: std.mem.Allocator) !Value {
+    var params = array(alloc);
+    try params.append(try idParameter(alloc));
+    inline for (&.{ "expand", "fields" }) |name| {
+        var param = object();
+        try param.put(alloc, "name", .{ .string = name });
+        try param.put(alloc, "in", .{ .string = "query" });
+        var value_schema = object();
+        try value_schema.put(alloc, "type", .{ .string = "string" });
+        try param.put(alloc, "schema", .{ .object = value_schema });
+        try params.append(.{ .object = param });
+    }
+    return .{ .array = params };
+}
+
 fn requestBody(alloc: std.mem.Allocator, schema_name: []const u8) !Value {
     var media = object();
     try media.put(alloc, "schema", try refValue(alloc, schema_name));
@@ -356,7 +419,7 @@ fn addCollection(alloc: std.mem.Allocator, paths: *Object, schemas: *Object, col
     try id_params.append(try idParameter(alloc));
     const params = Value{ .array = id_params };
     var item = object();
-    try item.put(alloc, "get", try operation(alloc, try std.fmt.allocPrint(alloc, "view{s}", .{base}), col.viewRule, record_name, null, params, false));
+    try item.put(alloc, "get", try operation(alloc, try std.fmt.allocPrint(alloc, "view{s}", .{base}), col.viewRule, record_name, null, try viewParameters(alloc), false));
     try item.put(alloc, "patch", try operation(alloc, try std.fmt.allocPrint(alloc, "update{s}", .{base}), col.updateRule, record_name, update_name, params, false));
     try item.put(alloc, "delete", try operation(alloc, try std.fmt.allocPrint(alloc, "delete{s}", .{base}), col.deleteRule, null, null, params, true));
     try paths.put(alloc, item_path, .{ .object = item });
@@ -378,7 +441,15 @@ fn zigSchema(comptime T: type, alloc: std.mem.Allocator) !Value {
         .bool => try out.put(alloc, "type", .{ .string = "boolean" }),
         .int => |i| {
             try out.put(alloc, "type", .{ .string = "integer" });
-            try out.put(alloc, "format", .{ .string = if (i.bits <= 32) "int32" else "int64" });
+            const format: ?[]const u8 = if (i.signedness == .signed)
+                if (i.bits <= 32) "int32" else if (i.bits <= 64) "int64" else null
+            else if (i.bits <= 31)
+                "int32"
+            else if (i.bits <= 63)
+                "int64"
+            else
+                null;
+            if (format) |value| try out.put(alloc, "format", .{ .string = value });
             if (i.signedness == .unsigned) try out.put(alloc, "minimum", .{ .integer = 0 });
         },
         .float => |f| {
@@ -402,8 +473,12 @@ fn zigSchema(comptime T: type, alloc: std.mem.Allocator) !Value {
         },
         .pointer => |p| {
             if (p.size != .slice) unreachable;
-            try out.put(alloc, "type", .{ .string = "array" });
-            try out.put(alloc, "items", try zigSchema(p.child, alloc));
+            if (p.child == u8) {
+                try out.put(alloc, "type", .{ .string = "string" });
+            } else {
+                try out.put(alloc, "type", .{ .string = "array" });
+                try out.put(alloc, "items", try zigSchema(p.child, alloc));
+            }
         },
         .@"struct" => |s| {
             try out.put(alloc, "type", .{ .string = "object" });
@@ -411,7 +486,7 @@ fn zigSchema(comptime T: type, alloc: std.mem.Allocator) !Value {
             var required = array(alloc);
             inline for (s.fields) |field| {
                 try props.put(alloc, field.name, try zigSchema(field.type, alloc));
-                if (@typeInfo(field.type) != .optional and field.default_value_ptr == null)
+                if (field.default_value_ptr == null)
                     try required.append(.{ .string = field.name });
             }
             try out.put(alloc, "properties", .{ .object = props });
@@ -674,15 +749,33 @@ test "collection export maps constraints, access, auth writes, and deterministic
     try std.testing.expect(post_list.get("security") == null);
     const post_view = root.get("paths").?.object.get("/api/collections/posts/records/{id}").?.object.get("get").?.object;
     try std.testing.expectEqual(@as(usize, 0), post_view.get("security").?.array.items.len);
+    const view_params = post_view.get("parameters").?.array.items;
+    try std.testing.expectEqual(@as(usize, 3), view_params.len);
+    try std.testing.expectEqualStrings("id", view_params[0].object.get("name").?.string);
+    try std.testing.expectEqualStrings("expand", view_params[1].object.get("name").?.string);
+    try std.testing.expectEqualStrings("fields", view_params[2].object.get("name").?.string);
     const schemas = root.get("components").?.object.get("schemas").?.object;
-    const props = schemas.get("PostsRecord").?.object.get("properties").?.object;
+    const record_schema = schemas.get("PostsRecord").?.object;
+    try std.testing.expect(record_schema.get("required") == null);
+    try std.testing.expect(record_schema.get("additionalProperties") == null);
+    const props = record_schema.get("properties").?.object;
     try std.testing.expectEqual(@as(i64, 2), props.get("title").?.object.get("minLength").?.integer);
+    const price_types = props.get("price").?.object.get("type").?.array.items;
+    try std.testing.expectEqualStrings("string", price_types[0].string);
+    try std.testing.expectEqualStrings("null", price_types[1].string);
     try std.testing.expectApproxEqAbs(@as(f64, 0.01), props.get("price").?.object.get("multipleOf").?.float, 0.000001);
     try std.testing.expectEqual(@as(i64, 2), props.get("roles").?.object.get("maxItems").?.integer);
     try std.testing.expect(props.get("secret").?.object.get("writeOnly").?.bool);
     const create_props = schemas.get("UsersCreate").?.object.get("properties").?.object;
     try std.testing.expect(create_props.get("password") != null);
     try std.testing.expect(create_props.get("passwordConfirm") != null);
+    const update_props = schemas.get("UsersUpdate").?.object.get("properties").?.object;
+    try std.testing.expect(update_props.get("password") != null);
+    try std.testing.expect(update_props.get("passwordConfirm") != null);
+    try std.testing.expect(update_props.get("oldPassword") != null);
+    const price_input_types = schemas.get("PostsCreate").?.object.get("properties").?.object.get("price").?.object.get("type").?.array.items;
+    try std.testing.expectEqualStrings("string", price_input_types[0].string);
+    try std.testing.expectEqualStrings("number", price_input_types[1].string);
     try std.testing.expect(std.mem.indexOf(u8, first, "passwordHash") == null);
 }
 
@@ -690,15 +783,15 @@ test "collection export covers every field option and preserves item bounds" {
     const a = std.testing.allocator;
     const fields = [_]schema.Field{
         .{ .id = "email", .name = "email", .options = .{ .email = .{} } },
-        .{ .id = "site", .name = "site", .options = .{ .url = .{} } },
-        .{ .id = "body", .name = "body", .options = .{ .editor = .{} } },
-        .{ .id = "when", .name = "when", .options = .{ .date = .{ .min = "2026-01-01 00:00:00.000Z", .max = "2027-01-01 00:00:00.000Z" } } },
-        .{ .id = "changed", .name = "changed", .options = .{ .autodate = .{ .onUpdate = true } } },
-        .{ .id = "active", .name = "active", .options = .{ .bool = .{} } },
-        .{ .id = "count", .name = "count", .options = .{ .number = .{ .mode = .int, .max = 9 } } },
-        .{ .id = "ratio", .name = "ratio", .options = .{ .number = .{ .mode = .float } } },
-        .{ .id = "meta", .name = "meta", .options = .{ .json = .{ .maxSize = 4096 } } },
-        .{ .id = "parents", .name = "parents", .options = .{ .relation = .{ .targetCollectionId = "nodes-id", .minSelect = 1, .maxSelect = 4 } } },
+        .{ .id = "site", .name = "site", .required = true, .options = .{ .url = .{} } },
+        .{ .id = "body", .name = "body", .required = true, .options = .{ .editor = .{} } },
+        .{ .id = "when", .name = "when", .required = true, .options = .{ .date = .{ .min = "2026-01-01 00:00:00.000Z", .max = "2027-01-01 00:00:00.000Z" } } },
+        .{ .id = "changed", .name = "changed", .required = true, .options = .{ .autodate = .{ .onUpdate = true } } },
+        .{ .id = "active", .name = "active", .required = true, .options = .{ .bool = .{} } },
+        .{ .id = "count", .name = "count", .required = true, .options = .{ .number = .{ .mode = .int, .max = 9 } } },
+        .{ .id = "ratio", .name = "ratio", .required = true, .options = .{ .number = .{ .mode = .float } } },
+        .{ .id = "meta", .name = "meta", .required = true, .options = .{ .json = .{ .maxSize = 4096 } } },
+        .{ .id = "parents", .name = "parents", .required = true, .options = .{ .relation = .{ .targetCollectionId = "nodes-id", .minSelect = 1, .maxSelect = 4 } } },
     };
     const cols = [_]schema.Collection{.{ .id = "nodes-id", .name = "nodes", .fields = &fields }};
     const doc = try generateCollections(a, &cols, .{ .api_version = "dev" });
@@ -713,7 +806,10 @@ test "collection export covers every field option and preserves item bounds" {
     try std.testing.expectEqualStrings("date-time", props.get("when").?.object.get("format").?.string);
     try std.testing.expect(props.get("changed").?.object.get("readOnly").?.bool);
     try std.testing.expectEqualStrings("boolean", props.get("active").?.object.get("type").?.string);
-    try std.testing.expectEqualStrings("integer", props.get("count").?.object.get("type").?.string);
+    const email_types = props.get("email").?.object.get("type").?.array.items;
+    try std.testing.expectEqualStrings("string", email_types[0].string);
+    try std.testing.expectEqualStrings("null", email_types[1].string);
+    try std.testing.expectEqualStrings("string", props.get("count").?.object.get("type").?.string);
     try std.testing.expectEqualStrings("number", props.get("ratio").?.object.get("type").?.string);
     try std.testing.expectEqual(@as(i64, 4096), props.get("meta").?.object.get("x-zigbase-maxBytes").?.integer);
     const parents = props.get("parents").?.object;
@@ -727,7 +823,7 @@ test "collection export covers every field option and preserves item bounds" {
 
 test "locked collection operations require bearer authentication" {
     const a = std.testing.allocator;
-    const cols = [_]schema.Collection{.{ .id = "notes", .name = "notes", .fields = &.{} }};
+    const cols = [_]schema.Collection{.{ .id = "notes", .name = "notes", .fields = &.{}, .updateRule = "" }};
     const doc = try generateCollections(a, &cols, .{ .api_version = "dev" });
     defer a.free(doc);
     const parsed = try std.json.parseFromSlice(Value, a, doc, .{});
@@ -735,12 +831,15 @@ test "locked collection operations require bearer authentication" {
     const op = parsed.value.object.get("paths").?.object.get("/api/collections/notes/records").?.object.get("post").?.object;
     try std.testing.expectEqualStrings("locked", op.get("x-zigbase-access").?.string);
     try std.testing.expect(op.get("security").?.array.items[0].object.get("bearerAuth") != null);
+    const update = parsed.value.object.get("paths").?.object.get("/api/collections/notes/records/{id}").?.object.get("patch").?.object;
+    try std.testing.expectEqualStrings("locked", update.get("x-zigbase-access").?.string);
+    try std.testing.expect(update.get("security").?.array.items[0].object.get("bearerAuth") != null);
 }
 
 test "consumer routes map bounded Zig types, methods, paths, and authentication" {
     const Query = struct { limit: u16, tag: ?[]const u8 = null };
     const State = enum { queued, done };
-    const Payload = struct { title: []const u8, state: State, scores: []const f32 };
+    const Payload = struct { title: []const u8, state: State, scores: []const f32, tag: ?[]const u8, token: [:0]const u8, count: u32, huge: u64 };
     const Reply = struct { ok: bool, payload: ?Payload };
     const routes = [_]events.RouteMeta{
         .{ .method = .GET, .path = "/api/jobs/:id", .name = "getJob", .auth = .public, .Input = Query, .Output = Reply },
@@ -771,6 +870,14 @@ test "consumer routes map bounded Zig types, methods, paths, and authentication"
     try std.testing.expectEqualStrings("boolean", reply.get("properties").?.object.get("ok").?.object.get("type").?.string);
     const create_job = paths.get("/api/jobs").?.object.get("post").?.object;
     try std.testing.expect(create_job.get("requestBody") != null);
+    const body_schema = create_job.get("requestBody").?.object.get("content").?.object.get("application/json").?.object.get("schema").?.object;
+    const body_required = body_schema.get("required").?.array.items;
+    try std.testing.expectEqual(@as(usize, 7), body_required.len);
+    try std.testing.expectEqualStrings("tag", body_required[3].string);
+    const body_props = body_schema.get("properties").?.object;
+    try std.testing.expectEqualStrings("string", body_props.get("token").?.object.get("type").?.string);
+    try std.testing.expectEqualStrings("int64", body_props.get("count").?.object.get("format").?.string);
+    try std.testing.expect(body_props.get("huge").?.object.get("format") == null);
     try std.testing.expectEqualStrings("authenticated", create_job.get("x-zigbase-auth").?.string);
     try std.testing.expect(create_job.get("security").?.array.items[0].object.get("bearerAuth") != null);
     const delete_job = paths.get("/api/jobs/{id}").?.object.get("delete").?.object;
