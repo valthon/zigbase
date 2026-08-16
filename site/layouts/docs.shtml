@@ -47,6 +47,7 @@
         <p class="docs-group">Reference</p>
         <ul>
           <li><a href="$site.page('docs/api').link()">API</a></li>
+          <li><a href="$site.page('docs/openapi').link()">OpenAPI export</a></li>
           <li><a href="$site.page('docs/fields').link()">Fields</a></li>
           <li><a href="$site.page('docs/observability').link()">Observability</a></li>
           <li><a href="$site.page('docs/agent-evals').link()">Agent evaluations</a></li>

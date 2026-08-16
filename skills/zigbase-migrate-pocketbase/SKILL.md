@@ -16,6 +16,7 @@ tool sequence, and stable ZigBase behavior.
 Read only the additional references needed:
 
 - `references/migration-tools.md` for schema, import, legacy-hash, and replay details.
+- `references/openapi.md` after porting custom behavior, to export and review the target HTTP contract.
 - `references/serve.md` before starting or diagnosing ZigBase or interpreting doctor.
 - `references/deployment.md` and `references/docker.md` before rehearsal, cutover, rollback, or
   production advice.

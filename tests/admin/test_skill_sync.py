@@ -12,6 +12,7 @@ REFERENCE_NAMES = (
     "app-genesis.md",
     "deployment.md",
     "docker.md",
+    "openapi.md",
     "serve.md",
     "testing.md",
 )
@@ -21,6 +22,7 @@ MIGRATION_REFERENCE_NAMES = (
     "docker.md",
     "migrate-pocketbase.md",
     "migration-tools.md",
+    "openapi.md",
     "serve.md",
 )
 

@@ -51,6 +51,7 @@ See [docs/docker.md](docs/docker.md) for the data-volume/non-root/healthcheck de
 
 - **Collections & schema** — define collections with typed fields; schema migrations run on startup.
 - **Records & query API** — typed CRUD with `filter`, `sort`, and `expand` on relations. → [docs/api.md](docs/api.md)
+- **OpenAPI export** — deterministic OpenAPI 3.1.2 JSON for live collection CRUD and framework-declared routes, with redacted secrets and honest access metadata. → [docs/openapi.md](docs/openapi.md)
 - **Search** — ranked full-text search (`?search=`) over `.searchable` fields, composed into the same scoped query as every other list request. SQLite FTS5 is compiled in by default (`-Dfts5=false` drops it, ~250-400 KB, for lean builds with no `.searchable` fields); Postgres full-text search is unaffected. Opt-in `-Dvector` build adds nearest-neighbor `?vector=` KNN search on both backends. → [docs/search.md](docs/search.md)
 - **Access rules** — per-collection list / view / create / update / delete rules. → [docs/api.md](docs/api.md)
 - **Auth** — argon2id password, magic-link, OTP, and WebAuthn passkey auth; JWT tokens; verification and password-reset flows. → [docs/api.md](docs/api.md)
@@ -131,7 +132,7 @@ pub fn main(init: std.process.Init) !void {
 ```
 
 `runCli` gives your binary the same commands as the stock server — `serve`, `migrate`,
-`migrate-db`, `import`, `schema`, `superuser create`, `rewrap`, `vapid-keygen`,
+`migrate-db`, `import`, `schema`, `openapi`, `superuser create`, `rewrap`, `vapid-keygen`,
 `explain-code`, `version`, and `help` (plus `typegen` when built with
 `.enable_typegen = true`). Beyond hooks, `App(.{...})` also accepts a comptime
 **schema** (`.collections` + `.migrations`, provisioned at startup with additive
@@ -154,6 +155,7 @@ zigbase serve stop | status [--json] | logs [--follow] [--data-dir PATH]
 zigbase migrate [status | rollback [N] | dump [--out FILE]] [--data-dir PATH]
 zigbase migrate-db --from SQLITE_PATH --to POSTGRES_URL [--force]
 zigbase schema [dump [--json] [--out FILE] | apply FILE [--dry-run] [--allow-destructive] [--prune]] [--data-dir PATH]
+zigbase openapi [--data-dir PATH] [--out FILE] [--title TEXT] [--api-version VERSION] [--server URL]
 zigbase import [--collection NAME [--upsert-key FIELD] <file.ndjson> | --manifest FILE]
                [--legacy-hashes ALG] [--dry-run] [--continue-on-error] [--error-log FILE]
                [--progress N] [--batch-size N] [--json] [--data-dir PATH]
@@ -211,6 +213,10 @@ and also resolves field and relation names. Together with `import --manifest` an
 `import --legacy-hashes` they are the machinery behind
 [migrating an existing backend to ZigBase](docs/migration-tools.md). PocketBase 0.39.11 has a
 dedicated, decision-driven workflow in [docs/migrate-pocketbase.md](docs/migrate-pocketbase.md).
+
+`openapi` inspects that live collection model without starting or mutating the server and emits
+OpenAPI 3.1.2 JSON. A framework binary also includes its comptime typed and untyped routes; the
+stock binary is collection-only. See [docs/openapi.md](docs/openapi.md).
 
 Running `zigbase` with no recognised command prints usage.
 
@@ -342,6 +348,7 @@ examples/
 - [docs/fields.md](docs/fields.md) — field-type & options catalog (all 12 types, defaults, validation rules)
 - [docs/recipes.md](docs/recipes.md) — task recipes: ship a frontend in the binary, schema provisioning (curl), signup, owner/relation access rules, hooks, custom routes, DB access in cron
 - [docs/api.md](docs/api.md) — HTTP API reference (collections, records, query, rules, auth, oauth2, realtime, files, static files, admin)
+- [docs/openapi.md](docs/openapi.md) — deterministic OpenAPI export for collection CRUD and framework consumer routes
 - [docs/framework.md](docs/framework.md) — embedding ZigBase: hooks, routes, jobs, static-file modes
 - [docs/serve.md](docs/serve.md) — running the server: background sessions, `stop`/`status`/`logs`, ephemeral instances, and the `doctor` preflight
 - [docs/deployment.md](docs/deployment.md) — systemd, Docker Compose, reverse-proxy TLS, Fly, Railway, backups, upgrades, and rollback

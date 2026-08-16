@@ -160,6 +160,16 @@
     }
   },
   {
+    "canonical": "docs/openapi.md",
+    "mirror": "openapi.md",
+    "frontmatter": {
+      "title": "OpenAPI export",
+      "description": "Export deterministic OpenAPI 3.1.2 JSON for live collection CRUD and framework-declared consumer routes, with honest access and redacted secret metadata.",
+      "order": 6,
+      "group": "reference"
+    }
+  },
+  {
     "canonical": "docs/postgres.md",
     "mirror": "postgres.md",
     "frontmatter": {

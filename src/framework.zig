@@ -35,6 +35,8 @@ const oauth_client = @import("oauth/client.zig");
 const migrator = @import("migrator.zig");
 const schema_dump = @import("schema_dump.zig");
 const schema_doc = @import("schema_doc.zig");
+const openapi = @import("openapi.zig");
+const openapi_cli = @import("openapi_cli.zig");
 const schema_diff = @import("schema_diff.zig");
 const schema = @import("schema.zig");
 // Named `collections_mod` (not `collections`): `App(cfg)` declares its own `pub const
@@ -1641,7 +1643,7 @@ pub fn App(comptime cfg: anytype) type {
         /// Parse argv and dispatch the CLI (serve / migrate / superuser create / help),
         /// wiring this app's `dispatch` into the runtime context for `serve`.
         pub fn runCli(init: std.process.Init) !void {
-            return runCliImpl(init, &dispatch, jobs, job_pool_size, collections, provision_migrations, Opts);
+            return runCliImpl(init, &dispatch, jobs, job_pool_size, collections, provision_migrations, routes, Opts);
         }
 
         /// Start the HTTP server directly with an explicit config (no CLI parsing).
@@ -1865,7 +1867,7 @@ pub const ServeOpts = struct {
 };
 
 /// Zig 0.16 entry point body: parse argv from `init.minimal.args` and dispatch.
-fn runCliImpl(init: std.process.Init, dispatch: *const events.Dispatch, jobs: []const scheduler.RuntimeJob, pool_size: usize, schema_collections: []const schema.Collection, schema_migrations: []const provision.Migration, comptime opts: ServeOpts) !void {
+fn runCliImpl(init: std.process.Init, dispatch: *const events.Dispatch, jobs: []const scheduler.RuntimeJob, pool_size: usize, schema_collections: []const schema.Collection, schema_migrations: []const provision.Migration, comptime route_meta: []const events.RouteMeta, comptime opts: ServeOpts) !void {
     // Boot-ordering chicken-and-egg (docs/observability.md "Log output"): a bad
     // ZIGBASE_LOG_FORMAT/LEVEL must be reported BY the logger it configures. This
     // pre-pass reads only those two vars and silently ignores an invalid value —
@@ -1915,6 +1917,7 @@ fn runCliImpl(init: std.process.Init, dispatch: *const events.Dispatch, jobs: []
             .vapid_keygen => printVapidKeygenUsage(init.io, std.Io.File.stdout()),
             .import => printImportUsage(init.io, std.Io.File.stdout()),
             .schema => printSchemaUsage(init.io, std.Io.File.stdout()),
+            .openapi => printOpenApiUsage(init.io, std.Io.File.stdout()),
             .explain_code => printExplainCodeUsage(init.io, std.Io.File.stdout()),
             .serve_control => printServeControlUsage(init.io, std.Io.File.stdout()),
             .doctor => printDoctorUsage(init.io, std.Io.File.stdout()),
@@ -2080,6 +2083,7 @@ fn runCliImpl(init: std.process.Init, dispatch: *const events.Dispatch, jobs: []
             .apply => try schemaApplyImpl(allocator, init.io, init.environ_map, sa, dispatch, jobs, pool_size, schema_collections, schema_migrations, opts),
             .check_rules => try schemaCheckRulesImpl(allocator, init.io, init.environ_map, sa),
         },
+        .openapi => |oa| try openApiImpl(route_meta, allocator, init.io, init.environ_map, oa),
         .rewrap => |ra| try rewrapImpl(allocator, init.io, init.environ_map, ra),
         .import => |ia| try importImpl(allocator, init.io, init.environ_map, ia, dispatch, jobs, pool_size, schema_collections, schema_migrations, opts),
         .migrate_db => |ma| try migrateDbImpl(allocator, init.io, ma),
@@ -2169,6 +2173,7 @@ fn printUsage(io: std.Io, file: std.Io.File, show_serve_static: bool, show_stati
         \\  import              Bulk-import NDJSON records offline (through the engine: validation + encryption).
         \\  schema              Dump the collection model as JSON, apply a schema document, or
         \\                      `check-rules` to lint access-rule expressions before they ship.
+        \\  openapi             Export collection and consumer-route contracts as OpenAPI JSON.
         \\  superuser create    Create an admin (superuser) account.
         \\  vapid-keygen        Generate a VAPID (Web Push) keypair for ctx.push().
         \\  explain-code        Explain a frozen API error code, or list them all. Add --json for one JSON object.
@@ -2613,6 +2618,19 @@ fn printSchemaUsage(io: std.Io, file: std.Io.File) void {
         \\  zigbase schema apply db/schema.json --allow-destructive
         \\  zigbase schema check-rules db/schema.json        # offline, syntax depth
         \\  zigbase schema check-rules --data-dir ./zb_data  # live, full depth
+        \\
+    , .{});
+}
+
+fn printOpenApiUsage(io: std.Io, file: std.Io.File) void {
+    emit(io, file,
+        \\Usage: zigbase openapi [--data-dir <path>] [--out <file>]
+        \\                        [--title <text>] [--api-version <version>]
+        \\                        [--server <url>]
+        \\
+        \\Exports deterministic OpenAPI 3.1.2 JSON for live non-system collections
+        \\and this framework binary's declared consumer routes. Writes stdout by
+        \\default; --out writes the artifact to a file.
         \\
     , .{});
 }
@@ -3131,6 +3149,53 @@ fn schemaDumpImpl(allocator: std.mem.Allocator, io: std.Io, environ: *const std.
         var wr = std.Io.File.stdout().writer(io, &buf);
         try wr.interface.writeAll(doc);
         try wr.interface.flush();
+    }
+}
+
+/// `zigbase openapi`: inspect the live logical collection model through a direct
+/// read-only connection and combine it with this binary's comptime consumer routes. It
+/// deliberately bypasses server boot, migrations, provisioning, and the SQLite pool's
+/// journal-mode setup, so exporting cannot mutate the database it describes.
+fn openApiImpl(comptime route_meta: []const events.RouteMeta, allocator: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map, oa: cli.OpenApiArgs) !void {
+    const cfg = try loadCfg(environ, .{ .data_dir = oa.data_dir });
+    const db_url = (config.EnvGetter{ .environ = environ }).get("ZIGBASE_DB_URL");
+    const target: []const u8 = switch (db.chooseBackend(db_url)) {
+        .postgres => db_url.?,
+        .postgres_url_without_build => blk: {
+            std.log.warn(
+                "ZIGBASE_DB_URL is a postgres:// URL but this binary was built without -Dpostgres; " ++
+                    "exporting the SQLite database at {s}/data.db instead",
+                .{cfg.data_dir},
+            );
+            break :blk try std.fmt.allocPrint(allocator, "{s}/data.db", .{cfg.data_dir});
+        },
+        .sqlite => try std.fmt.allocPrint(allocator, "{s}/data.db", .{cfg.data_dir}),
+    };
+    defer if (db.chooseBackend(db_url) != .postgres) allocator.free(target);
+
+    // Fail before SQLite's open if the live database does not exist. This makes the
+    // no-create guarantee explicit and yields the filesystem's useful FileNotFound error.
+    if (db.chooseBackend(db_url) != .postgres) _ = try std.Io.Dir.cwd().statFile(io, target, .{});
+    var conn = try db.openInspectionConnection(allocator, io, target);
+    defer conn.close();
+
+    var scratch = std.heap.ArenaAllocator.init(allocator);
+    defer scratch.deinit();
+    const cols = try collections_mod.list(scratch.allocator(), &conn);
+    const doc = try openapi.generate(route_meta, allocator, cols, .{
+        .title = oa.title,
+        .api_version = oa.api_version orelse build_options.version,
+        .server = oa.server,
+    });
+    defer allocator.free(doc);
+    if (oa.out) |path| {
+        try openapi_cli.writeAtomic(allocator, io, path, doc);
+        std.log.info("OpenAPI document written to {s} ({d} bytes)", .{ path, doc.len });
+    } else {
+        var buf: [4096]u8 = undefined;
+        var writer = std.Io.File.stdout().writer(io, &buf);
+        try writer.interface.writeAll(doc);
+        try writer.interface.flush();
     }
 }
 
@@ -5773,6 +5838,31 @@ test "App exposes route metadata for codegen" {
     try std.testing.expectEqual(@as(usize, 1), TestApp.routes.len);
     try std.testing.expectEqualStrings("widgetsPoke", TestApp.routes[0].name);
     try std.testing.expect(TestApp.routes[0].Input == In);
+}
+
+test "App route metadata preserves collection-scoped auth without secrets" {
+    const route_types = @import("route_types.zig");
+    const TestApp = App(.{
+        .collections = .{
+            .members = .{ .type = .auth, .fields = .{} },
+        },
+        .routes = .{
+            .{
+                .method = .GET,
+                .path = "/api/member-area",
+                .auth = .{ .authed = "members", .allow_superuser = true },
+                .handler = struct {
+                    fn h(req: *route_types.Req(void)) route_types.RouteError!void {
+                        _ = req;
+                    }
+                }.h,
+            },
+        },
+    });
+    const gate = TestApp.routes[0].authed_collection.?;
+    try std.testing.expectEqualStrings("members", gate.collection);
+    try std.testing.expect(gate.allow_superuser);
+    try std.testing.expect(TestApp.routes[0].path_secret == null);
 }
 
 test "anyEncryptedField detects an .encrypted field (drives the startup fail-closed guard)" {

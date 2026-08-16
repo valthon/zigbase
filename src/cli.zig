@@ -170,6 +170,16 @@ pub const SchemaArgs = struct {
     prune: bool = false,
 };
 
+/// `openapi`: export the live collection API plus this framework binary's comptime
+/// consumer routes as deterministic OpenAPI JSON.
+pub const OpenApiArgs = struct {
+    data_dir: ?[]const u8 = null,
+    out: ?[]const u8 = null,
+    title: []const u8 = "ZigBase API",
+    api_version: ?[]const u8 = null,
+    server: ?[]const u8 = null,
+};
+
 pub const InitMode = enum { box, framework };
 
 /// `init` — scaffold a starting-point project. Exclusive-create only; there is no
@@ -190,7 +200,7 @@ pub const AgentsMdArgs = struct {
 };
 
 /// Identifies which command a per-command `--help` request targets.
-pub const HelpTopic = enum { top, serve, serve_control, migrate, superuser_create, typegen, rewrap, migrate_db, vapid_keygen, import, schema, explain_code, doctor, init, agents_md };
+pub const HelpTopic = enum { top, serve, serve_control, migrate, superuser_create, typegen, rewrap, migrate_db, vapid_keygen, import, schema, openapi, explain_code, doctor, init, agents_md };
 
 pub const Command = union(enum) {
     /// `help`/`--help`/`-h`/no-args -> top-level usage; `<cmd> --help` -> that command's usage.
@@ -207,6 +217,7 @@ pub const Command = union(enum) {
     vapid_keygen: void,
     import: ImportArgs,
     schema: SchemaArgs,
+    openapi: OpenApiArgs,
     explain_code: ExplainCodeArgs,
     /// `serve stop|status|logs` -> manage an existing `serve` session.
     serve_control: ServeControlArgs,
@@ -392,6 +403,47 @@ pub fn parse(args: []const []const u8, popts: ParseOpts) ParseError!Command {
             } else return ParseError.UnknownFlag;
         }
         return .{ .schema = sa };
+    }
+    if (std.mem.eql(u8, args[0], "openapi")) {
+        var oa = OpenApiArgs{};
+        var seen_data_dir = false;
+        var seen_out = false;
+        var seen_title = false;
+        var seen_api_version = false;
+        var seen_server = false;
+        var i: usize = 1;
+        while (i < args.len) : (i += 1) {
+            const a = args[i];
+            if (isHelpFlag(a)) return .{ .help = .openapi };
+            const target: *?[]const u8 = if (std.mem.eql(u8, a, "--data-dir")) blk: {
+                if (seen_data_dir) return ParseError.ConflictingFlags;
+                seen_data_dir = true;
+                break :blk &oa.data_dir;
+            } else if (std.mem.eql(u8, a, "--out")) blk: {
+                if (seen_out) return ParseError.ConflictingFlags;
+                seen_out = true;
+                break :blk &oa.out;
+            } else if (std.mem.eql(u8, a, "--api-version")) blk: {
+                if (seen_api_version) return ParseError.ConflictingFlags;
+                seen_api_version = true;
+                break :blk &oa.api_version;
+            } else if (std.mem.eql(u8, a, "--server")) blk: {
+                if (seen_server) return ParseError.ConflictingFlags;
+                seen_server = true;
+                break :blk &oa.server;
+            } else if (std.mem.eql(u8, a, "--title")) {
+                if (seen_title) return ParseError.ConflictingFlags;
+                seen_title = true;
+                i += 1;
+                if (i >= args.len) return ParseError.MissingValue;
+                oa.title = args[i];
+                continue;
+            } else return ParseError.UnknownFlag;
+            i += 1;
+            if (i >= args.len) return ParseError.MissingValue;
+            target.* = args[i];
+        }
+        return .{ .openapi = oa };
     }
     if (std.mem.eql(u8, args[0], "import")) {
         var ia = ImportArgs{};
@@ -1038,6 +1090,43 @@ test "schema --help routes to its help topic" {
     try std.testing.expectEqual(HelpTopic.schema, (try parse(&.{ "schema", "--help" }, .{})).help);
     try std.testing.expectEqual(HelpTopic.schema, (try parse(&.{ "schema", "apply", "-h" }, .{})).help);
     try std.testing.expectEqual(HelpTopic.schema, (try parse(&.{ "schema", "check-rules", "--help" }, .{})).help);
+}
+
+test "openapi parses metadata and output flags" {
+    const bare = try parse(&.{"openapi"}, .{});
+    try std.testing.expect(std.meta.activeTag(bare) == .openapi);
+    try std.testing.expectEqualStrings("ZigBase API", bare.openapi.title);
+    try std.testing.expect(bare.openapi.data_dir == null);
+    try std.testing.expect(bare.openapi.out == null);
+    try std.testing.expect(bare.openapi.api_version == null);
+    try std.testing.expect(bare.openapi.server == null);
+
+    const full = try parse(&.{
+        "openapi",
+        "--data-dir",
+        "/tmp/zb",
+        "--out",
+        "api/openapi.json",
+        "--title",
+        "Acme API",
+        "--api-version",
+        "2026-08",
+        "--server",
+        "https://api.example.test",
+    }, .{});
+    try std.testing.expectEqualStrings("/tmp/zb", full.openapi.data_dir.?);
+    try std.testing.expectEqualStrings("api/openapi.json", full.openapi.out.?);
+    try std.testing.expectEqualStrings("Acme API", full.openapi.title);
+    try std.testing.expectEqualStrings("2026-08", full.openapi.api_version.?);
+    try std.testing.expectEqualStrings("https://api.example.test", full.openapi.server.?);
+}
+
+test "openapi rejects malformed flags and routes help" {
+    try std.testing.expectEqual(HelpTopic.openapi, (try parse(&.{ "openapi", "--help" }, .{})).help);
+    try std.testing.expectError(ParseError.UnknownFlag, parse(&.{ "openapi", "--json" }, .{}));
+    try std.testing.expectError(ParseError.MissingValue, parse(&.{ "openapi", "--out" }, .{}));
+    try std.testing.expectError(ParseError.ConflictingFlags, parse(&.{ "openapi", "--title", "A", "--title", "B" }, .{}));
+    try std.testing.expectError(ParseError.ConflictingFlags, parse(&.{ "openapi", "--server", "https://a.test", "--server", "https://b.test" }, .{}));
 }
 
 test "unknown command errors" {

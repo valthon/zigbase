@@ -369,6 +369,8 @@ test {
     _ = @import("migrator.zig");
     _ = @import("schema_dump.zig");
     _ = @import("schema_doc.zig");
+    _ = @import("openapi.zig");
+    _ = @import("openapi_cli.zig");
     _ = @import("schema_diff.zig");
     _ = @import("rules.zig");
     _ = @import("policy.zig");

@@ -14,6 +14,7 @@ Read `references/app-genesis.md` and `references/agents.md` before designing or 
 Read only the additional references the task needs:
 
 - `references/testing.md` before creating or changing tests.
+- `references/openapi.md` when generating, reviewing, or handing off the HTTP contract.
 - `references/serve.md` before running, diagnosing, or configuring a server.
 - `references/deployment.md` and `references/docker.md` before producing deployment files or
   launch advice. Custom non-root images must create a writable `/data` mountpoint before `USER`.

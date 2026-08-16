@@ -75,6 +75,10 @@ pub const Db = if (build_options.postgres) union(Backend) {
         return .{ .sqlite = try sqlite.Db.open(path) };
     }
 
+    pub fn openReadOnly(path: [:0]const u8) DbError!Db {
+        return .{ .sqlite = try sqlite.Db.openReadOnly(path) };
+    }
+
     /// Open a Postgres connection directly from a `postgres://…` URI.
     pub fn openPostgres(gpa: std.mem.Allocator, io: std.Io, uri: []const u8) DbError!Db {
         return .{ .postgres = try pg.Db.open(gpa, io, uri) };
@@ -127,6 +131,17 @@ pub const Db = if (build_options.postgres) union(Backend) {
         }
     }
 } else sqlite.Db;
+
+/// Open one direct connection for read-only inspection. SQLite is opened with
+/// SQLITE_OPEN_READONLY (and therefore cannot create or modify the database); PostgreSQL
+/// receives only SELECTs from the caller and bypasses migration/provisioning pools.
+pub fn openInspectionConnection(allocator: std.mem.Allocator, io: std.Io, target: []const u8) (DbError || std.mem.Allocator.Error)!Db {
+    if (build_options.postgres and connstrLooksLikePostgres(target))
+        return Db.openPostgres(allocator, io, target);
+    const path = try allocator.dupeZ(u8, target);
+    defer allocator.free(path);
+    return Db.openReadOnly(path);
+}
 
 // ===========================================================================
 // Stmt

@@ -79,6 +79,7 @@ zigbase doctor [--production] [--json] [--data-dir PATH]
 zigbase migrate [status|rollback N|dump]
 zigbase schema dump [--out FILE] [--data-dir PATH]
 zigbase schema apply FILE [--dry-run] [--allow-destructive] [--prune]
+zigbase openapi [--data-dir PATH] [--out FILE] [--title TEXT] [--server URL]
 zigbase superuser create --email … --password …
 zigbase explain-code [CODE] [--json]
 zigbase init [--box|--framework] [--dir PATH] [--name NAME]
@@ -99,6 +100,7 @@ trust it over any document, including this one.
 | turning an idea into an app design | [app-genesis.md](app-genesis.md) |
 | implementing collections and fields | [fields.md](fields.md), [recipes.md](recipes.md) |
 | calling the API | [api.md](api.md) |
+| generating or reviewing an HTTP contract | [openapi.md](openapi.md) |
 | writing Zig hooks, routes, jobs, or a comptime schema | [framework.md](framework.md) |
 | writing tests | [testing.md](testing.md) |
 | wiring a frontend | [typescript-sdk.md](typescript-sdk.md) |
