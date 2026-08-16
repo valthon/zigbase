@@ -300,6 +300,31 @@ fn applySourceTimestamps(st: *db.Stmt, ts: SourceTimestamps) !void {
     st.reset();
 }
 
+/// Reusable timestamp restorer for manifest phase-2 relation patches. Record updates normally
+/// advance `updated`; a timestamp-preserving import must put both source values back after each
+/// deferred patch so cyclic relations do not silently destroy migration history.
+pub const TimestampRestorer = struct {
+    statement: db.Stmt,
+
+    pub fn init(a: std.mem.Allocator, w: *db.Db, col: schema.Collection) !TimestampRestorer {
+        const sql = try std.fmt.allocPrintSentinel(
+            a,
+            "UPDATE {s} SET \"created\"=?2, \"updated\"=?3 WHERE \"id\"=?1;",
+            .{try ddl.quoteIdent(a, col.name)},
+            0,
+        );
+        return .{ .statement = try prep(a, w, sql) };
+    }
+
+    pub fn deinit(self: *TimestampRestorer) void {
+        self.statement.finalize();
+    }
+
+    pub fn apply(self: *TimestampRestorer, data: std.json.Value) !void {
+        try applySourceTimestamps(&self.statement, try sourceTimestamps(data));
+    }
+};
+
 /// Per-run statements prepared ONCE and reused for every row via reset/re-bind — avoiding an N+1
 /// prepare per row. Exactly one read statement is non-null: `upsert` with `--upsert-key`, or
 /// `dup_check` when preserving ids without a key. `timestamp_update` is independently present when
