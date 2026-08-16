@@ -22,7 +22,7 @@ def grade(names: tuple[str, ...], workspace: Path, artifacts: Path) -> GradeRepo
     """Dispatch the scenario's declared graders and combine independent grades."""
     reports = []
     for name in names:
-        if name not in {"genesis"}:
+        if name not in {"genesis", "pocketbase"}:
             raise ValueError(f"unknown grader: {name}")
         module = importlib.import_module(f"{__name__}.{name}")
         reports.append(module.grade(workspace=workspace, artifacts=artifacts))

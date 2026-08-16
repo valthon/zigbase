@@ -1,0 +1,9 @@
+{
+  "zigbasePocketBaseMigrationReport": 1,
+  "sourceVersion": "0.39.11",
+  "bundle": "migration/bundle",
+  "publicRules": ["members.create", "posts.list", "posts.view"],
+  "checks": ["bundle", "rules", "auth", "signup", "authorization", "parity", "timestamps", "files", "restart", "rollback"],
+  "unresolved": [],
+  "rollback": "Keep the stopped source snapshot and discard the target database, storage, and JWT identity as one unit."
+}
