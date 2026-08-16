@@ -15,8 +15,17 @@ captured public, owner-scoped, protected-file, and relation-expansion behavior. 
 auth create rule is intentional: anonymous signup must work, while production doctor must enumerate
 `members.createRule` as a warning rather than an error.
 
-Create `security/public-rules.json` with the exact reviewed ZigBase public-rule inventory. Add a
-dependency-free `tests/test_migration.py` integration boundary runnable with
+Create `security/public-rules.json` with exactly this compact reviewed inventory contract:
+
+```json
+{
+  "zigbasePublicRules": 1,
+  "rules": ["members.create", "posts.list", "posts.view"]
+}
+```
+
+The corresponding converter decisions carry the mandatory rationales. Add a dependency-free
+`tests/test_migration.py` integration boundary runnable with
 `python3 -m unittest discover -s tests -p test_migration.py`.
 
 Provide a production-shaped Docker Compose deployment that migrates the bundle into a named durable

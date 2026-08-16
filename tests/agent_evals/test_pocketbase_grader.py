@@ -165,6 +165,8 @@ def test_prompt_requires_open_signup_and_warning_not_error():
         "warning rather than an error",
         "zigbase_eval_binary",
         "do not substitute the older public release image",
+        '"zigbasepublicrules": 1',
+        '"members.create", "posts.list", "posts.view"',
         "named durable",
         "survive",
         "down -v --remove-orphans",
