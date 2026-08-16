@@ -605,6 +605,7 @@ jobs:
         env:
           ZIGBASE_DOCKER_EVAL_TEST: "1"
         run: |
+          python tools/sync_skill_references.py --check
           python -m pytest tests/pocketbase tests/agent_evals -q
           python -m pytest --noconftest tests/admin/test_skill_sync.py -q
 

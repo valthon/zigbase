@@ -8,7 +8,7 @@ and referenced local files. It makes every semantic mismatch a durable decision 
 guessing.
 
 For migrations from other backends, or for the underlying schema/import/replay contracts, see
-[migration-tools.md](migration-tools.md).
+[migration-tools.md](https://github.com/valthon/zigbase/blob/main/docs/migration-tools.md).
 
 ## Support boundary
 
@@ -237,7 +237,7 @@ An offline fixture or rehearsal without deployment SMTP settings is therefore ex
 mailer error; supply the production mail configuration before using doctor as a cutover gate.
 
 Start the production-shaped service, verify health/meta/data/files, restart it against the same
-durable volume, and repeat. Follow [deployment.md](deployment.md) and [docker.md](docker.md): persist
+durable volume, and repeat. Follow [deployment.md](https://github.com/valthon/zigbase/blob/main/docs/deployment.md) and [docker.md](https://github.com/valthon/zigbase/blob/main/docs/docker.md): persist
 the whole data directory, protect the JWT secret, terminate TLS, use one SQLite process, configure
 mail, and rehearse backup restore.
 

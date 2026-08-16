@@ -178,8 +178,10 @@ The real-agent Genesis run is opt-in, but its contracts, fake agents, negative g
 skill drift guard are ordinary blocking tests:
 
 ```sh
-python -m pytest tests/agent_evals tests/admin/test_skill_sync.py -q
+python -m pytest tests/agent_evals -q
+python -m pytest --noconftest tests/admin/test_skill_sync.py -q
 ZIGBASE_DOCKER_EVAL_TEST=1 python -m pytest tests/agent_evals/test_genesis_docker.py -q
+python3 tools/sync_skill_references.py --check
 ```
 
 The second command needs a local Docker daemon and exercises the pinned image, health/meta probes,
@@ -291,6 +293,10 @@ Stale published docs ship wrong — sometimes insecure — guidance to users, so
 part of every PR, not an afterthought.
 
 - **Canonical docs live in `docs/*.md`** (plus root `CHANGELOG.md` and `KNOWN_LIMITATIONS.md`).
+- **Official skill references are generated from those canonical docs.** After changing a mirrored
+  document, run `python3 tools/sync_skill_references.py`; CI runs the same command with `--check`.
+  The generator converts repository-relative Markdown links to stable repository URLs so the
+  standalone skill bundle has no dangling local links.
 - **The published site under `site/src/content/docs/` is generated** from those by
   `site/scripts/gen-docs-mirror.mjs`, which runs automatically on `npm run dev` / `npm run build`.
   **Never hand-edit a mirror** — they are gitignored build artifacts. Edit the canonical file and

@@ -36,7 +36,10 @@ automatic view/hook translation are outside the converter boundary.
 
 ## 2. Use the converter as the only extraction path
 
-Run `tools/pocketbase/pb2zb.py inventory`. Treat exit `2` as judgment required, not failure. Build
+The converter is a repository tool, not a file embedded in this skill: from a ZigBase source
+checkout, run the repo-root `tools/pocketbase/pb2zb.py inventory`. If the checkout does not contain
+that path, stop and obtain the matching ZigBase source release instead of inventing a converter.
+Treat exit `2` as judgment required, not failure. Build
 a versioned `decisions.json` keyed by every exact finding id. Require a non-empty rationale and a
 typed artifact for every replacement. Never replace these durable decisions with comments,
 unstructured notes, or warning suppression.

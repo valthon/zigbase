@@ -423,14 +423,14 @@ stays correct as the scheme grows.
   Docker's `--restart` policy, etc.) for that guarantee.
 - **No native Windows support.** Every piece of this page — `--background`, `stop`/`status`/
   `logs` — refuses outright on Windows with a pointer to the official Docker image. See
-  [docs/docker.md](docker.md) and [KNOWN_LIMITATIONS.md](../KNOWN_LIMITATIONS.md).
+  [docs/docker.md](https://github.com/valthon/zigbase/blob/main/docs/docker.md) and [KNOWN_LIMITATIONS.md](https://github.com/valthon/zigbase/blob/main/KNOWN_LIMITATIONS.md).
 
 ## See also
 
-- [docs/deployment.md](deployment.md) — systemd, Docker, hosted deployment, backups, upgrades, and rollback.
-- [docs/framework.md](framework.md) — embedding ZigBase as a Zig library; `runCli` is what
+- [docs/deployment.md](https://github.com/valthon/zigbase/blob/main/docs/deployment.md) — systemd, Docker, hosted deployment, backups, upgrades, and rollback.
+- [docs/framework.md](https://github.com/valthon/zigbase/blob/main/docs/framework.md) — embedding ZigBase as a Zig library; `runCli` is what
   gives a consumer binary this same `serve`/`doctor`/control-verb surface.
-- [docs/docker.md](docker.md) — the official image, data-volume ownership, and healthchecks
+- [docs/docker.md](https://github.com/valthon/zigbase/blob/main/docs/docker.md) — the official image, data-volume ownership, and healthchecks
   for deploying a `serve` session as a container instead of `--background`.
-- [KNOWN_LIMITATIONS.md](../KNOWN_LIMITATIONS.md) — current platform and scheduler caveats,
+- [KNOWN_LIMITATIONS.md](https://github.com/valthon/zigbase/blob/main/KNOWN_LIMITATIONS.md) — current platform and scheduler caveats,
   including the Windows gap this page's §9 points at.

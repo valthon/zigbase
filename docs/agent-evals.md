@@ -132,7 +132,8 @@ fake-agent cases, negative grader fixtures, and Genesis live Docker boundary wit
 
 ```sh
 ZIGBASE_TEST_BINARY=./zig-out/bin/zigbase \
-  python3 -m pytest tests/pocketbase tests/agent_evals tests/admin/test_skill_sync.py -q
+  python3 -m pytest tests/pocketbase tests/agent_evals -q
+python3 -m pytest --noconftest tests/admin/test_skill_sync.py -q
 python3 -m ruff check tools/pocketbase evals/agents tests/pocketbase tests/agent_evals
 ZIGBASE_DOCKER_EVAL_TEST=1 \
   python3 -m pytest tests/agent_evals/test_genesis_docker.py -q

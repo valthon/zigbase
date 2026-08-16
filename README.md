@@ -158,7 +158,7 @@ zigbase schema [dump [--json] [--out FILE] | apply FILE [--dry-run] [--allow-des
 zigbase openapi [--data-dir PATH] [--out FILE] [--title TEXT] [--api-version VERSION] [--server URL]
 zigbase import [--collection NAME [--upsert-key FIELD] <file.ndjson> | --manifest FILE]
                [--legacy-hashes ALG] [--dry-run] [--continue-on-error] [--error-log FILE]
-               [--progress N] [--batch-size N] [--json] [--data-dir PATH]
+               [--progress N] [--batch-size N] [--preserve-timestamps] [--json] [--data-dir PATH]
 zigbase superuser create --email E --password P [--data-dir PATH]
 zigbase typegen [--data-dir PATH | --url URL] [--out FILE] [--lang L] [--check] [...]
 zigbase rewrap [--data-dir PATH] [--dry-run]

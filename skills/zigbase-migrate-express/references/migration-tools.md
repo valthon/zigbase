@@ -6,9 +6,9 @@ This guide is about **re-platforming an application from another backend or fram
 onto ZigBase. It is not the SQLite-to-PostgreSQL database-backend guide.
 
 - To move an existing ZigBase instance from SQLite to PostgreSQL, see
-  [PostgreSQL backend](postgres.md#move-a-zigbase-instance-from-sqlite-to-postgresql).
+  [PostgreSQL backend](https://github.com/valthon/zigbase/blob/main/docs/postgres.md#move-a-zigbase-instance-from-sqlite-to-postgresql).
 - To evolve a ZigBase application's own schema over time, see
-  [Explicit migrations](framework.md#explicit-migrations-migrations).
+  [Explicit migrations](https://github.com/valthon/zigbase/blob/main/docs/framework.md#explicit-migrations-migrations).
 
 ZigBase ships four pieces of machinery for moving an existing application backend onto it: a
 declarative schema format (`zigbase schema dump`/`apply`/`check-rules`), a scaled NDJSON data pump
@@ -18,7 +18,7 @@ declarative schema format (`zigbase schema dump`/`apply`/`check-rules`), a scale
 
 PocketBase 0.39.11 migrations also have a supported offline converter for inventory, durable
 decisions, deterministic extraction, timestamp/password preservation, and local files. Follow
-[Migrate PocketBase 0.39.11 to ZigBase](migrate-pocketbase.md) instead of hand-building the schema
+[Migrate PocketBase 0.39.11 to ZigBase](https://github.com/valthon/zigbase/blob/main/docs/migrate-pocketbase.md) instead of hand-building the schema
 and NDJSON described here.
 
 ## 1. Re-platforming stages
@@ -572,7 +572,7 @@ verbatim from the design plan:
 `zigbase` subcommand, because it has to run against an *old* backend (PocketBase, Rails,
 an older ZigBase, anything that speaks HTTP/JSON) to record expectations, so it can't
 assume anything about what it's talking to. Full reference:
-[`tools/replay/README.md`](../tools/replay/README.md).
+[`tools/replay/README.md`](https://github.com/valthon/zigbase/blob/main/tools/replay/README.md).
 
 ### Capture format (NDJSON, one case per line)
 

@@ -2,8 +2,8 @@
 
 This guide is the judgment layer between an idea and ZigBase's API reference. It helps you decide
 what to build before you reach for collection JSON or Zig hooks. For exact field options, rule
-syntax, and callable interfaces, use [fields.md](fields.md), [api.md](api.md), and
-[framework.md](framework.md).
+syntax, and callable interfaces, use [fields.md](https://github.com/valthon/zigbase/blob/main/docs/fields.md), [api.md](https://github.com/valthon/zigbase/blob/main/docs/api.md), and
+[framework.md](https://github.com/valthon/zigbase/blob/main/docs/framework.md).
 
 The goal is a backend whose trust boundaries are visible in its schema, whose public surface is
 intentional, and whose tests exercise the same rules and hooks production will run.
@@ -227,7 +227,7 @@ A practical vertical slice is:
 4. client test: generated SDK performs the public workflow against an ephemeral server; and
 5. browser test: only the critical user journey the browser can uniquely break.
 
-See [testing.md](testing.md) for build wiring and copyable harness examples.
+See [testing.md](https://github.com/valthon/zigbase/blob/main/docs/testing.md) for build wiring and copyable harness examples.
 
 ## 10. Prove the app is ready to ship
 
@@ -249,17 +249,17 @@ version-only healthcheck does not prove that the mounted data directory is writa
 Do not report a queued CI job as green, a successful build as passing browser tests, or a healthy
 process as a production-safe configuration. Report the exact commands run and any gate not run.
 
-For local and agent-shaped server lifecycle details, see [serve.md](serve.md). For container
-ownership, healthchecks, and image tags, see [docker.md](docker.md). Use
-[deployment.md](deployment.md) for systemd, reverse-proxy TLS, Fly, Railway, backup/restore, and
+For local and agent-shaped server lifecycle details, see [serve.md](https://github.com/valthon/zigbase/blob/main/docs/serve.md). For container
+ownership, healthchecks, and image tags, see [docker.md](https://github.com/valthon/zigbase/blob/main/docs/docker.md). Use
+[deployment.md](https://github.com/valthon/zigbase/blob/main/docs/deployment.md) for systemd, reverse-proxy TLS, Fly, Railway, backup/restore, and
 upgrade/rollback boundaries.
 
 ## See also
 
-- [agents.md](agents.md) — compact orientation and the traps most likely to waste an agent loop.
-- [recipes.md](recipes.md) — copyable schema, rule, hook, route, and testing recipes.
-- [api.md](api.md) — rule grammar, records, expansion, cursor pagination, auth, files, and realtime.
-- [framework.md](framework.md) — hooks, typed routes, jobs, context capabilities, and build wiring.
-- [testing.md](testing.md) — in-process and spawned-server test boundaries.
-- [serve.md](serve.md) — foreground/background/ephemeral server operation and doctor.
-- [deployment.md](deployment.md) — production operation on a host, Docker, Fly, or Railway.
+- [agents.md](https://github.com/valthon/zigbase/blob/main/docs/agents.md) — compact orientation and the traps most likely to waste an agent loop.
+- [recipes.md](https://github.com/valthon/zigbase/blob/main/docs/recipes.md) — copyable schema, rule, hook, route, and testing recipes.
+- [api.md](https://github.com/valthon/zigbase/blob/main/docs/api.md) — rule grammar, records, expansion, cursor pagination, auth, files, and realtime.
+- [framework.md](https://github.com/valthon/zigbase/blob/main/docs/framework.md) — hooks, typed routes, jobs, context capabilities, and build wiring.
+- [testing.md](https://github.com/valthon/zigbase/blob/main/docs/testing.md) — in-process and spawned-server test boundaries.
+- [serve.md](https://github.com/valthon/zigbase/blob/main/docs/serve.md) — foreground/background/ephemeral server operation and doctor.
+- [deployment.md](https://github.com/valthon/zigbase/blob/main/docs/deployment.md) — production operation on a host, Docker, Fly, or Railway.

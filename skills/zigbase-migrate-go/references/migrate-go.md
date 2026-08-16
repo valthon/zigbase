@@ -4,7 +4,7 @@ A Go service may use `net/http`, chi, Gin, Echo, Fiber, generated transports, or
 database and worker conventions vary just as widely. Treat this as evidence-driven re-platforming,
 not source-to-source translation.
 
-Use the generic [migration tools](migration-tools.md) for target schema, NDJSON import, supported
+Use the generic [migration tools](https://github.com/valthon/zigbase/blob/main/docs/migration-tools.md) for target schema, NDJSON import, supported
 legacy bcrypt migration, and parity replay.
 
 ## Inventory the built service

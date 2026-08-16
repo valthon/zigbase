@@ -5,6 +5,11 @@ from pathlib import Path
 
 import pytest
 
+from tools.sync_skill_references import (
+    RELATIVE_MARKDOWN_LINK,
+    render_reference,
+)
+
 
 REPO = Path(__file__).resolve().parents[2]
 REFERENCE_NAMES = (
@@ -51,6 +56,14 @@ GO_REFERENCE_NAMES = (
 )
 
 
+def reference_is_current(repo: Path, embedded: Path, name: str) -> bool:
+    return (
+        (repo / "docs" / name).is_file()
+        and embedded.read_text() == render_reference(repo, name)
+        and RELATIVE_MARKDOWN_LINK.search(embedded.read_text()) is None
+    )
+
+
 def validate_skill(repo: Path) -> list[str]:
     errors = []
     skill = repo / "skills" / "zigbase-app-genesis"
@@ -72,6 +85,8 @@ def validate_skill(repo: Path) -> list[str]:
             if ":" in line:
                 key, value = line.split(":", 1)
                 fields[key.strip()] = value.strip()
+        if set(fields) != {"name", "description"}:
+            errors.append("skill.frontmatter_fields")
         if fields.get("name") != "zigbase-app-genesis":
             errors.append("skill.name")
         if not fields.get("description"):
@@ -87,12 +102,20 @@ def validate_skill(repo: Path) -> list[str]:
                 errors.append("skill.metadata_invalid")
                 break
 
+    expected_markdown = {"SKILL.md"} | {
+        f"references/{name}" for name in REFERENCE_NAMES
+    }
+    actual_markdown = {
+        path.relative_to(skill).as_posix() for path in skill.rglob("*.md")
+    }
+    if actual_markdown != expected_markdown:
+        errors.append("skill.unexpected_markdown")
+
     for name in REFERENCE_NAMES:
-        canonical = repo / "docs" / name
         embedded = skill / "references" / name
         if not embedded.is_file():
             errors.append(f"reference.missing:{name}")
-        elif not canonical.is_file() or embedded.read_bytes() != canonical.read_bytes():
+        elif not reference_is_current(repo, embedded, name):
             errors.append(f"reference.drift:{name}")
     return errors
 
@@ -160,11 +183,10 @@ def validate_migration_skill(repo: Path) -> list[str]:
     if actual_markdown != expected_markdown:
         errors.append("skill.unexpected_markdown")
     for name in MIGRATION_REFERENCE_NAMES:
-        canonical = repo / "docs" / name
         embedded = skill / "references" / name
         if not embedded.is_file():
             errors.append(f"reference.missing:{name}")
-        elif not canonical.is_file() or embedded.read_bytes() != canonical.read_bytes():
+        elif not reference_is_current(repo, embedded, name):
             errors.append(f"reference.drift:{name}")
     return errors
 
@@ -233,11 +255,10 @@ def validate_pairing_skill(repo: Path) -> list[str]:
     if actual_markdown != expected_markdown:
         errors.append("skill.unexpected_markdown")
     for name in PAIRING_REFERENCE_NAMES:
-        canonical = repo / "docs" / name
         embedded = skill / "references" / name
         if not embedded.is_file():
             errors.append(f"reference.missing:{name}")
-        elif not canonical.is_file() or embedded.read_bytes() != canonical.read_bytes():
+        elif not reference_is_current(repo, embedded, name):
             errors.append(f"reference.drift:{name}")
     return errors
 
@@ -304,11 +325,10 @@ def validate_express_skill(repo: Path) -> list[str]:
     if actual_markdown != expected_markdown:
         errors.append("skill.unexpected_markdown")
     for name in EXPRESS_REFERENCE_NAMES:
-        canonical = repo / "docs" / name
         embedded = skill / "references" / name
         if not embedded.is_file():
             errors.append(f"reference.missing:{name}")
-        elif not canonical.is_file() or embedded.read_bytes() != canonical.read_bytes():
+        elif not reference_is_current(repo, embedded, name):
             errors.append(f"reference.drift:{name}")
     return errors
 
@@ -326,7 +346,9 @@ def copy_express_subject(tmp_path: Path) -> Path:
     return subject
 
 
-def validate_source_skill(repo: Path, skill_name: str, guide: str, references) -> list[str]:
+def validate_source_skill(
+    repo: Path, skill_name: str, guide: str, references
+) -> list[str]:
     errors = []
     skill = repo / "skills" / skill_name
     skill_md = skill / "SKILL.md"
@@ -364,11 +386,10 @@ def validate_source_skill(repo: Path, skill_name: str, guide: str, references) -
     if actual != expected:
         errors.append("skill.unexpected_markdown")
     for name in references:
-        canonical = repo / "docs" / name
         embedded = skill / "references" / name
         if not embedded.is_file():
             errors.append(f"reference.missing:{name}")
-        elif not canonical.is_file() or embedded.read_bytes() != canonical.read_bytes():
+        elif not reference_is_current(repo, embedded, name):
             errors.append(f"reference.drift:{name}")
     return errors
 
@@ -480,7 +501,9 @@ def test_express_guard_rejects_drift(tmp_path, mutation, expected):
     elif mutation == "missing_guide":
         path = skill / "SKILL.md"
         path.write_text(
-            path.read_text().replace("references/migrate-express.md", "references/missing.md")
+            path.read_text().replace(
+                "references/migrate-express.md", "references/missing.md"
+            )
         )
     assert expected in validate_express_skill(subject)
 
@@ -516,7 +539,9 @@ def test_pairing_guard_rejects_drift(tmp_path, mutation, expected):
         path.write_text(path.read_text().replace("---\n\n#", "extra: no\n---\n\n#", 1))
     elif mutation == "bad_metadata":
         path = skill / "agents" / "openai.yaml"
-        path.write_text(path.read_text().replace("$zigbase-zigapagos-fullstack", "$wrong"))
+        path.write_text(
+            path.read_text().replace("$zigbase-zigapagos-fullstack", "$wrong")
+        )
     elif mutation == "missing_guide":
         path = skill / "SKILL.md"
         path.write_text(
@@ -550,16 +575,16 @@ def test_pocketbase_guard_rejects_drift(tmp_path, mutation, expected):
     elif mutation == "wrong_name":
         path = skill / "SKILL.md"
         path.write_text(
-            path.read_text().replace(
-                "name: zigbase-migrate-pocketbase", "name: wrong"
-            )
+            path.read_text().replace("name: zigbase-migrate-pocketbase", "name: wrong")
         )
     elif mutation == "extra_frontmatter":
         path = skill / "SKILL.md"
         path.write_text(path.read_text().replace("---\n\n#", "extra: no\n---\n\n#", 1))
     elif mutation == "bad_metadata":
         path = skill / "agents" / "openai.yaml"
-        path.write_text(path.read_text().replace("$zigbase-migrate-pocketbase", "$wrong"))
+        path.write_text(
+            path.read_text().replace("$zigbase-migrate-pocketbase", "$wrong")
+        )
     assert expected in validate_migration_skill(subject)
 
 
@@ -574,6 +599,8 @@ def test_pocketbase_guard_rejects_drift(tmp_path, mutation, expected):
         ("oversized", "skill.oversized"),
         ("missing_metadata", "skill.metadata_missing"),
         ("missing_docker_guidance", "skill.docker_reference"),
+        ("unexpected_markdown", "skill.unexpected_markdown"),
+        ("extra_frontmatter", "skill.frontmatter_fields"),
     ],
 )
 def test_guard_fails_for_each_supported_drift(tmp_path, mutation, expected):
@@ -604,6 +631,13 @@ def test_guard_fails_for_each_supported_drift(tmp_path, mutation, expected):
         (skill / "agents" / "openai.yaml").unlink()
     elif mutation == "missing_docker_guidance":
         path = skill / "SKILL.md"
-        path.write_text(path.read_text().replace("references/docker.md", "references/deployment.md"))
+        path.write_text(
+            path.read_text().replace("references/docker.md", "references/deployment.md")
+        )
+    elif mutation == "unexpected_markdown":
+        (skill / "references" / "stray.md").write_text("unexpected\n")
+    elif mutation == "extra_frontmatter":
+        path = skill / "SKILL.md"
+        path.write_text(path.read_text().replace("---\n\n#", "extra: no\n---\n\n#", 1))
 
     assert expected in validate_skill(subject)

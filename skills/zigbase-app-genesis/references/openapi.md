@@ -108,7 +108,7 @@ This first contract does not claim to describe the entire ZigBase server. Read t
 
 `consumerRoutes` is `false` for a binary with no declared custom routes. Admin management,
 WebSocket/SSE transports, file-byte endpoints, and every built-in auth-method endpoint remain in
-the ordinary [API reference](api.md); their omission from this document is explicit, not a claim
+the ordinary [API reference](https://github.com/valthon/zigbase/blob/main/docs/api.md); their omission from this document is explicit, not a claim
 that the running server lacks them.
 
 ## CI and agent workflow

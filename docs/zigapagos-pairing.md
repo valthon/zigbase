@@ -113,7 +113,10 @@ the corresponding `status`, `logs`, and `stop` commands.
 ## Frontend client contract
 
 Use the base `@zigbase/client` when the schema is still moving, or generate a typed client from the
-application binary when the boundary is stable:
+application binary when the boundary is stable. The framework build must opt in with
+`.enable_typegen = true`; the scaffold does not enable type generation by default. Treat that flag
+as a deliberate generated-client boundary and keep its output under review. The binary must also
+retain the default `-Ddev-tools=true` build setting:
 
 ```sh
 ./zig-out/bin/app typegen --data-dir ./zb_data --out frontend/src/zbase.gen.ts

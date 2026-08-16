@@ -6,7 +6,7 @@ ZigBase has no native Windows build (the embedded HTTP server depends on facil.i
 Linux/macOS only). The official Docker image, `ghcr.io/valthon/zigbase`, is the supported
 path for Windows-hardware users and for anyone who prefers a Docker-first self-host
 workflow on Linux/macOS too. It ships the same static-musl binary as the
-[release tarballs](../README.md#quickstart-run-the-binary) — no in-image compilation, no extra runtime deps.
+[release tarballs](https://github.com/valthon/zigbase/blob/main/README.md#quickstart-run-the-binary) — no in-image compilation, no extra runtime deps.
 
 ## Quick start
 
@@ -105,7 +105,7 @@ you have a reason to (e.g. mounting the data dir somewhere else inside the conta
 
 ## Healthchecks
 
-`GET /api/health` (see [API reference](./api.md)) is the right endpoint to probe, but the
+`GET /api/health` (see [API reference](https://github.com/valthon/zigbase/blob/main/docs/api.md)) is the right endpoint to probe, but the
 distroless base has no shell/curl/wget to run a classic `HEALTHCHECK CMD curl …`
 instruction from inside the image. Two supported options:
 
@@ -137,13 +137,13 @@ works for anonymous/public users.
 No shell, no package manager, no Zig toolchain, no build tools — you cannot `docker exec
 … sh` into it. Use `docker exec … /zigbase <subcommand>` for `superuser create`,
 `migrate`, etc. If you need a debugging shell, `docker cp` files out or run the same
-binary from a [release tarball](../README.md#quickstart-run-the-binary) locally instead.
+binary from a [release tarball](https://github.com/valthon/zigbase/blob/main/README.md#quickstart-run-the-binary) locally instead.
 
 ## See also
 
-- [Deployment](deployment.md) — production Compose, TLS proxies, Fly/Railway, backups, upgrades, and rollback.
+- [Deployment](https://github.com/valthon/zigbase/blob/main/docs/deployment.md) — production Compose, TLS proxies, Fly/Railway, backups, upgrades, and rollback.
 - [Configuration](https://valthon.github.io/zigbase/docs/configuration) — the full environment-variable reference.
-- The [README's Security section](../README.md#security) — what's safe to change and what
+- The [README's Security section](https://github.com/valthon/zigbase/blob/main/README.md#security) — what's safe to change and what
   isn't.
-- [Known limitations](../KNOWN_LIMITATIONS.md) — no native Windows build; Docker is the
+- [Known limitations](https://github.com/valthon/zigbase/blob/main/KNOWN_LIMITATIONS.md) — no native Windows build; Docker is the
   supported path there.

@@ -111,7 +111,7 @@ const mail = try t.captureMail(); // install BEFORE the request that sends
 
 The complete API — every `StartOptions` field, every `request` option, the
 `Response` accessors, seeding helpers, and encrypted-field apps — is in
-[framework.md §15](framework.md#15-testing-your-app-zigbasetesting).
+[framework.md §15](https://github.com/valthon/zigbase/blob/main/docs/framework.md#15-testing-your-app-zigbasetesting).
 
 ## What in-process tests do NOT cover
 
@@ -165,7 +165,7 @@ Positive result worth knowing on its own: a properly built
 a prod-mode build does not break the CLI, not even `--ephemeral`, whose
 random-suffix generator is the one CLI feature wired to the dev-mode-gated
 fake-entropy seam
-([framework.md §14](framework.md#14-test--dev-mode-determinism-seams)). If
+([framework.md §14](https://github.com/valthon/zigbase/blob/main/docs/framework.md#14-test--dev-mode-determinism-seams)). If
 you're staring at CLI failures after a flag-varied build, that's not it —
 look for staleness instead.
 
@@ -173,7 +173,7 @@ If you're working on ZigBase itself rather than an app built on it, there is
 a second, related instance: some of the repo's own browser-suite fixtures are
 separate `zig build <name>` steps that a plain `zig build` never produces,
 so a fresh checkout's local run reports a batch of setup errors that CI
-doesn't. See [CONTRIBUTING.md](../CONTRIBUTING.md) for the exact build steps
+doesn't. See [CONTRIBUTING.md](https://github.com/valthon/zigbase/blob/main/CONTRIBUTING.md) for the exact build steps
 that suite needs.
 
 Both instances are the same class: **a spawned-server suite tests whatever
@@ -198,6 +198,6 @@ free-port dance.
 
 ## See also
 
-- [framework.md §15](framework.md#15-testing-your-app-zigbasetesting) — the full `zigbase.testing` API
-- [framework.md §14](framework.md#14-test--dev-mode-determinism-seams) — determinism seams for a spawned server (`ZIGBASE_FAKE_NOW`, `ZIGBASE_FAKE_SEED`, `zigbase.testcapture`)
-- [recipes.md](recipes.md) — task-oriented recipes, including a deterministic-test recipe
+- [framework.md §15](https://github.com/valthon/zigbase/blob/main/docs/framework.md#15-testing-your-app-zigbasetesting) — the full `zigbase.testing` API
+- [framework.md §14](https://github.com/valthon/zigbase/blob/main/docs/framework.md#14-test--dev-mode-determinism-seams) — determinism seams for a spawned server (`ZIGBASE_FAKE_NOW`, `ZIGBASE_FAKE_SEED`, `zigbase.testcapture`)
+- [recipes.md](https://github.com/valthon/zigbase/blob/main/docs/recipes.md) — task-oriented recipes, including a deterministic-test recipe

@@ -5,8 +5,8 @@ that process supervised, keep its data and JWT signing secret across replacement
 front of it, and prove the resulting configuration with `zigbase doctor --production`.
 
 This guide covers a bare Linux host, Docker Compose, Fly.io, and Railway. For image construction,
-tags, and non-root volume ownership, see [docker.md](docker.md). For foreground/background
-development sessions and doctor's full output contract, see [serve.md](serve.md).
+tags, and non-root volume ownership, see [docker.md](https://github.com/valthon/zigbase/blob/main/docs/docker.md). For foreground/background
+development sessions and doctor's full output contract, see [serve.md](https://github.com/valthon/zigbase/blob/main/docs/serve.md).
 
 ## Production invariants
 
@@ -17,10 +17,10 @@ Keep these true on every platform:
 2. **Persist the whole data directory.** SQLite's database, uploaded files, and the generated
    `.jwt_secret` live below `ZIGBASE_DATA_DIR`. Losing only the secret logs every user out; losing
    the rest loses application state. A custom non-root image must create `/data` owned by its
-   runtime uid/gid before declaring or mounting the volume; see [docker.md](docker.md).
+   runtime uid/gid before declaring or mounting the volume; see [docker.md](https://github.com/valthon/zigbase/blob/main/docs/docker.md).
 3. **Use one SQLite writer process.** A mounted disk is not a replicated database. Run one ZigBase
    instance with SQLite. Move to the PostgreSQL backend before adding application replicas; see
-   [postgres.md](postgres.md).
+   [postgres.md](https://github.com/valthon/zigbase/blob/main/docs/postgres.md).
 4. **Terminate TLS before public traffic.** Leave secure cookies enabled. Set
    `ZIGBASE_PUBLIC_URL=https://…` so user-facing links use the external origin.
 5. **Trust proxy headers only behind a trusted proxy.** `ZIGBASE_TRUST_PROXY=true` makes rate-limit
@@ -222,7 +222,6 @@ primary_region = "iad"
   ZIGBASE_HTTP_PORT = "8090"
   ZIGBASE_DATA_DIR = "/data"
   ZIGBASE_COOKIE_SECURE = "true"
-  ZIGBASE_TRUST_PROXY = "true"
   ZIGBASE_PUBLIC_URL = "https://replace-with-your-app.fly.dev"
 
 [mounts]
@@ -243,6 +242,12 @@ primary_region = "iad"
     path = "/api/health"
     timeout = "5s"
 ```
+
+This recipe deliberately leaves `ZIGBASE_TRUST_PROXY` disabled so the production doctor gate is
+clean while the listener binds `0.0.0.0`. ZigBase will see Fly's proxy address rather than the
+original client IP for IP-derived rate-limit keys. If that tradeoff is unacceptable, use an
+application-defined rate-limit key; do not enable forwarded-header trust on a publicly reachable
+socket merely to recover client IPs.
 
 Set secrets outside `fly.toml`, then deploy:
 
@@ -280,10 +285,14 @@ ZIGBASE_HTTP_PORT=8090
 ZIGBASE_HTTP_HOST=0.0.0.0
 ZIGBASE_DATA_DIR=/data
 ZIGBASE_COOKIE_SECURE=true
-ZIGBASE_TRUST_PROXY=true
 ZIGBASE_PUBLIC_URL=https://${{RAILWAY_PUBLIC_DOMAIN}}
 RAILWAY_RUN_UID=0
 ```
+
+As with Fly, this leaves forwarded-header trust disabled because the service socket is not
+loopback-only; `doctor --production` would otherwise report `trust-proxy-consistency` as an error.
+IP-derived rate limits therefore see Railway's proxy address. Prefer an application-defined key
+when per-client enforcement is required.
 
 Add the stable JWT secret and mail credentials as Railway secret variables. Configure the service
 to use `ghcr.io/valthon/zigbase:0.13.0`, attach the volume, and set the healthcheck path to
@@ -364,8 +373,8 @@ changes.
 
 ## See also
 
-- [docker.md](docker.md) — official image, uid/gid, bind mounts, tags, and healthcheck limits.
-- [serve.md](serve.md) — server lifecycle and the full doctor check/exit contract.
-- [observability.md](observability.md) — structured logs, error codes, and machine-readable output.
-- [postgres.md](postgres.md) — PostgreSQL, multi-instance realtime, TLS, and SQLite migration.
-- [migration-tools.md](migration-tools.md) — schema transplant, data/password import, and parity replay.
+- [docker.md](https://github.com/valthon/zigbase/blob/main/docs/docker.md) — official image, uid/gid, bind mounts, tags, and healthcheck limits.
+- [serve.md](https://github.com/valthon/zigbase/blob/main/docs/serve.md) — server lifecycle and the full doctor check/exit contract.
+- [observability.md](https://github.com/valthon/zigbase/blob/main/docs/observability.md) — structured logs, error codes, and machine-readable output.
+- [postgres.md](https://github.com/valthon/zigbase/blob/main/docs/postgres.md) — PostgreSQL, multi-instance realtime, TLS, and SQLite migration.
+- [migration-tools.md](https://github.com/valthon/zigbase/blob/main/docs/migration-tools.md) — schema transplant, data/password import, and parity replay.

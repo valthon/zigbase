@@ -79,7 +79,7 @@ zigbase doctor [--production] [--json] [--data-dir PATH]
 zigbase migrate [status|rollback N|dump]
 zigbase schema dump [--out FILE] [--data-dir PATH]
 zigbase schema apply FILE [--dry-run] [--allow-destructive] [--prune]
-zigbase openapi [--data-dir PATH] [--out FILE] [--title TEXT] [--server URL]
+zigbase openapi [--data-dir PATH] [--out FILE] [--title TEXT] [--api-version VERSION] [--server URL]
 zigbase superuser create --email … --password …
 zigbase explain-code [CODE] [--json]
 zigbase init [--box|--framework] [--dir PATH] [--name NAME]

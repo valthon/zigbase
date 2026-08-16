@@ -5,8 +5,8 @@ routes, validate input, persist data, authenticate users, serve files, schedule 
 errors in completely different ways. This workflow is therefore a discovery-driven re-platforming,
 not a mechanical translation.
 
-Use the generic [migration tools](migration-tools.md) for target schema, NDJSON import, supported
-legacy bcrypt credentials, and parity replay. Use [OpenAPI export](openapi.md) to review the target
+Use the generic [migration tools](https://github.com/valthon/zigbase/blob/main/docs/migration-tools.md) for target schema, NDJSON import, supported
+legacy bcrypt credentials, and parity replay. Use [OpenAPI export](https://github.com/valthon/zigbase/blob/main/docs/openapi.md) to review the target
 surface after custom behavior is ported.
 
 ## Supported evidence boundary

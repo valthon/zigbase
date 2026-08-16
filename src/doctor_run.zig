@@ -110,16 +110,18 @@ test "doctor gather: only non-system auth create is classified as open signup" {
     const arena = arena_state.allocator();
 
     const cols = [_]schema.Collection{
-        .{ .id = "users", .name = "users", .type = .auth, .fields = &.{}, .createRule = "@public" },
+        .{ .id = "users", .name = "users", .type = .auth, .fields = &.{}, .createRule = "@public", .updateRule = "@public", .deleteRule = "@public" },
         .{ .id = "posts", .name = "posts", .fields = &.{}, .createRule = "@public" },
         .{ .id = "_superusers", .name = "_superusers", .type = .auth, .system = true, .fields = &.{}, .createRule = "@public" },
     };
 
     const found = try gatherPublicRules(arena, &cols);
-    try std.testing.expectEqual(@as(usize, 3), found.len);
+    try std.testing.expectEqual(@as(usize, 5), found.len);
     try std.testing.expect(found[0].auth_signup);
     try std.testing.expect(!found[1].auth_signup);
     try std.testing.expect(!found[2].auth_signup);
+    try std.testing.expect(!found[3].auth_signup);
+    try std.testing.expect(!found[4].auth_signup);
 }
 
 /// The exact prefix a legacy (pre-migration) password hash still starts with.

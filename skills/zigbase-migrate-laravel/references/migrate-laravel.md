@@ -4,7 +4,7 @@ Laravel has strong conventions, but production behavior still spans routes, midd
 policies, service providers, queues, filesystems, and packages. Re-platform from the exact locked
 application and a recoverable data snapshot; do not infer the service from migrations alone.
 
-Use the generic [migration tools](migration-tools.md) for target schema, NDJSON import, supported
+Use the generic [migration tools](https://github.com/valthon/zigbase/blob/main/docs/migration-tools.md) for target schema, NDJSON import, supported
 legacy bcrypt migration, and parity replay.
 
 ## Inventory the effective application

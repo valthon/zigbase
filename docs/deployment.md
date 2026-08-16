@@ -222,7 +222,6 @@ primary_region = "iad"
   ZIGBASE_HTTP_PORT = "8090"
   ZIGBASE_DATA_DIR = "/data"
   ZIGBASE_COOKIE_SECURE = "true"
-  ZIGBASE_TRUST_PROXY = "true"
   ZIGBASE_PUBLIC_URL = "https://replace-with-your-app.fly.dev"
 
 [mounts]
@@ -243,6 +242,12 @@ primary_region = "iad"
     path = "/api/health"
     timeout = "5s"
 ```
+
+This recipe deliberately leaves `ZIGBASE_TRUST_PROXY` disabled so the production doctor gate is
+clean while the listener binds `0.0.0.0`. ZigBase will see Fly's proxy address rather than the
+original client IP for IP-derived rate-limit keys. If that tradeoff is unacceptable, use an
+application-defined rate-limit key; do not enable forwarded-header trust on a publicly reachable
+socket merely to recover client IPs.
 
 Set secrets outside `fly.toml`, then deploy:
 
@@ -280,10 +285,14 @@ ZIGBASE_HTTP_PORT=8090
 ZIGBASE_HTTP_HOST=0.0.0.0
 ZIGBASE_DATA_DIR=/data
 ZIGBASE_COOKIE_SECURE=true
-ZIGBASE_TRUST_PROXY=true
 ZIGBASE_PUBLIC_URL=https://${{RAILWAY_PUBLIC_DOMAIN}}
 RAILWAY_RUN_UID=0
 ```
+
+As with Fly, this leaves forwarded-header trust disabled because the service socket is not
+loopback-only; `doctor --production` would otherwise report `trust-proxy-consistency` as an error.
+IP-derived rate limits therefore see Railway's proxy address. Prefer an application-defined key
+when per-client enforcement is required.
 
 Add the stable JWT secret and mail credentials as Railway secret variables. Configure the service
 to use `ghcr.io/valthon/zigbase:0.13.0`, attach the volume, and set the healthcheck path to
