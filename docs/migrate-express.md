@@ -85,11 +85,19 @@ with direct target SQL.
 For auth users, inspect the actual stored hash algorithm and parameters. ZigBase's legacy import
 supports bcrypt only. Import bcrypt with `--legacy-hashes bcrypt`, prove wrong-password non-mutation
 and correct-password rehash to argon2id, and track the remaining legacy count. For scrypt, PBKDF2,
-Argon2 variants, external identity-only accounts, or unknown formats, choose a reviewed reset or
-separately designed compatibility boundary. Never relabel a hash.
+Argon2 variants, or unknown formats, choose a reviewed reset or separately designed compatibility
+boundary. Never relabel a hash.
 
-Source sessions, refresh tokens, password-reset tokens, and signing keys do not migrate. Plan and
-communicate reauthentication.
+Accounts that sign in only through a provider (a Passport OAuth/OIDC strategy, "log in with X")
+have no hash to migrate; what they need is their provider linkage. Carry each
+`(provider, providerId)` pair on the auth row and import it with `--external-auths`
+([migration-tools.md §4b](migration-tools.md#4b-external-identities-oauth--omniauth--social-login)),
+after the same provider is configured on the target collection. Their first sign-in then resolves
+to the migrated record instead of colliding with its email.
+
+Source sessions, refresh tokens, password-reset tokens, signing keys, and provider access/refresh
+tokens do not migrate — only the `(provider, providerId)` identity does. Plan and communicate
+reauthentication.
 
 ## 4. Map the HTTP contract
 

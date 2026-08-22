@@ -2721,6 +2721,18 @@ fn printImportUsage(io: std.Io, file: std.Io.File) void {
         \\                     Requires a provided id on every row and is CREATE-ONLY: it cannot
         \\                     be combined with --upsert-key or a manifest entry's `upsertKey`.
         \\                     This operator-only seam never applies to HTTP/client writes.
+        \\  --external-auths   Install each row's `externalAuths` array as OAuth2 provider
+        \\                     linkage: [{{"provider":"google","providerId":"…"}}]. Without it the
+        \\                     array is IGNORED, so a file alone can never mint an identity link.
+        \\                     Requires an auth collection that already declares each named
+        \\                     provider, refuses _superusers, requires an id on every row, and is
+        \\                     CREATE-ONLY: it cannot be combined with --upsert-key (nor with a
+        \\                     manifest entry's `upsertKey`), because an updated row would land
+        \\                     with no linkage at all. Like --legacy-hashes the flag applies
+        \\                     uniformly to EVERY manifest entry, so it must be its own
+        \\                     single-collection run. A providerId already linked to any record is
+        \\                     a hard failure, never a re-point. Migrates identity only — provider
+        \\                     access and refresh tokens are credentials and never migrate.
         \\
         \\WHAT IT DOES:
         \\  Streams an NDJSON file (one JSON object per line) into the collection THROUGH THE
@@ -3771,6 +3783,7 @@ fn importImpl(
         .progress_every = ia.progress,
         .progress = if (ia.progress > 0) &prog_writer.interface else null,
         .legacy_hash_algorithm = ia.legacy_hashes,
+        .external_auths = ia.external_auths,
         .preserve_timestamps = ia.preserve_timestamps,
     };
 
@@ -3906,6 +3919,7 @@ fn importManifestImpl(
             .progress_every = ia.progress,
             .progress = if (ia.progress > 0) &prog_writer.interface else null,
             .legacy_hash_algorithm = ia.legacy_hashes,
+            .external_auths = ia.external_auths,
             .preserve_timestamps = ia.preserve_timestamps,
         },
     }) catch |e| return reportImportError(mpath, e);

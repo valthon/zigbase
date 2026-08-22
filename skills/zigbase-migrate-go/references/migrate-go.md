@@ -41,8 +41,12 @@ preserve ids/timestamps, hash inputs/outputs, and require byte-identical reruns.
 tables directly.
 
 Import only verified bcrypt hashes with `--legacy-hashes bcrypt`. Other formats require a reviewed
-reset or separate security design. Sessions, refresh/reset tokens, JWT signing material, API keys,
-and encrypted cookie state never migrate. Prove wrong-password non-mutation, correct-password
+reset or separate security design. Provider-only accounts have no hash to import: carry each
+`(provider, providerId)` pair on the auth row and import it with `--external-auths`
+([migration-tools.md §4b](https://github.com/valthon/zigbase/blob/main/docs/migration-tools.md#4b-external-identities-oauth--omniauth--social-login)),
+after configuring the same provider on the target collection. Sessions, refresh/reset tokens,
+provider access/refresh tokens, JWT signing material, API keys, and encrypted cookie state never
+migrate. Prove wrong-password non-mutation, correct-password
 argon2id upgrade, and post-restart login.
 
 Intentional anonymous signup uses exact `@public` create and a durable
