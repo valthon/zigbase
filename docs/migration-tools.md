@@ -540,7 +540,54 @@ failure is logged and swallowed — it **never** turns a valid login into a fail
 Operator progress query, to track how many accounts remain on legacy hashes:
 
 ```sql
-SELECT count(*) FROM users WHERE passwordHash LIKE '$zblegacy$%';
+SELECT count(*) FROM users WHERE "passwordHash" LIKE '$zblegacy$%';
+```
+
+## 4b. External identities (OAuth / OmniAuth / social login)
+
+An account that authenticates through a provider has no password, so `--legacy-hashes` does
+nothing for it. What it needs instead is its **provider linkage** — the `(provider, providerId)`
+pair that tells ZigBase which record an incoming identity resolves to. Without it a migrated
+social-login user is locked out: their first sign-in finds no link, cannot create a record
+because the email already exists, and is refused
+`409 Email already registered; sign in and link instead.` — with no password to sign in with.
+
+Carry the linkage on the auth row itself and import it with `--external-auths`:
+
+```json
+{"id":"42","email":"ada@example.test","externalAuths":[{"provider":"google","providerId":"110…"}]}
+```
+
+```sh
+zigbase import --collection users --external-auths --preserve-timestamps \
+  --data-dir ./zb_data users.ndjson
+```
+
+The record and its linkage are written in one transaction, so an account and the identity that
+reaches it commit or roll back together — there is no state where the user exists but cannot
+sign in.
+
+**Constraints, each of which is a refusal rather than a warning:**
+
+- **Off by default.** Without `--external-auths` the array is ignored, exactly as `passwordHash`
+  is ignored without `--legacy-hashes`. A file alone can never mint an identity link.
+- **The provider must already be declared** on the target collection's `auth.oauth2.providers`.
+  Apply your schema first. A link naming an unconfigured provider could never resolve at login,
+  so importing one would report success and leave the account unreachable.
+- **A `providerId` already linked to any record is a hard failure**, never a re-point. Silently
+  moving an existing identity to a different account is account takeover.
+- **Auth collections only, `_superusers` refused, create-only, and an id is required** on every
+  row. An upserted row returns before the linkage is written, which would leave the account
+  unreachable — the exact failure this seam removes.
+- **Identity only.** Provider access and refresh tokens are credentials and never migrate;
+  neither do sessions. `externalAuths` is stripped from every client payload by
+  `auth.isServerManagedField`, so this seam is reachable only by an operator with local disk
+  access.
+
+Verify afterwards, before cutover:
+
+```sql
+SELECT "provider", count(*) FROM "_externalAuths" GROUP BY "provider";
 ```
 
 ### Security constraints

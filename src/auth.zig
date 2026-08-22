@@ -36,6 +36,9 @@ pub const AuthError = error{ PasswordTooShort, IdentityTaken } || db.DbError || 
 fn isServerManagedField(name: []const u8) bool {
     return std.mem.eql(u8, name, "password") or std.mem.eql(u8, name, "oldPassword") or
         std.mem.eql(u8, name, "passwordHash") or
+        // Provider linkage decides WHO a record is: a client that could set it could hand
+        // itself someone else's account. Only the operator-only import seam writes it.
+        std.mem.eql(u8, name, "externalAuths") or
         std.mem.eql(u8, name, "tokenKey") or std.mem.eql(u8, name, "verified");
 }
 
@@ -803,4 +806,38 @@ test "verifyTokenOfTypes rejects a full .auth token under .file-only (file ?toke
         var v = verifyTokenOfTypes(a, &app, &d, auth_tok, &.{.auth}) orelse return error.TestUnexpectedNull; // sanity: valid .auth token
         v.deinit(a);
     }
+}
+
+test "applyCreate/applyProvision/applyUpdate strip a client-supplied externalAuths" {
+    // Provider linkage decides WHO a record is: whoever holds `(provider, providerId)` signs in
+    // as that record. It is installed only by the operator-only import seam
+    // (`zigbase import --external-auths`), so every request-payload path drops the key —
+    // create and update alike, and whether or not the collection declares such a field.
+    const a = std.testing.allocator;
+    var entry: std.json.ObjectMap = .empty;
+    defer entry.deinit(a);
+    try entry.put(a, "provider", .{ .string = "google" });
+    try entry.put(a, "providerId", .{ .string = "attacker-controlled" });
+    var links: std.json.Array = .init(a);
+    defer links.deinit();
+    try links.append(.{ .object = entry });
+
+    var data: std.json.ObjectMap = .empty;
+    defer data.deinit(a);
+    try data.put(a, "email", .{ .string = "a@b.c" });
+    try data.put(a, "password", .{ .string = "longenough" });
+    try data.put(a, "externalAuths", .{ .array = links });
+
+    const created = try applyCreate(std.testing.io, a, .{ .object = data }, 8);
+    defer freeProvisioned(a, created);
+    try std.testing.expect(created.object.get("externalAuths") == null);
+
+    const provisioned = try applyProvision(std.testing.io, a, .{ .object = data }, 8);
+    defer freeProvisioned(a, provisioned);
+    try std.testing.expect(provisioned.object.get("externalAuths") == null);
+
+    const updated = try applyUpdate(std.testing.io, a, .{ .object = data }, 8);
+    defer freeProvisioned(a, updated);
+    try std.testing.expect(updated.object.get("externalAuths") == null);
+    try std.testing.expectEqualStrings("a@b.c", updated.object.get("email").?.string); // legit field kept
 }

@@ -686,7 +686,8 @@ POST /api/collections/users/records
 
 On this create the server hashes the password (argon2id), strips the plaintext,
 mints a `tokenKey`, and **forces `verified` to `false`** (a client-supplied
-`verified` is ignored); `passwordHash`/`tokenKey` are hidden in the response. The
+`verified` is ignored, as is a client-supplied `externalAuths` — see
+[OAuth2](#oauth2)); `passwordHash`/`tokenKey` are hidden in the response. The
 auth collection needs a **public create rule** (`"@public"`) for open signup, and the
 password must be at least `minPasswordLength` (default 8) — otherwise the create is
 a `400`. After signup, obtain a token via `auth-with-password` above. Full walkthrough:
@@ -906,6 +907,15 @@ exclusively through the standard auth-method contract endpoints:
 | POST | `/api/collections/:col/auth/oauth2/initiate` | Return provider metadata so the client can drive the authorization redirect. |
 | POST | `/api/collections/:col/auth/oauth2/complete` | Exchange the authorization code for a session. |
 | DELETE | `/api/collections/:col/records/:id/external-auths/:provider` | Unlink a provider from a record. |
+
+**There is deliberately no HTTP counterpart that *creates* a link.** A `(provider, providerId)`
+link is written only by a successful `complete` — a first sign-in that creates the record, or an
+authenticated caller linking an additional provider to their own record. `externalAuths` is
+server-managed (`auth.isServerManagedField`): it is stripped from every record create/update
+payload, because whoever holds a `(provider, providerId)` pair signs in *as* that record. The one
+other writer is the operator-only offline import seam, `zigbase import --external-auths`, for
+carrying existing social-login accounts over from another backend — see
+[migration-tools.md §4b](migration-tools.md#4b-external-identities-oauth--omniauth--social-login).
 
 **`GET .../auth/oauth2/providers`** — no request body. Response:
 

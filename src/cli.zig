@@ -137,6 +137,8 @@ pub const ImportArgs = struct {
     legacy_hashes: ?[]const u8 = null,
     /// Preserve source `created` and `updated` values on create-only imports.
     preserve_timestamps: bool = false,
+    /// Install each row's `externalAuths` provider linkage. Create-only, auth collections only.
+    external_auths: bool = false,
 };
 
 /// `explain-code [CODE] [--json]`: print the long form for one frozen error code,
@@ -493,6 +495,8 @@ pub fn parse(args: []const []const u8, popts: ParseOpts) ParseError!Command {
                 ia.legacy_hashes = args[i];
             } else if (std.mem.eql(u8, a, "--preserve-timestamps")) {
                 ia.preserve_timestamps = true;
+            } else if (std.mem.eql(u8, a, "--external-auths")) {
+                ia.external_auths = true;
             } else if (std.mem.eql(u8, a, "-") or !std.mem.startsWith(u8, a, "-")) {
                 // Positional NDJSON file path (`-` = stdin). Only one is allowed.
                 if (ia.file != null) return ParseError.BadValue;
@@ -510,6 +514,10 @@ pub fn parse(args: []const []const u8, popts: ParseOpts) ParseError!Command {
         if (ia.legacy_hashes != null and ia.upsert_key != null)
             return ParseError.BadValue;
         if (ia.preserve_timestamps and ia.upsert_key != null)
+            return ParseError.BadValue;
+        // Same create-only reasoning as --legacy-hashes: an upserted row returns before the
+        // linkage is written, leaving an account nobody can sign in to.
+        if (ia.external_auths and ia.upsert_key != null)
             return ParseError.BadValue;
         return .{ .import = ia };
     }

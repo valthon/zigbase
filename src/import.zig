@@ -39,6 +39,7 @@ const datetime = @import("datetime.zig");
 const param_sink = @import("sql/param_sink.zig");
 const ddl = @import("ddl.zig");
 const app_mod = @import("app.zig");
+const oauth = @import("api/oauth.zig");
 
 pub const App = app_mod.App;
 
@@ -77,6 +78,11 @@ pub const Options = struct {
     /// with this algorithm. Only values in `crypto.legacy_algorithms` are accepted.
     /// Requires an auth collection; refuses `_superusers`.
     legacy_hash_algorithm: ?[]const u8 = null,
+    /// Install each row's `externalAuths` array as provider linkage in `_externalAuths`.
+    /// Off by default so a file cannot mint an identity link an operator did not ask for --
+    /// the same property that makes an ignored `passwordHash` safe without `--legacy-hashes`.
+    /// Requires an auth collection with the named providers configured; refuses `_superusers`.
+    external_auths: bool = false,
 };
 
 /// Row counts reported at completion.
@@ -133,6 +139,14 @@ pub const ImportError = error{
     TimestampRowMissingId,
     TimestampMissing,
     TimestampInvalid,
+    ExternalAuthRequiresAuthCollection,
+    ExternalAuthSuperuserRefused,
+    ExternalAuthRequiresPreservedIds,
+    ExternalAuthRequiresCreateOnly,
+    ExternalAuthRowMissingId,
+    MalformedExternalAuth,
+    UnknownExternalAuthProvider,
+    DuplicateExternalAuth,
 };
 
 /// Renumber `?N` placeholders for the active backend before preparing (SQLite verbatim,
@@ -266,6 +280,95 @@ fn applyLegacyCredential(
     _ = try st.step();
 }
 
+/// Install a row's provider linkage. Runs INSIDE the row's transaction, right after the
+/// record is created, so the account and the identity that reaches it commit or roll back
+/// together -- a half-migrated user who exists but cannot sign in is the failure this seam
+/// exists to prevent.
+///
+/// Like `applyLegacyCredential`, the HTTP path cannot reach this: `auth.isServerManagedField`
+/// strips `externalAuths` from every client payload, so linkage is operator-only.
+///
+/// A link is authentication: whoever holds `(provider, providerId)` becomes this record. So
+/// every refusal below is deliberate rather than defensive -- a typo'd provider that silently
+/// produced a dangling link, or a duplicate quietly upserted onto another account, would both
+/// hand a login to the wrong person.
+fn applyExternalAuths(
+    io: std.Io,
+    w: *db.Db,
+    a: std.mem.Allocator,
+    col: schema.Collection,
+    data: std.json.Value,
+) !void {
+    const raw = data.object.get("externalAuths") orelse return;
+    if (raw != .array) return ImportError.MalformedExternalAuth;
+    if (raw.array.items.len == 0) return;
+
+    const idv = data.object.get("id") orelse return ImportError.ExternalAuthRowMissingId;
+    if (idv != .string or idv.string.len == 0) return ImportError.ExternalAuthRowMissingId;
+
+    for (raw.array.items) |entry| {
+        if (entry != .object) return ImportError.MalformedExternalAuth;
+        const pv = entry.object.get("provider") orelse return ImportError.MalformedExternalAuth;
+        const iv = entry.object.get("providerId") orelse return ImportError.MalformedExternalAuth;
+        if (pv != .string or pv.string.len == 0) return ImportError.MalformedExternalAuth;
+        if (iv != .string or iv.string.len == 0) return ImportError.MalformedExternalAuth;
+
+        // The provider must be one this collection actually declares. A link naming a
+        // provider that was never configured can never resolve at login, so importing it
+        // would report success and leave the account unreachable -- exactly the outcome
+        // this whole feature exists to fix.
+        if (!providerConfigured(col, pv.string)) {
+            last_error_detail = "no such OAuth2 provider on this collection; configure it in the schema before importing linkage";
+            return ImportError.UnknownExternalAuthProvider;
+        }
+
+        // Both unique indexes are pre-checked so a collision is a named refusal rather than a
+        // raw constraint failure, and NEVER an upsert: silently re-pointing an existing
+        // identity at a different record is account takeover.
+        if (try oauth.findLink(a, w, pv.string, iv.string)) |link| {
+            last_error_detail = if (std.mem.eql(u8, link.recordRef, idv.string))
+                "this identity is already linked to this record"
+            else
+                "this identity is already linked to a different record";
+            return ImportError.DuplicateExternalAuth;
+        }
+        if (try recordHasProvider(a, w, col.name, idv.string, pv.string)) {
+            last_error_detail = "this record already has a link for that provider";
+            return ImportError.DuplicateExternalAuth;
+        }
+
+        try oauth.insertLink(io, a, w, col.name, idv.string, pv.string, iv.string);
+    }
+}
+
+/// True when `col` declares an OAuth2 provider named `name` that could actually resolve a
+/// sign-in. This deliberately mirrors `api/oauth.zig`'s `findProvider` gate -- collection-level
+/// `oauth2.enabled` AND the provider's own `enabled` -- because a link the login path would
+/// skip is exactly as useless as one naming a provider that was never declared: the account
+/// exists and nothing reaches it. Accepting a disabled provider here would reinstate, through
+/// the back door, the failure this whole seam removes.
+fn providerConfigured(col: schema.Collection, name: []const u8) bool {
+    if (!col.options.auth.oauth2.enabled) return false;
+    for (col.options.auth.oauth2.providers) |p| {
+        if (p.enabled and std.mem.eql(u8, p.name, name)) return true;
+    }
+    return false;
+}
+
+/// The `(collectionRef, recordRef, provider)` half of the uniqueness contract.
+fn recordHasProvider(a: std.mem.Allocator, w: *db.Db, col_name: []const u8, record_id: []const u8, provider: []const u8) !bool {
+    // Routed through `prep` so the `?N` placeholders are renumbered for the active backend
+    // (SQLite verbatim, Postgres `$n`) -- same discipline as every other statement here.
+    var st = try prep(a, w,
+        \\SELECT 1 FROM "_externalAuths" WHERE "collectionRef"=?1 AND "recordRef"=?2 AND "provider"=?3;
+    );
+    defer st.finalize();
+    try st.bindText(1, col_name);
+    try st.bindText(2, record_id);
+    try st.bindText(3, provider);
+    return try st.step();
+}
+
 const SourceTimestamps = struct {
     id: []const u8,
     created: [20]u8,
@@ -387,6 +490,7 @@ fn importRow(app: *App, w: *db.Db, io: std.Io, a: std.mem.Allocator, col: schema
     }
     try createRow(app, w, io, a, col, data, opts.preserve_ids);
     if (opts.legacy_hash_algorithm) |alg| try applyLegacyCredential(w, a, col, data, alg);
+    if (opts.external_auths) try applyExternalAuths(io, w, a, col, data);
     if (timestamps) |ts| try applySourceTimestamps(&lookups.timestamp_update.?, ts);
     return .created;
 }
@@ -464,6 +568,14 @@ pub fn run(app: *App, w: *db.Db, io: std.Io, reader: *std.Io.Reader, opts: Optio
     last_error_line = 0; // reset; set to the offending 1-based line on a row failure.
     last_error_detail = "";
 
+    if (opts.external_auths and opts.upsert_key != null) {
+        // `importRow`'s upsert branch returns as soon as the matched row is updated, so a
+        // matched row would be written with NO linkage — the account would exist and still
+        // be unreachable, which is the exact failure this seam removes. Refuse rather than
+        // half-perform it.
+        last_error_detail = "external-auth import is create-only and cannot be combined with an upsert key";
+        return ImportError.ExternalAuthRequiresCreateOnly;
+    }
     if (opts.preserve_timestamps and opts.upsert_key != null) {
         last_error_detail = "source timestamp preservation is create-only; remove --upsert-key / manifest `upsertKey`";
         return ImportError.TimestampRequiresCreateOnly;
@@ -484,6 +596,13 @@ pub fn run(app: *App, w: *db.Db, io: std.Io, reader: *std.Io.Reader, opts: Optio
     // passes `schema.isValidIdentifier`, which would otherwise mask this refusal behind a
     // generic `InvalidCollectionName`. A misconfigured run must fail before it writes
     // anything, so this all runs before any row is read.
+    // Same reasoning as the legacy block below: `_superusers` starts with `_` and so never
+    // passes the identifier gate, which would mask this refusal behind a generic
+    // `InvalidCollectionName`. Linking a provider identity to a superuser would hand
+    // administrative access to whoever controls that provider account.
+    if (opts.external_auths and std.mem.eql(u8, opts.collection, "_superusers"))
+        return ImportError.ExternalAuthSuperuserRefused;
+
     if (opts.legacy_hash_algorithm) |alg| {
         // The superuser table is created by `zigbase superuser create` with a real password;
         // there is no migration story for it, and it is the highest-value target.
@@ -515,6 +634,14 @@ pub fn run(app: *App, w: *db.Db, io: std.Io, reader: *std.Io.Reader, opts: Optio
     if (opts.legacy_hash_algorithm != null and !opts.preserve_ids) {
         last_error_detail = "legacy credential import requires preserve_ids=true — the credential row is matched by its source id";
         return ImportError.LegacyRequiresPreservedIds;
+    }
+
+    if (opts.external_auths and col.type != .auth)
+        return ImportError.ExternalAuthRequiresAuthCollection;
+
+    if (opts.external_auths and !opts.preserve_ids) {
+        last_error_detail = "external-auth import requires preserve_ids=true — a link points at the record's source id";
+        return ImportError.ExternalAuthRequiresPreservedIds;
     }
 
     // Prepare the per-run lookup statement(s) ONCE — reused for every row (reset + re-bind) so a
@@ -1503,4 +1630,237 @@ test "import: strip_fields drops the named keys before the engine sees them" {
     defer st.finalize();
     try std.testing.expect(try st.step());
     try std.testing.expectEqual(@as(usize, 0), st.columnText(0).len);
+}
+
+// ---------------------------------------------------------------------------
+// external-auth linkage
+// ---------------------------------------------------------------------------
+
+/// An auth collection declaring one OAuth2 provider, for the linkage tests below.
+fn seedLinkable(d: *db.Db, a: std.mem.Allocator, io: std.Io) !schema.Collection {
+    return try collections.create(a, io, d, .{
+        .id = "",
+        .name = "members",
+        .type = .auth,
+        .fields = &.{},
+        .options = .{ .auth = .{ .oauth2 = .{
+            .enabled = true,
+            .providers = &.{.{ .name = "google", .clientId = "cid", .clientSecret = "sec" }},
+        } } },
+    });
+}
+
+fn linkCountFor(d: *db.Db, record_id: []const u8) !i64 {
+    var st = try d.prepare("SELECT COUNT(*) FROM \"_externalAuths\" WHERE \"recordRef\"=?1;");
+    defer st.finalize();
+    try st.bindText(1, record_id);
+    _ = try st.step();
+    return st.columnInt(0);
+}
+
+test "import: --external-auths installs provider linkage with the record" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    try migrations.run(&d);
+    const members = try seedLinkable(&d, a, io);
+    defer members.deinit(a);
+    var app = testApp(a, io);
+
+    const rep = try runNdjson(&app, &d, io,
+        \\{"id":"member000000001","email":"ada@example.com","externalAuths":[{"provider":"google","providerId":"g-1"}]}
+        \\
+    , .{ .collection = "members", .external_auths = true });
+    try std.testing.expectEqual(@as(usize, 1), rep.created);
+
+    // The link must point at the imported record, so a later OAuth login resolves to it
+    // instead of being refused as an already-registered email.
+    const link = (try oauth.findLink(a, &d, "google", "g-1")).?;
+    defer a.free(link.collectionRef);
+    defer a.free(link.recordRef);
+    try std.testing.expectEqualStrings("members", link.collectionRef);
+    try std.testing.expectEqualStrings("member000000001", link.recordRef);
+}
+
+test "import: WITHOUT --external-auths the linkage in the row is silently ignored" {
+    // Mirrors the passwordHash property: a file alone can never mint an identity link.
+    var d = try db.Db.openMemory();
+    defer d.close();
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    try migrations.run(&d);
+    const members = try seedLinkable(&d, a, io);
+    defer members.deinit(a);
+    var app = testApp(a, io);
+
+    _ = try runNdjson(&app, &d, io,
+        \\{"id":"member000000001","email":"ada@example.com","externalAuths":[{"provider":"google","providerId":"g-1"}]}
+        \\
+    , .{ .collection = "members" });
+    try std.testing.expectEqual(@as(i64, 0), try linkCountFor(&d, "member000000001"));
+}
+
+test "import: a disabled provider or disabled oauth2 is refused like an unknown one" {
+    // The login path skips both, so a link naming either can never resolve -- the account
+    // would exist and stay unreachable, which is the outcome this flag exists to prevent.
+    var d = try db.Db.openMemory();
+    defer d.close();
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    try migrations.run(&d);
+    var app = testApp(a, io);
+    const row =
+        \\{"id":"member000000001","email":"ada@example.com","externalAuths":[{"provider":"google","providerId":"g-1"}]}
+        \\
+    ;
+
+    // The provider itself is switched off.
+    const off_provider = try collections.create(a, io, &d, .{
+        .id = "",
+        .name = "provider_off",
+        .type = .auth,
+        .fields = &.{},
+        .options = .{ .auth = .{ .oauth2 = .{
+            .enabled = true,
+            .providers = &.{.{ .name = "google", .clientId = "cid", .clientSecret = "sec", .enabled = false }},
+        } } },
+    });
+    defer off_provider.deinit(a);
+    try std.testing.expectError(ImportError.UnknownExternalAuthProvider, runNdjson(&app, &d, io, row, .{ .collection = "provider_off", .external_auths = true }));
+
+    // OAuth2 is switched off for the whole collection.
+    const oauth_off = try collections.create(a, io, &d, .{
+        .id = "",
+        .name = "oauth_off",
+        .type = .auth,
+        .fields = &.{},
+        .options = .{ .auth = .{ .oauth2 = .{
+            .enabled = false,
+            .providers = &.{.{ .name = "google", .clientId = "cid", .clientSecret = "sec" }},
+        } } },
+    });
+    defer oauth_off.deinit(a);
+    try std.testing.expectError(ImportError.UnknownExternalAuthProvider, runNdjson(&app, &d, io, row, .{ .collection = "oauth_off", .external_auths = true }));
+}
+
+test "import: an unconfigured provider is refused rather than left dangling" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    try migrations.run(&d);
+    const members = try seedLinkable(&d, a, io);
+    defer members.deinit(a);
+    var app = testApp(a, io);
+
+    try std.testing.expectError(ImportError.UnknownExternalAuthProvider, runNdjson(&app, &d, io,
+        \\{"id":"member000000001","email":"ada@example.com","externalAuths":[{"provider":"githbu","providerId":"x"}]}
+        \\
+    , .{ .collection = "members", .external_auths = true }));
+}
+
+test "import: a duplicate identity is refused, never re-pointed" {
+    // Silently moving an existing identity to another record is account takeover.
+    var d = try db.Db.openMemory();
+    defer d.close();
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    try migrations.run(&d);
+    const members = try seedLinkable(&d, a, io);
+    defer members.deinit(a);
+    var app = testApp(a, io);
+
+    _ = try runNdjson(&app, &d, io,
+        \\{"id":"member000000001","email":"ada@example.com","externalAuths":[{"provider":"google","providerId":"g-1"}]}
+        \\
+    , .{ .collection = "members", .external_auths = true });
+
+    try std.testing.expectError(ImportError.DuplicateExternalAuth, runNdjson(&app, &d, io,
+        \\{"id":"member000000002","email":"bob@example.com","externalAuths":[{"provider":"google","providerId":"g-1"}]}
+        \\
+    , .{ .collection = "members", .external_auths = true }));
+
+    // The original link is untouched by the refusal.
+    const link = (try oauth.findLink(a, &d, "google", "g-1")).?;
+    defer a.free(link.collectionRef);
+    defer a.free(link.recordRef);
+    try std.testing.expectEqualStrings("member000000001", link.recordRef);
+}
+
+test "import: a malformed linkage entry is refused" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    try migrations.run(&d);
+    const members = try seedLinkable(&d, a, io);
+    defer members.deinit(a);
+    var app = testApp(a, io);
+
+    for ([_][]const u8{
+        "{\"id\":\"member000000001\",\"email\":\"a@b.c\",\"externalAuths\":{\"provider\":\"google\"}}\n",
+        "{\"id\":\"member000000001\",\"email\":\"a@b.c\",\"externalAuths\":[{\"provider\":\"google\"}]}\n",
+        "{\"id\":\"member000000001\",\"email\":\"a@b.c\",\"externalAuths\":[{\"provider\":\"\",\"providerId\":\"g\"}]}\n",
+        "{\"id\":\"member000000001\",\"email\":\"a@b.c\",\"externalAuths\":[{\"provider\":\"google\",\"providerId\":\"\"}]}\n",
+    }) |row| {
+        try std.testing.expectError(ImportError.MalformedExternalAuth, runNdjson(&app, &d, io, row, .{ .collection = "members", .external_auths = true }));
+    }
+}
+
+test "import: linkage requires an id on the row" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    try migrations.run(&d);
+    const members = try seedLinkable(&d, a, io);
+    defer members.deinit(a);
+    var app = testApp(a, io);
+
+    try std.testing.expectError(ImportError.ExternalAuthRowMissingId, runNdjson(&app, &d, io,
+        \\{"email":"ada@example.com","externalAuths":[{"provider":"google","providerId":"g-1"}]}
+        \\
+    , .{ .collection = "members", .external_auths = true }));
+}
+
+test "import: linkage refuses a non-auth collection, _superusers, and an upsert key" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    try migrations.run(&d);
+    const posts_col = try seedPosts(&d, a, io);
+    defer posts_col.deinit(a);
+    const members = try seedLinkable(&d, a, io);
+    defer members.deinit(a);
+    var app = testApp(a, io);
+
+    try std.testing.expectError(ImportError.ExternalAuthRequiresAuthCollection, runNdjson(&app, &d, io, "{\"id\":\"p00000000000001\",\"title\":\"x\"}\n", .{ .collection = "posts", .external_auths = true }));
+    // Linking a provider to a superuser would hand admin access to whoever holds it.
+    try std.testing.expectError(ImportError.ExternalAuthSuperuserRefused, runNdjson(&app, &d, io, "{\"id\":\"s00000000000001\",\"email\":\"root@x.io\"}\n", .{ .collection = "_superusers", .external_auths = true }));
+    // An upserted row returns before linkage runs, so the account would exist unreachable.
+    try std.testing.expectError(ImportError.ExternalAuthRequiresCreateOnly, runNdjson(&app, &d, io, "{\"id\":\"member000000001\",\"email\":\"a@b.c\"}\n", .{ .collection = "members", .external_auths = true, .upsert_key = "email" }));
+}
+
+test "import: a refused link rolls back the record it belonged to" {
+    // The account and the identity that reaches it commit together or not at all.
+    var d = try db.Db.openMemory();
+    defer d.close();
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    try migrations.run(&d);
+    const members = try seedLinkable(&d, a, io);
+    defer members.deinit(a);
+    var app = testApp(a, io);
+
+    try std.testing.expectError(ImportError.UnknownExternalAuthProvider, runNdjson(&app, &d, io,
+        \\{"id":"member000000001","email":"ada@example.com","externalAuths":[{"provider":"nope","providerId":"x"}]}
+        \\
+    , .{ .collection = "members", .external_auths = true }));
+
+    var st = try d.prepare("SELECT COUNT(*) FROM \"members\" WHERE \"id\"='member000000001';");
+    defer st.finalize();
+    _ = try st.step();
+    try std.testing.expectEqual(@as(i64, 0), st.columnInt(0));
 }

@@ -629,3 +629,101 @@ test "OAuth2Method: server-state — replayed (consumed) state returns .fail 400
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Migrated provider linkage (#377)
+//
+// The tests above prove the OAuth2 sign-in tree in isolation. These two prove the
+// *point* of `zigbase import --external-auths`: a user carried over from another
+// backend signs in with the SAME provider identity and lands on the record they were
+// migrated into. The control test below runs the identical sign-in against the identical
+// row imported WITHOUT the flag, so the two together show the outcome the linkage
+// changes — the 409 an email collision produces when nothing links the identity.
+//
+// This is in-process: the transport is stubbed (a real provider round-trip needs the
+// network), but everything downstream of the fetched identity is the production path —
+// the real `completeImpl`, `resolveRecordFromIdentity`, and `findLink`, over a record
+// and a link row written by the real `import.run`.
+// ---------------------------------------------------------------------------
+
+const import_mod = @import("../../import.zig");
+
+/// One legacy user, carried in the shape an exporter emits: the account and, when the
+/// operator opts in, the provider identity that reaches it.
+const migrated_row =
+    \\{"id":"migrated0000001","email":"u@x.io","externalAuths":[{"provider":"google","providerId":"P1"}]}
+    \\
+;
+
+/// Run the real import engine over `migrated_row`, as the CLI does.
+fn importMigratedUser(env: *TestEnv, col_name: []const u8, external_auths: bool) !void {
+    const w = env.pool.acquireWriter();
+    defer env.pool.releaseWriter();
+    var reader = std.Io.Reader.fixed(migrated_row);
+    const rep = try import_mod.run(&env.app, w, std.testing.io, &reader, .{
+        .collection = col_name,
+        .external_auths = external_auths,
+    });
+    try std.testing.expectEqual(@as(usize, 1), rep.created);
+}
+
+fn loadCollection(env: *TestEnv, a: std.mem.Allocator, name: []const u8) !schema.Collection {
+    const w = env.pool.acquireWriter();
+    defer env.pool.releaseWriter();
+    return (try collections.get(a, w, name)).?;
+}
+
+test "OAuth2Method: an imported provider link signs the migrated user into their existing record" {
+    var env = try TestEnv.init();
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    env.app.oauth_state_server = false; // client-driven path; state replay is covered above
+    try env.seedOAuthCollection(a, "migrated");
+    try importMigratedUser(env, "migrated", true);
+
+    const col = try loadCollection(env, a, "migrated");
+    var req = env.ctx(RequestArena.from(&arena), .POST, try oauthBody(a), &[_]http.Param{});
+    var ac = AuthCtx{ .app = &env.app, .ctx = &req, .collection = col, .config = .null };
+    // The identity the legacy provider still issues for this person: sub=P1, u@x.io.
+    var stub = OAuthStub{};
+
+    switch (try completeImpl(&ac, stub.transport())) {
+        .record => |rid| try std.testing.expectEqualStrings("migrated0000001", rid),
+        .fail => |f| {
+            std.debug.print("Expected the imported record but got .fail: status={d} msg={s}\n", .{ f.status, f.message });
+            return error.TestFailed;
+        },
+    }
+}
+
+test "OAuth2Method: without the imported link the same sign-in is refused as an email collision" {
+    // The pre-#377 outcome, and the reason the flag exists: the account came over but the
+    // identity that reaches it did not, so the provider's first sign-in tries to CREATE a
+    // record and collides with the migrated email.
+    var env = try TestEnv.init();
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    env.app.oauth_state_server = false;
+    try env.seedOAuthCollection(a, "unmigrated");
+    try importMigratedUser(env, "unmigrated", false); // same row, linkage ignored
+
+    const col = try loadCollection(env, a, "unmigrated");
+    var req = env.ctx(RequestArena.from(&arena), .POST, try oauthBody(a), &[_]http.Param{});
+    var ac = AuthCtx{ .app = &env.app, .ctx = &req, .collection = col, .config = .null };
+    var stub = OAuthStub{};
+
+    switch (try completeImpl(&ac, stub.transport())) {
+        .fail => |f| {
+            try std.testing.expectEqual(@as(u16, 409), f.status);
+            try std.testing.expectEqualStrings("Email already registered; sign in and link instead.", f.message);
+        },
+        .record => |rid| {
+            std.debug.print("Expected a 409 but the sign-in resolved to {s}\n", .{rid});
+            return error.TestFailed;
+        },
+    }
+}
