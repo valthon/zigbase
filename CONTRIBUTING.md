@@ -143,8 +143,10 @@ surface and the unit-test root. This is easy to forget and silently skips your t
 `zig-out/bin/` — if the tree has moved since your last `zig build` (a rebase, a stash, a branch
 switch, or just time passing while you edited), that binary can be stale without anything telling
 you so; the symptom is a coherent subset of tests failing (e.g. one file's worth) while everything
-else passes, which reads like a real regression until you check the artifact. The suite also needs
-two fixture binaries that a plain `zig build` does not produce:
+else passes, which reads like a real regression until you check the artifact. The harness does
+build what it needs — including the fixture servers a plain `zig build` does not produce, which
+live behind named build steps — but a Zig build inside a parallel test run is slow and its output
+is buried, so pre-build to keep it out of the run:
 
 ```sh
 zig build                                 # refresh zig-out/bin/zigbase
