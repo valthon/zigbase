@@ -4,9 +4,28 @@
     .fingerprint = 0x306d84a90c011454,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
+        // FORK, not upstream — `valthon/zap` at upstream v0.10.6 (f6099ece) plus ONE
+        // commit: a two-line fix to the bundled facil.io (issue #380).
+        //
+        // `fio_poll`'s review loop force-closes on any error event, deriving the uuid
+        // from the raw descriptor in the event via `fd2uuid(fd)`. A poll/epoll result
+        // set is a SNAPSHOT: by the time the loop reaches an entry, another thread may
+        // have closed that descriptor and the OS may have reissued the number to an
+        // unrelated socket opened elsewhere in the process. `fd2uuid` re-reads the
+        // descriptor's CURRENT counter, so `uuid_is_valid()` can never reject a stale
+        // event — facil.io then closes a descriptor it does not own. Surfaced here as
+        // an intermittent EBADF panic in a queue worker whose SMTP socket was closed
+        // between `connect()` and `getsockname()`; it can take out ANY descriptor,
+        // including SQLite's. The fix gates the close on `.open`, the flag facil.io's
+        // own `fio_is_closed()` already consults.
+        //
+        // Upstream (including v0.11.0) still carries the unguarded call, so bumping
+        // the pin does NOT fix this. When re-pinning zap, rebase this commit onto the
+        // new upstream tag rather than dropping back to a plain zigzap/zap url — and
+        // keep `zap_version` / `facil_version` in build.zig in sync with the base tag.
         .zap = .{
-            .url = "git+https://github.com/zigzap/zap#f6099ecec496c7ec623c5913baa5b6b5da2e883d",
-            .hash = "zap-0.10.6-GoeB8y-IJAD3m9zkAkeTQalzU1NuvO072u8hA78Irdp8",
+            .url = "git+https://github.com/valthon/zap#1d7cb3b8cf288f9f78d767d19159b491d208a051",
+            .hash = "zap-0.10.6-GoeB80SLJACZeWlVU-LnGsweCgPJdMlYVkRsWNoOlzvi",
         },
     },
     .paths = .{

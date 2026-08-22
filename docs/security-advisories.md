@@ -33,6 +33,12 @@ SQLite/sqlite-vec from their vendored headers, `zap` from `build.zig.zon`, and f
 curated constant tied to the `zap` pin. Surface them at runtime with `zig build versions`,
 `zigbase --version`, or `GET /api/health`.
 
+Note that the `zap` pin is a **fork** — upstream v0.10.6 plus one commit fixing a facil.io
+descriptor-lifetime bug (the poll review loop could close a descriptor it no longer owned).
+The version rows below name the upstream base the fork is cut from, which is what the
+advisory ranges apply to; `zap_commit` reports the fork's SHA. The full rationale, and what
+to do when re-pinning, is on the `.zap` entry in `build.zig.zon`.
+
 ## Advisory table
 
 | Component  | Affected range | Min safe version | Advisory | Note |

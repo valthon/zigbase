@@ -154,6 +154,9 @@ pub fn build(b: *std.Build) void {
         .sqlite_version = readCDefineStr(b, "vendor/sqlite/sqlite3.h", "SQLITE_VERSION"),
         .sqlite_source_id = readCDefineStr(b, "vendor/sqlite/sqlite3.h", "SQLITE_SOURCE_ID"),
         .sqlite_vec_version = readCDefineStr(b, "vendor/sqlite-vec/sqlite-vec.h", "SQLITE_VEC_VERSION"),
+        // Curated: the UPSTREAM tag the zap pin is based on. The pin itself is a fork
+        // carrying one facil.io fix (see the comment on `.zap` in build.zig.zon), so
+        // `zap_commit` reports the fork's SHA while these two name the upstream base.
         .zap_version = "0.10.6", // curated: matches the zap pin in build.zig.zon
         .zap_commit = zapPinnedCommit(),
         .facil_version = "0.7.4", // curated: facil.io bundled inside the pinned zap (bump on zap re-pin)
