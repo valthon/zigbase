@@ -20,7 +20,13 @@ The converter supports a stopped PocketBase 0.39.11 snapshot containing:
 
 It does not download S3 objects, preserve PocketBase sessions or token keys, translate view SQL,
 hooks, custom Go, cron, mail templates, OAuth/MFA/OTP behavior, geospatial query semantics, or run
-a live dual-write. Those surfaces produce decisions or blockers. Port required behavior into
+a live dual-write. Those surfaces produce decisions or blockers. In particular the converter does
+not translate PocketBase's `_externalAuths` rows: if social-login accounts must survive the move,
+add each `(provider, providerId)` pair to the auth NDJSON row yourself and import it with
+`--external-auths`
+([migration-tools.md §4b](migration-tools.md#4b-external-identities-oauth--omniauth--social-login))
+once the provider is configured on the target collection. Provider tokens and sessions still never
+migrate. Port required behavior into
 trusted ZigBase hooks, routes, jobs, or configuration and test its allow and deny cases before
 cutover.
 

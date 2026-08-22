@@ -41,9 +41,13 @@ manifest, preserve required ids/timestamps, hash every input/output, and demand 
 reruns. Do not import through direct target SQL.
 
 Inspect actual password hash prefixes and parameters. Import verified bcrypt only with
-`--legacy-hashes bcrypt`; Laravel Argon2, custom hashers, external-only accounts, and unknown hashes
-need a reviewed reset or separate compatibility design. Never migrate sessions, remember tokens,
-Sanctum/Passport tokens, reset tokens, app keys, or signing secrets. Prove wrong-password
+`--legacy-hashes bcrypt`; Laravel Argon2, custom hashers, and unknown hashes need a reviewed reset
+or separate compatibility design. Socialite accounts with no password need no hash at all: put each
+`(provider, providerId)` pair on the auth row and import it with `--external-auths`
+([migration-tools.md §4b](migration-tools.md#4b-external-identities-oauth--omniauth--social-login)),
+once the same provider is configured on the target collection. Never migrate sessions, remember
+tokens, Sanctum/Passport tokens, provider access/refresh tokens, reset tokens, app keys, or signing
+secrets — the provider *identity* migrates, its credentials do not. Prove wrong-password
 non-mutation and successful bcrypt-to-argon2id rehash after restart.
 
 Intentional public signup is exact `@public` auth create plus a rationale in
