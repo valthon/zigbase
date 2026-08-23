@@ -51,7 +51,11 @@ beforeAll(async () => {
       { id: "", name: "author", type: "relation", options: { maxSelect: 1, targetCollectionId: usersId } },
       { id: "", name: "tags", type: "relation", options: { maxSelect: 99, targetCollectionId: tagsId } },
       { id: "", name: "cover", type: "file", options: { maxSelect: 1 } },
-      { id: "", name: "created", type: "autodate", options: { onCreate: true, onUpdate: false } },
+      // No `created` field here: every base collection already carries the engine's own
+      // id/created/updated columns, and `created` is a reserved field name. Declaring it was
+      // always a no-op — the engine dropped it silently — so the `-created` sorts below have
+      // only ever exercised the engine's column, and still do. Since #382 the same
+      // declaration is refused outright (`validation_reserved_name`) instead of dropped.
     ],
     listRule: "@public",
     viewRule: "@public",

@@ -1472,10 +1472,21 @@ pub fn parseCollectionInput(alloc: std.mem.Allocator, s: []const u8) !Collection
         for (raw_fields[scanned..]) |rf| freeFieldOwned(alloc, rf);
     }
     for (raw_fields) |f| {
-        if (isSystemFieldName(f.name)) {
-            // A submitted field colliding with a reserved system name is dropped rather than
-            // kept — without freeing it here, its id/name/options dupe would leak (previously
-            // masked by the request arena).
+        if (ctype == .auth and isSystemFieldName(f.name)) {
+            // ECHO PATH, auth collections only. A client that GETs an auth collection is
+            // handed the engine-injected system fields (`injectAuthFields`) and must be able
+            // to PUT the document straight back; refusing it for repeating what the engine
+            // just sent would break every read-modify-write client, the admin UI included.
+            // So for `.auth` these names are dropped — and freed, since without this their
+            // id/name/options dupes would leak (previously masked by the request arena).
+            //
+            // For every OTHER collection type the name is KEPT, so `validate` can refuse it
+            // with `validation_reserved_name` (#382). A base or view collection has no
+            // injected fields to echo, and `schema_doc.documentFields` filters system names
+            // out of every dump, so there is no round trip to preserve here — while `email`,
+            // `username`, `verified`, `created` and `updated` are ordinary column names on
+            // ordinary tables. Dropping them silently discarded the column, and its data,
+            // with a clean exit status at every step.
             freeFieldOwned(alloc, f);
         } else {
             try kept.append(alloc, f);
@@ -2156,6 +2167,60 @@ test "passwordEnabled backward compat and explicit opt-in" {
     // auth collection with only magic_link (no password) => not enabled
     const auth_col_ml = Collection{ .id = "c", .name = "users", .type = .auth, .fields = &.{}, .options = .{ .auth = .{ .methods = .{ .magic_link = .{} } } } };
     try std.testing.expect(!passwordEnabled(auth_col_ml));
+}
+
+test "parseCollectionInput keeps a reserved-named field on a BASE collection so validation can refuse it" {
+    // #382: the parse path used to DROP any field whose name `isSystemFieldName` reserves,
+    // for every collection type. On a base collection that made `validation_reserved_name`
+    // unreachable and silently discarded the column — `schema apply` exited 0 having thrown
+    // the field away. A base collection has no engine-injected fields to echo back, so the
+    // name must survive parse and be REFUSED by `validate`.
+    const a = std.testing.allocator;
+    const col = try parseCollectionInput(a,
+        \\{"name":"contacts","type":"base","fields":[
+        \\  {"id":"","name":"email","type":"text"},
+        \\  {"id":"","name":"created","type":"text"},
+        \\  {"id":"","name":"nickname","type":"text"}],"options":{}}
+    );
+    defer col.deinit(a);
+    try std.testing.expectEqual(@as(usize, 3), col.fields.len);
+
+    var errs: std.ArrayList(ValidationError) = .empty;
+    defer errs.deinit(a);
+    try validate(a, col, &errs);
+    var reserved: usize = 0;
+    for (errs.items) |e| {
+        if (std.mem.eql(u8, e.code, codes.s(.validation_reserved_name))) reserved += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), reserved);
+}
+
+test "parseCollectionInput still drops an AUTH collection's own system fields" {
+    // The echo path: a client GETs an auth collection (the engine serializes the injected
+    // email/username/verified) and PUTs it back. Refusing those would break every such
+    // round trip, so for `.auth` they stay dropped — silently, and only there.
+    const a = std.testing.allocator;
+    const col = try parseCollectionInput(a,
+        \\{"name":"users","type":"auth","fields":[
+        \\  {"id":"_email","name":"email","type":"email"},
+        \\  {"id":"_username","name":"username","type":"text"},
+        \\  {"id":"_verified","name":"verified","type":"bool"},
+        \\  {"id":"_pwhash","name":"passwordHash","type":"text","hidden":true},
+        \\  {"id":"_tokkey","name":"tokenKey","type":"text","hidden":true},
+        \\  {"id":"_tokepoch","name":"token_epoch","type":"number"},
+        \\  {"id":"","name":"id","type":"text"},
+        \\  {"id":"","name":"created","type":"text"},
+        \\  {"id":"","name":"updated","type":"text"},
+        \\  {"id":"","name":"bio","type":"text"}],"options":{}}
+    );
+    defer col.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), col.fields.len);
+    try std.testing.expectEqualStrings("bio", col.fields[0].name);
+
+    var errs: std.ArrayList(ValidationError) = .empty;
+    defer errs.deinit(a);
+    try validate(a, col, &errs);
+    try std.testing.expectEqual(@as(usize, 0), errs.items.len);
 }
 
 test "Collection.deinit frees an auth collection that was never auth-injected" {
