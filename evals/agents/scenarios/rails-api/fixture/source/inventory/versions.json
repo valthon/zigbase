@@ -1,0 +1,15 @@
+{
+  "adapter": "SQLite",
+  "api_only": true,
+  "application_class": "BookclubApi::Application",
+  "database_version": "3.53.2",
+  "exporter_version": "1.1.0",
+  "gemfile_lock_sha256": "aee4de193d4ac76e0bba11eb1f4bbe4beec438b3916e635e98599cbbd44984ce",
+  "rails_env": "development",
+  "rails_version": "8.1.3.1",
+  "ruby_description": "ruby 4.0.1 (2026-01-13 revision e04267a14b) +PRISM",
+  "ruby_version": "4.0.1",
+  "schema_format": "ruby",
+  "source": "observed",
+  "taken_at": "2024-01-15T09:00:00Z"
+}

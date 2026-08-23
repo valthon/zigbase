@@ -1,0 +1,26 @@
+{
+  "zigbaseRailsMigrationReport": 1,
+  "railsVersion": "8.1.3.1",
+  "sourceMode": "observed",
+  "bundle": "migration/bundle",
+  "frontend": "Rails views and frontend behavior were not migrated. This application is API-only; the only ERB under app/views is the mailer layout, which is not a browser-rendered surface, so no frontend is retained.",
+  "publicRules": [
+    "users.create"
+  ],
+  "checks": [
+    "scope",
+    "bundle",
+    "determinism",
+    "rules",
+    "auth",
+    "rehash",
+    "authorization",
+    "parity",
+    "timestamps",
+    "files",
+    "restart",
+    "restore"
+  ],
+  "unresolved": [],
+  "rollback": "The frozen snapshot under source/, decisions.json, migration/bundle/, the target data directory and its JWT secret are kept as one rollback unit; restoring all five together returns the target to this bundle."
+}

@@ -1,0 +1,238 @@
+{
+  "zigbaseRailsDecisions": 1,
+  "decisions": [
+    {
+      "id": "association.Flag.flaggable.polymorphic",
+      "choice": "replacement",
+      "rationale": "A ZigBase relation points at one collection; this association points at three, so the columns travel and a typed route resolves them.",
+      "artifact": "replacements/polymorphic-flaggable.md"
+    },
+    {
+      "id": "column.clubs.posts_count.default",
+      "choice": "hook",
+      "rationale": "Imported rows keep their values; a before-create hook supplies the same default for writes after cutover.",
+      "artifact": "replacements/column-defaults.md"
+    },
+    {
+      "id": "column.clubs.visibility.default",
+      "choice": "hook",
+      "rationale": "Imported rows keep their values; a before-create hook supplies the same default for writes after cutover.",
+      "artifact": "replacements/column-defaults.md"
+    },
+    {
+      "id": "column.memberships.role.default",
+      "choice": "hook",
+      "rationale": "Imported rows keep their values; a before-create hook supplies the same default for writes after cutover.",
+      "artifact": "replacements/column-defaults.md"
+    },
+    {
+      "id": "column.notifications.payload.default",
+      "choice": "hook",
+      "rationale": "Imported rows keep their values; a before-create hook supplies the same default for writes after cutover.",
+      "artifact": "replacements/column-defaults.md"
+    },
+    {
+      "id": "column.posts.status.default",
+      "choice": "hook",
+      "rationale": "Imported rows keep their values; a before-create hook supplies the same default for writes after cutover.",
+      "artifact": "replacements/column-defaults.md"
+    },
+    {
+      "id": "column.users.role.default",
+      "choice": "hook",
+      "rationale": "Imported rows keep their values; a before-create hook supplies the same default for writes after cutover.",
+      "artifact": "replacements/column-defaults.md"
+    },
+    {
+      "id": "jobs.disposition",
+      "choice": "replacement",
+      "rationale": "NotificationJob becomes a scheduled job; the Rails queue is drained before the final snapshot rather than migrated.",
+      "artifact": "replacements/jobs.md"
+    },
+    {
+      "id": "model.Club.default_scope",
+      "choice": "replacement",
+      "rationale": "Archived clubs must reach the target; the filter is reproduced in the list rule and index route where it is visible, not applied at extraction.",
+      "artifact": "replacements/default-scope.md"
+    },
+    {
+      "id": "model.Club.dependent",
+      "choice": "hook",
+      "rationale": "Dependent destruction is reproduced in a before-delete hook so the ordering and the counter update stay together.",
+      "artifact": "replacements/validations.md"
+    },
+    {
+      "id": "model.Club.validations",
+      "choice": "hook",
+      "rationale": "Presence, length and format checks become field constraints or before-write hooks, each with an allow and a deny test.",
+      "artifact": "replacements/validations.md"
+    },
+    {
+      "id": "model.Comment.dependent",
+      "choice": "hook",
+      "rationale": "Dependent destruction is reproduced in a before-delete hook so the ordering and the counter update stay together.",
+      "artifact": "replacements/validations.md"
+    },
+    {
+      "id": "model.Comment.validations",
+      "choice": "hook",
+      "rationale": "Presence, length and format checks become field constraints or before-write hooks, each with an allow and a deny test.",
+      "artifact": "replacements/validations.md"
+    },
+    {
+      "id": "model.Event.sti",
+      "choice": "replacement",
+      "rationale": "Events migrate as one collection carrying `type`; subclass behavior moves to the route layer.",
+      "artifact": "replacements/sti-events.md"
+    },
+    {
+      "id": "model.Event.validations",
+      "choice": "hook",
+      "rationale": "Presence, length and format checks become field constraints or before-write hooks, each with an allow and a deny test.",
+      "artifact": "replacements/validations.md"
+    },
+    {
+      "id": "model.Flag.validations",
+      "choice": "hook",
+      "rationale": "Presence, length and format checks become field constraints or before-write hooks, each with an allow and a deny test.",
+      "artifact": "replacements/validations.md"
+    },
+    {
+      "id": "model.MeetingEvent.validations",
+      "choice": "hook",
+      "rationale": "Presence, length and format checks become field constraints or before-write hooks, each with an allow and a deny test.",
+      "artifact": "replacements/validations.md"
+    },
+    {
+      "id": "model.Membership.validations",
+      "choice": "hook",
+      "rationale": "Presence, length and format checks become field constraints or before-write hooks, each with an allow and a deny test.",
+      "artifact": "replacements/validations.md"
+    },
+    {
+      "id": "model.Notification.serialized.payload",
+      "choice": "json",
+      "rationale": "The column holds a JSON object and the target has a json field, so it is stored as structured data rather than as text."
+    },
+    {
+      "id": "model.Post.dependent",
+      "choice": "hook",
+      "rationale": "Dependent destruction is reproduced in a before-delete hook so the ordering and the counter update stay together.",
+      "artifact": "replacements/validations.md"
+    },
+    {
+      "id": "model.Post.validations",
+      "choice": "hook",
+      "rationale": "Presence, length and format checks become field constraints or before-write hooks, each with an allow and a deny test.",
+      "artifact": "replacements/validations.md"
+    },
+    {
+      "id": "model.ReadingEvent.validations",
+      "choice": "hook",
+      "rationale": "Presence, length and format checks become field constraints or before-write hooks, each with an allow and a deny test.",
+      "artifact": "replacements/validations.md"
+    },
+    {
+      "id": "model.User.dependent",
+      "choice": "hook",
+      "rationale": "Dependent destruction is reproduced in a before-delete hook so the ordering and the counter update stay together.",
+      "artifact": "replacements/validations.md"
+    },
+    {
+      "id": "model.User.encrypted.phone",
+      "choice": "retire",
+      "rationale": "Ciphertext cannot travel without the application key, and the phone number is not required by any migrated route. Retired rather than re-keyed.",
+      "artifact": "replacements/encrypted-phone.md"
+    },
+    {
+      "id": "model.User.validations",
+      "choice": "hook",
+      "rationale": "Presence, length and format checks become field constraints or before-write hooks, each with an allow and a deny test.",
+      "artifact": "replacements/validations.md"
+    },
+    {
+      "id": "routes.disposition",
+      "choice": "replacement",
+      "rationale": "Every client-visible route is mapped to a collection call, a typed route, or recorded as retired, with the Rails envelope preserved behind typed routes.",
+      "artifact": "replacements/routes.md"
+    },
+    {
+      "id": "schema.trigger.posts_count_after_club_change",
+      "choice": "hook",
+      "rationale": "Counter maintenance moves into an application hook, so the value is kept by code that ships with the application rather than by DDL nobody reads.",
+      "artifact": "replacements/posts-count-trigger.md"
+    },
+    {
+      "id": "schema.trigger.posts_count_after_delete",
+      "choice": "hook",
+      "rationale": "Counter maintenance moves into an application hook, so the value is kept by code that ships with the application rather than by DDL nobody reads.",
+      "artifact": "replacements/posts-count-trigger.md"
+    },
+    {
+      "id": "schema.trigger.posts_count_after_insert",
+      "choice": "hook",
+      "rationale": "Counter maintenance moves into an application hook, so the value is kept by code that ships with the application rather than by DDL nobody reads.",
+      "artifact": "replacements/posts-count-trigger.md"
+    },
+    {
+      "id": "schema.view.published_post_counts",
+      "choice": "route",
+      "rationale": "Aggregation moves to a typed read route; the target has no database view.",
+      "artifact": "replacements/published-post-counts.md"
+    },
+    {
+      "id": "table.clubs.rules",
+      "choice": "expression",
+      "rationale": "Owner-scoped where the row has an owner, authenticated otherwise. `users.create` is deliberately @public so anonymous signup keeps working, and is recorded in security/public-rules.json.",
+      "artifact": "list = @request.auth.id != ''\nview = @request.auth.id != ''\ncreate = @request.auth.id != ''\nupdate = @request.auth.id = owner\ndelete = @request.auth.id = owner"
+    },
+    {
+      "id": "table.comments.rules",
+      "choice": "expression",
+      "rationale": "Owner-scoped where the row has an owner, authenticated otherwise. `users.create` is deliberately @public so anonymous signup keeps working, and is recorded in security/public-rules.json.",
+      "artifact": "list = @request.auth.id != ''\nview = @request.auth.id != ''\ncreate = @request.auth.id != ''\nupdate = @request.auth.id = author\ndelete = @request.auth.id = author"
+    },
+    {
+      "id": "table.events.rules",
+      "choice": "expression",
+      "rationale": "Owner-scoped where the row has an owner, authenticated otherwise. `users.create` is deliberately @public so anonymous signup keeps working, and is recorded in security/public-rules.json.",
+      "artifact": "list = @request.auth.id != ''\nview = @request.auth.id != ''\ncreate = @request.auth.id != ''\nupdate = @request.auth.id != ''\ndelete = @request.auth.id != ''"
+    },
+    {
+      "id": "table.flags.rules",
+      "choice": "expression",
+      "rationale": "Owner-scoped where the row has an owner, authenticated otherwise. `users.create` is deliberately @public so anonymous signup keeps working, and is recorded in security/public-rules.json.",
+      "artifact": "list = @request.auth.id = reporter\nview = @request.auth.id = reporter\ncreate = @request.auth.id != ''\nupdate = @request.auth.id = reporter\ndelete = @request.auth.id = reporter"
+    },
+    {
+      "id": "table.memberships.rules",
+      "choice": "expression",
+      "rationale": "Owner-scoped where the row has an owner, authenticated otherwise. `users.create` is deliberately @public so anonymous signup keeps working, and is recorded in security/public-rules.json.",
+      "artifact": "list = @request.auth.id != ''\nview = @request.auth.id != ''\ncreate = @request.auth.id != ''\nupdate = @request.auth.id = user\ndelete = @request.auth.id = user"
+    },
+    {
+      "id": "table.notifications.rules",
+      "choice": "expression",
+      "rationale": "Owner-scoped where the row has an owner, authenticated otherwise. `users.create` is deliberately @public so anonymous signup keeps working, and is recorded in security/public-rules.json.",
+      "artifact": "list = @request.auth.id = user\nview = @request.auth.id = user\ncreate = @request.auth.id != ''\nupdate = @request.auth.id = user\ndelete = @request.auth.id = user"
+    },
+    {
+      "id": "table.posts.rules",
+      "choice": "expression",
+      "rationale": "Owner-scoped where the row has an owner, authenticated otherwise. `users.create` is deliberately @public so anonymous signup keeps working, and is recorded in security/public-rules.json.",
+      "artifact": "list = @request.auth.id != ''\nview = @request.auth.id != ''\ncreate = @request.auth.id != ''\nupdate = @request.auth.id = author\ndelete = @request.auth.id = author"
+    },
+    {
+      "id": "table.users.rules",
+      "choice": "expression",
+      "rationale": "Owner-scoped where the row has an owner, authenticated otherwise. `users.create` is deliberately @public so anonymous signup keeps working, and is recorded in security/public-rules.json.",
+      "artifact": "list = @request.auth.id != ''\nview = @request.auth.id != ''\ncreate = @public\nupdate = @request.auth.id = id\ndelete = @request.auth.id = id"
+    },
+    {
+      "id": "validator.Post.body.presence",
+      "choice": "hook",
+      "rationale": "The presence check is guarded by `published?`, so it is state-dependent and belongs in a before-write hook rather than a field constraint. Allow and deny tests cover both sides of the guard.",
+      "artifact": "replacements/validations.md"
+    }
+  ]
+}

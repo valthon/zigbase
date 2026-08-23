@@ -1,0 +1,65 @@
+{
+  "outputs": [
+    {
+      "bytes": 920,
+      "path": "auth/users.ndjson",
+      "sha256": "80f3b320666e8d78cac20bdc77e641181a9130fd64d13b9af9c3ae968d8a4b68"
+    },
+    {
+      "bytes": 608,
+      "path": "data/clubs.ndjson",
+      "sha256": "3f6e3c128144f8aac179c440c9bb2af7d64aca3052a6b9f6744ea5e2afd97f30"
+    },
+    {
+      "bytes": 410,
+      "path": "data/comments.ndjson",
+      "sha256": "2d9bf330c1192c6a85784dc2d1feeedf7f5bbd99bf8ca5a8c7b223496a5bba4d"
+    },
+    {
+      "bytes": 631,
+      "path": "data/events.ndjson",
+      "sha256": "cdae15a91ea36d891329ee2729dbe7097bb92f87ae6ca5daa820bc537c7add8b"
+    },
+    {
+      "bytes": 306,
+      "path": "data/flags.ndjson",
+      "sha256": "3cb90da21d55db7759ad5af9bb4eafa720440ffbff5a1b5089e1e363fa1e3663"
+    },
+    {
+      "bytes": 601,
+      "path": "data/memberships.ndjson",
+      "sha256": "3f3c64e9d7f948456150f43777561be751bf1d376f2d109e38fd0d3268a59d79"
+    },
+    {
+      "bytes": 150,
+      "path": "data/notifications.ndjson",
+      "sha256": "0880bdcb2feb75b8b4d9e2f02384da9ad25b06238c0caa5614bfcf6114335797"
+    },
+    {
+      "bytes": 998,
+      "path": "data/posts.ndjson",
+      "sha256": "29455889058582d3dabc0bd60d40ee030371996604eef6f8925d97aaccbeb225"
+    },
+    {
+      "bytes": 474,
+      "path": "files/manifest.json",
+      "sha256": "9174f6e95fca466f5e81d98034aea2d78a1562474d1fd0714fc84a737d6187ee"
+    },
+    {
+      "bytes": 624,
+      "path": "manifest.json",
+      "sha256": "5ce9f8d6c06d9a20765c9baaa438a72a1c0c6cd79cb6c4dffb9bc11f086489e8"
+    },
+    {
+      "bytes": 1547,
+      "path": "report.json",
+      "sha256": "8f7d9ebfd0549016c0c70d81ef8cc071348b52c2bf6c6d8541a3853f57bc81e3"
+    },
+    {
+      "bytes": 12801,
+      "path": "schema.json",
+      "sha256": "98fd0a6ffe4b7cc1057b465c72271cd3805ee051d5fc5b2c239cf2f8c7cbdadb"
+    }
+  ],
+  "zigbaseRailsHashes": 1
+}

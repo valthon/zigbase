@@ -1,0 +1,1347 @@
+{
+  "action_text": {
+    "loaded": true,
+    "models_with_rich_text": [],
+    "row_count": null,
+    "source": "observed",
+    "table": "action_text_rich_texts",
+    "table_exists": false
+  },
+  "count": 10,
+  "framework_models": [
+    {
+      "name": "ActionMailbox::InboundEmail",
+      "source": "observed",
+      "table_name": "action_mailbox_inbound_emails"
+    },
+    {
+      "name": "ActionText::EncryptedRichText",
+      "source": "observed",
+      "table_name": "action_text_rich_texts"
+    },
+    {
+      "name": "ActionText::RichText",
+      "source": "observed",
+      "table_name": "action_text_rich_texts"
+    },
+    {
+      "name": "ActiveStorage::Attachment",
+      "source": "observed",
+      "table_name": "active_storage_attachments"
+    },
+    {
+      "name": "ActiveStorage::Blob",
+      "source": "observed",
+      "table_name": "active_storage_blobs"
+    },
+    {
+      "name": "ActiveStorage::VariantRecord",
+      "source": "observed",
+      "table_name": "active_storage_variant_records"
+    }
+  ],
+  "models": [
+    {
+      "abstract": false,
+      "associations": [
+        {
+          "as": null,
+          "class_name": "Event",
+          "dependent": "destroy",
+          "foreign_key": "club_id",
+          "foreign_type": null,
+          "inverse_of": null,
+          "macro": "has_many",
+          "name": "events",
+          "polymorphic": false,
+          "source": "observed",
+          "source_reflection": null,
+          "table_name": "events",
+          "through": null
+        },
+        {
+          "as": null,
+          "class_name": "User",
+          "dependent": null,
+          "foreign_key": "user_id",
+          "foreign_type": null,
+          "inverse_of": null,
+          "macro": "has_many",
+          "name": "members",
+          "polymorphic": false,
+          "source": "observed",
+          "source_reflection": "user",
+          "table_name": "users",
+          "through": "memberships"
+        },
+        {
+          "as": null,
+          "class_name": "Membership",
+          "dependent": "destroy",
+          "foreign_key": "club_id",
+          "foreign_type": null,
+          "inverse_of": null,
+          "macro": "has_many",
+          "name": "memberships",
+          "polymorphic": false,
+          "source": "observed",
+          "source_reflection": null,
+          "table_name": "memberships",
+          "through": null
+        },
+        {
+          "as": null,
+          "class_name": "User",
+          "dependent": null,
+          "foreign_key": "owner_id",
+          "foreign_type": null,
+          "inverse_of": "owned_clubs",
+          "macro": "belongs_to",
+          "name": "owner",
+          "polymorphic": false,
+          "source": "observed",
+          "source_reflection": null,
+          "table_name": "users",
+          "through": null
+        },
+        {
+          "as": null,
+          "class_name": "Post",
+          "dependent": "destroy",
+          "foreign_key": "club_id",
+          "foreign_type": null,
+          "inverse_of": null,
+          "macro": "has_many",
+          "name": "posts",
+          "polymorphic": false,
+          "source": "observed",
+          "source_reflection": null,
+          "table_name": "posts",
+          "through": null
+        }
+      ],
+      "attachments": [],
+      "default_scope": {
+        "count": 1,
+        "present": true,
+        "scoped_sql": "SELECT \"clubs\".* FROM \"clubs\" WHERE \"clubs\".\"archived_at\" IS NULL",
+        "source": "observed",
+        "unscoped_sql": "SELECT \"clubs\".* FROM \"clubs\""
+      },
+      "encrypted_attributes": [],
+      "enums": {
+        "visibility": {
+          "backing_type": "string",
+          "source": "observed",
+          "values": {
+            "private_club": "private_club",
+            "public_club": "public_club"
+          }
+        }
+      },
+      "name": "Club",
+      "primary_key": "id",
+      "record_timestamps": true,
+      "rich_texts": [],
+      "serialized_attributes": [],
+      "source": "observed",
+      "sti": {
+        "base_class": "Club",
+        "enabled": false,
+        "inheritance_column": "type",
+        "is_base_class": true,
+        "subclasses": []
+      },
+      "table_name": "clubs",
+      "validators": [
+        {
+          "attribute": "name",
+          "class": "ActiveRecord::Validations::LengthValidator",
+          "kind": "length",
+          "options": {
+            "maximum": 80
+          },
+          "source": "observed"
+        },
+        {
+          "attribute": "name",
+          "class": "ActiveRecord::Validations::PresenceValidator",
+          "kind": "presence",
+          "options": {},
+          "source": "observed"
+        },
+        {
+          "attribute": "owner",
+          "class": "ActiveRecord::Validations::PresenceValidator",
+          "kind": "presence",
+          "options": {
+            "if": {
+              "arity": 1,
+              "type": "proc"
+            },
+            "message": "required"
+          },
+          "source": "observed"
+        },
+        {
+          "attribute": "slug",
+          "class": "ActiveModel::Validations::FormatValidator",
+          "kind": "format",
+          "options": {
+            "message": "must be lowercase dash-case",
+            "with": {
+              "options": 0,
+              "source": "\\A[a-z0-9]+(?:-[a-z0-9]+)*\\z",
+              "type": "regexp"
+            }
+          },
+          "source": "observed"
+        },
+        {
+          "attribute": "slug",
+          "class": "ActiveRecord::Validations::PresenceValidator",
+          "kind": "presence",
+          "options": {},
+          "source": "observed"
+        },
+        {
+          "attribute": "slug",
+          "class": "ActiveRecord::Validations::UniquenessValidator",
+          "kind": "uniqueness",
+          "options": {},
+          "source": "observed"
+        },
+        {
+          "attribute": "visibility",
+          "class": "ActiveModel::Validations::InclusionValidator",
+          "kind": "inclusion",
+          "options": {
+            "in": [
+              "public_club",
+              "private_club"
+            ]
+          },
+          "source": "observed"
+        }
+      ]
+    },
+    {
+      "abstract": false,
+      "associations": [
+        {
+          "as": null,
+          "class_name": "User",
+          "dependent": null,
+          "foreign_key": "author_id",
+          "foreign_type": null,
+          "inverse_of": "comments",
+          "macro": "belongs_to",
+          "name": "author",
+          "polymorphic": false,
+          "source": "observed",
+          "source_reflection": null,
+          "table_name": "users",
+          "through": null
+        },
+        {
+          "as": "flaggable",
+          "class_name": "Flag",
+          "dependent": "destroy",
+          "foreign_key": "flaggable_id",
+          "foreign_type": null,
+          "inverse_of": null,
+          "macro": "has_many",
+          "name": "flags",
+          "polymorphic": false,
+          "source": "observed",
+          "source_reflection": null,
+          "table_name": "flags",
+          "through": null
+        },
+        {
+          "as": null,
+          "class_name": "Post",
+          "dependent": null,
+          "foreign_key": "post_id",
+          "foreign_type": null,
+          "inverse_of": null,
+          "macro": "belongs_to",
+          "name": "post",
+          "polymorphic": false,
+          "source": "observed",
+          "source_reflection": null,
+          "table_name": "posts",
+          "through": null
+        }
+      ],
+      "attachments": [],
+      "default_scope": {
+        "count": 0,
+        "present": false,
+        "source": "observed"
+      },
+      "encrypted_attributes": [],
+      "enums": {},
+      "name": "Comment",
+      "primary_key": "id",
+      "record_timestamps": true,
+      "rich_texts": [],
+      "serialized_attributes": [],
+      "source": "observed",
+      "sti": {
+        "base_class": "Comment",
+        "enabled": false,
+        "inheritance_column": "type",
+        "is_base_class": true,
+        "subclasses": []
+      },
+      "table_name": "comments",
+      "validators": [
+        {
+          "attribute": "author",
+          "class": "ActiveRecord::Validations::PresenceValidator",
+          "kind": "presence",
+          "options": {
+            "if": {
+              "arity": 1,
+              "type": "proc"
+            },
+            "message": "required"
+          },
+          "source": "observed"
+        },
+        {
+          "attribute": "body",
+          "class": "ActiveRecord::Validations::LengthValidator",
+          "kind": "length",
+          "options": {
+            "maximum": 2000
+          },
+          "source": "observed"
+        },
+        {
+          "attribute": "body",
+          "class": "ActiveRecord::Validations::PresenceValidator",
+          "kind": "presence",
+          "options": {},
+          "source": "observed"
+        },
+        {
+          "attribute": "post",
+          "class": "ActiveRecord::Validations::PresenceValidator",
+          "kind": "presence",
+          "options": {
+            "if": {
+              "arity": 1,
+              "type": "proc"
+            },
+            "message": "required"
+          },
+          "source": "observed"
+        }
+      ]
+    },
+    {
+      "abstract": false,
+      "associations": [
+        {
+          "as": null,
+          "class_name": "Club",
+          "dependent": null,
+          "foreign_key": "club_id",
+          "foreign_type": null,
+          "inverse_of": null,
+          "macro": "belongs_to",
+          "name": "club",
+          "polymorphic": false,
+          "source": "observed",
+          "source_reflection": null,
+          "table_name": "clubs",
+          "through": null
+        }
+      ],
+      "attachments": [],
+      "default_scope": {
+        "count": 0,
+        "present": false,
+        "source": "observed"
+      },
+      "encrypted_attributes": [],
+      "enums": {},
+      "name": "Event",
+      "primary_key": "id",
+      "record_timestamps": true,
+      "rich_texts": [],
+      "serialized_attributes": [],
+      "source": "observed",
+      "sti": {
+        "base_class": "Event",
+        "enabled": true,
+        "inheritance_column": "type",
+        "is_base_class": true,
+        "subclasses": [
+          "MeetingEvent",
+          "ReadingEvent"
+        ]
+      },
+      "table_name": "events",
+      "validators": [
+        {
+          "attribute": "club",
+          "class": "ActiveRecord::Validations::PresenceValidator",
+          "kind": "presence",
+          "options": {
+            "if": {
+              "arity": 1,
+              "type": "proc"
+            },
+            "message": "required"
+          },
+          "source": "observed"
+        },
+        {
+          "attribute": "starts_at",
+          "class": "ActiveRecord::Validations::PresenceValidator",
+          "kind": "presence",
+          "options": {},
+          "source": "observed"
+        },
+        {
+          "attribute": "title",
+          "class": "ActiveRecord::Validations::LengthValidator",
+          "kind": "length",
+          "options": {
+            "maximum": 120
+          },
+          "source": "observed"
+        },
+        {
+          "attribute": "title",
+          "class": "ActiveRecord::Validations::PresenceValidator",
+          "kind": "presence",
+          "options": {},
+          "source": "observed"
+        }
+      ]
+    },
+    {
+      "abstract": false,
+      "associations": [
+        {
+          "as": null,
+          "class_name": null,
+          "dependent": null,
+          "foreign_key": "flaggable_id",
+          "foreign_type": "flaggable_type",
+          "inverse_of": null,
+          "macro": "belongs_to",
+          "name": "flaggable",
+          "polymorphic": true,
+          "source": "observed",
+          "source_reflection": null,
+          "table_name": null,
+          "through": null
+        },
+        {
+          "as": null,
+          "class_name": "User",
+          "dependent": null,
+          "foreign_key": "reporter_id",
+          "foreign_type": null,
+          "inverse_of": "reported_flags",
+          "macro": "belongs_to",
+          "name": "reporter",
+          "polymorphic": false,
+          "source": "observed",
+          "source_reflection": null,
+          "table_name": "users",
+          "through": null
+        }
+      ],
+      "attachments": [],
+      "default_scope": {
+        "count": 0,
+        "present": false,
+        "source": "observed"
+      },
+      "encrypted_attributes": [],
+      "enums": {},
+      "name": "Flag",
+      "primary_key": "id",
+      "record_timestamps": true,
+      "rich_texts": [],
+      "serialized_attributes": [],
+      "source": "observed",
+      "sti": {
+        "base_class": "Flag",
+        "enabled": false,
+        "inheritance_column": "type",
+        "is_base_class": true,
+        "subclasses": []
+      },
+      "table_name": "flags",
+      "validators": [
+        {
+          "attribute": "flaggable",
+          "class": "ActiveRecord::Validations::PresenceValidator",
+          "kind": "presence",
+          "options": {
+            "if": {
+              "arity": 1,
+              "type": "proc"
+            },
+            "message": "required"
+          },
+          "source": "observed"
+        },
+        {
+          "attribute": "flaggable_type",
+          "class": "ActiveModel::Validations::InclusionValidator",
+          "kind": "inclusion",
+          "options": {
+            "in": [
+              "Post",
+              "Comment"
+            ]
+          },
+          "source": "observed"
+        },
+        {
+          "attribute": "reason",
+          "class": "ActiveRecord::Validations::LengthValidator",
+          "kind": "length",
+          "options": {
+            "maximum": 200
+          },
+          "source": "observed"
+        },
+        {
+          "attribute": "reason",
+          "class": "ActiveRecord::Validations::PresenceValidator",
+          "kind": "presence",
+          "options": {},
+          "source": "observed"
+        },
+        {
+          "attribute": "reporter",
+          "class": "ActiveRecord::Validations::PresenceValidator",
+          "kind": "presence",
+          "options": {
+            "if": {
+              "arity": 1,
+              "type": "proc"
+            },
+            "message": "required"
+          },
+          "source": "observed"
+        }
+      ]
+    },
+    {
+      "abstract": false,
+      "associations": [
+        {
+          "as": null,
+          "class_name": "Club",
+          "dependent": null,
+          "foreign_key": "club_id",
+          "foreign_type": null,
+          "inverse_of": null,
+          "macro": "belongs_to",
+          "name": "club",
+          "polymorphic": false,
+          "source": "observed",
+          "source_reflection": null,
+          "table_name": "clubs",
+          "through": null
+        }
+      ],
+      "attachments": [],
+      "default_scope": {
+        "count": 0,
+        "present": false,
+        "source": "observed"
+      },
+      "encrypted_attributes": [],
+      "enums": {},
+      "name": "MeetingEvent",
+      "primary_key": "id",
+      "record_timestamps": true,
+      "rich_texts": [],
+      "serialized_attributes": [],
+      "source": "observed",
+      "sti": {
+        "base_class": "Event",
+        "enabled": true,
+        "inheritance_column": "type",
+        "is_base_class": false,
+        "subclasses": [
+          "MeetingEvent",
+          "ReadingEvent"
+        ]
+      },
+      "table_name": "events",
+      "validators": [
+        {
+          "attribute": "club",
+          "class": "ActiveRecord::Validations::PresenceValidator",
+          "kind": "presence",
+          "options": {
+            "if": {
+              "arity": 1,
+              "type": "proc"
+            },
+            "message": "required"
+          },
+          "source": "observed"
+        },
+        {
+          "attribute": "location",
+          "class": "ActiveRecord::Validations::PresenceValidator",
+          "kind": "presence",
+          "options": {},
+          "source": "observed"
+        },
+        {
+          "attribute": "starts_at",
+          "class": "ActiveRecord::Validations::PresenceValidator",
+          "kind": "presence",
+          "options": {},
+          "source": "observed"
+        },
+        {
+          "attribute": "title",
+          "class": "ActiveRecord::Validations::LengthValidator",
+          "kind": "length",
+          "options": {
+            "maximum": 120
+          },
+          "source": "observed"
+        },
+        {
+          "attribute": "title",
+          "class": "ActiveRecord::Validations::PresenceValidator",
+          "kind": "presence",
+          "options": {},
+          "source": "observed"
+        }
+      ]
+    },
+    {
+      "abstract": false,
+      "associations": [
+        {
+          "as": null,
+          "class_name": "Club",
+          "dependent": null,
+          "foreign_key": "club_id",
+          "foreign_type": null,
+          "inverse_of": null,
+          "macro": "belongs_to",
+          "name": "club",
+          "polymorphic": false,
+          "source": "observed",
+          "source_reflection": null,
+          "table_name": "clubs",
+          "through": null
+        },
+        {
+          "as": null,
+          "class_name": "User",
+          "dependent": null,
+          "foreign_key": "user_id",
+          "foreign_type": null,
+          "inverse_of": null,
+          "macro": "belongs_to",
+          "name": "user",
+          "polymorphic": false,
+          "source": "observed",
+          "source_reflection": null,
+          "table_name": "users",
+          "through": null
+        }
+      ],
+      "attachments": [],
+      "default_scope": {
+        "count": 0,
+        "present": false,
+        "source": "observed"
+      },
+      "encrypted_attributes": [],
+      "enums": {
+        "role": {
+          "backing_type": "integer",
+          "source": "observed",
+          "values": {
+            "curator": 1,
+            "reader": 0
+          }
+        }
+      },
+      "name": "Membership",
+      "primary_key": "id",
+      "record_timestamps": true,
+      "rich_texts": [],
+      "serialized_attributes": [],
+      "source": "observed",
+      "sti": {
+        "base_class": "Membership",
+        "enabled": false,
+        "inheritance_column": "type",
+        "is_base_class": true,
+        "subclasses": []
+      },
+      "table_name": "memberships",
+      "validators": [
+        {
+          "attribute": "club",
+          "class": "ActiveRecord::Validations::PresenceValidator",
+          "kind": "presence",
+          "options": {
+            "if": {
+              "arity": 1,
+              "type": "proc"
+            },
+            "message": "required"
+          },
+          "source": "observed"
+        },
+        {
+          "attribute": "joined_at",
+          "class": "ActiveRecord::Validations::PresenceValidator",
+          "kind": "presence",
+          "options": {},
+          "source": "observed"
+        },
+        {
+          "attribute": "role",
+          "class": "ActiveModel::Validations::InclusionValidator",
+          "kind": "inclusion",
+          "options": {
+            "in": [
+              "reader",
+              "curator"
+            ]
+          },
+          "source": "observed"
+        },
+        {
+          "attribute": "user",
+          "class": "ActiveRecord::Validations::PresenceValidator",
+          "kind": "presence",
+          "options": {
+            "if": {
+              "arity": 1,
+              "type": "proc"
+            },
+            "message": "required"
+          },
+          "source": "observed"
+        },
+        {
+          "attribute": "user_id",
+          "class": "ActiveRecord::Validations::UniquenessValidator",
+          "kind": "uniqueness",
+          "options": {
+            "message": "is already a member of this club",
+            "scope": "club_id"
+          },
+          "source": "observed"
+        }
+      ]
+    },
+    {
+      "abstract": false,
+      "associations": [
+        {
+          "as": null,
+          "class_name": "User",
+          "dependent": null,
+          "foreign_key": "user_id",
+          "foreign_type": null,
+          "inverse_of": null,
+          "macro": "belongs_to",
+          "name": "user",
+          "polymorphic": false,
+          "source": "observed",
+          "source_reflection": null,
+          "table_name": "users",
+          "through": null
+        }
+      ],
+      "attachments": [],
+      "default_scope": {
+        "count": 0,
+        "present": false,
+        "source": "observed"
+      },
+      "encrypted_attributes": [],
+      "enums": {},
+      "name": "Notification",
+      "primary_key": "id",
+      "record_timestamps": false,
+      "rich_texts": [],
+      "serialized_attributes": [
+        {
+          "attribute": "payload",
+          "coder": "ActiveRecord::Coders::ColumnSerializer",
+          "source": "observed"
+        }
+      ],
+      "source": "observed",
+      "sti": {
+        "base_class": "Notification",
+        "enabled": false,
+        "inheritance_column": "type",
+        "is_base_class": true,
+        "subclasses": []
+      },
+      "table_name": "notifications",
+      "validators": [
+        {
+          "attribute": "kind",
+          "class": "ActiveRecord::Validations::PresenceValidator",
+          "kind": "presence",
+          "options": {},
+          "source": "observed"
+        },
+        {
+          "attribute": "user",
+          "class": "ActiveRecord::Validations::PresenceValidator",
+          "kind": "presence",
+          "options": {
+            "if": {
+              "arity": 1,
+              "type": "proc"
+            },
+            "message": "required"
+          },
+          "source": "observed"
+        }
+      ]
+    },
+    {
+      "abstract": false,
+      "associations": [
+        {
+          "as": null,
+          "class_name": "User",
+          "dependent": null,
+          "foreign_key": "author_id",
+          "foreign_type": null,
+          "inverse_of": "posts",
+          "macro": "belongs_to",
+          "name": "author",
+          "polymorphic": false,
+          "source": "observed",
+          "source_reflection": null,
+          "table_name": "users",
+          "through": null
+        },
+        {
+          "as": null,
+          "class_name": "Club",
+          "dependent": null,
+          "foreign_key": "club_id",
+          "foreign_type": null,
+          "inverse_of": null,
+          "macro": "belongs_to",
+          "name": "club",
+          "polymorphic": false,
+          "source": "observed",
+          "source_reflection": null,
+          "table_name": "clubs",
+          "through": null
+        },
+        {
+          "as": null,
+          "class_name": "Comment",
+          "dependent": "destroy",
+          "foreign_key": "post_id",
+          "foreign_type": null,
+          "inverse_of": null,
+          "macro": "has_many",
+          "name": "comments",
+          "polymorphic": false,
+          "source": "observed",
+          "source_reflection": null,
+          "table_name": "comments",
+          "through": null
+        },
+        {
+          "as": "record",
+          "class_name": "ActiveStorage::Attachment",
+          "dependent": "destroy",
+          "foreign_key": "record_id",
+          "foreign_type": null,
+          "inverse_of": "record",
+          "macro": "has_one",
+          "name": "cover_attachment",
+          "polymorphic": false,
+          "source": "observed",
+          "source_reflection": null,
+          "table_name": "active_storage_attachments",
+          "through": null
+        },
+        {
+          "as": null,
+          "class_name": "ActiveStorage::Blob",
+          "dependent": null,
+          "foreign_key": "blob_id",
+          "foreign_type": null,
+          "inverse_of": null,
+          "macro": "has_one",
+          "name": "cover_blob",
+          "polymorphic": false,
+          "source": "observed",
+          "source_reflection": "blob",
+          "table_name": "active_storage_blobs",
+          "through": "cover_attachment"
+        },
+        {
+          "as": "flaggable",
+          "class_name": "Flag",
+          "dependent": "destroy",
+          "foreign_key": "flaggable_id",
+          "foreign_type": null,
+          "inverse_of": null,
+          "macro": "has_many",
+          "name": "flags",
+          "polymorphic": false,
+          "source": "observed",
+          "source_reflection": null,
+          "table_name": "flags",
+          "through": null
+        }
+      ],
+      "attachments": [
+        {
+          "macro": "has_one_attached",
+          "name": "cover",
+          "source": "observed",
+          "variants": []
+        }
+      ],
+      "default_scope": {
+        "count": 0,
+        "present": false,
+        "source": "observed"
+      },
+      "encrypted_attributes": [],
+      "enums": {
+        "status": {
+          "backing_type": "string",
+          "source": "observed",
+          "values": {
+            "archived": "archived",
+            "draft": "draft",
+            "published": "published"
+          }
+        }
+      },
+      "name": "Post",
+      "primary_key": "id",
+      "record_timestamps": true,
+      "rich_texts": [],
+      "serialized_attributes": [],
+      "source": "observed",
+      "sti": {
+        "base_class": "Post",
+        "enabled": false,
+        "inheritance_column": "type",
+        "is_base_class": true,
+        "subclasses": []
+      },
+      "table_name": "posts",
+      "validators": [
+        {
+          "attribute": "author",
+          "class": "ActiveRecord::Validations::PresenceValidator",
+          "kind": "presence",
+          "options": {
+            "if": {
+              "arity": 1,
+              "type": "proc"
+            },
+            "message": "required"
+          },
+          "source": "observed"
+        },
+        {
+          "attribute": "body",
+          "class": "ActiveRecord::Validations::PresenceValidator",
+          "kind": "presence",
+          "options": {
+            "if": "published?"
+          },
+          "source": "observed"
+        },
+        {
+          "attribute": "club",
+          "class": "ActiveRecord::Validations::PresenceValidator",
+          "kind": "presence",
+          "options": {
+            "if": {
+              "arity": 1,
+              "type": "proc"
+            },
+            "message": "required"
+          },
+          "source": "observed"
+        },
+        {
+          "attribute": "status",
+          "class": "ActiveModel::Validations::InclusionValidator",
+          "kind": "inclusion",
+          "options": {
+            "in": [
+              "draft",
+              "published",
+              "archived"
+            ]
+          },
+          "source": "observed"
+        },
+        {
+          "attribute": "title",
+          "class": "ActiveRecord::Validations::LengthValidator",
+          "kind": "length",
+          "options": {
+            "maximum": 120,
+            "minimum": 3
+          },
+          "source": "observed"
+        },
+        {
+          "attribute": "title",
+          "class": "ActiveRecord::Validations::PresenceValidator",
+          "kind": "presence",
+          "options": {},
+          "source": "observed"
+        }
+      ]
+    },
+    {
+      "abstract": false,
+      "associations": [
+        {
+          "as": null,
+          "class_name": "Club",
+          "dependent": null,
+          "foreign_key": "club_id",
+          "foreign_type": null,
+          "inverse_of": null,
+          "macro": "belongs_to",
+          "name": "club",
+          "polymorphic": false,
+          "source": "observed",
+          "source_reflection": null,
+          "table_name": "clubs",
+          "through": null
+        }
+      ],
+      "attachments": [],
+      "default_scope": {
+        "count": 0,
+        "present": false,
+        "source": "observed"
+      },
+      "encrypted_attributes": [],
+      "enums": {},
+      "name": "ReadingEvent",
+      "primary_key": "id",
+      "record_timestamps": true,
+      "rich_texts": [],
+      "serialized_attributes": [],
+      "source": "observed",
+      "sti": {
+        "base_class": "Event",
+        "enabled": true,
+        "inheritance_column": "type",
+        "is_base_class": false,
+        "subclasses": [
+          "MeetingEvent",
+          "ReadingEvent"
+        ]
+      },
+      "table_name": "events",
+      "validators": [
+        {
+          "attribute": "club",
+          "class": "ActiveRecord::Validations::PresenceValidator",
+          "kind": "presence",
+          "options": {
+            "if": {
+              "arity": 1,
+              "type": "proc"
+            },
+            "message": "required"
+          },
+          "source": "observed"
+        },
+        {
+          "attribute": "pages_target",
+          "class": "ActiveRecord::Validations::NumericalityValidator",
+          "kind": "numericality",
+          "options": {
+            "greater_than": 0,
+            "only_integer": true
+          },
+          "source": "observed"
+        },
+        {
+          "attribute": "pages_target",
+          "class": "ActiveRecord::Validations::PresenceValidator",
+          "kind": "presence",
+          "options": {},
+          "source": "observed"
+        },
+        {
+          "attribute": "starts_at",
+          "class": "ActiveRecord::Validations::PresenceValidator",
+          "kind": "presence",
+          "options": {},
+          "source": "observed"
+        },
+        {
+          "attribute": "title",
+          "class": "ActiveRecord::Validations::LengthValidator",
+          "kind": "length",
+          "options": {
+            "maximum": 120
+          },
+          "source": "observed"
+        },
+        {
+          "attribute": "title",
+          "class": "ActiveRecord::Validations::PresenceValidator",
+          "kind": "presence",
+          "options": {},
+          "source": "observed"
+        }
+      ]
+    },
+    {
+      "abstract": false,
+      "associations": [
+        {
+          "as": null,
+          "class_name": "Club",
+          "dependent": null,
+          "foreign_key": "club_id",
+          "foreign_type": null,
+          "inverse_of": null,
+          "macro": "has_many",
+          "name": "clubs",
+          "polymorphic": false,
+          "source": "observed",
+          "source_reflection": "clubs",
+          "table_name": "clubs",
+          "through": "memberships"
+        },
+        {
+          "as": null,
+          "class_name": "Comment",
+          "dependent": "destroy",
+          "foreign_key": "author_id",
+          "foreign_type": null,
+          "inverse_of": "author",
+          "macro": "has_many",
+          "name": "comments",
+          "polymorphic": false,
+          "source": "observed",
+          "source_reflection": null,
+          "table_name": "comments",
+          "through": null
+        },
+        {
+          "as": null,
+          "class_name": "Membership",
+          "dependent": "destroy",
+          "foreign_key": "user_id",
+          "foreign_type": null,
+          "inverse_of": null,
+          "macro": "has_many",
+          "name": "memberships",
+          "polymorphic": false,
+          "source": "observed",
+          "source_reflection": null,
+          "table_name": "memberships",
+          "through": null
+        },
+        {
+          "as": null,
+          "class_name": "Notification",
+          "dependent": "destroy",
+          "foreign_key": "user_id",
+          "foreign_type": null,
+          "inverse_of": null,
+          "macro": "has_many",
+          "name": "notifications",
+          "polymorphic": false,
+          "source": "observed",
+          "source_reflection": null,
+          "table_name": "notifications",
+          "through": null
+        },
+        {
+          "as": null,
+          "class_name": "Club",
+          "dependent": "restrict_with_exception",
+          "foreign_key": "owner_id",
+          "foreign_type": null,
+          "inverse_of": "owner",
+          "macro": "has_many",
+          "name": "owned_clubs",
+          "polymorphic": false,
+          "source": "observed",
+          "source_reflection": null,
+          "table_name": "clubs",
+          "through": null
+        },
+        {
+          "as": null,
+          "class_name": "Post",
+          "dependent": "destroy",
+          "foreign_key": "author_id",
+          "foreign_type": null,
+          "inverse_of": "author",
+          "macro": "has_many",
+          "name": "posts",
+          "polymorphic": false,
+          "source": "observed",
+          "source_reflection": null,
+          "table_name": "posts",
+          "through": null
+        },
+        {
+          "as": null,
+          "class_name": "Flag",
+          "dependent": "destroy",
+          "foreign_key": "reporter_id",
+          "foreign_type": null,
+          "inverse_of": "reporter",
+          "macro": "has_many",
+          "name": "reported_flags",
+          "polymorphic": false,
+          "source": "observed",
+          "source_reflection": null,
+          "table_name": "flags",
+          "through": null
+        }
+      ],
+      "attachments": [],
+      "default_scope": {
+        "count": 0,
+        "present": false,
+        "source": "observed"
+      },
+      "encrypted_attributes": [
+        {
+          "attribute": "phone",
+          "deterministic": true,
+          "downcase": false,
+          "source": "observed"
+        }
+      ],
+      "enums": {
+        "role": {
+          "backing_type": "integer",
+          "source": "observed",
+          "values": {
+            "admin": 2,
+            "member": 0,
+            "moderator": 1
+          }
+        }
+      },
+      "name": "User",
+      "primary_key": "id",
+      "record_timestamps": true,
+      "rich_texts": [],
+      "serialized_attributes": [],
+      "source": "observed",
+      "sti": {
+        "base_class": "User",
+        "enabled": false,
+        "inheritance_column": "type",
+        "is_base_class": true,
+        "subclasses": []
+      },
+      "table_name": "users",
+      "validators": [
+        {
+          "attribute": "display_name",
+          "class": "ActiveRecord::Validations::LengthValidator",
+          "kind": "length",
+          "options": {
+            "maximum": 40,
+            "minimum": 2
+          },
+          "source": "observed"
+        },
+        {
+          "attribute": "display_name",
+          "class": "ActiveRecord::Validations::PresenceValidator",
+          "kind": "presence",
+          "options": {},
+          "source": "observed"
+        },
+        {
+          "attribute": "email",
+          "class": "ActiveModel::Validations::FormatValidator",
+          "kind": "format",
+          "options": {
+            "message": "must be a valid email address",
+            "with": {
+              "options": 0,
+              "source": "\\A[^@\\s]+@[^@\\s]+\\.[^@\\s]+\\z",
+              "type": "regexp"
+            }
+          },
+          "source": "observed"
+        },
+        {
+          "attribute": "email",
+          "class": "ActiveRecord::Validations::PresenceValidator",
+          "kind": "presence",
+          "options": {},
+          "source": "observed"
+        },
+        {
+          "attribute": "email",
+          "class": "ActiveRecord::Validations::UniquenessValidator",
+          "kind": "uniqueness",
+          "options": {
+            "case_sensitive": false
+          },
+          "source": "observed"
+        },
+        {
+          "attribute": "password",
+          "class": "ActiveModel::Validations::ConfirmationValidator",
+          "kind": "confirmation",
+          "options": {
+            "allow_nil": true,
+            "case_sensitive": true
+          },
+          "source": "observed"
+        },
+        {
+          "attribute": "role",
+          "class": "ActiveModel::Validations::InclusionValidator",
+          "kind": "inclusion",
+          "options": {
+            "in": [
+              "member",
+              "moderator",
+              "admin"
+            ]
+          },
+          "source": "observed"
+        }
+      ]
+    }
+  ],
+  "source": "observed"
+}

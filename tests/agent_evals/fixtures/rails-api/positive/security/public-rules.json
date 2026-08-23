@@ -1,0 +1,6 @@
+{
+  "zigbasePublicRules": 1,
+  "rules": [
+    "users.create"
+  ]
+}

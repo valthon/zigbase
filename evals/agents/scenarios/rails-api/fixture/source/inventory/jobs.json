@@ -1,0 +1,96 @@
+{
+  "configured_adapter": "inline",
+  "count": 11,
+  "jobs": [
+    {
+      "abstract": false,
+      "application_owned": false,
+      "name": "ActionMailbox::IncinerationJob",
+      "queue_adapter": "ActiveJob::QueueAdapters::InlineAdapter",
+      "queue_name": "default",
+      "source": "observed"
+    },
+    {
+      "abstract": false,
+      "application_owned": false,
+      "name": "ActionMailbox::RoutingJob",
+      "queue_adapter": "ActiveJob::QueueAdapters::InlineAdapter",
+      "queue_name": "default",
+      "source": "observed"
+    },
+    {
+      "abstract": false,
+      "application_owned": false,
+      "name": "ActionMailer::MailDeliveryJob",
+      "queue_adapter": "ActiveJob::QueueAdapters::InlineAdapter",
+      "queue_name": null,
+      "source": "observed"
+    },
+    {
+      "abstract": false,
+      "application_owned": false,
+      "name": "ActiveStorage::AnalyzeJob",
+      "queue_adapter": "ActiveJob::QueueAdapters::InlineAdapter",
+      "queue_name": "default",
+      "source": "observed"
+    },
+    {
+      "abstract": false,
+      "application_owned": false,
+      "name": "ActiveStorage::BaseJob",
+      "queue_adapter": "ActiveJob::QueueAdapters::InlineAdapter",
+      "queue_name": "default",
+      "source": "observed"
+    },
+    {
+      "abstract": false,
+      "application_owned": false,
+      "name": "ActiveStorage::MirrorJob",
+      "queue_adapter": "ActiveJob::QueueAdapters::InlineAdapter",
+      "queue_name": "default",
+      "source": "observed"
+    },
+    {
+      "abstract": false,
+      "application_owned": false,
+      "name": "ActiveStorage::PreviewImageJob",
+      "queue_adapter": "ActiveJob::QueueAdapters::InlineAdapter",
+      "queue_name": "default",
+      "source": "observed"
+    },
+    {
+      "abstract": false,
+      "application_owned": false,
+      "name": "ActiveStorage::PurgeJob",
+      "queue_adapter": "ActiveJob::QueueAdapters::InlineAdapter",
+      "queue_name": "default",
+      "source": "observed"
+    },
+    {
+      "abstract": false,
+      "application_owned": false,
+      "name": "ActiveStorage::TransformJob",
+      "queue_adapter": "ActiveJob::QueueAdapters::InlineAdapter",
+      "queue_name": "default",
+      "source": "observed"
+    },
+    {
+      "abstract": true,
+      "application_owned": false,
+      "name": "ApplicationJob",
+      "queue_adapter": "ActiveJob::QueueAdapters::InlineAdapter",
+      "queue_name": "default",
+      "source": "observed"
+    },
+    {
+      "abstract": false,
+      "application_owned": true,
+      "name": "PostPublishedNotificationJob",
+      "queue_adapter": "ActiveJob::QueueAdapters::InlineAdapter",
+      "queue_name": "notifications",
+      "source": "observed"
+    }
+  ],
+  "queue_adapter": "ActiveJob::QueueAdapters::InlineAdapter",
+  "source": "observed"
+}

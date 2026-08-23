@@ -1,0 +1,1333 @@
+{
+  "count": 47,
+  "routes": [
+    {
+      "action": "index",
+      "constraints": {},
+      "controller": "rails/mailers",
+      "controller_class": "Rails::MailersController",
+      "defaults": {
+        "action": "index",
+        "controller": "rails/mailers"
+      },
+      "engine": null,
+      "format_optional": true,
+      "internal": true,
+      "name": "rails_mailers",
+      "namespace_prefix": "rails",
+      "path": "/rails/mailers",
+      "path_spec": "/rails/mailers(.:format)",
+      "required_parts": [],
+      "requirements": {},
+      "segment_keys": [
+        "format"
+      ],
+      "source": "observed",
+      "verb": "GET"
+    },
+    {
+      "action": "download",
+      "constraints": {
+        "path": {
+          "options": 4,
+          "source": ".+?",
+          "type": "regexp"
+        }
+      },
+      "controller": "rails/mailers",
+      "controller_class": "Rails::MailersController",
+      "defaults": {
+        "action": "download",
+        "controller": "rails/mailers"
+      },
+      "engine": null,
+      "format_optional": true,
+      "internal": true,
+      "name": null,
+      "namespace_prefix": "rails",
+      "path": "/rails/mailers/download/*path",
+      "path_spec": "/rails/mailers/download/*path(.:format)",
+      "required_parts": [
+        "path"
+      ],
+      "requirements": {},
+      "segment_keys": [
+        "path",
+        "format"
+      ],
+      "source": "observed",
+      "verb": "GET"
+    },
+    {
+      "action": "preview",
+      "constraints": {
+        "path": {
+          "options": 4,
+          "source": ".+?",
+          "type": "regexp"
+        }
+      },
+      "controller": "rails/mailers",
+      "controller_class": "Rails::MailersController",
+      "defaults": {
+        "action": "preview",
+        "controller": "rails/mailers"
+      },
+      "engine": null,
+      "format_optional": true,
+      "internal": true,
+      "name": null,
+      "namespace_prefix": "rails",
+      "path": "/rails/mailers/*path",
+      "path_spec": "/rails/mailers/*path(.:format)",
+      "required_parts": [
+        "path"
+      ],
+      "requirements": {},
+      "segment_keys": [
+        "path",
+        "format"
+      ],
+      "source": "observed",
+      "verb": "GET"
+    },
+    {
+      "action": null,
+      "constraints": {},
+      "controller": null,
+      "controller_class": null,
+      "defaults": {},
+      "engine": null,
+      "format_optional": false,
+      "internal": true,
+      "name": null,
+      "namespace_prefix": null,
+      "path": "/cable",
+      "path_spec": "/cable",
+      "required_parts": [],
+      "requirements": {},
+      "segment_keys": [],
+      "source": "observed",
+      "verb": "ANY"
+    },
+    {
+      "action": "properties",
+      "constraints": {},
+      "controller": "rails/info",
+      "controller_class": "Rails::InfoController",
+      "defaults": {
+        "action": "properties",
+        "controller": "rails/info"
+      },
+      "engine": null,
+      "format_optional": true,
+      "internal": true,
+      "name": "rails_info_properties",
+      "namespace_prefix": "rails",
+      "path": "/rails/info/properties",
+      "path_spec": "/rails/info/properties(.:format)",
+      "required_parts": [],
+      "requirements": {},
+      "segment_keys": [
+        "format"
+      ],
+      "source": "observed",
+      "verb": "GET"
+    },
+    {
+      "action": "routes",
+      "constraints": {},
+      "controller": "rails/info",
+      "controller_class": "Rails::InfoController",
+      "defaults": {
+        "action": "routes",
+        "controller": "rails/info"
+      },
+      "engine": null,
+      "format_optional": true,
+      "internal": true,
+      "name": "rails_info_routes",
+      "namespace_prefix": "rails",
+      "path": "/rails/info/routes",
+      "path_spec": "/rails/info/routes(.:format)",
+      "required_parts": [],
+      "requirements": {},
+      "segment_keys": [
+        "format"
+      ],
+      "source": "observed",
+      "verb": "GET"
+    },
+    {
+      "action": "notes",
+      "constraints": {},
+      "controller": "rails/info",
+      "controller_class": "Rails::InfoController",
+      "defaults": {
+        "action": "notes",
+        "controller": "rails/info"
+      },
+      "engine": null,
+      "format_optional": true,
+      "internal": true,
+      "name": "rails_info_notes",
+      "namespace_prefix": "rails",
+      "path": "/rails/info/notes",
+      "path_spec": "/rails/info/notes(.:format)",
+      "required_parts": [],
+      "requirements": {},
+      "segment_keys": [
+        "format"
+      ],
+      "source": "observed",
+      "verb": "GET"
+    },
+    {
+      "action": "index",
+      "constraints": {},
+      "controller": "rails/info",
+      "controller_class": "Rails::InfoController",
+      "defaults": {
+        "action": "index",
+        "controller": "rails/info"
+      },
+      "engine": null,
+      "format_optional": true,
+      "internal": true,
+      "name": "rails_info",
+      "namespace_prefix": "rails",
+      "path": "/rails/info",
+      "path_spec": "/rails/info(.:format)",
+      "required_parts": [],
+      "requirements": {},
+      "segment_keys": [
+        "format"
+      ],
+      "source": "observed",
+      "verb": "GET"
+    },
+    {
+      "action": "show",
+      "constraints": {},
+      "controller": "rails/health",
+      "controller_class": "Rails::HealthController",
+      "defaults": {
+        "action": "show",
+        "controller": "rails/health"
+      },
+      "engine": null,
+      "format_optional": true,
+      "internal": false,
+      "name": "rails_health_check",
+      "namespace_prefix": "rails",
+      "path": "/up",
+      "path_spec": "/up(.:format)",
+      "required_parts": [],
+      "requirements": {},
+      "segment_keys": [
+        "format"
+      ],
+      "source": "observed",
+      "verb": "GET"
+    },
+    {
+      "action": "create",
+      "constraints": {},
+      "controller": "api/v1/sessions",
+      "controller_class": "Api::V1::SessionsController",
+      "defaults": {
+        "action": "create",
+        "controller": "api/v1/sessions"
+      },
+      "engine": null,
+      "format_optional": true,
+      "internal": false,
+      "name": "api_v1_sessions",
+      "namespace_prefix": "api/v1",
+      "path": "/api/v1/sessions",
+      "path_spec": "/api/v1/sessions(.:format)",
+      "required_parts": [],
+      "requirements": {},
+      "segment_keys": [
+        "format"
+      ],
+      "source": "observed",
+      "verb": "POST"
+    },
+    {
+      "action": "create",
+      "constraints": {},
+      "controller": "api/v1/users",
+      "controller_class": "Api::V1::UsersController",
+      "defaults": {
+        "action": "create",
+        "controller": "api/v1/users"
+      },
+      "engine": null,
+      "format_optional": true,
+      "internal": false,
+      "name": "api_v1_users",
+      "namespace_prefix": "api/v1",
+      "path": "/api/v1/users",
+      "path_spec": "/api/v1/users(.:format)",
+      "required_parts": [],
+      "requirements": {},
+      "segment_keys": [
+        "format"
+      ],
+      "source": "observed",
+      "verb": "POST"
+    },
+    {
+      "action": "create",
+      "constraints": {},
+      "controller": "api/v1/memberships",
+      "controller_class": "Api::V1::MembershipsController",
+      "defaults": {
+        "action": "create",
+        "controller": "api/v1/memberships"
+      },
+      "engine": null,
+      "format_optional": true,
+      "internal": false,
+      "name": "api_v1_club_memberships",
+      "namespace_prefix": "api/v1",
+      "path": "/api/v1/clubs/:club_slug/memberships",
+      "path_spec": "/api/v1/clubs/:club_slug/memberships(.:format)",
+      "required_parts": [
+        "club_slug"
+      ],
+      "requirements": {},
+      "segment_keys": [
+        "club_slug",
+        "format"
+      ],
+      "source": "observed",
+      "verb": "POST"
+    },
+    {
+      "action": "index",
+      "constraints": {},
+      "controller": "api/v1/posts",
+      "controller_class": "Api::V1::PostsController",
+      "defaults": {
+        "action": "index",
+        "controller": "api/v1/posts"
+      },
+      "engine": null,
+      "format_optional": true,
+      "internal": false,
+      "name": "api_v1_club_posts",
+      "namespace_prefix": "api/v1",
+      "path": "/api/v1/clubs/:club_slug/posts",
+      "path_spec": "/api/v1/clubs/:club_slug/posts(.:format)",
+      "required_parts": [
+        "club_slug"
+      ],
+      "requirements": {},
+      "segment_keys": [
+        "club_slug",
+        "format"
+      ],
+      "source": "observed",
+      "verb": "GET"
+    },
+    {
+      "action": "create",
+      "constraints": {},
+      "controller": "api/v1/posts",
+      "controller_class": "Api::V1::PostsController",
+      "defaults": {
+        "action": "create",
+        "controller": "api/v1/posts"
+      },
+      "engine": null,
+      "format_optional": true,
+      "internal": false,
+      "name": null,
+      "namespace_prefix": "api/v1",
+      "path": "/api/v1/clubs/:club_slug/posts",
+      "path_spec": "/api/v1/clubs/:club_slug/posts(.:format)",
+      "required_parts": [
+        "club_slug"
+      ],
+      "requirements": {},
+      "segment_keys": [
+        "club_slug",
+        "format"
+      ],
+      "source": "observed",
+      "verb": "POST"
+    },
+    {
+      "action": "index",
+      "constraints": {},
+      "controller": "api/v1/clubs",
+      "controller_class": "Api::V1::ClubsController",
+      "defaults": {
+        "action": "index",
+        "controller": "api/v1/clubs"
+      },
+      "engine": null,
+      "format_optional": true,
+      "internal": false,
+      "name": "api_v1_clubs",
+      "namespace_prefix": "api/v1",
+      "path": "/api/v1/clubs",
+      "path_spec": "/api/v1/clubs(.:format)",
+      "required_parts": [],
+      "requirements": {},
+      "segment_keys": [
+        "format"
+      ],
+      "source": "observed",
+      "verb": "GET"
+    },
+    {
+      "action": "show",
+      "constraints": {},
+      "controller": "api/v1/clubs",
+      "controller_class": "Api::V1::ClubsController",
+      "defaults": {
+        "action": "show",
+        "controller": "api/v1/clubs"
+      },
+      "engine": null,
+      "format_optional": true,
+      "internal": false,
+      "name": "api_v1_club",
+      "namespace_prefix": "api/v1",
+      "path": "/api/v1/clubs/:slug",
+      "path_spec": "/api/v1/clubs/:slug(.:format)",
+      "required_parts": [
+        "slug"
+      ],
+      "requirements": {},
+      "segment_keys": [
+        "slug",
+        "format"
+      ],
+      "source": "observed",
+      "verb": "GET"
+    },
+    {
+      "action": "update",
+      "constraints": {},
+      "controller": "api/v1/clubs",
+      "controller_class": "Api::V1::ClubsController",
+      "defaults": {
+        "action": "update",
+        "controller": "api/v1/clubs"
+      },
+      "engine": null,
+      "format_optional": true,
+      "internal": false,
+      "name": null,
+      "namespace_prefix": "api/v1",
+      "path": "/api/v1/clubs/:slug",
+      "path_spec": "/api/v1/clubs/:slug(.:format)",
+      "required_parts": [
+        "slug"
+      ],
+      "requirements": {},
+      "segment_keys": [
+        "slug",
+        "format"
+      ],
+      "source": "observed",
+      "verb": "PATCH"
+    },
+    {
+      "action": "update",
+      "constraints": {},
+      "controller": "api/v1/clubs",
+      "controller_class": "Api::V1::ClubsController",
+      "defaults": {
+        "action": "update",
+        "controller": "api/v1/clubs"
+      },
+      "engine": null,
+      "format_optional": true,
+      "internal": false,
+      "name": null,
+      "namespace_prefix": "api/v1",
+      "path": "/api/v1/clubs/:slug",
+      "path_spec": "/api/v1/clubs/:slug(.:format)",
+      "required_parts": [
+        "slug"
+      ],
+      "requirements": {},
+      "segment_keys": [
+        "slug",
+        "format"
+      ],
+      "source": "observed",
+      "verb": "PUT"
+    },
+    {
+      "action": "publish",
+      "constraints": {
+        "id": {
+          "options": 0,
+          "source": "\\d+",
+          "type": "regexp"
+        }
+      },
+      "controller": "api/v1/posts",
+      "controller_class": "Api::V1::PostsController",
+      "defaults": {
+        "action": "publish",
+        "controller": "api/v1/posts"
+      },
+      "engine": null,
+      "format_optional": true,
+      "internal": false,
+      "name": "publish_api_v1_post",
+      "namespace_prefix": "api/v1",
+      "path": "/api/v1/posts/:id/publish",
+      "path_spec": "/api/v1/posts/:id/publish(.:format)",
+      "required_parts": [
+        "id"
+      ],
+      "requirements": {
+        "id": {
+          "options": 0,
+          "source": "\\d+",
+          "type": "regexp"
+        }
+      },
+      "segment_keys": [
+        "id",
+        "format"
+      ],
+      "source": "observed",
+      "verb": "PATCH"
+    },
+    {
+      "action": "upload_cover",
+      "constraints": {
+        "id": {
+          "options": 0,
+          "source": "\\d+",
+          "type": "regexp"
+        }
+      },
+      "controller": "api/v1/posts",
+      "controller_class": "Api::V1::PostsController",
+      "defaults": {
+        "action": "upload_cover",
+        "controller": "api/v1/posts"
+      },
+      "engine": null,
+      "format_optional": true,
+      "internal": false,
+      "name": "upload_cover_api_v1_post",
+      "namespace_prefix": "api/v1",
+      "path": "/api/v1/posts/:id/cover",
+      "path_spec": "/api/v1/posts/:id/cover(.:format)",
+      "required_parts": [
+        "id"
+      ],
+      "requirements": {
+        "id": {
+          "options": 0,
+          "source": "\\d+",
+          "type": "regexp"
+        }
+      },
+      "segment_keys": [
+        "id",
+        "format"
+      ],
+      "source": "observed",
+      "verb": "POST"
+    },
+    {
+      "action": "show_cover",
+      "constraints": {
+        "id": {
+          "options": 0,
+          "source": "\\d+",
+          "type": "regexp"
+        }
+      },
+      "controller": "api/v1/posts",
+      "controller_class": "Api::V1::PostsController",
+      "defaults": {
+        "action": "show_cover",
+        "controller": "api/v1/posts"
+      },
+      "engine": null,
+      "format_optional": true,
+      "internal": false,
+      "name": "show_cover_api_v1_post",
+      "namespace_prefix": "api/v1",
+      "path": "/api/v1/posts/:id/cover",
+      "path_spec": "/api/v1/posts/:id/cover(.:format)",
+      "required_parts": [
+        "id"
+      ],
+      "requirements": {
+        "id": {
+          "options": 0,
+          "source": "\\d+",
+          "type": "regexp"
+        }
+      },
+      "segment_keys": [
+        "id",
+        "format"
+      ],
+      "source": "observed",
+      "verb": "GET"
+    },
+    {
+      "action": "show",
+      "constraints": {
+        "id": {
+          "options": 0,
+          "source": "\\d+",
+          "type": "regexp"
+        }
+      },
+      "controller": "api/v1/posts",
+      "controller_class": "Api::V1::PostsController",
+      "defaults": {
+        "action": "show",
+        "controller": "api/v1/posts"
+      },
+      "engine": null,
+      "format_optional": true,
+      "internal": false,
+      "name": "api_v1_post",
+      "namespace_prefix": "api/v1",
+      "path": "/api/v1/posts/:id",
+      "path_spec": "/api/v1/posts/:id(.:format)",
+      "required_parts": [
+        "id"
+      ],
+      "requirements": {
+        "id": {
+          "options": 0,
+          "source": "\\d+",
+          "type": "regexp"
+        }
+      },
+      "segment_keys": [
+        "id",
+        "format"
+      ],
+      "source": "observed",
+      "verb": "GET"
+    },
+    {
+      "action": "show",
+      "constraints": {
+        "format": {
+          "options": 0,
+          "source": "json",
+          "type": "regexp"
+        }
+      },
+      "controller": "api/v1/stats",
+      "controller_class": "Api::V1::StatsController",
+      "defaults": {
+        "action": "show",
+        "controller": "api/v1/stats",
+        "format": "json",
+        "internal": "true"
+      },
+      "engine": null,
+      "format_optional": true,
+      "internal": false,
+      "name": "api_v1_internal_stats",
+      "namespace_prefix": "api/v1",
+      "path": "/api/v1/internal/stats",
+      "path_spec": "/api/v1/internal/stats(.:format)",
+      "required_parts": [],
+      "requirements": {
+        "format": {
+          "options": 0,
+          "source": "json",
+          "type": "regexp"
+        },
+        "internal": "true"
+      },
+      "segment_keys": [
+        "format"
+      ],
+      "source": "observed",
+      "verb": "GET"
+    },
+    {
+      "action": "create",
+      "constraints": {},
+      "controller": "action_mailbox/ingresses/postmark/inbound_emails",
+      "controller_class": "ActionMailbox::Ingresses::Postmark::InboundEmailsController",
+      "defaults": {
+        "action": "create",
+        "controller": "action_mailbox/ingresses/postmark/inbound_emails"
+      },
+      "engine": null,
+      "format_optional": true,
+      "internal": false,
+      "name": "rails_postmark_inbound_emails",
+      "namespace_prefix": "action_mailbox/ingresses/postmark",
+      "path": "/rails/action_mailbox/postmark/inbound_emails",
+      "path_spec": "/rails/action_mailbox/postmark/inbound_emails(.:format)",
+      "required_parts": [],
+      "requirements": {},
+      "segment_keys": [
+        "format"
+      ],
+      "source": "observed",
+      "verb": "POST"
+    },
+    {
+      "action": "create",
+      "constraints": {},
+      "controller": "action_mailbox/ingresses/relay/inbound_emails",
+      "controller_class": "ActionMailbox::Ingresses::Relay::InboundEmailsController",
+      "defaults": {
+        "action": "create",
+        "controller": "action_mailbox/ingresses/relay/inbound_emails"
+      },
+      "engine": null,
+      "format_optional": true,
+      "internal": false,
+      "name": "rails_relay_inbound_emails",
+      "namespace_prefix": "action_mailbox/ingresses/relay",
+      "path": "/rails/action_mailbox/relay/inbound_emails",
+      "path_spec": "/rails/action_mailbox/relay/inbound_emails(.:format)",
+      "required_parts": [],
+      "requirements": {},
+      "segment_keys": [
+        "format"
+      ],
+      "source": "observed",
+      "verb": "POST"
+    },
+    {
+      "action": "create",
+      "constraints": {},
+      "controller": "action_mailbox/ingresses/sendgrid/inbound_emails",
+      "controller_class": "ActionMailbox::Ingresses::Sendgrid::InboundEmailsController",
+      "defaults": {
+        "action": "create",
+        "controller": "action_mailbox/ingresses/sendgrid/inbound_emails"
+      },
+      "engine": null,
+      "format_optional": true,
+      "internal": false,
+      "name": "rails_sendgrid_inbound_emails",
+      "namespace_prefix": "action_mailbox/ingresses/sendgrid",
+      "path": "/rails/action_mailbox/sendgrid/inbound_emails",
+      "path_spec": "/rails/action_mailbox/sendgrid/inbound_emails(.:format)",
+      "required_parts": [],
+      "requirements": {},
+      "segment_keys": [
+        "format"
+      ],
+      "source": "observed",
+      "verb": "POST"
+    },
+    {
+      "action": "health_check",
+      "constraints": {},
+      "controller": "action_mailbox/ingresses/mandrill/inbound_emails",
+      "controller_class": "ActionMailbox::Ingresses::Mandrill::InboundEmailsController",
+      "defaults": {
+        "action": "health_check",
+        "controller": "action_mailbox/ingresses/mandrill/inbound_emails"
+      },
+      "engine": null,
+      "format_optional": true,
+      "internal": false,
+      "name": "rails_mandrill_inbound_health_check",
+      "namespace_prefix": "action_mailbox/ingresses/mandrill",
+      "path": "/rails/action_mailbox/mandrill/inbound_emails",
+      "path_spec": "/rails/action_mailbox/mandrill/inbound_emails(.:format)",
+      "required_parts": [],
+      "requirements": {},
+      "segment_keys": [
+        "format"
+      ],
+      "source": "observed",
+      "verb": "GET"
+    },
+    {
+      "action": "create",
+      "constraints": {},
+      "controller": "action_mailbox/ingresses/mandrill/inbound_emails",
+      "controller_class": "ActionMailbox::Ingresses::Mandrill::InboundEmailsController",
+      "defaults": {
+        "action": "create",
+        "controller": "action_mailbox/ingresses/mandrill/inbound_emails"
+      },
+      "engine": null,
+      "format_optional": true,
+      "internal": false,
+      "name": "rails_mandrill_inbound_emails",
+      "namespace_prefix": "action_mailbox/ingresses/mandrill",
+      "path": "/rails/action_mailbox/mandrill/inbound_emails",
+      "path_spec": "/rails/action_mailbox/mandrill/inbound_emails(.:format)",
+      "required_parts": [],
+      "requirements": {},
+      "segment_keys": [
+        "format"
+      ],
+      "source": "observed",
+      "verb": "POST"
+    },
+    {
+      "action": "create",
+      "constraints": {},
+      "controller": "action_mailbox/ingresses/mailgun/inbound_emails",
+      "controller_class": "ActionMailbox::Ingresses::Mailgun::InboundEmailsController",
+      "defaults": {
+        "action": "create",
+        "controller": "action_mailbox/ingresses/mailgun/inbound_emails"
+      },
+      "engine": null,
+      "format_optional": true,
+      "internal": false,
+      "name": "rails_mailgun_inbound_emails",
+      "namespace_prefix": "action_mailbox/ingresses/mailgun",
+      "path": "/rails/action_mailbox/mailgun/inbound_emails/mime",
+      "path_spec": "/rails/action_mailbox/mailgun/inbound_emails/mime(.:format)",
+      "required_parts": [],
+      "requirements": {},
+      "segment_keys": [
+        "format"
+      ],
+      "source": "observed",
+      "verb": "POST"
+    },
+    {
+      "action": "index",
+      "constraints": {},
+      "controller": "rails/conductor/action_mailbox/inbound_emails",
+      "controller_class": "Rails::Conductor::ActionMailbox::InboundEmailsController",
+      "defaults": {
+        "action": "index",
+        "controller": "rails/conductor/action_mailbox/inbound_emails"
+      },
+      "engine": null,
+      "format_optional": true,
+      "internal": false,
+      "name": "rails_conductor_inbound_emails",
+      "namespace_prefix": "rails/conductor/action_mailbox",
+      "path": "/rails/conductor/action_mailbox/inbound_emails",
+      "path_spec": "/rails/conductor/action_mailbox/inbound_emails(.:format)",
+      "required_parts": [],
+      "requirements": {},
+      "segment_keys": [
+        "format"
+      ],
+      "source": "observed",
+      "verb": "GET"
+    },
+    {
+      "action": "create",
+      "constraints": {},
+      "controller": "rails/conductor/action_mailbox/inbound_emails",
+      "controller_class": "Rails::Conductor::ActionMailbox::InboundEmailsController",
+      "defaults": {
+        "action": "create",
+        "controller": "rails/conductor/action_mailbox/inbound_emails"
+      },
+      "engine": null,
+      "format_optional": true,
+      "internal": false,
+      "name": null,
+      "namespace_prefix": "rails/conductor/action_mailbox",
+      "path": "/rails/conductor/action_mailbox/inbound_emails",
+      "path_spec": "/rails/conductor/action_mailbox/inbound_emails(.:format)",
+      "required_parts": [],
+      "requirements": {},
+      "segment_keys": [
+        "format"
+      ],
+      "source": "observed",
+      "verb": "POST"
+    },
+    {
+      "action": "new",
+      "constraints": {},
+      "controller": "rails/conductor/action_mailbox/inbound_emails",
+      "controller_class": "Rails::Conductor::ActionMailbox::InboundEmailsController",
+      "defaults": {
+        "action": "new",
+        "controller": "rails/conductor/action_mailbox/inbound_emails"
+      },
+      "engine": null,
+      "format_optional": true,
+      "internal": false,
+      "name": "new_rails_conductor_inbound_email",
+      "namespace_prefix": "rails/conductor/action_mailbox",
+      "path": "/rails/conductor/action_mailbox/inbound_emails/new",
+      "path_spec": "/rails/conductor/action_mailbox/inbound_emails/new(.:format)",
+      "required_parts": [],
+      "requirements": {},
+      "segment_keys": [
+        "format"
+      ],
+      "source": "observed",
+      "verb": "GET"
+    },
+    {
+      "action": "show",
+      "constraints": {},
+      "controller": "rails/conductor/action_mailbox/inbound_emails",
+      "controller_class": "Rails::Conductor::ActionMailbox::InboundEmailsController",
+      "defaults": {
+        "action": "show",
+        "controller": "rails/conductor/action_mailbox/inbound_emails"
+      },
+      "engine": null,
+      "format_optional": true,
+      "internal": false,
+      "name": "rails_conductor_inbound_email",
+      "namespace_prefix": "rails/conductor/action_mailbox",
+      "path": "/rails/conductor/action_mailbox/inbound_emails/:id",
+      "path_spec": "/rails/conductor/action_mailbox/inbound_emails/:id(.:format)",
+      "required_parts": [
+        "id"
+      ],
+      "requirements": {},
+      "segment_keys": [
+        "id",
+        "format"
+      ],
+      "source": "observed",
+      "verb": "GET"
+    },
+    {
+      "action": "new",
+      "constraints": {},
+      "controller": "rails/conductor/action_mailbox/inbound_emails/sources",
+      "controller_class": "Rails::Conductor::ActionMailbox::InboundEmails::SourcesController",
+      "defaults": {
+        "action": "new",
+        "controller": "rails/conductor/action_mailbox/inbound_emails/sources"
+      },
+      "engine": null,
+      "format_optional": true,
+      "internal": false,
+      "name": "new_rails_conductor_inbound_email_source",
+      "namespace_prefix": "rails/conductor/action_mailbox/inbound_emails",
+      "path": "/rails/conductor/action_mailbox/inbound_emails/sources/new",
+      "path_spec": "/rails/conductor/action_mailbox/inbound_emails/sources/new(.:format)",
+      "required_parts": [],
+      "requirements": {},
+      "segment_keys": [
+        "format"
+      ],
+      "source": "observed",
+      "verb": "GET"
+    },
+    {
+      "action": "create",
+      "constraints": {},
+      "controller": "rails/conductor/action_mailbox/inbound_emails/sources",
+      "controller_class": "Rails::Conductor::ActionMailbox::InboundEmails::SourcesController",
+      "defaults": {
+        "action": "create",
+        "controller": "rails/conductor/action_mailbox/inbound_emails/sources"
+      },
+      "engine": null,
+      "format_optional": true,
+      "internal": false,
+      "name": "rails_conductor_inbound_email_sources",
+      "namespace_prefix": "rails/conductor/action_mailbox/inbound_emails",
+      "path": "/rails/conductor/action_mailbox/inbound_emails/sources",
+      "path_spec": "/rails/conductor/action_mailbox/inbound_emails/sources(.:format)",
+      "required_parts": [],
+      "requirements": {},
+      "segment_keys": [
+        "format"
+      ],
+      "source": "observed",
+      "verb": "POST"
+    },
+    {
+      "action": "create",
+      "constraints": {},
+      "controller": "rails/conductor/action_mailbox/reroutes",
+      "controller_class": "Rails::Conductor::ActionMailbox::ReroutesController",
+      "defaults": {
+        "action": "create",
+        "controller": "rails/conductor/action_mailbox/reroutes"
+      },
+      "engine": null,
+      "format_optional": true,
+      "internal": false,
+      "name": "rails_conductor_inbound_email_reroute",
+      "namespace_prefix": "rails/conductor/action_mailbox",
+      "path": "/rails/conductor/action_mailbox/:inbound_email_id/reroute",
+      "path_spec": "/rails/conductor/action_mailbox/:inbound_email_id/reroute(.:format)",
+      "required_parts": [
+        "inbound_email_id"
+      ],
+      "requirements": {},
+      "segment_keys": [
+        "inbound_email_id",
+        "format"
+      ],
+      "source": "observed",
+      "verb": "POST"
+    },
+    {
+      "action": "create",
+      "constraints": {},
+      "controller": "rails/conductor/action_mailbox/incinerates",
+      "controller_class": "Rails::Conductor::ActionMailbox::IncineratesController",
+      "defaults": {
+        "action": "create",
+        "controller": "rails/conductor/action_mailbox/incinerates"
+      },
+      "engine": null,
+      "format_optional": true,
+      "internal": false,
+      "name": "rails_conductor_inbound_email_incinerate",
+      "namespace_prefix": "rails/conductor/action_mailbox",
+      "path": "/rails/conductor/action_mailbox/:inbound_email_id/incinerate",
+      "path_spec": "/rails/conductor/action_mailbox/:inbound_email_id/incinerate(.:format)",
+      "required_parts": [
+        "inbound_email_id"
+      ],
+      "requirements": {},
+      "segment_keys": [
+        "inbound_email_id",
+        "format"
+      ],
+      "source": "observed",
+      "verb": "POST"
+    },
+    {
+      "action": "show",
+      "constraints": {
+        "filename": {
+          "options": 4,
+          "source": ".+?",
+          "type": "regexp"
+        }
+      },
+      "controller": "active_storage/blobs/redirect",
+      "controller_class": "ActiveStorage::Blobs::RedirectController",
+      "defaults": {
+        "action": "show",
+        "controller": "active_storage/blobs/redirect"
+      },
+      "engine": null,
+      "format_optional": true,
+      "internal": false,
+      "name": "rails_service_blob",
+      "namespace_prefix": "active_storage/blobs",
+      "path": "/rails/active_storage/blobs/redirect/:signed_id/*filename",
+      "path_spec": "/rails/active_storage/blobs/redirect/:signed_id/*filename(.:format)",
+      "required_parts": [
+        "signed_id",
+        "filename"
+      ],
+      "requirements": {},
+      "segment_keys": [
+        "signed_id",
+        "filename",
+        "format"
+      ],
+      "source": "observed",
+      "verb": "GET"
+    },
+    {
+      "action": "show",
+      "constraints": {
+        "filename": {
+          "options": 4,
+          "source": ".+?",
+          "type": "regexp"
+        }
+      },
+      "controller": "active_storage/blobs/proxy",
+      "controller_class": "ActiveStorage::Blobs::ProxyController",
+      "defaults": {
+        "action": "show",
+        "controller": "active_storage/blobs/proxy"
+      },
+      "engine": null,
+      "format_optional": true,
+      "internal": false,
+      "name": "rails_service_blob_proxy",
+      "namespace_prefix": "active_storage/blobs",
+      "path": "/rails/active_storage/blobs/proxy/:signed_id/*filename",
+      "path_spec": "/rails/active_storage/blobs/proxy/:signed_id/*filename(.:format)",
+      "required_parts": [
+        "signed_id",
+        "filename"
+      ],
+      "requirements": {},
+      "segment_keys": [
+        "signed_id",
+        "filename",
+        "format"
+      ],
+      "source": "observed",
+      "verb": "GET"
+    },
+    {
+      "action": "show",
+      "constraints": {
+        "filename": {
+          "options": 4,
+          "source": ".+?",
+          "type": "regexp"
+        }
+      },
+      "controller": "active_storage/blobs/redirect",
+      "controller_class": "ActiveStorage::Blobs::RedirectController",
+      "defaults": {
+        "action": "show",
+        "controller": "active_storage/blobs/redirect"
+      },
+      "engine": null,
+      "format_optional": true,
+      "internal": false,
+      "name": null,
+      "namespace_prefix": "active_storage/blobs",
+      "path": "/rails/active_storage/blobs/:signed_id/*filename",
+      "path_spec": "/rails/active_storage/blobs/:signed_id/*filename(.:format)",
+      "required_parts": [
+        "signed_id",
+        "filename"
+      ],
+      "requirements": {},
+      "segment_keys": [
+        "signed_id",
+        "filename",
+        "format"
+      ],
+      "source": "observed",
+      "verb": "GET"
+    },
+    {
+      "action": "show",
+      "constraints": {
+        "filename": {
+          "options": 4,
+          "source": ".+?",
+          "type": "regexp"
+        }
+      },
+      "controller": "active_storage/representations/redirect",
+      "controller_class": "ActiveStorage::Representations::RedirectController",
+      "defaults": {
+        "action": "show",
+        "controller": "active_storage/representations/redirect"
+      },
+      "engine": null,
+      "format_optional": true,
+      "internal": false,
+      "name": "rails_blob_representation",
+      "namespace_prefix": "active_storage/representations",
+      "path": "/rails/active_storage/representations/redirect/:signed_blob_id/:variation_key/*filename",
+      "path_spec": "/rails/active_storage/representations/redirect/:signed_blob_id/:variation_key/*filename(.:format)",
+      "required_parts": [
+        "signed_blob_id",
+        "variation_key",
+        "filename"
+      ],
+      "requirements": {},
+      "segment_keys": [
+        "signed_blob_id",
+        "variation_key",
+        "filename",
+        "format"
+      ],
+      "source": "observed",
+      "verb": "GET"
+    },
+    {
+      "action": "show",
+      "constraints": {
+        "filename": {
+          "options": 4,
+          "source": ".+?",
+          "type": "regexp"
+        }
+      },
+      "controller": "active_storage/representations/proxy",
+      "controller_class": "ActiveStorage::Representations::ProxyController",
+      "defaults": {
+        "action": "show",
+        "controller": "active_storage/representations/proxy"
+      },
+      "engine": null,
+      "format_optional": true,
+      "internal": false,
+      "name": "rails_blob_representation_proxy",
+      "namespace_prefix": "active_storage/representations",
+      "path": "/rails/active_storage/representations/proxy/:signed_blob_id/:variation_key/*filename",
+      "path_spec": "/rails/active_storage/representations/proxy/:signed_blob_id/:variation_key/*filename(.:format)",
+      "required_parts": [
+        "signed_blob_id",
+        "variation_key",
+        "filename"
+      ],
+      "requirements": {},
+      "segment_keys": [
+        "signed_blob_id",
+        "variation_key",
+        "filename",
+        "format"
+      ],
+      "source": "observed",
+      "verb": "GET"
+    },
+    {
+      "action": "show",
+      "constraints": {
+        "filename": {
+          "options": 4,
+          "source": ".+?",
+          "type": "regexp"
+        }
+      },
+      "controller": "active_storage/representations/redirect",
+      "controller_class": "ActiveStorage::Representations::RedirectController",
+      "defaults": {
+        "action": "show",
+        "controller": "active_storage/representations/redirect"
+      },
+      "engine": null,
+      "format_optional": true,
+      "internal": false,
+      "name": null,
+      "namespace_prefix": "active_storage/representations",
+      "path": "/rails/active_storage/representations/:signed_blob_id/:variation_key/*filename",
+      "path_spec": "/rails/active_storage/representations/:signed_blob_id/:variation_key/*filename(.:format)",
+      "required_parts": [
+        "signed_blob_id",
+        "variation_key",
+        "filename"
+      ],
+      "requirements": {},
+      "segment_keys": [
+        "signed_blob_id",
+        "variation_key",
+        "filename",
+        "format"
+      ],
+      "source": "observed",
+      "verb": "GET"
+    },
+    {
+      "action": "show",
+      "constraints": {
+        "filename": {
+          "options": 4,
+          "source": ".+?",
+          "type": "regexp"
+        }
+      },
+      "controller": "active_storage/disk",
+      "controller_class": "ActiveStorage::DiskController",
+      "defaults": {
+        "action": "show",
+        "controller": "active_storage/disk"
+      },
+      "engine": null,
+      "format_optional": true,
+      "internal": false,
+      "name": "rails_disk_service",
+      "namespace_prefix": "active_storage",
+      "path": "/rails/active_storage/disk/:encoded_key/*filename",
+      "path_spec": "/rails/active_storage/disk/:encoded_key/*filename(.:format)",
+      "required_parts": [
+        "encoded_key",
+        "filename"
+      ],
+      "requirements": {},
+      "segment_keys": [
+        "encoded_key",
+        "filename",
+        "format"
+      ],
+      "source": "observed",
+      "verb": "GET"
+    },
+    {
+      "action": "update",
+      "constraints": {},
+      "controller": "active_storage/disk",
+      "controller_class": "ActiveStorage::DiskController",
+      "defaults": {
+        "action": "update",
+        "controller": "active_storage/disk"
+      },
+      "engine": null,
+      "format_optional": true,
+      "internal": false,
+      "name": "update_rails_disk_service",
+      "namespace_prefix": "active_storage",
+      "path": "/rails/active_storage/disk/:encoded_token",
+      "path_spec": "/rails/active_storage/disk/:encoded_token(.:format)",
+      "required_parts": [
+        "encoded_token"
+      ],
+      "requirements": {},
+      "segment_keys": [
+        "encoded_token",
+        "format"
+      ],
+      "source": "observed",
+      "verb": "PUT"
+    },
+    {
+      "action": "create",
+      "constraints": {},
+      "controller": "active_storage/direct_uploads",
+      "controller_class": "ActiveStorage::DirectUploadsController",
+      "defaults": {
+        "action": "create",
+        "controller": "active_storage/direct_uploads"
+      },
+      "engine": null,
+      "format_optional": true,
+      "internal": false,
+      "name": "rails_direct_uploads",
+      "namespace_prefix": "active_storage",
+      "path": "/rails/active_storage/direct_uploads",
+      "path_spec": "/rails/active_storage/direct_uploads(.:format)",
+      "required_parts": [],
+      "requirements": {},
+      "segment_keys": [
+        "format"
+      ],
+      "source": "observed",
+      "verb": "POST"
+    },
+    {
+      "action": "index",
+      "constraints": {},
+      "controller": "rails/welcome",
+      "controller_class": "Rails::WelcomeController",
+      "defaults": {
+        "action": "index",
+        "controller": "rails/welcome"
+      },
+      "engine": null,
+      "format_optional": false,
+      "internal": true,
+      "name": null,
+      "namespace_prefix": "rails",
+      "path": "/",
+      "path_spec": "/",
+      "required_parts": [],
+      "requirements": {},
+      "segment_keys": [],
+      "source": "observed",
+      "verb": "GET"
+    }
+  ],
+  "source": "observed"
+}

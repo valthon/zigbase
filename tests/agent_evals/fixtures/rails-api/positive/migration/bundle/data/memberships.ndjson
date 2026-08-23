@@ -1,0 +1,4 @@
+{"club":"1","created":"2024-01-16T08:00:00Z","id":"1","joined_at":"2024-01-16T08:00:00Z","role":"reader","updated":"2024-01-16T08:00:00Z","user":"2"}
+{"club":"2","created":"2024-01-16T08:05:00Z","id":"2","joined_at":"2024-01-16T08:05:00Z","role":"curator","updated":"2024-01-16T08:05:00Z","user":"2"}
+{"club":"1","created":"2024-01-16T08:10:00Z","id":"3","joined_at":"2024-01-16T08:10:00Z","role":"reader","updated":"2024-01-16T08:10:00Z","user":"3"}
+{"club":"3","created":"2024-01-16T08:15:00Z","id":"4","joined_at":"2024-01-16T08:15:00Z","role":"reader","updated":"2024-01-16T08:15:00Z","user":"4"}

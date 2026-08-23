@@ -1,0 +1,17 @@
+{
+  "files": [
+    {
+      "bytes": 70,
+      "collection": "posts",
+      "contentType": "image/png",
+      "field": "cover",
+      "filename": "morning-pages-cover.png",
+      "key": "fixturecover0000000000000001",
+      "recordId": "1",
+      "sha256": "8c9e0aa0b0a951d9df2d9b1b956a27f3f750eca4bfe456ba939f0823a11ca5ec",
+      "sourcePath": "storage/fi/xt/fixturecover0000000000000001",
+      "targetName": "morning-pages-cover.png"
+    }
+  ],
+  "zigbaseRailsFiles": 1
+}
