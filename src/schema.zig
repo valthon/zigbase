@@ -143,13 +143,57 @@ pub const Collection = struct {
 
         // The leading auth system fields are static (from authSystemFields()); skip
         // them and free only the user fields, then the (owned) slice backing.
-        const skip = if (self.type == .auth) authSystemFields().len else 0;
+        const skip = authInjectionPrefix(self.type, self.fields);
         for (self.fields[skip..]) |f| freeFieldOwned(alloc, f);
         alloc.free(self.fields);
 
         deinitOptions(alloc, self.options);
     }
 };
+
+/// How many leading entries of `fields` are the STATIC `authSystemFields()` prepended by
+/// `injectAuthFields` — i.e. how many `Collection.deinit` must skip because their
+/// id/name/options point at literals rather than at owned allocations.
+///
+/// This deliberately does NOT key on `t == .auth`. An auth `Collection` exists in two
+/// shapes: the INJECTED one (`collections.get`/`create`/`update` return it, fields =
+/// six statics + the user fields) and the NOT-injected one (`parseCollectionInput`
+/// returns it, fields = the user fields alone). Assuming the injected shape from the type
+/// tag made `deinit` slice out of bounds — a PANIC — on an auth collection with fewer than
+/// six user fields, which `schema_doc.parse`'s errdefer reaches whenever a schema document
+/// pairs an auth collection with a malformed one.
+///
+/// `injectAuthFields` memcpy's the statics, so an injected prefix is detectable by SLICE
+/// IDENTITY against `authSystemFields()` — same pointer AND same length. Nothing else can
+/// alias those literals: an owned field's id/name come from `alloc.dupe`, and heap never
+/// aliases the `.rodata` a string literal lives in.
+///
+/// Identity, not equality: comparing by VALUE would be actively wrong here. An auth
+/// collection's own user fields can legitimately be named `email` with id `_email` — that is
+/// exactly what the echo path submits — and freeing those as if they were the statics would
+/// leak them.
+///
+/// Length is compared as well as pointer. A slice sharing a pointer with a literal but
+/// carrying a different length is not reachable here (it would take a Field whose id AND
+/// name were both prefix-slices of the corresponding literals, for all six entries in
+/// order), but this is the check that decides whether memory gets freed, and a wrong answer
+/// is a leak or a double free. Exact identity costs one comparison and removes the need to
+/// re-derive the rodata-vs-heap argument to trust it.
+fn authInjectionPrefix(t: CollectionType, fields: []const Field) usize {
+    if (t != .auth) return 0;
+    const sys = authSystemFields();
+    if (fields.len < sys.len) return 0;
+    for (sys, fields[0..sys.len]) |s, f| {
+        if (!sameSlice(s.id, f.id) or !sameSlice(s.name, f.name)) return 0;
+    }
+    return sys.len;
+}
+
+/// True when two slices are the SAME slice — same address and same length — rather than
+/// merely equal in content. See `authInjectionPrefix` for why identity is the question.
+fn sameSlice(a: []const u8, b: []const u8) bool {
+    return a.ptr == b.ptr and a.len == b.len;
+}
 
 /// Free one owned `Field`'s id/name/options (the inverse of `fieldFromValue`). Does NOT free a
 /// backing array — callers that own the array free it separately (see `freeFieldsOwned`, or
@@ -2112,4 +2156,59 @@ test "passwordEnabled backward compat and explicit opt-in" {
     // auth collection with only magic_link (no password) => not enabled
     const auth_col_ml = Collection{ .id = "c", .name = "users", .type = .auth, .fields = &.{}, .options = .{ .auth = .{ .methods = .{ .magic_link = .{} } } } };
     try std.testing.expect(!passwordEnabled(auth_col_ml));
+}
+
+test "Collection.deinit frees an auth collection that was never auth-injected" {
+    // `Collection.deinit` skipped `authSystemFields().len` leading fields whenever
+    // `type == .auth`, on the assumption that every auth collection is the INJECTED shape
+    // `collections.get` returns. `parseCollectionInput` returns the other shape — user
+    // fields only — so freeing one with fewer than six user fields sliced out of bounds and
+    // PANICKED. Reachable from `zigbase schema apply`: `schema_doc.parse`'s errdefer frees
+    // the auth collections it already parsed when a later collection in the document is
+    // malformed. Discriminate on the actual injection, not on the type tag.
+    const a = std.testing.allocator;
+    const col = try parseCollectionInput(a, "{\"name\":\"users\",\"type\":\"auth\",\"fields\":[{\"id\":\"\",\"name\":\"bio\",\"type\":\"text\"}],\"options\":{}}");
+    col.deinit(a); // must not panic, and must free `bio`
+}
+
+test "authInjectionPrefix answers identity, not equality" {
+    // The prefix decides whether `Collection.deinit` FREES a field or skips it, so it has to
+    // ask "is this the static?", never "does this look like the static?". A field can
+    // legitimately carry a system field's exact name and id while being owned heap memory —
+    // that is what an auth collection's echo path submits — and treating those as statics
+    // would leak them. Compare a duped copy (same bytes, different addresses) against the
+    // real thing to pin identity semantics against a regression to `std.mem.eql`.
+    const a = std.testing.allocator;
+    const sys = authSystemFields();
+
+    // The genuine injected shape: `injectAuthFields` memcpy's the statics.
+    const user = [_]Field{.{ .id = "f1", .name = "bio", .options = .{ .text = .{} } }};
+    const injected = try injectAuthFields(a, .{ .id = "c", .name = "users", .type = .auth, .fields = &user });
+    defer a.free(injected.fields);
+    try std.testing.expectEqual(sys.len, authInjectionPrefix(.auth, injected.fields));
+
+    // Byte-identical copies at different addresses are NOT the statics.
+    const copies = try a.alloc(Field, sys.len);
+    defer {
+        for (copies) |c| {
+            a.free(c.id);
+            a.free(c.name);
+        }
+        a.free(copies);
+    }
+    for (sys, copies) |s, *c| {
+        c.* = s;
+        c.id = try a.dupe(u8, s.id);
+        c.name = try a.dupe(u8, s.name);
+    }
+    try std.testing.expectEqual(@as(usize, 0), authInjectionPrefix(.auth, copies));
+
+    // A shorter slice of the same literal is not the literal either (the length half of the
+    // identity check), and a non-auth collection never has a prefix at all.
+    var truncated = try a.alloc(Field, sys.len);
+    defer a.free(truncated);
+    @memcpy(truncated, sys);
+    truncated[0].name = sys[0].name[0..1];
+    try std.testing.expectEqual(@as(usize, 0), authInjectionPrefix(.auth, truncated));
+    try std.testing.expectEqual(@as(usize, 0), authInjectionPrefix(.base, injected.fields));
 }
