@@ -1,0 +1,1294 @@
+{
+  "adapter": "SQLite",
+  "catalog_supported": true,
+  "database": "development.sqlite3",
+  "foreign_keys_supported": true,
+  "schema_migrations": [
+    "20240101000001",
+    "20240101000002",
+    "20240101000003",
+    "20240101000004",
+    "20240101000005",
+    "20240101000006",
+    "20240101000007",
+    "20240101000008",
+    "20240101000009",
+    "20240101000010"
+  ],
+  "source": "observed",
+  "tables": [
+    {
+      "check_constraints": [],
+      "columns": [
+        {
+          "default": null,
+          "default_function": null,
+          "name": "id",
+          "null": false,
+          "source": "observed",
+          "sql_type": "INTEGER",
+          "type": "integer"
+        },
+        {
+          "default": null,
+          "default_function": null,
+          "name": "name",
+          "null": false,
+          "source": "observed",
+          "sql_type": "varchar",
+          "type": "string"
+        },
+        {
+          "default": null,
+          "default_function": null,
+          "name": "record_type",
+          "null": false,
+          "source": "observed",
+          "sql_type": "varchar",
+          "type": "string"
+        },
+        {
+          "default": null,
+          "default_function": null,
+          "name": "record_id",
+          "null": false,
+          "source": "observed",
+          "sql_type": "bigint",
+          "type": "integer"
+        },
+        {
+          "default": null,
+          "default_function": null,
+          "name": "blob_id",
+          "null": false,
+          "source": "observed",
+          "sql_type": "bigint",
+          "type": "integer"
+        },
+        {
+          "default": null,
+          "default_function": null,
+          "name": "created_at",
+          "null": false,
+          "source": "observed",
+          "sql_type": "datetime(6)",
+          "type": "datetime"
+        }
+      ],
+      "foreign_keys": [
+        {
+          "column": "blob_id",
+          "from_table": "active_storage_attachments",
+          "name": null,
+          "on_delete": null,
+          "on_update": null,
+          "primary_key": "id",
+          "source": "observed",
+          "to_table": "active_storage_blobs"
+        }
+      ],
+      "indexes": [
+        {
+          "columns": [
+            "blob_id"
+          ],
+          "name": "index_active_storage_attachments_on_blob_id",
+          "source": "observed",
+          "unique": false,
+          "where": null
+        },
+        {
+          "columns": [
+            "record_type",
+            "record_id",
+            "name",
+            "blob_id"
+          ],
+          "name": "index_active_storage_attachments_uniqueness",
+          "source": "observed",
+          "unique": true,
+          "where": null
+        }
+      ],
+      "name": "active_storage_attachments",
+      "primary_key": "id",
+      "source": "observed"
+    },
+    {
+      "check_constraints": [],
+      "columns": [
+        {
+          "default": null,
+          "default_function": null,
+          "name": "id",
+          "null": false,
+          "source": "observed",
+          "sql_type": "INTEGER",
+          "type": "integer"
+        },
+        {
+          "default": null,
+          "default_function": null,
+          "name": "key",
+          "null": false,
+          "source": "observed",
+          "sql_type": "varchar",
+          "type": "string"
+        },
+        {
+          "default": null,
+          "default_function": null,
+          "name": "filename",
+          "null": false,
+          "source": "observed",
+          "sql_type": "varchar",
+          "type": "string"
+        },
+        {
+          "default": null,
+          "default_function": null,
+          "name": "content_type",
+          "null": true,
+          "source": "observed",
+          "sql_type": "varchar",
+          "type": "string"
+        },
+        {
+          "default": null,
+          "default_function": null,
+          "name": "metadata",
+          "null": true,
+          "source": "observed",
+          "sql_type": "TEXT",
+          "type": "text"
+        },
+        {
+          "default": null,
+          "default_function": null,
+          "name": "service_name",
+          "null": false,
+          "source": "observed",
+          "sql_type": "varchar",
+          "type": "string"
+        },
+        {
+          "default": null,
+          "default_function": null,
+          "name": "byte_size",
+          "null": false,
+          "source": "observed",
+          "sql_type": "bigint",
+          "type": "integer"
+        },
+        {
+          "default": null,
+          "default_function": null,
+          "name": "checksum",
+          "null": true,
+          "source": "observed",
+          "sql_type": "varchar",
+          "type": "string"
+        },
+        {
+          "default": null,
+          "default_function": null,
+          "name": "created_at",
+          "null": false,
+          "source": "observed",
+          "sql_type": "datetime(6)",
+          "type": "datetime"
+        }
+      ],
+      "foreign_keys": [],
+      "indexes": [
+        {
+          "columns": [
+            "key"
+          ],
+          "name": "index_active_storage_blobs_on_key",
+          "source": "observed",
+          "unique": true,
+          "where": null
+        }
+      ],
+      "name": "active_storage_blobs",
+      "primary_key": "id",
+      "source": "observed"
+    },
+    {
+      "check_constraints": [],
+      "columns": [
+        {
+          "default": null,
+          "default_function": null,
+          "name": "id",
+          "null": false,
+          "source": "observed",
+          "sql_type": "INTEGER",
+          "type": "integer"
+        },
+        {
+          "default": null,
+          "default_function": null,
+          "name": "blob_id",
+          "null": false,
+          "source": "observed",
+          "sql_type": "bigint",
+          "type": "integer"
+        },
+        {
+          "default": null,
+          "default_function": null,
+          "name": "variation_digest",
+          "null": false,
+          "source": "observed",
+          "sql_type": "varchar",
+          "type": "string"
+        }
+      ],
+      "foreign_keys": [
+        {
+          "column": "blob_id",
+          "from_table": "active_storage_variant_records",
+          "name": null,
+          "on_delete": null,
+          "on_update": null,
+          "primary_key": "id",
+          "source": "observed",
+          "to_table": "active_storage_blobs"
+        }
+      ],
+      "indexes": [
+        {
+          "columns": [
+            "blob_id",
+            "variation_digest"
+          ],
+          "name": "index_active_storage_variant_records_uniqueness",
+          "source": "observed",
+          "unique": true,
+          "where": null
+        }
+      ],
+      "name": "active_storage_variant_records",
+      "primary_key": "id",
+      "source": "observed"
+    },
+    {
+      "check_constraints": [],
+      "columns": [
+        {
+          "default": null,
+          "default_function": null,
+          "name": "key",
+          "null": false,
+          "source": "observed",
+          "sql_type": "varchar",
+          "type": "string"
+        },
+        {
+          "default": null,
+          "default_function": null,
+          "name": "value",
+          "null": true,
+          "source": "observed",
+          "sql_type": "varchar",
+          "type": "string"
+        },
+        {
+          "default": null,
+          "default_function": null,
+          "name": "created_at",
+          "null": false,
+          "source": "observed",
+          "sql_type": "datetime(6)",
+          "type": "datetime"
+        },
+        {
+          "default": null,
+          "default_function": null,
+          "name": "updated_at",
+          "null": false,
+          "source": "observed",
+          "sql_type": "datetime(6)",
+          "type": "datetime"
+        }
+      ],
+      "foreign_keys": [],
+      "indexes": [],
+      "name": "ar_internal_metadata",
+      "primary_key": "key",
+      "source": "observed"
+    },
+    {
+      "check_constraints": [],
+      "columns": [
+        {
+          "default": null,
+          "default_function": null,
+          "name": "id",
+          "null": false,
+          "source": "observed",
+          "sql_type": "INTEGER",
+          "type": "integer"
+        },
+        {
+          "default": null,
+          "default_function": null,
+          "name": "name",
+          "null": false,
+          "source": "observed",
+          "sql_type": "varchar",
+          "type": "string"
+        },
+        {
+          "default": null,
+          "default_function": null,
+          "name": "slug",
+          "null": false,
+          "source": "observed",
+          "sql_type": "varchar",
+          "type": "string"
+        },
+        {
+          "default": null,
+          "default_function": null,
+          "name": "owner_id",
+          "null": false,
+          "source": "observed",
+          "sql_type": "INTEGER",
+          "type": "integer"
+        },
+        {
+          "default": "public_club",
+          "default_function": null,
+          "name": "visibility",
+          "null": false,
+          "source": "observed",
+          "sql_type": "varchar",
+          "type": "string"
+        },
+        {
+          "default": 0,
+          "default_function": null,
+          "name": "posts_count",
+          "null": false,
+          "source": "observed",
+          "sql_type": "INTEGER",
+          "type": "integer"
+        },
+        {
+          "default": null,
+          "default_function": null,
+          "name": "archived_at",
+          "null": true,
+          "source": "observed",
+          "sql_type": "datetime(6)",
+          "type": "datetime"
+        },
+        {
+          "default": null,
+          "default_function": null,
+          "name": "created_at",
+          "null": false,
+          "source": "observed",
+          "sql_type": "datetime(6)",
+          "type": "datetime"
+        },
+        {
+          "default": null,
+          "default_function": null,
+          "name": "updated_at",
+          "null": false,
+          "source": "observed",
+          "sql_type": "datetime(6)",
+          "type": "datetime"
+        }
+      ],
+      "foreign_keys": [
+        {
+          "column": "owner_id",
+          "from_table": "clubs",
+          "name": null,
+          "on_delete": null,
+          "on_update": null,
+          "primary_key": "id",
+          "source": "observed",
+          "to_table": "users"
+        }
+      ],
+      "indexes": [
+        {
+          "columns": [
+            "archived_at"
+          ],
+          "name": "index_clubs_on_archived_at",
+          "source": "observed",
+          "unique": false,
+          "where": null
+        },
+        {
+          "columns": [
+            "owner_id"
+          ],
+          "name": "index_clubs_on_owner_id",
+          "source": "observed",
+          "unique": false,
+          "where": null
+        },
+        {
+          "columns": [
+            "slug"
+          ],
+          "name": "index_clubs_on_slug",
+          "source": "observed",
+          "unique": true,
+          "where": null
+        }
+      ],
+      "name": "clubs",
+      "primary_key": "id",
+      "source": "observed"
+    },
+    {
+      "check_constraints": [],
+      "columns": [
+        {
+          "default": null,
+          "default_function": null,
+          "name": "id",
+          "null": false,
+          "source": "observed",
+          "sql_type": "INTEGER",
+          "type": "integer"
+        },
+        {
+          "default": null,
+          "default_function": null,
+          "name": "post_id",
+          "null": false,
+          "source": "observed",
+          "sql_type": "INTEGER",
+          "type": "integer"
+        },
+        {
+          "default": null,
+          "default_function": null,
+          "name": "author_id",
+          "null": false,
+          "source": "observed",
+          "sql_type": "INTEGER",
+          "type": "integer"
+        },
+        {
+          "default": null,
+          "default_function": null,
+          "name": "body",
+          "null": false,
+          "source": "observed",
+          "sql_type": "TEXT",
+          "type": "text"
+        },
+        {
+          "default": null,
+          "default_function": null,
+          "name": "created_at",
+          "null": false,
+          "source": "observed",
+          "sql_type": "datetime(6)",
+          "type": "datetime"
+        },
+        {
+          "default": null,
+          "default_function": null,
+          "name": "updated_at",
+          "null": false,
+          "source": "observed",
+          "sql_type": "datetime(6)",
+          "type": "datetime"
+        }
+      ],
+      "foreign_keys": [
+        {
+          "column": "author_id",
+          "from_table": "comments",
+          "name": null,
+          "on_delete": null,
+          "on_update": null,
+          "primary_key": "id",
+          "source": "observed",
+          "to_table": "users"
+        },
+        {
+          "column": "post_id",
+          "from_table": "comments",
+          "name": null,
+          "on_delete": null,
+          "on_update": null,
+          "primary_key": "id",
+          "source": "observed",
+          "to_table": "posts"
+        }
+      ],
+      "indexes": [
+        {
+          "columns": [
+            "author_id"
+          ],
+          "name": "index_comments_on_author_id",
+          "source": "observed",
+          "unique": false,
+          "where": null
+        },
+        {
+          "columns": [
+            "post_id"
+          ],
+          "name": "index_comments_on_post_id",
+          "source": "observed",
+          "unique": false,
+          "where": null
+        }
+      ],
+      "name": "comments",
+      "primary_key": "id",
+      "source": "observed"
+    },
+    {
+      "check_constraints": [],
+      "columns": [
+        {
+          "default": null,
+          "default_function": null,
+          "name": "id",
+          "null": false,
+          "source": "observed",
+          "sql_type": "INTEGER",
+          "type": "integer"
+        },
+        {
+          "default": null,
+          "default_function": null,
+          "name": "type",
+          "null": false,
+          "source": "observed",
+          "sql_type": "varchar",
+          "type": "string"
+        },
+        {
+          "default": null,
+          "default_function": null,
+          "name": "club_id",
+          "null": false,
+          "source": "observed",
+          "sql_type": "INTEGER",
+          "type": "integer"
+        },
+        {
+          "default": null,
+          "default_function": null,
+          "name": "title",
+          "null": false,
+          "source": "observed",
+          "sql_type": "varchar",
+          "type": "string"
+        },
+        {
+          "default": null,
+          "default_function": null,
+          "name": "starts_at",
+          "null": false,
+          "source": "observed",
+          "sql_type": "datetime(6)",
+          "type": "datetime"
+        },
+        {
+          "default": null,
+          "default_function": null,
+          "name": "location",
+          "null": true,
+          "source": "observed",
+          "sql_type": "varchar",
+          "type": "string"
+        },
+        {
+          "default": null,
+          "default_function": null,
+          "name": "pages_target",
+          "null": true,
+          "source": "observed",
+          "sql_type": "INTEGER",
+          "type": "integer"
+        },
+        {
+          "default": null,
+          "default_function": null,
+          "name": "created_at",
+          "null": false,
+          "source": "observed",
+          "sql_type": "datetime(6)",
+          "type": "datetime"
+        },
+        {
+          "default": null,
+          "default_function": null,
+          "name": "updated_at",
+          "null": false,
+          "source": "observed",
+          "sql_type": "datetime(6)",
+          "type": "datetime"
+        }
+      ],
+      "foreign_keys": [
+        {
+          "column": "club_id",
+          "from_table": "events",
+          "name": null,
+          "on_delete": null,
+          "on_update": null,
+          "primary_key": "id",
+          "source": "observed",
+          "to_table": "clubs"
+        }
+      ],
+      "indexes": [
+        {
+          "columns": [
+            "club_id"
+          ],
+          "name": "index_events_on_club_id",
+          "source": "observed",
+          "unique": false,
+          "where": null
+        },
+        {
+          "columns": [
+            "type"
+          ],
+          "name": "index_events_on_type",
+          "source": "observed",
+          "unique": false,
+          "where": null
+        }
+      ],
+      "name": "events",
+      "primary_key": "id",
+      "source": "observed"
+    },
+    {
+      "check_constraints": [],
+      "columns": [
+        {
+          "default": null,
+          "default_function": null,
+          "name": "id",
+          "null": false,
+          "source": "observed",
+          "sql_type": "INTEGER",
+          "type": "integer"
+        },
+        {
+          "default": null,
+          "default_function": null,
+          "name": "flaggable_type",
+          "null": false,
+          "source": "observed",
+          "sql_type": "varchar",
+          "type": "string"
+        },
+        {
+          "default": null,
+          "default_function": null,
+          "name": "flaggable_id",
+          "null": false,
+          "source": "observed",
+          "sql_type": "bigint",
+          "type": "integer"
+        },
+        {
+          "default": null,
+          "default_function": null,
+          "name": "reporter_id",
+          "null": false,
+          "source": "observed",
+          "sql_type": "INTEGER",
+          "type": "integer"
+        },
+        {
+          "default": null,
+          "default_function": null,
+          "name": "reason",
+          "null": false,
+          "source": "observed",
+          "sql_type": "varchar",
+          "type": "string"
+        },
+        {
+          "default": null,
+          "default_function": null,
+          "name": "created_at",
+          "null": false,
+          "source": "observed",
+          "sql_type": "datetime(6)",
+          "type": "datetime"
+        },
+        {
+          "default": null,
+          "default_function": null,
+          "name": "updated_at",
+          "null": false,
+          "source": "observed",
+          "sql_type": "datetime(6)",
+          "type": "datetime"
+        }
+      ],
+      "foreign_keys": [
+        {
+          "column": "reporter_id",
+          "from_table": "flags",
+          "name": null,
+          "on_delete": null,
+          "on_update": null,
+          "primary_key": "id",
+          "source": "observed",
+          "to_table": "users"
+        }
+      ],
+      "indexes": [
+        {
+          "columns": [
+            "flaggable_type",
+            "flaggable_id"
+          ],
+          "name": "index_flags_on_flaggable_type_and_flaggable_id",
+          "source": "observed",
+          "unique": false,
+          "where": null
+        },
+        {
+          "columns": [
+            "reporter_id"
+          ],
+          "name": "index_flags_on_reporter_id",
+          "source": "observed",
+          "unique": false,
+          "where": null
+        }
+      ],
+      "name": "flags",
+      "primary_key": "id",
+      "source": "observed"
+    },
+    {
+      "check_constraints": [],
+      "columns": [
+        {
+          "default": null,
+          "default_function": null,
+          "name": "id",
+          "null": false,
+          "source": "observed",
+          "sql_type": "INTEGER",
+          "type": "integer"
+        },
+        {
+          "default": null,
+          "default_function": null,
+          "name": "user_id",
+          "null": false,
+          "source": "observed",
+          "sql_type": "INTEGER",
+          "type": "integer"
+        },
+        {
+          "default": null,
+          "default_function": null,
+          "name": "club_id",
+          "null": false,
+          "source": "observed",
+          "sql_type": "INTEGER",
+          "type": "integer"
+        },
+        {
+          "default": 0,
+          "default_function": null,
+          "name": "role",
+          "null": false,
+          "source": "observed",
+          "sql_type": "INTEGER",
+          "type": "integer"
+        },
+        {
+          "default": null,
+          "default_function": null,
+          "name": "joined_at",
+          "null": false,
+          "source": "observed",
+          "sql_type": "datetime(6)",
+          "type": "datetime"
+        },
+        {
+          "default": null,
+          "default_function": null,
+          "name": "created_at",
+          "null": false,
+          "source": "observed",
+          "sql_type": "datetime(6)",
+          "type": "datetime"
+        },
+        {
+          "default": null,
+          "default_function": null,
+          "name": "updated_at",
+          "null": false,
+          "source": "observed",
+          "sql_type": "datetime(6)",
+          "type": "datetime"
+        }
+      ],
+      "foreign_keys": [
+        {
+          "column": "club_id",
+          "from_table": "memberships",
+          "name": null,
+          "on_delete": null,
+          "on_update": null,
+          "primary_key": "id",
+          "source": "observed",
+          "to_table": "clubs"
+        },
+        {
+          "column": "user_id",
+          "from_table": "memberships",
+          "name": null,
+          "on_delete": null,
+          "on_update": null,
+          "primary_key": "id",
+          "source": "observed",
+          "to_table": "users"
+        }
+      ],
+      "indexes": [
+        {
+          "columns": [
+            "club_id"
+          ],
+          "name": "index_memberships_on_club_id",
+          "source": "observed",
+          "unique": false,
+          "where": null
+        },
+        {
+          "columns": [
+            "user_id",
+            "club_id"
+          ],
+          "name": "index_memberships_on_user_and_club",
+          "source": "observed",
+          "unique": true,
+          "where": null
+        },
+        {
+          "columns": [
+            "user_id"
+          ],
+          "name": "index_memberships_on_user_id",
+          "source": "observed",
+          "unique": false,
+          "where": null
+        }
+      ],
+      "name": "memberships",
+      "primary_key": "id",
+      "source": "observed"
+    },
+    {
+      "check_constraints": [],
+      "columns": [
+        {
+          "default": null,
+          "default_function": null,
+          "name": "id",
+          "null": false,
+          "source": "observed",
+          "sql_type": "INTEGER",
+          "type": "integer"
+        },
+        {
+          "default": null,
+          "default_function": null,
+          "name": "user_id",
+          "null": false,
+          "source": "observed",
+          "sql_type": "INTEGER",
+          "type": "integer"
+        },
+        {
+          "default": null,
+          "default_function": null,
+          "name": "kind",
+          "null": false,
+          "source": "observed",
+          "sql_type": "varchar",
+          "type": "string"
+        },
+        {
+          "default": "{}",
+          "default_function": null,
+          "name": "payload",
+          "null": false,
+          "source": "observed",
+          "sql_type": "TEXT",
+          "type": "text"
+        },
+        {
+          "default": null,
+          "default_function": null,
+          "name": "created_at",
+          "null": false,
+          "source": "observed",
+          "sql_type": "datetime(6)",
+          "type": "datetime"
+        }
+      ],
+      "foreign_keys": [
+        {
+          "column": "user_id",
+          "from_table": "notifications",
+          "name": null,
+          "on_delete": null,
+          "on_update": null,
+          "primary_key": "id",
+          "source": "observed",
+          "to_table": "users"
+        }
+      ],
+      "indexes": [
+        {
+          "columns": [
+            "user_id"
+          ],
+          "name": "index_notifications_on_user_id",
+          "source": "observed",
+          "unique": false,
+          "where": null
+        },
+        {
+          "columns": [
+            "user_id",
+            "kind"
+          ],
+          "name": "index_notifications_on_user_id_and_kind",
+          "source": "observed",
+          "unique": false,
+          "where": null
+        }
+      ],
+      "name": "notifications",
+      "primary_key": "id",
+      "source": "observed"
+    },
+    {
+      "check_constraints": [],
+      "columns": [
+        {
+          "default": null,
+          "default_function": null,
+          "name": "id",
+          "null": false,
+          "source": "observed",
+          "sql_type": "INTEGER",
+          "type": "integer"
+        },
+        {
+          "default": null,
+          "default_function": null,
+          "name": "club_id",
+          "null": false,
+          "source": "observed",
+          "sql_type": "INTEGER",
+          "type": "integer"
+        },
+        {
+          "default": null,
+          "default_function": null,
+          "name": "author_id",
+          "null": false,
+          "source": "observed",
+          "sql_type": "INTEGER",
+          "type": "integer"
+        },
+        {
+          "default": null,
+          "default_function": null,
+          "name": "title",
+          "null": false,
+          "source": "observed",
+          "sql_type": "varchar",
+          "type": "string"
+        },
+        {
+          "default": null,
+          "default_function": null,
+          "name": "body",
+          "null": true,
+          "source": "observed",
+          "sql_type": "TEXT",
+          "type": "text"
+        },
+        {
+          "default": "draft",
+          "default_function": null,
+          "name": "status",
+          "null": false,
+          "source": "observed",
+          "sql_type": "varchar",
+          "type": "string"
+        },
+        {
+          "default": null,
+          "default_function": null,
+          "name": "published_at",
+          "null": true,
+          "source": "observed",
+          "sql_type": "datetime(6)",
+          "type": "datetime"
+        },
+        {
+          "default": null,
+          "default_function": null,
+          "name": "created_at",
+          "null": false,
+          "source": "observed",
+          "sql_type": "datetime(6)",
+          "type": "datetime"
+        },
+        {
+          "default": null,
+          "default_function": null,
+          "name": "updated_at",
+          "null": false,
+          "source": "observed",
+          "sql_type": "datetime(6)",
+          "type": "datetime"
+        }
+      ],
+      "foreign_keys": [
+        {
+          "column": "author_id",
+          "from_table": "posts",
+          "name": null,
+          "on_delete": null,
+          "on_update": null,
+          "primary_key": "id",
+          "source": "observed",
+          "to_table": "users"
+        },
+        {
+          "column": "club_id",
+          "from_table": "posts",
+          "name": null,
+          "on_delete": null,
+          "on_update": null,
+          "primary_key": "id",
+          "source": "observed",
+          "to_table": "clubs"
+        }
+      ],
+      "indexes": [
+        {
+          "columns": [
+            "author_id"
+          ],
+          "name": "index_posts_on_author_id",
+          "source": "observed",
+          "unique": false,
+          "where": null
+        },
+        {
+          "columns": [
+            "club_id"
+          ],
+          "name": "index_posts_on_club_id",
+          "source": "observed",
+          "unique": false,
+          "where": null
+        },
+        {
+          "columns": [
+            "club_id",
+            "status"
+          ],
+          "name": "index_posts_on_club_id_and_status",
+          "source": "observed",
+          "unique": false,
+          "where": null
+        },
+        {
+          "columns": [
+            "published_at"
+          ],
+          "name": "index_posts_on_published_at",
+          "source": "observed",
+          "unique": false,
+          "where": null
+        }
+      ],
+      "name": "posts",
+      "primary_key": "id",
+      "source": "observed"
+    },
+    {
+      "check_constraints": [],
+      "columns": [
+        {
+          "default": null,
+          "default_function": null,
+          "name": "version",
+          "null": false,
+          "source": "observed",
+          "sql_type": "varchar",
+          "type": "string"
+        }
+      ],
+      "foreign_keys": [],
+      "indexes": [],
+      "name": "schema_migrations",
+      "primary_key": "version",
+      "source": "observed"
+    },
+    {
+      "check_constraints": [],
+      "columns": [
+        {
+          "default": null,
+          "default_function": null,
+          "name": "id",
+          "null": false,
+          "source": "observed",
+          "sql_type": "INTEGER",
+          "type": "integer"
+        },
+        {
+          "default": null,
+          "default_function": null,
+          "name": "email",
+          "null": false,
+          "source": "observed",
+          "sql_type": "varchar",
+          "type": "string"
+        },
+        {
+          "default": null,
+          "default_function": null,
+          "name": "password_digest",
+          "null": false,
+          "source": "observed",
+          "sql_type": "varchar",
+          "type": "string"
+        },
+        {
+          "default": null,
+          "default_function": null,
+          "name": "display_name",
+          "null": false,
+          "source": "observed",
+          "sql_type": "varchar",
+          "type": "string"
+        },
+        {
+          "default": null,
+          "default_function": null,
+          "name": "phone",
+          "null": true,
+          "source": "observed",
+          "sql_type": "TEXT",
+          "type": "text"
+        },
+        {
+          "default": 0,
+          "default_function": null,
+          "name": "role",
+          "null": false,
+          "source": "observed",
+          "sql_type": "INTEGER",
+          "type": "integer"
+        },
+        {
+          "default": null,
+          "default_function": null,
+          "name": "created_at",
+          "null": false,
+          "source": "observed",
+          "sql_type": "datetime(6)",
+          "type": "datetime"
+        },
+        {
+          "default": null,
+          "default_function": null,
+          "name": "updated_at",
+          "null": false,
+          "source": "observed",
+          "sql_type": "datetime(6)",
+          "type": "datetime"
+        }
+      ],
+      "foreign_keys": [],
+      "indexes": [
+        {
+          "columns": [
+            "email"
+          ],
+          "name": "index_users_on_email",
+          "source": "observed",
+          "unique": true,
+          "where": null
+        },
+        {
+          "columns": [
+            "role"
+          ],
+          "name": "index_users_on_role",
+          "source": "observed",
+          "unique": false,
+          "where": null
+        }
+      ],
+      "name": "users",
+      "primary_key": "id",
+      "source": "observed"
+    }
+  ],
+  "triggers": [
+    {
+      "name": "posts_count_after_club_change",
+      "source": "observed",
+      "sql": "CREATE TRIGGER posts_count_after_club_change\nAFTER UPDATE OF club_id ON posts\nWHEN OLD.club_id <> NEW.club_id\nBEGIN\n  UPDATE clubs SET posts_count = posts_count - 1 WHERE id = OLD.club_id;\n  UPDATE clubs SET posts_count = posts_count + 1 WHERE id = NEW.club_id;\nEND",
+      "table": "posts",
+      "type": "trigger"
+    },
+    {
+      "name": "posts_count_after_delete",
+      "source": "observed",
+      "sql": "CREATE TRIGGER posts_count_after_delete\nAFTER DELETE ON posts\nBEGIN\n  UPDATE clubs SET posts_count = posts_count - 1 WHERE id = OLD.club_id;\nEND",
+      "table": "posts",
+      "type": "trigger"
+    },
+    {
+      "name": "posts_count_after_insert",
+      "source": "observed",
+      "sql": "CREATE TRIGGER posts_count_after_insert\nAFTER INSERT ON posts\nBEGIN\n  UPDATE clubs SET posts_count = posts_count + 1 WHERE id = NEW.club_id;\nEND",
+      "table": "posts",
+      "type": "trigger"
+    }
+  ],
+  "views": [
+    {
+      "name": "published_post_counts",
+      "source": "observed",
+      "sql": "CREATE VIEW published_post_counts AS\nSELECT club_id, COUNT(*) AS published_count\nFROM posts\nWHERE status = 'published'\nGROUP BY club_id",
+      "table": "published_post_counts",
+      "type": "view"
+    }
+  ]
+}

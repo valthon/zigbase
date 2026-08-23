@@ -1,0 +1,6 @@
+# A frozen SQLite fixture must never ship its WAL sidecars. Opening the database --
+# even read-only, as the tests do -- creates them, so `git add -A` sweeps them in.
+# A committed stale WAL is replayed by SQLite on the next open, which silently changes
+# the fixture's contents depending on who ran the tests last.
+*.sqlite3-wal
+*.sqlite3-shm

@@ -54,6 +54,15 @@ GO_REFERENCE_NAMES = (
     "migration-tools.md",
     "openapi.md",
 )
+RAILS_API_REFERENCE_NAMES = (
+    "agents.md",
+    "deployment.md",
+    "docker.md",
+    "migrate-rails-api.md",
+    "migration-tools.md",
+    "openapi.md",
+    "serve.md",
+)
 
 
 def reference_is_current(repo: Path, embedded: Path, name: str) -> bool:
@@ -425,6 +434,11 @@ def test_express_migration_skill_is_valid_and_synced():
     [
         ("zigbase-migrate-laravel", "migrate-laravel.md", LARAVEL_REFERENCE_NAMES),
         ("zigbase-migrate-go", "migrate-go.md", GO_REFERENCE_NAMES),
+        (
+            "zigbase-migrate-rails-api",
+            "migrate-rails-api.md",
+            RAILS_API_REFERENCE_NAMES,
+        ),
     ],
 )
 def test_remaining_source_skills_are_valid_and_synced(skill_name, guide, references):
@@ -436,6 +450,11 @@ def test_remaining_source_skills_are_valid_and_synced(skill_name, guide, referen
     [
         ("zigbase-migrate-laravel", "migrate-laravel.md", LARAVEL_REFERENCE_NAMES),
         ("zigbase-migrate-go", "migrate-go.md", GO_REFERENCE_NAMES),
+        (
+            "zigbase-migrate-rails-api",
+            "migrate-rails-api.md",
+            RAILS_API_REFERENCE_NAMES,
+        ),
     ],
 )
 @pytest.mark.parametrize(

@@ -600,13 +600,13 @@ jobs:
       - name: Pull pinned Genesis deployment image
         run: docker pull ghcr.io/valthon/zigbase:0.13.0
       - name: Python lint for migration and evaluation tooling
-        run: python -m ruff check tools/pocketbase evals/agents tests/pocketbase tests/agent_evals
+        run: python -m ruff check tools/pocketbase tools/rails evals/agents tests/pocketbase tests/rails tests/agent_evals
       - name: Converter, skill drift, runner, graders, and live Docker boundary
         env:
           ZIGBASE_DOCKER_EVAL_TEST: "1"
         run: |
           python tools/sync_skill_references.py --check
-          python -m pytest tests/pocketbase tests/agent_evals -q
+          python -m pytest tests/pocketbase tests/rails tests/agent_evals -q
           python -m pytest --noconftest tests/admin/test_skill_sync.py -q
 
   dart-sdk:

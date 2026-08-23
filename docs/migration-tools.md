@@ -21,6 +21,11 @@ decisions, deterministic extraction, timestamp/password preservation, and local 
 [Migrate PocketBase 0.39.11 to ZigBase](migrate-pocketbase.md) instead of hand-building the schema
 and NDJSON described here.
 
+Rails API-only migrations have a supported offline converter as well, driven by metadata observed
+from the booted application rather than parsed from Ruby. Follow
+[Migrate a Rails API to ZigBase](migrate-rails-api.md) instead of hand-building the schema and
+NDJSON described here.
+
 ## 1. Re-platforming stages
 
 A real migration — Rails, Express, or another backend you're moving off of — is a
