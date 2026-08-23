@@ -139,6 +139,16 @@ pub const Db = struct {
         return self.exec("BEGIN IMMEDIATE;");
     }
 
+    /// True while a transaction is open on THIS connection. Asked by the callers that must
+    /// join an outer transaction with a `SAVEPOINT` rather than a nested `BEGIN` (which
+    /// SQLite refuses), and by `collections.update`, whose `PRAGMA foreign_keys` is a silent
+    /// no-op inside a transaction. Read from `sqlite3_get_autocommit` rather than from a
+    /// counter we maintain, so an error that auto-rolled the transaction back cannot leave
+    /// our idea of the state disagreeing with SQLite's.
+    pub fn inTransaction(self: *Db) bool {
+        return c.sqlite3_get_autocommit(self.handle) == 0;
+    }
+
     /// Number of rows changed/inserted/deleted by the most recent DML statement on this
     /// connection. Wraps `sqlite3_changes64`. Safe to call immediately after a Stmt.step()
     /// that ran a DML statement (UPDATE/INSERT/DELETE) on this connection.
