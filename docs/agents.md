@@ -112,6 +112,7 @@ trust it over any document, including this one.
 | re-platforming a Node.js/Express service | [migrate-express.md](migrate-express.md) |
 | re-platforming a Laravel application | [migrate-laravel.md](migrate-laravel.md) |
 | re-platforming a Go web service | [migrate-go.md](migrate-go.md) |
+| re-platforming a Rails API-only backend | [migrate-rails-api.md](migrate-rails-api.md) |
 | doing per-row authorization | [abilities.md](abilities.md), [tenancy.md](tenancy.md) |
 | adding search | [search.md](search.md) |
 | sending mail, or running background work | [email.md](email.md), [jobs-and-webhooks.md](jobs-and-webhooks.md) |

@@ -1,0 +1,4 @@
+interface:
+  display_name: "ZigBase Rails API Migration"
+  short_description: "Re-platform Rails API backends onto ZigBase"
+  default_prompt: "Use $zigbase-migrate-rails-api to inventory and re-platform my Rails API backend onto ZigBase with parity evidence."

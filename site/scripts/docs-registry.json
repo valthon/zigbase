@@ -240,6 +240,16 @@
     }
   },
   {
+    "canonical": "docs/migrate-rails-api.md",
+    "mirror": "migrate-rails-api.md",
+    "frontmatter": {
+      "title": "Migrate a Rails API to ZigBase",
+      "description": "Re-platform a Rails API-only backend through observed route, Active Record, authorization, job, and storage discovery; deterministic import; parity; and cutover rehearsal.",
+      "order": 15,
+      "group": "guides"
+    }
+  },
+  {
     "canonical": "docs/migrate-pocketbase.md",
     "mirror": "migrate-pocketbase.md",
     "frontmatter": {
