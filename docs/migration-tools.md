@@ -199,9 +199,24 @@ there is no separate migration-only code path that could disagree with what `POS
     means "needs judgment" and where you asked for an opinion. Run it against the document
     before `apply`, and again at full depth once the collections exist — that is exactly the
     two-step in §6's worked migration.
-- **Not atomic across collections.** Each collection's create/update opens its own
-  transaction; if collection 3 of 5 fails, the emitted `applied` list names exactly which
-  of the first two landed.
+- **Every collection is validated first, and one bad field refuses the whole apply.** The
+  same check `POST /api/collections` runs — collection and field names, reserved names,
+  duplicate fields, index and `select`/`number`/`date`/`relation` option constraints,
+  `tenant_field`/`ttl_field`, and the encryption/full-text rules — is run over every
+  collection in the document *before any write*. Every problem in the document is printed at
+  once, on stderr, with its error code (e.g. `validation_invalid_name`,
+  `validation_reserved_name`), and `apply` exits `1` having written nothing.
+
+  Like the rule gate, this runs in `--dry-run` **and** in the real run, from the same call,
+  so a rehearsal refuses exactly what a run refuses. Failures that need the *live* schema —
+  a relation whose target exists nowhere, a name already taken — still surface from the
+  write itself, which is rolled back whole.
+- **Atomic across collections.** All three passes — creates and updates, the second pass
+  that closes relation cycles, and `--prune` — run inside **one** transaction, which
+  `collections.create`/`update`/`delete` join with a `SAVEPOINT` rather than opening their
+  own. If collection 3 of 5 fails, nothing is left behind: not the first two, not their
+  `_collections` rows, not the schema-generation bump. Fix the document and re-run against
+  the state you started from. The emitted `applied` list is therefore empty on a failure.
 - **`dump` → `apply` is a no-op**, and stays one: re-running `apply` against an
   already-converged document changes nothing — no timestamp bump, no table rebuild, not
   even on a document containing a relation cycle. This holds for GitOps-style repeated
@@ -754,9 +769,6 @@ zigbase schema dump --out schema.json --data-dir ./zb_data
 
 ## 7. Limitations
 
-- **`schema apply` is not atomic across collections** (each `collections.create`/`update`
-  opens its own transaction); the emitted `applied` list names what landed before a
-  failure.
 - **`schema apply` checks access-rule SYNTAX only** — it refuses a document containing an
   unparseable rule (see §2's apply semantics), but it does not resolve field or relation
   names, so a rule naming a field that does not exist still applies cleanly and fails closed

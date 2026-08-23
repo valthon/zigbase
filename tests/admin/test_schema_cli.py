@@ -626,3 +626,74 @@ def test_dump_then_apply_round_trips_an_auth_and_a_base_collection(binary, data_
     again = run(binary, data_dir, "schema", "apply", dumped)
     assert again.returncode == 0, again.stdout + again.stderr
     assert json.loads(again.stdout)["changes"] == []
+
+
+# --- #383: dry-run/apply agreement, and atomicity -----------------------------------------
+
+def test_dry_run_refuses_exactly_what_apply_refuses(binary, data_dir):
+    """#383.1. `--dry-run` computed a diff and printed a plan without ever running the
+    engine's own `schema.validate`, so a document with an identifier-invalid field name
+    (`_draft` — leading underscore) rehearsed clean and then failed the real run. A rehearsal
+    that passes where the run fails is worse than no rehearsal: it turns a caught problem
+    into an uncaught one. Both must refuse, with the same code, writing nothing."""
+    bad = write_doc(data_dir, "bad.json", doc(
+        collection("users", [field("nick")], type="auth",
+                   options={"auth": {"identityFields": ["email"]}}),
+        collection("posts", [field("_draft")]),
+    ))
+    dry = run(binary, data_dir, "schema", "apply", bad, "--dry-run")
+    real = run(binary, data_dir, "schema", "apply", bad)
+    assert dry.returncode == 1, dry.stdout + dry.stderr
+    assert real.returncode == 1, real.stdout + real.stderr
+    assert "validation_invalid_name" in dry.stderr, dry.stderr
+    assert "validation_invalid_name" in real.stderr, real.stderr
+    # Neither run wrote anything — not even the collection ordered BEFORE the invalid one.
+    assert tables(data_dir).isdisjoint({"users", "posts"})
+
+
+def test_a_failed_apply_leaves_no_collections_behind(binary, data_dir):
+    """#383.2. Pass 1 committed each collection in its own transaction, so a document whose
+    first collections are fine and whose last one fails left the operator in a state that is
+    neither the old one nor the new one. The failure used here is deliberately one that only
+    the WRITE can find — a relation naming a collection that is neither in the document nor
+    live — so it survives the pre-flight validation gate and reaches pass 1 with `authors`
+    and `clubs` already created."""
+    bad = write_doc(data_dir, "bad.json", doc(
+        collection("authors", [field("nom")]),
+        collection("clubs", [field("title")]),
+        collection("posts", [
+            field("body"),
+            field("owner", "relation", options={"targetCollectionId": "ghosts", "maxSelect": 1}),
+        ]),
+    ))
+    r = run(binary, data_dir, "schema", "apply", bad)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert tables(data_dir).isdisjoint({"authors", "clubs", "posts"}), tables(data_dir)
+    # `_collections` agrees with the physical schema — no orphan rows for the rolled-back creates.
+    con = sqlite3.connect(os.path.join(data_dir, "data.db"))
+    try:
+        names = {r[0] for r in con.execute('SELECT name FROM "_collections"').fetchall()}
+    finally:
+        con.close()
+    assert names.isdisjoint({"authors", "clubs", "posts"}), names
+
+
+def test_a_failed_apply_rolls_back_a_modification_to_an_existing_collection(binary, data_dir):
+    """The other half of atomicity: an apply that MODIFIES a converged collection and then
+    fails must leave that collection exactly as it was, not half-rebuilt."""
+    good = write_doc(data_dir, "good.json", doc(
+        collection("notes", [field("body")], listRule='body != ""')))
+    assert run(binary, data_dir, "schema", "apply", good).returncode == 0
+    before = columns(data_dir, "notes")
+
+    bad = write_doc(data_dir, "bad.json", doc(
+        collection("notes", [field("body"), field("extra")], listRule='body != ""'),
+        collection("posts", [
+            field("owner", "relation", options={"targetCollectionId": "ghosts", "maxSelect": 1}),
+        ]),
+    ))
+    r = run(binary, data_dir, "schema", "apply", bad)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert columns(data_dir, "notes") == before
+    assert "posts" not in tables(data_dir)
+    assert stored_rule(data_dir, "notes") == 'body != ""'
