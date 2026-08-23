@@ -476,7 +476,7 @@ fn buildField(comptime col_name: []const u8, comptime f: anytype) schema.Field {
         const F = @TypeOf(f);
         if (!@hasField(F, "name")) @compileError("a field in collection '" ++ col_name ++ "' is missing .name");
         const fname: []const u8 = f.name;
-        if (schema.isSystemFieldName(fname)) @compileError("collection '" ++ col_name ++ "': field name '" ++ fname ++ "' is reserved by the engine (id/created/updated/email/username/passwordHash/tokenKey/verified); pick another name");
+        if (schema.isSystemFieldName(fname)) @compileError("collection '" ++ col_name ++ "': field name '" ++ fname ++ "' is reserved by the engine (id/created/updated/email/username/passwordHash/tokenKey/verified/token_epoch); pick another name");
         if (!@hasField(F, "type")) @compileError("field '" ++ fname ++ "' in collection '" ++ col_name ++ "' is missing .type");
         const ftype: schema.FieldType = f.type;
 

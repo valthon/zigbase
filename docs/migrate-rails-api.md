@@ -142,10 +142,11 @@ full column name, and a genuine collision is refused rather than letting one sil
 the other.
 
 **Names the engine owns.** ZigBase reserves `id`, `created`, `updated`, `email`, `username`,
-`passwordHash`, `tokenKey`, `verified` and `token_epoch` as field names, case-insensitively. A
-field carrying one of these is **dropped by `schema apply` rather than refused**, and the importer
-then discards that column's values while reporting success — so an ordinary `contacts.email` column
-migrated to nothing, with a clean exit at every step.
+`passwordHash`, `tokenKey`, `verified` and `token_epoch` as field names, case-insensitively. On a
+**base** collection `schema apply` refuses one outright (`validation_reserved_name`) and writes
+nothing; on an **auth** collection it is dropped instead, because the engine injects those columns
+itself and a client must be able to write back a document it just read. The converter raises a
+finding either way, so neither outcome is something a migration discovers at apply time.
 
 A column that *is* one of these names raises a finding offering `rename` or `omit`. A `rename` onto
 one of them is refused, except where the same exemption applies — a scalar column on an auth

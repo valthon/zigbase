@@ -125,6 +125,11 @@ pub const Db = if (build_options.postgres) union(Backend) {
             inline else => |*d| return d.beginImmediate(),
         }
     }
+    pub fn inTransaction(self: *Db) bool {
+        switch (self.*) {
+            inline else => |*d| return d.inTransaction(),
+        }
+    }
     pub fn changesCount(self: *Db) i64 {
         switch (self.*) {
             inline else => |*d| return d.changesCount(),

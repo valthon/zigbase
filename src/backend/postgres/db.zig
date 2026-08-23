@@ -119,6 +119,15 @@ pub const Db = struct {
         try self.exec("BEGIN;");
     }
 
+    /// True while a transaction is open on THIS connection (SQLite parity — see that
+    /// backend's `inTransaction`). Read from the backend's own `ReadyForQuery` transaction
+    /// status, which the connection records after every round trip: `'I'` is idle, `'T'` is
+    /// in a transaction and `'E'` is a failed transaction still awaiting rollback — both of
+    /// the latter mean a nested `BEGIN` would be rejected.
+    pub fn inTransaction(self: *Db) bool {
+        return self.conn.tx_status != 'I';
+    }
+
     /// Rows changed/inserted/deleted by the most recent DML on this connection. Parsed from
     /// the CommandComplete tag (the PG analog of `sqlite3_changes64`).
     pub fn changesCount(self: *Db) i64 {

@@ -17,6 +17,54 @@ pub const EngineError = error{ Validation, NotFound, Conflict } || db.DbError ||
 /// Validation details for the most recent failed create/update (2b surfaces these).
 pub threadlocal var last_errors: ?[]const schema.ValidationError = null;
 
+/// A write scope for one collection's DDL that JOINS an already-open transaction instead of
+/// failing inside it.
+///
+/// `create`/`update`/`delete` are each all-or-nothing on their own, which is all a single REST
+/// request needs. `schema apply` needs a whole DOCUMENT to be all-or-nothing (#383): a run that
+/// fails on the fourth collection must not leave the first three behind. It gets that by opening
+/// ONE transaction around the loop — but SQLite and PostgreSQL both reject a nested `BEGIN`, so a
+/// scope that finds a transaction already open brackets itself with a SAVEPOINT instead and lets
+/// the outer transaction decide the final outcome. Standalone callers are unaffected: with no
+/// outer transaction the scope is the plain `BEGIN`/`COMMIT` it always was.
+///
+/// The savepoint name is fixed. Nothing in this module nests two of these (no create/update/delete
+/// calls another), and both engines scope `ROLLBACK TO` to the most recent savepoint of that name,
+/// so a same-named savepoint opened by an unrelated layer (e.g. `import.zig`'s `zb_row`) cannot be
+/// released by this one.
+const Tx = struct {
+    const savepoint = "zb_collection";
+
+    w: *db.Db,
+    /// True when this scope is a savepoint inside a caller's transaction rather than the
+    /// transaction itself. Also the answer to "does this call own connection-level state?" —
+    /// see `update`'s `PRAGMA foreign_keys`, which is a silent no-op inside a transaction.
+    nested: bool,
+
+    fn begin(w: *db.Db) db.DbError!Tx {
+        const nested = w.inTransaction();
+        if (nested) try w.exec("SAVEPOINT " ++ savepoint ++ ";") else try w.begin();
+        return .{ .w = w, .nested = nested };
+    }
+
+    fn commit(self: Tx) db.DbError!void {
+        if (self.nested) return self.w.exec("RELEASE SAVEPOINT " ++ savepoint ++ ";");
+        return self.w.commit();
+    }
+
+    /// Best-effort undo for an `errdefer`, hence infallible: there is already an error in
+    /// flight and it is the one worth reporting. A failed `ROLLBACK TO` leaves the OUTER
+    /// transaction open and still doomed — the caller's own errdefer rolls it back whole.
+    fn rollback(self: Tx) void {
+        if (self.nested) {
+            self.w.exec("ROLLBACK TO SAVEPOINT " ++ savepoint ++ ";") catch return;
+            self.w.exec("RELEASE SAVEPOINT " ++ savepoint ++ ";") catch {};
+            return;
+        }
+        self.w.rollback() catch {};
+    }
+};
+
 pub fn create(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, def: schema.Collection) EngineError!schema.Collection {
     last_errors = null;
 
@@ -66,8 +114,8 @@ pub fn create(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, def: schema.Colle
     const ddl_col = try resolveRelations(sa, w, full);
 
     const d = db.dbDialect(w);
-    try w.begin();
-    errdefer w.rollback() catch {};
+    const tx = try Tx.begin(w);
+    errdefer tx.rollback();
     try w.exec(try sa.dupeZ(u8, try ddl.createTableSql(sa, ddl_col, null, d, &.{})));
     for (col.indexes) |idx| try w.exec(try sa.dupeZ(u8, try ddl.createIndexSql(sa, col.name, idx, d)));
     if (col.type == .auth) {
@@ -77,7 +125,7 @@ pub fn create(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, def: schema.Colle
     }
     try insertRow(sa, w, col);
     try schema_gen.bump(w); // inside the tx: a rolled-back create must not advertise a change
-    try w.commit();
+    try tx.commit();
 
     // Return a fully-owned reload on `alloc`. The just-persisted row round-trips through
     // toJson/fromJson to the same shape the former hand-assembled `full` had (now including
@@ -284,15 +332,21 @@ pub fn update(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, id_or_name: []con
     const d = db.dbDialect(w);
     // SQLite rebuilds via __new+copy+drop+rename, so FK enforcement must be paused around it;
     // Postgres uses in-place ALTERs (rebuildPlanPg) and has no such PRAGMA (it would error).
-    const sqlite_rebuild = d.kind == .sqlite;
+    //
+    // `PRAGMA foreign_keys` is a NO-OP inside a transaction, so this is also gated on there
+    // NOT being one already open: a caller that brought its own transaction (`schema apply`,
+    // which wraps a whole document in one) owns the PRAGMA and must have set it OUTSIDE that
+    // transaction. Issuing it here anyway would silently do nothing — the failure mode the
+    // gate exists to make impossible.
+    const sqlite_rebuild = d.kind == .sqlite and !w.inTransaction();
     if (sqlite_rebuild) {
         try w.exec("PRAGMA foreign_keys=OFF;");
     }
     errdefer if (sqlite_rebuild) {
         w.exec("PRAGMA foreign_keys=ON;") catch {};
     };
-    try w.begin();
-    errdefer w.rollback() catch {};
+    const tx = try Tx.begin(w);
+    errdefer tx.rollback();
     const plan = try ddl.rebuildPlan(sa, old, ddl_new, d);
     for (plan) |stmt| try w.exec(try sa.dupeZ(u8, stmt));
     if (newc.type == .auth) {
@@ -302,7 +356,7 @@ pub fn update(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, id_or_name: []con
     }
     try updateRow(sa, w, newc.id, newc); // persist user fields only
     try schema_gen.bump(w); // inside the tx: a rolled-back rebuild must not advertise a change
-    try w.commit();
+    try tx.commit();
     if (sqlite_rebuild) {
         try w.exec("PRAGMA foreign_keys=ON;");
     }
@@ -412,8 +466,8 @@ pub fn updateRules(alloc: std.mem.Allocator, w: *db.Db, col_id: []const u8, rule
     // did not bump would leave every serving process enforcing the OLD rule out of its cache,
     // which is precisely the staleness this marker exists to prevent. One transaction, so the
     // two either both happen or neither does.
-    try w.begin();
-    errdefer w.rollback() catch {};
+    const tx = try Tx.begin(w);
+    errdefer tx.rollback();
     {
         var st = try w.prepare(try d.renumberPlaceholders(sa, raw));
         defer st.finalize();
@@ -426,7 +480,7 @@ pub fn updateRules(alloc: std.mem.Allocator, w: *db.Db, col_id: []const u8, rule
         _ = try st.step();
     } // finalize the statement BEFORE commit — SQLite will not commit with a live statement
     try schema_gen.bump(w);
-    try w.commit();
+    try tx.commit();
 }
 
 pub fn delete(alloc: std.mem.Allocator, w: *db.Db, id_or_name: []const u8) EngineError!void {
@@ -447,15 +501,15 @@ pub fn delete(alloc: std.mem.Allocator, w: *db.Db, id_or_name: []const u8) Engin
             else => {},
         };
     }
-    try w.begin();
-    errdefer w.rollback() catch {};
+    const tx = try Tx.begin(w);
+    errdefer tx.rollback();
     try w.exec(try std.fmt.allocPrintSentinel(sa, "DROP TABLE {s};", .{try ddl.quoteIdent(sa, target.name)}, 0));
     var st = try w.prepare(try db.dbDialect(w).renumberPlaceholders(sa, "DELETE FROM \"_collections\" WHERE \"id\" = ?1;"));
     defer st.finalize();
     try st.bindText(1, target.id);
     _ = try st.step();
     try schema_gen.bump(w); // inside the tx: a rolled-back delete must not advertise a change
-    try w.commit();
+    try tx.commit();
 }
 
 test "create/update return a fully-owned reload and leak nothing on any error path" {
@@ -889,4 +943,99 @@ test "create and update return deinit-safe fully-owned reloads (base and auth)" 
     const af2 = [_]schema.Field{ .{ .id = "a1", .name = "bio", .options = .{ .text = .{} } }, .{ .id = "", .name = "nick", .options = .{ .text = .{} } } };
     const au = try update(a, std.testing.io, &d, "users", .{ .id = "", .name = "users", .type = .auth, .fields = &af2 });
     au.deinit(a);
+}
+
+test "create/update/delete join a caller's open transaction and roll back with it" {
+    // The seam `schema apply` is built on (#383). Each of these opens its own transaction
+    // when called standalone — which is why a nested `BEGIN` used to be a hard SQLite error
+    // ("cannot start a transaction within a transaction") and why a document could only ever
+    // be applied one committed collection at a time. Inside a caller's transaction they must
+    // instead bracket themselves with a SAVEPOINT, so the CALLER's rollback undoes all of it.
+    const a = std.testing.allocator;
+    var conn = try db.Db.openMemory();
+    defer conn.close();
+    try migrations.run(&conn);
+
+    // A collection that exists BEFORE the outer transaction, so the rollback has something to
+    // restore rather than merely something to discard.
+    const notes = try create(a, std.testing.io, &conn, .{
+        .id = "",
+        .name = "notes",
+        .fields = &.{.{ .id = "", .name = "body", .options = .{ .text = .{} } }},
+    });
+    defer notes.deinit(a);
+
+    try conn.begin();
+    {
+        const made = try create(a, std.testing.io, &conn, .{
+            .id = "",
+            .name = "scratch",
+            .fields = &.{.{ .id = "", .name = "x", .options = .{ .text = .{} } }},
+        });
+        made.deinit(a);
+        // Visible to this connection mid-transaction — the savepoint was released, not committed.
+        const seen = (try get(a, &conn, "scratch")).?;
+        seen.deinit(a);
+
+        const grown = try update(a, std.testing.io, &conn, "notes", .{
+            .id = "",
+            .name = "notes",
+            .fields = &.{
+                .{ .id = notes.fields[0].id, .name = "body", .options = .{ .text = .{} } },
+                .{ .id = "", .name = "extra", .options = .{ .text = .{} } },
+            },
+        });
+        defer grown.deinit(a);
+        try std.testing.expectEqual(@as(usize, 2), grown.fields.len);
+    }
+    try conn.rollback();
+
+    // The outer rollback undid every one of them.
+    try std.testing.expect((try get(a, &conn, "scratch")) == null);
+    const after = (try get(a, &conn, "notes")).?;
+    defer after.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), after.fields.len);
+    try std.testing.expectEqualStrings("body", after.fields[0].name);
+
+    // And the connection is left usable: `delete` still works standalone afterwards.
+    try delete(a, &conn, "notes");
+    try std.testing.expect((try get(a, &conn, "notes")) == null);
+}
+
+test "a failed create inside a caller's transaction leaves the caller's transaction usable" {
+    // The savepoint half of the contract: an inner failure must roll back to its OWN
+    // savepoint and no further, so the caller can decide whether to continue or abandon.
+    const a = std.testing.allocator;
+    var conn = try db.Db.openMemory();
+    defer conn.close();
+    try migrations.run(&conn);
+
+    try conn.begin();
+    const first = try create(a, std.testing.io, &conn, .{
+        .id = "",
+        .name = "keep",
+        .fields = &.{.{ .id = "", .name = "x", .options = .{ .text = .{} } }},
+    });
+    first.deinit(a);
+
+    // Fail INSIDE the savepoint, not before it: a raw table with no `_collections` row passes
+    // the up-front duplicate-name check (which reads `_collections`) and then collides on the
+    // `CREATE TABLE` — the first statement after `Tx.begin`. `insertRow`/`schema_gen.bump`
+    // never run, so there IS partial work for the savepoint to undo.
+    try conn.exec("CREATE TABLE \"squatter\" (\"x\" TEXT);");
+    try std.testing.expectError(error.ExecFailed, create(a, std.testing.io, &conn, .{
+        .id = "",
+        .name = "squatter",
+        .fields = &.{.{ .id = "", .name = "y", .options = .{ .text = .{} } }},
+    }));
+    try std.testing.expect((try get(a, &conn, "squatter")) == null);
+
+    // The caller's transaction survived the inner failure — it is still open and still holds
+    // the work done before it — so the caller, not the callee, decides the outcome.
+    try std.testing.expect(conn.inTransaction());
+    const kept = (try get(a, &conn, "keep")).?;
+    kept.deinit(a);
+    try conn.commit();
+    const still = (try get(a, &conn, "keep")).?;
+    still.deinit(a);
 }

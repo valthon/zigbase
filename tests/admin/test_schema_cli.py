@@ -543,3 +543,157 @@ def test_stdout_is_only_json(binary, data_dir):
         r = run(binary, data_dir, *args)
         assert r.returncode == 0, r.stderr
         json.loads(r.stdout)  # raises if anything else leaked onto stdout
+
+
+def tables(data):
+    con = sqlite3.connect(os.path.join(data, "data.db"))
+    try:
+        return {r[0] for r in con.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+    finally:
+        con.close()
+
+
+def test_a_reserved_field_name_on_a_base_collection_is_refused_not_dropped(binary, data_dir):
+    """#382. `email`/`created`/`verified` are ordinary column names on an ordinary table, but
+    `parseCollectionInput` DROPPED every field whose name the engine reserves — for every
+    collection type — before `validate` could object. `schema apply` therefore exited 0
+    having silently thrown the column away, and a later `import` reported success while
+    discarding that column's values. The bar is the REFUSAL: exit 1, the reserved name
+    named, and nothing written."""
+    path = write_doc(data_dir, "contacts.json", doc(
+        collection("contacts", [field("fullname"), field("email"), field("created")])))
+    r = run(binary, data_dir, "schema", "apply", path)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "validation_reserved_name" in r.stderr, r.stderr
+    # Both offenders are named, so fixing the document is a single pass.
+    assert "'email'" in r.stderr and "'created'" in r.stderr, r.stderr
+    assert "contacts" not in tables(data_dir)
+
+    # And the same document with the reserved names renamed applies, proving the refusal was
+    # about those names and not about anything else in the document.
+    ok = write_doc(data_dir, "fixed.json", doc(
+        collection("contacts", [field("fullname"), field("email_address"), field("added")])))
+    r2 = run(binary, data_dir, "schema", "apply", ok)
+    assert r2.returncode == 0, r2.stderr
+    assert "email_address" in columns(data_dir, "contacts")
+
+
+def test_an_auth_collection_still_accepts_a_document_echoing_its_injected_fields(binary, data_dir):
+    """The constraint the drop actually protects, and the only one: a client that reads an
+    auth collection is handed the engine-injected `email`/`username`/`verified` and must be
+    able to write the document straight back. Those names stay dropped for `.auth` — the
+    refusal above is base-collection-only."""
+    echoed = write_doc(data_dir, "users.json", doc(collection(
+        "users",
+        [field("email", "email"), field("username"), field("verified", "bool"),
+         field("id"), field("created"), field("updated"), field("nick")],
+        type="auth",
+        options={"auth": {"identityFields": ["email"]}},
+    )))
+    r = run(binary, data_dir, "schema", "apply", echoed)
+    assert r.returncode == 0, r.stdout + r.stderr
+    cols = columns(data_dir, "users")
+    assert "nick" in cols and "email" in cols and "passwordHash" in cols
+    # The echoed names were dropped, not stored twice: `_collections` holds user fields only.
+    con = sqlite3.connect(os.path.join(data_dir, "data.db"))
+    try:
+        stored = json.loads(con.execute(
+            'SELECT "schema" FROM "_collections" WHERE name = ?', ("users",)).fetchone()[0])
+    finally:
+        con.close()
+    assert [f["name"] for f in stored] == ["nick"]
+
+
+def test_dump_then_apply_round_trips_an_auth_and_a_base_collection(binary, data_dir):
+    """The round-trip property, now that the base-collection parse path refuses reserved
+    names: a dump must still re-apply as a no-op for BOTH collection types. It does because
+    `schema_doc.documentFields` filters system names out of every dump, auth and base alike —
+    the drop was never what made this work."""
+    path = write_doc(data_dir, "s.json", doc(
+        collection("members", [field("nick")], type="auth",
+                   options={"auth": {"identityFields": ["email"]}}),
+        collection("notes", [field("body")]),
+    ))
+    assert run(binary, data_dir, "schema", "apply", path).returncode == 0
+
+    d = run(binary, data_dir, "schema", "dump", "--json")
+    assert d.returncode == 0, d.stderr
+    assert "passwordHash" not in d.stdout and '"verified"' not in d.stdout
+    dumped = os.path.join(data_dir, "dumped.json")
+    pathlib.Path(dumped).write_text(d.stdout)
+
+    again = run(binary, data_dir, "schema", "apply", dumped)
+    assert again.returncode == 0, again.stdout + again.stderr
+    assert json.loads(again.stdout)["changes"] == []
+
+
+# --- #383: dry-run/apply agreement, and atomicity -----------------------------------------
+
+def test_dry_run_refuses_exactly_what_apply_refuses(binary, data_dir):
+    """#383.1. `--dry-run` computed a diff and printed a plan without ever running the
+    engine's own `schema.validate`, so a document with an identifier-invalid field name
+    (`_draft` — leading underscore) rehearsed clean and then failed the real run. A rehearsal
+    that passes where the run fails is worse than no rehearsal: it turns a caught problem
+    into an uncaught one. Both must refuse, with the same code, writing nothing."""
+    bad = write_doc(data_dir, "bad.json", doc(
+        collection("users", [field("nick")], type="auth",
+                   options={"auth": {"identityFields": ["email"]}}),
+        collection("posts", [field("_draft")]),
+    ))
+    dry = run(binary, data_dir, "schema", "apply", bad, "--dry-run")
+    real = run(binary, data_dir, "schema", "apply", bad)
+    assert dry.returncode == 1, dry.stdout + dry.stderr
+    assert real.returncode == 1, real.stdout + real.stderr
+    assert "validation_invalid_name" in dry.stderr, dry.stderr
+    assert "validation_invalid_name" in real.stderr, real.stderr
+    # Neither run wrote anything — not even the collection ordered BEFORE the invalid one.
+    assert tables(data_dir).isdisjoint({"users", "posts"})
+
+
+def test_a_failed_apply_leaves_no_collections_behind(binary, data_dir):
+    """#383.2. Pass 1 committed each collection in its own transaction, so a document whose
+    first collections are fine and whose last one fails left the operator in a state that is
+    neither the old one nor the new one. The failure used here is deliberately one that only
+    the WRITE can find — a relation naming a collection that is neither in the document nor
+    live — so it survives the pre-flight validation gate and reaches pass 1 with `authors`
+    and `clubs` already created."""
+    bad = write_doc(data_dir, "bad.json", doc(
+        collection("authors", [field("nom")]),
+        collection("clubs", [field("title")]),
+        collection("posts", [
+            field("body"),
+            field("owner", "relation", options={"targetCollectionId": "ghosts", "maxSelect": 1}),
+        ]),
+    ))
+    r = run(binary, data_dir, "schema", "apply", bad)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert tables(data_dir).isdisjoint({"authors", "clubs", "posts"}), tables(data_dir)
+    # `_collections` agrees with the physical schema — no orphan rows for the rolled-back creates.
+    con = sqlite3.connect(os.path.join(data_dir, "data.db"))
+    try:
+        names = {r[0] for r in con.execute('SELECT name FROM "_collections"').fetchall()}
+    finally:
+        con.close()
+    assert names.isdisjoint({"authors", "clubs", "posts"}), names
+
+
+def test_a_failed_apply_rolls_back_a_modification_to_an_existing_collection(binary, data_dir):
+    """The other half of atomicity: an apply that MODIFIES a converged collection and then
+    fails must leave that collection exactly as it was, not half-rebuilt."""
+    good = write_doc(data_dir, "good.json", doc(
+        collection("notes", [field("body")], listRule='body != ""')))
+    assert run(binary, data_dir, "schema", "apply", good).returncode == 0
+    before = columns(data_dir, "notes")
+
+    bad = write_doc(data_dir, "bad.json", doc(
+        collection("notes", [field("body"), field("extra")], listRule='body != ""'),
+        collection("posts", [
+            field("owner", "relation", options={"targetCollectionId": "ghosts", "maxSelect": 1}),
+        ]),
+    ))
+    r = run(binary, data_dir, "schema", "apply", bad)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert columns(data_dir, "notes") == before
+    assert "posts" not in tables(data_dir)
+    assert stored_rule(data_dir, "notes") == 'body != ""'

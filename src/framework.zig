@@ -3282,17 +3282,20 @@ fn schemaCheckRulesImpl(allocator: std.mem.Allocator, io: std.Io, environ: *cons
 /// then executes the difference through `collections.create/update/delete` — the exact
 /// functions `src/api/collections.zig` calls. There is no second DDL implementation.
 ///
-/// Every access rule in the document is syntax-checked (via `rules_lint.checkDocument`) before
-/// any write derived from the document happens; one unparseable rule refuses the whole apply.
-/// The gate, and why it is syntax-only, is documented at the gate itself below.
+/// Two whole-document gates run before any write derived from the document happens, and each
+/// refuses the WHOLE apply: every access rule is syntax-checked (`rules_lint.checkDocument`),
+/// and every collection is run through the engine's own `schema.validate`. Both sit above the
+/// `--dry-run` branch, so a rehearsal refuses exactly what a run refuses. The gates, and why
+/// the rule one is syntax-only, are documented at the gates themselves below.
 ///
 /// Refused when the app sets `.collections_frozen`: frozen means this deployment's schema is
 /// owned by the comptime `.collections` + `.migrations`, and a CLI write would silently
 /// diverge from that source at the next boot (provisioning would fight it).
 ///
-/// NOT atomic across collections — `collections.create`/`update` each open their own
-/// transaction and cannot join an outer one. Each collection is therefore all-or-nothing on
-/// its own, and the emitted `applied` list names exactly which ones landed before a failure.
+/// ATOMIC across collections: all three passes run inside one transaction that
+/// `collections.create`/`update`/`delete` join with a SAVEPOINT (`collections.Tx`), so a
+/// document that fails partway leaves nothing behind and the emitted `applied` list is empty
+/// on the error path.
 fn schemaApplyImpl(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -3393,6 +3396,51 @@ fn schemaApplyImpl(
         }
     }
 
+    // ---- Document validation gate -----------------------------------------------------
+    // Runs the engine's OWN `schema.validate` — the one `collections.create`/`update` run —
+    // over every collection in the document, BEFORE the `--dry-run` branch below.
+    //
+    // The placement is the point (#383). Validation used to happen only where the writes
+    // happen, so `--dry-run` computed a diff over a document it had never validated and
+    // reported success for one the real run then refused (an identifier-invalid field name,
+    // a reserved one, an unsatisfiable date range, a `tenant_field` naming nothing). A
+    // rehearsal that passes where the run fails is worse than no rehearsal: it converts a
+    // caught problem into an uncaught one. Gating both branches on the same call makes the
+    // two agree BY CONSTRUCTION rather than by maintenance.
+    //
+    // Whole-document, like the rule gate above: a document with one bad field is refused
+    // entire, and stderr names every problem at once so fixing it takes one pass. Validation
+    // is a property of the document alone, so nothing here needs the live schema — the
+    // failures that DO need it (a relation whose target exists nowhere, a name already
+    // taken) still surface from the write, which is now rolled back whole.
+    {
+        var verrs: std.ArrayList(schema.ValidationError) = .empty;
+        defer verrs.deinit(allocator);
+        var bad: usize = 0;
+        for (doc) |c| {
+            verrs.clearRetainingCapacity();
+            // Messages/codes are static literals or borrowed from `c`; only the list backing
+            // is owned, and it is reused across collections and freed by the `defer`.
+            try schema.validate(allocator, c, &verrs);
+            for (verrs.items) |ve| {
+                bad += 1;
+                // Same rendering as `reportCollectionError`, so a validation failure reads
+                // identically whether the gate caught it or the write did.
+                std.log.err("schema apply: collection '{s}' field '{s}': {s} ({s})", .{ c.name, ve.field, ve.message, ve.code });
+            }
+            // Hoisted out of pass 1 for the same reason: a document declaring an encrypted
+            // field without a key configured must fail the REHEARSAL, not just the run.
+            if (schema.hasEncryptedField(c) and db.poolFieldCipher(&holder.pool) == null) {
+                bad += 1;
+                std.log.err("schema apply: collection '{s}' declares an encrypted field but ZIGBASE_FIELD_KEY is unset", .{c.name});
+            }
+        }
+        if (bad > 0) {
+            std.log.err("schema apply: {d} validation error(s) in '{s}'; the whole document is refused and nothing was written", .{ bad, file });
+            return error.Validation;
+        }
+    }
+
     const w = holder.pool.acquireWriter();
     defer holder.pool.releaseWriter();
 
@@ -3421,9 +3469,36 @@ fn schemaApplyImpl(
     }
 
     var applied: std.ArrayList([]const u8) = .empty;
-    // Report what DID land even when a later collection fails, so a partial apply is
-    // diagnosable rather than mysterious.
-    errdefer emitApplyJson(allocator, io, plan, doc, sa_args, applied.items) catch {};
+    // A failed apply now lands NOTHING (see the transaction below), so the error path emits
+    // an EMPTY `applied` list rather than the collections that happened to be written before
+    // the failure. Reporting those would name work that has just been rolled back.
+    errdefer emitApplyJson(allocator, io, plan, doc, sa_args, &.{}) catch {};
+
+    // ---- One transaction for the whole document (#383) ---------------------------------
+    // `collections.create`/`update`/`delete` each opened their own transaction, so a document
+    // that failed on its fourth collection left the first three behind — a state that is
+    // neither the old one nor the new one, and that the next attempt then has to contend
+    // with. For a migration that is the difference between "fix the document and retry" and
+    // "work out by hand what the last attempt did".
+    //
+    // They now join an open transaction with a SAVEPOINT instead (`collections.Tx`), so
+    // wrapping all three passes here makes the document all-or-nothing: every create, every
+    // rebuild, every prune, and every `schema_gen` bump commits together or not at all.
+    //
+    // The PRAGMA must be set OUTSIDE the transaction and cannot move inside it: SQLite
+    // ignores `PRAGMA foreign_keys` while a transaction is open. `collections.update` sets it
+    // itself when it owns the transaction; here the transaction is ours, so the PRAGMA is
+    // ours — SQLite's own prescribed order for a rebuild-style schema change (foreign_keys
+    // off, BEGIN, rebuild, COMMIT, foreign_keys on).
+    const outer_sqlite = db.dbDialect(w).kind == .sqlite;
+    if (outer_sqlite) try w.exec("PRAGMA foreign_keys=OFF;");
+    // `defer`, not `errdefer`: the writer goes back to the pool with FK enforcement restored
+    // on BOTH paths. (`std.process.exit` is not reachable between here and the commit.)
+    defer if (outer_sqlite) {
+        w.exec("PRAGMA foreign_keys=ON;") catch {};
+    };
+    try w.begin();
+    errdefer w.rollback() catch {};
 
     // Pass 1 — creates and updates, in dependency order, with cycle back-edges omitted.
     for (plan.order) |idx| {
@@ -3449,10 +3524,9 @@ fn schemaApplyImpl(
         if (deferred_here.items.len > 0 and existing == null)
             def = try schema_diff.withoutFields(a, want, deferred_here.items);
 
-        if (schema.hasEncryptedField(def) and db.poolFieldCipher(&holder.pool) == null) {
-            std.log.err("schema apply: collection '{s}' declares an encrypted field but ZIGBASE_FIELD_KEY is unset", .{def.name});
-            return error.FieldKeyRequired;
-        }
+        // (The encrypted-field/`ZIGBASE_FIELD_KEY` check used to live here. It moved into the
+        // document validation gate above so `--dry-run` sees it too — see #383.)
+        //
         // One rule for OAuth secrets, shared with the REST handlers: an empty incoming
         // secret preserves the stored one (the document redacts them).
         collections_api.mergeOAuthConfig(holder.app.io, a, holder.app.jwt_secret, &def, existing) catch |e| return reportOAuthError(def.name, e);
@@ -3504,6 +3578,9 @@ fn schemaApplyImpl(
         collections_mod.delete(a, w, c.collection) catch |e| return reportCollectionError(c.collection, e);
         try applied.append(a, c.collection);
     }
+
+    // Everything above lands here, together, or not at all.
+    try w.commit();
 
     if (holder.app.col_cache) |cc| cc.invalidate();
     try emitApplyJson(allocator, io, plan, doc, sa_args, applied.items);

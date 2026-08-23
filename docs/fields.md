@@ -48,10 +48,19 @@ A field `name` must:
   only (`^[A-Za-z][A-Za-z0-9_]*$`);
 - not collide (case-insensitively) with another field in the same collection;
 - not be a **reserved system name**. The reserved set is: `id`, `created`,
-  `updated`, `email`, `username`, `passwordHash`, `tokenKey`, `verified`. These are
-  injected/managed by the engine. (On an `auth` collection, `email`, `username`,
-  `passwordHash`, `tokenKey`, and `verified` are added for you automatically — see
+  `updated`, `email`, `username`, `passwordHash`, `tokenKey`, `verified`,
+  `token_epoch`. These are injected/managed by the engine. (On an `auth` collection,
+  `email`, `username`, `passwordHash`, `tokenKey`, `verified` and `token_epoch` are
+  added for you automatically — see
   [auth collections](#auth-collections-and-system-fields).)
+
+  On an `auth` collection a submitted field carrying one of these names is **ignored**
+  rather than rejected: a client that reads a collection is handed the injected fields
+  and must be able to write the same document back. Everywhere else — a `base` or
+  `view` collection, where nothing is injected — the name is **refused**
+  (`validation_reserved_name`). `email`, `username`, `verified`, `created` and
+  `updated` are ordinary column names on an ordinary table, so a `contacts.email`
+  field is a mistake worth reporting, not a column to quietly discard.
 
 A field that violates any of these produces a `400` with a `validation_*` field
 error (`validation_invalid_name`, `validation_duplicate_name`,
