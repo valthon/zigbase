@@ -1,0 +1,3 @@
+{"archived_at":null,"created":"2024-01-15T10:00:00Z","id":"1","name":"Morning Pages","owner":"1","posts_count":2,"slug":"morning-pages","updated":"2024-01-15T10:00:00Z","visibility":"public_club"}
+{"archived_at":null,"created":"2024-01-15T10:01:00Z","id":"2","name":"Night Owls","owner":"3","posts_count":1,"slug":"night-owls","updated":"2024-01-15T10:01:00Z","visibility":"private_club"}
+{"archived_at":"2024-02-01T00:00:00Z","created":"2024-01-15T10:02:00Z","id":"3","name":"Retired Readers","owner":"1","posts_count":1,"slug":"retired-readers","updated":"2024-02-01T00:00:00Z","visibility":"public_club"}

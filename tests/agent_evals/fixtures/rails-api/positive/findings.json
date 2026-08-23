@@ -1,0 +1,521 @@
+{
+  "adapter": "SQLite",
+  "apiOnly": true,
+  "collections": [
+    {
+      "columns": 9,
+      "indexes": 3,
+      "model": "Club",
+      "rows": 3,
+      "rowsHiddenByDefaultScope": 1,
+      "table": "clubs"
+    },
+    {
+      "columns": 6,
+      "indexes": 2,
+      "model": "Comment",
+      "rows": 3,
+      "rowsHiddenByDefaultScope": 0,
+      "table": "comments"
+    },
+    {
+      "columns": 9,
+      "indexes": 2,
+      "model": "Event",
+      "rows": 3,
+      "rowsHiddenByDefaultScope": 0,
+      "table": "events"
+    },
+    {
+      "columns": 7,
+      "indexes": 2,
+      "model": "Flag",
+      "rows": 2,
+      "rowsHiddenByDefaultScope": 0,
+      "table": "flags"
+    },
+    {
+      "columns": 7,
+      "indexes": 3,
+      "model": "Membership",
+      "rows": 4,
+      "rowsHiddenByDefaultScope": 0,
+      "table": "memberships"
+    },
+    {
+      "columns": 5,
+      "indexes": 2,
+      "model": "Notification",
+      "rows": 1,
+      "rowsHiddenByDefaultScope": 0,
+      "table": "notifications"
+    },
+    {
+      "columns": 9,
+      "indexes": 4,
+      "model": "Post",
+      "rows": 4,
+      "rowsHiddenByDefaultScope": 0,
+      "table": "posts"
+    },
+    {
+      "columns": 8,
+      "indexes": 2,
+      "model": "User",
+      "rows": 4,
+      "rowsHiddenByDefaultScope": 0,
+      "table": "users"
+    }
+  ],
+  "databaseSha256": "d1290b3911f3e499abf63e5f82f428addc94636ce7bf4d3e6884e0fcd3c197af",
+  "findings": [
+    {
+      "choices": [
+        "omit",
+        "replacement"
+      ],
+      "code": "PolymorphicAssociation",
+      "id": "association.Flag.flaggable.polymorphic",
+      "message": "Flag.flaggable is polymorphic; a ZigBase relation targets exactly one collection",
+      "requiresArtifact": true,
+      "severity": "blocker"
+    },
+    {
+      "choices": [
+        "hook",
+        "accept-no-default",
+        "omit"
+      ],
+      "code": "ColumnDefaultNotReproduced",
+      "id": "column.clubs.posts_count.default",
+      "message": "clubs.posts_count defaults to 0 in the source; imported rows keep their values, but writes after cutover will not get this default",
+      "severity": "decision"
+    },
+    {
+      "choices": [
+        "hook",
+        "accept-no-default",
+        "omit"
+      ],
+      "code": "ColumnDefaultNotReproduced",
+      "id": "column.clubs.visibility.default",
+      "message": "clubs.visibility defaults to 'public_club' in the source; imported rows keep their values, but writes after cutover will not get this default",
+      "severity": "decision"
+    },
+    {
+      "choices": [
+        "hook",
+        "accept-no-default",
+        "omit"
+      ],
+      "code": "ColumnDefaultNotReproduced",
+      "id": "column.memberships.role.default",
+      "message": "memberships.role defaults to 0 in the source; imported rows keep their values, but writes after cutover will not get this default",
+      "severity": "decision"
+    },
+    {
+      "choices": [
+        "hook",
+        "accept-no-default",
+        "omit"
+      ],
+      "code": "ColumnDefaultNotReproduced",
+      "id": "column.notifications.payload.default",
+      "message": "notifications.payload defaults to '{}' in the source; imported rows keep their values, but writes after cutover will not get this default",
+      "severity": "decision"
+    },
+    {
+      "choices": [
+        "hook",
+        "accept-no-default",
+        "omit"
+      ],
+      "code": "ColumnDefaultNotReproduced",
+      "id": "column.posts.status.default",
+      "message": "posts.status defaults to 'draft' in the source; imported rows keep their values, but writes after cutover will not get this default",
+      "severity": "decision"
+    },
+    {
+      "choices": [
+        "hook",
+        "accept-no-default",
+        "omit"
+      ],
+      "code": "ColumnDefaultNotReproduced",
+      "id": "column.users.role.default",
+      "message": "users.role defaults to 0 in the source; imported rows keep their values, but writes after cutover will not get this default",
+      "severity": "decision"
+    },
+    {
+      "choices": [
+        "replacement",
+        "omit"
+      ],
+      "code": "JobsNeedDisposition",
+      "id": "jobs.disposition",
+      "message": "1 application Active Job classes were observed (adapter: inline); queued work, retries and mailers do not migrate on their own",
+      "requiresArtifact": true,
+      "severity": "blocker"
+    },
+    {
+      "choices": [
+        "replacement",
+        "omit"
+      ],
+      "code": "DefaultScopeHidesRows",
+      "id": "model.Club.default_scope",
+      "message": "Club declares a default_scope; extraction reads through unscoped so hidden rows are preserved, but every behavior that relied on the scope must be re-expressed in the target",
+      "requiresArtifact": true,
+      "severity": "blocker"
+    },
+    {
+      "choices": [
+        "hook",
+        "cascade",
+        "omit"
+      ],
+      "code": "DependentBehaviorNotReproduced",
+      "id": "model.Club.dependent",
+      "message": "Club declares dependent behavior on events, memberships, posts; deletion semantics do not migrate with the rows",
+      "severity": "decision"
+    },
+    {
+      "choices": [
+        "hook",
+        "field",
+        "omit"
+      ],
+      "code": "ValidationsNotReproduced",
+      "id": "model.Club.validations",
+      "message": "Club declares format, inclusion, length, uniqueness validations; ZigBase field options cover only some of these, so the rest need a hook or an explicit decision to drop them",
+      "severity": "decision"
+    },
+    {
+      "choices": [
+        "hook",
+        "omit"
+      ],
+      "code": "DependentBehaviorNotReproduced",
+      "id": "model.Comment.dependent",
+      "message": "Comment declares dependent behavior on flags; deletion semantics do not migrate with the rows (a cascade decision cannot cover flags: no database foreign key)",
+      "severity": "decision"
+    },
+    {
+      "choices": [
+        "hook",
+        "field",
+        "omit"
+      ],
+      "code": "ValidationsNotReproduced",
+      "id": "model.Comment.validations",
+      "message": "Comment declares length validations; ZigBase field options cover only some of these, so the rest need a hook or an explicit decision to drop them",
+      "severity": "decision"
+    },
+    {
+      "choices": [
+        "omit",
+        "replacement"
+      ],
+      "code": "SingleTableInheritance",
+      "id": "model.Event.sti",
+      "message": "Event is an STI base for MeetingEvent, ReadingEvent on one table; no automatic collection shape exists",
+      "requiresArtifact": true,
+      "severity": "blocker"
+    },
+    {
+      "choices": [
+        "hook",
+        "field",
+        "omit"
+      ],
+      "code": "ValidationsNotReproduced",
+      "id": "model.Event.validations",
+      "message": "Event declares length validations; ZigBase field options cover only some of these, so the rest need a hook or an explicit decision to drop them",
+      "severity": "decision"
+    },
+    {
+      "choices": [
+        "hook",
+        "field",
+        "omit"
+      ],
+      "code": "ValidationsNotReproduced",
+      "id": "model.Flag.validations",
+      "message": "Flag declares inclusion, length validations; ZigBase field options cover only some of these, so the rest need a hook or an explicit decision to drop them",
+      "severity": "decision"
+    },
+    {
+      "choices": [
+        "hook",
+        "field",
+        "omit"
+      ],
+      "code": "ValidationsNotReproduced",
+      "id": "model.MeetingEvent.validations",
+      "message": "MeetingEvent declares length validations; ZigBase field options cover only some of these, so the rest need a hook or an explicit decision to drop them",
+      "severity": "decision"
+    },
+    {
+      "choices": [
+        "hook",
+        "field",
+        "omit"
+      ],
+      "code": "ValidationsNotReproduced",
+      "id": "model.Membership.validations",
+      "message": "Membership declares inclusion, uniqueness validations; ZigBase field options cover only some of these, so the rest need a hook or an explicit decision to drop them",
+      "severity": "decision"
+    },
+    {
+      "choices": [
+        "json",
+        "text"
+      ],
+      "code": "SerializedAttribute",
+      "id": "model.Notification.serialized.payload",
+      "message": "Notification.payload is serialized by ActiveRecord::Coders::ColumnSerializer; confirm the target representation",
+      "severity": "decision"
+    },
+    {
+      "choices": [
+        "hook",
+        "cascade",
+        "omit"
+      ],
+      "code": "DependentBehaviorNotReproduced",
+      "id": "model.Post.dependent",
+      "message": "Post declares dependent behavior on comments, flags; deletion semantics do not migrate with the rows (a cascade decision cannot cover flags: no database foreign key)",
+      "severity": "decision"
+    },
+    {
+      "choices": [
+        "hook",
+        "field",
+        "omit"
+      ],
+      "code": "ValidationsNotReproduced",
+      "id": "model.Post.validations",
+      "message": "Post declares inclusion, length validations; ZigBase field options cover only some of these, so the rest need a hook or an explicit decision to drop them",
+      "severity": "decision"
+    },
+    {
+      "choices": [
+        "hook",
+        "field",
+        "omit"
+      ],
+      "code": "ValidationsNotReproduced",
+      "id": "model.ReadingEvent.validations",
+      "message": "ReadingEvent declares length, numericality validations; ZigBase field options cover only some of these, so the rest need a hook or an explicit decision to drop them",
+      "severity": "decision"
+    },
+    {
+      "choices": [
+        "hook",
+        "cascade",
+        "omit"
+      ],
+      "code": "DependentBehaviorNotReproduced",
+      "id": "model.User.dependent",
+      "message": "User declares dependent behavior on comments, memberships, notifications, owned_clubs, posts, reported_flags; deletion semantics do not migrate with the rows",
+      "severity": "decision"
+    },
+    {
+      "choices": [
+        "rekey",
+        "retire"
+      ],
+      "code": "EncryptedAttributeCannotMigrate",
+      "id": "model.User.encrypted.phone",
+      "message": "User.phone is Active Record encrypted; ciphertext is bound to the source key and never migrates",
+      "requiresArtifact": true,
+      "severity": "blocker"
+    },
+    {
+      "choices": [
+        "hook",
+        "field",
+        "omit"
+      ],
+      "code": "ValidationsNotReproduced",
+      "id": "model.User.validations",
+      "message": "User declares confirmation, format, inclusion, length, uniqueness validations; ZigBase field options cover only some of these, so the rest need a hook or an explicit decision to drop them",
+      "severity": "decision"
+    },
+    {
+      "choices": [
+        "replacement",
+        "omit"
+      ],
+      "code": "RoutesNeedDisposition",
+      "id": "routes.disposition",
+      "message": "38 client-visible routes were observed; each needs a target (collection API, hook, typed route, or deliberate retirement) and none is derivable automatically",
+      "requiresArtifact": true,
+      "severity": "blocker"
+    },
+    {
+      "choices": [
+        "hook",
+        "job",
+        "omit"
+      ],
+      "code": "DatabaseTrigger",
+      "id": "schema.trigger.posts_count_after_club_change",
+      "message": "trigger posts_count_after_club_change on posts maintains state outside the application; nothing in the target reproduces it automatically",
+      "requiresArtifact": true,
+      "severity": "blocker"
+    },
+    {
+      "choices": [
+        "hook",
+        "job",
+        "omit"
+      ],
+      "code": "DatabaseTrigger",
+      "id": "schema.trigger.posts_count_after_delete",
+      "message": "trigger posts_count_after_delete on posts maintains state outside the application; nothing in the target reproduces it automatically",
+      "requiresArtifact": true,
+      "severity": "blocker"
+    },
+    {
+      "choices": [
+        "hook",
+        "job",
+        "omit"
+      ],
+      "code": "DatabaseTrigger",
+      "id": "schema.trigger.posts_count_after_insert",
+      "message": "trigger posts_count_after_insert on posts maintains state outside the application; nothing in the target reproduces it automatically",
+      "requiresArtifact": true,
+      "severity": "blocker"
+    },
+    {
+      "choices": [
+        "route",
+        "collection",
+        "omit"
+      ],
+      "code": "DatabaseView",
+      "id": "schema.view.published_post_counts",
+      "message": "view published_post_counts is computed by the database and has no collection equivalent",
+      "requiresArtifact": true,
+      "severity": "blocker"
+    },
+    {
+      "choices": [
+        "locked",
+        "public",
+        "expression"
+      ],
+      "code": "AccessRulesRequireReview",
+      "id": "table.clubs.rules",
+      "message": "collection clubs needs explicit list/view/create/update/delete rules; unset means locked to superusers",
+      "severity": "decision"
+    },
+    {
+      "choices": [
+        "locked",
+        "public",
+        "expression"
+      ],
+      "code": "AccessRulesRequireReview",
+      "id": "table.comments.rules",
+      "message": "collection comments needs explicit list/view/create/update/delete rules; unset means locked to superusers",
+      "severity": "decision"
+    },
+    {
+      "choices": [
+        "locked",
+        "public",
+        "expression"
+      ],
+      "code": "AccessRulesRequireReview",
+      "id": "table.events.rules",
+      "message": "collection events needs explicit list/view/create/update/delete rules; unset means locked to superusers",
+      "severity": "decision"
+    },
+    {
+      "choices": [
+        "locked",
+        "public",
+        "expression"
+      ],
+      "code": "AccessRulesRequireReview",
+      "id": "table.flags.rules",
+      "message": "collection flags needs explicit list/view/create/update/delete rules; unset means locked to superusers",
+      "severity": "decision"
+    },
+    {
+      "choices": [
+        "locked",
+        "public",
+        "expression"
+      ],
+      "code": "AccessRulesRequireReview",
+      "id": "table.memberships.rules",
+      "message": "collection memberships needs explicit list/view/create/update/delete rules; unset means locked to superusers",
+      "severity": "decision"
+    },
+    {
+      "choices": [
+        "locked",
+        "public",
+        "expression"
+      ],
+      "code": "AccessRulesRequireReview",
+      "id": "table.notifications.rules",
+      "message": "collection notifications needs explicit list/view/create/update/delete rules; unset means locked to superusers",
+      "severity": "decision"
+    },
+    {
+      "code": "NoUpdatedAtColumn",
+      "id": "table.notifications.updated_at",
+      "message": "notifications records created_at but not updated_at; extraction mirrors created into updated so the row can be imported with --preserve-timestamps, which reads as never-updated",
+      "severity": "info"
+    },
+    {
+      "choices": [
+        "locked",
+        "public",
+        "expression"
+      ],
+      "code": "AccessRulesRequireReview",
+      "id": "table.posts.rules",
+      "message": "collection posts needs explicit list/view/create/update/delete rules; unset means locked to superusers",
+      "severity": "decision"
+    },
+    {
+      "choices": [
+        "locked",
+        "public",
+        "expression"
+      ],
+      "code": "AccessRulesRequireReview",
+      "id": "table.users.rules",
+      "message": "collection users needs explicit list/view/create/update/delete rules; unset means locked to superusers",
+      "severity": "decision"
+    },
+    {
+      "choices": [
+        "hook",
+        "rule",
+        "omit"
+      ],
+      "code": "ConditionalValidatorIsCode",
+      "id": "validator.Post.body.presence",
+      "message": "Post.body has a conditional presence validation guarded by `published?`, which cannot be converted mechanically",
+      "severity": "decision"
+    }
+  ],
+  "railsVersion": "8.1.3.1",
+  "rubyVersion": "4.0.1",
+  "schemaFormat": "ruby",
+  "sourceMode": "observed",
+  "summary": {
+    "blockers": 10,
+    "collections": 8,
+    "decisions": 29,
+    "info": 1
+  },
+  "zigbaseRailsInventory": 1
+}

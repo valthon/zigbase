@@ -1,0 +1,4 @@
+{"created":"2024-01-15T09:00:00Z","display_name":"Ada Lovelace","email":"ada@example.test","id":"1","passwordHash":"$2a$04$fixturesaltfixtures00uU9RJtmTs6Ml/RaXilZAdMIc8h2dgkl2","role":"admin","updated":"2024-01-15T09:00:00Z"}
+{"created":"2024-01-15T09:01:00Z","display_name":"Brian Kernighan","email":"brian@example.test","id":"2","passwordHash":"$2a$04$fixturesaltfixtures00uHwpqdZtciRktP2/o29MZB1VmZY6R8qS","role":"member","updated":"2024-01-15T09:01:00Z"}
+{"created":"2024-01-15T09:02:00Z","display_name":"Coral Reeves","email":"coral@example.test","id":"3","passwordHash":"$2a$04$fixturesaltfixtures00uxE/.ZfVDxQ5fafaZ9tMFnMj871GVJ1y","role":"moderator","updated":"2024-01-15T09:02:00Z"}
+{"created":"2024-01-15T09:03:00Z","display_name":"Dane Ortiz","email":"dane@example.test","id":"4","passwordHash":"$2a$04$fixturesaltfixtures00uDa51YdFpme/J21kiDAzSdudyx3k4.HW","role":"member","updated":"2024-01-15T09:03:00Z"}

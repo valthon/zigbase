@@ -1,0 +1,33 @@
+{
+  "collections": [
+    {
+      "collection": "clubs",
+      "file": "data/clubs.ndjson"
+    },
+    {
+      "collection": "comments",
+      "file": "data/comments.ndjson"
+    },
+    {
+      "collection": "events",
+      "file": "data/events.ndjson"
+    },
+    {
+      "collection": "flags",
+      "file": "data/flags.ndjson"
+    },
+    {
+      "collection": "memberships",
+      "file": "data/memberships.ndjson"
+    },
+    {
+      "collection": "notifications",
+      "file": "data/notifications.ndjson"
+    },
+    {
+      "collection": "posts",
+      "file": "data/posts.ndjson"
+    }
+  ],
+  "zigbaseImportManifest": 1
+}

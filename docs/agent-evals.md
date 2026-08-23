@@ -25,7 +25,8 @@ are never required by ordinary builds.
 The runner installs the scenario's declared skill into the isolated workspace:
 
 - `genesis` uses `skills/zigbase-app-genesis/`;
-- `pocketbase` uses `skills/zigbase-migrate-pocketbase/`.
+- `pocketbase` uses `skills/zigbase-migrate-pocketbase/`;
+- `rails-api` uses `skills/zigbase-migrate-rails-api/`.
 
 When running an agent outside this harness, use that product's normal local-skill installation
 mechanism and preserve the directory name. The harness deliberately does not know how any provider
@@ -80,6 +81,28 @@ bundle, exact durable decisions, autonomous public signup, owner/file authorizat
 rehash-on-login, historical timestamps, parity evidence, and a restartable named-volume Compose
 deployment. It neither downloads nor runs PocketBase.
 
+Use `rails-api` to evaluate an unattended migration from the committed, frozen Rails 8.1
+API-only snapshot:
+
+```sh
+mise exec zig@0.16.0 -- zig build
+ZIGBASE_EVAL_BINARY="$PWD/zig-out/bin/zigbase" \
+  python3 -m evals.agents.run rails-api --agent codex \
+  --pass-env ZIGBASE_EVAL_BINARY
+```
+
+That scenario provides the frozen snapshot, the supported converter, the migration skill, its
+prompt, and the read-only binary. Ruby is never installed and the application is never booted: the
+recorded inventory is the only observation available, which is the point — an agent that fabricates
+one fails `completion`.
+
+It is deliberately harder than a data copy. The snapshot carries a `default_scope` that hides a row
+from Rails itself, an encrypted attribute, single-table inheritance, a polymorphic association,
+database triggers behind a counter cache, and a serialized column — each a decision the converter
+refuses to take silently. It also carries the scope gate that gives the scenario its name: the only
+ERB in the application is a mailer layout, so the correct answer is that no frontend is retained,
+and a report claiming Rails views were migrated fails however good the data is.
+
 Metacharacters are literal argv data. Do not wrap the JSON command in `sh -c`. The scenario caps
 command size, runtime, and captured output.
 
@@ -123,6 +146,29 @@ For `pocketbase` they mean:
   bcrypt-to-argon2 login upgrade all pass; and
 - `deployed`: production-shaped Compose serves health, metadata, migrated data, auth, and files
   before and after restart, uses named `/data`, passes doctor, and tears down exactly.
+
+For `rails-api` they mean:
+
+- `completion`: the snapshot is untouched and still observed, the bundle is bound to that
+  snapshot's inventory digest and attests every output, every blocker carries a decision with a
+  usable rationale, row counts match including the row `default_scope` hides, and the report answers
+  the scope gate without claiming the frontend moved;
+- `rules_locked`: the emitted schema, `security/public-rules.json`, the report and production doctor
+  all agree that the public surface is exactly `users.create` — anonymous signup — as a reconciled
+  warning rather than a suppressed one;
+- `tests_green`: the agent's declared boundary passes, and the running target enforces the
+  semantics the guide demands: a list whose rule hides every row answers `200` with an empty array
+  rather than `401` or `403` — an access rule is not an authentication failure — a record the caller
+  may not see is concealed as `404`, an owner-scoped list returns the actor's own rows and only
+  those, an invalid signup is a validation failure, and the migrated bcrypt credential logs in and
+  rehashes to argon2id; and
+- `deployed`: the rehearsed target is copied whole — the documented SQLite backup — a server boots
+  on the copy, and the migrated credential logs in and reads its data there. A backup that cannot
+  serve is not a backup.
+
+The rehearsal steps themselves — schema dry-run then apply, auth imported separately from ordinary
+data with `--preserve-timestamps`, files installed, doctor, and the live probes — belong to
+`tests_green`, not to `deployed`.
 
 Exit `0` means all four grades passed. Exit `1` means the harness or agent command failed or timed
 out. Exit `2` means the agent completed but deterministic grading found a product condition that
@@ -169,7 +215,7 @@ sanitized result summaries.
 
 ## Three-run release evidence
 
-Run either flagship from a fresh agent context with only its installed skill, scenario prompt,
+Run any scenario from a fresh agent context with only its installed skill, scenario prompt,
 fixture, and ordinary repository-visible tools. Do not provide the grader source, an implementation
 plan, or coaching from an earlier failure. A failure resets that scenario's consecutive count. Fix
 the owning tool, docs/skill, or grader and add a deterministic regression test before restarting.
@@ -181,3 +227,9 @@ summaries and record the agent/model identifier supplied to `--agent`.
 The first qualifying sets are the tagged 2026-08-15 Genesis `3f3224d5` evidence and tagged
 2026-08-16 PocketBase `9a72b656` evidence linked above. Raw transcripts and scenario workspaces
 stay out of the repository.
+
+`rails-api` has **not** yet been run for release evidence, and this document does not claim it has.
+When it is, record it the same way — `evals/agents/evidence/rails-api/<date>-<short-commit>/run-{1,2,3}.json`,
+an immutable `agent-eval-rails-api-<date>` tag resolving to the full commit, and a link from the top
+of this page. Until those three runs exist, the scenario is a gate that has been built and not yet
+passed; the deterministic grader tests prove the gate works, not that an agent clears it.

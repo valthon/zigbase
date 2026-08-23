@@ -1,0 +1,110 @@
+{
+  "count": 13,
+  "source": "observed",
+  "tables": [
+    {
+      "hidden_by_default_scope": null,
+      "model": null,
+      "scoped_count": null,
+      "source": "observed",
+      "table": "active_storage_attachments",
+      "unscoped_count": 1
+    },
+    {
+      "hidden_by_default_scope": null,
+      "model": null,
+      "scoped_count": null,
+      "source": "observed",
+      "table": "active_storage_blobs",
+      "unscoped_count": 1
+    },
+    {
+      "hidden_by_default_scope": null,
+      "model": null,
+      "scoped_count": null,
+      "source": "observed",
+      "table": "active_storage_variant_records",
+      "unscoped_count": 0
+    },
+    {
+      "hidden_by_default_scope": null,
+      "model": null,
+      "scoped_count": null,
+      "source": "observed",
+      "table": "ar_internal_metadata",
+      "unscoped_count": 2
+    },
+    {
+      "hidden_by_default_scope": 1,
+      "model": "Club",
+      "scoped_count": 2,
+      "source": "observed",
+      "table": "clubs",
+      "unscoped_count": 3
+    },
+    {
+      "hidden_by_default_scope": 0,
+      "model": "Comment",
+      "scoped_count": 3,
+      "source": "observed",
+      "table": "comments",
+      "unscoped_count": 3
+    },
+    {
+      "hidden_by_default_scope": 0,
+      "model": "Event",
+      "scoped_count": 3,
+      "source": "observed",
+      "table": "events",
+      "unscoped_count": 3
+    },
+    {
+      "hidden_by_default_scope": 0,
+      "model": "Flag",
+      "scoped_count": 2,
+      "source": "observed",
+      "table": "flags",
+      "unscoped_count": 2
+    },
+    {
+      "hidden_by_default_scope": 0,
+      "model": "Membership",
+      "scoped_count": 4,
+      "source": "observed",
+      "table": "memberships",
+      "unscoped_count": 4
+    },
+    {
+      "hidden_by_default_scope": 0,
+      "model": "Notification",
+      "scoped_count": 1,
+      "source": "observed",
+      "table": "notifications",
+      "unscoped_count": 1
+    },
+    {
+      "hidden_by_default_scope": 0,
+      "model": "Post",
+      "scoped_count": 4,
+      "source": "observed",
+      "table": "posts",
+      "unscoped_count": 4
+    },
+    {
+      "hidden_by_default_scope": null,
+      "model": null,
+      "scoped_count": null,
+      "source": "observed",
+      "table": "schema_migrations",
+      "unscoped_count": 10
+    },
+    {
+      "hidden_by_default_scope": 0,
+      "model": "User",
+      "scoped_count": 4,
+      "source": "observed",
+      "table": "users",
+      "unscoped_count": 4
+    }
+  ]
+}

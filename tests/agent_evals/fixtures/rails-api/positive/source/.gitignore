@@ -1,0 +1,5 @@
+# Grading this workspace opens the frozen database, which creates these beside it.
+# A committed stale WAL is replayed on the next open, so the fixture's contents would
+# depend on who last ran the suite. Same rule as tests/rails/fixtures/.gitignore.
+*.sqlite3-wal
+*.sqlite3-shm

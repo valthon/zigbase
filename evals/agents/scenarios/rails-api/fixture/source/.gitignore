@@ -1,0 +1,6 @@
+# Reading the frozen database creates these beside it, even read-only. They must
+# never be committed: SQLite replays a stale WAL on open, so a checkout would get
+# a fixture whose contents depend on who last ran the eval. Same rule, and same
+# reason, as tests/rails/fixtures/.gitignore.
+*.sqlite3-wal
+*.sqlite3-shm

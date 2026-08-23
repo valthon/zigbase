@@ -1,0 +1,3 @@
+{"club":"1","created":"2024-01-15T11:00:00Z","id":"1","location":"Library, Room 2","pages_target":null,"starts_at":"2024-01-25T18:00:00Z","title":"January Meetup","type":"MeetingEvent","updated":"2024-01-15T11:00:00Z"}
+{"club":"1","created":"2024-01-15T11:05:00Z","id":"2","location":null,"pages_target":120,"starts_at":"2024-01-22T07:00:00Z","title":"Chapters 1-6","type":"ReadingEvent","updated":"2024-01-15T11:05:00Z"}
+{"club":"2","created":"2024-01-15T11:10:00Z","id":"3","location":"Video call","pages_target":null,"starts_at":"2024-01-26T22:00:00Z","title":"Owl Hours","type":"MeetingEvent","updated":"2024-01-15T11:10:00Z"}

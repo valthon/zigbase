@@ -1,0 +1,562 @@
+{
+  "collections": [
+    {
+      "createRule": "@request.auth.id != ''",
+      "deleteRule": "@request.auth.id = owner",
+      "fields": [
+        {
+          "id": "",
+          "name": "name",
+          "options": {},
+          "required": true,
+          "type": "text"
+        },
+        {
+          "id": "",
+          "name": "slug",
+          "options": {},
+          "required": true,
+          "type": "text"
+        },
+        {
+          "id": "",
+          "name": "owner",
+          "options": {
+            "cascadeDelete": false,
+            "maxSelect": 1,
+            "targetCollectionId": "users"
+          },
+          "required": true,
+          "type": "relation"
+        },
+        {
+          "id": "",
+          "name": "visibility",
+          "options": {
+            "maxSelect": 1,
+            "values": [
+              "private_club",
+              "public_club"
+            ]
+          },
+          "required": true,
+          "type": "select"
+        },
+        {
+          "id": "",
+          "name": "posts_count",
+          "options": {
+            "mode": "int"
+          },
+          "required": true,
+          "type": "number"
+        },
+        {
+          "id": "",
+          "name": "archived_at",
+          "options": {},
+          "required": false,
+          "type": "date"
+        }
+      ],
+      "indexes": [
+        {
+          "fields": [
+            "archived_at"
+          ],
+          "name": "index_clubs_on_archived_at",
+          "unique": false
+        },
+        {
+          "fields": [
+            "owner"
+          ],
+          "name": "index_clubs_on_owner_id",
+          "unique": false
+        },
+        {
+          "fields": [
+            "slug"
+          ],
+          "name": "index_clubs_on_slug",
+          "unique": true
+        }
+      ],
+      "listRule": "@request.auth.id != ''",
+      "name": "clubs",
+      "type": "base",
+      "updateRule": "@request.auth.id = owner",
+      "viewRule": "@request.auth.id != ''"
+    },
+    {
+      "createRule": "@request.auth.id != ''",
+      "deleteRule": "@request.auth.id = author",
+      "fields": [
+        {
+          "id": "",
+          "name": "post",
+          "options": {
+            "cascadeDelete": false,
+            "maxSelect": 1,
+            "targetCollectionId": "posts"
+          },
+          "required": true,
+          "type": "relation"
+        },
+        {
+          "id": "",
+          "name": "author",
+          "options": {
+            "cascadeDelete": false,
+            "maxSelect": 1,
+            "targetCollectionId": "users"
+          },
+          "required": true,
+          "type": "relation"
+        },
+        {
+          "id": "",
+          "name": "body",
+          "options": {},
+          "required": true,
+          "type": "text"
+        }
+      ],
+      "indexes": [
+        {
+          "fields": [
+            "author"
+          ],
+          "name": "index_comments_on_author_id",
+          "unique": false
+        },
+        {
+          "fields": [
+            "post"
+          ],
+          "name": "index_comments_on_post_id",
+          "unique": false
+        }
+      ],
+      "listRule": "@request.auth.id != ''",
+      "name": "comments",
+      "type": "base",
+      "updateRule": "@request.auth.id = author",
+      "viewRule": "@request.auth.id != ''"
+    },
+    {
+      "createRule": "@request.auth.id != ''",
+      "deleteRule": "@request.auth.id != ''",
+      "fields": [
+        {
+          "id": "",
+          "name": "type",
+          "options": {},
+          "required": true,
+          "type": "text"
+        },
+        {
+          "id": "",
+          "name": "club",
+          "options": {
+            "cascadeDelete": false,
+            "maxSelect": 1,
+            "targetCollectionId": "clubs"
+          },
+          "required": true,
+          "type": "relation"
+        },
+        {
+          "id": "",
+          "name": "title",
+          "options": {},
+          "required": true,
+          "type": "text"
+        },
+        {
+          "id": "",
+          "name": "starts_at",
+          "options": {},
+          "required": true,
+          "type": "date"
+        },
+        {
+          "id": "",
+          "name": "location",
+          "options": {},
+          "required": false,
+          "type": "text"
+        },
+        {
+          "id": "",
+          "name": "pages_target",
+          "options": {
+            "mode": "int"
+          },
+          "required": false,
+          "type": "number"
+        }
+      ],
+      "indexes": [
+        {
+          "fields": [
+            "club"
+          ],
+          "name": "index_events_on_club_id",
+          "unique": false
+        },
+        {
+          "fields": [
+            "type"
+          ],
+          "name": "index_events_on_type",
+          "unique": false
+        }
+      ],
+      "listRule": "@request.auth.id != ''",
+      "name": "events",
+      "type": "base",
+      "updateRule": "@request.auth.id != ''",
+      "viewRule": "@request.auth.id != ''"
+    },
+    {
+      "createRule": "@request.auth.id != ''",
+      "deleteRule": "@request.auth.id = reporter",
+      "fields": [
+        {
+          "id": "",
+          "name": "flaggable_type",
+          "options": {},
+          "required": true,
+          "type": "text"
+        },
+        {
+          "id": "",
+          "name": "flaggable_id",
+          "options": {
+            "mode": "int"
+          },
+          "required": true,
+          "type": "number"
+        },
+        {
+          "id": "",
+          "name": "reporter",
+          "options": {
+            "cascadeDelete": false,
+            "maxSelect": 1,
+            "targetCollectionId": "users"
+          },
+          "required": true,
+          "type": "relation"
+        },
+        {
+          "id": "",
+          "name": "reason",
+          "options": {},
+          "required": true,
+          "type": "text"
+        }
+      ],
+      "indexes": [
+        {
+          "fields": [
+            "flaggable_type",
+            "flaggable_id"
+          ],
+          "name": "index_flags_on_flaggable_type_and_flaggable_id",
+          "unique": false
+        },
+        {
+          "fields": [
+            "reporter"
+          ],
+          "name": "index_flags_on_reporter_id",
+          "unique": false
+        }
+      ],
+      "listRule": "@request.auth.id = reporter",
+      "name": "flags",
+      "type": "base",
+      "updateRule": "@request.auth.id = reporter",
+      "viewRule": "@request.auth.id = reporter"
+    },
+    {
+      "createRule": "@request.auth.id != ''",
+      "deleteRule": "@request.auth.id = user",
+      "fields": [
+        {
+          "id": "",
+          "name": "user",
+          "options": {
+            "cascadeDelete": false,
+            "maxSelect": 1,
+            "targetCollectionId": "users"
+          },
+          "required": true,
+          "type": "relation"
+        },
+        {
+          "id": "",
+          "name": "club",
+          "options": {
+            "cascadeDelete": false,
+            "maxSelect": 1,
+            "targetCollectionId": "clubs"
+          },
+          "required": true,
+          "type": "relation"
+        },
+        {
+          "id": "",
+          "name": "role",
+          "options": {
+            "maxSelect": 1,
+            "values": [
+              "curator",
+              "reader"
+            ]
+          },
+          "required": true,
+          "type": "select"
+        },
+        {
+          "id": "",
+          "name": "joined_at",
+          "options": {},
+          "required": true,
+          "type": "date"
+        }
+      ],
+      "indexes": [
+        {
+          "fields": [
+            "club"
+          ],
+          "name": "index_memberships_on_club_id",
+          "unique": false
+        },
+        {
+          "fields": [
+            "user",
+            "club"
+          ],
+          "name": "index_memberships_on_user_and_club",
+          "unique": true
+        },
+        {
+          "fields": [
+            "user"
+          ],
+          "name": "index_memberships_on_user_id",
+          "unique": false
+        }
+      ],
+      "listRule": "@request.auth.id != ''",
+      "name": "memberships",
+      "type": "base",
+      "updateRule": "@request.auth.id = user",
+      "viewRule": "@request.auth.id != ''"
+    },
+    {
+      "createRule": "@request.auth.id != ''",
+      "deleteRule": "@request.auth.id = user",
+      "fields": [
+        {
+          "id": "",
+          "name": "user",
+          "options": {
+            "cascadeDelete": false,
+            "maxSelect": 1,
+            "targetCollectionId": "users"
+          },
+          "required": true,
+          "type": "relation"
+        },
+        {
+          "id": "",
+          "name": "kind",
+          "options": {},
+          "required": true,
+          "type": "text"
+        },
+        {
+          "id": "",
+          "name": "payload",
+          "options": {},
+          "required": true,
+          "type": "json"
+        }
+      ],
+      "indexes": [
+        {
+          "fields": [
+            "user"
+          ],
+          "name": "index_notifications_on_user_id",
+          "unique": false
+        },
+        {
+          "fields": [
+            "user",
+            "kind"
+          ],
+          "name": "index_notifications_on_user_id_and_kind",
+          "unique": false
+        }
+      ],
+      "listRule": "@request.auth.id = user",
+      "name": "notifications",
+      "type": "base",
+      "updateRule": "@request.auth.id = user",
+      "viewRule": "@request.auth.id = user"
+    },
+    {
+      "createRule": "@request.auth.id != ''",
+      "deleteRule": "@request.auth.id = author",
+      "fields": [
+        {
+          "id": "",
+          "name": "club",
+          "options": {
+            "cascadeDelete": false,
+            "maxSelect": 1,
+            "targetCollectionId": "clubs"
+          },
+          "required": true,
+          "type": "relation"
+        },
+        {
+          "id": "",
+          "name": "author",
+          "options": {
+            "cascadeDelete": false,
+            "maxSelect": 1,
+            "targetCollectionId": "users"
+          },
+          "required": true,
+          "type": "relation"
+        },
+        {
+          "id": "",
+          "name": "title",
+          "options": {},
+          "required": true,
+          "type": "text"
+        },
+        {
+          "id": "",
+          "name": "body",
+          "options": {},
+          "required": false,
+          "type": "text"
+        },
+        {
+          "id": "",
+          "name": "status",
+          "options": {
+            "maxSelect": 1,
+            "values": [
+              "archived",
+              "draft",
+              "published"
+            ]
+          },
+          "required": true,
+          "type": "select"
+        },
+        {
+          "id": "",
+          "name": "published_at",
+          "options": {},
+          "required": false,
+          "type": "date"
+        },
+        {
+          "id": "",
+          "name": "cover",
+          "options": {},
+          "type": "file"
+        }
+      ],
+      "indexes": [
+        {
+          "fields": [
+            "author"
+          ],
+          "name": "index_posts_on_author_id",
+          "unique": false
+        },
+        {
+          "fields": [
+            "club"
+          ],
+          "name": "index_posts_on_club_id",
+          "unique": false
+        },
+        {
+          "fields": [
+            "club",
+            "status"
+          ],
+          "name": "index_posts_on_club_id_and_status",
+          "unique": false
+        },
+        {
+          "fields": [
+            "published_at"
+          ],
+          "name": "index_posts_on_published_at",
+          "unique": false
+        }
+      ],
+      "listRule": "@request.auth.id != ''",
+      "name": "posts",
+      "type": "base",
+      "updateRule": "@request.auth.id = author",
+      "viewRule": "@request.auth.id != ''"
+    },
+    {
+      "createRule": "@public",
+      "deleteRule": "@request.auth.id = id",
+      "fields": [
+        {
+          "id": "",
+          "name": "display_name",
+          "options": {},
+          "required": true,
+          "type": "text"
+        },
+        {
+          "id": "",
+          "name": "role",
+          "options": {
+            "maxSelect": 1,
+            "values": [
+              "admin",
+              "member",
+              "moderator"
+            ]
+          },
+          "required": true,
+          "type": "select"
+        }
+      ],
+      "indexes": [
+        {
+          "fields": [
+            "role"
+          ],
+          "name": "index_users_on_role",
+          "unique": false
+        }
+      ],
+      "listRule": "@request.auth.id != ''",
+      "name": "users",
+      "type": "auth",
+      "updateRule": "@request.auth.id = id",
+      "viewRule": "@request.auth.id != ''"
+    }
+  ],
+  "zigbaseSchema": 1
+}

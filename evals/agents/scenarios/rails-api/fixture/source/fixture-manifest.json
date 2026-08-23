@@ -1,0 +1,459 @@
+{
+  "count": 90,
+  "files": [
+    {
+      "bytes": 11,
+      "path": "app_source/.ruby-version",
+      "sha256": "2864b82925888310eb99b0c6635bb8bafd0ab503a65ce506fa8c92d800064559"
+    },
+    {
+      "bytes": 1469,
+      "path": "app_source/Gemfile",
+      "sha256": "60f531d3e7033f6cd526c4dc563d2d0bb07ca1589b31632e88695bb0f80b6f01"
+    },
+    {
+      "bytes": 16245,
+      "path": "app_source/Gemfile.lock",
+      "sha256": "aee4de193d4ac76e0bba11eb1f4bbe4beec438b3916e635e98599cbbd44984ce"
+    },
+    {
+      "bytes": 374,
+      "path": "app_source/README.md",
+      "sha256": "cb08e48b7df3451e22fb32b808eee8b7c12d330b7f04be49353715fe612fa7d7"
+    },
+    {
+      "bytes": 227,
+      "path": "app_source/Rakefile",
+      "sha256": "895c6a69d01c14f0dd437c0eb44914754006ce317807264ca7ffbd1c79a91ebf"
+    },
+    {
+      "bytes": 371,
+      "path": "app_source/app/controllers/api/v1/base_controller.rb",
+      "sha256": "cc1b55637369b36eb42a5adaece1c4a25b8b3b318be532b45b5005d82ad001be"
+    },
+    {
+      "bytes": 1515,
+      "path": "app_source/app/controllers/api/v1/clubs_controller.rb",
+      "sha256": "bbf4d2b81b74ccb88180412b65370b96e0c7cec23281e45746cbb3df1fbbe0d0"
+    },
+    {
+      "bytes": 1415,
+      "path": "app_source/app/controllers/api/v1/memberships_controller.rb",
+      "sha256": "c852aead8dffa9e80c6bb555374d0aacb8d2b1bab73a17fd0251d1b65b6f3cd1"
+    },
+    {
+      "bytes": 3851,
+      "path": "app_source/app/controllers/api/v1/posts_controller.rb",
+      "sha256": "c444e945b70432fa157f99371f7b6605934562d0063b7782736b02d56ffac993"
+    },
+    {
+      "bytes": 715,
+      "path": "app_source/app/controllers/api/v1/sessions_controller.rb",
+      "sha256": "da30a8e87ef11f2f7ddbe7abc0dd051b29fe9d9a0cead3780079ea305bb64502"
+    },
+    {
+      "bytes": 836,
+      "path": "app_source/app/controllers/api/v1/stats_controller.rb",
+      "sha256": "ee9b93a602731c093816b4192242428c73e2d5175e4285ddfe969a0f1631d153"
+    },
+    {
+      "bytes": 794,
+      "path": "app_source/app/controllers/api/v1/users_controller.rb",
+      "sha256": "87e66e71f4020b1c4f479455cefbd1b7546abe72fef84eb774175153eb816785"
+    },
+    {
+      "bytes": 2619,
+      "path": "app_source/app/controllers/application_controller.rb",
+      "sha256": "8e3918ce4950d10cdb8aaf31f3fe95323156334c1d841eef512c5c752c0f9f36"
+    },
+    {
+      "bytes": 0,
+      "path": "app_source/app/controllers/concerns/.keep",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "bytes": 269,
+      "path": "app_source/app/jobs/application_job.rb",
+      "sha256": "d51e125007521b0f59765422cf3cf949b59b2054cdac6567a95b4a7aeaf1d722"
+    },
+    {
+      "bytes": 788,
+      "path": "app_source/app/jobs/post_published_notification_job.rb",
+      "sha256": "5bed5a3580d02c7c688b608522c8ba7e1e871b334a421819bc3d7ab37a66ce07"
+    },
+    {
+      "bytes": 102,
+      "path": "app_source/app/mailers/application_mailer.rb",
+      "sha256": "51b58ee6215d29f50f4f35b309e849766e40f584016e48ec9ea66558ab352fa7"
+    },
+    {
+      "bytes": 74,
+      "path": "app_source/app/models/application_record.rb",
+      "sha256": "12bf7d0eaefce4d50e0719991e19b48a36a7865aeb7ac745980584806155fdc1"
+    },
+    {
+      "bytes": 1098,
+      "path": "app_source/app/models/club.rb",
+      "sha256": "009bdf2b4f5350f7bf5c68e2083c04f978a01968ddb5676016572447f9ba52f1"
+    },
+    {
+      "bytes": 239,
+      "path": "app_source/app/models/comment.rb",
+      "sha256": "378feee7d3c318d646c613cc410214b329a8059b4cc20679c2af117e7ffac669"
+    },
+    {
+      "bytes": 0,
+      "path": "app_source/app/models/concerns/.keep",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "bytes": 319,
+      "path": "app_source/app/models/event.rb",
+      "sha256": "a5b4f8f30d8add2961d6ed149e7dda001bbcfd93a75fadd9f65e189743b33b59"
+    },
+    {
+      "bytes": 492,
+      "path": "app_source/app/models/flag.rb",
+      "sha256": "f62ad198dbaf82bb75cdd49cd1df4b73cb3e3b6b954ee6638cba799a5ed5eda9"
+    },
+    {
+      "bytes": 69,
+      "path": "app_source/app/models/meeting_event.rb",
+      "sha256": "56e448a1ea406541ed1fc3f1fa59c79e05bc63808a16612419cb5afdd9b792c9"
+    },
+    {
+      "bytes": 275,
+      "path": "app_source/app/models/membership.rb",
+      "sha256": "f8ab1fb1841a61d64e03973981eeb3ad7920361932a3cc2c57a0f2c5ba38da30"
+    },
+    {
+      "bytes": 239,
+      "path": "app_source/app/models/notification.rb",
+      "sha256": "4bbd6712b877bbf3c560f81e40cd94e78cb7f888f7d2e9e648e33b01b9d46127"
+    },
+    {
+      "bytes": 463,
+      "path": "app_source/app/models/post.rb",
+      "sha256": "54422a326f6a4c00b5645471bd0cf8abd69af25ac274880d0fe5bd47313da4fb"
+    },
+    {
+      "bytes": 128,
+      "path": "app_source/app/models/reading_event.rb",
+      "sha256": "ee41a46f469007a934eafd8ad16e7aaa86cdd051520d5b90a1bec55ae72d3091"
+    },
+    {
+      "bytes": 1394,
+      "path": "app_source/app/models/user.rb",
+      "sha256": "1e868d5d8f56cdcd4628fa4f95ec43fb1599980728306ad69e19d3d6b7f021fa"
+    },
+    {
+      "bytes": 791,
+      "path": "app_source/app/services/auth_token.rb",
+      "sha256": "dc6e5d9da52bc384ce3271902921305cca0996c69476b9e7c268c65ad0766571"
+    },
+    {
+      "bytes": 227,
+      "path": "app_source/app/views/layouts/mailer.html.erb",
+      "sha256": "3be3ece9c575096f91f8ecc6a4efb0c7ffd509d2ed4b06c3461bd920201bbd37"
+    },
+    {
+      "bytes": 13,
+      "path": "app_source/app/views/layouts/mailer.text.erb",
+      "sha256": "51353f9de3a26d4b28f7db91152bf56d31cfa9e4bd3c834680772a63cd374698"
+    },
+    {
+      "bytes": 202,
+      "path": "app_source/bin/bundler-audit",
+      "sha256": "484ba9033e36465898620184f12f427b014bf91ac61a423d302447ea99cf378d"
+    },
+    {
+      "bytes": 180,
+      "path": "app_source/bin/ci",
+      "sha256": "ee240fa535e83197c3b79489f56454ec9e1b24f9b7db15eb26c35fc858e12c02"
+    },
+    {
+      "bytes": 56,
+      "path": "app_source/bin/dev",
+      "sha256": "bdf0071bfce9a25b347076aba2b678e2e90be4388e943ec8da21283b998680ca"
+    },
+    {
+      "bytes": 141,
+      "path": "app_source/bin/rails",
+      "sha256": "0862d7bc09d5ed61785d677ef2dba10ce285387d4d5d9e3d90d97630e3f69ab6"
+    },
+    {
+      "bytes": 90,
+      "path": "app_source/bin/rake",
+      "sha256": "5943c3811dc345727b5f330b599c4c6c45abc04816dd8f4201aeed88cf268cb3"
+    },
+    {
+      "bytes": 1069,
+      "path": "app_source/bin/setup",
+      "sha256": "0f5b139524ceb07af2e32cca242a2817f4df26f0ecf96c64cec402ebcfaa7294"
+    },
+    {
+      "bytes": 104,
+      "path": "app_source/bin/thrust",
+      "sha256": "ed1176b4df355db4b2a67ee37b45ca5c6d7118255d28a07dcdcb6d0fe4ae5c4f"
+    },
+    {
+      "bytes": 160,
+      "path": "app_source/config.ru",
+      "sha256": "1a5090e57cf9301e8bda3fec3abe4c72fbc001f6cd4909fd80b6cd488ab531b9"
+    },
+    {
+      "bytes": 3331,
+      "path": "app_source/config/application.rb",
+      "sha256": "5c1f087d10e167b7884a0ddd9fd2283a2d1cd4eb6effe32dd1f810803e89eca2"
+    },
+    {
+      "bytes": 128,
+      "path": "app_source/config/boot.rb",
+      "sha256": "129a59e499e2d551f78505c6d65bf1e568f09058353f61e167eba5af0e4ca242"
+    },
+    {
+      "bytes": 226,
+      "path": "app_source/config/bundler-audit.yml",
+      "sha256": "cf66f718f2c84c0ab6ae50fcb0b1323751c11522de80d0c66e25e4b5680cde55"
+    },
+    {
+      "bytes": 193,
+      "path": "app_source/config/cable.yml",
+      "sha256": "378bf8da123e7bb2cc192351d72c0735eb78f1015f90b521bc9610f5148d8c2e"
+    },
+    {
+      "bytes": 477,
+      "path": "app_source/config/ci.rb",
+      "sha256": "96a0dff565f9237416912334919ea3267d6ec4061ec9a4de30e99fd861ff8597"
+    },
+    {
+      "bytes": 1002,
+      "path": "app_source/config/database.yml",
+      "sha256": "762ffeff1ed72fe2deb7323af00c665239be84ffec5bbd8886c18f38ec390e25"
+    },
+    {
+      "bytes": 128,
+      "path": "app_source/config/environment.rb",
+      "sha256": "73b2e731e02cedb9dc0335e1a35c3a2b7738032e3aa7e62ac32cbb8432b43c69"
+    },
+    {
+      "bytes": 2565,
+      "path": "app_source/config/environments/development.rb",
+      "sha256": "d8c8ed77bfb06a5aae9a9389e5eed9ede2a0edeeaf218cb3d4d7046dbccc6ada"
+    },
+    {
+      "bytes": 3567,
+      "path": "app_source/config/environments/production.rb",
+      "sha256": "d5e1266fb915c486b767774048f89062fb2c5a80d657ce2e54dcd674d9e60449"
+    },
+    {
+      "bytes": 2319,
+      "path": "app_source/config/environments/test.rb",
+      "sha256": "b3208a3cb7383c4383dfa44d815fd0f942d03ca64ca2ca06a104aad9773403e2"
+    },
+    {
+      "bytes": 504,
+      "path": "app_source/config/initializers/cors.rb",
+      "sha256": "3d2204f77bb83b40940ae789f0201a66d0f40a55a9144d51f28c433d8eb0d1bd"
+    },
+    {
+      "bytes": 468,
+      "path": "app_source/config/initializers/filter_parameter_logging.rb",
+      "sha256": "f864bd67e7bdaa63a5331b9fc15446613c410c3a314cd70d1b6a7c8b566b6120"
+    },
+    {
+      "bytes": 649,
+      "path": "app_source/config/initializers/inflections.rb",
+      "sha256": "e2c18b803625a073b25e4ee4460677da33a8bf19bbbcad629718a8e15c58acc2"
+    },
+    {
+      "bytes": 908,
+      "path": "app_source/config/locales/en.yml",
+      "sha256": "ad72af216ad0a67a1155c685535698fdd2a7138810c7e6dcb5eab7f0cc1c5922"
+    },
+    {
+      "bytes": 1922,
+      "path": "app_source/config/puma.rb",
+      "sha256": "d1f67568aa22ac7404904351aa738829623d45312a32dc560a4640bcf9eceb3d"
+    },
+    {
+      "bytes": 1436,
+      "path": "app_source/config/routes.rb",
+      "sha256": "90f61949884110667d894c54f31eb473e649095e4472348f3fe2948c53ff44ff"
+    },
+    {
+      "bytes": 811,
+      "path": "app_source/config/storage.yml",
+      "sha256": "bb472986ec9dd77d0e30e840d8f2b21b9c435aa65e3096aa813e4bc2df658edb"
+    },
+    {
+      "bytes": 591,
+      "path": "app_source/db/migrate/20240101000001_create_users.rb",
+      "sha256": "2f314ae89830def188fd9eb8ef5184129f24a416717c6cd1f19a01464d4d2010"
+    },
+    {
+      "bytes": 717,
+      "path": "app_source/db/migrate/20240101000002_create_clubs.rb",
+      "sha256": "19a7b3c8f0501d8a765410633e037c1cd4e855069f4672c5ee59b780192ab98a"
+    },
+    {
+      "bytes": 455,
+      "path": "app_source/db/migrate/20240101000003_create_memberships.rb",
+      "sha256": "3742404aed142600398403ccece31f53e466d8941d72332d711998a9103780b9"
+    },
+    {
+      "bytes": 483,
+      "path": "app_source/db/migrate/20240101000004_create_posts.rb",
+      "sha256": "4f8040813ec5deddbbbbf238fb5a901e0f030f94aeeb3f64af62c489b45f65ae"
+    },
+    {
+      "bytes": 301,
+      "path": "app_source/db/migrate/20240101000005_create_comments.rb",
+      "sha256": "96c4155c42af799d9ad07d7db5c3dc6fb7bf33c5bcbf6a5d044e77aac7aa19ec"
+    },
+    {
+      "bytes": 592,
+      "path": "app_source/db/migrate/20240101000006_create_flags.rb",
+      "sha256": "fbe1ac014a6b303fcf7f48b19eb0059b3395051fd823d2f96be8d1fd074e5d02"
+    },
+    {
+      "bytes": 659,
+      "path": "app_source/db/migrate/20240101000007_create_notifications.rb",
+      "sha256": "0ea7f805f0a5cf1b1bdf032df8a0d5d07e8493ea5651b82d5ebe032e66dd7890"
+    },
+    {
+      "bytes": 586,
+      "path": "app_source/db/migrate/20240101000008_create_events.rb",
+      "sha256": "e120587b2d28450d1f43107f876c41b421dc1af0be1a97f712a9d33963d148fa"
+    },
+    {
+      "bytes": 1618,
+      "path": "app_source/db/migrate/20240101000009_add_posts_count_triggers.rb",
+      "sha256": "ce0427f5fbab938de5e77d1463be8c608091c6a82edcb1a50ffc179c93355d5a"
+    },
+    {
+      "bytes": 2197,
+      "path": "app_source/db/migrate/20240101000010_create_active_storage_tables.active_storage.rb",
+      "sha256": "3bf51e52925efe90408d3159f9de848d2f891dfda149e5706280b8c027e82ddf"
+    },
+    {
+      "bytes": 6347,
+      "path": "app_source/db/schema.rb",
+      "sha256": "bf80928cf8fb7bacada0e166a7ef78ae5212a8d3f55bf97d12c0fa30e2ef6aad"
+    },
+    {
+      "bytes": 12181,
+      "path": "app_source/db/seeds.rb",
+      "sha256": "e48ed48e08624cb4638cfa20bbb55c43c1c1202212293726a33f8fb2bcc80a57"
+    },
+    {
+      "bytes": 0,
+      "path": "app_source/lib/tasks/.keep",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "bytes": 0,
+      "path": "app_source/log/.keep",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "bytes": 99,
+      "path": "app_source/public/robots.txt",
+      "sha256": "2f15987e4606501202b9d337085439339e53a374e3d194847192c12f85ba78f8"
+    },
+    {
+      "bytes": 0,
+      "path": "app_source/script/.keep",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "bytes": 0,
+      "path": "app_source/storage/.keep",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "bytes": 0,
+      "path": "app_source/tmp/.keep",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "bytes": 0,
+      "path": "app_source/tmp/pids/.keep",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "bytes": 0,
+      "path": "app_source/tmp/storage/.keep",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "bytes": 0,
+      "path": "app_source/vendor/.keep",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "bytes": 180224,
+      "path": "db/development.sqlite3",
+      "sha256": "d1290b3911f3e499abf63e5f82f428addc94636ce7bf4d3e6884e0fcd3c197af"
+    },
+    {
+      "bytes": 4816,
+      "path": "freeze.json",
+      "sha256": "456cd941821dd462db1289b27a28fdf62ea643117c088664540be1042369a419"
+    },
+    {
+      "bytes": 42706,
+      "path": "http/cases.json",
+      "sha256": "a96b5af231ef5a452ed5f4e8bc7bee2207b522e59a415f93cff455a1973ce7a1"
+    },
+    {
+      "bytes": 11567,
+      "path": "inventory/auth.json",
+      "sha256": "be5b428667321d5586480a3a20ec2c050162e74c6990368609afad41df884c8c"
+    },
+    {
+      "bytes": 2480,
+      "path": "inventory/counts.json",
+      "sha256": "2bf55f76accaee30a0377970e6bc34da3a1b7b89d8c368fec8a368f63461ab05"
+    },
+    {
+      "bytes": 2784,
+      "path": "inventory/jobs.json",
+      "sha256": "6c0208f88610436e53aedc1980fb31caa337d80c1dc1941fdcc4c23bfcc4cc41"
+    },
+    {
+      "bytes": 35983,
+      "path": "inventory/models.json",
+      "sha256": "f4247498699b2d097eda468f901e0d1fb08b051585ffcb6019b804fccf5a1c27"
+    },
+    {
+      "bytes": 37647,
+      "path": "inventory/routes.json",
+      "sha256": "8b33fd05d7939aa6685745e80b7ec6960a307d23f561b0e6b6768e747cd2e3aa"
+    },
+    {
+      "bytes": 32354,
+      "path": "inventory/schema.json",
+      "sha256": "d5bd64e211d0ab55fe74f9ff9c9097712469a32cff53cb8b4ce70291c44a64f8"
+    },
+    {
+      "bytes": 937,
+      "path": "inventory/storage.json",
+      "sha256": "5fb0127d2e9750896d952faf9f7bb0ac039e509eb67c948ff3ab421e91dfdb14"
+    },
+    {
+      "bytes": 505,
+      "path": "inventory/versions.json",
+      "sha256": "37473f5185751fe284806858821c82456a7980ca7cef73fa233b5c68a7ada77b"
+    },
+    {
+      "bytes": 70,
+      "path": "storage/fi/xt/fixturecover0000000000000001",
+      "sha256": "8c9e0aa0b0a951d9df2d9b1b956a27f3f750eca4bfe456ba939f0823a11ca5ec"
+    }
+  ],
+  "fixture": "bookclub_api",
+  "note": "sha256 and byte size for every file in frozen/, sorted by path. fixture-manifest.json itself is excluded (it cannot contain its own digest).",
+  "taken_at": "2024-01-15T09:00:00Z",
+  "total_bytes": 438957
+}
