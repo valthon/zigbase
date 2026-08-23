@@ -148,6 +148,12 @@ Set `ZIGBASE_TRUST_PROXY=true` only because the ZigBase socket remains loopback-
 `ZIGBASE_COOKIE_SECURE=true` (the default) and set
 `ZIGBASE_PUBLIC_URL=https://app.example.com`.
 
+`--http-host` is a real constraint on the socket, not a label: an address this machine does not
+have — a typo, an address belonging to another box — fails at boot naming the address, rather
+than falling back to a wider bind. If you bind one specific interface rather than loopback, order
+the unit after that interface exists (the unit above already does: `After=network-online.target`).
+Confirm the bind rather than trusting the log line: `ss -ltnp | grep zigbase`.
+
 After changing the environment file or binary, use `systemctl restart zigbase`; `reload` has no
 special configuration semantics. Check the journal and both health endpoints after every restart.
 

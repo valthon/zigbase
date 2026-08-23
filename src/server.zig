@@ -99,6 +99,33 @@ fn replaceStaticMaxAge(_: ?*anyopaque) callconv(.c) void {
     HTTP_HVALUE_MAX_AGE = zap.fio.fiobj_str_new(static_cache_control_value.ptr, static_cache_control_value.len);
 }
 
+/// Map the configured `--http-host` / `ZIGBASE_HTTP_HOST` onto facil.io's bind argument
+/// (`fio_http_listen`'s `binding`, surfaced by zap as `HttpListenerSettings.interface`).
+///
+/// `null` there means "every interface" — and passing `null` unconditionally is exactly the
+/// bug this function exists to close (#384): the host was parsed, logged, and judged by
+/// `doctor`, but the listener never saw it, so every deployment bound `0.0.0.0` while the
+/// log line claimed loopback. The wildcards are mapped to `null` rather than handed to
+/// `getaddrinfo` so that the historical all-interfaces behaviour is byte-for-byte preserved
+/// where it was actually wanted (the container image sets `ZIGBASE_HTTP_HOST=0.0.0.0`);
+/// everything else — `127.0.0.1`, a specific interface address, a hostname — is passed
+/// through and genuinely restricts the bind.
+///
+/// An empty host is treated as unset (all interfaces) rather than as a bind of `""`, which
+/// `getaddrinfo` would reject and turn into a boot failure for a config that previously
+/// worked.
+///
+/// This mirrors `serve_session.probeHost`, which answers the dual question — *which address
+/// do I dial to reach this session* — and must agree with it: `probeHost` dials `127.0.0.1`
+/// for exactly the wildcards this maps to `null`.
+pub fn bindInterface(host: [:0]const u8) [*c]const u8 {
+    if (host.len == 0) return null;
+    if (std.mem.eql(u8, host, "0.0.0.0")) return null;
+    if (std.mem.eql(u8, host, "::")) return null;
+    if (std.mem.eql(u8, host, "[::]")) return null;
+    return host.ptr;
+}
+
 /// Type-erased pointer to the running app, set by whichever `Server(gates)` instance calls
 /// `listen()`. `realtime/ws.zig`'s `on_upgrade` callback runs outside any particular `Server`
 /// instantiation (it doesn't know the comptime `gates` used to build it), so it can't name
@@ -246,12 +273,23 @@ pub fn Server(comptime gates: Gates) type {
         pub fn listen(self: *Self) !void {
             instance = self;
             active_app = self.app;
-            var listener = zap.HttpListener.init(.{ .port = self.port, .on_request = onRequest, .on_upgrade = realtime_ws.handleUpgrade, .log = false, .max_body_size = @intCast(self.app.max_upload_size) });
+            var listener = zap.HttpListener.init(.{ .port = self.port, .interface = bindInterface(self.host), .on_request = onRequest, .on_upgrade = realtime_ws.handleUpgrade, .log = false, .max_body_size = @intCast(self.app.max_upload_size) });
             if (self.app.static_cache_control) |v| {
                 static_cache_control_value = v;
                 fio_state_callback_add(FIO_CALL_PRE_START, replaceStaticMaxAge, null);
             }
-            try listener.listen();
+            // Now that the host is actually honoured, a host this machine cannot bind (a typo, an
+            // address belonging to another box, an interface that is not up yet) fails here instead
+            // of silently falling back to every interface. zap collapses every bind failure into a
+            // bare `error.ListenError`, so name the address that failed — the operator's next move
+            // depends on whether it was the port or the host.
+            listener.listen() catch |e| {
+                std.log.err(
+                    "cannot bind {s}:{d}: {s} — check that --http-host/ZIGBASE_HTTP_HOST names an address on this machine and that the port is free",
+                    .{ self.host, self.port, @errorName(e) },
+                );
+                return e;
+            };
             std.log.info("zigbase listening on http://{s}:{d}", .{ self.host, self.port });
             realtime_ws.active = true; // reactor about to run; allow broadcast to publish
             // #159, PR-6b: on Postgres, fan realtime across app instances via LISTEN/NOTIFY. A no-op
@@ -1621,4 +1659,40 @@ test "warnUnkeyedRouteLimitOnce records each DISTINCT route pattern exactly once
     try std.testing.expectEqual(@as(usize, 2), unkeyed_route_limit_warned.count());
     try std.testing.expect(unkeyed_route_limit_warned.contains("/api/a"));
     try std.testing.expect(unkeyed_route_limit_warned.contains("/api/b"));
+}
+
+test "bindInterface: wildcards bind every interface, everything else restricts the bind" {
+    // The two spellings of "all interfaces", plus the bracketed form a copy-pasted URL
+    // authority yields, are the ONLY inputs allowed to reach facil.io as `null`.
+    try std.testing.expect(bindInterface("0.0.0.0") == null);
+    try std.testing.expect(bindInterface("::") == null);
+    try std.testing.expect(bindInterface("[::]") == null);
+    // Unset reads as unrestricted rather than as a bind of "", which getaddrinfo rejects.
+    try std.testing.expect(bindInterface("") == null);
+
+    // The bug itself (#384): the documented default must NOT reach the listener as "every
+    // interface". Assert the bytes facil.io will see, not merely that something non-null went by.
+    const loopback = bindInterface("127.0.0.1");
+    try std.testing.expect(loopback != null);
+    try std.testing.expectEqualStrings("127.0.0.1", std.mem.span(loopback));
+
+    // A specific interface address and a hostname are passed through verbatim.
+    try std.testing.expectEqualStrings("10.0.0.7", std.mem.span(bindInterface("10.0.0.7")));
+    try std.testing.expectEqualStrings("::1", std.mem.span(bindInterface("::1")));
+    try std.testing.expectEqualStrings("localhost", std.mem.span(bindInterface("localhost")));
+}
+
+test "bindInterface agrees with serve_session.probeHost on which hosts are wildcards" {
+    // These two answer opposite halves of one question — what to bind, and what to dial to
+    // reach what was bound. If they ever disagree, `serve status`/`serve stop` dial an address
+    // the listener never bound. Pin the agreement rather than the two lists separately.
+    // Imported here rather than at file scope: this is the only edge from the listener to the
+    // session-control module, and it exists solely to hold these two lists together.
+    const serve_session = @import("serve_session.zig");
+    const hosts = [_][:0]const u8{ "0.0.0.0", "::", "[::]", "127.0.0.1", "10.0.0.7", "::1", "localhost" };
+    for (hosts) |h| {
+        const binds_everything = bindInterface(h) == null;
+        const dialed_elsewhere = !std.mem.eql(u8, serve_session.probeHost(h), h);
+        try std.testing.expectEqual(binds_everything, dialed_elsewhere);
+    }
 }
