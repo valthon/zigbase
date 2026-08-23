@@ -1,0 +1,8 @@
+puts "Club.all             -> #{Club.order(:id).pluck(:id, :slug).inspect}"
+puts "Club.unscoped.all    -> #{Club.unscoped.order(:id).pluck(:id, :slug).inspect}"
+puts "Club.count           -> #{Club.count}"
+puts "Club.unscoped.count  -> #{Club.unscoped.count}"
+puts "raw SQL COUNT(*)     -> #{ActiveRecord::Base.connection.select_value('SELECT COUNT(*) FROM clubs')}"
+puts "Club.find_by(slug: 'retired-readers')          -> #{Club.find_by(slug: 'retired-readers').inspect}"
+puts "Club.unscoped.find_by(slug: 'retired-readers') -> #{Club.unscoped.find_by(slug: 'retired-readers')&.slug.inspect}"
+puts "Club.all.to_sql      -> #{Club.all.to_sql}"

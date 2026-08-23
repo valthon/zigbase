@@ -1,0 +1,88 @@
+{
+  "adapter": "SQLite",
+  "api_only": true,
+  "database_sha256": "d1290b3911f3e499abf63e5f82f428addc94636ce7bf4d3e6884e0fcd3c197af",
+  "database_version": "3.53.2",
+  "description": "Synthetic Rails 8.1 API-only application frozen as a migration-test fixture.",
+  "excluded_from_app_source": [
+    {
+      "path": "config/master.key",
+      "reason": "generated per-machine secret; this app reads nothing from Rails credentials (secret_key_base and the Active Record encryption keys are literals in config/application.rb) and freezing it would trip secret scanners. Verified: migrate, seed, serve and export all work without it."
+    },
+    {
+      "path": "config/credentials.yml.enc",
+      "reason": "unused, and unreadable without config/master.key"
+    },
+    {
+      "path": "log/development.log",
+      "reason": "runtime output"
+    },
+    {
+      "path": "tmp/restart.txt",
+      "reason": "runtime output"
+    },
+    {
+      "path": "storage/development.sqlite3",
+      "reason": "frozen separately as db/development.sqlite3"
+    },
+    {
+      "path": "storage/test.sqlite3",
+      "reason": "side effect of db:migrate:reset; not part of the fixture"
+    },
+    {
+      "path": "storage/fi/xt/fixturecover0000000000000001",
+      "reason": "frozen separately under storage/"
+    },
+    {
+      "path": ".bundle/, vendor/bundle/, node_modules/",
+      "reason": "installed dependencies"
+    }
+  ],
+  "extractor": {
+    "deterministic": true,
+    "invocation": "bin/rails runner tools/rails/export_source.rb -- --out DIR --taken-at 2024-01-15T09:00:00Z",
+    "outputs": [
+      "auth.json",
+      "counts.json",
+      "jobs.json",
+      "models.json",
+      "routes.json",
+      "schema.json",
+      "storage.json",
+      "versions.json"
+    ],
+    "path": "tools/rails/export_source.rb"
+  },
+  "fixture": "bookclub_api",
+  "gemfile_lock_sha256": "aee4de193d4ac76e0bba11eb1f4bbe4beec438b3916e635e98599cbbd44984ce",
+  "http_cases": {
+    "path": "http/cases.json",
+    "recorded_from": "a live `bin/rails server` run driven by proof.sh; never transcribed",
+    "replay_note": "Replay in file order against a freshly seeded database. Tokens and runtime-assigned ids are {{placeholders}}; resolve them per the file's own `placeholders` map."
+  },
+  "rails_version": "8.1.3.1",
+  "rebuild": {
+    "command": "bin/rails db:migrate:reset && bin/rails db:seed",
+    "note": "Plain `bin/rails db:migrate` against a MISSING database loads db/schema.rb instead of running the migrations, and the :ruby schema format cannot express triggers or views -- the rebuilt database would silently have neither. db:migrate:reset runs the migrations for real; db:seed is required after it (it deletes the stray schema_migrations version '0' that db:migrate:reset leaves behind, pins ar_internal_metadata timestamps, and VACUUMs).",
+    "reproducibility_note": "A from-scratch rebuild yields a byte-identical database file. Re-running db:seed on top of an existing database yields identical ROWS but a different file hash: SQLite's header change counter and schema cookie survive VACUUM.",
+    "reproducible": true
+  },
+  "revision": {
+    "app_source_file_count": 78,
+    "app_source_tree_sha256": "646a1c1bc81357dbb21e724cb1d38ffed817a38ec06b02fbf9f842e4e0ba94c2",
+    "kind": "content_digest",
+    "note": "The fixture is generated, not checked out; there is no git revision. This digest is sha256 over the sorted '<sha256>  <path>' lines of app_source/."
+  },
+  "ruby_description": "ruby 4.0.1 (2026-01-13 revision e04267a14b) +PRISM",
+  "ruby_version": "4.0.1",
+  "schema_format": "ruby",
+  "synthetic": {
+    "is_synthetic": true,
+    "keys_are_obvious_test_literals": "config/application.rb hard-codes secret_key_base as sixty-four zeroes and the Active Record encryption key set as the literal strings fixture_primary_key_..., fixture_deterministic_key_... and fixture_key_derivation_salt_.... They are placeholders chosen to be unmistakable on sight, they protect nothing, and they must never be reused by a real application.",
+    "no_real_personal_data": "The four seeded users (Ada, Brian, Coral, Dane) are invented. The email addresses use the reserved .test TLD and the phone numbers are in the +1-555-01xx reserved range. No real person is represented.",
+    "passwords_published_deliberately": "The plaintext passwords and their bcrypt digests are both recorded in db/seeds.rb on purpose, so that the recorded HTTP cases can be replayed. They are cost-4 hashes over a fixed salt and guard nothing.",
+    "statement": "THIS IS NOT A PRODUCTION SNAPSHOT. Every byte of this fixture was fabricated for testing.",
+    "why_hard_coded": "Byte-reproducibility. Random salts, random IVs and random Active Storage keys would make the frozen database differ on every rebuild."
+  },
+  "taken_at": "2024-01-15T09:00:00Z"
+}

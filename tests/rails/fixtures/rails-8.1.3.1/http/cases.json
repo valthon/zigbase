@@ -1,0 +1,1602 @@
+{
+  "cases": [
+    {
+      "actor": "none",
+      "body": {
+        "user": {
+          "display_name": "Eve Outsider",
+          "email": "eve@example.test",
+          "password": "eve-password-5",
+          "phone": "+1-555-0199"
+        }
+      },
+      "chain": "signup-eve",
+      "depends_on": [],
+      "expect": {
+        "body": {
+          "data": {
+            "created_at": "{{timestamp}}",
+            "display_name": "Eve Outsider",
+            "email": "eve@example.test",
+            "id": "{{user:eve}}",
+            "phone": "+1-555-0199",
+            "role": "member"
+          }
+        },
+        "body_shape": "json",
+        "content_type": "application/json; charset=utf-8",
+        "status": 201
+      },
+      "headers": {
+        "Content-Type": "application/json"
+      },
+      "label": "Signup (public, no token)",
+      "method": "POST",
+      "multipart": null,
+      "mutates": true,
+      "n": 1,
+      "path": "/api/v1/users",
+      "source": "observed",
+      "stateful": false
+    },
+    {
+      "actor": "none",
+      "body": {
+        "user": {
+          "display_name": "E",
+          "email": "not-an-email",
+          "password": "x"
+        }
+      },
+      "chain": null,
+      "depends_on": [],
+      "expect": {
+        "body": {
+          "error": {
+            "code": "validation_failed",
+            "details": {
+              "display_name": [
+                "is too short (minimum is 2 characters)"
+              ],
+              "email": [
+                "must be a valid email address"
+              ]
+            },
+            "message": "The submitted record is invalid."
+          }
+        },
+        "body_shape": "json",
+        "content_type": "application/json; charset=utf-8",
+        "status": 422
+      },
+      "headers": {
+        "Content-Type": "application/json"
+      },
+      "label": "Signup with an invalid email and a too-short display name (custom 422 envelope)",
+      "method": "POST",
+      "multipart": null,
+      "mutates": false,
+      "n": 2,
+      "path": "/api/v1/users",
+      "source": "observed",
+      "stateful": false
+    },
+    {
+      "actor": "none",
+      "body": {
+        "email": "ada@example.test",
+        "password": "wrong"
+      },
+      "chain": null,
+      "depends_on": [],
+      "expect": {
+        "body": {
+          "error": {
+            "code": "invalid_credentials",
+            "details": {},
+            "message": "Email or password is incorrect."
+          }
+        },
+        "body_shape": "json",
+        "content_type": "application/json; charset=utf-8",
+        "status": 401
+      },
+      "headers": {
+        "Content-Type": "application/json"
+      },
+      "label": "Login with the wrong password",
+      "method": "POST",
+      "multipart": null,
+      "mutates": false,
+      "n": 3,
+      "path": "/api/v1/sessions",
+      "source": "observed",
+      "stateful": false
+    },
+    {
+      "actor": "none",
+      "body": {
+        "email": "ada@example.test",
+        "password": "ada-password-1"
+      },
+      "chain": null,
+      "depends_on": [],
+      "expect": {
+        "body": {
+          "data": {
+            "token": "{{token:ada}}",
+            "user": {
+              "display_name": "Ada Lovelace",
+              "email": "ada@example.test",
+              "id": 1,
+              "role": "admin"
+            }
+          }
+        },
+        "body_shape": "json",
+        "content_type": "application/json; charset=utf-8",
+        "status": 201
+      },
+      "headers": {
+        "Content-Type": "application/json"
+      },
+      "label": "Login as ada (club owner / admin)",
+      "method": "POST",
+      "multipart": null,
+      "mutates": true,
+      "n": 4,
+      "path": "/api/v1/sessions",
+      "source": "observed",
+      "stateful": false
+    },
+    {
+      "actor": "none",
+      "body": {
+        "email": "brian@example.test",
+        "password": "brian-password-2"
+      },
+      "chain": null,
+      "depends_on": [],
+      "expect": {
+        "body": {
+          "data": {
+            "token": "{{token:brian}}",
+            "user": {
+              "display_name": "Brian Kernighan",
+              "email": "brian@example.test",
+              "id": 2,
+              "role": "member"
+            }
+          }
+        },
+        "body_shape": "json",
+        "content_type": "application/json; charset=utf-8",
+        "status": 201
+      },
+      "headers": {
+        "Content-Type": "application/json"
+      },
+      "label": "Login as brian (member of both clubs)",
+      "method": "POST",
+      "multipart": null,
+      "mutates": true,
+      "n": 5,
+      "path": "/api/v1/sessions",
+      "source": "observed",
+      "stateful": false
+    },
+    {
+      "actor": "none",
+      "body": {
+        "email": "coral@example.test",
+        "password": "coral-password-3"
+      },
+      "chain": null,
+      "depends_on": [],
+      "expect": {
+        "body": {
+          "data": {
+            "token": "{{token:coral}}",
+            "user": {
+              "display_name": "Coral Reeves",
+              "email": "coral@example.test",
+              "id": 3,
+              "role": "moderator"
+            }
+          }
+        },
+        "body_shape": "json",
+        "content_type": "application/json; charset=utf-8",
+        "status": 201
+      },
+      "headers": {
+        "Content-Type": "application/json"
+      },
+      "label": "Login as coral (owner of the PRIVATE club)",
+      "method": "POST",
+      "multipart": null,
+      "mutates": true,
+      "n": 6,
+      "path": "/api/v1/sessions",
+      "source": "observed",
+      "stateful": false
+    },
+    {
+      "actor": "none",
+      "body": {
+        "email": "dane@example.test",
+        "password": "dane-password-4"
+      },
+      "chain": null,
+      "depends_on": [],
+      "expect": {
+        "body": {
+          "data": {
+            "token": "{{token:dane}}",
+            "user": {
+              "display_name": "Dane Ortiz",
+              "email": "dane@example.test",
+              "id": 4,
+              "role": "member"
+            }
+          }
+        },
+        "body_shape": "json",
+        "content_type": "application/json; charset=utf-8",
+        "status": 201
+      },
+      "headers": {
+        "Content-Type": "application/json"
+      },
+      "label": "Login as dane (member of the archived club only)",
+      "method": "POST",
+      "multipart": null,
+      "mutates": true,
+      "n": 7,
+      "path": "/api/v1/sessions",
+      "source": "observed",
+      "stateful": false
+    },
+    {
+      "actor": "none",
+      "body": {
+        "email": "eve@example.test",
+        "password": "eve-password-5"
+      },
+      "chain": "signup-eve",
+      "depends_on": [],
+      "expect": {
+        "body": {
+          "data": {
+            "token": "{{token:eve}}",
+            "user": {
+              "display_name": "Eve Outsider",
+              "email": "eve@example.test",
+              "id": "{{user:eve}}",
+              "role": "member"
+            }
+          }
+        },
+        "body_shape": "json",
+        "content_type": "application/json; charset=utf-8",
+        "status": 201
+      },
+      "headers": {
+        "Content-Type": "application/json"
+      },
+      "label": "Login as eve (just signed up, member of nothing)",
+      "method": "POST",
+      "multipart": null,
+      "mutates": true,
+      "n": 8,
+      "path": "/api/v1/sessions",
+      "source": "observed",
+      "stateful": true
+    },
+    {
+      "actor": "none",
+      "body": null,
+      "chain": null,
+      "depends_on": [],
+      "expect": {
+        "body": {
+          "data": [
+            {
+              "archived_at": null,
+              "created_at": "2024-01-15T10:00:00Z",
+              "id": 1,
+              "name": "Morning Pages",
+              "owner_id": 1,
+              "posts_count": 2,
+              "slug": "morning-pages",
+              "updated_at": "2024-01-15T10:00:00Z",
+              "visibility": "public_club"
+            },
+            {
+              "archived_at": null,
+              "created_at": "2024-01-15T10:01:00Z",
+              "id": 2,
+              "name": "Night Owls",
+              "owner_id": 3,
+              "posts_count": 1,
+              "slug": "night-owls",
+              "updated_at": "2024-01-15T10:01:00Z",
+              "visibility": "private_club"
+            }
+          ],
+          "meta": {
+            "page": 1,
+            "per_page": 25,
+            "total": 2
+          }
+        },
+        "body_shape": "json",
+        "content_type": "application/json; charset=utf-8",
+        "status": 200
+      },
+      "headers": {},
+      "label": "List clubs (note: total=2, the archived club is silently absent)",
+      "method": "GET",
+      "multipart": null,
+      "mutates": false,
+      "n": 9,
+      "path": "/api/v1/clubs",
+      "source": "observed",
+      "stateful": false
+    },
+    {
+      "actor": "none",
+      "body": null,
+      "chain": null,
+      "depends_on": [],
+      "expect": {
+        "body": {
+          "data": [
+            {
+              "archived_at": null,
+              "created_at": "2024-01-15T10:01:00Z",
+              "id": 2,
+              "name": "Night Owls",
+              "owner_id": 3,
+              "posts_count": 1,
+              "slug": "night-owls",
+              "updated_at": "2024-01-15T10:01:00Z",
+              "visibility": "private_club"
+            }
+          ],
+          "meta": {
+            "page": 2,
+            "per_page": 1,
+            "total": 2
+          }
+        },
+        "body_shape": "json",
+        "content_type": "application/json; charset=utf-8",
+        "status": 200
+      },
+      "headers": {},
+      "label": "List clubs, page 2 of per_page=1",
+      "method": "GET",
+      "multipart": null,
+      "mutates": false,
+      "n": 10,
+      "path": "/api/v1/clubs?page=2&per_page=1",
+      "source": "observed",
+      "stateful": false
+    },
+    {
+      "actor": "none",
+      "body": null,
+      "chain": null,
+      "depends_on": [],
+      "expect": {
+        "body": {
+          "data": {
+            "archived_at": null,
+            "created_at": "2024-01-15T10:00:00Z",
+            "id": 1,
+            "name": "Morning Pages",
+            "owner_id": 1,
+            "posts_count": 2,
+            "slug": "morning-pages",
+            "updated_at": "2024-01-15T10:00:00Z",
+            "visibility": "public_club"
+          }
+        },
+        "body_shape": "json",
+        "content_type": "application/json; charset=utf-8",
+        "status": 200
+      },
+      "headers": {},
+      "label": "Show a club by SLUG",
+      "method": "GET",
+      "multipart": null,
+      "mutates": false,
+      "n": 11,
+      "path": "/api/v1/clubs/morning-pages",
+      "source": "observed",
+      "stateful": false
+    },
+    {
+      "actor": "none",
+      "body": null,
+      "chain": null,
+      "depends_on": [],
+      "expect": {
+        "body": {
+          "error": {
+            "code": "not_found",
+            "details": {
+              "model": [
+                "Club"
+              ]
+            },
+            "message": "Resource not found."
+          }
+        },
+        "body_shape": "json",
+        "content_type": "application/json; charset=utf-8",
+        "status": 404
+      },
+      "headers": {},
+      "label": "Show the ARCHIVED club by slug -> 404, although the row exists",
+      "method": "GET",
+      "multipart": null,
+      "mutates": false,
+      "n": 12,
+      "path": "/api/v1/clubs/retired-readers",
+      "source": "observed",
+      "stateful": false
+    },
+    {
+      "actor": "none",
+      "body": {
+        "club": {
+          "name": "Hijacked"
+        }
+      },
+      "chain": null,
+      "depends_on": [],
+      "expect": {
+        "body": {
+          "error": {
+            "code": "unauthorized",
+            "details": {},
+            "message": "A valid bearer token is required."
+          }
+        },
+        "body_shape": "json",
+        "content_type": "application/json; charset=utf-8",
+        "status": 401
+      },
+      "headers": {
+        "Content-Type": "application/json"
+      },
+      "label": "Update a club unauthenticated -> 401",
+      "method": "PATCH",
+      "multipart": null,
+      "mutates": false,
+      "n": 13,
+      "path": "/api/v1/clubs/morning-pages",
+      "source": "observed",
+      "stateful": false
+    },
+    {
+      "actor": "brian",
+      "body": {
+        "club": {
+          "name": "Hijacked"
+        }
+      },
+      "chain": null,
+      "depends_on": [
+        "token:brian"
+      ],
+      "expect": {
+        "body": {
+          "error": {
+            "code": "forbidden",
+            "details": {},
+            "message": "Only the club owner may update this club."
+          }
+        },
+        "body_shape": "json",
+        "content_type": "application/json; charset=utf-8",
+        "status": 403
+      },
+      "headers": {
+        "Authorization": "Bearer {{token:brian}}",
+        "Content-Type": "application/json"
+      },
+      "label": "Update a club as a NON-owner -> 403",
+      "method": "PATCH",
+      "multipart": null,
+      "mutates": false,
+      "n": 14,
+      "path": "/api/v1/clubs/morning-pages",
+      "source": "observed",
+      "stateful": false
+    },
+    {
+      "actor": "ada",
+      "body": {
+        "club": {
+          "name": "Morning Pages (renamed)"
+        }
+      },
+      "chain": null,
+      "depends_on": [
+        "token:ada"
+      ],
+      "expect": {
+        "body": {
+          "data": {
+            "archived_at": null,
+            "created_at": "2024-01-15T10:00:00Z",
+            "id": 1,
+            "name": "Morning Pages (renamed)",
+            "owner_id": 1,
+            "posts_count": 2,
+            "slug": "morning-pages",
+            "updated_at": "{{timestamp}}",
+            "visibility": "public_club"
+          }
+        },
+        "body_shape": "json",
+        "content_type": "application/json; charset=utf-8",
+        "status": 200
+      },
+      "headers": {
+        "Authorization": "Bearer {{token:ada}}",
+        "Content-Type": "application/json"
+      },
+      "label": "Update a club as the OWNER -> 200",
+      "method": "PATCH",
+      "multipart": null,
+      "mutates": true,
+      "n": 15,
+      "path": "/api/v1/clubs/morning-pages",
+      "source": "observed",
+      "stateful": false
+    },
+    {
+      "actor": "ada",
+      "body": {
+        "club": {
+          "visibility": "secret_club"
+        }
+      },
+      "chain": null,
+      "depends_on": [
+        "token:ada"
+      ],
+      "expect": {
+        "body": {
+          "error": {
+            "code": "validation_failed",
+            "details": {
+              "visibility": [
+                "is not included in the list"
+              ]
+            },
+            "message": "The submitted record is invalid."
+          }
+        },
+        "body_shape": "json",
+        "content_type": "application/json; charset=utf-8",
+        "status": 422
+      },
+      "headers": {
+        "Authorization": "Bearer {{token:ada}}",
+        "Content-Type": "application/json"
+      },
+      "label": "Update a club with an invalid enum value -> 422",
+      "method": "PATCH",
+      "multipart": null,
+      "mutates": false,
+      "n": 16,
+      "path": "/api/v1/clubs/morning-pages",
+      "source": "observed",
+      "stateful": false
+    },
+    {
+      "actor": "none",
+      "body": null,
+      "chain": null,
+      "depends_on": [],
+      "expect": {
+        "body": {
+          "error": {
+            "code": "not_found",
+            "details": {},
+            "message": "Resource not found."
+          }
+        },
+        "body_shape": "json",
+        "content_type": "application/json; charset=utf-8",
+        "status": 404
+      },
+      "headers": {},
+      "label": "Private club posts, unauthenticated -> 404",
+      "method": "GET",
+      "multipart": null,
+      "mutates": false,
+      "n": 17,
+      "path": "/api/v1/clubs/night-owls/posts",
+      "source": "observed",
+      "stateful": false
+    },
+    {
+      "actor": "eve",
+      "body": null,
+      "chain": null,
+      "depends_on": [
+        "token:eve"
+      ],
+      "expect": {
+        "body": {
+          "error": {
+            "code": "not_found",
+            "details": {},
+            "message": "Resource not found."
+          }
+        },
+        "body_shape": "json",
+        "content_type": "application/json; charset=utf-8",
+        "status": 404
+      },
+      "headers": {
+        "Authorization": "Bearer {{token:eve}}"
+      },
+      "label": "Private club posts as eve (authenticated NON-member) -> 404",
+      "method": "GET",
+      "multipart": null,
+      "mutates": false,
+      "n": 18,
+      "path": "/api/v1/clubs/night-owls/posts",
+      "source": "observed",
+      "stateful": true
+    },
+    {
+      "actor": "brian",
+      "body": null,
+      "chain": null,
+      "depends_on": [
+        "token:brian"
+      ],
+      "expect": {
+        "body": {
+          "data": [
+            {
+              "author_id": 3,
+              "body": "Members only: the reading order for February.",
+              "club_id": 2,
+              "cover": null,
+              "created_at": "2024-01-19T19:00:00Z",
+              "id": 3,
+              "published_at": "2024-01-19T20:00:00Z",
+              "status": "published",
+              "title": "Private Notes",
+              "updated_at": "2024-01-19T20:00:00Z"
+            }
+          ],
+          "meta": {
+            "page": 1,
+            "per_page": 25,
+            "total": 1
+          }
+        },
+        "body_shape": "json",
+        "content_type": "application/json; charset=utf-8",
+        "status": 200
+      },
+      "headers": {
+        "Authorization": "Bearer {{token:brian}}"
+      },
+      "label": "Private club posts as brian (member) -> 200",
+      "method": "GET",
+      "multipart": null,
+      "mutates": false,
+      "n": 19,
+      "path": "/api/v1/clubs/night-owls/posts",
+      "source": "observed",
+      "stateful": false
+    },
+    {
+      "actor": "coral",
+      "body": null,
+      "chain": null,
+      "depends_on": [
+        "token:coral"
+      ],
+      "expect": {
+        "body": {
+          "data": [
+            {
+              "author_id": 3,
+              "body": "Members only: the reading order for February.",
+              "club_id": 2,
+              "cover": null,
+              "created_at": "2024-01-19T19:00:00Z",
+              "id": 3,
+              "published_at": "2024-01-19T20:00:00Z",
+              "status": "published",
+              "title": "Private Notes",
+              "updated_at": "2024-01-19T20:00:00Z"
+            }
+          ],
+          "meta": {
+            "page": 1,
+            "per_page": 25,
+            "total": 1
+          }
+        },
+        "body_shape": "json",
+        "content_type": "application/json; charset=utf-8",
+        "status": 200
+      },
+      "headers": {
+        "Authorization": "Bearer {{token:coral}}"
+      },
+      "label": "Private club posts as coral (owner) -> 200",
+      "method": "GET",
+      "multipart": null,
+      "mutates": false,
+      "n": 20,
+      "path": "/api/v1/clubs/night-owls/posts",
+      "source": "observed",
+      "stateful": false
+    },
+    {
+      "actor": "none",
+      "body": null,
+      "chain": null,
+      "depends_on": [],
+      "expect": {
+        "body": {
+          "data": [
+            {
+              "author_id": 1,
+              "body": "Notes in the margin are the only honest book review.",
+              "club_id": 1,
+              "cover": {
+                "attached": true,
+                "blob_id": 1,
+                "byte_size": 70,
+                "checksum": "tBByO+NJsrcZPcv67sy1fw==",
+                "content_type": "image/png",
+                "filename": "morning-pages-cover.png",
+                "key": "fixturecover0000000000000001"
+              },
+              "created_at": "2024-01-17T11:00:00Z",
+              "id": 1,
+              "published_at": "2024-01-17T12:00:00Z",
+              "status": "published",
+              "title": "On Marginalia",
+              "updated_at": "2024-01-17T12:00:00Z"
+            },
+            {
+              "author_id": 2,
+              "body": "A half-finished thought about unfinished books.",
+              "club_id": 1,
+              "cover": null,
+              "created_at": "2024-01-18T09:30:00Z",
+              "id": 2,
+              "published_at": null,
+              "status": "draft",
+              "title": "Drafting In Public",
+              "updated_at": "2024-01-18T09:30:00Z"
+            }
+          ],
+          "meta": {
+            "page": 1,
+            "per_page": 25,
+            "total": 2
+          }
+        },
+        "body_shape": "json",
+        "content_type": "application/json; charset=utf-8",
+        "status": 200
+      },
+      "headers": {},
+      "label": "Public club posts, unauthenticated -> 200",
+      "method": "GET",
+      "multipart": null,
+      "mutates": false,
+      "n": 21,
+      "path": "/api/v1/clubs/morning-pages/posts",
+      "source": "observed",
+      "stateful": false
+    },
+    {
+      "actor": "dane",
+      "body": {
+        "role": "reader"
+      },
+      "chain": "membership-join",
+      "depends_on": [
+        "token:dane"
+      ],
+      "expect": {
+        "body": {
+          "data": {
+            "club_id": 2,
+            "id": "{{membership:new}}",
+            "joined_at": "{{timestamp}}",
+            "role": "reader",
+            "user_id": 4
+          }
+        },
+        "body_shape": "json",
+        "content_type": "application/json; charset=utf-8",
+        "status": 201
+      },
+      "headers": {
+        "Authorization": "Bearer {{token:dane}}",
+        "Content-Type": "application/json"
+      },
+      "label": "Join the private club as dane -> 201 (Membership + owner Notification, atomically)",
+      "method": "POST",
+      "multipart": null,
+      "mutates": true,
+      "n": 22,
+      "path": "/api/v1/clubs/night-owls/memberships",
+      "source": "observed",
+      "stateful": false
+    },
+    {
+      "actor": "dane",
+      "body": {
+        "role": "reader"
+      },
+      "chain": "membership-join",
+      "depends_on": [
+        "token:dane"
+      ],
+      "expect": {
+        "body": {
+          "error": {
+            "code": "validation_failed",
+            "details": {
+              "user_id": [
+                "is already a member of this club"
+              ]
+            },
+            "message": "The submitted record is invalid."
+          }
+        },
+        "body_shape": "json",
+        "content_type": "application/json; charset=utf-8",
+        "status": 422
+      },
+      "headers": {
+        "Authorization": "Bearer {{token:dane}}",
+        "Content-Type": "application/json"
+      },
+      "label": "Join the SAME club again -> 422 (unique index + validation)",
+      "method": "POST",
+      "multipart": null,
+      "mutates": false,
+      "n": 23,
+      "path": "/api/v1/clubs/night-owls/memberships",
+      "source": "observed",
+      "stateful": true
+    },
+    {
+      "actor": "dane",
+      "body": null,
+      "chain": "membership-join",
+      "depends_on": [
+        "token:dane"
+      ],
+      "expect": {
+        "body": {
+          "data": [
+            {
+              "author_id": 3,
+              "body": "Members only: the reading order for February.",
+              "club_id": 2,
+              "cover": null,
+              "created_at": "2024-01-19T19:00:00Z",
+              "id": 3,
+              "published_at": "2024-01-19T20:00:00Z",
+              "status": "published",
+              "title": "Private Notes",
+              "updated_at": "2024-01-19T20:00:00Z"
+            }
+          ],
+          "meta": {
+            "page": 1,
+            "per_page": 25,
+            "total": 1
+          }
+        },
+        "body_shape": "json",
+        "content_type": "application/json; charset=utf-8",
+        "status": 200
+      },
+      "headers": {
+        "Authorization": "Bearer {{token:dane}}"
+      },
+      "label": "dane can now read the private club he just joined -> 200",
+      "method": "GET",
+      "multipart": null,
+      "mutates": false,
+      "n": 24,
+      "path": "/api/v1/clubs/night-owls/posts",
+      "source": "observed",
+      "stateful": true
+    },
+    {
+      "actor": "brian",
+      "body": {
+        "post": {
+          "body": "On the pleasures of being read to.",
+          "title": "Reading Aloud"
+        }
+      },
+      "chain": "post-lifecycle",
+      "depends_on": [
+        "token:brian"
+      ],
+      "expect": {
+        "body": {
+          "data": {
+            "author_id": 2,
+            "body": "On the pleasures of being read to.",
+            "club_id": 1,
+            "cover": null,
+            "created_at": "{{timestamp}}",
+            "id": "{{post:new}}",
+            "published_at": null,
+            "status": "draft",
+            "title": "Reading Aloud",
+            "updated_at": "{{timestamp}}"
+          }
+        },
+        "body_shape": "json",
+        "content_type": "application/json; charset=utf-8",
+        "status": 201
+      },
+      "headers": {
+        "Authorization": "Bearer {{token:brian}}",
+        "Content-Type": "application/json"
+      },
+      "label": "Create a post -> 201",
+      "method": "POST",
+      "multipart": null,
+      "mutates": true,
+      "n": 25,
+      "path": "/api/v1/clubs/morning-pages/posts",
+      "source": "observed",
+      "stateful": false
+    },
+    {
+      "actor": "brian",
+      "body": {
+        "post": {
+          "body": "no title",
+          "title": ""
+        }
+      },
+      "chain": null,
+      "depends_on": [
+        "token:brian"
+      ],
+      "expect": {
+        "body": {
+          "error": {
+            "code": "validation_failed",
+            "details": {
+              "title": [
+                "can't be blank",
+                "is too short (minimum is 3 characters)"
+              ]
+            },
+            "message": "The submitted record is invalid."
+          }
+        },
+        "body_shape": "json",
+        "content_type": "application/json; charset=utf-8",
+        "status": 422
+      },
+      "headers": {
+        "Authorization": "Bearer {{token:brian}}",
+        "Content-Type": "application/json"
+      },
+      "label": "Create a post with a blank title -> 422 custom error envelope",
+      "method": "POST",
+      "multipart": null,
+      "mutates": false,
+      "n": 26,
+      "path": "/api/v1/clubs/morning-pages/posts",
+      "source": "observed",
+      "stateful": false
+    },
+    {
+      "actor": "brian",
+      "body": {
+        "post": {
+          "status": "published",
+          "title": "Empty But Published"
+        }
+      },
+      "chain": null,
+      "depends_on": [
+        "token:brian"
+      ],
+      "expect": {
+        "body": {
+          "error": {
+            "code": "validation_failed",
+            "details": {
+              "body": [
+                "can't be blank"
+              ]
+            },
+            "message": "The submitted record is invalid."
+          }
+        },
+        "body_shape": "json",
+        "content_type": "application/json; charset=utf-8",
+        "status": 422
+      },
+      "headers": {
+        "Authorization": "Bearer {{token:brian}}",
+        "Content-Type": "application/json"
+      },
+      "label": "Create a published post with no body -> 422 (conditional validation)",
+      "method": "POST",
+      "multipart": null,
+      "mutates": false,
+      "n": 27,
+      "path": "/api/v1/clubs/morning-pages/posts",
+      "source": "observed",
+      "stateful": false
+    },
+    {
+      "actor": "none",
+      "body": {
+        "post": {
+          "body": "nope",
+          "title": "Anonymous"
+        }
+      },
+      "chain": null,
+      "depends_on": [],
+      "expect": {
+        "body": {
+          "error": {
+            "code": "unauthorized",
+            "details": {},
+            "message": "A valid bearer token is required."
+          }
+        },
+        "body_shape": "json",
+        "content_type": "application/json; charset=utf-8",
+        "status": 401
+      },
+      "headers": {
+        "Content-Type": "application/json"
+      },
+      "label": "Create a post with no auth -> 401",
+      "method": "POST",
+      "multipart": null,
+      "mutates": false,
+      "n": 28,
+      "path": "/api/v1/clubs/morning-pages/posts",
+      "source": "observed",
+      "stateful": false
+    },
+    {
+      "actor": "ada",
+      "body": null,
+      "chain": "post-lifecycle",
+      "depends_on": [
+        "post:new",
+        "token:ada"
+      ],
+      "expect": {
+        "body": {
+          "error": {
+            "code": "forbidden",
+            "details": {},
+            "message": "Only the post author may publish this post."
+          }
+        },
+        "body_shape": "json",
+        "content_type": "application/json; charset=utf-8",
+        "status": 403
+      },
+      "headers": {
+        "Authorization": "Bearer {{token:ada}}"
+      },
+      "label": "Publish as a NON-author -> 403",
+      "method": "PATCH",
+      "multipart": null,
+      "mutates": false,
+      "n": 29,
+      "path": "/api/v1/posts/{{post:new}}/publish",
+      "source": "observed",
+      "stateful": true
+    },
+    {
+      "actor": "brian",
+      "body": null,
+      "chain": "post-lifecycle",
+      "depends_on": [
+        "post:new",
+        "token:brian"
+      ],
+      "expect": {
+        "body": {
+          "data": {
+            "author_id": 2,
+            "body": "On the pleasures of being read to.",
+            "club_id": 1,
+            "cover": null,
+            "created_at": "{{timestamp}}",
+            "id": "{{post:new}}",
+            "published_at": "{{timestamp}}",
+            "status": "published",
+            "title": "Reading Aloud",
+            "updated_at": "{{timestamp}}"
+          }
+        },
+        "body_shape": "json",
+        "content_type": "application/json; charset=utf-8",
+        "status": 200
+      },
+      "headers": {
+        "Authorization": "Bearer {{token:brian}}"
+      },
+      "label": "Publish as the author -> 200",
+      "method": "PATCH",
+      "multipart": null,
+      "mutates": true,
+      "n": 30,
+      "path": "/api/v1/posts/{{post:new}}/publish",
+      "source": "observed",
+      "stateful": true
+    },
+    {
+      "actor": "ada",
+      "body": null,
+      "chain": "post-lifecycle",
+      "depends_on": [
+        "post:new",
+        "token:ada"
+      ],
+      "expect": {
+        "body": {
+          "error": {
+            "code": "forbidden",
+            "details": {},
+            "message": "Only the post author may attach a cover."
+          }
+        },
+        "body_shape": "json",
+        "content_type": "application/json; charset=utf-8",
+        "status": 403
+      },
+      "headers": {
+        "Authorization": "Bearer {{token:ada}}"
+      },
+      "label": "Upload a cover for a post the caller does NOT own -> 403",
+      "method": "POST",
+      "multipart": {
+        "bytes": 78,
+        "content_type": "image/png",
+        "field": "cover",
+        "file": "upload_cover.png",
+        "sha256": "da6034642769e2f52897bed03eeb92e3ea48fcfe5f895c207013b219ca770366"
+      },
+      "mutates": false,
+      "n": 31,
+      "path": "/api/v1/posts/{{post:new}}/cover",
+      "source": "observed",
+      "stateful": true
+    },
+    {
+      "actor": "brian",
+      "body": null,
+      "chain": "post-lifecycle",
+      "depends_on": [
+        "post:new",
+        "token:brian"
+      ],
+      "expect": {
+        "body": {
+          "data": {
+            "attached": true,
+            "blob_id": "{{blob:new_id}}",
+            "byte_size": 78,
+            "checksum": "V6mvNYtgsKveVOZaPYEeXw==",
+            "content_type": "image/png",
+            "filename": "upload_cover.png",
+            "key": "{{blob:new_key}}"
+          }
+        },
+        "body_shape": "json",
+        "content_type": "application/json; charset=utf-8",
+        "status": 201
+      },
+      "headers": {
+        "Authorization": "Bearer {{token:brian}}"
+      },
+      "label": "Upload a cover as the author -> 201 (multipart/form-data)",
+      "method": "POST",
+      "multipart": {
+        "bytes": 78,
+        "content_type": "image/png",
+        "field": "cover",
+        "file": "upload_cover.png",
+        "sha256": "da6034642769e2f52897bed03eeb92e3ea48fcfe5f895c207013b219ca770366"
+      },
+      "mutates": true,
+      "n": 32,
+      "path": "/api/v1/posts/{{post:new}}/cover",
+      "source": "observed",
+      "stateful": true
+    },
+    {
+      "actor": "none",
+      "body": null,
+      "chain": null,
+      "depends_on": [],
+      "expect": {
+        "body": null,
+        "body_bytes": 70,
+        "body_sha256": "8c9e0aa0b0a951d9df2d9b1b956a27f3f750eca4bfe456ba939f0823a11ca5ec",
+        "body_shape": "binary",
+        "content_type": "image/png",
+        "status": 200
+      },
+      "headers": {},
+      "label": "Download the seeded cover of post 1 (public club) -> 200 image/png",
+      "method": "GET",
+      "multipart": null,
+      "mutates": false,
+      "n": 33,
+      "path": "/api/v1/posts/1/cover",
+      "source": "observed",
+      "stateful": false
+    },
+    {
+      "actor": "coral",
+      "body": null,
+      "chain": "private-cover",
+      "depends_on": [
+        "token:coral"
+      ],
+      "expect": {
+        "body": {
+          "data": {
+            "attached": true,
+            "blob_id": "{{blob:private_id}}",
+            "byte_size": 78,
+            "checksum": "V6mvNYtgsKveVOZaPYEeXw==",
+            "content_type": "image/png",
+            "filename": "upload_cover.png",
+            "key": "{{blob:private_key}}"
+          }
+        },
+        "body_shape": "json",
+        "content_type": "application/json; charset=utf-8",
+        "status": 201
+      },
+      "headers": {
+        "Authorization": "Bearer {{token:coral}}"
+      },
+      "label": "Upload a cover on a post in the PRIVATE club as its author -> 201",
+      "method": "POST",
+      "multipart": {
+        "bytes": 78,
+        "content_type": "image/png",
+        "field": "cover",
+        "file": "upload_cover.png",
+        "sha256": "da6034642769e2f52897bed03eeb92e3ea48fcfe5f895c207013b219ca770366"
+      },
+      "mutates": true,
+      "n": 34,
+      "path": "/api/v1/posts/3/cover",
+      "source": "observed",
+      "stateful": false
+    },
+    {
+      "actor": "eve",
+      "body": null,
+      "chain": "private-cover",
+      "depends_on": [
+        "token:eve"
+      ],
+      "expect": {
+        "body": {
+          "error": {
+            "code": "not_found",
+            "details": {},
+            "message": "Resource not found."
+          }
+        },
+        "body_shape": "json",
+        "content_type": "application/json; charset=utf-8",
+        "status": 404
+      },
+      "headers": {
+        "Authorization": "Bearer {{token:eve}}"
+      },
+      "label": "Download that private cover as eve (non-member) -> 404",
+      "method": "GET",
+      "multipart": null,
+      "mutates": false,
+      "n": 35,
+      "path": "/api/v1/posts/3/cover",
+      "source": "observed",
+      "stateful": true
+    },
+    {
+      "actor": "brian",
+      "body": null,
+      "chain": "private-cover",
+      "depends_on": [
+        "token:brian"
+      ],
+      "expect": {
+        "body": null,
+        "body_bytes": 78,
+        "body_sha256": "da6034642769e2f52897bed03eeb92e3ea48fcfe5f895c207013b219ca770366",
+        "body_shape": "binary",
+        "content_type": "image/png",
+        "status": 200
+      },
+      "headers": {
+        "Authorization": "Bearer {{token:brian}}"
+      },
+      "label": "Download that private cover as brian (member) -> 200",
+      "method": "GET",
+      "multipart": null,
+      "mutates": false,
+      "n": 36,
+      "path": "/api/v1/posts/3/cover",
+      "source": "observed",
+      "stateful": true
+    },
+    {
+      "actor": "none",
+      "body": null,
+      "chain": null,
+      "depends_on": [],
+      "expect": {
+        "body": {
+          "data": {
+            "clubs_total": 3,
+            "clubs_visible": 2,
+            "format": "application/json",
+            "internal": "true",
+            "posts_total": 5,
+            "users_total": 5
+          },
+          "meta": {
+            "page": 1,
+            "per_page": 1,
+            "total": 1
+          }
+        },
+        "body_shape": "json",
+        "content_type": "application/json; charset=utf-8",
+        "status": 200
+      },
+      "headers": {},
+      "label": "Internal stats (defaults: internal=true, format=json)",
+      "method": "GET",
+      "multipart": null,
+      "mutates": false,
+      "n": 37,
+      "path": "/api/v1/internal/stats",
+      "source": "observed",
+      "stateful": true
+    },
+    {
+      "actor": "none",
+      "body": null,
+      "chain": null,
+      "depends_on": [],
+      "expect": {
+        "body": {
+          "data": {
+            "clubs_total": 3,
+            "clubs_visible": 2,
+            "format": "application/json",
+            "internal": "true",
+            "posts_total": 5,
+            "users_total": 5
+          },
+          "meta": {
+            "page": 1,
+            "per_page": 1,
+            "total": 1
+          }
+        },
+        "body_shape": "json",
+        "content_type": "application/json; charset=utf-8",
+        "status": 200
+      },
+      "headers": {},
+      "label": "Internal stats with an explicit .json format",
+      "method": "GET",
+      "multipart": null,
+      "mutates": false,
+      "n": 38,
+      "path": "/api/v1/internal/stats.json",
+      "source": "observed",
+      "stateful": true
+    },
+    {
+      "actor": "none",
+      "body": null,
+      "chain": null,
+      "depends_on": [],
+      "expect": {
+        "body": null,
+        "body_shape": "rails_routing_error",
+        "content_type": "application/json; charset=UTF-8",
+        "status": 404
+      },
+      "headers": {},
+      "label": "Internal stats with a format the constraint rejects -> routing failure",
+      "method": "GET",
+      "multipart": null,
+      "mutates": false,
+      "n": 39,
+      "path": "/api/v1/internal/stats.xml",
+      "source": "observed",
+      "stateful": false
+    },
+    {
+      "actor": "none",
+      "body": null,
+      "chain": null,
+      "depends_on": [],
+      "expect": {
+        "body": {
+          "error": {
+            "code": "not_found",
+            "details": {
+              "model": [
+                "Post"
+              ]
+            },
+            "message": "Resource not found."
+          }
+        },
+        "body_shape": "json",
+        "content_type": "application/json; charset=utf-8",
+        "status": 404
+      },
+      "headers": {},
+      "label": "A post id that does not exist -> 404 custom envelope (rescue_from RecordNotFound)",
+      "method": "GET",
+      "multipart": null,
+      "mutates": false,
+      "n": 40,
+      "path": "/api/v1/posts/9999",
+      "source": "observed",
+      "stateful": false
+    },
+    {
+      "actor": "none",
+      "body": null,
+      "chain": null,
+      "depends_on": [],
+      "expect": {
+        "body": null,
+        "body_shape": "rails_routing_error",
+        "content_type": "application/json; charset=UTF-8",
+        "status": 404
+      },
+      "headers": {},
+      "label": "A non-numeric post id -> no route matches the `id: /\\d+/` constraint",
+      "method": "GET",
+      "multipart": null,
+      "mutates": false,
+      "n": 41,
+      "path": "/api/v1/posts/abc",
+      "source": "observed",
+      "stateful": false
+    },
+    {
+      "actor": "none",
+      "body": null,
+      "chain": null,
+      "depends_on": [],
+      "expect": {
+        "body": {
+          "error": {
+            "code": "not_found",
+            "details": {
+              "model": [
+                "Club"
+              ]
+            },
+            "message": "Resource not found."
+          }
+        },
+        "body_shape": "json",
+        "content_type": "application/json; charset=utf-8",
+        "status": 404
+      },
+      "headers": {},
+      "label": "A club slug that does not exist -> 404",
+      "method": "GET",
+      "multipart": null,
+      "mutates": false,
+      "n": 42,
+      "path": "/api/v1/clubs/no-such-club",
+      "source": "observed",
+      "stateful": false
+    }
+  ],
+  "count": 42,
+  "notes": [
+    "Recorded from a live `bin/rails server` run by proof.sh; never transcribed.",
+    "Cases are in execution order and MUST be replayed in order against a freshly seeded database.",
+    "Bearer tokens and runtime-assigned ids appear only as {{placeholders}}; resolve them per `placeholders`.",
+    "`stateful: true` marks a case whose EXPECTATION depends on a mutation made by an earlier case; `mutates: true` marks a case that itself changes state.",
+    "`chain` groups a sequence that must not be split or reordered."
+  ],
+  "placeholders": {
+    "{{blob:new_id}}": {
+      "kind": "record_id",
+      "resolve": "data.blob_id from case 32"
+    },
+    "{{blob:new_key}}": {
+      "kind": "record_key",
+      "resolve": "data.key from case 32; Active Storage assigns it randomly"
+    },
+    "{{blob:private_id}}": {
+      "kind": "record_id",
+      "resolve": "data.blob_id from case 34"
+    },
+    "{{blob:private_key}}": {
+      "kind": "record_key",
+      "resolve": "data.key from case 34; Active Storage assigns it randomly"
+    },
+    "{{membership:new}}": {
+      "kind": "record_id",
+      "resolve": "data.id from case 22 (POST /api/v1/clubs/night-owls/memberships)"
+    },
+    "{{post:new}}": {
+      "kind": "record_id",
+      "resolve": "data.id from case 25 (POST /api/v1/clubs/morning-pages/posts)"
+    },
+    "{{timestamp}}": {
+      "kind": "volatile",
+      "resolve": "a wall-clock timestamp written during the run; assert presence and ISO8601 shape, never equality"
+    },
+    "{{token:ada}}": {
+      "kind": "bearer_token",
+      "resolve": "POST /api/v1/sessions {email: ada@example.test, password: ada-password-1} -> data.token"
+    },
+    "{{token:brian}}": {
+      "kind": "bearer_token",
+      "resolve": "POST /api/v1/sessions {email: brian@example.test, password: brian-password-2} -> data.token"
+    },
+    "{{token:coral}}": {
+      "kind": "bearer_token",
+      "resolve": "POST /api/v1/sessions {email: coral@example.test, password: coral-password-3} -> data.token"
+    },
+    "{{token:dane}}": {
+      "kind": "bearer_token",
+      "resolve": "POST /api/v1/sessions {email: dane@example.test, password: dane-password-4} -> data.token"
+    },
+    "{{token:eve}}": {
+      "kind": "bearer_token",
+      "resolve": "POST /api/v1/sessions {email: eve@example.test, password: eve-password-5} -> data.token; eve is created by case 1, not by the seed"
+    },
+    "{{user:eve}}": {
+      "kind": "record_id",
+      "resolve": "data.id from case 1 (POST /api/v1/users)"
+    }
+  },
+  "source": "observed"
+}
