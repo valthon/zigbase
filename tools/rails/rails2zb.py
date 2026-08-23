@@ -3530,6 +3530,9 @@ def _indexes_for(
     return out
 
 
+#: The one rule expression that means "anyone", including anonymous callers.
+PUBLIC_RULE = "@public"
+
 RULE_ACTIONS = ("list", "view", "create", "update", "delete")
 # `list  = @public` (two spaces, or a tab) matched neither prefix form, so the mixed-form
 # refusal never fired and the literal line shipped as the rule for all five actions.
@@ -3552,7 +3555,7 @@ def _rules_for(decisions: dict[str, Decision], table: str) -> dict[str, str | No
     if decision is None or decision.choice == "locked":
         return {action: None for action in RULE_ACTIONS}
     if decision.choice == "public":
-        return {action: "@public" for action in RULE_ACTIONS}
+        return {action: PUBLIC_RULE for action in RULE_ACTIONS}
 
     artifact = (decision.artifact or "").strip()
     lines = [line.strip() for line in artifact.splitlines() if line.strip()]
@@ -4608,7 +4611,13 @@ def extract(
         "files": len(files),
         "findings": len(findings),
         "decisions": len(decisions),
-        "omittedTables": sorted(_omitted_tables(decisions)),
+        # Both ways a table leaves the migration. `_refuse_inert_decisions` already
+        # unions these two; the report listed only the first, so a table dropped by an
+        # STI `omit` disappeared from the bundle with nothing recording that it had —
+        # the same understatement `publicRules` carried.
+        "omittedTables": sorted(
+            _omitted_tables(decisions) | _sti_omitted_tables(src, decisions)
+        ),
         # An index can be dropped for several honest reasons -- it covered a column that
         # was omitted, it was partial and its predicate was not reviewed, it named a
         # field the engine owns. Every one of those was silent until now.
@@ -4619,10 +4628,26 @@ def extract(
         # Blobs left behind: a decision dropped the field, or the row names an
         # attachment the model no longer declares.
         "droppedAttachments": dropped_attachments,
+        # Read from the EMITTED SCHEMA, not from which decisions chose `public`. The
+        # per-action rule form the guide teaches writes `create = @public` inside an
+        # `expression` decision, and counting choices saw none of those -- so a bundle
+        # granting anonymous create reported no public rules at all, which is the one
+        # number an operator checks before deciding the surface is closed.
+        #
+        # Named by SOURCE table, not by emitted collection: the question this answers is
+        # which Rails table's rules ended up open, and a renamed collection would hide
+        # that behind its new name.
         "publicRules": sorted(
-            split_id(fid)[1]
-            for fid, d in decisions.items()
-            if fid.startswith("table.") and d.choice == "public"
+            {
+                entry.table
+                for entry in mapped
+                for collection in document["collections"]
+                if collection["name"] == entry.collection
+                and any(
+                    key.endswith("Rule") and value == PUBLIC_RULE
+                    for key, value in collection.items()
+                )
+            }
         ),
     }
     write_canonical_json(out / "report.json", report)

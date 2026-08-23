@@ -58,6 +58,80 @@ def test_extraction_is_byte_identical_across_runs(source, tmp_path):
     assert tree_digest(first) == tree_digest(second)
 
 
+def test_the_report_names_a_table_dropped_by_an_sti_decision(mutable_source, workspace):
+    """A table can leave the migration two ways, and the report listed one.
+
+    `model.Event.sti: omit` drops `events` exactly as a table-level omit would, but
+    `omittedTables` was built from `table.*` decisions alone — so the collection simply
+    was not there, with nothing in the report saying it had been dropped or why.
+    """
+    src = rails2zb.load_source(mutable_source)
+    value = decisions_for([f.to_dict() for f in rails2zb.build_findings(src)])
+    for entry in value["decisions"]:
+        if entry["id"] == "model.Event.sti":
+            entry["choice"] = "omit"
+            entry.pop("artifact", None)
+            break
+    else:  # pragma: no cover - the fixture must carry the STI finding
+        raise AssertionError("the fixture no longer raises the STI finding")
+
+    bundle = workspace / "bundle"
+    rails2zb.extract(src, rails2zb.load_decisions_from_value(value), bundle)
+    report = json.loads((bundle / "report.json").read_text())
+    assert "events" not in {c["collection"] for c in report["collections"]}, (
+        "the setup must really drop the table"
+    )
+    assert "events" in report["omittedTables"]
+
+
+def test_the_report_names_a_public_rule_written_as_an_expression(
+    mutable_source, workspace
+):
+    """`publicRules` counted CHOICES, and the guide teaches the expression form.
+
+    A per-action block containing `create = @public` is an `expression` decision, not a
+    `public` one, so a bundle that granted anonymous create reported no public rules at
+    all — the one number an operator checks before deciding the surface is closed. It is
+    read from the emitted schema now, which is what the target will actually enforce.
+
+    The field keeps naming SOURCE tables, which is the contract
+    `test_the_report_names_public_rules_by_their_real_table_name` pins; only the
+    detection changed.
+    """
+    src = rails2zb.load_source(mutable_source)
+    findings = rails2zb.build_findings(src)
+    fid = "table.users.rules"
+    assert fid in {f.id for f in findings}, "the fixture must raise the rules finding"
+    value = decisions_for([f.to_dict() for f in findings])
+    value["decisions"] = [
+        {
+            **d,
+            "choice": "expression",
+            "artifact": (
+                "list = @request.auth.id != ''\n"
+                "view = @request.auth.id != ''\n"
+                "create = @public\n"
+                "update = @request.auth.id = id\n"
+                "delete = @request.auth.id = id"
+            ),
+        }
+        if d["id"] == fid
+        else d
+        for d in value["decisions"]
+    ]
+    bundle = workspace / "bundle"
+    rails2zb.extract(src, rails2zb.load_decisions_from_value(value), bundle)
+
+    schema = json.loads((bundle / "schema.json").read_text())
+    users = next(c for c in schema["collections"] if c["name"] == "users")
+    assert users["createRule"] == "@public", "the setup must really grant public create"
+
+    report = json.loads((bundle / "report.json").read_text())
+    assert report["publicRules"] == ["users"], (
+        "the table must be named as public even though no decision chose `public`"
+    )
+
+
 def test_hashes_cover_every_output_but_themselves(bundle):
     recorded = json.loads((bundle / "hashes.json").read_text())["outputs"]
     listed = {entry["path"] for entry in recorded}
