@@ -57,7 +57,6 @@ function normalizeCanonicalSyntax(body: string, canonicalPath: string): string {
     'who-may-subscribe-realtime---cansubscribe--fn': 'who-may-subscribe-realtime---cansubscribe--fn-',
   };
   let output = body
-    .replace(/<a id="spa-fallback"><\/a>/g, '\n\n#### SPA fallback\n')
     .replace(/(^\s*>?\s*`{3,})jsonc\s*$/gm, '$1json')
     .replace(/(^\s*>?\s*`{3,})(?:text|txt|dart)\s*$/gm, '$1');
   if (canonicalPath.startsWith('docs/')) {

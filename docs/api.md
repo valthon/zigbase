@@ -1287,19 +1287,21 @@ file delivery, use [file storage](#files) instead.
   `application/octet-stream`).
 - Paths containing `..`, backslashes, or NUL bytes are rejected (404). There are no
   directory listings.
-- **SPA fallback:** a directory containing a file named `.spa` is an SPA root —
-  GET/HEAD misses at or below it serve that directory's `index.html` with 200
-  (real files always win; the `.spa` file itself is never served). The fallback
-  shell response is always `Cache-Control: no-cache` with a revalidation `ETag`
-  (a redeploy can't strand a deep link on a stale cached shell), regardless of the
-  Cache-Control knob above; a **direct** hit on that same `index.html` file (not via
-  the fallback) keeps the knob's normal value. In **embedded** mode the marker set
-  is derived once at startup (the manifest can't change at runtime); in **dir** mode
-  it's resolved **live** against the filesystem on every miss, so adding/removing a
-  marker needs no restart (startup only fails fast if a `.spa` has no
-  `index.html`). Custom builds can also declare comptime `static_routes` rewrites,
-  consulted before the marker. See
-  [framework.md → Static files](framework.md) for details. <a id="spa-fallback"></a>
+
+### SPA fallback
+
+A directory containing a file named `.spa` is an SPA root — GET/HEAD misses at or
+below it serve that directory's `index.html` with 200 (real files always win; the
+`.spa` file itself is never served). The fallback shell response is always
+`Cache-Control: no-cache` with a revalidation `ETag` (a redeploy can't strand a deep
+link on a stale cached shell), regardless of the Cache-Control knob above; a **direct**
+hit on that same `index.html` file (not via the fallback) keeps the knob's normal value.
+In **embedded** mode the marker set is derived once at startup (the manifest can't
+change at runtime); in **dir** mode it's resolved **live** against the filesystem on
+every miss, so adding/removing a marker needs no restart (startup only fails fast if a
+`.spa` has no `index.html`). Custom builds can also declare comptime `static_routes`
+rewrites, consulted before the marker. See
+[framework.md → Static files](framework.md) for details.
 
 ---
 
