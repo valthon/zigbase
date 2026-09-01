@@ -17,6 +17,12 @@ sanitized summaries are preserved under
 [`evals/agents/evidence/pocketbase/2026-08-16-9a72b656/`](../evals/agents/evidence/pocketbase/2026-08-16-9a72b656/).
 The immutable tag `agent-eval-pocketbase-2026-08-16` resolves to the recorded full commit
 `9a72b656b7df8cc732aa249b7ba9f84ddd89dba6`.
+The Rails API migration flagship passed its release gate on 2026-09-01: commit `8fec10ae`
+produced three consecutive score-4 runs with zero interventions using
+`codex-cli-0.150-default`. Its sanitized summaries are preserved under
+[`evals/agents/evidence/rails-api/2026-09-01-8fec10ae/`](../evals/agents/evidence/rails-api/2026-09-01-8fec10ae/).
+The immutable tag `agent-eval-rails-api-2026-09-01` resolves to the recorded full commit
+`8fec10ae45aca023bf1f46da3f73d4a320735cde`.
 Deterministic harness tests block CI; real-agent runs remain opt-in so model tokens and credentials
 are never required by ordinary builds.
 
@@ -225,12 +231,6 @@ The flagship criterion is three consecutive results from the same commit where a
 are true, `score` is 4, `interventions` is 0, and `failures` is empty. Preserve those sanitized
 summaries and record the agent/model identifier supplied to `--agent`.
 
-The first qualifying sets are the tagged 2026-08-15 Genesis `3f3224d5` evidence and tagged
-2026-08-16 PocketBase `9a72b656` evidence linked above. Raw transcripts and scenario workspaces
-stay out of the repository.
-
-`rails-api` has **not** yet been run for release evidence, and this document does not claim it has.
-When it is, record it the same way — `evals/agents/evidence/rails-api/<date>-<short-commit>/run-{1,2,3}.json`,
-an immutable `agent-eval-rails-api-<date>` tag resolving to the full commit, and a link from the top
-of this page. Until those three runs exist, the scenario is a gate that has been built and not yet
-passed; the deterministic grader tests prove the gate works, not that an agent clears it.
+The qualifying sets are the tagged 2026-08-15 Genesis `3f3224d5`, 2026-08-16 PocketBase
+`9a72b656`, and 2026-09-01 Rails API `8fec10ae` evidence linked above. Raw transcripts and scenario
+workspaces stay out of the repository.

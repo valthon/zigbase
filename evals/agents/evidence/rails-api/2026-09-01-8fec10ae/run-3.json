@@ -1,0 +1,17 @@
+{
+  "zigbaseAgentEval": 1,
+  "scenario": "rails-api",
+  "commit": "8fec10ae45aca023bf1f46da3f73d4a320735cde",
+  "agent": "codex-cli-0.150-default",
+  "started_at": "2026-09-01T18:22:39.384135Z",
+  "duration_ms": 579575,
+  "agent_exit": 0,
+  "timed_out": false,
+  "interventions": 0,
+  "completion": true,
+  "rules_locked": true,
+  "tests_green": true,
+  "deployed": true,
+  "score": 4,
+  "failures": []
+}
