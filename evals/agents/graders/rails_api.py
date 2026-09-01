@@ -879,6 +879,7 @@ def run_restore(
     health_getter: Callable[..., Any] = _health_json,
     health_attempts: int = 30,
     restore_probe: Callable[..., None] = None,  # type: ignore[assignment]
+    database_inspector: Callable[..., None] = _inspect_database,
 ) -> tuple[bool, list[EvalFailure]]:
     """The rehearsal's last obligation: the target survives being restored elsewhere.
 
@@ -888,8 +889,10 @@ def run_restore(
     (docs/deployment.md). Anything less is not a rollback unit: restore the database
     without `.jwt_secret` and every migrated session is void.
 
-    So this copies the rehearsed target, boots a server on the copy, and proves the
-    migrated credential still logs in there. A backup that cannot serve is not a backup.
+    So this copies the rehearsed target, verifies its database directly, boots a server
+    on the copy, and proves the migrated credential still logs in there. Authorization
+    semantics stay in ``tests_green``; repeating one here would let one rule defect sink
+    two supposedly independent grades. A backup that cannot serve is not a backup.
     """
     failures: list[EvalFailure] = []
     try:
@@ -942,6 +945,7 @@ def run_restore(
             )
             started = True
             _wait_http(health_getter, f"{base}/api/health", health_attempts)
+            database_inspector(second)
             (restore_probe or _probe_restored)(base)
         finally:
             if started:
@@ -980,20 +984,10 @@ def _probe_restored(
             "deployment.restored_login",
             f"the migrated credential did not log in against the restored copy ({status})",
         )
-    token = json.loads(payload).get("token")
-    status, payload = http_request(
-        "GET", f"{base}/api/collections/clubs/records", token=token
-    )
-    if status != 200:
+    if not json.loads(payload).get("token"):
         raise GradeFailure(
-            "deployment.restored_data",
-            f"the restored copy did not serve clubs ({status})",
-        )
-    items = json.loads(payload).get("items") or []
-    if len(items) != EXPECTED_ROWS["clubs"]:
-        raise GradeFailure(
-            "deployment.restored_data",
-            f"the restored copy serves {len(items)} clubs, not {EXPECTED_ROWS['clubs']}",
+            "deployment.restored_login",
+            "login against the restored copy returned no token",
         )
 
 
@@ -1041,6 +1035,7 @@ def grade(
         health_getter=health_getter,
         health_attempts=health_attempts,
         restore_probe=restore_probe,
+        database_inspector=database_inspector,
     )
     failures.extend(restore_failures)
 

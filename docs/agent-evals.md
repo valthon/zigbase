@@ -157,14 +157,15 @@ For `rails-api` they mean:
   all agree that the public surface is exactly `users.create` — anonymous signup — as a reconciled
   warning rather than a suppressed one;
 - `tests_green`: the agent's declared boundary passes, and the running target enforces the
-  semantics the guide demands: a list whose rule hides every row answers `200` with an empty array
-  rather than `401` or `403` — an access rule is not an authentication failure — a record the caller
-  may not see is concealed as `404`, an owner-scoped list returns the actor's own rows and only
-  those, an invalid signup is a validation failure, and the migrated bcrypt credential logs in and
-  rehashes to argon2id; and
+  semantics the guide demands: the unauthenticated posts list, whose rule hides every row, answers
+  `200` with an empty array rather than `401` or `403` — an access rule is not an authentication
+  failure — a post the caller may not see is concealed as `404`, the notifications list returns the
+  actor's own rows and only those, an invalid signup is a validation failure, and the migrated
+  bcrypt credential logs in and rehashes to argon2id; the migrated author's protected attachment
+  serves with their bearer token and is concealed without it; and
 - `deployed`: the rehearsed target is copied whole — the documented SQLite backup — a server boots
-  on the copy, and the migrated credential logs in and reads its data there. A backup that cannot
-  serve is not a backup.
+  on the copy, direct database inspection verifies the complete migrated row set and timestamps,
+  and the migrated credential logs in there. A backup that cannot serve is not a backup.
 
 The rehearsal steps themselves — schema dry-run then apply, auth imported separately from ordinary
 data with `--preserve-timestamps`, files installed, doctor, and the live probes — belong to
