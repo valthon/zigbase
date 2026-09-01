@@ -21,6 +21,7 @@ import pytest
 from evals.agents.graders.genesis import CommandResult
 from evals.agents.graders.rails_api import (
     EXPECTED_PUBLIC,
+    _probe_restored,
     grade,
     inspect_completion,
     load_reviewed_public_inventory,
@@ -170,6 +171,13 @@ def test_prompt_states_the_boundaries_the_grader_enforces():
     # The two semantics the grader probes and an agent most often gets backwards.
     assert "empty `items` array" in prompt
     assert "concealed as `404`" in prompt
+    assert "/api/collections/posts/records" in prompt
+    assert "unauthenticated" in prompt
+    assert "author = @request.auth.id" in prompt
+    assert "/api/files/posts/1/morning-pages-cover.png" in prompt
+    assert "/api/collections/notifications/records" in prompt
+    assert "ada@example.test" in prompt
+    assert "brian@example.test" in prompt
     # The scope gate, which is the whole reason this scenario is `-rails-api`.
     assert "not migrated" in prompt or "never" in prompt
     assert '"users.create"' in prompt
@@ -195,6 +203,24 @@ def test_positive_fixture_scores_four(tmp_path):
         True,
         True,
     )
+
+
+def test_restored_probe_does_not_regrade_authorization():
+    """Deployment proves complete restored bytes and login, not rule policy twice.
+
+    Full restored counts are checked directly from SQLite. Owner scoping belongs to
+    ``tests_green``; issuing a scoped read here would make one rule fault sink two grades.
+    """
+
+    calls = []
+
+    def request(method, url, *, token=None, body=None):  # noqa: ANN001, ARG001
+        calls.append((method, url, token, body))
+        return 200, json.dumps({"token": "ada-token"}).encode()
+
+    _probe_restored("http://127.0.0.1:45999", http_request=request)
+    assert len(calls) == 1
+    assert calls[0][1].endswith("/auth-with-password")
 
 
 def test_the_rehearsal_runs_the_documented_commands_in_order(tmp_path):

@@ -21,6 +21,9 @@ GENESIS_EVIDENCE = (
 POCKETBASE_EVIDENCE = (
     REPO / "evals" / "agents" / "evidence" / "pocketbase" / "2026-08-16-9a72b656"
 )
+RAILS_API_EVIDENCE = (
+    REPO / "evals" / "agents" / "evidence" / "rails-api" / "2026-09-01-8fec10ae"
+)
 DOCKER_REFERENCE = REPO / "skills" / "zigbase-app-genesis" / "references" / "docker.md"
 GENESIS_REFERENCE = (
     REPO / "skills" / "zigbase-app-genesis" / "references" / "app-genesis.md"
@@ -124,6 +127,30 @@ def test_first_pocketbase_release_evidence_is_three_clean_consecutive_runs():
     assert all(
         result.scenario == "pocketbase"
         and result.agent == "codex-cli-0.147-default"
+        and result.agent_exit == 0
+        and not result.timed_out
+        and result.interventions == 0
+        and result.completion
+        and result.rules_locked
+        and result.tests_green
+        and result.deployed
+        and result.score == 4
+        and result.failures == ()
+        for result in results
+    )
+
+
+def test_first_rails_api_release_evidence_is_three_clean_consecutive_runs():
+    files = sorted(RAILS_API_EVIDENCE.glob("run-*.json"))
+    assert [path.name for path in files] == ["run-1.json", "run-2.json", "run-3.json"]
+
+    results = [EvalResult.from_json(path.read_text()) for path in files]
+    assert {result.commit for result in results} == {
+        "8fec10ae45aca023bf1f46da3f73d4a320735cde"
+    }
+    assert all(
+        result.scenario == "rails-api"
+        and result.agent == "codex-cli-0.150-default"
         and result.agent_exit == 0
         and not result.timed_out
         and result.interventions == 0

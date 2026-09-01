@@ -33,6 +33,20 @@ every row is `200` with an empty `items` array, not `403`; a denied single-recor
 concealed as `404`, and where Rails already concealed a record as `404` the target must too. Do not
 "fix" a concealment into a `403`.
 
+The hidden-row list in this boundary is the target `posts` collection. An unauthenticated
+`GET /api/collections/posts/records` must return `200` with an empty `items` array, and an
+unauthenticated read of a specific post must be concealed as `404`. Give `posts` list/view rules
+the owner expression `author = @request.auth.id`: the absent auth id makes the anonymous list
+filter to empty rather than fail as Locked, while the migrated author can still view their post.
+With Ada's bearer token, `GET /api/files/posts/1/morning-pages-cover.png` must serve the installed
+Active Storage bytes; without a token the same protected file route must be concealed as `404`.
+
+The owner-scoped list in this boundary is the target `notifications` collection. After login as
+`ada@example.test`, `GET /api/collections/notifications/records` must return Ada's one notification;
+after login as `brian@example.test`, the same endpoint must return `200` with an empty `items` array.
+Give `notifications` list/view rules an owner expression against its `user` relation; do not leave
+that collection Locked merely because the source exposed notifications through another operation.
+
 Create `security/public-rules.json` with exactly this compact reviewed inventory contract, naming
 every rule you deliberately made public and nothing else:
 
@@ -55,9 +69,10 @@ exercised against a running server during rehearsal, not here.
 
 Rehearse the cutover on a fresh disposable target: dry-run and apply the schema, run rule lint,
 import auth then ordinary data, verify counts and file digests directly rather than trusting a tool
-summary, run production doctor and reconcile the public-rule warning rather than suppressing it,
-prove the bcrypt-to-argon2id rehash survives a restart, and restore a backup into a **second**
-target. Do not deploy or mutate external infrastructure.
+summary, serve the migrated attachment through the protected file route, run production doctor and
+reconcile the public-rule warning rather than suppressing it, prove the bcrypt-to-argon2id rehash
+survives a restart, and restore a backup into a **second** target. Do not deploy or mutate external
+infrastructure.
 
 Write `migration/report.json` with exactly these fields:
 
