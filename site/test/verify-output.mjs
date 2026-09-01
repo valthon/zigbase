@@ -33,6 +33,17 @@ for (const path of htmlFiles) {
   if (!/<link rel="canonical" href="https:\/\/valthon\.github\.io\/zigbase\//.test(html)) fail(`${label}: bad canonical URL`);
   if (!/<meta property="og:image" content="https:\/\//.test(html)) fail(`${label}: og:image is not absolute`);
   if (/data-astro|astro:page-load|\/_astro\//i.test(html)) fail(`${label}: stale framework artifact`);
+  const mainStart = html.indexOf('<main');
+  const mainEnd = html.indexOf('</main>');
+  if (mainStart >= 0) {
+    const main = html.slice(mainStart, mainEnd > mainStart ? mainEnd : html.length);
+    let level = null;
+    for (const match of main.matchAll(/<h([1-6])\b/g)) {
+      const heading = Number(match[1]);
+      if (level !== null && heading > level + 1) fail(`${label}: heading order skips h${level + 1} -> h${heading}`);
+      level = heading;
+    }
+  }
   for (const match of html.matchAll(/(?:href|src)="(\/zigbase\/[^"#?]*)/g)) {
     const urlPath = match[1].slice('/zigbase/'.length);
     if (!urlPath) continue;
