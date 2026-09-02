@@ -34,15 +34,20 @@ if __package__ in (None, ""):  # direct `python3 tools/rails/rails2zb.py`
 from tools.rails._core import (  # noqa: E402
     Decision,
     Finding,
+    INFERRED,
+    OBSERVED,
     RailsError,
+    _private_parent,
     compact_summary,
     ensure_output_outside_source,
     finding_id,
     install_file_atomic,
+    read_bytes,
     read_json,
     required_string,
     sha256_file,
     split_id,
+    validate_inventory_source,
     write_canonical_json,
     write_ndjson,
 )
@@ -50,9 +55,6 @@ from tools.rails._core import (  # noqa: E402
 INVENTORY_VERSION = 1
 DECISIONS_VERSION = 1
 BUNDLE_VERSION = 1
-
-OBSERVED = "observed"
-INFERRED = "inferred"
 
 INVENTORY_FILES = (
     "routes",
@@ -247,28 +249,6 @@ class Source:
         ]
 
 
-def _nested_sources(value: Any) -> set[str]:
-    """Every `source` marker anywhere in a payload, not just the top-level one.
-
-    Checking only the outermost key let an `inferred` record sit inside an `observed`
-    file -- exactly the mixing the mode contract exists to forbid, one level down.
-    """
-    # Only values that ARE a mode count. `source` is not a reserved word: a serialized
-    # route constraint carries `{"source": ".+?", "type": "regexp"}`, where it means the
-    # regexp's own source text. Treating that as provenance made every route look mixed.
-    found: set[str] = set()
-    if isinstance(value, dict):
-        marker = value.get("source")
-        if marker in (OBSERVED, INFERRED):
-            found.add(marker)
-        for nested in value.values():
-            found |= _nested_sources(nested)
-    elif isinstance(value, list):
-        for nested in value:
-            found |= _nested_sources(nested)
-    return found
-
-
 def _is_composite(value: Any) -> bool:
     """A key naming more than one column, in either shape the extractor can produce.
 
@@ -354,19 +334,7 @@ def load_source(root: Path) -> Source:
     # prevent: one inferred record in an otherwise observed inventory would let a guess
     # ride along as if the framework had reported it.
     for name in INVENTORY_FILES:
-        nested = _nested_sources(payloads[name])
-        if nested - {mode}:
-            raise RailsError(
-                f"inventory/{name}.json declares '{mode}' but contains nested records "
-                f"marked {sorted(nested - {mode})}; observed and inferred records must "
-                f"not be mixed, at any depth"
-            )
-        declared = payloads[name].get("source")
-        if declared != mode:
-            raise RailsError(
-                f"inventory/{name}.json declares source '{declared}' but the inventory "
-                f"is '{mode}'; observed and inferred records must not be mixed"
-            )
+        validate_inventory_source(payloads[name], name=name, expected_mode=mode)
 
     # Loading stays adapter-neutral, because the inventory is: `export_source.rb` reads
     # whatever connection the application booted. Only row EXTRACTION needs the frozen
@@ -4443,6 +4411,7 @@ def extract(
     # Check the destination first: reconciliation is the expensive, noisy failure, and a
     # caller pointing at a dirty directory should hear about that immediately.
     _require_clean_output(out, src)
+    _private_parent(out)
     findings = build_findings(src)
     reconcile(findings, decisions, artifact_root=artifact_root)
 
@@ -4470,7 +4439,7 @@ def extract(
         _refuse_duplicate_auth_identities(scan, mapped)
         _refuse_invalid_auth_identities(scan, mapped)
     document = build_schema_document(mapped, decisions)
-    write_canonical_json(out / "schema.json", document)
+    write_canonical_json(out / "schema.json", document, private=True)
     # Read back off the document rather than recomputing: a second, parallel call to
     # `_indexes_for` could drift from the one that actually produced the schema.
     emitted_indexes = {
@@ -4552,6 +4521,7 @@ def extract(
     write_canonical_json(
         out / "manifest.json",
         {"zigbaseImportManifest": 1, "collections": ordinary},
+        private=True,
     )
     if separate:
         # Imported WITHOUT --preserve-timestamps; the report names it so the operator
@@ -4559,10 +4529,12 @@ def extract(
         write_canonical_json(
             out / "manifest-no-timestamps.json",
             {"zigbaseImportManifest": 1, "collections": separate},
+            private=True,
         )
     write_canonical_json(
         out / "files/manifest.json",
         {"zigbaseRailsFiles": BUNDLE_VERSION, "files": files},
+        private=True,
     )
 
     _refuse_incoherent_row_counts(src, mapped, counts)
@@ -4650,7 +4622,7 @@ def extract(
             }
         ),
     }
-    write_canonical_json(out / "report.json", report)
+    write_canonical_json(out / "report.json", report, private=True)
 
     # Hashes last: they cover every other output, so the file that records them cannot
     # be part of what it records.
@@ -4664,7 +4636,9 @@ def extract(
         if path.name != "hashes.json"
     ]
     write_canonical_json(
-        out / "hashes.json", {"zigbaseRailsHashes": BUNDLE_VERSION, "outputs": entries}
+        out / "hashes.json",
+        {"zigbaseRailsHashes": BUNDLE_VERSION, "outputs": entries},
+        private=True,
     )
     return report
 
@@ -4729,7 +4703,12 @@ def _inventory_digest(src: Source) -> str:
     digest = hashlib.sha256()
     for name in INVENTORY_FILES:
         digest.update(name.encode())
-        digest.update((src.root / "inventory" / f"{name}.json").read_bytes())
+        digest.update(
+            read_bytes(
+                src.root / "inventory" / f"{name}.json",
+                label=f"inventory/{name}.json",
+            )
+        )
     return digest.hexdigest()
 
 

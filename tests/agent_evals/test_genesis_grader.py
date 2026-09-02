@@ -8,10 +8,13 @@ from evals.agents.graders.genesis import (
     CommandResult,
     GradeFailure,
     SubprocessCommands,
+    _http_json,
+    _grader_environment,
     _evaluation_environment,
     _client_test_sources,
     compare_public_rules,
     grade,
+    inspect_completion,
     inspect_compose,
     load_public_inventory,
     parse_doctor_ndjson,
@@ -127,6 +130,32 @@ def healthy(_url, _timeout):
     return {"ok": True}
 
 
+@pytest.mark.parametrize("name", [".home", ".tmp"])
+def test_grader_environment_refuses_non_directory_scratch_paths(tmp_path, name):
+    target = tmp_path / "workspace"
+    target.mkdir()
+    unsafe = target / name
+    unsafe.write_text("not a directory", encoding="utf-8")
+
+    with pytest.raises(GradeFailure) as raised:
+        _grader_environment(target)
+
+    assert raised.value.code == "environment.scratch_unsafe"
+
+
+def test_grader_environment_creates_private_real_scratch_directories(tmp_path):
+    target = tmp_path / "workspace"
+    target.mkdir()
+
+    environment = _grader_environment(target)
+
+    for variable, name in (("HOME", ".home"), ("TMPDIR", ".tmp")):
+        path = target / name
+        assert environment[variable] == str(path.resolve())
+        assert path.is_dir() and not path.is_symlink()
+        assert path.stat().st_mode & 0o777 == 0o700
+
+
 def grade_fixture(workspace_path, artifacts, **kwargs):
     return grade(
         workspace_path,
@@ -156,6 +185,41 @@ def test_positive_fixture_scores_four_and_always_tears_down(tmp_path):
     assert any("down" in call for call in commands.calls)
     assert any("ps" in call for call in commands.calls)
     assert "zigbase_eval" in (artifacts / "genesis-compose.override.yml").read_text()
+
+
+def test_agent_build_and_tests_run_last(tmp_path):
+    target = workspace(tmp_path)
+
+    class RecordingCommands(FakeCommands):
+        def __init__(self):
+            super().__init__()
+            self.cwd_calls = []
+
+        def run(self, argv, *, cwd, env=None, timeout=300):
+            self.cwd_calls.append((list(argv), Path(cwd)))
+            return super().run(argv, cwd=cwd, env=env, timeout=timeout)
+
+    commands = RecordingCommands()
+    report = grade_fixture(target, tmp_path / "artifacts", commands=commands)
+
+    assert (
+        report.completion,
+        report.rules_locked,
+        report.tests_green,
+        report.deployed,
+    ) == (True, True, True, True)
+    build_indexes = [
+        index
+        for index, (argv, _) in enumerate(commands.cwd_calls)
+        if argv[:2] == ["zig", "build"]
+    ]
+    assert build_indexes
+    assert all(commands.cwd_calls[index][1] == target for index in build_indexes)
+    assert max(
+        index
+        for index, (argv, _) in enumerate(commands.cwd_calls)
+        if "down" in argv or "ps" in argv
+    ) < min(build_indexes)
 
 
 def test_named_request_collection_counts_as_request_workflow(tmp_path):
@@ -322,6 +386,40 @@ def test_doctor_parser_requires_exactly_one_summary():
         parse_doctor_ndjson(doctor_output() + "\n" + duplicate_summary)
 
 
+@pytest.mark.parametrize(
+    "line",
+    [
+        '{"summary":true,"summary":false}',
+        '{"summary":true,"errors":NaN}',
+    ],
+)
+def test_doctor_parser_rejects_non_rfc_json_records(line):
+    with pytest.raises(GradeFailure) as raised:
+        parse_doctor_ndjson(line)
+    assert raised.value.code == "rules.doctor_invalid"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [b"null", b"{}", b'{"status":"down"}', b'{"status":"down","status":"ok"}'],
+)
+def test_genesis_health_reader_requires_a_strict_ok_object(monkeypatch, payload):
+    monkeypatch.setattr(
+        "evals.agents.graders.genesis.http_response",
+        lambda *_args, **_kwargs: (200, payload, {}),
+    )
+    with pytest.raises(ValueError):
+        _http_json("http://target.invalid/api/health", 1.0)
+
+
+def test_genesis_json_reader_accepts_metadata_without_health_status(monkeypatch):
+    monkeypatch.setattr(
+        "evals.agents.graders.genesis.http_response",
+        lambda *_args, **_kwargs: (200, b'{"zigbase":"0.1"}', {}),
+    )
+    assert _http_json("http://target.invalid/api/meta", 1.0) == {"zigbase": "0.1"}
+
+
 def test_inventory_rejects_duplicate_empty_rationale_and_unknown_keys(tmp_path):
     base = {
         "collection": "equipment",
@@ -339,6 +437,20 @@ def test_inventory_rejects_duplicate_empty_rationale_and_unknown_keys(tmp_path):
         path.write_text(json.dumps({"zigbasePublicRules": 1, "rules": rules}))
         with pytest.raises(GradeFailure):
             load_public_inventory(path)
+
+
+def test_inventory_rejects_duplicate_keys_and_nonfinite_numbers(tmp_path):
+    for index, payload in enumerate(
+        (
+            '{"zigbasePublicRules":1,"zigbasePublicRules":1,"rules":[]}',
+            '{"zigbasePublicRules":1,"rules":[],"value":NaN}',
+        )
+    ):
+        path = tmp_path / f"invalid-{index}.json"
+        path.write_text(payload)
+        with pytest.raises(GradeFailure) as raised:
+            load_public_inventory(path)
+        assert raised.value.code == "rules.inventory_invalid"
 
 
 def test_rules_grade_accepts_filtered_anonymous_read_without_public_inventory(tmp_path):
@@ -401,6 +513,27 @@ def test_client_source_in_singular_test_directory_is_discovered(tmp_path):
     source.write_text('import assert from "node:assert/strict"; assert.ok(true);')
 
     assert _client_test_sources(target) == (source,)
+
+
+def test_completion_bounds_the_aggregate_client_test_source(tmp_path):
+    target = workspace(tmp_path)
+    client = target / "tests/client-large.py"
+    client.write_bytes(b"assert True\n" + b"x" * (4 * 1024 * 1024))
+
+    failures = inspect_completion(target)
+
+    assert any(failure.code == "completion.client_test_invalid" for failure in failures)
+
+
+def test_package_reader_rejects_duplicate_keys(tmp_path):
+    target = workspace(tmp_path)
+    package = target / "package.json"
+    package.write_text('{"scripts":{},"scripts":{"test:e2e":"node --test"}}')
+
+    _, tests_green, failures = run_build_and_tests(target, FakeCommands())
+
+    assert tests_green is False
+    assert any(failure.code == "tests.package_invalid" for failure in failures)
 
 
 @pytest.mark.parametrize("step", ["client-test", "test-client", "test-journey"])

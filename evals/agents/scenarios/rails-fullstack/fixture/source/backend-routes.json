@@ -1,0 +1,27 @@
+{
+  "source": "observed",
+  "count": 21,
+  "routes": [
+    {"verb":"GET","path":"/","controller":"pages","action":"about","internal":false,"source":"observed"},
+    {"verb":"GET","path":"/about","controller":"pages","action":"about","internal":false,"source":"observed"},
+    {"verb":"GET","path":"/broken","controller":"pages","action":"broken","internal":false,"source":"observed"},
+    {"verb":"GET","path":"/feed","controller":"posts","action":"feed","internal":false,"source":"observed"},
+    {"verb":"GET","path":"/help","controller":"pages","action":"help","internal":false,"source":"observed"},
+    {"verb":"GET","path":"/linked","controller":"pages","action":"linked","internal":false,"source":"observed"},
+    {"verb":"GET","path":"/links","controller":"pages","action":"links","internal":false,"source":"observed"},
+    {"verb":"GET","path":"/live","controller":"pages","action":"live","internal":false,"source":"observed"},
+    {"verb":"GET","path":"/old","controller":"pages","action":"old","internal":false,"source":"observed"},
+    {"verb":"GET","path":"/posts","controller":"posts","action":"index","internal":false,"source":"observed"},
+    {"verb":"POST","path":"/posts","controller":"posts","action":"create","internal":false,"source":"observed"},
+    {"verb":"GET","path":"/posts/:id","controller":"posts","action":"show","internal":false,"source":"observed"},
+    {"verb":"GET","path":"/posts/legacy","controller":"posts","action":"legacy","internal":false,"source":"observed"},
+    {"verb":"GET","path":"/posts/new","controller":"posts","action":"new","internal":false,"source":"observed"},
+    {"verb":"POST","path":"/registration","controller":"registrations","action":"create","internal":false,"source":"observed"},
+    {"verb":"GET","path":"/registration/new","controller":"registrations","action":"new","internal":false,"source":"observed"},
+    {"verb":"DELETE","path":"/session","controller":"sessions","action":"destroy","internal":false,"source":"observed"},
+    {"verb":"POST","path":"/session","controller":"sessions","action":"create","internal":false,"source":"observed"},
+    {"verb":"GET","path":"/session/new","controller":"sessions","action":"new","internal":false,"source":"observed"},
+    {"verb":"GET","path":"/stream","controller":"pages","action":"stream","internal":false,"source":"observed"},
+    {"verb":"GET","path":"/widgets","controller":"pages","action":"widgets","internal":false,"source":"observed"}
+  ]
+}

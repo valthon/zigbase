@@ -1,6 +1,7 @@
 import json
 import os
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -13,6 +14,7 @@ from evals.agents.graders import GradeReport
 from evals.agents.process import run_process
 from evals.agents.run import (
     HarnessError,
+    _atomic_result_copy,
     child_environment,
     execute,
     parse_agent_command,
@@ -23,6 +25,22 @@ from evals.agents.scenario import AgentScenario
 
 REPO = Path(__file__).resolve().parents[2]
 FAKE_AGENT = Path(__file__).parent / "fixtures" / "fake_agent.py"
+
+
+def test_result_copy_is_private_and_atomic(tmp_path, monkeypatch):
+    output = tmp_path / "results/latest.json"
+    _atomic_result_copy(output, '{"ok":true}')
+    assert stat.S_IMODE(output.stat().st_mode) == 0o600
+
+    output.write_text("prior\n")
+    monkeypatch.setattr(
+        run_module.os,
+        "replace",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("replace denied")),
+    )
+    with pytest.raises(OSError, match="replace denied"):
+        _atomic_result_copy(output, '{"ok":false}')
+    assert output.read_text() == "prior\n"
 
 
 def scenario(**overrides):
@@ -79,6 +97,10 @@ def test_execute_success_sends_prompt_and_grades(tmp_path):
     assert result.score == 4
     assert result.failures == ()
     assert result.commit == run_module.repository_commit()
+    run_directory = next((tmp_path / "artifacts").iterdir())
+    assert stat.S_IMODE(run_directory.stat().st_mode) == 0o700
+    assert stat.S_IMODE((run_directory / "agent.stdout.log").stat().st_mode) == 0o600
+    assert stat.S_IMODE((run_directory / "agent.stderr.log").stat().st_mode) == 0o600
 
 
 def test_cleanup_failure_preserves_grade_and_adds_harness_finding(
@@ -231,6 +253,25 @@ def test_process_kills_grandchild_and_never_invokes_a_shell(tmp_path):
         time.sleep(0.05)
     else:
         pytest.fail("agent grandchild survived process-group cleanup")
+
+
+def test_process_logs_are_private(tmp_path):
+    stdout = tmp_path / "stdout.log"
+    stderr = tmp_path / "stderr.log"
+    result = run_process(
+        [sys.executable, "-c", "print('private')"],
+        cwd=tmp_path,
+        env=child_environment(tmp_path, [], {"PATH": os.environ["PATH"]}),
+        stdin=None,
+        stdout_path=stdout,
+        stderr_path=stderr,
+        timeout_seconds=2,
+        term_grace_seconds=1,
+        max_output_bytes=4096,
+    )
+    assert result.exit_code == 0
+    assert stat.S_IMODE(stdout.stat().st_mode) == 0o600
+    assert stat.S_IMODE(stderr.stat().st_mode) == 0o600
 
 
 def test_timeout_still_applies_when_agent_does_not_read_large_stdin(tmp_path):
