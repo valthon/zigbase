@@ -376,6 +376,16 @@ Each spec needs `.method`, `.path`, and `.handler` (a missing field or
 wrong-typed handler is a compile error). `.auth` is optional and **defaults to
 `.superuser`** (the safe default) when omitted. The three auth levels are:
 
+Route paths are canonical absolute paths. A `:name` segment captures exactly one
+path segment; capture names use identifier syntax (`[A-Za-z_][A-Za-z0-9_]*`) and
+cannot repeat within one route. Relative paths, trailing or repeated slashes,
+dot segments, delimiter-changing percent escapes, literal OpenAPI braces, and
+`.UNKNOWN` methods are compile errors, so runtime routing and OpenAPI export use
+one grammar. A `.path_secret` carried in the path must name one of those captures,
+including when a helper returns the explicitly named `RouteAuthGuard` type.
+`HEAD` handlers may return their representation body normally: the server preserves
+its `Content-Length` metadata and removes the bytes at the transport boundary.
+
 - `.public` — anyone (anonymous identity still provided).
 - `.authed` — any authenticated principal (a token from **any** auth collection).
 - `.superuser` — superusers only.

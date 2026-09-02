@@ -569,6 +569,7 @@ pub fn App(comptime cfg: anytype) type {
             if (@hasField(@TypeOf(cfg), "hooks")) d.record = events.buildRecordDispatcher(cfg.hooks);
             if (@hasField(@TypeOf(cfg), "onError")) d.on_error = cfg.onError;
             if (@hasField(@TypeOf(cfg), "routes")) {
+                validateConsumerRoutes(cfg.routes);
                 d.routes = events.buildRoutes(cfg.routes);
                 // #243: every route with a `.auth = .{ .authed = "<col>" }` gate must name a
                 // DECLARED auth collection (exists + `.type = .auth`). buildRoutes can't check this
@@ -618,6 +619,28 @@ pub fn App(comptime cfg: anytype) type {
             }
             break :blk d;
         };
+
+        fn validateConsumerRoutes(comptime specs: anytype) void {
+            @setEvalBranchQuota(100_000);
+            const consumer = events.routeMeta(specs);
+            for (consumer, 0..) |candidate, index| {
+                for (consumer[0..index]) |previous| {
+                    if (candidate.method == previous.method and server.routePatternsOverlap(candidate.path, previous.path))
+                        @compileError("consumer route '" ++ @tagName(candidate.method) ++ " " ++ candidate.path ++ "' overlaps consumer route '" ++ previous.path ++ "'");
+                }
+                if (server.adminRouteReserved(route_gates, candidate.path))
+                    @compileError("consumer route '" ++ @tagName(candidate.method) ++ " " ++ candidate.path ++ "' overlaps reserved ZigBase admin prefix '/_'");
+                for (server.Server(route_gates).routes) |reserved| {
+                    if (candidate.method == reserved.method and server.routePatternsOverlap(candidate.path, reserved.pattern))
+                        @compileError("consumer route '" ++ @tagName(candidate.method) ++ " " ++ candidate.path ++ "' overlaps reserved ZigBase route '" ++ reserved.pattern ++ "'");
+                }
+                if (features_public_route) |feature_path| {
+                    if ((candidate.method == .GET or candidate.method == .HEAD) and
+                        server.routePatternsOverlap(candidate.path, feature_path))
+                        @compileError("consumer route '" ++ @tagName(candidate.method) ++ " " ++ candidate.path ++ "' overlaps reserved feature-state route '" ++ feature_path ++ "'");
+                }
+            }
+        }
 
         /// The consumer's cron/interval/reactive job table (empty when no `.cron`).
         const user_jobs: []const scheduler.RuntimeJob = if (@hasField(@TypeOf(cfg), "cron")) scheduler.buildJobs(cfg.cron) else &.{};
@@ -1265,10 +1288,11 @@ pub fn App(comptime cfg: anytype) type {
         /// Mirrors `App.collections`; consumed by the SP2.2b TS client generator to
         /// emit typed fetch wrappers. Each entry carries the derived camelCase name,
         /// method, path, auth level, and the handler's Input/Output types.
-        pub const routes: []const events.RouteMeta = if (@hasField(@TypeOf(cfg), "routes"))
-            events.routeMeta(cfg.routes)
-        else
-            &.{};
+        pub const routes: []const events.RouteMeta = blk: {
+            if (!@hasField(@TypeOf(cfg), "routes")) break :blk &.{};
+            validateConsumerRoutes(cfg.routes);
+            break :blk events.routeMeta(cfg.routes);
+        };
 
         /// Comptime-reflected typed I/O for CUSTOM auth methods declared in the
         /// `.collections` literal (one entry per `.{ .slug, .Initiate, .Complete }`
@@ -1356,6 +1380,8 @@ pub fn App(comptime cfg: anytype) type {
             };
             if (!is_str)
                 @compileError(".features.public_route must be a path string (e.g. \"/api/state\") or .disabled");
+            if (!server.featureRouteAvailable(route_gates, pr))
+                @compileError(".features.public_route must be a canonical absolute path that does not overlap a reserved ZigBase route or prefix");
             break :blk pr;
         };
 
@@ -2083,7 +2109,7 @@ fn runCliImpl(init: std.process.Init, dispatch: *const events.Dispatch, jobs: []
             .apply => try schemaApplyImpl(allocator, init.io, init.environ_map, sa, dispatch, jobs, pool_size, schema_collections, schema_migrations, opts),
             .check_rules => try schemaCheckRulesImpl(allocator, init.io, init.environ_map, sa),
         },
-        .openapi => |oa| try openApiImpl(route_meta, allocator, init.io, init.environ_map, oa),
+        .openapi => |oa| try openApiImpl(route_meta, opts, allocator, init.io, init.environ_map, oa),
         .rewrap => |ra| try rewrapImpl(allocator, init.io, init.environ_map, ra),
         .import => |ia| try importImpl(allocator, init.io, init.environ_map, ia, dispatch, jobs, pool_size, schema_collections, schema_migrations, opts),
         .migrate_db => |ma| try migrateDbImpl(allocator, init.io, ma),
@@ -3168,7 +3194,7 @@ fn schemaDumpImpl(allocator: std.mem.Allocator, io: std.Io, environ: *const std.
 /// read-only connection and combine it with this binary's comptime consumer routes. It
 /// deliberately bypasses server boot, migrations, provisioning, and the SQLite pool's
 /// journal-mode setup, so exporting cannot mutate the database it describes.
-fn openApiImpl(comptime route_meta: []const events.RouteMeta, allocator: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map, oa: cli.OpenApiArgs) !void {
+fn openApiImpl(comptime route_meta: []const events.RouteMeta, comptime opts: ServeOpts, allocator: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map, oa: cli.OpenApiArgs) !void {
     const cfg = try loadCfg(environ, .{ .data_dir = oa.data_dir });
     const db_url = (config.EnvGetter{ .environ = environ }).get("ZIGBASE_DB_URL");
     const target: []const u8 = switch (db.chooseBackend(db_url)) {
@@ -3199,7 +3225,10 @@ fn openApiImpl(comptime route_meta: []const events.RouteMeta, allocator: std.mem
     var scratch = std.heap.ArenaAllocator.init(allocator);
     defer scratch.deinit();
     const cols = try collections_mod.list(scratch.allocator(), &conn);
-    const doc = try openapi.generate(route_meta, allocator, cols, .{
+    const doc = try openapi.generate(route_meta, .{
+        .gates = opts.gates,
+        .features_public_route = opts.features_public_route,
+    }, allocator, cols, .{
         .title = oa.title,
         .api_version = oa.api_version orelse build_options.version,
         .server = oa.server,
@@ -5364,6 +5393,30 @@ test "App(cfg) assembles custom routes onto dispatch" {
     const A = App(.{ .routes = .{.{ .method = .GET, .path = "/api/x", .handler = H.h, .auth = .public }} });
     try std.testing.expectEqual(@as(usize, 1), A.dispatch.routes.len);
     try std.testing.expectEqualStrings("/api/x", A.dispatch.routes[0].pattern);
+}
+
+test "App(cfg) admin route reservation follows the gate and segment boundary" {
+    const route_types = @import("route_types.zig");
+    const H = struct {
+        fn h(req: *route_types.Req(void)) route_types.RouteError!void {
+            _ = req;
+        }
+    };
+    const AdminDisabled = App(.{
+        .admin = .disabled,
+        .routes = .{.{ .method = .GET, .path = "/_/deep/health", .handler = H.h, .auth = .public }},
+    });
+    try std.testing.expectEqual(@as(usize, 1), AdminDisabled.dispatch.routes.len);
+    try std.testing.expectEqualStrings("/_/deep/health", AdminDisabled.dispatch.routes[0].pattern);
+
+    const NearMiss = App(.{
+        .routes = .{.{ .method = .GET, .path = "/__", .name = "nearMiss", .handler = H.h, .auth = .public }},
+    });
+    try std.testing.expectEqual(@as(usize, 1), NearMiss.dispatch.routes.len);
+    try std.testing.expectEqualStrings("/__", NearMiss.dispatch.routes[0].pattern);
+
+    // A default-gated route at `/_` or any `/_/...` depth is a loud
+    // compile error in validateConsumerRoutes; it cannot be an inline negative test.
 }
 
 test "App(cfg): .auth = .{ .authed = collection } gate assembles + comptime-validates (#243)" {

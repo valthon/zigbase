@@ -63,6 +63,26 @@ RAILS_API_REFERENCE_NAMES = (
     "openapi.md",
     "serve.md",
 )
+RAILS_FULLSTACK_REFERENCE_NAMES = (
+    "agents.md",
+    "deployment.md",
+    "docker.md",
+    "migrate-rails-api.md",
+    "migrate-rails-fullstack.md",
+    "migration-tools.md",
+    "openapi.md",
+    "serve.md",
+    "zigapagos-pairing.md",
+)
+RAILS_FULLSTACK_REQUIRED_PHRASES = (
+    "route-local presentation blocker",
+    "handoff finding and decision ids",
+    '"method_transform": {"from": "PUT", "to": "PATCH", "rationale": "..."}',
+)
+OPENAPI_COLLECTION_MARKERS = (
+    "`x-zigbase-collection` with the authoritative",
+    "`x-zigbase-collection-type` with its schema kind",
+)
 
 
 def reference_is_current(repo: Path, embedded: Path, name: str) -> bool:
@@ -368,6 +388,10 @@ def validate_source_skill(
         errors.append("skill.oversized")
     if f"references/{guide}" not in body:
         errors.append("skill.guide_reference")
+    if skill_name == "zigbase-migrate-rails-fullstack":
+        for phrase in RAILS_FULLSTACK_REQUIRED_PHRASES:
+            if phrase not in body:
+                errors.append(f"skill.contract_guidance:{phrase}")
     if not body.startswith("---\n") or "\n---\n" not in body[4:]:
         errors.append("skill.frontmatter")
     else:
@@ -439,10 +463,46 @@ def test_express_migration_skill_is_valid_and_synced():
             "migrate-rails-api.md",
             RAILS_API_REFERENCE_NAMES,
         ),
+        (
+            "zigbase-migrate-rails-fullstack",
+            "migrate-rails-fullstack.md",
+            RAILS_FULLSTACK_REFERENCE_NAMES,
+        ),
     ],
 )
 def test_remaining_source_skills_are_valid_and_synced(skill_name, guide, references):
     assert validate_source_skill(REPO, skill_name, guide, references) == []
+
+
+def test_openapi_reference_documents_collection_markers():
+    canonical = (REPO / "docs" / "openapi.md").read_text()
+    references = tuple(REPO.glob("skills/*/references/openapi.md"))
+
+    for phrase in OPENAPI_COLLECTION_MARKERS:
+        assert phrase in canonical
+        assert all(phrase in reference.read_text() for reference in references)
+
+
+@pytest.mark.parametrize("phrase", RAILS_FULLSTACK_REQUIRED_PHRASES)
+def test_rails_fullstack_skill_guard_rejects_missing_contract_guidance(
+    tmp_path, phrase
+):
+    subject = copy_source_subject(
+        tmp_path,
+        "zigbase-migrate-rails-fullstack",
+        RAILS_FULLSTACK_REFERENCE_NAMES,
+    )
+    skill = subject / "skills" / "zigbase-migrate-rails-fullstack" / "SKILL.md"
+    skill.write_text(skill.read_text().replace(phrase, "removed guidance", 1))
+    assert any(
+        error.startswith("skill.contract_guidance:")
+        for error in validate_source_skill(
+            subject,
+            "zigbase-migrate-rails-fullstack",
+            "migrate-rails-fullstack.md",
+            RAILS_FULLSTACK_REFERENCE_NAMES,
+        )
+    )
 
 
 @pytest.mark.parametrize(
@@ -454,6 +514,11 @@ def test_remaining_source_skills_are_valid_and_synced(skill_name, guide, referen
             "zigbase-migrate-rails-api",
             "migrate-rails-api.md",
             RAILS_API_REFERENCE_NAMES,
+        ),
+        (
+            "zigbase-migrate-rails-fullstack",
+            "migrate-rails-fullstack.md",
+            RAILS_FULLSTACK_REFERENCE_NAMES,
         ),
     ],
 )

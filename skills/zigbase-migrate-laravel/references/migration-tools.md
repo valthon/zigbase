@@ -646,12 +646,13 @@ assume anything about what it's talking to. Full reference:
 | Key | Meaning |
 |---|---|
 | `id` | Stable, unique case identifier. Required. Findings key off it. |
-| `method`, `path` | Required. `path` is appended to `--base-url`. |
+| `method`, `path` | Required. `method` is an HTTP token. `path` is one canonical absolute path without a query or fragment and is appended to `--base-url`; exact `{{name}}` segments are revalidated after substitution. |
 | `query` | Object of string → string. Optional. |
 | `headers` | Only the headers that matter. `{{name}}` placeholders resolve from `--var`. |
 | `body` | JSON value or `null`. Sent as `application/json` when non-null. |
 | `expect.status` | Exact match. |
 | `expect.bodySubset` | Recursive **subset** of the response body. |
+| `expect.control` | Optional producer-reviewed semantic label. Predeclare it before `record`; recording preserves it while refreshing status/body. |
 
 ### Subset matching
 
@@ -680,8 +681,26 @@ zb_replay.py replay --base-url URL capture.ndjson [--out findings.ndjson] \
 ```
 
 `record` runs each case in `requests.ndjson` against the **old** backend and fills in
-`expect` from the actual (volatile-stripped) response. `replay` runs a capture against
-the **new** backend and diffs each response against its `expect`.
+`expect.status` and `expect.bodySubset` from the actual (volatile-stripped) response while preserving
+an explicitly supplied `expect.control`. `replay` runs a capture against
+the **new** backend and diffs each response against its `expect`. Explicit `"expect": null`
+retains its historical meaning of no expectation. Before replay, every recorded control is checked
+against its status classification. `record` atomically replaces a complete capture with private
+`0600` permissions; `replay` atomically installs private `0600` findings only after every case has
+run, since response diffs may contain sensitive values. Both outputs flush the completed payload
+before replacement. Validation and failures before replacement leave
+the previous complete artifact unchanged.
+Replay ignores ambient HTTP proxy variables so captured authorization is sent only to the explicitly
+selected backend, and it never forwards credentials across redirects.
+
+Put query parameters in the `query` object instead of embedding `?` or `#` in `path`. Query and
+header names and values are strings. The complete file is size-bounded and validated as strict
+UTF-8/RFC JSON before any request is sent. Resolved paths are validated again immediately before
+network I/O, empty inputs fail because they exercise nothing, non-RFC JSON responses are compared
+as raw text, and emitted artifacts always use strict JSON.
+The client observes the first HTTP response without following redirects, bounds each response body
+to 32 MiB, and requires response bytes to be valid UTF-8. This preserves `3xx` journey evidence and
+prevents request headers from being forwarded to a `Location` target.
 
 ### Findings and summary channels
 
