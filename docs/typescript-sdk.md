@@ -670,7 +670,7 @@ When a generated `zbase.gen.ts` declares typed routes (registered via the Zig se
 
 - **`params` object** is present IFF the route path contains `:param` segments (e.g. `{ id: string }`).
 - **`input` argument** is present IFF the route's `Input` type is non-void (POST/PUT/PATCH bodies).
-- GET/DELETE routes pass non-param fields as **query string** parameters; POST/PUT/PATCH routes serialize them as the **request body**.
+- GET/HEAD/DELETE routes pass non-param fields as **query string** parameters; POST/PUT/PATCH/OPTIONS routes serialize them as the **request body**.
 - Throws a `ZigbaseError` on non-2xx — the same throw/parse behavior as `zb.send` and the typed collection methods.
 - An optional final `opts` argument accepts `SendOptions` (`signal`, `requestKey`, custom headers).
 

@@ -313,6 +313,52 @@ pub fn build(b: *std.Build) void {
     const features_fix_step = b.step("features-fixture", "Build the demo-features fixture server (browser tests)");
     features_fix_step.dependOn(&b.addInstallArtifact(features_fix_exe, .{}).step);
 
+    // Feature-route protocol fixtures: real servers for the remapped and disabled
+    // GET/HEAD mount behavior. Keeping these as separate App instantiations exercises
+    // the compile-time route configuration used by production applications.
+    const features_remapped_mod = b.createModule(.{
+        .root_source_file = b.path("fixtures/features-remapped/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    features_remapped_mod.addImport("zigbase", zigbase_mod);
+    const features_remapped_exe = b.addExecutable(.{ .name = "feature-remapped-fixture", .root_module = features_remapped_mod });
+    const features_remapped_step = b.step("feature-remapped-fixture", "Build the remapped feature-route protocol fixture");
+    features_remapped_step.dependOn(&b.addInstallArtifact(features_remapped_exe, .{}).step);
+
+    const features_disabled_mod = b.createModule(.{
+        .root_source_file = b.path("fixtures/features-disabled/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    features_disabled_mod.addImport("zigbase", zigbase_mod);
+    const features_disabled_exe = b.addExecutable(.{ .name = "feature-disabled-fixture", .root_module = features_disabled_mod });
+    const features_disabled_step = b.step("feature-disabled-fixture", "Build the disabled feature-route protocol fixture");
+    features_disabled_step.dependOn(&b.addInstallArtifact(features_disabled_exe, .{}).step);
+
+    // Compile-fail contract fixtures. Merely declaring these lazy steps does not build
+    // them during normal gates; the Python contract tests invoke each step and assert
+    // the framework's comptime diagnostic instead of allowing an exporter panic.
+    inline for (&.{
+        .{ .step = "invalid-route-missing-method", .file = "fixtures/invalid-routes/missing-method.zig" },
+        .{ .step = "invalid-route-unknown-method", .file = "fixtures/invalid-routes/unknown-method.zig" },
+        .{ .step = "invalid-route-noncanonical-path", .file = "fixtures/invalid-routes/noncanonical-path.zig" },
+        .{ .step = "invalid-route-missing-secret-capture", .file = "fixtures/invalid-routes/missing-secret-capture.zig" },
+        .{ .step = "invalid-route-typed-missing-secret-capture", .file = "fixtures/invalid-routes/typed-missing-secret-capture.zig" },
+    }) |invalid| {
+        const invalid_mod = b.createModule(.{
+            .root_source_file = b.path(invalid.file),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        invalid_mod.addImport("zigbase", zigbase_mod);
+        const invalid_exe = b.addExecutable(.{ .name = invalid.step, .root_module = invalid_mod });
+        const invalid_step = b.step(invalid.step, "Compile-fail consumer route contract fixture");
+        invalid_step.dependOn(&b.addInstallArtifact(invalid_exe, .{}).step);
+    }
     // --- minimal-server: gating-invariant fixture (R2-7) --------------------------
     // A consumer App with NOTHING optional configured. scripts/check-gating.sh nm-scans
     // this binary to prove deselected subsystems (webauthn/magic_link/oauth2, analytics,
