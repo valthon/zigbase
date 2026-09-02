@@ -16,6 +16,7 @@ const collections = @import("collections.zig");
 const schema = @import("schema.zig");
 const route_types = @import("route_types.zig");
 const rpc_ts = @import("codegen/rpc_ts.zig");
+const route_path = @import("route_path.zig");
 
 // ---------------------------------------------------------------------------
 // RAII DB-access handles used where a `*Ctx` isn't already bound to a live
@@ -297,7 +298,15 @@ fn lowerSecretSource(comptime src: anytype, comptime path: []const u8) PathSecre
 /// Loud `@compileError` on a malformed `.path_secret` (missing `.param`/`.source`, unknown keys).
 fn lowerRouteAuthGuard(comptime a: anytype, comptime path: []const u8) RouteAuthGuard {
     const A = @TypeOf(a);
-    if (A == RouteAuthGuard) return a;
+    if (A == RouteAuthGuard) {
+        switch (a) {
+            .path_secret => |guard| {
+                if (guard.in == .path and !route_path.hasCapture(path, guard.param))
+                    @compileError("route '" ++ path ++ "': .path_secret.param '" ++ guard.param ++ "' must name a :capture in the route path");
+            },
+        }
+        return a;
+    }
     if (@typeInfo(A) != .@"struct")
         @compileError("route '" ++ path ++ "': .auth must be an AuthLevel (.public/.authed/.superuser) " ++
             "or a guard struct like .{ .path_secret = .{ .param = \"...\", .source = .{ .kv = \"...\" } } }");
@@ -323,6 +332,8 @@ fn lowerRouteAuthGuard(comptime a: anytype, comptime path: []const u8) RouteAuth
     var guard = PathSecretGuard{ .param = ps.param, .source = lowerSecretSource(ps.source, path) };
     if (@hasField(P, "in")) guard.in = ps.in;
     if (@hasField(P, "on_mismatch")) guard.on_mismatch = ps.on_mismatch;
+    if (guard.in == .path and !route_path.hasCapture(path, guard.param))
+        @compileError("route '" ++ path ++ "': .path_secret.param '" ++ guard.param ++ "' must name a :capture in the route path");
     return .{ .path_secret = guard };
 }
 
@@ -570,7 +581,7 @@ pub const JobTask = *const fn (ctx: *Ctx, ev: *JobEvent) anyerror!void;
 /// (`fn(*route_types.Req(In)) route_types.RouteError!Out`); its shape is validated by
 /// `route_types.HandlerInput`/`HandlerOutput`'s own `@compileError`s when `routeMeta`
 /// reflects it — so no raw-Response coercion check is performed here.
-fn validateRouteSpecs(comptime specs: anytype) void {
+pub fn validateRouteSpecs(comptime specs: anytype) void {
     // The exact keys read by `routeMeta`/`buildRoutes` (and the auth helpers). Kept in
     // lock-step with those readers — a key read there must appear here or a valid spec
     // would falsely @compileError.
@@ -580,6 +591,11 @@ fn validateRouteSpecs(comptime specs: anytype) void {
         if (!@hasField(@TypeOf(s), "method")) @compileError("route spec is missing '.method' (expected .{ .method = .GET, .path = \"/...\", .handler = fn })");
         if (!@hasField(@TypeOf(s), "path")) @compileError("route spec is missing '.path' (expected .{ .method = .GET, .path = \"/...\", .handler = fn })");
         if (!@hasField(@TypeOf(s), "handler")) @compileError("route spec is missing '.handler' (expected .{ .method = .GET, .path = \"/...\", .handler = fn })");
+        const method: http.Method = s.method;
+        if (method == .UNKNOWN)
+            @compileError("route '" ++ s.path ++ "': .method cannot be .UNKNOWN");
+        if (!route_path.isCanonicalPattern(s.path))
+            @compileError("route '" ++ s.path ++ "': .path must be a canonical absolute router pattern with optional :name captures");
         // Fail loud on a typo'd optional key (e.g. `.rate_limt`, `.rate_limit_ky`) which the
         // `@hasField`-gated readers would otherwise silently ignore, shipping the route with
         // NO rate limit / default keying the developer believed they had configured.
@@ -799,6 +815,10 @@ pub fn comptimeRouteName(comptime path: []const u8, comptime override: ?[]const 
 /// slice is returnable.
 pub fn routeMeta(comptime specs: anytype) []const RouteMeta {
     const fields = std.meta.fields(@TypeOf(specs));
+    comptime {
+        @setEvalBranchQuota(10_000 + fields.len * 5_000); // scale with route count
+        validateRouteSpecs(specs);
+    }
     const Holder = struct {
         const table: [fields.len]RouteMeta = blk: {
             @setEvalBranchQuota(10_000 + fields.len * 5_000); // scale with route count
@@ -846,7 +866,6 @@ pub fn routeMeta(comptime specs: anytype) []const RouteMeta {
 /// Comptime-validates each route's Input/Output representability and `@compileError`s on a
 /// duplicate derived method name.
 pub fn buildRoutes(comptime specs: anytype) []const RuntimeRoute {
-    comptime validateRouteSpecs(specs);
     const fields = std.meta.fields(@TypeOf(specs));
     const meta = comptime routeMeta(specs);
     // Representability + duplicate-name guards, all at comptime.
@@ -857,14 +876,14 @@ pub fn buildRoutes(comptime specs: anytype) []const RuntimeRoute {
                 @compileError("route '" ++ m.path ++ "' derives an empty method name; add an explicit .name to the route spec");
             route_types.assertRepresentable(m.Input, m.name);
             route_types.assertRepresentable(m.Output, m.name);
-            // GET/DELETE routes communicate their Input via a query string.
+            // GET/HEAD/DELETE routes communicate their Input via a query string.
             // If the Input is representable but not query-parseable (e.g. contains a
             // non-string slice or a nested struct), the server's `parseQuery` cannot
             // decode it and every call would get a misleading 400 at runtime. Catch it
             // at build time instead.
-            if (m.method == .GET or m.method == .DELETE) {
+            if (route_types.inputUsesQuery(m.method)) {
                 if (!route_types.isQueryParseable(m.Input))
-                    @compileError("route '" ++ m.name ++ "': GET/DELETE Input must be encodable as a query string (scalars/enums/strings/optionals only); got a type with a non-query field. Use POST/PUT/PATCH for a JSON body, or simplify the Input.");
+                    @compileError("route '" ++ m.name ++ "': GET/HEAD/DELETE Input must be encodable as a query string (scalars/enums/strings/optionals only); got a type with a non-query field. Use POST/PUT/PATCH for a JSON body, or simplify the Input.");
             }
             for (meta[0..i]) |prev| {
                 if (std.mem.eql(u8, prev.name, m.name))

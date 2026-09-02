@@ -23,8 +23,12 @@ const feature_cache = @import("../feature_cache.zig");
 // Mount path + enable/disable come from `app.features_public_route` (the `.features`
 // config knob): default "/api/state"; a custom path remounts it; `.disabled` → 404.
 
-/// GET <features_public_route>?subject=<id> — resolved flags + experiments, no auth.
+/// GET/HEAD <features_public_route>?subject=<id> — resolved flags + experiments, no auth.
 pub fn handle(ctx: *http.RequestCtx) anyerror!http.Response {
+    return handleGet(ctx);
+}
+
+fn handleGet(ctx: *http.RequestCtx) anyerror!http.Response {
     const app = ctx.app orelse return ApiError.internal().toResponse(ctx.allocator.a);
 
     // Disabled (`.features = .{ .public_route = .disabled }`) → not found.
@@ -184,13 +188,13 @@ test "GET /api/state: disabled route → 404" {
     try std.testing.expectEqual(@as(u16, 404), (try handle(&ctx)).status);
 }
 
-test "GET /api/state: static mount 404s when remapped to a custom path" {
+test "GET /api/state handler rejects a path other than the configured mount" {
     var env = try TestEnv.init();
     defer env.deinit();
     env.app.features_public_route = "/public/features"; // remapped
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    // The static "/api/state" entry must NOT serve when the mount moved elsewhere.
+    // A direct handler call must not serve a path after the mount moved elsewhere.
     var ctx = http.RequestCtx{ .method = .GET, .path = "/api/state", .query = "", .allocator = RequestArena.from(&arena), .app = &env.app };
     try std.testing.expectEqual(@as(u16, 404), (try handle(&ctx)).status);
 }

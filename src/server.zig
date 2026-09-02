@@ -1,4 +1,5 @@
 const std = @import("std");
+const route_path = @import("route_path.zig");
 const RequestArena = @import("request_arena.zig").RequestArena;
 const zap = @import("zap");
 const http = @import("http.zig");
@@ -67,6 +68,123 @@ pub const Gates = struct {
     /// module (`api/mail_unsubscribe.zig`), gated like senders/mail_webhook on `.mail`.
     mail_unsubscribe: bool = true,
 };
+
+/// Stable migration-facing names for the standard auth operations.  This is
+/// deliberately owned beside the dispatch table: `Server.routes` is assembled
+/// from these entries, and OpenAPI exports the same entries, so a route cannot
+/// be renamed or remapped in only one of the two contracts.
+pub const MigrationBuiltinOperation = struct {
+    operation_id: []const u8,
+    method: http.Method,
+    pattern: []const u8,
+    access: []const u8,
+    handler: http.Handler,
+};
+
+pub const migration_builtin_operations = [_]MigrationBuiltinOperation{
+    .{ .operation_id = "authWithPassword", .method = .POST, .pattern = "/api/collections/:col/auth-with-password", .access = "public", .handler = auth_api.authWithPassword },
+    .{ .operation_id = "authRefresh", .method = .POST, .pattern = "/api/collections/:col/auth-refresh", .access = "authenticated", .handler = auth_api.authRefresh },
+    .{ .operation_id = "logout", .method = .POST, .pattern = "/api/collections/:col/auth-logout", .access = "public", .handler = auth_api.authLogout },
+    .{ .operation_id = "requestVerification", .method = .POST, .pattern = "/api/collections/:col/request-verification", .access = "public", .handler = auth_api.requestVerification },
+    .{ .operation_id = "confirmVerification", .method = .POST, .pattern = "/api/collections/:col/confirm-verification", .access = "public", .handler = auth_api.confirmVerification },
+    .{ .operation_id = "requestPasswordReset", .method = .POST, .pattern = "/api/collections/:col/request-password-reset", .access = "public", .handler = auth_api.requestPasswordReset },
+    .{ .operation_id = "confirmPasswordReset", .method = .POST, .pattern = "/api/collections/:col/confirm-password-reset", .access = "public", .handler = auth_api.confirmPasswordReset },
+};
+
+/// Whether two router patterns can select the same concrete path. A `:capture`
+/// segment matches any segment, mirroring router.matchPath.
+pub fn routePatternsOverlap(a: []const u8, b: []const u8) bool {
+    return route_path.patternsOverlap(a, b);
+}
+
+/// Whether `path` is the prefix itself or a descendant separated by `/`.
+/// The segment boundary is significant: the admin reservation `/_` owns `/_`
+/// and `/_/...`, but not the unrelated `/__` namespace.
+pub fn pathMatchesReservedPrefix(path: []const u8, prefix: []const u8) bool {
+    return std.mem.eql(u8, path, prefix) or
+        (path.len > prefix.len and
+            std.mem.startsWith(u8, path, prefix) and
+            path[prefix.len] == '/');
+}
+
+pub fn adminRouteReserved(comptime gates: Gates, path: []const u8) bool {
+    return gates.admin and pathMatchesReservedPrefix(path, "/_");
+}
+
+/// Return whether a configured exact route is a canonical absolute URI path.
+/// Unlike router patterns, configured feature routes are concrete: capture-like
+/// `:name` segments are rejected so export and runtime cannot disagree about
+/// whether a segment is literal. Percent escapes must be uppercase, necessary,
+/// valid UTF-8, and may not decode into a delimiter or dot segment.
+pub fn isCanonicalFixedRoutePath(comptime path: []const u8) bool {
+    return route_path.isCanonicalFixed(path);
+}
+
+pub fn featureRouteAvailable(comptime gates: Gates, comptime path: []const u8) bool {
+    if (!isCanonicalFixedRoutePath(path)) return false;
+    if (adminRouteReserved(gates, path)) return false;
+    for (Server(gates).routes) |reserved| {
+        if ((reserved.method == .GET or reserved.method == .HEAD) and
+            routePatternsOverlap(path, reserved.pattern))
+            return false;
+    }
+    return true;
+}
+
+test "routePatternsOverlap follows router capture and segment boundaries" {
+    try std.testing.expect(routePatternsOverlap(
+        "/api/collections/posts/records",
+        "/api/collections/:col/records",
+    ));
+    try std.testing.expect(routePatternsOverlap(
+        "/api/collections/:collection/records/:record",
+        "/api/collections/:col/records/:id",
+    ));
+    try std.testing.expect(!routePatternsOverlap(
+        "/api/collections/posts/publish",
+        "/api/collections/:col/records",
+    ));
+    try std.testing.expect(!routePatternsOverlap(
+        "/api/collections/posts/records/archive",
+        "/api/collections/:col/records",
+    ));
+}
+
+test "feature state is mounted dynamically rather than reserved in the static table" {
+    for (Server(.{}).routes) |route| {
+        try std.testing.expect(!std.mem.eql(u8, route.pattern, "/api/state"));
+    }
+}
+
+test "pathMatchesReservedPrefix preserves the segment boundary" {
+    try std.testing.expect(pathMatchesReservedPrefix("/_", "/_"));
+    try std.testing.expect(pathMatchesReservedPrefix("/_/health", "/_"));
+    try std.testing.expect(pathMatchesReservedPrefix("/_/deep/health", "/_"));
+    try std.testing.expect(!pathMatchesReservedPrefix("/__", "/_"));
+    try std.testing.expect(!pathMatchesReservedPrefix("/api/_", "/_"));
+    try std.testing.expect(adminRouteReserved(.{}, "/_/deep/path"));
+    try std.testing.expect(!adminRouteReserved(.{ .admin = false }, "/_/deep/path"));
+}
+
+test "isCanonicalFixedRoutePath rejects ambiguous route spellings" {
+    inline for (&.{ "/api/state", "/caf%C3%A9", "/a:b" }) |path|
+        try std.testing.expect(isCanonicalFixedRoutePath(path));
+    inline for (&.{
+        "",              "relative",  "//host",     "/trailing/", "/double//slash", "/./state",
+        "/%2E%2E/state", "/%41",      "/%2f",       "/%252F",     "/api?x=1",       "/api#x",
+        "/api\\state",   "/:capture", "/caf%c3%a9", "/caf%C3",
+    }) |path| try std.testing.expect(!isCanonicalFixedRoutePath(path));
+}
+
+test "featureRouteAvailable rejects engine and admin collisions" {
+    try std.testing.expect(featureRouteAvailable(.{}, "/api/state"));
+    try std.testing.expect(featureRouteAvailable(.{}, "/public/features"));
+    try std.testing.expect(!featureRouteAvailable(.{}, "/api/meta"));
+    try std.testing.expect(!featureRouteAvailable(.{}, "/api/collections/posts/records"));
+    try std.testing.expect(!featureRouteAvailable(.{}, "/_/features"));
+    try std.testing.expect(featureRouteAvailable(.{ .admin = false }, "/_/features"));
+    try std.testing.expect(!featureRouteAvailable(.{}, "relative"));
+}
 
 // ── §C.1: tunable static Cache-Control via facil.io's OWN state-callback API ────────
 // There is no facil.io settings field and no compile-time define for the static
@@ -160,13 +278,6 @@ pub fn Server(comptime gates: Gates) type {
                 .{ .method = .POST, .pattern = "/api/collections/:col/records", .handler = records_api.create },
                 .{ .method = .PATCH, .pattern = "/api/collections/:col/records/:id", .handler = records_api.update },
                 .{ .method = .DELETE, .pattern = "/api/collections/:col/records/:id", .handler = records_api.delete },
-                .{ .method = .POST, .pattern = "/api/collections/:col/auth-with-password", .handler = auth_api.authWithPassword },
-                .{ .method = .POST, .pattern = "/api/collections/:col/auth-refresh", .handler = auth_api.authRefresh },
-                .{ .method = .POST, .pattern = "/api/collections/:col/auth-logout", .handler = auth_api.authLogout },
-                .{ .method = .POST, .pattern = "/api/collections/:col/request-verification", .handler = auth_api.requestVerification },
-                .{ .method = .POST, .pattern = "/api/collections/:col/confirm-verification", .handler = auth_api.confirmVerification },
-                .{ .method = .POST, .pattern = "/api/collections/:col/request-password-reset", .handler = auth_api.requestPasswordReset },
-                .{ .method = .POST, .pattern = "/api/collections/:col/confirm-password-reset", .handler = auth_api.confirmPasswordReset },
                 .{ .method = .POST, .pattern = "/api/collections/:col/auth/:method/initiate", .handler = auth_methods_api.initiate },
                 .{ .method = .POST, .pattern = "/api/collections/:col/auth/:method/complete", .handler = auth_methods_api.complete },
                 // Per-device sessions (spec §F3). Always registered — the handlers branch on the
@@ -192,16 +303,17 @@ pub fn Server(comptime gates: Gates) type {
                 // Superuser-only realtime health snapshot (admin-UI Phase 4). 3 segments, so it
                 // cannot collide with the 4-segment /api/realtime/sse/:clientId route above.
                 .{ .method = .GET, .pattern = "/api/realtime/stats", .handler = realtime_stats_api.get },
-                // Public, UNAUTHENTICATED feature-state projection (#130). Mounted at the default
-                // "/api/state"; the handler 404s when disabled or remapped (a custom path is
-                // dispatched dynamically in onRequest). NEVER exposes the superuser settings verbs.
-                .{ .method = .GET, .pattern = "/api/state", .handler = state_api.handle },
                 .{ .method = .GET, .pattern = "/api/settings", .handler = settings_api.list },
                 .{ .method = .GET, .pattern = "/api/settings/:key", .handler = settings_api.get },
                 .{ .method = .PUT, .pattern = "/api/settings/:key", .handler = settings_api.put },
                 .{ .method = .DELETE, .pattern = "/api/settings/:key", .handler = settings_api.delete },
                 .{ .method = .GET, .pattern = "/api/features", .handler = features_api.get },
             };
+            for (migration_builtin_operations) |operation| t = t ++ &[_]router.Route{.{
+                .method = operation.method,
+                .pattern = operation.pattern,
+                .handler = operation.handler,
+            }};
             if (gates.magic_link) t = t ++ &[_]router.Route{
                 .{ .method = .GET, .pattern = "/api/collections/:col/auth/magic-link/consume", .handler = magic_link_consume_api.consume },
             };
@@ -312,8 +424,7 @@ pub fn Server(comptime gates: Gates) type {
         pub fn route(ctx: *http.RequestCtx) anyerror!http.Response {
             const app = ctx.app.?;
             if (comptime gates.admin) {
-                if (std.mem.startsWith(u8, ctx.path, "/_/") or std.mem.eql(u8, ctx.path, "/_"))
-                    return admin.serve(ctx);
+                if (adminRouteReserved(gates, ctx.path)) return admin.serve(ctx);
             }
             // Built-in API routes win over custom routes.
             const builtin = router.tryDispatch(routes, ctx) catch |e| {
@@ -321,13 +432,12 @@ pub fn Server(comptime gates: Gates) type {
                 return try ApiError.internal().toResponse(ctx.allocator.a);
             };
             if (builtin) |hit| return hit;
-            // Public feature-state projection at a CUSTOM-configured path. The default
-            // "/api/state" is already in the static table above; this covers a remapped
-            // `.features = .{ .public_route = "/custom" }`. Reserved ahead of custom routes
-            // so a consumer route cannot shadow it. Disabled (null) → skipped entirely.
+            // Public feature-state projection at its configured path, including the default
+            // "/api/state". It is mounted outside the static table so a remapped or disabled
+            // feature route leaves the old path available to consumer routes. A live feature
+            // route still wins ahead of custom routes. Disabled (null) → skipped entirely.
             if (app.features_public_route) |fp| {
                 if ((ctx.method == .GET or ctx.method == .HEAD) and
-                    !std.mem.eql(u8, fp, "/api/state") and
                     std.mem.eql(u8, ctx.path, fp))
                 {
                     return state_api.handle(ctx) catch |e| {
@@ -441,20 +551,25 @@ pub fn Server(comptime gates: Gates) type {
             // dropped connection and the access line records status 0, a status nothing
             // ever sent. Answer with the same raw 500 envelope every other escape uses.
             const multipart_err = applyMultipart(&ctx) catch {
-                sendRawEnvelope(r, 500, "{\"status\":500,\"code\":\"internal\",\"message\":\"Something went wrong.\",\"data\":{}}");
+                sendRawEnvelope(r, ctx.method, 500, "{\"status\":500,\"code\":\"internal\",\"message\":\"Something went wrong.\",\"data\":{}}");
                 logged_status = 500;
                 return;
             };
-            const resp = blk: {
+            const routed = blk: {
                 if (multipart_err) |er| break :blk er;
                 // The full routing/fallback chain lives in the socketless `route` seam (#239
                 // stage 2). Its only escaping errors are the OOM-while-building-an-error-Response
                 // paths that historically wrote this exact raw 500 envelope inline and returned.
                 break :blk route(&ctx) catch {
-                    sendRawEnvelope(r, 500, "{\"status\":500,\"code\":\"internal\",\"message\":\"Something went wrong.\",\"data\":{}}");
+                    sendRawEnvelope(r, ctx.method, 500, "{\"status\":500,\"code\":\"internal\",\"message\":\"Something went wrong.\",\"data\":{}}");
                     logged_status = 500;
                     return;
                 };
+            };
+            const resp = normalizeHeadResponse(&ctx, routed) catch {
+                sendRawEnvelope(r, ctx.method, 500, "{\"status\":500,\"code\":\"internal\",\"message\":\"Something went wrong.\",\"data\":{}}");
+                logged_status = 500;
+                return;
             };
             setZapStatus(r, resp.status);
             logged_status = resp.status;
@@ -484,14 +599,14 @@ pub fn Server(comptime gates: Gates) type {
                     r.setHeader("content-type", resp.content_type) catch {};
                     sendFileRange(r, self.app.io, f.path, f.offset, len) catch {
                         // Open failure => the existing 404 raw envelope (unchanged semantics).
-                        sendRawEnvelope(r, 404, "{\"status\":404,\"code\":\"not_found\",\"message\":\"Not found.\",\"data\":{}}");
+                        sendRawEnvelope(r, ctx.method, 404, "{\"status\":404,\"code\":\"not_found\",\"message\":\"Not found.\",\"data\":{}}");
                         logged_status = 404;
                     };
                 } else {
                     // Wholesale facil.io delegation (dir-mode static): mime, ETag, 304,
                     // `.gz` sidecar, Range are ALL facil.io's (§A.3) — byte-identical to today.
                     r.sendFile(f.path) catch {
-                        sendRawEnvelope(r, 404, "{\"status\":404,\"code\":\"not_found\",\"message\":\"Not found.\",\"data\":{}}");
+                        sendRawEnvelope(r, ctx.method, 404, "{\"status\":404,\"code\":\"not_found\",\"message\":\"Not found.\",\"data\":{}}");
                         logged_status = 404;
                     };
                 }
@@ -1598,10 +1713,43 @@ fn sendFileRange(r: zap.Request, io: std.Io, path: []const u8, offset: u64, len:
 
 /// Last-resort raw error envelope, used only when even building the normal ApiError
 /// response fails (allocation failure). Sends a fixed JSON body bypassing the arena.
-fn sendRawEnvelope(r: zap.Request, status: u16, body: []const u8) void {
+fn hasResponseHeader(headers: []const http.Header, name: []const u8) bool {
+    for (headers) |header| if (std.ascii.eqlIgnoreCase(header.name, name)) return true;
+    return false;
+}
+
+/// Apply HTTP HEAD representation semantics before a response reaches either the
+/// socket adapter or the in-process testing harness. Whole-file responses remain
+/// delegated to facil.io because it owns their stat/range/ETag metadata.
+pub fn normalizeHeadResponse(ctx: *http.RequestCtx, response: http.Response) !http.Response {
+    if (ctx.method != .HEAD or (response.file != null and response.file.?.len == null))
+        return response;
+
+    var normalized = response;
+    const representation_length = if (response.file) |file| file.len.? else response.body.len;
+    if (!hasResponseHeader(response.extra_headers, "content-length")) {
+        const length = try std.fmt.allocPrint(ctx.allocator.a, "{d}", .{representation_length});
+        const headers = try ctx.allocator.a.alloc(http.Header, response.extra_headers.len + 1);
+        @memcpy(headers[0..response.extra_headers.len], response.extra_headers);
+        headers[response.extra_headers.len] = .{ .name = "content-length", .value = length };
+        normalized.extra_headers = headers;
+    }
+    normalized.body = "";
+    normalized.file = null;
+    return normalized;
+}
+
+fn sendRawEnvelope(r: zap.Request, method: http.Method, status: u16, body: []const u8) void {
     setZapStatus(r, status);
     r.setContentType(.JSON) catch {};
-    r.sendBody(body) catch {};
+    if (method == .HEAD) {
+        var length_buf: [32]u8 = undefined;
+        const length = std.fmt.bufPrint(&length_buf, "{d}", .{body.len}) catch "0";
+        r.setHeader("content-length", length) catch {};
+        r.sendBody("") catch {};
+    } else {
+        r.sendBody(body) catch {};
+    }
 }
 
 fn hasRoute(rs: []const router.Route, method: http.Method, pattern: []const u8) bool {

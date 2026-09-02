@@ -20,6 +20,7 @@ import subprocess
 import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 import pytest
@@ -59,10 +60,44 @@ def _http(method, url, token=None, body=None):
         return e.code, e.read().decode()
 
 
+def _raw_head(url):
+    parsed = urllib.parse.urlsplit(url)
+    with socket.create_connection((parsed.hostname, parsed.port), timeout=5) as sock:
+        target = parsed.path or "/"
+        if parsed.query:
+            target += f"?{parsed.query}"
+        sock.sendall(
+            f"HEAD {target} HTTP/1.1\r\nHost: {parsed.hostname}\r\n"
+            "Connection: close\r\n\r\n".encode()
+        )
+        chunks = []
+        while chunk := sock.recv(65536):
+            chunks.append(chunk)
+    head, body = b"".join(chunks).split(b"\r\n\r\n", 1)
+    lines = head.decode("iso-8859-1").split("\r\n")
+    status = int(lines[0].split()[1])
+    headers = {
+        name.lower(): value.strip()
+        for name, value in (line.split(":", 1) for line in lines[1:] if ":" in line)
+    }
+    return status, headers, body
+
+
+def _assert_head_parity(url, expected_status, expected_content_type="application/json"):
+    get_status, get_body = _http("GET", url)
+    head_status, headers, wire_body = _raw_head(url)
+    assert get_status == expected_status
+    assert head_status == get_status
+    assert headers["content-type"].startswith(expected_content_type)
+    assert int(headers["content-length"]) == len(get_body.encode())
+    assert wire_body == b""
+
+
 # ---------------------------------------------------------------------------
 # Stock binary: declares NO flags/experiments (R2-1 evicted the demo ones into
 # fixtures/features) — empty projection, public, no leakage.
 # ---------------------------------------------------------------------------
+
 
 def test_state_public_no_auth_returns_resolved_shape(server):
     # No Authorization header at all — the endpoint is public.
@@ -76,8 +111,16 @@ def test_state_public_no_auth_returns_resolved_shape(server):
     assert doc["experiments"] == {}
     # Must NOT leak the _kv admin surface (raw keys / timestamps / key prefixes /
     # declared defaults / weights).
-    for forbidden in ('"key"', '"created"', '"updated"', "flag:", "exp:",
-                      '"default"', '"weights"', '"variants"'):
+    for forbidden in (
+        '"key"',
+        '"created"',
+        '"updated"',
+        "flag:",
+        "exp:",
+        '"default"',
+        '"weights"',
+        '"variants"',
+    ):
         assert forbidden not in body, forbidden
 
 
@@ -90,9 +133,95 @@ def test_state_does_not_expose_admin_verbs_or_settings(server):
     assert status == 403
 
 
+@pytest.fixture(scope="session")
+def feature_route_binaries():
+    binaries = {}
+    for mode in ("remapped", "disabled"):
+        env_name = f"ZIGBASE_TEST_FEATURE_{mode.upper()}_BINARY"
+        override = os.environ.get(env_name)
+        if override:
+            path = pathlib.Path(override)
+            if not path.exists():
+                raise FileNotFoundError(f"{env_name}={override} does not exist")
+        else:
+            step = f"feature-{mode}-fixture"
+            subprocess.run(ZIG + ["build", step], cwd=REPO, check=True)
+            path = REPO / "zig-out" / "bin" / step
+        binaries[mode] = path
+    return binaries
+
+
+def test_feature_head_is_bodyless_for_default_remapped_and_disabled(
+    server, feature_route_binaries
+):
+    _assert_head_parity(f"{server}/api/state?subject=head", 200)
+
+    for mode, path, expected_status in (
+        ("remapped", "/public/features?subject=head", 200),
+        ("remapped", "/api/state?subject=head", 200),
+        ("disabled", "/api/state?subject=head", 200),
+    ):
+        with tempfile.TemporaryDirectory(prefix=f"zb_feature_{mode}_") as data:
+            port = _free_port()
+            proc = subprocess.Popen(
+                [
+                    str(feature_route_binaries[mode]),
+                    "serve",
+                    "--http-port",
+                    str(port),
+                    "--data-dir",
+                    data,
+                ],
+                env={
+                    **os.environ,
+                    "ZIGBASE_SERVE_BACKGROUND": "0",
+                    "ZIGBASE_JWT_SECRET": "test-secret-not-default-0123456789abcdef",
+                },
+            )
+            try:
+                _wait_port(port)
+                content_type = (
+                    "text/plain"
+                    if path.startswith("/api/state")
+                    else "application/json"
+                )
+                _assert_head_parity(
+                    f"http://127.0.0.1:{port}{path}", expected_status, content_type
+                )
+
+                if path.startswith("/api/state"):
+                    status, body = _http("GET", f"http://127.0.0.1:{port}{path}")
+                    assert status == 200
+                    assert body == "consumer-state"
+
+                if mode == "remapped":
+                    for custom_path, custom_status, representation_length in (
+                        (
+                            "/custom/head-success",
+                            200,
+                            len(b"custom-head-representation"),
+                        ),
+                        ("/custom/head-error", 500, None),
+                    ):
+                        status, headers, wire_body = _raw_head(
+                            f"http://127.0.0.1:{port}{custom_path}"
+                        )
+                        assert status == custom_status
+                        assert wire_body == b""
+                        assert int(headers["content-length"]) > 0
+                        if representation_length is not None:
+                            assert (
+                                int(headers["content-length"]) == representation_length
+                            )
+            finally:
+                proc.terminate()
+                proc.wait(timeout=10)
+
+
 # ---------------------------------------------------------------------------
 # Configured app (dating-server: 2 flags + 1 experiment): resolution + override.
 # ---------------------------------------------------------------------------
+
 
 @pytest.fixture(scope="session")
 def dating_binary():
@@ -106,15 +235,26 @@ def dating_binary():
 def dating_server(dating_binary):
     data = tempfile.mkdtemp(prefix="zb_state_")
     subprocess.run(
-        [dating_binary, "superuser", "create", "--email", "admin@x.io",
-         "--password", "adminpassword", "--data-dir", data],
+        [
+            dating_binary,
+            "superuser",
+            "create",
+            "--email",
+            "admin@x.io",
+            "--password",
+            "adminpassword",
+            "--data-dir",
+            data,
+        ],
         check=True,
     )
     port = _free_port()
     env = {**os.environ, "ZIGBASE_DATA_DIR": data, "ZIGBASE_HTTP_PORT": str(port)}
     proc = subprocess.Popen(
         [dating_binary, "serve", "--insecure-cookies"],
-        env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
     )
     _wait_port(port)
     try:
@@ -127,7 +267,8 @@ def dating_server(dating_binary):
 
 def _su_token(base):
     status, body = _http(
-        "POST", f"{base}/api/collections/_superusers/auth-with-password",
+        "POST",
+        f"{base}/api/collections/_superusers/auth-with-password",
         body={"identity": "admin@x.io", "password": "adminpassword"},
     )
     assert status == 200, body
@@ -151,8 +292,12 @@ def test_state_reflects_superuser_override(dating_server):
     base = dating_server
     # Operator flips a DECLARED flag via the superuser settings API (writes flag:<name>).
     token = _su_token(base)
-    status, _ = _http("PUT", f"{base}/api/settings/flag:verbose_winks", token=token,
-                      body={"value": "false"})
+    status, _ = _http(
+        "PUT",
+        f"{base}/api/settings/flag:verbose_winks",
+        token=token,
+        body={"value": "false"},
+    )
     assert status == 200
     # The public projection reflects the override — still WITHOUT any auth.
     status, body = _http("GET", f"{base}/api/state?subject=user-42")
@@ -162,8 +307,12 @@ def test_state_reflects_superuser_override(dating_server):
 
 def test_state_experiment_is_deterministic_per_subject(dating_server):
     base = dating_server
-    a = json.loads(_http("GET", f"{base}/api/state?subject=stable")[1])["experiments"]["discovery_ranking"]
-    b = json.loads(_http("GET", f"{base}/api/state?subject=stable")[1])["experiments"]["discovery_ranking"]
+    a = json.loads(_http("GET", f"{base}/api/state?subject=stable")[1])["experiments"][
+        "discovery_ranking"
+    ]
+    b = json.loads(_http("GET", f"{base}/api/state?subject=stable")[1])["experiments"][
+        "discovery_ranking"
+    ]
     assert a == b
 
 
@@ -175,20 +324,32 @@ def test_state_sticky_experiment_survives_weight_override(dating_server):
     base = dating_server
     subject = "sticky-seen-1"
     # First call (no auth) persists the assignment under the declared weights.
-    seen = json.loads(_http("GET", f"{base}/api/state?subject={subject}")[1])["experiments"]["discovery_ranking"]
+    seen = json.loads(_http("GET", f"{base}/api/state?subject={subject}")[1])[
+        "experiments"
+    ]["discovery_ranking"]
     assert seen in ("recency", "affinity", "hybrid")
 
     # Operator forces ALL future buckets to a different variant via a weight override.
     token = _su_token(base)
     forced = "recency" if seen != "recency" else "hybrid"
-    weights = {"recency": "[100,0,0]", "affinity": "[0,100,0]", "hybrid": "[0,0,100]"}[forced]
-    status, _ = _http("PUT", f"{base}/api/settings/exp:discovery_ranking:weights",
-                      token=token, body={"value": weights})
+    weights = {"recency": "[100,0,0]", "affinity": "[0,100,0]", "hybrid": "[0,0,100]"}[
+        forced
+    ]
+    status, _ = _http(
+        "PUT",
+        f"{base}/api/settings/exp:discovery_ranking:weights",
+        token=token,
+        body={"value": weights},
+    )
     assert status == 200
 
     # The already-seen subject KEEPS its persisted variant (sticky), still without auth.
-    after = json.loads(_http("GET", f"{base}/api/state?subject={subject}")[1])["experiments"]["discovery_ranking"]
+    after = json.loads(_http("GET", f"{base}/api/state?subject={subject}")[1])[
+        "experiments"
+    ]["discovery_ranking"]
     assert after == seen
     # A brand-new subject under the override DOES follow the new weights (override is live).
-    fresh = json.loads(_http("GET", f"{base}/api/state?subject=sticky-new-1")[1])["experiments"]["discovery_ranking"]
+    fresh = json.loads(_http("GET", f"{base}/api/state?subject=sticky-new-1")[1])[
+        "experiments"
+    ]["discovery_ranking"]
     assert fresh == forced
