@@ -30,6 +30,7 @@
           <li><a href="$site.page('docs/migrate-laravel').link()">Migrate Laravel</a></li>
           <li><a href="$site.page('docs/migrate-go').link()">Migrate Go</a></li>
           <li><a href="$site.page('docs/migrate-rails-api').link()">Migrate Rails API</a></li>
+          <li><a href="$site.page('docs/migrate-rails-fullstack').link()">Migrate Rails full stack</a></li>
         </ul>
         <p class="docs-group">Client SDKs</p>
         <ul>
