@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html>
+  <head id="head">
+    <title>Widgets</title>
+    <!-- rails: csrf_meta_tags dropped; the ZigBase cookie/CSRF boundary owns this -->
+    <link rel="stylesheet" href="/stylesheets/application.css">
+    <!-- rails: javascript_importmap_tags dropped; @z/runtime replaces the Rails JS entry -->
+  <script type="importmap">{"imports":{"@z/runtime":"/zigapagos-runtime.js","@z/runtime/jsx-runtime":"/zigapagos-runtime.js","@z/runtime/jsx-dev-runtime":"/zigapagos-runtime.js","@z/runtime/compat":"/zigapagos-runtime.js","@z/runtime/compat/client":"/zigapagos-runtime.js","react":"/zigapagos-runtime.js","react-dom":"/zigapagos-runtime.js","react-dom/client":"/zigapagos-runtime.js","react/jsx-runtime":"/zigapagos-runtime.js","react/jsx-dev-runtime":"/zigapagos-runtime.js"}}</script><link rel="modulepreload" href="/zigapagos-runtime.js"><link rel="modulepreload" href="/islands/AuthStatus.island.js"><link rel="modulepreload" href="/islands/reveal.island.js"><link rel="modulepreload" href="/islands/TurboFrame.island.js"><link rel="modulepreload" href="/islands/Chart.island.js"><script type="module" src="/zigapagos-runtime.js"></script></head>
+  <body class="marketing">
+    <nav>
+  <a href="/">Home</a>
+  <a href="/about">About</a>
+  <div data-z-island id="z-island-0" data-z-src="components/AuthStatus.island.tsx" data-z-client="load" data-z-module="/islands/AuthStatus.island.js"><a href="/session/new">Sign in</a></div><script type="application/json" data-z-props="z-island-0">{}</script>
+  
+  <img src="/images/logo.png" alt="Logo">
+</nav>
+
+    <main><div id="main">
+
+<div data-z-island id="z-island-1" data-z-src="components/stimulus/reveal.island.tsx" data-z-client="load" data-z-module="/islands/reveal.island.js"><div style="display:contents"><z-slot data-z-slot="default" style="display:contents"><div data-controller="reveal" data-reveal-open-value="false"><div data-controller="reveal" data-reveal-open-value="false">
+  <button data-action="click->reveal#toggle">Show details</button>
+  <p data-reveal-target="details" class="hidden">Details</p>
+</div></div></z-slot></div></div><script type="application/json" data-z-props="z-island-1">{}</script><script type="application/json" data-z-slots="z-island-1">{"default":"<div data-controller=\"reveal\" data-reveal-open-value=\"false\"><div data-controller=\"reveal\" data-reveal-open-value=\"false\">\n  <button data-action=\"click->reveal#toggle\">Show details<\/button>\n  <p data-reveal-target=\"details\" class=\"hidden\">Details<\/p>\n<\/div><\/div>"}</script>
+<div data-z-island id="z-island-2" data-z-src="components/TurboFrame.island.tsx" data-z-client="load" data-z-module="/islands/TurboFrame.island.js"><div id="latest"><z-slot data-z-slot="default" style="display:contents"><p>Loading latest…</p></z-slot></div></div><script type="application/json" data-z-props="z-island-2">{"id":"latest","src":"/posts"}</script><script type="application/json" data-z-slots="z-island-2">{"default":"<p>Loading latest…<\/p>"}</script>
+<turbo-frame id="static"><p>Just markup</p></turbo-frame>
+<div data-z-island id="z-island-3" data-z-src="components/Chart.island.tsx" data-z-client="load" data-z-module="/islands/Chart.island.js"><button type="button">a:3</button></div><script type="application/json" data-z-props="z-island-3">{"points":3,"series":"a"}</script>
+<a href="/about">About</a>
+</div></main>
+    <footer>Presentation Fixture</footer>
+  </body>
+</html>

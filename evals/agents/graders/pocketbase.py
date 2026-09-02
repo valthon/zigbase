@@ -18,6 +18,7 @@ from tools.pocketbase import pb2zb
 
 from ..result import EvalFailure
 from . import GradeReport
+from ._harness import write_private_text
 from .genesis import (
     Commands,
     DoctorReport,
@@ -766,7 +767,8 @@ def run_deployment(
         config = json.loads(config_result.stdout)
         service = inspect_compose(config)
         port = port_picker()
-        override.write_text(
+        write_private_text(
+            override,
             "services:\n"
             f"  {service}:\n"
             "    ports: !override\n"

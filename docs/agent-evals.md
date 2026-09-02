@@ -23,6 +23,12 @@ produced three consecutive score-4 runs with zero interventions using
 [`evals/agents/evidence/rails-api/2026-09-01-8fec10ae/`](../evals/agents/evidence/rails-api/2026-09-01-8fec10ae/).
 The immutable tag `agent-eval-rails-api-2026-09-01` resolves to the recorded full commit
 `8fec10ae45aca023bf1f46da3f73d4a320735cde`.
+The Rails full-stack coordination flagship passed its current release gate on 2026-09-02: commit
+`1e025f01` produced three consecutive score-4 runs with zero interventions using
+`codex-cli-0.150-default`. Its sanitized summaries are preserved under
+[`evals/agents/evidence/rails-fullstack/2026-09-02-1e025f01/`](../evals/agents/evidence/rails-fullstack/2026-09-02-1e025f01/).
+The immutable tag `agent-eval-rails-fullstack-2026-09-02` resolves to the recorded full commit
+`1e025f01d25254330f6492a2ccc4ca4a910be34c`.
 Deterministic harness tests block CI; real-agent runs remain opt-in so model tokens and credentials
 are never required by ordinary builds.
 
@@ -33,6 +39,7 @@ The runner installs the scenario's declared skill into the isolated workspace:
 - `genesis` uses `skills/zigbase-app-genesis/`;
 - `pocketbase` uses `skills/zigbase-migrate-pocketbase/`;
 - `rails-api` uses `skills/zigbase-migrate-rails-api/`.
+- `rails-fullstack` uses `skills/zigbase-migrate-rails-fullstack/`.
 
 When running an agent outside this harness, use that product's normal local-skill installation
 mechanism and preserve the directory name. The harness deliberately does not know how any provider
@@ -109,6 +116,32 @@ refuses to take silently. It also carries the scope gate that gives the scenario
 ERB in the application is a mailer layout, so the correct answer is that no frontend is retained,
 and a report claiming Rails views were migrated fails however good the data is.
 
+Use `rails-fullstack` to evaluate the coordinating step after the backend and presentation adapters
+have both run against one frozen representative application:
+
+```sh
+python3 -m evals.agents.run rails-fullstack --agent codex
+```
+
+The live grader needs the already-built application binary and a Python environment containing
+Playwright plus its Chrome channel:
+
+```sh
+ZIGBASE_EVAL_BINARY=./zig-out/bin/zigbase \
+PLAYWRIGHT_PYTHON=/path/to/playwright-python \
+python3 -m evals.agents.run rails-fullstack --agent codex
+```
+
+The scenario supplies observed Rails routes, ZigBase OpenAPI, all-passing backend replay with its
+request capture and direct data/file/job evidence, plus a generated Zigapagos v0.5.0 target,
+presentation manifest, and handoff. The agent must
+produce exact route decisions, run the shipped coordinator twice, preserve an unsupported Vue root
+as an explicit blocker, reconcile every reviewed public rule, and report same-origin restart,
+restore, rollback, and cutover plans. The grader independently reruns reconciliation, applies the
+schema, runs production doctor, serves the generated site with the pinned ZigBase binary, executes
+HTTP and Playwright parity, restarts the target, and boots a restored copy. It does not trust the
+agent's completion or operational claims.
+
 Metacharacters are literal argv data. Do not wrap the JSON command in `sh -c`. The scenario caps
 command size, runtime, and captured output.
 
@@ -177,6 +210,25 @@ The rehearsal steps themselves — schema dry-run then apply, auth imported sepa
 data with `--preserve-timestamps`, files installed, doctor, and the live probes — belong to
 `tests_green`, not to `deployed`.
 
+For PocketBase, Rails API, and Genesis, the grader runs agent-authored build and integration tests
+after the deterministic rehearsal and deployment checks. This keeps command ordering stable and
+makes failures easier to attribute. Genesis keeps `build:`-backed Compose services supported by
+running that boundary immediately before `docker compose up --build`; image-backed services retain
+the normal tests-last order.
+
+For `rails-fullstack` they mean:
+
+- `completion`: the immutable source set is unchanged, the released presentation and handoff
+  schemas validate, every route has a reconciled disposition, evidence retains producer semantics,
+  and the manifest is exact canonical coordinator output;
+- `rules_locked`: the reconciled auth boundaries and production doctor agree on the complete
+  reviewed public surface, with no errors, skipped checks, or unreviewed public rules;
+- `tests_green`: the schema applies, HTTP parity runs against a live same-origin target, the
+  generated Playwright journey passes, and the stopped target restarts with parity intact; and
+- `deployed`: a copy of the stopped complete data directory boots independently and serves both
+  the generated frontend and API as a synthetic cutover; after it stops, the original unit boots
+  again and accepts the pre-switch credential as an executable rollback.
+
 Exit `0` means all four grades passed. Exit `1` means the harness or agent command failed or timed
 out. Exit `2` means the agent completed but deterministic grading found a product condition that
 needs attention.
@@ -192,8 +244,10 @@ python3 -m evals.agents.run genesis \
 ```
 
 `--out` cannot escape the selected artifact directory. Raw logs may contain source, prompts, or
-credentials printed by the external command. Keep them local or in a short-lived restricted CI
-artifact; never commit transcripts. Only sanitized result summaries belong in release evidence.
+credentials printed by the external command. Run directories are created with mode `0700` and
+process logs with mode `0600`. Commands run in their own process group, which is terminated on a
+timeout or interruption. Keep logs local or in a short-lived restricted CI artifact; never commit
+transcripts. Only sanitized result summaries belong in release evidence.
 
 ## Deterministic development checks
 
@@ -202,9 +256,13 @@ fake-agent cases, negative grader fixtures, and Genesis live Docker boundary wit
 
 ```sh
 ZIGBASE_TEST_BINARY=./zig-out/bin/zigbase \
-  python3 -m pytest tests/pocketbase tests/agent_evals -q
+  python3 -m pytest tests/pocketbase tests/rails tests/rails_fullstack tests/tools tests/agent_evals -q
 python3 -m pytest --noconftest tests/admin/test_skill_sync.py -q
-python3 -m ruff check tools/pocketbase evals/agents tests/pocketbase tests/agent_evals
+python3 tools/sync_skill_references.py --check
+python3 -m ruff check \
+  --extend-exclude evals/agents/scenarios/rails-fullstack/fixture/source/presentation-target/test/journey_playwright.py \
+  tools/pocketbase tools/rails tools/replay evals/agents tests/pocketbase tests/rails \
+  tests/rails_fullstack tests/tools tests/agent_evals
 ZIGBASE_DOCKER_EVAL_TEST=1 \
   python3 -m pytest tests/agent_evals/test_genesis_docker.py -q
 ```
@@ -232,5 +290,5 @@ are true, `score` is 4, `interventions` is 0, and `failures` is empty. Preserve 
 summaries and record the agent/model identifier supplied to `--agent`.
 
 The qualifying sets are the tagged 2026-08-15 Genesis `3f3224d5`, 2026-08-16 PocketBase
-`9a72b656`, and 2026-09-01 Rails API `8fec10ae` evidence linked above. Raw transcripts and scenario
-workspaces stay out of the repository.
+`9a72b656`, 2026-09-01 Rails API `8fec10ae`, and 2026-09-02 Rails full-stack `1e025f01` evidence
+linked above. Raw transcripts and scenario workspaces stay out of the repository.
