@@ -600,13 +600,19 @@ jobs:
       - name: Pull pinned Genesis deployment image
         run: docker pull ghcr.io/valthon/zigbase:0.13.0
       - name: Python lint for migration and evaluation tooling
-        run: python -m ruff check tools/pocketbase tools/rails evals/agents tests/pocketbase tests/rails tests/agent_evals
+        # Preserve the released Zigapagos target byte-for-byte: its generated browser journey is
+        # immutable eval input, not repository-authored Python. The live grader executes it.
+        run: >-
+          python -m ruff check
+          --extend-exclude evals/agents/scenarios/rails-fullstack/fixture/source/presentation-target/test/journey_playwright.py
+          tools/pocketbase tools/rails tools/replay evals/agents tests/pocketbase tests/rails
+          tests/rails_fullstack tests/tools tests/agent_evals
       - name: Converter, skill drift, runner, graders, and live Docker boundary
         env:
           ZIGBASE_DOCKER_EVAL_TEST: "1"
         run: |
           python tools/sync_skill_references.py --check
-          python -m pytest tests/pocketbase tests/rails tests/agent_evals -q
+          python -m pytest tests/pocketbase tests/rails tests/rails_fullstack tests/agent_evals -q
           python -m pytest --noconftest tests/admin/test_skill_sync.py -q
 
   dart-sdk:

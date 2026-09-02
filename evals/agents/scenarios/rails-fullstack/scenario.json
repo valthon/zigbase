@@ -1,0 +1,12 @@
+{
+  "zigbaseAgentScenario": 1,
+  "name": "rails-fullstack",
+  "prompt": "prompt.md",
+  "fixture": "fixture",
+  "skills": ["zigbase-migrate-rails-fullstack"],
+  "graders": ["rails-fullstack"],
+  "timeout_seconds": 900,
+  "term_grace_seconds": 10,
+  "max_command_bytes": 16384,
+  "max_output_bytes": 16777216
+}

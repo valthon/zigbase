@@ -1,0 +1,68 @@
+{
+  "zigbaseSchema": 1,
+  "collections": [
+    {
+      "name": "posts",
+      "type": "base",
+      "fields": [
+        {
+          "name": "title",
+          "required": true,
+          "unique": false,
+          "encrypted": false,
+          "searchable": true,
+          "hidden": false,
+          "type": "text",
+          "options": {
+            "min": null,
+            "max": null,
+            "pattern": null
+          },
+          "id": "t1t1e0000000"
+        },
+        {
+          "name": "body",
+          "required": false,
+          "unique": false,
+          "encrypted": false,
+          "searchable": true,
+          "hidden": false,
+          "type": "editor",
+          "options": {},
+          "id": "b0dy00000000"
+        }
+      ],
+      "indexes": [],
+      "listRule": "@public",
+      "viewRule": "@public",
+      "createRule": "@request.auth.id != \"\"",
+      "updateRule": null,
+      "deleteRule": null,
+      "options": {}
+    },
+    {
+      "name": "users",
+      "type": "auth",
+      "fields": [
+        {
+          "name": "email",
+          "required": true,
+          "unique": true,
+          "encrypted": false,
+          "searchable": true,
+          "hidden": false,
+          "type": "email",
+          "options": {},
+          "id": "ema1l0000000"
+        }
+      ],
+      "indexes": [],
+      "listRule": null,
+      "viewRule": null,
+      "createRule": "@public",
+      "updateRule": null,
+      "deleteRule": null,
+      "options": {}
+    }
+  ]
+}

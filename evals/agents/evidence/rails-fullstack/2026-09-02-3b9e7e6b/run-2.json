@@ -1,0 +1,1 @@
+{"zigbaseAgentEval":1,"scenario":"rails-fullstack","commit":"3b9e7e6b802c1d61a99f83f0640f31fca82141bb","agent":"codex-cli-0.150-default","started_at":"2026-09-02T15:32:22.819459Z","duration_ms":407030,"agent_exit":0,"timed_out":false,"interventions":0,"completion":true,"rules_locked":true,"tests_green":true,"deployed":true,"score":4,"failures":[]}

@@ -1,0 +1,667 @@
+{
+  "schema": "zigapagos.rails-handoff/1",
+  "schema_version": 1,
+  "generator": {
+    "tool": "zigapagos",
+    "version": "v0.5.0"
+  },
+  "backend": {
+    "file": "openapi.json",
+    "contract_version": "1.0.0"
+  },
+  "complete": true,
+  "routes": [
+    {
+      "route_id": "GET /",
+      "status": "migrated",
+      "artifacts": [
+        "components/AuthStatus.island.tsx",
+        "content/index.smd",
+        "layouts/pages/about.shtml",
+        "layouts/templates/marketing.shtml",
+        "lib/zb.ts"
+      ],
+      "endpoint": null,
+      "decision": {
+        "id": "RAILS_JS_ENTRY.app/javascript/application%2Ejs.entry",
+        "choice": "drop",
+        "rationale": "The generated islands replace the reviewed Turbo and controller imports; the Rails application entry itself is not copied."
+      },
+      "findings": [],
+      "note": "csrf_meta_tags dropped; javascript_importmap_tags dropped; app/javascript/application.js dropped by decision; app/views/shared/_nav.html.erb:5 `if current_user` folded into the AuthStatus island above it; app/views/shared/_nav.html.erb:5 `current_user.email` is inside the region the AuthStatus island replaced, so it mounts nothing of its own"
+    },
+    {
+      "route_id": "GET /about",
+      "status": "migrated",
+      "artifacts": [
+        "components/AuthStatus.island.tsx",
+        "content/about/index.smd",
+        "layouts/pages/about.shtml",
+        "layouts/templates/marketing.shtml",
+        "lib/zb.ts"
+      ],
+      "endpoint": null,
+      "decision": {
+        "id": "RAILS_JS_ENTRY.app/javascript/application%2Ejs.entry",
+        "choice": "drop",
+        "rationale": "The generated islands replace the reviewed Turbo and controller imports; the Rails application entry itself is not copied."
+      },
+      "findings": [],
+      "note": "csrf_meta_tags dropped; javascript_importmap_tags dropped; app/javascript/application.js dropped by decision; app/views/shared/_nav.html.erb:5 `if current_user` folded into the AuthStatus island above it; app/views/shared/_nav.html.erb:5 `current_user.email` is inside the region the AuthStatus island replaced, so it mounts nothing of its own"
+    },
+    {
+      "route_id": "GET /broken",
+      "status": "blocked",
+      "artifacts": [],
+      "endpoint": null,
+      "decision": {
+        "id": "RAILS_TEMPLATE_PARSE_ERROR.app/views/pages/broken%2Ehtml%2Eerb.L2",
+        "choice": "blocked",
+        "rationale": "broken.html.erb has an unclosed <% if %>; nothing can convert a template that does not parse, and nothing is emitted for it."
+      },
+      "findings": [
+        "RAILS_TEMPLATE_PARSE_ERROR.app/views/pages/broken%2Ehtml%2Eerb.L2"
+      ],
+      "note": "view app/views/pages/broken.html.erb was not converted"
+    },
+    {
+      "route_id": "GET /feed",
+      "status": "backend",
+      "artifacts": [],
+      "endpoint": {
+        "operation_id": "listPosts",
+        "verb": "GET",
+        "path": "/api/collections/posts/records"
+      },
+      "decision": {
+        "id": "RAILS_BACKEND_ENDPOINT.config/routes%2Erb.L20.GET.posts",
+        "choice": "listPosts",
+        "rationale": "#167 Stage 3. GET /feed renders `Post.all` as JSON, which is exactly what the backend document's `listPosts` operation returns -- so the route is bound to it rather than kept on Rails. It is also the one route assumption A2 bites on: a user-facing GET the handoff calls `backend` is UNACCOUNTED until an operation is chosen, so without this answer the run cannot reach `complete` however everything else is answered."
+      },
+      "findings": [],
+      "note": null
+    },
+    {
+      "route_id": "GET /help",
+      "status": "blocked",
+      "artifacts": [],
+      "endpoint": null,
+      "decision": {
+        "id": "RAILS_HELPER_UNKNOWN.app/views/pages/help%2Ehtml%2Eerb.L1C18",
+        "choice": "blocked",
+        "rationale": "number_to_currency has no static equivalent; /help does not ship until someone decides what it should render, so the target emits no page for it."
+      },
+      "findings": [
+        "RAILS_HELPER_UNKNOWN.app/views/pages/help%2Ehtml%2Eerb.L1C18",
+        "RAILS_I18N_UNRESOLVED.app/views/pages/help%2Ehtml%2Eerb.L1C62",
+        "RAILS_JS_ENTRY.app/javascript/application%2Ejs.entry",
+        "RAILS_RAW_OUTPUT.app/views/pages/help%2Ehtml%2Eerb.L1C47"
+      ],
+      "note": "csrf_meta_tags dropped; javascript_importmap_tags dropped"
+    },
+    {
+      "route_id": "GET /linked",
+      "status": "migrated",
+      "artifacts": [
+        "components/AuthStatus.island.tsx",
+        "content/linked/index.smd",
+        "layouts/pages/linked.shtml",
+        "layouts/templates/marketing.shtml",
+        "lib/zb.ts"
+      ],
+      "endpoint": null,
+      "decision": {
+        "id": "RAILS_JS_ENTRY.app/javascript/application%2Ejs.entry",
+        "choice": "drop",
+        "rationale": "The generated islands replace the reviewed Turbo and controller imports; the Rails application entry itself is not copied."
+      },
+      "findings": [],
+      "note": "csrf_meta_tags dropped; javascript_importmap_tags dropped; app/javascript/application.js dropped by decision; app/views/shared/_nav.html.erb:5 `if current_user` folded into the AuthStatus island above it; app/views/shared/_nav.html.erb:5 `current_user.email` is inside the region the AuthStatus island replaced, so it mounts nothing of its own"
+    },
+    {
+      "route_id": "GET /links",
+      "status": "blocked",
+      "artifacts": [],
+      "endpoint": null,
+      "decision": {
+        "id": "RAILS_ROUTE_HELPER_UNKNOWN.app/views/pages/links%2Ehtml%2Eerb.L1C5",
+        "choice": "blocked",
+        "rationale": "ghost_path names no route this run recovered; the link target is unknown, so /links does not ship."
+      },
+      "findings": [
+        "RAILS_JS_ENTRY.app/javascript/application%2Ejs.entry",
+        "RAILS_ROUTE_HELPER_UNKNOWN.app/views/pages/links%2Ehtml%2Eerb.L1C5"
+      ],
+      "note": "csrf_meta_tags dropped; javascript_importmap_tags dropped"
+    },
+    {
+      "route_id": "GET /live",
+      "status": "blocked",
+      "artifacts": [],
+      "endpoint": null,
+      "decision": {
+        "id": "RAILS_COMPONENT_VUE_UNSUPPORTED.app/views/pages/live%2Ehtml%2Eerb.L1C33",
+        "choice": "blocked",
+        "rationale": "The runtime compatibility bridge is React-only, so the Vue root blocks /live rather than shipping inert markup."
+      },
+      "findings": [
+        "RAILS_COMPONENT_VUE_UNSUPPORTED.app/views/pages/live%2Ehtml%2Eerb.L1C33",
+        "RAILS_JS_ENTRY.app/javascript/application%2Ejs.entry",
+        "RAILS_TURBO_STREAM.app/views/pages/live%2Ehtml%2Eerb.L1C5"
+      ],
+      "note": "csrf_meta_tags dropped; javascript_importmap_tags dropped"
+    },
+    {
+      "route_id": "GET /old",
+      "status": "redirect",
+      "artifacts": [],
+      "endpoint": null,
+      "decision": {
+        "id": "RAILS_REDIRECT_HOST_CONFIG.config/routes%2Erb.L53",
+        "choice": "retain",
+        "rationale": "/old keeps redirecting to /about; the host config owns the rule, so there is nothing for the static tree to carry."
+      },
+      "findings": [
+        "RAILS_REDIRECT_HOST_CONFIG.config/routes%2Erb.L53"
+      ],
+      "note": null
+    },
+    {
+      "route_id": "GET /posts",
+      "status": "migrated",
+      "artifacts": [
+        "components/AuthStatus.island.tsx",
+        "components/data/posts_index.island.tsx",
+        "content/posts/index.smd",
+        "layouts/posts/index.shtml",
+        "layouts/templates/application.shtml",
+        "lib/zb.ts"
+      ],
+      "endpoint": null,
+      "decision": {
+        "id": "RAILS_JS_ENTRY.app/javascript/application%2Ejs.entry",
+        "choice": "drop",
+        "rationale": "The generated islands replace the reviewed Turbo and controller imports; the Rails application entry itself is not copied."
+      },
+      "findings": [],
+      "note": "csrf_meta_tags dropped; javascript_importmap_tags dropped; app/javascript/application.js dropped by decision; guarded by before_action :require_login; shipped public by decision; app/views/shared/_nav.html.erb:5 `if current_user` folded into the AuthStatus island above it; app/views/shared/_nav.html.erb:5 `current_user.email` is inside the region the AuthStatus island replaced, so it mounts nothing of its own"
+    },
+    {
+      "route_id": "POST /posts",
+      "status": "backend",
+      "artifacts": [],
+      "endpoint": {
+        "operation_id": "createPosts",
+        "verb": "POST",
+        "path": "/api/collections/posts/records"
+      },
+      "decision": null,
+      "findings": [
+        "RAILS_BACKEND_ENDPOINT.config/routes%2Erb.L14.POST.posts"
+      ],
+      "note": null
+    },
+    {
+      "route_id": "GET /posts/:id",
+      "status": "blocked",
+      "artifacts": [],
+      "endpoint": null,
+      "decision": {
+        "id": "RAILS_ROUTE_DYNAMIC_SEGMENT.config/routes%2Erb.L14",
+        "choice": "blocked",
+        "rationale": "The source route has no deterministic browser example for parity, so the full-stack fixture keeps it blocked instead of claiming an unproved SPA migration."
+      },
+      "findings": [
+        "RAILS_ROUTE_DYNAMIC_SEGMENT.config/routes%2Erb.L14"
+      ],
+      "note": null
+    },
+    {
+      "route_id": "GET /posts/legacy",
+      "status": "blocked",
+      "artifacts": [],
+      "endpoint": null,
+      "decision": {
+        "id": "RAILS_TEMPLATE_ENGINE_UNSUPPORTED.app/views/posts/legacy%2Ehtml%2Ehaml.engine",
+        "choice": "blocked",
+        "rationale": "legacy.html.haml is Haml; no converter reads that engine, so /posts/legacy is blocked rather than shipped empty."
+      },
+      "findings": [
+        "RAILS_TEMPLATE_ENGINE_UNSUPPORTED.app/views/posts/legacy%2Ehtml%2Ehaml.engine"
+      ],
+      "note": "view app/views/posts/legacy.html.haml was not converted"
+    },
+    {
+      "route_id": "GET /posts/new",
+      "status": "migrated",
+      "artifacts": [
+        "components/AuthStatus.island.tsx",
+        "components/forms/posts_new.island.tsx",
+        "content/posts/new/index.smd",
+        "layouts/posts/new.shtml",
+        "layouts/templates/application.shtml",
+        "lib/zb.ts"
+      ],
+      "endpoint": null,
+      "decision": {
+        "id": "RAILS_BACKEND_ENDPOINT.app/views/posts/new%2Ehtml%2Eerb.L3C5",
+        "choice": "createPosts",
+        "rationale": "Stage 5 binds the conventional posts#new title/body form to the conditional createPosts ZigBase operation so the generated island and parity replay share one endpoint."
+      },
+      "findings": [],
+      "note": "csrf_meta_tags dropped; javascript_importmap_tags dropped; app/javascript/application.js dropped by decision; guarded by before_action :?; shipped public by decision; app/views/shared/_nav.html.erb:5 `if current_user` folded into the AuthStatus island above it; app/views/shared/_nav.html.erb:5 `current_user.email` is inside the region the AuthStatus island replaced, so it mounts nothing of its own"
+    },
+    {
+      "route_id": "POST /registration",
+      "status": "backend",
+      "artifacts": [],
+      "endpoint": {
+        "operation_id": "createUsers",
+        "verb": "POST",
+        "path": "/api/collections/users/records"
+      },
+      "decision": {
+        "id": "RAILS_AUTH_JOURNEY.config/routes%2Erb.L38",
+        "choice": "island",
+        "rationale": "#167 Stage 3 assumption A5 folds the sign-in and sign-up forms into one question, because the answer to both is a single ZigBase auth collection. `users` is the artifact: it is the only auth collection in backend/openapi.json (an auth collection is recognisable ONLY by its create schema carrying both `password` and `passwordConfirm`), and naming any other name is refused. The answer scaffolds ONE components/AuthForm.island.tsx told apart by a `mode` prop, lib/zb.ts, and the three endpoints the document has no ids for -- authWithPassword, logout, createUsers."
+      },
+      "findings": [],
+      "note": null
+    },
+    {
+      "route_id": "GET /registration/new",
+      "status": "migrated",
+      "artifacts": [
+        "components/AuthForm.island.tsx",
+        "components/AuthStatus.island.tsx",
+        "content/registration/new/index.smd",
+        "layouts/registrations/new.shtml",
+        "layouts/templates/application.shtml",
+        "lib/zb.ts"
+      ],
+      "endpoint": null,
+      "decision": {
+        "id": "RAILS_AUTH_JOURNEY.config/routes%2Erb.L38",
+        "choice": "island",
+        "rationale": "#167 Stage 3 assumption A5 folds the sign-in and sign-up forms into one question, because the answer to both is a single ZigBase auth collection. `users` is the artifact: it is the only auth collection in backend/openapi.json (an auth collection is recognisable ONLY by its create schema carrying both `password` and `passwordConfirm`), and naming any other name is refused. The answer scaffolds ONE components/AuthForm.island.tsx told apart by a `mode` prop, lib/zb.ts, and the three endpoints the document has no ids for -- authWithPassword, logout, createUsers."
+      },
+      "findings": [],
+      "note": "csrf_meta_tags dropped; javascript_importmap_tags dropped; app/javascript/application.js dropped by decision; choice island on RAILS_REQUEST_TIME_STATE.app/views/registrations/new%2Ehtml%2Eerb.L1C36 superseded by the island answering RAILS_AUTH_JOURNEY.config/routes%2Erb.L38, which replaced the region it sits in; choice island on RAILS_REQUEST_TIME_STATE.app/views/registrations/new%2Ehtml%2Eerb.L1C4 superseded by the island answering RAILS_AUTH_JOURNEY.config/routes%2Erb.L38, which replaced the region it sits in; app/views/shared/_nav.html.erb:5 `if current_user` folded into the AuthStatus island above it; app/views/shared/_nav.html.erb:5 `current_user.email` is inside the region the AuthStatus island replaced, so it mounts nothing of its own"
+    },
+    {
+      "route_id": "DELETE /session",
+      "status": "backend",
+      "artifacts": [],
+      "endpoint": {
+        "operation_id": "logout",
+        "verb": "POST",
+        "path": "/api/collections/users/auth-logout"
+      },
+      "decision": {
+        "id": "RAILS_AUTH_JOURNEY.config/routes%2Erb.L38",
+        "choice": "island",
+        "rationale": "#167 Stage 3 assumption A5 folds the sign-in and sign-up forms into one question, because the answer to both is a single ZigBase auth collection. `users` is the artifact: it is the only auth collection in backend/openapi.json (an auth collection is recognisable ONLY by its create schema carrying both `password` and `passwordConfirm`), and naming any other name is refused. The answer scaffolds ONE components/AuthForm.island.tsx told apart by a `mode` prop, lib/zb.ts, and the three endpoints the document has no ids for -- authWithPassword, logout, createUsers."
+      },
+      "findings": [],
+      "note": null
+    },
+    {
+      "route_id": "POST /session",
+      "status": "backend",
+      "artifacts": [],
+      "endpoint": {
+        "operation_id": "authWithPassword",
+        "verb": "POST",
+        "path": "/api/collections/users/auth-with-password"
+      },
+      "decision": {
+        "id": "RAILS_AUTH_JOURNEY.config/routes%2Erb.L38",
+        "choice": "island",
+        "rationale": "#167 Stage 3 assumption A5 folds the sign-in and sign-up forms into one question, because the answer to both is a single ZigBase auth collection. `users` is the artifact: it is the only auth collection in backend/openapi.json (an auth collection is recognisable ONLY by its create schema carrying both `password` and `passwordConfirm`), and naming any other name is refused. The answer scaffolds ONE components/AuthForm.island.tsx told apart by a `mode` prop, lib/zb.ts, and the three endpoints the document has no ids for -- authWithPassword, logout, createUsers."
+      },
+      "findings": [],
+      "note": null
+    },
+    {
+      "route_id": "GET /session/new",
+      "status": "migrated",
+      "artifacts": [
+        "components/AuthForm.island.tsx",
+        "components/AuthStatus.island.tsx",
+        "content/session/new/index.smd",
+        "layouts/sessions/new.shtml",
+        "layouts/templates/application.shtml",
+        "lib/zb.ts"
+      ],
+      "endpoint": null,
+      "decision": {
+        "id": "RAILS_AUTH_JOURNEY.config/routes%2Erb.L38",
+        "choice": "island",
+        "rationale": "#167 Stage 3 assumption A5 folds the sign-in and sign-up forms into one question, because the answer to both is a single ZigBase auth collection. `users` is the artifact: it is the only auth collection in backend/openapi.json (an auth collection is recognisable ONLY by its create schema carrying both `password` and `passwordConfirm`), and naming any other name is refused. The answer scaffolds ONE components/AuthForm.island.tsx told apart by a `mode` prop, lib/zb.ts, and the three endpoints the document has no ids for -- authWithPassword, logout, createUsers."
+      },
+      "findings": [],
+      "note": "csrf_meta_tags dropped; javascript_importmap_tags dropped; app/javascript/application.js dropped by decision; app/views/shared/_nav.html.erb:5 `if current_user` folded into the AuthStatus island above it; app/views/shared/_nav.html.erb:5 `current_user.email` is inside the region the AuthStatus island replaced, so it mounts nothing of its own"
+    },
+    {
+      "route_id": "GET /stream",
+      "status": "migrated",
+      "artifacts": [
+        "components/AuthStatus.island.tsx",
+        "components/TurboStream.island.tsx",
+        "content/stream/index.smd",
+        "layouts/pages/stream.shtml",
+        "layouts/templates/marketing.shtml",
+        "lib/zb.ts"
+      ],
+      "endpoint": null,
+      "decision": {
+        "id": "RAILS_JS_ENTRY.app/javascript/application%2Ejs.entry",
+        "choice": "drop",
+        "rationale": "The generated islands replace the reviewed Turbo and controller imports; the Rails application entry itself is not copied."
+      },
+      "findings": [],
+      "note": "csrf_meta_tags dropped; javascript_importmap_tags dropped; app/javascript/application.js dropped by decision; app/views/shared/_nav.html.erb:5 `if current_user` folded into the AuthStatus island above it; app/views/shared/_nav.html.erb:5 `current_user.email` is inside the region the AuthStatus island replaced, so it mounts nothing of its own"
+    },
+    {
+      "route_id": "GET /widgets",
+      "status": "migrated",
+      "artifacts": [
+        "components/AuthStatus.island.tsx",
+        "components/Chart.island.tsx",
+        "components/TurboFrame.island.tsx",
+        "components/stimulus/reveal.island.tsx",
+        "content/widgets/index.smd",
+        "layouts/pages/widgets.shtml",
+        "layouts/templates/marketing.shtml",
+        "lib/stimulus.ts",
+        "lib/zb.ts"
+      ],
+      "endpoint": null,
+      "decision": {
+        "id": "RAILS_COMPONENT_ROOT.app/views/pages/widgets%2Ehtml%2Eerb.L8C5",
+        "choice": "island",
+        "rationale": "Chart has literal serialisable props and a discovered React source, so the compatibility bridge can copy, render, and hydrate it."
+      },
+      "findings": [],
+      "note": "data-turbo attributes dropped; Turbo Drive is ordinary navigation here; csrf_meta_tags dropped; javascript_importmap_tags dropped; app/javascript/application.js dropped by decision; turbo-frame `static` inlined; app/views/shared/_nav.html.erb:5 `if current_user` folded into the AuthStatus island above it; app/views/shared/_nav.html.erb:5 `current_user.email` is inside the region the AuthStatus island replaced, so it mounts nothing of its own"
+    }
+  ],
+  "assets": [
+    {
+      "source": "app/assets/images/logo.png",
+      "rails_url": "/assets/logo-abc123.png",
+      "target_url": "/images/logo.png"
+    },
+    {
+      "source": "app/assets/stylesheets/application.css",
+      "rails_url": "/assets/application-def456.css",
+      "target_url": "/stylesheets/application.css"
+    },
+    {
+      "source": "public/robots.txt",
+      "rails_url": "/robots.txt",
+      "target_url": "/robots.txt"
+    }
+  ],
+  "redirects": [
+    {
+      "from": "/old",
+      "to": "/about"
+    }
+  ],
+  "parity": [
+    {
+      "id": "asset:/images/logo.png",
+      "kind": "asset",
+      "url": "/images/logo.png",
+      "expect": {
+        "status": 200,
+        "content_type": "image/png",
+        "rails_url": "/assets/logo-abc123.png"
+      }
+    },
+    {
+      "id": "asset:/robots.txt",
+      "kind": "asset",
+      "url": "/robots.txt",
+      "expect": {
+        "status": 200,
+        "content_type": "text/plain",
+        "rails_url": "/robots.txt"
+      }
+    },
+    {
+      "id": "asset:/stylesheets/application.css",
+      "kind": "asset",
+      "url": "/stylesheets/application.css",
+      "expect": {
+        "status": 200,
+        "content_type": "text/css",
+        "rails_url": "/assets/application-def456.css"
+      }
+    },
+    {
+      "id": "navigate:GET /",
+      "kind": "navigate",
+      "url": "/",
+      "expect": {
+        "status": 200,
+        "title": "About",
+        "h1": "About us",
+        "links": [
+          "/",
+          "/?from=about#top",
+          "/about"
+        ]
+      }
+    },
+    {
+      "id": "navigate:GET /about",
+      "kind": "navigate",
+      "url": "/about",
+      "expect": {
+        "status": 200,
+        "title": "About",
+        "h1": "About us",
+        "links": [
+          "/",
+          "/?from=about#top",
+          "/about"
+        ]
+      }
+    },
+    {
+      "id": "navigate:GET /linked",
+      "kind": "navigate",
+      "url": "/linked",
+      "expect": {
+        "status": 200,
+        "title": "Linked",
+        "h1": "Linked",
+        "links": [
+          "/",
+          "/about"
+        ]
+      }
+    },
+    {
+      "id": "navigate:GET /posts",
+      "kind": "navigate",
+      "url": "/posts",
+      "expect": {
+        "status": 200,
+        "title": "Posts",
+        "h1": "Posts",
+        "links": [
+          "/",
+          "/about"
+        ]
+      }
+    },
+    {
+      "id": "navigate:GET /posts/new",
+      "kind": "navigate",
+      "url": "/posts/new",
+      "expect": {
+        "status": 200,
+        "title": "New post",
+        "h1": "New post",
+        "links": [
+          "/",
+          "/about"
+        ]
+      }
+    },
+    {
+      "id": "navigate:GET /registration/new",
+      "kind": "navigate",
+      "url": "/registration/new",
+      "expect": {
+        "status": 200,
+        "title": null,
+        "h1": null,
+        "links": [
+          "/",
+          "/about"
+        ]
+      }
+    },
+    {
+      "id": "navigate:GET /session/new",
+      "kind": "navigate",
+      "url": "/session/new",
+      "expect": {
+        "status": 200,
+        "title": null,
+        "h1": null,
+        "links": [
+          "/",
+          "/about"
+        ]
+      }
+    },
+    {
+      "id": "navigate:GET /stream",
+      "kind": "navigate",
+      "url": "/stream",
+      "expect": {
+        "status": 200,
+        "title": null,
+        "h1": null,
+        "links": [
+          "/",
+          "/about"
+        ]
+      }
+    },
+    {
+      "id": "navigate:GET /widgets",
+      "kind": "navigate",
+      "url": "/widgets",
+      "expect": {
+        "status": 200,
+        "title": "Widgets",
+        "h1": null,
+        "links": [
+          "/",
+          "/about"
+        ]
+      }
+    },
+    {
+      "id": "signin:users",
+      "kind": "signin",
+      "url": "/api/collections/users/auth-with-password",
+      "expect": {
+        "status": 200,
+        "collection": "users",
+        "page_url": "/session/new"
+      }
+    },
+    {
+      "id": "signup:users",
+      "kind": "signup",
+      "url": "/api/collections/users/records",
+      "expect": {
+        "status": 201,
+        "collection": "users",
+        "page_url": "/registration/new"
+      }
+    },
+    {
+      "id": "submit_allowed:createPosts",
+      "kind": "submit_allowed",
+      "url": "/api/collections/posts/records",
+      "expect": {
+        "status_family": 2,
+        "operation_id": "createPosts",
+        "method": "POST",
+        "collection": "posts",
+        "page_url": "/posts/new",
+        "fields": [
+          {
+            "name": "body",
+            "value": "zigapagos parity",
+            "invalid_value": null
+          },
+          {
+            "name": "title",
+            "value": "zigapagos parity",
+            "invalid_value": ""
+          }
+        ]
+      }
+    },
+    {
+      "id": "submit_denied:createPosts",
+      "kind": "submit_denied",
+      "url": "/api/collections/posts/records",
+      "expect": {
+        "statuses": [
+          401,
+          403
+        ],
+        "operation_id": "createPosts",
+        "method": "POST",
+        "collection": "posts",
+        "fields": [
+          {
+            "name": "body",
+            "value": "zigapagos parity",
+            "invalid_value": null
+          },
+          {
+            "name": "title",
+            "value": "zigapagos parity",
+            "invalid_value": ""
+          }
+        ]
+      }
+    },
+    {
+      "id": "validation_error:createPosts:title",
+      "kind": "validation_error",
+      "url": "/api/collections/posts/records",
+      "expect": {
+        "status": 400,
+        "operation_id": "createPosts",
+        "method": "POST",
+        "collection": "posts",
+        "page_url": "/posts/new",
+        "field": "title",
+        "fields": [
+          {
+            "name": "body",
+            "value": "zigapagos parity",
+            "invalid_value": null
+          },
+          {
+            "name": "title",
+            "value": "zigapagos parity",
+            "invalid_value": ""
+          }
+        ]
+      }
+    }
+  ]
+}

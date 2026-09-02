@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html>
+  <head id="head">
+    <title>registrations new</title>
+    <!-- rails: csrf_meta_tags dropped; the ZigBase cookie/CSRF boundary owns this -->
+    <link rel="stylesheet" href="/stylesheets/application.css">
+    <!-- rails: javascript_importmap_tags dropped; @z/runtime replaces the Rails JS entry -->
+  <script type="importmap">{"imports":{"@z/runtime":"/zigapagos-runtime.js","@z/runtime/jsx-runtime":"/zigapagos-runtime.js","@z/runtime/jsx-dev-runtime":"/zigapagos-runtime.js","@z/runtime/compat":"/zigapagos-runtime.js","@z/runtime/compat/client":"/zigapagos-runtime.js","react":"/zigapagos-runtime.js","react-dom":"/zigapagos-runtime.js","react-dom/client":"/zigapagos-runtime.js","react/jsx-runtime":"/zigapagos-runtime.js","react/jsx-dev-runtime":"/zigapagos-runtime.js"}}</script><link rel="modulepreload" href="/zigapagos-runtime.js"><link rel="modulepreload" href="/islands/AuthStatus.island.js"><link rel="modulepreload" href="/islands/AuthForm.island.js"><script type="module" src="/zigapagos-runtime.js"></script></head>
+  <body class="application">
+    <nav>
+  <a href="/">Home</a>
+  <a href="/about">About</a>
+  <div data-z-island id="z-island-0" data-z-src="components/AuthStatus.island.tsx" data-z-client="load" data-z-module="/islands/AuthStatus.island.js"><a href="/session/new">Sign in</a></div><script type="application/json" data-z-props="z-island-0">{}</script>
+  
+  <img src="/images/logo.png" alt="Logo">
+</nav>
+
+    <main><div id="main">
+<div data-z-island id="z-island-1" data-z-src="components/AuthForm.island.tsx" data-z-client="load" data-z-module="/islands/AuthForm.island.js"><form><ul class="errors"></ul><label for="email">Email</label><input id="email" type="email" name="email" value/><label for="password">Password</label><input id="password" type="password" name="password" value/><label for="passwordConfirm">Password confirmation</label><input id="passwordConfirm" type="password" name="passwordConfirm" value/><button type="submit">Sign up</button></form></div><script type="application/json" data-z-props="z-island-1">{"mode":"signup"}</script>
+</div></main>
+    <footer>Presentation Fixture</footer>
+  </body>
+</html>

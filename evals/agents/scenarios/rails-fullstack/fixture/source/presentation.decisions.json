@@ -1,0 +1,146 @@
+{
+  "schema": "zigapagos.rails-decisions/1",
+  "decisions": [
+    {
+      "id": "RAILS_HELPER_UNKNOWN.app/views/pages/help%2Ehtml%2Eerb.L1C18",
+      "choice": "blocked",
+      "rationale": "number_to_currency has no static equivalent; /help does not ship until someone decides what it should render, so the target emits no page for it."
+    },
+    {
+      "id": "RAILS_RAW_OUTPUT.app/views/pages/help%2Ehtml%2Eerb.L1C47",
+      "choice": "blocked",
+      "rationale": "raw() output is unescaped author HTML from a Ruby expression; same route, same block."
+    },
+    {
+      "id": "RAILS_I18N_UNRESOLVED.app/views/pages/help%2Ehtml%2Eerb.L1C62",
+      "choice": "blocked",
+      "rationale": "the t() key resolves to nothing in this app's locale table; same route, same block."
+    },
+    {
+      "id": "RAILS_TEMPLATE_PARSE_ERROR.app/views/pages/broken%2Ehtml%2Eerb.L2",
+      "choice": "blocked",
+      "rationale": "broken.html.erb has an unclosed <% if %>; nothing can convert a template that does not parse, and nothing is emitted for it."
+    },
+    {
+      "id": "RAILS_ROUTE_HELPER_UNKNOWN.app/views/pages/links%2Ehtml%2Eerb.L1C5",
+      "choice": "blocked",
+      "rationale": "ghost_path names no route this run recovered; the link target is unknown, so /links does not ship."
+    },
+    {
+      "id": "RAILS_TEMPLATE_ENGINE_UNSUPPORTED.app/views/posts/legacy%2Ehtml%2Ehaml.engine",
+      "choice": "blocked",
+      "rationale": "legacy.html.haml is Haml; no converter reads that engine, so /posts/legacy is blocked rather than shipped empty."
+    },
+    {
+      "id": "RAILS_REDIRECT_HOST_CONFIG.config/routes%2Erb.L53",
+      "choice": "retain",
+      "rationale": "/old keeps redirecting to /about; the host config owns the rule, so there is nothing for the static tree to carry."
+    },
+    {
+      "id": "RAILS_REQUEST_TIME_STATE.app/views/posts/index%2Ehtml%2Eerb.L1C33",
+      "choice": "backend",
+      "rationale": "#184 and Stage 4 ruling B7: @posts is a portable collection read, so the generated data island calls the backend document's listPosts operation and owns the dynamic partial beneath it."
+    },
+    {
+      "id": "RAILS_REQUEST_TIME_STATE.app/views/posts/show%2Ehtml%2Eerb.L1C9",
+      "choice": "backend",
+      "rationale": "Stage 4 ruling B7: @post is a portable record read, so the generated SPA view calls the backend document's viewPosts operation."
+    },
+    {
+      "id": "RAILS_ROUTE_AUTH_GUARD.config/routes%2Erb.L14",
+      "choice": "public",
+      "rationale": "#167 Stage 3 assumption A7. PostsController runs before_action :require_login on #index, and a static page cannot enforce it -- the ZigBase rules on the posts collection do (listRule @public, createRule @request.auth.id != \"\"). `public` is the operator saying so out loud rather than the migration shipping a guarded page silently. It does NOT settle this route: the two `retain` answers above outrank it, so /posts stays on Rails and no page is written for it (ruling S20). Deleting those two is what makes this answer visible, and rails-presentation.sh runs exactly that variant."
+    },
+    {
+      "id": "RAILS_ROUTE_DYNAMIC_SEGMENT.config/routes%2Erb.L14",
+      "choice": "blocked",
+      "rationale": "The source route has no deterministic browser example for parity, so the full-stack fixture keeps it blocked instead of claiming an unproved SPA migration."
+    },
+    {
+      "id": "RAILS_BACKEND_ENDPOINT.config/routes%2Erb.L20.GET.posts",
+      "choice": "listPosts",
+      "rationale": "#167 Stage 3. GET /feed renders `Post.all` as JSON, which is exactly what the backend document's `listPosts` operation returns -- so the route is bound to it rather than kept on Rails. It is also the one route assumption A2 bites on: a user-facing GET the handoff calls `backend` is UNACCOUNTED until an operation is chosen, so without this answer the run cannot reach `complete` however everything else is answered."
+    },
+    {
+      "id": "RAILS_AUTH_JOURNEY.config/routes%2Erb.L38",
+      "choice": "island",
+      "artifact": "users",
+      "rationale": "#167 Stage 3 assumption A5 folds the sign-in and sign-up forms into one question, because the answer to both is a single ZigBase auth collection. `users` is the artifact: it is the only auth collection in backend/openapi.json (an auth collection is recognisable ONLY by its create schema carrying both `password` and `passwordConfirm`), and naming any other name is refused. The answer scaffolds ONE components/AuthForm.island.tsx told apart by a `mode` prop, lib/zb.ts, and the three endpoints the document has no ids for -- authWithPassword, logout, createUsers."
+    },
+    {
+      "id": "RAILS_REQUEST_TIME_STATE.app/views/shared/_nav%2Ehtml%2Eerb.L4C6",
+      "choice": "island",
+      "rationale": "the signed-OUT half of the nav (`unless current_user`). Together with the `if` half below it this is one complementary pair on one predicate, so the two answers mount ONE components/AuthStatus.island.tsx -- the component renders both branches itself, and mounting it twice would print the nav's sign-in link twice in the built page."
+    },
+    {
+      "id": "RAILS_REQUEST_TIME_STATE.app/views/shared/_nav%2Ehtml%2Eerb.L5C6",
+      "choice": "island",
+      "rationale": "the signed-IN half. The route's note names which of the pair was folded into the other."
+    },
+    {
+      "id": "RAILS_REQUEST_TIME_STATE.app/views/shared/_nav%2Ehtml%2Eerb.L5C28",
+      "choice": "island",
+      "rationale": "`current_user.email` inside that half; the AuthStatus island reads it from the browser's auth store instead. Note what is NOT answered here: the `button_to \"Sign out\"` beside it raises its own RAILS_BACKEND_ENDPOINT, and the AuthStatus island replaces the whole region including that control, so the region's answer is the only one it needs -- answering it separately is what rails-presentation.sh's negative arm covers."
+    },
+    {
+      "id": "RAILS_REQUEST_TIME_STATE.app/views/registrations/new%2Ehtml%2Eerb.L1C4",
+      "choice": "island",
+      "rationale": "the `@user&.errors&.any?` summary. The bound AuthForm renders the backend's own field errors where this rendered Rails', so the region is answered by the island rather than retained: this is the validation-presentation half of the backend boundary."
+    },
+    {
+      "id": "RAILS_REQUEST_TIME_STATE.app/views/registrations/new%2Ehtml%2Eerb.L1C36",
+      "choice": "island",
+      "rationale": "the `full_messages.each do |m|` loop inside that same summary. Answering it `island` is also what closes #181 here: the unbound `|m|` block local never reaches the converter at all once the island owns the region, so the route no longer carries an id-less `rails:unmapped local` that no answer could settle."
+    },
+    {
+      "id": "RAILS_STIMULUS_CONTROLLER.app/views/pages/widgets%2Ehtml%2Eerb.L2C1",
+      "choice": "island",
+      "rationale": "The reveal controller has a portable structural contract; preserve its element and targets in a generated island while flagging the untranslated action body at runtime."
+    },
+    {
+      "id": "RAILS_TURBO_FRAME.app/views/pages/widgets%2Ehtml%2Eerb.L6C5",
+      "choice": "island",
+      "rationale": "The latest frame has a static HTML route source, so a client island can fetch /posts and replace the frame body."
+    },
+    {
+      "id": "RAILS_TURBO_FRAME.app/views/pages/widgets%2Ehtml%2Eerb.L7C5",
+      "choice": "inline",
+      "rationale": "The static frame has no source; preserve its turbo-frame markup without adding a client island."
+    },
+    {
+      "id": "RAILS_COMPONENT_ROOT.app/views/pages/widgets%2Ehtml%2Eerb.L8C5",
+      "choice": "island",
+      "rationale": "Chart has literal serialisable props and a discovered React source, so the compatibility bridge can copy, render, and hydrate it."
+    },
+    {
+      "id": "RAILS_TURBO_STREAM.app/views/pages/live%2Ehtml%2Eerb.L1C5",
+      "choice": "blocked",
+      "rationale": "Realtime Turbo streams are deliberately outside Stage 4; /live does not ship until the follow-up converter exists."
+    },
+    {
+      "id": "RAILS_TURBO_STREAM.app/views/pages/stream%2Ehtml%2Eerb.L1C5",
+      "choice": "island-realtime",
+      "rationale": "The literal posts subscription maps to the ZigBase realtime client and dispatches portable create, update, and delete actions."
+    },
+    {
+      "id": "RAILS_TURBO_STREAM.app/views/pages/stream%2Ehtml%2Eerb.L2C5",
+      "choice": "island-realtime",
+      "rationale": "The literal append target is carried into the same realtime island as an explicit stream action."
+    },
+    {
+      "id": "RAILS_COMPONENT_VUE_UNSUPPORTED.app/views/pages/live%2Ehtml%2Eerb.L1C33",
+      "choice": "blocked",
+      "rationale": "The runtime compatibility bridge is React-only, so the Vue root blocks /live rather than shipping inert markup."
+    },
+    {
+      "id": "RAILS_BACKEND_ENDPOINT.app/views/posts/new%2Ehtml%2Eerb.L3C5",
+      "choice": "createPosts",
+      "rationale": "Stage 5 binds the conventional posts#new title/body form to the conditional createPosts ZigBase operation so the generated island and parity replay share one endpoint."
+    },
+    {
+      "id": "RAILS_JS_ENTRY.app/javascript/application%2Ejs.entry",
+      "choice": "drop",
+      "rationale": "The generated islands replace the reviewed Turbo and controller imports; the Rails application entry itself is not copied."
+    }
+  ]
+}
