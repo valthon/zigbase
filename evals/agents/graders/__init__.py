@@ -11,7 +11,7 @@ from ..result import EvalFailure
 
 #: Every grader a scenario may declare. Names use the manifest's hyphen convention;
 #: `grade` maps each to its module.
-GRADERS = frozenset({"genesis", "pocketbase", "rails-api"})
+GRADERS = frozenset({"genesis", "pocketbase", "rails-api", "rails-fullstack"})
 
 
 @dataclass(frozen=True)

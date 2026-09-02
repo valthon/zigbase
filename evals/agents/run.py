@@ -51,6 +51,30 @@ class HarnessError(RuntimeError):
     """The runner could not safely execute or grade the scenario."""
 
 
+def _atomic_result_copy(path: Path, rendered: str) -> None:
+    payload = (rendered + "\n").encode("utf-8")
+    path = path.absolute()
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        os.fchmod(descriptor, 0o600)
+        view = memoryview(payload)
+        while view:
+            written = os.write(descriptor, view)
+            view = view[written:]
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = -1
+        os.replace(temporary, path)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        temporary.unlink(missing_ok=True)
+
+
 def parse_agent_command(raw: str | None, maximum_bytes: int) -> list[str]:
     if raw is None:
         raise HarnessError("ZIGBASE_AGENT_COMMAND_JSON is not set")
@@ -177,6 +201,7 @@ def execute(
     )
     artifacts = artifacts_root.resolve() / run_id
     artifacts.mkdir(parents=True, exist_ok=False)
+    artifacts.chmod(0o700)
     workspace = Path(
         tempfile.mkdtemp(prefix="zigbase-agent-eval-", dir=work_root)
     ).resolve()
@@ -206,6 +231,7 @@ def execute(
             timeout_seconds=scenario.timeout_seconds,
             term_grace_seconds=scenario.term_grace_seconds,
             max_output_bytes=scenario.max_output_bytes,
+            read_output=False,
         )
         process_exit = completed.exit_code
         timed_out = completed.timed_out
@@ -352,8 +378,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.out is not None:
         try:
             output = resolve_output_path(args.out, args.artifacts_dir)
-            output.parent.mkdir(parents=True, exist_ok=True)
-            output.write_text(rendered + "\n")
+            _atomic_result_copy(output, rendered)
         except (ResultError, OSError) as exc:
             # Stdout remains authoritative when the optional copy cannot be
             # written; never emit a second object or a transcript.

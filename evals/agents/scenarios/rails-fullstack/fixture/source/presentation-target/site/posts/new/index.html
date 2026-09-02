@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html>
+  <head id="head">
+    <title>New post</title>
+    <!-- rails: csrf_meta_tags dropped; the ZigBase cookie/CSRF boundary owns this -->
+    <link rel="stylesheet" href="/stylesheets/application.css">
+    <!-- rails: javascript_importmap_tags dropped; @z/runtime replaces the Rails JS entry -->
+  <script type="importmap">{"imports":{"@z/runtime":"/zigapagos-runtime.js","@z/runtime/jsx-runtime":"/zigapagos-runtime.js","@z/runtime/jsx-dev-runtime":"/zigapagos-runtime.js","@z/runtime/compat":"/zigapagos-runtime.js","@z/runtime/compat/client":"/zigapagos-runtime.js","react":"/zigapagos-runtime.js","react-dom":"/zigapagos-runtime.js","react-dom/client":"/zigapagos-runtime.js","react/jsx-runtime":"/zigapagos-runtime.js","react/jsx-dev-runtime":"/zigapagos-runtime.js"}}</script><link rel="modulepreload" href="/zigapagos-runtime.js"><link rel="modulepreload" href="/islands/AuthStatus.island.js"><link rel="modulepreload" href="/islands/posts_new.island.js"><script type="module" src="/zigapagos-runtime.js"></script></head>
+  <body class="application">
+    <nav>
+  <a href="/">Home</a>
+  <a href="/about">About</a>
+  <div data-z-island id="z-island-0" data-z-src="components/AuthStatus.island.tsx" data-z-client="load" data-z-module="/islands/AuthStatus.island.js"><a href="/session/new">Sign in</a></div><script type="application/json" data-z-props="z-island-0">{}</script>
+  
+  <img src="/images/logo.png" alt="Logo">
+</nav>
+
+    <main><div id="main">
+<h1>New post</h1>
+<div data-z-island id="z-island-1" data-z-src="components/forms/posts_new.island.tsx" data-z-client="load" data-z-module="/islands/posts_new.island.js"><form><label for="title">Title</label><input id="title" type="text" name="title" value/><label for="body">Body</label><textarea id="body" name="body"></textarea><ul class="errors"></ul><button type="submit">Create post</button></form></div><script type="application/json" data-z-props="z-island-1">{}</script>
+</div></main>
+    <footer>Presentation Fixture</footer>
+  </body>
+</html>

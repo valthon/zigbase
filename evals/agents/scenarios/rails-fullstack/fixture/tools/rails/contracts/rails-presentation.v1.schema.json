@@ -1,0 +1,520 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://zigapagos.dev/schema/rails-presentation/1",
+  "title": "zigapagos Rails presentation manifest",
+  "description": "The `zigapagos.rails-presentation/1` manifest emitted by `zigapagos migrate --from rails`. Written by `src/cli/rails/manifest.zig`'s `build`, which is the binding shape -- this schema is generated FROM that file's Zig types (`src/cli/rails/schema_gen.zig`), not maintained by hand. Field order in every object below matches the manifest's actual emitted key order, which is part of the wire contract (see `manifest.zig`'s module doc).\n\nSTABILITY. Every declared field appears in `required`, because the emitter always writes every key -- `null` included -- rather than omitting absent ones. Schema `/1` has not shipped in a release (the manifest landed after v0.4.0), so its shape is still being completed and a required field may still be added to it. Once a release carries `/1`, that stops: adding a required key to a published version would make two documents claiming the same version id disagree about what a conforming document contains, and the id would then assert a compatibility it does not have. After that point, additions bump the version.",
+  "type": "object",
+  "properties": {
+    "schema": {
+      "type": "string"
+    },
+    "schema_version": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "generator": {
+      "type": "object",
+      "properties": {
+        "tool": {
+          "type": "string"
+        },
+        "version": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "version"
+      ],
+      "additionalProperties": false
+    },
+    "source": {
+      "type": "object",
+      "properties": {
+        "framework": {
+          "type": "string"
+        },
+        "version": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "properties": {
+            "value": {
+              "type": "string"
+            },
+            "evidence": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "value",
+            "evidence"
+          ],
+          "additionalProperties": false
+        },
+        "root_evidence": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "framework",
+        "version",
+        "root_evidence"
+      ],
+      "additionalProperties": false
+    },
+    "discovery": {
+      "type": "object",
+      "properties": {
+        "route_mode": {
+          "type": "string"
+        },
+        "ruby": {
+          "type": "object",
+          "properties": {
+            "available": {
+              "type": "boolean"
+            },
+            "version": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "available",
+            "version"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "route_mode",
+        "ruby"
+      ],
+      "additionalProperties": false
+    },
+    "routes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "`verb` + one space + `path` (e.g. \"GET /articles/:id\"). NOT a unique key: two identical route declarations in config/routes.rb -- an ordinary, if unusual, occurrence the parser does not reject -- produce the same id. Do not join on this field expecting uniqueness; a repeated id is a fact about the route table, not a generator defect to disambiguate away."
+          },
+          "verb": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "controller": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "action": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "source": {
+            "type": "object",
+            "properties": {
+              "file": {
+                "type": "string"
+              },
+              "line": {
+                "type": "integer",
+                "minimum": 0
+              }
+            },
+            "required": [
+              "file",
+              "line"
+            ],
+            "additionalProperties": false
+          },
+          "origin": {
+            "type": "string",
+            "enum": [
+              "static_ast",
+              "actiondispatch",
+              "routes_import"
+            ]
+          },
+          "confidence": {
+            "type": "string",
+            "enum": [
+              "certain",
+              "uncertain"
+            ]
+          },
+          "classification": {
+            "type": "string",
+            "enum": [
+              "content",
+              "island",
+              "spa",
+              "backend",
+              "redirect",
+              "unresolved"
+            ]
+          },
+          "reason": {
+            "type": "string"
+          },
+          "candidates": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "target": {
+                  "type": "string"
+                },
+                "evidence": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "target",
+                "evidence"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "templates": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The view plus every partial (direct or nested) this route's scan resolved and read. Can be SHORTER than the route's true template set: when a shared template (e.g. a layout) is unreadable, it drops out of every route that uses it, but RAILS_TEMPLATE_UNREADABLE names only ONE of those routes (see `blockers[].route_id`'s description) -- the other affected routes' shortened lists carry no blocker of their own."
+          },
+          "layout": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "verb",
+          "path",
+          "controller",
+          "action",
+          "name",
+          "source",
+          "origin",
+          "confidence",
+          "classification",
+          "reason",
+          "candidates",
+          "templates",
+          "layout"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "templates": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          },
+          "engine": {
+            "type": "string",
+            "enum": [
+              "erb",
+              "haml",
+              "slim",
+              "jbuilder",
+              "builder",
+              "none"
+            ]
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "view",
+              "layout",
+              "partial",
+              "mailer_view",
+              "controller",
+              "helper",
+              "stimulus_controller",
+              "js_entry",
+              "js_module",
+              "asset",
+              "other"
+            ]
+          },
+          "renders": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The partials (and other templates) this template's scan resolved AND successfully read. NOT guaranteed complete: an empty array at the scan's depth cap means \"the walk stopped looking here\", not \"this template renders nothing\" (a RAILS_TEMPLATE_RENDER_DEPTH_EXCEEDED blocker names where the walk stopped), and a shorter-than-source array can mean one or more of this template's OWN render calls named a target the scan could not resolve -- a dynamic expression (`render @post`) or a literal matching no known template -- in which case a RAILS_TEMPLATE_RENDER_UNRESOLVED blocker on this same `path` names the dropped call. An unreadable template never becomes a `templates[]` entry at all, so every entry present here was itself successfully read; only its own render targets may be unresolved."
+          },
+          "stimulus_controllers": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "component_roots": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "required": [
+          "path",
+          "engine",
+          "kind",
+          "renders",
+          "stimulus_controllers",
+          "component_roots"
+        ],
+        "additionalProperties": false
+      },
+      "description": "Every template this run's route scans resolved and read, deduplicated by path -- ROUTE-REACHABLE, not an app-wide listing of every file under app/views/. A template no recovered route's scan ever reaches (e.g. a mailer view) is simply absent, with no blocker naming the gap."
+    },
+    "assets": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "source": {
+            "type": "string"
+          },
+          "public_url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "pipeline": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "enum": [
+              "propshaft",
+              "sprockets",
+              null
+            ]
+          },
+          "deterministic": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "source",
+          "public_url",
+          "pipeline",
+          "deterministic"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "integrations": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "version": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The Gemfile.lock-resolved version for a gem-sourced integration, the package.json dependency value for an npm-sourced one, or `null` when neither source names a version. `null` here is a real, expected answer, never a placeholder."
+          },
+          "evidence": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "version",
+          "evidence"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "blockers": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "severity": {
+            "type": "string",
+            "enum": [
+              "error",
+              "warn"
+            ],
+            "description": "Descriptive metadata about the finding -- a DIFFERENT axis from `integrity` on this same object (see that field's description); do not derive one from the other. A run that merely lacks Ruby reports `severity: \"error\"` blockers with `integrity: false`: filtering on `severity == \"error\"` alone will surface those on an otherwise perfectly healthy run."
+          },
+          "integrity": {
+            "type": "boolean",
+            "description": "Whether this blocker means the manifest itself is untrustworthy -- this is the field the tool's exit code is computed from. A DIFFERENT axis from `severity` on this same object (see that field's description); do not derive one from the other. `integrity: false` blockers (e.g. Ruby genuinely unavailable) describe expected, non-failing degradation, not a defect to fix."
+          },
+          "source": {
+            "type": "object",
+            "properties": {
+              "file": {
+                "type": "string",
+                "description": "Source path the blocker concerns, relative to the app root -- never an absolute path from the machine that ran this tool. A blocker about the toolchain itself rather than one app file (e.g. a missing Ruby interpreter) names the sidecar script it ran (`sidecar/rails/analyze.rb`) here; machine-specific detail belongs in `message`, never in this field, so two machines running the same app produce the same manifest bytes."
+              },
+              "line": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "minimum": 0,
+                "description": "1-based source line, or `null` when this blocker genuinely has no single source line (an unreadable Gemfile, a missing sidecar). `null` here is a real, expected answer, never a placeholder for an unset value."
+              }
+            },
+            "required": [
+              "file",
+              "line"
+            ],
+            "additionalProperties": false
+          },
+          "message": {
+            "type": "string"
+          },
+          "route_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Names ONE route affected by this blocker, not necessarily every route affected. RAILS_TEMPLATE_UNREADABLE in particular is deduplicated per FILE: a layout shared by twenty routes yields a single blocker carrying whichever route's scan happened to hit the unreadable file first. Do not treat this field as exhaustive -- fixing only the named route can leave every other affected route still broken. `null` when the blocker names no single route (e.g. an unreadable Gemfile)."
+          }
+        },
+        "required": [
+          "code",
+          "severity",
+          "integrity",
+          "source",
+          "message",
+          "route_id"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "`<code>.<path>.<loc>` with `%` and `.` reversibly escaped (`%` -> `%25`, then `.` -> `%2E`) -- rails2zb's own scheme, reused rather than reimplemented. Stable across a reworded `message` or a template edit elsewhere in the file, so a Stage 2 decision file can reconcile against a PRIOR run's recorded operator choice even after either changes. This is the join key; `message` is prose and deliberately not part of it."
+          },
+          "code": {
+            "type": "string"
+          },
+          "severity": {
+            "type": "string",
+            "enum": [
+              "error",
+              "warn"
+            ]
+          },
+          "source": {
+            "type": "object",
+            "properties": {
+              "file": {
+                "type": "string"
+              },
+              "line": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "minimum": 0
+              }
+            },
+            "required": [
+              "file",
+              "line"
+            ],
+            "additionalProperties": false
+          },
+          "route_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The one recovered route this question is scoped to, or `null` for template-, controller-, and application-scoped questions. This is context, not the finding join key: use `id` to record a decision, and do not assume route ids are unique when routes.rb repeats a declaration."
+          },
+          "message": {
+            "type": "string",
+            "description": "Human-readable explanation of the unresolved choice. This prose may be clarified between generator versions and is deliberately not stable identity; join decisions using `id`, never this field."
+          },
+          "choices": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The fixed set of answers an operator may record against this finding (e.g. \"island\", \"retain\", \"blocked\"). Always non-empty and always drawn from the derivation table's static choice sets -- never computed per finding."
+          },
+          "requires_artifact": {
+            "type": "boolean",
+            "description": "Whether resolving this finding requires generating an artifact (e.g. an island component) rather than merely recording a choice. `false` for every finding this generator version produces; reserved for a later finding kind that needs Stage 2 to emit something, not just record a decision."
+          }
+        },
+        "required": [
+          "id",
+          "code",
+          "severity",
+          "source",
+          "route_id",
+          "message",
+          "choices",
+          "requires_artifact"
+        ],
+        "additionalProperties": false
+      },
+      "description": "Questions for the operator this run could not answer on its own -- each meant to be answered by id in a Stage 2 MIGRATION.decisions.json, not positionally. A SEPARATE array from `blockers[]` on purpose: a blocker is a fact about what discovery could or couldn't establish (drives the exit code via `integrity`); a finding is a per-fragment CHOICE this run leaves to the operator (keep an ERB helper as an island, retire it, block the route). A consumer filtering `blockers[]` for integrity facts must never see operator questions mixed in."
+    }
+  },
+  "required": [
+    "schema",
+    "schema_version",
+    "generator",
+    "source",
+    "discovery",
+    "routes",
+    "templates",
+    "assets",
+    "integrations",
+    "blockers",
+    "findings"
+  ],
+  "additionalProperties": false
+}

@@ -17,14 +17,13 @@ on its own:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
-import socket
 import sqlite3
+import stat
 import tempfile
-import urllib.error
-import urllib.request
 from pathlib import Path
 from typing import Any, Callable
 
@@ -32,6 +31,19 @@ from tools.rails import rails2zb
 
 from ..result import EvalFailure
 from . import GradeReport
+from ._harness import (
+    EVAL_ENVIRONMENT,
+    canonical_executable,
+    free_port,
+    health_json,
+    json_http_request,
+    read_bounded_regular,
+    regular_file_inventory,
+    require_command_success,
+    served_target,
+    strict_json_loads,
+    strict_utf8,
+)
 from .genesis import (
     Commands,
     DoctorReport,
@@ -40,9 +52,16 @@ from .genesis import (
     _failure,
     _wait_http,
     parse_doctor_ndjson,
+    prepare_grader_scratch,
 )
 
 MAX_JSON_BYTES = 4 * 1024 * 1024
+MAX_SOURCE_FILE_BYTES = 16 * 1024 * 1024
+MAX_SOURCE_TOTAL_BYTES = 64 * 1024 * 1024
+PINNED_SOURCE = (
+    Path(__file__).resolve().parents[1] / "scenarios/rails-api/fixture/source"
+)
+
 
 #: Every row of the frozen snapshot, including the club `default_scope` hides. A
 #: migration that reads through the model loses that one and looks correct doing it.
@@ -137,11 +156,6 @@ FRONTEND_DENIALS = (
 #: The rehearsal runs offline against a disposable target. A fixed secret keeps the
 #: rehash-survives-restart check meaningful: a fresh one each boot would invalidate
 #: every token and mask a credential that did not actually migrate.
-EVAL_ENVIRONMENT = {
-    "ZIGBASE_JWT_SECRET": "x" * 64,
-    "ZIGBASE_SMTP_HOST": "smtp.example.invalid",
-    "ZIGBASE_PUBLIC_URL": "https://eval.invalid",
-}
 
 LOGIN_EMAIL = "ada@example.test"
 LOGIN_PASSWORD = "ada-password-1"
@@ -162,18 +176,55 @@ MIGRATED_FILE_PATH = "/api/files/posts/1/morning-pages-cover.png"
 
 
 def _json(path: Path, label: str) -> Any:
-    if not path.is_file():
-        raise GradeFailure(f"completion.{label}_missing", f"{label} is missing: {path}")
-    if path.stat().st_size > MAX_JSON_BYTES:
-        raise GradeFailure(
-            f"completion.{label}_too_large", f"{label} exceeds the size bound"
-        )
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raw = read_bounded_regular(path, MAX_JSON_BYTES)
+        return strict_json_loads(strict_utf8(raw, str(path)))
+    except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
         raise GradeFailure(
             f"completion.{label}_unreadable", f"{label} is unreadable: {exc}"
         ) from exc
+
+
+def _source_files(root: Path) -> dict[Path, tuple[Path, int]]:
+    try:
+        return regular_file_inventory(
+            root,
+            ignored=lambda relative: (
+                "__pycache__" in relative.parts
+                or relative.suffix in {".pyc", ".pyo"}
+                or relative.name.endswith(("-wal", "-shm"))
+            ),
+            maximum_file=MAX_SOURCE_FILE_BYTES,
+            maximum_total=MAX_SOURCE_TOTAL_BYTES,
+        )
+    except ValueError as exc:
+        raise GradeFailure("source.changed", f"source snapshot changed: {exc}") from exc
+    except OSError as exc:
+        raise GradeFailure(
+            "source.unreadable", f"cannot inspect source: {exc}"
+        ) from exc
+
+
+def _verify_frozen_source(source: Path) -> None:
+    expected = _source_files(PINNED_SOURCE)
+    actual = _source_files(source)
+    if set(expected) != set(actual) or any(
+        actual[relative][1] != expected_size
+        for relative, (_, expected_size) in expected.items()
+    ):
+        raise GradeFailure("source.changed", "source snapshot differs from the fixture")
+    try:
+        for relative, (expected_path, _) in expected.items():
+            if read_bounded_regular(
+                expected_path, MAX_SOURCE_FILE_BYTES
+            ) != read_bounded_regular(actual[relative][0], MAX_SOURCE_FILE_BYTES):
+                raise GradeFailure(
+                    "source.changed", f"source artifact changed: {relative}"
+                )
+    except GradeFailure:
+        raise
+    except (OSError, ValueError) as exc:
+        raise GradeFailure("source.unreadable", f"cannot read source: {exc}") from exc
 
 
 def verify_source(source: Path) -> dict[str, Any]:
@@ -188,6 +239,7 @@ def verify_source(source: Path) -> dict[str, Any]:
             "source.wrong_revision",
             f"the snapshot reports Rails {freeze.get('rails_version')!r}, not 8.1.3.1",
         )
+    _verify_frozen_source(source)
     loaded = rails2zb.load_source(source)
     if loaded.mode != "observed":
         raise GradeFailure(
@@ -374,19 +426,95 @@ def _verify_bundle(
             "the bundle was not built from this snapshot's inventory",
         )
     hashes = _json(bundle / "hashes.json", "hashes")
-    recorded = {entry["path"]: entry["sha256"] for entry in hashes["outputs"]}
-    on_disk = {
-        path.relative_to(bundle).as_posix()
-        for path in bundle.rglob("*")
-        if path.is_file() and path.name != "hashes.json"
-    }
-    if set(recorded) != on_disk:
+    if (
+        not isinstance(hashes, dict)
+        or set(hashes) != {"zigbaseRailsHashes", "outputs"}
+        or hashes["zigbaseRailsHashes"] != 1
+        or not isinstance(hashes["outputs"], list)
+    ):
+        raise GradeFailure(
+            "completion.bundle_unattested", "hashes.json has an invalid envelope"
+        )
+    recorded: dict[str, tuple[int, str]] = {}
+    for index, entry in enumerate(hashes["outputs"]):
+        if not isinstance(entry, dict) or set(entry) != {"path", "bytes", "sha256"}:
+            raise GradeFailure(
+                "completion.bundle_unattested",
+                f"hashes.json output {index} has an invalid shape",
+            )
+        relative, size, digest = entry["path"], entry["bytes"], entry["sha256"]
+        relative_path = Path(relative) if isinstance(relative, str) else Path()
+        if (
+            not isinstance(relative, str)
+            or not relative
+            or relative_path.is_absolute()
+            or ".." in relative_path.parts
+            or "\\" in relative
+            or "\x00" in relative
+            or isinstance(size, bool)
+            or not isinstance(size, int)
+            or size < 0
+            or not isinstance(digest, str)
+            or len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+        ):
+            raise GradeFailure(
+                "completion.bundle_unattested",
+                f"hashes.json output {index} has invalid values",
+            )
+        if relative in recorded:
+            raise GradeFailure(
+                "completion.bundle_unattested",
+                f"hashes.json repeats output path {relative!r}",
+            )
+        recorded[relative] = (size, digest)
+    on_disk: dict[str, tuple[Path, int]] = {}
+    total = 0
+    try:
+        for path in bundle.rglob("*"):
+            relative = path.relative_to(bundle).as_posix()
+            metadata = os.lstat(path)
+            if stat.S_ISLNK(metadata.st_mode) or not (
+                stat.S_ISDIR(metadata.st_mode) or stat.S_ISREG(metadata.st_mode)
+            ):
+                raise GradeFailure(
+                    "completion.bundle_unsafe", f"unsafe bundle artifact: {relative}"
+                )
+            if stat.S_ISDIR(metadata.st_mode) or path.name == "hashes.json":
+                continue
+            if metadata.st_size > MAX_SOURCE_FILE_BYTES:
+                raise GradeFailure(
+                    "completion.bundle_unsafe", f"oversized bundle artifact: {relative}"
+                )
+            total += metadata.st_size
+            if total > MAX_SOURCE_TOTAL_BYTES:
+                raise GradeFailure(
+                    "completion.bundle_unsafe", "migration bundle is oversized"
+                )
+            on_disk[relative] = (path, metadata.st_size)
+    except OSError as exc:
+        raise GradeFailure(
+            "completion.bundle_unsafe", f"cannot inspect migration bundle: {exc}"
+        ) from exc
+    if set(recorded) != set(on_disk):
         raise GradeFailure(
             "completion.bundle_unattested",
             "hashes.json does not cover exactly the bundle's outputs",
         )
-    for relative, digest in recorded.items():
-        if rails2zb.sha256_file(bundle / relative) != digest:
+    for relative, (recorded_size, digest) in recorded.items():
+        if on_disk[relative][1] != recorded_size:
+            raise GradeFailure(
+                "completion.bundle_corrupt",
+                f"{relative} does not match its recorded size",
+            )
+        try:
+            payload = read_bounded_regular(on_disk[relative][0], MAX_SOURCE_FILE_BYTES)
+        except (OSError, ValueError) as exc:
+            raise GradeFailure(
+                "completion.bundle_unsafe",
+                f"cannot safely read bundle artifact {relative}: {exc}",
+            ) from exc
+        if hashlib.sha256(payload).hexdigest() != digest:
             raise GradeFailure(
                 "completion.bundle_corrupt",
                 f"{relative} does not match its recorded hash",
@@ -468,45 +596,77 @@ def inspect_rules(workspace: Path, report: dict[str, Any] | None) -> list[EvalFa
 
 
 def _binary(binary_path: str | None = None) -> str:
-    resolved = binary_path or os.environ.get("ZIGBASE_EVAL_BINARY")
-    if not resolved:
+    candidate = binary_path or os.environ.get("ZIGBASE_EVAL_BINARY")
+    if not candidate:
         raise GradeFailure(
             "rehearsal.binary_missing",
             "ZIGBASE_EVAL_BINARY is not set; the rehearsal needs the pinned binary",
         )
-    if not Path(resolved).is_file():
-        raise GradeFailure("rehearsal.binary_missing", f"no binary at {resolved}")
-    return resolved
-
-
-def _free_port() -> int:
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
+    resolved = canonical_executable(candidate)
+    if resolved is None:
+        raise GradeFailure(
+            "rehearsal.binary_missing", f"no regular executable binary at {candidate}"
+        )
+    return str(resolved)
 
 
 def _request(
     method: str, url: str, *, token: str | None = None, body: Any = None
 ) -> tuple[int, bytes]:
-    data = None if body is None else json.dumps(body).encode()
-    request = urllib.request.Request(url, data=data, method=method)
-    if data is not None:
-        request.add_header("Content-Type", "application/json")
-    if token:
-        request.add_header("Authorization", f"Bearer {token}")
+    status, payload, _ = json_http_request(method, url, token=token, body=body)
+    return status, payload
+
+
+def _response_json(payload: bytes, code: str) -> dict[str, Any]:
     try:
-        with urllib.request.urlopen(request, timeout=15) as response:
-            return response.status, response.read()
-    except urllib.error.HTTPError as error:
-        return error.code, error.read()
+        value = strict_json_loads(strict_utf8(payload, f"{code} response"))
+    except (ValueError, json.JSONDecodeError) as exc:
+        raise GradeFailure(code, "target returned malformed JSON") from exc
+    if not isinstance(value, dict):
+        raise GradeFailure(code, "target response is not a JSON object")
+    return value
 
 
 def _run_ok(result: Any, code: str, what: str) -> None:
-    if result.returncode != 0:
-        raise GradeFailure(
-            code,
-            f"{what} failed ({result.returncode}): {(result.stderr or result.stdout)[-400:]}",
+    require_command_success(result, code, what, GradeFailure)
+
+
+def _check_rehearsal_start(result: Any) -> None:
+    _run_ok(result, "rehearsal.serve", "starting the rehearsal server")
+
+
+def _rehearsal_teardown_failure(result: Any) -> EvalFailure | None:
+    if isinstance(result, Exception):
+        return _failure(
+            "tests.teardown",
+            f"the rehearsal server stop command failed: {type(result).__name__}: {result}",
         )
+    return (
+        None
+        if result.returncode == 0
+        else _failure(
+            "tests.teardown",
+            "the rehearsal server did not stop; a later run would find the data dir "
+            "owned by an orphan",
+        )
+    )
+
+
+def _check_deployment_start(result: Any) -> None:
+    _run_ok(result, "deployment.serve", "starting a server on the restored copy")
+
+
+def _deployment_teardown_failure(result: Any) -> EvalFailure | None:
+    if isinstance(result, Exception):
+        return _failure(
+            "deployment.teardown",
+            f"the restored server stop command failed: {type(result).__name__}: {result}",
+        )
+    return (
+        None
+        if result.returncode == 0
+        else _failure("deployment.teardown", "the restored server did not stop")
+    )
 
 
 def probe_behavior(
@@ -531,7 +691,7 @@ def probe_behavior(
             "parity.legacy_login",
             f"the migrated bcrypt credential did not log in ({status})",
         )
-    token = json.loads(payload).get("token")
+    token = _response_json(payload, "parity.legacy_login").get("token")
     if not token:
         raise GradeFailure("parity.legacy_login", "login returned no token")
 
@@ -543,7 +703,7 @@ def probe_behavior(
             f"an unauthenticated list returned {status}; a rule hiding every row "
             f"answers 200 with an empty array",
         )
-    if json.loads(payload).get("items") != []:
+    if _response_json(payload, "parity.empty_list").get("items") != []:
         raise GradeFailure("parity.empty_list", "an unauthenticated list leaked rows")
 
     # A single record the caller may not see is CONCEALED, not announced.
@@ -564,7 +724,10 @@ def probe_behavior(
         raise GradeFailure(
             "parity.owner_scope", f"an owner-scoped list returned {status}, not 200"
         )
-    if len(json.loads(payload).get("items") or []) != EXPECTED_ROWS["notifications"]:
+    if (
+        len(_response_json(payload, "parity.owner_scope").get("items") or [])
+        != EXPECTED_ROWS["notifications"]
+    ):
         raise GradeFailure(
             "parity.owner_scope", "the owner cannot see their own notification"
         )
@@ -579,11 +742,13 @@ def probe_behavior(
             "parity.legacy_login",
             f"the second migrated credential did not log in ({status})",
         )
-    other = json.loads(payload).get("token")
+    other = _response_json(payload, "parity.legacy_login").get("token")
     status, payload = http_request(
         "GET", f"{base}/api/collections/notifications/records", token=other
     )
-    if status != 200 or (json.loads(payload).get("items") or []):
+    if status != 200 or (
+        _response_json(payload, "parity.owner_scope").get("items") or []
+    ):
         raise GradeFailure(
             "parity.owner_scope",
             "a second actor can see notifications belonging to someone else",
@@ -620,11 +785,6 @@ def probe_behavior(
             "parity.validation",
             f"an invalid signup returned {status}, not a validation failure",
         )
-
-
-def _health_json(url: str, timeout: float) -> Any:
-    with urllib.request.urlopen(url, timeout=timeout) as response:
-        return json.loads(response.read())
 
 
 def _inspect_database(data_dir: Path) -> None:
@@ -678,12 +838,12 @@ def run_rehearsal(
     artifacts: Path,
     commands: Commands,
     *,
-    port_picker: Callable[[], int] = _free_port,
+    port_picker: Callable[[], int] = free_port,
     binary_path: str | None = None,
     behavior_probe: Callable[..., None] = probe_behavior,
     database_inspector: Callable[..., None] = _inspect_database,
     file_installer: Callable[..., dict[str, int]] = rails2zb.install_files,
-    health_getter: Callable[..., Any] = _health_json,
+    health_getter: Callable[..., Any] = health_json,
     health_attempts: int = 30,
 ) -> tuple[bool, DoctorReport | None, list[EvalFailure]]:
     failures: list[EvalFailure] = []
@@ -698,8 +858,7 @@ def run_rehearsal(
         # workspace has no runner behind it, and facil.io needs a real TMPDIR to open
         # its cluster socket. Without them `serve` dies with a FATAL nobody would trace
         # back to a missing directory.
-        for scaffold in (".home", ".tmp"):
-            (workspace / scaffold).mkdir(exist_ok=True)
+        prepare_grader_scratch(workspace)
         env = dict(EVAL_ENVIRONMENT)
 
         _run_ok(
@@ -791,9 +950,47 @@ def run_rehearsal(
             )
         doctor = parse_doctor_ndjson(doctor_result.stdout)
 
-        # Doctor runs BEFORE the agent's own boundary: it grades the target's
-        # configuration, which exists as soon as the data is imported, and a failing
-        # agent test must not take `rules_locked` down with `tests_green`.
+        with served_target(
+            commands,
+            binary,
+            workspace,
+            target,
+            port_picker(),
+            health_getter,
+            _wait_http,
+            failures,
+            _check_rehearsal_start,
+            _rehearsal_teardown_failure,
+            health_attempts=health_attempts,
+        ) as base:
+            # `--background` rather than a Popen: `serve` DETACHES on its own inside any
+            # AI-agent environment (src/serve_control.zig sniffs CLAUDECODE and friends),
+            # so a foreground child forks and exits and `terminate()` kills a corpse --
+            # leaving a live server holding the port and the data dir, and letting the
+            # restore copy a database out from under a running writer. Going through
+            # `commands.run` also keeps the server on the same allowlisted environment
+            # every other command gets, so `doctor` judges the configuration that is
+            # actually serving.
+            behavior_probe(base)
+            database_inspector(target)
+        return True, doctor, failures
+    except GradeFailure as exc:
+        failures.append(_failure(exc.code, str(exc)))
+    except (rails2zb.RailsError, OSError, KeyError, TypeError, ValueError) as exc:
+        failures.append(_failure("rehearsal.error", f"{type(exc).__name__}: {exc}"))
+    return False, doctor, failures
+
+
+def run_agent_boundary(
+    workspace: Path,
+    commands: Commands,
+    *,
+    binary_path: str | None = None,
+) -> tuple[bool, list[EvalFailure]]:
+    """Run mutable agent-authored code only after every trusted live probe is done."""
+    failures: list[EvalFailure] = []
+    try:
+        binary = _binary(binary_path)
         result = commands.run(
             [
                 "python3",
@@ -806,67 +1003,17 @@ def run_rehearsal(
                 "test_migration.py",
             ],
             cwd=workspace,
-            env=env,
+            env={**EVAL_ENVIRONMENT, "ZIGBASE_BINARY": binary},
         )
         _run_ok(result, "tests.boundary_failed", "the agent's migration boundary")
-
-        port = port_picker()
-        base = f"http://127.0.0.1:{port}"
-        started = False
-        try:
-            # `--background` rather than a Popen: `serve` DETACHES on its own inside any
-            # AI-agent environment (src/serve_control.zig sniffs CLAUDECODE and friends),
-            # so a foreground child forks and exits and `terminate()` kills a corpse --
-            # leaving a live server holding the port and the data dir, and letting the
-            # restore copy a database out from under a running writer. Going through
-            # `commands.run` also keeps the server on the same allowlisted environment
-            # every other command gets, so `doctor` judges the configuration that is
-            # actually serving.
-            _run_ok(
-                commands.run(
-                    [
-                        binary,
-                        "serve",
-                        "--background",
-                        "--insecure-cookies",
-                        "--http-port",
-                        str(port),
-                        "--data-dir",
-                        str(target),
-                    ],
-                    cwd=workspace,
-                    env=env,
-                    timeout=60,
-                ),
-                "rehearsal.serve",
-                "starting the rehearsal server",
-            )
-            started = True
-            _wait_http(health_getter, f"{base}/api/health", health_attempts)
-            behavior_probe(base)
-            database_inspector(target)
-        finally:
-            if started:
-                stopped = commands.run(
-                    [binary, "serve", "stop", "--data-dir", str(target)],
-                    cwd=workspace,
-                    env=env,
-                    timeout=30,
-                )
-                if stopped.returncode != 0:
-                    failures.append(
-                        _failure(
-                            "tests.teardown",
-                            "the rehearsal server did not stop; a later run would "
-                            "find the data dir owned by an orphan",
-                        )
-                    )
-        return True, doctor, failures
+        return True, failures
     except GradeFailure as exc:
         failures.append(_failure(exc.code, str(exc)))
-    except (rails2zb.RailsError, OSError, KeyError, TypeError, ValueError) as exc:
-        failures.append(_failure("rehearsal.error", f"{type(exc).__name__}: {exc}"))
-    return False, doctor, failures
+    except (OSError, TypeError, ValueError) as exc:
+        failures.append(
+            _failure("tests.boundary_error", f"{type(exc).__name__}: {exc}")
+        )
+    return False, failures
 
 
 def run_restore(
@@ -875,8 +1022,8 @@ def run_restore(
     commands: Commands,
     *,
     binary_path: str | None = None,
-    port_picker: Callable[[], int] = _free_port,
-    health_getter: Callable[..., Any] = _health_json,
+    port_picker: Callable[[], int] = free_port,
+    health_getter: Callable[..., Any] = health_json,
     health_attempts: int = 30,
     restore_probe: Callable[..., None] = None,  # type: ignore[assignment]
     database_inspector: Callable[..., None] = _inspect_database,
@@ -920,48 +1067,21 @@ def run_restore(
                 "deployment.incomplete_unit", "the copied backup has no data.db"
             )
 
-        port = port_picker()
-        base = f"http://127.0.0.1:{port}"
-        started = False
-        try:
-            _run_ok(
-                commands.run(
-                    [
-                        binary,
-                        "serve",
-                        "--background",
-                        "--insecure-cookies",
-                        "--http-port",
-                        str(port),
-                        "--data-dir",
-                        str(second),
-                    ],
-                    cwd=workspace,
-                    env=dict(EVAL_ENVIRONMENT),
-                    timeout=60,
-                ),
-                "deployment.serve",
-                "starting a server on the restored copy",
-            )
-            started = True
-            _wait_http(health_getter, f"{base}/api/health", health_attempts)
+        with served_target(
+            commands,
+            binary,
+            workspace,
+            second,
+            port_picker(),
+            health_getter,
+            _wait_http,
+            failures,
+            _check_deployment_start,
+            _deployment_teardown_failure,
+            health_attempts=health_attempts,
+        ) as base:
             database_inspector(second)
             (restore_probe or _probe_restored)(base)
-        finally:
-            if started:
-                stopped = commands.run(
-                    [binary, "serve", "stop", "--data-dir", str(second)],
-                    cwd=workspace,
-                    env=dict(EVAL_ENVIRONMENT),
-                    timeout=30,
-                )
-                if stopped.returncode != 0:
-                    failures.append(
-                        _failure(
-                            "deployment.teardown",
-                            "the restored server did not stop",
-                        )
-                    )
         return True, failures
     except GradeFailure as exc:
         failures.append(_failure(exc.code, str(exc)))
@@ -984,7 +1104,7 @@ def _probe_restored(
             "deployment.restored_login",
             f"the migrated credential did not log in against the restored copy ({status})",
         )
-    if not json.loads(payload).get("token"):
+    if not _response_json(payload, "restore.legacy_login").get("token"):
         raise GradeFailure(
             "deployment.restored_login",
             "login against the restored copy returned no token",
@@ -996,12 +1116,12 @@ def grade(
     artifacts: Path,
     *,
     commands: Commands | None = None,
-    port_picker: Callable[[], int] = _free_port,
+    port_picker: Callable[[], int] = free_port,
     binary_path: str | None = None,
     behavior_probe: Callable[..., None] = probe_behavior,
     database_inspector: Callable[..., None] = _inspect_database,
     file_installer: Callable[..., dict[str, int]] = rails2zb.install_files,
-    health_getter: Callable[..., Any] = _health_json,
+    health_getter: Callable[..., Any] = health_json,
     health_attempts: int = 30,
     restore_probe: Callable[..., None] | None = None,
 ) -> GradeReport:
@@ -1038,6 +1158,12 @@ def grade(
         database_inspector=database_inspector,
     )
     failures.extend(restore_failures)
+
+    boundary_green, boundary_failures = run_agent_boundary(
+        workspace, commands, binary_path=binary_path
+    )
+    failures.extend(boundary_failures)
+    tests_green = tests_green and boundary_green
 
     # `rules_locked` does not depend on the rehearsal reaching doctor. Every step before
     # the doctor call — schema apply, either import — used to leave `doctor` None and so
