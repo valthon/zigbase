@@ -14,10 +14,12 @@ from __future__ import annotations
 
 import json
 import shutil
+import sys
 from pathlib import Path
 
 import pytest
 
+from evals.agents.graders import rails_api as rails_api_grader
 from evals.agents.graders.genesis import CommandResult
 from evals.agents.graders.rails_api import (
     EXPECTED_PUBLIC,
@@ -25,12 +27,31 @@ from evals.agents.graders.rails_api import (
     grade,
     inspect_completion,
     load_reviewed_public_inventory,
+    run_rehearsal,
 )
 from evals.agents.scenario import AgentScenario
 
 REPO = Path(__file__).resolve().parents[2]
 FIXTURE = REPO / "tests" / "agent_evals" / "fixtures" / "rails-api" / "positive"
 SCENARIO = REPO / "evals" / "agents" / "scenarios" / "rails-api"
+
+
+@pytest.mark.parametrize("name", [".home", ".tmp"])
+def test_rehearsal_refuses_non_directory_scratch_before_commands(tmp_path, name):
+    target = tmp_path / "workspace"
+    target.mkdir()
+    unsafe = target / name
+    unsafe.write_text("not a directory", encoding="utf-8")
+    commands = FakeCommands()
+
+    green, doctor, failures = run_rehearsal(
+        target, tmp_path / "artifacts", commands, binary_path=sys.executable
+    )
+
+    assert green is False and doctor is None
+    assert [failure.code for failure in failures] == ["environment.scratch_unsafe"]
+    assert commands.calls == []
+
 
 #: What `doctor --production --json` emits for this migration: one reviewed public
 #: rule as a WARNING, which the guide says to reconcile rather than suppress.
@@ -92,7 +113,7 @@ def grade_fixture(target: Path, artifacts: Path, commands=None, **kwargs):
         target,
         artifacts,
         commands=commands or FakeCommands(),
-        binary_path=str(REPO / "tools" / "rails" / "rails2zb.py"),  # any real file
+        binary_path=sys.executable,
         port_picker=lambda: 45999,
         behavior_probe=lambda *_a, **_k: None,
         database_inspector=lambda *_a, **_k: None,
@@ -112,6 +133,78 @@ def test_rails_api_scenario_loads_and_names_only_the_migration_skill():
     assert scenario.name == "rails-api"
     assert scenario.skills == ("zigbase-migrate-rails-api",)
     assert scenario.graders == ("rails-api",)
+
+
+def test_live_http_uses_shared_binary_safe_first_response(monkeypatch):
+    def transport(request, timeout, *, include_error_status):  # noqa: ANN001
+        assert timeout == 15
+        assert include_error_status is True
+        assert request.get_header("Authorization") == "Bearer secret"
+        return 302, b"\xff", {"Location": "https://collector.invalid"}
+
+    monkeypatch.setattr(rails_api_grader, "http_response", transport)
+    assert rails_api_grader._request(
+        "GET", "http://target.invalid/private", token="secret"
+    ) == (302, b"\xff")
+
+
+@pytest.mark.parametrize("payload", [b'{"same":1,"same":2}', b'{"value":NaN}', b"\xff"])
+def test_artifact_json_is_strict(payload, tmp_path):
+    path = tmp_path / "report.json"
+    path.write_bytes(payload)
+    with pytest.raises(rails_api_grader.GradeFailure):
+        rails_api_grader._json(path, "report")
+
+
+def test_source_rejects_oversized_extra_before_reading(tmp_path, monkeypatch):
+    source = tmp_path / "source"
+    shutil.copytree(SCENARIO / "fixture/source", source)
+    oversized = source / "invented.bin"
+    with oversized.open("wb") as stream:
+        stream.truncate(rails_api_grader.MAX_SOURCE_FILE_BYTES + 1)
+    original = rails_api_grader.read_bounded_regular
+
+    def bounded(path, maximum):  # noqa: ANN001
+        if path == oversized:
+            pytest.fail("oversized source file was read")
+        return original(path, maximum)
+
+    monkeypatch.setattr(rails_api_grader, "read_bounded_regular", bounded)
+    with pytest.raises(rails_api_grader.GradeFailure, match="oversized"):
+        rails_api_grader.verify_source(source)
+
+
+def test_bundle_attestation_rejects_symlinked_output_even_when_bytes_match(tmp_path):
+    target = workspace(tmp_path)
+    output = target / "migration/bundle/data/clubs.ndjson"
+    external = tmp_path / "external.ndjson"
+    external.write_bytes(output.read_bytes())
+    output.unlink()
+    output.symlink_to(external)
+
+    _, failures = inspect_completion(target)
+
+    assert any(failure.code == "completion.bundle_unsafe" for failure in failures)
+
+
+def test_bundle_attestation_rejects_oversized_output_before_hashing(
+    tmp_path, monkeypatch
+):
+    target = workspace(tmp_path)
+    oversized = target / "migration/bundle/oversized.bin"
+    with oversized.open("wb") as stream:
+        stream.truncate(rails_api_grader.MAX_SOURCE_FILE_BYTES + 1)
+    original = rails_api_grader.read_bounded_regular
+
+    def bounded(path, maximum):  # noqa: ANN001
+        if path == oversized:
+            pytest.fail("oversized bundle artifact was read")
+        return original(path, maximum)
+
+    monkeypatch.setattr(rails_api_grader, "read_bounded_regular", bounded)
+    _, failures = inspect_completion(target)
+
+    assert any(failure.code == "completion.bundle_unsafe" for failure in failures)
 
 
 def test_scenario_source_and_converter_are_exact_pinned_copies():
@@ -237,9 +330,10 @@ def test_the_rehearsal_runs_the_documented_commands_in_order(tmp_path):
     assert any("--dry-run" in call for call in joined), "the schema is dry-run first"
     assert any("--preserve-timestamps" in call for call in joined)
     assert any("--legacy-hashes bcrypt" in call for call in joined)
-    # Doctor precedes the agent's own boundary, so a failing test cannot take
-    # `rules_locked` down with `tests_green`.
+    # Every trusted live and restored-target probe precedes the mutable agent-authored
+    # boundary. Nothing may consume workspace or target state after that test runs.
     assert index("doctor") < index("unittest")
+    assert index("unittest") == len(joined) - 1
 
 
 def test_the_reviewed_inventory_is_exactly_the_public_surface(tmp_path):
@@ -455,6 +549,18 @@ def test_a_bundle_that_does_not_match_its_decisions_is_rejected(tmp_path):
     assert any(f.code == "completion.nondeterministic" for f in failures), (
         f"expected a determinism failure, got {[f.code for f in failures]}"
     )
+
+
+def test_hash_attestation_rejects_duplicate_output_paths(tmp_path):
+    target = workspace(tmp_path)
+    path = target / "migration/bundle/hashes.json"
+    value = json.loads(path.read_text())
+    value["outputs"].append(dict(value["outputs"][0]))
+    path.write_text(json.dumps(value))
+
+    _, failures = inspect_completion(target)
+
+    assert [failure.code for failure in failures] == ["completion.bundle_unattested"]
 
 
 def test_a_bundle_from_a_different_snapshot_is_rejected(tmp_path):

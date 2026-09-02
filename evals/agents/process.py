@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import os
 import signal
+import stat
 import subprocess
 import threading
+from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -16,6 +18,8 @@ class ProcessResult:
     timed_out: bool
     interrupted: bool
     output_truncated: bool
+    stdout: str = ""
+    stderr: str = ""
 
 
 class _CaptureBudget:
@@ -85,7 +89,25 @@ def run_process(
     budget = _CaptureBudget(max_output_bytes)
     timed_out = False
     interrupted = False
-    with stdout_path.open("wb") as stdout_file, stderr_path.open("wb") as stderr_file:
+
+    def private_log(path: Path):
+        descriptor = os.open(
+            path,
+            os.O_RDWR | os.O_CREAT | os.O_TRUNC | getattr(os, "O_CLOEXEC", 0),
+            0o600,
+        )
+        try:
+            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                raise OSError(f"{path} is not a regular file")
+            os.fchmod(descriptor, 0o600)
+            return os.fdopen(descriptor, "w+b")
+        except Exception:
+            os.close(descriptor)
+            raise
+
+    with ExitStack() as stack:
+        stdout_file = stack.enter_context(private_log(stdout_path))
+        stderr_file = stack.enter_context(private_log(stderr_path))
         process = subprocess.Popen(
             argv,
             cwd=cwd,
@@ -125,8 +147,7 @@ def run_process(
             interrupted = True
             _terminate_group(process, term_grace_seconds)
         finally:
-            # A successful agent may still leave helpers behind. The grader owns
-            # Docker resources; arbitrary child processes never outlive the run.
+            # Clean up ordinary helpers that remain in the command's process group.
             _signal_group(process.pid, signal.SIGTERM)
             for pump in pumps:
                 pump.join(timeout=term_grace_seconds)
@@ -137,9 +158,20 @@ def run_process(
             if feeder is not None:
                 feeder.join(timeout=term_grace_seconds)
 
+        stdout_file.flush()
+        stderr_file.flush()
+        stdout_file.seek(0)
+        stderr_file.seek(0)
+        stdout_bytes = stdout_file.read(max_output_bytes + 1)
+        stderr_bytes = stderr_file.read(max_output_bytes + 1)
+        captured_stdout = stdout_bytes.decode("utf-8", errors="replace")
+        captured_stderr = stderr_bytes.decode("utf-8", errors="replace")
+
     return ProcessResult(
         exit_code=process.returncode,
         timed_out=timed_out,
         interrupted=interrupted,
         output_truncated=budget.truncated,
+        stdout=captured_stdout,
+        stderr=captured_stderr,
     )

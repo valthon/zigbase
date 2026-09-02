@@ -24,6 +24,14 @@ POCKETBASE_EVIDENCE = (
 RAILS_API_EVIDENCE = (
     REPO / "evals" / "agents" / "evidence" / "rails-api" / "2026-09-01-8fec10ae"
 )
+RAILS_FULLSTACK_EVIDENCE = (
+    REPO
+    / "evals"
+    / "agents"
+    / "evidence"
+    / "rails-fullstack"
+    / "2026-09-02-1e025f01"
+)
 DOCKER_REFERENCE = REPO / "skills" / "zigbase-app-genesis" / "references" / "docker.md"
 GENESIS_REFERENCE = (
     REPO / "skills" / "zigbase-app-genesis" / "references" / "app-genesis.md"
@@ -150,6 +158,30 @@ def test_first_rails_api_release_evidence_is_three_clean_consecutive_runs():
     }
     assert all(
         result.scenario == "rails-api"
+        and result.agent == "codex-cli-0.150-default"
+        and result.agent_exit == 0
+        and not result.timed_out
+        and result.interventions == 0
+        and result.completion
+        and result.rules_locked
+        and result.tests_green
+        and result.deployed
+        and result.score == 4
+        and result.failures == ()
+        for result in results
+    )
+
+
+def test_first_rails_fullstack_release_evidence_is_three_clean_consecutive_runs():
+    files = sorted(RAILS_FULLSTACK_EVIDENCE.glob("run-*.json"))
+    assert [path.name for path in files] == ["run-1.json", "run-2.json", "run-3.json"]
+
+    results = [EvalResult.from_json(path.read_text()) for path in files]
+    assert {result.commit for result in results} == {
+        "1e025f01d25254330f6492a2ccc4ca4a910be34c"
+    }
+    assert all(
+        result.scenario == "rails-fullstack"
         and result.agent == "codex-cli-0.150-default"
         and result.agent_exit == 0
         and not result.timed_out
