@@ -1,0 +1,10 @@
+{"id":"list-posts","result":"pass","diff":[]}
+{"id":"create-post-allowed","result":"pass","diff":[]}
+{"id":"create-post-denied","result":"pass","diff":[]}
+{"id":"create-post-invalid","result":"pass","diff":[]}
+{"id":"signup-user","result":"pass","diff":[]}
+{"id":"signin-user","result":"pass","diff":[]}
+{"id":"signin-denied","result":"pass","diff":[]}
+{"id":"logout-allowed","result":"pass","diff":[]}
+{"id":"logout-repeat","result":"pass","diff":[]}
+{"id":"view-post","result":"pass","diff":[]}

@@ -1,0 +1,10 @@
+{"id":"list-posts","method":"GET","path":"/api/collections/posts/records","expect":{"status":200,"control":"allowed"}}
+{"id":"create-post-allowed","method":"POST","path":"/api/collections/posts/records","headers":{"Authorization":"Bearer {{token}}"},"body":{"title":"Full-stack parity","body":"Created by the parity run"},"expect":{"status":201,"control":"allowed"}}
+{"id":"create-post-denied","method":"POST","path":"/api/collections/posts/records","body":{"title":"Denied","body":"No token"},"expect":{"status":403,"control":"denied"}}
+{"id":"create-post-invalid","method":"POST","path":"/api/collections/posts/records","headers":{"Authorization":"Bearer {{token}}"},"body":{"title":"","body":"Invalid"},"expect":{"status":400,"control":"validation"}}
+{"id":"signup-user","method":"POST","path":"/api/collections/users/records","body":{"email":"fullstack@example.invalid","password":"migration-password","passwordConfirm":"migration-password"},"expect":{"status":201,"control":"allowed"}}
+{"id":"signin-user","method":"POST","path":"/api/collections/users/auth-with-password","body":{"identity":"fullstack@example.invalid","password":"migration-password"},"expect":{"status":200,"control":"allowed"}}
+{"id":"signin-denied","method":"POST","path":"/api/collections/users/auth-with-password","body":{"identity":"fullstack@example.invalid","password":"wrong-password"},"expect":{"status":400,"control":"denied"}}
+{"id":"logout-allowed","method":"POST","path":"/api/collections/users/auth-logout","expect":{"status":204,"control":"allowed"}}
+{"id":"logout-repeat","method":"POST","path":"/api/collections/users/auth-logout","expect":{"status":204,"control":"allowed"}}
+{"id":"view-post","method":"GET","path":"/api/collections/posts/records/{{id}}","expect":{"status":200,"control":"allowed"}}

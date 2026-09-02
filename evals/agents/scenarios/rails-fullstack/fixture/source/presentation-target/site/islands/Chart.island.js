@@ -1,0 +1,1 @@
+import s from"react";import{jsxs as o}from"@z/runtime/jsx-runtime";function e({series:t,points:r}){return o("button",{type:"button",children:[t,":",r]})}import{jsx as n}from"@z/runtime/jsx-runtime";function a(t){return n(e,{...t})}export{a as default};
