@@ -8,13 +8,69 @@ property worth asserting.
 
 from __future__ import annotations
 
+import hashlib
 import json
+from pathlib import Path
 
 import pytest
 
 from .conftest import read_inventory, write_inventory
-from tools.rails import rails2zb
-from tools.rails._core import RailsError
+from tools.rails import _core, rails2zb
+from tools.rails._core import RailsError, install_file_atomic, sha256_file
+
+
+def test_hash_reader_has_no_arbitrary_total_size_cap():
+    class ApparentlyLargeChunk(bytes):
+        def __len__(self):
+            return 1024 * 1024 * 1024 + 1
+
+    class Stream:
+        chunks = iter((ApparentlyLargeChunk(b"x"), b""))
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, _size):
+            return next(self.chunks)
+
+    class Source:
+        def open(self, _mode):
+            return Stream()
+
+    assert sha256_file(Source()) == hashlib.sha256(b"x").hexdigest()
+
+
+def test_install_reports_parent_creation_failure(tmp_path, monkeypatch):
+    source = tmp_path / "source"
+    source.write_bytes(b"payload")
+    destination = tmp_path / "missing" / "destination"
+    digest = sha256_file(source)
+
+    def fail_mkdir(_self, *args, **kwargs):
+        raise PermissionError("mkdir denied")
+
+    monkeypatch.setattr(Path, "mkdir", fail_mkdir)
+
+    with pytest.raises(RailsError, match="cannot install .*mkdir denied"):
+        install_file_atomic(source, destination, digest)
+
+
+def test_install_reports_temporary_file_creation_failure(tmp_path, monkeypatch):
+    source = tmp_path / "source"
+    source.write_bytes(b"payload")
+    destination = tmp_path / "destination"
+    digest = sha256_file(source)
+
+    def fail_mkstemp(*args, **kwargs):
+        raise PermissionError("temporary file denied")
+
+    monkeypatch.setattr(_core.tempfile, "mkstemp", fail_mkstemp)
+
+    with pytest.raises(RailsError, match="cannot install .*temporary file denied"):
+        install_file_atomic(source, destination, digest)
 
 
 @pytest.fixture(scope="module")
@@ -149,6 +205,15 @@ def test_an_unknown_source_mode_is_refused(mutable_source):
         payload["source"] = "assumed"
         write_inventory(mutable_source, name, payload)
     with pytest.raises(RailsError, match="observed"):
+        rails2zb.load_source(mutable_source)
+
+
+def test_an_unknown_nested_source_mode_is_refused(mutable_source):
+    models = read_inventory(mutable_source, "models")
+    models["models"][0]["source"] = "assumed"
+    write_inventory(mutable_source, "models", models)
+
+    with pytest.raises(RailsError, match="unsupported source 'assumed'"):
         rails2zb.load_source(mutable_source)
 
 

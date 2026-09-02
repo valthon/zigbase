@@ -9,12 +9,16 @@ from __future__ import annotations
 
 import hashlib
 import json
+import stat
 
 import pytest
 
 from .conftest import decisions_for, read_inventory, write_inventory
 from tools.rails import rails2zb
-from tools.rails._core import RailsError
+from tools.rails._core import (
+    RailsError,
+    write_ndjson,
+)
 
 
 @pytest.fixture(scope="module")
@@ -41,6 +45,25 @@ def tree_digest(root):
         digest.update(path.relative_to(root).as_posix().encode())
         digest.update(path.read_bytes())
     return digest.hexdigest()
+
+
+def test_bundle_artifacts_are_private(bundle):
+    assert stat.S_IMODE(bundle.stat().st_mode) == 0o700
+    for path in bundle.rglob("*"):
+        expected = 0o700 if path.is_dir() else 0o600
+        assert stat.S_IMODE(path.stat().st_mode) == expected, path
+
+
+def test_ndjson_failure_preserves_prior_artifact_and_cleans_temporary(tmp_path):
+    output = tmp_path / "data/rows.ndjson"
+    output.parent.mkdir()
+    output.write_text('{"old":true}\n')
+
+    with pytest.raises(RailsError, match="cannot represent"):
+        write_ndjson(output, [{"id": "ok"}, {"id": "bad", "value": float("nan")}])
+
+    assert output.read_text() == '{"old":true}\n'
+    assert not list(output.parent.glob(".rows.ndjson.*.tmp"))
 
 
 # ---------------------------------------------------------------------------

@@ -16,6 +16,7 @@ const collections = @import("collections.zig");
 const schema = @import("schema.zig");
 const route_types = @import("route_types.zig");
 const rpc_ts = @import("codegen/rpc_ts.zig");
+const route_path = @import("route_path.zig");
 
 // ---------------------------------------------------------------------------
 // RAII DB-access handles used where a `*Ctx` isn't already bound to a live
@@ -297,7 +298,15 @@ fn lowerSecretSource(comptime src: anytype, comptime path: []const u8) PathSecre
 /// Loud `@compileError` on a malformed `.path_secret` (missing `.param`/`.source`, unknown keys).
 fn lowerRouteAuthGuard(comptime a: anytype, comptime path: []const u8) RouteAuthGuard {
     const A = @TypeOf(a);
-    if (A == RouteAuthGuard) return a;
+    if (A == RouteAuthGuard) {
+        switch (a) {
+            .path_secret => |guard| {
+                if (guard.in == .path and !route_path.hasCapture(path, guard.param))
+                    @compileError("route '" ++ path ++ "': .path_secret.param '" ++ guard.param ++ "' must name a :capture in the route path");
+            },
+        }
+        return a;
+    }
     if (@typeInfo(A) != .@"struct")
         @compileError("route '" ++ path ++ "': .auth must be an AuthLevel (.public/.authed/.superuser) " ++
             "or a guard struct like .{ .path_secret = .{ .param = \"...\", .source = .{ .kv = \"...\" } } }");
@@ -323,6 +332,8 @@ fn lowerRouteAuthGuard(comptime a: anytype, comptime path: []const u8) RouteAuth
     var guard = PathSecretGuard{ .param = ps.param, .source = lowerSecretSource(ps.source, path) };
     if (@hasField(P, "in")) guard.in = ps.in;
     if (@hasField(P, "on_mismatch")) guard.on_mismatch = ps.on_mismatch;
+    if (guard.in == .path and !route_path.hasCapture(path, guard.param))
+        @compileError("route '" ++ path ++ "': .path_secret.param '" ++ guard.param ++ "' must name a :capture in the route path");
     return .{ .path_secret = guard };
 }
 
@@ -580,6 +591,11 @@ fn validateRouteSpecs(comptime specs: anytype) void {
         if (!@hasField(@TypeOf(s), "method")) @compileError("route spec is missing '.method' (expected .{ .method = .GET, .path = \"/...\", .handler = fn })");
         if (!@hasField(@TypeOf(s), "path")) @compileError("route spec is missing '.path' (expected .{ .method = .GET, .path = \"/...\", .handler = fn })");
         if (!@hasField(@TypeOf(s), "handler")) @compileError("route spec is missing '.handler' (expected .{ .method = .GET, .path = \"/...\", .handler = fn })");
+        const method: http.Method = s.method;
+        if (method == .UNKNOWN)
+            @compileError("route '" ++ s.path ++ "': .method cannot be .UNKNOWN");
+        if (!route_path.isCanonicalPattern(s.path))
+            @compileError("route '" ++ s.path ++ "': .path must be a canonical absolute router pattern with optional :name captures");
         // Fail loud on a typo'd optional key (e.g. `.rate_limt`, `.rate_limit_ky`) which the
         // `@hasField`-gated readers would otherwise silently ignore, shipping the route with
         // NO rate limit / default keying the developer believed they had configured.

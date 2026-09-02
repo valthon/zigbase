@@ -213,6 +213,9 @@ and also resolves field and relation names. Together with `import --manifest` an
 `import --legacy-hashes` they are the machinery behind
 [migrating an existing backend to ZigBase](docs/migration-tools.md). PocketBase 0.39.11 has a
 dedicated, decision-driven workflow in [docs/migrate-pocketbase.md](docs/migrate-pocketbase.md).
+Complete Rails applications use the coordinating
+[full-stack Rails workflow](docs/migrate-rails-fullstack.md), which composes the Rails backend and
+Zigapagos presentation adapters through a versioned, reconciled route map.
 
 `openapi` inspects that live collection model without starting or mutating the server and emits
 OpenAPI 3.1.2 JSON. A framework binary also includes its comptime typed and untyped routes; the
@@ -357,6 +360,7 @@ examples/
 - [docs/migrate-express.md](docs/migrate-express.md) — discovery-driven Express re-platforming with durable endpoint decisions, deterministic import, parity replay, and rehearsed cutover
 - [docs/migrate-laravel.md](docs/migrate-laravel.md) and [docs/migrate-go.md](docs/migrate-go.md) — source-specific Laravel and Go migration workflows on the same evidence-first skeleton
 - [docs/migrate-rails-api.md](docs/migrate-rails-api.md) — Rails API-only re-platforming with an observed-metadata inventory, the `tools/rails/rails2zb.py` converter, deterministic extraction, and an explicit backend-only scope gate
+- [docs/migrate-rails-fullstack.md](docs/migrate-rails-fullstack.md) — complete Rails-to-ZigBase + Zigapagos migration with versioned handoffs, a reconciled route map, backend/browser parity, and rehearsed cutover
 - [docs/typescript-sdk.md](docs/typescript-sdk.md) — the official `@zigbase/client` TypeScript SDK: auth, records, offset + cursor pagination, files, realtime + live store
 - [docs/dart-sdk.md](docs/dart-sdk.md) — the official `zigbase_client` Dart SDK: auth, records, offset + cursor pagination, files, and realtime, for the Dart VM, Flutter, and Flutter web
 - [docs/python-sdk.md](docs/python-sdk.md) — the official `zigbase` Python SDK: sync and async clients for auth, records, offset + cursor pagination, and files

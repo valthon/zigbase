@@ -23,8 +23,12 @@ const feature_cache = @import("../feature_cache.zig");
 // Mount path + enable/disable come from `app.features_public_route` (the `.features`
 // config knob): default "/api/state"; a custom path remounts it; `.disabled` → 404.
 
-/// GET <features_public_route>?subject=<id> — resolved flags + experiments, no auth.
+/// GET/HEAD <features_public_route>?subject=<id> — resolved flags + experiments, no auth.
 pub fn handle(ctx: *http.RequestCtx) anyerror!http.Response {
+    return handleGet(ctx);
+}
+
+fn handleGet(ctx: *http.RequestCtx) anyerror!http.Response {
     const app = ctx.app orelse return ApiError.internal().toResponse(ctx.allocator.a);
 
     // Disabled (`.features = .{ .public_route = .disabled }`) → not found.

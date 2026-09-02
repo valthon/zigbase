@@ -113,6 +113,7 @@ trust it over any document, including this one.
 | re-platforming a Laravel application | [migrate-laravel.md](https://github.com/valthon/zigbase/blob/main/docs/migrate-laravel.md) |
 | re-platforming a Go web service | [migrate-go.md](https://github.com/valthon/zigbase/blob/main/docs/migrate-go.md) |
 | re-platforming a Rails API-only backend | [migrate-rails-api.md](https://github.com/valthon/zigbase/blob/main/docs/migrate-rails-api.md) |
+| replacing a complete Rails application | [migrate-rails-fullstack.md](https://github.com/valthon/zigbase/blob/main/docs/migrate-rails-fullstack.md) |
 | doing per-row authorization | [abilities.md](https://github.com/valthon/zigbase/blob/main/docs/abilities.md), [tenancy.md](https://github.com/valthon/zigbase/blob/main/docs/tenancy.md) |
 | adding search | [search.md](https://github.com/valthon/zigbase/blob/main/docs/search.md) |
 | sending mail, or running background work | [email.md](https://github.com/valthon/zigbase/blob/main/docs/email.md), [jobs-and-webhooks.md](https://github.com/valthon/zigbase/blob/main/docs/jobs-and-webhooks.md) |
