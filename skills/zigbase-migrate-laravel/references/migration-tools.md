@@ -652,6 +652,7 @@ assume anything about what it's talking to. Full reference:
 | `body` | JSON value or `null`. Sent as `application/json` when non-null. |
 | `expect.status` | Exact match. |
 | `expect.bodySubset` | Recursive **subset** of the response body. |
+| `expect.control` | Optional producer-reviewed semantic label. Predeclare it before `record`; recording preserves it while refreshing status/body. |
 
 ### Subset matching
 
@@ -680,7 +681,8 @@ zb_replay.py replay --base-url URL capture.ndjson [--out findings.ndjson] \
 ```
 
 `record` runs each case in `requests.ndjson` against the **old** backend and fills in
-`expect` from the actual (volatile-stripped) response. `replay` runs a capture against
+`expect.status` and `expect.bodySubset` from the actual (volatile-stripped) response while preserving
+an explicitly supplied `expect.control`. `replay` runs a capture against
 the **new** backend and diffs each response against its `expect`.
 
 ### Findings and summary channels

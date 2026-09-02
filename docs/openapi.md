@@ -56,6 +56,13 @@ Auth create/update schemas include the write-only password fields accepted by th
 Engine-only credential columns such as `passwordHash` and `tokenKey` are never exported. A
 user-defined hidden field remains visible to contract tooling as `writeOnly: true`.
 
+Every generated collection operation also carries `x-zigbase-collection` with the authoritative
+collection name and `x-zigbase-collection-type` with its schema kind (`base`, `auth`, or `view`).
+Consumers must use the name marker to bind an operation to its collection and the type marker to
+distinguish authentication collections rather than re-deriving either value from URL segments,
+`password`, `passwordConfirm`, or other field names; ordinary hidden fields are also write-only and
+are not an auth signal.
+
 List operations describe both offset (`page`, `perPage`) and cursor (`cursor`, `limit`) pagination,
 plus filter, sort, search, vector, expand, and field-projection parameters. Responses use the real
 ZigBase list envelopes and the canonical `{status, code, message, data}` error schema.

@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import stat
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -28,9 +29,17 @@ class RailsError(Exception):
 # "routes.json" is a mistake or an attack, not a migration, so every read is bounded
 # and the limit is part of the contract rather than a defensive afterthought.
 JSON_LIMIT = 32 * 1024 * 1024
+OBSERVED = "observed"
+INFERRED = "inferred"
+SOURCE_MODES = frozenset({OBSERVED, INFERRED})
 
 
 def read_json(path: Path, *, limit: int = JSON_LIMIT, label: str = "file") -> Any:
+    payload = read_bytes(path, limit=limit, label=label)
+    return parse_json(payload, path=path, label=label)
+
+
+def read_bytes(path: Path, *, limit: int = JSON_LIMIT, label: str = "file") -> bytes:
     try:
         size = path.stat().st_size
     except OSError as exc:
@@ -38,9 +47,33 @@ def read_json(path: Path, *, limit: int = JSON_LIMIT, label: str = "file") -> An
     if size > limit:
         raise RailsError(f"{label} exceeds the {limit}-byte limit: {path}")
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        payload = path.read_bytes()
+    except OSError as exc:
         raise RailsError(f"cannot read {label} {path}: {exc}") from exc
+    if len(payload) > limit:
+        raise RailsError(f"{label} exceeds the {limit}-byte limit: {path}")
+    return payload
+
+
+def reject_json_constant(value: str) -> None:
+    raise ValueError(f"non-finite JSON number {value}")
+
+
+def parse_json(payload: bytes, *, path: Path, label: str = "file") -> Any:
+    try:
+        return json.loads(payload.decode("utf-8"), parse_constant=reject_json_constant)
+    except (UnicodeError, json.JSONDecodeError, ValueError) as exc:
+        raise RailsError(f"cannot read {label} {path}: {exc}") from exc
+
+
+def read_json_with_sha256(
+    path: Path, *, limit: int = JSON_LIMIT, label: str = "file"
+) -> tuple[Any, str]:
+    """Parse and hash the same bounded bytes so provenance cannot race the parser."""
+    payload = read_bytes(path, limit=limit, label=label)
+    return parse_json(payload, path=path, label=label), hashlib.sha256(
+        payload
+    ).hexdigest()
 
 
 def sha256_file(path: Path) -> str:
@@ -61,6 +94,52 @@ def required_string(value: dict[str, Any], key: str, where: str) -> str:
     return result
 
 
+def nested_source_modes(value: Any) -> set[str]:
+    """Return every observed/inferred provenance marker nested in a JSON value."""
+    found: set[str] = set()
+    if isinstance(value, dict):
+        marker = value.get("source")
+        if marker in SOURCE_MODES:
+            found.add(marker)
+        for nested in value.values():
+            found |= nested_source_modes(nested)
+    elif isinstance(value, list):
+        for nested in value:
+            found |= nested_source_modes(nested)
+    return found
+
+
+def validate_inventory_source(
+    payload: Any,
+    *,
+    name: str,
+    expected_mode: str | None = None,
+) -> str:
+    """Validate one rails2zb inventory document's provenance contract."""
+    if not isinstance(payload, dict):
+        raise RailsError(f"inventory/{name}.json must be a JSON object")
+    declared = payload.get("source")
+    if declared not in SOURCE_MODES:
+        raise RailsError(
+            f"inventory/{name}.json does not declare source 'observed' or 'inferred'"
+        )
+    mode = expected_mode or declared
+    if mode not in SOURCE_MODES:
+        raise RailsError(f"inventory source mode {mode!r} is unsupported")
+    if declared != mode:
+        raise RailsError(
+            f"inventory/{name}.json declares source {declared!r} but the inventory "
+            f"is {mode!r}; observed and inferred records must not be mixed"
+        )
+    mixed = nested_source_modes(payload) - {mode}
+    if mixed:
+        raise RailsError(
+            f"inventory/{name}.json declares {mode!r} but contains nested records "
+            f"marked {sorted(mixed)}; observed and inferred records must not be mixed"
+        )
+    return mode
+
+
 # ---------------------------------------------------------------------------
 # Deterministic writers
 # ---------------------------------------------------------------------------
@@ -70,20 +149,54 @@ def required_string(value: dict[str, Any], key: str, where: str) -> str:
 # this module may consult the clock, the environment, or a random source.
 
 
-def write_canonical_json(path: Path, value: Any) -> None:
+def canonical_text(value: Any) -> str:
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(
+        return (
             json.dumps(
                 value, indent=2, ensure_ascii=False, sort_keys=True, allow_nan=False
             )
-            + "\n",
-            encoding="utf-8",
+            + "\n"
         )
+    except ValueError as exc:  # non-finite float
+        raise RailsError(f"cannot encode canonical JSON: {exc}") from exc
+
+
+def write_canonical_json(path: Path, value: Any) -> None:
+    """Atomically replace ``path`` with canonical JSON and fsync the payload."""
+    payload = canonical_text(value)
+    temporary: Path | None = None
+    descriptor: int | None = None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, raw_temporary = tempfile.mkstemp(
+            dir=path.parent, prefix=f".{path.name}.", suffix=".tmp", text=True
+        )
+        temporary = Path(raw_temporary)
+        mode = 0o644
+        try:
+            existing = path.lstat()
+            if stat.S_ISREG(existing.st_mode):
+                mode = stat.S_IMODE(existing.st_mode)
+        except FileNotFoundError:
+            pass
+        os.fchmod(descriptor, mode)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            descriptor = None
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        temporary = None
     except OSError as exc:
         raise RailsError(f"cannot write {path}: {exc}") from exc
-    except ValueError as exc:  # non-finite float
-        raise RailsError(f"cannot write {path}: {exc}") from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        if temporary is not None:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
 
 
 def canonical_line(record: Any) -> str:

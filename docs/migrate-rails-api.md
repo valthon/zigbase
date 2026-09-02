@@ -326,6 +326,8 @@ it:
   `'banana'`, or a REAL `1.5` that keeps its storage class and that the target refuses for an
   integer field. A non-finite float, or one outside the target's 64-bit range, cannot be stored at
   all.
+  Hand-authored inventory and decisions files must likewise be RFC 8259 JSON: `NaN`, `Infinity`,
+  and `-Infinity` are refused rather than accepted as implementation-specific values.
 - **Dates must be real dates.** `0000-00-00 00:00:00` — the legacy-MySQL zero date — along with
   `2024-02-30`, `1900-02-29`, `24:00:00` and an impossible UTC offset like `+30:00` are all
   well-formed to a pattern match and impossible to the target, which range-checks every component.

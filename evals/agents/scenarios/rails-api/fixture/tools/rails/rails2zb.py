@@ -34,6 +34,8 @@ if __package__ in (None, ""):  # direct `python3 tools/rails/rails2zb.py`
 from tools.rails._core import (  # noqa: E402
     Decision,
     Finding,
+    INFERRED,
+    OBSERVED,
     RailsError,
     compact_summary,
     ensure_output_outside_source,
@@ -43,6 +45,7 @@ from tools.rails._core import (  # noqa: E402
     required_string,
     sha256_file,
     split_id,
+    validate_inventory_source,
     write_canonical_json,
     write_ndjson,
 )
@@ -50,9 +53,6 @@ from tools.rails._core import (  # noqa: E402
 INVENTORY_VERSION = 1
 DECISIONS_VERSION = 1
 BUNDLE_VERSION = 1
-
-OBSERVED = "observed"
-INFERRED = "inferred"
 
 INVENTORY_FILES = (
     "routes",
@@ -247,28 +247,6 @@ class Source:
         ]
 
 
-def _nested_sources(value: Any) -> set[str]:
-    """Every `source` marker anywhere in a payload, not just the top-level one.
-
-    Checking only the outermost key let an `inferred` record sit inside an `observed`
-    file -- exactly the mixing the mode contract exists to forbid, one level down.
-    """
-    # Only values that ARE a mode count. `source` is not a reserved word: a serialized
-    # route constraint carries `{"source": ".+?", "type": "regexp"}`, where it means the
-    # regexp's own source text. Treating that as provenance made every route look mixed.
-    found: set[str] = set()
-    if isinstance(value, dict):
-        marker = value.get("source")
-        if marker in (OBSERVED, INFERRED):
-            found.add(marker)
-        for nested in value.values():
-            found |= _nested_sources(nested)
-    elif isinstance(value, list):
-        for nested in value:
-            found |= _nested_sources(nested)
-    return found
-
-
 def _is_composite(value: Any) -> bool:
     """A key naming more than one column, in either shape the extractor can produce.
 
@@ -354,19 +332,7 @@ def load_source(root: Path) -> Source:
     # prevent: one inferred record in an otherwise observed inventory would let a guess
     # ride along as if the framework had reported it.
     for name in INVENTORY_FILES:
-        nested = _nested_sources(payloads[name])
-        if nested - {mode}:
-            raise RailsError(
-                f"inventory/{name}.json declares '{mode}' but contains nested records "
-                f"marked {sorted(nested - {mode})}; observed and inferred records must "
-                f"not be mixed, at any depth"
-            )
-        declared = payloads[name].get("source")
-        if declared != mode:
-            raise RailsError(
-                f"inventory/{name}.json declares source '{declared}' but the inventory "
-                f"is '{mode}'; observed and inferred records must not be mixed"
-            )
+        validate_inventory_source(payloads[name], name=name, expected_mode=mode)
 
     # Loading stays adapter-neutral, because the inventory is: `export_source.rb` reads
     # whatever connection the application booted. Only row EXTRACTION needs the frozen

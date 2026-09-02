@@ -1,0 +1,4 @@
+interface:
+  display_name: "ZigBase Rails Full-Stack Migration"
+  short_description: "Migrate complete Rails apps to ZigBase"
+  default_prompt: "Use $zigbase-migrate-rails-fullstack to migrate my complete Rails application to ZigBase and Zigapagos with reconciled parity evidence."

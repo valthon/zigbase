@@ -17,15 +17,31 @@ itself a finding, not a tool problem); 1 a tool failure — an unreadable captur
 unresolved `{{placeholder}}`, or every single case dying in transport (nothing was exercised,
 so there is nothing to judge).
 """
+
 import argparse
 import json
+import os
 import sys
+import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
 
+try:
+    from tools.replay._contract import EVIDENCE_CONTROLS, allowed_controls_for_status
+except ModuleNotFoundError:  # Direct execution: python tools/replay/zb_replay.py
+    from _contract import EVIDENCE_CONTROLS, allowed_controls_for_status
+
 CAPTURE_VERSION = 1
-DEFAULT_VOLATILE = ["id", "created", "updated", "token", "collectionId", "collectionName", "expand"]
+DEFAULT_VOLATILE = [
+    "id",
+    "created",
+    "updated",
+    "token",
+    "collectionId",
+    "collectionName",
+    "expand",
+]
 
 # Sentinel for "this key is absent from `actual`", distinct from an actual value of `None`.
 # `dict.get(k)` returns `None` both when the key holds `null` and when the key is missing —
@@ -65,9 +81,11 @@ def _expand_pass(out, variables):
             result.append(out[i:])
             break
         result.append(out[i:start])
-        name = out[start + 2:end]
+        name = out[start + 2 : end]
         if name not in variables:
-            raise ReplayError(f"unresolved placeholder {{{{{name}}}}} — pass --var {name}=VALUE")
+            raise ReplayError(
+                f"unresolved placeholder {{{{{name}}}}} — pass --var {name}=VALUE"
+            )
         result.append(variables[name])
         expanded = True
         i = end + 2
@@ -129,7 +147,14 @@ def diff_subset(expected, actual, path=""):
             sub = f"{path}.{k}" if path else k
             av = actual.get(k, _MISSING)
             if av is _MISSING:
-                out.append({"path": sub, "expected": v, "actual": None, "message": "missing key"})
+                out.append(
+                    {
+                        "path": sub,
+                        "expected": v,
+                        "actual": None,
+                        "message": "missing key",
+                    }
+                )
             else:
                 out.extend(diff_subset(v, av, sub))
         return out
@@ -140,7 +165,14 @@ def diff_subset(expected, actual, path=""):
             sub = f"{path}.{i}" if path else str(i)
             av = actual[i] if i < len(actual) else _MISSING
             if av is _MISSING:
-                out.append({"path": sub, "expected": v, "actual": None, "message": "missing key"})
+                out.append(
+                    {
+                        "path": sub,
+                        "expected": v,
+                        "actual": None,
+                        "message": "missing key",
+                    }
+                )
             else:
                 out.extend(diff_subset(v, av, sub))
         return out
@@ -167,11 +199,24 @@ def load_capture(path):
             raise ReplayError(f"{path}:{n}: not JSON: {e}") from e
         cid = case.get("id")
         if not cid:
-            raise ReplayError(f"{path}:{n}: every case needs a unique \"id\"")
+            raise ReplayError(f'{path}:{n}: every case needs a unique "id"')
         if cid in seen:
             raise ReplayError(f"{path}:{n}: duplicate case id {cid!r}")
         if not case.get("method") or not case.get("path"):
-            raise ReplayError(f"{path}:{n}: case {cid!r} needs \"method\" and \"path\"")
+            raise ReplayError(f'{path}:{n}: case {cid!r} needs "method" and "path"')
+        if "expect" in case and not isinstance(case["expect"], dict):
+            raise ReplayError(f"{path}:{n}: case {cid!r} expect must be an object")
+        expect = case.get("expect", {})
+        if "control" in expect:
+            control = expect["control"]
+            if not isinstance(control, str) or not control.strip():
+                raise ReplayError(
+                    f"{path}:{n}: case {cid!r} expect.control must be a non-empty string"
+                )
+            if control not in EVIDENCE_CONTROLS:
+                raise ReplayError(
+                    f"{path}:{n}: case {cid!r} expect.control {control!r} is unsupported"
+                )
         seen.add(cid)
         cases.append(case)
     return cases
@@ -226,17 +271,82 @@ def parse_vars(pairs):
     return out
 
 
+def validate_recorded_control(case_id, status, control):
+    """Validate an optional producer control against the response being recorded."""
+    if control is _MISSING:
+        return
+    if not isinstance(control, str) or not control.strip():
+        raise ReplayError(f"{case_id}: expect.control must be a non-empty string")
+    allowed = allowed_controls_for_status(status)
+    if control not in allowed:
+        raise ReplayError(
+            f"{case_id}: expect.control {control!r} is incompatible with recorded status "
+            f"{status}; expected one of {sorted(allowed)}"
+        )
+
+
+def _write_capture_atomic(path, cases):
+    """Replace a capture only after its complete NDJSON payload is durable."""
+    destination = os.path.abspath(path)
+    descriptor = None
+    temporary = None
+    try:
+        descriptor, temporary = tempfile.mkstemp(
+            dir=os.path.dirname(destination),
+            prefix=f".{os.path.basename(destination)}.",
+            suffix=".tmp",
+            text=True,
+        )
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as out:
+            descriptor = None
+            for case in cases:
+                out.write(json.dumps(case) + "\n")
+            out.flush()
+            os.fsync(out.fileno())
+        os.replace(temporary, destination)
+        temporary = None
+    except OSError as exc:
+        raise ReplayError(f"cannot write capture {path}: {exc}") from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        if temporary is not None:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+
+
 def cmd_record(args):
     variables = parse_vars(args.var)
     volatile = DEFAULT_VOLATILE + (args.volatile or [])
     cases = load_capture(args.requests)
-    with open(args.out, "w", encoding="utf-8") as out:
-        for case in cases:
-            status, body = send(args.base_url, case, variables, args.timeout)
-            case["expect"] = {"status": status, "bodySubset": strip_volatile(body, volatile)}
-            out.write(json.dumps(case) + "\n")
-    summary = {"zigbaseReplay": CAPTURE_VERSION, "mode": "record", "base_url": args.base_url,
-               "recorded": len(cases), "capture": args.out}
+    recorded = []
+    for case in cases:
+        status, body = send(args.base_url, case, variables, args.timeout)
+        prior_expect = case.get("expect")
+        control = (
+            prior_expect.get("control", _MISSING)
+            if isinstance(prior_expect, dict)
+            else _MISSING
+        )
+        validate_recorded_control(case["id"], status, control)
+        case["expect"] = {
+            "status": status,
+            "bodySubset": strip_volatile(body, volatile),
+        }
+        if control is not _MISSING:
+            case["expect"]["control"] = control
+        recorded.append(case)
+    _write_capture_atomic(args.out, recorded)
+    summary = {
+        "zigbaseReplay": CAPTURE_VERSION,
+        "mode": "record",
+        "base_url": args.base_url,
+        "recorded": len(recorded),
+        "capture": args.out,
+    }
     print(json.dumps(summary))
     return 0
 
@@ -251,7 +361,10 @@ def cmd_replay(args):
                 status, body = send(args.base_url, case, variables, args.timeout)
             except ReplayError as e:
                 errors += 1
-                out.write(json.dumps({"id": case["id"], "result": "error", "message": str(e)}) + "\n")
+                out.write(
+                    json.dumps({"id": case["id"], "result": "error", "message": str(e)})
+                    + "\n"
+                )
                 continue
             finding = compare(case, status, body)
             if finding["result"] == "pass":
@@ -260,16 +373,26 @@ def cmd_replay(args):
                 failed += 1
             out.write(json.dumps(finding) + "\n")
     total = len(cases)
-    summary = {"zigbaseReplay": CAPTURE_VERSION, "mode": "replay", "base_url": args.base_url,
-               "total": total, "passed": passed, "failed": failed, "errors": errors,
-               "findings": args.out}
+    summary = {
+        "zigbaseReplay": CAPTURE_VERSION,
+        "mode": "replay",
+        "base_url": args.base_url,
+        "total": total,
+        "passed": passed,
+        "failed": failed,
+        "errors": errors,
+        "findings": args.out,
+    }
     print(json.dumps(summary))
     if total > 0 and errors == total and passed == 0 and failed == 0:
         # Every case died in transport — nothing was exercised, so there is nothing for a
         # human to judge. That's a tool/environment failure (dead host, wrong --base-url),
         # not a parity finding.
-        print(f"zb_replay: every case failed in transport against {args.base_url} — "
-              "the replay target looks unreachable; nothing was exercised", file=sys.stderr)
+        print(
+            f"zb_replay: every case failed in transport against {args.base_url} — "
+            "the replay target looks unreachable; nothing was exercised",
+            file=sys.stderr,
+        )
         return 1
     # 2 = ran correctly, found something needing judgment: a parity failure, and/or some
     # (but not all) cases erroring in transport — a vanished endpoint is itself a finding.
@@ -281,7 +404,9 @@ def main(argv=None):
     p = argparse.ArgumentParser(prog="zb_replay.py", description=__doc__)
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    rec = sub.add_parser("record", help="run requests against the OLD backend and record expectations")
+    rec = sub.add_parser(
+        "record", help="run requests against the OLD backend and record expectations"
+    )
     rec.add_argument("--base-url", required=True)
     rec.add_argument("--requests", required=True)
     rec.add_argument("--out", default="capture.ndjson")
@@ -290,7 +415,9 @@ def main(argv=None):
     rec.add_argument("--timeout", type=float, default=30.0)
     rec.set_defaults(fn=cmd_record)
 
-    rep = sub.add_parser("replay", help="replay a capture against the NEW backend and diff")
+    rep = sub.add_parser(
+        "replay", help="replay a capture against the NEW backend and diff"
+    )
     rep.add_argument("capture")
     rep.add_argument("--base-url", required=True)
     rep.add_argument("--out", default="findings.ndjson")

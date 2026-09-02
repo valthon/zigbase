@@ -42,9 +42,13 @@ without parsing the findings stream, or vice versa.
 | `body` | JSON value or `null`. Sent as `application/json` when non-null. |
 | `expect.status` | Exact match. |
 | `expect.bodySubset` | Recursive **subset** of the response body. |
+| `expect.control` | Optional producer-reviewed semantic label. Predeclare it before `record`; recording preserves it while refreshing status/body. |
 
-A `requests.ndjson` fed to `record` needs only `id`, `method`, `path`, and optionally `query`/
-`headers`/`body` — `expect` is filled in by the recording run.
+A `requests.ndjson` fed to `record` needs `id`, `method`, and `path`, plus optional `query`/
+`headers`/`body`. It may also predeclare `expect.control`; `record` preserves that label while
+replacing `expect.status` and `expect.bodySubset` with the observed response. This lets a reviewed
+producer label concealment responses such as 404 as `denied` without allowing a later consumer to
+relabel evidence.
 
 ## Subset matching
 
