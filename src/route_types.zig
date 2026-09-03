@@ -17,6 +17,12 @@ pub const Failure = struct { status: u16, message: []const u8 };
 /// `RouteFailed` means "see req.failure for a custom status+message".
 pub const RouteError = error{ BadRequest, Unauthorized, Forbidden, NotFound, Conflict, RouteFailed };
 
+/// The methods whose typed input is encoded in the URL query string. Every
+/// other supported method carries typed input as JSON in the request body.
+pub fn inputUsesQuery(method: anytype) bool {
+    return method == .GET or method == .HEAD or method == .DELETE;
+}
+
 pub fn statusForError(e: RouteError) u16 {
     return switch (e) {
         error.BadRequest => 400,
@@ -198,8 +204,8 @@ pub fn makeThunk(comptime handler: anytype) @import("events.zig").RouteHandler {
             defer a.a.free(params);
             for (rc.params, 0..) |p, i| params[i] = .{ .key = p.key, .value = p.value };
 
-            // 1. Parse input (void -> skip; GET/DELETE -> query; else JSON body).
-            // The GET query branch is gated behind a comptime `isQueryParseable(In)`
+            // 1. Parse input (void -> skip; GET/HEAD/DELETE -> query; else JSON body).
+            // The query branch is gated behind a comptime `isQueryParseable(In)`
             // so that complex POST-body types (with nested slices, enums, optional
             // structs) don't instantiate `parseQuery` and hit its @compileError paths.
             // The JSON branch keeps its `Parsed` handle so its parse arena is freed (the old
@@ -208,7 +214,7 @@ pub fn makeThunk(comptime handler: anytype) @import("events.zig").RouteHandler {
             defer if (parsed) |*p| p.deinit();
             const input: In = if (In == void) {} else blk: {
                 if (comptime isQueryParseable(In)) {
-                    if (rc.method == .GET or rc.method == .DELETE) {
+                    if (inputUsesQuery(rc.method)) {
                         break :blk parseQuery(In, a.a, rc.query) catch
                             return badRequest(a.a, "Invalid query parameters.");
                     }
@@ -259,11 +265,11 @@ fn jsonError(a: std.mem.Allocator, status: u16, message: []const u8) !@import("h
 }
 
 /// Minimal query (`a=1&b=hi`) parser into a flat struct of string/int/bool fields.
-/// Covers GET/DELETE routes whose Input is flat; golfsim's GET routes use `Req(void)`,
+/// Covers GET/HEAD/DELETE routes whose Input is flat; golfsim's GET routes use `Req(void)`,
 /// so today this is exercised only by its own unit test.
 fn parseQuery(comptime T: type, a: std.mem.Allocator, query: []const u8) !T {
     if (@typeInfo(T) != .@"struct")
-        @compileError("GET/DELETE route Input must be a struct (typed query input lands in SP2.2b): " ++ @typeName(T));
+        @compileError("GET/HEAD/DELETE route Input must be a struct (typed query input lands in SP2.2b): " ++ @typeName(T));
     var result: T = undefined;
     inline for (@typeInfo(T).@"struct".fields) |f| {
         const raw = findQueryValue(query, f.name);
@@ -299,7 +305,7 @@ fn isQueryScalar(comptime F: type) bool {
 /// Used by `makeThunk` as a comptime guard to avoid instantiating `parseQuery`
 /// for complex struct types (e.g. POST-body inputs with nested slices/structs)
 /// that will never appear on the GET code path at runtime. Also used by
-/// `buildRoutes` (events.zig) to enforce the GET/DELETE contract at app-build time.
+/// `buildRoutes` (events.zig) to enforce the GET/HEAD/DELETE contract at app-build time.
 ///
 /// A top-level struct is accepted ONLY if every field is a query scalar (int,
 /// float, bool, enum, `[]const u8`, or optional-of-those). Nested structs and
@@ -335,7 +341,7 @@ fn coerceQueryField(comptime F: type, a: std.mem.Allocator, raw: ?[]const u8) !F
         .float => std.fmt.parseFloat(F, r) catch error.BadRequest,
         .bool => std.mem.eql(u8, r, "true") or std.mem.eql(u8, r, "1"),
         .@"enum" => std.meta.stringToEnum(F, r) orelse error.BadRequest,
-        else => @compileError("GET/DELETE query field type not yet supported: " ++ @typeName(F)),
+        else => @compileError("GET/HEAD/DELETE query field type not yet supported: " ++ @typeName(F)),
     };
 }
 
@@ -458,6 +464,35 @@ test "makeThunk: parses input, serializes output (200)" {
     try testing.expect(std.mem.indexOf(u8, resp.body, "\"confirmed\":true") != null);
     try testing.expect(std.mem.indexOf(u8, resp.body, "\"id\":\"bk1\"") != null);
     try testing.expect(std.mem.indexOf(u8, resp.body, "\"guests\":2") != null);
+}
+
+test "makeThunk parses typed HEAD input from the query string" {
+    const http = @import("http.zig");
+    const Ctx = @import("ctx.zig").Ctx;
+    const Input = struct { id: u32 };
+    const Seen = struct {
+        var id: u32 = 0;
+    };
+    const H = struct {
+        fn h(req: *Req(Input)) RouteError!void {
+            Seen.id = req.input.id;
+        }
+    }.h;
+    const thunk = makeThunk(H);
+    const a = testing.allocator;
+    var request_ctx = http.RequestCtx{
+        .method = .HEAD,
+        .path = "/api/report",
+        .query = "id=42",
+        .allocator = RequestArena.forTest(a),
+    };
+    const rctx = @import("request.zig").RequestContext{ .auth = null, .is_superuser = false, .method = "HEAD" };
+    var cx = Ctx{ .app = undefined, .arena = RequestArena.forTest(a), .rctx = rctx, .request = &request_ctx };
+    defer cx.deinit();
+
+    const response = try thunk(&cx);
+    try testing.expectEqual(@as(u16, 204), response.status);
+    try testing.expectEqual(@as(u32, 42), Seen.id);
 }
 
 test "coerceQueryField: enum field parses valid variant, rejects unknown, optional works" {

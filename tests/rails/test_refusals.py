@@ -165,6 +165,28 @@ def test_an_oversized_json_document_is_refused_before_it_is_parsed(tmp_path):
         rails2zb.read_json(document, limit=4096, label="routes")
 
 
+def test_duplicate_json_keys_are_refused(tmp_path):
+    document = tmp_path / "routes.json"
+    document.write_text('{"source":"inferred","source":"observed"}\n')
+
+    with pytest.raises(rails2zb.RailsError, match="duplicate JSON key 'source'"):
+        rails2zb.read_json(document, label="routes")
+
+
+def test_output_guard_checks_lexical_placement_before_following_a_leaf_symlink(
+    tmp_path,
+):
+    source = tmp_path / "frozen"
+    source.mkdir()
+    external = tmp_path / "external.json"
+    external.write_text("outside\n")
+    planted = source / "inventory.json"
+    planted.symlink_to(external)
+
+    with pytest.raises(rails2zb.RailsError, match="outside the frozen source tree"):
+        rails2zb.ensure_output_outside_source(planted, source)
+
+
 def test_a_declared_secure_password_without_its_column_is_refused(mutable_source):
     """`has_secure_password :login` with no `login_digest` cannot be reconciled.
 
@@ -2413,6 +2435,7 @@ def test_a_renamed_table_reconciles_its_rows_under_the_new_name(
         'DELETE FROM "events-legacy" WHERE id = (SELECT MIN(id) FROM "events-legacy")'
     )
     connection.commit()
+    connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
     connection.close()
     src, decisions = _decide(mutable_source, **{fid: ("rename", "gatherings")})
     with pytest.raises(rails2zb.RailsError, match="events-legacy holds"):

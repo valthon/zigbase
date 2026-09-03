@@ -194,6 +194,14 @@ Run extraction only after every finding reconciles:
 python3 tools/rails/rails2zb.py extract --source source --decisions decisions.json --out bundle
 ```
 
+The converter builds the bundle in private `0700` directories and writes every JSON and NDJSON
+artifact with mode `0600`; migrated rows and legacy password hashes are sensitive data. Canonical
+JSON and NDJSON are installed with same-directory atomic replacement only after the complete file is
+fully written and flushed, so a failed row serialization cannot leave a partial destination. Keep
+every output path outside the frozen source tree. Output parents must be writable, and an existing
+symlink destination is refused rather than followed or replaced; choose the intended regular output
+path explicitly.
+
 Review source and decision digests, row and file counts, omissions, replacement artifacts, public
 rules, unreferenced objects, and credential redaction. Run it twice and require byte-identical
 bundles.
@@ -326,6 +334,8 @@ it:
   `'banana'`, or a REAL `1.5` that keeps its storage class and that the target refuses for an
   integer field. A non-finite float, or one outside the target's 64-bit range, cannot be stored at
   all.
+  Hand-authored inventory and decisions files must likewise be RFC 8259 JSON: `NaN`, `Infinity`,
+  and `-Infinity` are refused rather than accepted as implementation-specific values.
 - **Dates must be real dates.** `0000-00-00 00:00:00` — the legacy-MySQL zero date — along with
   `2024-02-30`, `1900-02-29`, `24:00:00` and an impossible UTC offset like `+30:00` are all
   well-formed to a pattern match and impossible to the target, which range-checks every component.

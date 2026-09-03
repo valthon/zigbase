@@ -16,6 +16,7 @@ const collections = @import("collections.zig");
 const schema = @import("schema.zig");
 const route_types = @import("route_types.zig");
 const rpc_ts = @import("codegen/rpc_ts.zig");
+const route_path = @import("route_path.zig");
 
 // ---------------------------------------------------------------------------
 // RAII DB-access handles used where a `*Ctx` isn't already bound to a live
@@ -297,7 +298,15 @@ fn lowerSecretSource(comptime src: anytype, comptime path: []const u8) PathSecre
 /// Loud `@compileError` on a malformed `.path_secret` (missing `.param`/`.source`, unknown keys).
 fn lowerRouteAuthGuard(comptime a: anytype, comptime path: []const u8) RouteAuthGuard {
     const A = @TypeOf(a);
-    if (A == RouteAuthGuard) return a;
+    if (A == RouteAuthGuard) {
+        switch (a) {
+            .path_secret => |guard| {
+                if (guard.in == .path and !route_path.hasCapture(path, guard.param))
+                    @compileError("route '" ++ path ++ "': .path_secret.param '" ++ guard.param ++ "' must name a :capture in the route path");
+            },
+        }
+        return a;
+    }
     if (@typeInfo(A) != .@"struct")
         @compileError("route '" ++ path ++ "': .auth must be an AuthLevel (.public/.authed/.superuser) " ++
             "or a guard struct like .{ .path_secret = .{ .param = \"...\", .source = .{ .kv = \"...\" } } }");
@@ -323,6 +332,8 @@ fn lowerRouteAuthGuard(comptime a: anytype, comptime path: []const u8) RouteAuth
     var guard = PathSecretGuard{ .param = ps.param, .source = lowerSecretSource(ps.source, path) };
     if (@hasField(P, "in")) guard.in = ps.in;
     if (@hasField(P, "on_mismatch")) guard.on_mismatch = ps.on_mismatch;
+    if (guard.in == .path and !route_path.hasCapture(path, guard.param))
+        @compileError("route '" ++ path ++ "': .path_secret.param '" ++ guard.param ++ "' must name a :capture in the route path");
     return .{ .path_secret = guard };
 }
 
@@ -570,7 +581,7 @@ pub const JobTask = *const fn (ctx: *Ctx, ev: *JobEvent) anyerror!void;
 /// (`fn(*route_types.Req(In)) route_types.RouteError!Out`); its shape is validated by
 /// `route_types.HandlerInput`/`HandlerOutput`'s own `@compileError`s when `routeMeta`
 /// reflects it — so no raw-Response coercion check is performed here.
-fn validateRouteSpecs(comptime specs: anytype) void {
+pub fn validateRouteSpecs(comptime specs: anytype) void {
     // The exact keys read by `routeMeta`/`buildRoutes` (and the auth helpers). Kept in
     // lock-step with those readers — a key read there must appear here or a valid spec
     // would falsely @compileError.
@@ -580,6 +591,11 @@ fn validateRouteSpecs(comptime specs: anytype) void {
         if (!@hasField(@TypeOf(s), "method")) @compileError("route spec is missing '.method' (expected .{ .method = .GET, .path = \"/...\", .handler = fn })");
         if (!@hasField(@TypeOf(s), "path")) @compileError("route spec is missing '.path' (expected .{ .method = .GET, .path = \"/...\", .handler = fn })");
         if (!@hasField(@TypeOf(s), "handler")) @compileError("route spec is missing '.handler' (expected .{ .method = .GET, .path = \"/...\", .handler = fn })");
+        const method: http.Method = s.method;
+        if (method == .UNKNOWN)
+            @compileError("route '" ++ s.path ++ "': .method cannot be .UNKNOWN");
+        if (!route_path.isCanonicalPattern(s.path))
+            @compileError("route '" ++ s.path ++ "': .path must be a canonical absolute router pattern with optional :name captures");
         // Fail loud on a typo'd optional key (e.g. `.rate_limt`, `.rate_limit_ky`) which the
         // `@hasField`-gated readers would otherwise silently ignore, shipping the route with
         // NO rate limit / default keying the developer believed they had configured.
@@ -752,40 +768,41 @@ pub fn customAuthMeta(comptime cols_cfg: anytype) []const CustomAuthMeta {
 }
 
 /// Comptime path→method-name (mirrors codegen `identifiers.routeMethodName`) with an
-/// optional `.name` override. Strips the "/api" prefix + ":param" segments, camel-joins
-/// the rest. Comptime-friendly (no allocator) for the framework-side collision check.
-/// Separators ('_', '-') within a segment are stripped and the following char is
-/// uppercased, matching codegen `pascal()` semantics (drift-guard test enforces parity).
+/// optional `.name` override. Strips the "/api" prefix + ":param" segments, then
+/// camel-joins the remaining literal bytes into an identifier. URI punctuation acts
+/// as a word separator (`robots.txt` -> `robotsTxt`), and a leading digit is prefixed
+/// with `_` (`2fa/verify` -> `_2faVerify`). Comptime-friendly (no allocator) for the
+/// framework-side collision check; a drift-guard pins the runtime reference helper.
 pub fn comptimeRouteName(comptime path: []const u8, comptime override: ?[]const u8) []const u8 {
     if (override) |n| return n;
     return comptime blk: {
         var rest: []const u8 = path;
         const prefix = "/api";
-        if (std.mem.startsWith(u8, rest, prefix)) rest = rest[prefix.len..];
+        if (std.mem.eql(u8, rest, prefix)) {
+            rest = "";
+        } else if (std.mem.startsWith(u8, rest, prefix ++ "/")) {
+            rest = rest[prefix.len..];
+        }
         var name: []const u8 = "";
-        var first = true;
         var it = std.mem.tokenizeScalar(u8, rest, '/');
         while (it.next()) |seg| {
             if (seg.len == 0 or seg[0] == ':') continue;
-            // PascalCase the segment, stripping '_'/'-' separators (matches
-            // codegen identifiers.pascal); first segment keeps its leading
-            // char lowercase to yield camelCase overall.
-            var piece: []const u8 = "";
-            var upper_next = false;
-            var seg_first = true;
+            var upper_next = name.len > 0;
             for (seg) |ch| {
-                if (ch == '_' or ch == '-') {
+                if (!std.ascii.isAlphanumeric(ch)) {
                     upper_next = true;
                     continue;
                 }
-                // Lowercase the first emitted char to match routeMethodName's camelCase (first char always lowercase).
-                const c = if (first and seg_first) std.ascii.toLower(ch) else if (upper_next or (!first and seg_first)) std.ascii.toUpper(ch) else ch;
-                piece = piece ++ &[_]u8{c};
+                if (name.len == 0 and std.ascii.isDigit(ch)) name = "_";
+                const c = if (name.len == 0)
+                    std.ascii.toLower(ch)
+                else if (upper_next)
+                    std.ascii.toUpper(ch)
+                else
+                    ch;
+                name = name ++ &[_]u8{c};
                 upper_next = false;
-                seg_first = false;
             }
-            name = name ++ piece;
-            first = false;
         }
         break :blk name;
     };
@@ -799,6 +816,10 @@ pub fn comptimeRouteName(comptime path: []const u8, comptime override: ?[]const 
 /// slice is returnable.
 pub fn routeMeta(comptime specs: anytype) []const RouteMeta {
     const fields = std.meta.fields(@TypeOf(specs));
+    comptime {
+        @setEvalBranchQuota(10_000 + fields.len * 5_000); // scale with route count
+        validateRouteSpecs(specs);
+    }
     const Holder = struct {
         const table: [fields.len]RouteMeta = blk: {
             @setEvalBranchQuota(10_000 + fields.len * 5_000); // scale with route count
@@ -808,11 +829,14 @@ pub fn routeMeta(comptime specs: anytype) []const RouteMeta {
                 const H = @TypeOf(s.handler);
                 const untyped = isUntypedHandler(H);
                 const override: ?[]const u8 = if (@hasField(@TypeOf(s), "name")) s.name else null;
+                const name = comptimeRouteName(s.path, override);
+                if (!route_path.isIdentifier(name))
+                    @compileError("route '" ++ s.path ++ "' has invalid method name '" ++ name ++ "'; set '.name' to an identifier such as 'reportV1'");
                 const guard = routeAuthGuard(s);
                 t[i] = .{
                     .method = s.method,
                     .path = s.path,
-                    .name = comptimeRouteName(s.path, override),
+                    .name = name,
                     // `.auth` may be an AuthLevel literal OR a guard struct; the guard maps to
                     // a `.public` AuthLevel here (the secret is the gate). See `routeAuthLevel`.
                     .auth = routeAuthLevel(s),
@@ -846,7 +870,6 @@ pub fn routeMeta(comptime specs: anytype) []const RouteMeta {
 /// Comptime-validates each route's Input/Output representability and `@compileError`s on a
 /// duplicate derived method name.
 pub fn buildRoutes(comptime specs: anytype) []const RuntimeRoute {
-    comptime validateRouteSpecs(specs);
     const fields = std.meta.fields(@TypeOf(specs));
     const meta = comptime routeMeta(specs);
     // Representability + duplicate-name guards, all at comptime.
@@ -857,14 +880,14 @@ pub fn buildRoutes(comptime specs: anytype) []const RuntimeRoute {
                 @compileError("route '" ++ m.path ++ "' derives an empty method name; add an explicit .name to the route spec");
             route_types.assertRepresentable(m.Input, m.name);
             route_types.assertRepresentable(m.Output, m.name);
-            // GET/DELETE routes communicate their Input via a query string.
+            // GET/HEAD/DELETE routes communicate their Input via a query string.
             // If the Input is representable but not query-parseable (e.g. contains a
             // non-string slice or a nested struct), the server's `parseQuery` cannot
             // decode it and every call would get a misleading 400 at runtime. Catch it
             // at build time instead.
-            if (m.method == .GET or m.method == .DELETE) {
+            if (route_types.inputUsesQuery(m.method)) {
                 if (!route_types.isQueryParseable(m.Input))
-                    @compileError("route '" ++ m.name ++ "': GET/DELETE Input must be encodable as a query string (scalars/enums/strings/optionals only); got a type with a non-query field. Use POST/PUT/PATCH for a JSON body, or simplify the Input.");
+                    @compileError("route '" ++ m.name ++ "': GET/HEAD/DELETE Input must be encodable as a query string (scalars/enums/strings/optionals only); got a type with a non-query field. Use POST/PUT/PATCH for a JSON body, or simplify the Input.");
             }
             for (meta[0..i]) |prev| {
                 if (std.mem.eql(u8, prev.name, m.name))
@@ -1447,6 +1470,22 @@ test "buildRoutes builds thunks + metadata with derived names" {
     try std.testing.expect(meta[0].Input == In);
     try std.testing.expect(meta[0].Output == Out);
     try std.testing.expect(meta[1].Input == void);
+}
+
+test "route metadata derives identifiers from ordinary literal URI paths" {
+    const H = struct {
+        fn run(req: *route_types.Req(void)) route_types.RouteError!void {
+            _ = req;
+        }
+    };
+    const meta = comptime routeMeta(.{
+        .{ .method = .GET, .path = "/robots.txt", .handler = H.run, .auth = .public },
+        .{ .method = .POST, .path = "/api/2fa/verify", .handler = H.run, .auth = .public },
+        .{ .method = .GET, .path = "/apian/status", .handler = H.run, .auth = .public },
+    });
+    try std.testing.expectEqualStrings("robotsTxt", meta[0].name);
+    try std.testing.expectEqualStrings("_2faVerify", meta[1].name);
+    try std.testing.expectEqualStrings("apianStatus", meta[2].name);
 }
 
 test "buildRoutes defaults auth to .superuser when omitted" {

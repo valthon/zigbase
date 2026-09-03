@@ -376,6 +376,24 @@ Each spec needs `.method`, `.path`, and `.handler` (a missing field or
 wrong-typed handler is a compile error). `.auth` is optional and **defaults to
 `.superuser`** (the safe default) when omitted. The three auth levels are:
 
+Route paths are canonical absolute paths. A `:name` segment captures exactly one
+path segment; capture names use identifier syntax (`[A-Za-z_][A-Za-z0-9_]*`) and
+cannot repeat within one route. Relative paths, trailing or repeated slashes,
+dot segments, percent escapes, literal OpenAPI braces, and
+`.UNKNOWN` methods are compile errors, so runtime routing and OpenAPI export use
+one grammar. Consumer routes use declaration-order precedence, including when
+two routes with the same method overlap. Put a more-specific literal route such
+as `/api/items/new` before a capture route such as `/api/items/:id`. A
+`.path_secret` carried in the path must name one of those captures,
+including when a helper returns the explicitly named `RouteAuthGuard` type.
+The generated OpenAPI `operationId` defaults to a name derived from the path and
+must be globally unique, including against built-in operation IDs. The derived
+name sanitizes punctuation and leading digits into a TypeScript-safe identifier
+(`[A-Za-z_][A-Za-z0-9_]*`); set an explicit `.name = "..."` when the result would
+collide or the path has no usable name components.
+`HEAD` handlers may return their representation body normally: the server preserves
+its `Content-Length` metadata and removes the bytes at the transport boundary.
+
 - `.public` — anyone (anonymous identity still provided).
 - `.authed` — any authenticated principal (a token from **any** auth collection).
 - `.superuser` — superusers only.
@@ -774,11 +792,11 @@ For routes that carry a structured input or output, ZigBase supports **typed rou
 // Input and Output are Zig types in the bounded Zig→TS subset: bool, int/float,
 // []const u8 (string), enums (→ string-literal union), std.json.Value (→ unknown),
 // optionals ?T, slices []T, and nested structs — applied recursively, so ?Struct
-// and []Struct are allowed. Anything else is a comptime error. (Caveat: a GET/DELETE
+// and []Struct are allowed. Anything else is a comptime error. (Caveat: a GET/HEAD/DELETE
 // query Input must be a flat struct of scalars/enums/strings/optionals-of-those.)
 fn handler(req: *zigbase.Req(InputType)) zigbase.RouteError!OutputType {
     const id = req.param("id");   // ?[]const u8 — a :param from the path
-    const input = req.input;      // InputType — parsed request body (POST/PUT/PATCH) or query (GET/DELETE)
+    const input = req.input;      // InputType — parsed request body (POST/PUT/PATCH/OPTIONS) or query (GET/HEAD/DELETE)
     // ...
     return OutputType{ ... };
     // or: return req.fail(404, "not found");   // → RouteError propagated as HTTP 404
@@ -802,7 +820,7 @@ Register typed routes in `.routes` identically to untyped ones (`.method`, `.pat
 
 The generated TypeScript method signature mirrors the route shape:
 - **`params` object** (e.g. `{ id: string }`) when the path has `:param` segments.
-- **`input` argument** when the Zig `Input` type is non-void (POST/PUT/PATCH routes serialize as the request body; GET/DELETE routes pass as query parameters).
+- **`input` argument** when the Zig `Input` type is non-void (POST/PUT/PATCH/OPTIONS routes serialize as the request body; GET/HEAD/DELETE routes pass as query parameters).
 - Output is the TypeScript equivalent of the Zig return type; `std.json.Value` maps to `unknown`.
 - `.auth` defaults to `.superuser` when omitted — typed routes are locked to superusers unless explicitly set.
 

@@ -645,13 +645,15 @@ assume anything about what it's talking to. Full reference:
 
 | Key | Meaning |
 |---|---|
-| `id` | Stable, unique case identifier. Required. Findings key off it. |
-| `method`, `path` | Required. `path` is appended to `--base-url`. |
+| `id` | Stable, unique case identifier. Required. Strings are recommended; numeric v1 identifiers remain accepted. Findings key off it. |
+| `method`, `path` | Required. `method` is an HTTP token. `path` is absolute and appended to `--base-url`. Legacy query-bearing paths, percent escapes, and raw Unicode remain valid in v1; prefer `query` for new captures. |
 | `query` | Object of string → string. Optional. |
 | `headers` | Only the headers that matter. `{{name}}` placeholders resolve from `--var`. |
 | `body` | JSON value or `null`. Sent as `application/json` when non-null. |
-| `expect.status` | Exact match. |
+| `expect.status` | Exact match. Omitted or `null` means no status expectation. |
 | `expect.bodySubset` | Recursive **subset** of the response body. |
+| `expect.control` | Optional producer-reviewed semantic label. Predeclare it before `record`; recording preserves it while refreshing status/body. |
+| `followRedirects` | Optional boolean, default `true` for v1 compatibility. Set `false` when the first `3xx` response is itself the evidence. |
 
 ### Subset matching
 
@@ -680,8 +682,28 @@ zb_replay.py replay --base-url URL capture.ndjson [--out findings.ndjson] \
 ```
 
 `record` runs each case in `requests.ndjson` against the **old** backend and fills in
-`expect` from the actual (volatile-stripped) response. `replay` runs a capture against
-the **new** backend and diffs each response against its `expect`.
+`expect.status` and `expect.bodySubset` from the actual (volatile-stripped) response while preserving
+an explicitly supplied `expect.control`. `replay` runs a capture against
+the **new** backend and diffs each response against its `expect`. Explicit `"expect": null`
+retains its historical meaning of no expectation. Before replay, every recorded control is checked
+against its status classification. `record` atomically replaces a complete capture with private
+`0600` permissions; `replay` atomically installs private `0600` findings only after every case has
+run, since response diffs may contain sensitive values. Both outputs flush the completed payload
+before replacement. Validation and failures before replacement leave
+the previous complete artifact unchanged.
+Binary responses remain usable as status evidence. Because v1 has no binary-body encoding, `record`
+omits `bodySubset` for a non-UTF-8 response; a textual `bodySubset` against one becomes a parity diff
+rather than a transport failure. Use byte-oriented tests when body content itself matters.
+Replay ignores ambient HTTP proxy variables. It follows redirects by default for v1 compatibility,
+but strips credentials when a redirect crosses origins; set `followRedirects` to `false` when the
+first `3xx` response is itself the evidence.
+
+Put query parameters in the `query` object for new captures. Query and header names and values are
+strings. The complete file is size-bounded and validated as strict UTF-8/RFC JSON before any request
+is sent. Resolved paths are checked again immediately before network I/O for unresolved placeholders
+and control characters; empty inputs fail because they exercise nothing, non-RFC JSON responses are
+compared as raw text, and emitted artifacts always use strict JSON. Response bodies are bounded to
+32 MiB; non-UTF-8 bodies remain available for status-only evidence.
 
 ### Findings and summary channels
 

@@ -74,6 +74,7 @@ def test_revoke_all_kills_everything_and_clears_cookies(auth2_page, auth2_server
                                  headers={"Authorization": f"Bearer {tok_a}"})
     with urllib.request.urlopen(req) as resp:
         assert resp.status == 204
+        assert resp.headers.get_all("Content-Length") is None
         set_cookies = resp.headers.get_all("Set-Cookie") or []
     # Pin CLEARED, not merely re-set: the zb_auth cookie's value must be empty AND
     # carry an expiry attribute that tells the browser to drop it (Max-Age <= 0 or an

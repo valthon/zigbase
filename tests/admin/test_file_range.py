@@ -132,8 +132,16 @@ def test_record_file_range_matrix(file_server):
     req = urllib.request.Request(url, method="HEAD")
     with urllib.request.urlopen(req, timeout=5) as r:
         assert r.status == 200
-        assert r.headers.get("Content-Length") == str(len(blob))
+        assert r.headers.get_all("Content-Length") == [str(len(blob))]
         assert len(r.read()) == 0
+
+    conditional_head = urllib.request.Request(
+        url, headers={"If-None-Match": etag}, method="HEAD"
+    )
+    with pytest.raises(urllib.error.HTTPError) as raised:
+        urllib.request.urlopen(conditional_head, timeout=5)
+    assert raised.value.code == 304
+    assert raised.value.headers.get_all("Content-Length") == [str(len(blob))]
 
 
 def test_locked_collection_file_stays_private_single_header(file_server):

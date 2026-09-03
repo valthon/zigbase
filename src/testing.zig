@@ -377,10 +377,11 @@ pub fn Harness(comptime AppType: type) type {
             // Multipart pre-parse: mirror `onRequest`, which runs `applyMultipart` before `route`
             // so a `multipart/form-data` body populates ctx.form_fields/ctx.files (and a malformed
             // body short-circuits to the same 400) — off-socket file uploads behave as in prod.
-            const resp = if (try server.applyMultipart(&ctx)) |multipart_err|
+            const routed = if (try server.applyMultipart(&ctx)) |multipart_err|
                 multipart_err
             else
                 try AppType.routeForTest(&ctx);
+            const resp = try server.normalizeResponse(&ctx, routed);
             return .{
                 .status = resp.status,
                 .body = resp.body,
@@ -557,6 +558,25 @@ fn echoHandler(ctx: *Ctx) anyerror!http.Response {
     };
 }
 
+fn headSuccessHandler(ctx: *Ctx) anyerror!http.Response {
+    _ = ctx;
+    return .{
+        .status = 200,
+        .body = "head-success-representation",
+        .content_type = "text/plain",
+        .extra_headers = &.{.{ .name = "X-Head", .value = "success" }},
+    };
+}
+
+fn headErrorHandler(ctx: *Ctx) anyerror!http.Response {
+    _ = ctx;
+    return .{
+        .status = 422,
+        .body = "{\"status\":422,\"code\":\"invalid\"}",
+        .extra_headers = &.{.{ .name = "X-Head", .value = "error" }},
+    };
+}
+
 /// App used across the harness tests: public + authed custom routes (typed and untyped), a
 /// `@public` collection so the built-in records API is exercised end-to-end, and a `users` auth
 /// collection so `createRecord` + real password login can be covered.
@@ -566,6 +586,8 @@ const HarnessTestApp = framework.App(.{
         .{ .method = .GET, .path = "/api/whoami", .handler = whoamiHandler, .auth = .authed },
         .{ .method = .POST, .path = "/api/send-mail", .handler = sendMailHandler, .auth = .public },
         .{ .method = .GET, .path = "/api/echo", .handler = echoHandler, .auth = .public },
+        .{ .method = .HEAD, .path = "/api/head-success", .handler = headSuccessHandler, .auth = .public },
+        .{ .method = .HEAD, .path = "/api/head-error", .handler = headErrorHandler, .auth = .public },
     },
     .collections = .{
         .things = .{
@@ -766,6 +788,25 @@ test "harness: query + headers + cookie opts reach the handler; Response.header/
     try std.testing.expectEqual(@as(u16, 200), r2.status);
     const echoed2 = try r2.json(struct { h: []const u8 });
     try std.testing.expectEqualStrings("from-slice", echoed2.h);
+}
+
+test "harness: HEAD matches live body suppression for success and error responses" {
+    var t = try start(HarnessTestApp, .{});
+    defer t.deinit();
+
+    const success = try t.request(.HEAD, "/api/head-success", .{});
+    try std.testing.expectEqual(@as(u16, 200), success.status);
+    try std.testing.expectEqualStrings("", success.body);
+    try std.testing.expectEqualStrings("text/plain", success.content_type);
+    try std.testing.expectEqualStrings("success", success.header("X-Head").?);
+    try std.testing.expectEqualStrings("27", success.header("content-length").?);
+
+    const failure = try t.request(.HEAD, "/api/head-error", .{});
+    try std.testing.expectEqual(@as(u16, 422), failure.status);
+    try std.testing.expectEqualStrings("", failure.body);
+    try std.testing.expectEqualStrings("application/json", failure.content_type);
+    try std.testing.expectEqualStrings("error", failure.header("X-Head").?);
+    try std.testing.expectEqualStrings("31", failure.header("content-length").?);
 }
 
 test "harness: a cookie-authenticated request (zb_auth) authorizes an .authed route" {

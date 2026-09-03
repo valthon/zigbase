@@ -8,13 +8,178 @@ property worth asserting.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import shutil
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from .conftest import read_inventory, write_inventory
-from tools.rails import rails2zb
-from tools.rails._core import RailsError
+from tools.rails import _core, rails2zb
+from tools.rails._core import RailsError, install_file_atomic, sha256_file
+
+
+def test_hash_reader_has_no_arbitrary_total_size_cap():
+    class ApparentlyLargeChunk(bytes):
+        def __len__(self):
+            return 1024 * 1024 * 1024 + 1
+
+    class Stream:
+        chunks = iter((ApparentlyLargeChunk(b"x"), b""))
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, _size):
+            return next(self.chunks)
+
+    class Source:
+        def open(self, _mode):
+            return Stream()
+
+    assert sha256_file(Source()) == hashlib.sha256(b"x").hexdigest()
+
+
+def test_install_reports_parent_creation_failure(tmp_path, monkeypatch):
+    source = tmp_path / "source"
+    source.write_bytes(b"payload")
+    destination = tmp_path / "missing" / "destination"
+    digest = sha256_file(source)
+
+    def fail_mkdir(_self, *args, **kwargs):
+        raise PermissionError("mkdir denied")
+
+    monkeypatch.setattr(Path, "mkdir", fail_mkdir)
+
+    with pytest.raises(RailsError, match="cannot install .*mkdir denied"):
+        install_file_atomic(source, destination, digest)
+
+
+def test_private_directory_creation_translates_os_errors(tmp_path, monkeypatch):
+    def fail_mkdir(_self, *args, **kwargs):
+        raise PermissionError("mkdir denied")
+
+    monkeypatch.setattr(Path, "mkdir", fail_mkdir)
+    with pytest.raises(
+        RailsError, match="cannot prepare private directory.*mkdir denied"
+    ):
+        _core._private_parent(tmp_path / "private")
+
+
+def test_install_reports_temporary_file_creation_failure(tmp_path, monkeypatch):
+    source = tmp_path / "source"
+    source.write_bytes(b"payload")
+    destination = tmp_path / "destination"
+    digest = sha256_file(source)
+
+    def fail_mkstemp(*args, **kwargs):
+        raise PermissionError("temporary file denied")
+
+    monkeypatch.setattr(_core.tempfile, "mkstemp", fail_mkstemp)
+
+    with pytest.raises(RailsError, match="cannot install .*temporary file denied"):
+        install_file_atomic(source, destination, digest)
+
+
+def test_install_hashes_while_copying_and_leaves_no_bad_destination(tmp_path):
+    source = tmp_path / "source"
+    source.write_bytes(b"payload")
+    destination = tmp_path / "destination"
+
+    with pytest.raises(RailsError, match="does not match its recorded digest"):
+        install_file_atomic(source, destination, "0" * 64)
+
+    assert not destination.exists()
+
+
+def test_extract_does_not_create_output_when_source_loading_fails(tmp_path):
+    (tmp_path / "source").mkdir()
+    output = tmp_path / "new" / "bundle"
+    args = SimpleNamespace(
+        out=output,
+        source=tmp_path / "source",
+        decisions=tmp_path / "decisions.json",
+    )
+    with pytest.raises(RailsError, match="inventory"):
+        rails2zb.cmd_extract(args)
+    assert not output.exists()
+
+
+def test_canonical_writer_refuses_existing_symlink_destination(tmp_path):
+    victim = tmp_path / "victim.json"
+    victim.write_text("unchanged\n")
+    destination = tmp_path / "manifest.json"
+    destination.symlink_to(victim)
+
+    with pytest.raises(RailsError, match="refusing to replace symlink"):
+        _core.write_canonical_json(destination, {"replacement": True})
+
+    assert destination.is_symlink()
+    assert victim.read_text() == "unchanged\n"
+
+
+def test_require_sqlite_rejects_nonempty_wal_but_allows_empty_sidecar(source, tmp_path):
+    copied = tmp_path / "source"
+    shutil.copytree(source, copied)
+    loaded = rails2zb.load_source(copied)
+    wal = loaded.database.with_name(loaded.database.name + "-wal")
+    wal.write_bytes(b"")
+    assert rails2zb.require_sqlite(loaded) == loaded.database
+    wal.write_bytes(b"uncheckpointed")
+    with pytest.raises(RailsError, match="uncheckpointed WAL"):
+        rails2zb.require_sqlite(loaded)
+
+
+def test_extract_rejects_an_output_file_before_loading_source(tmp_path, monkeypatch):
+    source = tmp_path / "source"
+    source.mkdir()
+    output = tmp_path / "bundle"
+    output.write_text("not a directory")
+    monkeypatch.setattr(
+        rails2zb,
+        "load_source",
+        lambda _path: pytest.fail("source loaded before output preflight"),
+    )
+    args = SimpleNamespace(
+        out=output,
+        source=source,
+        decisions=tmp_path / "decisions.json",
+    )
+    with pytest.raises(RailsError, match="must be a directory"):
+        rails2zb.cmd_extract(args)
+
+    with pytest.raises(RailsError, match="must be a directory"):
+        rails2zb.extract(SimpleNamespace(root=source), {}, output)
+
+
+def test_extract_rejects_a_dirty_output_before_loading_inputs(tmp_path, monkeypatch):
+    source = tmp_path / "source"
+    source.mkdir()
+    output = tmp_path / "bundle"
+    output.mkdir()
+    (output / "stale").write_text("stale")
+    monkeypatch.setattr(
+        rails2zb,
+        "load_source",
+        lambda _path: pytest.fail("source loaded before output preflight"),
+    )
+    monkeypatch.setattr(
+        rails2zb,
+        "load_decisions",
+        lambda _path: pytest.fail("decisions loaded before output preflight"),
+    )
+    args = SimpleNamespace(
+        out=output,
+        source=source,
+        decisions=tmp_path / "decisions.json",
+    )
+    with pytest.raises(RailsError, match="not empty"):
+        rails2zb.cmd_extract(args)
 
 
 @pytest.fixture(scope="module")
@@ -150,6 +315,29 @@ def test_an_unknown_source_mode_is_refused(mutable_source):
         write_inventory(mutable_source, name, payload)
     with pytest.raises(RailsError, match="observed"):
         rails2zb.load_source(mutable_source)
+
+
+@pytest.mark.parametrize("bad_source", [[], {}, 7, None])
+def test_a_non_string_source_mode_is_refused_cleanly(mutable_source, bad_source):
+    schema = read_inventory(mutable_source, "schema")
+    schema["source"] = bad_source
+    write_inventory(mutable_source, "schema", schema)
+    with pytest.raises(RailsError, match="does not declare source"):
+        rails2zb.load_source(mutable_source)
+
+
+def test_nested_source_named_application_data_is_not_provenance(mutable_source):
+    models = read_inventory(mutable_source, "models")
+    model = models["models"][0]
+    model["source"] = "assumed"
+    model["enums"] = {"source": {"web": 0}}
+    model["defaults"] = {"source": "web"}
+    model["constraints"] = {
+        "source": {"type": "regexp", "source": "csv|json", "options": ""}
+    }
+    write_inventory(mutable_source, "models", models)
+
+    assert rails2zb.load_source(mutable_source).mode == "observed"
 
 
 def test_an_incomplete_inventory_is_refused(mutable_source):

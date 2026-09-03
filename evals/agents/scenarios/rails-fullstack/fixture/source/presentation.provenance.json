@@ -1,0 +1,11 @@
+{
+  "zigapagosRailsFixture": 1,
+  "release": "v0.5.0",
+  "release_commit": "2c2c4936caed2a4db211b082140f0b008563b0bc",
+  "release_url": "https://github.com/valthon/zigapagos/releases/tag/v0.5.0",
+  "presentation_schema": "zigapagos.rails-presentation/1",
+  "handoff_schema": "zigapagos.rails-handoff/1",
+  "endpoint_contract": "v0.5.0 emits non-null endpoint bindings after a RAILS_BACKEND_ENDPOINT decision",
+  "dynamic_route_decision": "blocked until a deterministic browser example exists",
+  "generated_target": "presentation-target/site"
+}

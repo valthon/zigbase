@@ -1,10 +1,13 @@
 """End-to-end contract for `zigbase openapi` against real SQLite metadata."""
+
 import json
 import os
 import pathlib
 import subprocess
 
 import pytest
+
+from tools.rails.fullstack import load_operations
 
 
 REPO = pathlib.Path(__file__).resolve().parents[2]
@@ -17,10 +20,28 @@ def dating_binary():
     if override:
         path = pathlib.Path(override)
         if not path.exists():
-            raise FileNotFoundError(f"ZIGBASE_TEST_DATING_BINARY={override} does not exist")
+            raise FileNotFoundError(
+                f"ZIGBASE_TEST_DATING_BINARY={override} does not exist"
+            )
         return str(path)
     subprocess.run(ZIG + ["build", "dating-server"], cwd=REPO, check=True)
     path = REPO / "zig-out" / "bin" / "dating-server"
+    assert path.exists()
+    return str(path)
+
+
+@pytest.fixture(scope="session")
+def collection_auth_binary():
+    override = os.environ.get("ZIGBASE_TEST_FEATURE_REMAPPED_BINARY")
+    if override:
+        path = pathlib.Path(override)
+        if not path.exists():
+            raise FileNotFoundError(
+                f"ZIGBASE_TEST_FEATURE_REMAPPED_BINARY={override} does not exist"
+            )
+        return str(path)
+    subprocess.run(ZIG + ["build", "feature-remapped-fixture"], cwd=REPO, check=True)
+    path = REPO / "zig-out" / "bin" / "feature-remapped-fixture"
     assert path.exists()
     return str(path)
 
@@ -31,27 +52,35 @@ def run(binary, *args):
 
 def provision(binary, data_dir):
     schema = data_dir / "schema.json"
-    schema.write_text(json.dumps({
-        "zigbaseSchema": 1,
-        "collections": [{
-            "name": "notes",
-            "type": "base",
-            "fields": [{
-                "id": "",
-                "name": "body",
-                "type": "text",
-                "required": True,
-                "options": {"min": 2, "max": 200},
-            }],
-            "indexes": [],
-            "listRule": "@public",
-            "viewRule": "@public",
-            "createRule": None,
-            "updateRule": "owner = @request.auth.id",
-            "deleteRule": None,
-            "options": {},
-        }],
-    }))
+    schema.write_text(
+        json.dumps(
+            {
+                "zigbaseSchema": 1,
+                "collections": [
+                    {
+                        "name": "notes",
+                        "type": "base",
+                        "fields": [
+                            {
+                                "id": "",
+                                "name": "body",
+                                "type": "text",
+                                "required": True,
+                                "options": {"min": 2, "max": 200},
+                            }
+                        ],
+                        "indexes": [],
+                        "listRule": "@public",
+                        "viewRule": "@public",
+                        "createRule": None,
+                        "updateRule": "owner = @request.auth.id",
+                        "deleteRule": None,
+                        "options": {},
+                    }
+                ],
+            }
+        )
+    )
     result = run(binary, "schema", "apply", schema, "--data-dir", data_dir)
     assert result.returncode == 0, result.stderr
 
@@ -61,21 +90,103 @@ def test_stdout_metadata_collections_and_database_is_unchanged(binary, tmp_path)
     database = tmp_path / "data.db"
     before = database.read_bytes()
     result = run(
-        binary, "openapi", "--data-dir", tmp_path,
-        "--title", "Example API", "--api-version", "2026-08",
-        "--server", "https://api.example.test",
+        binary,
+        "openapi",
+        "--data-dir",
+        tmp_path,
+        "--title",
+        "Example API",
+        "--api-version",
+        "2026-08",
+        "--server",
+        "https://api.example.test",
     )
     assert result.returncode == 0, result.stderr
     doc = json.loads(result.stdout)
     assert doc["openapi"] == "3.1.2"
     assert doc["info"] == {"title": "Example API", "version": "2026-08"}
+    assert doc["x-zigbase-contract-version"] == "1"
     assert doc["servers"] == [{"url": "https://api.example.test"}]
     assert "/api/collections/notes/records" in doc["paths"]
     assert doc["paths"]["/api/collections/notes/records"]["get"]["security"] == []
-    assert doc["paths"]["/api/collections/notes/records"]["post"]["x-zigbase-access"] == "locked"
-    assert doc["paths"]["/api/collections/notes/records/{id}"]["patch"]["x-zigbase-rule"] == "owner = @request.auth.id"
+    assert (
+        doc["paths"]["/api/collections/notes/records"]["post"]["x-zigbase-access"]
+        == "locked"
+    )
+    assert (
+        doc["paths"]["/api/collections/notes/records/{id}"]["patch"]["x-zigbase-rule"]
+        == "owner = @request.auth.id"
+    )
     assert doc["x-zigbase-coverage"]["consumerRoutes"] is False
     assert database.read_bytes() == before, "OpenAPI inspection must not mutate data.db"
+
+
+def test_real_openapi_export_is_accepted_by_the_rails_fullstack_consumer(
+    binary, tmp_path
+):
+    provision(binary, tmp_path)
+    output = tmp_path / "openapi.json"
+    result = run(binary, "openapi", "--data-dir", tmp_path, "--out", output)
+    assert result.returncode == 0, result.stderr
+
+    operations, routes, contract, _auth_collections = load_operations(output)
+
+    assert operations
+    assert routes
+    assert contract["builtin_endpoints"]["authWithPassword"]["path"] == (
+        "/api/collections/{collection}/auth-with-password"
+    )
+    assert contract["reserved_prefixes"] == (("/_", "admin"),)
+    assert operations["createNotes"]["collection"] == "notes"
+    assert operations["createNotes"]["collection_type"] == "base"
+    assert (
+        routes[("POST", "/api/collections/notes/records")]["operation_id"]
+        == "createNotes"
+    )
+
+
+def test_colliding_friendly_collection_names_are_disambiguated(binary, tmp_path):
+    schema = tmp_path / "schema.json"
+    schema.write_text(
+        json.dumps(
+            {
+                "zigbaseSchema": 1,
+                "collections": [
+                    {
+                        "name": name,
+                        "type": "base",
+                        "fields": [],
+                        "indexes": [],
+                        "listRule": "@public",
+                        "viewRule": "@public",
+                        "createRule": None,
+                        "updateRule": None,
+                        "deleteRule": None,
+                        "options": {},
+                    }
+                    for name in ("user_posts", "userPosts")
+                ],
+            }
+        )
+    )
+    applied = run(binary, "schema", "apply", schema, "--data-dir", tmp_path)
+    assert applied.returncode == 0, applied.stderr
+
+    result = run(binary, "openapi", "--data-dir", tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    doc = json.loads(result.stdout)
+    paths = doc["paths"]
+    assert (
+        paths["/api/collections/user_posts/records"]["get"]["operationId"]
+        == "listUserPosts_user_posts"
+    )
+    assert (
+        paths["/api/collections/userPosts/records"]["get"]["operationId"]
+        == "listUserPosts_userPosts"
+    )
+    assert "UserPosts_user_postsRecord" in doc["components"]["schemas"]
+    assert "UserPosts_userPostsRecord" in doc["components"]["schemas"]
 
 
 def test_out_creates_parents_and_atomically_replaces_existing_file(binary, tmp_path):
@@ -101,7 +212,31 @@ def test_framework_binary_includes_its_comptime_routes(binary, dating_binary, tm
     assert route["x-zigbase-auth"] == "public"
     assert "requestBody" not in route
     publish = doc["paths"]["/api/testing/publish"]["post"]
-    assert publish["requestBody"]["content"]["application/json"]["schema"]["type"] == "object"
+    assert (
+        publish["requestBody"]["content"]["application/json"]["schema"]["type"]
+        == "object"
+    )
+
+
+def test_real_export_preserves_collection_specific_consumer_auth(
+    binary, collection_auth_binary, tmp_path
+):
+    provision(binary, tmp_path)
+    result = run(collection_auth_binary, "openapi", "--data-dir", tmp_path)
+    assert result.returncode == 0, result.stderr
+    output = tmp_path / "collection-auth-openapi.json"
+    output.write_text(result.stdout)
+    operations, _routes, _contract, _auth_collections = load_operations(output)
+    assert operations["profileMe"] == {
+        "operation_id": "profileMe",
+        "verb": "GET",
+        "path": "/api/profile/me",
+        "collection": None,
+        "collection_type": None,
+        "access": "authenticated",
+        "auth_collection": "profiles",
+        "allow_superuser": True,
+    }
 
 
 def test_missing_database_fails_without_creating_it(binary, tmp_path):

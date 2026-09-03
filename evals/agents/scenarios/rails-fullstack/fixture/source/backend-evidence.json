@@ -1,0 +1,13 @@
+{
+  "zigbaseRailsFullstackBackendEvidence": 1,
+  "source_mode": "observed",
+  "active_record_data": {"preserved_ids": true, "preserved_timestamps": true, "relations_verified": true},
+  "authorization": {"allowed_and_denied": true, "server_enforced": true},
+  "files": {"active_storage_digest_verified": true},
+  "side_effects": {"transaction_verified": true, "job_verified": true, "mail_verified": true},
+  "doctor": {"errors": 0, "warnings": ["posts.listRule", "posts.viewRule", "users.createRule"], "reviewed_public_rules": ["posts.list", "posts.view", "users.create"]},
+  "restart": "Plan: restart the migrated database, JWT material, and frontend release together, then rerun parity.",
+  "restore": "Plan: copy the stopped complete data directory into a fresh second target, boot it, and rerun probes.",
+  "rollback": "Plan: stop the cutover copy, switch back to the stopped original unit, and verify its pre-switch credential before writes resume.",
+  "cutover": "Plan: stop writes and workers, copy the complete stopped unit, boot the restored copy, and verify static, API, and credential behavior before switching traffic."
+}
