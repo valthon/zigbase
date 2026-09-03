@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import socket
 import sqlite3
 import urllib.error
 import urllib.parse
@@ -18,6 +17,7 @@ from tools.pocketbase import pb2zb
 
 from ..result import EvalFailure
 from . import GradeReport
+from ._harness import free_port as _free_port, write_private_text
 from .genesis import (
     Commands,
     DoctorReport,
@@ -385,12 +385,6 @@ def _binary() -> str:
 def _run_ok(result: Any, code: str) -> None:
     if result.returncode != 0 or result.timed_out or result.output_truncated:
         raise GradeFailure(code, "fixed migration verification command failed")
-
-
-def _free_port() -> int:
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
 
 
 def _request(
@@ -766,7 +760,8 @@ def run_deployment(
         config = json.loads(config_result.stdout)
         service = inspect_compose(config)
         port = port_picker()
-        override.write_text(
+        write_private_text(
+            override,
             "services:\n"
             f"  {service}:\n"
             "    ports: !override\n"
@@ -786,7 +781,7 @@ def run_deployment(
             "    networks:\n"
             "      zigbase_eval: {}\n"
             "networks:\n"
-            "  zigbase_eval: {}\n"
+            "  zigbase_eval: {}\n",
         )
         stack = [*base, "-f", str(compose), "-f", str(override)]
         cleanup = True

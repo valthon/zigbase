@@ -6,10 +6,8 @@ import json
 import os
 import re
 import shutil
-import socket
+import stat
 import subprocess
-import urllib.error
-import urllib.request
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,9 +16,19 @@ from typing import Any, Callable, Protocol
 from ..process import run_process
 from ..result import EvalFailure
 from . import GradeReport
+from ._harness import (
+    EVAL_ENVIRONMENT,
+    free_port as _free_port,
+    http_response,
+    read_bounded_regular,
+    strict_json_loads,
+    strict_utf8,
+    write_private_text,
+)
 
 
 MAX_SOURCE_BYTES = 4 * 1024 * 1024
+MAX_JSON_ARTIFACT_BYTES = 16 * 1024 * 1024
 MAX_COMMAND_OUTPUT_BYTES = 1024 * 1024
 RULE_OPERATIONS = {"list", "view", "create", "update", "delete"}
 COMPOSE_VARIABLE = re.compile(
@@ -131,8 +139,8 @@ class SubprocessCommands:
         )
         return CommandResult(
             returncode=result.exit_code,
-            stdout=stdout_path.read_text(errors="replace"),
-            stderr=stderr_path.read_text(errors="replace"),
+            stdout=result.stdout,
+            stderr=result.stderr,
             timed_out=result.timed_out,
             output_truncated=result.output_truncated,
         )
@@ -157,6 +165,7 @@ def _failure(code: str, message: str) -> EvalFailure:
 
 
 def _grader_environment(workspace: Path) -> dict[str, str]:
+    scratch = prepare_grader_scratch(workspace)
     allowed = (
         "PATH",
         "LANG",
@@ -174,14 +183,47 @@ def _grader_environment(workspace: Path) -> dict[str, str]:
         "DOCKER_CONTEXT",
     )
     env = {name: os.environ[name] for name in allowed if name in os.environ}
-    env.update({"HOME": str(workspace / ".home"), "TMPDIR": str(workspace / ".tmp")})
+    env.update({"HOME": str(scratch["HOME"]), "TMPDIR": str(scratch["TMPDIR"])})
     return env
+
+
+def prepare_grader_scratch(workspace: Path) -> dict[str, Path]:
+    """Create private workspace-local scratch directories."""
+    try:
+        if not workspace.is_dir():
+            raise GradeFailure(
+                "environment.scratch_unsafe", "grader workspace is not a directory"
+            )
+        result = {}
+        for variable, name in (("HOME", ".home"), ("TMPDIR", ".tmp")):
+            path = workspace / name
+            try:
+                metadata = os.lstat(path)
+            except FileNotFoundError:
+                path.mkdir(mode=0o700)
+                metadata = os.lstat(path)
+            if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+                raise GradeFailure(
+                    "environment.scratch_unsafe",
+                    f"grader {name} must be a real directory, not a link or other file",
+                )
+            path.chmod(0o700)
+            result[variable] = path
+        return result
+    except GradeFailure:
+        raise
+    except OSError as exc:
+        raise GradeFailure(
+            "environment.scratch_unsafe",
+            f"cannot prepare private grader scratch directories: {exc}",
+        ) from exc
 
 
 def load_public_inventory(path: Path) -> frozenset[tuple[str, str]]:
     try:
-        value = json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError) as exc:
+        raw = read_bounded_regular(path, MAX_JSON_ARTIFACT_BYTES)
+        value = strict_json_loads(strict_utf8(raw, str(path)))
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
         raise GradeFailure(
             "rules.inventory_invalid", f"cannot read public-rule inventory: {exc}"
         ) from exc
@@ -245,8 +287,12 @@ def parse_doctor_ndjson(text: str) -> DoctorReport:
     public_rules: set[tuple[str, str]] = set()
     for line in text.splitlines():
         try:
-            value = json.loads(line)
-        except json.JSONDecodeError:
+            value = strict_json_loads(line)
+        except (ValueError, json.JSONDecodeError) as exc:
+            if line.lstrip().startswith(("{", "[")):
+                raise GradeFailure(
+                    "rules.doctor_invalid", f"doctor emitted malformed JSON: {exc}"
+                ) from exc
             continue
         if not isinstance(value, dict):
             continue
@@ -327,18 +373,34 @@ def _zig_application_text(workspace: Path) -> str:
     pieces = []
     total = 0
     source = workspace / "src"
-    if not source.is_dir():
+    try:
+        source_metadata = os.lstat(source)
+    except OSError as exc:
+        raise GradeFailure(
+            "completion.app_missing", "src directory is missing"
+        ) from exc
+    if stat.S_ISLNK(source_metadata.st_mode) or not stat.S_ISDIR(
+        source_metadata.st_mode
+    ):
         raise GradeFailure("completion.app_missing", "src directory is missing")
     for path in source.rglob("*.zig"):
-        if path.is_symlink() or not path.is_file():
+        metadata = os.lstat(path)
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
             continue
-        total += path.stat().st_size
-        if total > MAX_SOURCE_BYTES:
+        try:
+            payload = read_bounded_regular(path, MAX_SOURCE_BYTES - total)
+        except (OSError, ValueError) as exc:
             raise GradeFailure(
                 "completion.source_limit",
-                "Zig application source exceeds the grading limit",
-            )
-        pieces.append(path.read_text(errors="replace"))
+                f"Zig application source is unsafe or exceeds the grading limit: {exc}",
+            ) from exc
+        total += len(payload)
+        try:
+            pieces.append(strict_utf8(payload, str(path)))
+        except ValueError as exc:
+            raise GradeFailure(
+                "completion.source_invalid", f"Zig application source is invalid: {exc}"
+            ) from exc
     return "\n".join(pieces).lower()
 
 
@@ -440,11 +502,28 @@ def inspect_completion(workspace: Path) -> tuple[EvalFailure, ...]:
                 "completion.client_test_missing", "no client test source was found"
             )
         )
-    elif not any(
-        marker in path.read_text(errors="replace")
-        for path in client_tests
-        for marker in ("expect(", "assert", "should(")
-    ):
+    else:
+        client_total = 0
+        client_texts = []
+        try:
+            for path in client_tests:
+                payload = read_bounded_regular(path, MAX_SOURCE_BYTES - client_total)
+                client_total += len(payload)
+                client_texts.append(strict_utf8(payload, str(path)))
+        except (OSError, ValueError) as exc:
+            failures.append(
+                _failure(
+                    "completion.client_test_invalid",
+                    f"client test source is unsafe or exceeds the grading limit: {exc}",
+                )
+            )
+            return tuple(failures)
+        if any(
+            marker in text
+            for text in client_texts
+            for marker in ("expect(", "assert", "should(")
+        ):
+            return tuple(failures)
         failures.append(
             _failure(
                 "completion.client_test_invalid",
@@ -458,9 +537,10 @@ def _client_test_command(workspace: Path) -> list[str]:
     package_path = workspace / "package.json"
     if package_path.is_file():
         try:
-            package = json.loads(package_path.read_text())
+            raw = read_bounded_regular(package_path, MAX_SOURCE_BYTES)
+            package = strict_json_loads(strict_utf8(raw, str(package_path)))
             scripts = package["scripts"]
-        except (OSError, json.JSONDecodeError, KeyError, TypeError) as exc:
+        except (OSError, ValueError, json.JSONDecodeError, KeyError, TypeError) as exc:
             raise GradeFailure(
                 "tests.package_invalid", f"cannot read package test scripts: {exc}"
             ) from exc
@@ -485,8 +565,11 @@ def _client_test_command(workspace: Path) -> list[str]:
                 return ["npm", "run", name]
 
     try:
-        build = (workspace / "build.zig").read_text()
-    except OSError as exc:
+        build_path = workspace / "build.zig"
+        build = strict_utf8(
+            read_bounded_regular(build_path, MAX_SOURCE_BYTES), str(build_path)
+        )
+    except (OSError, ValueError) as exc:
         raise GradeFailure("tests.client_missing", "build.zig is unavailable") from exc
     for step in (
         "client-test",
@@ -641,16 +724,16 @@ def inspect_compose(config: dict[str, Any]) -> str:
 
 
 def _evaluation_environment(compose: Path) -> dict[str, str]:
-    environment = {
-        "ZIGBASE_JWT_SECRET": "x" * 64,
-        "ZIGBASE_SMTP_HOST": "smtp.example.invalid",
-        "ZIGBASE_PUBLIC_URL": "https://eval.invalid",
-    }
-    text = compose.read_text(errors="replace")
-    if len(text.encode()) > MAX_SOURCE_BYTES:
-        raise GradeFailure(
-            "deployment.compose_invalid", "Compose file exceeds the grading limit"
+    environment = dict(EVAL_ENVIRONMENT)
+    try:
+        text = strict_utf8(
+            read_bounded_regular(compose, MAX_SOURCE_BYTES), str(compose)
         )
+    except (OSError, ValueError) as exc:
+        raise GradeFailure(
+            "deployment.compose_invalid",
+            f"Compose file is unsafe or exceeds the grading limit: {exc}",
+        ) from exc
     for name, operator in COMPOSE_VARIABLE.findall(text):
         if operator in {":-", "-", ":+", "+"}:
             continue
@@ -690,21 +773,15 @@ def _evaluation_environment(compose: Path) -> dict[str, str]:
     return environment
 
 
-def _free_port() -> int:
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
-
-
 def _http_json(url: str, timeout: float) -> dict[str, Any]:
-    with urllib.request.urlopen(url, timeout=timeout) as response:
-        if response.status != 200:
-            raise urllib.error.HTTPError(
-                url, response.status, "not healthy", response.headers, None
-            )
-        value = json.loads(response.read())
+    status, payload, _ = http_response(url, timeout, include_error_status=False)
+    if status != 200:
+        raise ValueError(f"response has HTTP status {status}, not 200")
+    value = strict_json_loads(strict_utf8(payload, f"{url} response"))
     if not isinstance(value, dict):
         raise ValueError("response is not a JSON object")
+    if url.rstrip("/").endswith("/api/health") and value.get("status") != "ok":
+        raise ValueError("health response does not report status 'ok'")
     return value
 
 
@@ -730,6 +807,7 @@ def run_deployment(
     http_get=_http_json,
     port_picker=_free_port,
     health_attempts: int = 30,
+    before_local_build: Callable[[], None] | None = None,
 ) -> tuple[bool, DoctorReport | None, tuple[EvalFailure, ...]]:
     failures = []
     project = f"zigbase-genesis-{uuid.uuid4().hex[:12]}"
@@ -754,14 +832,18 @@ def run_deployment(
                 "deployment.compose_invalid", "docker compose config failed"
             )
         try:
-            config = json.loads(config_result.stdout)
-        except json.JSONDecodeError as exc:
+            config = strict_json_loads(config_result.stdout)
+        except (ValueError, json.JSONDecodeError) as exc:
             raise GradeFailure(
                 "deployment.compose_invalid", "Compose config did not return JSON"
             ) from exc
         service = inspect_compose(config)
+        _, service_config = _compose_service(config)
+        if service_config.get("build") is not None and before_local_build is not None:
+            before_local_build()
         port = port_picker()
-        override.write_text(
+        write_private_text(
+            override,
             "services:\n"
             f"  {service}:\n"
             "    ports: !override\n"
@@ -778,7 +860,7 @@ def run_deployment(
             "    networks:\n"
             "      zigbase_eval: {}\n"
             "networks:\n"
-            "  zigbase_eval: {}\n"
+            "  zigbase_eval: {}\n",
         )
         stack = [*base, "-f", str(compose), "-f", str(override)]
         cleanup_required = True
@@ -881,10 +963,37 @@ def grade(
     health_attempts: int = 30,
 ) -> GradeReport:
     artifacts.mkdir(parents=True, exist_ok=True)
+    artifacts.chmod(0o700)
     commands = commands or SubprocessCommands(artifacts)
     failures = list(inspect_completion(workspace))
-    build_ok, tests_green, command_failures = run_build_and_tests(workspace, commands)
-    failures.extend(command_failures)
+    inventory = None
+    try:
+        inventory = load_public_inventory(workspace / "security" / "public-rules.json")
+    except GradeFailure as exc:
+        failures.append(_failure(exc.code, str(exc)))
+
+    build_ok = False
+    tests_green = False
+    build_boundary_ran = False
+
+    def run_build_boundary() -> None:
+        nonlocal build_ok, tests_green, build_boundary_ran
+        if build_boundary_ran:
+            return
+        build_boundary_ran = True
+        try:
+            build_ok, tests_green, command_failures = run_build_and_tests(
+                workspace, commands
+            )
+            failures.extend(command_failures)
+        except (OSError, TypeError, ValueError) as exc:
+            failures.append(
+                _failure(
+                    "tests.boundary_error",
+                    f"agent build/test boundary failed: {type(exc).__name__}: {exc}",
+                )
+            )
+
     deployed, doctor, deployment_failures = run_deployment(
         workspace,
         artifacts,
@@ -892,20 +1001,23 @@ def grade(
         http_get=http_get,
         port_picker=port_picker,
         health_attempts=health_attempts,
+        before_local_build=run_build_boundary,
     )
     failures.extend(deployment_failures)
 
     rules_locked = False
-    try:
-        inventory = load_public_inventory(workspace / "security" / "public-rules.json")
-        if doctor is None:
-            raise GradeFailure(
-                "rules.doctor_missing", "production doctor output is unavailable"
-            )
-        compare_public_rules(inventory, doctor)
-        rules_locked = True
-    except GradeFailure as exc:
-        failures.append(_failure(exc.code, str(exc)))
+    if inventory is not None:
+        try:
+            if doctor is None:
+                raise GradeFailure(
+                    "rules.doctor_missing", "production doctor output is unavailable"
+                )
+            compare_public_rules(inventory, doctor)
+            rules_locked = True
+        except GradeFailure as exc:
+            failures.append(_failure(exc.code, str(exc)))
+
+    run_build_boundary()
 
     completion = (
         not any(failure.code.startswith("completion.") for failure in failures)
