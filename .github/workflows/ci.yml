@@ -74,6 +74,12 @@ jobs:
         run: mise exec zig@0.16.0 -- zig build auth2-server -Dcpu=baseline
       - name: Build features-fixture (demo flags/experiments browser fixture)
         run: mise exec zig@0.16.0 -- zig build features-fixture -Dcpu=baseline
+      - name: Build configured feature-route fixtures
+        run: |
+          mise exec zig@0.16.0 -- zig build feature-remapped-fixture -Dcpu=baseline
+          mise exec zig@0.16.0 -- zig build feature-disabled-fixture -Dcpu=baseline
+      - name: Consumer route compile-fail contracts
+        run: mise exec zig@0.16.0 -- zig build check-route-contracts -Dcpu=baseline
       - name: Build import-fixture (offline-import e2e fixture, #283)
         run: mise exec zig@0.16.0 -- zig build import-fixture -Dcpu=baseline
       - name: Build lean gating fixture
@@ -184,6 +190,8 @@ jobs:
             zig-out/bin/dating-server
             zig-out/bin/auth2-server
             zig-out/bin/features-fixture
+            zig-out/bin/feature-remapped-fixture
+            zig-out/bin/feature-disabled-fixture
             zig-out/bin/import-fixture
             zig-out/bin/full-fixture
             examples/blog/zig-out/bin/blog
@@ -443,6 +451,9 @@ jobs:
           echo "ZIGBASE_TEST_PLUGINS_BINARY=$GITHUB_WORKSPACE/artifacts/examples/plugins/zig-out/bin/plugins" >> "$GITHUB_ENV"
           chmod +x artifacts/zig-out/bin/features-fixture
           echo "ZIGBASE_FEATURES_BINARY=$GITHUB_WORKSPACE/artifacts/zig-out/bin/features-fixture" >> "$GITHUB_ENV"
+          chmod +x artifacts/zig-out/bin/feature-remapped-fixture artifacts/zig-out/bin/feature-disabled-fixture
+          echo "ZIGBASE_TEST_FEATURE_REMAPPED_BINARY=$GITHUB_WORKSPACE/artifacts/zig-out/bin/feature-remapped-fixture" >> "$GITHUB_ENV"
+          echo "ZIGBASE_TEST_FEATURE_DISABLED_BINARY=$GITHUB_WORKSPACE/artifacts/zig-out/bin/feature-disabled-fixture" >> "$GITHUB_ENV"
           chmod +x artifacts/zig-out/bin/import-fixture
           echo "ZIGBASE_TEST_IMPORT_BINARY=$GITHUB_WORKSPACE/artifacts/zig-out/bin/import-fixture" >> "$GITHUB_ENV"
           chmod +x artifacts/zig-out/bin/full-fixture
@@ -553,27 +564,24 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-node@v6
+      - uses: jdx/mise-action@v4
         with:
-          node-version: 24
-      - uses: actions/setup-python@v6
-        with:
-          python-version: '3.13'
+          install_args: node@24 python@3.13
       - name: Build and verify public site
         working-directory: site
         run: |
-          npm run build
-          npm run doctor
-          npm run test:static
-          npm run test:generated
+          mise exec node@24 -- npm run build
+          mise exec node@24 -- npm run doctor
+          mise exec node@24 -- npm run test:static
+          mise exec node@24 -- npm run test:generated
       - name: Install browser test dependencies
         working-directory: site
         run: |
-          python -m pip install --quiet playwright
-          python -m playwright install --with-deps chromium
+          mise exec python@3.13 -- python -m pip install --quiet playwright
+          mise exec python@3.13 -- python -m playwright install --with-deps chromium
       - name: Browser smoke and accessibility tests
         working-directory: site
-        run: npm run test:browser
+        run: mise exec node@24 -- npm run test:browser
 
   agent-evals:
     runs-on: ubuntu-latest
@@ -582,9 +590,9 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-python@v6
+      - uses: jdx/mise-action@v4
         with:
-          python-version: '3.13'
+          install_args: python@3.13
       - name: Download prebuilt ZigBase binary
         uses: actions/download-artifact@v8
         with:
@@ -596,18 +604,25 @@ jobs:
           echo "ZIGBASE_TEST_BINARY=$GITHUB_WORKSPACE/artifacts/zig-out/bin/zigbase" >> "$GITHUB_ENV"
           echo "ZIGBASE_EVAL_BINARY=$GITHUB_WORKSPACE/artifacts/zig-out/bin/zigbase" >> "$GITHUB_ENV"
       - name: Install deterministic test dependencies
-        run: python -m pip install --quiet pytest ruff==0.15.21
+        run: mise exec python@3.13 -- python -m pip install --quiet pytest ruff==0.15.21
       - name: Pull pinned Genesis deployment image
         run: docker pull ghcr.io/valthon/zigbase:0.13.0
       - name: Python lint for migration and evaluation tooling
-        run: python -m ruff check tools/pocketbase tools/rails evals/agents tests/pocketbase tests/rails tests/agent_evals
+        # The pinned Zigapagos browser journey is eval input rather than repository-authored
+        # Python, and the live grader executes it against Chromium.
+        run: >-
+          mise exec python@3.13 -- python -m ruff check
+          --extend-exclude evals/agents/scenarios/rails-fullstack/fixture/source/presentation-target/test/journey_playwright.py
+          tools/pocketbase tools/rails tools/replay evals/agents tests/pocketbase tests/rails
+          tests/rails_fullstack tests/tools tests/agent_evals
       - name: Converter, skill drift, runner, graders, and live Docker boundary
         env:
           ZIGBASE_DOCKER_EVAL_TEST: "1"
         run: |
-          python tools/sync_skill_references.py --check
-          python -m pytest tests/pocketbase tests/rails tests/agent_evals -q
-          python -m pytest --noconftest tests/admin/test_skill_sync.py -q
+          mise exec python@3.13 -- python tools/sync_skill_references.py --check
+          mise exec python@3.13 -- python tools/sync_agent_eval_fixtures.py --check
+          mise exec python@3.13 -- python -m pytest tests/pocketbase tests/rails tests/rails_fullstack tests/tools tests/agent_evals -q
+          mise exec python@3.13 -- python -m pytest --noconftest tests/admin/test_skill_sync.py -q
 
   dart-sdk:
     runs-on: ubuntu-latest
