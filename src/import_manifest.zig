@@ -24,14 +24,18 @@ fn relField(name: []const u8, target: []const u8, max: u32) schema.Field {
     return .{ .id = "", .name = name, .options = .{ .relation = .{ .targetCollectionId = target, .maxSelect = max } } };
 }
 
-/// Frozen manifest-format version. Bumping this is a breaking change to the file format.
-pub const manifest_version: u32 = 1;
+/// Current manifest-format version. Version 1 remains readable; version 2 adds an
+/// entry-local timestamp policy so collections with and without source timestamps can
+/// share one dependency graph and deferred-relation pass.
+pub const manifest_version: u32 = 2;
 
 pub const Entry = struct {
     collection: []const u8,
     /// NDJSON path, relative to the manifest file's directory unless absolute.
     file: []const u8,
     upsert_key: ?[]const u8 = null,
+    /// Version 2 only. Null inherits the command-wide `--preserve-timestamps` flag.
+    preserve_timestamps: ?bool = null,
 };
 
 /// Owns every string. `deinit` frees the whole thing.
@@ -85,7 +89,8 @@ pub fn parseManifest(alloc: std.mem.Allocator, bytes: []const u8) ManifestError!
     if (root != .object) return ManifestError.InvalidManifest;
     const ver = root.object.get("zigbaseImportManifest") orelse return ManifestError.InvalidManifest;
     if (ver != .integer) return ManifestError.InvalidManifest;
-    if (ver.integer != @as(i64, @intCast(manifest_version))) return ManifestError.UnsupportedVersion;
+    if (ver.integer < 1 or ver.integer > @as(i64, @intCast(manifest_version))) return ManifestError.UnsupportedVersion;
+    const version: u32 = @intCast(ver.integer);
     const list = root.object.get("collections") orelse return ManifestError.InvalidManifest;
     if (list != .array) return ManifestError.InvalidManifest;
 
@@ -98,6 +103,10 @@ pub fn parseManifest(alloc: std.mem.Allocator, bytes: []const u8) ManifestError!
         var e = Entry{ .collection = try sa.dupe(u8, c.string), .file = try sa.dupe(u8, f.string) };
         if (el.object.get("upsertKey")) |k| {
             if (k == .string) e.upsert_key = try sa.dupe(u8, k.string);
+        }
+        if (el.object.get("preserveTimestamps")) |p| {
+            if (version < 2 or p != .bool) return ManifestError.InvalidManifest;
+            e.preserve_timestamps = p.bool;
         }
         try out.append(sa, e);
     }
@@ -207,6 +216,7 @@ pub fn deferralSet(sa: std.mem.Allocator, live: []const schema.Collection, entri
 
 pub const EntryReport = struct {
     collection: []const u8,
+    preserve_timestamps: bool,
     created: usize,
     updated: usize,
     failed: usize,
@@ -217,13 +227,6 @@ pub const Report = struct {
     /// Rows whose deferred relation values were patched in phase 2.
     patched: usize = 0,
     failed: usize = 0,
-    /// True when phase 2 (the patch pass) was skipped because this was a dry run. Phase 1
-    /// rolls every batch back in a dry run, so none of its rows ever exist for phase 2's
-    /// `records.updateInTxn` to find — running it anyway would validation-fail on every
-    /// deferred row and abort the whole run. `patched` stays 0 in that case; this field lets
-    /// a caller (the CLI summary) tell "dry run, patch pass skipped" apart from "real run,
-    /// nothing needed patching".
-    patch_skipped_dry_run: bool = false,
 };
 
 pub const RunOptions = struct {
@@ -275,8 +278,8 @@ const PatchOutcome = struct { patched: usize = 0, failed: usize = 0 };
 /// to carry its own `id` — without one there is nothing to patch, since the record's
 /// generated id is not knowable from the file. Rows with no deferred value are skipped.
 ///
-/// Only called for a real (non-dry-run) run — see `Report.patch_skipped_dry_run`. Always
-/// commits: a dry run never reaches here.
+/// Joins a manifest-wide dry-run transaction when one is open; otherwise owns and commits
+/// its transaction as before.
 ///
 /// A missing target row (phase 1 never created this id — typically a `continue_on_error`
 /// row that failed phase 1) or a validation failure on the patch itself: under
@@ -308,8 +311,8 @@ fn patchDeferred(
     defer row_arena.deinit();
 
     var out: PatchOutcome = .{};
-    try w.begin();
-    errdefer w.rollback() catch {};
+    const scope = try import.WriteScope.begin(w);
+    errdefer scope.rollback();
     while (true) {
         const maybe = try fr.interface.takeDelimiter('\n');
         const raw = maybe orelse break;
@@ -332,12 +335,16 @@ fn patchDeferred(
         const idv = parsed.object.get("id") orelse return ManifestError.DeferredRowMissingId;
         if (idv != .string or idv.string.len == 0) return ManifestError.DeferredRowMissingId;
 
+        if (opts.import.continue_on_error) try w.exec("SAVEPOINT zb_patch_row;");
         const updated = records.updateInTxn(a, w, col, idv.string, .{ .object = patch }) catch |err| {
             if (!opts.import.continue_on_error) return err;
+            w.exec("ROLLBACK TO SAVEPOINT zb_patch_row;") catch |rollback_err| return rollback_err;
+            w.exec("RELEASE SAVEPOINT zb_patch_row;") catch |release_err| return release_err;
             logPatchFinding(opts.import.error_log, e.collection, idv.string, @errorName(err), capturePatchDetail(err));
             out.failed += 1;
             continue;
         };
+        if (opts.import.continue_on_error) try w.exec("RELEASE SAVEPOINT zb_patch_row;");
         if (updated == null) {
             // The id this row names does not exist to patch — phase 1 either failed it
             // (continue_on_error) or, absent that, this is a manifest/data inconsistency.
@@ -355,7 +362,7 @@ fn patchDeferred(
         if (timestamp_restorer) |*restorer| try restorer.apply(parsed);
         out.patched += 1;
     }
-    try w.commit();
+    try scope.close(false);
     return out;
 }
 
@@ -384,6 +391,13 @@ pub fn run(
     const order = try loadOrder(sa, all_live, manifest.entries);
     const deferred = try deferralSet(sa, all_live, manifest.entries);
 
+    // A manifest dry run is one transaction, not one rollback per collection. Earlier
+    // collections must remain visible while later relation fields validate, and deferred
+    // cycle edges must be patched for real before the entire dataset is rolled back.
+    var dry_scope: ?import.WriteScope = null;
+    if (opts.import.dry_run) dry_scope = try import.WriteScope.begin(w);
+    errdefer if (dry_scope) |scope| scope.rollback();
+
     var reports = try alloc.alloc(EntryReport, manifest.entries.len);
     // The caller owns `reports` only once we return it; free it on every error path.
     errdefer alloc.free(reports);
@@ -398,40 +412,46 @@ pub fn run(
         var o = opts.import;
         o.collection = e.collection;
         o.upsert_key = e.upsert_key;
+        o.preserve_timestamps = e.preserve_timestamps orelse opts.import.preserve_timestamps;
         o.strip_fields = try strippedFor(sa, deferred, e.collection);
+        if (dry_scope != null) o.dry_run = false;
 
         const f = try std.Io.Dir.cwd().openFile(io, path, .{});
         defer f.close(io);
         var fr = f.readerStreaming(io, line_buf);
         const rep = try import.run(app, w, io, &fr.interface, o);
-        reports[i] = .{ .collection = e.collection, .created = rep.created, .updated = rep.updated, .failed = rep.failed };
+        reports[i] = .{
+            .collection = e.collection,
+            .preserve_timestamps = o.preserve_timestamps,
+            .created = rep.created,
+            .updated = rep.updated,
+            .failed = rep.failed,
+        };
         total_failed += rep.failed;
     }
 
-    // Phase 2 — patch the deferred values, now that every target row exists. Skipped
-    // entirely in a dry run: phase 1 rolled every one of its batches back, so none of those
-    // rows ever exist on disk for `records.updateInTxn` to find. Running phase 2 anyway would
-    // validation-fail on every deferred row and abort the whole run — see
-    // `Report.patch_skipped_dry_run`.
+    // Phase 2 — patch the deferred values, now that every target row exists. A dry run
+    // performs this too inside its outer transaction, so it validates the complete dataset.
     var patched: usize = 0;
-    var patch_skipped_dry_run = false;
-    if (opts.import.dry_run) {
-        patch_skipped_dry_run = true;
-    } else {
-        for (order) |i| {
-            const e = manifest.entries[i];
-            const strip = try strippedFor(sa, deferred, e.collection);
-            if (strip.len == 0) continue;
-            const outcome = try patchDeferred(w, io, sa, opts, e, strip, line_buf);
-            patched += outcome.patched;
-            total_failed += outcome.failed;
-        }
+    for (order) |i| {
+        const e = manifest.entries[i];
+        const strip = try strippedFor(sa, deferred, e.collection);
+        if (strip.len == 0) continue;
+        var entry_opts = opts;
+        entry_opts.import.preserve_timestamps = e.preserve_timestamps orelse opts.import.preserve_timestamps;
+        const outcome = try patchDeferred(w, io, sa, entry_opts, e, strip, line_buf);
+        patched += outcome.patched;
+        total_failed += outcome.failed;
     }
 
-    return .{ .entries = reports, .patched = patched, .failed = total_failed, .patch_skipped_dry_run = patch_skipped_dry_run };
+    if (dry_scope) |scope| {
+        try scope.close(true);
+        dry_scope = null;
+    }
+    return .{ .entries = reports, .patched = patched, .failed = total_failed };
 }
 
-test "parseManifest reads entries and rejects a bad document" {
+test "parseManifest reads v1 and v2 entries and rejects a bad document" {
     const a = std.testing.allocator;
     var m = try parseManifest(a,
         \\{"zigbaseImportManifest":1,"collections":[
@@ -444,6 +464,17 @@ test "parseManifest reads entries and rejects a bad document" {
     try std.testing.expectEqualStrings("authors", m.entries[0].collection);
     try std.testing.expectEqual(@as(?[]const u8, null), m.entries[0].upsert_key);
     try std.testing.expectEqualStrings("slug", m.entries[1].upsert_key.?);
+    try std.testing.expectEqual(@as(?bool, null), m.entries[1].preserve_timestamps);
+
+    var mixed = try parseManifest(a,
+        \\{"zigbaseImportManifest":2,"collections":[
+        \\  {"collection":"authors","file":"authors.ndjson","preserveTimestamps":true},
+        \\  {"collection":"posts","file":"posts.ndjson","preserveTimestamps":false}
+        \\]}
+    );
+    defer mixed.deinit();
+    try std.testing.expectEqual(@as(?bool, true), mixed.entries[0].preserve_timestamps);
+    try std.testing.expectEqual(@as(?bool, false), mixed.entries[1].preserve_timestamps);
 
     try std.testing.expectError(ManifestError.InvalidManifest, parseManifest(a, "[]"));
     try std.testing.expectError(ManifestError.UnsupportedVersion, parseManifest(a,
@@ -451,6 +482,12 @@ test "parseManifest reads entries and rejects a bad document" {
     ));
     try std.testing.expectError(ManifestError.InvalidManifest, parseManifest(a,
         \\{"zigbaseImportManifest":1,"collections":[{"collection":"a"}]}
+    ));
+    try std.testing.expectError(ManifestError.InvalidManifest, parseManifest(a,
+        \\{"zigbaseImportManifest":1,"collections":[{"collection":"a","file":"a.ndjson","preserveTimestamps":false}]}
+    ));
+    try std.testing.expectError(ManifestError.InvalidManifest, parseManifest(a,
+        \\{"zigbaseImportManifest":2,"collections":[{"collection":"a","file":"a.ndjson","preserveTimestamps":"no"}]}
     ));
 }
 
@@ -588,6 +625,72 @@ test "a self-relation loads in any row order and is patched afterwards" {
     try std.testing.expectEqualStrings("2006-02-03T04:05:06Z", st.columnText(2));
 }
 
+test "v2 imports a relation cycle across mixed timestamp policies in one pass" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try migrations.run(&d);
+    var app = import.testApp(a, io);
+
+    const funds_base = try collections.create(a, io, &d, .{ .id = "", .name = "funds", .fields = &.{} });
+    defer funds_base.deinit(a);
+    const allocations = try collections.create(a, io, &d, .{
+        .id = "",
+        .name = "allocations",
+        .fields = &.{relField("fund", "funds", 1)},
+    });
+    defer allocations.deinit(a);
+    const funds = try collections.update(a, io, &d, funds_base.id, .{
+        .id = funds_base.id,
+        .name = "funds",
+        .fields = &.{relField("allocation", "allocations", 1)},
+    });
+    defer funds.deinit(a);
+
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    try dir.dir.writeFile(io, .{ .sub_path = "funds.ndjson", .data =
+        \\{"id":"fund00000000001","created":"2005-01-02T03:04:05Z","updated":"2006-02-03T04:05:06Z","allocation":"allocation00001"}
+        \\
+    });
+    try dir.dir.writeFile(io, .{ .sub_path = "allocations.ndjson", .data =
+        \\{"id":"allocation00001","fund":"fund00000000001"}
+        \\
+    });
+    const base = try dir.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(base);
+
+    var m = try parseManifest(a,
+        \\{"zigbaseImportManifest":2,"collections":[
+        \\  {"collection":"funds","file":"funds.ndjson","preserveTimestamps":true},
+        \\  {"collection":"allocations","file":"allocations.ndjson","preserveTimestamps":false}
+        \\]}
+    );
+    defer m.deinit();
+
+    const rep = try run(&app, &d, io, a, m, .{ .base_dir = base, .import = .{ .collection = "" } });
+    defer a.free(rep.entries);
+    try std.testing.expectEqual(@as(usize, 1), rep.patched);
+    try std.testing.expectEqual(@as(usize, 0), rep.failed);
+    try std.testing.expect(rep.entries[0].preserve_timestamps);
+    try std.testing.expect(!rep.entries[1].preserve_timestamps);
+
+    var fund = try d.prepare("SELECT \"allocation\", \"created\", \"updated\" FROM \"funds\" WHERE \"id\"='fund00000000001';");
+    defer fund.finalize();
+    try std.testing.expect(try fund.step());
+    try std.testing.expectEqualStrings("allocation00001", fund.columnText(0));
+    try std.testing.expectEqualStrings("2005-01-02T03:04:05Z", fund.columnText(1));
+    try std.testing.expectEqualStrings("2006-02-03T04:05:06Z", fund.columnText(2));
+
+    var allocation = try d.prepare("SELECT \"fund\", \"created\", \"updated\" FROM \"allocations\" WHERE \"id\"='allocation00001';");
+    defer allocation.finalize();
+    try std.testing.expect(try allocation.step());
+    try std.testing.expectEqualStrings("fund00000000001", allocation.columnText(0));
+    try std.testing.expect(allocation.columnText(1).len > 0);
+    try std.testing.expect(allocation.columnText(2).len > 0);
+}
+
 test "run fails fast with RequiredRelationInCycle instead of drowning every row in validation_required" {
     // A required self-relation has no legal two-pass load order: phase 1 must strip it to
     // break the cycle, and a required field absent from every row then fails
@@ -640,10 +743,7 @@ test "run fails fast with RequiredRelationInCycle instead of drowning every row 
     try std.testing.expectEqual(@as(i64, 0), st.columnInt(0));
 }
 
-test "run: dry_run skips the patch pass instead of aborting on the now-rolled-back targets" {
-    // Phase 1 rolls every batch back in a dry run, so phase 2 would find none of its target
-    // rows and validation-fail on all of them if it ran. `run` must skip phase 2 entirely and
-    // report that honestly instead of aborting.
+test "run: dry_run validates deferred patches and rolls the whole manifest back" {
     const a = std.testing.allocator;
     const io = std.testing.io;
     var d = try db.Db.openMemory();
@@ -679,14 +779,107 @@ test "run: dry_run skips the patch pass instead of aborting on the now-rolled-ba
     const rep = try run(&app, &d, io, a, m, .{ .base_dir = base, .import = .{ .collection = "", .dry_run = true } });
     defer a.free(rep.entries);
     try std.testing.expectEqual(@as(usize, 2), rep.entries[0].created); // what a real run WOULD create
-    try std.testing.expectEqual(@as(usize, 0), rep.patched);
-    try std.testing.expect(rep.patch_skipped_dry_run);
+    try std.testing.expectEqual(@as(usize, 1), rep.patched);
     try std.testing.expectEqual(@as(usize, 0), rep.failed);
 
     var st = try d.prepare("SELECT COUNT(*) FROM \"tree\";");
     defer st.finalize();
     try std.testing.expect(try st.step());
     try std.testing.expectEqual(@as(i64, 0), st.columnInt(0)); // nothing actually committed
+}
+
+test "run: dry_run refuses a missing deferred target and leaves no rows or transaction" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try migrations.run(&d);
+    var app = import.testApp(a, io);
+
+    const tree = try collections.create(a, io, &d, .{
+        .id = "",
+        .name = "tree",
+        .fields = &.{relField("parent", "tree", 1)},
+    });
+    defer tree.deinit(a);
+
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    try dir.dir.writeFile(io, .{ .sub_path = "tree.ndjson", .data =
+        \\{"id":"treechild00001","parent":"missing000001"}
+        \\
+    });
+    const base = try dir.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(base);
+    var m = try parseManifest(a,
+        \\{"zigbaseImportManifest":1,"collections":[{"collection":"tree","file":"tree.ndjson"}]}
+    );
+    defer m.deinit();
+
+    try std.testing.expectError(
+        error.Validation,
+        run(&app, &d, io, a, m, .{ .base_dir = base, .import = .{ .collection = "", .dry_run = true } }),
+    );
+    try std.testing.expect(!d.inTransaction());
+    var st = try d.prepare("SELECT COUNT(*) FROM \"tree\";");
+    defer st.finalize();
+    try std.testing.expect(try st.step());
+    try std.testing.expectEqual(@as(i64, 0), st.columnInt(0));
+}
+
+test "run: dry_run keeps dependency rows visible across files and batches" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try migrations.run(&d);
+    var app = import.testApp(a, io);
+
+    const authors = try collections.create(a, io, &d, .{ .id = "", .name = "authors", .fields = &.{} });
+    defer authors.deinit(a);
+    const posts = try collections.create(a, io, &d, .{
+        .id = "",
+        .name = "posts",
+        .fields = &.{relField("author", "authors", 1)},
+    });
+    defer posts.deinit(a);
+
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    try dir.dir.writeFile(io, .{ .sub_path = "authors.ndjson", .data =
+        \\{"id":"author000001"}
+        \\
+    });
+    try dir.dir.writeFile(io, .{ .sub_path = "posts.ndjson", .data =
+        \\{"id":"post00000001","author":"author000001"}
+        \\
+    });
+    const base = try dir.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(base);
+
+    // Deliberately reverse the dependency order in the document. The manifest runner must
+    // load authors first and retain them through the posts validation, even at batch size 1.
+    var m = try parseManifest(a,
+        \\{"zigbaseImportManifest":1,"collections":[
+        \\  {"collection":"posts","file":"posts.ndjson"},
+        \\  {"collection":"authors","file":"authors.ndjson"}
+        \\]}
+    );
+    defer m.deinit();
+
+    const rep = try run(&app, &d, io, a, m, .{ .base_dir = base, .import = .{ .collection = "", .dry_run = true, .batch_size = 1 } });
+    defer a.free(rep.entries);
+    try std.testing.expectEqual(@as(usize, 0), rep.failed);
+    try std.testing.expect(!d.inTransaction());
+
+    for ([_][]const u8{ "authors", "posts" }) |name| {
+        const sql = try std.fmt.allocPrintSentinel(a, "SELECT COUNT(*) FROM \"{s}\";", .{name}, 0);
+        defer a.free(sql);
+        var st = try d.prepare(sql);
+        defer st.finalize();
+        try std.testing.expect(try st.step());
+        try std.testing.expectEqual(@as(i64, 0), st.columnInt(0));
+    }
 }
 
 test "run: continue_on_error survives a phase-1-failed row that also carried a deferred value" {

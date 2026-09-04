@@ -28,9 +28,10 @@ const Asset = struct {
     headers: []const http.Header,
 };
 
-/// Build a manifest row with its comptime CRC32 ETag + [ETag, nosniff] headers.
+/// Build a manifest row with its comptime CRC32 ETag and representation headers.
 fn mk(comptime path: []const u8, comptime bytes: []const u8, comptime ctype: []const u8) Asset {
     const tag: []const u8 = crcEtag(bytes);
+    const representation_length = std.fmt.comptimePrint("{d}", .{bytes.len});
     return .{
         .path = path,
         .bytes = bytes,
@@ -39,6 +40,7 @@ fn mk(comptime path: []const u8, comptime bytes: []const u8, comptime ctype: []c
         .headers = &.{
             .{ .name = "ETag", .value = tag },
             .{ .name = "X-Content-Type-Options", .value = "nosniff" },
+            .{ .name = "content-length", .value = representation_length },
         },
     };
 }
@@ -95,7 +97,9 @@ test "serve returns assets with correct content types + nosniff" {
     var js = http.RequestCtx{ .method = .GET, .path = "/_/assets/app.js", .allocator = RequestArena.forTest(std.testing.allocator) };
     const rjs = serve(&js);
     try std.testing.expectEqualStrings("application/javascript", rjs.content_type);
-    try std.testing.expect(rjs.extra_headers.len == 2 and std.mem.eql(u8, rjs.extra_headers[1].name, "X-Content-Type-Options"));
+    try std.testing.expect(rjs.extra_headers.len == 3 and std.mem.eql(u8, rjs.extra_headers[1].name, "X-Content-Type-Options"));
+    try std.testing.expectEqualStrings("content-length", rjs.extra_headers[2].name);
+    try std.testing.expectEqualStrings(std.fmt.comptimePrint("{d}", .{app_js.len}), rjs.extra_headers[2].value);
     var css = http.RequestCtx{ .method = .GET, .path = "/_/assets/style.css", .allocator = RequestArena.forTest(std.testing.allocator) };
     try std.testing.expectEqualStrings("text/css", serve(&css).content_type);
     var pj = http.RequestCtx{ .method = .GET, .path = "/_/assets/preact.js", .allocator = RequestArena.forTest(std.testing.allocator) };

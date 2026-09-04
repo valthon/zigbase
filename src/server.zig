@@ -1,4 +1,5 @@
 const std = @import("std");
+const route_path = @import("route_path.zig");
 const RequestArena = @import("request_arena.zig").RequestArena;
 const zap = @import("zap");
 const http = @import("http.zig");
@@ -31,6 +32,8 @@ const realtime_stats_api = @import("api/realtime_stats.zig");
 const files_multipart = @import("files/multipart.zig");
 const admin = @import("admin.zig");
 const static_files = @import("static_files.zig");
+
+const internal_error_envelope = "{\"status\":500,\"code\":\"internal\",\"message\":\"Something went wrong.\",\"data\":{}}";
 const ApiError = @import("api/error.zig").ApiError;
 const auth = @import("auth.zig");
 const events = @import("events.zig");
@@ -67,6 +70,144 @@ pub const Gates = struct {
     /// module (`api/mail_unsubscribe.zig`), gated like senders/mail_webhook on `.mail`.
     mail_unsubscribe: bool = true,
 };
+
+/// Stable migration-facing names for the standard auth operations.  This is
+/// deliberately owned beside the dispatch table: `Server.routes` is assembled
+/// from these entries, and OpenAPI exports the same entries, so a route cannot
+/// be renamed or remapped in only one of the two contracts.
+pub const MigrationBuiltinOperation = struct {
+    operation_id: []const u8,
+    method: http.Method,
+    pattern: []const u8,
+    access: []const u8,
+    handler: http.Handler,
+};
+
+pub const migration_builtin_operations = [_]MigrationBuiltinOperation{
+    .{ .operation_id = "authWithPassword", .method = .POST, .pattern = "/api/collections/:col/auth-with-password", .access = "public", .handler = auth_api.authWithPassword },
+    .{ .operation_id = "authRefresh", .method = .POST, .pattern = "/api/collections/:col/auth-refresh", .access = "authenticated", .handler = auth_api.authRefresh },
+    .{ .operation_id = "logout", .method = .POST, .pattern = "/api/collections/:col/auth-logout", .access = "public", .handler = auth_api.authLogout },
+    .{ .operation_id = "requestVerification", .method = .POST, .pattern = "/api/collections/:col/request-verification", .access = "public", .handler = auth_api.requestVerification },
+    .{ .operation_id = "confirmVerification", .method = .POST, .pattern = "/api/collections/:col/confirm-verification", .access = "public", .handler = auth_api.confirmVerification },
+    .{ .operation_id = "requestPasswordReset", .method = .POST, .pattern = "/api/collections/:col/request-password-reset", .access = "public", .handler = auth_api.requestPasswordReset },
+    .{ .operation_id = "confirmPasswordReset", .method = .POST, .pattern = "/api/collections/:col/confirm-password-reset", .access = "public", .handler = auth_api.confirmPasswordReset },
+};
+
+pub const realtime_upgrade_routes = realtime_ws.upgrade_routes;
+pub const feature_route_methods = [_]http.Method{ .GET, .HEAD };
+
+pub fn isFeatureRouteMethod(method: http.Method) bool {
+    inline for (feature_route_methods) |candidate| {
+        if (method == candidate) return true;
+    }
+    return false;
+}
+
+/// Whether two router patterns can select the same concrete path. A `:capture`
+/// segment matches any segment, mirroring router.matchPath.
+pub fn routePatternsOverlap(a: []const u8, b: []const u8) bool {
+    return route_path.patternsOverlap(a, b);
+}
+
+/// Whether `path` is the prefix itself or a descendant separated by `/`.
+/// The segment boundary is significant: the admin reservation `/_` owns `/_`
+/// and `/_/...`, but not the unrelated `/__` namespace.
+pub fn pathMatchesReservedPrefix(path: []const u8, prefix: []const u8) bool {
+    return std.mem.eql(u8, path, prefix) or
+        (path.len > prefix.len and
+            std.mem.startsWith(u8, path, prefix) and
+            path[prefix.len] == '/');
+}
+
+pub fn adminRouteReserved(comptime gates: Gates, path: []const u8) bool {
+    return gates.admin and pathMatchesReservedPrefix(path, "/_");
+}
+
+pub fn adminRoutePatternReserved(comptime gates: Gates, pattern: []const u8) bool {
+    return gates.admin and route_path.patternMatchesPrefix(pattern, "/_");
+}
+
+/// Return whether a configured exact route is a canonical absolute URI path.
+/// Unlike router patterns, configured feature routes are concrete: capture-like
+/// `:name` segments and percent escapes are rejected so export and the raw-byte
+/// router cannot disagree about whether two spellings identify the same route.
+pub fn isCanonicalFixedRoutePath(comptime path: []const u8) bool {
+    return route_path.isCanonicalFixed(path);
+}
+
+pub fn featureRouteAvailable(comptime gates: Gates, comptime path: []const u8) bool {
+    @setEvalBranchQuota(5_000);
+    if (!isCanonicalFixedRoutePath(path)) return false;
+    if (adminRouteReserved(gates, path)) return false;
+    for (Server(gates).routes) |reserved| {
+        if (isFeatureRouteMethod(reserved.method) and
+            routePatternsOverlap(path, reserved.pattern))
+            return false;
+    }
+    for (realtime_upgrade_routes) |reserved| {
+        if (routePatternsOverlap(path, reserved.pattern)) return false;
+    }
+    return true;
+}
+
+test "routePatternsOverlap follows router capture and segment boundaries" {
+    try std.testing.expect(routePatternsOverlap(
+        "/api/collections/posts/records",
+        "/api/collections/:col/records",
+    ));
+    try std.testing.expect(routePatternsOverlap(
+        "/api/collections/:collection/records/:record",
+        "/api/collections/:col/records/:id",
+    ));
+    try std.testing.expect(!routePatternsOverlap(
+        "/api/collections/posts/publish",
+        "/api/collections/:col/records",
+    ));
+    try std.testing.expect(!routePatternsOverlap(
+        "/api/collections/posts/records/archive",
+        "/api/collections/:col/records",
+    ));
+}
+
+test "feature state is mounted dynamically rather than reserved in the static table" {
+    for (Server(.{}).routes) |route| {
+        try std.testing.expect(!std.mem.eql(u8, route.pattern, "/api/state"));
+    }
+}
+
+test "pathMatchesReservedPrefix preserves the segment boundary" {
+    try std.testing.expect(pathMatchesReservedPrefix("/_", "/_"));
+    try std.testing.expect(pathMatchesReservedPrefix("/_/health", "/_"));
+    try std.testing.expect(pathMatchesReservedPrefix("/_/deep/health", "/_"));
+    try std.testing.expect(!pathMatchesReservedPrefix("/__", "/_"));
+    try std.testing.expect(!pathMatchesReservedPrefix("/api/_", "/_"));
+    try std.testing.expect(adminRouteReserved(.{}, "/_/deep/path"));
+    try std.testing.expect(!adminRouteReserved(.{ .admin = false }, "/_/deep/path"));
+    try std.testing.expect(adminRoutePatternReserved(.{}, "/:tenant/settings"));
+    try std.testing.expect(!adminRoutePatternReserved(.{}, "/__/settings"));
+}
+
+test "isCanonicalFixedRoutePath rejects ambiguous route spellings" {
+    inline for (&.{ "/api/state", "/a:b" }) |path|
+        try std.testing.expect(isCanonicalFixedRoutePath(path));
+    inline for (&.{
+        "",              "relative",  "//host",     "/trailing/", "/double//slash", "/./state",
+        "/%2E%2E/state", "/%41",      "/%2f",       "/%252F",     "/api?x=1",       "/api#x",
+        "/api\\state",   "/:capture", "/caf%C3%A9", "/caf%C3",
+    }) |path| try std.testing.expect(!isCanonicalFixedRoutePath(path));
+}
+
+test "featureRouteAvailable rejects engine and admin collisions" {
+    try std.testing.expect(featureRouteAvailable(.{}, "/api/state"));
+    try std.testing.expect(featureRouteAvailable(.{}, "/public/features"));
+    try std.testing.expect(!featureRouteAvailable(.{}, "/api/meta"));
+    try std.testing.expect(!featureRouteAvailable(.{}, "/api/realtime"));
+    try std.testing.expect(!featureRouteAvailable(.{}, "/api/realtime/sse"));
+    try std.testing.expect(!featureRouteAvailable(.{}, "/api/collections/posts/records"));
+    try std.testing.expect(!featureRouteAvailable(.{}, "/_/features"));
+    try std.testing.expect(featureRouteAvailable(.{ .admin = false }, "/_/features"));
+    try std.testing.expect(!featureRouteAvailable(.{}, "relative"));
+}
 
 // ── §C.1: tunable static Cache-Control via facil.io's OWN state-callback API ────────
 // There is no facil.io settings field and no compile-time define for the static
@@ -160,13 +301,6 @@ pub fn Server(comptime gates: Gates) type {
                 .{ .method = .POST, .pattern = "/api/collections/:col/records", .handler = records_api.create },
                 .{ .method = .PATCH, .pattern = "/api/collections/:col/records/:id", .handler = records_api.update },
                 .{ .method = .DELETE, .pattern = "/api/collections/:col/records/:id", .handler = records_api.delete },
-                .{ .method = .POST, .pattern = "/api/collections/:col/auth-with-password", .handler = auth_api.authWithPassword },
-                .{ .method = .POST, .pattern = "/api/collections/:col/auth-refresh", .handler = auth_api.authRefresh },
-                .{ .method = .POST, .pattern = "/api/collections/:col/auth-logout", .handler = auth_api.authLogout },
-                .{ .method = .POST, .pattern = "/api/collections/:col/request-verification", .handler = auth_api.requestVerification },
-                .{ .method = .POST, .pattern = "/api/collections/:col/confirm-verification", .handler = auth_api.confirmVerification },
-                .{ .method = .POST, .pattern = "/api/collections/:col/request-password-reset", .handler = auth_api.requestPasswordReset },
-                .{ .method = .POST, .pattern = "/api/collections/:col/confirm-password-reset", .handler = auth_api.confirmPasswordReset },
                 .{ .method = .POST, .pattern = "/api/collections/:col/auth/:method/initiate", .handler = auth_methods_api.initiate },
                 .{ .method = .POST, .pattern = "/api/collections/:col/auth/:method/complete", .handler = auth_methods_api.complete },
                 // Per-device sessions (spec §F3). Always registered — the handlers branch on the
@@ -192,16 +326,17 @@ pub fn Server(comptime gates: Gates) type {
                 // Superuser-only realtime health snapshot (admin-UI Phase 4). 3 segments, so it
                 // cannot collide with the 4-segment /api/realtime/sse/:clientId route above.
                 .{ .method = .GET, .pattern = "/api/realtime/stats", .handler = realtime_stats_api.get },
-                // Public, UNAUTHENTICATED feature-state projection (#130). Mounted at the default
-                // "/api/state"; the handler 404s when disabled or remapped (a custom path is
-                // dispatched dynamically in onRequest). NEVER exposes the superuser settings verbs.
-                .{ .method = .GET, .pattern = "/api/state", .handler = state_api.handle },
                 .{ .method = .GET, .pattern = "/api/settings", .handler = settings_api.list },
                 .{ .method = .GET, .pattern = "/api/settings/:key", .handler = settings_api.get },
                 .{ .method = .PUT, .pattern = "/api/settings/:key", .handler = settings_api.put },
                 .{ .method = .DELETE, .pattern = "/api/settings/:key", .handler = settings_api.delete },
                 .{ .method = .GET, .pattern = "/api/features", .handler = features_api.get },
             };
+            for (migration_builtin_operations) |operation| t = t ++ &[_]router.Route{.{
+                .method = operation.method,
+                .pattern = operation.pattern,
+                .handler = operation.handler,
+            }};
             if (gates.magic_link) t = t ++ &[_]router.Route{
                 .{ .method = .GET, .pattern = "/api/collections/:col/auth/magic-link/consume", .handler = magic_link_consume_api.consume },
             };
@@ -312,8 +447,7 @@ pub fn Server(comptime gates: Gates) type {
         pub fn route(ctx: *http.RequestCtx) anyerror!http.Response {
             const app = ctx.app.?;
             if (comptime gates.admin) {
-                if (std.mem.startsWith(u8, ctx.path, "/_/") or std.mem.eql(u8, ctx.path, "/_"))
-                    return admin.serve(ctx);
+                if (adminRouteReserved(gates, ctx.path)) return admin.serve(ctx);
             }
             // Built-in API routes win over custom routes.
             const builtin = router.tryDispatch(routes, ctx) catch |e| {
@@ -321,13 +455,12 @@ pub fn Server(comptime gates: Gates) type {
                 return try ApiError.internal().toResponse(ctx.allocator.a);
             };
             if (builtin) |hit| return hit;
-            // Public feature-state projection at a CUSTOM-configured path. The default
-            // "/api/state" is already in the static table above; this covers a remapped
-            // `.features = .{ .public_route = "/custom" }`. Reserved ahead of custom routes
-            // so a consumer route cannot shadow it. Disabled (null) → skipped entirely.
+            // Public feature-state projection at its configured path, including the default
+            // "/api/state". It is mounted outside the static table so a remapped or disabled
+            // feature route leaves the old path available to consumer routes. A live feature
+            // route still wins ahead of custom routes. Disabled (null) → skipped entirely.
             if (app.features_public_route) |fp| {
-                if ((ctx.method == .GET or ctx.method == .HEAD) and
-                    !std.mem.eql(u8, fp, "/api/state") and
+                if (isFeatureRouteMethod(ctx.method) and
                     std.mem.eql(u8, ctx.path, fp))
                 {
                     return state_api.handle(ctx) catch |e| {
@@ -441,21 +574,36 @@ pub fn Server(comptime gates: Gates) type {
             // dropped connection and the access line records status 0, a status nothing
             // ever sent. Answer with the same raw 500 envelope every other escape uses.
             const multipart_err = applyMultipart(&ctx) catch {
-                sendRawEnvelope(r, 500, "{\"status\":500,\"code\":\"internal\",\"message\":\"Something went wrong.\",\"data\":{}}");
+                sendRawEnvelope(r, ctx.method, 500, internal_error_envelope);
                 logged_status = 500;
                 return;
             };
-            const resp = blk: {
+            const routed = blk: {
                 if (multipart_err) |er| break :blk er;
                 // The full routing/fallback chain lives in the socketless `route` seam (#239
                 // stage 2). Its only escaping errors are the OOM-while-building-an-error-Response
                 // paths that historically wrote this exact raw 500 envelope inline and returned.
                 break :blk route(&ctx) catch {
-                    sendRawEnvelope(r, 500, "{\"status\":500,\"code\":\"internal\",\"message\":\"Something went wrong.\",\"data\":{}}");
+                    sendRawEnvelope(r, ctx.method, 500, internal_error_envelope);
                     logged_status = 500;
                     return;
                 };
             };
+            const resp = normalizeResponse(&ctx, routed) catch {
+                sendRawEnvelope(r, ctx.method, 500, internal_error_envelope);
+                logged_status = 500;
+                return;
+            };
+            var bounded_file: ?std.Io.File = null;
+            if (resp.file) |file| {
+                if (file.len != null) {
+                    bounded_file = std.Io.Dir.cwd().openFile(self.app.io, file.path, .{}) catch {
+                        sendRawEnvelope(r, ctx.method, 404, "{\"status\":404,\"code\":\"not_found\",\"message\":\"Not found.\",\"data\":{}}");
+                        logged_status = 404;
+                        return;
+                    };
+                }
+            }
             setZapStatus(r, resp.status);
             logged_status = resp.status;
             for (resp.cookies) |c| {
@@ -482,25 +630,50 @@ pub fn Server(comptime gates: Gates) type {
                     // Content-Type comes from the handler's Response (facil.io's
                     // add_content_type is set-if-missing, so this value wins, exactly once).
                     r.setHeader("content-type", resp.content_type) catch {};
-                    sendFileRange(r, self.app.io, f.path, f.offset, len) catch {
-                        // Open failure => the existing 404 raw envelope (unchanged semantics).
-                        sendRawEnvelope(r, 404, "{\"status\":404,\"code\":\"not_found\",\"message\":\"Not found.\",\"data\":{}}");
-                        logged_status = 404;
+                    const send_result = if (ctx.method == .HEAD)
+                        finishFileRangeHead(r, self.app.io, bounded_file.?)
+                    else
+                        sendFileRange(r, bounded_file.?, f.offset, len);
+                    send_result catch |err| {
+                        // Once response metadata is committed, a transport failure cannot be
+                        // repaired with a second envelope. Report it and let facil.io close the
+                        // failed request instead of appending contradictory framing headers.
+                        reportRouteError(&ctx, self.app, err, "bounded file transport");
                     };
                 } else {
                     // Wholesale facil.io delegation (dir-mode static): mime, ETag, 304,
                     // `.gz` sidecar, Range are ALL facil.io's (§A.3) — byte-identical to today.
                     r.sendFile(f.path) catch {
-                        sendRawEnvelope(r, 404, "{\"status\":404,\"code\":\"not_found\",\"message\":\"Not found.\",\"data\":{}}");
+                        sendRawEnvelope(r, ctx.method, 404, "{\"status\":404,\"code\":\"not_found\",\"message\":\"Not found.\",\"data\":{}}");
                         logged_status = 404;
                     };
                 }
                 return;
             }
             r.setHeader("content-type", resp.content_type) catch {};
+            if (statusIsBodyless(resp.status)) {
+                finishBodylessStatus(r, self.app.io, hasHeader(resp.extra_headers, "date"));
+                return;
+            }
             r.sendBody(resp.body) catch {};
         }
     };
+}
+
+// Compiled against zap's vendored http_internal.h; a dependency ABI change is
+// therefore resolved by C member lookup or fails the build, never a stale Zig slot.
+extern fn zigbase_http_finish_without_content_length([*c]zap.fio.http_s) void;
+
+fn finishBodylessStatus(r: zap.Request, io: std.Io, has_date: bool) void {
+    if (!has_date) {
+        var date_buf: [64]u8 = undefined;
+        const now: zap.fio.time_t = @intCast(std.Io.Clock.real.now(io).toSeconds());
+        const date_len = zap.fio.http_time2str(&date_buf, now);
+        r.setHeader("date", date_buf[0..date_len]) catch {};
+    }
+
+    zigbase_http_finish_without_content_length(r.h);
+    r.markAsFinished(true);
 }
 
 fn methodFromZap(r: zap.Request) http.Method {
@@ -1590,18 +1763,350 @@ test "guard chain: path_secret AND rate_limit composed on one route" {
 /// every header the handler set goes on the wire exactly once (the §B.1 double-header
 /// analysis). The zap handle is consumed on success — mark the request finished so
 /// zap's implicit-response machinery stays quiet.
-fn sendFileRange(r: zap.Request, io: std.Io, path: []const u8, offset: u64, len: u64) !void {
-    const f = try std.Io.Dir.cwd().openFile(io, path, .{});
+fn sendFileRange(r: zap.Request, f: std.Io.File, offset: u64, len: u64) !void {
     if (zap.fio.http_sendfile(r.h, f.handle, len, offset) != 0) return error.SendFile;
     r.markAsFinished(true);
 }
 
-/// Last-resort raw error envelope, used only when even building the normal ApiError
-/// response fails (allocation failure). Sends a fixed JSON body bypassing the arena.
-fn sendRawEnvelope(r: zap.Request, status: u16, body: []const u8) void {
+fn finishFileRangeHead(r: zap.Request, io: std.Io, f: std.Io.File) !void {
+    f.close(io);
+    try r.sendBody("");
+}
+
+/// Apply bodyless-status and HTTP HEAD representation semantics before a response
+/// reaches either the socket adapter or the in-process testing harness. Whole-file
+/// responses remain delegated to facil.io because it owns their metadata.
+pub fn normalizeResponse(ctx: *http.RequestCtx, response: http.Response) !http.Response {
+    // `Response` is a completed application response: it cannot express an interim 1xx
+    // followed by a final response. Protocol upgrades use separate WS/SSE paths and never
+    // reach here. Likewise, 304 is only meaningful for GET/HEAD, and zap cannot put an
+    // unnamed status on the wire. Turn every invalid application status into one coherent
+    // final response so the wire, body, and access log all agree.
+    const invalid_status = (response.status >= 100 and response.status < 200) or
+        (response.status == 304 and ctx.method != .GET and ctx.method != .HEAD) or
+        (response.status != 500 and statusToCode(response.status) == .internal_server_error);
+    var normalized = response;
+    if (invalid_status) {
+        reportInvalidResponseStatus(ctx, response.status);
+        normalized.status = 500;
+        normalized.body = internal_error_envelope;
+        normalized.content_type = "application/json";
+        normalized.file = null;
+        normalized.extra_headers = &.{};
+    }
+
+    const status_is_bodyless = statusIsBodyless(normalized.status);
+    const is_head = ctx.method == .HEAD;
+    if (!invalid_status and !status_is_bodyless and !is_head and
+        !hasFramingHeader(normalized.extra_headers)) return normalized;
+
+    var content_length: ?[]const u8 = null;
+    var content_length_valid = true;
+    var other_count: usize = 0;
+    for (normalized.extra_headers) |header| {
+        if (std.ascii.eqlIgnoreCase(header.name, "content-length")) {
+            if (!isDecimal(header.value) or (content_length != null and !std.mem.eql(u8, content_length.?, header.value))) {
+                content_length_valid = false;
+            } else if (content_length == null) {
+                content_length = header.value;
+            }
+        } else if (!isFramingHeader(header.name)) {
+            other_count += 1;
+        }
+    }
+
+    // Framing belongs to the transport. Producer Transfer-Encoding/Trailer are never safe
+    // here: Response contains decoded bytes/a file, not an encoded HTTP/1 message. Producer
+    // Content-Length is retained only as selected-representation metadata for bodyless
+    // HEAD/304; every response that carries content gets its exact length from ZigBase.
+    const selected_length = if (content_length_valid) content_length else null;
+    const length = switch (normalized.status) {
+        204 => null,
+        205 => "0",
+        304 => selected_length,
+        else => if (is_head and normalized.body.len == 0 and normalized.file == null)
+            selected_length orelse "0"
+        else if (normalized.file) |file|
+            if (file.len) |file_len|
+                try std.fmt.allocPrint(ctx.allocator.a, "{d}", .{file_len})
+            else
+                null
+        else
+            try std.fmt.allocPrint(ctx.allocator.a, "{d}", .{normalized.body.len}),
+    };
+    const header_count = other_count + @intFromBool(length != null);
+    if (header_count == 0) {
+        normalized.extra_headers = &.{};
+        if (is_head or status_is_bodyless) normalized.body = "";
+        if (status_is_bodyless) normalized.file = null;
+        return normalized;
+    }
+    const headers = try ctx.allocator.a.alloc(http.Header, header_count);
+    var index: usize = 0;
+    for (normalized.extra_headers) |header| {
+        if (!isFramingHeader(header.name)) {
+            headers[index] = header;
+            index += 1;
+        }
+    }
+    if (length) |value| headers[index] = .{ .name = "content-length", .value = value };
+    normalized.extra_headers = headers;
+    if (is_head or status_is_bodyless) normalized.body = "";
+    if (status_is_bodyless) normalized.file = null;
+    return normalized;
+}
+
+fn isFramingHeader(name: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(name, "content-length") or
+        std.ascii.eqlIgnoreCase(name, "transfer-encoding") or
+        std.ascii.eqlIgnoreCase(name, "trailer");
+}
+
+fn hasFramingHeader(headers: []const http.Header) bool {
+    for (headers) |header| if (isFramingHeader(header.name)) return true;
+    return false;
+}
+
+fn hasHeader(headers: []const http.Header, name: []const u8) bool {
+    for (headers) |header| if (std.ascii.eqlIgnoreCase(header.name, name)) return true;
+    return false;
+}
+
+fn invalidResponseStatusMessage(
+    allocator: std.mem.Allocator,
+    fallback: *[96]u8,
+    status: u16,
+    method: http.Method,
+    path: []const u8,
+) []const u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        "route returned invalid final status {d} for {s} {s}",
+        .{ status, @tagName(method), path },
+    ) catch std.fmt.bufPrint(
+        fallback,
+        "route returned invalid final status {d} for {s}",
+        .{ status, @tagName(method) },
+    ) catch unreachable;
+}
+
+fn reportInvalidResponseStatus(ctx: *http.RequestCtx, status: u16) void {
+    const app = ctx.app orelse return;
+    var fallback: [96]u8 = undefined;
+    const message = invalidResponseStatusMessage(
+        ctx.allocator.a,
+        &fallback,
+        status,
+        ctx.method,
+        ctx.path,
+    );
+    if (@import("builtin").is_test)
+        std.log.warn("{s}", .{message})
+    else
+        std.log.err("{s}", .{message});
+    var request_ctx = request.RequestContext{ .method = @tagName(ctx.method) };
+    var event = events.ErrorEvent{
+        .app = app,
+        .ctx = &request_ctx,
+        .err = error.InvalidResponseStatus,
+        .phase = .request,
+        .message = message,
+    };
+    events.dispatchError(app, app.dispatch, &event);
+}
+
+test "invalid response status fallback retains status and method on allocation failure" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var fallback: [96]u8 = undefined;
+    const message = invalidResponseStatusMessage(
+        failing.allocator(),
+        &fallback,
+        799,
+        .HEAD,
+        "/custom/status-unsupported/this-path-is-deliberately-not-retained",
+    );
+    try std.testing.expectEqualStrings(
+        "route returned invalid final status 799 for HEAD",
+        message,
+    );
+}
+
+fn statusIsBodyless(status: u16) bool {
+    return status == 204 or status == 205 or status == 304;
+}
+
+fn isDecimal(value: []const u8) bool {
+    if (value.len == 0) return false;
+    for (value) |c| if (c < '0' or c > '9') return false;
+    return true;
+}
+
+test "normalizeResponse obeys status-specific content-length rules" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var ctx = http.RequestCtx{
+        .method = .HEAD,
+        .path = "/custom",
+        .allocator = RequestArena.from(&arena),
+        .app = null,
+    };
+
+    const no_content = try normalizeResponse(&ctx, .{
+        .status = 204,
+        .body = "",
+        .extra_headers = &.{
+            .{ .name = "Content-Length", .value = "9" },
+            .{ .name = "Transfer-Encoding", .value = "chunked" },
+        },
+    });
+    try std.testing.expectEqual(@as(usize, 0), no_content.extra_headers.len);
+
+    const unqualified = try normalizeResponse(&ctx, .{ .status = 304, .body = "" });
+    try std.testing.expectEqual(@as(usize, 0), unqualified.extra_headers.len);
+
+    const qualified = try normalizeResponse(&ctx, .{
+        .status = 304,
+        .body = "",
+        .extra_headers = &.{
+            .{ .name = "Content-Length", .value = "9" },
+            .{ .name = "content-length", .value = "0" },
+            .{ .name = "Transfer-Encoding", .value = "chunked" },
+        },
+    });
+    try std.testing.expectEqual(@as(usize, 0), qualified.extra_headers.len);
+
+    ctx.method = .POST;
+    const posted = try normalizeResponse(&ctx, .{
+        .status = 204,
+        .body = "wrong",
+        .extra_headers = &.{
+            .{ .name = "Content-Length", .value = "5" },
+            .{ .name = "transfer-encoding", .value = "chunked" },
+        },
+    });
+    try std.testing.expectEqualStrings("", posted.body);
+    try std.testing.expectEqual(@as(usize, 0), posted.extra_headers.len);
+
+    const reset = try normalizeResponse(&ctx, .{
+        .status = 205,
+        .body = "wrong",
+        .extra_headers = &.{
+            .{ .name = "Content-Length", .value = "5" },
+            .{ .name = "TRANSFER-ENCODING", .value = "chunked" },
+        },
+    });
+    try std.testing.expectEqualStrings("", reset.body);
+    try std.testing.expectEqual(@as(usize, 1), reset.extra_headers.len);
+    try std.testing.expectEqualStrings("0", reset.extra_headers[0].value);
+}
+
+test "normalizeResponse emits one lowercase content-length for HEAD" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var ctx = http.RequestCtx{
+        .method = .HEAD,
+        .path = "/custom",
+        .allocator = RequestArena.from(&arena),
+        .app = null,
+    };
+    const response = http.Response{
+        .status = 200,
+        .body = "body",
+        .extra_headers = &.{
+            .{ .name = "Content-Length", .value = "4" },
+            .{ .name = "content-length", .value = "0" },
+            .{ .name = "Transfer-Encoding", .value = "chunked" },
+            .{ .name = "X-Test", .value = "yes" },
+        },
+    };
+    const normalized = try normalizeResponse(&ctx, response);
+    try std.testing.expectEqualStrings("", normalized.body);
+    try std.testing.expectEqual(@as(usize, 2), normalized.extra_headers.len);
+    try std.testing.expectEqualStrings("X-Test", normalized.extra_headers[0].name);
+    try std.testing.expectEqualStrings("content-length", normalized.extra_headers[1].name);
+    try std.testing.expectEqualStrings("4", normalized.extra_headers[1].value);
+
+    const owned_file = try normalizeResponse(&ctx, .{
+        .status = 200,
+        .body = "",
+        .file = .{ .path = "ignored", .offset = 3, .len = 7 },
+    });
+    try std.testing.expect(owned_file.file != null);
+    try std.testing.expectEqualStrings("7", owned_file.extra_headers[0].value);
+
+    const delegated_file = try normalizeResponse(&ctx, .{
+        .status = 200,
+        .body = "",
+        .file = .{ .path = "ignored" },
+    });
+    try std.testing.expect(delegated_file.file != null);
+    try std.testing.expectEqual(@as(usize, 0), delegated_file.extra_headers.len);
+}
+
+test "normalizeResponse owns framing for content responses" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var ctx = http.RequestCtx{
+        .method = .POST,
+        .path = "/custom",
+        .allocator = RequestArena.from(&arena),
+        .app = null,
+    };
+    const normalized = try normalizeResponse(&ctx, .{
+        .status = 200,
+        .body = "body",
+        .extra_headers = &.{
+            .{ .name = "Content-Length", .value = "99" },
+            .{ .name = "content-length", .value = "bogus" },
+            .{ .name = "Transfer-Encoding", .value = "chunked" },
+            .{ .name = "Trailer", .value = "X-Checksum" },
+            .{ .name = "X-Test", .value = "yes" },
+        },
+    });
+    try std.testing.expectEqualStrings("body", normalized.body);
+    try std.testing.expectEqual(@as(usize, 2), normalized.extra_headers.len);
+    try std.testing.expectEqualStrings("X-Test", normalized.extra_headers[0].name);
+    try std.testing.expectEqualStrings("content-length", normalized.extra_headers[1].name);
+    try std.testing.expectEqualStrings("4", normalized.extra_headers[1].value);
+}
+
+test "normalizeResponse maps invalid final statuses to one framed 500" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var ctx = http.RequestCtx{
+        .method = .GET,
+        .path = "/custom",
+        .allocator = RequestArena.from(&arena),
+        .app = null,
+    };
+    for ([_]u16{ 100, 103, 199, 799 }) |status| {
+        const normalized = try normalizeResponse(&ctx, .{ .status = status, .body = "wrong" });
+        try std.testing.expectEqual(@as(u16, 500), normalized.status);
+        try std.testing.expectEqualStrings("application/json", normalized.content_type);
+        try std.testing.expect(std.mem.indexOf(u8, normalized.body, "\"code\":\"internal\"") != null);
+        try std.testing.expectEqualStrings(
+            try std.fmt.allocPrint(ctx.allocator.a, "{d}", .{normalized.body.len}),
+            normalized.extra_headers[0].value,
+        );
+    }
+
+    ctx.method = .POST;
+    const invalid_not_modified = try normalizeResponse(&ctx, .{ .status = 304, .body = "wrong" });
+    try std.testing.expectEqual(@as(u16, 500), invalid_not_modified.status);
+}
+
+/// Last-resort fixed envelope used when building the normal ApiError response fails.
+fn sendRawEnvelope(r: zap.Request, method: http.Method, status: u16, body: []const u8) void {
     setZapStatus(r, status);
     r.setContentType(.JSON) catch {};
-    r.sendBody(body) catch {};
+    var length_buf: [32]u8 = undefined;
+    const length = std.fmt.bufPrint(&length_buf, "{d}", .{body.len}) catch "0";
+    r.setHeader("content-length", length) catch {};
+    if (method == .HEAD) {
+        r.sendBody("") catch {};
+    } else {
+        r.sendBody(body) catch {};
+    }
 }
 
 fn hasRoute(rs: []const router.Route, method: http.Method, pattern: []const u8) bool {

@@ -3,6 +3,7 @@
 Uses the `import-fixture` binary (fixtures/import/main.zig), which declares the relation
 graph `posts.author -> authors` plus the self-relation `authors.mentor -> authors`.
 """
+
 import json
 import os
 import pathlib
@@ -23,7 +24,9 @@ def import_binary():
     override = os.environ.get("ZIGBASE_TEST_IMPORT_BINARY")
     if override:
         if not pathlib.Path(override).exists():
-            raise FileNotFoundError(f"ZIGBASE_TEST_IMPORT_BINARY={override} does not exist")
+            raise FileNotFoundError(
+                f"ZIGBASE_TEST_IMPORT_BINARY={override} does not exist"
+            )
         return override
     subprocess.run(ZIG + ["build", "import-fixture"], cwd=REPO, check=True)
     path = REPO / "zig-out" / "bin" / "import-fixture"
@@ -56,24 +59,50 @@ def query(data, sql):
         con.close()
 
 
-def test_manifest_loads_out_of_order_files_and_patches_deferred_relations(import_binary, data_dir):
+def test_manifest_loads_out_of_order_files_and_patches_deferred_relations(
+    import_binary, data_dir
+):
     # `posts` is listed FIRST and references `authors`; `authors.mentor` is a self-relation
     # whose child row appears BEFORE its mentor. Neither can load naively.
-    write(data_dir, "posts.ndjson",
-          '{"id":"post0000000001","title":"Hello","author":"author00000001"}\n')
-    write(data_dir, "authors.ndjson",
-          '{"id":"author00000001","nom":"Ada","mentor":"author00000002"}\n'
-          '{"id":"author00000002","nom":"Grace","mentor":null}\n')
-    manifest = write(data_dir, "m.json", json.dumps({
-        "zigbaseImportManifest": 1,
-        "collections": [
-            {"collection": "posts", "file": "posts.ndjson"},
-            {"collection": "authors", "file": "authors.ndjson"},
-        ],
-    }))
+    write(
+        data_dir,
+        "posts.ndjson",
+        '{"id":"post0000000001","title":"Hello","author":"author00000001"}\n',
+    )
+    write(
+        data_dir,
+        "authors.ndjson",
+        '{"id":"author00000001","nom":"Ada","mentor":"author00000002"}\n'
+        '{"id":"author00000002","nom":"Grace","mentor":null}\n',
+    )
+    manifest = write(
+        data_dir,
+        "m.json",
+        json.dumps(
+            {
+                "zigbaseImportManifest": 1,
+                "collections": [
+                    {"collection": "posts", "file": "posts.ndjson"},
+                    {"collection": "authors", "file": "authors.ndjson"},
+                ],
+            }
+        ),
+    )
 
-    r = subprocess.run([import_binary, "import", "--manifest", manifest, "--json",
-                        "--data-dir", data_dir], env=env(data_dir), capture_output=True, text=True)
+    r = subprocess.run(
+        [
+            import_binary,
+            "import",
+            "--manifest",
+            manifest,
+            "--json",
+            "--data-dir",
+            data_dir,
+        ],
+        env=env(data_dir),
+        capture_output=True,
+        text=True,
+    )
     assert r.returncode == 0, r.stderr
     out = json.loads(r.stdout)
     assert out["failed"] == 0
@@ -82,67 +111,194 @@ def test_manifest_loads_out_of_order_files_and_patches_deferred_relations(import
     assert by_col["authors"]["created"] == 2
     assert by_col["posts"]["created"] == 1
 
-    assert query(data_dir, 'SELECT author FROM posts') == [("author00000001",)]
-    assert query(data_dir, 'SELECT mentor FROM authors WHERE id="author00000001"') == [("author00000002",)]
+    assert query(data_dir, "SELECT author FROM posts") == [("author00000001",)]
+    assert query(data_dir, 'SELECT mentor FROM authors WHERE id="author00000001"') == [
+        ("author00000002",)
+    ]
+
+
+def test_manifest_v2_applies_timestamp_policy_per_collection(import_binary, data_dir):
+    write(
+        data_dir,
+        "authors.ndjson",
+        '{"id":"author00000001","nom":"Ada","created":"2005-01-02T03:04:05Z","updated":"2006-02-03T04:05:06Z"}\n',
+    )
+    write(
+        data_dir,
+        "posts.ndjson",
+        '{"id":"post0000000001","title":"Hello","author":"author00000001"}\n',
+    )
+    manifest = write(
+        data_dir,
+        "mixed.json",
+        json.dumps(
+            {
+                "zigbaseImportManifest": 2,
+                "collections": [
+                    {
+                        "collection": "posts",
+                        "file": "posts.ndjson",
+                        "preserveTimestamps": False,
+                    },
+                    {
+                        "collection": "authors",
+                        "file": "authors.ndjson",
+                        "preserveTimestamps": True,
+                    },
+                ],
+            }
+        ),
+    )
+
+    result = subprocess.run(
+        [
+            import_binary,
+            "import",
+            "--manifest",
+            manifest,
+            "--json",
+            "--data-dir",
+            data_dir,
+        ],
+        env=env(data_dir),
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    policies = {
+        item["collection"]: item["preserve_timestamps"]
+        for item in json.loads(result.stdout)["collections"]
+    }
+    assert policies == {"posts": False, "authors": True}
+    assert query(data_dir, "SELECT created, updated FROM authors") == [
+        ("2005-01-02T03:04:05Z", "2006-02-03T04:05:06Z")
+    ]
+    [(created, updated)] = query(data_dir, "SELECT created, updated FROM posts")
+    assert created and updated
+    assert query(data_dir, "SELECT author FROM posts") == [("author00000001",)]
 
 
 def test_manifest_dry_run_writes_nothing(import_binary, data_dir):
     write(data_dir, "authors.ndjson", '{"id":"author00000001","nom":"Ada"}\n')
-    manifest = write(data_dir, "m.json", json.dumps({
-        "zigbaseImportManifest": 1,
-        "collections": [{"collection": "authors", "file": "authors.ndjson"}],
-    }))
-    r = subprocess.run([import_binary, "import", "--manifest", manifest, "--dry-run", "--json",
-                        "--data-dir", data_dir], env=env(data_dir), capture_output=True, text=True)
+    manifest = write(
+        data_dir,
+        "m.json",
+        json.dumps(
+            {
+                "zigbaseImportManifest": 1,
+                "collections": [{"collection": "authors", "file": "authors.ndjson"}],
+            }
+        ),
+    )
+    r = subprocess.run(
+        [
+            import_binary,
+            "import",
+            "--manifest",
+            manifest,
+            "--dry-run",
+            "--json",
+            "--data-dir",
+            data_dir,
+        ],
+        env=env(data_dir),
+        capture_output=True,
+        text=True,
+    )
     assert r.returncode == 0, r.stderr
     assert json.loads(r.stdout)["dry_run"] is True
     assert query(data_dir, "SELECT count(*) FROM authors") == [(0,)]
 
 
 def test_continue_on_error_exits_3_and_writes_findings(import_binary, data_dir):
-    src = write(data_dir, "vault.ndjson",
-                '{"code":"A"}\nnot json\n{"code":"B"}\n{"nope":"missing required code"}\n')
+    src = write(
+        data_dir,
+        "vault.ndjson",
+        '{"code":"A"}\nnot json\n{"code":"B"}\n{"nope":"missing required code"}\n',
+    )
     log = os.path.join(data_dir, "errs.ndjson")
-    r = subprocess.run([import_binary, "import", "--collection", "vault", "--data-dir", data_dir,
-                        "--continue-on-error", "--error-log", log, "--json", src],
-                       env=env(data_dir), capture_output=True, text=True)
+    r = subprocess.run(
+        [
+            import_binary,
+            "import",
+            "--collection",
+            "vault",
+            "--data-dir",
+            data_dir,
+            "--continue-on-error",
+            "--error-log",
+            log,
+            "--json",
+            src,
+        ],
+        env=env(data_dir),
+        capture_output=True,
+        text=True,
+    )
     assert r.returncode == 3, r.stderr
     out = json.loads(r.stdout)
     assert (out["created"], out["failed"]) == (2, 2)
-    findings = [json.loads(l) for l in pathlib.Path(log).read_text().splitlines() if l.strip()]
+    findings = [
+        json.loads(line)
+        for line in pathlib.Path(log).read_text().splitlines()
+        if line.strip()
+    ]
     assert [f["line"] for f in findings] == [2, 4]
     assert findings[0]["code"] == "MalformedJson"
     assert query(data_dir, "SELECT count(*) FROM vault") == [(2,)]
 
 
-def test_manifest_rejects_a_bad_document_and_an_unknown_collection(import_binary, data_dir):
+def test_manifest_rejects_a_bad_document_and_an_unknown_collection(
+    import_binary, data_dir
+):
     bad = write(data_dir, "bad.json", '{"collections":[]}')
-    r = subprocess.run([import_binary, "import", "--manifest", bad, "--data-dir", data_dir],
-                       env=env(data_dir), capture_output=True, text=True)
+    r = subprocess.run(
+        [import_binary, "import", "--manifest", bad, "--data-dir", data_dir],
+        env=env(data_dir),
+        capture_output=True,
+        text=True,
+    )
     assert r.returncode == 1 and "InvalidManifest" in r.stderr
 
     write(data_dir, "x.ndjson", "{}\n")
-    unknown = write(data_dir, "u.json", json.dumps({
-        "zigbaseImportManifest": 1,
-        "collections": [{"collection": "nosuch", "file": "x.ndjson"}],
-    }))
-    r2 = subprocess.run([import_binary, "import", "--manifest", unknown, "--data-dir", data_dir],
-                        env=env(data_dir), capture_output=True, text=True)
+    unknown = write(
+        data_dir,
+        "u.json",
+        json.dumps(
+            {
+                "zigbaseImportManifest": 1,
+                "collections": [{"collection": "nosuch", "file": "x.ndjson"}],
+            }
+        ),
+    )
+    r2 = subprocess.run(
+        [import_binary, "import", "--manifest", unknown, "--data-dir", data_dir],
+        env=env(data_dir),
+        capture_output=True,
+        text=True,
+    )
     assert r2.returncode == 1 and "UnknownCollection" in r2.stderr
 
 
 def test_manifest_prints_preflight_timestamp_detail(import_binary, data_dir):
     write(data_dir, "authors.ndjson", '{"id":"author00000001"}\n')
-    manifest = write(data_dir, "m.json", json.dumps({
-        "zigbaseImportManifest": 1,
-        "collections": [
+    manifest = write(
+        data_dir,
+        "m.json",
+        json.dumps(
             {
-                "collection": "authors",
-                "file": "authors.ndjson",
-                "upsertKey": "nom",
+                "zigbaseImportManifest": 1,
+                "collections": [
+                    {
+                        "collection": "authors",
+                        "file": "authors.ndjson",
+                        "upsertKey": "nom",
+                    }
+                ],
             }
-        ],
-    }))
+        ),
+    )
     result = subprocess.run(
         [
             import_binary,

@@ -31,7 +31,7 @@ fn configureZigbaseModule(
     b: *std.Build,
     module: *std.Build.Module,
     build_options: *std.Build.Step.Options,
-    zap_module: *std.Build.Module,
+    zap: *std.Build.Dependency,
     sqlite_flags: []const []const u8,
     vector: bool,
 ) void {
@@ -48,7 +48,15 @@ fn configureZigbaseModule(
             .flags = &.{ "-DSQLITE_CORE", "-DSQLITE_VEC_STATIC" },
         });
     }
-    module.addImport("zap", zap_module);
+    module.addImport("zap", zap.module("zap"));
+    module.addIncludePath(zap.path("facil.io/lib/facil"));
+    module.addIncludePath(zap.path("facil.io/lib/facil/fiobj"));
+    module.addIncludePath(zap.path("facil.io/lib/facil/http"));
+    module.addIncludePath(zap.path("facil.io/lib/facil/http/parsers"));
+    module.addCSourceFile(.{
+        .file = b.path("src/facilio_compat.c"),
+        .flags = &.{},
+    });
 }
 
 pub fn build(b: *std.Build) void {
@@ -186,7 +194,7 @@ pub fn build(b: *std.Build) void {
     else
         &sqlite_base_flags;
     // Opt-in vector search compiles sqlite-vec statically into each ZigBase module.
-    configureZigbaseModule(b, zigbase_mod, build_options, zap.module("zap"), sqlite_flags, vector);
+    configureZigbaseModule(b, zigbase_mod, build_options, zap, sqlite_flags, vector);
 
     // The shipped binary: a thin consumer of the library module.
     const exe_mod = b.createModule(.{
@@ -242,7 +250,7 @@ pub fn build(b: *std.Build) void {
         .optimize = bench_optimize,
         .link_libc = true,
     });
-    configureZigbaseModule(b, bench_zigbase_mod, bench_build_options, bench_zap.module("zap"), sqlite_flags, vector);
+    configureZigbaseModule(b, bench_zigbase_mod, bench_build_options, bench_zap, sqlite_flags, vector);
     const bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/main.zig"),
         .target = target,
@@ -313,6 +321,57 @@ pub fn build(b: *std.Build) void {
     const features_fix_step = b.step("features-fixture", "Build the demo-features fixture server (browser tests)");
     features_fix_step.dependOn(&b.addInstallArtifact(features_fix_exe, .{}).step);
 
+    // Feature-route protocol fixtures: real servers for the remapped and disabled
+    // GET/HEAD mount behavior. Keeping these as separate App instantiations exercises
+    // the compile-time route configuration used by production applications.
+    const features_remapped_mod = b.createModule(.{
+        .root_source_file = b.path("fixtures/features-remapped/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    features_remapped_mod.addImport("zigbase", zigbase_mod);
+    const features_remapped_exe = b.addExecutable(.{ .name = "feature-remapped-fixture", .root_module = features_remapped_mod });
+    const features_remapped_step = b.step("feature-remapped-fixture", "Build the remapped feature-route protocol fixture");
+    features_remapped_step.dependOn(&b.addInstallArtifact(features_remapped_exe, .{}).step);
+
+    const features_disabled_mod = b.createModule(.{
+        .root_source_file = b.path("fixtures/features-disabled/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    features_disabled_mod.addImport("zigbase", zigbase_mod);
+    const features_disabled_exe = b.addExecutable(.{ .name = "feature-disabled-fixture", .root_module = features_disabled_mod });
+    const features_disabled_step = b.step("feature-disabled-fixture", "Build the disabled feature-route protocol fixture");
+    features_disabled_step.dependOn(&b.addInstallArtifact(features_disabled_exe, .{}).step);
+
+    // Compile-fail contract fixtures. Zig owns the expected diagnostics and may compile
+    // the independent children in parallel; CI and Python invoke one aggregate step.
+    const route_contracts = b.step("check-route-contracts", "Check consumer route compile-time contracts");
+    inline for (&.{
+        .{ .step = "invalid-route-missing-method", .file = "fixtures/invalid-routes/missing-method.zig", .expected = "route spec is missing '.method' (expected .{ .method = .GET, .path = \"/...\", .handler = fn })" },
+        .{ .step = "invalid-route-unknown-method", .file = "fixtures/invalid-routes/unknown-method.zig", .expected = "route '/api/unknown': .method cannot be .UNKNOWN" },
+        .{ .step = "invalid-route-noncanonical-path", .file = "fixtures/invalid-routes/noncanonical-path.zig", .expected = "route '/api/reports/:bad-name': .path must be a canonical absolute router pattern with optional :name captures" },
+        .{ .step = "invalid-route-missing-secret-capture", .file = "fixtures/invalid-routes/missing-secret-capture.zig", .expected = "route '/api/hooks/:token': .path_secret.param 'missing' must name a :capture in the route path" },
+        .{ .step = "invalid-route-typed-missing-secret-capture", .file = "fixtures/invalid-routes/typed-missing-secret-capture.zig", .expected = "route '/api/hooks/:token': .path_secret.param 'missing' must name a :capture in the route path" },
+        .{ .step = "invalid-route-realtime-upgrade", .file = "fixtures/invalid-routes/realtime-upgrade.zig", .expected = "consumer route 'GET /api/realtime' overlaps reserved ZigBase route '/api/realtime'" },
+        .{ .step = "invalid-route-realtime-feature", .file = "fixtures/invalid-routes/realtime-feature.zig", .expected = ".features.public_route must be a canonical absolute path that does not overlap a reserved ZigBase route or prefix" },
+        .{ .step = "invalid-route-admin-capture", .file = "fixtures/invalid-routes/admin-capture.zig", .expected = "consumer route 'GET /:tenant/preferences' overlaps reserved ZigBase admin prefix '/_'" },
+        .{ .step = "invalid-route-builtin-operation-name", .file = "fixtures/invalid-routes/builtin-operation-name.zig", .expected = "consumer route 'POST /api/logout' derives reserved operation name 'logout' used by builtin route '/api/collections/:col/auth-logout'; set a distinct '.name'" },
+        .{ .step = "invalid-route-explicit-name", .file = "fixtures/invalid-routes/explicit-name.zig", .expected = "route '/api/report' has invalid method name 'report.v1'; set '.name' to an identifier such as 'reportV1'" },
+    }) |invalid| {
+        const invalid_mod = b.createModule(.{
+            .root_source_file = b.path(invalid.file),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        invalid_mod.addImport("zigbase", zigbase_mod);
+        const invalid_exe = b.addExecutable(.{ .name = invalid.step, .root_module = invalid_mod });
+        invalid_exe.expect_errors = .{ .contains = invalid.expected };
+        route_contracts.dependOn(&invalid_exe.step);
+    }
     // --- minimal-server: gating-invariant fixture (R2-7) --------------------------
     // A consumer App with NOTHING optional configured. scripts/check-gating.sh nm-scans
     // this binary to prove deselected subsystems (webauthn/magic_link/oauth2, analytics,

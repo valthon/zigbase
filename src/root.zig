@@ -355,6 +355,7 @@ test {
     _ = @import("sql/param_sink.zig");
     _ = @import("http.zig");
     _ = @import("router.zig");
+    _ = @import("route_path.zig");
     _ = @import("request.zig");
     _ = @import("server.zig");
     _ = @import("schema.zig");

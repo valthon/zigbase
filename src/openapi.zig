@@ -1,17 +1,27 @@
 //! Deterministic OpenAPI 3.1 export for ZigBase collections and consumer routes.
 const std = @import("std");
+const route_path = @import("route_path.zig");
 const schema = @import("schema.zig");
 const schema_doc = @import("schema_doc.zig");
 const events = @import("events.zig");
+const route_types = @import("route_types.zig");
 const http = @import("http.zig");
+const engine_server = @import("server.zig");
 
 const Value = std.json.Value;
 const Object = std.json.ObjectMap;
+
+pub const contract_version = "1";
 
 pub const Options = struct {
     title: []const u8 = "ZigBase API",
     api_version: []const u8,
     server: ?[]const u8 = null,
+};
+
+pub const Namespace = struct {
+    gates: engine_server.Gates = .{},
+    features_public_route: ?[]const u8 = "/api/state",
 };
 
 fn object() Object {
@@ -397,8 +407,65 @@ fn operation(alloc: std.mem.Allocator, operation_id: []const u8, rule: ?[]const 
     return .{ .object = op };
 }
 
-fn addCollection(alloc: std.mem.Allocator, paths: *Object, schemas: *Object, col: schema.Collection, all: []const schema.Collection) !void {
-    const base = try componentBase(alloc, col.name);
+fn collectionOperation(alloc: std.mem.Allocator, col: schema.Collection, operation_id: []const u8, rule: ?[]const u8, result: ?[]const u8, body: ?[]const u8, parameters: ?Value, deleted: bool) !Value {
+    var out = try operation(alloc, operation_id, rule, result, body, parameters, deleted);
+    try out.object.put(alloc, "x-zigbase-collection", .{ .string = col.name });
+    try out.object.put(alloc, "x-zigbase-collection-type", .{ .string = @tagName(col.type) });
+    return out;
+}
+
+const collection_operation_prefixes = [_][]const u8{ "list", "create", "view", "update", "delete" };
+
+fn collectionOperationIdsConflict(alloc: std.mem.Allocator, ids: *const std.StringHashMap(void), base: []const u8) !bool {
+    for (collection_operation_prefixes) |prefix| {
+        const operation_id = try std.fmt.allocPrint(alloc, "{s}{s}", .{ prefix, base });
+        if (ids.contains(operation_id)) return true;
+    }
+    return false;
+}
+
+fn reserveCollectionOperationIds(alloc: std.mem.Allocator, ids: *std.StringHashMap(void), base: []const u8) !void {
+    for (collection_operation_prefixes) |prefix|
+        try ids.put(try std.fmt.allocPrint(alloc, "{s}{s}", .{ prefix, base }), {});
+}
+
+fn collectionSymbolBases(
+    alloc: std.mem.Allocator,
+    collections: []const schema.Collection,
+    comptime route_meta: []const events.RouteMeta,
+) ![][]const u8 {
+    var reserved = std.StringHashMap(void).init(alloc);
+    defer reserved.deinit();
+    for (engine_server.migration_builtin_operations) |builtin| try reserved.put(builtin.operation_id, {});
+    inline for (route_meta) |meta| try reserved.put(meta.name, {});
+
+    const friendly = try alloc.alloc([]const u8, collections.len);
+    for (collections, 0..) |col, index| friendly[index] = try componentBase(alloc, col.name);
+    const symbols = try alloc.alloc([]const u8, collections.len);
+    for (collections, 0..) |col, index| {
+        var duplicate_friendly = false;
+        for (friendly, 0..) |other, other_index| {
+            if (other_index != index and std.mem.eql(u8, friendly[index], other)) {
+                duplicate_friendly = true;
+                break;
+            }
+        }
+
+        const stem = if (duplicate_friendly or try collectionOperationIdsConflict(alloc, &reserved, friendly[index]))
+            try std.fmt.allocPrint(alloc, "{s}_{s}", .{ friendly[index], col.name })
+        else
+            friendly[index];
+        var candidate = stem;
+        var suffix: usize = 2;
+        while (try collectionOperationIdsConflict(alloc, &reserved, candidate)) : (suffix += 1)
+            candidate = try std.fmt.allocPrint(alloc, "{s}_{d}", .{ stem, suffix });
+        symbols[index] = candidate;
+        try reserveCollectionOperationIds(alloc, &reserved, candidate);
+    }
+    return symbols;
+}
+
+fn addCollection(alloc: std.mem.Allocator, paths: *Object, schemas: *Object, col: schema.Collection, base: []const u8, all: []const schema.Collection) !void {
     const record_name = try std.fmt.allocPrint(alloc, "{s}Record", .{base});
     const create_name = try std.fmt.allocPrint(alloc, "{s}Create", .{base});
     const update_name = try std.fmt.allocPrint(alloc, "{s}Update", .{base});
@@ -410,8 +477,8 @@ fn addCollection(alloc: std.mem.Allocator, paths: *Object, schemas: *Object, col
 
     const collection_path = try std.fmt.allocPrint(alloc, "/api/collections/{s}/records", .{col.name});
     var collection_item = object();
-    try collection_item.put(alloc, "get", try operation(alloc, try std.fmt.allocPrint(alloc, "list{s}", .{base}), col.listRule, list_name, null, try queryParameters(alloc), false));
-    try collection_item.put(alloc, "post", try operation(alloc, try std.fmt.allocPrint(alloc, "create{s}", .{base}), col.createRule, record_name, create_name, null, false));
+    try collection_item.put(alloc, "get", try collectionOperation(alloc, col, try std.fmt.allocPrint(alloc, "list{s}", .{base}), col.listRule, list_name, null, try queryParameters(alloc), false));
+    try collection_item.put(alloc, "post", try collectionOperation(alloc, col, try std.fmt.allocPrint(alloc, "create{s}", .{base}), col.createRule, record_name, create_name, null, false));
     try paths.put(alloc, collection_path, .{ .object = collection_item });
 
     const item_path = try std.fmt.allocPrint(alloc, "{s}/{{id}}", .{collection_path});
@@ -419,9 +486,9 @@ fn addCollection(alloc: std.mem.Allocator, paths: *Object, schemas: *Object, col
     try id_params.append(try idParameter(alloc));
     const params = Value{ .array = id_params };
     var item = object();
-    try item.put(alloc, "get", try operation(alloc, try std.fmt.allocPrint(alloc, "view{s}", .{base}), col.viewRule, record_name, null, try viewParameters(alloc), false));
-    try item.put(alloc, "patch", try operation(alloc, try std.fmt.allocPrint(alloc, "update{s}", .{base}), col.updateRule, record_name, update_name, params, false));
-    try item.put(alloc, "delete", try operation(alloc, try std.fmt.allocPrint(alloc, "delete{s}", .{base}), col.deleteRule, null, null, params, true));
+    try item.put(alloc, "get", try collectionOperation(alloc, col, try std.fmt.allocPrint(alloc, "view{s}", .{base}), col.viewRule, record_name, null, try viewParameters(alloc), false));
+    try item.put(alloc, "patch", try collectionOperation(alloc, col, try std.fmt.allocPrint(alloc, "update{s}", .{base}), col.updateRule, record_name, update_name, params, false));
+    try item.put(alloc, "delete", try collectionOperation(alloc, col, try std.fmt.allocPrint(alloc, "delete{s}", .{base}), col.deleteRule, null, null, params, true));
     try paths.put(alloc, item_path, .{ .object = item });
 }
 
@@ -527,25 +594,117 @@ fn openApiPath(alloc: std.mem.Allocator, path: []const u8) ![]const u8 {
     return out.toOwnedSlice(alloc);
 }
 
-fn routePathParameters(comptime meta: events.RouteMeta, alloc: std.mem.Allocator) !std.json.Array {
+fn reservedRoutes(comptime namespace: Namespace, alloc: std.mem.Allocator) !Value {
+    var routes = array(alloc);
+    for (engine_server.Server(namespace.gates).routes) |route| {
+        var item = object();
+        try item.put(alloc, "method", .{ .string = methodName(route.method) });
+        try item.put(alloc, "path", .{ .string = try openApiPath(alloc, route.pattern) });
+        try routes.append(.{ .object = item });
+    }
+    for (engine_server.realtime_upgrade_routes) |route| {
+        var item = object();
+        try item.put(alloc, "method", .{ .string = methodName(route.method) });
+        try item.put(alloc, "path", .{ .string = route.pattern });
+        try routes.append(.{ .object = item });
+    }
+    if (namespace.features_public_route) |path| {
+        inline for (engine_server.feature_route_methods) |feature_method| {
+            var item = object();
+            try item.put(alloc, "method", .{ .string = methodName(feature_method) });
+            try item.put(alloc, "path", .{ .string = path });
+            try routes.append(.{ .object = item });
+        }
+    }
+    return .{ .array = routes };
+}
+
+fn reservedPrefixes(comptime namespace: Namespace, alloc: std.mem.Allocator) !Value {
+    var prefixes = array(alloc);
+    if (namespace.gates.admin) {
+        var item = object();
+        try item.put(alloc, "path", .{ .string = "/_" });
+        try item.put(alloc, "source", .{ .string = "admin" });
+        try prefixes.append(.{ .object = item });
+    }
+    return .{ .array = prefixes };
+}
+
+fn builtinOperations(alloc: std.mem.Allocator) !Value {
+    var operations = array(alloc);
+    for (engine_server.migration_builtin_operations) |builtin| {
+        var item = object();
+        try item.put(alloc, "operationId", .{ .string = builtin.operation_id });
+        try item.put(alloc, "method", .{ .string = methodName(builtin.method) });
+        try item.put(alloc, "path", .{ .string = try openApiPath(alloc, builtin.pattern) });
+        try item.put(alloc, "access", .{ .string = builtin.access });
+        try item.put(alloc, "collectionType", .{ .string = "auth" });
+        try operations.append(.{ .object = item });
+    }
+    return .{ .array = operations };
+}
+
+fn exportedGates(comptime namespace: Namespace, alloc: std.mem.Allocator) !Value {
+    var gates = object();
+    inline for (std.meta.fields(engine_server.Gates)) |field|
+        try gates.put(alloc, field.name, .{ .bool = @field(namespace.gates, field.name) });
+    return .{ .object = gates };
+}
+
+fn routePathParameters(comptime meta: events.RouteMeta, canonical_path: []const u8, alloc: std.mem.Allocator) !std.json.Array {
     var params = array(alloc);
-    var segments = std.mem.splitScalar(u8, meta.path, '/');
-    while (segments.next()) |segment| {
-        if (segment.len <= 1 or segment[0] != ':') continue;
+    var source_segments = std.mem.splitScalar(u8, meta.path, '/');
+    var canonical_segments = std.mem.splitScalar(u8, canonical_path, '/');
+    while (source_segments.next()) |source_segment| {
+        const canonical_segment = canonical_segments.next() orelse unreachable;
+        if (source_segment.len <= 1 or source_segment[0] != ':') continue;
+        const canonical_name = if (canonical_segment.len > 2 and canonical_segment[0] == '{' and canonical_segment[canonical_segment.len - 1] == '}')
+            canonical_segment[1 .. canonical_segment.len - 1]
+        else if (canonical_segment.len > 1 and canonical_segment[0] == ':')
+            canonical_segment[1..]
+        else
+            unreachable;
         var param = object();
-        try param.put(alloc, "name", .{ .string = segment[1..] });
+        try param.put(alloc, "name", .{ .string = canonical_name });
         try param.put(alloc, "in", .{ .string = "path" });
         try param.put(alloc, "required", .{ .bool = true });
         var param_schema = object();
         try param_schema.put(alloc, "type", .{ .string = "string" });
         if (meta.path_secret) |secret| {
-            if (secret.in == .path and std.mem.eql(u8, secret.param, segment[1..]))
+            if (secret.in == .path and std.mem.eql(u8, secret.param, source_segment[1..]))
                 try param_schema.put(alloc, "writeOnly", .{ .bool = true });
         }
         try param.put(alloc, "schema", .{ .object = param_schema });
         try params.append(.{ .object = param });
     }
     return params;
+}
+
+fn isTemplateCapture(segment: []const u8) bool {
+    return (segment.len > 1 and segment[0] == ':') or
+        (segment.len > 2 and segment[0] == '{' and segment[segment.len - 1] == '}');
+}
+
+fn sameTemplateShape(a: []const u8, b: []const u8) bool {
+    var a_segments = std.mem.splitScalar(u8, a, '/');
+    var b_segments = std.mem.splitScalar(u8, b, '/');
+    while (true) {
+        const a_segment = a_segments.next();
+        const b_segment = b_segments.next();
+        if (a_segment == null or b_segment == null) return a_segment == null and b_segment == null;
+        const a_capture = isTemplateCapture(a_segment.?);
+        const b_capture = isTemplateCapture(b_segment.?);
+        if (a_capture != b_capture) return false;
+        if (!a_capture and !std.mem.eql(u8, a_segment.?, b_segment.?)) return false;
+    }
+}
+
+fn canonicalPathItem(paths: *const Object, candidate: []const u8) ?[]const u8 {
+    var it = paths.iterator();
+    while (it.next()) |entry| {
+        if (sameTemplateShape(entry.key_ptr.*, candidate)) return entry.key_ptr.*;
+    }
+    return null;
 }
 
 fn queryFieldParameter(comptime field: std.builtin.Type.StructField, alloc: std.mem.Allocator) !Value {
@@ -575,7 +734,7 @@ fn secretParameter(secret: events.PathSecretMeta, alloc: std.mem.Allocator) !Val
     return .{ .object = param };
 }
 
-fn routeResponses(comptime Output: type, untyped: bool, alloc: std.mem.Allocator) !Value {
+fn routeResponses(comptime method: http.Method, comptime Output: type, untyped: bool, alloc: std.mem.Allocator) !Value {
     var responses = object();
     var success = object();
     if (Output == void and !untyped) {
@@ -583,7 +742,7 @@ fn routeResponses(comptime Output: type, untyped: bool, alloc: std.mem.Allocator
         try responses.put(alloc, "204", .{ .object = success });
     } else {
         try success.put(alloc, "description", .{ .string = "Success" });
-        if (!untyped) {
+        if (!untyped and method != .HEAD) {
             var media = object();
             try media.put(alloc, "schema", try zigSchema(Output, alloc));
             var content = object();
@@ -625,9 +784,14 @@ fn applyRouteSecurity(comptime meta: events.RouteMeta, alloc: std.mem.Allocator,
 }
 
 fn addRoute(comptime meta: events.RouteMeta, alloc: std.mem.Allocator, paths: *Object) !void {
-    const path = try openApiPath(alloc, meta.path);
-    var params = try routePathParameters(meta, alloc);
-    if (!meta.untyped and meta.Input != void and (meta.method == .GET or meta.method == .DELETE) and @typeInfo(meta.Input) == .@"struct") {
+    if (comptime !route_path.isCanonicalPattern(meta.path))
+        @compileError("consumer route '" ++ meta.path ++ "' is not a canonical router pattern");
+    if (comptime meta.method == .UNKNOWN)
+        @compileError("consumer route '" ++ meta.path ++ "' cannot use method .UNKNOWN");
+    const rendered_path = try openApiPath(alloc, meta.path);
+    const path = canonicalPathItem(paths, rendered_path) orelse rendered_path;
+    var params = try routePathParameters(meta, path, alloc);
+    if (!meta.untyped and meta.Input != void and route_types.inputUsesQuery(meta.method) and @typeInfo(meta.Input) == .@"struct") {
         inline for (@typeInfo(meta.Input).@"struct".fields) |field|
             try params.append(try queryFieldParameter(field, alloc));
     }
@@ -639,7 +803,7 @@ fn addRoute(comptime meta: events.RouteMeta, alloc: std.mem.Allocator, paths: *O
     if (params.items.len > 0) try op.put(alloc, "parameters", .{ .array = params });
     if (meta.untyped) {
         try op.put(alloc, "x-zigbase-untyped", .{ .bool = true });
-    } else if (meta.Input != void and !((meta.method == .GET or meta.method == .DELETE) and @typeInfo(meta.Input) == .@"struct")) {
+    } else if (meta.Input != void and !(route_types.inputUsesQuery(meta.method) and @typeInfo(meta.Input) == .@"struct")) {
         var media = object();
         try media.put(alloc, "schema", try zigSchema(meta.Input, alloc));
         var content = object();
@@ -649,14 +813,54 @@ fn addRoute(comptime meta: events.RouteMeta, alloc: std.mem.Allocator, paths: *O
         try body.put(alloc, "content", .{ .object = content });
         try op.put(alloc, "requestBody", .{ .object = body });
     }
-    try op.put(alloc, "responses", try routeResponses(meta.Output, meta.untyped, alloc));
+    try op.put(alloc, "responses", try routeResponses(meta.method, meta.Output, meta.untyped, alloc));
     try applyRouteSecurity(meta, alloc, &op);
     var item = if (paths.get(path)) |existing| existing.object else object();
-    try item.put(alloc, methodName(meta.method), .{ .object = op });
+    const method = methodName(meta.method);
+    if (item.contains(method)) {
+        std.debug.print(
+            "zigbase openapi: duplicate route {s} {s} while exporting consumer operationId '{s}'\n",
+            .{ method, path, meta.name },
+        );
+        return error.DuplicateRoute;
+    }
+    try item.put(alloc, method, .{ .object = op });
     try paths.put(alloc, path, .{ .object = item });
 }
 
-pub fn generate(comptime route_meta: []const events.RouteMeta, alloc: std.mem.Allocator, collections: []const schema.Collection, options: Options) ![]u8 {
+fn validateUniqueOperationIds(alloc: std.mem.Allocator, paths: Object) !void {
+    const Origin = struct { method: []const u8, path: []const u8 };
+    var seen: std.StringHashMap(Origin) = .init(alloc);
+    defer seen.deinit();
+    for (engine_server.migration_builtin_operations) |builtin| {
+        try seen.put(builtin.operation_id, .{
+            .method = methodName(builtin.method),
+            .path = builtin.pattern,
+        });
+    }
+    var path_it = paths.iterator();
+    while (path_it.next()) |path_entry| {
+        var method_it = path_entry.value_ptr.object.iterator();
+        while (method_it.next()) |method_entry| {
+            const operation_id = method_entry.value_ptr.object.get("operationId") orelse continue;
+            const result = try seen.getOrPut(operation_id.string);
+            if (result.found_existing) {
+                const first = result.value_ptr.*;
+                std.debug.print(
+                    "zigbase openapi: duplicate operationId '{s}' at {s} {s}; first used by {s} {s}\n",
+                    .{ operation_id.string, method_entry.key_ptr.*, path_entry.key_ptr.*, first.method, first.path },
+                );
+                return error.DuplicateOperationId;
+            }
+            result.value_ptr.* = .{
+                .method = method_entry.key_ptr.*,
+                .path = path_entry.key_ptr.*,
+            };
+        }
+    }
+}
+
+pub fn generate(comptime route_meta: []const events.RouteMeta, comptime namespace: Namespace, alloc: std.mem.Allocator, collections: []const schema.Collection, options: Options) ![]u8 {
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const aa = arena.allocator();
@@ -667,8 +871,10 @@ pub fn generate(comptime route_meta: []const events.RouteMeta, alloc: std.mem.Al
     var paths = object();
     var schemas = object();
     try schemas.put(aa, "ZigBaseError", try errorSchema(aa));
-    for (kept.items) |col| try addCollection(aa, &paths, &schemas, col, kept.items);
+    const symbol_bases = try collectionSymbolBases(aa, kept.items, route_meta);
+    for (kept.items, symbol_bases) |col, base| try addCollection(aa, &paths, &schemas, col, base, kept.items);
     inline for (route_meta) |meta| try addRoute(meta, aa, &paths);
+    try validateUniqueOperationIds(aa, paths);
 
     var bearer = object();
     try bearer.put(aa, "type", .{ .string = "http" });
@@ -700,6 +906,12 @@ pub fn generate(comptime route_meta: []const events.RouteMeta, alloc: std.mem.Al
     try root.put(aa, "paths", .{ .object = paths });
     try root.put(aa, "components", .{ .object = components });
     try root.put(aa, "x-zigbase-coverage", .{ .object = coverage });
+    try root.put(aa, "x-zigbase-contract-version", .{ .string = contract_version });
+    try root.put(aa, "x-zigbase-gates", try exportedGates(namespace, aa));
+    try root.put(aa, "x-zigbase-feature-public-route", if (namespace.features_public_route) |path| .{ .string = path } else .null);
+    try root.put(aa, "x-zigbase-reserved-routes", try reservedRoutes(namespace, aa));
+    try root.put(aa, "x-zigbase-reserved-prefixes", try reservedPrefixes(namespace, aa));
+    try root.put(aa, "x-zigbase-builtin-operations", try builtinOperations(aa));
     const json = try std.json.Stringify.valueAlloc(aa, Value{ .object = root }, .{ .whitespace = .indent_2 });
     const result = try alloc.alloc(u8, json.len + 1);
     @memcpy(result[0..json.len], json);
@@ -708,7 +920,16 @@ pub fn generate(comptime route_meta: []const events.RouteMeta, alloc: std.mem.Al
 }
 
 pub fn generateCollections(alloc: std.mem.Allocator, collections: []const schema.Collection, options: Options) ![]u8 {
-    return generate(&.{}, alloc, collections, options);
+    return generate(&.{}, .{}, alloc, collections, options);
+}
+
+fn reservedHasRoute(routes: []const Value, method: []const u8, path: []const u8) bool {
+    for (routes) |entry| {
+        const route = entry.object;
+        if (std.mem.eql(u8, route.get("method").?.string, method) and
+            std.mem.eql(u8, route.get("path").?.string, path)) return true;
+    }
+    return false;
 }
 
 test "collection export maps constraints, access, auth writes, and deterministic ordering" {
@@ -742,9 +963,22 @@ test "collection export maps constraints, access, auth writes, and deterministic
     defer parsed.deinit();
     const root = parsed.value.object;
     try std.testing.expectEqualStrings("3.1.2", root.get("openapi").?.string);
+    try std.testing.expectEqualStrings(contract_version, root.get("x-zigbase-contract-version").?.string);
+    try std.testing.expectEqualStrings("1.2.3", root.get("info").?.object.get("version").?.string);
+    const reserved = root.get("x-zigbase-reserved-routes").?.array.items;
+    try std.testing.expect(reserved.len >= engine_server.Server(.{}).routes.len);
+    for ([_][2][]const u8{
+        .{ "post", "/api/files/token" },
+        .{ "get", "/api/realtime" },
+        .{ "get", "/api/realtime/sse" },
+    }) |expected| try std.testing.expect(reservedHasRoute(reserved, expected[0], expected[1]));
+    const builtins = root.get("x-zigbase-builtin-operations").?.array.items;
+    try std.testing.expectEqual(@as(usize, engine_server.migration_builtin_operations.len), builtins.len);
     try std.testing.expect(root.get("paths").?.object.get("/api/collections/_private/records") == null);
     const post_list = root.get("paths").?.object.get("/api/collections/posts/records").?.object.get("get").?.object;
     try std.testing.expectEqualStrings("conditional", post_list.get("x-zigbase-access").?.string);
+    try std.testing.expectEqualStrings("posts", post_list.get("x-zigbase-collection").?.string);
+    try std.testing.expectEqualStrings("base", post_list.get("x-zigbase-collection-type").?.string);
     try std.testing.expectEqualStrings("owner = @request.auth.id", post_list.get("x-zigbase-rule").?.string);
     try std.testing.expect(post_list.get("security") == null);
     const post_view = root.get("paths").?.object.get("/api/collections/posts/records/{id}").?.object.get("get").?.object;
@@ -767,6 +1001,9 @@ test "collection export maps constraints, access, auth writes, and deterministic
     try std.testing.expectEqual(@as(i64, 2), props.get("roles").?.object.get("maxItems").?.integer);
     try std.testing.expect(props.get("secret").?.object.get("writeOnly").?.bool);
     const create_props = schemas.get("UsersCreate").?.object.get("properties").?.object;
+    const users_create = root.get("paths").?.object.get("/api/collections/users/records").?.object.get("post").?.object;
+    try std.testing.expectEqualStrings("auth", users_create.get("x-zigbase-collection-type").?.string);
+    try std.testing.expectEqualStrings("users", users_create.get("x-zigbase-collection").?.string);
     try std.testing.expect(create_props.get("password") != null);
     try std.testing.expect(create_props.get("passwordConfirm") != null);
     const update_props = schemas.get("UsersUpdate").?.object.get("properties").?.object;
@@ -850,7 +1087,7 @@ test "consumer routes map bounded Zig types, methods, paths, and authentication"
         .{ .method = .GET, .path = "/api/account", .name = "account", .auth = .authed, .Input = void, .Output = bool, .authed_collection = .{ .collection = "members", .allow_superuser = true } },
     };
     const a = std.testing.allocator;
-    const doc = try generate(&routes, a, &.{}, .{ .api_version = "dev" });
+    const doc = try generate(&routes, .{}, a, &.{}, .{ .api_version = "dev" });
     defer a.free(doc);
     const parsed = try std.json.parseFromSlice(Value, a, doc, .{});
     defer parsed.deinit();
@@ -891,7 +1128,211 @@ test "consumer routes map bounded Zig types, methods, paths, and authentication"
     try std.testing.expect(deploy_secret.get("x-zigbase-path-secret").?.bool);
     const account = paths.get("/api/account").?.object.get("get").?.object;
     try std.testing.expectEqualStrings("members", account.get("x-zigbase-auth-collection").?.string);
+    try std.testing.expect(account.get("x-zigbase-collection") == null);
+    try std.testing.expect(account.get("x-zigbase-collection-type") == null);
     try std.testing.expect(account.get("x-zigbase-allow-superuser").?.bool);
+}
+
+test "reserved namespace follows feature gates and the remapped feature route" {
+    const a = std.testing.allocator;
+    const doc = try generate(&.{}, .{
+        .gates = .{
+            .analytics = false,
+            .senders = false,
+            .mail_webhook = false,
+            .tenancy = false,
+            .webauthn = false,
+            .magic_link = false,
+            .oauth2 = false,
+            .mail_unsubscribe = false,
+        },
+        .features_public_route = "/public/features",
+    }, a, &.{}, .{ .api_version = "dev" });
+    defer a.free(doc);
+    const parsed = try std.json.parseFromSlice(Value, a, doc, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings(
+        "/public/features",
+        parsed.value.object.get("x-zigbase-feature-public-route").?.string,
+    );
+    const reserved = parsed.value.object.get("x-zigbase-reserved-routes").?.array.items;
+    for (reserved) |entry| {
+        const path = entry.object.get("path").?.string;
+        try std.testing.expect(!std.mem.eql(u8, path, "/api/analytics/events"));
+        try std.testing.expect(!std.mem.eql(u8, path, "/api/collections/{col}/auth/webauthn/register/begin"));
+        try std.testing.expect(!std.mem.eql(u8, path, "/api/state"));
+    }
+    for ([_][]const u8{ "get", "head" }) |method|
+        try std.testing.expect(reservedHasRoute(reserved, method, "/public/features"));
+    const prefixes = parsed.value.object.get("x-zigbase-reserved-prefixes").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), prefixes.len);
+    try std.testing.expectEqualStrings("/_", prefixes[0].object.get("path").?.string);
+    try std.testing.expectEqualStrings("admin", prefixes[0].object.get("source").?.string);
+
+    const no_admin_doc = try generate(&.{}, .{ .gates = .{ .admin = false } }, a, &.{}, .{ .api_version = "dev" });
+    defer a.free(no_admin_doc);
+    const no_admin = try std.json.parseFromSlice(Value, a, no_admin_doc, .{});
+    defer no_admin.deinit();
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        no_admin.value.object.get("x-zigbase-reserved-prefixes").?.array.items.len,
+    );
+}
+
+test "feature route metadata distinguishes default, remapped, and disabled configurations" {
+    const a = std.testing.allocator;
+    inline for (.{
+        .{ .namespace = Namespace{}, .expected = "/api/state", .is_null = false },
+        .{ .namespace = Namespace{ .features_public_route = null }, .expected = "", .is_null = true },
+    }) |case| {
+        const doc = try generate(&.{}, case.namespace, a, &.{}, .{ .api_version = "dev" });
+        defer a.free(doc);
+        const parsed = try std.json.parseFromSlice(Value, a, doc, .{});
+        defer parsed.deinit();
+        const marker = parsed.value.object.get("x-zigbase-feature-public-route").?;
+        if (case.is_null) {
+            try std.testing.expectEqual(.null, std.meta.activeTag(marker));
+        } else {
+            try std.testing.expectEqualStrings(case.expected, marker.string);
+        }
+        const reserved = parsed.value.object.get("x-zigbase-reserved-routes").?.array.items;
+        for ([_][]const u8{ "get", "head" }) |method|
+            try std.testing.expectEqual(!case.is_null, reservedHasRoute(reserved, method, "/api/state"));
+    }
+}
+
+test "typed HEAD route exports query parameters without a request body" {
+    const a = std.testing.allocator;
+    const Input = struct { report_id: u32 };
+    const routes = [_]events.RouteMeta{.{
+        .method = .HEAD,
+        .path = "/api/report",
+        .name = "report",
+        .auth = .public,
+        .Input = Input,
+        .Output = struct { count: u32 },
+    }};
+    const doc = try generate(&routes, .{}, a, &.{}, .{ .api_version = "dev" });
+    defer a.free(doc);
+    const parsed = try std.json.parseFromSlice(Value, a, doc, .{});
+    defer parsed.deinit();
+    const head_operation = parsed.value.object.get("paths").?.object
+        .get("/api/report").?.object.get("head").?.object;
+    try std.testing.expect(head_operation.get("requestBody") == null);
+    const success = head_operation.get("responses").?.object.get("200").?.object;
+    try std.testing.expect(success.get("content") == null);
+    try std.testing.expect(head_operation.get("responses").?.object.get("204") == null);
+    const parameters = head_operation.get("parameters").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), parameters.len);
+    try std.testing.expectEqualStrings("report_id", parameters[0].object.get("name").?.string);
+    try std.testing.expectEqualStrings("query", parameters[0].object.get("in").?.string);
+}
+
+test "OpenAPI generation disambiguates collection operation ids and rejects consumer collisions" {
+    const a = std.testing.allocator;
+    const cols = [_]schema.Collection{.{ .id = "posts-id", .name = "posts", .fields = &.{} }};
+    const duplicate_id = [_]events.RouteMeta{.{
+        .method = .POST,
+        .path = "/api/publish",
+        .name = "listPosts",
+        .auth = .superuser,
+        .Input = void,
+        .Output = void,
+    }};
+    const disambiguated = try generate(&duplicate_id, .{}, a, &cols, .{ .api_version = "dev" });
+    defer a.free(disambiguated);
+    const parsed = try std.json.parseFromSlice(Value, a, disambiguated, .{});
+    defer parsed.deinit();
+    const paths = parsed.value.object.get("paths").?.object;
+    try std.testing.expectEqualStrings(
+        "listPosts_posts",
+        paths.get("/api/collections/posts/records").?.object.get("get").?.object.get("operationId").?.string,
+    );
+    try std.testing.expectEqualStrings(
+        "listPosts",
+        paths.get("/api/publish").?.object.get("post").?.object.get("operationId").?.string,
+    );
+
+    const builtin_id = [_]events.RouteMeta{.{
+        .method = .POST,
+        .path = "/api/logout-wrapper",
+        .name = "logout",
+        .auth = .public,
+        .Input = void,
+        .Output = void,
+    }};
+    try std.testing.expectError(error.DuplicateOperationId, generate(&builtin_id, .{}, a, &.{}, .{ .api_version = "dev" }));
+
+    const duplicate_route = [_]events.RouteMeta{.{
+        .method = .GET,
+        .path = "/api/collections/posts/records",
+        .name = "shadowPosts",
+        .auth = .superuser,
+        .Input = void,
+        .Output = void,
+    }};
+    try std.testing.expectError(error.DuplicateRoute, generate(&duplicate_route, .{}, a, &cols, .{ .api_version = "dev" }));
+}
+
+test "collection symbols remain unique when friendly names collapse" {
+    const a = std.testing.allocator;
+    const snake_fields = [_]schema.Field{.{ .id = "snake", .name = "snake_only", .options = .{ .text = .{} } }};
+    const camel_fields = [_]schema.Field{.{ .id = "camel", .name = "camel_only", .options = .{ .text = .{} } }};
+    const cols = [_]schema.Collection{
+        .{ .id = "snake-id", .name = "my_posts", .fields = &snake_fields },
+        .{ .id = "camel-id", .name = "myPosts", .fields = &camel_fields },
+        .{ .id = "upper-id", .name = "Foo", .fields = &.{} },
+        .{ .id = "lower-id", .name = "foo", .fields = &.{} },
+        .{ .id = "single-id", .name = "a_b", .fields = &.{} },
+        .{ .id = "double-id", .name = "a__b", .fields = &.{} },
+    };
+    const doc = try generateCollections(a, &cols, .{ .api_version = "dev" });
+    defer a.free(doc);
+    const parsed = try std.json.parseFromSlice(Value, a, doc, .{});
+    defer parsed.deinit();
+    const root = parsed.value.object;
+    const schemas = root.get("components").?.object.get("schemas").?.object;
+    try std.testing.expect(schemas.get("MyPosts_my_postsRecord").?.object.get("properties").?.object.get("snake_only") != null);
+    try std.testing.expect(schemas.get("MyPosts_myPostsRecord").?.object.get("properties").?.object.get("camel_only") != null);
+    inline for (&.{ "Foo_FooRecord", "Foo_fooRecord", "AB_a_bRecord", "AB_a__bRecord" }) |name|
+        try std.testing.expect(schemas.get(name) != null);
+
+    const paths = root.get("paths").?.object;
+    try std.testing.expectEqualStrings(
+        "listMyPosts_my_posts",
+        paths.get("/api/collections/my_posts/records").?.object.get("get").?.object.get("operationId").?.string,
+    );
+    try std.testing.expectEqualStrings(
+        "listMyPosts_myPosts",
+        paths.get("/api/collections/myPosts/records").?.object.get("get").?.object.get("operationId").?.string,
+    );
+}
+
+test "template-equivalent routes merge under one canonical OpenAPI path item" {
+    const a = std.testing.allocator;
+    const routes = [_]events.RouteMeta{
+        .{ .method = .GET, .path = "/api/items/:id", .name = "getItem", .auth = .public, .Input = void, .Output = bool },
+        .{ .method = .DELETE, .path = "/api/items/:item_id", .name = "deleteItem", .auth = .public, .Input = void, .Output = void, .path_secret = .{ .param = "item_id", .in = .path, .on_mismatch = .not_found } },
+        .{ .method = .POST, .path = "/api/collections/posts/records/:record", .name = "restorePost", .auth = .public, .Input = void, .Output = void, .path_secret = .{ .param = "record", .in = .path, .on_mismatch = .not_found } },
+    };
+    const cols = [_]schema.Collection{.{ .id = "posts-id", .name = "posts", .fields = &.{} }};
+    const doc = try generate(&routes, .{}, a, &cols, .{ .api_version = "dev" });
+    defer a.free(doc);
+    const parsed = try std.json.parseFromSlice(Value, a, doc, .{});
+    defer parsed.deinit();
+    const paths = parsed.value.object.get("paths").?.object;
+    try std.testing.expect(paths.get("/api/items/{item_id}") == null);
+    const items = paths.get("/api/items/{id}").?.object;
+    try std.testing.expect(items.get("get") != null);
+    const delete_params = items.get("delete").?.object.get("parameters").?.array.items;
+    try std.testing.expectEqualStrings("id", delete_params[0].object.get("name").?.string);
+    try std.testing.expect(delete_params[0].object.get("schema").?.object.get("writeOnly").?.bool);
+
+    try std.testing.expect(paths.get("/api/collections/posts/records/{record}") == null);
+    const post_item = paths.get("/api/collections/posts/records/{id}").?.object;
+    const restore_params = post_item.get("post").?.object.get("parameters").?.array.items;
+    try std.testing.expectEqualStrings("id", restore_params[0].object.get("name").?.string);
+    try std.testing.expect(restore_params[0].object.get("schema").?.object.get("writeOnly").?.bool);
 }
 
 test "path secret route metadata is useful and contains no configured secret source" {
@@ -905,7 +1346,7 @@ test "path secret route metadata is useful and contains no configured secret sou
         .path_secret = .{ .param = "token", .in = .path, .on_mismatch = .forbidden },
     }};
     const a = std.testing.allocator;
-    const doc = try generate(&routes, a, &.{}, .{ .api_version = "dev" });
+    const doc = try generate(&routes, .{}, a, &.{}, .{ .api_version = "dev" });
     defer a.free(doc);
     const parsed = try std.json.parseFromSlice(Value, a, doc, .{});
     defer parsed.deinit();
@@ -915,6 +1356,7 @@ test "path secret route metadata is useful and contains no configured secret sou
     try std.testing.expectEqual(@as(usize, 0), op.get("security").?.array.items.len);
     const param_schema = op.get("parameters").?.array.items[0].object.get("schema").?.object;
     try std.testing.expect(param_schema.get("writeOnly").?.bool);
-    try std.testing.expect(std.mem.indexOf(u8, doc, "source") == null);
-    try std.testing.expect(std.mem.indexOf(u8, doc, "config") == null);
+    try std.testing.expect(op.get("x-zigbase-secret-source") == null);
+    try std.testing.expect(param_schema.get("default") == null);
+    try std.testing.expect(param_schema.get("example") == null);
 }

@@ -5,6 +5,7 @@
 const std = @import("std");
 const events = @import("../events.zig");
 const http = @import("../http.zig");
+const route_types = @import("../route_types.zig");
 const rpc_ts = @import("rpc_ts.zig");
 
 const RouteMeta = events.RouteMeta;
@@ -40,12 +41,14 @@ fn methodStr(comptime m: http.Method) []const u8 {
         .PUT => "PUT",
         .PATCH => "PATCH",
         .DELETE => "DELETE",
+        .OPTIONS => "OPTIONS",
+        .HEAD => "HEAD",
         else => @compileError("rpc: unsupported HTTP method for a typed route"),
     };
 }
 
 fn isBodyMethod(comptime m: http.Method) bool {
-    return m == .POST or m == .PUT or m == .PATCH;
+    return !route_types.inputUsesQuery(m);
 }
 
 /// `params: { id: string }` type literal, or "" if no params.
@@ -116,7 +119,8 @@ pub fn renderShared(comptime routes: []const RouteMeta, alloc: std.mem.Allocator
 
         // 1) named decls for Input (if struct/enum) and Output (if struct/enum)
         try rpc_ts.renderNamedDeclsShared(r.Input, &decls, alloc, seen);
-        try rpc_ts.renderNamedDeclsShared(r.Output, &decls, alloc, seen);
+        if (r.method != .HEAD)
+            try rpc_ts.renderNamedDeclsShared(r.Output, &decls, alloc, seen);
 
         // 2) interface member: name(<params,><input,> opts?): Promise<Out>;
         try iface.appendSlice(alloc, "    ");
@@ -135,7 +139,7 @@ pub fn renderShared(comptime routes: []const RouteMeta, alloc: std.mem.Allocator
         }
         if (wrote_arg) try iface.appendSlice(alloc, ", ");
         try iface.appendSlice(alloc, "opts?: SendOptions): Promise<");
-        try iface.appendSlice(alloc, if (r.Output == void) "void" else out_ts);
+        try iface.appendSlice(alloc, if (r.method == .HEAD or r.Output == void) "void" else out_ts);
         try iface.appendSlice(alloc, ">;\n");
 
         // 3) factory method
@@ -182,11 +186,14 @@ pub fn renderShared(comptime routes: []const RouteMeta, alloc: std.mem.Allocator
 // ---------------------------------------------------------------------------
 
 const ConfirmOut = struct { id: []const u8, status: []const u8 };
+const HeadOut = struct { count: u32 };
 const SearchIn = struct { q: []const u8, limit: i32 };
 
 const test_routes = [_]events.RouteMeta{
     .{ .method = .POST, .path = "/api/bookings/:id/confirm", .name = "bookingsConfirm", .auth = .authed, .Input = void, .Output = ConfirmOut },
     .{ .method = .GET, .path = "/api/search", .name = "search", .auth = .public, .Input = SearchIn, .Output = std.json.Value },
+    .{ .method = .HEAD, .path = "/api/report", .name = "report", .auth = .public, .Input = SearchIn, .Output = HeadOut },
+    .{ .method = .OPTIONS, .path = "/api/report", .name = "reportOptions", .auth = .public, .Input = SearchIn, .Output = void },
 };
 
 test "pathParams extracts colon segments in order" {
@@ -210,6 +217,10 @@ test "render emits interface member, factory method, and named decls" {
     // Interface member: void input → no input arg; params object present; query route has input
     try std.testing.expect(std.mem.indexOf(u8, sec.iface_member, "bookingsConfirm(params: { id: string }, opts?: SendOptions): Promise<ConfirmOut>;") != null);
     try std.testing.expect(std.mem.indexOf(u8, sec.iface_member, "search(input: SearchIn, opts?: SendOptions): Promise<unknown>;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sec.iface_member, "report(input: SearchIn, opts?: SendOptions): Promise<void>;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sec.decls, "HeadOut") == null);
+    try std.testing.expect(std.mem.indexOf(u8, sec.factory_member, "return base.send(\"HEAD\", `/api/report`, { query: input") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sec.factory_member, "return base.send(\"OPTIONS\", `/api/report`, { body: input") != null);
 
     // Factory: POST interpolates :id and sends body absent (void input); GET sends query
     try std.testing.expect(std.mem.indexOf(u8, sec.factory_member, "bookingsConfirm(params, opts) {") != null);

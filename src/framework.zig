@@ -479,6 +479,38 @@ fn assertPluginContract(comptime P: type, comptime kind: []const u8) void {
     }
 }
 
+/// Validate the lowered consumer namespace once its route specs have passed the
+/// field/grammar checks in events.routeMeta. Consumer routes retain declared-order
+/// precedence; this guard only prevents them from shadowing framework-owned routes.
+fn validateConsumerRouteMeta(
+    comptime gates: server.Gates,
+    comptime feature_path: ?[]const u8,
+    comptime consumer: []const events.RouteMeta,
+) void {
+    @setEvalBranchQuota(20_000 + consumer.len * (server.Server(gates).routes.len + server.realtime_upgrade_routes.len + 1) * 128);
+    for (consumer) |candidate| {
+        if (server.adminRoutePatternReserved(gates, candidate.path))
+            @compileError("consumer route '" ++ @tagName(candidate.method) ++ " " ++ candidate.path ++ "' overlaps reserved ZigBase admin prefix '/_'");
+        for (server.Server(gates).routes) |reserved| {
+            if (candidate.method == reserved.method and server.routePatternsOverlap(candidate.path, reserved.pattern))
+                @compileError("consumer route '" ++ @tagName(candidate.method) ++ " " ++ candidate.path ++ "' overlaps reserved ZigBase route '" ++ reserved.pattern ++ "'");
+        }
+        for (server.realtime_upgrade_routes) |reserved| {
+            if (candidate.method == reserved.method and server.routePatternsOverlap(candidate.path, reserved.pattern))
+                @compileError("consumer route '" ++ @tagName(candidate.method) ++ " " ++ candidate.path ++ "' overlaps reserved ZigBase route '" ++ reserved.pattern ++ "'");
+        }
+        for (server.migration_builtin_operations) |operation| {
+            if (std.mem.eql(u8, candidate.name, operation.operation_id))
+                @compileError("consumer route '" ++ @tagName(candidate.method) ++ " " ++ candidate.path ++ "' derives reserved operation name '" ++ operation.operation_id ++ "' used by builtin route '" ++ operation.pattern ++ "'; set a distinct '.name'");
+        }
+        if (feature_path) |path| {
+            if (server.isFeatureRouteMethod(candidate.method) and
+                server.routePatternsOverlap(candidate.path, path))
+                @compileError("consumer route '" ++ @tagName(candidate.method) ++ " " ++ candidate.path ++ "' overlaps reserved feature-state route '" ++ path ++ "'");
+        }
+    }
+}
+
 /// Comptime application builder. `cfg` is an anonymous struct VALUE with optional
 /// `.hooks` (record hook groups) and optional `.onError` (an ErrorHandler).
 /// Returns a type exposing the prebuilt `dispatch` and the CLI/serve entry points.
@@ -569,6 +601,7 @@ pub fn App(comptime cfg: anytype) type {
             if (@hasField(@TypeOf(cfg), "hooks")) d.record = events.buildRecordDispatcher(cfg.hooks);
             if (@hasField(@TypeOf(cfg), "onError")) d.on_error = cfg.onError;
             if (@hasField(@TypeOf(cfg), "routes")) {
+                _ = validated_route_meta;
                 d.routes = events.buildRoutes(cfg.routes);
                 // #243: every route with a `.auth = .{ .authed = "<col>" }` gate must name a
                 // DECLARED auth collection (exists + `.type = .auth`). buildRoutes can't check this
@@ -1265,10 +1298,14 @@ pub fn App(comptime cfg: anytype) type {
         /// Mirrors `App.collections`; consumed by the SP2.2b TS client generator to
         /// emit typed fetch wrappers. Each entry carries the derived camelCase name,
         /// method, path, auth level, and the handler's Input/Output types.
-        pub const routes: []const events.RouteMeta = if (@hasField(@TypeOf(cfg), "routes"))
-            events.routeMeta(cfg.routes)
-        else
-            &.{};
+        const validated_route_meta: []const events.RouteMeta = blk: {
+            if (!@hasField(@TypeOf(cfg), "routes")) break :blk &.{};
+            const meta = events.routeMeta(cfg.routes);
+            validateConsumerRouteMeta(route_gates, features_public_route, meta);
+            break :blk meta;
+        };
+
+        pub const routes = validated_route_meta;
 
         /// Comptime-reflected typed I/O for CUSTOM auth methods declared in the
         /// `.collections` literal (one entry per `.{ .slug, .Initiate, .Complete }`
@@ -1356,6 +1393,8 @@ pub fn App(comptime cfg: anytype) type {
             };
             if (!is_str)
                 @compileError(".features.public_route must be a path string (e.g. \"/api/state\") or .disabled");
+            if (!server.featureRouteAvailable(route_gates, pr))
+                @compileError(".features.public_route must be a canonical absolute path that does not overlap a reserved ZigBase route or prefix");
             break :blk pr;
         };
 
@@ -2083,7 +2122,7 @@ fn runCliImpl(init: std.process.Init, dispatch: *const events.Dispatch, jobs: []
             .apply => try schemaApplyImpl(allocator, init.io, init.environ_map, sa, dispatch, jobs, pool_size, schema_collections, schema_migrations, opts),
             .check_rules => try schemaCheckRulesImpl(allocator, init.io, init.environ_map, sa),
         },
-        .openapi => |oa| try openApiImpl(route_meta, allocator, init.io, init.environ_map, oa),
+        .openapi => |oa| try openApiImpl(route_meta, opts, allocator, init.io, init.environ_map, oa),
         .rewrap => |ra| try rewrapImpl(allocator, init.io, init.environ_map, ra),
         .import => |ia| try importImpl(allocator, init.io, init.environ_map, ia, dispatch, jobs, pool_size, schema_collections, schema_migrations, opts),
         .migrate_db => |ma| try migrateDbImpl(allocator, init.io, ma),
@@ -2699,9 +2738,9 @@ fn printImportUsage(io: std.Io, file: std.Io.File) void {
         \\  --progress N       Print a progress line to stderr every N rows (0 = off).
         \\  --json             Print the summary as one JSON object on stdout.
         \\  --manifest FILE    Load several collections in relation order from a manifest:
-        \\                     {{"zigbaseImportManifest":1,"collections":[
-        \\                       {{"collection":"authors","file":"authors.ndjson"}},
-        \\                       {{"collection":"posts","file":"posts.ndjson","upsertKey":"slug"}}]}}
+        \\                     {{"zigbaseImportManifest":2,"collections":[
+        \\                       {{"collection":"authors","file":"authors.ndjson","preserveTimestamps":true}},
+        \\                       {{"collection":"posts","file":"posts.ndjson","preserveTimestamps":false}}]}}
         \\                     File paths resolve against the MANIFEST's directory. Relation cycles
         \\                     and self-relations are loaded with the offending values stripped and
         \\                     patched afterwards by record id (those rows must carry their own id).
@@ -3168,7 +3207,7 @@ fn schemaDumpImpl(allocator: std.mem.Allocator, io: std.Io, environ: *const std.
 /// read-only connection and combine it with this binary's comptime consumer routes. It
 /// deliberately bypasses server boot, migrations, provisioning, and the SQLite pool's
 /// journal-mode setup, so exporting cannot mutate the database it describes.
-fn openApiImpl(comptime route_meta: []const events.RouteMeta, allocator: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map, oa: cli.OpenApiArgs) !void {
+fn openApiImpl(comptime route_meta: []const events.RouteMeta, comptime opts: ServeOpts, allocator: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map, oa: cli.OpenApiArgs) !void {
     const cfg = try loadCfg(environ, .{ .data_dir = oa.data_dir });
     const db_url = (config.EnvGetter{ .environ = environ }).get("ZIGBASE_DB_URL");
     const target: []const u8 = switch (db.chooseBackend(db_url)) {
@@ -3199,11 +3238,23 @@ fn openApiImpl(comptime route_meta: []const events.RouteMeta, allocator: std.mem
     var scratch = std.heap.ArenaAllocator.init(allocator);
     defer scratch.deinit();
     const cols = try collections_mod.list(scratch.allocator(), &conn);
-    const doc = try openapi.generate(route_meta, allocator, cols, .{
+    const doc = openapi.generate(route_meta, .{
+        .gates = opts.gates,
+        .features_public_route = opts.features_public_route,
+    }, allocator, cols, .{
         .title = oa.title,
         .api_version = oa.api_version orelse build_options.version,
         .server = oa.server,
-    });
+    }) catch |err| {
+        // The generated error set depends on comptime route metadata, so a binary
+        // with no consumer routes may not contain DuplicateRoute at all. Classify
+        // these two contract failures by their stable names instead of naming an
+        // error-set member that can be compiled out.
+        const name = @errorName(err);
+        if (std.mem.eql(u8, name, "DuplicateOperationId") or std.mem.eql(u8, name, "DuplicateRoute"))
+            std.process.exit(1);
+        return err;
+    };
     defer allocator.free(doc);
     if (oa.out) |path| {
         try openapi_cli.writeAtomic(allocator, io, path, doc);
@@ -4007,6 +4058,7 @@ fn importManifestImpl(
         for (report.entries) |er| {
             var o: std.json.ObjectMap = .empty;
             try o.put(a, "collection", .{ .string = er.collection });
+            try o.put(a, "preserve_timestamps", .{ .bool = er.preserve_timestamps });
             try o.put(a, "created", .{ .integer = @intCast(er.created) });
             try o.put(a, "updated", .{ .integer = @intCast(er.updated) });
             try o.put(a, "failed", .{ .integer = @intCast(er.failed) });
@@ -5364,6 +5416,64 @@ test "App(cfg) assembles custom routes onto dispatch" {
     const A = App(.{ .routes = .{.{ .method = .GET, .path = "/api/x", .handler = H.h, .auth = .public }} });
     try std.testing.expectEqual(@as(usize, 1), A.dispatch.routes.len);
     try std.testing.expectEqualStrings("/api/x", A.dispatch.routes[0].pattern);
+}
+
+test "App(cfg) preserves declared precedence for literal and capture routes" {
+    const route_types = @import("route_types.zig");
+    const H = struct {
+        fn h(req: *route_types.Req(void)) route_types.RouteError!void {
+            _ = req;
+        }
+    };
+    const A = App(.{ .routes = .{
+        .{ .method = .GET, .path = "/items/new", .handler = H.h, .auth = .public },
+        .{ .method = .GET, .path = "/items/:id", .handler = H.h, .auth = .public },
+    } });
+    try std.testing.expectEqual(@as(usize, 2), A.dispatch.routes.len);
+    try std.testing.expectEqualStrings("/items/new", A.dispatch.routes[0].pattern);
+    try std.testing.expectEqualStrings("/items/:id", A.dispatch.routes[1].pattern);
+}
+
+test "consumer route reservation validation scales past realistic migrated route tables" {
+    comptime {
+        const path_source = "/consumer/" ++ ("x" ** 100);
+        var routes: [100]events.RouteMeta = undefined;
+        for (0..routes.len) |index| {
+            routes[index] = .{
+                .method = .GET,
+                .path = path_source[0 .. "/consumer/".len + index + 1],
+                .name = "route",
+                .auth = .public,
+                .Input = void,
+                .Output = void,
+            };
+        }
+        validateConsumerRouteMeta(.{ .admin = false }, null, &routes);
+    }
+}
+
+test "App(cfg) admin route reservation follows the gate and segment boundary" {
+    const route_types = @import("route_types.zig");
+    const H = struct {
+        fn h(req: *route_types.Req(void)) route_types.RouteError!void {
+            _ = req;
+        }
+    };
+    const AdminDisabled = App(.{
+        .admin = .disabled,
+        .routes = .{.{ .method = .GET, .path = "/_/deep/health", .handler = H.h, .auth = .public }},
+    });
+    try std.testing.expectEqual(@as(usize, 1), AdminDisabled.dispatch.routes.len);
+    try std.testing.expectEqualStrings("/_/deep/health", AdminDisabled.dispatch.routes[0].pattern);
+
+    const NearMiss = App(.{
+        .routes = .{.{ .method = .GET, .path = "/__", .name = "nearMiss", .handler = H.h, .auth = .public }},
+    });
+    try std.testing.expectEqual(@as(usize, 1), NearMiss.dispatch.routes.len);
+    try std.testing.expectEqualStrings("/__", NearMiss.dispatch.routes[0].pattern);
+
+    // A default-gated route at `/_` or any `/_/...` depth is a loud
+    // compile error in validateConsumerRoutes; it cannot be an inline negative test.
 }
 
 test "App(cfg): .auth = .{ .authed = collection } gate assembles + comptime-validates (#243)" {

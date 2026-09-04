@@ -188,9 +188,11 @@ pub fn serve(ctx: *http.RequestCtx) anyerror!http.Response {
         // RFC 9110 §15.4.5: a 304 replays the validator + cache policy only, but the
         // Content-Type still applies to the (unsent) representation — omitting it lets
         // the server fall back to its default application/json, which is wrong here.
+        const representation_length = try std.fmt.allocPrint(ctx.allocator.a, "{d}", .{st.size});
         const hs304 = try ctx.allocator.a.dupe(http.Header, &.{
             .{ .name = "ETag", .value = etag },
             .{ .name = "Cache-Control", .value = cache },
+            .{ .name = "content-length", .value = representation_length },
         });
         return .{ .status = 304, .body = "", .content_type = content_type, .extra_headers = hs304 };
     }
@@ -228,7 +230,7 @@ pub fn serve(ctx: *http.RequestCtx) anyerror!http.Response {
         // Content-Length + empty body — http_send_body's add_content_length is
         // set-if-missing, so the real length survives while zero bytes are sent.
         try hs.append(ctx.allocator.a, .{
-            .name = "Content-Length",
+            .name = "content-length",
             .value = try std.fmt.allocPrint(ctx.allocator.a, "{d}", .{p.len}),
         });
         return .{ .status = p.status, .body = "", .content_type = content_type, .extra_headers = try hs.toOwnedSlice(ctx.allocator.a) };
@@ -452,11 +454,13 @@ test "serve: header emission — exactly one Cache-Control, ETag, Accept-Ranges;
     try std.testing.expectEqual(@as(u64, 100), r206.file.?.offset);
     try std.testing.expectEqual(@as(?u64, 900), r206.file.?.len);
 
-    // Conditional GET with the minted ETag: 304 with ETag + Cache-Control ONLY.
+    // Conditional GET carries the selected representation length for valid HEAD parity.
     var ctx304 = http.RequestCtx{ .method = .GET, .path = "/", .allocator = RequestArena.from(&arena), .app = &app, .params = &params, .if_none_match = etag_val };
     const r304 = try serve(&ctx304);
     try std.testing.expectEqual(@as(u16, 304), r304.status);
-    try std.testing.expectEqual(@as(usize, 2), r304.extra_headers.len);
+    try std.testing.expectEqual(@as(usize, 3), r304.extra_headers.len);
+    try std.testing.expectEqualStrings("content-length", r304.extra_headers[2].name);
+    try std.testing.expectEqualStrings("1000", r304.extra_headers[2].value);
 
     // Unsatisfiable range: 416 + `bytes */1000`, security headers intact, no file ref.
     const bad = [_]http.Param{.{ .key = "range", .value = "bytes=5000-" }};
@@ -477,7 +481,7 @@ test "serve: header emission — exactly one Cache-Control, ETag, Accept-Ranges;
     try std.testing.expectEqual(@as(u16, 200), rh.status);
     try std.testing.expect(rh.file == null);
     var got_cl = false;
-    for (rh.extra_headers) |h| if (std.mem.eql(u8, h.name, "Content-Length")) {
+    for (rh.extra_headers) |h| if (std.mem.eql(u8, h.name, "content-length")) {
         try std.testing.expectEqualStrings("1000", h.value);
         got_cl = true;
     };
