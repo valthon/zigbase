@@ -92,7 +92,8 @@ def test_a_dotted_index_name_keeps_its_reviewed_predicate(mutable_source):
     `build_schema_document` keyed the reviewed predicate by the ESCAPED name while
     `_indexes_for` looked it up by the RAW one, so the lookup missed and the index --
     which may be a UNIQUE constraint -- was dropped entirely, with a recorded decision
-    saying it had been kept.
+    saying it had been kept. The source name is normalized for ZigBase only after that
+    raw-name lookup succeeds.
     """
     schema = read_inventory(mutable_source, "schema")
     posts = next(t for t in schema["tables"] if t["name"] == "posts")
@@ -108,10 +109,10 @@ def test_a_dotted_index_name_keeps_its_reviewed_predicate(mutable_source):
     )
     collection = next(c for c in document["collections"] if c["name"] == "posts")
     emitted = {i["name"]: i for i in collection["indexes"]}
-    assert "idx.posts.published" in emitted, (
+    assert "idx_posts_published" in emitted, (
         "the index was dropped even though its predicate was reviewed"
     )
-    assert emitted["idx.posts.published"]["where"] == "status = 1"
+    assert emitted["idx_posts_published"]["where"] == "status = 1"
 
 
 def test_a_schema_qualified_table_can_be_renamed(mutable_source):

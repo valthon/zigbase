@@ -2,32 +2,39 @@
   "collections": [
     {
       "collection": "clubs",
-      "file": "data/clubs.ndjson"
+      "file": "data/clubs.ndjson",
+      "preserveTimestamps": true
     },
     {
       "collection": "comments",
-      "file": "data/comments.ndjson"
+      "file": "data/comments.ndjson",
+      "preserveTimestamps": true
     },
     {
       "collection": "events",
-      "file": "data/events.ndjson"
+      "file": "data/events.ndjson",
+      "preserveTimestamps": true
     },
     {
       "collection": "flags",
-      "file": "data/flags.ndjson"
+      "file": "data/flags.ndjson",
+      "preserveTimestamps": true
     },
     {
       "collection": "memberships",
-      "file": "data/memberships.ndjson"
+      "file": "data/memberships.ndjson",
+      "preserveTimestamps": true
     },
     {
       "collection": "notifications",
-      "file": "data/notifications.ndjson"
+      "file": "data/notifications.ndjson",
+      "preserveTimestamps": true
     },
     {
       "collection": "posts",
-      "file": "data/posts.ndjson"
+      "file": "data/posts.ndjson",
+      "preserveTimestamps": true
     }
   ],
-  "zigbaseImportManifest": 1
+  "zigbaseImportManifest": 2
 }

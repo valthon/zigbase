@@ -518,12 +518,39 @@ fn tickProgress(opts: Options, seen: usize) void {
     sink.flush() catch {};
 }
 
-/// Close the currently open batch transaction. A dry run executes everything and throws it
-/// away, so validation, defaults, the encryption envelope and the auth transforms are all
-/// exercised for real — only the commit is skipped.
-fn closeBatch(w: *db.Db, opts: Options) !void {
-    if (opts.dry_run) try w.rollback() else try w.commit();
-}
+/// One import batch. Standalone imports own a transaction; a manifest-wide dry run already
+/// has one open, so batches join it through a savepoint and leave the outer scope in charge
+/// of the final rollback.
+pub const WriteScope = struct {
+    const savepoint = "zb_import_batch";
+
+    w: *db.Db,
+    nested: bool,
+
+    pub fn begin(w: *db.Db) db.DbError!WriteScope {
+        const nested = w.inTransaction();
+        if (nested) try w.exec("SAVEPOINT " ++ savepoint ++ ";") else try w.begin();
+        return .{ .w = w, .nested = nested };
+    }
+
+    pub fn close(self: WriteScope, dry_run: bool) db.DbError!void {
+        if (self.nested) {
+            if (dry_run) try self.w.exec("ROLLBACK TO SAVEPOINT " ++ savepoint ++ ";");
+            return self.w.exec("RELEASE SAVEPOINT " ++ savepoint ++ ";");
+        }
+        if (dry_run) return self.w.rollback();
+        return self.w.commit();
+    }
+
+    pub fn rollback(self: WriteScope) void {
+        if (self.nested) {
+            self.w.exec("ROLLBACK TO SAVEPOINT " ++ savepoint ++ ";") catch return;
+            self.w.exec("RELEASE SAVEPOINT " ++ savepoint ++ ";") catch {};
+            return;
+        }
+        self.w.rollback() catch {};
+    }
+};
 
 /// Parse one NDJSON line and import it. Split out of `run` so the malformed-JSON and the
 /// engine-error paths share one savepoint/finding/counter treatment.
@@ -685,15 +712,12 @@ pub fn run(app: *App, w: *db.Db, io: std.Io, reader: *std.Io.Reader, opts: Optio
     var line_no: usize = 0;
     var in_batch: usize = 0;
 
-    try w.begin();
-    // `batch_open` tracks whether a transaction is actually open, so the errdefer only rolls back
-    // when there is something to roll back. It is cleared the instant a commit succeeds and re-set
-    // the instant the next begin succeeds — so a `begin` that fails after a successful `commit`
-    // leaves it false, and the errdefer does NOT attempt a spurious rollback on a closed txn.
+    var batch = try WriteScope.begin(w);
+    // `batch_open` tracks whether this transaction/savepoint scope is open, so errdefer only
+    // rolls back when there is something to roll back. It is cleared as soon as close succeeds
+    // and re-set after the next scope begins.
     var batch_open = true;
-    errdefer if (batch_open) {
-        w.rollback() catch |e| std.log.err("import: rollback of the in-flight batch failed: {s}", .{@errorName(e)});
-    };
+    errdefer if (batch_open) batch.rollback();
 
     while (true) {
         const maybe = reader.takeDelimiter('\n') catch |e| switch (e) {
@@ -742,15 +766,15 @@ pub fn run(app: *App, w: *db.Db, io: std.Io, reader: *std.Io.Reader, opts: Optio
         tickProgress(opts, line_no);
 
         if (in_batch >= opts.batch_size) {
-            try closeBatch(w, opts);
-            batch_open = false; // txn closed; if the begin below fails, errdefer must NOT roll back
+            try batch.close(opts.dry_run);
+            batch_open = false; // scope closed; a failed next begin must not roll it back again
             in_batch = 0;
-            try w.begin();
+            batch = try WriteScope.begin(w);
             batch_open = true;
         }
     }
 
-    try closeBatch(w, opts);
+    try batch.close(opts.dry_run);
     batch_open = false;
     return report;
 }

@@ -12,7 +12,9 @@ def test_resolve_binary_uses_existing_env_override(tmp_path, monkeypatch):
     monkeypatch.setenv("ZIGBASE_TEST_FAKE", str(fake))
     # package_dir is bogus on purpose: a valid override must short-circuit
     # before any build is attempted.
-    got = _bin.resolve_binary("ZIGBASE_TEST_FAKE", pathlib.Path("/nonexistent/pkg"), "whatever")
+    got = _bin.resolve_binary(
+        "ZIGBASE_TEST_FAKE", pathlib.Path("/nonexistent/pkg"), "whatever"
+    )
     assert got == str(fake)
 
 
@@ -25,11 +27,21 @@ def test_resolve_binary_raises_when_override_set_but_missing(monkeypatch):
 
 
 def test_resolve_binary_falls_back_to_build_when_env_unset(monkeypatch):
-    # Env unset -> local dev path: build via zig. /tmp has no build.zig, so the
-    # build exits non-zero, proving we took the build branch.
+    # Env unset -> local dev path: build via zig. Stub the process boundary so
+    # this unit test proves the branch and command without making the lean
+    # agent-evals job install a Zig compiler solely for one expected failure.
     monkeypatch.delenv("ZIGBASE_TEST_FAKE", raising=False)
+    calls = []
+
+    def fail_build(cmd, **kwargs):
+        calls.append((cmd, kwargs))
+        raise subprocess.CalledProcessError(1, cmd)
+
+    monkeypatch.setattr(_bin.subprocess, "run", fail_build)
     with pytest.raises(subprocess.CalledProcessError):
         _bin.resolve_binary("ZIGBASE_TEST_FAKE", pathlib.Path("/tmp"), "whatever")
+    assert calls[0][0] == _bin.ZIG + ["build", "--list-steps"]
+    assert calls[0][1]["cwd"] == pathlib.Path("/tmp")
 
 
 def test_resolve_plugins_binary_raises_when_override_set_but_missing(monkeypatch):
@@ -84,7 +96,9 @@ def test_zig_build_uses_the_step_named_after_the_binary(tmp_path, monkeypatch):
     assert build_cmds == [_bin.ZIG + ["build", "features-fixture"]]
 
 
-def test_zig_build_uses_default_step_when_no_step_is_named_after_the_binary(tmp_path, monkeypatch):
+def test_zig_build_uses_default_step_when_no_step_is_named_after_the_binary(
+    tmp_path, monkeypatch
+):
     # examples/blog and examples/plugins b.installArtifact their binary, so the
     # default step is the one that builds it.
     out = tmp_path / "zig-out" / "bin" / "blog"
@@ -97,7 +111,9 @@ def test_zig_build_uses_default_step_when_no_step_is_named_after_the_binary(tmp_
     assert build_cmds == [_bin.ZIG + ["build", "install"]]
 
 
-def test_zig_build_error_names_the_step_that_failed_to_produce_the_binary(tmp_path, monkeypatch):
+def test_zig_build_error_names_the_step_that_failed_to_produce_the_binary(
+    tmp_path, monkeypatch
+):
     # A build that succeeds but installs nothing must say which step was run,
     # not just that a file is missing.
     _fake_zig(monkeypatch, ["install", "minimal-server"], produce=None)
@@ -118,7 +134,9 @@ def test_build_steps_are_queried_once_per_package(tmp_path, monkeypatch):
     assert sum(1 for cmd, _ in calls if "--list-steps" in cmd) == 1
 
 
-def test_resolve_plugins_binary_builds_the_frontend_from_the_package_root(tmp_path, monkeypatch):
+def test_resolve_plugins_binary_builds_the_frontend_from_the_package_root(
+    tmp_path, monkeypatch
+):
     # frontend/ has no package.json and no `build` script: npm must run from
     # examples/plugins with the `build:frontend` script.
     monkeypatch.delenv("ZIGBASE_TEST_PLUGINS_BINARY", raising=False)
@@ -139,7 +157,9 @@ def test_resolve_plugins_binary_builds_the_frontend_from_the_package_root(tmp_pa
     ]
 
 
-def test_resolve_plugins_binary_skips_npm_when_dist_already_built(tmp_path, monkeypatch):
+def test_resolve_plugins_binary_skips_npm_when_dist_already_built(
+    tmp_path, monkeypatch
+):
     monkeypatch.delenv("ZIGBASE_TEST_PLUGINS_BINARY", raising=False)
     monkeypatch.setattr(_bin.shutil, "which", lambda _name: "/usr/bin/npm")
     monkeypatch.setattr(_bin, "REPO", tmp_path)

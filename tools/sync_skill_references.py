@@ -63,6 +63,17 @@ SKILL_REFERENCES = {
         "openapi.md",
         "serve.md",
     ),
+    "zigbase-migrate-rails-fullstack": (
+        "agents.md",
+        "deployment.md",
+        "docker.md",
+        "migrate-rails-api.md",
+        "migrate-rails-fullstack.md",
+        "migration-tools.md",
+        "openapi.md",
+        "serve.md",
+        "zigapagos-pairing.md",
+    ),
 }
 RELATIVE_MARKDOWN_LINK = re.compile(
     r"(?P<prefix>!?\[[^\]]*\]\()(?P<target>(?![a-z][a-z0-9+.-]*:|#|/)[^\s)]+\.md(?:#[^\s)]*)?)(?P<suffix>\))",

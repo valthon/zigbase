@@ -1,0 +1,21 @@
+{
+  "zigbaseAgentScenario": 1,
+  "name": "rails-fullstack",
+  "prompt": "prompt.md",
+  "fixture": "fixture",
+  "repository_files": [
+    "tools/rails/__init__.py",
+    "tools/rails/_core.py",
+    "tools/rails/fullstack.py",
+    "tools/rails/contracts/rails-handoff.v1.schema.json",
+    "tools/rails/contracts/rails-presentation.v1.schema.json",
+    "tools/replay/__init__.py",
+    "tools/replay/zb_replay.py"
+  ],
+  "skills": ["zigbase-migrate-rails-fullstack"],
+  "graders": ["rails-fullstack"],
+  "timeout_seconds": 900,
+  "term_grace_seconds": 10,
+  "max_command_bytes": 16384,
+  "max_output_bytes": 16777216
+}

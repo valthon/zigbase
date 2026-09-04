@@ -1,0 +1,1293 @@
+{
+  "schema": "zigapagos.rails-presentation/1",
+  "schema_version": 1,
+  "generator": {
+    "tool": "zigapagos",
+    "version": "v0.5.0"
+  },
+  "source": {
+    "framework": "rails",
+    "version": {
+      "value": "7.2.1",
+      "evidence": "Gemfile.lock:rails (7.2.1)"
+    },
+    "root_evidence": [
+      "config/application.rb",
+      "config/routes.rb",
+      "app/views",
+      "Gemfile"
+    ]
+  },
+  "discovery": {
+    "route_mode": "static_ast",
+    "ruby": {
+      "available": true,
+      "version": "4.0.1"
+    }
+  },
+  "routes": [
+    {
+      "id": "GET /",
+      "verb": "GET",
+      "path": "/",
+      "controller": "pages",
+      "action": "about",
+      "name": "root",
+      "source": {
+        "file": "config/routes.rb",
+        "line": 5
+      },
+      "origin": "static_ast",
+      "confidence": "certain",
+      "classification": "unresolved",
+      "reason": "the resolved layout reads request-time state",
+      "candidates": [],
+      "templates": [
+        "app/views/pages/about.html.erb",
+        "app/views/shared/_nav.html.erb"
+      ],
+      "layout": "app/views/layouts/marketing.html.erb"
+    },
+    {
+      "id": "GET /about",
+      "verb": "GET",
+      "path": "/about",
+      "controller": "pages",
+      "action": "about",
+      "name": "about",
+      "source": {
+        "file": "config/routes.rb",
+        "line": 6
+      },
+      "origin": "static_ast",
+      "confidence": "certain",
+      "classification": "unresolved",
+      "reason": "the resolved layout reads request-time state",
+      "candidates": [],
+      "templates": [
+        "app/views/pages/about.html.erb",
+        "app/views/shared/_nav.html.erb"
+      ],
+      "layout": "app/views/layouts/marketing.html.erb"
+    },
+    {
+      "id": "GET /broken",
+      "verb": "GET",
+      "path": "/broken",
+      "controller": "pages",
+      "action": "broken",
+      "name": "broken",
+      "source": {
+        "file": "config/routes.rb",
+        "line": 54
+      },
+      "origin": "static_ast",
+      "confidence": "certain",
+      "classification": "unresolved",
+      "reason": "the resolved layout reads request-time state",
+      "candidates": [],
+      "templates": [
+        "app/views/pages/broken.html.erb",
+        "app/views/shared/_nav.html.erb"
+      ],
+      "layout": "app/views/layouts/marketing.html.erb"
+    },
+    {
+      "id": "GET /feed",
+      "verb": "GET",
+      "path": "/feed",
+      "controller": "posts",
+      "action": "feed",
+      "name": "feed",
+      "source": {
+        "file": "config/routes.rb",
+        "line": 20
+      },
+      "origin": "static_ast",
+      "confidence": "certain",
+      "classification": "backend",
+      "reason": "action renders JSON, not a view",
+      "candidates": [],
+      "templates": [],
+      "layout": null
+    },
+    {
+      "id": "GET /help",
+      "verb": "GET",
+      "path": "/help",
+      "controller": "pages",
+      "action": "help",
+      "name": "help",
+      "source": {
+        "file": "config/routes.rb",
+        "line": 9
+      },
+      "origin": "static_ast",
+      "confidence": "certain",
+      "classification": "unresolved",
+      "reason": "the resolved layout reads request-time state",
+      "candidates": [],
+      "templates": [
+        "app/views/pages/help.html.erb",
+        "app/views/shared/_nav.html.erb"
+      ],
+      "layout": "app/views/layouts/marketing.html.erb"
+    },
+    {
+      "id": "GET /linked",
+      "verb": "GET",
+      "path": "/linked",
+      "controller": "pages",
+      "action": "linked",
+      "name": "linked",
+      "source": {
+        "file": "config/routes.rb",
+        "line": 61
+      },
+      "origin": "static_ast",
+      "confidence": "certain",
+      "classification": "unresolved",
+      "reason": "the resolved layout reads request-time state",
+      "candidates": [],
+      "templates": [
+        "app/views/pages/linked.html.erb",
+        "app/views/shared/_nav.html.erb"
+      ],
+      "layout": "app/views/layouts/marketing.html.erb"
+    },
+    {
+      "id": "GET /links",
+      "verb": "GET",
+      "path": "/links",
+      "controller": "pages",
+      "action": "links",
+      "name": "links",
+      "source": {
+        "file": "config/routes.rb",
+        "line": 55
+      },
+      "origin": "static_ast",
+      "confidence": "certain",
+      "classification": "unresolved",
+      "reason": "the resolved layout reads request-time state",
+      "candidates": [],
+      "templates": [
+        "app/views/pages/links.html.erb",
+        "app/views/shared/_nav.html.erb"
+      ],
+      "layout": "app/views/layouts/marketing.html.erb"
+    },
+    {
+      "id": "GET /live",
+      "verb": "GET",
+      "path": "/live",
+      "controller": "pages",
+      "action": "live",
+      "name": "live",
+      "source": {
+        "file": "config/routes.rb",
+        "line": 65
+      },
+      "origin": "static_ast",
+      "confidence": "certain",
+      "classification": "unresolved",
+      "reason": "the resolved layout reads request-time state",
+      "candidates": [],
+      "templates": [
+        "app/views/pages/live.html.erb",
+        "app/views/shared/_nav.html.erb"
+      ],
+      "layout": "app/views/layouts/marketing.html.erb"
+    },
+    {
+      "id": "GET /old",
+      "verb": "GET",
+      "path": "/old",
+      "controller": "pages",
+      "action": "old",
+      "name": "old",
+      "source": {
+        "file": "config/routes.rb",
+        "line": 53
+      },
+      "origin": "static_ast",
+      "confidence": "certain",
+      "classification": "redirect",
+      "reason": "controller action only issues a redirect",
+      "candidates": [],
+      "templates": [],
+      "layout": null
+    },
+    {
+      "id": "GET /posts",
+      "verb": "GET",
+      "path": "/posts",
+      "controller": "posts",
+      "action": "index",
+      "name": "posts",
+      "source": {
+        "file": "config/routes.rb",
+        "line": 14
+      },
+      "origin": "static_ast",
+      "confidence": "certain",
+      "classification": "unresolved",
+      "reason": "the resolved layout reads request-time state",
+      "candidates": [],
+      "templates": [
+        "app/views/posts/_post.html.erb",
+        "app/views/posts/index.html.erb",
+        "app/views/shared/_nav.html.erb"
+      ],
+      "layout": "app/views/layouts/application.html.erb"
+    },
+    {
+      "id": "POST /posts",
+      "verb": "POST",
+      "path": "/posts",
+      "controller": "posts",
+      "action": "create",
+      "name": "posts",
+      "source": {
+        "file": "config/routes.rb",
+        "line": 14
+      },
+      "origin": "static_ast",
+      "confidence": "certain",
+      "classification": "backend",
+      "reason": "non-GET verb is a backend responsibility",
+      "candidates": [],
+      "templates": [],
+      "layout": null
+    },
+    {
+      "id": "GET /posts/:id",
+      "verb": "GET",
+      "path": "/posts/:id",
+      "controller": "posts",
+      "action": "show",
+      "name": "post",
+      "source": {
+        "file": "config/routes.rb",
+        "line": 14
+      },
+      "origin": "static_ast",
+      "confidence": "certain",
+      "classification": "unresolved",
+      "reason": "the resolved layout reads request-time state",
+      "candidates": [],
+      "templates": [
+        "app/views/posts/show.html.erb",
+        "app/views/shared/_nav.html.erb"
+      ],
+      "layout": "app/views/layouts/application.html.erb"
+    },
+    {
+      "id": "GET /posts/legacy",
+      "verb": "GET",
+      "path": "/posts/legacy",
+      "controller": "posts",
+      "action": "legacy",
+      "name": "posts_legacy",
+      "source": {
+        "file": "config/routes.rb",
+        "line": 25
+      },
+      "origin": "static_ast",
+      "confidence": "certain",
+      "classification": "unresolved",
+      "reason": "unsupported template engine, never converted",
+      "candidates": [],
+      "templates": [
+        "app/views/posts/legacy.html.haml",
+        "app/views/shared/_nav.html.erb"
+      ],
+      "layout": "app/views/layouts/application.html.erb"
+    },
+    {
+      "id": "GET /posts/new",
+      "verb": "GET",
+      "path": "/posts/new",
+      "controller": "posts",
+      "action": "new",
+      "name": "new_post",
+      "source": {
+        "file": "config/routes.rb",
+        "line": 14
+      },
+      "origin": "static_ast",
+      "confidence": "certain",
+      "classification": "unresolved",
+      "reason": "the resolved layout reads request-time state",
+      "candidates": [],
+      "templates": [
+        "app/views/posts/new.html.erb",
+        "app/views/shared/_nav.html.erb"
+      ],
+      "layout": "app/views/layouts/application.html.erb"
+    },
+    {
+      "id": "POST /registration",
+      "verb": "POST",
+      "path": "/registration",
+      "controller": "registrations",
+      "action": "create",
+      "name": "registration",
+      "source": {
+        "file": "config/routes.rb",
+        "line": 42
+      },
+      "origin": "static_ast",
+      "confidence": "certain",
+      "classification": "backend",
+      "reason": "non-GET verb is a backend responsibility",
+      "candidates": [],
+      "templates": [],
+      "layout": null
+    },
+    {
+      "id": "GET /registration/new",
+      "verb": "GET",
+      "path": "/registration/new",
+      "controller": "registrations",
+      "action": "new",
+      "name": "new_registration",
+      "source": {
+        "file": "config/routes.rb",
+        "line": 42
+      },
+      "origin": "static_ast",
+      "confidence": "certain",
+      "classification": "unresolved",
+      "reason": "the resolved layout reads request-time state",
+      "candidates": [],
+      "templates": [
+        "app/views/registrations/new.html.erb",
+        "app/views/shared/_nav.html.erb"
+      ],
+      "layout": "app/views/layouts/application.html.erb"
+    },
+    {
+      "id": "DELETE /session",
+      "verb": "DELETE",
+      "path": "/session",
+      "controller": "sessions",
+      "action": "destroy",
+      "name": "session",
+      "source": {
+        "file": "config/routes.rb",
+        "line": 38
+      },
+      "origin": "static_ast",
+      "confidence": "certain",
+      "classification": "backend",
+      "reason": "non-GET verb is a backend responsibility",
+      "candidates": [],
+      "templates": [],
+      "layout": null
+    },
+    {
+      "id": "POST /session",
+      "verb": "POST",
+      "path": "/session",
+      "controller": "sessions",
+      "action": "create",
+      "name": "session",
+      "source": {
+        "file": "config/routes.rb",
+        "line": 38
+      },
+      "origin": "static_ast",
+      "confidence": "certain",
+      "classification": "backend",
+      "reason": "non-GET verb is a backend responsibility",
+      "candidates": [],
+      "templates": [],
+      "layout": null
+    },
+    {
+      "id": "GET /session/new",
+      "verb": "GET",
+      "path": "/session/new",
+      "controller": "sessions",
+      "action": "new",
+      "name": "new_session",
+      "source": {
+        "file": "config/routes.rb",
+        "line": 38
+      },
+      "origin": "static_ast",
+      "confidence": "certain",
+      "classification": "unresolved",
+      "reason": "view reads request-time state",
+      "candidates": [],
+      "templates": [
+        "app/views/sessions/new.html.erb",
+        "app/views/shared/_nav.html.erb"
+      ],
+      "layout": "app/views/layouts/application.html.erb"
+    },
+    {
+      "id": "GET /stream",
+      "verb": "GET",
+      "path": "/stream",
+      "controller": "pages",
+      "action": "stream",
+      "name": "stream",
+      "source": {
+        "file": "config/routes.rb",
+        "line": 67
+      },
+      "origin": "static_ast",
+      "confidence": "certain",
+      "classification": "unresolved",
+      "reason": "the resolved layout reads request-time state",
+      "candidates": [],
+      "templates": [
+        "app/views/pages/stream.html.erb",
+        "app/views/shared/_nav.html.erb"
+      ],
+      "layout": "app/views/layouts/marketing.html.erb"
+    },
+    {
+      "id": "GET /widgets",
+      "verb": "GET",
+      "path": "/widgets",
+      "controller": "pages",
+      "action": "widgets",
+      "name": "widgets",
+      "source": {
+        "file": "config/routes.rb",
+        "line": 63
+      },
+      "origin": "static_ast",
+      "confidence": "certain",
+      "classification": "unresolved",
+      "reason": "the resolved layout reads request-time state",
+      "candidates": [],
+      "templates": [
+        "app/views/pages/widgets.html.erb",
+        "app/views/shared/_nav.html.erb"
+      ],
+      "layout": "app/views/layouts/marketing.html.erb"
+    }
+  ],
+  "templates": [
+    {
+      "path": "app/views/layouts/application.html.erb",
+      "engine": "erb",
+      "kind": "layout",
+      "renders": [
+        "app/views/shared/_nav.html.erb",
+        "app/views/shared/_nav.html.erb"
+      ],
+      "stimulus_controllers": [],
+      "component_roots": []
+    },
+    {
+      "path": "app/views/layouts/marketing.html.erb",
+      "engine": "erb",
+      "kind": "layout",
+      "renders": [
+        "app/views/shared/_nav.html.erb"
+      ],
+      "stimulus_controllers": [],
+      "component_roots": []
+    },
+    {
+      "path": "app/views/pages/about.html.erb",
+      "engine": "erb",
+      "kind": "view",
+      "renders": [],
+      "stimulus_controllers": [],
+      "component_roots": []
+    },
+    {
+      "path": "app/views/pages/broken.html.erb",
+      "engine": "erb",
+      "kind": "view",
+      "renders": [],
+      "stimulus_controllers": [],
+      "component_roots": []
+    },
+    {
+      "path": "app/views/pages/help.html.erb",
+      "engine": "erb",
+      "kind": "view",
+      "renders": [],
+      "stimulus_controllers": [],
+      "component_roots": []
+    },
+    {
+      "path": "app/views/pages/linked.html.erb",
+      "engine": "erb",
+      "kind": "view",
+      "renders": [],
+      "stimulus_controllers": [],
+      "component_roots": []
+    },
+    {
+      "path": "app/views/pages/links.html.erb",
+      "engine": "erb",
+      "kind": "view",
+      "renders": [],
+      "stimulus_controllers": [],
+      "component_roots": []
+    },
+    {
+      "path": "app/views/pages/live.html.erb",
+      "engine": "erb",
+      "kind": "view",
+      "renders": [],
+      "stimulus_controllers": [],
+      "component_roots": [
+        "data-vue-component"
+      ]
+    },
+    {
+      "path": "app/views/pages/stream.html.erb",
+      "engine": "erb",
+      "kind": "view",
+      "renders": [],
+      "stimulus_controllers": [],
+      "component_roots": []
+    },
+    {
+      "path": "app/views/pages/widgets.html.erb",
+      "engine": "erb",
+      "kind": "view",
+      "renders": [],
+      "stimulus_controllers": [
+        "reveal"
+      ],
+      "component_roots": [
+        "react_component"
+      ]
+    },
+    {
+      "path": "app/views/posts/_post.html.erb",
+      "engine": "erb",
+      "kind": "partial",
+      "renders": [],
+      "stimulus_controllers": [],
+      "component_roots": []
+    },
+    {
+      "path": "app/views/posts/index.html.erb",
+      "engine": "erb",
+      "kind": "view",
+      "renders": [
+        "app/views/posts/_post.html.erb"
+      ],
+      "stimulus_controllers": [],
+      "component_roots": []
+    },
+    {
+      "path": "app/views/posts/legacy.html.haml",
+      "engine": "haml",
+      "kind": "view",
+      "renders": [],
+      "stimulus_controllers": [],
+      "component_roots": []
+    },
+    {
+      "path": "app/views/posts/new.html.erb",
+      "engine": "erb",
+      "kind": "view",
+      "renders": [],
+      "stimulus_controllers": [],
+      "component_roots": []
+    },
+    {
+      "path": "app/views/posts/show.html.erb",
+      "engine": "erb",
+      "kind": "view",
+      "renders": [],
+      "stimulus_controllers": [],
+      "component_roots": []
+    },
+    {
+      "path": "app/views/registrations/new.html.erb",
+      "engine": "erb",
+      "kind": "view",
+      "renders": [],
+      "stimulus_controllers": [],
+      "component_roots": []
+    },
+    {
+      "path": "app/views/sessions/new.html.erb",
+      "engine": "erb",
+      "kind": "view",
+      "renders": [],
+      "stimulus_controllers": [],
+      "component_roots": []
+    },
+    {
+      "path": "app/views/shared/_nav.html.erb",
+      "engine": "erb",
+      "kind": "partial",
+      "renders": [],
+      "stimulus_controllers": [],
+      "component_roots": []
+    }
+  ],
+  "assets": [
+    {
+      "source": "app/assets/images/logo.png",
+      "public_url": "/assets/logo-abc123.png",
+      "pipeline": "propshaft",
+      "deterministic": true
+    },
+    {
+      "source": "app/assets/stylesheets/application.css",
+      "public_url": "/assets/application-def456.css",
+      "pipeline": "propshaft",
+      "deterministic": true
+    },
+    {
+      "source": "public/assets/.manifest.json",
+      "public_url": "/assets/.manifest.json",
+      "pipeline": null,
+      "deterministic": true
+    },
+    {
+      "source": "public/robots.txt",
+      "public_url": "/robots.txt",
+      "pipeline": null,
+      "deterministic": true
+    }
+  ],
+  "integrations": [
+    {
+      "name": "propshaft",
+      "version": "1.1.0",
+      "evidence": "Gemfile:propshaft"
+    },
+    {
+      "name": "turbo",
+      "version": "2.0.11",
+      "evidence": "Gemfile:turbo-rails"
+    },
+    {
+      "name": "stimulus",
+      "version": "1.3.4",
+      "evidence": "Gemfile:stimulus-rails"
+    }
+  ],
+  "blockers": [
+    {
+      "code": "RAILS_COMPONENT_VUE_UNSUPPORTED",
+      "severity": "warn",
+      "integrity": false,
+      "source": {
+        "file": "app/views/pages/live.html.erb",
+        "line": null
+      },
+      "message": "Vue roots have no runtime bridge; React only",
+      "route_id": null
+    },
+    {
+      "code": "RAILS_TEMPLATE_ENGINE_UNSUPPORTED",
+      "severity": "warn",
+      "integrity": false,
+      "source": {
+        "file": "app/views/posts/legacy.html.haml",
+        "line": null
+      },
+      "message": "Haml template is not converted",
+      "route_id": null
+    }
+  ],
+  "findings": [
+    {
+      "id": "RAILS_AUTH_JOURNEY.config/routes%2Erb.L38",
+      "code": "RAILS_AUTH_JOURNEY",
+      "severity": "warn",
+      "source": {
+        "file": "config/routes.rb",
+        "line": 38
+      },
+      "route_id": "DELETE /session",
+      "message": "auth journey: DELETE /session, GET /session/new, POST /session, GET /registration/new, POST /registration; island needs artifact = the ZigBase auth collection name (in --backend: users)",
+      "choices": [
+        "island",
+        "retain",
+        "blocked"
+      ],
+      "requires_artifact": true
+    },
+    {
+      "id": "RAILS_BACKEND_ENDPOINT.app/views/posts/new%2Ehtml%2Eerb.L3C5",
+      "code": "RAILS_BACKEND_ENDPOINT",
+      "severity": "warn",
+      "source": {
+        "file": "app/views/posts/new.html.erb",
+        "line": 3
+      },
+      "route_id": null,
+      "message": "form submits to a Rails action: model `post`; bind it to a backend operation, retain, or block. A route not in the document is answerable as custom:/<path>.",
+      "choices": [
+        "createPosts",
+        "createUsers",
+        "retain",
+        "blocked"
+      ],
+      "requires_artifact": false
+    },
+    {
+      "id": "RAILS_BACKEND_ENDPOINT.app/views/shared/_nav%2Ehtml%2Eerb.L5C54",
+      "code": "RAILS_BACKEND_ENDPOINT",
+      "severity": "warn",
+      "source": {
+        "file": "app/views/shared/_nav.html.erb",
+        "line": 5
+      },
+      "route_id": null,
+      "message": "link performs a mutation: button_to `Sign out` method=delete",
+      "choices": [
+        "deletePosts",
+        "deleteUsers",
+        "retain",
+        "blocked"
+      ],
+      "requires_artifact": false
+    },
+    {
+      "id": "RAILS_BACKEND_ENDPOINT.config/routes%2Erb.L14.POST.posts",
+      "code": "RAILS_BACKEND_ENDPOINT",
+      "severity": "warn",
+      "source": {
+        "file": "config/routes.rb",
+        "line": 14
+      },
+      "route_id": "POST /posts",
+      "message": "route is API traffic and needs a backend operation: POST /posts",
+      "choices": [
+        "createPosts",
+        "createUsers",
+        "retain",
+        "blocked"
+      ],
+      "requires_artifact": false
+    },
+    {
+      "id": "RAILS_BACKEND_ENDPOINT.config/routes%2Erb.L20.GET.posts",
+      "code": "RAILS_BACKEND_ENDPOINT",
+      "severity": "warn",
+      "source": {
+        "file": "config/routes.rb",
+        "line": 20
+      },
+      "route_id": "GET /feed",
+      "message": "route is API traffic and needs a backend operation: GET /feed",
+      "choices": [
+        "listPosts",
+        "viewPosts",
+        "listUsers",
+        "viewUsers",
+        "retain",
+        "blocked"
+      ],
+      "requires_artifact": false
+    },
+    {
+      "id": "RAILS_COMPONENT_ROOT.app/views/pages/widgets%2Ehtml%2Eerb.L8C5",
+      "code": "RAILS_COMPONENT_ROOT",
+      "severity": "warn",
+      "source": {
+        "file": "app/views/pages/widgets.html.erb",
+        "line": 8
+      },
+      "route_id": null,
+      "message": "React root `Chart` props {points, series}; source app/javascript/components/Chart.jsx",
+      "choices": [
+        "island",
+        "retain",
+        "blocked"
+      ],
+      "requires_artifact": false
+    },
+    {
+      "id": "RAILS_COMPONENT_VUE_UNSUPPORTED.app/views/pages/live%2Ehtml%2Eerb.L1C33",
+      "code": "RAILS_COMPONENT_VUE_UNSUPPORTED",
+      "severity": "warn",
+      "source": {
+        "file": "app/views/pages/live.html.erb",
+        "line": 1
+      },
+      "route_id": null,
+      "message": "Vue root `Widget`: the runtime bridge is React-only",
+      "choices": [
+        "retain",
+        "blocked"
+      ],
+      "requires_artifact": false
+    },
+    {
+      "id": "RAILS_HELPER_UNKNOWN.app/views/pages/help%2Ehtml%2Eerb.L1C18",
+      "code": "RAILS_HELPER_UNKNOWN",
+      "severity": "warn",
+      "source": {
+        "file": "app/views/pages/help.html.erb",
+        "line": 1
+      },
+      "route_id": null,
+      "message": "unknown helper `number_to_currency`",
+      "choices": [
+        "island",
+        "retain",
+        "blocked"
+      ],
+      "requires_artifact": false
+    },
+    {
+      "id": "RAILS_I18N_UNRESOLVED.app/views/pages/help%2Ehtml%2Eerb.L1C62",
+      "code": "RAILS_I18N_UNRESOLVED",
+      "severity": "warn",
+      "source": {
+        "file": "app/views/pages/help.html.erb",
+        "line": 1
+      },
+      "route_id": null,
+      "message": "missing translation `pages.help.missing` (locale en)",
+      "choices": [
+        "retain",
+        "blocked"
+      ],
+      "requires_artifact": false
+    },
+    {
+      "id": "RAILS_JS_ENTRY.app/javascript/application%2Ejs.entry",
+      "code": "RAILS_JS_ENTRY",
+      "severity": "warn",
+      "source": {
+        "file": "app/javascript/application.js",
+        "line": null
+      },
+      "route_id": null,
+      "message": "JS entry app/javascript/application.js was not inspected; imports: ./controllers, @hotwired/turbo-rails; the islands replace it — drop after review, or block",
+      "choices": [
+        "drop",
+        "blocked"
+      ],
+      "requires_artifact": false
+    },
+    {
+      "id": "RAILS_LAYOUT_DYNAMIC.app/controllers/posts_controller%2Erb.L3",
+      "code": "RAILS_LAYOUT_DYNAMIC",
+      "severity": "warn",
+      "source": {
+        "file": "app/controllers/posts_controller.rb",
+        "line": 3
+      },
+      "route_id": null,
+      "message": "controller declares a dynamic layout",
+      "choices": [
+        "retain",
+        "blocked"
+      ],
+      "requires_artifact": false
+    },
+    {
+      "id": "RAILS_PARTIAL_DYNAMIC.app/views/posts/index%2Ehtml%2Eerb.L1C61",
+      "code": "RAILS_PARTIAL_DYNAMIC",
+      "severity": "warn",
+      "source": {
+        "file": "app/views/posts/index.html.erb",
+        "line": 1
+      },
+      "route_id": null,
+      "message": "dynamic render target `post`",
+      "choices": [
+        "island",
+        "spa",
+        "retain",
+        "blocked"
+      ],
+      "requires_artifact": false
+    },
+    {
+      "id": "RAILS_RAW_OUTPUT.app/views/pages/help%2Ehtml%2Eerb.L1C47",
+      "code": "RAILS_RAW_OUTPUT",
+      "severity": "warn",
+      "source": {
+        "file": "app/views/pages/help.html.erb",
+        "line": 1
+      },
+      "route_id": null,
+      "message": "unescaped output",
+      "choices": [
+        "island",
+        "retain",
+        "blocked"
+      ],
+      "requires_artifact": false
+    },
+    {
+      "id": "RAILS_REDIRECT_HOST_CONFIG.config/routes%2Erb.L53",
+      "code": "RAILS_REDIRECT_HOST_CONFIG",
+      "severity": "warn",
+      "source": {
+        "file": "config/routes.rb",
+        "line": 53
+      },
+      "route_id": "GET /old",
+      "message": "route redirects; the host config owns it, not the static tree: GET /old",
+      "choices": [
+        "retain",
+        "blocked"
+      ],
+      "requires_artifact": false
+    },
+    {
+      "id": "RAILS_REQUEST_TIME_STATE.app/views/posts/index%2Ehtml%2Eerb.L1C33",
+      "code": "RAILS_REQUEST_TIME_STATE",
+      "severity": "warn",
+      "source": {
+        "file": "app/views/posts/index.html.erb",
+        "line": 1
+      },
+      "route_id": null,
+      "message": "request-time state `@posts`; collection posts (in --backend)",
+      "choices": [
+        "island",
+        "spa",
+        "backend",
+        "retain",
+        "blocked"
+      ],
+      "requires_artifact": false
+    },
+    {
+      "id": "RAILS_REQUEST_TIME_STATE.app/views/posts/show%2Ehtml%2Eerb.L1C9",
+      "code": "RAILS_REQUEST_TIME_STATE",
+      "severity": "warn",
+      "source": {
+        "file": "app/views/posts/show.html.erb",
+        "line": 1
+      },
+      "route_id": null,
+      "message": "request-time state `@post`; collection posts (in --backend)",
+      "choices": [
+        "island",
+        "spa",
+        "backend",
+        "retain",
+        "blocked"
+      ],
+      "requires_artifact": false
+    },
+    {
+      "id": "RAILS_REQUEST_TIME_STATE.app/views/registrations/new%2Ehtml%2Eerb.L1C36",
+      "code": "RAILS_REQUEST_TIME_STATE",
+      "severity": "warn",
+      "source": {
+        "file": "app/views/registrations/new.html.erb",
+        "line": 1
+      },
+      "route_id": null,
+      "message": "validation errors of `@user`",
+      "choices": [
+        "island",
+        "retain",
+        "blocked"
+      ],
+      "requires_artifact": false
+    },
+    {
+      "id": "RAILS_REQUEST_TIME_STATE.app/views/registrations/new%2Ehtml%2Eerb.L1C4",
+      "code": "RAILS_REQUEST_TIME_STATE",
+      "severity": "warn",
+      "source": {
+        "file": "app/views/registrations/new.html.erb",
+        "line": 1
+      },
+      "route_id": null,
+      "message": "validation errors of `@user`",
+      "choices": [
+        "island",
+        "retain",
+        "blocked"
+      ],
+      "requires_artifact": false
+    },
+    {
+      "id": "RAILS_REQUEST_TIME_STATE.app/views/shared/_nav%2Ehtml%2Eerb.L4C6",
+      "code": "RAILS_REQUEST_TIME_STATE",
+      "severity": "warn",
+      "source": {
+        "file": "app/views/shared/_nav.html.erb",
+        "line": 4
+      },
+      "route_id": null,
+      "message": "request-time state `current_user`",
+      "choices": [
+        "island",
+        "spa",
+        "backend",
+        "retain",
+        "blocked"
+      ],
+      "requires_artifact": false
+    },
+    {
+      "id": "RAILS_REQUEST_TIME_STATE.app/views/shared/_nav%2Ehtml%2Eerb.L5C28",
+      "code": "RAILS_REQUEST_TIME_STATE",
+      "severity": "warn",
+      "source": {
+        "file": "app/views/shared/_nav.html.erb",
+        "line": 5
+      },
+      "route_id": null,
+      "message": "request-time state `current_user`",
+      "choices": [
+        "island",
+        "spa",
+        "backend",
+        "retain",
+        "blocked"
+      ],
+      "requires_artifact": false
+    },
+    {
+      "id": "RAILS_REQUEST_TIME_STATE.app/views/shared/_nav%2Ehtml%2Eerb.L5C6",
+      "code": "RAILS_REQUEST_TIME_STATE",
+      "severity": "warn",
+      "source": {
+        "file": "app/views/shared/_nav.html.erb",
+        "line": 5
+      },
+      "route_id": null,
+      "message": "request-time state `current_user`",
+      "choices": [
+        "island",
+        "spa",
+        "backend",
+        "retain",
+        "blocked"
+      ],
+      "requires_artifact": false
+    },
+    {
+      "id": "RAILS_ROUTE_AUTH_GUARD.config/routes%2Erb.L14",
+      "code": "RAILS_ROUTE_AUTH_GUARD",
+      "severity": "warn",
+      "source": {
+        "file": "config/routes.rb",
+        "line": 14
+      },
+      "route_id": "GET /posts",
+      "message": "page is guarded by before_action :require_login on posts; a static page cannot enforce it: GET /posts",
+      "choices": [
+        "public",
+        "retain",
+        "blocked"
+      ],
+      "requires_artifact": false
+    },
+    {
+      "id": "RAILS_ROUTE_DYNAMIC_SEGMENT.config/routes%2Erb.L14",
+      "code": "RAILS_ROUTE_DYNAMIC_SEGMENT",
+      "severity": "warn",
+      "source": {
+        "file": "config/routes.rb",
+        "line": 14
+      },
+      "route_id": "GET /posts/:id",
+      "message": "route path has a dynamic segment: GET /posts/:id",
+      "choices": [
+        "spa",
+        "retain",
+        "blocked"
+      ],
+      "requires_artifact": false
+    },
+    {
+      "id": "RAILS_ROUTE_HELPER_DYNAMIC.app/views/posts/_post%2Ehtml%2Eerb.L1C14",
+      "code": "RAILS_ROUTE_HELPER_DYNAMIC",
+      "severity": "warn",
+      "source": {
+        "file": "app/views/posts/_post.html.erb",
+        "line": 1
+      },
+      "route_id": null,
+      "message": "route helper `post` has non-literal arguments",
+      "choices": [
+        "island",
+        "spa",
+        "retain",
+        "blocked"
+      ],
+      "requires_artifact": false
+    },
+    {
+      "id": "RAILS_ROUTE_HELPER_UNKNOWN.app/views/pages/links%2Ehtml%2Eerb.L1C5",
+      "code": "RAILS_ROUTE_HELPER_UNKNOWN",
+      "severity": "warn",
+      "source": {
+        "file": "app/views/pages/links.html.erb",
+        "line": 1
+      },
+      "route_id": null,
+      "message": "route helper `ghost` matches no certain named route",
+      "choices": [
+        "retain",
+        "blocked"
+      ],
+      "requires_artifact": false
+    },
+    {
+      "id": "RAILS_STIMULUS_CONTROLLER.app/views/pages/widgets%2Ehtml%2Eerb.L2C1",
+      "code": "RAILS_STIMULUS_CONTROLLER",
+      "severity": "warn",
+      "source": {
+        "file": "app/views/pages/widgets.html.erb",
+        "line": 2
+      },
+      "route_id": null,
+      "message": "stimulus `reveal` on <div>; actions: click->reveal#toggle; targets: details; source app/javascript/controllers/reveal_controller.js",
+      "choices": [
+        "island",
+        "drop",
+        "retain",
+        "blocked"
+      ],
+      "requires_artifact": false
+    },
+    {
+      "id": "RAILS_TEMPLATE_CONTROL_FLOW.app/views/posts/_post%2Ehtml%2Eerb.L8C4",
+      "code": "RAILS_TEMPLATE_CONTROL_FLOW",
+      "severity": "warn",
+      "source": {
+        "file": "app/views/posts/_post.html.erb",
+        "line": 8
+      },
+      "route_id": null,
+      "message": "control flow `if`",
+      "choices": [
+        "island",
+        "spa",
+        "retain",
+        "blocked"
+      ],
+      "requires_artifact": false
+    },
+    {
+      "id": "RAILS_TEMPLATE_ENGINE_UNSUPPORTED.app/views/posts/legacy%2Ehtml%2Ehaml.engine",
+      "code": "RAILS_TEMPLATE_ENGINE_UNSUPPORTED",
+      "severity": "warn",
+      "source": {
+        "file": "app/views/posts/legacy.html.haml",
+        "line": null
+      },
+      "route_id": null,
+      "message": "Haml template is not converted: no converter reads this engine",
+      "choices": [
+        "retain",
+        "blocked"
+      ],
+      "requires_artifact": false
+    },
+    {
+      "id": "RAILS_TEMPLATE_PARSE_ERROR.app/views/pages/broken%2Ehtml%2Eerb.L2",
+      "code": "RAILS_TEMPLATE_PARSE_ERROR",
+      "severity": "error",
+      "source": {
+        "file": "app/views/pages/broken.html.erb",
+        "line": 2
+      },
+      "route_id": null,
+      "message": "template does not parse: unexpected end-of-input, assuming it is closing the parent top level context",
+      "choices": [
+        "retain",
+        "blocked"
+      ],
+      "requires_artifact": false
+    },
+    {
+      "id": "RAILS_TURBO_FRAME.app/views/pages/widgets%2Ehtml%2Eerb.L6C5",
+      "code": "RAILS_TURBO_FRAME",
+      "severity": "warn",
+      "source": {
+        "file": "app/views/pages/widgets.html.erb",
+        "line": 6
+      },
+      "route_id": null,
+      "message": "turbo-frame `latest` src=/posts",
+      "choices": [
+        "island",
+        "retain",
+        "blocked"
+      ],
+      "requires_artifact": false
+    },
+    {
+      "id": "RAILS_TURBO_FRAME.app/views/pages/widgets%2Ehtml%2Eerb.L7C5",
+      "code": "RAILS_TURBO_FRAME",
+      "severity": "warn",
+      "source": {
+        "file": "app/views/pages/widgets.html.erb",
+        "line": 7
+      },
+      "route_id": null,
+      "message": "turbo-frame `static` (no src)",
+      "choices": [
+        "inline",
+        "retain",
+        "blocked"
+      ],
+      "requires_artifact": false
+    },
+    {
+      "id": "RAILS_TURBO_STREAM.app/views/pages/live%2Ehtml%2Eerb.L1C5",
+      "code": "RAILS_TURBO_STREAM",
+      "severity": "warn",
+      "source": {
+        "file": "app/views/pages/live.html.erb",
+        "line": 1
+      },
+      "route_id": null,
+      "message": "turbo-stream `posts` subscription can become a realtime island",
+      "choices": [
+        "island-realtime",
+        "retain",
+        "blocked"
+      ],
+      "requires_artifact": false
+    },
+    {
+      "id": "RAILS_TURBO_STREAM.app/views/pages/stream%2Ehtml%2Eerb.L1C5",
+      "code": "RAILS_TURBO_STREAM",
+      "severity": "warn",
+      "source": {
+        "file": "app/views/pages/stream.html.erb",
+        "line": 1
+      },
+      "route_id": null,
+      "message": "turbo-stream `posts` subscription can become a realtime island",
+      "choices": [
+        "island-realtime",
+        "retain",
+        "blocked"
+      ],
+      "requires_artifact": false
+    },
+    {
+      "id": "RAILS_TURBO_STREAM.app/views/pages/stream%2Ehtml%2Eerb.L2C5",
+      "code": "RAILS_TURBO_STREAM",
+      "severity": "warn",
+      "source": {
+        "file": "app/views/pages/stream.html.erb",
+        "line": 2
+      },
+      "route_id": null,
+      "message": "turbo-stream `post_list` action append can become a realtime island",
+      "choices": [
+        "island-realtime",
+        "retain",
+        "blocked"
+      ],
+      "requires_artifact": false
+    }
+  ]
+}

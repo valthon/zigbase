@@ -3,6 +3,7 @@
   "name": "genesis",
   "prompt": "prompt.md",
   "fixture": null,
+  "repository_files": [],
   "skills": ["zigbase-app-genesis"],
   "graders": ["genesis"],
   "timeout_seconds": 1800,

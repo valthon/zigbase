@@ -28,6 +28,7 @@ class AgentScenario:
     name: str
     prompt: str
     fixture: str | None
+    repository_files: tuple[str, ...]
     skills: tuple[str, ...]
     graders: tuple[str, ...]
     timeout_seconds: int
@@ -41,6 +42,7 @@ class AgentScenario:
         "name",
         "prompt",
         "fixture",
+        "repository_files",
         "skills",
         "graders",
         "timeout_seconds",
@@ -66,6 +68,12 @@ class AgentScenario:
         _relative_path(self.prompt, "prompt")
         if self.fixture is not None:
             _relative_path(self.fixture, "fixture")
+        if not isinstance(self.repository_files, tuple):
+            raise ScenarioError("repository_files must be an array")
+        if len(set(self.repository_files)) != len(self.repository_files):
+            raise ScenarioError("repository_files must not contain duplicates")
+        for path in self.repository_files:
+            _relative_path(path, "repository_files")
         if not isinstance(self.skills, tuple) or not self.skills:
             raise ScenarioError("skills must be a non-empty array")
         if len(set(self.skills)) != len(self.skills) or not all(
@@ -99,10 +107,13 @@ class AgentScenario:
         if not isinstance(value, dict) or set(value) != set(cls.FIELDS):
             raise ScenarioError(f"scenario fields must be exactly {list(cls.FIELDS)}")
         prepared = dict(value)
-        if not isinstance(prepared["skills"], list) or not isinstance(
-            prepared["graders"], list
+        if (
+            not isinstance(prepared["repository_files"], list)
+            or not isinstance(prepared["skills"], list)
+            or not isinstance(prepared["graders"], list)
         ):
-            raise ScenarioError("skills and graders must be arrays")
+            raise ScenarioError("repository_files, skills, and graders must be arrays")
+        prepared["repository_files"] = tuple(prepared["repository_files"])
         prepared["skills"] = tuple(prepared["skills"])
         prepared["graders"] = tuple(prepared["graders"])
         return cls(**prepared)

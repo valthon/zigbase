@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """rails2zb — offline Rails-to-ZigBase migration converter.
 
-Three subcommands, in the order they must be run:
+Four subcommands, in the order they are normally run:
 
     inventory     enumerate findings from a frozen source; exit 2 == judgment required
+    schema        emit the adapter-neutral ZigBase schema after decisions are complete
     extract       emit a deterministic bundle once every finding has a decision
     install-files place Active Storage blobs into a ZigBase data directory
 
@@ -16,17 +17,22 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import datetime as datetime_module
+import decimal
 import hashlib
 import json
 import math
+import os
 import re
 import string
 import sqlite3
 import sys
+import uuid
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote, urlsplit
 
 if __package__ in (None, ""):  # direct `python3 tools/rails/rails2zb.py`
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -34,15 +40,20 @@ if __package__ in (None, ""):  # direct `python3 tools/rails/rails2zb.py`
 from tools.rails._core import (  # noqa: E402
     Decision,
     Finding,
+    INFERRED,
+    OBSERVED,
     RailsError,
+    _private_parent,
     compact_summary,
     ensure_output_outside_source,
     finding_id,
     install_file_atomic,
+    read_bytes,
     read_json,
     required_string,
     sha256_file,
     split_id,
+    validate_inventory_source,
     write_canonical_json,
     write_ndjson,
 )
@@ -50,9 +61,6 @@ from tools.rails._core import (  # noqa: E402
 INVENTORY_VERSION = 1
 DECISIONS_VERSION = 1
 BUNDLE_VERSION = 1
-
-OBSERVED = "observed"
-INFERRED = "inferred"
 
 INVENTORY_FILES = (
     "routes",
@@ -100,6 +108,17 @@ TYPE_MAP = {
     "uuid": "text",
 }
 
+
+def _column_type_supported(column: dict[str, Any]) -> bool:
+    """Reject PostgreSQL arrays even when Rails reports their scalar element type."""
+    sql_type = str(column.get("sql_type") or "").strip()
+    return (
+        column.get("type") in TYPE_MAP
+        and not column.get("array")
+        and not sql_type.endswith("[]")
+    )
+
+
 # `ActiveModel::Type::Boolean::FALSE_VALUES`, the string members, verbatim and
 # CASE-SENSITIVE. Rails reads every other non-empty value as true -- `False` and `Off`
 # included, because they are not in this set. That is the trap: a column literally
@@ -129,6 +148,7 @@ IMPLEMENTATION_CHOICES = frozenset(
         "expression",
         "rekey",
         "rename",
+        "external-auths",
     }
 )
 
@@ -156,6 +176,11 @@ RESERVED_FIELD_NAMES = frozenset(
 # maps them onto the engine's own fields, so a Rails `email` column on a table with a
 # password digest is exactly right and must not raise a finding.
 AUTH_MAPPED_FIELD_NAMES = frozenset({"email", "username", "verified"})
+
+# Active Storage's `has_many_attached` has no cardinality ceiling. ZigBase represents
+# multi-file cardinality as a u32, so its maximum value is the closest faithful schema
+# representation and remains above any physically practical attachment count.
+UNBOUNDED_MAX_SELECT = (1 << 32) - 1
 # ...and the Rails column types each of them can actually BE. The engine reads
 # `verified` only as a boolean (src/import.zig), so an integer column of that name
 # travels and is then silently ignored -- the same silent loss, one layer down.
@@ -247,28 +272,6 @@ class Source:
         ]
 
 
-def _nested_sources(value: Any) -> set[str]:
-    """Every `source` marker anywhere in a payload, not just the top-level one.
-
-    Checking only the outermost key let an `inferred` record sit inside an `observed`
-    file -- exactly the mixing the mode contract exists to forbid, one level down.
-    """
-    # Only values that ARE a mode count. `source` is not a reserved word: a serialized
-    # route constraint carries `{"source": ".+?", "type": "regexp"}`, where it means the
-    # regexp's own source text. Treating that as provenance made every route look mixed.
-    found: set[str] = set()
-    if isinstance(value, dict):
-        marker = value.get("source")
-        if marker in (OBSERVED, INFERRED):
-            found.add(marker)
-        for nested in value.values():
-            found |= _nested_sources(nested)
-    elif isinstance(value, list):
-        for nested in value:
-            found |= _nested_sources(nested)
-    return found
-
-
 def _is_composite(value: Any) -> bool:
     """A key naming more than one column, in either shape the extractor can produce.
 
@@ -332,6 +335,20 @@ def _lift_composite_keys(schema: dict[str, Any], models: dict[str, Any]) -> list
     return lifted
 
 
+def _drop_generated_habtm_models(models: dict[str, Any]) -> None:
+    """Normalize inventories from exporters that included Rails join helpers."""
+    entries = models.get("models")
+    if not isinstance(entries, list):
+        return
+    models["models"] = [
+        model
+        for model in entries
+        if not str(model.get("name", "")).startswith("HABTM_")
+    ]
+    if isinstance(models.get("count"), int):
+        models["count"] = len(models["models"])
+
+
 def load_source(root: Path) -> Source:
     inventory = root / "inventory"
     if not inventory.is_dir():
@@ -354,19 +371,12 @@ def load_source(root: Path) -> Source:
     # prevent: one inferred record in an otherwise observed inventory would let a guess
     # ride along as if the framework had reported it.
     for name in INVENTORY_FILES:
-        nested = _nested_sources(payloads[name])
-        if nested - {mode}:
-            raise RailsError(
-                f"inventory/{name}.json declares '{mode}' but contains nested records "
-                f"marked {sorted(nested - {mode})}; observed and inferred records must "
-                f"not be mixed, at any depth"
-            )
-        declared = payloads[name].get("source")
-        if declared != mode:
-            raise RailsError(
-                f"inventory/{name}.json declares source '{declared}' but the inventory "
-                f"is '{mode}'; observed and inferred records must not be mixed"
-            )
+        validate_inventory_source(payloads[name], name=name, expected_mode=mode)
+
+    # Rails' has_and_belongs_to_many builder creates implementation classes named
+    # HABTM_<Association>. Current exporters omit them, but normalizing older frozen
+    # inventories here keeps the offline converter from inventing duplicate models.
+    _drop_generated_habtm_models(payloads["models"])
 
     # Loading stays adapter-neutral, because the inventory is: `export_source.rb` reads
     # whatever connection the application booted. Only row EXTRACTION needs the frozen
@@ -424,8 +434,8 @@ FINDING_CATALOG: dict[str, dict[str, frozenset[str]]] = {
         "external": frozenset({"confirmed-no-pepper"}),
     },
     "DeviseWithoutPepper": {"consumes": frozenset(), "external": frozenset()},
-    "ExternalIdentitiesCannotMigrate": {
-        "consumes": frozenset(),
+    "ExternalIdentitiesRequireMapping": {
+        "consumes": frozenset({"external-auths"}),
         "external": frozenset({"passwordless-rollout", "out-of-scope"}),
     },
     "OAuthTokensNeverMigrate": {"consumes": frozenset(), "external": frozenset()},
@@ -703,6 +713,7 @@ def _model_findings(src: Source) -> list[Finding]:
             )
 
         association_names = {a["name"] for a in model.get("associations") or []}
+        validators: dict[str, dict[str, Any]] = {}
         for validator in model.get("validators") or []:
             options = validator.get("options") or {}
             conditional = options.get("if") or options.get("unless")
@@ -714,22 +725,65 @@ def _model_findings(src: Source) -> list[Finding]:
                 # relation field's `required`, and flagging them buries the handful of
                 # conditionals a human actually wrote.
                 continue
+            identity = _validator_identity(validator)
+            # Inherited callback walks can expose the same validator more than once.
+            # Identical observed semantics are one migration question, not several.
+            validators.setdefault(identity, validator)
+
+        base_ids: dict[str, list[str]] = {}
+        for identity, validator in validators.items():
+            attribute = validator.get("attribute")
+            attribute_id = "__record__" if attribute is None else attribute
+            base = finding_id("validator", name, attribute_id, validator["kind"])
+            base_ids.setdefault(base, []).append(identity)
+
+        for identity, validator in validators.items():
+            options = validator.get("options") or {}
+            conditional = options.get("if") or options.get("unless")
+            attribute = validator.get("attribute")
+            attribute_id = "__record__" if attribute is None else attribute
+            subject = name if attribute is None else f"{name}.{attribute}"
             described = (
                 "a proc" if isinstance(conditional, dict) else f"`{conditional}`"
             )
+            base = finding_id("validator", name, attribute_id, validator["kind"])
+            fid = base
+            if len(base_ids[base]) > 1:
+                digest = hashlib.sha256(identity.encode()).hexdigest()[:12]
+                fid = f"{base}.{digest}"
             out.append(
                 _decision(
-                    finding_id(
-                        "validator", name, validator["attribute"], validator["kind"]
-                    ),
+                    fid,
                     "ConditionalValidatorIsCode",
-                    f"{name}.{validator['attribute']} has a conditional "
+                    f"{subject} has a conditional "
                     f"{validator['kind']} validation guarded by {described}, which "
                     f"cannot be converted mechanically",
                     ("hook", "rule", "omit"),
                 )
             )
     return out
+
+
+def _validator_identity(validator: dict[str, Any]) -> str:
+    """Return the observed semantics that distinguish a conditional validator.
+
+    Human-facing message text is excluded so rewording an error does not invalidate
+    a durable decision. The remaining shape includes the condition and constraints.
+    Identical observed semantics intentionally collapse to one finding.
+    """
+    options = dict(validator.get("options") or {})
+    options.pop("message", None)
+    return json.dumps(
+        {
+            "attribute": validator.get("attribute"),
+            "class": validator.get("class"),
+            "kind": validator.get("kind"),
+            "options": options,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
 
 
 def _is_belongs_to_presence(
@@ -1020,7 +1074,7 @@ def _unmigratable_relation_findings(src: Source) -> list[Finding]:
     for table in src.migratable_tables():
         name = table["name"]
         unmigratable = _primary_key_names(table) | set(TIMESTAMP_COLUMNS)
-        if name in digests:
+        if digests.get(name):
             unmigratable.add(digests[name])
         for fk in table.get("foreign_keys") or []:
             column = fk.get("column")
@@ -1333,7 +1387,7 @@ def _unmigratable_relation_columns(src: Source, entry: dict[str, Any]) -> set[st
     encrypted = _encrypted_columns(src).get(entry["name"], set())
     digests = _auth_tables(src)
     columns = _primary_key_names(entry) | set(TIMESTAMP_COLUMNS) | encrypted
-    if entry["name"] in digests:
+    if digests.get(entry["name"]):
         columns.add(digests[entry["name"]])
     return columns
 
@@ -1524,12 +1578,18 @@ def _schema_findings(src: Source) -> list[Finding]:
                         ("rename", "omit"),
                     )
                 )
-            if column["type"] not in TYPE_MAP:
+            if not _column_type_supported(column):
+                type_name = (
+                    f"PostgreSQL array {column.get('sql_type')!r}"
+                    if column.get("array")
+                    or str(column.get("sql_type") or "").strip().endswith("[]")
+                    else f"Rails type {column['type']!r}"
+                )
                 out.append(
                     _blocker(
                         finding_id("column", name, column["name"], "type"),
                         "ColumnTypeUnmapped",
-                        f"{name}.{column['name']} has Rails type {column['type']!r} with "
+                        f"{name}.{column['name']} has {type_name} with "
                         f"no ZigBase equivalent",
                         ("omit",),
                     )
@@ -1656,14 +1716,39 @@ def _credential_findings(src: Source) -> list[Finding]:
     omniauth = auth.get("omniauth") or {}
     if omniauth.get("present"):
         providers = ", ".join(omniauth.get("providers") or []) or "unnamed providers"
+        candidates = _external_auth_candidates(src)
+        choices = ("passwordless-rollout", "out-of-scope")
+        mapping = ""
+        if len(candidates) == 1:
+            candidate = candidates[0]
+            choices = ("external-auths", *choices)
+            mapping = (
+                f" A conventional mapping was observed: {candidate['identity_table']}."
+                f"({candidate['provider_column']}, {candidate['provider_id_column']}) -> "
+                f"{candidate['account_table']} through "
+                f"{candidate['account_foreign_key']}; choosing `external-auths` emits "
+                f"only that provider linkage on each auth row and requires the artifact "
+                f"to name {candidate['account_table']!r}."
+            )
+        elif candidates:
+            mapping = (
+                " Several conventional identity mappings were observed, so the "
+                "converter will not guess which account collection owns them."
+            )
+        else:
+            mapping = (
+                " No unambiguous conventional identity table with provider, provider "
+                "ID, and an account foreign key was observed."
+            )
         out.append(
             _blocker(
                 "auth.omniauth.identities",
-                "ExternalIdentitiesCannotMigrate",
-                f"OmniAuth is configured ({providers}); ZigBase stores provider linkage in "
-                f"the engine-owned _externalAuths table, which the import path refuses, so "
-                f"a migrated external-identity account has no way to sign in",
-                ("passwordless-rollout", "out-of-scope"),
+                "ExternalIdentitiesRequireMapping",
+                f"OmniAuth is configured ({providers}); each source provider identity "
+                f"must be mapped to ZigBase's engine-owned _externalAuths linkage."
+                f"{mapping} Provider configuration and secrets are target-side "
+                f"prerequisites; tokens and raw provider payloads never migrate.",
+                choices,
             )
         )
 
@@ -1677,7 +1762,11 @@ def _credential_findings(src: Source) -> list[Finding]:
             )
         )
 
-    if not devise.get("present") and not auth.get("has_secure_password"):
+    if (
+        not devise.get("present")
+        and not auth.get("has_secure_password")
+        and not _external_auth_candidates(src)
+    ):
         out.append(
             _blocker(
                 "auth.mechanism.unknown",
@@ -1693,25 +1782,90 @@ def _credential_findings(src: Source) -> list[Finding]:
 def require_sqlite(src: Source) -> Path:
     """Return the frozen database, or refuse with the reason extraction cannot proceed.
 
-    Called only from the paths that read rows. `inventory` deliberately does not call it:
-    findings and durable decisions come from the adapter-neutral observed inventory, and
-    a Postgres or MySQL operator needs exactly that half before exporting their rows
-    through the generic NDJSON path.
+    Called only by the SQLite source backend. `inventory` and `schema` deliberately do
+    not call it, while PostgreSQL extraction uses `_connect_source`'s driver-backed path.
     """
     adapter = str(src.versions.get("adapter") or "unknown")
     if adapter.lower() not in ("sqlite", "sqlite3"):
         raise RailsError(
-            f"extraction reads rows from a frozen SQLite file; this inventory was "
-            f"observed on {adapter}. The inventory and its decisions are adapter-neutral "
-            f"and remain usable — export the rows separately and follow the generic "
-            f"NDJSON path in docs/migration-tools.md."
+            f"this row-source helper requires a frozen SQLite file; the inventory was "
+            f"observed on {adapter}"
         )
     if src.database is None:
         raise RailsError(
             f"expected exactly one .sqlite3 database under {src.root / 'db'} for "
             f"extraction"
         )
+    wal = src.database.with_name(src.database.name + "-wal")
+    try:
+        if wal.exists() and wal.stat().st_size:
+            raise RailsError(
+                f"source database has an uncheckpointed WAL at {wal}; stop Rails and "
+                "checkpoint or copy the complete database before extraction"
+            )
+    except OSError as exc:
+        raise RailsError(f"cannot inspect SQLite WAL {wal}: {exc}") from exc
     return src.database
+
+
+def _sanitized_postgres_error(exc: Exception, database_url: str) -> RailsError:
+    """Translate a driver failure without ever echoing its credential-bearing DSN."""
+    detail = str(exc).replace(database_url, "<redacted PostgreSQL URL>")
+    try:
+        password = urlsplit(database_url).password
+        if password:
+            detail = detail.replace(password, "<redacted>").replace(
+                unquote(password), "<redacted>"
+            )
+    except ValueError:
+        pass
+    return RailsError(f"cannot read the frozen PostgreSQL source: {detail}")
+
+
+@contextlib.contextmanager
+def _connect_source(src: Source, database_url: str | None = None) -> Any:
+    """Open one read-only source snapshot for every check and emitted row."""
+    adapter = str(src.versions.get("adapter") or "unknown").lower()
+    if adapter in ("sqlite", "sqlite3"):
+        with _connect(require_sqlite(src)) as conn:
+            yield conn
+        return
+    if adapter not in ("postgres", "postgresql"):
+        raise RailsError(f"row extraction does not support the {adapter!r} adapter")
+    if not database_url:
+        raise RailsError(
+            "PostgreSQL row extraction needs a frozen source URL in the environment; "
+            "pass its variable name with --database-url-env"
+        )
+    try:
+        import psycopg
+        from psycopg.rows import dict_row
+    except ImportError as exc:
+        raise RailsError(
+            "PostgreSQL row extraction needs psycopg 3; install the pinned Rails "
+            "tool dependency before retrying"
+        ) from exc
+
+    conn = None
+    try:
+        conn = psycopg.connect(database_url, autocommit=True, row_factory=dict_row)
+        conn.execute("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+    except Exception as exc:
+        if conn is not None:
+            conn.close()
+        raise _sanitized_postgres_error(exc, database_url) from exc
+    try:
+        yield conn
+    except Exception as exc:
+        if exc.__class__.__module__.startswith("psycopg"):
+            raise _sanitized_postgres_error(exc, database_url) from exc
+        raise
+    finally:
+        try:
+            conn.execute("ROLLBACK")
+        except Exception:
+            pass
+        conn.close()
 
 
 def _composite_key_findings(src: Source) -> list[Finding]:
@@ -1890,6 +2044,8 @@ def _artifact_is_inline(fid: str, choice: str) -> bool:
         return True  # an access rule; the artifact IS the rule
     if choice == "rename":
         return True  # the artifact IS the new collection name
+    if choice == "external-auths":
+        return True  # the artifact IS the target auth collection/table name
     parts = split_id(fid)
     return parts[0] == "index" and parts[-1] == "where"
 
@@ -2103,6 +2259,10 @@ def to_rfc3339(value: Any) -> str | None:
     """
     if value is None or value == "":
         return None
+    if isinstance(value, datetime_module.datetime):
+        value = value.isoformat(sep=" ")
+    elif isinstance(value, datetime_module.date):
+        value = value.isoformat()
     if not isinstance(value, str):
         raise RailsError(f"expected a datetime string, got {type(value).__name__}")
     match = _RAILS_DATETIME.match(value)
@@ -2243,6 +2403,8 @@ def coerce(
         # without complaint. The inventory says number, the data disagrees, and passing
         # it through emitted a JSON string into a number field -- refused by the target
         # partway through the import, after earlier collections had committed.
+        if isinstance(value, decimal.Decimal):
+            value = int(value) if number_mode == "int" else float(value)
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             raise RailsError(
                 f"a number column holds {value!r}, which is not a number; the inventory "
@@ -2324,9 +2486,75 @@ class Mapped:
     attachment_names: dict[str, str]
 
 
-def _auth_tables(src: Source) -> dict[str, str]:
-    """table -> digest column, for every table that carries a password digest."""
-    out: dict[str, str] = {}
+def _external_auth_candidates(src: Source) -> list[dict[str, str]]:
+    """Return narrow, structurally observed OmniAuth identity-table mappings."""
+    if not (src.auth.get("omniauth") or {}).get("present"):
+        return []
+    tables = {table["name"]: table for table in src.migratable_tables()}
+    out: list[dict[str, str]] = []
+    for table in sorted(tables.values(), key=lambda item: item["name"]):
+        columns = {column["name"] for column in table.get("columns") or []}
+        provider_id = (
+            "uid"
+            if "uid" in columns
+            else "provider_id"
+            if "provider_id" in columns
+            else None
+        )
+        if "id" not in columns or "provider" not in columns or provider_id is None:
+            continue
+        candidates = []
+        for fk in table.get("foreign_keys") or []:
+            target = tables.get(fk.get("to_table"))
+            target_columns = {
+                column["name"] for column in (target or {}).get("columns") or []
+            }
+            if (
+                target
+                and fk.get("column") in columns
+                and (fk.get("primary_key") or "id") == "id"
+                and "email" in target_columns
+            ):
+                candidates.append(fk)
+        if len(candidates) != 1:
+            continue
+        fk = candidates[0]
+        out.append(
+            {
+                "account_table": str(fk["to_table"]),
+                "identity_table": str(table["name"]),
+                "account_foreign_key": str(fk["column"]),
+                "provider_column": "provider",
+                "provider_id_column": provider_id,
+            }
+        )
+    return out
+
+
+def _external_auth_plan(
+    src: Source, decisions: dict[str, Decision]
+) -> dict[str, str] | None:
+    decision = decisions.get("auth.omniauth.identities")
+    if decision is None or decision.choice != "external-auths":
+        return None
+    candidates = _external_auth_candidates(src)
+    if len(candidates) != 1:
+        raise RailsError(
+            "external-auths requires exactly one conventional provider identity mapping"
+        )
+    candidate = candidates[0]
+    target = (decision.artifact or "").strip()
+    if target != candidate["account_table"]:
+        raise RailsError(
+            "auth.omniauth.identities external-auths artifact must name the observed "
+            f"account table {candidate['account_table']!r}, not {target!r}"
+        )
+    return candidate
+
+
+def _auth_tables(src: Source) -> dict[str, str | None]:
+    """Map every target auth table to its optional password digest column."""
+    out: dict[str, str | None] = {}
     # Group by TABLE first: two Active Record models can share one table, and judging
     # each entry alone let the genuinely ambiguous case through with the winner decided
     # by which model name sorted first.
@@ -2390,6 +2618,8 @@ def _auth_tables(src: Source) -> dict[str, str]:
                 f"decided, not guessed"
             )
         out.setdefault(table, "encrypted_password")
+    for candidate in _external_auth_candidates(src):
+        out.setdefault(candidate["account_table"], None)
     return out
 
 
@@ -2926,7 +3156,10 @@ def map_tables(src: Source, decisions: dict[str, Decision]) -> list[Mapped]:
     auth_tables = _auth_tables(src)
     encrypted = _encrypted_columns(src)
     serialized_choice = _serialized_choices(decisions)
+    external_auth = _external_auth_plan(src, decisions)
     omitted = _omitted_tables(decisions) | _sti_omitted_tables(src, decisions)
+    if external_auth:
+        omitted.add(external_auth["identity_table"])
     # `omit` and `rename` on one table are contradictory; refuse rather than pick.
     both = omitted & set(_renamed_tables(decisions))
     if both:
@@ -2985,6 +3218,7 @@ def map_tables(src: Source, decisions: dict[str, Decision]) -> list[Mapped]:
             continue
         model = src.model_for_table(name)
         enums = (model or {}).get("enums") or {}
+        is_auth = name in auth_tables
         digest_column = auth_tables.get(name)
         encrypted_here = encrypted.get(name, set())
 
@@ -3067,7 +3301,7 @@ def map_tables(src: Source, decisions: dict[str, Decision]) -> list[Mapped]:
             attachments,
             skipped_columns,
             renamed_columns,
-            digest_column is not None,
+            is_auth,
             renamed_attachments,
         )
 
@@ -3143,7 +3377,9 @@ def map_tables(src: Source, decisions: dict[str, Decision]) -> list[Mapped]:
                     "name": attachment_names[attachment],
                     "type": "file",
                     "options": (
-                        {} if macro == "has_one_attached" else {"maxSelect": 0}
+                        {}
+                        if macro == "has_one_attached"
+                        else {"maxSelect": UNBOUNDED_MAX_SELECT}
                     ),
                 }
             )
@@ -3152,7 +3388,7 @@ def map_tables(src: Source, decisions: dict[str, Decision]) -> list[Mapped]:
             Mapped(
                 table=name,
                 collection=renamed.get(name, name),
-                is_auth=digest_column is not None,
+                is_auth=is_auth,
                 model=model,
                 columns=table["columns"],
                 indexes=list(table.get("indexes") or []),
@@ -3484,6 +3720,20 @@ def _schema_fields(entry: Mapped) -> list[dict[str, Any]]:
     return [f for f in entry.fields if f["name"].lower() not in AUTH_MAPPED_FIELD_NAMES]
 
 
+def _index_is_emittable(
+    entry: Mapped,
+    index: dict[str, Any],
+    predicates: dict[tuple[str, str], str],
+    declared: set[str] | None,
+) -> bool:
+    if not all(column in entry.field_names for column in index["columns"]):
+        return False
+    fields = [entry.field_names[column] for column in index["columns"]]
+    if declared is not None and not all(field in declared for field in fields):
+        return False
+    return not index.get("where") or (entry.table, index["name"]) in predicates
+
+
 def _indexes_for(
     entry: Mapped,
     predicates: dict[tuple[str, str], str] | None = None,
@@ -3497,19 +3747,28 @@ def _indexes_for(
     """
     predicates = predicates or {}
     out = []
+    emitted_names: set[str] = set()
     for index in sorted(entry.indexes, key=lambda i: i["name"]):
         # Resolve through field_names by KEY, never by falling back to the raw column.
         # A dropped `author` column beside a relation `author_id` fell back to "author"
         # -- the name the relation had just inherited -- and emitted the source column's
         # UNIQUE index over the relation field, silently making it one-post-per-user.
-        if not all(c in entry.field_names for c in index["columns"]):
+        if not _index_is_emittable(entry, index, predicates, declared):
             continue
         fields = [entry.field_names[c] for c in index["columns"]]
-        # An index may only name a field the document actually declares.
-        if declared is not None and not all(f in declared for f in fields):
-            continue
+        source_name = index["name"]
+        emitted_name = source_name
+        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", emitted_name):
+            emitted_name = re.sub(r"[^A-Za-z0-9_]+", "_", emitted_name)
+            emitted_name = re.sub(r"_+", "_", emitted_name).strip("_")
+            if not emitted_name or not emitted_name[0].isalpha():
+                emitted_name = f"index_{emitted_name}" if emitted_name else "index"
+        if emitted_name.lower() in emitted_names:
+            suffix = hashlib.sha256(source_name.encode()).hexdigest()[:12]
+            emitted_name = f"{emitted_name}_{suffix}"
+        emitted_names.add(emitted_name.lower())
         emitted: dict[str, Any] = {
-            "name": index["name"],
+            "name": emitted_name,
             "fields": fields,
             "unique": bool(index.get("unique")),
         }
@@ -3522,8 +3781,6 @@ def _indexes_for(
         # decision's artifact, or the index is omitted; this converter does not translate
         # SQL it cannot verify.
         replacement = predicates.get((entry.table, index["name"]))
-        if index.get("where") and replacement is None:
-            continue
         if replacement:
             emitted["where"] = replacement
         out.append(emitted)
@@ -3677,7 +3934,7 @@ def _quote(identifier: str) -> str:
     return '"' + identifier.replace('"', '""') + '"'
 
 
-def read_rows(conn: sqlite3.Connection, entry: Mapped) -> list[dict[str, Any]]:
+def read_rows(conn: Any, entry: Mapped) -> list[dict[str, Any]]:
     """Read every row, in id order.
 
     Raw SQL is inherently unscoped, which is the point: a `default_scope` would hide
@@ -3728,6 +3985,8 @@ def _record_id(entry: Mapped, row: dict[str, Any]) -> str:
     value = row.get("id")
     if value is None:
         raise RailsError(f"{entry.table} has a row with no id; it cannot be migrated")
+    if isinstance(value, uuid.UUID):
+        value = str(value)
     if isinstance(value, bool) or not isinstance(value, (int, str)):
         raise RailsError(f"{entry.table} has a row whose id is {value!r}")
     text = str(value)
@@ -3784,6 +4043,8 @@ def build_record(
             continue
         if f["type"] == "relation":
             value = row.get(column)
+            if isinstance(value, uuid.UUID):
+                value = str(value)
             if value is not None and (
                 isinstance(value, bool) or not isinstance(value, (int, str))
             ):
@@ -3843,6 +4104,8 @@ def build_auth_record(
     emit_credentials: bool = True,
 ) -> dict[str, Any]:
     record = build_record(entry, row, attachments)
+    if entry.digest_column is None:
+        return record
     if not emit_credentials:
         # The operator chose `reset-passwords`, which is the ONLY safe answer to a
         # configured Devise pepper. Emitting the digest anyway would ship credentials
@@ -3867,6 +4130,65 @@ def build_auth_record(
         )
     record["passwordHash"] = digest
     return record
+
+
+def _external_auths_by_account(
+    conn: Any, plan: dict[str, str] | None, account_ids: set[str]
+) -> tuple[dict[str, list[dict[str, str]]], list[str]]:
+    """Read reviewed identity linkage without ever selecting credential columns."""
+    if plan is None:
+        return {}, []
+    table = plan["identity_table"]
+    account_column = plan["account_foreign_key"]
+    provider_column = plan["provider_column"]
+    provider_id_column = plan["provider_id_column"]
+    rows = _fetch(
+        conn,
+        f"SELECT id, {_quoted(account_column)}, {_quoted(provider_column)}, "
+        f"{_quoted(provider_id_column)} FROM {_quoted(table)} ORDER BY id",
+        table,
+    )
+    links: dict[str, list[dict[str, str]]] = {}
+    identities: set[tuple[str, str]] = set()
+    per_account: set[tuple[str, str]] = set()
+    providers: set[str] = set()
+    for row in rows:
+        account = row[account_column]
+        provider = row[provider_column]
+        provider_id = row[provider_id_column]
+        if account in (None, "") or provider in (None, "") or provider_id in (None, ""):
+            raise RailsError(
+                f"{table}.{row['id']} has a blank account, provider, or provider id; "
+                "external authentication linkage cannot be partial"
+            )
+        account_key = str(account)
+        provider_key = str(provider)
+        provider_id_key = str(provider_id)
+        if account_key not in account_ids:
+            raise RailsError(
+                f"{table}.{row['id']} points at missing {plan['account_table']}."
+                f"{account_key}"
+            )
+        identity = (provider_key, provider_id_key)
+        owner_provider = (account_key, provider_key)
+        if identity in identities:
+            raise RailsError(
+                f"{table} repeats provider identity {provider_key!r}/{provider_id_key!r}"
+            )
+        if owner_provider in per_account:
+            raise RailsError(
+                f"{table} gives {plan['account_table']}.{account_key} more than one "
+                f"{provider_key!r} identity; ZigBase permits one per provider"
+            )
+        identities.add(identity)
+        per_account.add(owner_provider)
+        providers.add(provider_key)
+        links.setdefault(account_key, []).append(
+            {"provider": provider_key, "providerId": provider_id_key}
+        )
+    for account_links in links.values():
+        account_links.sort(key=lambda item: (item["provider"], item["providerId"]))
+    return links, sorted(providers)
 
 
 # ---------------------------------------------------------------------------
@@ -3996,7 +4318,7 @@ def require_disk_storage(src: Source) -> None:
         )
 
 
-def _fetch(conn: sqlite3.Connection, sql: str, table: str) -> list[Any]:
+def _fetch(conn: Any, sql: str, table: str) -> list[Any]:
     """Drain a cursor, naming the table if a value refuses to decode.
 
     `_decode_text` is installed as a text factory, so it sees bytes and no column. Every
@@ -4019,9 +4341,7 @@ def _is_empty_to_the_engine(value: Any) -> bool:
     return value is None or value == "" or value == []
 
 
-def _relax_required_for_empty_values(
-    conn: sqlite3.Connection, mapped: list[Mapped]
-) -> list[str]:
+def _relax_required_for_empty_values(conn: Any, mapped: list[Mapped]) -> list[str]:
     """`NOT NULL` is a NULL-level contract; ZigBase's `required` is an EMPTINESS one.
 
     `t.string :nickname, null: false, default: ""` is idiomatic Rails, and an empty
@@ -4058,7 +4378,8 @@ def _relax_required_for_empty_values(
             entry.table,
         )
         for row in rows:
-            row_id, values = row[0], row[1:]
+            row_id = row["id"]
+            values = [row[column] for column in columns]
             for field, column, value in zip(candidates, columns, values):
                 if field["name"] in found:
                     continue
@@ -4080,9 +4401,7 @@ def _relax_required_for_empty_values(
     return sorted(relaxed)
 
 
-def _refuse_dangling_relation_values(
-    conn: sqlite3.Connection, mapped: list[Mapped]
-) -> None:
+def _refuse_dangling_relation_values(conn: Any, mapped: list[Mapped]) -> None:
     """The row-level sibling of the foreign-key gate.
 
     The converter checked that a foreign key was DECLARED; nothing checked that each
@@ -4097,15 +4416,16 @@ def _refuse_dangling_relation_values(
             destination = by_collection.get(target)
             if destination is None:
                 continue  # already refused, by name, in map_tables
-            orphans = conn.execute(
-                f"SELECT COUNT(*) FROM {_quoted(entry.table)} AS src "
+            orphan = conn.execute(
+                f"SELECT COUNT(*) AS orphan_count FROM {_quoted(entry.table)} AS src "
                 f"LEFT JOIN {_quoted(destination.table)} AS dst "
                 # The bundle emits `str(value)` and the engine matches ids byte-for-
                 # byte, so a TEXT key holding '01' or ' 1' is affinity-equal here and
                 # a miss there. Compare as text, the way the target will.
                 f"  ON CAST(dst.id AS TEXT) = CAST(src.{_quoted(column)} AS TEXT) "
                 f"WHERE src.{_quoted(column)} IS NOT NULL AND dst.id IS NULL"
-            ).fetchone()[0]
+            ).fetchone()
+            orphans = orphan["orphan_count"]
             if orphans:
                 raise RailsError(
                     f"{entry.table}.{column} has {orphans} row(s) pointing at a "
@@ -4115,7 +4435,7 @@ def _refuse_dangling_relation_values(
 
 
 def _timestampless_collections(decisions: dict[str, Decision]) -> set[str]:
-    """Collections routed to the second manifest, by their POST-rename names."""
+    """Collections imported without source timestamps, by POST-rename name."""
     renames = _renamed_tables(decisions)
     return {
         renames.get(split_id(fid)[1], split_id(fid)[1])
@@ -4125,59 +4445,7 @@ def _timestampless_collections(decisions: dict[str, Decision]) -> set[str]:
     }
 
 
-def _manifest_order(mapped: list[Mapped], timestampless: set[str]) -> list[str]:
-    """Sequence the two manifests, or refuse when no sequence works.
-
-    Strip-then-patch is scoped to a single manifest RUN, which is exactly the argument
-    that makes a relation out of an auth collection unimportable -- and it applies just
-    as much to the second manifest. A relation crossing the boundary needs its target's
-    manifest imported first; relations crossing BOTH ways cannot be ordered at all.
-
-    An auth collection rides in NEITHER manifest -- it is imported from its own file
-    BEFORE both -- so a relation pointing INTO one is already satisfied and is not a
-    crossing. Counting them produced spurious "both directions" refusals that no
-    decision could resolve (`separate-import` is only offered on tables that have the
-    finding) and a `manifestOrder` naming a file the bundle does not contain. Auth as a
-    relation SOURCE is a different problem, and `AuthCollectionRelation` refuses it.
-    """
-    members = {entry.collection for entry in mapped if not entry.is_auth}
-    separate = {
-        entry.collection
-        for entry in mapped
-        if not entry.is_auth and entry.collection in timestampless
-    }
-    if not separate:
-        return ["manifest.json"]
-    crossings: dict[str, list[str]] = {"main-first": [], "separate-first": []}
-    for entry in mapped:
-        if entry.is_auth:
-            continue
-        for column, target in sorted(entry.relations.items()):
-            if target not in members:
-                continue  # an auth target is imported before either manifest
-            here, there = entry.collection in separate, target in separate
-            if here == there:
-                continue
-            # The REFERENCED manifest has to be imported first, so the rows a relation
-            # points at already exist when the referencing side is validated.
-            key = "main-first" if here else "separate-first"
-            crossings[key].append(f"{entry.collection}.{column} -> {target}")
-    if crossings["main-first"] and crossings["separate-first"]:
-        raise RailsError(
-            "relations cross the timestamp manifest boundary in both directions, so "
-            "neither manifest can be imported first: "
-            + "; ".join(sorted(crossings["main-first"] + crossings["separate-first"]))
-            + " — decide `separate-import` for the tables on one side of the boundary "
-            "too, or omit the relations that cross it"
-        )
-    if crossings["separate-first"]:
-        return ["manifest-no-timestamps.json", "manifest.json"]
-    return ["manifest.json", "manifest-no-timestamps.json"]
-
-
-def _refuse_duplicate_auth_identities(
-    conn: sqlite3.Connection, mapped: list[Mapped]
-) -> None:
+def _refuse_duplicate_auth_identities(conn: Any, mapped: list[Mapped]) -> None:
     """The engine puts a partial UNIQUE index on an auth collection's email.
 
     A legacy Rails app that relied on `validates_uniqueness_of` alone -- no database
@@ -4195,14 +4463,16 @@ def _refuse_duplicate_auth_identities(
                 continue
             duplicates = _fetch(
                 conn,
-                f"SELECT {_quoted(column)}, COUNT(*) FROM {_quoted(entry.table)} "
+                f"SELECT {_quoted(column)} AS identity_value, "
+                f"COUNT(*) AS duplicate_count FROM {_quoted(entry.table)} "
                 f"WHERE {_quoted(column)} IS NOT NULL AND {_quoted(column)} != '' "
                 f"GROUP BY {_quoted(column)} HAVING COUNT(*) > 1",
                 entry.table,
             )
             if duplicates:
                 shown = ", ".join(
-                    f"{value!r} x{count}" for value, count in duplicates[:3]
+                    f"{row['identity_value']!r} x{row['duplicate_count']}"
+                    for row in duplicates[:3]
                 )
                 raise RailsError(
                     f"{entry.table}.{column} has duplicate values ({shown}); ZigBase "
@@ -4220,9 +4490,7 @@ def _is_servable_email(value: str) -> bool:
     return bool(at) and bool(local) and bool(domain) and "@" not in domain
 
 
-def _refuse_invalid_auth_identities(
-    conn: sqlite3.Connection, mapped: list[Mapped]
-) -> None:
+def _refuse_invalid_auth_identities(conn: Any, mapped: list[Mapped]) -> None:
     """A legacy user table full of junk emails is ordinary.
 
     The engine's injected `email` field is email-typed and validates every non-empty
@@ -4238,14 +4506,14 @@ def _refuse_invalid_auth_identities(
         if column is None:
             continue
         bad = [
-            (row[0], row[1])
+            (row["id"], row[column])
             for row in _fetch(
                 conn,
                 f"SELECT id, {_quoted(column)} FROM {_quoted(entry.table)} "
                 f"WHERE {_quoted(column)} IS NOT NULL AND {_quoted(column)} != ''",
                 entry.table,
             )
-            if not _is_servable_email(str(row[1]))
+            if not _is_servable_email(str(row[column]))
         ]
         if bad:
             shown = ", ".join(f"row {rid}: {value!r}" for rid, value in bad[:3])
@@ -4288,7 +4556,7 @@ def _refuse_incoherent_row_counts(
 
 def build_file_plan(
     src: Source,
-    conn: sqlite3.Connection,
+    conn: Any,
     mapped: list[Mapped] | None = None,
 ) -> tuple[list[dict[str, Any]], list[str]]:
     """Active Storage blobs, resolved to their on-disk path and owning record.
@@ -4323,7 +4591,7 @@ def build_file_plan(
     # Their bytes were installed under a record directory that will never exist, and
     # counted in `files` as though they had been migrated.
     live_ids = {
-        (entry.table, str(row[0]))
+        (entry.table, str(row["id"]))
         for entry in (mapped or [])
         # `create_table id: :string` -- the ordinary UUID-on-SQLite shape -- declares a
         # non-alias TEXT primary key that holds arbitrary bytes, and this drain is the
@@ -4413,24 +4681,31 @@ def build_file_plan(
 IMPORT_LINE_LIMIT = 1024 * 1024
 
 
-def _require_clean_output(out: Path, src: Source) -> None:
+def _require_clean_output(out: Path, source_root: Path) -> None:
     """A bundle must be built into an empty directory disjoint from the source.
 
     Otherwise stale NDJSON from an earlier run, or source files themselves, get swept
     into `hashes.json` and the bundle attests to content it did not produce.
     """
-    ensure_output_outside_source(out, src.root)
-    resolved_out, resolved_src = out.resolve(), src.root.resolve()
+    ensure_output_outside_source(out, source_root)
+    resolved_out, resolved_src = out.resolve(), source_root.resolve()
     if resolved_out in resolved_src.parents:
         raise RailsError(
             f"output {out} is an ancestor of the source tree; the bundle would contain "
             f"the snapshot it claims to have converted"
         )
-    if out.exists() and any(out.iterdir()):
-        raise RailsError(
-            f"output {out} is not empty; extraction must build into a clean directory so "
-            f"stale files cannot be attested in hashes.json"
-        )
+    if out.exists():
+        if not out.is_dir():
+            raise RailsError(f"output {out} must be a directory")
+        try:
+            dirty = next(out.iterdir(), None) is not None
+        except OSError as exc:
+            raise RailsError(f"cannot inspect output directory {out}: {exc}") from exc
+        if dirty:
+            raise RailsError(
+                f"output {out} is not empty; extraction must build into a clean directory so "
+                f"stale files cannot be attested in hashes.json"
+            )
 
 
 def extract(
@@ -4439,22 +4714,24 @@ def extract(
     out: Path,
     *,
     artifact_root: Path | None = None,
+    database_url: str | None = None,
 ) -> dict[str, Any]:
     # Check the destination first: reconciliation is the expensive, noisy failure, and a
     # caller pointing at a dirty directory should hear about that immediately.
-    _require_clean_output(out, src)
+    output_exists = out.exists()
+    _require_clean_output(out, src.root)
     findings = build_findings(src)
     reconcile(findings, decisions, artifact_root=artifact_root)
 
-    database = require_sqlite(src)
     reset = decisions.get("auth.devise.pepper")
     emit_credentials = not (reset and reset.choice == "reset-passwords")
+    external_auth_plan = _external_auth_plan(src, decisions)
     mapped = map_tables(src, decisions)
     # Row-level checks, before the document is written: the import contract is valued
     # per ROW, and every column-level gate above can be satisfied by a schema whose own
     # data violates it.
     timestampless = _timestampless_collections(decisions)
-    manifest_order = _manifest_order(mapped, timestampless)
+    manifest_order = ["manifest.json"]
     # Which tables actually HAVE a timestamp finding, and so can be routed by decision.
     # SQLite lets `''` satisfy NOT NULL on a datetime column, so a row can lack a
     # timestamp on a table that raised no finding at all -- and naming `separate-import`
@@ -4464,35 +4741,82 @@ def extract(
         for f in findings
         if f.id.endswith((".no_timestamps", ".nullable_timestamps"))
     }
-    with _connect(database) as scan:
-        relaxed_required = _relax_required_for_empty_values(scan, mapped)
-        _refuse_dangling_relation_values(scan, mapped)
-        _refuse_duplicate_auth_identities(scan, mapped)
-        _refuse_invalid_auth_identities(scan, mapped)
-    document = build_schema_document(mapped, decisions)
-    write_canonical_json(out / "schema.json", document)
-    # Read back off the document rather than recomputing: a second, parallel call to
-    # `_indexes_for` could drift from the one that actually produced the schema.
-    emitted_indexes = {
-        collection["name"]: {index["name"] for index in collection["indexes"]}
-        for collection in document["collections"]
-    }
-    dropped_indexes = sorted(
-        f"{entry.collection}.{index['name']}"
-        for entry in mapped
-        for index in entry.indexes
-        if index["name"] not in emitted_indexes.get(entry.collection, set())
-    )
+    with _connect_source(src, database_url) as conn:
+        relaxed_required = _relax_required_for_empty_values(conn, mapped)
+        _refuse_dangling_relation_values(conn, mapped)
+        _refuse_duplicate_auth_identities(conn, mapped)
+        _refuse_invalid_auth_identities(conn, mapped)
+        if not output_exists:
+            # The operator owns an existing empty directory and its sharing policy.
+            # Only directories created by rails2zb receive the private default, and only
+            # once all input and source validation has succeeded.
+            _private_parent(out)
+        document = build_schema_document(mapped, decisions)
+        write_canonical_json(out / "schema.json", document, private=True)
+        # Read back off the document rather than recomputing: a second, parallel call to
+        # `_indexes_for` could drift from the one that actually produced the schema.
+        predicates = _index_predicates(decisions)
+        schema_collections = {item["name"]: item for item in document["collections"]}
+        dropped_indexes = sorted(
+            f"{entry.collection}.{index['name']}"
+            for entry in mapped
+            for index in entry.indexes
+            if not _index_is_emittable(
+                entry,
+                index,
+                predicates,
+                {field["name"] for field in _schema_fields(entry)},
+            )
+        )
+        renamed_indexes: list[dict[str, str]] = []
+        for entry in mapped:
+            declared = {field["name"] for field in _schema_fields(entry)}
+            source_indexes = [
+                index
+                for index in sorted(entry.indexes, key=lambda item: item["name"])
+                if _index_is_emittable(entry, index, predicates, declared)
+            ]
+            target_indexes = schema_collections[entry.collection]["indexes"]
+            if len(source_indexes) != len(target_indexes):
+                raise RailsError(
+                    f"internal index accounting mismatch for {entry.collection!r}"
+                )
+            renamed_indexes.extend(
+                {
+                    "collection": entry.collection,
+                    "source": source["name"],
+                    "target": target["name"],
+                }
+                for source, target in zip(source_indexes, target_indexes, strict=True)
+                if source["name"] != target["name"]
+            )
 
-    counts: dict[str, int] = {}
-    ordinary: list[dict[str, str]] = []
-    separate: list[dict[str, str]] = []
-    _renames = _renamed_tables(decisions)
-    timestampless = _timestampless_collections(decisions)
-    auth_files: list[str] = []
-    auth_files_no_timestamps: list[str] = []
+        counts: dict[str, int] = {}
+        ordinary: list[dict[str, str | bool]] = []
+        timestampless = _timestampless_collections(decisions)
+        auth_files: list[str] = []
+        auth_files_no_timestamps: list[str] = []
+        account_entry = next(
+            (
+                entry
+                for entry in mapped
+                if external_auth_plan
+                and entry.table == external_auth_plan["account_table"]
+            ),
+            None,
+        )
+        account_rows = read_rows(conn, account_entry) if account_entry else []
+        external_auths, external_auth_providers = _external_auths_by_account(
+            conn,
+            external_auth_plan,
+            {str(row["id"]) for row in account_rows},
+        )
+        external_auth_file = (
+            f"auth/{account_entry.collection}.ndjson"
+            if external_auth_plan is not None and account_entry is not None
+            else None
+        )
 
-    with _connect(database) as conn:
         files, dropped_attachments = build_file_plan(src, conn, mapped)
         index: dict[tuple[str, str, str], list[str]] = {}
         for item in files:
@@ -4501,15 +4825,22 @@ def extract(
             ).append(item.get("targetName") or item["filename"])
 
         for entry in mapped:
-            rows = read_rows(conn, entry)
+            rows = account_rows if entry is account_entry else read_rows(conn, entry)
             if entry.is_auth:
                 relative = f"auth/{entry.collection}.ndjson"
                 counts[entry.collection] = write_ndjson(
                     out / relative,
                     _importable_with_timestamps(
                         (
-                            build_auth_record(
-                                entry, r, index, emit_credentials=emit_credentials
+                            dict(
+                                build_auth_record(
+                                    entry, r, index, emit_credentials=emit_credentials
+                                ),
+                                **(
+                                    {"externalAuths": external_auths[str(r["id"])]}
+                                    if str(r["id"]) in external_auths
+                                    else {}
+                                ),
                             )
                             for r in rows
                         ),
@@ -4536,33 +4867,29 @@ def extract(
                         entry.table in routable_tables,
                     ),
                 )
-                # Manifest file paths resolve against the manifest's own directory,
-                # which is the bundle root -- so this is `data/x.ndjson`, not `../`.
-                if entry.collection in timestampless:
-                    # These rows carry no created/updated, and the documented workflow
-                    # runs the main manifest with --preserve-timestamps, which requires
-                    # both on every row. Keeping them here produced a bundle that
-                    # extracted cleanly and then failed the documented import.
-                    separate.append({"collection": entry.collection, "file": relative})
-                else:
-                    ordinary.append({"collection": entry.collection, "file": relative})
+                # Manifest v2 keeps every non-auth collection in one dependency graph.
+                # The per-entry policy lets the importer defer relation cycles across
+                # timestamped and timestamp-less tables, while preserving timestamps
+                # wherever the source actually has them.
+                ordinary.append(
+                    {
+                        "collection": entry.collection,
+                        "file": relative,
+                        "preserveTimestamps": entry.collection not in timestampless,
+                    }
+                )
 
     # Auth rows never ride in the ordinary manifest: --legacy-hashes applies to every
     # entry in a manifest, so a legacy-hash import has to be its own single-collection run.
     write_canonical_json(
         out / "manifest.json",
-        {"zigbaseImportManifest": 1, "collections": ordinary},
+        {"zigbaseImportManifest": 2, "collections": ordinary},
+        private=True,
     )
-    if separate:
-        # Imported WITHOUT --preserve-timestamps; the report names it so the operator
-        # cannot miss that a second command is required.
-        write_canonical_json(
-            out / "manifest-no-timestamps.json",
-            {"zigbaseImportManifest": 1, "collections": separate},
-        )
     write_canonical_json(
         out / "files/manifest.json",
         {"zigbaseRailsFiles": BUNDLE_VERSION, "files": files},
+        private=True,
     )
 
     _refuse_incoherent_row_counts(src, mapped, counts)
@@ -4578,12 +4905,14 @@ def extract(
     report = {
         "zigbaseRailsBundle": BUNDLE_VERSION,
         "sourceMode": src.mode,
-        # Bind the bundle to the exact snapshot it was built from, so a compatible but
-        # different database cannot silently reuse an earlier set of decisions.
+        # Bind the bundle to its exact inventory and, for a file-backed source, the
+        # database bytes. PostgreSQL consistency is enforced by the single repeatable-
+        # read transaction plus the observed-vs-written row-count check.
         "inventorySha256": _inventory_digest(src),
         "railsVersion": src.versions.get("rails_version"),
         "rubyVersion": src.versions.get("ruby_version"),
-        "databaseSha256": sha256_file(database),
+        "databaseAdapter": src.versions.get("adapter"),
+        "databaseSha256": sha256_file(src.database) if src.database else None,
         "collections": [
             {
                 "collection": entry.collection,
@@ -4602,11 +4931,14 @@ def extract(
             and "updated_at" not in {c["name"] for c in entry.columns}
         ),
         "authFiles": sorted(auth_files),
-        # Import these WITHOUT --preserve-timestamps; their rows carry no created.
+        "externalAuthFiles": (
+            [external_auth_file] if external_auth_file is not None else []
+        ),
+        "externalAuthProviders": external_auth_providers,
+        # Manifest v2 carries non-auth timestamp policy per entry. Auth files remain
+        # individual imports because their legacy-hash policy is collection-specific.
         "authFilesNoTimestamps": sorted(auth_files_no_timestamps),
-        "separateManifest": ("manifest-no-timestamps.json" if separate else None),
-        # Strip-then-patch is scoped to one manifest run, so when relations cross the
-        # boundary the manifests have to be imported in this order.
+        "separateManifest": None,
         "manifestOrder": manifest_order,
         "files": len(files),
         "findings": len(findings),
@@ -4616,12 +4948,21 @@ def extract(
         # STI `omit` disappeared from the bundle with nothing recording that it had —
         # the same understatement `publicRules` carried.
         "omittedTables": sorted(
-            _omitted_tables(decisions) | _sti_omitted_tables(src, decisions)
+            _omitted_tables(decisions)
+            | _sti_omitted_tables(src, decisions)
+            | (
+                {external_auth_plan["identity_table"]}
+                if external_auth_plan is not None
+                else set()
+            )
         ),
         # An index can be dropped for several honest reasons -- it covered a column that
         # was omitted, it was partial and its predicate was not reviewed, it named a
         # field the engine owns. Every one of those was silent until now.
         "droppedIndexes": dropped_indexes,
+        # Rails permits index names that ZigBase cannot store. Those names are converted
+        # mechanically and recorded here so the schema change remains reviewable.
+        "renamedIndexes": renamed_indexes,
         # Columns the source declares NOT NULL that nonetheless hold empty values, so
         # the field cannot be `required` in ZigBase's sense.
         "relaxedRequired": relaxed_required,
@@ -4650,7 +4991,7 @@ def extract(
             }
         ),
     }
-    write_canonical_json(out / "report.json", report)
+    write_canonical_json(out / "report.json", report, private=True)
 
     # Hashes last: they cover every other output, so the file that records them cannot
     # be part of what it records.
@@ -4664,7 +5005,9 @@ def extract(
         if path.name != "hashes.json"
     ]
     write_canonical_json(
-        out / "hashes.json", {"zigbaseRailsHashes": BUNDLE_VERSION, "outputs": entries}
+        out / "hashes.json",
+        {"zigbaseRailsHashes": BUNDLE_VERSION, "outputs": entries},
+        private=True,
     )
     return report
 
@@ -4729,7 +5072,12 @@ def _inventory_digest(src: Source) -> str:
     digest = hashlib.sha256()
     for name in INVENTORY_FILES:
         digest.update(name.encode())
-        digest.update((src.root / "inventory" / f"{name}.json").read_bytes())
+        digest.update(
+            read_bytes(
+                src.root / "inventory" / f"{name}.json",
+                label=f"inventory/{name}.json",
+            )
+        )
     return digest.hexdigest()
 
 
@@ -4796,14 +5144,46 @@ def cmd_inventory(args: argparse.Namespace) -> int:
     return 2 if (summary["blockers"] or summary["decisions"]) else 0
 
 
-def cmd_extract(args: argparse.Namespace) -> int:
+def cmd_schema(args: argparse.Namespace) -> int:
     ensure_output_outside_source(args.out, args.source)
+    src = load_source(args.source)
+    decisions = load_decisions(args.decisions)
+    findings = build_findings(src)
+    reconcile(
+        findings,
+        decisions,
+        artifact_root=args.decisions.resolve().parent,
+    )
+    document = build_schema_document(map_tables(src, decisions), decisions)
+    write_canonical_json(args.out, document, private=True)
+    print(
+        compact_summary(
+            {
+                "zigbase_rails_schema": BUNDLE_VERSION,
+                "out": str(args.out),
+                "collections": len(document["collections"]),
+            }
+        )
+    )
+    return 0
+
+
+def cmd_extract(args: argparse.Namespace) -> int:
+    _require_clean_output(args.out, args.source)
     src = load_source(args.source)
     decisions = load_decisions(args.decisions)
     # Artifact paths are relative to the decisions file that names them, which is the
     # only location an operator can reasonably be said to have meant.
     report = extract(
-        src, decisions, args.out, artifact_root=args.decisions.resolve().parent
+        src,
+        decisions,
+        args.out,
+        artifact_root=args.decisions.resolve().parent,
+        database_url=(
+            os.environ.get(args.database_url_env)
+            if getattr(args, "database_url_env", None)
+            else None
+        ),
     )
     print(
         compact_summary(
@@ -4835,10 +5215,21 @@ def build_parser() -> argparse.ArgumentParser:
     inv.add_argument("--out", type=Path, required=True)
     inv.set_defaults(func=cmd_inventory)
 
+    sch = sub.add_parser("schema", help="emit the decided ZigBase schema")
+    sch.add_argument("--source", type=Path, required=True)
+    sch.add_argument("--decisions", type=Path, required=True)
+    sch.add_argument("--out", type=Path, required=True)
+    sch.set_defaults(func=cmd_schema)
+
     ext = sub.add_parser("extract", help="emit a deterministic migration bundle")
     ext.add_argument("--source", type=Path, required=True)
     ext.add_argument("--decisions", type=Path, required=True)
     ext.add_argument("--out", type=Path, required=True)
+    ext.add_argument(
+        "--database-url-env",
+        default="DATABASE_URL",
+        help="environment variable holding the frozen PostgreSQL source URL",
+    )
     ext.set_defaults(func=cmd_extract)
 
     ins = sub.add_parser("install-files", help="place Active Storage blobs")

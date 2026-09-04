@@ -13,6 +13,8 @@
 const std = @import("std");
 const dbm = @import("../../db.zig");
 const dumpload = @import("../../dumpload.zig");
+const import = @import("../../import.zig");
+const import_manifest = @import("../../import_manifest.zig");
 const migrations = @import("../../migrations.zig");
 const collections = @import("../../collections.zig");
 const schema = @import("../../schema.zig");
@@ -433,4 +435,56 @@ test "pg dumpload: a dangling cyclic reference rolls the whole load back at COMM
     try std.testing.expectEqual(@as(i64, 0), try countPg(al, &target, "alpha"));
     try std.testing.expectEqual(@as(i64, 0), try countPg(al, &target, "beta"));
     try std.testing.expectEqual(@as(i64, 0), try countPg(al, &target, "nodes"));
+}
+
+test "pg manifest dry run keeps dependency rows visible and rolls everything back" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const al = arena.allocator();
+
+    var target = (try openTargetOrSkip(a, io)) orelse return error.SkipZigTest;
+    defer target.close();
+    const schema_name = try enterTempSchema(al, &target);
+    const drop_schema = try std.fmt.allocPrintSentinel(al, "DROP SCHEMA IF EXISTS \"{s}\" CASCADE;", .{schema_name}, 0);
+    defer {
+        target.exec("SET search_path TO public;") catch {};
+        target.exec(drop_schema) catch {};
+    }
+    try migrations.run(&target);
+    var app = import.testApp(a, io);
+
+    const authors = try collections.create(a, io, &target, .{ .id = "", .name = "authors", .fields = &.{} });
+    defer authors.deinit(a);
+    const posts = try collections.create(a, io, &target, .{
+        .id = "",
+        .name = "posts",
+        .fields = &.{.{ .id = "", .name = "author", .options = .{ .relation = .{ .targetCollectionId = "authors", .maxSelect = 1 } } }},
+    });
+    defer posts.deinit(a);
+
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    try dir.dir.writeFile(io, .{ .sub_path = "authors.ndjson", .data = "{\"id\":\"author000001\"}\n" });
+    try dir.dir.writeFile(io, .{ .sub_path = "posts.ndjson", .data = "{\"id\":\"post00000001\",\"author\":\"author000001\"}\n" });
+    const base = try dir.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(base);
+
+    var manifest = try import_manifest.parseManifest(a,
+        \\{"zigbaseImportManifest":1,"collections":[
+        \\  {"collection":"posts","file":"posts.ndjson"},
+        \\  {"collection":"authors","file":"authors.ndjson"}
+        \\]}
+    );
+    defer manifest.deinit();
+    const report = try import_manifest.run(&app, &target, io, a, manifest, .{
+        .base_dir = base,
+        .import = .{ .collection = "", .dry_run = true, .batch_size = 1 },
+    });
+    defer a.free(report.entries);
+    try std.testing.expectEqual(@as(usize, 0), report.failed);
+    try std.testing.expect(!target.inTransaction());
+    try std.testing.expectEqual(@as(i64, 0), try countPg(al, &target, "authors"));
+    try std.testing.expectEqual(@as(i64, 0), try countPg(al, &target, "posts"));
 }

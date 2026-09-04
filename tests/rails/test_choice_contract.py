@@ -20,7 +20,12 @@ import sqlite3
 
 import pytest
 
-from .conftest import decisions_for, read_inventory, write_inventory
+from .conftest import (
+    add_external_auth_fixture,
+    decisions_for,
+    read_inventory,
+    write_inventory,
+)
 from tools.rails import rails2zb
 
 
@@ -104,9 +109,8 @@ def _mutate(source, code):
         ]
         write_inventory(source, "schema", schema)
     elif code == "TableHasNoTimestamps":
-        # `events` is referenced by nothing, so routing it to the second manifest does
-        # not create a relation crossing the boundary in both directions -- which is a
-        # different, correct refusal, and would mask this one.
+        # `events` is a simple fixture for checking the manifest-v2 entry policy without
+        # involving a relation cycle (covered separately by the importer regression).
         events = next(t for t in schema["tables"] if t["name"] == "events")
         events["columns"] = [
             c
@@ -189,6 +193,8 @@ def _mutate(source, code):
         auth = read_inventory(source, "auth")
         auth["devise"] = {"present": True, "pepper_configured": True, "models": []}
         write_inventory(source, "auth", auth)
+    elif code == "ExternalIdentitiesRequireMapping":
+        add_external_auth_fixture(source)
     else:
         return False
     return True
@@ -206,7 +212,7 @@ TARGETED = {
     "AssociationWithoutForeignKey": "test_relation_choice_emits_an_actual_relation",
     "TableNameRejected": "test_rename_choice_renames_the_collection_and_its_referrers",
     "ForeignKeyTargetsNonIdColumn": "test_target_key_omit_drops_the_untrustworthy_relation",
-    "TableHasNoTimestamps": "test_separate_import_routes_the_table_to_its_own_manifest",
+    "TableHasNoTimestamps": "test_separate_import_sets_an_entry_local_timestamp_policy",
     "SingleTableInheritance": "test_sti_omit_drops_the_table",
     "PolymorphicAssociation": "test_polymorphic_omit_drops_the_recorded_columns",
     "DependentBehaviorNotReproduced": "test_cascade_choice_sets_cascade_delete",
@@ -222,12 +228,15 @@ TARGETED = {
     "DevisePepperBreaksImport": "test_reset_passwords_suppresses_the_digest",
     "ColumnNameRejected": "test_a_rejected_column_name_can_be_renamed",
     "ReservedFieldName": "test_a_column_named_for_an_engine_field_must_be_decided",
-    "NullableTimestampColumn": "test_a_nullable_timestamp_routes_out_of_the_main_manifest",
+    "NullableTimestampColumn": "test_a_nullable_timestamp_disables_timestamp_preservation",
     "AuthCollectionRelation": "test_an_auth_relation_omit_drops_the_unimportable_field",
     "AttachmentNameCollision": "test_an_attachment_colliding_with_a_column_is_decidable",
     "CascadeContradictsRestrict": "test_a_database_cascade_cannot_silently_beat_a_restrict",
     "ForeignKeyInspectionUnsupported": (
         "test_untrusted_foreign_keys_omit_drops_every_derived_relation"
+    ),
+    "ExternalIdentitiesRequireMapping": (
+        "test_external_auth_mapping_emits_only_reviewed_provider_linkage"
     ),
 }
 
@@ -244,7 +253,11 @@ def _emit_digest(src, base, finding, choice, tmp_path):
         if entry["id"] == finding.id:
             entry["choice"] = choice
             entry["artifact"] = (
-                "people" if choice == "rename" else "docs/replacements/probe.md"
+                "people"
+                if choice == "rename"
+                else "users"
+                if choice == "external-auths"
+                else "docs/replacements/probe.md"
             )
     out = tmp_path / f"bundle-{choice}"
     try:
@@ -373,7 +386,6 @@ EXTERNAL_WITHOUT_A_SUBJECT = {
     "CheckConstraintNeedsReplacement",
     "CheckConstraintsUnreadable",
     "DeviseModuleBehaviorNotReproduced",
-    "ExternalIdentitiesCannotMigrate",
     "InventoryIsInferred",
 }
 
@@ -486,24 +498,19 @@ def test_target_key_omit_drops_the_untrustworthy_relation(mutable_source):
     assert "club" not in {f["name"] for f in posts.fields}
 
 
-def test_separate_import_routes_the_table_to_its_own_manifest(mutable_source, tmp_path):
+def test_separate_import_sets_an_entry_local_timestamp_policy(mutable_source, tmp_path):
     src, decisions, _ = _mapped(
         mutable_source, "TableHasNoTimestamps", "no_timestamps", "separate-import"
     )
     report = rails2zb.extract(src, decisions, tmp_path / "bundle")
-    assert report["separateManifest"] == "manifest-no-timestamps.json"
+    assert report["separateManifest"] is None
     main = json.loads((tmp_path / "bundle" / "manifest.json").read_text())
-    assert "events" not in {e["collection"] for e in main["collections"]}
-    second = json.loads(
-        (tmp_path / "bundle" / "manifest-no-timestamps.json").read_text()
+    event = next(
+        entry for entry in main["collections"] if entry["collection"] == "events"
     )
-    assert "events" in {e["collection"] for e in second["collections"]}
-    # `events` references `clubs`, which stays in the main manifest, so the boundary is
-    # crossed one way and the report has to say which manifest goes first.
-    assert report["manifestOrder"] == [
-        "manifest.json",
-        "manifest-no-timestamps.json",
-    ]
+    assert event["preserveTimestamps"] is False
+    assert not (tmp_path / "bundle" / "manifest-no-timestamps.json").exists()
+    assert report["manifestOrder"] == ["manifest.json"]
 
 
 def test_sti_omit_drops_the_table(mutable_source):

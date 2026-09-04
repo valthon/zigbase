@@ -17,6 +17,16 @@ const sse = @import("sse.zig");
 const request = @import("../request.zig");
 const tenancy = @import("../tenancy/tenancy.zig");
 const Ctx = @import("../ctx.zig").Ctx;
+const http = @import("../http.zig");
+
+pub const UpgradeRoute = struct { method: http.Method, pattern: []const u8, protocol: []const u8 };
+
+/// Upgrade-only routes bypass the ordinary dispatch table, but remain part of the
+/// engine-owned route contract used by collision checks and OpenAPI metadata.
+pub const upgrade_routes = [_]UpgradeRoute{
+    .{ .method = .GET, .pattern = "/api/realtime", .protocol = "websocket" },
+    .{ .method = .GET, .pattern = "/api/realtime/sse", .protocol = "sse" },
+};
 
 /// Set true by the server just before `zap.start`; gates `broadcast` so it is a no-op when the
 /// facil.io reactor isn't running (tests/CLI), avoiding "facil.io cluster inactive" noise + UB.
@@ -121,9 +131,11 @@ pub fn cookieValue(header: []const u8, name: []const u8) ?[]const u8 {
 pub fn handleUpgrade(r: zap.Request, target_protocol: []const u8) anyerror!void {
     const app = @import("../server.zig").active_app.?;
     const path = r.path orelse "";
-    const is_ws = std.mem.eql(u8, target_protocol, "websocket") and std.mem.eql(u8, path, "/api/realtime");
-    const is_sse = std.mem.eql(u8, target_protocol, "sse") and std.mem.eql(u8, path, "/api/realtime/sse");
-    if (!is_ws and !is_sse) {
+    const selected = for (upgrade_routes) |route| {
+        if (std.mem.eql(u8, target_protocol, route.protocol) and std.mem.eql(u8, path, route.pattern))
+            break route;
+    } else null;
+    if (selected == null) {
         r.setStatus(.not_found);
         r.markAsFinished(true);
         return;
@@ -139,7 +151,7 @@ pub fn handleUpgrade(r: zap.Request, target_protocol: []const u8) anyerror!void 
         r.markAsFinished(true);
         return;
     }
-    if (is_sse) {
+    if (std.mem.eql(u8, selected.?.protocol, "sse")) {
         sse.openStream(r, app); // owns releasing the slot on any failure inside
         return;
     }

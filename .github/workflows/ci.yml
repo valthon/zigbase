@@ -15,6 +15,11 @@ jobs:
       ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/.zig-local
     steps:
       - uses: actions/checkout@v7
+        with:
+          # The append-only ledger guards below compare against the merge base.
+          # A depth guess cannot reliably connect GitHub's synthetic PR merge
+          # commit after a force-push, so this job needs the actual history.
+          fetch-depth: 0
       - uses: jdx/mise-action@v4
       # Global cache holds toolchain-shared artifacts (compiler_rt, translate-c, libc).
       - name: Cache zig global cache
@@ -74,6 +79,12 @@ jobs:
         run: mise exec zig@0.16.0 -- zig build auth2-server -Dcpu=baseline
       - name: Build features-fixture (demo flags/experiments browser fixture)
         run: mise exec zig@0.16.0 -- zig build features-fixture -Dcpu=baseline
+      - name: Build configured feature-route fixtures
+        run: |
+          mise exec zig@0.16.0 -- zig build feature-remapped-fixture -Dcpu=baseline
+          mise exec zig@0.16.0 -- zig build feature-disabled-fixture -Dcpu=baseline
+      - name: Consumer route compile-fail contracts
+        run: mise exec zig@0.16.0 -- zig build check-route-contracts -Dcpu=baseline
       - name: Build import-fixture (offline-import e2e fixture, #283)
         run: mise exec zig@0.16.0 -- zig build import-fixture -Dcpu=baseline
       - name: Build lean gating fixture
@@ -93,34 +104,9 @@ jobs:
       - name: Allocator ownership contracts (ratchet)
         run: ./scripts/check-allocator-contracts.sh
       - name: Error-code ledger is append-only
-        # actions/checkout leaves a depth-1 clone: HEAD (the PR merge commit) has
-        # no reachable ancestry, so a bare fetch of the base ref alone leaves
-        # `git merge-base origin/main HEAD` with disjoint histories and the check
-        # dies before it can diff anything. Fetch main's full history AND deepen
-        # HEAD's own line far enough to reach the fork point. The doctor-ledger
-        # step below reuses the deepened clone this one already produced.
-        run: |
-          git fetch --no-tags origin main
-          git fetch --no-tags --deepen=200 origin
-          ./scripts/check-error-code-ledger.sh origin/main
+        run: ./scripts/check-error-code-ledger.sh origin/main
       - name: Doctor check-id ledger is append-only
-        # actions/checkout leaves a depth-1 clone: HEAD (the PR merge commit) has
-        # no reachable ancestry, so a bare fetch of the base ref alone leaves
-        # `git merge-base origin/main HEAD` with disjoint histories and the check
-        # dies before it can diff anything. Fetch main's full history AND deepen
-        # HEAD's own line far enough to reach the fork point.
-        #
-        # Deliberately repeats the fetch that a neighbouring ledger step also
-        # performs, rather than relying on that step having run first: on an
-        # already-deepened clone the repeat costs about a second, whereas the
-        # deduplicated form would make THIS guard's correctness depend on another
-        # step's presence and ordering — a silent breakage nobody would predict
-        # when editing that other step. This check exists precisely to not be
-        # silently defeated (it already died once, invisibly, in a shallow clone).
-        run: |
-          git fetch --no-tags origin main
-          git fetch --no-tags --deepen=200 origin
-          ./scripts/check-doctor-ledger.sh origin/main
+        run: ./scripts/check-doctor-ledger.sh origin/main
       - name: Changelog fragments are valid
         run: ./scripts/assemble-changelog.sh --dry-run >/dev/null
       - name: Dating client snapshot is fresh
@@ -184,6 +170,8 @@ jobs:
             zig-out/bin/dating-server
             zig-out/bin/auth2-server
             zig-out/bin/features-fixture
+            zig-out/bin/feature-remapped-fixture
+            zig-out/bin/feature-disabled-fixture
             zig-out/bin/import-fixture
             zig-out/bin/full-fixture
             examples/blog/zig-out/bin/blog
@@ -200,6 +188,8 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: jdx/mise-action@v4
+        with:
+          install_args: zig@0.16.0
       - name: Cache zig global cache
         uses: actions/cache@v5
         with:
@@ -255,6 +245,7 @@ jobs:
       # SSLRequest and transparently falls back to plaintext. SCRAM is still exercised here;
       # TLS-handshake + verification coverage runs in the postgres-tls job.
       ZIGBASE_PG_TEST_URL: postgres://zbpg:zbpg_secret_pw@127.0.0.1:5432/zbpgtest?sslmode=prefer
+      ZIGBASE_RAILS_PG_TEST_URL: postgres://zbpg:zbpg_secret_pw@127.0.0.1:5432/zbpgtest?sslmode=prefer
       # No server TLS in this job: gates the live test asserting the DEFAULT (verify-full)
       # refuses a plaintext-only server with the actionable "server refused TLS" error.
       ZIGBASE_PG_PLAINTEXT: "1"
@@ -280,6 +271,8 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: jdx/mise-action@v4
+        with:
+          install_args: zig@0.16.0 python@3.13
       - name: Cache zig global cache
         uses: actions/cache@v5
         with:
@@ -299,6 +292,10 @@ jobs:
       # above makes `CREATE EXTENSION vector` succeed for the superuser test role.
       - name: Unit + PostgreSQL driver tests (-Dpostgres=true -Dvector=true)
         run: mise exec zig@0.16.0 -- zig build test --summary all -Dpostgres=true -Dvector=true
+      - name: Rails PostgreSQL row-source integration
+        run: |
+          mise exec python@3.13 -- python -m pip install --quiet pytest -r tools/rails/requirements-postgres.txt
+          mise exec python@3.13 -- python -m pytest tests/rails/test_postgres_source.py -q
 
   # PostgreSQL with server TLS, so the suite runs over a REAL sslmode=require connection —
   # exercising the TLS handshake, the dual-layer flushOut, and TLS partial-read framing (the
@@ -315,6 +312,8 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: jdx/mise-action@v4
+        with:
+          install_args: zig@0.16.0
       - name: Cache zig global cache
         uses: actions/cache@v5
         with:
@@ -380,6 +379,8 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: jdx/mise-action@v4
+        with:
+          install_args: zig@0.16.0 python@3.13
       - name: Cache zig global cache
         uses: actions/cache@v5
         with:
@@ -426,6 +427,8 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: jdx/mise-action@v4
+        with:
+          install_args: node@24 python@3.13
       - name: Download prebuilt binaries
         uses: actions/download-artifact@v8
         with:
@@ -443,6 +446,9 @@ jobs:
           echo "ZIGBASE_TEST_PLUGINS_BINARY=$GITHUB_WORKSPACE/artifacts/examples/plugins/zig-out/bin/plugins" >> "$GITHUB_ENV"
           chmod +x artifacts/zig-out/bin/features-fixture
           echo "ZIGBASE_FEATURES_BINARY=$GITHUB_WORKSPACE/artifacts/zig-out/bin/features-fixture" >> "$GITHUB_ENV"
+          chmod +x artifacts/zig-out/bin/feature-remapped-fixture artifacts/zig-out/bin/feature-disabled-fixture
+          echo "ZIGBASE_TEST_FEATURE_REMAPPED_BINARY=$GITHUB_WORKSPACE/artifacts/zig-out/bin/feature-remapped-fixture" >> "$GITHUB_ENV"
+          echo "ZIGBASE_TEST_FEATURE_DISABLED_BINARY=$GITHUB_WORKSPACE/artifacts/zig-out/bin/feature-disabled-fixture" >> "$GITHUB_ENV"
           chmod +x artifacts/zig-out/bin/import-fixture
           echo "ZIGBASE_TEST_IMPORT_BINARY=$GITHUB_WORKSPACE/artifacts/zig-out/bin/import-fixture" >> "$GITHUB_ENV"
           chmod +x artifacts/zig-out/bin/full-fixture
@@ -492,6 +498,8 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: jdx/mise-action@v4
+        with:
+          install_args: node@24
       - name: Download prebuilt binaries
         uses: actions/download-artifact@v8
         with:
@@ -553,27 +561,24 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-node@v6
+      - uses: jdx/mise-action@v4
         with:
-          node-version: 24
-      - uses: actions/setup-python@v6
-        with:
-          python-version: '3.13'
+          install_args: node@24 python@3.13
       - name: Build and verify public site
         working-directory: site
         run: |
-          npm run build
-          npm run doctor
-          npm run test:static
-          npm run test:generated
+          mise exec node@24 -- npm run build
+          mise exec node@24 -- npm run doctor
+          mise exec node@24 -- npm run test:static
+          mise exec node@24 -- npm run test:generated
       - name: Install browser test dependencies
         working-directory: site
         run: |
-          python -m pip install --quiet playwright
-          python -m playwright install --with-deps chromium
+          mise exec python@3.13 -- python -m pip install --quiet playwright
+          mise exec python@3.13 -- python -m playwright install --with-deps chromium
       - name: Browser smoke and accessibility tests
         working-directory: site
-        run: npm run test:browser
+        run: mise exec node@24 -- npm run test:browser
 
   agent-evals:
     runs-on: ubuntu-latest
@@ -582,9 +587,9 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-python@v6
+      - uses: jdx/mise-action@v4
         with:
-          python-version: '3.13'
+          install_args: python@3.13 ruby@2.7.8
       - name: Download prebuilt ZigBase binary
         uses: actions/download-artifact@v8
         with:
@@ -596,18 +601,26 @@ jobs:
           echo "ZIGBASE_TEST_BINARY=$GITHUB_WORKSPACE/artifacts/zig-out/bin/zigbase" >> "$GITHUB_ENV"
           echo "ZIGBASE_EVAL_BINARY=$GITHUB_WORKSPACE/artifacts/zig-out/bin/zigbase" >> "$GITHUB_ENV"
       - name: Install deterministic test dependencies
-        run: python -m pip install --quiet pytest ruff==0.15.21
+        run: mise exec python@3.13 -- python -m pip install --quiet pytest ruff==0.15.21
       - name: Pull pinned Genesis deployment image
         run: docker pull ghcr.io/valthon/zigbase:0.13.0
       - name: Python lint for migration and evaluation tooling
-        run: python -m ruff check tools/pocketbase tools/rails evals/agents tests/pocketbase tests/rails tests/agent_evals
+        # The pinned Zigapagos browser journey is eval input rather than repository-authored
+        # Python, and the live grader executes it against Chromium.
+        run: >-
+          mise exec python@3.13 -- python -m ruff check
+          --extend-exclude evals/agents/scenarios/rails-fullstack/fixture/source/presentation-target/test/journey_playwright.py
+          tools/pocketbase tools/rails tools/replay evals/agents tests/pocketbase tests/rails
+          tests/rails_fullstack tests/tools tests/agent_evals
+      - name: Rails exporter supports legacy Ruby
+        run: mise exec ruby@2.7.8 -- ruby -c tools/rails/export_source.rb
       - name: Converter, skill drift, runner, graders, and live Docker boundary
         env:
           ZIGBASE_DOCKER_EVAL_TEST: "1"
         run: |
-          python tools/sync_skill_references.py --check
-          python -m pytest tests/pocketbase tests/rails tests/agent_evals -q
-          python -m pytest --noconftest tests/admin/test_skill_sync.py -q
+          mise exec python@3.13 -- python tools/sync_skill_references.py --check
+          mise exec python@3.13 -- python -m pytest tests/pocketbase tests/rails tests/rails_fullstack tests/agent_evals -q
+          mise exec python@3.13 -- python -m pytest --noconftest tests/admin/test_skill_sync.py -q
 
   dart-sdk:
     runs-on: ubuntu-latest
@@ -615,6 +628,8 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: jdx/mise-action@v4
+        with:
+          install_args: dart@3.12
       - name: Download prebuilt binaries
         uses: actions/download-artifact@v8
         with:
@@ -653,6 +668,8 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: jdx/mise-action@v4
+        with:
+          install_args: python@3.13
       - name: Download prebuilt binaries
         uses: actions/download-artifact@v8
         with:
@@ -695,6 +712,8 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: jdx/mise-action@v4
+        with:
+          install_args: java@openjdk-17 gradle@9.6
       - name: Download prebuilt binaries
         uses: actions/download-artifact@v8
         with:

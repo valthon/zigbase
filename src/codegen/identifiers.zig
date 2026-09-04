@@ -79,10 +79,8 @@ pub fn metaConst(alloc: std.mem.Allocator, c: []const u8) ![]const u8 {
 }
 
 /// Derive a camelCase RPC method name from a route path: strip the api-prefix, drop
-/// `:param` segments, and camel-join the remaining segments. First segment camelCased
-/// (leading char lowercase, separators stripped with following char uppercased);
-/// subsequent segments PascalCased: "/api/bookings/:id/confirm" -> "bookingsConfirm",
-/// "/api/user-profile/list-items" -> "userProfileListItems".
+/// `:param` segments, and camel-join the remaining literal URI bytes into an identifier.
+/// URI punctuation is a word separator and a leading digit receives an `_` prefix.
 ///
 /// NOTE: this function is NOT on the code-generation path — the generator consumes
 /// `events.RouteMeta.name` (populated at comptime by `events.comptimeRouteName`).
@@ -91,37 +89,32 @@ pub fn metaConst(alloc: std.mem.Allocator, c: []const u8) ![]const u8 {
 /// `comptimeRouteName` against. Do not delete it.
 pub fn routeMethodName(alloc: std.mem.Allocator, path: []const u8, api_prefix: []const u8) ![]const u8 {
     var rest = path;
-    if (std.mem.startsWith(u8, rest, api_prefix)) rest = rest[api_prefix.len..];
+    if (std.mem.eql(u8, rest, api_prefix)) {
+        rest = "";
+    } else if (std.mem.startsWith(u8, rest, api_prefix) and
+        rest.len > api_prefix.len and rest[api_prefix.len] == '/')
+    {
+        rest = rest[api_prefix.len..];
+    }
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(alloc); // free the buffer if an append OOMs mid-build
-    var first = true;
     var it = std.mem.tokenizeScalar(u8, rest, '/');
     while (it.next()) |seg| {
         if (seg.len == 0 or seg[0] == ':') continue; // skip path params
-        if (first) {
-            // first segment: camelCase (leading char lowercase, strip separators).
-            var seg_first = true;
-            var upper_next = false;
-            for (seg) |ch| {
-                if (ch == '_' or ch == '-') {
-                    upper_next = true;
-                    continue;
-                }
-                if (upper_next) {
-                    try out.append(alloc, std.ascii.toUpper(ch));
-                    upper_next = false;
-                } else if (seg_first) {
-                    try out.append(alloc, std.ascii.toLower(ch));
-                } else {
-                    try out.append(alloc, ch);
-                }
-                seg_first = false;
+        var upper_next = out.items.len > 0;
+        for (seg) |ch| {
+            if (!std.ascii.isAlphanumeric(ch)) {
+                upper_next = true;
+                continue;
             }
-            first = false;
-        } else {
-            const p = try pascal(alloc, seg);
-            defer alloc.free(p);
-            try out.appendSlice(alloc, p);
+            if (out.items.len == 0 and std.ascii.isDigit(ch)) try out.append(alloc, '_');
+            try out.append(alloc, if (out.items.len == 0)
+                std.ascii.toLower(ch)
+            else if (upper_next)
+                std.ascii.toUpper(ch)
+            else
+                ch);
+            upper_next = false;
         }
     }
     return out.toOwnedSlice(alloc);
@@ -213,6 +206,9 @@ test "routeMethodName camel-joins non-param segments" {
         .{ .path = "/api/listings/:id/availability", .want = "listingsAvailability" },
         .{ .path = "/api/golfsim/health", .want = "golfsimHealth" },
         .{ .path = "/api/ping", .want = "ping" },
+        .{ .path = "/robots.txt", .want = "robotsTxt" },
+        .{ .path = "/api/2fa/verify", .want = "_2faVerify" },
+        .{ .path = "/apian/status", .want = "apianStatus" },
     };
     inline for (cases) |c| {
         const got = try routeMethodName(a, c.path, "/api");
@@ -231,6 +227,9 @@ test "routeMethodName matches the framework's comptimeRouteName" {
         "/api/ping",
         "/api/user-profile/list-items", // separator case: both must strip '-'
         "/api/Bookings/confirm", // uppercase-initial first segment: both must lowercase first char
+        "/robots.txt",
+        "/api/2fa/verify",
+        "/apian/status", // `/api` is stripped only on a segment boundary
         "/health",
     };
     inline for (cases) |path| {

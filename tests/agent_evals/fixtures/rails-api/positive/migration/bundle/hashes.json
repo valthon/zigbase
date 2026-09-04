@@ -46,14 +46,14 @@
       "sha256": "9174f6e95fca466f5e81d98034aea2d78a1562474d1fd0714fc84a737d6187ee"
     },
     {
-      "bytes": 624,
+      "bytes": 862,
       "path": "manifest.json",
-      "sha256": "5ce9f8d6c06d9a20765c9baaa438a72a1c0c6cd79cb6c4dffb9bc11f086489e8"
+      "sha256": "df11a0972ed331b64d4a25666e95c4ffd6e355d565f32723b2294dc83174cfb5"
     },
     {
-      "bytes": 1547,
+      "bytes": 1660,
       "path": "report.json",
-      "sha256": "8f7d9ebfd0549016c0c70d81ef8cc071348b52c2bf6c6d8541a3853f57bc81e3"
+      "sha256": "d355f503aff102ddd9225a02d5724612d8e8c645d0c5d5107c1372868a588816"
     },
     {
       "bytes": 12801,

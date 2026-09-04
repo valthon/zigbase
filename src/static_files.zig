@@ -222,7 +222,11 @@ fn serveEmbedded(ctx: *http.RequestCtx, files: []const StaticFile, rel: []const 
         nosniff,
         .{ .name = "Cache-Control", .value = cache_control },
     });
-    if (p.status == 304) return notModified(content_type, try hs.toOwnedSlice(ctx.allocator.a));
+    if (p.status == 304) {
+        const representation_length = try std.fmt.allocPrint(ctx.allocator.a, "{d}", .{hit.bytes.len});
+        try hs.append(ctx.allocator.a, .{ .name = "content-length", .value = representation_length });
+        return notModified(content_type, try hs.toOwnedSlice(ctx.allocator.a));
+    }
     try hs.append(ctx.allocator.a, .{ .name = "Accept-Ranges", .value = "bytes" });
     if (p.content_range) |cr| try hs.append(ctx.allocator.a, .{ .name = "Content-Range", .value = cr });
     if (p.status == 416) return .{ .status = 416, .body = "", .content_type = content_type, .extra_headers = try hs.toOwnedSlice(ctx.allocator.a) };
@@ -630,7 +634,13 @@ fn serveShellOwned(io: std.Io, ctx: *http.RequestCtx, root: []const u8, shell_re
         nosniff,
         .{ .name = "Cache-Control", .value = "no-cache" },
     });
-    if (serve_file.etagMatches(ctx.if_none_match, etag)) return notModified("text/html; charset=utf-8", hs);
+    if (serve_file.etagMatches(ctx.if_none_match, etag)) {
+        const representation_length = try std.fmt.allocPrint(ctx.allocator.a, "{d}", .{st.size});
+        const conditional_headers = try ctx.allocator.a.alloc(http.Header, hs.len + 1);
+        @memcpy(conditional_headers[0..hs.len], hs);
+        conditional_headers[hs.len] = .{ .name = "content-length", .value = representation_length };
+        return notModified("text/html; charset=utf-8", conditional_headers);
+    }
     const bytes = std.Io.Dir.cwd().readFileAlloc(io, full, ctx.allocator.a, .limited(16 << 20)) catch return null;
     return .{ .status = 200, .body = bytes, .content_type = "text/html; charset=utf-8", .extra_headers = hs };
 }

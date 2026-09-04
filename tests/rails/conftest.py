@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import re
 import shutil
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -81,6 +82,136 @@ def write_inventory(source: Path, name: str, value: dict) -> None:
     )
 
 
+def add_external_auth_fixture(source: Path) -> None:
+    """Add a conventional OmniAuth identities table to a mutable fixture."""
+    schema = read_inventory(source, "schema")
+    schema["tables"].append(
+        {
+            "name": "identities",
+            "source": "observed",
+            "primary_key": "id",
+            "columns": [
+                {
+                    "name": name,
+                    "source": "observed",
+                    "sql_type": sql_type,
+                    "type": column_type,
+                    "null": nullable,
+                    "default": None,
+                    "default_function": None,
+                }
+                for name, sql_type, column_type, nullable in (
+                    ("id", "integer", "integer", False),
+                    ("user_id", "integer", "integer", False),
+                    ("provider", "varchar", "string", False),
+                    ("uid", "varchar", "string", False),
+                    ("token", "varchar", "string", True),
+                    ("raw_data", "text", "text", True),
+                    ("created_at", "datetime", "datetime", False),
+                    ("updated_at", "datetime", "datetime", False),
+                )
+            ],
+            "foreign_keys": [
+                {
+                    "source": "observed",
+                    "name": "fk_identities_users",
+                    "column": "user_id",
+                    "to_table": "users",
+                    "primary_key": "id",
+                    "on_delete": None,
+                    "on_update": None,
+                }
+            ],
+            "indexes": [
+                {
+                    "source": "observed",
+                    "name": "index_identities_on_provider_and_uid",
+                    "columns": ["provider", "uid"],
+                    "unique": True,
+                    "where": None,
+                }
+            ],
+            "check_constraints": [],
+        }
+    )
+    write_inventory(source, "schema", schema)
+    models = read_inventory(source, "models")
+    models["models"].append(
+        {
+            "name": "Identity",
+            "table_name": "identities",
+            "source": "observed",
+            "abstract": False,
+            "primary_key": "id",
+            "record_timestamps": True,
+            "associations": [
+                {
+                    "name": "user",
+                    "macro": "belongs_to",
+                    "foreign_key": "user_id",
+                    "table_name": "users",
+                    "polymorphic": False,
+                    "source": "observed",
+                }
+            ],
+            "attachments": [],
+            "default_scope": {"count": 0, "present": False, "source": "observed"},
+            "encrypted_attributes": [],
+            "enums": {},
+            "rich_texts": [],
+            "serialized_attributes": [],
+            "validators": [],
+            "sti": {
+                "base_class": "Identity",
+                "enabled": False,
+                "inheritance_column": "type",
+                "is_base_class": True,
+                "subclasses": [],
+            },
+        }
+    )
+    write_inventory(source, "models", models)
+    auth = read_inventory(source, "auth")
+    auth["omniauth"] = {"present": True, "providers": ["github", "google"]}
+    write_inventory(source, "auth", auth)
+    counts = read_inventory(source, "counts")
+    counts["count"] += 1
+    counts["tables"].append(
+        {
+            "table": "identities",
+            "model": "Identity",
+            "unscoped_count": 2,
+            "scoped_count": 2,
+            "hidden_by_default_scope": 0,
+            "source": "observed",
+        }
+    )
+    write_inventory(source, "counts", counts)
+    database = next((source / "db").glob("*.sqlite3"))
+    connection = sqlite3.connect(database)
+    connection.executescript(
+        """
+        CREATE TABLE identities (
+          id integer PRIMARY KEY,
+          user_id integer NOT NULL,
+          provider varchar NOT NULL,
+          uid varchar NOT NULL,
+          token varchar,
+          raw_data text,
+          created_at datetime NOT NULL,
+          updated_at datetime NOT NULL
+        );
+        INSERT INTO identities VALUES
+          (1, 1, 'google', 'google-ada', 'secret-token', '{"secret":true}',
+           '2024-01-15 09:00:00', '2024-01-15 09:00:00'),
+          (2, 1, 'github', 'github-ada', 'other-token', '{"secret":true}',
+           '2024-01-15 09:00:00', '2024-01-15 09:00:00');
+        """
+    )
+    connection.commit()
+    connection.close()
+
+
 def materialize_artifacts(value: dict, root: Path) -> dict:
     """Create every artifact a decision set names, under `root`.
 
@@ -139,6 +270,8 @@ def decisions_for(findings: list[dict], **overrides: str) -> dict:
             # input. Deriving it from the subject keeps two renames from colliding.
             subject = _core.split_id(finding["id"])[-2]
             entry["artifact"] = "renamed_" + re.sub(r"[^A-Za-z0-9_]", "_", subject)
+        elif choice == "external-auths":
+            entry["artifact"] = "users"
         elif needs_artifact:
             entry["artifact"] = f"docs/replacements/{finding['id']}.md"
         entries.append(entry)
