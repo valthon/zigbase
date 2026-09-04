@@ -12,6 +12,7 @@ import argparse
 import json
 import os
 import shutil
+import stat
 import sys
 import tempfile
 import time
@@ -49,6 +50,30 @@ MAX_PROMPT_BYTES = 256 * 1024
 
 class HarnessError(RuntimeError):
     """The runner could not safely execute or grade the scenario."""
+
+
+def _atomic_result_copy(path: Path, rendered: str) -> None:
+    payload = (rendered + "\n").encode("utf-8")
+    path = path.absolute()
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        os.fchmod(descriptor, 0o600)
+        view = memoryview(payload)
+        while view:
+            written = os.write(descriptor, view)
+            view = view[written:]
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = -1
+        os.replace(temporary, path)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        temporary.unlink(missing_ok=True)
 
 
 def parse_agent_command(raw: str | None, maximum_bytes: int) -> list[str]:
@@ -119,6 +144,24 @@ def copy_fixture(fixture: Path, workspace: Path) -> None:
     shutil.copytree(fixture, workspace, dirs_exist_ok=True)
 
 
+def copy_repository_files(names: Sequence[str], workspace: Path) -> None:
+    for name in names:
+        source = REPO / name
+        if (
+            source.is_symlink()
+            or not source.is_file()
+            or REPO not in source.resolve().parents
+        ):
+            raise HarnessError(f"scenario repository file is missing or unsafe: {name}")
+        destination = workspace / name
+        if destination.exists() or destination.is_symlink():
+            raise HarnessError(
+                f"scenario repository file collides with fixture: {name}"
+            )
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, destination)
+
+
 def install_skills(names: Sequence[str], workspace: Path) -> None:
     destination_root = workspace / ".agents" / "skills"
     for name in names:
@@ -157,6 +200,34 @@ def cleanup_workspace(workspace: Path) -> None:
         pass
 
 
+def directory_identity(path: Path) -> tuple[int, int]:
+    metadata = os.lstat(path)
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise HarnessError(f"runner directory was replaced: {path}")
+    return metadata.st_dev, metadata.st_ino
+
+
+def require_directory_identity(path: Path, expected: tuple[int, int]) -> None:
+    if directory_identity(path) != expected:
+        raise HarnessError(f"runner directory was replaced: {path}")
+
+
+def reset_grader_scratch(workspace: Path) -> None:
+    """Discard agent-controlled HOME/TMPDIR contents before grader commands run."""
+    for name in (".home", ".tmp"):
+        path = workspace / name
+        try:
+            metadata = os.lstat(path)
+        except FileNotFoundError:
+            pass
+        else:
+            if stat.S_ISDIR(metadata.st_mode):
+                shutil.rmtree(path)
+            else:
+                path.unlink()
+        path.mkdir(mode=0o700)
+
+
 def execute(
     *,
     scenario: AgentScenario,
@@ -177,11 +248,14 @@ def execute(
     )
     artifacts = artifacts_root.resolve() / run_id
     artifacts.mkdir(parents=True, exist_ok=False)
+    artifacts.chmod(0o700)
     workspace = Path(
         tempfile.mkdtemp(prefix="zigbase-agent-eval-", dir=work_root)
     ).resolve()
     (workspace / ".home").mkdir()
     (workspace / ".tmp").mkdir()
+    artifacts_identity = directory_identity(artifacts)
+    workspace_identity = directory_identity(workspace)
     process_exit = -1
     timed_out = False
 
@@ -193,6 +267,7 @@ def execute(
             raise HarnessError("scenario prompt exceeds the runner byte limit")
         if scenario.fixture is not None:
             copy_fixture((scenario_root / scenario.fixture).resolve(), workspace)
+        copy_repository_files(scenario.repository_files, workspace)
         install_skills(scenario.skills, workspace)
         env = child_environment(workspace, passed_env)
         env["ZIGBASE_EVAL_COMMIT"] = evaluation_commit
@@ -206,9 +281,12 @@ def execute(
             timeout_seconds=scenario.timeout_seconds,
             term_grace_seconds=scenario.term_grace_seconds,
             max_output_bytes=scenario.max_output_bytes,
+            read_output=False,
         )
         process_exit = completed.exit_code
         timed_out = completed.timed_out
+        require_directory_identity(workspace, workspace_identity)
+        require_directory_identity(artifacts, artifacts_identity)
         failures: tuple[EvalFailure, ...] = ()
         if completed.interrupted:
             failures = (
@@ -235,6 +313,7 @@ def execute(
             report = GradeReport(False, False, False, False, failures)
             exit_code = 1
         else:
+            reset_grader_scratch(workspace)
             report = grader(scenario.graders, workspace, artifacts)
             exit_code = (
                 0
@@ -352,8 +431,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.out is not None:
         try:
             output = resolve_output_path(args.out, args.artifacts_dir)
-            output.parent.mkdir(parents=True, exist_ok=True)
-            output.write_text(rendered + "\n")
+            _atomic_result_copy(output, rendered)
         except (ResultError, OSError) as exc:
             # Stdout remains authoritative when the optional copy cannot be
             # written; never emit a second object or a transcript.

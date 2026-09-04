@@ -3,6 +3,11 @@
   "name": "rails-api",
   "prompt": "prompt.md",
   "fixture": "fixture",
+  "repository_files": [
+    "tools/rails/__init__.py",
+    "tools/rails/_core.py",
+    "tools/rails/rails2zb.py"
+  ],
   "skills": ["zigbase-migrate-rails-api"],
   "graders": ["rails-api"],
   "timeout_seconds": 2700,

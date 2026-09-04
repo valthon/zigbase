@@ -250,6 +250,16 @@
     }
   },
   {
+    "canonical": "docs/migrate-rails-fullstack.md",
+    "mirror": "migrate-rails-fullstack.md",
+    "frontmatter": {
+      "title": "Migrate a complete Rails application",
+      "description": "Coordinate Rails backend and Zigapagos presentation migration through versioned handoffs, a reconciled route map, backend and browser parity, and rehearsed cutover.",
+      "order": 16,
+      "group": "guides"
+    }
+  },
+  {
     "canonical": "docs/migrate-pocketbase.md",
     "mirror": "migrate-pocketbase.md",
     "frontmatter": {

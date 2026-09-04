@@ -29,10 +29,14 @@ require "digest"
 # -----------------------------------------------------------------------------
 
 module RailsExportSource
+  # 1.3.0: inspect PostgreSQL triggers/views, recover configured OmniAuth provider
+  # names from the Rails middleware stack, and distinguish gem-owned jobs by source.
+  # 1.2.0: record PostgreSQL array columns explicitly for safe row extraction.
+  # 1.1.1: ignore Rails-generated HABTM join classes and retain Ruby 2.7 syntax.
   # 1.1.0: wide model walk (ActiveRecord::Base, not ApplicationRecord), Action
   # Text inventory, foreign-key inspection failures reported as unknown, storage
   # locality made explicit.
-  VERSION = "1.1.0"
+  VERSION = "1.3.0"
   OBSERVED = "observed".freeze
 
   # Credential-ish keys whose VALUES are replaced with "[REDACTED]".
@@ -211,6 +215,14 @@ module RailsExportSource
     INTERNAL_MODEL_NAMESPACES.any? { |ns| name == ns || name.start_with?("#{ns}::") }
   end
 
+  # Active Record creates one implementation class named `HABTM_<Association>`
+  # behind every has_and_belongs_to_many reflection. These are framework plumbing,
+  # not application models; several owners may legitimately generate the same name.
+  # Their join behavior is already represented by the owners' reflections.
+  def generated_habtm_model?(klass)
+    klass.name.to_s.start_with?("HABTM_")
+  end
+
   # Walk from `ActiveRecord::Base`, NOT from `ApplicationRecord`. A model written
   # as `class Legacy < ActiveRecord::Base` -- still supported, and what every
   # pre-5.0 application is full of -- is invisible to the ApplicationRecord walk.
@@ -226,7 +238,7 @@ module RailsExportSource
   # The application's own models: every concrete Active Record class Rails itself
   # does not own.
   def application_models
-    active_record_models.reject { |k| internal_model?(k) }
+    active_record_models.reject { |k| internal_model?(k) || generated_habtm_model?(k) }
   end
 
   # Framework-owned models, recorded separately so that their absence from
@@ -301,14 +313,27 @@ module RailsExportSource
     }.sort_by { |h| h["name"] }
   end
 
-  def safe_class_name(r) = (r.class_name rescue nil)
-  def safe_table_name(r) = (r.klass.table_name rescue nil)
+  def safe_class_name(r)
+    r.class_name
+  rescue StandardError
+    nil
+  end
+
+  def safe_table_name(r)
+    r.klass.table_name
+  rescue StandardError
+    nil
+  end
   # NOT `.to_s`: a Rails 7.1 composite key is an Array, and `Array#to_s` is `inspect`,
   # which yields the literal `["a_id", "b_id"]` -- a string that is the name of nothing.
   # The converter cannot tell that from a real column name, so it looked the column up,
   # failed to find it, and skipped the association without a word. Emitted faithfully,
   # the shape is visible and the converter refuses it by name.
-  def safe_foreign_key(r) = (composite_or_name(r.foreign_key) rescue nil)
+  def safe_foreign_key(r)
+    composite_or_name(r.foreign_key)
+  rescue StandardError
+    nil
+  end
 
   # A single key stays a string, as every consumer expects; a composite stays a list.
   def composite_or_name(value)
@@ -480,6 +505,8 @@ module RailsExportSource
     connection = ActiveRecord::Base.connection
 
     tables = connection.tables.sort.map { |table| table_entry(connection, table) }
+    triggers = catalog_rows(connection, "trigger")
+    views = catalog_rows(connection, "view")
 
     {
       "source" => OBSERVED,
@@ -490,19 +517,20 @@ module RailsExportSource
       # An empty array from an adapter we cannot interrogate is a LIE stamped `observed`:
       # a Postgres source with twenty triggers would report none. Say whether the catalog
       # was actually readable, so the converter can refuse rather than believe silence.
-      "catalog_supported" => catalog_supported?(connection),
+      "catalog_supported" => (catalog_supported?(connection) && !triggers.nil? && !views.nil?),
       # Distinguishes "this adapter has no foreign key concept at all" from "this
       # one table's inspection failed" -- both surface as a null `foreign_keys`.
       "foreign_keys_supported" => foreign_keys_supported?(connection),
-      "triggers" => sqlite_master_rows(connection, "trigger"),
-      "views" => sqlite_master_rows(connection, "view")
+      "triggers" => triggers || [],
+      "views" => views || []
     }
   end
 
-  # Trigger/view inspection is implemented for SQLite only. Anything else must be
-  # reported as UNKNOWN, never as absent.
+  # Trigger/view inspection is explicit per adapter. Anything else must be reported as
+  # UNKNOWN, never as absent.
   def catalog_supported?(connection)
-    connection.adapter_name.to_s.downcase.include?("sqlite")
+    adapter = connection.adapter_name.to_s.downcase
+    adapter.include?("sqlite") || adapter.include?("postgres")
   end
 
   # `schema.rb` cannot express a check constraint, so the guide tells readers not to
@@ -566,6 +594,7 @@ module RailsExportSource
           "name" => c.name,
           "sql_type" => c.sql_type,
           "type" => c.type.to_s,
+          "array" => (c.respond_to?(:array) ? !!c.array : false),
           "null" => !!c.null,
           "default" => jsonify(c.default),
           "default_function" => c.default_function
@@ -602,6 +631,51 @@ module RailsExportSource
         "sql" => row["sql"]
       }
     }
+  end
+
+  def postgres_catalog_rows(connection, type)
+    return [] unless connection.adapter_name.to_s.downcase.include?("postgres")
+
+    if type == "trigger"
+      sql = <<~SQL
+        SELECT t.tgname AS name, c.relname AS table_name,
+               pg_get_triggerdef(t.oid, true) AS definition
+          FROM pg_trigger t
+          JOIN pg_class c ON c.oid = t.tgrelid
+          JOIN pg_namespace n ON n.oid = c.relnamespace
+         WHERE NOT t.tgisinternal
+           AND n.nspname = ANY (current_schemas(false))
+         ORDER BY n.nspname, c.relname, t.tgname
+      SQL
+    else
+      sql = <<~SQL
+        SELECT c.relname AS name, c.relname AS table_name,
+               pg_get_viewdef(c.oid, true) AS definition
+          FROM pg_class c
+          JOIN pg_namespace n ON n.oid = c.relnamespace
+         WHERE c.relkind IN ('v', 'm')
+           AND n.nspname = ANY (current_schemas(false))
+         ORDER BY n.nspname, c.relname
+      SQL
+    end
+    connection.select_all(sql).to_a.map { |row|
+      {
+        "source" => OBSERVED,
+        "type" => type,
+        "name" => row["name"],
+        "table" => row["table_name"],
+        "sql" => row["definition"]
+      }
+    }
+  rescue StandardError
+    nil
+  end
+
+  def catalog_rows(connection, type)
+    adapter = connection.adapter_name.to_s.downcase
+    return sqlite_master_rows(connection, type) if adapter.include?("sqlite")
+    return postgres_catalog_rows(connection, type) if adapter.include?("postgres")
+    []
   end
 
   # ---------------------------------------------------------------------------
@@ -755,6 +829,17 @@ module RailsExportSource
     name = klass.name.to_s
     return false if name.empty?
     return false if name == "ApplicationJob"
+
+    location = begin
+      klass.instance_method(:perform).source_location&.first
+    rescue StandardError
+      nil
+    end
+    unless location.nil? || location.empty?
+      app_root = File.join(Rails.root.to_s, "app") + File::SEPARATOR
+      return File.expand_path(location).start_with?(app_root)
+    end
+
     INTERNAL_JOB_NAMESPACES.none? { |ns| name == ns || name.start_with?("#{ns}::") }
   end
 
@@ -922,17 +1007,41 @@ module RailsExportSource
     return { "present" => false } unless defined?(::OmniAuth)
 
     providers = begin
-      # Provider *names* only. Client ids and secrets are never read.
-      ::OmniAuth::Builder.providers.map(&:to_s).sort
+      omniauth_middleware_providers
     rescue StandardError
-      begin
-        ::Devise.omniauth_configs.keys.map(&:to_s).sort
-      rescue StandardError
-        []
-      end
+      []
+    end
+
+    if providers.empty? && defined?(::Devise)
+      providers = (::Devise.omniauth_configs.keys.map(&:to_s).sort rescue [])
     end
 
     { "present" => true, "providers" => providers, "credentials_emitted" => false }
+  end
+
+  # OmniAuth 2 has no global provider registry. Rails retains the configured Builder
+  # block on its middleware descriptor, so build that one middleware around an inert
+  # Rack endpoint and inspect only the resulting strategy names. No request runs, no
+  # provider endpoint is contacted, and client ids/secrets are never read or emitted.
+  def omniauth_middleware_providers
+    middleware = Rails.application.config.middleware.select { |entry|
+      entry.klass.name.to_s == "OmniAuth::Builder"
+    }
+    providers = []
+    middleware.each do |entry|
+      builder = entry.build(lambda { |_env| [ 404, {}, [] ] })
+      app = builder.respond_to?(:to_app) ? builder.to_app : builder
+      256.times do
+        break if app.nil?
+        if defined?(::OmniAuth::Strategy) && app.is_a?(::OmniAuth::Strategy)
+          name = (app.options.name.to_s rescue "")
+          providers << name unless name.empty?
+        end
+        break unless app.instance_variable_defined?(:@app)
+        app = app.instance_variable_get(:@app)
+      end
+    end
+    providers.uniq.sort
   end
 
   def auth_payload

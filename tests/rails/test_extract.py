@@ -9,12 +9,25 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
+import sqlite3
+import stat
+from datetime import date, datetime, timezone
+from decimal import Decimal
 
 import pytest
 
-from .conftest import decisions_for, read_inventory, write_inventory
+from .conftest import (
+    add_external_auth_fixture,
+    decisions_for,
+    read_inventory,
+    write_inventory,
+)
 from tools.rails import rails2zb
-from tools.rails._core import RailsError
+from tools.rails._core import (
+    RailsError,
+    write_ndjson,
+)
 
 
 @pytest.fixture(scope="module")
@@ -35,12 +48,56 @@ def ndjson(bundle, relative):
     ]
 
 
+def test_postgres_driver_values_use_the_same_wire_types():
+    assert rails2zb.to_rfc3339(date(2024, 1, 15)) == "2024-01-15T00:00:00Z"
+    assert (
+        rails2zb.to_rfc3339(
+            datetime(2024, 1, 15, 14, 30, 0, 123456, tzinfo=timezone.utc)
+        )
+        == "2024-01-15T14:30:00.123456Z"
+    )
+    assert rails2zb.coerce(Decimal("12.50"), "number", None) == 12.5
+    assert rails2zb.coerce(Decimal("42"), "number", None, number_mode="int") == 42
+
+
 def tree_digest(root):
     digest = hashlib.sha256()
     for path in sorted(p for p in root.rglob("*") if p.is_file()):
         digest.update(path.relative_to(root).as_posix().encode())
         digest.update(path.read_bytes())
     return digest.hexdigest()
+
+
+def test_bundle_artifacts_are_private(bundle):
+    assert stat.S_IMODE(bundle.stat().st_mode) == 0o700
+    for path in bundle.rglob("*"):
+        expected = 0o700 if path.is_dir() else 0o600
+        assert stat.S_IMODE(path.stat().st_mode) == expected, path
+
+
+def test_extraction_preserves_an_existing_empty_output_directory_mode(source, tmp_path):
+    src = rails2zb.load_source(source)
+    findings = [finding.to_dict() for finding in rails2zb.build_findings(src)]
+    decisions = rails2zb.load_decisions_from_value(decisions_for(findings))
+    output = tmp_path / "shared-bundle"
+    output.mkdir(mode=0o775)
+    output.chmod(0o2775)
+
+    rails2zb.extract(src, decisions, output)
+
+    assert stat.S_IMODE(output.stat().st_mode) == 0o2775
+
+
+def test_ndjson_failure_preserves_prior_artifact_and_cleans_temporary(tmp_path):
+    output = tmp_path / "data/rows.ndjson"
+    output.parent.mkdir()
+    output.write_text('{"old":true}\n')
+
+    with pytest.raises(RailsError, match="cannot represent"):
+        write_ndjson(output, [{"id": "ok"}, {"id": "bad", "value": float("nan")}])
+
+    assert output.read_text() == '{"old":true}\n'
+    assert not list(output.parent.glob(".rows.ndjson.*.tmp"))
 
 
 # ---------------------------------------------------------------------------
@@ -199,6 +256,57 @@ def test_attachments_name_their_file(bundle):
     assert posts["2"]["cover"] is None, "has_one_attached with nothing attached is null"
 
 
+def test_has_many_attached_is_multi_valued_even_when_empty(mutable_source):
+    models = read_inventory(mutable_source, "models")
+    post = next(model for model in models["models"] if model["name"] == "Post")
+    post["attachments"].append(
+        {"source": "observed", "name": "gallery", "macro": "has_many_attached"}
+    )
+    write_inventory(mutable_source, "models", models)
+
+    src = rails2zb.load_source(mutable_source)
+    findings = [finding.to_dict() for finding in rails2zb.build_findings(src)]
+    decisions = rails2zb.load_decisions_from_value(decisions_for(findings))
+    entry = next(
+        item for item in rails2zb.map_tables(src, decisions) if item.table == "posts"
+    )
+    field = next(item for item in entry.fields if item["name"] == "gallery")
+
+    assert field["options"]["maxSelect"] == rails2zb.UNBOUNDED_MAX_SELECT
+    assert field["options"]["maxSelect"] > 1
+    assert rails2zb.build_record(entry, {"id": 1})["gallery"] == []
+
+
+def test_invalid_source_index_names_are_safely_and_uniquely_renamed(
+    mutable_source, workspace
+):
+    schema = read_inventory(mutable_source, "schema")
+    posts = next(table for table in schema["tables"] if table["name"] == "posts")
+    assert len(posts["indexes"]) >= 2
+    posts["indexes"][0]["name"] = "1 bad"
+    posts["indexes"][1]["name"] = "1-bad"
+    write_inventory(mutable_source, "schema", schema)
+
+    src = rails2zb.load_source(mutable_source)
+    findings = [finding.to_dict() for finding in rails2zb.build_findings(src)]
+    decisions = rails2zb.load_decisions_from_value(decisions_for(findings))
+    out = workspace / "bundle"
+    report = rails2zb.extract(src, decisions, out)
+    document = json.loads((out / "schema.json").read_text())
+    emitted = next(c for c in document["collections"] if c["name"] == "posts")[
+        "indexes"
+    ]
+    names = [index["name"] for index in emitted]
+
+    assert all(re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", name) for name in names)
+    assert len({name.lower() for name in names}) == len(names)
+    assert "posts.1 bad" not in report["droppedIndexes"]
+    assert "posts.1-bad" not in report["droppedIndexes"]
+    renamed = {item["source"]: item["target"] for item in report["renamedIndexes"]}
+    assert renamed.keys() >= {"1 bad", "1-bad"}
+    assert renamed["1 bad"] != renamed["1-bad"]
+
+
 def test_missing_updated_at_mirrors_created(bundle):
     rows = ndjson(bundle, "data/notifications.ndjson")
     assert rows[0]["created"] == rows[0]["updated"]
@@ -284,6 +392,73 @@ def test_auth_collection_is_typed_auth(bundle):
     kinds = {c["name"]: c["type"] for c in document["collections"]}
     assert kinds["users"] == "auth"
     assert kinds["posts"] == "base"
+
+
+def test_external_auth_mapping_emits_only_reviewed_provider_linkage(
+    mutable_source, workspace
+):
+    add_external_auth_fixture(mutable_source)
+    src = rails2zb.load_source(mutable_source)
+    findings = rails2zb.build_findings(src)
+    by_id = {finding.id: finding for finding in findings}
+    external = by_id["auth.omniauth.identities"]
+    assert external.code == "ExternalIdentitiesRequireMapping"
+    assert external.choices[0] == "external-auths"
+    assert "auth.mechanism.unknown" not in by_id
+    assert "column.users.email.reserved" not in by_id
+
+    value = decisions_for([finding.to_dict() for finding in findings])
+    decisions = rails2zb.load_decisions_from_value(value)
+    out = workspace / "external-auth-bundle"
+    report = rails2zb.extract(src, decisions, out)
+
+    users = {row["id"]: row for row in ndjson(out, "auth/users.ndjson")}
+    assert users["1"]["externalAuths"] == [
+        {"provider": "github", "providerId": "github-ada"},
+        {"provider": "google", "providerId": "google-ada"},
+    ]
+    emitted = (out / "auth/users.ndjson").read_text()
+    assert "secret-token" not in emitted
+    assert "other-token" not in emitted
+    assert '"secret":true' not in emitted
+    assert not (out / "data/identities.ndjson").exists()
+    assert report["externalAuthFiles"] == ["auth/users.ndjson"]
+    assert report["externalAuthProviders"] == ["github", "google"]
+    assert "identities" in report["omittedTables"]
+
+
+@pytest.mark.parametrize(
+    ("values", "message"),
+    [
+        ((3, 2, "google", "google-ada"), "repeats provider identity"),
+        ((3, 1, "google", "another-google-id"), "more than one 'google' identity"),
+        (
+            (3, 2, "", "missing-provider"),
+            "external authentication linkage cannot be partial",
+        ),
+    ],
+)
+def test_external_auth_mapping_refuses_ambiguous_or_partial_links(
+    mutable_source, workspace, values, message
+):
+    add_external_auth_fixture(mutable_source)
+    database = next((mutable_source / "db").glob("*.sqlite3"))
+    connection = sqlite3.connect(database)
+    connection.execute(
+        "INSERT INTO identities VALUES (?, ?, ?, ?, 'token', '{}', "
+        "'2024-01-15 09:00:00', '2024-01-15 09:00:00')",
+        values,
+    )
+    connection.commit()
+    connection.close()
+    src = rails2zb.load_source(mutable_source)
+    findings = rails2zb.build_findings(src)
+    decisions = rails2zb.load_decisions_from_value(
+        decisions_for([finding.to_dict() for finding in findings])
+    )
+
+    with pytest.raises(RailsError, match=message):
+        rails2zb.extract(src, decisions, workspace / "external-auth-refused")
 
 
 # ---------------------------------------------------------------------------
@@ -696,9 +871,10 @@ def test_file_install_refuses_a_source_path_that_escapes(
         rails2zb.install_files(doctored, source, tmp_path / "zb_data")
 
 
-def test_a_non_sqlite_source_still_yields_an_inventory(mutable_source):
-    """Postgres and MySQL operators need the findings and decisions; only row extraction
-    is SQLite-bound, and gating `load_source` would deny them the half that works."""
+def test_a_postgres_source_yields_inventory_and_requires_an_explicit_url(
+    mutable_source, tmp_path
+):
+    """Postgres inventory and schema work offline; rows require a frozen source URL."""
     from .conftest import read_inventory, write_inventory
 
     versions = read_inventory(mutable_source, "versions")
@@ -711,6 +887,40 @@ def test_a_non_sqlite_source_still_yields_an_inventory(mutable_source):
 
     with pytest.raises(RailsError, match="frozen SQLite file"):
         rails2zb.require_sqlite(src)
+
+    findings = [finding.to_dict() for finding in rails2zb.build_findings(src)]
+    decisions = rails2zb.load_decisions_from_value(decisions_for(findings))
+    with pytest.raises(RailsError, match="--database-url-env"):
+        rails2zb.extract(src, decisions, tmp_path / "bundle")
+
+
+def test_schema_emission_is_adapter_neutral(mutable_source, tmp_path):
+    """A PostgreSQL row source must not prevent generation of the decided schema."""
+    from types import SimpleNamespace
+
+    from .conftest import materialize_artifacts, read_inventory, write_inventory
+
+    versions = read_inventory(mutable_source, "versions")
+    versions["adapter"] = "PostgreSQL"
+    write_inventory(mutable_source, "versions", versions)
+    src = rails2zb.load_source(mutable_source)
+    findings = [finding.to_dict() for finding in rails2zb.build_findings(src)]
+    decision_value = materialize_artifacts(decisions_for(findings), tmp_path)
+    decision_path = tmp_path / "decisions.json"
+    decision_path.write_text(json.dumps(decision_value))
+    output = tmp_path / "schema.json"
+
+    assert (
+        rails2zb.cmd_schema(
+            SimpleNamespace(
+                source=mutable_source,
+                decisions=decision_path,
+                out=output,
+            )
+        )
+        == 0
+    )
+    assert json.loads(output.read_text())["collections"]
 
 
 def test_a_leaf_symlink_in_the_source_is_refused(bundle, source, tmp_path):

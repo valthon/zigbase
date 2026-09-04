@@ -99,11 +99,13 @@ configuration are blockers, not omissions.
 
 The converter is a repository tool, not a file embedded in a skill. From a ZigBase source checkout:
 
-**Scope.** The observed inventory is adapter-neutral — the extractor reads whatever connection the
-application booted, Postgres and MySQL included, and `inventory` works on all of them. Row
-*extraction* is not: `extract` opens the frozen SQLite file directly and refuses any other adapter
-by name. For a Postgres or MySQL source, take the findings and durable decisions from `inventory`,
-then export the rows through the generic NDJSON path in [migration tools](migration-tools.md).
+**Scope.** The observed inventory and decided ZigBase schema are adapter-neutral: the exporter reads
+whatever connection the application booted, and `inventory` and `schema` work without reopening the
+database. `extract` reads a frozen SQLite file directly or a PostgreSQL snapshot through psycopg 3.
+PostgreSQL uses one `REPEATABLE READ READ ONLY` transaction for every row check and emitted record;
+the connection URL is read only from a named environment variable and is never accepted as a
+command-line value or written to the bundle. MySQL still uses the generic NDJSON path in
+[migration tools](migration-tools.md).
 
 **Decisions that change the output.** Most choices record work you will do elsewhere, but a few are
 carried out by the converter itself and are worth knowing: `rename` on a rejected table name takes
@@ -121,13 +123,16 @@ application's refusal, and `omit` accepts neither. Section 4 describes that find
 renamed or omitted table takes its Active Storage attachments with it — omitting a table also
 excuses its blobs, so `omit` is a usable route around the damaged part of a snapshot. Omitting an *attachment* leaves its blobs behind too, and `report.json`
 records them under `droppedAttachments` alongside `droppedIndexes`, so nothing disappears without
-a trail.
+a trail. Rails index names outside ZigBase's identifier grammar are normalized deterministically;
+`renamedIndexes` records the source and emitted names instead of misreporting the index as dropped.
 
 **Filenames.** Active Storage keeps the client-supplied filename verbatim, and ZigBase's file
 route byte-compares the raw path segment — the SDKs build that URL with `encodeURIComponent`, so a
 name outside `[A-Za-z0-9._-]` installs cleanly and then 404s for every client. Extraction rewrites
 such a name using the same rule the engine's own upload path uses, and `files/manifest.json` keeps
 the original alongside the rewritten one. `My Photo.png` is stored and served as `My_Photo.png`.
+`has_many_attached` remains multi-valued even when a particular source has no files for that field;
+its unbounded Rails cardinality is represented by ZigBase's maximum `maxSelect` value.
 
 Names are carried through decision ids intact, including schema-qualified ones such as
 `legacy.posts`: a decision id escapes the separator reversibly, so `rename` and `omit` work on
@@ -191,8 +196,26 @@ decision.
 Run extraction only after every finding reconciles:
 
 ```sh
+# Optional: review and validate the decided schema before handling any source rows.
+python3 tools/rails/rails2zb.py schema --source source --decisions decisions.json --out schema.json
+
+# SQLite source (the frozen .sqlite3 file is discovered under source/db).
 python3 tools/rails/rails2zb.py extract --source source --decisions decisions.json --out bundle
+
+# PostgreSQL source. Install the pinned optional driver through mise's Python, then
+# place the frozen snapshot URL in your secret-managed environment.
+mise exec python@3.13 -- python -m pip install -r tools/rails/requirements-postgres.txt
+python3 tools/rails/rails2zb.py extract --source source --decisions decisions.json \
+  --database-url-env DATABASE_URL --out bundle
 ```
+
+The converter builds the bundle in private `0700` directories and writes every JSON and NDJSON
+artifact with mode `0600`; migrated rows and legacy password hashes are sensitive data. Canonical
+JSON and NDJSON are installed with same-directory atomic replacement only after the complete file is
+fully written and flushed, so a failed row serialization cannot leave a partial destination. Keep
+every output path outside the frozen source tree. Output parents must be writable, and an existing
+symlink destination is refused rather than followed or replaced; choose the intended regular output
+path explicitly.
 
 Review source and decision digests, row and file counts, omissions, replacement artifacts, public
 rules, unreferenced objects, and credential redaction. Run it twice and require byte-identical
@@ -277,6 +300,14 @@ Rails-side, the pairs come from whatever your OmniAuth setup persists — common
 `authentications` table carrying `(provider, uid)`. `uid` is the `providerId`. Inventory that table
 explicitly; it is easy to miss because it is not where account data usually lives.
 
+The observed converter recognizes one unambiguous conventional identity table when it has
+`provider`, `uid` (or `provider_id`), and a real foreign key into an account table with `email`.
+Resolve `auth.omniauth.identities` as `external-auths` and put that account table name in the
+decision artifact. The converter then makes the account collection an auth collection, folds the
+reviewed pairs into its auth NDJSON, omits the standalone identity table, and records both the file
+and provider names in `report.json`. It never selects token or raw-provider-payload columns. If
+there is no unique structural mapping, the choice is withheld rather than guessed.
+
 Accounts whose provider you are not carrying over still need a route back in: enable a passwordless
 method (magic link or OTP) and run a rollout before cutover, or declare them out of scope and say so
 plainly. Do not report a migration as complete while any account has no way to sign in.
@@ -326,6 +357,8 @@ it:
   `'banana'`, or a REAL `1.5` that keeps its storage class and that the target refuses for an
   integer field. A non-finite float, or one outside the target's 64-bit range, cannot be stored at
   all.
+  Hand-authored inventory and decisions files must likewise be RFC 8259 JSON: `NaN`, `Infinity`,
+  and `-Infinity` are refused rather than accepted as implementation-specific values.
 - **Dates must be real dates.** `0000-00-00 00:00:00` — the legacy-MySQL zero date — along with
   `2024-02-30`, `1900-02-29`, `24:00:00` and an impossible UTC offset like `+30:00` are all
   well-formed to a pattern match and impossible to the target, which range-checks every component.
@@ -407,12 +440,13 @@ Emptiness is judged on the value the bundle *emits*, not on the raw column: a `s
 the text `null` in SQLite — non-empty there, JSON null in the bundle — while a text column whose
 content is literally `[]` is the reverse.
 
-**The two manifests have an order.** Strip-then-patch is scoped to a single manifest run, so a
-relation crossing the boundary needs its target's manifest imported first; `report.json` gives the
-sequence as `manifestOrder`. Relations crossing in *both* directions cannot be ordered at all, and
-extraction refuses rather than producing a bundle no sequence can import. Auth collections are not
-part of this: they are imported from their own files before either manifest, so a relation pointing
-into one is already satisfied and never counts as a crossing.
+**Timestamp policy is per manifest entry.** The Rails bundle emits manifest v2 and keeps every
+non-auth collection in one dependency graph. Each entry carries `preserveTimestamps: true` or
+`false`, so timestamped and timestamp-less tables can reference each other in either direction;
+the manifest runner strips cycle back-edges and patches them only after all target rows exist.
+`report.json.manifestOrder` therefore contains only `manifest.json`. Auth collections remain
+separate because their legacy credential policy is collection-specific; import them before the
+manifest, so ordinary relations pointing into auth are already satisfied.
 
 **Auth identities are validated against the target's own rule.** ZigBase's injected `email` field
 rejects control characters and spaces, and requires exactly one `@` with both sides non-empty. A
@@ -424,16 +458,16 @@ unique index is partial.
 **Auth collections cannot hold relations.** An auth file is imported on its own, without the
 manifest importer's ordering machinery, so a relation *out of* an auth collection — including one
 pointing back at itself — resolves in no documented order. Each one raises a finding: drop it, or
-keep it and re-establish those links yourself after the import. A `separate-import` decision puts such a table in
-`manifest-no-timestamps.json`; `report.json` names that file when it exists, and it is imported
-**without** `--preserve-timestamps`. An **auth** table in that state has no second manifest to go
-to, since auth files are imported one at a time — `report.json` lists it under
+keep it and re-establish those links yourself after the import. A `separate-import` decision sets
+`preserveTimestamps: false` on that non-auth table's manifest-v2 entry while keeping it in the
+shared relation graph. An **auth** table remains outside the manifest because auth files are
+imported one at a time — `report.json` lists it under
 `authFilesNoTimestamps`, and that one file drops the flag:
 
 ```sh
 zigbase import --collection users --legacy-hashes bcrypt --preserve-timestamps \
   --data-dir ./zb_data bundle/auth/users.ndjson
-zigbase import --manifest bundle/manifest.json --preserve-timestamps --data-dir ./zb_data
+zigbase import --manifest bundle/manifest.json --data-dir ./zb_data
 python3 tools/rails/rails2zb.py install-files --bundle bundle --source source --data-dir ./zb_data
 ```
 
@@ -468,10 +502,15 @@ cannot observe them.
 ## 6. Rehearse cutover and preserve rollback
 
 On a fresh, disposable target: syntax-lint and dry-run the schema, apply it, run full-depth rule
-lint, import auth then ordinary data, verify counts and files, run the allow/deny and parity suites,
+lint, dry-run each import command, import auth then ordinary data, verify counts and files, run the
+allow/deny and parity suites,
 prove bcrypt-to-argon2id rehash on login survives a restart, run production doctor, restart, and
 restore a backup into a second target. See [running the server](serve.md),
 [deployment](deployment.md), and [Docker](docker.md).
+
+A manifest dry run holds all of its collections in one transaction, including the deferred
+relation patch pass, then rolls the whole dataset back. This lets cross-collection references be
+validated without leaving test rows behind.
 
 At final cutover stop writes, workers, and the scheduler; drain or durably account for enqueued
 jobs; take the final snapshot; regenerate from the already-reviewed decisions; repeat every

@@ -165,6 +165,28 @@ def test_an_oversized_json_document_is_refused_before_it_is_parsed(tmp_path):
         rails2zb.read_json(document, limit=4096, label="routes")
 
 
+def test_duplicate_json_keys_are_refused(tmp_path):
+    document = tmp_path / "routes.json"
+    document.write_text('{"source":"inferred","source":"observed"}\n')
+
+    with pytest.raises(rails2zb.RailsError, match="duplicate JSON key 'source'"):
+        rails2zb.read_json(document, label="routes")
+
+
+def test_output_guard_checks_lexical_placement_before_following_a_leaf_symlink(
+    tmp_path,
+):
+    source = tmp_path / "frozen"
+    source.mkdir()
+    external = tmp_path / "external.json"
+    external.write_text("outside\n")
+    planted = source / "inventory.json"
+    planted.symlink_to(external)
+
+    with pytest.raises(rails2zb.RailsError, match="outside the frozen source tree"):
+        rails2zb.ensure_output_outside_source(planted, source)
+
+
 def test_a_declared_secure_password_without_its_column_is_refused(mutable_source):
     """`has_secure_password :login` with no `login_digest` cannot be reconciled.
 
@@ -285,7 +307,7 @@ def _rename_timestampless_events(source, new_name):
 def test_a_renamed_timestampless_table_is_routed_under_its_new_name(
     mutable_source, workspace
 ):
-    """The second manifest must name the collection that actually exists.
+    """The mixed-policy manifest must name the collection that actually exists.
 
     Routing by source table would emit an import manifest naming a collection the schema
     document never creates -- and the operator only finds out at import time.
@@ -294,13 +316,19 @@ def test_a_renamed_timestampless_table_is_routed_under_its_new_name(
     src, decisions = _decide(mutable_source, **overrides)
     bundle = workspace / "bundle"
     rails2zb.extract(src, decisions, bundle)
-    separate = json.loads((bundle / "manifest-no-timestamps.json").read_text())
-    assert separate["collections"] == [
-        {"collection": "gatherings", "file": "data/gatherings.ndjson"}
-    ]
+    manifest = json.loads((bundle / "manifest.json").read_text())
+    gathering = next(
+        entry
+        for entry in manifest["collections"]
+        if entry["collection"] == "gatherings"
+    )
+    assert gathering == {
+        "collection": "gatherings",
+        "file": "data/gatherings.ndjson",
+        "preserveTimestamps": False,
+    }
     assert (bundle / "data/gatherings.ndjson").is_file()
-    ordinary = json.loads((bundle / "manifest.json").read_text())
-    assert "gatherings" not in {c["collection"] for c in ordinary["collections"]}
+    assert not (bundle / "manifest-no-timestamps.json").exists()
 
 
 # ---------------------------------------------------------------------------
@@ -1062,7 +1090,7 @@ def test_a_table_with_only_updated_at_is_a_decision(mutable_source):
     assert finding.choices == ("separate-import", "omit")
 
 
-def test_an_updated_at_only_table_is_routed_out_of_the_main_manifest(
+def test_an_updated_at_only_table_disables_timestamp_preservation(
     mutable_source, workspace
 ):
     _drop_created_at(mutable_source, "events")
@@ -1070,12 +1098,8 @@ def test_an_updated_at_only_table_is_routed_out_of_the_main_manifest(
     bundle = workspace / "bundle"
     rails2zb.extract(src, decisions, bundle)
     main = json.loads((bundle / "manifest.json").read_text())
-    assert "events" not in {c["collection"] for c in main["collections"]}, (
-        "a row with no `created` fails --preserve-timestamps, which the documented "
-        "workflow applies to every entry in this manifest"
-    )
-    separate = json.loads((bundle / "manifest-no-timestamps.json").read_text())
-    assert "events" in {c["collection"] for c in separate["collections"]}
+    event = next(c for c in main["collections"] if c["collection"] == "events")
+    assert event["preserveTimestamps"] is False
 
 
 def test_a_timestampless_auth_file_is_named_in_the_report(mutable_source, workspace):
@@ -1153,7 +1177,7 @@ def test_a_nullable_timestamp_column_is_a_decision(mutable_source):
     assert finding.choices == ("separate-import", "omit")
 
 
-def test_a_nullable_timestamp_routes_out_of_the_main_manifest(
+def test_a_nullable_timestamp_disables_timestamp_preservation(
     mutable_source, workspace
 ):
     _nullable_timestamps(mutable_source)
@@ -1161,9 +1185,8 @@ def test_a_nullable_timestamp_routes_out_of_the_main_manifest(
     bundle = workspace / "bundle"
     rails2zb.extract(src, decisions, bundle)
     main = json.loads((bundle / "manifest.json").read_text())
-    assert "comments" not in {c["collection"] for c in main["collections"]}
-    separate = json.loads((bundle / "manifest-no-timestamps.json").read_text())
-    assert "comments" in {c["collection"] for c in separate["collections"]}
+    comments = next(c for c in main["collections"] if c["collection"] == "comments")
+    assert comments["preserveTimestamps"] is False
 
 
 def test_a_row_with_no_created_value_is_refused(mutable_source, workspace):
@@ -1342,19 +1365,28 @@ def test_text_that_merely_looks_empty_stays_required(mutable_source, workspace):
     )
 
 
-def test_relations_crossing_the_manifest_boundary_both_ways_are_refused(
+def test_relations_crossing_timestamp_policies_both_ways_share_one_manifest(
     mutable_source, workspace
 ):
-    """Strip-then-patch is scoped to one manifest run — the same reason an auth
-    collection cannot hold relations, applied to the second manifest.
+    """Mixed timestamp policy must not split one relation graph into two runs.
 
-    `posts` is referenced by `comments` and itself references `clubs`, so routing it
-    away leaves relations crossing in both directions and no order works.
+    `posts` is referenced by `comments` and itself references `clubs`. Manifest v2
+    keeps all three in the same deferred-relation pass while only posts disables
+    timestamp preservation.
     """
     _drop_created_at(mutable_source, "posts")
     src, decisions = _decide(mutable_source)
-    with pytest.raises(rails2zb.RailsError, match="both directions"):
-        rails2zb.extract(src, decisions, workspace / "bundle")
+    bundle = workspace / "bundle"
+    report = rails2zb.extract(src, decisions, bundle)
+    manifest = json.loads((bundle / "manifest.json").read_text())
+    policies = {
+        entry["collection"]: entry["preserveTimestamps"]
+        for entry in manifest["collections"]
+    }
+    assert policies["posts"] is False
+    assert policies["comments"] is True
+    assert policies["clubs"] is True
+    assert report["manifestOrder"] == ["manifest.json"]
 
 
 def test_duplicate_auth_emails_are_refused(mutable_source, workspace):
@@ -1466,10 +1498,7 @@ def test_an_auth_collection_is_not_a_manifest_boundary(mutable_source, workspace
     bundle = workspace / "bundle"
     rails2zb.extract(src, decisions, bundle)  # must not refuse
     report = json.loads((bundle / "report.json").read_text())
-    assert report["manifestOrder"] == [
-        "manifest.json",
-        "manifest-no-timestamps.json",
-    ]
+    assert report["manifestOrder"] == ["manifest.json"]
 
 
 def test_the_reported_order_only_names_manifests_that_exist(mutable_source, workspace):
@@ -1571,10 +1600,7 @@ def test_a_relation_from_a_separate_table_into_auth_is_not_a_crossing(
     bundle = workspace / "bundle"
     rails2zb.extract(src, decisions, bundle)  # must not refuse
     report = json.loads((bundle / "report.json").read_text())
-    assert report["manifestOrder"] == [
-        "manifest-no-timestamps.json",
-        "manifest.json",
-    ], "the referenced (timestampless) manifest has to be imported first"
+    assert report["manifestOrder"] == ["manifest.json"]
 
 
 def test_a_relation_out_of_auth_is_not_a_manifest_crossing_either(
@@ -1596,10 +1622,7 @@ def test_a_relation_out_of_auth_is_not_a_manifest_crossing_either(
     bundle = workspace / "bundle"
     rails2zb.extract(src, decisions, bundle)  # must not refuse
     report = json.loads((bundle / "report.json").read_text())
-    assert report["manifestOrder"] == [
-        "manifest.json",
-        "manifest-no-timestamps.json",
-    ]
+    assert report["manifestOrder"] == ["manifest.json"]
 
 
 # ---------------------------------------------------------------------------
@@ -2413,6 +2436,7 @@ def test_a_renamed_table_reconciles_its_rows_under_the_new_name(
         'DELETE FROM "events-legacy" WHERE id = (SELECT MIN(id) FROM "events-legacy")'
     )
     connection.commit()
+    connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
     connection.close()
     src, decisions = _decide(mutable_source, **{fid: ("rename", "gatherings")})
     with pytest.raises(rails2zb.RailsError, match="events-legacy holds"):

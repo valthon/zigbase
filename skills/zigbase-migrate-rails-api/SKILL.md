@@ -78,9 +78,14 @@ Treat exit `2` as judgment required, not failure. Build a versioned `decisions.j
 exact finding id, each with a non-empty rationale and a typed replacement artifact. Never replace a
 durable decision with a comment, an unstructured note, or warning suppression.
 
-Run `extract` only after every finding reconciles. Review source and decision digests, counts,
-omissions, replacement artifacts, public rules, unreferenced objects, and credential redaction. Run
-it twice and require byte-identical bundles.
+Run `schema` after every finding reconciles; it is adapter-neutral and must not be skipped because
+row extraction is blocked. Run `extract` against the frozen SQLite file or, for PostgreSQL, install
+`tools/rails/requirements-postgres.txt` through mise's Python and pass only the name of the
+secret-bearing environment variable with `--database-url-env`. PostgreSQL extraction must use the
+tool's single repeatable-read, read-only snapshot; do not replace it with ad hoc model iteration or
+a manual dump. Review source and decision digests, counts, omissions, replacement artifacts, public
+rules, unreferenced objects, and credential redaction. Run it twice and require byte-identical
+bundles.
 
 These never convert silently — each needs a decision: `default_scope` (extraction reads `unscoped`;
 a scoped read is data loss), Active Record encryption (ciphertext never migrates), polymorphic

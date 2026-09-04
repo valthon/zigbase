@@ -3,6 +3,7 @@
   "name": "pocketbase",
   "prompt": "prompt.md",
   "fixture": "fixture",
+  "repository_files": [],
   "skills": ["zigbase-migrate-pocketbase"],
   "graders": ["pocketbase"],
   "timeout_seconds": 1800,
