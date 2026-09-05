@@ -2215,7 +2215,7 @@ fn printUsage(io: std.Io, file: std.Io.File, show_serve_static: bool, show_stati
         \\
         \\COMMANDS:
         \\  serve               Start the HTTP server (REST + WebSocket + admin UI at /_/).
-        \\  serve stop|status|logs   Manage a background `serve` session (see `zigbase serve status --help`).
+        \\  serve stop|status|logs|wait   Manage a tracked `serve` session (see `zigbase serve status --help`).
         \\  doctor              Preflight checks; --production escalates, --json emits NDJSON. Exits 1 on any error.
         \\  migrate             Apply database migrations, then exit. `status` reports; `rollback [N]` reverses; `dump` dumps the live schema.
         \\  rewrap              Re-encrypt all encrypted fields under the primary key (key rotation).
@@ -2817,11 +2817,13 @@ fn printImportUsage(io: std.Io, file: std.Io.File) void {
 
 fn printServeControlUsage(io: std.Io, file: std.Io.File) void {
     emit(io, file,
-        \\zigbase serve stop|status|logs — manage a background `zigbase serve` session.
+        \\zigbase serve stop|status|logs|wait — manage a tracked `zigbase serve` session.
         \\
         \\USAGE:
         \\  zigbase serve stop   [--data-dir PATH]            Stop the session owning this data dir.
         \\  zigbase serve status [--json] [--data-dir PATH]   Report the session; exit 0 running, 1 not.
+        \\  zigbase serve wait [--json] [--timeout-ms N] [--data-dir PATH]
+        \\                                                   Await healthy readiness (default 30000ms).
         \\  zigbase serve logs   [--json] [--follow|-f] [--data-dir P]
         \\                                                   Print (and optionally tail) serve.log.
         \\
@@ -3403,30 +3405,15 @@ fn schemaApplyImpl(
 
     // ---- Rule syntax gate -------------------------------------------------------------
     // Every access rule the document declares is parsed BEFORE a single write derived from
-    // the document happens. Nothing else in the engine validates a rule at write time:
-    // `schema.parseCollectionInput` decodes the five rule fields as opaque strings and
-    // `collections.create`/`update` bind them straight into `_collections`. The first thing
-    // that parses a rule is the request that has to evaluate it — where a parse failure
-    // fails CLOSED (500, and on a write the write never runs). `apply` is the last
-    // chokepoint before a typo becomes a production outage, so a document with an
+    // the document happens. A malformed persisted rule fails closed at request time
+    // (500, and on a write the write never runs), so a document with an
     // unparseable rule is refused WHOLE: nothing is written, not even the collections whose
     // rules are fine.
     //
-    // WHY SYNTAX ONLY — this deliberately runs `checkDocument` (lexer + parser) and reports
-    // nothing but hard parse errors:
-    //
-    //   * Exit code 2 is frozen as "dry-run found destructive changes". Emitting `@public`
-    //     warnings or full-resolution findings from `apply` would force them onto exit 2,
-    //     and an agent branching on 2 must never have to disambiguate "you opened a
-    //     collection to the public" from "destructive schema change pending". Overloading a
-    //     frozen exit code to save a flag is a bad trade.
-    //   * Full field resolution would false-positive on rules that are correct in the
-    //     document's own terms: a rule referencing a field added later in the same apply, or
-    //     a relation created in pass 2, resolves against a live schema that does not exist
-    //     yet. A linter that cries wolf during apply gets suppressed, and a suppressed
-    //     linter protects nothing.
-    //   * Judgment-shaped findings therefore live in `schema check-rules`, where exit 2
-    //     already means "needs judgment" and where the operator asked for an opinion.
+    // This first gate needs no database. Reference validation follows below, using the
+    // complete proposed schema rather than the not-yet-updated live tables. Invalid rules
+    // exit 1; public-rule warnings remain the explicit lint command's job, and exit 2
+    // remains reserved for destructive dry-run plans.
     //
     // There is no flag and no opt-out: an unparseable rule is not a judgment call, it is a
     // document that cannot mean anything.
@@ -3506,9 +3493,36 @@ fn schemaApplyImpl(
     const w = holder.pool.acquireWriter();
     defer holder.pool.releaseWriter();
 
+    // Keep the prospective-schema check and DDL on one serialized metadata snapshot.
+    // Collection writes join this transaction via SAVEPOINT, making every create,
+    // rebuild, prune and generation bump all-or-nothing. SQLite ignores foreign_keys
+    // inside BEGIN, so disable it first for rebuilds and restore it on both return
+    // paths, after rollback/commit. Dry runs briefly take this writer/schema lock too;
+    // destructive dry-run exit(2) relies on process teardown to release the connection.
+    const outer_sqlite = db.dbDialect(w).kind == .sqlite;
+    if (outer_sqlite) try w.exec("PRAGMA foreign_keys=OFF;");
+    defer if (outer_sqlite) w.exec("PRAGMA foreign_keys=ON;") catch {};
+    try w.beginImmediate();
+    defer if (w.inTransaction()) w.rollback() catch {};
+    try @import("schema_gen.zig").lock(w);
     const all_live = try collections_mod.list(a, w);
     var live: std.ArrayList(schema.Collection) = .empty;
     for (all_live) |c| if (!c.system) try live.append(a, c);
+
+    // Resolve against the complete proposed graph, not today's tables. This also runs for
+    // --dry-run: newly added fields and forward/cyclic relations exist in this metadata
+    // snapshot, while pruned collections do not. No speculative DDL or request values needed.
+    {
+        const report = try rules_lint.checkChanges(allocator, w, all_live, doc, sa_args.prune);
+        defer allocator.free(report.findings);
+        var bad: usize = 0;
+        for (report.findings) |f| {
+            if (!std.mem.eql(u8, f.severity, "error")) continue;
+            bad += 1;
+            std.log.err("schema apply: collection '{s}' {s}: {s} ({s})", .{ f.collection, f.rule, f.message, f.code });
+        }
+        if (bad > 0) return error.InvalidRule;
+    }
 
     var plan = try schema_diff.compute(allocator, live.items, doc, .{ .prune = sa_args.prune });
     defer plan.deinit();
@@ -3535,32 +3549,6 @@ fn schemaApplyImpl(
     // an EMPTY `applied` list rather than the collections that happened to be written before
     // the failure. Reporting those would name work that has just been rolled back.
     errdefer emitApplyJson(allocator, io, plan, doc, sa_args, &.{}) catch {};
-
-    // ---- One transaction for the whole document (#383) ---------------------------------
-    // `collections.create`/`update`/`delete` each opened their own transaction, so a document
-    // that failed on its fourth collection left the first three behind — a state that is
-    // neither the old one nor the new one, and that the next attempt then has to contend
-    // with. For a migration that is the difference between "fix the document and retry" and
-    // "work out by hand what the last attempt did".
-    //
-    // They now join an open transaction with a SAVEPOINT instead (`collections.Tx`), so
-    // wrapping all three passes here makes the document all-or-nothing: every create, every
-    // rebuild, every prune, and every `schema_gen` bump commits together or not at all.
-    //
-    // The PRAGMA must be set OUTSIDE the transaction and cannot move inside it: SQLite
-    // ignores `PRAGMA foreign_keys` while a transaction is open. `collections.update` sets it
-    // itself when it owns the transaction; here the transaction is ours, so the PRAGMA is
-    // ours — SQLite's own prescribed order for a rebuild-style schema change (foreign_keys
-    // off, BEGIN, rebuild, COMMIT, foreign_keys on).
-    const outer_sqlite = db.dbDialect(w).kind == .sqlite;
-    if (outer_sqlite) try w.exec("PRAGMA foreign_keys=OFF;");
-    // `defer`, not `errdefer`: the writer goes back to the pool with FK enforcement restored
-    // on BOTH paths. (`std.process.exit` is not reachable between here and the commit.)
-    defer if (outer_sqlite) {
-        w.exec("PRAGMA foreign_keys=ON;") catch {};
-    };
-    try w.begin();
-    errdefer w.rollback() catch {};
 
     // Pass 1 — creates and updates, in dependency order, with cycle back-edges omitted.
     for (plan.order) |idx| {
@@ -4238,8 +4226,9 @@ fn serveControlImpl(allocator: std.mem.Allocator, io: std.Io, environ: *const st
         .stop => .stop,
         .status => .status,
         .logs => .logs,
+        .wait => .wait,
     };
-    serve_control.runVerb(io, allocator, verb, abs, ca.json, ca.follow);
+    serve_control.runVerb(io, allocator, verb, abs, ca.json, ca.follow, ca.timeout_ms);
 }
 
 /// `zigbase doctor [--production] [--json] [--data-dir PATH]`.

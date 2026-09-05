@@ -67,7 +67,14 @@ def provision(binary, data_dir):
                                 "type": "text",
                                 "required": True,
                                 "options": {"min": 2, "max": 200},
-                            }
+                            },
+                            {
+                                "id": "",
+                                "name": "owner",
+                                "type": "text",
+                                "required": False,
+                                "options": {},
+                            },
                         ],
                         "indexes": [],
                         "listRule": "@public",

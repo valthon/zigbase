@@ -75,7 +75,7 @@ and the job is routed to the named queue's backend.
   done replays the job, so durable consumers must tolerate replays (idempotency keys are the
   antidote). A **reclaim sweep** resets jobs stranded by a crashed worker (claimed longer than
   that queue's `visibility_timeout_s`), and a GC sweep reaps done/failed rows older than its
-  `done_ttl_s` — **both are per-queue** (set `visibility_timeout_s` above the queue's longest job
+  `done_ttl_s` — **both are per-queue** (set `visibility_timeout_s` above the entire serial batch's
   runtime, or a long job gets reclaimed mid-flight and re-dispatched). The poller and GC jobs are
   installed **only when a durable queue is declared** — pure-memory and no-queue apps install
   nothing.
@@ -87,7 +87,10 @@ and the job is routed to the named queue's backend.
   at `max_ms`); exhausting `max_attempts` marks it `failed` and fires your `.onError` handler
   (phase `.job`). Memory jobs retry in-process the same way.
 - **Caveat:** durable workers **poll** (roughly every scheduler tick, ~0.5s), so durable jobs
-  drain with low but non-zero latency; the scheduler is single-process.
+  drain with low but non-zero latency. PostgreSQL workers share locked claims and
+  database-backed rate windows; cron/interval callbacks still run per process.
+  Drain old workers before upgrading claim/rate semantics, and run migrations
+  through one leader before starting the new worker fleet.
 
 ## Outbound webhooks
 

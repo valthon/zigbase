@@ -503,7 +503,9 @@ pub fn buildEventFrames(
     record: ?std.json.Value,
 ) !EventFrames {
     const coll_channel = try alloc.dupe(u8, collection);
+    errdefer alloc.free(coll_channel);
     const rec_channel = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ collection, record_id });
+    errdefer alloc.free(rec_channel);
 
     // The delete-only wrapper map (`delete_body`) is pure scratch: both serializeEvent calls below
     // stringify it into a fresh, self-contained buffer, so it is freed before this function returns
@@ -519,12 +521,26 @@ pub fn buildEventFrames(
         break :blk .{ .object = delete_body };
     } else record.?;
 
+    const frame_collection = try protocol.serializeEvent(alloc, coll_channel, action, body);
+    errdefer alloc.free(frame_collection);
     return .{
         .collection_channel = coll_channel,
         .record_channel = rec_channel,
-        .frame_collection = try protocol.serializeEvent(alloc, coll_channel, action, body),
+        .frame_collection = frame_collection,
         .frame_record = try protocol.serializeEvent(alloc, rec_channel, action, body),
     };
+}
+
+test "event frame construction releases partial allocations" {
+    const Check = struct {
+        fn run(alloc: std.mem.Allocator) !void {
+            inline for (.{ protocol.Action.create, protocol.Action.update, protocol.Action.delete }) |action| {
+                const frames = try buildEventFrames(alloc, "posts", action, "r1", .{ .object = .empty });
+                defer frames.deinit(alloc);
+            }
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
 }
 
 /// Two-factor policy is dynamic even for an already-open transport. Use the
@@ -1354,6 +1370,79 @@ test "frameForDelivery: viewRule deny -> null; @public + matching filter -> fram
     try std.testing.expect(frameForDelivery(a, &app, &anon, "owner = \"bob\"", "fitems", ef.frame_collection) == null);
     // Locked collection: anonymous denied outright (frame for a locked col).
     try std.testing.expect(frameForDelivery(a, &app, &anon, null, "flocked", lf.frame_collection) == null);
+}
+
+test "frameForDelivery: committed mid-fanout policy and revocation affect later subscribers" {
+    var env = try PoolEnv.init();
+    defer env.deinit();
+    const a = std.testing.allocator;
+    var cache = colcache.Cache.init(a);
+    defer cache.deinit();
+    var app = App{ .allocator = a, .io = std.testing.io, .pool = &env.pool, .col_cache = &cache };
+    const Guard = struct {
+        fn canSubscribe(cx: *Ctx, _: []const u8) bool {
+            return cx.rctx.auth != null;
+        }
+    };
+    var dispatch = @import("../events.zig").Dispatch{ .realtime_can_subscribe = Guard.canSubscribe };
+    app.dispatch = &dispatch;
+    {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        const principals = try collections.create(a, app.io, w, .{ .id = "", .name = "principals", .type = .auth, .fields = &.{} });
+        defer principals.deinit(a);
+        const posts = try collections.create(a, app.io, w, .{
+            .id = "",
+            .name = "fanout_posts",
+            .viewRule = "owner = @request.auth.id",
+            .fields = &.{.{ .id = "owner", .name = "owner", .options = .{ .text = .{} } }},
+        });
+        defer posts.deinit(a);
+        try w.exec("INSERT INTO principals (id,created,updated,email,passwordHash,tokenKey,verified) VALUES ('u1','','','u1@example.test','','test-key',1);");
+        try w.exec("INSERT INTO fanout_posts (id,created,updated,owner) VALUES ('r1','','','u1');");
+    }
+    const jwt = @import("../jwt.zig");
+    const key = @import("../crypto.zig").deriveKey(app.jwt_secret, "test-key");
+    const token = try jwt.sign(a, .{ .id = "u1", .collection = "principals", .type = .auth, .iat = 0, .exp = 9999999999 }, &key);
+    defer a.free(token);
+    const retained = Conn{ .auth = .{ .record = .null, .is_superuser = false, .exp = 9999999999, .token = token } };
+    const subscribers = [_]Conn{retained} ** 10;
+    const frame = "{\"action\":\"update\",\"record\":{\"id\":\"r1\"}}";
+    // Warm col_cache for record/custom topics. The auth collection is re-read
+    // directly per callback; mutations below must not reuse cached auth state.
+    try std.testing.expect(frameForDelivery(a, &app, &retained, null, "fanout_posts", frame) != null);
+    try std.testing.expect(frameForDelivery(a, &app, &retained, null, "private_topic", frame) != null);
+    // Deterministically interleave a COMMITTED writer between subscriber callbacks,
+    // without timing/sleep races. Both WS and SSE invoke this same seam independently.
+    // No two-factor runtime is installed: newly required 2FA must fail closed.
+    // This does not exercise enabled factor callbacks or enrollment lookups.
+    for ([_][:0]const u8{
+        "UPDATE _collections SET options='{\"auth\":{\"two_factor\":\"required\"}}' WHERE name='principals';",
+        "UPDATE principals SET tokenKey='revoked';",
+    }) |mutation| {
+        {
+            const w = env.pool.acquireWriter();
+            defer env.pool.releaseWriter();
+            try w.exec("UPDATE _collections SET options='{}' WHERE name='principals';");
+            try w.exec("UPDATE principals SET tokenKey='test-key';");
+        }
+        for (&subscribers, 0..) |*subscriber, index| {
+            if (index == 5) {
+                const w = env.pool.acquireWriter();
+                defer env.pool.releaseWriter();
+                try w.exec("BEGIN;");
+                errdefer w.exec("ROLLBACK;") catch |err| std.log.err("fanout test rollback: {s}", .{@errorName(err)});
+                try w.exec(mutation);
+                try w.exec("COMMIT;");
+            }
+            const record_frame = frameForDelivery(a, &app, subscriber, null, "fanout_posts", frame);
+            const custom_frame = frameForDelivery(a, &app, subscriber, null, "private_topic", frame);
+            try std.testing.expectEqual(index < 5, record_frame != null);
+            try std.testing.expectEqual(index < 5, custom_frame != null);
+            if (record_frame) |value| try std.testing.expect(value.ptr == frame.ptr);
+            if (custom_frame) |value| try std.testing.expect(value.ptr == frame.ptr);
+        }
+    }
 }
 
 test "frameForDelivery: F4 delete snapshot authorizes, then is STRIPPED to an id-only frame" {

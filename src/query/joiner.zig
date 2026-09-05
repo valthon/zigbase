@@ -23,6 +23,9 @@ pub const Joiner = struct {
     scratch: std.heap.ArenaAllocator,
     conn: *db.Db,
     base: schema.Collection,
+    /// Optional complete metadata snapshot for schema preflight. Never falls back to the
+    /// database: a collection absent here may be scheduled for pruning.
+    schema_snapshot: ?[]const schema.Collection = null,
     joins: std.ArrayList([]const u8) = .empty,
     seen: std.ArrayList(Seen) = .empty,
     counter: usize = 0,
@@ -97,7 +100,14 @@ pub const Joiner = struct {
                 cur_alias = s.alias;
                 cur_col = s.col;
             } else {
-                const target = (try collections.get(sa, self.conn, rf.options.relation.targetCollectionId)) orelse return error.UnknownField;
+                const target = if (self.schema_snapshot) |snapshot| blk: {
+                    for (snapshot) |candidate| {
+                        const key = rf.options.relation.targetCollectionId;
+                        if (std.mem.eql(u8, candidate.name, key) or
+                            (candidate.id.len > 0 and std.mem.eql(u8, candidate.id, key))) break :blk candidate;
+                    }
+                    return error.UnknownField;
+                } else (try collections.get(sa, self.conn, rf.options.relation.targetCollectionId)) orelse return error.UnknownField;
                 self.counter += 1;
                 const alias = try std.fmt.allocPrint(sa, "j{d}", .{self.counter});
                 const join = try std.fmt.allocPrint(sa, "LEFT JOIN {s} AS {s} ON {s}.{s} = {s}.\"id\"", .{ try ddl.quoteIdent(sa, target.name), alias, cur_alias, try ddl.quoteIdent(sa, seg), alias });

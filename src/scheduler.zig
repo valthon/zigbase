@@ -105,19 +105,33 @@ pub const JobState = struct {
 
 /// Pure decision: append the indices of jobs that are `.idle` AND due (`next_fire <= now`)
 /// to `out`, marking each `.running` (single-flight). Returns the filled slice of `out`.
-/// Capping at out.len is a safety bound; callers pass out.len >= state.len.
+/// `out` may be shorter than `state`; due jobs beyond its capacity remain idle
+/// and are eligible for the next tick.
 pub fn tick(state: []JobState, now: i64, out: []usize) []usize {
     var n: usize = 0;
     for (state, 0..) |*s, i| {
         if (s.status == .idle and s.next_fire <= now) {
-            s.status = .running;
             if (n < out.len) {
+                s.status = .running;
                 out[n] = i;
                 n += 1;
             }
         }
     }
     return out[0..n];
+}
+
+test "tick leaves due jobs beyond the output capacity idle for the next tick" {
+    var state = [_]JobState{
+        .{ .status = .idle, .next_fire = 10 },
+        .{ .status = .idle, .next_fire = 10 },
+        .{ .status = .idle, .next_fire = 10 },
+    };
+    var out: [1]usize = undefined;
+    try std.testing.expectEqualSlices(usize, &.{0}, tick(&state, 10, &out));
+    try std.testing.expect(state[1].status == .idle);
+    try std.testing.expectEqualSlices(usize, &.{1}, tick(&state, 10, &out));
+    try std.testing.expectEqualSlices(usize, &.{2}, tick(&state, 10, &out));
 }
 
 /// Apply a job's completion to its state. `reactive_result` is non-null ONLY for reactive

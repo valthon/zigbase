@@ -74,7 +74,7 @@ Docker image, and npm packages always have them.
 ```
 zigbase serve [--http-host H] [--http-port N] [--data-dir PATH] [--insecure-cookies]
               [--background] [--ephemeral]
-zigbase serve stop|status|logs [--data-dir PATH]   # manage a --background session
+zigbase serve stop|status|wait|logs [--data-dir PATH]   # manage a tracked session
 zigbase doctor [--production] [--json] [--data-dir PATH]
 zigbase migrate [status|rollback N|dump]
 zigbase schema dump [--out FILE] [--data-dir PATH]

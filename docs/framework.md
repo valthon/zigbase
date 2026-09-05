@@ -1548,6 +1548,9 @@ The guard is reevaluated before custom-topic delivery as well as subscription;
 keep it read-only and inexpensive. Retained sessions are reverified before
 delivery, so changed two-factor requirements or revocation require reauthentication.
 
+For contributor-only fanout measurements and their scope, see the
+[realtime benchmark guide](../CONTRIBUTING.md#realtime-delivery-authorization-benchmark).
+
 #### Multi-instance realtime (Postgres)
 
 Realtime delivery is **in-process**: a record write publishes to facil.io's pub/sub inside the
@@ -3137,24 +3140,57 @@ built-in itself is gated off.
   next run is pushed out by the queue's backoff (`fixed` or `exponential`, with optional
   jitter, capped at `max_ms`); exhausting `max_attempts` marks it `failed` and fires your
   `.onError` handler (phase `.job`). Memory jobs retry in-process the same way.
-- **Rate throttling** (`.rate = .{ .per_second = N }`, durable only): a token bucket per
-  rated queue, capacity = one second's worth of tokens (the max burst), enforced at **claim
-  time** — a job that can't claim a token this tick simply waits for the next ~500ms
-  scheduler tick rather than sleeping in the worker. It's in-process and
-  single-process-authoritative (see Caveats below); `.rate` on a `memory` queue is a
+- **Rate throttling** (`.rate = .{ .per_second = N }`, durable only): a per-second window per
+  rated queue, capacity = `per_second` (max burst = one second), enforced at **claim
+  time** — a job without remaining capacity this tick simply waits for the next ~500ms
+  scheduler tick rather than sleeping in the worker. Integer-second windows are
+  stored in the database: all instances sharing that database and queue name share
+  the ceiling. Claims and their rate charge commit atomically; empty claims spend
+  no capacity, and restarts do not reset the current window. Deploy the same rate
+  configuration on each instance (mixed configurations apply each claimant's own
+  ceiling to the window's already-used capacity). `.rate` on a `memory` queue is a
   compile error (memory jobs dispatch inline and can't be throttled).
 
 ### Caveats
 
 - Durable workers **poll** (roughly every scheduler tick, ~0.5s), so durable jobs drain with
-  low but non-zero latency. The scheduler is single-process (see §7 caveats).
+  low but non-zero latency. PostgreSQL workers use `FOR UPDATE SKIP LOCKED`, so
+  multiple instances can drain the same durable queues without claiming the same
+  pending row. Completion is fenced by a claim generation: a handler that outlives
+  its visibility timeout cannot overwrite a newer attempt's state. Delivery stays
+  **at-least-once**; fencing does not undo external side effects, so handlers still
+  need idempotency and an appropriate visibility timeout. A worker claims its whole
+  batch before running handlers serially: size the visibility timeout for the
+  **entire batch's worst-case processing time**, not just one handler, or reduce
+  `.concurrency` (the batch size). No lease heartbeat extends that timeout. The scheduler itself is
+  per-process (see §7 caveats); ordinary scheduled handlers are not coordinated.
+- **Upgrade coordinated workers together:** drain and stop older worker binaries
+  before applying migration `0025_queue_rates` from one process, then start the
+  upgraded instances. Older binaries neither enforce shared rate windows nor fence
+  completion, so mixed-version workers do not provide these guarantees. Consumer
+  migrations and older binaries still need a single migration leader; built-in system
+  migrations are serialized automatically (see §8).
 - Memory jobs run on a bounded worker pool that is drained and joined at shutdown (like `app.submit`); jobs still queued at a hard crash are lost (at-most-once), and a full ring rejects with `error.QueueFull`.
 
 ## 8. Define your schema in code (`.collections` + `.migrations`)
 
-Instead of provisioning collections over the REST API (see
-[recipes.md](recipes.md#recipe-provisioning-your-schema)), you can declare them at
-**comptime** and have ZigBase provision them at startup:
+Declare collections at **comptime** instead of provisioning them through the REST API
+(see [recipes.md](recipes.md#recipe-provisioning-your-schema)).
+
+Built-in system migrations coordinate concurrent startups automatically. PostgreSQL takes
+a database-scoped transaction advisory lock in a `READ COMMITTED` transaction before ledger bootstrap and each migration's
+applied-state check; SQLite takes its immediate writer lock. Each migration retains its own
+commit boundary. Failure rolls back that migration and releases its lock, so another startup
+can retry; earlier committed migrations remain applied. A failed lock acquisition aborts
+startup rather than proceeding unlocked (PostgreSQL deployment `lock_timeout` applies).
+This does not coordinate consumer migrations or old binaries that lack the lock: use a
+single migration leader for those, and continue draining old workers before incompatible
+queue upgrades. The system runner and public ledger bootstrap (`ensureLedger`, also used
+by status/rollback/doctor) share this lock and must run outside a caller-owned transaction.
+Nested use logs an explicit refusal and preserves the caller's transaction, returning
+`ExecFailed` for compatibility with the existing database error surface.
+
+ZigBase provisions the declarations at startup:
 
 ```zig
 zigbase.App(.{
@@ -3215,7 +3251,19 @@ with the rest of the comptime-validated surface.
 ### Indexes
 
 A collection may declare `.indexes` — a tuple of index literals provisioned as
-`CREATE INDEX` statements when the collection is created:
+`CREATE INDEX` statements when the collection is created, and reconciled on later startups
+even when no fields change. Added, removed, or changed declarations update only their
+indexes and metadata; index-only changes do not copy the table or remove unrelated indexes
+created by explicit migrations. A failed unique-index build rolls back index changes and
+metadata together **and refuses server startup**, with collection/index diagnostics.
+The declaration is authoritative, including the default empty `.indexes`: indexes added
+through REST/admin metadata but omitted from code are removed at the next startup. Every
+DROP/CREATE is logged. Existing ordinary migration-created indexes with matching table,
+columns, uniqueness, direction and collation are adopted into metadata ownership rather
+than recreated. Conflicting names or unsupported definitions (such as partial indexes)
+are preserved and refuse startup; resolve them with an explicit migration. Once adopted,
+an index follows the declaration, including later removal.
+Unchanged declarations do not rebuild indexes or bump schema generation:
 
 ```zig
 .indexes = .{
@@ -4156,6 +4204,19 @@ to a local cache); `null` means the backend has no such object. *(0.10.0:
 parameter; return a local path, materializing the file locally if necessary;
 `null` = object missing.)*
 
+Record uploads call `put` **before acquiring the database writer**, using
+server-generated record IDs and freshly generated file names. A plugin must not
+assume the destination record already exists. The subsequent transaction runs
+hooks, validation, and access rules before committing references to those bytes;
+failed requests best-effort delete their uploads, including a PUT whose reply
+failed. Upload POST returns `409` when the collection definition changed during
+transfer. An upload PATCH rechecks its record snapshot under the write transaction
+(with a PostgreSQL row lock) and returns `409` if another write changed the record
+during upload, or if the collection definition changed. PATCH checks update access
+to the existing row before transfer and to the updated row before commit.
+Reload the record and retry a conflict. A crash between PUT and
+commit can still leave unreferenced bytes; this is not a distributed transaction.
+
 **Presigned-redirect serving (S3).** By default every download is *proxied*: the
 server calls `fetch` (spooling to a local cache for S3) and streams the bytes
 itself. With `App(.{ .files = .{ .s3_presign_redirect = true } })` and the S3
@@ -4232,8 +4293,10 @@ requests, `ETag`, and per-collection cacheability exactly as with local
 storage** (§9's `fetch` contract). Startup runs a fail-fast `HeadObject` probe
 (200 or 404 both prove DNS/TLS/SigV4/bucket/permissions end-to-end; anything
 else refuses to start) so a bad S3 config is caught at boot, not on first
-upload. See [Known limitations](../KNOWN_LIMITATIONS.md) for the write-lock,
-best-effort-delete, proxy-only-serving, and 5 GiB single-`PUT` caveats.
+upload. Record cleanup follows every ListObjectsV2 continuation page, decodes XML
+key text, and refuses malformed or out-of-prefix listings. See
+[Known limitations](../KNOWN_LIMITATIONS.md) for best-effort cleanup, crash
+orphans, presigned-URL trade-offs, and the 5 GiB single-`PUT` cap.
 
 `zigbase.S3Storage` is exported alongside `zigbase.LocalStorage` (an empty
 placeholder type on a stock, non-`-Ds3` build — its `create`/`interface`

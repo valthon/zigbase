@@ -152,7 +152,7 @@ a Zigapagos + Preact frontend demonstrating a different static-files mode.
 zigbase serve [--http-host H] [--http-port N] [--data-dir PATH] [--serve-static DIR]
               [--insecure-cookies] [--trust-proxy] [--realtime-origins CSV]
               [--background] [--ephemeral] [--ignore-lock] [--force]
-zigbase serve stop | status [--json] | logs [--follow] [--data-dir PATH]
+zigbase serve stop | status [--json] | wait [--json] [--timeout-ms N] | logs [--follow] [--data-dir PATH]
 zigbase migrate [status | rollback [N] | dump [--out FILE]] [--data-dir PATH]
 zigbase migrate-db --from SQLITE_PATH --to POSTGRES_URL [--force]
 zigbase schema [dump [--json] [--out FILE] | apply FILE [--dry-run] [--allow-destructive] [--prune]] [--data-dir PATH]
@@ -175,7 +175,7 @@ changing anything, `rollback [N]` reverses the last N applied, and `dump` writes
 schema as a canonical migration.
 
 `serve --background` detaches and exits 0 only once the server answers; `serve
-stop|status|logs` manage that session; `serve --ephemeral` starts a throwaway server on a
+stop|status|wait|logs` manage that session; `serve --ephemeral` starts a throwaway server on a
 temp dir and a free port, printing one JSON object; `doctor` runs preflight checks and exits
 `1` on any error, `2` on warnings only, `0` when fully clean. See [docs/serve.md](docs/serve.md).
 

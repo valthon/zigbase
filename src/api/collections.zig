@@ -129,6 +129,10 @@ pub fn create(ctx: *http.RequestCtx) anyerror!http.Response {
     defer app.pool.releaseWriter();
     var def_mut = def;
     if (try prepareOAuthConfig(ctx, &def_mut, null)) |resp| return resp;
+    try w.beginImmediate();
+    defer if (w.inTransaction()) w.rollback() catch {};
+    try @import("../schema_gen.zig").lock(w);
+    if (try validateRules(ctx, w, def_mut)) |resp| return resp;
     const created = collections.create(ctx.allocator.a, app.io, w, def_mut) catch |e| switch (e) {
         error.Validation => return validationResponse(ctx),
         // The pre-check (`get() != null`) catches the common duplicate; error.Constraint covers a
@@ -136,6 +140,7 @@ pub fn create(ctx: *http.RequestCtx) anyerror!http.Response {
         error.Conflict, error.Constraint => return ApiError.conflict("Collection already exists.").toResponse(ctx.allocator.a),
         else => return e,
     };
+    try w.commit();
     if (app.col_cache) |cc| cc.invalidate(); // R1-4: collection DDL invalidates the metadata cache
     return .{ .status = 201, .body = try schema.collectionToJson(ctx.allocator.a, created) };
 }
@@ -161,7 +166,13 @@ pub fn update(ctx: *http.RequestCtx) anyerror!http.Response {
         return ApiError.badRequest("Encrypted fields require ZIGBASE_FIELD_KEY to be configured.").toResponse(ctx.allocator.a);
     const w = app.pool.acquireWriter();
     defer app.pool.releaseWriter();
-    const existing = collections.get(ctx.allocator.a, w, key) catch null;
+    const sqlite = db.dbDialect(w).kind == .sqlite;
+    if (sqlite) try w.exec("PRAGMA foreign_keys=OFF;");
+    defer if (sqlite) w.exec("PRAGMA foreign_keys=ON;") catch {};
+    try w.beginImmediate();
+    defer if (w.inTransaction()) w.rollback() catch {};
+    try @import("../schema_gen.zig").lock(w);
+    const existing = try collections.get(ctx.allocator.a, w, key);
     var def_mut = def;
     if (try prepareOAuthConfig(ctx, &def_mut, existing)) |resp| return resp;
     // The built-in superuser table is not an application schema: permit auth
@@ -180,18 +191,35 @@ pub fn update(ctx: *http.RequestCtx) anyerror!http.Response {
             defer st.finalize();
             try st.bindText(1, options);
             _ = try st.step();
+            try w.commit();
             if (app.col_cache) |cc| cc.invalidate();
             return .{ .status = 200, .body = try schema.collectionToJson(ctx.allocator.a, updated) };
         }
     }
+    // The engine preserves names on update; validate the same effective definition.
+    if (existing) |old| def_mut.name = old.name;
+    if (try validateRules(ctx, w, def_mut)) |resp| return resp;
     const updated = collections.update(ctx.allocator.a, app.io, w, key, def_mut) catch |e| switch (e) {
         error.NotFound => return ApiError.notFound().toResponse(ctx.allocator.a),
         error.Validation => return validationResponse(ctx),
         error.Conflict, error.Constraint => return ApiError.conflict("Conflict.").toResponse(ctx.allocator.a),
         else => return e,
     };
+    try w.commit();
     if (app.col_cache) |cc| cc.invalidate(); // R1-4: collection DDL invalidates the metadata cache
     return .{ .status = 200, .body = try schema.collectionToJson(ctx.allocator.a, updated) };
+}
+
+fn validateRules(ctx: *http.RequestCtx, w: *db.Db, def: schema.Collection) !?http.Response {
+    const lint = @import("../rules_lint.zig");
+    const live = try collections.list(ctx.allocator.a, w);
+    const report = try lint.checkChanges(ctx.allocator.a, w, live, &.{def}, false);
+    for (report.findings) |finding| {
+        if (!std.mem.eql(u8, finding.severity, "error")) continue;
+        const message = try std.fmt.allocPrint(ctx.allocator.a, "{s} collection '{s}' {s}: {s} ({s}).", .{ if (std.mem.eql(u8, finding.collection, def.name)) "Proposed" else "Retained (different)", finding.collection, finding.rule, finding.message, finding.code });
+        return try ApiError.badRequest(message).toResponse(ctx.allocator.a);
+    }
+    return null;
 }
 
 pub fn delete(ctx: *http.RequestCtx) anyerror!http.Response {
@@ -279,6 +307,51 @@ test "create then get then list a collection over handlers" {
     try std.testing.expectEqual(@as(u16, 200), lres.status);
     try std.testing.expect(std.mem.startsWith(u8, lres.body, "{\"items\":["));
     try std.testing.expect(std.mem.indexOf(u8, lres.body, "\"posts\"") != null);
+
+    var bad_create = ctxFor(env, RequestArena.from(&arena), .POST, "/api/collections",
+        \\{"name":"bad","fields":[],"viewRule":"missing = @request.auth.id"}
+    , &.{});
+    bad_create.authorization = auth_hdr;
+    const refused = try create(&bad_create);
+    try std.testing.expectEqual(@as(u16, 400), refused.status);
+    try std.testing.expect(std.mem.indexOf(u8, refused.body, "UnknownField") != null);
+    var bad_update = ctxFor(env, RequestArena.from(&arena), .PATCH, "/api/collections/posts",
+        \\{"name":"posts","fields":[],"viewRule":"title = 'x'"}
+    , &.{.{ .key = "idOrName", .value = "posts" }});
+    bad_update.authorization = auth_hdr;
+    try std.testing.expectEqual(@as(u16, 400), (try update(&bad_update)).status);
+    const after = try get(&gctx);
+    try std.testing.expect(std.mem.indexOf(u8, after.body, "\"title\"") != null);
+
+    const posts = blk: {
+        const writer = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        break :blk (try collections.get(a, writer, "posts")).?;
+    };
+    const comments_body = try std.fmt.allocPrint(a, "{{\"name\":\"comments\",\"fields\":[{{\"id\":\"\",\"name\":\"author\",\"type\":\"relation\",\"options\":{{\"targetCollectionId\":\"{s}\",\"maxSelect\":1}}}}],\"viewRule\":\"author.title != ''\"}}", .{posts.id});
+    var comments_ctx = ctxFor(env, RequestArena.from(&arena), .POST, "/api/collections", comments_body, &.{});
+    comments_ctx.authorization = auth_hdr;
+    try std.testing.expectEqual(@as(u16, 201), (try create(&comments_ctx)).status);
+    // No local invalid rule: only comments' retained relation traversal becomes invalid.
+    bad_update.body =
+        \\{"name":"posts","fields":[]}
+    ;
+    const cross_refused = try update(&bad_update);
+    try std.testing.expectEqual(@as(u16, 400), cross_refused.status);
+    try std.testing.expect(std.mem.indexOf(u8, cross_refused.body, "comments") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cross_refused.body, "Retained (different)") != null);
+    // A legacy invalid rule anywhere in the retained graph also blocks unrelated DDL.
+    {
+        const writer = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        try writer.exec("UPDATE _collections SET viewRule='missing = 1' WHERE name='comments';");
+    }
+    bad_create.body =
+        \\{"name":"unrelated","fields":[]}
+    ;
+    const legacy_refused = try create(&bad_create);
+    try std.testing.expectEqual(@as(u16, 400), legacy_refused.status);
+    try std.testing.expect(std.mem.indexOf(u8, legacy_refused.body, "comments") != null);
 }
 
 test "collections_frozen 403s the runtime DDL endpoints without mutating collections (#234)" {

@@ -42,6 +42,12 @@ pub fn bump(w: *db.Db) db.DbError!void {
     try w.exec("UPDATE \"_schema_state\" SET \"generation\" = \"generation\" + 1 WHERE \"id\" = 1;");
 }
 
+/// Serialize metadata preflight and mutation across processes, without advertising a schema
+/// change. Must be inside a transaction; the no-op UPDATE locks the singleton on both DBs.
+pub fn lock(w: *db.Db) db.DbError!void {
+    try w.exec("UPDATE \"_schema_state\" SET \"generation\" = \"generation\" WHERE \"id\" = 1;");
+}
+
 /// Read the current marker value. Returns 0 when the row is somehow absent, which is the same
 /// value the migration seeds — an absent row can only mean "nothing has ever bumped".
 pub fn read(conn: *db.Db) db.DbError!i64 {

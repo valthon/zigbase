@@ -1,4 +1,5 @@
 import os, re, socket, subprocess, tempfile, time, shutil, pathlib, pytest
+import json, urllib.request, urllib.error
 from playwright.sync_api import sync_playwright
 from _bin import resolve_binary
 
@@ -80,16 +81,19 @@ def server(binary, request):
     # Plain-HTTP local test server: opt out of Secure cookies (default-on) so the
     # browser stores the auth/CSRF cookies over http://; the default loopback bind
     # and auto-generated JWT secret are exactly what we want.
-    proc = subprocess.Popen([binary, "serve", "--insecure-cookies"], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    for _ in range(50):
-        try:
-            with socket.create_connection(("127.0.0.1", port), timeout=0.2): break
-        except OSError: time.sleep(0.1)
+    log_path = os.path.join(data, "server.log")
+    with open(log_path, "wb") as log:
+        proc = subprocess.Popen([binary, "serve", "--insecure-cookies"], env=env,
+                                stdout=log, stderr=subprocess.STDOUT)
     base = f"http://127.0.0.1:{port}"
     try:
+        _wait_reachable_or_fail(proc, port, log_path)
         yield base
     finally:
-        proc.terminate(); proc.wait(timeout=5); shutil.rmtree(data, ignore_errors=True)
+        try:
+            _stop_server(proc)
+        finally:
+            shutil.rmtree(data, ignore_errors=True)
 
 # Launching Chromium (~0.5s) once per test dominated the wall time of the (now
 # parallel) suite. Reuse ONE browser process per test session — under pytest-xdist
@@ -134,25 +138,34 @@ def auth2_binary():
     assert path.exists(), f"auth2-server not built at {path}"
     return str(path)
 
-def _wait_reachable_or_fail(proc, port, log_path, timeout_s=5.0):
-    """Poll the port until it accepts connections; raise loudly instead of returning
-    silently if the server dies early or never comes up. A fixture that raises here
-    fails cleanly at setup, instead of yielding a base URL nothing is listening on and
-    leaving every test in the fixture to fail later with a generic connection error."""
-    deadline = time.time() + timeout_s
-    while time.time() < deadline:
-        if proc.poll() is not None:
-            break  # process already exited; no point polling further
-        try:
-            with socket.create_connection(("127.0.0.1", port), timeout=0.2):
-                return
-        except OSError:
-            time.sleep(0.1)
+def _stop_server(proc):
     proc.terminate()
     try:
         proc.wait(timeout=5)
     except subprocess.TimeoutExpired:
-        proc.kill(); proc.wait(timeout=5)
+        proc.kill()
+        proc.wait(timeout=5)
+
+
+def _wait_reachable_or_fail(proc, port, log_path, timeout_s=5.0):
+    """Require HTTP health readiness, not merely an open socket; raise instead of returning
+    silently if the server dies early or never comes up. A fixture that raises here
+    fails cleanly at setup, instead of yielding a base URL nothing is listening on and
+    leaving every test in the fixture to fail later with a generic connection error."""
+    deadline = time.monotonic() + timeout_s
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            break  # process already exited; no point polling further
+        try:
+            with opener.open(f"http://127.0.0.1:{port}/api/health", timeout=0.2) as response:
+                body = json.load(response)
+                if response.status == 200 and isinstance(body, dict) and body.get("status") == "ok":
+                    return
+        except (OSError, ValueError, urllib.error.URLError):
+            pass
+        time.sleep(0.1)
+    _stop_server(proc)
     output = pathlib.Path(log_path).read_text(errors="replace") if pathlib.Path(log_path).exists() else "<no output captured>"
     raise AssertionError(f"server on port {port} never became reachable (exit={proc.returncode}):\n{output}")
 
@@ -177,7 +190,10 @@ def auth2_server(auth2_binary):
     try:
         yield f"http://127.0.0.1:{port}"
     finally:
-        proc.terminate(); proc.wait(timeout=5); shutil.rmtree(data, ignore_errors=True)
+        try:
+            _stop_server(proc)
+        finally:
+            shutil.rmtree(data, ignore_errors=True)
 
 @pytest.fixture()
 def auth2_page(_browser, auth2_server):

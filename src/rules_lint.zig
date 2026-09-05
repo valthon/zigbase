@@ -1,13 +1,10 @@
 //! `zigbase schema check-rules`: lint every collection's access rules through the REAL
 //! rule pipeline, BEFORE a request has to.
 //!
-//! Access rules are never validated at write time. `schema.parseCollectionInput` decodes
-//! the five rule fields as opaque strings and `collections.create`/`update` bind them
-//! straight into `_collections`; nothing calls the lexer. The first thing that parses a
-//! rule is the request that has to evaluate it — and a rule that fails to parse fails
-//! CLOSED (500, the write never runs). So a typo ships silently and breaks production on
-//! the first request that touches the collection. This module is the preflight that
-//! closes that gap.
+//! REST collection mutations and schema apply call `checkChanges` before writing: syntax
+//! and reference checks against a complete prospective schema, without substituting
+//! guessed request values. Trusted low-level collection writers can still stage schema
+//! graphs; callers of those writers should explicitly preflight their final graph.
 //!
 //! **It does not fork the parser.** The full/live check calls `rules.compileGuard` — the
 //! exact function the request path calls (lexer -> parser -> joiner -> compiler). The
@@ -16,10 +13,11 @@
 //! second grammar here to drift.
 //!
 //! **Two depths, honestly labeled.** Field and relation resolution happens in the joiner,
-//! which needs a live DB (it looks the target collection up). Offline, against a document,
-//! that is simply not knowable — so document mode reports `"depth":"syntax"` and live mode
+//! which ordinarily looks target collections up in the DB. The explicit lint command's
+//! document mode reports `"depth":"syntax"` and live mode
 //! reports `"depth":"full"`, and the summary carries the distinction on every run. Syntax
-//! depth catches malformed expressions; only full depth catches `UnknownField`.
+//! depth catches malformed expressions. Schema apply separately constructs a complete
+//! prospective snapshot for the joiner, catching UnknownField before DDL, even on dry runs.
 //!
 //! Rule POLICY lives above the parser (`rules.decide`): `null` and `""` both mean Locked
 //! (superusers only) — the safe default, never a finding — and the exact string `"@public"`
@@ -32,6 +30,7 @@ const request = @import("request.zig");
 const rules = @import("rules.zig");
 const lexer = @import("query/lexer.zig");
 const parser = @import("query/parser.zig");
+const joiner = @import("query/joiner.zig");
 
 /// How deep the check could go. `full` = the whole pipeline against a live database;
 /// `syntax` = lexer + parser only, because a document has no schema to resolve against.
@@ -158,8 +157,21 @@ const public_message = "the rule is \"@public\": this collection is open to ever
 /// — the compiled Guard, which `compileGuard` deep-clones onto `sa` before returning. The
 /// explicit `g.deinit(sa)` makes that ownership visible even though the arena would reclaim
 /// it regardless; nothing escapes, so there is no error path that can leak an owner.
-fn checkOne(sa: std.mem.Allocator, conn: ?*db.Db, col: schema.Collection, rule: []const u8, rctx: *const request.RequestContext) !void {
+fn checkOne(sa: std.mem.Allocator, conn: ?*db.Db, snapshot: ?[]const schema.Collection, col: schema.Collection, rule: []const u8, rctx: *const request.RequestContext) !void {
     if (conn) |c| {
+        if (snapshot) |cols| {
+            const toks = try lexer.lex(sa, rule);
+            const ast = try parser.parse(sa, toks);
+            var j = joiner.Joiner.init(sa, c, col);
+            defer j.deinit();
+            j.allow_hidden = true;
+            j.schema_snapshot = cols;
+            // Resolve every structural path, but do not substitute an anonymous request's
+            // empty/null values into typed comparisons. Those values are unknowable here;
+            // e.g. a select compared to @request.auth.role can be valid at request time.
+            try checkPaths(&j, ast);
+            return;
+        }
         // The same call `rules.decide` -> `check` leads to on a real request. `compileGuard`
         // sets `allow_hidden = true` internally: an access rule is operator-authored and is
         // allowed to gate on a hidden field (it is evaluated, never serialized), so linting
@@ -172,6 +184,30 @@ fn checkOne(sa: std.mem.Allocator, conn: ?*db.Db, col: schema.Collection, rule: 
     _ = try parser.parse(sa, toks);
 }
 
+fn checkPaths(j: *joiner.Joiner, node: *const parser.Node) !void {
+    switch (node.*) {
+        .logic => |logic| {
+            try checkPaths(j, logic.l);
+            try checkPaths(j, logic.r);
+        },
+        .cmp => |cmp| {
+            try checkOperandPath(j, cmp.lhs);
+            try checkOperandPath(j, cmp.rhs);
+        },
+    }
+}
+
+fn checkOperandPath(j: *joiner.Joiner, operand: parser.Operand) !void {
+    switch (operand) {
+        .path => |path| if (!std.mem.startsWith(u8, path, "@")) {
+            _ = try j.resolve(path);
+        },
+        .list => |items| for (items) |item| try checkOperandPath(j, item),
+        .placeholder => return error.BadFilter, // access rules have no bound filter_args
+        else => {},
+    }
+}
+
 /// The shared core of both modes: identical collection/rule selection and identical policy
 /// handling, differing only in how deep `checkOne` goes. One code path so document mode can
 /// never disagree with live mode about WHICH rules are rules.
@@ -180,7 +216,7 @@ fn checkOne(sa: std.mem.Allocator, conn: ?*db.Db, col: schema.Collection, rule: 
 /// it; the finding strings are all either static literals or borrowed from `cols`, so none
 /// of them outlive their source. Per-rule pipeline scratch lives on a nested arena torn
 /// down at the end of each iteration.
-fn run(arena: std.mem.Allocator, cols: []const schema.Collection, conn: ?*db.Db) !Report {
+fn run(arena: std.mem.Allocator, cols: []const schema.Collection, conn: ?*db.Db, snapshot: ?[]const schema.Collection) !Report {
     var out: std.ArrayList(Finding) = .empty;
     // The findings themselves borrow (static messages, names from `cols`), so only the
     // backing buffer is owned here. Released on every abort path — an OOM, or an
@@ -225,7 +261,7 @@ fn run(arena: std.mem.Allocator, cols: []const schema.Collection, conn: ?*db.Db)
             var scratch = std.heap.ArenaAllocator.init(arena);
             defer scratch.deinit();
 
-            checkOne(scratch.allocator(), conn, c, rule, &rctx) catch |e| {
+            checkOne(scratch.allocator(), conn, snapshot, c, rule, &rctx) catch |e| {
                 const code = @errorName(e);
                 // Not a rule defect (OOM, DB failure, a dangling relation target): the lint
                 // could not run, so say so by failing rather than by reporting "clean".
@@ -247,13 +283,49 @@ fn run(arena: std.mem.Allocator, cols: []const schema.Collection, conn: ?*db.Db)
 /// FULL depth: every rule through `rules.compileGuard` against `conn`, so field and
 /// relation resolution is checked too. `cols` is what `collections.list` returned.
 pub fn checkLive(arena: std.mem.Allocator, conn: *db.Db, cols: []const schema.Collection) !Report {
-    return run(arena, cols, conn);
+    return run(arena, cols, conn, null);
+}
+
+/// Validate syntax and field/relation paths through the runtime parser and joiner, without
+/// writing DDL or guessing the values of request macros.
+/// `cols` must contain the complete post-change schema, including retained live collections
+/// and injected auth fields. Relation lookups use ONLY this snapshot, so forward/cyclic
+/// relations work and pruned collections cannot accidentally satisfy a reference.
+/// Owns only `findings`; caller frees it. Names borrow from `cols`.
+pub fn checkSchema(alloc: std.mem.Allocator, conn: *db.Db, cols: []const schema.Collection) !Report {
+    return run(alloc, cols, conn, cols);
+}
+
+/// Overlay desired definitions on live metadata before validating. Scratch is self-freeing;
+/// the report owns only its findings slice, whose collection names borrow from the inputs.
+pub fn checkChanges(alloc: std.mem.Allocator, conn: *db.Db, live: []const schema.Collection, desired: []const schema.Collection, prune: bool) !Report {
+    var scratch = std.heap.ArenaAllocator.init(alloc);
+    defer scratch.deinit();
+    const sa = scratch.allocator();
+    var snapshot: std.ArrayList(schema.Collection) = .empty;
+    for (desired) |def| {
+        var c = def;
+        for (live) |old| {
+            if (std.mem.eql(u8, old.name, def.name)) {
+                c.id = old.id;
+                break;
+            }
+        }
+        try snapshot.append(sa, try schema.injectAuthFields(sa, c));
+    }
+    for (live) |old| {
+        const replaced = for (desired) |def| {
+            if (std.mem.eql(u8, def.name, old.name)) break true;
+        } else false;
+        if (!replaced and (!prune or old.system)) try snapshot.append(sa, old);
+    }
+    return checkSchema(alloc, conn, snapshot.items);
 }
 
 /// SYNTAX depth: lexer + parser only. Field/relation names are NOT resolved — that needs a
 /// live schema and a connection, which a document does not carry.
 pub fn checkDocument(arena: std.mem.Allocator, cols: []const schema.Collection) !Report {
-    return run(arena, cols, null);
+    return run(arena, cols, null, null);
 }
 
 pub fn summarize(r: Report, depth: Depth) Summary {
@@ -333,6 +405,28 @@ fn testCollection(name: []const u8, rules_in: [5]?[]const u8) schema.Collection 
 }
 
 const no_rules = [5]?[]const u8{ null, null, null, null, null };
+
+test "prospective rules resolve forward relations and request-valued comparisons" {
+    const a = testing.allocator;
+    var conn = try db.Db.openMemory();
+    defer conn.close();
+    const cols = [_]schema.Collection{
+        .{ .id = "", .name = "posts", .fields = &.{.{ .id = "f1", .name = "author", .options = .{ .relation = .{ .targetCollectionId = "users", .maxSelect = 1 } } }}, .viewRule = "author.role = @request.auth.role" },
+        .{ .id = "", .name = "users", .fields = &.{.{ .id = "f2", .name = "role", .options = .{ .select = .{ .values = &.{"admin"} } } }} },
+    };
+    const valid = try checkChanges(a, &conn, &.{}, &cols, false);
+    defer a.free(valid.findings);
+    try testing.expectEqual(@as(usize, 0), valid.findings.len);
+    var invalid = cols;
+    invalid[0].viewRule = "author.missing = @request.auth.role";
+    const bad = try checkChanges(a, &conn, &.{}, &invalid, false);
+    defer a.free(bad.findings);
+    try testing.expectEqualStrings("UnknownField", bad.findings[0].code);
+    // A removed target must not be resolved through the live database fallback.
+    const pruned = try checkChanges(a, &conn, &cols, cols[0..1], true);
+    defer a.free(pruned.findings);
+    try testing.expectEqualStrings("UnknownField", pruned.findings[0].code);
+}
 
 test "checkDocument: a clean schema produces no findings, only coverage" {
     const cols = [_]schema.Collection{

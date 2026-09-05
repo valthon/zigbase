@@ -103,6 +103,8 @@ jobs:
         run: ./scripts/check-gating.sh
       - name: Allocator ownership contracts (ratchet)
         run: ./scripts/check-allocator-contracts.sh
+      - name: Realtime fanout benchmark correctness (no timing threshold)
+        run: mise exec zig@0.16.0 -- zig build bench -Dbench-optimize=ReleaseSafe -- --realtime-only --json
       - name: Error-code ledger is append-only
         run: ./scripts/check-error-code-ledger.sh origin/main
       - name: Doctor check-id ledger is append-only

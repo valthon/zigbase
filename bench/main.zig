@@ -109,12 +109,22 @@ pub fn main(init: std.process.Init) !void {
 
     const argv = try init.minimal.args.toSlice(arena);
     var json = false;
+    var realtime_only = false;
     for (argv[1..]) |arg| {
         if (std.mem.eql(u8, arg, "--json")) json = true;
+        if (std.mem.eql(u8, arg, "--realtime-only")) realtime_only = true;
     }
 
     var results: std.ArrayList(harness.Result) = .empty;
     defer results.deinit(alloc);
+    if (realtime_only) {
+        try @import("realtime.zig").run(alloc, init.io, &results);
+        var buffer: [4096]u8 = undefined;
+        var output = std.Io.File.stdout().writer(init.io, &buffer);
+        try harness.report(results.items, json, &output.interface);
+        try output.interface.flush();
+        return;
+    }
     try results.append(alloc, try harness.run("smoke/alloc-16", 100, 1000, init.io, {}, benchNoop));
 
     const key = crypto.deriveKey("bench-secret", "tk1");
@@ -176,6 +186,7 @@ pub fn main(init: std.process.Init) !void {
     const fctx = FilterCtx{ .conn = &rdb, .col = post_col, .filter = "title = \"hi\" && views > 5 && (title = \"a\" || title = \"b\")" };
     try results.append(alloc, try harness.runArena("query/filter-compile", 100, 2000, init.io, fctx, benchFilterCompile));
 
+    try @import("realtime.zig").run(alloc, init.io, &results);
     var buf: [4096]u8 = undefined;
     var w = std.Io.File.stdout().writer(init.io, &buf);
     try harness.report(results.items, json, &w.interface);

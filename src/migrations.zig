@@ -646,6 +646,11 @@ fn init_0022_schema_state(m: *Migrator) db.DbError!void {
     try m.exec(schema_state_seed_sql);
 }
 
+fn init_0025_queue_rates(m: *Migrator) db.DbError!void {
+    try m.exec("CREATE TABLE IF NOT EXISTS \"_queue_rates\" (\"queue\" TEXT PRIMARY KEY, \"window_s\" BIGINT NOT NULL, \"used\" BIGINT NOT NULL CHECK (\"used\" >= 0));");
+    try m.exec("ALTER TABLE \"_queue_jobs\" ADD COLUMN \"claim_generation\" BIGINT NOT NULL DEFAULT 0;");
+}
+
 pub const all = [_]Migration{
     .{ .name = "0001_init", .up = init_0001 },
     .{ .name = "0002_auth", .up = init_0002 },
@@ -671,13 +676,21 @@ pub const all = [_]Migration{
     .{ .name = "0022_schema_state", .up = init_0022_schema_state },
     .{ .name = "0023_two_factor_attempts", .up = @import("auth/two_factor_attempt.zig").migrate },
     .{ .name = "0024_two_factor_credentials", .up = @import("auth/two_factor_store.zig").migrate },
+    .{ .name = "0025_queue_rates", .up = init_0025_queue_rates },
 };
 
-/// Create the `_migrations` ledger table if it is absent (idempotent). The auto-increment PK
-/// keyword diverges per backend (AUTOINCREMENT vs IDENTITY), so it is composed via the dialect
-/// rather than lowered textually. Shared by `run` (which then applies the system migrations) and
-/// by the `migrate status` CLI path, which reads the ledger without applying anything.
+/// Create the ledger under the same startup lock used by system migrations. Public CLI
+/// callers (status, rollback, doctor) must not race catalog bootstrap on a fresh database.
+/// Owns its transaction; refuses an already-open caller transaction without changing it.
 pub fn ensureLedger(w: *db.Db) db.DbError!void {
+    try beginSystemMigration(w);
+    errdefer rollbackSystemMigration(w);
+    try createLedgerLocked(w);
+    try w.commit();
+}
+
+/// Only call while holding beginSystemMigration's transaction-scoped lock.
+fn createLedgerLocked(w: *db.Db) db.DbError!void {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     var m = Migrator{ .db = w, .dialect = db.dbDialect(w), .arena = arena.allocator(), .io = undefined };
@@ -695,17 +708,13 @@ pub fn run(w: *db.Db) db.DbError!void {
     // The system migrations never read `io`; it is provided only on the consumer-migration path.
     var m = Migrator{ .db = w, .dialect = db.dbDialect(w), .arena = arena.allocator(), .io = undefined };
 
+    // Bootstrap is protected too: concurrent CREATE TABLE IF NOT EXISTS can race
+    // in PostgreSQL's catalogs before there is a ledger row/table to lock.
     try ensureLedger(w);
 
     var applied_any = false;
     for (all) |mig| {
-        if (try isApplied(&m, mig.name)) continue;
-        try w.begin();
-        errdefer w.rollback() catch {};
-        try mig.up(&m);
-        try recordApplied(&m, mig.name);
-        try w.commit();
-        applied_any = true;
+        if (try applySystemMigration(&m, mig)) applied_any = true;
     }
 
     // A system migration can create or reshape collections, and it bypasses the collections.zig
@@ -716,7 +725,51 @@ pub fn run(w: *db.Db) db.DbError!void {
     //
     // Deliberately AFTER the loop rather than inside each transaction: 0022 CREATEs the marker
     // table itself, so a bump inside its own transaction would have to special-case ordering.
-    if (applied_any) try schema_gen.bump(w);
+    if (applied_any) {
+        try beginSystemMigration(w);
+        errdefer rollbackSystemMigration(w);
+        try schema_gen.bump(w);
+        try w.commit();
+    }
+}
+
+// A database-scoped, engine-owned advisory key ("ZBMG", system migrations).
+// Transaction-scoped locks release on commit, rollback, and connection loss;
+// no session lock can leak back into the pool after a failed migration.
+const system_migration_lock_sql = "SELECT pg_advisory_xact_lock(1514294599, 1);";
+
+fn beginSystemMigration(w: *db.Db) db.DbError!void {
+    // PostgreSQL merely warns on nested BEGIN, then COMMIT would commit the caller's
+    // transaction. This runner owns its boundaries and must refuse that use explicitly.
+    if (w.inTransaction()) {
+        std.log.warn("system migrations refused: connection already in a transaction; caller state preserved", .{});
+        return error.ExecFailed;
+    }
+    const postgres = db.dbDialect(w).kind == .postgres;
+    // The lock acquisition itself is a SELECT. Under a database default of REPEATABLE
+    // READ it could pin a pre-wait snapshot, making the later ledger recheck stale.
+    if (postgres) try w.exec("BEGIN ISOLATION LEVEL READ COMMITTED;") else try w.beginImmediate();
+    errdefer rollbackSystemMigration(w);
+    if (postgres) try w.exec(system_migration_lock_sql);
+}
+
+fn rollbackSystemMigration(w: *db.Db) void {
+    w.rollback() catch |err| std.log.err("system migration rollback failed: {s}", .{@errorName(err)});
+}
+
+/// The ledger read MUST follow the lock: another startup may have applied this
+/// migration while we waited. Each migration retains its own atomic commit.
+fn applySystemMigration(m: *Migrator, mig: Migration) db.DbError!bool {
+    try beginSystemMigration(m.db);
+    errdefer rollbackSystemMigration(m.db);
+    if (try isApplied(m, mig.name)) {
+        try m.db.commit();
+        return false;
+    }
+    try mig.up(m);
+    try recordApplied(m, mig.name);
+    try m.db.commit();
+    return true;
 }
 
 fn isApplied(m: *Migrator, name: []const u8) db.DbError!bool {
@@ -732,6 +785,169 @@ fn recordApplied(m: *Migrator, name: []const u8) db.DbError!void {
     defer st.finalize();
     try st.bindText(1, name);
     _ = try st.step();
+}
+
+const RollbackProbe = struct {
+    fn fail(m: *Migrator) db.DbError!void {
+        try m.exec("CREATE TABLE migration_probe (value BIGINT);");
+        return error.ExecFailed;
+    }
+
+    fn succeed(m: *Migrator) db.DbError!void {
+        try m.exec("CREATE TABLE migration_probe (value BIGINT);");
+        try m.exec("INSERT INTO migration_probe VALUES (1);");
+    }
+};
+
+fn expectMigrationRollbackAndRetry(w: *db.Db) !void {
+    // These two tiny migration bodies and the ledger statement fit this bounded SQL scratch.
+    var buffer: [8192]u8 = undefined;
+    var scratch = std.heap.FixedBufferAllocator.init(&buffer);
+    var m = Migrator{ .db = w, .dialect = db.dbDialect(w), .arena = scratch.allocator(), .io = undefined };
+    const name = "test_rollback_probe";
+    try std.testing.expectError(error.ExecFailed, applySystemMigration(&m, .{ .name = name, .up = RollbackProbe.fail }));
+    try std.testing.expect(!w.inTransaction());
+    try std.testing.expect(!try isApplied(&m, name));
+    // No IF NOT EXISTS: this succeeds only if the failed migration's DDL rolled back.
+    try std.testing.expect(try applySystemMigration(&m, .{ .name = name, .up = RollbackProbe.succeed }));
+    try std.testing.expect(!try applySystemMigration(&m, .{ .name = name, .up = RollbackProbe.fail }));
+    try std.testing.expect(!w.inTransaction());
+    try w.begin();
+    defer if (w.inTransaction()) rollbackSystemMigration(w);
+    try std.testing.expectError(error.ExecFailed, run(w));
+    try std.testing.expectError(error.ExecFailed, ensureLedger(w));
+    try std.testing.expect(w.inTransaction()); // refusal did not commit/rollback caller state
+    try w.rollback();
+}
+
+test "SQLite system migration failure rolls back DDL and ledger and permits retry" {
+    var w = try db.Db.openMemory();
+    defer w.close();
+    try run(&w);
+    try expectMigrationRollbackAndRetry(&w);
+}
+
+const ConcurrentMigrationTest = struct {
+    first: db.Db,
+    second: db.Db,
+
+    fn init() !ConcurrentMigrationTest {
+        if (!@import("build_options").postgres) return error.SkipZigTest;
+        const url = std.testing.environ.getPosix("ZIGBASE_PG_TEST_URL") orelse return error.SkipZigTest;
+        var first = try db.Db.openPostgres(std.testing.allocator, std.testing.io, url);
+        errdefer first.close();
+        var second = try db.Db.openPostgres(std.testing.allocator, std.testing.io, url);
+        errdefer second.close();
+        try first.exec("DROP SCHEMA IF EXISTS zb_migration_coordination CASCADE;");
+        try first.exec("CREATE SCHEMA zb_migration_coordination;");
+        errdefer first.exec("DROP SCHEMA zb_migration_coordination CASCADE;") catch |err|
+            std.log.err("migration test cleanup failed: {s}", .{@errorName(err)});
+        try first.exec("SET search_path TO zb_migration_coordination;");
+        try second.exec("SET search_path TO zb_migration_coordination;");
+        return .{ .first = first, .second = second };
+    }
+
+    fn deinit(self: *ConcurrentMigrationTest) void {
+        self.second.close();
+        self.first.exec("DROP SCHEMA zb_migration_coordination CASCADE;") catch |err|
+            std.log.err("migration test cleanup failed: {s}", .{@errorName(err)});
+        self.first.close();
+    }
+};
+
+test "pg simultaneous system startup creates ledger and applies non-idempotent migrations once" {
+    if (!@import("build_options").postgres) return error.SkipZigTest;
+    var env = try ConcurrentMigrationTest.init();
+    defer env.deinit();
+    // A deployment's default isolation must not turn the post-lock recheck into a
+    // stale snapshot taken by the SELECT that began waiting for the advisory lock.
+    try env.first.exec("SET default_transaction_isolation = 'repeatable read';");
+    try env.second.exec("SET default_transaction_isolation = 'repeatable read';");
+    const Runner = struct {
+        w: *db.Db,
+        start: *std.atomic.Value(bool),
+        err: ?db.DbError = null,
+        fn execute(self: *@This()) void {
+            while (!self.start.load(.acquire)) std.atomic.spinLoopHint();
+            run(self.w) catch |err| {
+                self.err = err;
+            };
+        }
+    };
+    var start = std.atomic.Value(bool).init(false);
+    var first = Runner{ .w = &env.first, .start = &start };
+    var second = Runner{ .w = &env.second, .start = &start };
+    const thread = try std.Thread.spawn(.{}, Runner.execute, .{&first});
+    start.store(true, .release);
+    second.execute();
+    thread.join();
+    if (first.err) |err| return err;
+    if (second.err) |err| return err;
+    try std.testing.expect(!env.first.inTransaction() and !env.second.inTransaction());
+    var st = try env.first.prepare("SELECT count(*) FROM \"_migrations\";");
+    defer st.finalize();
+    try std.testing.expect(try st.step());
+    try std.testing.expectEqual(@as(i64, all.len), st.columnInt(0));
+    // Reproduce an upgrade from the prior queue schema as well as first installation.
+    try env.first.exec("ALTER TABLE \"_queue_jobs\" DROP COLUMN \"claim_generation\";");
+    try env.first.exec("DROP TABLE \"_queue_rates\";");
+    try env.first.exec("DELETE FROM \"_migrations\" WHERE \"name\"='0025_queue_rates';");
+    start.store(false, .release);
+    const upgrade_thread = try std.Thread.spawn(.{}, Runner.execute, .{&first});
+    start.store(true, .release);
+    second.execute();
+    upgrade_thread.join();
+    if (first.err) |err| return err;
+    if (second.err) |err| return err;
+    try expectMigrationRollbackAndRetry(&env.second);
+}
+
+test "pg public ledger bootstrap coordinates with a fresh replica startup" {
+    if (!@import("build_options").postgres) return error.SkipZigTest;
+    var env = try ConcurrentMigrationTest.init();
+    defer env.deinit();
+    const Runner = struct {
+        w: *db.Db,
+        start: *std.atomic.Value(bool),
+        err: ?db.DbError = null,
+        fn execute(self: *@This()) void {
+            while (!self.start.load(.acquire)) std.atomic.spinLoopHint();
+            ensureLedger(self.w) catch |err| {
+                self.err = err;
+            };
+        }
+    };
+    var start = std.atomic.Value(bool).init(false);
+    var runner = Runner{ .w = &env.first, .start = &start };
+    const thread = try std.Thread.spawn(.{}, Runner.execute, .{&runner});
+    start.store(true, .release);
+    const result = run(&env.second);
+    thread.join();
+    try result;
+    if (runner.err) |err| return err;
+    try std.testing.expect(!env.first.inTransaction() and !env.second.inTransaction());
+}
+
+test "pg system migration lock timeout rolls back and releases on retry" {
+    if (!@import("build_options").postgres) return error.SkipZigTest;
+    var env = try ConcurrentMigrationTest.init();
+    defer env.deinit();
+    try beginSystemMigration(&env.first);
+    defer if (env.first.inTransaction()) rollbackSystemMigration(&env.first);
+    try env.second.exec("SET lock_timeout = '100ms';");
+    try std.testing.expectError(error.ExecFailed, run(&env.second));
+    try std.testing.expect(!env.second.inTransaction());
+    // Public ledger-only CLI callers share the lock and release their transaction
+    // after timeout rather than racing CREATE TABLE in the PostgreSQL catalogs.
+    try std.testing.expectError(error.ExecFailed, ensureLedger(&env.second));
+    try std.testing.expect(!env.second.inTransaction());
+    try env.first.rollback();
+    try ensureLedger(&env.second);
+    try std.testing.expect(!env.second.inTransaction());
+    try run(&env.second);
+    // The completed run retained no advisory lock; another connection proceeds immediately.
+    try env.first.exec("SET lock_timeout = '100ms';");
+    try run(&env.first);
 }
 
 test "migrations apply once and are idempotent" {
@@ -920,7 +1136,7 @@ test "0013 creates the _queue_jobs table with its indexes" {
     var t = try d.prepare("SELECT COUNT(*) FROM pragma_table_info('_queue_jobs');");
     defer t.finalize();
     _ = try t.step();
-    try std.testing.expectEqual(@as(i64, 13), t.columnInt(0));
+    try std.testing.expectEqual(@as(i64, 14), t.columnInt(0)); // includes the 0025 claim-generation fence
     var idx = try d.prepare("SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name IN ('idx_queue_jobs_ready','idx_queue_jobs_created');");
     defer idx.finalize();
     _ = try idx.step();

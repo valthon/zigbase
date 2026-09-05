@@ -45,9 +45,10 @@ pub const RetryPolicy = struct {
 
 /// Sustained per-queue delivery ceiling (durable only). `per_second` is BOTH the
 /// refill rate and the bucket capacity, so the maximum burst is one second's worth
-/// of tokens. The bucket is in-process, per queue name, shared by every worker
-/// draining that queue — authoritative because the scheduler is single-process
-/// (documented). Memory queues cannot be rated (loud @compileError at lowering).
+/// of tokens. Integer-second windows are stored in the database, keyed by queue
+/// name and shared by every worker/instance draining it. Claiming rows and charging
+/// the window are one transaction. Memory queues cannot be rated (loud
+/// @compileError at lowering).
 pub const Rate = struct { per_second: u16 };
 
 /// One declared queue (lowered from a `.queues` entry, or the synthesized `.default`).

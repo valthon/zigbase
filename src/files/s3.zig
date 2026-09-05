@@ -298,9 +298,49 @@ pub const Client = struct {
         return res.status;
     }
 
-    /// List every key under `prefix` via `GET ?list-type=2&prefix=…`. No retry (not on
-    /// the retry list); a non-200 status is `error.S3RequestFailed`.
+    /// List every key under `prefix`, following ListObjectsV2 continuation tokens.
+    /// Caller owns the slice and every key. A reusable page arena bounds response
+    /// scratch by its high-water mark even when the caller uses an outer arena.
     pub fn listKeys(self: Client, io: std.Io, alloc: std.mem.Allocator, prefix: []const u8) ![][]const u8 {
+        var keys: std.ArrayList([]const u8) = .empty;
+        errdefer {
+            for (keys.items) |key| alloc.free(key);
+            keys.deinit(alloc);
+        }
+        var tokens: std.StringHashMapUnmanaged(void) = .empty;
+        defer {
+            var it = tokens.keyIterator();
+            while (it.next()) |token| alloc.free(token.*);
+            tokens.deinit(alloc);
+        }
+        var continuation: ?[]const u8 = null;
+        var page = std.heap.ArenaAllocator.init(alloc);
+        defer page.deinit();
+        while (true) {
+            _ = page.reset(.retain_capacity);
+            const xml = try self.listPage(io, page.allocator(), prefix, continuation);
+            const page_keys = try scanKeys(page.allocator(), xml);
+            for (page_keys) |key| {
+                // Never let an unexpected listing response widen record cleanup.
+                if (!std.mem.startsWith(u8, key, prefix)) return error.S3InvalidListResponse;
+                const owned = try alloc.dupe(u8, key);
+                errdefer alloc.free(owned);
+                try keys.append(alloc, owned);
+            }
+            const truncated = (try xmlText(xml, "IsTruncated")) orelse return error.S3InvalidListResponse;
+            if (std.mem.eql(u8, truncated, "false")) return keys.toOwnedSlice(alloc);
+            if (!std.mem.eql(u8, truncated, "true")) return error.S3InvalidListResponse;
+            const raw_token = (try xmlText(xml, "NextContinuationToken")) orelse return error.S3InvalidListResponse;
+            const token = try decodeXmlText(alloc, raw_token);
+            errdefer alloc.free(token);
+            if (token.len == 0 or tokens.contains(token)) return error.S3InvalidListResponse;
+            try tokens.put(alloc, token, {});
+            continuation = token;
+        }
+    }
+
+    /// Response body borrows the supplied page arena (HttpClient's response contract).
+    fn listPage(self: Client, io: std.Io, alloc: std.mem.Allocator, prefix: []const u8, continuation: ?[]const u8) ![]const u8 {
         const path = try bucketPath(alloc, self);
         defer alloc.free(path);
         const host = try effectiveHost(alloc, self);
@@ -308,7 +348,12 @@ pub const Client = struct {
 
         const encoded_prefix = try uriEncodeQueryValue(alloc, prefix);
         defer alloc.free(encoded_prefix);
-        const query = try std.fmt.allocPrint(alloc, "list-type=2&prefix={s}", .{encoded_prefix});
+        const encoded_token = if (continuation) |token| try uriEncodeQueryValue(alloc, token) else "";
+        defer if (continuation != null) alloc.free(encoded_token);
+        const query = if (continuation != null)
+            try std.fmt.allocPrint(alloc, "continuation-token={s}&list-type=2&prefix={s}", .{ encoded_token, encoded_prefix })
+        else
+            try std.fmt.allocPrint(alloc, "list-type=2&prefix={s}", .{encoded_prefix});
         defer alloc.free(query);
 
         const url = try buildUrl(alloc, self, host, path, query);
@@ -330,7 +375,8 @@ pub const Client = struct {
             },
         });
         if (res.status != 200) return error.S3RequestFailed;
-        return scanKeys(alloc, res.body);
+        if (std.mem.indexOf(u8, res.body, "</ListBucketResult>") == null) return error.S3InvalidListResponse;
+        return res.body;
     }
 
     /// Presign a GET URL for `key` (SigV4 query-string signing). Builds the effective host +
@@ -397,9 +443,49 @@ fn uriEncodeQueryValue(alloc: std.mem.Allocator, value: []const u8) ![]const u8 
     return out.toOwnedSlice(alloc);
 }
 
-/// Minimal, bounded <Key> extraction from a ListObjectsV2 body. NOT a general XML
-/// parser: keys are ZigBase-written (validated ids + sanitized stored names, no '<'),
-/// so a plain tag scan is sufficient; anything malformed simply yields fewer keys.
+/// Extract an S3 scalar element without accepting nested markup or a truncated tag.
+fn xmlText(xml: []const u8, comptime tag: []const u8) !?[]const u8 {
+    const open = "<" ++ tag ++ ">";
+    const close = "</" ++ tag ++ ">";
+    const start = std.mem.indexOf(u8, xml, open) orelse return null;
+    const rest = xml[start + open.len ..];
+    const end = std.mem.indexOf(u8, rest, close) orelse return error.S3InvalidListResponse;
+    if (std.mem.indexOfScalar(u8, rest[0..end], '<') != null) return error.S3InvalidListResponse;
+    return rest[0..end];
+}
+
+/// XML character data, not a general XML parser: no DTDs or external entities.
+/// Self-freeing scratch; caller owns the decoded string.
+fn decodeXmlText(alloc: std.mem.Allocator, raw: []const u8) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    var i: usize = 0;
+    while (i < raw.len) {
+        if (raw[i] != '&') {
+            if (raw[i] == '<') return error.S3InvalidListResponse;
+            try out.append(alloc, raw[i]);
+            i += 1;
+            continue;
+        }
+        const end = std.mem.indexOfScalarPos(u8, raw, i, ';') orelse return error.S3InvalidListResponse;
+        const entity = raw[i + 1 .. end];
+        const cp: u21 = if (std.mem.eql(u8, entity, "amp")) '&' else if (std.mem.eql(u8, entity, "lt")) '<' else if (std.mem.eql(u8, entity, "gt")) '>' else if (std.mem.eql(u8, entity, "quot")) '"' else if (std.mem.eql(u8, entity, "apos")) '\'' else if (std.mem.startsWith(u8, entity, "#x"))
+            std.fmt.parseInt(u21, entity[2..], 16) catch return error.S3InvalidListResponse
+        else if (std.mem.startsWith(u8, entity, "#"))
+            std.fmt.parseInt(u21, entity[1..], 10) catch return error.S3InvalidListResponse
+        else
+            return error.S3InvalidListResponse;
+        if (cp == 0) return error.S3InvalidListResponse;
+        var buf: [4]u8 = undefined;
+        const n = std.unicode.utf8Encode(cp, &buf) catch return error.S3InvalidListResponse;
+        try out.appendSlice(alloc, buf[0..n]);
+        i = end + 1;
+    }
+    return out.toOwnedSlice(alloc);
+}
+
+/// Bounded scalar extraction for ListObjectsV2. Reject malformed key elements
+/// instead of treating a partial listing as successful cleanup.
 fn scanKeys(alloc: std.mem.Allocator, xml: []const u8) ![][]const u8 {
     var out: std.ArrayList([]const u8) = .empty;
     errdefer {
@@ -409,8 +495,10 @@ fn scanKeys(alloc: std.mem.Allocator, xml: []const u8) ![][]const u8 {
     var rest = xml;
     while (std.mem.indexOf(u8, rest, "<Key>")) |start| {
         rest = rest[start + "<Key>".len ..];
-        const end = std.mem.indexOf(u8, rest, "</Key>") orelse break; // truncated tag: stop
-        try out.append(alloc, try alloc.dupe(u8, rest[0..end]));
+        const end = std.mem.indexOf(u8, rest, "</Key>") orelse return error.S3InvalidListResponse;
+        const key = try decodeXmlText(alloc, rest[0..end]);
+        errdefer alloc.free(key);
+        try out.append(alloc, key);
         rest = rest[end + "</Key>".len ..];
     }
     return out.toOwnedSlice(alloc);
@@ -534,10 +622,9 @@ pub const S3Storage = struct {
     }
 
     /// PutObject with Content-Type from content sniffing (stored as object metadata).
-    /// Runs inside the global write transaction — a failure errors into the existing
-    /// rollback-plus-best-effort-cleanup path in api/records.zig (deliberate: a storage
-    /// failure rolls the row back); the writer-lock latency trade-off is documented in
-    /// KNOWN_LIMITATIONS. Retry-once lives in `Client.put`.
+    /// HTTP record handlers upload before acquiring the writer and only commit
+    /// references after successful validation; failed requests best-effort remove
+    /// these immutable names. Retry-once lives in `Client.put`.
     fn putImpl(ctx: *anyopaque, io: std.Io, col: []const u8, record_id: []const u8, filename: []const u8, bytes: []const u8) anyerror!void {
         const self: *S3Storage = @ptrCast(@alignCast(ctx));
         var arena = std.heap.ArenaAllocator.init(self.gpa);
@@ -968,6 +1055,68 @@ test "head: returns the raw status for 200/404/403 without erroring" {
     }
 }
 
+test "listKeys follows encoded continuation tokens and decodes XML keys" {
+    if (!testcapture.enabled) return error.SkipZigTest;
+    testcapture.http.enable(true);
+    defer testcapture.http.reset();
+    testcapture.http.mockSequence("list-type=2", &.{
+        .{ .status = 200, .body = "<ListBucketResult><IsTruncated>true</IsTruncated><Key>col/r1/a&amp;b</Key><NextContinuationToken>a+/=&amp;</NextContinuationToken></ListBucketResult>" },
+        .{ .status = 200, .body = "<ListBucketResult><IsTruncated>false</IsTruncated><Key>col/r1/c&#xE9;</Key></ListBucketResult>" },
+    });
+    const a = testing.allocator;
+    const keys = try testClient().listKeys(std.testing.io, a, "col/r1/");
+    defer {
+        for (keys) |key| a.free(key);
+        a.free(keys);
+    }
+    try testing.expectEqual(@as(usize, 2), keys.len);
+    try testing.expectEqualStrings("col/r1/a&b", keys[0]);
+    try testing.expectEqualStrings("col/r1/cé", keys[1]);
+    try testing.expect(std.mem.indexOf(u8, testcapture.http.requestAt(1).?.url, "continuation-token=a%2B%2F%3D%26") != null);
+}
+
+test "listKeys reuses response scratch under an outer arena" {
+    if (!testcapture.enabled) return error.SkipZigTest;
+    var fixture = std.heap.ArenaAllocator.init(testing.allocator);
+    defer fixture.deinit();
+    const a = fixture.allocator();
+    const padding = try a.alloc(u8, 128 * 1024);
+    @memset(padding, ' ');
+    var responses: [32]testcapture.MockResponse = undefined;
+    for (&responses, 0..) |*response, i| response.* = .{
+        .body = try std.fmt.allocPrint(a, "{s}<ListBucketResult><IsTruncated>{s}</IsTruncated><Key>col/r1/{d}</Key><NextContinuationToken>{d}</NextContinuationToken></ListBucketResult>", .{ padding, if (i + 1 == responses.len) "false" else "true", i, i }),
+    };
+    testcapture.http.enable(true);
+    defer testcapture.http.reset();
+    testcapture.http.mockSequence("list-type=2", &responses);
+    var output = std.heap.ArenaAllocator.init(testing.allocator);
+    defer output.deinit();
+    const keys = try testClient().listKeys(std.testing.io, output.allocator(), "col/r1/");
+    try testing.expectEqual(responses.len, keys.len);
+    try testing.expectEqualStrings("col/r1/0", keys[0]);
+    try testing.expectEqualStrings("col/r1/31", keys[31]);
+    // The returned keys/tokens are small. Retaining 32 response bodies alone
+    // would exceed 4 MiB; scratch must plateau instead of accumulating pages.
+    try testing.expect(output.queryCapacity() < 2 * 1024 * 1024);
+}
+
+test "listKeys refuses partial, out-of-prefix, and non-progressing listings" {
+    if (!testcapture.enabled) return error.SkipZigTest;
+    const invalid = [_][]const u8{
+        "<ListBucketResult><IsTruncated>true</IsTruncated></ListBucketResult>",
+        "<ListBucketResult><IsTruncated>false</IsTruncated><Key>other/r1/a</Key></ListBucketResult>",
+        "<ListBucketResult><IsTruncated>false</IsTruncated><Key>col/r1/a</Key>",
+        "<ListBucketResult><IsTruncated>true</IsTruncated><NextContinuationToken>repeat</NextContinuationToken></ListBucketResult>",
+    };
+    for (invalid) |body| {
+        testcapture.http.enable(true);
+        defer testcapture.http.reset();
+        testcapture.http.mock("list-type=2", .{ .status = 200, .body = body });
+        try testing.expectError(error.S3InvalidListResponse, testClient().listKeys(std.testing.io, testing.allocator, "col/r1/"));
+        try testing.expect(testcapture.http.requestCount() <= 2);
+    }
+}
+
 test "scanKeys: well-formed, truncated, and hostile input" {
     const a = testing.allocator;
 
@@ -982,27 +1131,8 @@ test "scanKeys: well-formed, truncated, and hostile input" {
         try testing.expectEqualStrings("b/c", keys[1]);
     }
 
-    // Truncated tag: stop cleanly, no crash, yields the well-formed prefix.
-    {
-        const keys = try scanKeys(a, "<Key>a</Key><Key>trunc");
-        defer {
-            for (keys) |k| a.free(k);
-            a.free(keys);
-        }
-        try testing.expectEqual(@as(usize, 1), keys.len);
-        try testing.expectEqualStrings("a", keys[0]);
-    }
-
-    // Nested junk: no general parser, just yields whatever is between the tags.
-    {
-        const keys = try scanKeys(a, "<Key><Key>inner</Key>");
-        defer {
-            for (keys) |k| a.free(k);
-            a.free(keys);
-        }
-        try testing.expectEqual(@as(usize, 1), keys.len);
-        try testing.expectEqualStrings("<Key>inner", keys[0]);
-    }
+    try testing.expectError(error.S3InvalidListResponse, scanKeys(a, "<Key>a</Key><Key>trunc"));
+    try testing.expectError(error.S3InvalidListResponse, scanKeys(a, "<Key><Key>inner</Key>"));
 
     // 10k keys bound: never crashes, extracts all of them.
     {

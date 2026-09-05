@@ -108,6 +108,15 @@ await fetch("/api/collections/posts/records", {
 
 ## Collections
 
+Collection creation and updates reject malformed access rules or unresolved field/relation
+paths with `400` before changing the schema. Validation uses the proposed collection together
+with retained live collections, so removing a field referenced by another collection's rule
+is rejected too. Request macros remain dynamic; validation does not prove access decisions.
+Use `schema apply` for coordinated changes across multiple collections.
+The gate validates **all retained non-system collections**, not just dependencies of the
+mutation: a pre-existing invalid rule elsewhere also blocks POST/PATCH. The `400` message
+labels that collection `Retained (different)` and names the rule to repair.
+
 Collection management endpoints are **superuser-only**.
 
 | Method | Path | Description |
@@ -1268,6 +1277,12 @@ File-type fields hold uploaded files.
 - **Upload:** files are submitted via `multipart/form-data` on record create
   (`POST .../records`) or update (`PATCH .../records/:id`), alongside the other
   field values.
+- **Concurrent uploads:** bytes transfer before the database writer is acquired.
+  An upload POST returns `409` if the collection schema changes; upload PATCH
+  returns `409` if the record or collection schema changes during
+  transfer; reload and retry. Failed requests best-effort clean up uploaded bytes.
+  Upload PATCH requires update permission on the existing row before transfer
+  and checks the rule again on the updated row before commit.
 - **Serve:** `GET /api/files/:col/:rec/:name`.
 - **Admin config:** `GET /api/files/config` — **superuser-only**, read-only
   storage backend info for the admin UI: `{ "backend": "local" | "s3", ... }`
