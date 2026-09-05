@@ -684,6 +684,7 @@ const Backend = zigbase.App(.{
         .cron = .{
             .{
                 .name = "audit-sweep",
+                .distributed = .{ .lease_seconds = 120 }, // one shared schedule across replicas
                 .schedule = zigbase.schedule.Schedule{ .cron = "* * * * *" },
                 .handler = auditSweepJob,
             },

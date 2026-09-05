@@ -27,6 +27,7 @@ pub const PaginationConfig = @import("pagination.zig").Config;
 pub const RecordEvent = events.RecordEvent;
 pub const ErrorEvent = events.ErrorEvent;
 pub const JobEvent = events.JobEvent; // cron/interval/reactive job + app.submit handlers
+pub const DistributedJobConfig = @import("scheduler_coordination.zig").Config;
 pub const AuthEvent = events.AuthEvent;
 pub const TwoFactorPolicyContext = @import("auth/two_factor.zig").PolicyContext;
 pub const AuthHandler = events.AuthHandler;
@@ -464,6 +465,7 @@ test {
     _ = @import("records_hooks_test.zig");
     _ = @import("schedule.zig");
     _ = @import("scheduler.zig");
+    _ = @import("scheduler_coordination.zig");
     _ = @import("mail/mailer.zig");
     _ = @import("mail/send.zig");
     _ = @import("mail/bulk.zig");

@@ -45,6 +45,7 @@ DEVTOOLS_OFF=zig-out-devtools-off/bin/zigbase
 # why every pattern below is namespaced past the Gates-struct field name (a
 # trailing "." into the real module path, not " = ").
 PATTERNS=(
+  "scheduler_coordination.claim" # opted-in distributed scheduler dispatcher
   "two_factor.Subsystem" # optional second-factor dispatcher and verification
   "totp.verify"          # TOTP verification is absent when unselected
   "webauthn.second_factor" # separate WebAuthn second-factor ceremonies
