@@ -443,7 +443,13 @@ pub const CommandMailer = struct {
             // close must happen before `wait`, or a child that drains all of stdin
             // (sendmail/msmtp do) would block forever waiting for more input.
             const stdin = child.stdin.?;
-            try stdin.writeStreamingAll(io, msg);
+            stdin.writeStreamingAll(io, msg) catch |err| {
+                // A command may close its input before we finish writing. That
+                // is a failed delivery even if it exits zero, and must have the
+                // same error contract as observing its failed exit first.
+                // The scoped errdefer still reaps the child on this path.
+                return if (err == error.BrokenPipe) error.MailCommandFailed else err;
+            };
             stdin.close(io);
             child.stdin = null;
 
@@ -1091,6 +1097,25 @@ test "CommandMailer surfaces a non-zero child exit as an error" {
         .subject = "Hi",
         .text_body = "body",
     }));
+}
+
+test "CommandMailer reports closed input as failed delivery regardless of exit code" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    // Keep well above Linux's default and macOS's maximum 64 KiB pipe capacity.
+    // Neither the parent nor the child requests a larger Linux pipe (F_SETPIPE_SZ);
+    // the configurable pipe-max-size ceiling does not automatically grow it.
+    const body = try a.alloc(u8, 1024 * 1024);
+    defer a.free(body);
+    @memset(body, 'x');
+    for ([_][]const u8{ "exec 0<&-; exit 0", "exec 0<&-; exit 7" }) |script| {
+        var cm = CommandMailer.init(&.{ "/bin/sh", "-c", script }, "noreply@zigbase.dev");
+        try std.testing.expectError(error.MailCommandFailed, cm.mailer().send(std.testing.io, a, .{
+            .to = "user@example.com",
+            .subject = "Closed input",
+            .text_body = body,
+        }));
+    }
 }
 
 test "CommandMailer rejects header injection before spawning" {
