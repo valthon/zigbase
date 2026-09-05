@@ -3137,17 +3137,36 @@ built-in itself is gated off.
   next run is pushed out by the queue's backoff (`fixed` or `exponential`, with optional
   jitter, capped at `max_ms`); exhausting `max_attempts` marks it `failed` and fires your
   `.onError` handler (phase `.job`). Memory jobs retry in-process the same way.
-- **Rate throttling** (`.rate = .{ .per_second = N }`, durable only): a token bucket per
-  rated queue, capacity = one second's worth of tokens (the max burst), enforced at **claim
-  time** — a job that can't claim a token this tick simply waits for the next ~500ms
-  scheduler tick rather than sleeping in the worker. It's in-process and
-  single-process-authoritative (see Caveats below); `.rate` on a `memory` queue is a
+- **Rate throttling** (`.rate = .{ .per_second = N }`, durable only): a per-second window per
+  rated queue, capacity = `per_second` (max burst = one second), enforced at **claim
+  time** — a job without remaining capacity this tick simply waits for the next ~500ms
+  scheduler tick rather than sleeping in the worker. Integer-second windows are
+  stored in the database: all instances sharing that database and queue name share
+  the ceiling. Claims and their rate charge commit atomically; empty claims spend
+  no capacity, and restarts do not reset the current window. Deploy the same rate
+  configuration on each instance (mixed configurations apply each claimant's own
+  ceiling to the window's already-used capacity). `.rate` on a `memory` queue is a
   compile error (memory jobs dispatch inline and can't be throttled).
 
 ### Caveats
 
 - Durable workers **poll** (roughly every scheduler tick, ~0.5s), so durable jobs drain with
-  low but non-zero latency. The scheduler is single-process (see §7 caveats).
+  low but non-zero latency. PostgreSQL workers use `FOR UPDATE SKIP LOCKED`, so
+  multiple instances can drain the same durable queues without claiming the same
+  pending row. Completion is fenced by a claim generation: a handler that outlives
+  its visibility timeout cannot overwrite a newer attempt's state. Delivery stays
+  **at-least-once**; fencing does not undo external side effects, so handlers still
+  need idempotency and an appropriate visibility timeout. A worker claims its whole
+  batch before running handlers serially: size the visibility timeout for the
+  **entire batch's worst-case processing time**, not just one handler, or reduce
+  `.concurrency` (the batch size). No lease heartbeat extends that timeout. The scheduler itself is
+  per-process (see §7 caveats); ordinary scheduled handlers are not coordinated.
+- **Upgrade coordinated workers together:** drain and stop older worker binaries
+  before applying migration `0025_queue_rates` from one process, then start the
+  upgraded instances. Older binaries neither enforce shared rate windows nor fence
+  completion, so mixed-version workers do not provide these guarantees. Run system
+  migrations from one designated process before starting replicas; migration
+  application is not itself a distributed leader-election mechanism.
 - Memory jobs run on a bounded worker pool that is drained and joined at shutdown (like `app.submit`); jobs still queued at a hard crash are lost (at-most-once), and a full ring rejects with `error.QueueFull`.
 
 ## 8. Define your schema in code (`.collections` + `.migrations`)

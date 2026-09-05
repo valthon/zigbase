@@ -646,6 +646,11 @@ fn init_0022_schema_state(m: *Migrator) db.DbError!void {
     try m.exec(schema_state_seed_sql);
 }
 
+fn init_0025_queue_rates(m: *Migrator) db.DbError!void {
+    try m.exec("CREATE TABLE IF NOT EXISTS \"_queue_rates\" (\"queue\" TEXT PRIMARY KEY, \"window_s\" BIGINT NOT NULL, \"used\" BIGINT NOT NULL CHECK (\"used\" >= 0));");
+    try m.exec("ALTER TABLE \"_queue_jobs\" ADD COLUMN \"claim_generation\" BIGINT NOT NULL DEFAULT 0;");
+}
+
 pub const all = [_]Migration{
     .{ .name = "0001_init", .up = init_0001 },
     .{ .name = "0002_auth", .up = init_0002 },
@@ -671,6 +676,7 @@ pub const all = [_]Migration{
     .{ .name = "0022_schema_state", .up = init_0022_schema_state },
     .{ .name = "0023_two_factor_attempts", .up = @import("auth/two_factor_attempt.zig").migrate },
     .{ .name = "0024_two_factor_credentials", .up = @import("auth/two_factor_store.zig").migrate },
+    .{ .name = "0025_queue_rates", .up = init_0025_queue_rates },
 };
 
 /// Create the `_migrations` ledger table if it is absent (idempotent). The auto-increment PK
@@ -920,7 +926,7 @@ test "0013 creates the _queue_jobs table with its indexes" {
     var t = try d.prepare("SELECT COUNT(*) FROM pragma_table_info('_queue_jobs');");
     defer t.finalize();
     _ = try t.step();
-    try std.testing.expectEqual(@as(i64, 13), t.columnInt(0));
+    try std.testing.expectEqual(@as(i64, 14), t.columnInt(0)); // includes the 0025 claim-generation fence
     var idx = try d.prepare("SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name IN ('idx_queue_jobs_ready','idx_queue_jobs_created');");
     defer idx.finalize();
     _ = try idx.step();

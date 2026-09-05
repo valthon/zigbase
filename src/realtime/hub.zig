@@ -503,7 +503,9 @@ pub fn buildEventFrames(
     record: ?std.json.Value,
 ) !EventFrames {
     const coll_channel = try alloc.dupe(u8, collection);
+    errdefer alloc.free(coll_channel);
     const rec_channel = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ collection, record_id });
+    errdefer alloc.free(rec_channel);
 
     // The delete-only wrapper map (`delete_body`) is pure scratch: both serializeEvent calls below
     // stringify it into a fresh, self-contained buffer, so it is freed before this function returns
@@ -519,12 +521,26 @@ pub fn buildEventFrames(
         break :blk .{ .object = delete_body };
     } else record.?;
 
+    const frame_collection = try protocol.serializeEvent(alloc, coll_channel, action, body);
+    errdefer alloc.free(frame_collection);
     return .{
         .collection_channel = coll_channel,
         .record_channel = rec_channel,
-        .frame_collection = try protocol.serializeEvent(alloc, coll_channel, action, body),
+        .frame_collection = frame_collection,
         .frame_record = try protocol.serializeEvent(alloc, rec_channel, action, body),
     };
+}
+
+test "event frame construction releases partial allocations" {
+    const Check = struct {
+        fn run(alloc: std.mem.Allocator) !void {
+            inline for (.{ protocol.Action.create, protocol.Action.update, protocol.Action.delete }) |action| {
+                const frames = try buildEventFrames(alloc, "posts", action, "r1", .{ .object = .empty });
+                defer frames.deinit(alloc);
+            }
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
 }
 
 /// Two-factor policy is dynamic even for an already-open transport. Use the

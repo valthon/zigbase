@@ -20,83 +20,20 @@ const QueueDef = queue.QueueDef;
 const WorkerDef = queue.WorkerDef;
 const Registry = queue.Registry;
 
+/// All callers pass bounded engine-owned SQL literals (under 1 KiB). Lowering
+/// uses caller-buffer scratch, not a hidden heap allocator; prepare copies the
+/// statement before this stack buffer expires. Dynamic claim SQL uses its own
+/// explicitly allocated scratch below instead.
+fn prepareStatic(w: *db.Db, sql: [:0]const u8) !db.Stmt {
+    if (db.dbDialect(w).kind == .sqlite) return w.prepare(sql);
+    var buf: [8192]u8 = undefined;
+    var scratch = std.heap.FixedBufferAllocator.init(&buf);
+    return w.prepare(try @import("../sql/param_sink.zig").lowerStmtZ(scratch.allocator(), db.dbDialect(w), sql));
+}
+
 /// Bound on a single GC / reclaim batch so a large backlog never holds the writer
 /// for one long statement (mirrors `features_resolver.assignment_gc_batch`).
 pub const gc_batch: usize = 1000;
-
-// ── Per-queue rate throttling (#154 round 2) ─────────────────────────────
-// Enforced HERE, at claim time: rated queues are claimed per-queue with
-// `limit = min(worker's remaining concurrency, reserved tokens)`. Unclaimed ready
-// jobs simply wait for the next ~500ms scheduler tick — no sleeping in the worker,
-// no per-job pacing. Refill is INTEGER-SECOND on the framework clock (capacity ==
-// per_second, so any new second refills to full): deterministic, ZIGBASE_FAKE_NOW-
-// compatible, and equivalent to continuous refill at the tick granularity. The map
-// is process-global (single-process scheduler ⇒ authoritative) and lazily populated
-// ONLY for queues that set `.rate` — zero cost for unrated queues.
-
-/// Pure token-bucket math (unit-tested directly; production drives it via
-/// reserveTokens/refundTokens under the global mutex).
-pub const TokenBucket = struct {
-    capacity: u32,
-    tokens: u32,
-    last_s: i64,
-
-    pub fn init(per_second: u16, now_s: i64) TokenBucket {
-        return .{ .capacity = per_second, .tokens = per_second, .last_s = now_s };
-    }
-
-    fn refill(self: *TokenBucket, now_s: i64) void {
-        if (now_s <= self.last_s) return; // clock went backwards / same second: no refill
-        self.tokens = self.capacity; // capacity == per_second ⇒ any elapsed second refills to full
-        self.last_s = now_s;
-    }
-
-    /// Reserve up to `want` tokens (decrementing). Returns the grant.
-    pub fn reserve(self: *TokenBucket, now_s: i64, want: usize) usize {
-        self.refill(now_s);
-        const take: u32 = @intCast(@min(want, self.tokens));
-        self.tokens -= take;
-        return take;
-    }
-
-    /// Return unused reserved tokens (claim came up short), capped at capacity.
-    pub fn refund(self: *TokenBucket, n: usize) void {
-        self.tokens = @intCast(@min(@as(usize, self.capacity), self.tokens + n));
-    }
-};
-
-fn lockMutex(m: *std.atomic.Mutex) void {
-    while (!m.tryLock()) std.atomic.spinLoopHint();
-}
-
-var rate_mutex: std.atomic.Mutex = .unlocked;
-// page_allocator: process-lifetime map (a handful of tiny entries keyed by the
-// registry's comptime-static queue names — no key dup, never freed in prod).
-var rate_buckets: std.StringHashMapUnmanaged(TokenBucket) = .empty;
-
-fn reserveTokens(name: []const u8, per_second: u16, now_s: i64, want: usize) usize {
-    lockMutex(&rate_mutex);
-    defer rate_mutex.unlock();
-    const gop = rate_buckets.getOrPut(std.heap.page_allocator, name) catch return 0; // OOM: claim nothing this tick
-    if (!gop.found_existing) gop.value_ptr.* = TokenBucket.init(per_second, now_s);
-    return gop.value_ptr.reserve(now_s, want);
-}
-
-fn refundTokens(name: []const u8, n: usize) void {
-    if (n == 0) return;
-    lockMutex(&rate_mutex);
-    defer rate_mutex.unlock();
-    if (rate_buckets.getPtr(name)) |b| b.refund(n);
-}
-
-/// TEST-ONLY: drop all buckets so each test starts from a full burst.
-pub fn resetRateBucketsForTest() void {
-    if (!@import("builtin").is_test) @compileError("resetRateBucketsForTest is test-only");
-    lockMutex(&rate_mutex);
-    defer rate_mutex.unlock();
-    rate_buckets.deinit(std.heap.page_allocator);
-    rate_buckets = .empty;
-}
 
 /// Insert a `pending` durable job and return its generated id. `run_at` is the earliest
 /// unix-second the job may be claimed (pass `clock.nowUnix(io)` for immediate; a future
@@ -104,7 +41,7 @@ pub fn resetRateBucketsForTest() void {
 /// The writer must be held by the caller.
 pub fn enqueue(w: *db.Db, io: std.Io, def: QueueDef, kind: []const u8, payload: []const u8, run_at: i64) ![15]u8 {
     const jid = id.collectionId(io);
-    var st = try w.prepare(
+    var st = try prepareStatic(w,
         \\INSERT INTO "_queue_jobs"
         \\  ("id","queue","kind","payload","priority","max_attempts","run_at","status","created")
         \\ VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', datetime('now'));
@@ -130,6 +67,7 @@ pub const Claimed = struct {
     payload: []const u8,
     attempts: i64,
     max_attempts: i64,
+    generation: i64,
 
     /// Free this claim's four owned string slices (NOT the containing slice — see `freeClaimed`).
     fn deinit(self: Claimed, alloc: std.mem.Allocator) void {
@@ -166,6 +104,7 @@ fn claimOne(alloc: std.mem.Allocator, st: *db.Stmt) !Claimed {
         .payload = cpayload,
         .attempts = st.columnInt(4),
         .max_attempts = st.columnInt(5),
+        .generation = st.columnInt(6),
     };
 }
 
@@ -192,7 +131,7 @@ pub fn claimBatch(
 
     var sql: std.ArrayList(u8) = .empty;
     try sql.appendSlice(sa,
-        \\UPDATE "_queue_jobs" SET "status"='claimed', "claimed_at"=?1, "claimed_by"=?2
+        \\UPDATE "_queue_jobs" SET "status"='claimed', "claimed_at"=?1, "claimed_by"=?2, "claim_generation"="claim_generation"+1
         \\ WHERE "id" IN (
         \\   SELECT "id" FROM "_queue_jobs"
         \\    WHERE "status"='pending' AND "run_at" <= ?3 AND "queue" IN (
@@ -207,10 +146,14 @@ pub fn claimBatch(
     }
     try sql.appendSlice(sa, ") ORDER BY \"priority\" ASC, \"run_at\" ASC LIMIT ?");
     try sql.appendSlice(sa, std.fmt.bufPrint(&numbuf, "{d}", .{pidx}) catch unreachable);
-    try sql.appendSlice(sa, ") RETURNING \"id\",\"queue\",\"kind\",\"payload\",\"attempts\",\"max_attempts\";");
+    // Lock candidates before UPDATE on PostgreSQL: another instance must skip
+    // these rows, not wait and subsequently overwrite their claim. SQLite's
+    // single writer already makes this statement atomic.
+    if (db.dbDialect(w).kind == .postgres) try sql.appendSlice(sa, " FOR UPDATE SKIP LOCKED");
+    try sql.appendSlice(sa, ") RETURNING \"id\",\"queue\",\"kind\",\"payload\",\"attempts\",\"max_attempts\",\"claim_generation\";");
     const sql_z = try sa.dupeZ(u8, sql.items);
 
-    var st = try w.prepare(sql_z);
+    var st = try w.prepare(try @import("../sql/param_sink.zig").lowerStmtZ(sa, db.dbDialect(w), sql_z));
     defer st.finalize();
     try st.bindInt(1, now);
     try st.bindText(2, worker_name);
@@ -235,38 +178,86 @@ pub fn claimBatch(
     return out.toOwnedSlice(alloc);
 }
 
-/// Mark a claimed job `done` (success). Writer held by caller.
-pub fn markDone(w: *db.Db, job_id: []const u8) !void {
-    var st = try w.prepare("UPDATE \"_queue_jobs\" SET \"status\"='done', \"claimed_at\"=NULL, \"last_error\"='' WHERE \"id\"=?1;");
-    defer st.finalize();
-    try st.bindText(1, job_id);
-    _ = try st.step();
+/// Claim a rated queue in one transaction with its shared rate window. The caller
+/// holds the writer, but MUST NOT already be in a transaction. Only actual claims
+/// spend capacity; errors roll back both the claims and their rate charge. The
+/// returned graph has the same owned-result contract as claimBatch.
+pub fn claimRateLimited(alloc: std.mem.Allocator, w: *db.Db, name: []const u8, worker: []const u8, per_second: u16, limit: usize, now: i64) ![]Claimed {
+    if (limit == 0 or per_second == 0) return &.{};
+    try w.beginImmediate();
+    errdefer w.rollback() catch |e| std.log.err("queue rate claim rollback failed: {s}", .{@errorName(e)});
+    {
+        var st = try prepareStatic(w, "INSERT INTO \"_queue_rates\" (\"queue\",\"window_s\",\"used\") VALUES (?1,?2,0) ON CONFLICT (\"queue\") DO NOTHING;");
+        defer st.finalize();
+        try st.bindText(1, name);
+        try st.bindInt(2, now);
+        _ = try st.step();
+    }
+    var window: i64 = undefined;
+    var used: i64 = undefined;
+    {
+        const sql = "SELECT \"window_s\",\"used\" FROM \"_queue_rates\" WHERE \"queue\"=?1";
+        var st = try prepareStatic(w, if (db.dbDialect(w).kind == .postgres) sql ++ " FOR UPDATE;" else sql ++ ";");
+        defer st.finalize();
+        try st.bindText(1, name);
+        if (!try st.step()) return error.MissingRateWindow;
+        window = st.columnInt(0);
+        used = st.columnInt(1);
+    }
+    // A backwards clock never refills; a changed configured ceiling applies to
+    // the capacity remaining after claims already charged in this second.
+    if (now > window) {
+        window = now;
+        used = 0;
+    }
+    const remaining: usize = @intCast(@max(0, @as(i64, per_second) - used));
+    if (remaining == 0) {
+        try w.commit();
+        return &.{};
+    }
+    const claimed = try claimBatch(alloc, w, &.{name}, worker, @min(limit, remaining), now);
+    errdefer freeClaimed(alloc, claimed);
+    // No claim spends capacity. Do not persist a window rollover just because
+    // an idle worker polled: the next claimant recomputes it from the clock.
+    if (claimed.len == 0) {
+        try w.commit();
+        return claimed;
+    }
+    {
+        var st = try prepareStatic(w, "UPDATE \"_queue_rates\" SET \"window_s\"=?2,\"used\"=?3 WHERE \"queue\"=?1;");
+        defer st.finalize();
+        try st.bindText(1, name);
+        try st.bindInt(2, window);
+        try st.bindInt(3, used + @as(i64, @intCast(claimed.len)));
+        _ = try st.step();
+    }
+    try w.commit();
+    return claimed;
 }
 
-/// Re-queue a retryable failure: bump attempts, push `run_at` out by the backoff,
-/// clear the claim, record the error. Writer held by caller.
-pub fn markRetry(w: *db.Db, job_id: []const u8, new_attempts: i64, run_at: i64, last_error: []const u8) !void {
-    var st = try w.prepare(
-        \\UPDATE "_queue_jobs"
-        \\ SET "status"='pending', "attempts"=?2, "run_at"=?3, "claimed_at"=NULL, "claimed_by"='', "last_error"=?4
-        \\ WHERE "id"=?1;
+const Outcome = enum { done, retry, failed };
+
+/// A visibility timeout can expire while the old handler is still executing.
+/// Its completion must not overwrite a newer attempt (even on the same named
+/// worker or in the same second). The monotonically incremented claim generation
+/// fences all three outcomes. A reclaimed but not re-claimed attempt may finish;
+/// terminal states (including cancellation after reclaim) remain terminal.
+/// False means ownership was lost or the row is terminal, not success.
+fn finishClaim(w: *db.Db, job: Claimed, outcome: Outcome, attempts: i64, run_at: i64, last_error: []const u8) !bool {
+    var st = try prepareStatic(w,
+        \\UPDATE "_queue_jobs" SET "status"=?3, "attempts"=?4, "run_at"=?5,
+        \\ "last_error"=?6, "claimed_at"=NULL, "claimed_by"=''
+        \\ WHERE "id"=?1 AND "claim_generation"=?2 AND "status" IN ('claimed','pending');
     );
     defer st.finalize();
-    try st.bindText(1, job_id);
-    try st.bindInt(2, new_attempts);
-    try st.bindInt(3, run_at);
-    try st.bindText(4, last_error);
+    try st.bindText(1, job.id);
+    try st.bindInt(2, job.generation);
+    try st.bindText(3, if (outcome == .retry) "pending" else @tagName(outcome));
+    try st.bindInt(4, attempts);
+    try st.bindInt(5, run_at);
+    try st.bindText(6, last_error);
     _ = try st.step();
-}
-
-/// Mark a job terminally `failed` (attempts exhausted, or an unknown kind). Writer held by caller.
-pub fn markFailed(w: *db.Db, job_id: []const u8, new_attempts: i64, last_error: []const u8) !void {
-    var st = try w.prepare("UPDATE \"_queue_jobs\" SET \"status\"='failed', \"attempts\"=?2, \"claimed_at\"=NULL, \"last_error\"=?3 WHERE \"id\"=?1;");
-    defer st.finalize();
-    try st.bindText(1, job_id);
-    try st.bindInt(2, new_attempts);
-    try st.bindText(3, last_error);
-    _ = try st.step();
+    return w.changesCount() != 0;
 }
 
 /// Cancel a still-PENDING durable job. Returns true when the row transitioned
@@ -276,7 +267,7 @@ pub fn markFailed(w: *db.Db, job_id: []const u8, new_attempts: i64, last_error: 
 /// touched by triggers (e.g. FTS5), so equality-with-1 false-positives on tables
 /// with triggers. `claimBatch` only claims 'pending', so no claim-path change.
 pub fn cancelJob(w: *db.Db, job_id: []const u8) !bool {
-    var st = try w.prepare(
+    var st = try prepareStatic(w,
         \\UPDATE "_queue_jobs" SET "status"='canceled', "claimed_at"=NULL
         \\ WHERE "id"=?1 AND "status"='pending';
     );
@@ -292,7 +283,7 @@ pub fn cancelJob(w: *db.Db, job_id: []const u8) !bool {
 /// per-queue (`QueueDef.visibility_timeout_s`). Returns the number reclaimed. Writer held by caller.
 pub fn reclaimStale(w: *db.Db, queue_name: []const u8, now: i64, visibility_timeout_s: i64) !usize {
     const cutoff = now - visibility_timeout_s;
-    var st = try w.prepare(
+    var st = try prepareStatic(w,
         \\UPDATE "_queue_jobs" SET "status"='pending', "claimed_at"=NULL, "claimed_by"=''
         \\ WHERE "status"='claimed' AND "queue"=?1 AND "claimed_at" IS NOT NULL AND "claimed_at" <= ?2
         \\ RETURNING "id";
@@ -316,7 +307,7 @@ pub fn gcDoneJobs(w: *db.Db, queue_name: []const u8, ttl_s: i64) !usize {
         // `created` is always written canonical via datetime('now'), so compare it DIRECTLY
         // against datetime('now', ?2) rather than wrapping both sides in strftime — keeping
         // the predicate sargable so the `(created)` index serves the scan instead of a full table scan.
-        var st = try w.prepare(comptime std.fmt.comptimePrint(
+        const sqlite_sql = comptime std.fmt.comptimePrint(
             \\DELETE FROM "_queue_jobs"
             \\ WHERE rowid IN (
             \\   SELECT rowid FROM "_queue_jobs"
@@ -325,10 +316,18 @@ pub fn gcDoneJobs(w: *db.Db, queue_name: []const u8, ttl_s: i64) !usize {
             \\    LIMIT {d}
             \\ )
             \\ RETURNING "id";
-        , .{gc_batch}));
+        , .{gc_batch});
+        const postgres_sql = comptime std.fmt.comptimePrint(
+            \\DELETE FROM "_queue_jobs" WHERE "id" IN (
+            \\ SELECT "id" FROM "_queue_jobs" WHERE "status" IN ('done','failed','canceled') AND "queue"=?1
+            \\ AND "created" <= to_char((now() - (?2 * INTERVAL '1 second')) AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS"Z"')
+            \\ LIMIT {d} FOR UPDATE SKIP LOCKED) RETURNING "id";
+        , .{gc_batch});
+        const pg = db.dbDialect(w).kind == .postgres;
+        var st = try prepareStatic(w, if (pg) postgres_sql else sqlite_sql);
         defer st.finalize();
         try st.bindText(1, queue_name);
-        try st.bindText(2, modifier);
+        if (pg) try st.bindInt(2, ttl_s) else try st.bindText(2, modifier);
         var batch: usize = 0;
         while (try st.step()) batch += 1;
         total += batch;
@@ -382,12 +381,7 @@ pub fn pollOnce(app: *App, reg: *const Registry, worker: WorkerDef) !usize {
         }
         for (rated_qs.items) |q| {
             if (remaining == 0) break;
-            // Reserve-then-claim-then-refund is race-safe: tokens are decremented up
-            // front, and only the shortfall (grant - actually claimed) is returned.
-            const grant = reserveTokens(q.name, q.rate.?.per_second, now, remaining);
-            if (grant == 0) continue;
-            const c = try claimBatch(pa, w, &.{q.name}, worker.name, grant, now);
-            if (c.len < grant) refundTokens(q.name, grant - c.len);
+            const c = try claimRateLimited(pa, w, q.name, worker.name, q.rate.?.per_second, remaining, now);
             try claimed_list.appendSlice(pa, c);
             remaining -= c.len;
         }
@@ -416,7 +410,7 @@ pub fn pollOnce(app: *App, reg: *const Registry, worker: WorkerDef) !usize {
             const new_attempts = job.attempts + 1;
             const terminal = (reg_job == null) or (new_attempts >= job.max_attempts);
             if (terminal) {
-                try markFailed(w, job.id, new_attempts, @errorName(e));
+                if (!try finishClaim(w, job, .failed, new_attempts, now, @errorName(e))) continue;
                 var err_ev = events.ErrorEvent{ .app = app, .ctx = null, .err = e, .phase = .job, .message = @errorName(e) };
                 events.dispatchError(app, app.dispatch, &err_ev);
             } else {
@@ -425,10 +419,10 @@ pub fn pollOnce(app: *App, reg: *const Registry, worker: WorkerDef) !usize {
                 // Round ms→s UP so a sub-second backoff (e.g. base_ms=500) still waits >=1s
                 // rather than truncating to an immediate retry. (delay_ms==0 stays 0.)
                 const run_at = now + @as(i64, @intCast((delay_ms + 999) / 1000));
-                try markRetry(w, job.id, new_attempts, run_at, @errorName(e));
+                _ = try finishClaim(w, job, .retry, new_attempts, run_at, @errorName(e));
             }
         } else {
-            try markDone(w, job.id);
+            _ = try finishClaim(w, job, .done, job.attempts, now, "");
         }
     }
     return claimed.len;
@@ -453,7 +447,7 @@ const report_log = @import("../report/log.zig");
 fn noopSink(_: []const u8) void {}
 
 fn countStatus(d: *db.Db, status: []const u8) !i64 {
-    var st = try d.prepare("SELECT COUNT(*) FROM \"_queue_jobs\" WHERE \"status\"=?1;");
+    var st = try prepareStatic(d, "SELECT COUNT(*) FROM \"_queue_jobs\" WHERE \"status\"=?1;");
     defer st.finalize();
     try st.bindText(1, status);
     _ = try st.step();
@@ -508,6 +502,242 @@ test "durable claimBatch drains queues in strict priority order" {
     try testing.expectEqualStrings("lo", c3[0].payload);
 }
 
+test "shared rate window charges actual claims, respects changed limits and backwards clocks" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try migrations.run(&d);
+    const a = testing.allocator;
+    const empty = try claimRateLimited(a, &d, "rated", "a", 3, 10, 100);
+    defer freeClaimed(a, empty);
+    try testing.expectEqual(@as(usize, 0), empty.len);
+    for (0..6) |_| _ = try enqueue(&d, testing.io, .{ .name = "rated", .backend = .durable }, "k", "{}", 0);
+    const first = try claimRateLimited(a, &d, "rated", "a", 3, 2, 100);
+    defer freeClaimed(a, first);
+    try testing.expectEqual(@as(usize, 2), first.len);
+    const lowered = try claimRateLimited(a, &d, "rated", "b", 1, 10, 100);
+    defer freeClaimed(a, lowered);
+    try testing.expectEqual(@as(usize, 0), lowered.len);
+    const remainder = try claimRateLimited(a, &d, "rated", "b", 3, 10, 99);
+    defer freeClaimed(a, remainder);
+    try testing.expectEqual(@as(usize, 1), remainder.len);
+    const drained = try claimRateLimited(a, &d, "rated", "a", 3, 10, 100);
+    defer freeClaimed(a, drained);
+    try testing.expectEqual(@as(usize, 0), drained.len);
+    const refilled = try claimRateLimited(a, &d, "rated", "b", 3, 10, 101);
+    defer freeClaimed(a, refilled);
+    try testing.expectEqual(@as(usize, 3), refilled.len);
+}
+
+test "shared rate claim rolls back job mutations and budget on allocation failure" {
+    const Probe = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var d = try db.Db.openMemory();
+            defer d.close();
+            try migrations.run(&d);
+            _ = try enqueue(&d, testing.io, .{ .name = "rated", .backend = .durable }, "k", "{}", 0);
+            const claimed = claimRateLimited(a, &d, "rated", "a", 1, 10, 100) catch |e| {
+                try testing.expectEqual(@as(i64, 1), try countStatus(&d, "pending"));
+                // A fresh allocator must still be able to claim the entire budget
+                // after failures both before and after UPDATE RETURNING ran.
+                const retried = try claimRateLimited(testing.allocator, &d, "rated", "b", 1, 10, 100);
+                defer freeClaimed(testing.allocator, retried);
+                try testing.expectEqual(@as(usize, 1), retried.len);
+                return e;
+            };
+            defer freeClaimed(a, claimed);
+            try testing.expectEqual(@as(usize, 1), claimed.len);
+        }
+    };
+    try testing.checkAllAllocationFailures(testing.allocator, Probe.run, .{});
+}
+
+test "idle and exhausted rated polls never update the rate row" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try migrations.run(&d);
+    const a = testing.allocator;
+    const first = try claimRateLimited(a, &d, "rated", "a", 1, 1, 100);
+    defer freeClaimed(a, first);
+    try d.exec("CREATE TRIGGER reject_idle_rate_write BEFORE UPDATE ON _queue_rates BEGIN SELECT RAISE(ABORT, 'unexpected idle rate write'); END;");
+    const rollover = try claimRateLimited(a, &d, "rated", "a", 1, 1, 101);
+    defer freeClaimed(a, rollover);
+    try testing.expectEqual(@as(usize, 0), rollover.len);
+    try d.exec("DROP TRIGGER reject_idle_rate_write;");
+    _ = try enqueue(&d, testing.io, .{ .name = "rated", .backend = .durable }, "k", "{}", 0);
+    const claimed = try claimRateLimited(a, &d, "rated", "a", 1, 1, 101);
+    defer freeClaimed(a, claimed);
+    try testing.expectEqual(@as(usize, 1), claimed.len);
+    try d.exec("CREATE TRIGGER reject_exhausted_rate_write BEFORE UPDATE ON _queue_rates BEGIN SELECT RAISE(ABORT, 'unexpected exhausted rate write'); END;");
+    const exhausted = try claimRateLimited(a, &d, "rated", "a", 1, 1, 101);
+    defer freeClaimed(a, exhausted);
+    try testing.expectEqual(@as(usize, 0), exhausted.len);
+}
+
+test "reclaimed attempts may finish before re-claim but never override cancellation" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try migrations.run(&d);
+    inline for (.{ Outcome.done, Outcome.retry, Outcome.failed }) |outcome| {
+        _ = try enqueue(&d, testing.io, .{ .name = "q", .backend = .durable }, "k", "{}", 0);
+        const jobs = try claimBatch(testing.allocator, &d, &.{"q"}, "worker", 1, 100);
+        defer freeClaimed(testing.allocator, jobs);
+        try testing.expectEqual(@as(usize, 1), try reclaimStale(&d, "q", 101, 1));
+        try testing.expect(try finishClaim(&d, jobs[0], outcome, 1, 200, "late"));
+        try d.exec("DELETE FROM _queue_jobs;");
+        const id_cancel = try enqueue(&d, testing.io, .{ .name = "q", .backend = .durable }, "k", "{}", 0);
+        const canceled = try claimBatch(testing.allocator, &d, &.{"q"}, "worker", 1, 100);
+        defer freeClaimed(testing.allocator, canceled);
+        _ = try reclaimStale(&d, "q", 101, 1);
+        try testing.expect(try cancelJob(&d, &id_cancel));
+        try testing.expect(!try finishClaim(&d, canceled[0], outcome, 1, 200, "late"));
+        try testing.expectEqual(@as(i64, 1), try countStatus(&d, "canceled"));
+        try d.exec("DELETE FROM _queue_jobs;");
+    }
+}
+
+test "expired queue attempts cannot overwrite a newer claim with any outcome" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try migrations.run(&d);
+    _ = try enqueue(&d, testing.io, .{ .name = "q", .backend = .durable }, "k", "{}", 0);
+    const first = try claimBatch(testing.allocator, &d, &.{"q"}, "same-worker", 1, 100);
+    defer freeClaimed(testing.allocator, first);
+    try testing.expectEqual(@as(usize, 1), try reclaimStale(&d, "q", 101, 1));
+    const second = try claimBatch(testing.allocator, &d, &.{"q"}, "same-worker", 1, 101);
+    defer freeClaimed(testing.allocator, second);
+    try testing.expect(second[0].generation > first[0].generation);
+    inline for (.{ Outcome.done, Outcome.retry, Outcome.failed }) |outcome| {
+        try testing.expect(!try finishClaim(&d, first[0], outcome, 1, 102, "stale"));
+        try testing.expectEqual(@as(i64, 1), try countStatus(&d, "claimed"));
+    }
+    try testing.expect(try finishClaim(&d, second[0], .done, 0, 102, ""));
+    try testing.expectEqual(@as(i64, 1), try countStatus(&d, "done"));
+    try testing.expect(!try finishClaim(&d, second[0], .retry, 1, 103, "duplicate"));
+}
+
+// Two independent connections, isolated from other live suites. No arena: all
+// connection allocations remain visible to the test allocator's leak detector.
+const PgQueueTest = struct {
+    first: db.Db,
+    second: db.Db,
+    name: [15]u8,
+
+    fn init() !PgQueueTest {
+        if (!@import("build_options").postgres) return error.SkipZigTest;
+        const url = @import("../backend/postgres/tests.zig").testUrl();
+        var first = db.Db.openPostgres(testing.allocator, testing.io, url) catch |e| switch (e) {
+            error.OpenFailed => return error.SkipZigTest,
+            else => return e,
+        };
+        errdefer first.close();
+        var second = try db.Db.openPostgres(testing.allocator, testing.io, url);
+        errdefer second.close();
+        const name = id.collectionId(testing.io);
+        var buf: [128]u8 = undefined;
+        try first.exec(try std.fmt.bufPrintZ(&buf, "CREATE SCHEMA \"zbq_{s}\";", .{name}));
+        errdefer first.exec(std.fmt.bufPrintZ(&buf, "DROP SCHEMA \"zbq_{s}\" CASCADE;", .{name}) catch unreachable) catch |e|
+            std.log.err("queue test schema cleanup failed: {s}", .{@errorName(e)});
+        const path = try std.fmt.bufPrintZ(&buf, "SET search_path TO \"zbq_{s}\";", .{name});
+        try first.exec(path);
+        try second.exec(path);
+        try migrations.run(&first);
+        return .{ .first = first, .second = second, .name = name };
+    }
+
+    fn deinit(self: *PgQueueTest) void {
+        self.second.close();
+        var buf: [128]u8 = undefined;
+        self.first.exec(std.fmt.bufPrintZ(&buf, "DROP SCHEMA \"zbq_{s}\" CASCADE;", .{self.name}) catch unreachable) catch |e|
+            std.log.err("queue test schema cleanup failed: {s}", .{@errorName(e)});
+        self.first.close();
+    }
+};
+
+test "pg durable claims skip another connection's uncommitted claims" {
+    if (!@import("build_options").postgres) return error.SkipZigTest;
+    var env = try PgQueueTest.init();
+    defer env.deinit();
+    for (0..2) |_| _ = try enqueue(&env.first, testing.io, .{ .name = "q", .backend = .durable }, "k", "{}", 0);
+    try env.first.beginImmediate();
+    defer env.first.rollback() catch |e| std.log.err("test rollback failed: {s}", .{@errorName(e)});
+    const first = try claimBatch(testing.allocator, &env.first, &.{"q"}, "a", 1, 100);
+    defer freeClaimed(testing.allocator, first);
+    // Without SKIP LOCKED this times out trying to overwrite the first claim.
+    try env.second.exec("SET lock_timeout = '250ms';");
+    const second = try claimBatch(testing.allocator, &env.second, &.{"q"}, "b", 2, 100);
+    defer freeClaimed(testing.allocator, second);
+    try testing.expectEqual(@as(usize, 1), first.len);
+    try testing.expectEqual(@as(usize, 1), second.len);
+    try testing.expect(!std.mem.eql(u8, first[0].id, second[0].id));
+}
+
+test "pg concurrent rated claimers share one database rate ceiling" {
+    if (!@import("build_options").postgres) return error.SkipZigTest;
+    var env = try PgQueueTest.init();
+    defer env.deinit();
+    for (0..10) |_| _ = try enqueue(&env.first, testing.io, .{ .name = "q", .backend = .durable }, "k", "{}", 0);
+    const Runner = struct {
+        conn: *db.Db,
+        start: *std.atomic.Value(bool),
+        claimed: []Claimed = &.{},
+        err: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            while (!self.start.load(.acquire)) std.atomic.spinLoopHint();
+            self.claimed = claimRateLimited(testing.allocator, self.conn, "q", "worker", 3, 10, 100) catch |e| {
+                self.err = e;
+                return;
+            };
+        }
+    };
+    var start = std.atomic.Value(bool).init(false);
+    var one = Runner{ .conn = &env.first, .start = &start };
+    var two = Runner{ .conn = &env.second, .start = &start };
+    const thread = try std.Thread.spawn(.{}, Runner.run, .{&one});
+    start.store(true, .release);
+    two.run();
+    thread.join();
+    defer freeClaimed(testing.allocator, one.claimed);
+    defer freeClaimed(testing.allocator, two.claimed);
+    if (one.err) |e| return e;
+    if (two.err) |e| return e;
+    try testing.expectEqual(@as(usize, 3), one.claimed.len + two.claimed.len);
+    try testing.expectEqual(@as(i64, 3), try countStatus(&env.first, "claimed"));
+}
+
+test "pg durable reclaim, fenced completion, cancellation and GC use backend-correct SQL" {
+    if (!@import("build_options").postgres) return error.SkipZigTest;
+    var env = try PgQueueTest.init();
+    defer env.deinit();
+    const q = QueueDef{ .name = "q", .backend = .durable };
+    _ = try enqueue(&env.first, testing.io, q, "k", "{}", 0);
+    const first = try claimBatch(testing.allocator, &env.first, &.{"q"}, "a", 1, 100);
+    defer freeClaimed(testing.allocator, first);
+    try testing.expectEqual(@as(usize, 1), try reclaimStale(&env.second, "q", 101, 1));
+    const second = try claimBatch(testing.allocator, &env.second, &.{"q"}, "b", 1, 101);
+    defer freeClaimed(testing.allocator, second);
+    try testing.expect(!try finishClaim(&env.first, first[0], .done, 0, 101, ""));
+    try testing.expect(try finishClaim(&env.second, second[0], .retry, 1, 102, "retry"));
+    const third = try claimBatch(testing.allocator, &env.first, &.{"q"}, "a", 1, 102);
+    defer freeClaimed(testing.allocator, third);
+    try testing.expect(try finishClaim(&env.first, third[0], .failed, 2, 102, "failed"));
+    const canceled = try enqueue(&env.second, testing.io, q, "k", "{}", 0);
+    try testing.expect(try cancelJob(&env.second, &canceled));
+    try testing.expect(!try cancelJob(&env.second, &canceled));
+    _ = try enqueue(&env.first, testing.io, q, "k", "{}", 0);
+    const late = try claimBatch(testing.allocator, &env.first, &.{"q"}, "a", 1, 103);
+    defer freeClaimed(testing.allocator, late);
+    _ = try reclaimStale(&env.second, "q", 104, 1);
+    try testing.expect(try finishClaim(&env.first, late[0], .done, 0, 104, ""));
+    const cancel_late = try enqueue(&env.first, testing.io, q, "k", "{}", 0);
+    const interrupted = try claimBatch(testing.allocator, &env.first, &.{"q"}, "a", 1, 105);
+    defer freeClaimed(testing.allocator, interrupted);
+    _ = try reclaimStale(&env.second, "q", 106, 1);
+    try testing.expect(try cancelJob(&env.second, &cancel_late));
+    try testing.expect(!try finishClaim(&env.first, interrupted[0], .retry, 1, 107, ""));
+    try testing.expectEqual(@as(usize, 4), try gcDoneJobs(&env.first, "q", 0));
+}
+
 test "durable reclaimStale honors the per-queue timeout and queue scope" {
     var d = try db.Db.openMemory();
     defer d.close();
@@ -531,7 +761,7 @@ test "durable reclaimStale honors the per-queue timeout and queue scope" {
     try testing.expectEqual(@as(usize, 0), try reclaimStale(&d, "default", now, 200000));
 }
 
-test "durable markRetry / markFailed update attempts + state" {
+test "durable fenced retry and failure update attempts and state" {
     var d = try db.Db.openMemory();
     defer d.close();
     try migrations.run(&d);
@@ -543,7 +773,9 @@ test "durable markRetry / markFailed update attempts + state" {
     defer testing.allocator.free(jid);
     idst.finalize();
 
-    try markRetry(&d, jid, 1, 12345, "boom");
+    const first = try claimBatch(testing.allocator, &d, &.{"default"}, "w", 1, clock.nowUnix(io));
+    defer freeClaimed(testing.allocator, first);
+    try testing.expect(try finishClaim(&d, first[0], .retry, 1, 12345, "boom"));
     {
         var st = try d.prepare("SELECT status, attempts, run_at, claimed_at, last_error FROM \"_queue_jobs\" WHERE id=?1;");
         defer st.finalize();
@@ -555,7 +787,9 @@ test "durable markRetry / markFailed update attempts + state" {
         try testing.expect(st.isNull(3));
         try testing.expectEqualStrings("boom", st.columnText(4));
     }
-    try markFailed(&d, jid, 5, "dead");
+    const second = try claimBatch(testing.allocator, &d, &.{"default"}, "w", 1, 12345);
+    defer freeClaimed(testing.allocator, second);
+    try testing.expect(try finishClaim(&d, second[0], .failed, 5, 12345, "dead"));
     try testing.expectEqual(@as(i64, 1), try countStatus(&d, "failed"));
 }
 
@@ -626,16 +860,6 @@ test "gcDoneJobs reaps old canceled rows" {
     try d.exec("INSERT INTO \"_queue_jobs\" (\"id\",\"queue\",\"kind\",\"max_attempts\",\"status\",\"created\") VALUES ('c1','q','k',5,'canceled',datetime('now','-400 days'));");
     try d.exec("INSERT INTO \"_queue_jobs\" (\"id\",\"queue\",\"kind\",\"max_attempts\",\"status\",\"created\") VALUES ('c2','q','k',5,'canceled',datetime('now'));");
     try testing.expectEqual(@as(usize, 1), try gcDoneJobs(&d, "q", 30 * 24 * 3600)); // old canceled reaped, fresh kept
-}
-
-test "TokenBucket: full burst, drain, integer-second refill, refund cap" {
-    var b = TokenBucket.init(3, 100);
-    try testing.expectEqual(@as(usize, 3), b.reserve(100, 10)); // burst = 1s of tokens
-    try testing.expectEqual(@as(usize, 0), b.reserve(100, 1)); // same second: empty
-    try testing.expectEqual(@as(usize, 3), b.reserve(101, 5)); // new second: refilled to capacity
-    b.refund(99);
-    try testing.expectEqual(@as(u32, 3), b.tokens); // refund never exceeds capacity
-    try testing.expectEqual(@as(usize, 2), b.reserve(50, 2)); // clock going BACKWARDS: no refill, but reserve still works
 }
 
 // --- Integration: pollOnce over a real pool ---------------------------------
@@ -806,8 +1030,6 @@ test "pollOnce claims <= tokens on a rated queue while an unrated queue drains u
     if (!clock.enabled) return error.SkipZigTest;
     const env = try PollTestEnv.init();
     defer env.deinit();
-    resetRateBucketsForTest();
-    defer resetRateBucketsForTest();
     clock.setForTest(1_000_000);
     defer clock.resetForTest();
     th_runs = 0;
