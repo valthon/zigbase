@@ -10,6 +10,7 @@ const BuildOptionValues = struct {
     vector: bool,
     postgres: bool,
     s3: bool,
+    file_inventory: bool,
     fts5: bool,
     sqlite_version: []const u8,
     sqlite_source_id: []const u8,
@@ -107,6 +108,7 @@ pub fn build(b: *std.Build) void {
     // verb names, but returns an actionable "rebuild with -Ddev-tools=true" error instead of
     // a bare UnknownCommand.
     const dev_tools = b.option(bool, "dev-tools", "Compile in the development-time CLI verbs: init, agents-md, typegen (default: on; -Ddev-tools=false strips them from a custom build)") orelse true;
+    const file_inventory = b.option(bool, "file-inventory", "Compile read-only local/S3 file inventory reporting (default: off)") orelse false;
     // Opt-in vector search (#157; Postgres pgvector port #159). OFF by default: the default build
     // does NOT compile or link the sqlite-vec amalgamation, and every vector code path folds to
     // comptime-dead — the shipped binary is byte-for-byte unaffected. `-Dvector=true` enables vector
@@ -154,6 +156,7 @@ pub fn build(b: *std.Build) void {
         .commit = commit,
         .dev_mode = dev_mode,
         .dev_tools = dev_tools,
+        .file_inventory = file_inventory,
         .internal_api = false,
         .vector = vector,
         .postgres = postgres,

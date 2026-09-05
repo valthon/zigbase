@@ -1971,6 +1971,7 @@ fn runCliImpl(init: std.process.Init, dispatch: *const events.Dispatch, jobs: []
             .explain_code => printExplainCodeUsage(init.io, std.Io.File.stdout()),
             .serve_control => printServeControlUsage(init.io, std.Io.File.stdout()),
             .doctor => printDoctorUsage(init.io, std.Io.File.stdout()),
+            .files => printFileInventoryUsage(init.io, std.Io.File.stdout()),
             .init => printInitUsage(init.io, std.Io.File.stdout()),
             .agents_md => printAgentsMdUsage(init.io, std.Io.File.stdout()),
         },
@@ -2122,6 +2123,14 @@ fn runCliImpl(init: std.process.Init, dispatch: *const events.Dispatch, jobs: []
         // `.migrations` to judge the migrations check, and settling the call
         // shape now means this dispatch line is written once.
         .doctor => |da| try doctorImpl(allocator, init.io, init.environ_map, da, schema_migrations),
+        .file_inventory => |fa| {
+            if (comptime build_options.file_inventory) {
+                try fileInventoryImpl(opts, allocator, init.io, init.environ_map, fa);
+            } else {
+                std.log.err("files inventory is not compiled in; rebuild with -Dfile-inventory=true", .{});
+                std.process.exit(1);
+            }
+        },
         .migrate => |ma| switch (ma.action) {
             .apply => try migrateImpl(allocator, init.io, init.environ_map, ma, schema_migrations),
             .status => try migrateStatusImpl(allocator, init.io, init.environ_map, ma, schema_migrations),
@@ -2217,6 +2226,7 @@ fn printUsage(io: std.Io, file: std.Io.File, show_serve_static: bool, show_stati
         \\  serve               Start the HTTP server (REST + WebSocket + admin UI at /_/).
         \\  serve stop|status|logs|wait   Manage a tracked `serve` session (see `zigbase serve status --help`).
         \\  doctor              Preflight checks; --production escalates, --json emits NDJSON. Exits 1 on any error.
+        \\  files inventory     Read-only storage page, usage, and reference candidates (-Dfile-inventory).
         \\  migrate             Apply database migrations, then exit. `status` reports; `rollback [N]` reverses; `dump` dumps the live schema.
         \\  rewrap              Re-encrypt all encrypted fields under the primary key (key rotation).
         \\  migrate-db          Copy an existing SQLite instance into PostgreSQL (requires -Dpostgres).
@@ -2833,6 +2843,20 @@ fn printServeControlUsage(io: std.Io, file: std.Io.File) void {
         \\
         \\Each verb resolves its session from the data dir, exactly like `serve` itself
         \\[env ZIGBASE_DATA_DIR, default ./zb_data]. See docs/serve.md for the JSON contract.
+        \\
+    , .{});
+}
+
+fn printFileInventoryUsage(io: std.Io, file: std.Io.File) void {
+    emit(io, file,
+        \\zigbase files inventory — read-only storage inventory, usage, and reference candidates.
+        \\
+        \\USAGE:
+        \\  zigbase files inventory [--limit 1..1000] [--cursor KEY] [--data-dir PATH]
+        \\
+        \\Requires -Dfile-inventory=true; S3 additionally requires -Ds3=true.
+        \\Prints one JSON page. Usage is PAGE-ONLY, not a bucket-wide total.
+        \\Unreferenced objects are candidates, including in-flight uploads; never auto-delete.
         \\
     , .{});
 }
@@ -4231,18 +4255,52 @@ fn serveControlImpl(allocator: std.mem.Allocator, io: std.Io, environ: *const st
     serve_control.runVerb(io, allocator, verb, abs, ca.json, ca.follow, ca.timeout_ms);
 }
 
-/// `zigbase doctor [--production] [--json] [--data-dir PATH]`.
-///
-/// Reads config from env exactly as `serve` would, probes the data dir, and
-/// opens the database read-mostly (it does create the `_migrations` ledger if
-/// absent — the same write `migrate status` performs, and nothing else).
-/// `schema_migrations` is the binary's compiled-in `.migrations`: without it,
-/// the migrations check would report a clean bill of health for a binary that
-/// has pending work.
-///
-/// One arena for the whole call: `doctor_run.gather`, `doctor.evaluate`, and
-/// `doctor_run.renderToSlice` are all Contract 4 against it, so nothing below
-/// is freed individually — the arena's `deinit()` is the only cleanup.
+/// Read-only operational inspection, deliberately bypassing migrations,
+/// provisioning, server boot, and writer pools. Every result has explicit ownership.
+fn fileInventoryImpl(comptime opts: ServeOpts, allocator: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map, fa: cli.FileInventoryArgs) !void {
+    fileInventoryRun(opts, allocator, io, environ, fa) catch |err| {
+        const advice: []const u8 = switch (err) {
+            error.OpenFailed => "cannot open the configured database; verify --data-dir (data.db) or ZIGBASE_DB_URL and read permissions",
+            error.InventoryUnsupported => "the selected storage plugin does not implement read-only inventory",
+            error.InventoryScanLimit => "local storage exceeds the 100000-entry scan bound; narrow the configured storage root or use backend-native inventory",
+            error.S3InventoryRequiresS3Build => "S3 is configured; rebuild with -Ds3=true together with -Dfile-inventory=true",
+            error.PostgresInventoryRequiresPostgresBuild => "PostgreSQL is configured; rebuild with -Dpostgres=true together with -Dfile-inventory=true",
+            error.InvalidInventoryUtf8 => "an object key or cursor is not UTF-8; use backend-native byte-safe inventory to inspect it",
+            else => "inspection failed; check database and storage configuration, read permissions, and backend availability",
+        };
+        std.log.err("files inventory: {s} ({s})", .{ advice, @errorName(err) });
+        std.process.exit(1);
+    };
+}
+
+fn fileInventoryRun(comptime opts: ServeOpts, allocator: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map, fa: cli.FileInventoryArgs) !void {
+    const cfg = try loadCfg(environ, .{ .data_dir = fa.data_dir });
+    if (opts.StoragePlugin == DefaultStoragePlugin and cfg.s3_bucket.len > 0 and !build_options.s3)
+        return error.S3InventoryRequiresS3Build;
+    const db_url = (config.EnvGetter{ .environ = environ }).get("ZIGBASE_DB_URL");
+    const backend = db.chooseBackend(db_url);
+    if (backend == .postgres_url_without_build) return error.PostgresInventoryRequiresPostgresBuild;
+    const target = if (backend == .postgres) db_url.? else try std.fmt.allocPrint(allocator, "{s}/data.db", .{cfg.data_dir});
+    defer if (backend != .postgres) allocator.free(target);
+    var conn = try db.openInspectionConnection(allocator, io, target);
+    defer conn.close();
+    if (backend == .postgres) try conn.exec("SET default_transaction_read_only = on;");
+    var plugin = try opts.StoragePlugin.create(allocator, io, cfg);
+    defer plugin.deinit();
+    const storage = plugin.interface();
+    const page = try storage.inventory(io, allocator, fa.cursor, fa.limit);
+    defer page.deinit(allocator);
+    const output = try @import("files/inventory.zig").render(allocator, &conn, page);
+    defer allocator.free(output);
+    var buffer: [4096]u8 = undefined;
+    var writer = std.Io.File.stdout().writerStreaming(io, &buffer);
+    try writer.interface.writeAll(output);
+    try writer.interface.writeByte('\n');
+    try writer.interface.flush();
+}
+
+/// Read-mostly preflight; may create the migration ledger. Its interlinked
+/// findings/render graph lives in one command-scoped arena (contract 4).
 fn doctorImpl(allocator: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map, da: cli.DoctorArgs, schema_migrations: []const provision.Migration) !void {
     const cfg = try loadCfg(environ, .{ .data_dir = da.data_dir });
     var arena_state = std.heap.ArenaAllocator.init(allocator);

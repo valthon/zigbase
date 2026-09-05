@@ -4177,8 +4177,8 @@ zigbase.App(.{ .mailer = AuditMailer }).runCli(init);
 
 A custom storage plugin follows the same shape, returning a `zigbase.Storage`
 view from `interface()`. The `zigbase.Storage` vtable has **four** required
-methods — `put` / `fetch` / `delete` / `deleteRecord` — plus one **optional**
-`presignGetUrl` (defaults to `null`, so existing four-method backends stay
+methods — `put` / `fetch` / `delete` / `deleteRecord` — plus **optional**
+`presignGetUrl` and `inventory` (both default to `null`, so existing four-method backends stay
 valid) — so a custom backend wraps or replaces them. `fetch(ctx, io, alloc,
 col, record_id, filename)` returns a local filesystem path whose contents ARE
 the file, materializing it locally first if necessary (a remote backend spools
@@ -4200,7 +4200,57 @@ to the existing row before transfer and to the updated row before commit.
 Reload the record and retry a conflict. A crash between PUT and
 commit can still leave unreferenced bytes; this is not a distributed transaction.
 
-**Presigned-redirect serving (S3).** By default every download is *proxied*: the
+### Read-only inventory (opt-in CLI)
+
+Build with `-Dfile-inventory=true` to include
+`zigbase files inventory [--limit 1..1000] [--cursor KEY] [--data-dir PATH]`.
+Add `-Ds3=true` for S3 storage and `-Dpostgres=true` when the database uses PostgreSQL.
+This is a binary-cost decision, not an HTTP policy: there is no inventory endpoint,
+and the tool requires the operator's existing database/filesystem/S3 credentials.
+There is deliberately no duplicate `App(.{})` runtime switch. A consumer dependency
+can select it with `b.dependency("zigbase", .{ .target = target, .optimize = optimize,
+.@"file-inventory" = true })`. The default build retains neither built-in inventory
+callbacks nor the CLI implementation. Existing custom storage vtables remain valid;
+without the optional capability the command reports `InventoryUnsupported`.
+
+The command prints one JSON page with `items` (`key`, `bytes`, `reference`),
+`nextCursor`, `hasNext`, and `usage` (`scope: "page"`, object/byte counts and
+candidate/unknown counts). Pass `nextCursor` unchanged to the next invocation,
+using the same backend, database, and key prefix. `usage` is **not a global total**;
+sum pages only when a best-effort live observation is sufficient. Object keys are
+relative to the configured local root or S3 key prefix; S3 credentials, signed
+URLs, file contents, and other record fields are never included in the report.
+
+`reference` is `referenced`, `candidate_unreferenced`, or `unknown` (unexpected
+layout or metadata lookup failure). References include hidden file fields and
+expired TTL rows that still physically exist; normal record visibility does not
+determine blob ownership. Candidates include uploads between PUT and
+COMMIT, failed cleanup, and concurrent record/schema changes. No candidate is
+proven safe to delete. The command has **no deletion mode**, runs no migrations or
+provisioning, and opens SQLite read-only or PostgreSQL with read-only transactions.
+Builtin storage initialization performs no writes; custom plugin initialization
+and its `inventory` callback must honor the same read-only contract.
+
+Keys and cursors must be UTF-8; otherwise the command fails without a partial
+JSON page and directs operators to byte-safe backend-native tooling. This keeps
+their JSON types stable rather than emitting integer arrays for invalid bytes.
+Local inventory scans regular files in the three-level record-file layout and
+shallower paths. The operator-configured storage root may be a symlink (for an
+external volume); descendant symlinks are never followed. Unknown filesystem
+entry types are resolved with no-follow metadata reads. Each invocation rescans
+up to 100,000
+directory entries, retaining at most `limit + 1` keys in memory; exceeding this
+bound fails with `InventoryScanLimit` instead of returning a misleading partial
+total. Deeper directories and nonregular files are outside this scope. S3 inventory
+requests one ListObjectsV2 page with `max-keys=limit`, needs bucket listing
+permission, and observes only the configured prefix. It lists current objects,
+not old object versions, delete markers, or unfinished multipart uploads.
+Neither backend offers snapshot isolation across pages; concurrent writes can
+change the observation. Inventory does not change record download authorization.
+
+### Presigned-redirect serving (S3)
+
+By default every download is *proxied*: the
 server calls `fetch` (spooling to a local cache for S3) and streams the bytes
 itself. With `App(.{ .files = .{ .s3_presign_redirect = true } })` and the S3
 backend active (`-Ds3` + `ZIGBASE_S3_*`), an authorized download is instead
@@ -4953,6 +5003,7 @@ code to comptime-dead when off, so a build that doesn't need a feature doesn't p
 | `-Dfts5` | **on** | SQLite full-text search (FTS5). `-Dfts5=false` drops `-DSQLITE_ENABLE_FTS5` from the SQLite build (~250-400 KB smaller) for lean binaries with no `.searchable` field; `?search=` then 400s and the server refuses to start over a `.searchable` SQLite schema. Postgres full-text search is unaffected. → [docs/search.md](./search.md#build-requirement--dfts5-default-on) |
 | `-Dvector` | off | Opt-in nearest-neighbor `?vector=` KNN search — sqlite-vec on SQLite, pgvector on Postgres. → [docs/search.md](./search.md#vector-search-opt-in) |
 | `-Dpostgres` | off | Opt-in pure-Zig PostgreSQL wire-protocol backend, alongside the default SQLite one. → [docs/postgres.md](./postgres.md) |
+| `-Dfile-inventory` | off | Read-only `files inventory` CLI plus optional local/S3 inventory callbacks. Bounded pages, page usage and reference candidates; no HTTP surface or deletion. S3 additionally needs `-Ds3=true`. |
 | `-Ddev-mode` | on in `Debug`, off in release | The dev-only, never-in-prod seams: `ZIGBASE_FAKE_NOW` / `ZIGBASE_FAKE_SEED` (§14 above), test-capture, and fake field-crypto; the release script forces it off for shipped binaries. |
 | `-Ddev-tools` | **on** | The `init`/`agents-md`/`typegen` CLI verbs (scaffolding + schema-to-client codegen — `src/scaffold*.zig` + `src/codegen/**`, ~24 files, none of it needed by a *deployed* server). **Every official artifact we publish builds at this default** — GitHub release tarballs, the Docker image, and the `@zigbase/server` npm packages all ship with the three verbs in. `-Ddev-tools=false` is an opt-out for a consumer compiling their **own** binary for their **own** deployment who wants to shed the ~490 KiB behind it; the stripped binary still recognizes the verb names but exits non-zero with a "rebuild with -Ddev-tools=true" message instead of running them. Distinct from `.enable_typegen` below — see §3b. |
 | `-Dstrip` | on except in `Debug` | Strip debug info from the binary (~7 MiB vs ~24 MiB unstripped in a release build). |

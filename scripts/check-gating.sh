@@ -16,7 +16,31 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+# A separate build-flag axis. The build job checks absence in its stock binary;
+# the S3 job invokes the paired mode against explicit off/on binaries as a
+# positive control, so renamed patterns cannot silently make the test vacuous.
+INVENTORY_PATTERNS=('files\.inventory\.' 'files\.local_inventory\.' 'fileInventoryRun')
+check_inventory() {
+  local off=$1 on=${2:-} symbols pattern
+  symbols=$(nm --defined-only "$off")
+  for pattern in "${INVENTORY_PATTERNS[@]}"; do
+    if grep -Eq "$pattern" <<< "$symbols"; then
+      echo "LEAK: inventory pattern '$pattern' in $off"; return 1
+    fi
+    if [ -n "$on" ] && ! nm --defined-only "$on" | grep -E "$pattern" >/dev/null; then
+      echo "DRIFT: inventory pattern '$pattern' absent in $on"; return 1
+    fi
+  done
+}
+if [ "${1:-}" = --inventory ]; then
+  [ "$#" -eq 3 ] || { echo 'usage: check-gating.sh --inventory OFF_BINARY ON_BINARY'; exit 2; }
+  check_inventory "$2" "$3"
+  echo 'inventory gating: OK'
+  exit 0
+fi
+
 FULL=zig-out/bin/zigbase
+check_inventory "$FULL"
 FULL2=zig-out/bin/full-fixture
 LEAN=zig-out/bin/minimal-server
 [ -x "$FULL" ] || { echo "build $FULL first (zig build)"; exit 2; }

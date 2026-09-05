@@ -31,6 +31,12 @@ pub const ServeArgs = struct {
 
 pub const ServeControlVerb = enum { stop, status, logs, wait };
 
+pub const FileInventoryArgs = struct {
+    data_dir: ?[]const u8 = null,
+    cursor: ?[]const u8 = null,
+    limit: u16 = 100,
+};
+
 pub const ServeControlArgs = struct {
     verb: ServeControlVerb,
     data_dir: ?[]const u8 = null,
@@ -204,7 +210,7 @@ pub const AgentsMdArgs = struct {
 };
 
 /// Identifies which command a per-command `--help` request targets.
-pub const HelpTopic = enum { top, serve, serve_control, migrate, superuser_create, typegen, rewrap, migrate_db, vapid_keygen, import, schema, openapi, explain_code, doctor, init, agents_md };
+pub const HelpTopic = enum { top, serve, serve_control, migrate, superuser_create, typegen, rewrap, migrate_db, vapid_keygen, import, schema, openapi, explain_code, doctor, init, agents_md, files };
 
 pub const Command = union(enum) {
     /// `help`/`--help`/`-h`/no-args -> top-level usage; `<cmd> --help` -> that command's usage.
@@ -227,6 +233,7 @@ pub const Command = union(enum) {
     serve_control: ServeControlArgs,
     /// `doctor` -> preflight checks over config/data-dir/schema.
     doctor: DoctorArgs,
+    file_inventory: FileInventoryArgs,
     /// `init` -> scaffold a project into a directory and exit.
     init: InitArgs,
     /// `agents-md` -> write AGENTS.md + CLAUDE.md for an existing project and exit.
@@ -256,6 +263,28 @@ pub fn parse(args: []const []const u8, popts: ParseOpts) ParseError!Command {
     if (args.len == 0) return .{ .help = .top };
     if (std.mem.eql(u8, args[0], "help") or isHelpFlag(args[0]))
         return .{ .help = .top };
+    if (std.mem.eql(u8, args[0], "files")) {
+        if (args.len == 1 or isHelpFlag(args[1])) return .{ .help = .files };
+        if (!std.mem.eql(u8, args[1], "inventory")) return ParseError.UnknownCommand;
+        var fa = FileInventoryArgs{};
+        var i: usize = 2;
+        while (i < args.len) : (i += 1) {
+            const flag = args[i];
+            if (isHelpFlag(flag)) return .{ .help = .files };
+            if (std.mem.eql(u8, flag, "--json")) continue; // output is always JSON
+            if (!std.mem.eql(u8, flag, "--limit") and !std.mem.eql(u8, flag, "--cursor") and !std.mem.eql(u8, flag, "--data-dir")) return ParseError.UnknownFlag;
+            i += 1;
+            if (i == args.len) return ParseError.MissingValue;
+            if (std.mem.eql(u8, flag, "--data-dir")) fa.data_dir = args[i] else if (std.mem.eql(u8, flag, "--cursor")) {
+                if (args[i].len == 0 or args[i].len > 4096) return ParseError.BadValue;
+                fa.cursor = args[i];
+            } else {
+                fa.limit = std.fmt.parseInt(u16, args[i], 10) catch return ParseError.BadValue;
+                if (fa.limit == 0 or fa.limit > 1000) return ParseError.BadValue;
+            }
+        }
+        return .{ .file_inventory = fa };
+    }
     if (std.mem.eql(u8, args[0], "version") or
         std.mem.eql(u8, args[0], "--version") or
         std.mem.eql(u8, args[0], "-V"))
@@ -1229,6 +1258,16 @@ test "serve --ignore-lock parses alone but conflicts with --background" {
     // handshake would have nothing to poll. Refuse the pair up front.
     try std.testing.expectError(ParseError.ConflictingFlags, parse(&.{ "serve", "--background", "--ignore-lock" }, .{}));
     try std.testing.expectError(ParseError.ConflictingFlags, parse(&.{ "serve", "--ignore-lock", "--background" }, .{}));
+}
+
+test "files inventory parses pagination and rejects unsafe bounds" {
+    const cmd = try parse(&.{ "files", "inventory", "--limit", "25", "--cursor", "key", "--data-dir", "data" }, .{});
+    try std.testing.expectEqual(@as(u16, 25), cmd.file_inventory.limit);
+    try std.testing.expectEqualStrings("key", cmd.file_inventory.cursor.?);
+    for ([_][]const u8{ "0", "1001", "-1", "bad" }) |bad|
+        try std.testing.expectError(ParseError.BadValue, parse(&.{ "files", "inventory", "--limit", bad }, .{}));
+    try std.testing.expectError(ParseError.UnknownFlag, parse(&.{ "files", "inventory", "--delete" }, .{}));
+    try std.testing.expectError(ParseError.MissingValue, parse(&.{ "files", "inventory", "--cursor" }, .{}));
 }
 
 test "serve wait validates its bounded timeout and output options" {
