@@ -10,6 +10,9 @@ pub const Storage = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
+        /// Optional, read-only inventory. The result owns its keys and cursor;
+        /// missing callback preserves compatibility with existing plugins.
+        inventory: ?*const fn (ctx: *anyopaque, io: std.Io, alloc: std.mem.Allocator, cursor: ?[]const u8, limit: u16) anyerror!InventoryPage = null,
         put: *const fn (ctx: *anyopaque, io: std.Io, col: []const u8, record_id: []const u8, filename: []const u8, bytes: []const u8) anyerror!void,
         fetch: *const fn (ctx: *anyopaque, io: std.Io, alloc: std.mem.Allocator, col: []const u8, record_id: []const u8, filename: []const u8) anyerror!?[]const u8,
         delete: *const fn (ctx: *anyopaque, io: std.Io, col: []const u8, record_id: []const u8, filename: []const u8) anyerror!void,
@@ -22,6 +25,30 @@ pub const Storage = struct {
         /// `VTable{ ... }` literals valid (backward-compatible for custom storage plugins).
         presignGetUrl: ?*const fn (ctx: *anyopaque, io: std.Io, alloc: std.mem.Allocator, col: []const u8, record_id: []const u8, filename: []const u8, expires_seconds: u32) anyerror!?[]const u8 = null,
     };
+
+    pub const InventoryItem = struct { key: []const u8, bytes: u64 };
+    pub const InventoryPage = struct {
+        items: []InventoryItem,
+        nextCursor: ?[]const u8 = null,
+        pub fn deinit(self: InventoryPage, alloc: std.mem.Allocator) void {
+            for (self.items) |item| alloc.free(item.key);
+            alloc.free(self.items);
+            if (self.nextCursor) |cursor| alloc.free(cursor);
+        }
+    };
+
+    pub fn inventory(self: Storage, io: std.Io, alloc: std.mem.Allocator, cursor: ?[]const u8, limit: u16) !InventoryPage {
+        if (limit == 0 or limit > 1000) return error.InvalidInventoryLimit;
+        if (cursor) |c| if (c.len == 0 or c.len > 4096) return error.InvalidInventoryCursor;
+        const callback = self.vtable.inventory orelse return error.InventoryUnsupported;
+        const result = try callback(self.ctx, io, alloc, cursor, limit);
+        errdefer result.deinit(alloc);
+        if (result.items.len > limit) return error.InvalidInventoryPage;
+        if (result.nextCursor) |next| {
+            if (next.len == 0 or next.len > 4096 or (cursor != null and std.mem.eql(u8, next, cursor.?))) return error.InvalidInventoryPage;
+        }
+        return result;
+    }
 
     pub fn put(self: Storage, io: std.Io, col: []const u8, record_id: []const u8, filename: []const u8, bytes: []const u8) anyerror!void {
         return self.vtable.put(self.ctx, io, col, record_id, filename, bytes);
@@ -58,7 +85,13 @@ pub const LocalStorage = struct {
         return .{ .ctx = self, .vtable = &vtable };
     }
 
-    const vtable = Storage.VTable{ .put = put, .fetch = fetch, .delete = delete, .deleteRecord = deleteRecord };
+    const vtable = Storage.VTable{
+        .put = put,
+        .fetch = fetch,
+        .delete = delete,
+        .deleteRecord = deleteRecord,
+        .inventory = if (@import("build_options").file_inventory) @import("local_inventory.zig").page else null,
+    };
 
     fn dirPath(alloc: std.mem.Allocator, root: []const u8, col: []const u8, record_id: []const u8) ![]u8 {
         return std.fs.path.join(alloc, &.{ root, col, record_id });
@@ -140,4 +173,14 @@ test "LocalStorage does not presign (wrapper returns null)" {
     const st = local.storage();
     const url = try st.presignGetUrl(std.testing.io, std.testing.allocator, "posts", "rec1", "a.png", 900);
     try std.testing.expect(url == null);
+}
+
+test "inventory capability is absent in a default binary and validates bounds" {
+    var local = LocalStorage.init("/tmp/unused-storage-inventory");
+    const st = local.storage();
+    try std.testing.expectError(error.InvalidInventoryLimit, st.inventory(std.testing.io, std.testing.allocator, null, 0));
+    try std.testing.expectError(error.InvalidInventoryLimit, st.inventory(std.testing.io, std.testing.allocator, null, 1001));
+    try std.testing.expectError(error.InvalidInventoryCursor, st.inventory(std.testing.io, std.testing.allocator, "", 1));
+    if (!@import("build_options").file_inventory)
+        try std.testing.expectError(error.InventoryUnsupported, st.inventory(std.testing.io, std.testing.allocator, null, 1));
 }

@@ -149,6 +149,13 @@ Two files live under the data dir:
 
 ## 4. `serve status --json`
 
+For read-only storage inspection, an opt-in `-Dfile-inventory=true` build provides
+`zigbase files inventory --limit 100 --data-dir ./zb_data`. It reports one JSON
+page of file sizes and reference candidates, never deletes anything, and does
+not treat unreferenced/in-flight objects as safe to remove. See
+[storage inventory](https://github.com/valthon/zigbase/blob/main/docs/framework.md#read-only-inventory-opt-in-cli) for scope,
+pagination, S3 requirements, and consistency limitations.
+
 For startup synchronization, use `zigbase serve wait [--json] [--timeout-ms N]`
 with the same `--data-dir` (or `ZIGBASE_DATA_DIR`) as the server. It waits for a
 held session lock, published session identity, and a successful `/api/health`
