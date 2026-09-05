@@ -3164,16 +3164,30 @@ built-in itself is gated off.
 - **Upgrade coordinated workers together:** drain and stop older worker binaries
   before applying migration `0025_queue_rates` from one process, then start the
   upgraded instances. Older binaries neither enforce shared rate windows nor fence
-  completion, so mixed-version workers do not provide these guarantees. Run system
-  migrations from one designated process before starting replicas; migration
-  application is not itself a distributed leader-election mechanism.
+  completion, so mixed-version workers do not provide these guarantees. Consumer
+  migrations and older binaries still need a single migration leader; built-in system
+  migrations are serialized automatically (see §8).
 - Memory jobs run on a bounded worker pool that is drained and joined at shutdown (like `app.submit`); jobs still queued at a hard crash are lost (at-most-once), and a full ring rejects with `error.QueueFull`.
 
 ## 8. Define your schema in code (`.collections` + `.migrations`)
 
-Instead of provisioning collections over the REST API (see
-[recipes.md](recipes.md#recipe-provisioning-your-schema)), you can declare them at
-**comptime** and have ZigBase provision them at startup:
+Declare collections at **comptime** instead of provisioning them through the REST API
+(see [recipes.md](recipes.md#recipe-provisioning-your-schema)).
+
+Built-in system migrations coordinate concurrent startups automatically. PostgreSQL takes
+a database-scoped transaction advisory lock in a `READ COMMITTED` transaction before ledger bootstrap and each migration's
+applied-state check; SQLite takes its immediate writer lock. Each migration retains its own
+commit boundary. Failure rolls back that migration and releases its lock, so another startup
+can retry; earlier committed migrations remain applied. A failed lock acquisition aborts
+startup rather than proceeding unlocked (PostgreSQL deployment `lock_timeout` applies).
+This does not coordinate consumer migrations or old binaries that lack the lock: use a
+single migration leader for those, and continue draining old workers before incompatible
+queue upgrades. The system runner and public ledger bootstrap (`ensureLedger`, also used
+by status/rollback/doctor) share this lock and must run outside a caller-owned transaction.
+Nested use logs an explicit refusal and preserves the caller's transaction, returning
+`ExecFailed` for compatibility with the existing database error surface.
+
+ZigBase provisions the declarations at startup:
 
 ```zig
 zigbase.App(.{
