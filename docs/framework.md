@@ -4187,6 +4187,19 @@ to a local cache); `null` means the backend has no such object. *(0.10.0:
 parameter; return a local path, materializing the file locally if necessary;
 `null` = object missing.)*
 
+Record uploads call `put` **before acquiring the database writer**, using
+server-generated record IDs and freshly generated file names. A plugin must not
+assume the destination record already exists. The subsequent transaction runs
+hooks, validation, and access rules before committing references to those bytes;
+failed requests best-effort delete their uploads, including a PUT whose reply
+failed. Upload POST returns `409` when the collection definition changed during
+transfer. An upload PATCH rechecks its record snapshot under the write transaction
+(with a PostgreSQL row lock) and returns `409` if another write changed the record
+during upload, or if the collection definition changed. PATCH checks update access
+to the existing row before transfer and to the updated row before commit.
+Reload the record and retry a conflict. A crash between PUT and
+commit can still leave unreferenced bytes; this is not a distributed transaction.
+
 **Presigned-redirect serving (S3).** By default every download is *proxied*: the
 server calls `fetch` (spooling to a local cache for S3) and streams the bytes
 itself. With `App(.{ .files = .{ .s3_presign_redirect = true } })` and the S3
@@ -4263,8 +4276,10 @@ requests, `ETag`, and per-collection cacheability exactly as with local
 storage** (§9's `fetch` contract). Startup runs a fail-fast `HeadObject` probe
 (200 or 404 both prove DNS/TLS/SigV4/bucket/permissions end-to-end; anything
 else refuses to start) so a bad S3 config is caught at boot, not on first
-upload. See [Known limitations](../KNOWN_LIMITATIONS.md) for the write-lock,
-best-effort-delete, proxy-only-serving, and 5 GiB single-`PUT` caveats.
+upload. Record cleanup follows every ListObjectsV2 continuation page, decodes XML
+key text, and refuses malformed or out-of-prefix listings. See
+[Known limitations](../KNOWN_LIMITATIONS.md) for best-effort cleanup, crash
+orphans, presigned-URL trade-offs, and the 5 GiB single-`PUT` cap.
 
 `zigbase.S3Storage` is exported alongside `zigbase.LocalStorage` (an empty
 placeholder type on a stock, non-`-Ds3` build — its `create`/`interface`

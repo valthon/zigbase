@@ -172,22 +172,16 @@ fn peekPasswordFields(ctx: *http.RequestCtx) ?PwFields {
     return out;
 }
 
-/// Write the planned uploads for `record_id` via Storage, then delete replaced/removed files.
-/// On a write failure, deletes the files written so far and returns error.StorageFailed (caller
-/// rolls back the record). No-op when no storage is configured (unit tests).
-fn writeUploads(ctx: *http.RequestCtx, col: schema.Collection, record_id: []const u8, writes: []const file_plan.FieldWrite, deletes: []const []const u8) !void {
+/// Write newly named uploads. These names are not referenced by a committed row
+/// until the caller's transaction succeeds; failed requests remove them.
+/// On failure, the caller's outer cleanup removes the newly named objects,
+/// including the PUT whose reply failed. No-op when no storage is configured.
+fn writeUploads(ctx: *http.RequestCtx, col: schema.Collection, record_id: []const u8, writes: []const file_plan.FieldWrite) !void {
     const app = ctx.app.?;
     const storage = app.storage orelse return;
-    var written: usize = 0;
     for (writes) |wr| {
-        storage.put(app.io, col.name, record_id, wr.filename, wr.bytes) catch {
-            deleteWrites(app, col.name, record_id, writes[0..written]);
-            return error.StorageFailed;
-        };
-        written += 1;
+        storage.put(app.io, col.name, record_id, wr.filename, wr.bytes) catch return error.StorageFailed;
     }
-    for (deletes) |d| storage.delete(app.io, col.name, record_id, d) catch |e|
-        std.log.warn("replaced-file cleanup failed for {s}/{s}/{s}: {s}", .{ col.name, record_id, d, @errorName(e) });
 }
 
 /// Best-effort removal of just-written upload bytes when a create/update did NOT commit, so a
@@ -198,6 +192,56 @@ fn deleteWrites(app: *app_mod.App, col_name: []const u8, record_id: []const u8, 
     const storage = app.storage orelse return;
     for (writes) |wr| storage.delete(app.io, col_name, record_id, wr.filename) catch |e|
         std.log.warn("orphaned upload cleanup failed for {s}/{s}/{s}: {s}", .{ col_name, record_id, wr.filename, @errorName(e) });
+}
+
+/// Bypass the metadata cache after a slow upload: another process can have
+/// tightened file constraints while bytes were transferring. Own and free both
+/// serialized snapshots, including hidden fields and unredacted options.
+fn uploadSchemaUnchanged(alloc: std.mem.Allocator, w: *@import("../db.zig").Db, planned: schema.Collection) !bool {
+    if (@import("../db.zig").dbDialect(w).kind == .postgres) {
+        // Schema DDL locks the data table before updating _collections. Match
+        // that order before checking metadata, including on upload creates.
+        const table = try @import("../ddl.zig").quoteIdent(alloc, planned.name);
+        defer alloc.free(table);
+        const table_lock = try std.fmt.allocPrintSentinel(alloc, "LOCK TABLE {s} IN ROW EXCLUSIVE MODE", .{table}, 0);
+        defer alloc.free(table_lock);
+        // A concurrent collection deletion can remove the table before LOCK.
+        // Recover only this statement so missing/renamed metadata can still
+        // yield a conflict. Other lock/database failures retain their error.
+        try w.exec("SAVEPOINT zigbase_upload_table_lock;");
+        w.exec(table_lock) catch |err| {
+            try w.exec("ROLLBACK TO SAVEPOINT zigbase_upload_table_lock;");
+            try w.exec("RELEASE SAVEPOINT zigbase_upload_table_lock;");
+            const surviving = (try collections.get(alloc, w, planned.id)) orelse return false;
+            defer surviving.deinit(alloc);
+            if (!std.mem.eql(u8, surviving.name, planned.name)) return false;
+            return err;
+        };
+        try w.exec("RELEASE SAVEPOINT zigbase_upload_table_lock;");
+        var lock = try w.prepare("SELECT id FROM \"_collections\" WHERE id=$1 FOR SHARE");
+        defer lock.finalize();
+        try lock.bindText(1, planned.id);
+        if (!try lock.step()) return false;
+    }
+    const current = (try collections.get(alloc, w, planned.id)) orelse return false;
+    defer current.deinit(alloc);
+    const before = try std.json.Stringify.valueAlloc(alloc, planned, .{});
+    defer alloc.free(before);
+    const after = try std.json.Stringify.valueAlloc(alloc, current, .{});
+    defer alloc.free(after);
+    return std.mem.eql(u8, before, after);
+}
+
+fn lockUploadRecord(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection, rid: []const u8) !void {
+    if (db.dbDialect(w).kind != .postgres) return;
+    const table = try @import("../ddl.zig").quoteIdent(alloc, col.name);
+    defer alloc.free(table);
+    const sql = try std.fmt.allocPrintSentinel(alloc, "SELECT \"id\" FROM {s} WHERE \"id\"=$1 FOR UPDATE", .{table}, 0);
+    defer alloc.free(sql);
+    var lock = try w.prepare(sql);
+    defer lock.finalize();
+    try lock.bindText(1, rid);
+    _ = try lock.step();
 }
 
 pub fn view(ctx: *http.RequestCtx) anyerror!http.Response {
@@ -309,6 +353,21 @@ pub fn create(ctx: *http.RequestCtx) anyerror!http.Response {
     };
     const data = all.data;
 
+    // Reserve a SERVER-generated id, never the client/hook's id. The immutable
+    // file names may be uploaded before taking the writer; download authorization
+    // cannot expose them until the committed record references them.
+    const upload_id = if (all.writes.len > 0) @import("../id.zig").collectionId(app.io) else [_]u8{0} ** 15;
+    var committed = false;
+    defer if (!committed) deleteWrites(app, col.name, &upload_id, all.writes);
+    if (all.writes.len > 0) {
+        var r = try app.pool.acquireReader();
+        defer app.pool.releaseReader(&r);
+        const preflight = buildContext(ctx, &r, data);
+        if (policy.decide(col, .create, &preflight) == .deny_locked) return forbidden(ctx);
+    }
+    writeUploads(ctx, col, &upload_id, all.writes) catch
+        return ApiError.internal().toResponse(ctx.allocator.a);
+
     const w = app.pool.acquireWriter();
     defer app.pool.releaseWriter();
     const rctx = buildContext(ctx, w, data);
@@ -331,6 +390,10 @@ pub fn create(ctx: *http.RequestCtx) anyerror!http.Response {
     // error), so each rolls back explicitly before returning.
     try w.beginImmediate();
     errdefer w.rollback() catch {};
+    if (all.writes.len > 0 and !try uploadSchemaUnchanged(ctx.allocator.a, w, col)) {
+        w.rollback() catch {};
+        return ApiError.conflict("Collection changed during upload; reload and retry.").toResponse(ctx.allocator.a);
+    }
 
     // A before-hook may `put` NEW keys, which reallocs the map header captured in this
     // local; downstream MUST read the `_mut` binding (here and for rec_mut/ur_mut/ex_mut
@@ -359,7 +422,11 @@ pub fn create(ctx: *http.RequestCtx) anyerror!http.Response {
 
     // KNOWN LIMITATION: a `.check` guard evaluates `@request.data.*` from rctx.data, which is
     // built pre-hook; a hook mutating a guard-referenced field is not seen by the WHERE clause.
-    const rec = records.createInTxn(ctx.allocator.a, app.io, w, col, data_mut) catch |e| switch (e) {
+    if (all.writes.len > 0 and data_mut == .object)
+        try data_mut.object.put(ctx.allocator.a, "id", .{ .string = &upload_id });
+    const rec = records.createInTxnOpts(ctx.allocator.a, app.io, w, col, data_mut, .{
+        .allow_provided_id = all.writes.len > 0, // overwritten above with the reserved SERVER id
+    }) catch |e| switch (e) {
         error.Validation => {
             w.rollback() catch {};
             return validationResponse(ctx);
@@ -369,8 +436,7 @@ pub fn create(ctx: *http.RequestCtx) anyerror!http.Response {
             return ApiError.badRequest("Body must be a JSON object.").toResponse(ctx.allocator.a);
         },
         // A UNIQUE/CHECK/NOT NULL/FK violation (e.g. a duplicate email on signup) is a client
-        // error, not a server fault — 409, never 500. No files have been written yet on the
-        // create path (writeUploads runs after the INSERT), so an explicit rollback is enough.
+        // error, not a server fault — 409, never 500. The outer cleanup removes uploads.
         error.Constraint => {
             w.rollback() catch {};
             return ApiError.conflict("A record with these values already exists.").toResponse(ctx.allocator.a);
@@ -387,18 +453,7 @@ pub fn create(ctx: *http.RequestCtx) anyerror!http.Response {
         }
     }
     const rid = rec.object.get("id").?.string;
-    // File bytes are written before commit so a storage failure rolls the row back
-    // (via the explicit rollback below); on commit the files and the row are both durable.
-    writeUploads(ctx, col, rid, all.writes, all.deletes) catch {
-        w.rollback() catch {};
-        return ApiError.internal().toResponse(ctx.allocator.a);
-    };
-    // The upload bytes are now durable but the row is not until COMMIT succeeds. A commit
-    // failure (SQLITE_FULL/IOERR) rolls the INSERT back via the errdefer above, so without
-    // this guard the files would be orphaned under a record id that never existed — and, with
-    // no orphan-file GC, be permanently unreclaimable. Flip on success so kept files stay.
-    var committed = false;
-    errdefer if (!committed) deleteWrites(app, col.name, rid, all.writes);
+    // Bytes already exist; only a successful commit makes their references visible.
     try w.commit();
     committed = true;
 
@@ -464,15 +519,62 @@ pub fn update(ctx: *http.RequestCtx) anyerror!http.Response {
             }
         }
     }
+    const rid = ctx.param("id") orelse return ApiError.notFound().toResponse(ctx.allocator.a);
+    var upload_lease: colcache.Lease = .{ .col = null };
+    defer upload_lease.release();
+    var upload_plan: ?file_plan.AllPlan = null;
+    var upload_snapshot: []const u8 = "";
+    var committed = false;
+    // Cleanup runs AFTER the writer defer below, so a slow remote DELETE does not
+    // hold the writer either. The failed PUT itself may have persisted bytes.
+    defer if (!committed) if (upload_plan) |p|
+        deleteWrites(app, upload_lease.col.?.name, rid, p.writes);
+    if (ctx.files.len > 0) {
+        var r = try app.pool.acquireReader();
+        defer app.pool.releaseReader(&r);
+        upload_lease = try resolveCollection(ctx, &r);
+        const upload_col = upload_lease.col orelse return ApiError.notFound().toResponse(ctx.allocator.a);
+        const snapshot = (try records.get(ctx.allocator.a, &r, upload_col, rid)) orelse return ApiError.notFound().toResponse(ctx.allocator.a);
+        const planned = switch (try prepareRecordData(ctx, upload_col, snapshot)) {
+            .plan => |p| p,
+            .resp => |resp| return resp,
+        };
+        const preflight = buildContext(ctx, &r, planned.data);
+        switch (policy.decide(upload_col, .update, &preflight)) {
+            .deny_locked => return forbidden(ctx),
+            .allow => {},
+            .check => if (!try policy.authorizes(ctx.allocator.a, &r, upload_col, .update, rid, &preflight))
+                return ApiError.notFound().toResponse(ctx.allocator.a),
+        }
+        upload_plan = planned;
+        upload_snapshot = try std.json.Stringify.valueAlloc(ctx.allocator.a, snapshot, .{});
+    }
+    if (upload_plan) |p| writeUploads(ctx, upload_lease.col.?, rid, p.writes) catch
+        return ApiError.internal().toResponse(ctx.allocator.a);
+
     const w = app.pool.acquireWriter();
     defer app.pool.releaseWriter();
+    var txn_open = false;
+    defer if (txn_open) w.rollback() catch |err|
+        std.log.err("record update rollback failed: {s}", .{@errorName(err)});
+    if (upload_plan != null) {
+        try w.beginImmediate();
+        txn_open = true;
+    }
     var col_lease = try resolveCollection(ctx, w);
     defer col_lease.release();
     const col = col_lease.col orelse return ApiError.notFound().toResponse(ctx.allocator.a);
-    const rid = ctx.param("id") orelse return ApiError.notFound().toResponse(ctx.allocator.a);
+    if (upload_plan != null and !try uploadSchemaUnchanged(ctx.allocator.a, w, upload_lease.col.?))
+        return ApiError.conflict("Collection changed during upload; reload and retry.").toResponse(ctx.allocator.a);
+    if (upload_plan != null) try lockUploadRecord(ctx.allocator.a, w, col, rid);
     const existing = (try records.get(ctx.allocator.a, w, col, rid)) orelse return ApiError.notFound().toResponse(ctx.allocator.a);
+    if (upload_plan != null) {
+        const current = try std.json.Stringify.valueAlloc(ctx.allocator.a, existing, .{});
+        if (!std.mem.eql(u8, upload_snapshot, current))
+            return ApiError.conflict("Record changed during upload; reload and retry.").toResponse(ctx.allocator.a);
+    }
 
-    const all = switch (try prepareRecordData(ctx, col, existing)) {
+    const all = upload_plan orelse switch (try prepareRecordData(ctx, col, existing)) {
         .plan => |p| p,
         .resp => |resp| return resp,
     };
@@ -503,14 +605,15 @@ pub fn update(ctx: *http.RequestCtx) anyerror!http.Response {
         }
     }
 
-    // A2 KEYSTONE: one transaction spanning the before-hook, the UPDATE, and the
-    // access-rule guard (see create() for the errdefer/explicit-rollback rationale).
-    try w.beginImmediate();
-    errdefer w.rollback() catch {};
+    // One deferred rollback covers both errors and HTTP error responses.
+    // Upload updates already opened this transaction before snapshot checks.
+    if (!txn_open) {
+        try w.beginImmediate();
+        txn_open = true;
+    }
 
     var data_mut = data2;
     emitRecord(app, &rctx, ctx.allocator, w, col.name, &data_mut, .before_update) catch {
-        w.rollback() catch {};
         return hookRejected(ctx);
     };
 
@@ -521,30 +624,12 @@ pub fn update(ctx: *http.RequestCtx) anyerror!http.Response {
     if (col.type == .auth and pw_change) {
         var snap = existing;
         if (try api_auth.fireAuthLifecycleBefore(ctx, w, col.name, rid, .before_password_change, &snap, existing)) |resp| {
-            w.rollback() catch {};
             return resp;
         }
     }
 
-    // Write new file bytes BEFORE the DB update so a storage failure can't leave dangling refs.
-    if (ctx.app.?.storage) |storage| {
-        var written: usize = 0;
-        for (all.writes) |wr| {
-            storage.put(app.io, col.name, rid, wr.filename, wr.bytes) catch {
-                deleteWrites(app, col.name, rid, all.writes[0..written]);
-                w.rollback() catch {};
-                return ApiError.internal().toResponse(ctx.allocator.a);
-            };
-            written += 1;
-        }
-    }
-    // The upload bytes are durable but the row is not until COMMIT. Every exit before commit —
-    // whether it returns an error (via `try` on the guard/session paths or a failing commit,
-    // which the errdefer above rolls back) or an error RESPONSE value (validation/not-found/
-    // guard-miss below) — must remove the just-written files, or a rolled-back UPDATE leaks
-    // them in storage. One guard replaces the cleanup that was copy-pasted into each branch.
-    var committed = false;
-    defer if (!committed) deleteWrites(app, col.name, rid, all.writes);
+    // Uploads completed before acquiring the writer. The snapshot check above
+    // prevents a slow upload from overwriting a concurrent file-list mutation.
 
     // KNOWN LIMITATION: a `.check` guard evaluates `@request.data.*` from rctx.data, which is
     // built pre-hook; a hook mutating a guard-referenced field is not seen by the WHERE clause.
@@ -552,23 +637,19 @@ pub fn update(ctx: *http.RequestCtx) anyerror!http.Response {
         // The `committed`-guarded defer above deletes the written files on each of these
         // pre-commit exits, so no branch repeats the storage cleanup.
         error.Validation => {
-            w.rollback() catch {};
             return validationResponse(ctx);
         },
         error.NotObject => {
-            w.rollback() catch {};
             return ApiError.badRequest("Body must be a JSON object.").toResponse(ctx.allocator.a);
         },
         // A UNIQUE/CHECK/NOT NULL/FK violation is a client error → 409, not 500. This is a
         // value-return, so the `committed`-guarded defer above deletes the just-written files.
         error.Constraint => {
-            w.rollback() catch {};
             return ApiError.conflict("A record with these values already exists.").toResponse(ctx.allocator.a);
         },
-        else => return e, // errdefer rolls back
+        else => return e,
     };
     const ur = updated orelse {
-        w.rollback() catch {};
         return ApiError.notFound().toResponse(ctx.allocator.a);
     };
     // Access-rule guard evaluated INSIDE the transaction on the UPDATED row:
@@ -576,7 +657,6 @@ pub fn update(ctx: *http.RequestCtx) anyerror!http.Response {
     if (decision == .check) {
         const guard = (try policy.compilePredicate(ctx.allocator.a, w, col, .update, &rctx)).?;
         if (!try records.guardPasses(ctx.allocator.a, w, col, rid, guard)) {
-            w.rollback() catch {};
             return ApiError.notFound().toResponse(ctx.allocator.a);
         }
     }
@@ -586,6 +666,7 @@ pub fn update(ctx: *http.RequestCtx) anyerror!http.Response {
     if (col.type == .auth and pw_change and app.session_store == .table)
         try api_auth.deleteSessionsForPrincipal(w, col.name, rid);
     try w.commit();
+    txn_open = false;
     committed = true; // row is durable — the write-cleanup defer must NOT fire past here
 
     // Side effects AFTER commit: drop replaced files, fire file/after-update hooks, broadcast.
@@ -1469,6 +1550,209 @@ fn formCtx(env: *TestEnv, a: RequestArena, m: http.Method, fields: std.json.Obje
         .form_fields = .{ .object = fields },
         .files = files,
     };
+}
+
+test "pg: upload schema checks lock metadata until commit" {
+    if (!@import("build_options").postgres) return error.SkipZigTest;
+    const url = std.testing.environ.getPosix("ZIGBASE_PG_TEST_URL") orelse return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var first = try db.Db.openPostgres(a, std.testing.io, url);
+    defer first.close();
+    try first.exec("CREATE SCHEMA zb_upload_schema_lock;");
+    defer first.exec("DROP SCHEMA zb_upload_schema_lock CASCADE;") catch |err|
+        std.log.err("upload schema test cleanup failed: {s}", .{@errorName(err)});
+    try first.exec("SET search_path TO zb_upload_schema_lock;");
+    try first.exec("SET lock_timeout = '100ms';");
+    try migrations.run(&first);
+    const col = try collections.create(a, std.testing.io, &first, .{
+        .id = "",
+        .name = "uploads",
+        .fields = &.{.{ .id = "photo", .name = "photo", .options = .{ .file = .{ .maxSize = 100 } } }},
+    });
+    defer col.deinit(a);
+
+    var other = try db.Db.openPostgres(a, std.testing.io, url);
+    defer other.close();
+    try other.exec("SET search_path TO zb_upload_schema_lock;");
+    try other.exec("SET lock_timeout = '100ms';");
+    var fields = [_]schema.Field{col.fields[0]};
+    fields[0].options.file.maxSize = 1;
+    const encoded = try schema.fieldsToJson(a, &fields);
+    defer a.free(encoded);
+    var update_metadata = try other.prepare("UPDATE \"_collections\" SET schema=$1 WHERE id=$2");
+    defer update_metadata.finalize();
+    try update_metadata.bindText(1, encoded);
+    try update_metadata.bindText(2, col.id);
+
+    try first.beginImmediate();
+    errdefer first.rollback() catch |err| std.log.err("upload schema test rollback failed: {s}", .{@errorName(err)});
+    try std.testing.expect(try uploadSchemaUnchanged(a, &first, col));
+    // Independent autocommit UPDATE cannot change the checked definition while
+    // the upload's transaction is still deciding whether to commit its row.
+    try std.testing.expectError(error.StepFailed, update_metadata.step());
+    try first.commit();
+
+    // A fresh statement runs after the lock is released and changes constraints.
+    var retry = try other.prepare("UPDATE \"_collections\" SET schema=$1 WHERE id=$2");
+    defer retry.finalize();
+    try retry.bindText(1, encoded);
+    try retry.bindText(2, col.id);
+    _ = try retry.step();
+    try first.beginImmediate();
+    try std.testing.expect(!try uploadSchemaUnchanged(a, &first, col));
+    try first.rollback();
+
+    // A schema writer already holds the table. Upload must wait there BEFORE
+    // locking metadata, so that writer can still update its collection row.
+    try other.beginImmediate();
+    try other.exec("LOCK TABLE uploads IN ACCESS EXCLUSIVE MODE;");
+    try first.beginImmediate();
+    try std.testing.expectError(error.ExecFailed, uploadSchemaUnchanged(a, &first, col));
+    try first.rollback();
+    try other.exec("UPDATE _collections SET name=name WHERE name='uploads';");
+    try other.commit();
+
+    // Exercise the same FOR UPDATE helper used by the handler. Metadata locks
+    // alone cannot protect a record snapshot from a second record writer.
+    try first.exec("INSERT INTO uploads (id) VALUES ('row_lock');");
+    try first.beginImmediate();
+    try lockUploadRecord(a, &first, col, "row_lock");
+    try std.testing.expectError(error.ExecFailed, other.exec("UPDATE uploads SET photo='other.txt' WHERE id='row_lock';"));
+    try first.commit();
+    try other.exec("UPDATE uploads SET photo='other.txt' WHERE id='row_lock';");
+
+    // Dropping the whole collection during a POST's transfer is a conflict,
+    // not a failed LOCK reported as 500. Unrelated lock errors above propagate.
+    try other.beginImmediate();
+    try other.exec("DROP TABLE uploads;");
+    try other.exec("DELETE FROM _collections WHERE name='uploads';");
+    try other.commit();
+    try first.beginImmediate();
+    try std.testing.expect(!try uploadSchemaUnchanged(a, &first, col));
+    try first.rollback();
+}
+
+test "uploads release writer, reserve server ids, clean failed puts, and reject stale updates" {
+    var env = try TestEnv.init();
+    defer env.deinit();
+    try seedTyped(env, "upload_checks");
+    // A real handler invocation owns an interlinked JSON/request graph.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const Storage = @import("../files/storage.zig").Storage;
+    const Probe = struct {
+        env: *TestEnv,
+        alloc: std.mem.Allocator,
+        fail: bool = false,
+        mutate: bool = false,
+        schema_limit: ?u64 = null,
+        deleted: usize = 0,
+        puts: usize = 0,
+        fn put(ptr: *anyopaque, _: std.Io, _: []const u8, rid: []const u8, _: []const u8, _: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.puts += 1;
+            // A storage plugin can acquire the writer: PUT must not hold it.
+            const w = self.env.pool.acquireWriter();
+            defer self.env.pool.releaseWriter();
+            if (self.mutate) {
+                var stmt = try w.prepare("UPDATE upload_checks SET title='concurrent' WHERE id=?1");
+                defer stmt.finalize();
+                try stmt.bindText(1, rid);
+                _ = try stmt.step();
+            }
+            if (self.schema_limit) |limit| {
+                // Simulate another instance tightening constraints during PUT.
+                // Direct metadata write deliberately bypasses the local cache.
+                const col = (try collections.get(self.alloc, w, "upload_checks")).?;
+                defer col.deinit(self.alloc);
+                for (@constCast(col.fields)) |*field| {
+                    if (field.options == .file) field.options.file.maxSize = limit;
+                }
+                const encoded = try schema.fieldsToJson(self.alloc, col.fields);
+                defer self.alloc.free(encoded);
+                var stmt = try w.prepare("UPDATE _collections SET schema=?1 WHERE name='upload_checks'");
+                defer stmt.finalize();
+                try stmt.bindText(1, encoded);
+                _ = try stmt.step();
+            }
+            if (self.fail) return error.SimulatedPartialPut;
+        }
+        fn fetch(_: *anyopaque, _: std.Io, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8) !?[]const u8 {
+            return null;
+        }
+        fn remove(ptr: *anyopaque, _: std.Io, _: []const u8, _: []const u8, _: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.deleted += 1;
+        }
+        fn removeRecord(_: *anyopaque, _: std.Io, _: []const u8, _: []const u8) !void {}
+        const vtable = Storage.VTable{ .put = put, .fetch = fetch, .delete = remove, .deleteRecord = removeRecord };
+    };
+    var probe = Probe{ .env = env, .alloc = a };
+    const storage = Storage{ .ctx = &probe, .vtable = &Probe.vtable };
+    env.app.storage = &storage;
+    defer env.app.storage = null;
+    var fields: std.json.ObjectMap = .empty;
+    try fields.put(a, "title", .{ .string = "original" });
+    try fields.put(a, "id", .{ .string = "client_chosen" });
+    const uploads = [_]http.UploadedFile{.{ .field = "photos", .filename = "x.txt", .mimetype = "text/plain", .bytes = "bytes" }};
+    const params = [_]http.Param{.{ .key = "col", .value = "upload_checks" }};
+    var cctx = formCtx(env, RequestArena.from(&arena), .POST, fields, &uploads, &params);
+    const created = try create(&cctx);
+    try std.testing.expectEqual(@as(u16, 201), created.status);
+    const rec = (try std.json.parseFromSlice(std.json.Value, a, created.body, .{})).value;
+    const rid = rec.object.get("id").?.string;
+    try std.testing.expect(!std.mem.eql(u8, rid, "client_chosen"));
+    try std.testing.expectEqual(@as(usize, 0), probe.deleted);
+
+    probe.mutate = true;
+    const update_params = [_]http.Param{ .{ .key = "col", .value = "upload_checks" }, .{ .key = "id", .value = rid } };
+    var uctx = formCtx(env, RequestArena.from(&arena), .PATCH, fields, &uploads, &update_params);
+    const conflict = try update(&uctx);
+    try std.testing.expectEqual(@as(u16, 409), conflict.status);
+    try std.testing.expect(probe.deleted > 0);
+
+    probe.mutate = false;
+    const updated = try update(&uctx);
+    try std.testing.expectEqual(@as(u16, 200), updated.status);
+    probe.fail = true;
+    probe.deleted = 0;
+    const failed = try create(&cctx);
+    try std.testing.expectEqual(@as(u16, 500), failed.status);
+    try std.testing.expect(probe.deleted > 0); // includes the PUT whose reply failed
+    try std.testing.expectEqual(@as(i64, 1), try countRows(env, "upload_checks"));
+
+    probe.fail = false;
+    // A rule miss must be 404 before PUT, even when PUT would mutate the row
+    // and otherwise expose its existence through a snapshot-conflict 409.
+    {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        try w.exec("UPDATE _collections SET updateRule='title = ''allowed''' WHERE name='upload_checks';");
+    }
+    probe.mutate = true;
+    const puts_before = probe.puts;
+    try std.testing.expectEqual(@as(u16, 404), (try update(&uctx)).status);
+    try std.testing.expectEqual(puts_before, probe.puts);
+    {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        try w.exec("UPDATE _collections SET updateRule='@public' WHERE name='upload_checks';");
+    }
+    probe.mutate = false;
+    probe.schema_limit = 10;
+    probe.deleted = 0;
+    const create_schema_conflict = try create(&cctx);
+    try std.testing.expectEqual(@as(u16, 409), create_schema_conflict.status);
+    try std.testing.expect(probe.deleted > 0);
+    try std.testing.expectEqual(@as(i64, 1), try countRows(env, "upload_checks"));
+
+    probe.schema_limit = 2; // now the already-transferring five bytes exceed it
+    probe.deleted = 0;
+    const update_schema_conflict = try update(&uctx);
+    try std.testing.expectEqual(@as(u16, 409), update_schema_conflict.status);
+    try std.testing.expect(probe.deleted > 0);
+    try std.testing.expectEqual(@as(i64, 1), try countRows(env, "upload_checks"));
 }
 
 test "multipart create: schema coercion (bool/float/multi-select) + verbatim text/fixed" {

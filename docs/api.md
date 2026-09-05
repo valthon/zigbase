@@ -1277,6 +1277,12 @@ File-type fields hold uploaded files.
 - **Upload:** files are submitted via `multipart/form-data` on record create
   (`POST .../records`) or update (`PATCH .../records/:id`), alongside the other
   field values.
+- **Concurrent uploads:** bytes transfer before the database writer is acquired.
+  An upload POST returns `409` if the collection schema changes; upload PATCH
+  returns `409` if the record or collection schema changes during
+  transfer; reload and retry. Failed requests best-effort clean up uploaded bytes.
+  Upload PATCH requires update permission on the existing row before transfer
+  and checks the rule again on the updated row before commit.
 - **Serve:** `GET /api/files/:col/:rec/:name`.
 - **Admin config:** `GET /api/files/config` — **superuser-only**, read-only
   storage backend info for the admin UI: `{ "backend": "local" | "s3", ... }`
