@@ -406,7 +406,7 @@ pub fn pickFreePort(io: Io, host: []const u8) !u16 {
 /// Named (not anonymous) so call sites can spell the type. Deliberately a
 /// separate enum from `cli.ServeControlVerb`: this file must not depend on the
 /// argv parser, and `serveControlImpl` maps between them in one place.
-pub const Verb = enum { stop, status, logs };
+pub const Verb = enum { stop, status, logs, wait };
 
 pub fn runVerb(
     io: Io,
@@ -415,6 +415,7 @@ pub fn runVerb(
     data_dir_abs: []const u8,
     json: bool,
     follow: bool,
+    timeout_ms: u32,
 ) noreturn {
     if (builtin.os.tag == .windows) {
         std.debug.print("error: `zigbase serve {s}` is not supported on Windows (use the official Docker image)\n", .{@tagName(verb)});
@@ -424,7 +425,104 @@ pub fn runVerb(
         .status => statusVerb(io, gpa, data_dir_abs, json),
         .stop => stopVerb(io, gpa, data_dir_abs),
         .logs => logsVerb(io, gpa, data_dir_abs, json, follow),
+        .wait => waitVerb(io, gpa, data_dir_abs, json, timeout_ms),
     }
+}
+
+// The timeout covers the entire operation, including a health endpoint which
+// accepts the connection but never responds. Cancellation closes its socket.
+const WaitOutcome = union(enum) { ready, stopped, failed: error{ OutOfMemory, Canceled } };
+
+fn renderWaitReady(gpa: Allocator, lf: serve_session.LockFile, json: bool) error{OutOfMemory}![]u8 {
+    if (!json) return renderStatusText(gpa, lf, true);
+    const status = try renderStatusJson(gpa, lf, true);
+    defer gpa.free(status);
+    return std.fmt.allocPrint(gpa, "{{\"ready\":true,{s}", .{status[1..]});
+}
+
+fn finishWait(gpa: Allocator, lf: serve_session.LockFile, json: bool, output: *?[]u8) WaitOutcome {
+    output.* = renderWaitReady(gpa, lf, json) catch |err| return .{ .failed = err };
+    return .ready;
+}
+
+fn waitVerb(io: Io, gpa: Allocator, data_dir_abs: []const u8, json: bool, timeout_ms: u32) noreturn {
+    const Result = union(enum) { ready: WaitOutcome, deadline: Io.Cancelable!void };
+    var buffer: [2]Result = undefined;
+    var select = Io.Select(Result).init(io, &buffer);
+    var output: ?[]u8 = null;
+    var stopped = std.atomic.Value(bool).init(false);
+    select.concurrent(.ready, waitForReady, .{ io, gpa, data_dir_abs, json, &output, &stopped }) catch |err| {
+        std.debug.print("error: serve wait: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    select.concurrent(.deadline, Io.sleep, .{ io, Io.Duration.fromMilliseconds(timeout_ms), .awake }) catch |err| {
+        stopped.store(true, .release);
+        select.cancelDiscard();
+        if (output) |bytes| gpa.free(bytes);
+        std.debug.print("error: serve wait: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    const result = select.await() catch |err| {
+        stopped.store(true, .release);
+        select.cancelDiscard();
+        if (output) |bytes| gpa.free(bytes);
+        std.debug.print("error: serve wait: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    stopped.store(true, .release);
+    select.cancelDiscard();
+    // Only the winning result prints, never the canceled worker. Joining above
+    // also transfers its output ownership safely back to this thread.
+    const ready = result == .ready and result.ready == .ready;
+    if (output) |bytes| {
+        if (ready) writeStdout(io, bytes);
+        gpa.free(bytes);
+    }
+    if (ready) std.process.exit(0);
+    const failure: ?error{ OutOfMemory, Canceled } = switch (result) {
+        .ready => |outcome| if (outcome == .failed) outcome.failed else null,
+        .deadline => |elapsed| blk: {
+            elapsed catch |err| break :blk err;
+            break :blk null;
+        },
+    };
+    if (failure) |err| {
+        if (json) writeStdout(io, "{\"ready\":false,\"reason\":\"failed\"}\n");
+        std.debug.print("error: serve wait: readiness check failed ({s}) in {s}\n", .{ @errorName(err), data_dir_abs });
+        std.process.exit(1);
+    }
+    if (json) writeStdout(io, "{\"ready\":false,\"reason\":\"timeout\"}\n");
+    std.debug.print("error: serve wait: no healthy tracked session within {d}ms in {s}\n", .{ timeout_ms, data_dir_abs });
+    std.process.exit(1);
+}
+
+fn waitForReady(io: Io, gpa: Allocator, data_dir_abs: []const u8, json: bool, output: *?[]u8, stopped: *std.atomic.Value(bool)) WaitOutcome {
+    // Session/probe helpers intentionally collapse IO errors to "not ready".
+    // Cancellation may be consumed there, so retain an explicit stop signal.
+    while (!stopped.load(.acquire)) {
+        // Each iteration owns its parsed session strings; no growth while waiting.
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        defer arena.deinit();
+        if (serve_session.isLive(io, gpa, data_dir_abs)) {
+            if (serve_session.read(arena.allocator(), io, data_dir_abs)) |lf| {
+                if (probeHealth(io, gpa, lf.host, lf.port) and serve_session.isLive(io, gpa, data_dir_abs)) {
+                    const latest = serve_session.read(arena.allocator(), io, data_dir_abs);
+                    if (latest) |current| {
+                        // Do not report an old probe as readiness for a replacement.
+                        if (lf.pid == current.pid and lf.port == current.port and
+                            std.mem.eql(u8, lf.host, current.host) and
+                            std.mem.eql(u8, lf.started_at, current.started_at))
+                        {
+                            return finishWait(gpa, lf, json, output);
+                        }
+                    }
+                }
+            }
+        }
+        if (stopped.load(.acquire)) return .stopped;
+        io.sleep(Io.Duration.fromMilliseconds(100), .awake) catch |err| return .{ .failed = err };
+    }
+    return .stopped;
 }
 
 fn statusVerb(io: Io, gpa: Allocator, data_dir_abs: []const u8, json: bool) noreturn {
@@ -633,7 +731,7 @@ fn checkBackgroundReady(
             "serve: running in the background at {s} (pid {d})\n" ++
                 "serve: admin UI: {s}/_/\n" ++
                 "serve: log file: {s}\n" ++
-                "serve: manage:   zigbase serve stop | status [--json] | logs [--follow]\n",
+                "serve: manage:   zigbase serve stop | status [--json] | wait [--json] [--timeout-ms N] | logs [--follow]\n",
             .{ lf.url, lf.pid, lf.url, log_path },
         );
     }
@@ -1013,7 +1111,7 @@ const Verifier = struct {
     }
 };
 
-/// One bounded HTTP GET: connect, send, strip headers, return the body. A
+/// One bounded HTTP GET: connect, send, require HTTP 200, return the body. A
 /// deliberately tiny client rather than `http_client.zig` — this runs on a
 /// detached thread with a page allocator and must not reach into app state.
 /// Contract 1: caller frees.
@@ -1038,17 +1136,21 @@ pub fn fetchBody(io: Io, gpa: Allocator, address: std.Io.net.IpAddress, path: []
         reader.interface.toss(chunk.len);
     }
     const split = std.mem.indexOf(u8, all.items, "\r\n\r\n") orelse return error.MalformedResponse;
+    if (!std.mem.startsWith(u8, all.items, "HTTP/1.1 200 ") and
+        !std.mem.startsWith(u8, all.items, "HTTP/1.0 200 ")) return error.BadStatus;
     return gpa.dupe(u8, all.items[split + 4 ..]);
 }
 
-/// True iff `GET /api/health` answers with a `"status"` field — the endpoint the
+/// True iff `GET /api/health` answers HTTP 200 with JSON `status: "ok"` — the endpoint the
 /// stock binary has served since v0.12.0. Dials `probeHost(host)`, never a
 /// hardcoded loopback. Contract 1.
 pub fn probeHealth(io: Io, gpa: Allocator, host: []const u8, port: u16) bool {
     const addr = std.Io.net.IpAddress.parse(serve_session.probeHost(host), port) catch return false;
     const body = fetchBody(io, gpa, addr, "/api/health") catch return false;
     defer gpa.free(body);
-    return std.mem.indexOf(u8, body, "\"status\"") != null;
+    const parsed = std.json.parseFromSlice(struct { status: []const u8 }, gpa, body, .{ .ignore_unknown_fields = true }) catch return false;
+    defer parsed.deinit();
+    return std.mem.eql(u8, parsed.value.status, "ok");
 }
 
 /// The single JSON object a `--ephemeral` session prints on stdout when it is
@@ -1339,6 +1441,16 @@ test "serve control: renderStatusJson emits both state keys and the lockfile fac
     defer gpa.free(unhealthy);
     try std.testing.expect(std.mem.indexOf(u8, unhealthy, "\"healthy\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, unhealthy, "\"running\":true") != null);
+    var output: ?[]u8 = null;
+    var failing = std.testing.FailingAllocator.init(gpa, .{ .fail_index = 0 });
+    const failure = finishWait(failing.allocator(), lf, true, &output);
+    try std.testing.expectEqual(error.OutOfMemory, failure.failed);
+    try std.testing.expect(output == null);
+    try std.testing.expect(finishWait(gpa, lf, true, &output) == .ready);
+    defer gpa.free(output.?);
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, output.?, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.object.get("ready").?.bool);
 }
 
 test "serve control: the negative status objects are stable and machine-readable" {

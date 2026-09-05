@@ -3,7 +3,7 @@
 # Running the server: background sessions, control verbs, and `doctor`
 
 `zigbase serve` normally blocks in the foreground for as long as it runs. This page covers
-everything around that: detaching it into the background, the `stop`/`status`/`logs` verbs
+everything around that: detaching it into the background, the `stop`/`status`/`logs`/`wait` verbs
 that manage a detached session, the on-disk session contract those verbs read, throwaway
 `--ephemeral` instances for test backends, and the `zigbase doctor` preflight command.
 
@@ -35,14 +35,14 @@ On success (not `--ephemeral`), the parent prints:
 serve: running in the background at http://127.0.0.1:8090 (pid 4242)
 serve: admin UI: http://127.0.0.1:8090/_/
 serve: log file: /abs/zb_data/serve.log
-serve: manage:   zigbase serve stop | status [--json] | logs [--follow]
+serve: manage:   zigbase serve stop | status [--json] | wait [--json] [--timeout-ms N] | logs [--follow]
 ```
 
 Any failure path exits **1**.
 
 ## 2. Control verbs
 
-`zigbase serve stop | status [--json] | logs [--json] [--follow|-f]`, each taking `[--data-dir PATH]`
+`zigbase serve stop | status [--json] | wait [--json] [--timeout-ms N] | logs [--json] [--follow|-f]`, each taking `[--data-dir PATH]`
 (env `ZIGBASE_DATA_DIR`, default `./zb_data`) — every verb resolves its target session from
 the data dir exactly like `serve` itself.
 
@@ -64,6 +64,10 @@ report a session mid-startup and let the caller retry. Three states, exit code i
 
 The `running` case re-probes `/api/health` right now (not a cached bit) and reports it as
 `healthy`. See §4 for the exact JSON.
+
+**`serve wait [--json] [--timeout-ms N]`** — waits for the tracked session to be
+healthy, bounded by a monotonic deadline (default 30000 ms). Success exits 0;
+timeout or an internal wait failure exits 1. It never starts or stops a session.
 
 **`serve logs [--json] [--follow|-f]`** — prints `<data-dir>/serve.log`. Errors (exit **1**) if the
 session is live but running in the **foreground** (its output is the terminal that started
@@ -144,6 +148,20 @@ Two files live under the data dir:
 ```
 
 ## 4. `serve status --json`
+
+For startup synchronization, use `zigbase serve wait [--json] [--timeout-ms N]`
+with the same `--data-dir` (or `ZIGBASE_DATA_DIR`) as the server. It waits for a
+held session lock, published session identity, and a successful `/api/health`
+response. The default deadline is 30000ms; `N` must be a positive integer.
+The deadline includes an unresponsive HTTP probe. It does not start, stop, or
+clean up a session. Untracked (`--ignore-lock`) instances are not discoverable.
+Success exits 0; with `--json` it prints the healthy status object below plus
+`"ready":true`. Timeout exits 1 and, only with `--json`, prints
+`{"ready":false,"reason":"timeout"}`. Internal worker failures use
+`{"ready":false,"reason":"failed"}` instead. Failures also print a stderr
+diagnostic; without `--json` they produce no stdout object. The `running` and
+`starting` fields described below belong to status snapshots, not wait failures.
+Unlike `wait`, `status` remains a single snapshot.
 
 Three possible response objects, each terminated by a newline. **`running` and `starting`
 are always present** in every one of them, so a consumer never needs a null-check dance to

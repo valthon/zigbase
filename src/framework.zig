@@ -2215,7 +2215,7 @@ fn printUsage(io: std.Io, file: std.Io.File, show_serve_static: bool, show_stati
         \\
         \\COMMANDS:
         \\  serve               Start the HTTP server (REST + WebSocket + admin UI at /_/).
-        \\  serve stop|status|logs   Manage a background `serve` session (see `zigbase serve status --help`).
+        \\  serve stop|status|logs|wait   Manage a tracked `serve` session (see `zigbase serve status --help`).
         \\  doctor              Preflight checks; --production escalates, --json emits NDJSON. Exits 1 on any error.
         \\  migrate             Apply database migrations, then exit. `status` reports; `rollback [N]` reverses; `dump` dumps the live schema.
         \\  rewrap              Re-encrypt all encrypted fields under the primary key (key rotation).
@@ -2817,11 +2817,13 @@ fn printImportUsage(io: std.Io, file: std.Io.File) void {
 
 fn printServeControlUsage(io: std.Io, file: std.Io.File) void {
     emit(io, file,
-        \\zigbase serve stop|status|logs — manage a background `zigbase serve` session.
+        \\zigbase serve stop|status|logs|wait — manage a tracked `zigbase serve` session.
         \\
         \\USAGE:
         \\  zigbase serve stop   [--data-dir PATH]            Stop the session owning this data dir.
         \\  zigbase serve status [--json] [--data-dir PATH]   Report the session; exit 0 running, 1 not.
+        \\  zigbase serve wait [--json] [--timeout-ms N] [--data-dir PATH]
+        \\                                                   Await healthy readiness (default 30000ms).
         \\  zigbase serve logs   [--json] [--follow|-f] [--data-dir P]
         \\                                                   Print (and optionally tail) serve.log.
         \\
@@ -4224,8 +4226,9 @@ fn serveControlImpl(allocator: std.mem.Allocator, io: std.Io, environ: *const st
         .stop => .stop,
         .status => .status,
         .logs => .logs,
+        .wait => .wait,
     };
-    serve_control.runVerb(io, allocator, verb, abs, ca.json, ca.follow);
+    serve_control.runVerb(io, allocator, verb, abs, ca.json, ca.follow, ca.timeout_ms);
 }
 
 /// `zigbase doctor [--production] [--json] [--data-dir PATH]`.

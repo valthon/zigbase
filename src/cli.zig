@@ -29,15 +29,17 @@ pub const ServeArgs = struct {
     force: bool = false,
 };
 
-pub const ServeControlVerb = enum { stop, status, logs };
+pub const ServeControlVerb = enum { stop, status, logs, wait };
 
 pub const ServeControlArgs = struct {
     verb: ServeControlVerb,
     data_dir: ?[]const u8 = null,
-    /// `status` only.
+    /// `status`, `wait`, and `logs`.
     json: bool = false,
     /// `logs` only.
     follow: bool = false,
+    /// `wait` only: deadline covering both startup and the health probe.
+    timeout_ms: u32 = 30_000,
 };
 
 pub const DoctorArgs = struct {
@@ -700,6 +702,8 @@ pub fn parse(args: []const []const u8, popts: ParseOpts) ParseError!Command {
                 .status
             else if (std.mem.eql(u8, args[1], "logs"))
                 .logs
+            else if (std.mem.eql(u8, args[1], "wait"))
+                .wait
             else
                 return ParseError.UnknownCommand;
         var ca = ServeControlArgs{ .verb = verb };
@@ -714,12 +718,17 @@ pub fn parse(args: []const []const u8, popts: ParseOpts) ParseError!Command {
                 ci += 1;
                 if (ci >= args.len) return ParseError.MissingValue;
                 ca.data_dir = args[ci];
-            } else if ((verb == .status or verb == .logs) and std.mem.eql(u8, a, "--json")) {
+            } else if ((verb == .status or verb == .logs or verb == .wait) and std.mem.eql(u8, a, "--json")) {
                 // `status --json`: one JSON object describing the session.
                 // `logs --json`: keep only the NDJSON records, dropping the
                 // plain-text lines facil.io writes into serve.log from C.
                 // Still rejected on `stop`, which has no output to shape.
                 ca.json = true;
+            } else if (verb == .wait and std.mem.eql(u8, a, "--timeout-ms")) {
+                ci += 1;
+                if (ci >= args.len) return ParseError.MissingValue;
+                ca.timeout_ms = std.fmt.parseInt(u32, args[ci], 10) catch return ParseError.BadValue;
+                if (ca.timeout_ms == 0) return ParseError.BadValue;
             } else if (verb == .logs and (std.mem.eql(u8, a, "--follow") or std.mem.eql(u8, a, "-f"))) {
                 ca.follow = true;
             } else return ParseError.UnknownFlag;
@@ -1220,6 +1229,20 @@ test "serve --ignore-lock parses alone but conflicts with --background" {
     // handshake would have nothing to poll. Refuse the pair up front.
     try std.testing.expectError(ParseError.ConflictingFlags, parse(&.{ "serve", "--background", "--ignore-lock" }, .{}));
     try std.testing.expectError(ParseError.ConflictingFlags, parse(&.{ "serve", "--ignore-lock", "--background" }, .{}));
+}
+
+test "serve wait validates its bounded timeout and output options" {
+    const ca = (try parse(&.{ "serve", "wait", "--timeout-ms", "250", "--json" }, .{})).serve_control;
+    try std.testing.expectEqual(ServeControlVerb.wait, ca.verb);
+    try std.testing.expectEqual(@as(u32, 250), ca.timeout_ms);
+    try std.testing.expect(ca.json);
+    try std.testing.expectEqual(@as(u32, 30_000), (try parse(&.{ "serve", "wait" }, .{})).serve_control.timeout_ms);
+    for ([_][]const u8{ "0", "-1", "4294967296", "abc" }) |bad| {
+        try std.testing.expectError(ParseError.BadValue, parse(&.{ "serve", "wait", "--timeout-ms", bad }, .{}));
+    }
+    try std.testing.expectError(ParseError.MissingValue, parse(&.{ "serve", "wait", "--timeout-ms" }, .{}));
+    try std.testing.expectError(ParseError.UnknownFlag, parse(&.{ "serve", "status", "--timeout-ms", "1" }, .{}));
+    try std.testing.expectError(ParseError.UnknownFlag, parse(&.{ "serve", "wait", "--follow" }, .{}));
 }
 
 test "serve stop/status/logs parse to the control verbs" {
