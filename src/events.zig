@@ -566,6 +566,10 @@ pub const LifecycleHandler = *const fn (ctx: *Ctx, ev: *LifecycleEvent) anyerror
 pub const JobEvent = struct {
     app: *App,
     name: []const u8,
+    /// Distributed jobs only: stable occurrence due time across retries/recovery.
+    scheduled_at: ?i64 = null,
+    /// Distributed jobs only: monotonically increasing claim attempt.
+    generation: ?i64 = null,
 };
 /// Cron/interval/reactive jobs and `app.submit` tasks receive a `*Ctx` (built by
 /// the scheduler per invocation from `app`, anonymous rctx, no request) plus the

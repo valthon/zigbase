@@ -677,7 +677,12 @@ pub const all = [_]Migration{
     .{ .name = "0023_two_factor_attempts", .up = @import("auth/two_factor_attempt.zig").migrate },
     .{ .name = "0024_two_factor_credentials", .up = @import("auth/two_factor_store.zig").migrate },
     .{ .name = "0025_queue_rates", .up = init_0025_queue_rates },
+    .{ .name = "0026_scheduler_coordination", .up = init_0026_scheduler_coordination },
 };
+
+fn init_0026_scheduler_coordination(m: *Migrator) db.DbError!void {
+    try m.exec("CREATE TABLE IF NOT EXISTS \"_scheduler_jobs\" (\"name\" TEXT PRIMARY KEY, \"definition\" TEXT NOT NULL, \"next_fire\" BIGINT NOT NULL, \"occurrence_at\" BIGINT NOT NULL, \"stopped\" INTEGER NOT NULL DEFAULT 0, \"owner\" TEXT NOT NULL DEFAULT '', \"generation\" BIGINT NOT NULL DEFAULT 0, \"lease_until\" BIGINT NOT NULL DEFAULT 0, \"failures\" BIGINT NOT NULL DEFAULT 0 CHECK (\"failures\" BETWEEN 0 AND 4294967295));");
+}
 
 /// Create the ledger under the same startup lock used by system migrations. Public CLI
 /// callers (status, rollback, doctor) must not race catalog bootstrap on a fresh database.

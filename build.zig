@@ -10,6 +10,7 @@ const BuildOptionValues = struct {
     vector: bool,
     postgres: bool,
     s3: bool,
+    file_inventory: bool,
     fts5: bool,
     sqlite_version: []const u8,
     sqlite_source_id: []const u8,
@@ -107,6 +108,7 @@ pub fn build(b: *std.Build) void {
     // verb names, but returns an actionable "rebuild with -Ddev-tools=true" error instead of
     // a bare UnknownCommand.
     const dev_tools = b.option(bool, "dev-tools", "Compile in the development-time CLI verbs: init, agents-md, typegen (default: on; -Ddev-tools=false strips them from a custom build)") orelse true;
+    const file_inventory = b.option(bool, "file-inventory", "Compile read-only local/S3 file inventory reporting (default: off)") orelse false;
     // Opt-in vector search (#157; Postgres pgvector port #159). OFF by default: the default build
     // does NOT compile or link the sqlite-vec amalgamation, and every vector code path folds to
     // comptime-dead — the shipped binary is byte-for-byte unaffected. `-Dvector=true` enables vector
@@ -154,6 +156,7 @@ pub fn build(b: *std.Build) void {
         .commit = commit,
         .dev_mode = dev_mode,
         .dev_tools = dev_tools,
+        .file_inventory = file_inventory,
         .internal_api = false,
         .vector = vector,
         .postgres = postgres,
@@ -371,6 +374,20 @@ pub fn build(b: *std.Build) void {
         const invalid_exe = b.addExecutable(.{ .name = invalid.step, .root_module = invalid_mod });
         invalid_exe.expect_errors = .{ .contains = invalid.expected };
         route_contracts.dependOn(&invalid_exe.step);
+    }
+    const scheduler_contracts = b.step("check-scheduler-contracts", "Check distributed scheduler compile-time contracts");
+    inline for (&.{
+        .{ .name = "reactive", .expected = "distributed jobs require a cron or interval schedule" },
+        .{ .name = "zero-lease", .expected = "distributed lease_seconds must be positive" },
+        .{ .name = "duplicate", .expected = "distributed job names must be unique" },
+        .{ .name = "zero-interval", .expected = "scheduled minute intervals must be positive" },
+        .{ .name = "reserved-name", .expected = "distributed job names must contain 1..200 bytes and not start with '_'" },
+    }) |invalid| {
+        const mod = b.createModule(.{ .root_source_file = b.path("fixtures/invalid-scheduler/" ++ invalid.name ++ ".zig"), .target = target, .optimize = optimize, .link_libc = true });
+        mod.addImport("zigbase", zigbase_mod);
+        const invalid_scheduler_exe = b.addExecutable(.{ .name = "invalid-scheduler-" ++ invalid.name, .root_module = mod });
+        invalid_scheduler_exe.expect_errors = .{ .contains = invalid.expected };
+        scheduler_contracts.dependOn(&invalid_scheduler_exe.step);
     }
     // --- minimal-server: gating-invariant fixture (R2-7) --------------------------
     // A consumer App with NOTHING optional configured. scripts/check-gating.sh nm-scans

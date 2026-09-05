@@ -183,6 +183,14 @@ pub const Stmt = struct {
         _ = self.result_arena.reset(.free_all);
     }
 
+    /// Forget all bindings and release their owned bytes. Unlike reset(), this
+    /// does not preserve values for another execution. Batch callers should reset
+    /// then clear bindings before rebinding to avoid retaining every old payload.
+    pub fn clearBindings(self: *Stmt) StmtError!void {
+        @memset(self.params.items, null);
+        _ = self.param_arena.reset(.free_all);
+    }
+
     pub fn finalize(self: *Stmt) void {
         self.params.deinit(self.gpa);
         self.param_arena.deinit();
@@ -190,3 +198,19 @@ pub const Stmt = struct {
         self.gpa.free(self.sql);
     }
 };
+
+test "clearBindings releases repeated large parameter copies without changing reset semantics" {
+    var conn: Conn = undefined; // binding does not touch the connection
+    var st = try Stmt.init(&conn, std.testing.allocator, "SELECT $1", null);
+    defer st.finalize();
+    const payload = [_]u8{'x'} ** 65536;
+    for (0..128) |_| {
+        try st.bindText(1, &payload);
+        try std.testing.expect(st.param_arena.queryCapacity() >= payload.len);
+        st.reset();
+        try std.testing.expectEqualStrings(&payload, st.params.items[0].?);
+        try st.clearBindings();
+        try std.testing.expectEqual(@as(usize, 0), st.param_arena.queryCapacity());
+        try std.testing.expectEqual(@as(?[]const u8, null), st.params.items[0]);
+    }
+}

@@ -66,13 +66,15 @@ configures in code:
    `.file_serve`) and `.message`. Logs a structured one-liner so operators can
    distinguish request errors from background-job failures.
 
-6. **Cron job** (`audit-sweep`) via `.cron`. Fires every minute
+6. **Cron job** (`audit-sweep`) via `.cron`, with comptime `.distributed` coordination
+   and a 120-second lease so replicas sharing a database share one schedule. Fires every minute
    (`"* * * * *"`, UTC, 5-field numeric). Demonstrates the full ctx-first job
    DB-access pattern: collection reads use `ctx.records()` (the pooled reader is
    managed for you); raw SQL on the migration-owned `plugin_audit_log` table uses
    the pooled writer via `ctx.app.pool` (`acquireWriter` / `releaseWriter`), since
    it is not a comptime collection. Counts published posts, then INSERTs an audit
-   row into `plugin_audit_log`.
+   row into `plugin_audit_log`. It also captures two analytics events together with
+   `ctx.trackBatch`, demonstrating atomic multi-event capture without a background buffer.
 
 7. **Pool levers** via `.pools` (`.readers` / `.jobs` / `.cache_kib`) to tune
    the warm-reader pool, scheduler worker count, and per-connection SQLite

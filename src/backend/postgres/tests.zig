@@ -159,6 +159,10 @@ test "pg: reset re-executes a prepared statement with new bindings" {
     try st.bindInt(1, 100);
     try std.testing.expect(try st.step());
     try std.testing.expectEqual(@as(i64, 101), st.columnInt(0));
+    st.reset();
+    try st.clearBindings();
+    try std.testing.expect(try st.step());
+    try std.testing.expect(st.isNull(0));
 }
 
 test "pg: pool acquire/release across threads" {

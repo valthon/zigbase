@@ -445,6 +445,16 @@ fn auditSweepJob(ctx: *zigbase.Ctx, ev: *zigbase.events.JobEvent) anyerror!void 
     );
     const published_count: i64 = if (rows.len > 0) rows[0].n else 0;
     std.log.info("[audit-sweep] published_posts={d}", .{published_count});
+    // Explicit atomic capture: both events persist together, with one writer
+    // acquisition. A failed batch retains neither event; no background flush.
+    const sweep_payload = try std.json.Stringify.valueAlloc(ctx.arena.a, .{ .published_posts = published_count }, .{});
+    var batch: std.ArrayList(zigbase.EventInput) = .empty;
+    defer batch.deinit(ctx.arena.a);
+    try batch.appendSlice(ctx.arena.a, &.{
+        .{ .name = "audit.published-count", .payload_json = sweep_payload },
+        .{ .name = "audit.sweep-observed" },
+    });
+    try ctx.trackBatch(batch.items);
 
     // The typed SELECT builder (#281, option 2) is the "constructed SQL" counterpart to the
     // hand-written `checkedSql` above: `zigbase.Query.select` VALIDATES every table/column against
@@ -684,6 +694,7 @@ const Backend = zigbase.App(.{
         .cron = .{
             .{
                 .name = "audit-sweep",
+                .distributed = .{ .lease_seconds = 120 }, // one shared schedule across replicas
                 .schedule = zigbase.schedule.Schedule{ .cron = "* * * * *" },
                 .handler = auditSweepJob,
             },

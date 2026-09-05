@@ -27,12 +27,14 @@ pub const PaginationConfig = @import("pagination.zig").Config;
 pub const RecordEvent = events.RecordEvent;
 pub const ErrorEvent = events.ErrorEvent;
 pub const JobEvent = events.JobEvent; // cron/interval/reactive job + app.submit handlers
+pub const DistributedJobConfig = @import("scheduler_coordination.zig").Config;
 pub const AuthEvent = events.AuthEvent;
 pub const TwoFactorPolicyContext = @import("auth/two_factor.zig").PolicyContext;
 pub const AuthHandler = events.AuthHandler;
 pub const AuthSuccessEvent = events.AuthSuccessEvent; // beforeAuthSuccess hook (writable, abortable)
 pub const AuthSuccessHandler = events.AuthSuccessHandler;
 pub const ExposureEvent = events.ExposureEvent; // .onFeatureExposure analytics hook
+pub const EventInput = @import("analytics/analytics.zig").EventInput;
 pub const ExposureKind = events.ExposureKind;
 pub const ExposureHandler = events.ExposureHandler;
 pub const Req = @import("route_types.zig").Req;
@@ -350,6 +352,10 @@ pub const codegen = struct {
 // so its `test {}` blocks are analyzed and run (matches pre-restructure behavior
 // where main.zig's import graph reached them).
 test {
+    if (@import("build_options").file_inventory) {
+        _ = @import("files/inventory.zig");
+        _ = @import("files/local_inventory.zig");
+    }
     _ = @import("zig_compat.zig");
     _ = @import("app.zig");
     _ = @import("config.zig");
@@ -471,6 +477,7 @@ test {
     _ = @import("records_hooks_test.zig");
     _ = @import("schedule.zig");
     _ = @import("scheduler.zig");
+    _ = @import("scheduler_coordination.zig");
     _ = @import("mail/mailer.zig");
     _ = @import("mail/send.zig");
     _ = @import("mail/bulk.zig");

@@ -3,6 +3,7 @@
 Checked items describe work included in this branch, not a release.
 Development-workflow, realtime/scaling, and storage work is tracked by its own PRs.
 
+
 - [x] Reconcile index-only comptime schema changes transactionally without table rebuilds.
 - [x] Preserve unrelated migration-owned indexes and adopt matching ordinary indexes.
 - [x] Log authoritative index changes and diagnose startup failures by collection/index.
@@ -22,3 +23,8 @@ Development-workflow, realtime/scaling, and storage work is tracked by its own P
 - [x] Measure actual delivery authorization, allocations, and subscriber fanout.
 - [x] Exercise benchmark correctness under ReleaseSafe in CI.
 - [ ] Design bounded replay/backfill with current authorization and explicit gap semantics.
+
+## Analytics batching (#401)
+
+- [x] Capture explicit atomic batches with server-stamped identity and bounded inputs.
+- [x] Preserve outer transaction ownership and provide a nameable runtime input type.
