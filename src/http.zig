@@ -14,6 +14,9 @@ pub const RequestCtx = struct {
     allocator: RequestArena,
     /// Present for real requests; null in pure-handler unit tests that don't need the DB.
     app: ?*App = null,
+    /// Framework-owned assurance after verifying both factors or a signed full
+    /// session during refresh. Never populated from request fields.
+    two_factor_assurance: ?struct { collection: []const u8, principal: []const u8 } = null,
     /// Path params captured by the router (e.g. ":id").
     params: []const Param = &.{},
     /// Raw request headers (filled by server.zig; "" when absent). Names are lowercase.

@@ -58,6 +58,7 @@ fn metaHandler(ctx: *http.RequestCtx) anyerror!http.Response {
 /// optional capabilities — fn-pointer tables are where Zig's lazy analysis dies,
 /// so every optional subsystem's routes concat in ONLY under its gate.
 pub const Gates = struct {
+    two_factor: bool = false,
     admin: bool = true,
     analytics: bool = true,
     senders: bool = true,
@@ -337,6 +338,9 @@ pub fn Server(comptime gates: Gates) type {
                 .pattern = operation.pattern,
                 .handler = operation.handler,
             }};
+            if (gates.two_factor) t = &[_]router.Route{
+                .{ .method = .POST, .pattern = "/api/collections/:col/auth/two-factor/:action", .handler = @import("api/two_factor.zig").dispatch },
+            } ++ t;
             if (gates.magic_link) t = t ++ &[_]router.Route{
                 .{ .method = .GET, .pattern = "/api/collections/:col/auth/magic-link/consume", .handler = magic_link_consume_api.consume },
             };

@@ -24,6 +24,12 @@ parts** of building a real backend on ZigBase *as a library*.
 
 ## What it proves
 
+The example also demonstrates **compile-time-selected TOTP two-factor authentication**:
+optional enrollment from Account security, required enrollment for operator-selected
+members, authenticator verification, and single-use recovery codes. Its server-side
+policy hook combines application requirements with voluntary enrollment. The same
+hook can evaluate group memberships without imposing a framework-owned group model.
+
 1. **A computed + validating `before_create` hook on `bookings`.** It reads
    **related** data (the target listing) through `ctx.records()`, **rejects** invalid
    input (a 400 to the client), stamps a server-authoritative `guest` from the

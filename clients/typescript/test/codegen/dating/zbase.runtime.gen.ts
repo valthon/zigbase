@@ -679,6 +679,7 @@ export interface ProfilesService {
   delete(id: string): Promise<void>;
   filter(fn: (f: ProfileFields) => Expr): string;
   getAbilities(id: string, opts?: { signal?: AbortSignal; requestKey?: string }): Promise<RecordAbilities>;
+  auth: ReturnType<Client["collection"]>;
   authWithPassword(
     identity: string,
     password: string,
@@ -1019,6 +1020,13 @@ export type WinksRealtime = RawTypedRealtime<Wink, WinkWhere>;
 
 // ---- createClient ----
 
+export interface PendingAuthentication {
+  status: "factor_required" | "enrollment_required";
+  pendingToken: string;
+  expiresIn: number;
+  factors?: { totp: boolean; webauthn: boolean };
+  recoveryCodes?: boolean;
+}
 export interface ZbClient {
   db: {
     messages: MessagesService;
@@ -1109,6 +1117,7 @@ function makeClient(base: RealtimeEnabledClient): ZbClient {
         {
           authWithPassword: (identity: string, password: string) =>
             base.collection("profiles").authWithPassword(identity, password),
+          auth: base.collection("profiles"),
           fileUrl: (record: any, field: any, opts: any) =>
             base.files.getUrl({ id: record.id, collectionName: "profiles" }, (record as Record<string, string>)[field] ?? "", opts),
         },

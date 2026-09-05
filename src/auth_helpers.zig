@@ -39,6 +39,14 @@ pub const RateLimitFn = *const fn (ctx: *http.RequestCtx, scope: []const u8, ide
 
 // ---- Session -------------------------------------------------------------------
 
+/// Call after verifying a custom primary credential, under the writer. A
+/// non-null response is restricted pending authentication and must be returned
+/// to the client. Only a null result permits ordinary issueSession below.
+pub fn beginAuthentication(ctx: *http.RequestCtx, conn: *db.Db, collection: []const u8, record_id: []const u8) !?http.Response {
+    const col = (try @import("collections.zig").get(ctx.allocator.a, conn, collection)) orelse return error.NotFound;
+    return @import("auth/two_factor.zig").beginAuthentication(ctx, conn, col, record_id, .custom);
+}
+
 /// Issue a session for a record. Uses `.custom` as the auth-method tag, which is
 /// appropriate for magic-link and other custom flows. Returns the signed JWT + 2
 /// cookies (zb_auth, zb_csrf). `conn` must be an already-acquired DB connection.

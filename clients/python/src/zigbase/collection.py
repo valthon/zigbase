@@ -51,6 +51,30 @@ class AuthResponse:
     token: str
     record: dict[str, Any] | None
     meta: dict[str, Any] | None
+    management_token: str | None = None
+    recovery_codes: list[str] | None = None
+
+
+class TwoFactorRequiredError(Exception):
+    """Primary authentication succeeded; pending is a restricted capability."""
+
+    def __init__(self, pending: dict[str, Any]):
+        super().__init__(
+            "Second-factor enrollment required."
+            if pending["status"] == "enrollment_required"
+            else "Second factor required."
+        )
+        self.pending = pending
+
+
+def _reject_pending(body: Any, auth_store: Any) -> None:
+    if (
+        isinstance(body, dict)
+        and body.get("status") in ("factor_required", "enrollment_required")
+        and isinstance(body.get("pendingToken"), str)
+    ):
+        auth_store.clear()
+        raise TwoFactorRequiredError(body)
 
 
 @dataclass
@@ -126,6 +150,8 @@ def _parse_auth_response(body: Any, context: str) -> AuthResponse:
         token=require_str_field(envelope, "token", context=context),
         record=raw_record if isinstance(raw_record, dict) else None,
         meta=raw_meta if isinstance(raw_meta, dict) else None,
+        management_token=envelope.get("managementToken"),
+        recovery_codes=envelope.get("recoveryCodes"),
     )
 
 
@@ -268,6 +294,28 @@ class CollectionService:
         self._transport = transport
         self.name = name
 
+    def second_factor(self, action: str, **body: Any) -> dict[str, Any] | None:
+        """Run an enrollment, verification, or management ceremony; save only full sessions."""
+        result = self._transport.request(
+            RequestSpec(
+                method="POST",
+                path=f"{_collection_base(self.name)}/auth/two-factor/{encode_path_segment(action)}",
+                body=body,
+                skip_auth=action != "enroll",
+            )
+        )
+        if result is None:
+            if action == "remove":
+                self._transport.auth_store.clear()
+            return None
+        out = _as_dict(result, "second_factor")
+        if isinstance(out.get("token"), str):
+            auth = _parse_auth_response(out, "second_factor")
+            self._transport.auth_store.save(auth.token, auth.record)
+        if out.get("reauthenticate") is True:
+            self._transport.auth_store.clear()
+        return out
+
     # -----------------------------------------------------------------
     # Auth
     # -----------------------------------------------------------------
@@ -284,6 +332,7 @@ class CollectionService:
                 skip_auth=True,
             )
         )
+        _reject_pending(body, self._transport.auth_store)
         auth = _parse_auth_response(body, "auth_with_password")
         self._transport.auth_store.save(auth.token, auth.record)
         return auth
@@ -352,7 +401,10 @@ class CollectionService:
                 skip_auth=True,
             )
         )
-        token = _as_dict(body, "auth_with_oauth2").get("token", "")
+        _reject_pending(body, self._transport.auth_store)
+        token = require_str_field(
+            _as_dict(body, "auth_with_oauth2"), "token", context="auth_with_oauth2"
+        )
         self._transport.auth_store.save(token, None)
         return AuthResponse(token=token, record=None, meta=None)
 
@@ -619,6 +671,28 @@ class AsyncCollectionService:
         self._transport = transport
         self.name = name
 
+    async def second_factor(self, action: str, **body: Any) -> dict[str, Any] | None:
+        """Async counterpart of CollectionService.second_factor."""
+        result = await self._transport.request(
+            RequestSpec(
+                method="POST",
+                path=f"{_collection_base(self.name)}/auth/two-factor/{encode_path_segment(action)}",
+                body=body,
+                skip_auth=action != "enroll",
+            )
+        )
+        if result is None:
+            if action == "remove":
+                self._transport.auth_store.clear()
+            return None
+        out = _as_dict(result, "second_factor")
+        if isinstance(out.get("token"), str):
+            auth = _parse_auth_response(out, "second_factor")
+            self._transport.auth_store.save(auth.token, auth.record)
+        if out.get("reauthenticate") is True:
+            self._transport.auth_store.clear()
+        return out
+
     # -----------------------------------------------------------------
     # Auth
     # -----------------------------------------------------------------
@@ -635,6 +709,7 @@ class AsyncCollectionService:
                 skip_auth=True,
             )
         )
+        _reject_pending(body, self._transport.auth_store)
         auth = _parse_auth_response(body, "auth_with_password")
         self._transport.auth_store.save(auth.token, auth.record)
         return auth
@@ -697,7 +772,10 @@ class AsyncCollectionService:
                 skip_auth=True,
             )
         )
-        token = _as_dict(body, "auth_with_oauth2").get("token", "")
+        _reject_pending(body, self._transport.auth_store)
+        token = require_str_field(
+            _as_dict(body, "auth_with_oauth2"), "token", context="auth_with_oauth2"
+        )
         self._transport.auth_store.save(token, None)
         return AuthResponse(token=token, record=None, meta=None)
 

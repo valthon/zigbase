@@ -18,10 +18,41 @@ import pytest
 
 from zigbase._request import RequestSpec
 from zigbase.auth_store import MemoryAuthStore
-from zigbase.collection import AsyncCollectionService, CollectionService
+from zigbase.collection import AsyncCollectionService, CollectionService, TwoFactorRequiredError
 from zigbase.errors import ZigbaseError
 
 Handler = Callable[[RequestSpec], Any]
+
+
+def test_pending_auth_is_not_a_session_and_completion_saves_only_full_token() -> None:
+    pending = {"status": "factor_required", "pendingToken": "capability", "expiresIn": 300}
+    store = MemoryAuthStore()
+    store.save("old", {"id": "old"})
+    transport = MockTransport(
+        sequence_handler(pending, {"ceremonyId": "c"}, {"token": "full", "record": {"id": "u"}}),
+        auth_store=store,
+    )
+    svc = CollectionService(transport, "users")
+    with pytest.raises(TwoFactorRequiredError) as error:
+        svc.auth_with_password("a@b.test", "password")
+    assert error.value.pending == pending
+    assert not store.token
+    svc.second_factor("initiate", pendingToken="capability", factor="webauthn")
+    assert not store.token
+    svc.second_factor("complete", pendingToken="capability", factor="totp", code="123456")
+    assert store.token == "full"
+
+
+async def test_async_pending_auth_clears_predecessor_session() -> None:
+    pending = {"status": "enrollment_required", "pendingToken": "capability", "expiresIn": 300}
+    store = MemoryAuthStore()
+    store.save("old", {"id": "old"})
+    svc = AsyncCollectionService(
+        AsyncMockTransport(sequence_handler(pending), auth_store=store), "users"
+    )
+    with pytest.raises(TwoFactorRequiredError):
+        await svc.auth_with_password("a@b.test", "password")
+    assert not store.token
 
 
 class MockTransport:

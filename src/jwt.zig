@@ -34,6 +34,8 @@ pub const Claims = struct {
     /// byte-identical to pre-#99-Variant-B tokens — the zero-overhead requirement. A missing
     /// `sid` on parse falls back to null.
     sid: ?[]const u8 = null,
+    /// Omitted for primary-only sessions and disabled two-factor configurations.
+    two_factor: ?bool = null,
     iat: i64,
     exp: i64,
 };

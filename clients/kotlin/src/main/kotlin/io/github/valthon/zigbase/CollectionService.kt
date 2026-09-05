@@ -66,6 +66,10 @@ data class AuthResponse(
  * Constructed internally -- obtain one from the top-level client rather than
  * calling this constructor directly.
  */
+class TwoFactorRequiredException(
+    val pending: JsonObject,
+) : Exception("Second factor required.")
+
 class CollectionService internal constructor(
     private val transport: Transport,
     val name: String,
@@ -75,6 +79,42 @@ class CollectionService internal constructor(
     private fun recordsBase(): String = "${collectionBase()}/records"
 
     private fun recordPath(id: String): String = "${recordsBase()}/${encodePathSegment(id)}"
+
+    private fun rejectPending(body: JsonElement?) {
+        val envelope = body as? JsonObject ?: return
+        val status = stringOrNullField(envelope, "status")
+        if (status in listOf("factor_required", "enrollment_required") && stringOrNullField(envelope, "pendingToken") != null) {
+            transport.authStore.clear()
+            throw TwoFactorRequiredException(envelope)
+        }
+    }
+
+    /** Pending capabilities are returned to the caller, never stored as sessions. */
+    suspend fun secondFactor(
+        action: String,
+        body: Map<String, Any?>,
+    ): JsonObject? {
+        val result =
+            transport.request(
+                RequestSpec(
+                    HttpMethod.Post,
+                    "${collectionBase()}/auth/two-factor/${encodePathSegment(action)}",
+                    body = body,
+                    skipAuth =
+                        action != "enroll",
+                ),
+            ) as? JsonObject
+        if (result == null) {
+            if (action == "remove") transport.authStore.clear()
+            return null
+        }
+        if (stringOrNullField(result, "token") != null) {
+            val auth = parseAuthResponse(result, "secondFactor")
+            transport.authStore.save(auth.token, auth.record?.raw)
+        }
+        if (result["reauthenticate"] == JsonPrimitive(true)) transport.authStore.clear()
+        return result
+    }
 
     // -----------------------------------------------------------------
     // Auth
@@ -97,6 +137,7 @@ class CollectionService internal constructor(
                     skipAuth = true,
                 ),
             )
+        rejectPending(body)
         val auth = parseAuthResponse(body, "authWithPassword")
         transport.authStore.save(auth.token, auth.record?.raw)
         return auth
@@ -176,6 +217,7 @@ class CollectionService internal constructor(
                     skipAuth = true,
                 ),
             )
+        rejectPending(body)
         val token = requireStringField(ensureObjectBody(body, "authWithOAuth2"), "token", "authWithOAuth2")
         transport.authStore.save(token, null)
         return AuthResponse(token = token, record = null, meta = null)

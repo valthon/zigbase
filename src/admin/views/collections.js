@@ -106,8 +106,8 @@ export function SchemaEditor({ name }) {
 
   async function save() {
     setErr(''); setFieldErrs({});
-    const payload = { name: col.name, type: col.type, fields: col.schema, options: col.options };
-    for (const r of RULES) payload[r] = col[r];
+    const payload = { name: col.name, type: col.type, fields: col.name === '_superusers' ? [] : col.schema, options: col.options };
+    if (col.name !== '_superusers') for (const r of RULES) payload[r] = col[r];
     try {
       const saved = isNew ? await API.createCollection(payload) : await API.updateCollection(name, payload);
       // Do a full page load of the saved collection's records view so the sidebar list refreshes.
@@ -229,6 +229,9 @@ function AuthTab({ col, setCol }) {
   return html`<div data-test="tab-auth-body">
     <div class="field"><label>identityFields (comma)</label><input data-test="identity-fields" value=${(auth.identityFields||[]).join(',')} onInput=${e => setAuth({ identityFields: e.target.value.split(',').map(s=>s.trim()).filter(Boolean) })}/></div>
     <div class="field"><label>minPasswordLength</label><input type="number" data-test="min-pw" value=${auth.minPasswordLength||8} onInput=${e => setAuth({ minPasswordLength: +e.target.value || 8 })}/></div>
+    <div class="field"><label>Two-factor authentication</label><select data-test="two-factor-policy" value=${auth.two_factor || 'disabled'} onChange=${e => setAuth({ two_factor: e.target.value })}>
+      <option value="disabled">Disabled</option><option value="optional">Optional — enforced after enrollment</option><option value="required">Required for everyone</option>
+    </select><small class="muted">Requires a binary built with two-factor support. Application policy can additionally require enrollment for selected users or groups.</small></div>
     <label class="muted"><input type="checkbox" style="width:auto" data-test="oauth-enabled" checked=${oauth2.enabled} onChange=${e => setOauth({ enabled: e.target.checked })}/> OAuth2 enabled</label>
     ${oauth2.providers.map((p, i) => html`<div class="row" data-test="oauth-provider" style="flex-wrap:wrap; border:1px solid var(--line); border-radius:8px; padding:8px; margin:8px 0" key=${i}>
       <select style="width:120px" data-test="oauth-name" value=${p.name} onChange=${e => setProv(i, { name: e.target.value })}>${OAUTH_PRESETS.map(n => html`<option key=${n} value=${n}>${n}</option>`)}</select>

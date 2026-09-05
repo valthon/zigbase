@@ -367,6 +367,7 @@ fn emitClientFactory(
                 \\        {{
                 \\          authWithPassword: (identity: string, password: string) =>
                 \\            base.collection("{0s}").authWithPassword(identity, password),
+                \\          auth: base.collection("{0s}"),
                 \\          fileUrl: (record: any, field: any, opts: any) =>
                 \\            base.files.getUrl({{ id: record.id, collectionName: "{0s}" }}, (record as Record<string, string>)[field] ?? "", opts),
                 \\        }},
@@ -382,6 +383,7 @@ fn emitClientFactory(
                 \\        {{
                 \\          authWithPassword: (identity: string, password: string) =>
                 \\            base.collection("{0s}").authWithPassword(identity, password),
+                \\          auth: base.collection("{0s}"),
                 \\        }},
                 \\      ) as unknown as {3s},
                 \\
@@ -626,6 +628,16 @@ fn builtinIO(slug: []const u8) ?BuiltinIO {
 /// just before the client interface. `AuthMethodResult` is shared by every
 /// built-in `complete`.
 fn emitAuthMethodIODecls(alloc: std.mem.Allocator, w: *W, cols: []const schema.Collection) !void {
+    if (anyNonPasswordAuthMethods(cols)) try w.appendSlice(alloc,
+        \\export interface PendingAuthentication {
+        \\  status: "factor_required" | "enrollment_required";
+        \\  pendingToken: string;
+        \\  expiresIn: number;
+        \\  factors?: { totp: boolean; webauthn: boolean };
+        \\  recoveryCodes?: boolean;
+        \\}
+        \\
+    );
     var any_ml = false;
     var any_otp = false;
     var any_wa = false;
@@ -642,10 +654,10 @@ fn emitAuthMethodIODecls(alloc: std.mem.Allocator, w: *W, cols: []const schema.C
     // Shared success result for every built-in `complete` (the session is also set
     // via zb_auth/zb_csrf cookies on the response).
     try w.appendSlice(alloc,
-        \\export interface AuthMethodResult {
+        \\export type AuthMethodResult = {
         \\  /** Session JWT. Session cookies (zb_auth/zb_csrf) are also set on the response. */
         \\  token: string;
-        \\}
+        \\} | PendingAuthentication;
         \\
     );
     if (any_ml) try w.appendSlice(alloc,
@@ -888,7 +900,7 @@ fn emitCustomTyped(
     const init_in = comptime rpc_ts.tsForType(cm.InitiateInput);
     const init_out = comptime rpc_ts.tsForType(cm.InitiateOutput);
     const comp_in = comptime rpc_ts.tsForType(cm.CompleteInput);
-    const comp_out = comptime rpc_ts.tsForType(cm.CompleteOutput);
+    const comp_out = comptime rpc_ts.tsForType(cm.CompleteOutput) ++ " | PendingAuthentication";
     const init_has_input = cm.InitiateInput != void;
     const comp_has_input = cm.CompleteInput != void;
 
@@ -1224,7 +1236,7 @@ test "auth-method endpoints: magic_link emits TYPED initiate/complete; password 
     try std.testing.expect(std.mem.indexOf(u8, out_ml, "magicLink") != null);
     // Typed I/O: shared interfaces emitted + referenced (no untyped Record stub).
     inline for (.{
-        "export interface AuthMethodResult {",
+        "export type AuthMethodResult =",
         "export interface MagicLinkInitiateInput {",
         "export interface MagicLinkCompleteInput {",
         "initiate(input: MagicLinkInitiateInput, opts?: SendOptions): Promise<void>;",
@@ -1252,7 +1264,7 @@ test "auth-method endpoints: magic_link emits TYPED initiate/complete; password 
     // Should NOT contain an auth namespace on the client interface
     try std.testing.expect(std.mem.indexOf(u8, out_pw, "auth: {") == null);
     // No auth methods ⇒ none of the shared built-in I/O interfaces are emitted.
-    try std.testing.expect(std.mem.indexOf(u8, out_pw, "export interface AuthMethodResult") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out_pw, "export type AuthMethodResult") == null);
 }
 
 test "auth-method endpoints: otp + webauthn emit precise typed I/O" {
@@ -1321,7 +1333,7 @@ test "auth-method endpoints: custom slugs stay untyped with a follow-up TODO" {
     try std.testing.expect(std.mem.indexOf(u8, out, "initiate(input: Record<string, unknown>, opts?: SendOptions): Promise<unknown>;") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "comptime typed-I/O declaration API") != null);
     // No built-in I/O interfaces are emitted when only custom methods exist.
-    try std.testing.expect(std.mem.indexOf(u8, out, "export interface AuthMethodResult") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "export type AuthMethodResult") == null);
 }
 
 test "auth-method endpoints: custom methods with declared I/O emit typed interfaces" {
@@ -1367,8 +1379,8 @@ test "auth-method endpoints: custom methods with declared I/O emit typed interfa
 
     // Typed initiate/complete signatures + URLs for the typed method.
     try std.testing.expect(std.mem.indexOf(u8, out, "initiate(input: SsoInitiateReq, opts?: SendOptions): Promise<SsoInitiateResp>;") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "complete(input: SsoCompleteReq, opts?: SendOptions): Promise<SsoCompleteResp>;") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "base.send<SsoCompleteResp>(\"POST\", `/api/collections/users/auth/corp_sso/complete`") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "complete(input: SsoCompleteReq, opts?: SendOptions): Promise<SsoCompleteResp | PendingAuthentication>;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "base.send<SsoCompleteResp | PendingAuthentication>(\"POST\", `/api/collections/users/auth/corp_sso/complete`") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "corpSso") != null);
 
     // The bare-string `legacy` slug remains untyped (the Record stub still appears).
@@ -1402,7 +1414,7 @@ test "auth-method endpoints: custom method void I/O omits input arg and returns 
     // void input → no `input` arg; void output → Promise<void>.
     try std.testing.expect(std.mem.indexOf(u8, out, "initiate(opts?: SendOptions): Promise<void>;") != null);
     // void complete input but typed output.
-    try std.testing.expect(std.mem.indexOf(u8, out, "complete(opts?: SendOptions): Promise<TokenResp>;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "complete(opts?: SendOptions): Promise<TokenResp | PendingAuthentication>;") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "export interface TokenResp {") != null);
     // Typed method must NOT fall back to the untyped Record stub.
     try std.testing.expect(std.mem.indexOf(u8, out, "Record<string, unknown>") == null);

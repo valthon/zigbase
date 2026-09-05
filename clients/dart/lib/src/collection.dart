@@ -17,6 +17,13 @@ import 'records.dart';
 import 'transport.dart';
 
 /// Response shape from the password/refresh auth endpoints.
+class TwoFactorRequiredException implements Exception {
+  final Map<String, dynamic> pending;
+  TwoFactorRequiredException(this.pending);
+  @override
+  String toString() => 'Second factor required.';
+}
+
 class AuthResponse {
   final String token;
   final ZbRecord? record;
@@ -151,6 +158,36 @@ class CollectionService {
 
   Map<String, dynamic> _asMap(dynamic v) => v as Map<String, dynamic>;
 
+  void _rejectPending(Map<String, dynamic> body) {
+    if (body['pendingToken'] is String &&
+        (body['status'] == 'factor_required' ||
+            body['status'] == 'enrollment_required')) {
+      _authStore.clear();
+      throw TwoFactorRequiredException(body);
+    }
+  }
+
+  /// Two-factor ceremony or management action. Pending capabilities stay out of the auth store.
+  Future<Map<String, dynamic>?> secondFactor(
+      String action, Map<String, dynamic> body) async {
+    final result = await _transport.send(
+        '${_base()}/auth/two-factor/${Uri.encodeComponent(action)}',
+        method: 'POST',
+        body: body,
+        skipAuth: action != 'enroll');
+    if (result == null) {
+      if (action == 'remove') _authStore.clear();
+      return null;
+    }
+    final out = _asMap(result);
+    if (out['token'] is String) {
+      final auth = AuthResponse.fromJson(out);
+      _authStore.save(auth.token, auth.record?.data);
+    }
+    if (out['reauthenticate'] == true) _authStore.clear();
+    return out;
+  }
+
   // ---------------------------------------------------------------------
   // Auth
   // ---------------------------------------------------------------------
@@ -166,6 +203,7 @@ class CollectionService {
         body: body,
         skipAuth: skipAuth,
         isRefreshCall: path == '/auth-refresh');
+    _rejectPending(_asMap(res));
     final auth = AuthResponse.fromJson(_asMap(res));
     _authStore.save(auth.token, auth.record?.data);
     return auth;
@@ -202,6 +240,7 @@ class CollectionService {
     };
     final res = await _transport.send('${_base()}/auth/oauth2/complete',
         method: 'POST', body: body, skipAuth: true);
+    _rejectPending(_asMap(res));
     final token = _asMap(res)['token'] as String;
     _authStore.save(token, null);
     return token;

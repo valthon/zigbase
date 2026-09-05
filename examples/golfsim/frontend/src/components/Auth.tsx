@@ -7,7 +7,10 @@ import {
   otpInitiate,
   otpComplete,
   EmailNotVerifiedError,
+  SecondFactorRequiredError,
+  type PendingAuthentication,
 } from '../lib/api';
+import { SecondFactor } from './SecondFactor';
 
 type Step = 'signin' | 'signup' | 'verify' | 'otp_sent';
 
@@ -37,6 +40,7 @@ export default function Auth({ onAuthed }: { onAuthed: () => void }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [info, setInfo] = useState<string | null>(null);
+  const [pending, setPending] = useState<PendingAuthentication | null>(null);
 
   function reset(nextStep: Step, infoMsg?: string) {
     setError(null);
@@ -51,6 +55,10 @@ export default function Auth({ onAuthed }: { onAuthed: () => void }) {
     try {
       await fn();
     } catch (e: unknown) {
+      if (e instanceof SecondFactorRequiredError) {
+        setPending(e.pending);
+        return;
+      }
       setError(e instanceof Error ? e.message : String(e));
     } finally {
       setBusy(false);
@@ -118,6 +126,7 @@ export default function Auth({ onAuthed }: { onAuthed: () => void }) {
   }
 
   // ── Render ────────────────────────────────────────────────────────────────
+  if (pending) return <SecondFactor pending={pending} onDone={onAuthed} />;
   return (
     <div className="card">
       {info && <p className="info">{info}</p>}

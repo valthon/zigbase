@@ -55,6 +55,7 @@ See [docs/docker.md](docs/docker.md) for the data-volume/non-root/healthcheck de
 - **Search** — ranked full-text search (`?search=`) over `.searchable` fields, composed into the same scoped query as every other list request. SQLite FTS5 is compiled in by default (`-Dfts5=false` drops it, ~250-400 KB, for lean builds with no `.searchable` fields); Postgres full-text search is unaffected. Opt-in `-Dvector` build adds nearest-neighbor `?vector=` KNN search on both backends. → [docs/search.md](docs/search.md)
 - **Access rules** — per-collection list / view / create / update / delete rules. → [docs/api.md](docs/api.md)
 - **Auth** — argon2id password, magic-link, OTP, and WebAuthn passkey auth; JWT tokens; verification and password-reset flows. → [docs/api.md](docs/api.md)
+- **Two-factor authentication** — TOTP, WebAuthn, and single-use recovery codes; require it for everyone, selected users/groups, or voluntary enrollment. Factor selection and policy hooks are comptime-configurable. → [docs/framework.md](docs/framework.md#two-factor-authentication)
 - **Session management** — stateless epoch-based revocation (`revokeAllSessions` / `refresh` / `rotate`); opt-in per-device table store (`listActiveSessions` / `revoke(sessionId)`). → [docs/framework.md](docs/framework.md)
 - **Auth lifecycle hooks** — `beforeAuthSuccess` / `beforeRegister` / `afterRegister` hooks intercept and extend the auth pipeline. → [docs/framework.md](docs/framework.md)
 - **OAuth2** — Authorization-Code + PKCE provider login and account linking. → [docs/api.md](docs/api.md)

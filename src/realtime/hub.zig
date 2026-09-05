@@ -115,7 +115,11 @@ pub fn authVerb(app: *App, conn: *Conn, identity_arena: *std.heap.ArenaAllocator
             conn.clearAuth();
             return false;
         };
-        conn.setAuth(.{ .record = record, .is_superuser = v.is_superuser, .exp = v.exp });
+        const saved_token = ia.dupe(u8, token) catch {
+            conn.clearAuth();
+            return false;
+        };
+        conn.setAuth(.{ .record = record, .is_superuser = v.is_superuser, .exp = v.exp, .token = saved_token });
         // Reset the account scope to static empties on EVERY re-auth: the `identity_arena.reset`
         // above reclaimed the bytes backing the prior `account_id`/`memberships`, and the tenancy
         // branch below refreshes them onto the fresh arena ONLY for a non-superuser tenant. Without
@@ -182,7 +186,11 @@ pub fn subscribeCheck(app: *App, conn: *const Conn, alloc: RequestArena, topic: 
     if (std.mem.eql(u8, t.collection, FEATURES_CHANNEL)) return .ok;
     var r = app.pool.acquireReader() catch return .unknown;
     const now = auth.nowUnixPub(&r) catch 0;
-    const rctx = conn.requestContext(now);
+    const current = currentIdentity(alloc, app, &r, conn) orelse {
+        app.pool.releaseReader(&r);
+        return .auth_required;
+    };
+    const rctx = current.requestContext(now);
     const lookup = collections.get(alloc.a, &r, t.collection) catch {
         app.pool.releaseReader(&r);
         return .unknown;
@@ -519,6 +527,21 @@ pub fn buildEventFrames(
     };
 }
 
+/// Two-factor policy is dynamic even for an already-open transport. Use the
+/// same verifier as HTTP, including epoch/session revocation and current record
+/// data. The fresh record graph is used only during this subscription/delivery
+/// decision; its interlinked JSON lives on that scratch arena, not the connection.
+fn currentIdentity(arena: RequestArena, app: *App, reader: *db.Db, conn: *const Conn) ?Conn {
+    const a = arena.a;
+    var current = conn.*;
+    const previous = conn.auth orelse return current;
+    const verified = auth.verifyToken(a, app, reader, previous.token) orelse return null;
+    defer a.free(verified.collection);
+    defer a.free(verified.sid);
+    current.auth = .{ .record = verified.record, .is_superuser = verified.is_superuser, .exp = verified.exp, .token = previous.token };
+    return current;
+}
+
 /// Transport-neutral per-subscriber delivery (the body of the old ws.onChannelMessage —
 /// F4 delete-snapshot authz, #143 custom-topic verbatim forward, #156 tenancy, all via
 /// `shouldDeliver`). Returns the frame to deliver or null; both transports reduce to
@@ -539,18 +562,30 @@ pub fn frameForDelivery(
 
     const t = protocol.parseTopic(channel);
     var r = app.pool.acquireReader() catch return null;
-    defer app.pool.releaseReader(&r);
+    var reader_held = true;
+    defer if (reader_held) app.pool.releaseReader(&r);
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    const sa = scratch.allocator();
+    const current = currentIdentity(RequestArena.from(&scratch), app, &r, conn) orelse return null;
 
     // Resolve the topic to a collection FIRST. A non-collection topic is a consumer CUSTOM
-    // channel (#143): forward its frame VERBATIM with NO per-record viewRule — subscription
-    // was already authorized at subscribe time via `canSubscribe`.
+    // channel (#143): forward its frame VERBATIM only while its subscription
+    // guard still permits this identity (including after failed reauthentication).
     // R1-4: cached metadata — this runs once per SUBSCRIBER per event; the cache removes
     // the per-delivery `_collections` SELECT + schema-JSON parse (and caches the NEGATIVE
     // result for custom non-collection topics). Falls back to a direct load when no cache
     // is installed (tests / Postgres backend).
     var col_lease = colcache.lease(app.col_cache, &r, a, t.collection) catch return null;
     defer col_lease.release();
-    const col = col_lease.col orelse return message;
+    const col = col_lease.col orelse {
+        const now = auth.nowUnixPub(&r) catch return null;
+        // A consumer predicate may acquire its own reader. Match subscribeCheck's
+        // lock order rather than holding a pool reader across application code.
+        app.pool.releaseReader(&r);
+        reader_held = false;
+        return if (canSubscribeTopic(app, RequestArena.from(&scratch), current.requestContext(now), channel)) message else null;
+    };
 
     // #17: parse ONLY the three envelope fields the delivery decision needs — `action`,
     // `record.id`, and (delete only) the private `_deleteSnapshot` — with a TYPED parse +
@@ -563,9 +598,6 @@ pub fn frameForDelivery(
     // `parseFromSliceLeaky` never frees what it allocates, and nothing here needs `env` (or the
     // delete-snapshot subtree) to outlive this call — so it is parsed onto a THROWAWAY scratch
     // arena backed by `a`, reclaimed on return, rather than leaking per delivery.
-    var scratch = std.heap.ArenaAllocator.init(a);
-    defer scratch.deinit();
-    const sa = scratch.allocator();
     const env = std.json.parseFromSliceLeaky(DeliveryEnvelope, sa, message, .{ .ignore_unknown_fields = true }) catch return null;
     const action: protocol.Action = if (std.mem.eql(u8, env.action, "create"))
         .create
@@ -584,7 +616,7 @@ pub fn frameForDelivery(
     const delete_snapshot: ?std.json.Value = if (action == .delete) env.record._deleteSnapshot else null;
 
     const now = auth.nowUnixPub(&r) catch return null;
-    const deliver = shouldDeliver(a, app.io, &r, col, conn, now, action, record_id, sub_filter, delete_snapshot) catch return null;
+    const deliver = shouldDeliver(a, app.io, &r, col, &current, now, action, record_id, sub_filter, delete_snapshot) catch return null;
     if (!deliver) return null;
 
     if (action == .delete and delete_snapshot != null) {
@@ -1245,7 +1277,7 @@ test "authVerb: bad token clears auth and returns false (transport-neutral)" {
     try std.testing.expect(c.auth == null);
 }
 
-test "frameForDelivery: custom topic + __features forward VERBATIM (no authz, no parse requirement)" {
+test "frameForDelivery: custom topic rechecks its guard; public signals forward verbatim" {
     var env = try PoolEnv.init();
     defer env.deinit();
     // Leak-clean under the raw allocator: "orders" is not a collection (`collections.get` returns
@@ -1261,6 +1293,16 @@ test "frameForDelivery: custom topic + __features forward VERBATIM (no authz, no
     try std.testing.expectEqualStrings(msg, out);
     // __features: verbatim too.
     const sig = "{\"type\":\"signal\",\"topic\":\"__features\"}";
+    try std.testing.expectEqualStrings(sig, frameForDelivery(a, &app, &anon, null, FEATURES_CHANNEL, sig).?);
+    const Guard = struct {
+        fn canSubscribe(cx: *Ctx, _: []const u8) bool {
+            return cx.rctx.auth != null;
+        }
+    };
+    var dispatch = @import("../events.zig").Dispatch{ .realtime_can_subscribe = Guard.canSubscribe };
+    app.dispatch = &dispatch;
+    // A cleared identity cannot retain a private custom-topic subscription.
+    try std.testing.expect(frameForDelivery(a, &app, &anon, null, "orders", msg) == null);
     try std.testing.expectEqualStrings(sig, frameForDelivery(a, &app, &anon, null, FEATURES_CHANNEL, sig).?);
 }
 
@@ -1331,6 +1373,13 @@ test "frameForDelivery: F4 delete snapshot authorizes, then is STRIPPED to an id
         });
     }
     defer fnotes.deinit(a);
+    {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        const principals = try collections.create(a, std.testing.io, w, .{ .id = "", .name = "principals", .type = .auth, .fields = &.{} });
+        defer principals.deinit(a);
+        try w.exec("INSERT INTO principals (id,created,updated,email,passwordHash,tokenKey,verified) VALUES ('u1','','','u1@example.test','','test-key',1),('u2','','','u2@example.test','','test-key',1);");
+    }
 
     var snap: std.json.ObjectMap = .empty;
     try snap.put(a, "id", .{ .string = "GONE" });
@@ -1348,6 +1397,14 @@ test "frameForDelivery: F4 delete snapshot authorizes, then is STRIPPED to an id
     defer freeConn(a, &owner);
     var other = try authedConn(a, "u2", false);
     defer freeConn(a, &other);
+    const jwt = @import("../jwt.zig");
+    const key = @import("../crypto.zig").deriveKey(app.jwt_secret, "test-key");
+    const owner_token = try jwt.sign(a, .{ .id = "u1", .collection = "principals", .type = .auth, .iat = 0, .exp = 9999999999 }, &key);
+    defer a.free(owner_token);
+    const other_token = try jwt.sign(a, .{ .id = "u2", .collection = "principals", .type = .auth, .iat = 0, .exp = 9999999999 }, &key);
+    defer a.free(other_token);
+    owner.auth.?.token = owner_token;
+    other.auth.?.token = other_token;
     // Owner: delivered — and the delivered frame is ID-ONLY (snapshot + owner field stripped).
     // The id-only frame is a FRESH re-serialization (frameForDelivery strips the snapshot before
     // returning), so it escapes onto `a` and must be freed here — unlike the verbatim-forward case.
@@ -1359,4 +1416,12 @@ test "frameForDelivery: F4 delete snapshot authorizes, then is STRIPPED to an id
     try std.testing.expect(std.mem.indexOf(u8, out, "\"action\":\"delete\"") != null);
     // Non-owner: nothing (no id leak, and nothing allocated on the deny path).
     try std.testing.expect(frameForDelivery(a, &app, &other, null, "fnotes", ef.frame_collection) == null);
+    // A runtime requirement on a build that omitted the subsystem must still
+    // invalidate the retained identity, not bypass checks because no runtime exists.
+    {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        try w.exec("UPDATE \"_collections\" SET \"options\"='{\"auth\":{\"two_factor\":\"required\"}}' WHERE \"name\"='principals';");
+    }
+    try std.testing.expect(frameForDelivery(a, &app, &owner, null, "fnotes", ef.frame_collection) == null);
 }

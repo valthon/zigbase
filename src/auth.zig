@@ -421,6 +421,7 @@ fn freeIdentity(alloc: std.mem.Allocator, record: std.json.Value, collection: []
 }
 
 pub const Authed = struct {
+    two_factor: bool = false,
     record: std.json.Value, // the auth record with hidden fields stripped
     collection: []const u8,
     is_superuser: bool,
@@ -445,6 +446,7 @@ pub const Authed = struct {
 };
 
 pub const Verified = struct {
+    two_factor: bool = false,
     record: std.json.Value,
     collection: []const u8,
     is_superuser: bool,
@@ -515,6 +517,32 @@ pub fn verifyTokenOfTypes(alloc: std.mem.Allocator, app: anytype, conn: *db.Db, 
         const records = @import("records.zig");
         break :blk (records.get(alloc, conn, col_or_null.?, claims.id) catch return null) orelse return null;
     };
+    if (verified.type == .auth) {
+        const tf = @import("auth/two_factor.zig");
+        if (tf.runtime(app)) |rt| {
+            const col = col_or_null orelse ((collections.get(sa, conn, table) catch null) orelse {
+                @import("records.zig").freeRecord(alloc, rec);
+                return null;
+            });
+            const decision = tf.decision(.{ .a = sa }, conn, rt, col, rec, verified.two_factor orelse false) catch {
+                @import("records.zig").freeRecord(alloc, rec);
+                return null;
+            };
+            if (decision != .authenticated) {
+                @import("records.zig").freeRecord(alloc, rec);
+                return null;
+            }
+        } else {
+            const col = col_or_null orelse ((collections.get(sa, conn, table) catch null) orelse {
+                @import("records.zig").freeRecord(alloc, rec);
+                return null;
+            });
+            if (col.options.auth.two_factor != .disabled) {
+                @import("records.zig").freeRecord(alloc, rec);
+                return null;
+            }
+        }
+    }
     // Dupe the two escaping strings onto `alloc` so nothing aliases the scratch parse (which is
     // about to drop), the input token, or a literal. On an OOM here, free what we already own.
     const collection = alloc.dupe(u8, claims.collection) catch {
@@ -526,7 +554,7 @@ pub fn verifyTokenOfTypes(alloc: std.mem.Allocator, app: anytype, conn: *db.Db, 
         @import("records.zig").freeRecord(alloc, rec);
         return null;
     };
-    return .{ .record = rec, .collection = collection, .is_superuser = is_super, .exp = claims.exp, .sid = sid };
+    return .{ .record = rec, .collection = collection, .is_superuser = is_super, .exp = claims.exp, .sid = sid, .two_factor = verified.two_factor orelse false };
 }
 
 /// Variant B: true iff session `sid` exists and is unexpired (`expires IS NULL OR expires > now`).
@@ -640,7 +668,7 @@ pub fn authenticate(io: std.Io, alloc: std.mem.Allocator, app: anytype, ctx: *co
     // record/collection/sid (we do not deinit `v`); only the scalar `exp` is dropped. So a single
     // `Authed.deinit(alloc)` frees exactly this graph — no double-free, no leak.
     const v = verifyToken(alloc, app, conn, token) orelse return null;
-    return Authed{ .record = v.record, .collection = v.collection, .is_superuser = v.is_superuser, .sid = v.sid };
+    return Authed{ .record = v.record, .collection = v.collection, .is_superuser = v.is_superuser, .sid = v.sid, .two_factor = v.two_factor };
 }
 
 test "authenticate resolves a valid bearer token to its record" {

@@ -45,6 +45,9 @@ DEVTOOLS_OFF=zig-out-devtools-off/bin/zigbase
 # why every pattern below is namespaced past the Gates-struct field name (a
 # trailing "." into the real module path, not " = ").
 PATTERNS=(
+  "two_factor.Subsystem" # optional second-factor dispatcher and verification
+  "totp.verify"          # TOTP verification is absent when unselected
+  "webauthn.second_factor" # separate WebAuthn second-factor ceremonies
   "methods.webauthn"      # WebAuthn method (register endpoints live under api.webauthn_register)
   "cbor"                  # WebAuthn attestation parsing (CBOR/COSE stack)
   "methods.magic_link"    # magic-link method (consume route + mailer body)

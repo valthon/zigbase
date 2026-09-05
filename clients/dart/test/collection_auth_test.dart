@@ -46,6 +46,24 @@ Transport _scripted(
 }
 
 void main() {
+  test('pending login is not stored and factor completion saves a session',
+      () async {
+    final store = MemoryAuthStore()..save('old', {'id': 'old'});
+    final calls = <_Call>[];
+    final transport = _scripted([
+      http.Response(
+          '{"status":"factor_required","pendingToken":"pending","expiresIn":300}',
+          200),
+      http.Response('{"token":"full","record":{"id":"u"}}', 200),
+    ], calls, authStore: store);
+    final svc = CollectionService(transport, store, 'users');
+    await expectLater(svc.authWithPassword('a@b.test', 'password'),
+        throwsA(isA<TwoFactorRequiredException>()));
+    expect(store.token, isNull);
+    await svc.secondFactor('complete',
+        {'pendingToken': 'pending', 'factor': 'totp', 'code': '123456'});
+    expect(store.token, 'full');
+  });
   group('AuthResponse', () {
     test('record is an optional named parameter (defaults to null)', () {
       final auth = AuthResponse(token: 't');

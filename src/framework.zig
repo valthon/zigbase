@@ -566,8 +566,8 @@ pub fn App(comptime cfg: anytype) type {
                             @compileError(".auth hook groups moved under .auth.hooks = .{ ... } (e.g. .auth = .{ .hooks = .{ ." ++ hn ++ " = fn } })");
                     }
                     const sub_ok = std.mem.eql(u8, f.name, "hooks") or std.mem.eql(u8, f.name, "methods") or
-                        std.mem.eql(u8, f.name, "captcha") or std.mem.eql(u8, f.name, "session");
-                    if (!sub_ok) @compileError(".auth: unknown key '." ++ f.name ++ "' (recognized: .hooks, .methods, .captcha, .session)");
+                        std.mem.eql(u8, f.name, "captcha") or std.mem.eql(u8, f.name, "session") or std.mem.eql(u8, f.name, "two_factor");
+                    if (!sub_ok) @compileError(".auth: unknown key '." ++ f.name ++ "' (recognized: .hooks, .methods, .captcha, .session, .two_factor)");
                 }
                 if (@hasField(AuthT, "hooks")) {
                     const HT = @TypeOf(cfg.auth.hooks);
@@ -928,6 +928,7 @@ pub fn App(comptime cfg: anytype) type {
         /// a deselected built-in's route (and its ~thousands of LOC) never gets pulled
         /// into the binary by Zig's lazy analysis.
         pub const route_gates: server.Gates = .{
+            .two_factor = two_factor_selection.enabled,
             .admin = enable_admin,
             .analytics = @hasField(@TypeOf(cfg), "analytics"),
             .senders = @hasField(@TypeOf(cfg), "mail"),
@@ -1138,6 +1139,14 @@ pub fn App(comptime cfg: anytype) type {
         /// `.auth.methods`). Each type in the list is validated against the auth-method
         /// contract (create/method/deinit) at compile time. Used in serveImpl to
         /// instantiate the Registry stack vars.
+        const two_factor_cfg = if (@hasField(@TypeOf(cfg), "auth") and @hasField(@TypeOf(cfg.auth), "two_factor")) cfg.auth.two_factor else .disabled;
+        pub const two_factor_selection = @import("auth/two_factor_config.zig").select(two_factor_cfg);
+        const two_factor_hook: ?@import("auth/two_factor.zig").PolicyHook = if (@typeInfo(@TypeOf(two_factor_cfg)) == .@"struct" and @hasField(@TypeOf(two_factor_cfg), "policy")) two_factor_cfg.policy else null;
+        const two_factor_runtime: ?*const @import("auth/two_factor.zig").Runtime = if (two_factor_selection.enabled)
+            &@import("api/two_factor.zig").Subsystem(two_factor_selection, two_factor_hook).runtime
+        else
+            null;
+
         pub const auth_method_types: []const type = blk: {
             const am = @import("auth/method.zig");
             const types = registry.assembleTypes(auth_methods_cfg);
@@ -1650,6 +1659,7 @@ pub fn App(comptime cfg: anytype) type {
             .report_dedup_window_s = report_dedup_window_s,
             .SmsProviderPlugin = SmsProviderPlugin,
             .auth_method_types = auth_method_types,
+            .two_factor = two_factor_runtime,
             .reader_pool_size = reader_pool_size,
             .job_stack_size = job_stack_size,
             .cache_kib = cache_kib,
@@ -1830,6 +1840,7 @@ pub const ServeOpts = struct {
     /// Defaults to just PasswordMethod when absent. serveImpl uses this to
     /// instantiate the Registry via registry.build/deinit.
     auth_method_types: []const type = &.{@import("auth/methods/password.zig").PasswordMethod},
+    two_factor: ?*const @import("auth/two_factor.zig").Runtime = null,
     reader_pool_size: usize,
     job_stack_size: usize = scheduler.default_job_stack_size,
     cache_kib: u32 = db.default_cache_kib,
@@ -4789,6 +4800,7 @@ fn bootApp(
         .mailer = &holder.mailer_iface,
         .reporter = &holder.reporter_iface,
         .auth_methods = @ptrCast(&holder.am_registry),
+        .two_factor = if (opts.two_factor) |rt| @ptrCast(rt) else null,
         .dispatch = dispatch,
         .features = opts.features,
         .experiment_assignment_ttl = opts.experiment_assignment_ttl,

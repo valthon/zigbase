@@ -176,6 +176,7 @@ jobs:
             zig-out/bin/full-fixture
             examples/blog/zig-out/bin/blog
             examples/golfsim/zig-out/bin/golfsim
+            examples/golfsim/frontend/dist/
             examples/plugins/zig-out/bin/plugins
           if-no-files-found: error
           retention-days: 1
@@ -428,7 +429,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: jdx/mise-action@v4
         with:
-          install_args: node@24 python@3.13
+          install_args: node@24 python@3.13 zig@0.16.0
       - name: Download prebuilt binaries
         uses: actions/download-artifact@v8
         with:
@@ -443,6 +444,9 @@ jobs:
           echo "ZIGBASE_TEST_BINARY=$GITHUB_WORKSPACE/artifacts/zig-out/bin/zigbase" >> "$GITHUB_ENV"
           echo "ZIGBASE_TEST_AUTH2_BINARY=$GITHUB_WORKSPACE/artifacts/zig-out/bin/auth2-server" >> "$GITHUB_ENV"
           echo "ZIGBASE_TEST_BLOG_BINARY=$GITHUB_WORKSPACE/artifacts/examples/blog/zig-out/bin/blog" >> "$GITHUB_ENV"
+          chmod +x artifacts/examples/golfsim/zig-out/bin/golfsim
+          echo "ZIGBASE_TEST_GOLFSIM_BINARY=$GITHUB_WORKSPACE/artifacts/examples/golfsim/zig-out/bin/golfsim" >> "$GITHUB_ENV"
+          cp -R artifacts/examples/golfsim/frontend/dist examples/golfsim/frontend/dist
           echo "ZIGBASE_TEST_PLUGINS_BINARY=$GITHUB_WORKSPACE/artifacts/examples/plugins/zig-out/bin/plugins" >> "$GITHUB_ENV"
           chmod +x artifacts/zig-out/bin/features-fixture
           echo "ZIGBASE_FEATURES_BINARY=$GITHUB_WORKSPACE/artifacts/zig-out/bin/features-fixture" >> "$GITHUB_ENV"

@@ -28,6 +28,29 @@ import org.junit.jupiter.api.Test
  * `clients/python/tests/test_collection_auth.py`.
  */
 class CollectionServiceAuthTest {
+    @Test
+    fun `pending login clears predecessor and factor completion saves full session`() =
+        runTest {
+            val store = MemoryAuthStore()
+            store.save("old", null)
+            var count = 0
+            val svc =
+                makeService(authStore = store) {
+                    respond(
+                        if (count++ == 0) {
+                            """{"status":"factor_required","pendingToken":"pending","expiresIn":300}"""
+                        } else {
+                            """{"token":"full","record":{"id":"u"}}"""
+                        },
+                        HttpStatusCode.OK,
+                    )
+                }
+            assertFailsWithSuspend<TwoFactorRequiredException> { svc.authWithPassword("a@b.test", "password") }
+            assertNull(store.token)
+            svc.secondFactor("complete", mapOf("pendingToken" to "pending", "factor" to "totp", "code" to "123456"))
+            assertEquals("full", store.token)
+        }
+
     /** Runs [block] and returns the thrown [T], or fails if nothing was thrown. Suspend-friendly `assertThrows`. */
     private suspend inline fun <reified T : Throwable> assertFailsWithSuspend(noinline block: suspend () -> Unit): T {
         try {

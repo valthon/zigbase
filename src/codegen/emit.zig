@@ -550,6 +550,7 @@ pub fn emitService(alloc: std.mem.Allocator, w: *W, c: schema.Collection) !void 
     }
     try put(alloc, w, "  getAbilities(id: string, opts?: { signal?: AbortSignal; requestKey?: string }): Promise<RecordAbilities>;\n");
     if (c.type == .auth) {
+        try put(alloc, w, "  auth: ReturnType<Client[\"collection\"]>;\n");
         try putf(alloc, w,
             \\  authWithPassword(
             \\    identity: string,

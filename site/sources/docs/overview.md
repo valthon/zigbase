@@ -44,6 +44,9 @@ There are two ways to use ZigBase:
   verification, and password-reset flows. → [API](./api#auth)
 - **OAuth2** — Authorization-Code + PKCE provider login and account linking.
   → [API](./api#oauth2)
+- **Two-factor authentication** — TOTP, WebAuthn, and recovery codes with collection,
+  user, and application-owned group policies; select factors and policy hooks at
+  compile time. → [Framework](./framework#two-factor-authentication)
 - **Session management** — token-epoch revocation (`revokeAllSessions`), optional
   per-device session table (`listActiveSessions` / `revoke`), and auth lifecycle hooks
   (`beforeAuthSuccess`, `beforeRegister`). → [Framework](./framework)

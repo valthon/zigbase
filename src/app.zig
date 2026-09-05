@@ -167,6 +167,8 @@ pub const App = struct {
     /// Cast to `*const @import("auth/registry.zig").Registry` to read slugs. Stored as opaque
     /// to avoid an import cycle: app.zig must NOT import registry.zig or auth/method.zig.
     auth_methods: ?*const anyopaque = null,
+    /// Installed only by the comptime-selected two-factor subsystem.
+    two_factor: ?*const anyopaque = null,
     /// The CAPTCHA provider configured via `App(.{ .captcha = .{ .provider = ..., .secret = "..." } })`.
     /// null = captcha not configured (ctx.verifyCaptcha uses the dev-bypass — ok=true — when secret is "").
     captcha_provider: ?captcha.Provider = null,
