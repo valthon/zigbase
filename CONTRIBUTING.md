@@ -359,3 +359,52 @@ review threads are resolved.
 
 ZigBase is [Apache-2.0](LICENSE). By contributing, you agree that your contributions are licensed
 under the same terms. There is no separate CLA.
+
+## Realtime delivery authorization benchmark
+
+Run `zig build bench -- --realtime-only --json` for the production
+`hub.frameForDelivery` authorization callback shared by WS and SSE. The private
+benchmark build defaults to ReleaseFast and disables test clock, entropy, and
+capture seams. It measures 1/10/100/1000 serial subscriber callbacks with 1 KiB
+and 10 KiB body strings (the JSON envelope adds a few bytes), covering anonymous
+public records, authenticated ownership rules, tenant-scoped records, and an
+authenticated custom-topic guard. Each case warms twice and samples 20 events.
+The existing collection metadata cache is warm; each authenticated delivery
+still verifies its JWT and current auth record through the default epoch-token
+path. Tokens have no session id, and no two-factor runtime is installed. This
+measures the disabled-runtime policy gate, not active enrollment lookups,
+configured factor/policy callbacks, or table-session database lookups. A separate
+deterministic regression warms the metadata cache and commits a newly required
+2FA policy or token-key revocation between subscribers: later callbacks must
+deny, including failing closed when 2FA is required without an installed runtime.
+
+JSON rows report median/maximum nanoseconds per event, median nanoseconds per
+subscriber, cumulative successful allocation-request counts/bytes per event,
+and peak live bytes. With 20 samples, the reported maximum is not labeled p95.
+Successful resize/remap growth is
+represented only in the live/peak counters, not the allocation-request totals;
+these totals are not a measure of all heap traffic. Allocation metrics cover only the supplied Zig delivery
+allocator: SQLite C allocations, database/cache setup, fixture payloads and
+connection storage are excluded. Every event must leave zero residual live
+bytes; unexpected denial, frame copying or cross-tenant delivery fails the run.
+CI runs these correctness checks under ReleaseSafe without timing thresholds;
+local measurements default to ReleaseFast. Successful rows omit residual live
+bytes because a nonzero residual fails before any row is emitted.
+
+This is a serial callback benchmark on a local SQLite database, not socket
+throughput or a concurrent-client load test. Distinct connection structs share
+one authenticated principal; tenant measurements use a retained account scope,
+not membership resolution. Transport queues/writes, subscription lookup,
+network overhead, PostgreSQL and writer contention are outside its scope.
+
+A local baseline on an Intel Core i9-13900K under Linux/WSL, Zig 0.16.0
+ReleaseFast, measured approximately 0.83 ms per 1,000-subscriber event for
+public 1 KiB records, 18.4 ms for ownership authorization, 17.8 ms for tenant
+scoping and 14.3 ms for private custom topics. Increasing body size to 10 KiB
+raised public record delivery to about 5.9 ms and tenant delivery to 23.4 ms;
+custom topics remained about 14.3 ms because their payload is forwarded
+without record-envelope parsing. These single-machine observations are not
+service guarantees. All cases had zero residual live delivery allocations;
+peak live delivery bytes stayed bounded as fanout increased, while cumulative
+allocation traffic grew with subscriber count. Re-run on deployment hardware
+before choosing an optimization; this benchmark introduces no auth caching.

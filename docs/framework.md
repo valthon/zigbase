@@ -1548,6 +1548,9 @@ The guard is reevaluated before custom-topic delivery as well as subscription;
 keep it read-only and inexpensive. Retained sessions are reverified before
 delivery, so changed two-factor requirements or revocation require reauthentication.
 
+For contributor-only fanout measurements and their scope, see the
+[realtime benchmark guide](../CONTRIBUTING.md#realtime-delivery-authorization-benchmark).
+
 #### Multi-instance realtime (Postgres)
 
 Realtime delivery is **in-process**: a record write publishes to facil.io's pub/sub inside the

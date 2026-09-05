@@ -24,6 +24,10 @@ pub const CountingAllocator = struct {
         return self.st;
     }
 
+    pub fn requireEmpty(self: *const CountingAllocator) error{LiveAllocations}!void {
+        if (self.live != 0) return error.LiveAllocations;
+    }
+
     pub fn allocator(self: *CountingAllocator) std.mem.Allocator {
         return .{ .ptr = self, .vtable = &vtable };
     }
@@ -83,8 +87,10 @@ test "counts allocations into size buckets and tracks peak live bytes" {
 
     const small = try a.alloc(u8, 8); // bucket 0
     const big = try a.alloc(u8, 100_000); // bucket 4
+    try std.testing.expectError(error.LiveAllocations, c.requireEmpty());
     a.free(small);
     a.free(big);
+    try c.requireEmpty();
 
     const s = c.stats();
     try std.testing.expectEqual(@as(u64, 2), s.allocs);

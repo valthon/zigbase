@@ -16,3 +16,9 @@ Development-workflow, realtime/scaling, and storage work is tracked by its own P
 - [x] Preserve caller transactions on refusal and release locks on failure.
 - [ ] Coordinate consumer migrations automatically; these and older binaries still
   require a single migration leader.
+
+## Realtime fanout (#403)
+
+- [x] Measure actual delivery authorization, allocations, and subscriber fanout.
+- [x] Exercise benchmark correctness under ReleaseSafe in CI.
+- [ ] Design bounded replay/backfill with current authorization and explicit gap semantics.

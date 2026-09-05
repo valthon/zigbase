@@ -9,6 +9,10 @@ pub const Result = struct {
     bytes: u64,
     buckets: [5]u64,
     peak_live: u64,
+    iterations: usize = 1,
+    subscribers: usize = 1,
+    payload_bytes: usize = 0,
+    ns_max: u64 = 0,
 };
 
 /// Warm up `warmup` times (JIT-free, but page/cache warm), then measure `iters`
@@ -122,6 +126,10 @@ pub fn runArena(
 pub fn report(results: []const Result, json: bool, w: anytype) !void {
     if (json) {
         for (results) |r| {
+            if (r.payload_bytes != 0) {
+                try w.print("{{\"name\":\"realtime/{s}\",\"subscribers\":{d},\"payload_bytes\":{d},\"iterations\":{d},\"ns_event_median\":{d},\"ns_event_max\":{d},\"ns_subscriber_median\":{d},\"allocs_per_event\":{d},\"bytes_per_event\":{d},\"peak_live_bytes\":{d}}}\n", .{ r.name, r.subscribers, r.payload_bytes, r.iterations, r.ns_median, r.ns_max, r.ns_median / r.subscribers, r.allocs / r.iterations, r.bytes / r.iterations, r.peak_live });
+                continue;
+            }
             try w.print(
                 "{{\"name\":\"{s}\",\"ns_median\":{d},\"ns_p95\":{d},\"allocs\":{d},\"bytes\":{d},\"peak_live\":{d},\"buckets\":[{d},{d},{d},{d},{d}]}}\n",
                 .{ r.name, r.ns_median, r.ns_p95, r.allocs, r.bytes, r.peak_live, r.buckets[0], r.buckets[1], r.buckets[2], r.buckets[3], r.buckets[4] },
@@ -131,6 +139,10 @@ pub fn report(results: []const Result, json: bool, w: anytype) !void {
     }
     try w.print("{s:<34} {s:>10} {s:>10} {s:>8} {s:>10}  {s}\n", .{ "benchmark", "ns/op", "p95", "allocs", "bytes", "size buckets (<=64,512,4K,64K,>64K)" });
     for (results) |r| {
+        if (r.payload_bytes != 0) {
+            try w.print("realtime/{s} subscribers={d} payload={d} ns/event={d} ns/subscriber={d} allocs/event={d} bytes/event={d} peak={d} max_ns/event={d}\n", .{ r.name, r.subscribers, r.payload_bytes, r.ns_median, r.ns_median / r.subscribers, r.allocs / r.iterations, r.bytes / r.iterations, r.peak_live, r.ns_max });
+            continue;
+        }
         try w.print("{s:<34} {d:>10} {d:>10} {d:>8} {d:>10}  {d},{d},{d},{d},{d}\n", .{
             r.name,       r.ns_median,  r.ns_p95,     r.allocs,     r.bytes,
             r.buckets[0], r.buckets[1], r.buckets[2], r.buckets[3], r.buckets[4],
@@ -152,4 +164,30 @@ test "run reports a median, a p95, and the allocation profile" {
     try std.testing.expect(r.ns_p95 >= r.ns_median);
     try std.testing.expectEqual(@as(u64, 10), r.allocs); // measured iters only, warmup excluded
     try std.testing.expectEqual(@as(u64, 10), r.buckets[0]);
+}
+
+test "fanout JSON normalizes measured allocation totals and subscriber timing" {
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    try report(&.{.{
+        .name = "public_posts",
+        .ns_median = 1000,
+        .ns_p95 = 1200,
+        .ns_max = 1300,
+        .allocs = 200,
+        .bytes = 51200,
+        .buckets = .{0} ** 5,
+        .peak_live = 256,
+        .iterations = 20,
+        .subscribers = 10,
+        .payload_bytes = 1024,
+    }}, true, &output.writer);
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, output.written(), .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(i64, 100), parsed.value.object.get("ns_subscriber_median").?.integer);
+    try std.testing.expectEqual(@as(i64, 10), parsed.value.object.get("allocs_per_event").?.integer);
+    try std.testing.expectEqual(@as(i64, 2560), parsed.value.object.get("bytes_per_event").?.integer);
+    try std.testing.expectEqual(@as(i64, 256), parsed.value.object.get("peak_live_bytes").?.integer);
+    try std.testing.expectEqual(@as(i64, 1300), parsed.value.object.get("ns_event_max").?.integer);
+    try std.testing.expect(parsed.value.object.get("live_bytes") == null);
 }
