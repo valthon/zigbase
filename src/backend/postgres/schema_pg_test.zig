@@ -97,6 +97,60 @@ test "pg: all system migrations apply on a fresh database (tables + seeds + ledg
     try std.testing.expectError(error.ExecFailed, w.exec("INSERT INTO \"_accounts\" (\"id\",\"created\",\"updated\",\"slug\") VALUES ('a2','','','acme');"));
 }
 
+test "pg: index-only provisioning replaces constraints atomically and preserves external indexes" {
+    const a = std.testing.allocator;
+    var ctx = (try Ctx.open(a, std.testing.io, "index_only")) orelse return error.SkipZigTest;
+    defer ctx.deinit();
+    const w = ctx.w();
+    try migrations.run(w);
+    const fields = [_]schema.Field{.{ .id = "title_id", .name = "title", .options = .{ .text = .{} } }};
+    var specs = [_]schema.Collection{.{ .id = "", .name = "posts", .fields = &fields }};
+    try provision.applySpecs(a, std.testing.io, w, &specs);
+    try w.exec("CREATE INDEX migration_owned ON posts(created);");
+    try w.exec("INSERT INTO posts(id,title) VALUES ('p1','same'),('p2','same');");
+    specs[0].indexes = &.{.{ .name = "idx_title", .fields = &.{"title"} }};
+    try w.exec("CREATE INDEX idx_title ON posts(title);"); // prior migration workaround
+    try provision.applySpecs(a, std.testing.io, w, &specs);
+    const generation = try @import("../../schema_gen.zig").read(w);
+    try provision.applySpecs(a, std.testing.io, w, &specs);
+    try std.testing.expectEqual(generation, try @import("../../schema_gen.zig").read(w));
+    specs[0].indexes = &.{.{ .name = "idx_title", .fields = &.{"title"}, .unique = true }};
+    try std.testing.expectError(error.ExecFailed, provision.applySpecs(a, std.testing.io, w, &specs));
+    try std.testing.expectEqual(generation, try @import("../../schema_gen.zig").read(w));
+    try std.testing.expectEqual(@as(i64, 1), try scalarCount(w, "SELECT count(*) FROM pg_indexes WHERE schemaname=current_schema() AND indexname='idx_title' AND indexdef NOT LIKE '%UNIQUE%';"));
+    try w.exec("DELETE FROM posts WHERE id='p2';");
+    try provision.applySpecs(a, std.testing.io, w, &specs);
+    try std.testing.expectError(error.ExecFailed, w.exec("INSERT INTO posts(id,title) VALUES ('p3','same');"));
+    specs[0].indexes = &.{};
+    try provision.applySpecs(a, std.testing.io, w, &specs);
+    try std.testing.expectEqual(@as(i64, 1), try scalarCount(w, "SELECT count(*) FROM pg_indexes WHERE schemaname=current_schema() AND indexname='migration_owned';"));
+    try std.testing.expectEqual(@as(i64, 0), try scalarCount(w, "SELECT count(*) FROM pg_indexes WHERE schemaname=current_schema() AND indexname='idx_title';"));
+    specs[0].indexes = &.{.{ .name = "migration_owned", .fields = &.{"title"} }};
+    try std.testing.expectError(error.ExecFailed, provision.applySpecs(a, std.testing.io, w, &specs));
+    try w.exec("CREATE INDEX partial_title ON posts(title) WHERE title != ''; CREATE INDEX desc_title ON posts(title DESC);");
+    specs[0].indexes = &.{.{ .name = "partial_title", .fields = &.{"title"} }};
+    try std.testing.expectError(error.ExecFailed, provision.applySpecs(a, std.testing.io, w, &specs));
+    specs[0].indexes = &.{.{ .name = "desc_title", .fields = &.{"title"} }};
+    try std.testing.expectError(error.ExecFailed, provision.applySpecs(a, std.testing.io, w, &specs));
+    try w.exec("CREATE INDEX pattern_title ON posts(title text_pattern_ops); CREATE INDEX case_title ON posts(lower(title));");
+    specs[0].indexes = &.{.{ .name = "pattern_title", .fields = &.{"title"} }};
+    try std.testing.expectError(error.ExecFailed, provision.applySpecs(a, std.testing.io, w, &specs));
+    specs[0].indexes = &.{.{ .name = "case_title", .fields = &.{"title"}, .collation = .nocase }};
+    try provision.applySpecs(a, std.testing.io, w, &specs);
+    if (try scalarCount(w, "SELECT current_setting('server_version_num')::bigint;") >= 150000) {
+        try w.exec("DELETE FROM posts WHERE id='p3'; CREATE UNIQUE INDEX null_title ON posts(title) NULLS NOT DISTINCT;");
+        const before_nulls = try @import("../../schema_gen.zig").read(w);
+        specs[0].indexes = &.{.{ .name = "null_title", .fields = &.{"title"}, .unique = true }};
+        try std.testing.expectError(error.ExecFailed, provision.applySpecs(a, std.testing.io, w, &specs));
+        try std.testing.expectEqual(before_nulls, try @import("../../schema_gen.zig").read(w));
+        try w.exec("INSERT INTO posts(id,title) VALUES ('null1',NULL);");
+        try std.testing.expectError(error.ExecFailed, w.exec("INSERT INTO posts(id,title) VALUES ('null2',NULL);"));
+        // The refused adoption neither deletes the external constraint nor commits
+        // the earlier planned removal of the metadata-owned case-insensitive index.
+        try std.testing.expectEqual(@as(i64, 2), try scalarCount(w, "SELECT count(*) FROM pg_indexes WHERE schemaname=current_schema() AND indexname IN ('case_title','null_title');"));
+    }
+}
+
 test "pg: full comptime schema provisions on a fresh database" {
     const a = std.testing.allocator;
     var ctx = (try Ctx.open(a, std.testing.io, "prov")) orelse return error.SkipZigTest;

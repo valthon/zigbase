@@ -179,26 +179,18 @@ there is no separate migration-only code path that could disagree with what `POS
   prints the offending collection, rule field and error code on stderr, and exits `1`. This
   runs in `--dry-run` too, and *ahead of* the destructive check, so a document that is both
   unparseable and destructive exits `1` (the document is invalid) rather than `2`. There is
-  no flag to skip it: nothing else in the engine validates a rule at write time, and a rule
+  no flag to skip it: a rule
   that fails to parse fails **closed** at request time (`500`), so `apply` is the last
   chokepoint before a typo becomes an outage.
 
-  This gate is deliberately **syntax only** — it does not resolve field or relation names,
-  and it does not report `@public`:
-
-  - Full field resolution would cry wolf. A rule may legitimately name a field this same
-    apply is about to add, or traverse a relation created in the second pass; resolved
-    against the not-yet-updated live schema those read as errors. A linter that
-    false-positives during apply gets suppressed, and a suppressed linter protects nothing.
-  - Exit code `2` is frozen as "`--dry-run` found destructive changes". Reporting `@public`
-    rules or resolution findings from `apply` would have to land on exit `2`, and an agent
-    branching on `2` must never have to work out whether it means "you just opened a
-    collection to the public" or "destructive schema change pending". Overloading a frozen
-    exit code to save a flag is a bad trade.
-  - Judgment-shaped findings live in `zigbase schema check-rules`, where exit `2` already
-    means "needs judgment" and where you asked for an opinion. Run it against the document
-    before `apply`, and again at full depth once the collections exist — that is exactly the
-    two-step in §6's worked migration.
+  A second preflight resolves field and relation paths against the **complete proposed
+  schema**, including new fields, forward/cyclic relations, retained live collections, and
+  pruning. Both real and dry runs refuse unknown fields, non-relation traversal, and
+  encrypted comparisons with exit `1`, before document writes. Request macros remain dynamic:
+  the preflight does not invent user/body values or claim to prove policy decisions.
+  The snapshot and writes share a transaction-level metadata lock across processes.
+  `@public` remains allowed; warnings belong to `schema check-rules`, and exit `2` still
+  means destructive changes in a dry run.
 - **Every collection is validated first, and one bad field refuses the whole apply.** The
   same check `POST /api/collections` runs — collection and field names, reserved names,
   duplicate fields, index and `select`/`number`/`date`/`relation` option constraints,
@@ -224,6 +216,8 @@ there is no separate migration-only code path that could disagree with what `POS
 - **`--dry-run` is not a true no-op.** It computes and prints the plan without executing
   it, but reaching that point still boots the app — system migrations and the comptime
   `.collections` provisioning run first, and those *do* write, same as any other startup.
+  Validation/planning also briefly holds the writer/schema lock to prevent concurrent
+  changes invalidating its snapshot; SQLite's normal 5-second busy timeout applies.
   What `--dry-run` guarantees is that the *document's own* changes are not applied; it is
   not a read-only connection to an already-running database. `import --dry-run` (§3) has
   the same caveat.
@@ -301,13 +295,12 @@ Postgres recreate atomically as part of the same collection update.
 
 ### Linting access rules (`schema check-rules`)
 
-**Access rules are never validated when they are written.** `schema.parseCollectionInput`
-decodes `listRule`/`viewRule`/`createRule`/`updateRule`/`deleteRule` as opaque strings and
-`collections.create`/`update` bind them straight into `_collections` — the REST API does the
-same. The first thing that ever parses a rule is the request that has to evaluate it, and a
-rule that fails to parse fails **closed** (`500`, and on a write the write never runs). So a
-typo'd rule applies cleanly, ships, and takes the collection down on the first request that
-touches it. `zigbase schema check-rules` is the preflight that closes that gap.
+`schema apply` and REST collection creation/update validate syntax and field/relation
+references before writing. They check the prospective schema, including rules on retained
+collections that might depend on a changed field. Invalid existing rules therefore also
+need correction before an unrelated schema mutation can proceed. Low-level Zig collection
+writers remain available for trusted staged migrations. `schema check-rules` is the explicit
+lint/report command, including public-rule warnings and live compiler checks.
 
 It does **not** reimplement the grammar: the live check calls `rules.compileGuard`, the exact
 function the request path calls (lexer → parser → joiner → compiler), and the document check
@@ -335,8 +328,8 @@ the live check after `schema apply` to catch everything else. (Building a throwa
 to fake a full check offline would duplicate `apply`'s two-pass create ordering, so it is
 deliberately not done.)
 
-`schema apply` does **not** run this automatically — whether it should is an open design
-question, not a settled default.
+`schema apply` automatically checks syntax and references, but does not automatically emit
+this command's public-rule warnings or evaluate request-dependent values.
 
 #### Policy: what is and is not a finding
 
@@ -796,14 +789,10 @@ zigbase schema dump --out schema.json --data-dir ./zb_data
 
 ## 7. Limitations
 
-- **`schema apply` checks access-rule SYNTAX only** — it refuses a document containing an
-  unparseable rule (see §2's apply semantics), but it does not resolve field or relation
-  names, so a rule naming a field that does not exist still applies cleanly and fails closed
-  at evaluation time (500). The REST API validates neither. Run `zigbase schema check-rules`
-  (§2) against the data dir *after* applying for the full-depth pass; `apply` never runs
-  that depth itself. Exercising every rule once via the replay harness (§5) before cutover
-  remains worthwhile too — the linter proves a rule *compiles*, not that it *decides* what
-  you meant.
+- **Rule preflight does not prove policy decisions.** `schema apply` and REST mutations
+  validate syntax and references, not the values a future request will supply. Run
+  `schema check-rules` against the live data dir and exercise access rules via replay before
+  cutover; compiling a rule is not proof it decides what you intended.
 - **Collection rename is not supported by the engine** (`collections.update` preserves
   the stored name), so a renamed collection in a document reads as create + untracked.
 - **A live server sees another process's schema change within about five seconds, not

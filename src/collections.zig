@@ -44,7 +44,10 @@ const Tx = struct {
     fn begin(w: *db.Db) db.DbError!Tx {
         const nested = w.inTransaction();
         if (nested) try w.exec("SAVEPOINT " ++ savepoint ++ ";") else try w.begin();
-        return .{ .w = w, .nested = nested };
+        const tx = Tx{ .w = w, .nested = nested };
+        errdefer tx.rollback();
+        try schema_gen.lock(w);
+        return tx;
     }
 
     fn commit(self: Tx) db.DbError!void {
@@ -481,6 +484,152 @@ pub fn updateRules(alloc: std.mem.Allocator, w: *db.Db, col_id: []const u8, rule
     } // finalize the statement BEFORE commit — SQLite will not commit with a live statement
     try schema_gen.bump(w);
     try tx.commit();
+}
+
+/// Reconcile only declared indexes. Migration-owned indexes and table data are untouched.
+/// A failed CREATE (e.g. duplicate values for a new UNIQUE constraint) rolls back both the
+/// index changes and metadata. No-op declarations do not bump the schema generation.
+pub fn updateIndexes(alloc: std.mem.Allocator, w: *db.Db, col_id: []const u8, indexes: []const schema.Index) EngineError!void {
+    var scratch = std.heap.ArenaAllocator.init(alloc);
+    defer scratch.deinit();
+    const sa = scratch.allocator();
+    const tx = try Tx.begin(w);
+    errdefer tx.rollback();
+    const old = (try get(sa, w, col_id)) orelse return error.NotFound;
+    const old_json = try schema.indexesToJson(sa, old.indexes);
+    const new_json = try schema.indexesToJson(sa, indexes);
+    if (std.mem.eql(u8, old_json, new_json)) {
+        try tx.commit();
+        return;
+    }
+    var newc = old;
+    newc.indexes = indexes;
+    var user_fields: std.ArrayList(schema.Field) = .empty;
+    for (old.fields) |field| {
+        if (field.id.len > 0 and field.id[0] == '_') continue;
+        if (schema.isSystemFieldName(field.name)) continue;
+        try user_fields.append(sa, field);
+    }
+    newc.fields = user_fields.items;
+    var errs: std.ArrayList(schema.ValidationError) = .empty;
+    errdefer errs.deinit(alloc);
+    try schema.validate(alloc, newc, &errs);
+    if (errs.items.len > 0) {
+        last_errors = try errs.toOwnedSlice(alloc);
+        return error.Validation;
+    }
+    const d = db.dbDialect(w);
+    // Only names recorded as belonging to this collection may be dropped. In particular,
+    // never DROP a newly declared name: an unrelated migration/collection may own it.
+    for (old.indexes) |idx| {
+        const unchanged = for (indexes) |next| {
+            if (indexEql(idx, next)) break true;
+        } else false;
+        if (!unchanged) {
+            std.log.info("provision: collection '{s}' DROP index '{s}'", .{ old.name, idx.name });
+            w.exec(try std.fmt.allocPrintSentinel(sa, "DROP INDEX IF EXISTS {s};", .{try ddl.quoteIdent(sa, idx.name)}, 0)) catch |err| {
+                std.log.warn("provision: collection '{s}' index '{s}' DROP failed: {s}; {s}", .{ old.name, idx.name, @errorName(err), w.errMsg() });
+                return err;
+            };
+        }
+    }
+    for (indexes) |idx| {
+        const unchanged = for (old.indexes) |prev| {
+            if (indexEql(prev, idx)) break true;
+        } else false;
+        if (!unchanged) {
+            switch (try existingIndex(sa, w, old.name, idx)) {
+                .matching => {
+                    std.log.info("provision: collection '{s}' ADOPT existing index '{s}'", .{ old.name, idx.name });
+                    continue;
+                },
+                .conflicting => {
+                    std.log.warn("provision: collection '{s}' index '{s}' already exists with a different or unsupported definition; startup refused, index preserved", .{ old.name, idx.name });
+                    return error.ExecFailed;
+                },
+                .absent => {},
+            }
+            std.log.info("provision: collection '{s}' CREATE index '{s}'", .{ old.name, idx.name });
+            w.exec(try sa.dupeZ(u8, try ddl.createIndexSql(sa, old.name, idx, d))) catch |err| {
+                std.log.warn("provision: collection '{s}' index '{s}' CREATE failed: {s}; {s}; startup refused", .{ old.name, idx.name, @errorName(err), w.errMsg() });
+                return err;
+            };
+        }
+    }
+    {
+        const raw = try std.fmt.allocPrint(sa, "UPDATE \"_collections\" SET \"indexes\"=?2, \"updated\"={s} WHERE \"id\"=?1;", .{d.nowTextExpr()});
+        var st = try w.prepare(try d.renumberPlaceholders(sa, raw));
+        defer st.finalize();
+        try st.bindText(1, old.id);
+        try st.bindText(2, new_json);
+        _ = try st.step();
+    }
+    try schema_gen.bump(w);
+    try tx.commit();
+}
+
+/// Conservative adoption of ordinary migration-created indexes. Compare catalog properties,
+/// not SQL whitespace/quoting. Partial/expression/constraint indexes require an explicit
+/// migration: guessing equivalence could silently weaken a declared constraint.
+fn existingIndex(alloc: std.mem.Allocator, w: *db.Db, table: []const u8, idx: schema.Index) EngineError!enum { absent, matching, conflicting } {
+    var scratch = std.heap.ArenaAllocator.init(alloc);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const pg = db.dbDialect(w).kind == .postgres;
+    // indnullsnotdistinct was introduced in PostgreSQL 15. Catalog-row JSON keeps
+    // older servers compatible: absence means their only supported NULLS DISTINCT.
+    var st = try w.prepare(if (pg)
+        "SELECT t.relname, i.indisunique::int, i.indisvalid::int, i.indnatts, i.indnkeyatts, (i.indpred IS NULL)::int, am.amname, (NOT EXISTS (SELECT 1 FROM pg_constraint c WHERE c.conindid=i.indexrelid))::int, COALESCE((to_jsonb(i)->>'indnullsnotdistinct')::boolean, false)::int FROM pg_class n JOIN pg_namespace ns ON ns.oid=n.relnamespace LEFT JOIN pg_index i ON i.indexrelid=n.oid LEFT JOIN pg_class t ON t.oid=i.indrelid LEFT JOIN pg_am am ON am.oid=n.relam WHERE ns.nspname=current_schema() AND n.relname=$1;"
+    else
+        "SELECT tbl_name FROM sqlite_master WHERE name=?1 COLLATE NOCASE;");
+    defer st.finalize();
+    try st.bindText(1, idx.name);
+    if (!try st.step()) return .absent;
+    if (!std.mem.eql(u8, st.columnText(0), table) or idx.where != null) return .conflicting;
+    if (pg) {
+        if (st.columnInt(1) != @intFromBool(idx.unique) or st.columnInt(2) != 1 or
+            st.columnInt(3) != idx.fields.len or st.columnInt(4) != idx.fields.len or
+            st.columnInt(5) != 1 or !std.mem.eql(u8, st.columnText(6), "btree") or st.columnInt(7) != 1 or
+            st.columnInt(8) != 0) return .conflicting;
+        // Column-only pg_get_indexdef omits ordering/opclass/collation decorations;
+        // check those catalog properties separately before comparing the expression.
+        var cols = try w.prepare("SELECT pg_get_indexdef(n.oid, k, true), i.indoption[k-1], op.opcdefault::int, (i.indcollation[k-1] = (SELECT a.attcollation FROM pg_attribute a WHERE a.attrelid=i.indrelid AND a.attname=(string_to_array($3, ','))[k]))::int FROM pg_class n JOIN pg_namespace ns ON ns.oid=n.relnamespace JOIN pg_index i ON i.indexrelid=n.oid CROSS JOIN generate_series(1, $2::int) k JOIN pg_opclass op ON op.oid=i.indclass[k-1] WHERE ns.nspname=current_schema() AND n.relname=$1 ORDER BY k;");
+        defer cols.finalize();
+        try cols.bindText(1, idx.name);
+        try cols.bindInt(2, @intCast(idx.fields.len));
+        try cols.bindText(3, try std.mem.join(a, ",", idx.fields));
+        for (idx.fields) |field| {
+            if (!try cols.step()) return .conflicting;
+            if (cols.columnInt(1) != 0 or cols.columnInt(2) != 1 or cols.columnInt(3) != 1) return .conflicting;
+            const quoted = try ddl.quoteIdent(a, field);
+            const bare_expr = if (idx.collation == .nocase) try std.fmt.allocPrint(a, "lower({s})", .{field}) else field;
+            const quoted_expr = if (idx.collation == .nocase) try std.fmt.allocPrint(a, "lower({s})", .{quoted}) else quoted;
+            if (!std.mem.eql(u8, cols.columnText(0), bare_expr) and !std.mem.eql(u8, cols.columnText(0), quoted_expr)) return .conflicting;
+        }
+    } else {
+        var props = try w.prepare("SELECT \"unique\", origin, partial FROM pragma_index_list(?1) WHERE name=?2 COLLATE NOCASE;");
+        defer props.finalize();
+        try props.bindText(1, table);
+        try props.bindText(2, idx.name);
+        if (!try props.step() or props.columnInt(0) != @intFromBool(idx.unique) or
+            !std.mem.eql(u8, props.columnText(1), "c") or props.columnInt(2) != 0) return .conflicting;
+        var cols = try w.prepare("SELECT name, \"desc\", coll FROM pragma_index_xinfo(?1) WHERE key=1 ORDER BY seqno;");
+        defer cols.finalize();
+        try cols.bindText(1, idx.name);
+        for (idx.fields) |field| {
+            if (!try cols.step() or !std.mem.eql(u8, cols.columnText(0), field) or cols.columnInt(1) != 0 or
+                !std.ascii.eqlIgnoreCase(cols.columnText(2), if (idx.collation == .nocase) "nocase" else "binary")) return .conflicting;
+        }
+        if (try cols.step()) return .conflicting;
+    }
+    return .matching;
+}
+
+fn indexEql(a: schema.Index, b: schema.Index) bool {
+    if (!std.mem.eql(u8, a.name, b.name) or a.unique != b.unique or a.collation != b.collation or
+        (a.where == null) != (b.where == null) or !ruleEql(a.where, b.where) or a.fields.len != b.fields.len) return false;
+    for (a.fields, b.fields) |af, bf| if (!std.mem.eql(u8, af, bf)) return false;
+    return true;
 }
 
 pub fn delete(alloc: std.mem.Allocator, w: *db.Db, id_or_name: []const u8) EngineError!void {

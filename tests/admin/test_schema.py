@@ -122,7 +122,7 @@ def test_edit_rules_expression_from_locked(page):
     page.select_option('[data-test=rulemode-listRule]', 'expr')
     assert page.input_value('[data-test=rulemode-listRule]') == 'expr'
     page.wait_for_selector('[data-test=rule-listRule]', timeout=8000)
-    page.fill('[data-test=rule-listRule]', 'status = "published"')
+    page.fill('[data-test=rule-listRule]', 'body = "published"')
     # wait for the post-save reload to COMPLETE before navigating back to the editor
     save_collection_and_wait(page)
     page.wait_for_selector('[data-test=records-view]', timeout=8000)
@@ -131,7 +131,7 @@ def test_edit_rules_expression_from_locked(page):
     page.wait_for_selector('[data-test=schema-editor]', timeout=8000)
     page.click('[data-test=tab-rules]')
     assert page.input_value('[data-test=rulemode-listRule]') == 'expr'
-    assert page.input_value('[data-test=rule-listRule]') == 'status = "published"'
+    assert page.input_value('[data-test=rule-listRule]') == 'body = "published"'
 
 
 def test_rule_public_cancel_reverts_select(page):

@@ -3215,7 +3215,19 @@ with the rest of the comptime-validated surface.
 ### Indexes
 
 A collection may declare `.indexes` — a tuple of index literals provisioned as
-`CREATE INDEX` statements when the collection is created:
+`CREATE INDEX` statements when the collection is created, and reconciled on later startups
+even when no fields change. Added, removed, or changed declarations update only their
+indexes and metadata; index-only changes do not copy the table or remove unrelated indexes
+created by explicit migrations. A failed unique-index build rolls back index changes and
+metadata together **and refuses server startup**, with collection/index diagnostics.
+The declaration is authoritative, including the default empty `.indexes`: indexes added
+through REST/admin metadata but omitted from code are removed at the next startup. Every
+DROP/CREATE is logged. Existing ordinary migration-created indexes with matching table,
+columns, uniqueness, direction and collation are adopted into metadata ownership rather
+than recreated. Conflicting names or unsupported definitions (such as partial indexes)
+are preserved and refuse startup; resolve them with an explicit migration. Once adopted,
+an index follows the declaration, including later removal.
+Unchanged declarations do not rebuild indexes or bump schema generation:
 
 ```zig
 .indexes = .{

@@ -1102,7 +1102,10 @@ pub fn ensureCollection(
         std.log.info("provision: collection '{s}' access rules updated", .{spec.name});
     }
 
-    if (!changed) return; // idempotent no-op
+    if (!changed) {
+        try collections.updateIndexes(alloc, w, live.id, spec.indexes);
+        return;
+    }
 
     // Additive auto-migration: rebuild the table with the union of live + new
     // fields, matching existing columns by id (rebuildPlan preserves their data),
@@ -1895,6 +1898,58 @@ test "applySpecs additively adds a new field (auto-migration), preserving data" 
     try std.testing.expect(try st.step());
     try std.testing.expectEqualStrings("hello", st.columnText(0)); // data preserved
     try std.testing.expect(st.isNull(1)); // new column, null for old row
+}
+
+test "index-only provisioning reconciles definitions without rebuilding tables" {
+    const a = std.testing.allocator;
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try migrations.run(&d);
+    const fields = [_]schema.Field{.{ .id = "title_id", .name = "title", .options = .{ .text = .{} } }};
+    var specs = [_]schema.Collection{.{ .id = "", .name = "posts", .fields = &fields }};
+    try applySpecs(a, std.testing.io, &d, &specs);
+    try d.exec("CREATE INDEX migration_owned ON posts(created);");
+    try d.exec("CREATE TRIGGER migration_trigger AFTER INSERT ON posts BEGIN SELECT 1; END;");
+    try d.exec("INSERT INTO posts(id,title) VALUES ('p1','same'),('p2','same');");
+    specs[0].indexes = &.{.{ .name = "idx_title", .fields = &.{"title"} }};
+    // Upgrade from the previously documented raw-migration workaround. Adoption
+    // must leave the physical index intact while adding its metadata ownership.
+    try d.exec("CREATE INDEX idx_title ON posts(title);");
+    try applySpecs(a, std.testing.io, &d, &specs);
+    const generation = try @import("schema_gen.zig").read(&d);
+    try applySpecs(a, std.testing.io, &d, &specs);
+    try std.testing.expectEqual(generation, try @import("schema_gen.zig").read(&d));
+    // Unique activation fails, preserving the previous non-unique index and metadata.
+    specs[0].indexes = &.{.{ .name = "idx_title", .fields = &.{"title"}, .unique = true }};
+    try std.testing.expectError(error.ExecFailed, applySpecs(a, std.testing.io, &d, &specs));
+    const stored = (try collections.get(a, &d, "posts")).?;
+    defer stored.deinit(a);
+    try std.testing.expect(!stored.indexes[0].unique);
+    try std.testing.expectEqual(generation, try @import("schema_gen.zig").read(&d));
+    try d.exec("DELETE FROM posts WHERE id='p2';");
+    try applySpecs(a, std.testing.io, &d, &specs);
+    try std.testing.expectError(error.ExecFailed, d.exec("INSERT INTO posts(id,title) VALUES ('p3','same');"));
+    specs[0].indexes = &.{};
+    try applySpecs(a, std.testing.io, &d, &specs);
+    var st = try d.prepare("SELECT count(*) FROM sqlite_master WHERE name IN ('migration_owned','migration_trigger');");
+    defer st.finalize();
+    try std.testing.expect(try st.step());
+    try std.testing.expectEqual(@as(i64, 2), st.columnInt(0));
+    try d.exec("INSERT INTO posts(id,title) VALUES ('p3','same');");
+    // A new declaration cannot steal an existing migration-owned index name.
+    specs[0].indexes = &.{.{ .name = "migration_owned", .fields = &.{"title"} }};
+    try std.testing.expectError(error.ExecFailed, applySpecs(a, std.testing.io, &d, &specs));
+    // A partial or descending external index is not equivalent to a plain one.
+    try d.exec("CREATE INDEX partial_title ON posts(title) WHERE title != ''; CREATE INDEX desc_title ON posts(title DESC);");
+    specs[0].indexes = &.{.{ .name = "partial_title", .fields = &.{"title"} }};
+    try std.testing.expectError(error.ExecFailed, applySpecs(a, std.testing.io, &d, &specs));
+    specs[0].indexes = &.{.{ .name = "desc_title", .fields = &.{"title"} }};
+    try std.testing.expectError(error.ExecFailed, applySpecs(a, std.testing.io, &d, &specs));
+    try d.exec("CREATE INDEX case_title ON posts(title COLLATE NOCASE);");
+    specs[0].indexes = &.{.{ .name = "case_title", .fields = &.{"title"} }};
+    try std.testing.expectError(error.ExecFailed, applySpecs(a, std.testing.io, &d, &specs));
+    specs[0].indexes = &.{.{ .name = "case_title", .fields = &.{"title"}, .collation = .nocase }};
+    try applySpecs(a, std.testing.io, &d, &specs);
 }
 
 test "applySpecs persists a ttl_field added to an existing collection (then GC reaps)" {

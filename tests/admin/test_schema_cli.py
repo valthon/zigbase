@@ -84,6 +84,30 @@ def indexes(data, table):
         con.close()
 
 
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_apply_rejects_unknown_rule_field_before_any_write(binary, data_dir, dry_run):
+    path = write_doc(data_dir, "bad-rule.json", doc(
+        collection("good", [field("title")]),
+        collection("bad", [field("title")], viewRule="missing = @request.auth.id"),
+    ))
+    result = run(binary, data_dir, "schema", "apply", path, *(["--dry-run"] if dry_run else []))
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "UnknownField" in result.stderr
+    assert not columns(data_dir, "good")
+    assert not columns(data_dir, "bad")
+
+
+def test_apply_rule_forward_relation_and_new_field(binary, data_dir):
+    path = write_doc(data_dir, "forward-rule.json", doc(
+        collection("posts", [field("author", "relation", options={"targetCollectionId": "authors", "maxSelect": 1})], viewRule="author.title = @request.auth.title"),
+        collection("authors", [field("title")]),
+    ))
+    for flags in (["--dry-run"], []):
+        result = run(binary, data_dir, "schema", "apply", path, *flags)
+        assert result.returncode == 0, result.stdout + result.stderr
+    assert "author" in columns(data_dir, "posts")
+
+
 def test_apply_creates_collections_in_relation_order(binary, data_dir):
     """`posts` references `authors`, but is listed first: apply must still order the
     creates so the FK target exists."""
@@ -492,8 +516,8 @@ def test_check_rules_live_mode_is_full_depth_and_sees_what_syntax_depth_cannot(b
     """The honesty of the two-depth design, end to end. `nope = "x"` is well-formed
     syntax, so the document check passes it; only the live check — which resolves field
     names against the real schema through the request path's own compiler — knows the
-    field does not exist. It also proves the premise: `schema apply` accepts the broken
-    rule without complaint, because rules are never validated at write time."""
+    field does not exist. Apply now rejects this; direct SQL simulates legacy metadata
+    so the explicit live lint still has a persisted defect to diagnose."""
     path = write_doc(data_dir, "s.json", doc(
         collection("posts", [field("title")], listRule='nope = "x"', viewRule='title != ""')))
 
@@ -503,7 +527,12 @@ def test_check_rules_live_mode_is_full_depth_and_sees_what_syntax_depth_cannot(b
     assert off_findings == []
     assert off_summary["depth"] == "syntax"
 
-    assert run(binary, data_dir, "schema", "apply", path).returncode == 0
+    assert run(binary, data_dir, "schema", "apply", path).returncode == 1
+    valid = write_doc(data_dir, "valid.json", doc(
+        collection("posts", [field("title")], listRule='title = "x"', viewRule='title != ""')))
+    assert run(binary, data_dir, "schema", "apply", valid).returncode == 0
+    with sqlite3.connect(os.path.join(data_dir, "data.db")) as con:
+        con.execute('UPDATE _collections SET listRule=? WHERE name=?', ('nope = "x"', 'posts'))
 
     live = run(binary, data_dir, "schema", "check-rules")
     assert live.returncode == 1, live.stdout + live.stderr
