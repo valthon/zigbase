@@ -4,6 +4,7 @@
   "type": "module",
   "scripts": {
     "typecheck": "tsc --noEmit",
+    "test:frontend": "vitest run --config vitest.frontend.config.ts",
     "test:e2e": "vitest run"
   },
   "dependencies": {

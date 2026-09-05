@@ -73,7 +73,7 @@ export interface GolfServer {
  */
 function ensureFrontend(): void {
   if (existsSync(FRONTEND_DIST)) return;
-  const build = spawnSync("bash", ["build.sh"], { cwd: FRONTEND_ROOT, stdio: "inherit" });
+  const build = spawnSync("bash", ["build.sh", "--no-install"], { cwd: FRONTEND_ROOT, stdio: "inherit" });
   if (build.status !== 0) throw new Error("frontend build failed");
 }
 
@@ -124,7 +124,9 @@ export async function startGolfsim(opts: StartOptions = {}): Promise<GolfServer>
     const proc: ChildProcess = spawn(BIN, ["serve", "--http-port", String(port), "--data-dir", dataDir, "--insecure-cookies"], {
       cwd: EXAMPLE_ROOT,
       stdio: ["inherit", "inherit", "pipe"],
-      env: { ...process.env, ...(opts.env ?? {}) },
+      // The harness owns this child and captures its mail log. Never let
+      // agent-environment auto-backgrounding detach either lifecycle.
+      env: { ...process.env, ...(opts.env ?? {}), ZIGBASE_SERVE_BACKGROUND: '0' },
     });
     const url = `http://127.0.0.1:${port}`;
 

@@ -557,7 +557,7 @@ jobs:
         run: mise exec node@24 -- npm run build
       - name: Golfsim e2e
         working-directory: examples/golfsim
-        run: mise exec node@24 -- npm install && mise exec node@24 -- npm run typecheck && mise exec node@24 -- npm run test:e2e
+        run: mise exec node@24 -- npm install && mise exec node@24 -- npm run typecheck && mise exec node@24 -- npm run test:frontend && mise exec node@24 -- npm run test:e2e
       - name: Blog e2e (base SDK)
         working-directory: examples/blog
         run: mise exec node@24 -- npm install && mise exec node@24 -- npm run typecheck && mise exec node@24 -- npm run test:e2e
