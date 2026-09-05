@@ -27,15 +27,17 @@ const App = @import("../app.zig").App;
 
 /// Lower + renumber a curated `_events`/`_kv` statement for `conn`'s active backend, then prepare
 /// it. SQLite gets the verbatim `?N`/`datetime`/`strftime` SQL (zero-cost); Postgres gets the
-/// dialect's now-expressions + `$n` placeholders. The lowered SQL lives in a transient arena
-/// (`Db.prepare` copies it), so it need only outlive this call.
+/// dialect's now-expressions + `$n` placeholders. The lowered SQL lives in bounded stack scratch
+/// (`Db.prepare` copies it), so it need only outlive this call. Only the short
+/// engine-owned statements in this module may use this helper: PostgreSQL's
+/// lowering intermediates must fit in 8 KiB or return PrepareFailed. SQL with
+/// consumer-controlled names uses caller-owned scratch instead (see runRollup).
 fn prep(conn: *db.Db, sql: [:0]const u8) db.DbError!db.Stmt {
-    // Arena over the page allocator: no fixed ceiling (lowerStmtZ makes several intermediate
-    // allocations that the arena frees together on return), and on SQLite lowerStmtZ is a no-op
-    // returning the input slice, so this costs one empty arena. `Db.prepare` copies the text.
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
-    const lowered = param_sink.lowerStmtZ(arena.allocator(), db.dbDialect(conn), sql) catch return db.DbError.PrepareFailed;
+    // All callers use short engine-owned SQL. Lower into bounded caller
+    // scratch; prepare copies it before this stack frame returns.
+    var buffer: [8192]u8 = undefined;
+    var scratch = std.heap.FixedBufferAllocator.init(&buffer);
+    const lowered = param_sink.lowerStmtZ(scratch.allocator(), db.dbDialect(conn), sql) catch return db.DbError.PrepareFailed;
     return conn.prepare(lowered);
 }
 
@@ -106,21 +108,80 @@ pub const EventContext = struct {
     account: []const u8 = "",
 };
 
+/// Input to Ctx.trackBatch. Identity and tenant fields intentionally do not exist
+/// here: Ctx stamps them from its authenticated request context.
+pub const EventInput = struct {
+    name: []const u8,
+    payload_json: []const u8 = "{}",
+};
+
+pub const EventScope = struct {
+    actor: []const u8 = "",
+    actor_collection: []const u8 = "",
+    account: []const u8 = "",
+};
+
+/// An explicit batch bounds writer occupancy and temporary request memory.
+pub const max_batch_events = 1024;
+
+const insert_sql =
+    \\INSERT INTO "_events"
+    \\  ("id","created","updated","name","payload","actor_collection","actor","account","occurred_at")
+    \\ VALUES (?1,
+    \\   strftime('%Y-%m-%dT%H:%M:%SZ','now'), strftime('%Y-%m-%dT%H:%M:%SZ','now'),
+    \\   ?2, ?3, ?4, ?5, ?6,
+    \\   strftime('%Y-%m-%dT%H:%M:%SZ','now'));
+;
+
+/// Persist a whole batch or none, reusing one prepared statement and transaction.
+/// Within an existing hook/ctx.tx transaction use a savepoint: a caught batch
+/// failure must not leave its prefix persisted or commit the caller's work.
+/// Storage failures can auto-abort the outer transaction; callers catching an
+/// error must check inTransaction() before attempting further transactional work.
+pub fn insertBatch(conn: *db.Db, io: std.Io, events: []const EventInput, context: EventScope) !void {
+    if (events.len > max_batch_events) return error.BatchTooLarge;
+    if (events.len == 0) return;
+    const nested = conn.inTransaction();
+    if (nested) try conn.exec("SAVEPOINT zigbase_analytics_batch;") else try conn.beginImmediate();
+    errdefer {
+        if (nested) {
+            conn.exec("ROLLBACK TO SAVEPOINT zigbase_analytics_batch;") catch |err|
+                std.log.err("analytics batch rollback failed: {s}", .{@errorName(err)});
+            conn.exec("RELEASE SAVEPOINT zigbase_analytics_batch;") catch |err|
+                std.log.err("analytics batch savepoint release failed: {s}", .{@errorName(err)});
+        } else conn.rollback() catch |err|
+            std.log.warn("analytics batch rollback failed: {s}", .{@errorName(err)});
+    }
+    {
+        var st = try prep(conn, insert_sql);
+        defer st.finalize();
+        for (events) |event| {
+            try bindEvent(&st, io, .{
+                .name = event.name,
+                .payload_json = event.payload_json,
+                .actor = context.actor,
+                .actor_collection = context.actor_collection,
+                .account = context.account,
+            });
+            st.reset();
+            try st.clearBindings();
+        }
+    }
+    if (nested) try conn.exec("RELEASE SAVEPOINT zigbase_analytics_batch;") else try conn.commit();
+}
+
 /// Append one immutable `_events` row on `conn`. `created`/`updated`/`occurred_at` are stamped
 /// server-side via SQLite's `now` (which honors `ZIGBASE_FAKE_NOW` through the clock VFS), so the
 /// timestamp is never client-supplied. `payload_json` is bound (opaque text), never interpolated.
 pub fn insertEvent(conn: *db.Db, io: std.Io, ev: EventContext) !void {
+    var st = try prep(conn, insert_sql);
+    defer st.finalize();
+    try bindEvent(&st, io, ev);
+}
+
+fn bindEvent(st: *db.Stmt, io: std.Io, ev: EventContext) !void {
     var idbuf: [15]u8 = undefined;
     id_gen.generate(io, &idbuf);
-    var st = try prep(conn,
-        \\INSERT INTO "_events"
-        \\  ("id","created","updated","name","payload","actor_collection","actor","account","occurred_at")
-        \\ VALUES (?1,
-        \\   strftime('%Y-%m-%dT%H:%M:%SZ','now'), strftime('%Y-%m-%dT%H:%M:%SZ','now'),
-        \\   ?2, ?3, ?4, ?5, ?6,
-        \\   strftime('%Y-%m-%dT%H:%M:%SZ','now'));
-    );
-    defer st.finalize();
     try st.bindText(1, &idbuf);
     try st.bindText(2, ev.name);
     try st.bindText(3, ev.payload_json);
@@ -243,7 +304,10 @@ pub fn runRollup(conn: *db.Db, alloc: std.mem.Allocator, spec: RollupSpec) !void
         \\   DO UPDATE SET "value" = "{s}"."value" + excluded."value", "computed_at" = excluded."computed_at";
     , .{ table, bucketExpr(conn, spec.time_bucket), account_expr, actor_expr, seq, seq, table }, 0);
 
-    var st = try prep(conn, sql);
+    // Rollup names contribute to this SQL, so use the caller-backed arena
+    // instead of imposing the fixed-statement helper's scratch-size bound.
+    const lowered = try param_sink.lowerStmtZ(a, db.dbDialect(conn), sql);
+    var st = try conn.prepare(lowered);
     defer st.finalize();
     try st.bindText(1, spec.event);
     try st.bindText(2, computed_at);
@@ -335,6 +399,66 @@ test "insertEvent appends an immutable row with server-stamped timestamps" {
     try std.testing.expect(st.columnText(4).len > 0); // occurred_at stamped
 }
 
+test "batch capture is atomic, bounded, and preserves an outer transaction" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try migrations.run(&d);
+    try insertBatch(&d, std.testing.io, &.{}, .{});
+    try std.testing.expect(!d.inTransaction());
+    const large = [_]EventInput{.{ .name = "large" }} ** (max_batch_events + 1);
+    try std.testing.expectError(error.BatchTooLarge, insertBatch(&d, std.testing.io, &large, .{}));
+    try std.testing.expectEqual(@as(i64, 0), try countEvents(&d));
+    try d.exec("CREATE TRIGGER reject_batch BEFORE INSERT ON _events WHEN NEW.name='reject' BEGIN SELECT RAISE(ABORT,'rejected'); END;");
+    const good = [_]EventInput{ .{ .name = "one", .payload_json = "{\"n\":1}" }, .{ .name = "two", .payload_json = "{\"n\":2}" } };
+    const bad = [_]EventInput{ .{ .name = "prefix" }, .{ .name = "reject" } };
+    try std.testing.expectError(error.Constraint, insertBatch(&d, std.testing.io, &bad, .{}));
+    try std.testing.expect(!d.inTransaction());
+    try std.testing.expectEqual(@as(i64, 0), try countEvents(&d));
+    try d.beginImmediate();
+    defer if (d.inTransaction()) d.rollback() catch |err| std.log.err("test rollback failed: {s}", .{@errorName(err)});
+    try insertEvent(&d, std.testing.io, .{ .name = "outer", .payload_json = "{}" });
+    try std.testing.expectError(error.Constraint, insertBatch(&d, std.testing.io, &bad, .{}));
+    try std.testing.expect(d.inTransaction());
+    try std.testing.expectEqual(@as(i64, 1), try countEvents(&d));
+    try insertBatch(&d, std.testing.io, &good, .{ .actor = "user1", .actor_collection = "users", .account = "tenant1" });
+    try std.testing.expectEqual(@as(i64, 3), try countEvents(&d));
+    try d.rollback();
+    try std.testing.expectEqual(@as(i64, 0), try countEvents(&d));
+    try insertBatch(&d, std.testing.io, &good, .{ .actor = "user1", .actor_collection = "users", .account = "tenant1" });
+    try std.testing.expectEqual(@as(i64, 2), try countEvents(&d));
+    var st = try d.prepare("SELECT count(*) FROM _events WHERE actor='user1' AND actor_collection='users' AND account='tenant1';");
+    defer st.finalize();
+    try std.testing.expect(try st.step());
+    try std.testing.expectEqual(@as(i64, 2), st.columnInt(0));
+}
+
+test "pg batch capture reuses bindings and rolls back failed nested prefixes" {
+    if (!@import("build_options").postgres) return error.SkipZigTest;
+    const url = std.testing.environ.getPosix("ZIGBASE_PG_TEST_URL") orelse return error.SkipZigTest;
+    var d = try db.Db.openPostgres(std.testing.allocator, std.testing.io, url);
+    defer d.close();
+    try d.exec("DROP SCHEMA IF EXISTS zb_analytics_batch CASCADE;");
+    try d.exec("CREATE SCHEMA zb_analytics_batch;");
+    defer d.exec("DROP SCHEMA zb_analytics_batch CASCADE;") catch |err| std.log.err("test cleanup failed: {s}", .{@errorName(err)});
+    try d.exec("SET search_path TO zb_analytics_batch;");
+    try migrations.run(&d);
+    try d.exec("ALTER TABLE _events ADD CONSTRAINT reject_batch CHECK (name <> 'reject');");
+    const good = [_]EventInput{ .{ .name = "first", .payload_json = "{\"n\":1}" }, .{ .name = "second", .payload_json = "{\"n\":2}" } };
+    const bad = [_]EventInput{ .{ .name = "prefix" }, .{ .name = "reject" } };
+    try insertBatch(&d, std.testing.io, &good, .{ .actor = "user1" });
+    try std.testing.expectEqual(@as(i64, 2), try countEvents(&d));
+    try std.testing.expectError(error.Constraint, insertBatch(&d, std.testing.io, &bad, .{}));
+    try std.testing.expectEqual(@as(i64, 2), try countEvents(&d));
+    try d.beginImmediate();
+    defer if (d.inTransaction()) d.rollback() catch |err| std.log.err("test rollback failed: {s}", .{@errorName(err)});
+    try insertEvent(&d, std.testing.io, .{ .name = "outer", .payload_json = "{}" });
+    try std.testing.expectError(error.Constraint, insertBatch(&d, std.testing.io, &bad, .{}));
+    try std.testing.expect(d.inTransaction());
+    try std.testing.expectEqual(@as(i64, 3), try countEvents(&d));
+    try d.rollback();
+    try std.testing.expectEqual(@as(i64, 2), try countEvents(&d));
+}
+
 test "summaryTable gates the rollup name through isValidIdentifier" {
     // summaryTable is contract-1: only the returned name escapes, on the caller allocator.
     const a = std.testing.allocator;
@@ -387,6 +511,28 @@ test "runRollup aggregates incrementally and is idempotent" {
     defer v.finalize();
     _ = try v.step();
     try std.testing.expectEqual(@as(i64, 2), v.columnInt(0));
+}
+
+test "runRollup accepts a long valid rollup name on SQLite" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try migrations.run(&d);
+    try insertEvent(&d, std.testing.io, .{ .name = "long-name-event", .payload_json = "{}" });
+    const name = "r" ** 5000;
+    try runRollup(&d, std.testing.allocator, .{
+        .name = name,
+        .event = "long-name-event",
+        .every = .{ .interval = .hourly },
+        .group_account = false,
+        .group_actor = false,
+        .time_bucket = .none,
+        .metric = .count,
+    });
+    const key = try watermarkKey(std.testing.allocator, name);
+    defer std.testing.allocator.free(key);
+    const mark = (try kvGet(&d, std.testing.allocator, key)).?;
+    defer std.testing.allocator.free(mark);
+    try std.testing.expectEqualStrings("1", mark);
 }
 
 test "runRollup does not drop an event sharing the prior pass's wall-clock second (rowid watermark)" {

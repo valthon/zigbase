@@ -3482,6 +3482,13 @@ tenant scope, `""` when tenancy is off), and the `occurred_at` timestamp are all
 stored as opaque JSON text (a `[]const u8` is taken as raw JSON). It is a single cheap INSERT; inside
 a hook / `ctx.tx` it reuses the in-transaction connection.
 
+For multiple events, `ctx.trackBatch(&.{ .{ .name = "event.one", .payload_json = "{}" },
+.{ .name = "event.two" } })` persists up to 1024 events atomically with one writer
+acquisition and prepared statement. It stamps the same server-side context as
+`track`. A failed batch rolls back its own inserts; a successful batch inside a
+hook/`ctx.tx` is still rolled back if that outer transaction fails. No background
+buffer or shutdown flush is introduced. See [analytics.md](analytics.md#capture-an-atomic-batch).
+
 **2. Rollups — declarative, scheduled aggregation.** Declare named rollups; each registers one job on
 the existing scheduler that aggregates `_events` into a `_rollup_<name>` summary table:
 

@@ -72,7 +72,8 @@ configures in code:
    managed for you); raw SQL on the migration-owned `plugin_audit_log` table uses
    the pooled writer via `ctx.app.pool` (`acquireWriter` / `releaseWriter`), since
    it is not a comptime collection. Counts published posts, then INSERTs an audit
-   row into `plugin_audit_log`.
+   row into `plugin_audit_log`. It also captures two analytics events together with
+   `ctx.trackBatch`, demonstrating atomic multi-event capture without a background buffer.
 
 7. **Pool levers** via `.pools` (`.readers` / `.jobs` / `.cache_kib`) to tune
    the warm-reader pool, scheduler worker count, and per-connection SQLite
