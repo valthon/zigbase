@@ -624,6 +624,25 @@ pub const Ctx = struct {
         return analytics.insertEvent(w, self.app.io, ev);
     }
 
+    /// Capture up to 1024 events atomically, with one writer acquisition and one
+    /// prepared statement. Payloads are explicit JSON text; actor/tenant values
+    /// are stamped here. No background buffering or shutdown flush is involved.
+    /// Inside a bound transaction, success remains subject to its final commit.
+    pub fn trackBatch(self: *Ctx, batch: []const analytics.EventInput) !void {
+        if (batch.len > analytics.max_batch_events) return error.BatchTooLarge;
+        if (batch.len == 0) return;
+        const u = self.user();
+        const context = analytics.EventScope{
+            .actor = if (u) |uu| uu.id else "",
+            .actor_collection = if (u) |uu| uu.collection else "",
+            .account = self.rctx.account_id,
+        };
+        if (self.bound_conn) |c| return analytics.insertBatch(c, self.app.io, batch, context);
+        const w = self.app.pool.acquireWriter();
+        defer self.app.pool.releaseWriter();
+        return analytics.insertBatch(w, self.app.io, batch, context);
+    }
+
     fn serializePayload(self: *Ctx, payload: anytype) ![]const u8 {
         const T = @TypeOf(payload);
         // Already-serialized JSON text passes through unchanged.
@@ -1507,6 +1526,34 @@ pub const Tx = struct {
 // Test harness (file-backed pool, posts collection) — matches TestEnv pattern
 // from events.zig.
 // ---------------------------------------------------------------------------
+
+test "trackBatch stamps identity and participates in bound transactions" {
+    const env = try CtxTestEnv.init();
+    defer env.deinit();
+    var principal: std.json.ObjectMap = .empty;
+    defer principal.deinit(std.testing.allocator);
+    try principal.put(std.testing.allocator, "id", .{ .string = "user1" });
+    // This API requires no request allocations even for a batch.
+    var ctx = Ctx{
+        .app = &env.app,
+        .arena = RequestArena.forTest(std.testing.failing_allocator),
+        .rctx = .{ .auth = .{ .object = principal }, .collection = "users", .account_id = "tenant1" },
+    };
+    const batch = [_]analytics.EventInput{ .{ .name = "first", .payload_json = "{\"account\":\"forged\"}" }, .{ .name = "second" } };
+    try ctx.trackBatch(&batch);
+    const w = env.pool.acquireWriter();
+    defer env.pool.releaseWriter();
+    try w.beginImmediate();
+    defer if (w.inTransaction()) w.rollback() catch |err| std.log.err("test rollback failed: {s}", .{@errorName(err)});
+    ctx.bound_conn = w;
+    try ctx.trackBatch(&batch); // does not reacquire writer or commit outer work
+    try std.testing.expect(w.inTransaction());
+    try w.rollback();
+    var st = try w.prepare("SELECT count(*) FROM _events WHERE actor='user1' AND actor_collection='users' AND account='tenant1';");
+    defer st.finalize();
+    try std.testing.expect(try st.step());
+    try std.testing.expectEqual(@as(i64, 2), st.columnInt(0));
+}
 
 const CtxTestEnv = struct {
     tmp: std.testing.TmpDir,

@@ -8,11 +8,13 @@ const Ctx = @import("ctx.zig").Ctx;
 
 /// A registered job after comptime assembly. `run` is a uniform wrapper returning
 /// `?schedule.Reactive`: `null` for cron/interval jobs (next fire computed from `schedule`),
-/// or the handler's returned `Reactive` for reactive jobs.
+/// or the handler's returned `Reactive` for reactive jobs. Distributed wrappers
+/// return a reactive result; the dispatcher bounds their polling to 15 seconds.
 pub const RuntimeJob = struct {
     name: []const u8,
     schedule: schedule.Schedule,
     run: *const fn (ctx: *Ctx, ev: *events.JobEvent) anyerror!?schedule.Reactive,
+    distributed: bool = false,
 };
 
 /// `@compileError` on a malformed job spec, mirroring `events.validateRouteSpecs`: a missing
@@ -30,17 +32,31 @@ fn validateJobSpecs(comptime specs: anytype) void {
         // isn't silently dropped, mirroring the unknown-key gates on collections/fields/routes.
         inline for (std.meta.fields(@TypeOf(s))) |sf| {
             comptime var ok = false;
-            inline for ([_][]const u8{ "name", "schedule", "handler" }) |a| {
+            inline for ([_][]const u8{ "name", "schedule", "handler", "distributed" }) |a| {
                 if (comptime std.mem.eql(u8, sf.name, a)) ok = true;
             }
             if (!ok) @compileError("job spec '" ++ s.name ++ "': unknown key '." ++ sf.name ++
-                "' (recognized keys: .name, .schedule, .handler)");
+                "' (recognized keys: .name, .schedule, .handler, .distributed)");
         }
         // Validate a comptime-known cron grammar so a malformed expression (wrong field
         // count, a full day name, a trailing space) fails at build time instead of silently
         // firing at every boot and never on schedule (see schedule.validateCron).
         const sched: schedule.Schedule = s.schedule;
         if (sched == .cron) schedule.validateCron(sched.cron, "job spec '" ++ s.name ++ "'");
+        if (sched == .interval and sched.interval == .minutes and sched.interval.minutes == 0) @compileError("scheduled minute intervals must be positive");
+        if (@hasField(@TypeOf(s), "distributed")) {
+            if (sched == .reactive) @compileError("distributed jobs require a cron or interval schedule");
+            if (s.name.len == 0 or s.name.len > 200 or s.name[0] == '_') @compileError("distributed job names must contain 1..200 bytes and not start with '_'");
+            _ = @import("scheduler_coordination.zig").lowerConfig(s.distributed);
+            if (sched == .interval and (sched.interval == .minutes and (sched.interval.minutes == 0 or sched.interval.minutes > 525600))) @compileError("distributed minute intervals must be between 1 and 525600");
+        }
+    }
+    inline for (std.meta.fields(@TypeOf(specs)), 0..) |f, i| {
+        inline for (std.meta.fields(@TypeOf(specs))[0..i]) |prior| {
+            const current = @field(specs, f.name);
+            const previous = @field(specs, prior.name);
+            if ((@hasField(@TypeOf(current), "distributed") or @hasField(@TypeOf(previous), "distributed")) and std.mem.eql(u8, current.name, previous.name)) @compileError("distributed job names must be unique");
+        }
     }
 }
 
@@ -63,7 +79,11 @@ pub fn buildJobs(comptime specs: anytype) []const RuntimeJob {
                 const handler = s.handler;
                 const Wrap = struct {
                     fn run(ctx: *Ctx, ev: *events.JobEvent) anyerror!?schedule.Reactive {
-                        if (reactive) {
+                        if (@hasField(@TypeOf(s), "distributed")) {
+                            const status = try @import("scheduler_coordination.zig").run(ctx, ev, sched, comptime @import("scheduler_coordination.zig").lowerConfig(s.distributed), handler);
+                            if (status == .stopped) return .stop;
+                            return .{ .after = .{ .minutes = 0 } };
+                        } else if (reactive) {
                             return try handler(ctx, ev);
                         } else {
                             try handler(ctx, ev);
@@ -71,7 +91,7 @@ pub fn buildJobs(comptime specs: anytype) []const RuntimeJob {
                         }
                     }
                 };
-                t[i] = .{ .name = s.name, .schedule = sched, .run = Wrap.run };
+                t[i] = .{ .name = s.name, .schedule = sched, .run = Wrap.run, .distributed = @hasField(@TypeOf(s), "distributed") };
             }
             break :blk t;
         };
@@ -134,8 +154,9 @@ test "tick leaves due jobs beyond the output capacity idle for the next tick" {
     try std.testing.expectEqualSlices(usize, &.{2}, tick(&state, 10, &out));
 }
 
-/// Apply a job's completion to its state. `reactive_result` is non-null ONLY for reactive
-/// jobs (the handler's return). For cron/interval, next_fire is recomputed from `sched`;
+/// Apply a job's completion to its local state. `reactive_result` is non-null for
+/// reactive jobs or distributed wrappers polling a database-owned schedule.
+/// For ordinary cron/interval jobs, next_fire is recomputed from `sched`;
 /// if there is no future fire (e.g. an impossible cron), the job is retired (`.stopped`).
 pub fn completeJob(s: *JobState, sched: schedule.Schedule, reactive_result: ?schedule.Reactive, now: i64) void {
     s.failures = 0; // a successful completion resets the backoff counter
@@ -157,6 +178,26 @@ pub fn completeJob(s: *JobState, sched: schedule.Schedule, reactive_result: ?sch
         return;
     };
     s.status = .idle;
+}
+
+fn completeRuntimeJob(s: *JobState, job: RuntimeJob, result: ?schedule.Reactive, now: i64) void {
+    completeJob(s, job.schedule, result, now);
+    // No public seconds-granularity schedule is needed for this internal poll.
+    if (job.distributed and s.status == .idle) s.next_fire = @max(s.next_fire, now + 15);
+}
+
+test "distributed idle polling is bounded and stopped jobs retire locally" {
+    const H = struct {
+        fn handler(_: *Ctx, _: *events.JobEvent) anyerror!void {}
+    };
+    const jobs = buildJobs(.{.{ .name = "poll", .schedule = schedule.Schedule{ .interval = .hourly }, .distributed = .{}, .handler = H.handler }});
+    var state = JobState{ .status = .running, .next_fire = 0 };
+    completeRuntimeJob(&state, jobs[0], .{ .after = .{ .minutes = 0 } }, 100);
+    try std.testing.expectEqual(@as(i64, 115), state.next_fire);
+    var out: [1]usize = undefined;
+    try std.testing.expectEqual(@as(usize, 0), tick((&state)[0..1], 114, &out).len);
+    completeRuntimeJob(&state, jobs[0], .stop, 115);
+    try std.testing.expect(state.status == .stopped);
 }
 
 /// Exponential backoff delay (seconds) for the Nth consecutive failure: 1, 2, 4, 8, ...
@@ -244,6 +285,10 @@ pub const Scheduler = struct {
         errdefer allocator.free(state);
         const now = unixNow(app.io);
         for (state, 0..) |*s, i| {
+            if (jobs[i].distributed) {
+                s.* = .{ .status = .idle, .next_fire = now };
+                continue;
+            }
             const sched = jobs[i].schedule;
             if (schedule.nextFire(sched, now)) |nf| {
                 s.* = .{ .status = .idle, .next_fire = nf };
@@ -354,7 +399,7 @@ pub const Scheduler = struct {
                 // SUCCESS: resume the normal schedule (resets the backoff counter).
                 const now = unixNow(self.app.io);
                 self.lock();
-                completeJob(&self.state[idx], job.schedule, result, now);
+                completeRuntimeJob(&self.state[idx], job, result, now);
                 const retired_no_fire = result == null and self.state[idx].status == .stopped;
                 self.unlock();
                 // A cron/interval job (result == null) that completeJob retired has no further

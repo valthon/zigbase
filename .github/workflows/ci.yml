@@ -85,6 +85,8 @@ jobs:
           mise exec zig@0.16.0 -- zig build feature-disabled-fixture -Dcpu=baseline
       - name: Consumer route compile-fail contracts
         run: mise exec zig@0.16.0 -- zig build check-route-contracts -Dcpu=baseline
+      - name: Scheduler compile-fail contracts
+        run: mise exec zig@0.16.0 -- zig build check-scheduler-contracts -Dcpu=baseline
       - name: Build import-fixture (offline-import e2e fixture, #283)
         run: mise exec zig@0.16.0 -- zig build import-fixture -Dcpu=baseline
       - name: Build lean gating fixture
@@ -412,12 +414,19 @@ jobs:
           docker run --rm --network host --entrypoint sh minio/mc:latest -c \
             "mc alias set local http://127.0.0.1:9000 minioadmin minioadmin && mc mb local/zbtest"
       - name: Unit + live S3 tests (-Ds3=true)
-        run: mise exec zig@0.16.0 -- zig build test --summary all -Ds3=true
+        run: mise exec zig@0.16.0 -- zig build test --summary all -Ds3=true -Dfile-inventory=true
       - name: Build zigbase (-Ds3=true) for the raw-HTTP e2e
-        run: mise exec zig@0.16.0 -- zig build -Ds3=true -Dcpu=baseline
+        run: mise exec zig@0.16.0 -- zig build -Ds3=true -Dfile-inventory=true -Dcpu=baseline
+      - name: Inventory build-flag gating (absent and positive controls)
+        run: |
+          mise exec zig@0.16.0 -- zig build -Dfile-inventory=false -Dcpu=baseline -p zig-out-inventory-off
+          bash scripts/check-gating.sh --inventory zig-out-inventory-off/bin/zigbase zig-out/bin/zigbase
+      - name: Install Python S3 and inventory test dependencies
+        run: mise exec python@3.13 -- python -m pip install --quiet pytest
+      - name: Read-only inventory CLI (local and S3 fixture)
+        run: ZIGBASE_TEST_INVENTORY_BINARY="$PWD/zig-out/bin/zigbase" mise exec python@3.13 -- python -m pytest tests/cli/test_file_inventory.py -q
       - name: S3 end-to-end (upload -> Range/304/416 -> delete)
         run: |
-          mise exec python@3.13 -- python -m pip install --quiet pytest
           ZIGBASE_TEST_BINARY="$PWD/zig-out/bin/zigbase" \
             mise exec python@3.13 -- python -m pytest tests/s3 -q
       - name: Stop MinIO

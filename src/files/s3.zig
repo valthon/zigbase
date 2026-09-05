@@ -318,7 +318,7 @@ pub const Client = struct {
         defer page.deinit();
         while (true) {
             _ = page.reset(.retain_capacity);
-            const xml = try self.listPage(io, page.allocator(), prefix, continuation);
+            const xml = try self.listPage(io, page.allocator(), prefix, continuation, null);
             const page_keys = try scanKeys(page.allocator(), xml);
             for (page_keys) |key| {
                 // Never let an unexpected listing response widen record cleanup.
@@ -340,7 +340,7 @@ pub const Client = struct {
     }
 
     /// Response body borrows the supplied page arena (HttpClient's response contract).
-    fn listPage(self: Client, io: std.Io, alloc: std.mem.Allocator, prefix: []const u8, continuation: ?[]const u8) ![]const u8 {
+    fn listPage(self: Client, io: std.Io, alloc: std.mem.Allocator, prefix: []const u8, continuation: ?[]const u8, limit: ?u16) ![]const u8 {
         const path = try bucketPath(alloc, self);
         defer alloc.free(path);
         const host = try effectiveHost(alloc, self);
@@ -350,10 +350,12 @@ pub const Client = struct {
         defer alloc.free(encoded_prefix);
         const encoded_token = if (continuation) |token| try uriEncodeQueryValue(alloc, token) else "";
         defer if (continuation != null) alloc.free(encoded_token);
+        const max_keys = if (limit) |n| try std.fmt.allocPrint(alloc, "&max-keys={d}", .{n}) else "";
+        defer if (limit != null) alloc.free(max_keys);
         const query = if (continuation != null)
-            try std.fmt.allocPrint(alloc, "continuation-token={s}&list-type=2&prefix={s}", .{ encoded_token, encoded_prefix })
+            try std.fmt.allocPrint(alloc, "continuation-token={s}&list-type=2{s}&prefix={s}", .{ encoded_token, max_keys, encoded_prefix })
         else
-            try std.fmt.allocPrint(alloc, "list-type=2&prefix={s}", .{encoded_prefix});
+            try std.fmt.allocPrint(alloc, "list-type=2{s}&prefix={s}", .{ max_keys, encoded_prefix });
         defer alloc.free(query);
 
         const url = try buildUrl(alloc, self, host, path, query);
@@ -441,6 +443,40 @@ fn uriEncodeQueryValue(alloc: std.mem.Allocator, value: []const u8) ![]const u8 
         }
     }
     return out.toOwnedSlice(alloc);
+}
+
+/// One bounded ListObjectsV2 page; keys are relative to the configured prefix.
+/// Owned result; malformed/oversized pages fail instead of reporting partial usage.
+fn inventoryFromXml(alloc: std.mem.Allocator, xml: []const u8, prefix: []const u8, cursor: ?[]const u8, limit: u16) !files_storage.Storage.InventoryPage {
+    var items: std.ArrayList(files_storage.Storage.InventoryItem) = .empty;
+    errdefer {
+        for (items.items) |item| alloc.free(item.key);
+        items.deinit(alloc);
+    }
+    var rest = xml;
+    while (std.mem.indexOf(u8, rest, "<Contents>")) |start| {
+        rest = rest[start + "<Contents>".len ..];
+        const end = std.mem.indexOf(u8, rest, "</Contents>") orelse return error.S3InvalidListResponse;
+        if (items.items.len >= limit) return error.S3InvalidListResponse;
+        const raw_key = (try xmlText(rest[0..end], "Key")) orelse return error.S3InvalidListResponse;
+        const full_key = try decodeXmlText(alloc, raw_key);
+        defer alloc.free(full_key);
+        if (!std.mem.startsWith(u8, full_key, prefix)) return error.S3InvalidListResponse;
+        const raw_size = (try xmlText(rest[0..end], "Size")) orelse return error.S3InvalidListResponse;
+        const size = std.fmt.parseInt(u64, raw_size, 10) catch return error.S3InvalidListResponse;
+        const key = try alloc.dupe(u8, full_key[prefix.len..]);
+        errdefer alloc.free(key);
+        try items.append(alloc, .{ .key = key, .bytes = size });
+        rest = rest[end + "</Contents>".len ..];
+    }
+    const truncated = (try xmlText(xml, "IsTruncated")) orelse return error.S3InvalidListResponse;
+    var next: ?[]const u8 = null;
+    errdefer if (next) |value| alloc.free(value);
+    if (std.mem.eql(u8, truncated, "true")) {
+        next = try decodeXmlText(alloc, (try xmlText(xml, "NextContinuationToken")) orelse return error.S3InvalidListResponse);
+        if (next.?.len == 0 or next.?.len > 4096 or (cursor != null and std.mem.eql(u8, cursor.?, next.?))) return error.S3InvalidListResponse;
+    } else if (!std.mem.eql(u8, truncated, "false")) return error.S3InvalidListResponse;
+    return .{ .items = try items.toOwnedSlice(alloc), .nextCursor = next };
 }
 
 /// Extract an S3 scalar element without accepting nested markup or a truncated tag.
@@ -604,12 +640,21 @@ pub const S3Storage = struct {
     }
 
     const vtable = files_storage.Storage.VTable{
+        .inventory = if (@import("build_options").file_inventory) inventoryImpl else null,
         .put = putImpl,
         .fetch = fetchImpl,
         .delete = deleteImpl,
         .deleteRecord = deleteRecordImpl,
         .presignGetUrl = presignGetUrlImpl,
     };
+
+    fn inventoryImpl(ctx: *anyopaque, io: std.Io, alloc: std.mem.Allocator, cursor: ?[]const u8, limit: u16) !files_storage.Storage.InventoryPage {
+        const self: *S3Storage = @ptrCast(@alignCast(ctx));
+        var scratch = std.heap.ArenaAllocator.init(alloc);
+        defer scratch.deinit();
+        const xml = try self.client.listPage(io, scratch.allocator(), self.client.key_prefix, cursor, limit);
+        return inventoryFromXml(alloc, xml, self.client.key_prefix, cursor, limit);
+    }
 
     /// Presign a time-limited GET URL for the object so api/files.serve can 302-redirect instead of
     /// spooling+streaming the bytes. Reuses the SigV4 query-string signer over the same object key
@@ -1053,6 +1098,26 @@ test "head: returns the raw status for 200/404/403 without erroring" {
         try testing.expectEqual(status, got);
         testcapture.http.reset();
     }
+}
+
+test "inventory uses one bounded S3 page and keeps usage within configured prefix" {
+    if (!testcapture.enabled or !@import("build_options").file_inventory) return error.SkipZigTest;
+    testcapture.http.enable(true);
+    defer testcapture.http.reset();
+    testcapture.http.mock("list-type=2", .{ .status = 200, .body = "<ListBucketResult><IsTruncated>true</IsTruncated><Contents><Key>tenant/posts/r1/a&amp;b</Key><Size>42</Size></Contents><NextContinuationToken>next+/=</NextContinuationToken></ListBucketResult>" });
+    const a = testing.allocator;
+    var client = testClient();
+    client.key_prefix = "tenant/";
+    var instance = S3Storage{ .gpa = a, .client = client, .cache_dir = "", .cache_max_bytes = 0, .host_buf = &.{} };
+    const result = try instance.storage().inventory(std.testing.io, a, "previous", 1);
+    defer result.deinit(a);
+    try testing.expectEqualStrings("posts/r1/a&b", result.items[0].key);
+    try testing.expectEqual(@as(u64, 42), result.items[0].bytes);
+    try testing.expectEqualStrings("next+/=", result.nextCursor.?);
+    try testing.expectEqual(@as(usize, 1), testcapture.http.requestCount());
+    try testing.expect(std.mem.indexOf(u8, testcapture.http.requestAt(0).?.url, "continuation-token=previous&list-type=2&max-keys=1&prefix=tenant%2F") != null);
+    try testing.expectError(error.S3InvalidListResponse, inventoryFromXml(a, "<ListBucketResult><IsTruncated>false</IsTruncated><Contents><Key>outside/r1/a</Key><Size>1</Size></Contents></ListBucketResult>", "tenant/", null, 1));
+    try testing.expectError(error.S3InvalidListResponse, inventoryFromXml(a, "<ListBucketResult><IsTruncated>true</IsTruncated><NextContinuationToken>repeat</NextContinuationToken></ListBucketResult>", "tenant/", "repeat", 1));
 }
 
 test "listKeys follows encoded continuation tokens and decodes XML keys" {

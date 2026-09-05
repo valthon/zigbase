@@ -2990,10 +2990,70 @@ raw SQL on a migration-owned table acquire the pooled writer via
 
 ### Caveats
 
+#### Shared cron/interval jobs across replicas
+
+Opt a job into database-backed coordination at **compile time**:
+
+```zig
+.cron = .{
+    .{
+        .name = "billing-sweep-v1", // durable identity shared by every replica
+        .schedule = zigbase.schedule.Schedule{ .interval = .{ .minutes = 5 } },
+        .distributed = .{ .lease_seconds = 120 },
+        .handler = billingSweep,
+    },
+},
+```
+
+Only opted-in wrappers reference the coordination runtime. Jobs without
+`.distributed` retain their per-process behavior, and reactive jobs cannot opt in.
+The typed configuration is `zigbase.DistributedJobConfig`.
+
+All replicas sharing a database and job name observe one persisted cadence. A
+short transaction claims due work with an owner token, generation and expiry;
+handlers run **outside** that transaction. PostgreSQL uses row locks and its server
+clock after lock acquisition, while SQLite uses its immediate writer transaction.
+SQLite coordination applies to processes sharing the same local database file,
+not independent database copies or unsupported network filesystems.
+
+A new schedule first fires at its next scheduled time, never immediately on boot.
+Restarts retain that time. Missed cron occurrences coalesce into one pending run;
+after success the next cron time is calculated from completion. Intervals likewise
+advance from completion. Errors persist capped exponential retry backoff. The
+`JobEvent.scheduled_at` value remains stable across retries and crash recovery;
+combine it with `JobEvent.name` for an application idempotency key. `generation`
+identifies the current claim attempt; both fields are null for ordinary jobs.
+
+Expired leases can be recovered by another replica. An expired owner can still
+complete if no replacement has claimed that occurrence. Completion from a
+replaced owner cannot advance the schedule, reset failures, or clear the newer
+lease. This fences **dispatcher state**, not arbitrary application writes or
+external effects: a crashed/paused handler may execute more than once, and an
+overrun can overlap its replacement. Make handlers idempotent and set
+`lease_seconds` above worst-case handler duration. There is no automatic lease
+heartbeat or cancellation of application code.
+
+Distributed job names must be unique, nonempty, at most 200 bytes, and not start with `_`.
+Idle replicas probe readiness using readers every 15 seconds, acquiring the writer
+only when registration or claiming may be needed. Due jobs and expired leases
+can therefore wait up to roughly 15 seconds plus worker availability. Stopped
+schedules retire locally rather than polling forever. Claimed work still rechecks
+readiness under the database row lock.
+
+Replicas must deploy identical schedule definitions for a name; a
+mismatch fails closed with `DistributedScheduleMismatch`. To change a definition,
+drain old replicas and explicitly remove that job's `_scheduler_jobs` row in an
+application migration before restarting, or use a new versioned name after
+retiring the old job. Removing a declaration does not delete its saved state.
+Lease duration may differ between replicas and can be tuned during a rolling
+deployment; each claim stores its own expiry. All declared minute intervals
+(including per-process jobs) must be positive; reactive handlers can still request
+an immediate next tick explicitly.
+
 The scheduler is intentionally simple (see
 [../KNOWN_LIMITATIONS.md](../KNOWN_LIMITATIONS.md)):
 
-- **Single-process** — no distributed coordination.
+- **Per-process by default** — use `.distributed` for coordinated cron/interval jobs.
 - **UTC** — all cron/interval evaluation is in UTC.
 - **Cron** — UTC, minute-granularity; supports the full standard grammar: `*`, `a`,
   `a,b,c`, `a-b`, `*/n`, `a-b/n` (a step over a range, e.g. `0-23/2` for every other
@@ -3498,6 +3558,13 @@ tenant scope, `""` when tenancy is off), and the `occurred_at` timestamp are all
 **server-side** — a client cannot forge any of them. `payload` is any JSON-serializable value,
 stored as opaque JSON text (a `[]const u8` is taken as raw JSON). It is a single cheap INSERT; inside
 a hook / `ctx.tx` it reuses the in-transaction connection.
+
+For multiple events, `ctx.trackBatch(&.{ .{ .name = "event.one", .payload_json = "{}" },
+.{ .name = "event.two" } })` persists up to 1024 events atomically with one writer
+acquisition and prepared statement. It stamps the same server-side context as
+`track`. A failed batch rolls back its own inserts; a successful batch inside a
+hook/`ctx.tx` is still rolled back if that outer transaction fails. No background
+buffer or shutdown flush is introduced. See [analytics.md](analytics.md#capture-an-atomic-batch).
 
 **2. Rollups — declarative, scheduled aggregation.** Declare named rollups; each registers one job on
 the existing scheduler that aggregates `_events` into a `_rollup_<name>` summary table:
@@ -4194,8 +4261,8 @@ zigbase.App(.{ .mailer = AuditMailer }).runCli(init);
 
 A custom storage plugin follows the same shape, returning a `zigbase.Storage`
 view from `interface()`. The `zigbase.Storage` vtable has **four** required
-methods — `put` / `fetch` / `delete` / `deleteRecord` — plus one **optional**
-`presignGetUrl` (defaults to `null`, so existing four-method backends stay
+methods — `put` / `fetch` / `delete` / `deleteRecord` — plus **optional**
+`presignGetUrl` and `inventory` (both default to `null`, so existing four-method backends stay
 valid) — so a custom backend wraps or replaces them. `fetch(ctx, io, alloc,
 col, record_id, filename)` returns a local filesystem path whose contents ARE
 the file, materializing it locally first if necessary (a remote backend spools
@@ -4217,7 +4284,57 @@ to the existing row before transfer and to the updated row before commit.
 Reload the record and retry a conflict. A crash between PUT and
 commit can still leave unreferenced bytes; this is not a distributed transaction.
 
-**Presigned-redirect serving (S3).** By default every download is *proxied*: the
+### Read-only inventory (opt-in CLI)
+
+Build with `-Dfile-inventory=true` to include
+`zigbase files inventory [--limit 1..1000] [--cursor KEY] [--data-dir PATH]`.
+Add `-Ds3=true` for S3 storage and `-Dpostgres=true` when the database uses PostgreSQL.
+This is a binary-cost decision, not an HTTP policy: there is no inventory endpoint,
+and the tool requires the operator's existing database/filesystem/S3 credentials.
+There is deliberately no duplicate `App(.{})` runtime switch. A consumer dependency
+can select it with `b.dependency("zigbase", .{ .target = target, .optimize = optimize,
+.@"file-inventory" = true })`. The default build retains neither built-in inventory
+callbacks nor the CLI implementation. Existing custom storage vtables remain valid;
+without the optional capability the command reports `InventoryUnsupported`.
+
+The command prints one JSON page with `items` (`key`, `bytes`, `reference`),
+`nextCursor`, `hasNext`, and `usage` (`scope: "page"`, object/byte counts and
+candidate/unknown counts). Pass `nextCursor` unchanged to the next invocation,
+using the same backend, database, and key prefix. `usage` is **not a global total**;
+sum pages only when a best-effort live observation is sufficient. Object keys are
+relative to the configured local root or S3 key prefix; S3 credentials, signed
+URLs, file contents, and other record fields are never included in the report.
+
+`reference` is `referenced`, `candidate_unreferenced`, or `unknown` (unexpected
+layout or metadata lookup failure). References include hidden file fields and
+expired TTL rows that still physically exist; normal record visibility does not
+determine blob ownership. Candidates include uploads between PUT and
+COMMIT, failed cleanup, and concurrent record/schema changes. No candidate is
+proven safe to delete. The command has **no deletion mode**, runs no migrations or
+provisioning, and opens SQLite read-only or PostgreSQL with read-only transactions.
+Builtin storage initialization performs no writes; custom plugin initialization
+and its `inventory` callback must honor the same read-only contract.
+
+Keys and cursors must be UTF-8; otherwise the command fails without a partial
+JSON page and directs operators to byte-safe backend-native tooling. This keeps
+their JSON types stable rather than emitting integer arrays for invalid bytes.
+Local inventory scans regular files in the three-level record-file layout and
+shallower paths. The operator-configured storage root may be a symlink (for an
+external volume); descendant symlinks are never followed. Unknown filesystem
+entry types are resolved with no-follow metadata reads. Each invocation rescans
+up to 100,000
+directory entries, retaining at most `limit + 1` keys in memory; exceeding this
+bound fails with `InventoryScanLimit` instead of returning a misleading partial
+total. Deeper directories and nonregular files are outside this scope. S3 inventory
+requests one ListObjectsV2 page with `max-keys=limit`, needs bucket listing
+permission, and observes only the configured prefix. It lists current objects,
+not old object versions, delete markers, or unfinished multipart uploads.
+Neither backend offers snapshot isolation across pages; concurrent writes can
+change the observation. Inventory does not change record download authorization.
+
+### Presigned-redirect serving (S3)
+
+By default every download is *proxied*: the
 server calls `fetch` (spooling to a local cache for S3) and streams the bytes
 itself. With `App(.{ .files = .{ .s3_presign_redirect = true } })` and the S3
 backend active (`-Ds3` + `ZIGBASE_S3_*`), an authorized download is instead
@@ -4970,6 +5087,7 @@ code to comptime-dead when off, so a build that doesn't need a feature doesn't p
 | `-Dfts5` | **on** | SQLite full-text search (FTS5). `-Dfts5=false` drops `-DSQLITE_ENABLE_FTS5` from the SQLite build (~250-400 KB smaller) for lean binaries with no `.searchable` field; `?search=` then 400s and the server refuses to start over a `.searchable` SQLite schema. Postgres full-text search is unaffected. → [docs/search.md](./search.md#build-requirement--dfts5-default-on) |
 | `-Dvector` | off | Opt-in nearest-neighbor `?vector=` KNN search — sqlite-vec on SQLite, pgvector on Postgres. → [docs/search.md](./search.md#vector-search-opt-in) |
 | `-Dpostgres` | off | Opt-in pure-Zig PostgreSQL wire-protocol backend, alongside the default SQLite one. → [docs/postgres.md](./postgres.md) |
+| `-Dfile-inventory` | off | Read-only `files inventory` CLI plus optional local/S3 inventory callbacks. Bounded pages, page usage and reference candidates; no HTTP surface or deletion. S3 additionally needs `-Ds3=true`. |
 | `-Ddev-mode` | on in `Debug`, off in release | The dev-only, never-in-prod seams: `ZIGBASE_FAKE_NOW` / `ZIGBASE_FAKE_SEED` (§14 above), test-capture, and fake field-crypto; the release script forces it off for shipped binaries. |
 | `-Ddev-tools` | **on** | The `init`/`agents-md`/`typegen` CLI verbs (scaffolding + schema-to-client codegen — `src/scaffold*.zig` + `src/codegen/**`, ~24 files, none of it needed by a *deployed* server). **Every official artifact we publish builds at this default** — GitHub release tarballs, the Docker image, and the `@zigbase/server` npm packages all ship with the three verbs in. `-Ddev-tools=false` is an opt-out for a consumer compiling their **own** binary for their **own** deployment who wants to shed the ~490 KiB behind it; the stripped binary still recognizes the verb names but exits non-zero with a "rebuild with -Ddev-tools=true" message instead of running them. Distinct from `.enable_typegen` below — see §3b. |
 | `-Dstrip` | on except in `Debug` | Strip debug info from the binary (~7 MiB vs ~24 MiB unstripped in a release build). |
