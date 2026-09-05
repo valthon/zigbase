@@ -5,6 +5,7 @@ import {
   type Booking, type RealtimeEvent,
 } from '../lib/api';
 import Auth from './Auth';
+import { SecuritySettings } from './SecondFactor';
 
 // ---------------------------------------------------------------------------
 // ReviewForm — leave a rating + note for a CONFIRMED booking. The backend's
@@ -140,6 +141,7 @@ export default function MyBookings() {
       {bookings.length === 0 && (
         <p className="muted">No bookings yet — <a href="/">browse listings</a>.</p>
       )}
+      <SecuritySettings />
       {bookings.map((b) => (
         <BookingCard key={b.id} booking={b} onReload={reload} />
       ))}

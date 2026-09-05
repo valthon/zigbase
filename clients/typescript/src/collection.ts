@@ -16,6 +16,43 @@ export interface AuthResponse {
   token: string;
   record: AuthRecord;
   meta?: Record<string, unknown>;
+  managementToken?: string;
+  recoveryCodes?: string[];
+}
+
+export interface PendingAuthentication {
+  status: "factor_required" | "enrollment_required";
+  pendingToken: string;
+  expiresIn: number;
+  factors?: { totp: boolean; webauthn: boolean };
+  recoveryCodes?: boolean;
+}
+
+/** A successful primary login that still needs a second factor. Never saved as a session. */
+export class TwoFactorRequiredError extends Error {
+  constructor(public readonly pending: PendingAuthentication) {
+    super(pending.status === "enrollment_required" ? "Second-factor enrollment required." : "Second factor required.");
+    this.name = "TwoFactorRequiredError";
+  }
+}
+
+export type SecondFactorProof =
+  | { factor: "totp" | "recovery"; code: string }
+  | { factor: "webauthn"; ceremonyId: string; credentialId: string; authenticatorData: string; clientDataJSON: string; signature: string };
+
+export interface TotpEnrollment { ceremonyId: string; secret: string; algorithm: "SHA1"; digits: 6; period: 30 }
+export interface WebAuthnOptions {
+  ceremonyId: string;
+  challenge: string;
+  rpId?: string;
+  rp?: { id: string; name: string };
+  user?: { id: string; name: string; displayName: string };
+  pubKeyCredParams?: Array<{ type: "public-key"; alg: number }>;
+  allowCredentials?: Array<{ type: "public-key"; id: string }>;
+  userVerification?: "required" | "preferred";
+  authenticatorSelection?: { userVerification: "required" | "preferred" };
+  attestation?: "none";
+  timeout: number;
 }
 
 /** Response shape from POST /auth/oauth2/complete (record and meta are no longer included). */
@@ -77,7 +114,7 @@ export class CollectionService {
   }
 
   private async authRequest(path: string, body: unknown): Promise<AuthResponse> {
-    const res = await this.transport.send<AuthResponse>(`${this.base()}${path}`, {
+    const res = await this.transport.send<AuthResponse | PendingAuthentication>(`${this.base()}${path}`, {
       method: "POST",
       body,
       skipAuth: path === "/auth-with-password",
@@ -87,6 +124,10 @@ export class CollectionService {
       // deadlock / unbounded recursion otherwise).
       isRefreshCall: path === "/auth-refresh",
     });
+    if ("pendingToken" in res) {
+      this.authStore.clear();
+      throw new TwoFactorRequiredError(res);
+    }
     this.authStore.save(res.token, res.record);
     return res;
   }
@@ -100,14 +141,68 @@ export class CollectionService {
   }
 
   async authWithOAuth2(args: OAuth2Args): Promise<OAuth2AuthResponse> {
-    const res = await this.transport.send<OAuth2AuthResponse>(
+    const res = await this.transport.send<OAuth2AuthResponse | PendingAuthentication>(
       `${this.base()}/auth/oauth2/complete`,
       { method: "POST", body: args, skipAuth: true },
     );
     // The /auth/oauth2/complete endpoint sets zb_auth/zb_csrf cookies directly.
     // It does not return a record; store the token only.
+    if ("pendingToken" in res) {
+      this.authStore.clear();
+      throw new TwoFactorRequiredError(res);
+    }
     this.authStore.save(res.token, null);
     return res;
+  }
+
+  /** Start voluntary enrollment from a primary-authenticated session. */
+  enrollSecondFactor(): Promise<PendingAuthentication> {
+    return this.transport.send(`${this.base()}/auth/two-factor/enroll`, { method: "POST", body: {} });
+  }
+
+  beginTotpEnrollment(pendingToken: string): Promise<TotpEnrollment> {
+    return this.transport.send(`${this.base()}/auth/two-factor/enroll-begin`, {
+      method: "POST", skipAuth: true, body: { pendingToken, factor: "totp" },
+    });
+  }
+
+  completeTotpEnrollment(pendingToken: string, ceremonyId: string, code: string): Promise<AuthResponse> {
+    return this.completeSecondFactorRequest("enroll-complete", { pendingToken, ceremonyId, factor: "totp", code });
+  }
+
+  completeSecondFactor(pendingToken: string, proof: SecondFactorProof): Promise<AuthResponse> {
+    return this.completeSecondFactorRequest("complete", { pendingToken, ...proof });
+  }
+
+  beginWebAuthnSecondFactor(pendingToken: string, enrollment = false): Promise<WebAuthnOptions> {
+    return this.transport.send(`${this.base()}/auth/two-factor/${enrollment ? "enroll-begin" : "initiate"}`, {
+      method: "POST", skipAuth: true, body: { pendingToken, factor: "webauthn" },
+    });
+  }
+
+  completeWebAuthnEnrollment(pendingToken: string, ceremonyId: string, attestationObject: string, clientDataJSON: string): Promise<AuthResponse> {
+    return this.completeSecondFactorRequest("enroll-complete", { pendingToken, ceremonyId, factor: "webauthn", attestationObject, clientDataJSON });
+  }
+
+  private async completeSecondFactorRequest(action: string, body: unknown): Promise<AuthResponse> {
+    const res = await this.transport.send<AuthResponse>(`${this.base()}/auth/two-factor/${action}`, { method: "POST", skipAuth: true, body });
+    this.authStore.save(res.token, res.record);
+    return res;
+  }
+
+  async replaceRecoveryCodes(managementToken: string): Promise<string[]> {
+    const response = await this.transport.send<{ recoveryCodes: string[] }>(`${this.base()}/auth/two-factor/replace-recovery`, {
+      method: "POST", skipAuth: true, body: { pendingToken: managementToken },
+    });
+    this.authStore.clear();
+    return response.recoveryCodes;
+  }
+
+  async removeSecondFactor(managementToken: string, factor: "totp" | "webauthn", credentialId = "default"): Promise<void> {
+    await this.transport.send(`${this.base()}/auth/two-factor/remove`, {
+      method: "POST", skipAuth: true, body: { pendingToken: managementToken, factor, credentialId },
+    });
+    this.authStore.clear();
   }
 
   async logout(): Promise<void> {

@@ -164,6 +164,26 @@ pub fn update(ctx: *http.RequestCtx) anyerror!http.Response {
     const existing = collections.get(ctx.allocator.a, w, key) catch null;
     var def_mut = def;
     if (try prepareOAuthConfig(ctx, &def_mut, existing)) |resp| return resp;
+    // The built-in superuser table is not an application schema: permit auth
+    // options only, without rebuilding its table or relaxing reserved names.
+    if (existing) |old| {
+        if (std.mem.eql(u8, old.name, "_superusers")) {
+            if (def_mut.type != .auth or def_mut.fields.len != 0 or def_mut.indexes.len != 0 or
+                def_mut.listRule != null or def_mut.viewRule != null or def_mut.createRule != null or
+                def_mut.updateRule != null or def_mut.deleteRule != null)
+                return ApiError.badRequest("Superuser updates accept auth options only; omit fields, indexes, and access rules.").toResponse(ctx.allocator.a);
+            var updated = old;
+            updated.options.auth = def_mut.options.auth;
+            const options = try schema.optionsToJson(ctx.allocator.a, updated, false);
+            const dialect = db.dbDialect(w);
+            var st = try w.prepare(try dialect.renumberPlaceholders(ctx.allocator.a, "UPDATE \"_collections\" SET \"options\"=?1 WHERE \"name\"='_superusers';"));
+            defer st.finalize();
+            try st.bindText(1, options);
+            _ = try st.step();
+            if (app.col_cache) |cc| cc.invalidate();
+            return .{ .status = 200, .body = try schema.collectionToJson(ctx.allocator.a, updated) };
+        }
+    }
     const updated = collections.update(ctx.allocator.a, app.io, w, key, def_mut) catch |e| switch (e) {
         error.NotFound => return ApiError.notFound().toResponse(ctx.allocator.a),
         error.Validation => return validationResponse(ctx),

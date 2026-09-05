@@ -892,6 +892,86 @@ Per-method rate-limit behavior is configured in `.auth.methods` via the `rate_li
   identity/email, which is not header-spoofable. This makes direct exposure safe by default.
   See [Known limitations](../KNOWN_LIMITATIONS.md).
 
+### Two-factor authentication
+
+The standalone binary includes TOTP and WebAuthn second factors. Embedded apps
+select the subsystem and factors at compile time; see
+[framework configuration](framework.md#two-factor-authentication).
+Set collection `options.auth.two_factor` to `disabled` (default), `optional`
+(required after voluntary enrollment), or `required` (all users must enroll).
+An application policy hook can add requirements for users, roles, or groups.
+
+For the built-in admin collection, a current superuser can PATCH
+`/api/collections/_superusers` with `{ "name": "_superusers", "type": "auth",
+"options": { "auth": { "two_factor": "required" } } }`. This updates auth
+options only; omit fields, indexes, and access rules. Include any other auth
+options you want to preserve. The admin login supports TOTP enrollment,
+WebAuthn ceremonies, and recovery. Keep an administrative recovery procedure
+before enforcing a requirement on every superuser.
+
+A successful primary login can return HTTP 200 with
+`{status: "factor_required" | "enrollment_required", pendingToken, expiresIn,
+factors, recoveryCodes}` instead of `{token, record?}`. Pending responses set no
+session cookies. Keep the pending capability in memory, not an auth store or URL.
+Password, OAuth, magic-link, OTP, and custom method completion share this gate.
+Magic-link GET consumption returns the pending JSON instead of redirecting when
+another factor is required. Existing login clients must handle that response.
+
+All ceremony endpoints are POSTs below
+`/api/collections/:col/auth/two-factor/`. Their JSON bodies contain `pendingToken`
+unless noted. The server derives the principal from its attempt; never send a
+user ID as authentication authority.
+
+| Action | Additional request fields | Result |
+| --- | --- | --- |
+| `enroll` | No pending token; authenticated session required | Restricted first-enrollment attempt for an unenrolled user |
+| `enroll-begin` | `factor: "totp"` | `ceremonyId`, Base32 `secret`, SHA1, six digits, 30-second period |
+| `enroll-complete` | `factor: "totp"`, `ceremonyId`, `code` | Activates enrollment after verifying a code |
+| `initiate` / `enroll-begin` | `factor: "webauthn"` | WebAuthn request/creation options plus `ceremonyId` |
+| `complete` | `factor: "totp"`, `code` | Completes an enrolled user's login |
+| `complete` | `factor: "webauthn"`, `ceremonyId`, `credentialId`, `clientDataJSON`, `authenticatorData`, `signature` | Verifies a WebAuthn assertion |
+| `enroll-complete` | `factor: "webauthn"`, `ceremonyId`, `clientDataJSON`, `attestationObject` | Activates a WebAuthn second factor |
+| `complete` | `factor: "recovery"`, `code` | Consumes one recovery code |
+| `replace-recovery` | Use a fresh `managementToken` as `pendingToken` | Replaces recovery codes and requires reauthentication |
+| `remove` | Management capability, `factor`, optional `credentialId` (WebAuthn) | 204; refuses to remove the last required factor |
+
+Successful enrollment/completion returns `{status: "authenticated", token,
+record, managementToken, recoveryCodes?}` and ordinary session cookies. Save the
+ten recovery codes shown after initial enrollment; plaintext codes are returned
+once. A management capability can authorize new enrollment or TOTP replacement
+through the enrollment endpoints. It lasts five minutes and is single-use.
+Factor changes invalidate existing sessions and pending attempts. Recovering an
+account does not disable its factors; use the returned management capability
+to explicitly replace the lost factor.
+
+WebAuthn byte strings use unpadded Base64url. Decode challenge, user ID, and
+credential IDs to buffers before calling `navigator.credentials.create/get`;
+encode response buffers before posting them. RP/origin configuration uses
+`options.auth.methods.webauthn`. Second-factor credentials and ceremony purposes
+are separate from primary passkeys. After a WebAuthn primary login, choose a
+different second factor. Local browser testing requires `localhost`, not an IP
+address as RP ID; deployed origins must use HTTPS.
+
+Attempts expire after five minutes and permit five verification tries. A durable
+ten-attempt/five-minute account limit persists across new primary logins and
+applies even when the global rate limiter is disabled. Invalid proofs return
+401; exhausted account limits return 429. Restart an enrollment ceremony after
+a failed enrollment proof. TOTP accepts one adjacent time step each way and
+rejects reuse of an accepted step across login attempts.
+
+Current policy is checked again for authenticated requests and refresh. Enabling
+a requirement invalidates access by primary-only sessions. Custom code calling
+`zigbase.auth.issueSession` receives `SecondFactorRequired` instead of bypassing
+policy; use `zigbase.auth.beginAuthentication` after primary verification and
+return its pending response when present.
+
+TypeScript clients throw `TwoFactorRequiredError` from primary login and expose
+typed enrollment/completion methods on `client.collection(name)`. Generated
+TypeScript auth collections also expose that service as `zb.db.users.auth`.
+Generated raw method-completion results are a session/pending union. Python,
+Dart, and Kotlin expose pending exceptions and `second_factor`/`secondFactor`
+for ceremony actions. Pending capabilities never enter the ordinary auth store.
+
 ### OAuth2
 
 ZigBase uses **client-driven PKCE**: the client generates and holds the PKCE state
@@ -1369,6 +1449,10 @@ When a subscribed record changes, the server pushes:
 Delete events are authorized per subscriber against a snapshot of the just-deleted record,
 so an owner-scoped (or otherwise gated) `viewRule` only notifies subscribers who were allowed
 to view that record — a delete on someone else's record is not leaked to other subscribers.
+Existing WebSocket and SSE sessions are reverified before subscriptions and delivery.
+New two-factor requirements and session revocation therefore stop private delivery
+without waiting for the original token to expire; send a fresh `auth` frame after
+completing authentication to restore access.
 
 Malformed or unknown client frames produce
 `{ "type": "error", "message": "..." }`.

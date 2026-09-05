@@ -191,6 +191,9 @@ fn dispatch(ctx: *http.RequestCtx, phase: DispatchPhase) anyerror!http.Response 
                     if (col.options.auth.require_verified and !auth.recordVerified(rec))
                         return ApiError.withCode(403, .email_not_verified, "Email not verified.").toResponse(ctx.allocator.a);
 
+                    if (try @import("../auth/two_factor.zig").beginAuthentication(ctx, w, col, rid, auth_tag)) |pending|
+                        return pending;
+
                     // Transactional login: the beforeAuthSuccess hook's side-writes commit
                     // atomically with session issuance; an aborting hook rolls everything
                     // back and blocks the session (fail closed).
@@ -232,6 +235,53 @@ pub fn initiate(ctx: *http.RequestCtx) anyerror!http.Response {
 
 pub fn complete(ctx: *http.RequestCtx) anyerror!http.Response {
     return dispatch(ctx, .complete);
+}
+
+test "every primary method resolution enters the second-factor gate" {
+    const env = try auth.TestEnv.initAuth("users");
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try env.createUser(a, "users", "u@x.io", "longenough");
+    const System = @import("two_factor.zig").Subsystem(.{ .enabled = true, .totp = true }, null);
+    env.app.two_factor = @ptrCast(&System.runtime);
+    {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        var col = (try collections.get(a, w, "users")).?;
+        col.fields = &.{};
+        col.options.auth.two_factor = .required;
+        col.options.auth.methods = .{ .password = .{}, .otp = .{}, .magic_link = .{}, .webauthn = .{}, .custom = &.{"custom"} };
+        col.options.auth.oauth2.enabled = true;
+        _ = try collections.update(a, env.app.io, w, "users", col);
+    }
+    // Stub only primary proof validation; the actual registry dispatch, pending
+    // creation, policy decision and lowest session guard remain production code.
+    const Proof = struct {
+        fn startProof(_: *anyopaque, _: *method_mod.AuthCtx) !method_mod.InitiateResult {
+            return .{};
+        }
+        fn resolve(_: *anyopaque, ac: *method_mod.AuthCtx) !method_mod.Resolution {
+            var r = try ac.reader();
+            defer r.deinit();
+            return .{ .record = (try ac.findByIdentity(&r.conn, "u@x.io")).? };
+        }
+        const vt = method_mod.AuthMethod.VTable{ .initiate = startProof, .complete = resolve };
+    };
+    var dummy: u8 = 0;
+    for ([_][]const u8{ "password", "oauth2", "magic_link", "otp", "webauthn", "custom" }) |slug| {
+        const methods = [_]method_mod.AuthMethod{.{ .slug = slug, .ctx = &dummy, .vtable = &Proof.vt }};
+        var reg = registry_mod.Registry{ .methods = &methods };
+        env.app.auth_methods = @ptrCast(&reg);
+        const params = [_]http.Param{ .{ .key = "col", .value = "users" }, .{ .key = "method", .value = slug } };
+        var ctx = env.ctx(RequestArena.from(&arena), .POST, "{}", &params);
+        const response = try complete(&ctx);
+        try std.testing.expectEqual(@as(u16, 200), response.status);
+        try std.testing.expectEqual(@as(usize, 0), response.cookies.len);
+        try std.testing.expect(std.mem.indexOf(u8, response.body, "enrollment_required") != null);
+        try std.testing.expect(std.mem.indexOf(u8, response.body, "\"token\"") == null);
+    }
 }
 
 // ---------------------------------------------------------------------------

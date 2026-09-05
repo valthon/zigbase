@@ -802,6 +802,17 @@ fn seedConfig(ctx: *zigbase.Ctx, ev: *zigbase.events.LifecycleEvent) anyerror!vo
 // ---------------------------------------------------------------------------
 // App wiring
 // ---------------------------------------------------------------------------
+fn requireSecondFactor(ctx: *zigbase.TwoFactorPolicyContext) !bool {
+    if (!std.mem.eql(u8, ctx.collection, "users")) return false;
+    const id = ctx.record.object.get("id").?.string;
+    const requirements = try ctx.list("security_requirements", .{
+        .filter = "principal = ? && required = true",
+        .filter_args = &.{.{ .string = id }},
+        .perPage = 1,
+    });
+    return requirements.items.len > 0;
+}
+
 pub const App = zigbase.App(.{
     .hooks = .{
         .bookings = .{ .beforeCreate = prepareBooking },
@@ -818,6 +829,7 @@ pub const App = zigbase.App(.{
     // sweep). The default `.epoch` mode keeps only a token-epoch counter and has no
     // per-session inventory.
     .auth = .{
+        .two_factor = .{ .factors = .{.totp}, .policy = requireSecondFactor },
         .hooks = .{ .beforeRegister = seedNewUser },
         .session = .{ .store = .table },
     },
@@ -874,6 +886,14 @@ pub const App = zigbase.App(.{
     // The schema the hooks/route/cron reference, provisioned at startup.
     // Mirrors the runtime-provisioning recipe in docs/recipes.md.
     .collections = .{
+        // Locked by default: only a superuser may assign an account requirement.
+        // Ordinary members can voluntarily enroll without an entry here.
+        .security_requirements = .{
+            .fields = .{
+                .{ .name = "principal", .type = .relation, .target = "users", .required = true, .cascadeDelete = true },
+                .{ .name = "required", .type = .bool },
+            },
+        },
         .users = .{
             .type = .auth,
             .fields = .{
@@ -888,6 +908,7 @@ pub const App = zigbase.App(.{
             // NOTE: .password = .{} must be explicit — specifying .methods at all opts OUT of the
             // implicit password default. Omitting it would disable /auth-with-password entirely.
             .auth = .{
+                .two_factor = .optional,
                 .require_verified = true,
                 .methods = .{
                     .password = .{}, // keep password login (required for post-verify signin)
@@ -1100,6 +1121,22 @@ fn setupGuest(t: *zigbase.testing.Harness(App), email: []const u8) !struct { id:
     const id = guest.object.get("id").?.string;
     const token = try t.mintSession("users", id);
     return .{ .id = id, .token = token };
+}
+
+test "application requirement revokes primary-only access without allowing member opt-out" {
+    var t = try zigbase.testing.start(App, .{});
+    defer t.deinit();
+    const user = try setupGuest(&t, "policy@golf.app");
+    const path = "/api/golfsim/sessions";
+    try std.testing.expectEqual(@as(u16, 200), (try t.request(.GET, path, .{ .auth = user.token })).status);
+    _ = try t.createRecord("security_requirements", .{ .principal = user.id, .required = true });
+    const denied = try t.request(.GET, path, .{ .auth = user.token });
+    try std.testing.expect(denied.status != 200);
+    const opt_out = try t.request(.POST, "/api/collections/security_requirements/records", .{
+        .auth = user.token,
+        .json = .{ .principal = user.id, .required = false },
+    });
+    try std.testing.expect(opt_out.status != 201);
 }
 
 /// A host, one of their simulators, and one PUBLISHED listing on it (price_per_hour as given).

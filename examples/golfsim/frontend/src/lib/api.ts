@@ -59,6 +59,36 @@ export class EmailNotVerifiedError extends Error {
   }
 }
 
+export type PendingAuthentication = { status: 'factor_required' | 'enrollment_required'; pendingToken: string };
+export class SecondFactorRequiredError extends Error {
+  constructor(public readonly pending: PendingAuthentication) { super('Complete two-factor authentication.'); }
+}
+
+function saveAuthentication(out: any): void {
+  if (out.pendingToken) {
+    if (typeof localStorage !== 'undefined') localStorage.removeItem(TOKEN_KEY);
+    throw new SecondFactorRequiredError(out);
+  }
+  if (typeof out.token !== 'string' || !out.token) throw new Error('Invalid authentication response.');
+  if (typeof localStorage !== 'undefined') localStorage.setItem(TOKEN_KEY, out.token);
+}
+
+export async function enrollSecondFactor(): Promise<PendingAuthentication> {
+  return req('/api/collections/users/auth/two-factor/enroll', { method: 'POST', body: '{}' });
+}
+
+export async function beginTotp(pendingToken: string): Promise<{ ceremonyId: string; secret: string }> {
+  return req('/api/collections/users/auth/two-factor/enroll-begin', { method: 'POST', body: JSON.stringify({ pendingToken, factor: 'totp' }) });
+}
+
+export async function finishSecondFactor(pendingToken: string, code: string, ceremonyId?: string, recovery = false): Promise<string[]> {
+  const out = await req(`/api/collections/users/auth/two-factor/${ceremonyId ? 'enroll-complete' : 'complete'}`, {
+    method: 'POST', body: JSON.stringify({ pendingToken, code, ceremonyId, factor: recovery ? 'recovery' : 'totp' }),
+  });
+  saveAuthentication(out);
+  return out.recoveryCodes ?? [];
+}
+
 /** Read the CSRF token from the zb_csrf cookie (set by the server on login). */
 function csrfToken(): string | null {
   if (typeof document === 'undefined') return null;
@@ -106,7 +136,7 @@ export async function login(email: string, password: string): Promise<void> {
     throw new Error(msg);
   }
   const out = await r.json();
-  if (typeof localStorage !== 'undefined') localStorage.setItem(TOKEN_KEY, out.token);
+  saveAuthentication(out);
 }
 
 export async function signup(email: string, password: string): Promise<void> {
@@ -168,7 +198,7 @@ export async function otpComplete(email: string, code: string): Promise<void> {
     throw new Error(err?.message ?? `HTTP ${r.status}`);
   }
   const out = await r.json();
-  if (typeof localStorage !== 'undefined') localStorage.setItem(TOKEN_KEY, out.token);
+  saveAuthentication(out);
 }
 
 export async function listListings(): Promise<Listing[]> {

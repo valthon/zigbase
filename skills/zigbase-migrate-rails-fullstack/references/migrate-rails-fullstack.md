@@ -129,7 +129,11 @@ policy boundary must complete the deferred patch pass rather than be erased by o
 
 Treat WebAuthn login and WebAuthn step-up as different contracts. Enabling ZigBase passkey login
 does not reproduce a Rails journey that issues an OAuth session and then requires a second factor;
-that flow needs an explicit custom-auth/session replacement and its own replay evidence.
+use ZigBase's [two-factor subsystem](https://github.com/valthon/zigbase/blob/main/docs/framework.md#two-factor-authentication) with
+WebAuthn selected, the matching collection/application requirement, and the
+[pending-authentication wire contract](https://github.com/valthon/zigbase/blob/main/docs/api.md#two-factor-authentication). Preserve
+the source enrollment/recovery policy and prove pending capabilities cannot access
+protected routes. Configuring a primary passkey method alone is not step-up evidence.
 
 For a route absent from OpenAPI, bind the handoff endpoint with the exact operation id
 `custom:/absolute/path` and add `backend_access` to the decision with one of `public`,

@@ -70,6 +70,16 @@
     }
   },
   {
+    "canonical": "docs/two-factor-design.md",
+    "mirror": "two-factor-design.md",
+    "frontmatter": {
+      "title": "Two-factor authentication",
+      "description": "Compile-time factor selection, user and group requirements, TOTP and WebAuthn enrollment, recovery, and shared session enforcement.",
+      "order": 9,
+      "group": "features"
+    }
+  },
+  {
     "canonical": "docs/api.md",
     "mirror": "api.md",
     "frontmatter": {

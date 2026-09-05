@@ -454,6 +454,7 @@ pub const MethodsOptions = struct {
 };
 
 pub const AuthOptions = struct {
+    two_factor: @import("auth/two_factor_policy.zig").Mode = .disabled,
     identityFields: []const []const u8 = &.{"email"},
     minPasswordLength: u8 = 8,
     /// When true, a login that resolves a record whose `verified` field is not true is
@@ -498,6 +499,7 @@ pub fn optionsToJson(alloc: std.mem.Allocator, c: Collection, redact: bool) ![]u
     try auth.put(sa, "identityFields", .{ .array = ids });
     try auth.put(sa, "minPasswordLength", .{ .integer = c.options.auth.minPasswordLength });
     try auth.put(sa, "require_verified", .{ .bool = c.options.auth.require_verified });
+    try auth.put(sa, "two_factor", .{ .string = @tagName(c.options.auth.two_factor) });
 
     var oauth2: ObjectMap = .empty;
     try oauth2.put(sa, "enabled", .{ .bool = c.options.auth.oauth2.enabled });
@@ -642,11 +644,21 @@ pub fn optionsFromJson(alloc: std.mem.Allocator, s: []const u8) !CollectionOptio
     defer parsed.deinit();
     const root = parsed.value;
     if (root != .object) return try defaultOwnedOptions(alloc);
+    // Validate the strict security option before allocating the owned options
+    // graph; rejecting an unknown mode must neither downgrade nor leak it.
+    const two_factor: @import("auth/two_factor_policy.zig").Mode = blk: {
+        const auth_value = root.object.get("auth") orelse break :blk .disabled;
+        if (auth_value != .object) break :blk .disabled;
+        const value = auth_value.object.get("two_factor") orelse break :blk .disabled;
+        if (value != .string) return error.InvalidSchema;
+        break :blk std.meta.stringToEnum(@import("auth/two_factor_policy.zig").Mode, value.string) orelse return error.InvalidSchema;
+    };
     // `identityFields` must be OWNED for the whole options graph to be freeable by
     // Collection.deinit — otherwise a stored options JSON without an `auth` block (a base
     // collection, or a system collection) would leave the static `&.{"email"}` default in place,
     // which deinit would then try (and fail) to free. Start owned; a parsed value replaces it below.
     var opts = try defaultOwnedOptions(alloc);
+    opts.auth.two_factor = two_factor;
     // `ttl` lives at the options root (sibling of `auth`); parse it regardless of
     // whether the `auth` block is present.
     if (root.object.get("ttl")) |tv| if (tv == .object) if (tv.object.get("field")) |fv| if (fv == .string) {
@@ -1775,6 +1787,20 @@ test "require_verified round-trips through optionsToJson/optionsFromJson" {
     const back = try optionsFromJson(a, s);
     defer deinitOptions(a, back);
     try std.testing.expectEqual(true, back.auth.require_verified);
+}
+
+test "two-factor modes round-trip and invalid modes fail without leaking" {
+    const a = std.testing.allocator;
+    inline for (.{ .disabled, .optional, .required }) |mode| {
+        const c = Collection{ .id = "c", .name = "users", .type = .auth, .fields = &.{}, .options = .{ .auth = .{ .two_factor = mode } } };
+        const json = try optionsToJson(a, c, false);
+        defer a.free(json);
+        const back = try optionsFromJson(a, json);
+        defer deinitOptions(a, back);
+        try std.testing.expectEqual(mode, back.auth.two_factor);
+    }
+    try std.testing.expectError(error.InvalidSchema, optionsFromJson(a, "{\"ttl\":{\"field\":\"expires\"},\"auth\":{\"two_factor\":\"typo\"}}"));
+    try std.testing.expectError(error.InvalidSchema, optionsFromJson(a, "{\"auth\":{\"two_factor\":true}}"));
 }
 
 test "ttl_field round-trips through optionsToJson/optionsFromJson" {

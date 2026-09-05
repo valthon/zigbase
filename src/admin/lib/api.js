@@ -19,6 +19,7 @@ export const API = {
   // Read-only backend badge (no secrets): { status, backend: 'sqlite' | 'postgres' }.
   health: () => api('GET', '/health'),
   login: (identity, password) => api('POST', '/collections/_superusers/auth-with-password', { identity, password }),
+  secondFactor: (action, body) => api('POST', `/collections/_superusers/auth/two-factor/${action}`, body),
   logout: () => api('POST', '/collections/_superusers/auth-logout'),
   collections: () => api('GET', '/collections').then(r => r.items),
   records: (col, q) => api('GET', `/collections/${encodeURIComponent(col)}/records?${q}`),

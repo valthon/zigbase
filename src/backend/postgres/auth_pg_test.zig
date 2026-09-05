@@ -63,6 +63,61 @@ fn scalarCount(w: *db.Db, sql: [:0]const u8) !i64 {
     return st.columnInt(0);
 }
 
+test "pg: two-factor attempts, counters, recovery and account budgets" {
+    const a = std.testing.allocator;
+    var ctx = (try Ctx.open(a, std.testing.io, "two_factor")) orelse return error.SkipZigTest;
+    defer ctx.deinit();
+    const w = ctx.w();
+    try migrations.run(w);
+    const attempts = @import("../../auth/two_factor_attempt.zig");
+    const factors = @import("../../auth/two_factor_store.zig");
+    const binding = attempts.Binding{ .collection = "users", .principal = "alice", .generation = "key:epoch", .purpose = .login };
+    const pending = try attempts.create(a, std.testing.io, w, binding, "context");
+    defer a.free(pending);
+    const payload = (try attempts.reserve(a, w, pending, binding)).?;
+    defer a.free(payload);
+    try std.testing.expectEqualStrings("context", payload);
+    try w.beginImmediate();
+    try std.testing.expect(try attempts.consume(a, w, pending, binding));
+    try w.rollback();
+    try std.testing.expect(try attempts.consume(a, w, pending, binding));
+    try std.testing.expect(!try attempts.consume(a, w, pending, binding));
+    const key = factors.Key{ .collection = "users", .principal = "alice", .kind = "totp" };
+    try factors.insert(a, w, key, "encrypted", 1);
+    try std.testing.expect(try factors.enrolled(a, w, "users", "alice"));
+    try std.testing.expect(try factors.advance(a, w, key, 2));
+    try std.testing.expect(!try factors.advance(a, w, key, 2));
+    const recovery = factors.Key{ .collection = "users", .principal = "alice", .kind = "recovery", .id = "digest" };
+    try factors.insert(a, w, recovery, "", -1);
+    try std.testing.expect(try factors.remove(a, w, recovery));
+    try std.testing.expect(!try factors.remove(a, w, recovery));
+    for (0..10) |_| try std.testing.expect(try factors.allowAttempt(a, w, "users", "alice"));
+    try std.testing.expect(!try factors.allowAttempt(a, w, "users", "alice"));
+    try attempts.gc(a, w);
+    // Distinct DB connections model distinct server instances. PostgreSQL's
+    // plain BEGIN does not serialize them; lockPrincipal must acquire a real
+    // row lock, and subsequent reads must see the winner's committed epoch.
+    try w.exec("CREATE TABLE principals (id TEXT PRIMARY KEY, token_epoch BIGINT NOT NULL);");
+    try w.exec("INSERT INTO principals VALUES ('alice',0);");
+    var other = try db.Db.openPostgres(a, std.testing.io, testUrlZ().?);
+    defer other.close();
+    try other.exec("SET search_path TO zb_authpg_two_factor;");
+    try other.exec("SET lock_timeout = '100ms';");
+    try w.beginImmediate();
+    errdefer w.rollback() catch |err| std.log.err("test rollback failed: {s}", .{@errorName(err)});
+    try std.testing.expect(try factors.lockPrincipal(a, w, "principals", "alice"));
+    try other.beginImmediate();
+    try std.testing.expectError(error.StepFailed, factors.lockPrincipal(a, &other, "principals", "alice"));
+    try other.rollback();
+    try w.exec("UPDATE principals SET token_epoch=1 WHERE id='alice';");
+    try w.commit();
+    try other.beginImmediate();
+    errdefer other.rollback() catch |err| std.log.err("test rollback failed: {s}", .{@errorName(err)});
+    try std.testing.expect(try factors.lockPrincipal(a, &other, "principals", "alice"));
+    try std.testing.expectEqual(@as(i64, 1), try scalarCount(&other, "SELECT token_epoch FROM principals WHERE id='alice';"));
+    try other.rollback();
+}
+
 // ---------------------------------------------------------------------------
 // Analytics: event insert (strftime->to_char) + `_seq` watermark + rollup UPSERT + `_kv` upsert.
 // ---------------------------------------------------------------------------

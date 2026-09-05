@@ -40,19 +40,69 @@ function Login() {
   const [pw, setPw] = useState('');
   const [err, setErr] = useState('');
   const [busy, setBusy] = useState(false);
+  const [pending, setPending] = useState(null);
+  const [enrollment, setEnrollment] = useState(null);
+  const [code, setCode] = useState('');
+  const [recovery, setRecovery] = useState(false);
+  const [recoveryCodes, setRecoveryCodes] = useState(null);
+  async function accepted(out) {
+    if (Array.isArray(out.recoveryCodes)) { setRecoveryCodes(out.recoveryCodes); return; }
+    if (!out.pendingToken) { go('#/collections'); return; }
+    setPending(out);
+    if (out.status === 'enrollment_required' && out.factors?.totp) {
+      setEnrollment(await API.secondFactor('enroll-begin', { pendingToken: out.pendingToken, factor: 'totp' }));
+    }
+  }
   async function submit(e) {
     e.preventDefault();
     setErr(''); setBusy(true);
-    try { await API.login(email, pw); go('#/collections'); }
-    catch (x) { setErr((x.data && x.data.message) || 'Login failed'); }
+    try {
+      if (pending) await accepted(await API.secondFactor(enrollment ? 'enroll-complete' : 'complete', {
+        pendingToken: pending.pendingToken, factor: recovery ? 'recovery' : 'totp', code, ceremonyId: enrollment?.ceremonyId,
+      }));
+      else await accepted(await API.login(email, pw));
+    }
+    catch (x) {
+      setErr((x.data && x.data.message) || 'Login failed');
+      if (enrollment && pending) {
+        try { setEnrollment(await API.secondFactor('enroll-begin', { pendingToken: pending.pendingToken, factor: 'totp' })); }
+        catch (_) { setEnrollment(null); setPending(null); }
+      }
+    }
     finally { setBusy(false); }
   }
+  async function webauthn() {
+    setErr(''); setBusy(true);
+    const decode = s => Uint8Array.from(atob(s.replace(/-/g, '+').replace(/_/g, '/')), c => c.charCodeAt(0));
+    const encode = b => btoa(String.fromCharCode(...new Uint8Array(b))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+    try {
+      const enrolling = pending.status === 'enrollment_required';
+      const options = await API.secondFactor(enrolling ? 'enroll-begin' : 'initiate', { pendingToken: pending.pendingToken, factor: 'webauthn' });
+      const ceremonyId = options.ceremonyId;
+      delete options.ceremonyId;
+      options.challenge = decode(options.challenge);
+      if (options.user) options.user.id = decode(options.user.id);
+      if (options.allowCredentials) options.allowCredentials = options.allowCredentials.map(c => ({ ...c, id: decode(c.id) }));
+      const credential = await navigator.credentials[enrolling ? 'create' : 'get']({ publicKey: options });
+      const proof = { pendingToken: pending.pendingToken, factor: 'webauthn', ceremonyId, credentialId: credential.id, clientDataJSON: encode(credential.response.clientDataJSON) };
+      if (enrolling) proof.attestationObject = encode(credential.response.attestationObject);
+      else { proof.authenticatorData = encode(credential.response.authenticatorData); proof.signature = encode(credential.response.signature); }
+      await accepted(await API.secondFactor(enrolling ? 'enroll-complete' : 'complete', proof));
+    } catch (x) { setErr(x.data?.message || x.message || 'WebAuthn verification failed'); }
+    finally { setBusy(false); }
+  }
+  if (recoveryCodes) return html`<div class="login-wrap"><h2>Save your recovery codes</h2><p>Store these privately. Each code works once.</p><pre data-test="recovery-codes">${recoveryCodes.join('\n')}</pre><button onClick=${() => go('#/collections')}>I saved my recovery codes</button></div>`;
   return html`
     <div class="login-wrap">
       <h2>ZigBase admin</h2>
       <form onSubmit=${submit}>
-        <div class="field"><label>Email</label><input data-test="email" value=${email} onInput=${e => setEmail(e.target.value)} autofocus/></div>
-        <div class="field"><label>Password</label><input data-test="password" type="password" value=${pw} onInput=${e => setPw(e.target.value)}/></div>
+        ${!pending ? html`<div class="field"><label>Email</label><input data-test="email" value=${email} onInput=${e => setEmail(e.target.value)} autofocus/></div>
+        <div class="field"><label>Password</label><input data-test="password" type="password" value=${pw} onInput=${e => setPw(e.target.value)}/></div>` : html`
+        <h3>${enrollment ? 'Set up an authenticator app' : 'Verify your sign-in'}</h3>
+        ${enrollment && html`<p>Enter this setup key in your authenticator app:</p><code>${enrollment.secret}</code>`}
+        <div class="field"><label>${recovery ? 'Recovery code' : 'Authenticator code'}</label><input data-test="second-factor-code" value=${code} onInput=${e => setCode(e.target.value)} autocomplete="one-time-code"/></div>
+        ${pending.factors?.webauthn && html`<button type="button" disabled=${busy} onClick=${webauthn}>Use a security key or passkey</button>`}
+        ${pending.recoveryCodes && html`<button type="button" onClick=${() => setRecovery(!recovery)}>Use ${recovery ? 'authenticator' : 'recovery'} code</button>`}`}
         ${err && html`<div class="error" data-test="login-error">${err}</div>`}
         <button data-test="login-submit" disabled=${busy}>${busy ? '…' : 'Sign in'}</button>
       </form>

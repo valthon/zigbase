@@ -276,8 +276,9 @@ fn buildCollection(comptime name: []const u8, comptime spec: anytype) schema.Col
         }
         // auth-specific collection options
         if (@hasField(S, "auth")) {
-            rejectUnknownKeys(spec.auth, &.{ "methods", "require_verified", "oauth2" }, "collection '" ++ name ++ "' .auth");
+            rejectUnknownKeys(spec.auth, &.{ "methods", "require_verified", "oauth2", "two_factor" }, "collection '" ++ name ++ "' .auth");
             const A = @TypeOf(spec.auth);
+            if (@hasField(A, "two_factor")) col.options.auth.two_factor = spec.auth.two_factor;
             if (@hasField(A, "methods")) {
                 col.options.auth.methods = buildMethodsOptions("collection '" ++ name ++ "' .auth.methods", spec.auth.methods);
             }
@@ -658,16 +659,16 @@ fn customSlugsToSlice(comptime t: anytype) []const []const u8 {
             switch (@typeInfo(@TypeOf(elem))) {
                 .pointer => {
                     const slug: []const u8 = elem;
-                    if (std.mem.eql(u8, slug, "sessions"))
-                        @compileError("auth method slug 'sessions' is reserved: GET/DELETE /api/collections/:col/auth/sessions are the per-device session routes");
+                    if (std.mem.eql(u8, slug, "sessions") or std.mem.eql(u8, slug, "two-factor"))
+                        @compileError("auth method slug '" ++ slug ++ "' is reserved for framework session or two-factor routes");
                     out[i] = elem; // bare slug string
                 },
                 .@"struct" => {
                     if (!@hasField(@TypeOf(elem), "slug"))
                         @compileError(".auth.methods.custom struct entry must have a .slug field");
                     const slug: []const u8 = elem.slug;
-                    if (std.mem.eql(u8, slug, "sessions"))
-                        @compileError("auth method slug 'sessions' is reserved: GET/DELETE /api/collections/:col/auth/sessions are the per-device session routes");
+                    if (std.mem.eql(u8, slug, "sessions") or std.mem.eql(u8, slug, "two-factor"))
+                        @compileError("auth method slug '" ++ slug ++ "' is reserved for framework session or two-factor routes");
                     out[i] = slug;
                 },
                 else => @compileError(".auth.methods.custom entry must be a slug string or a struct with a .slug field"),

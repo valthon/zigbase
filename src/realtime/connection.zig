@@ -80,6 +80,8 @@ pub const AuthIdentity = struct {
     record: std.json.Value,
     is_superuser: bool,
     exp: i64,
+    /// Owned by the identity arena; retained for current-policy verification.
+    token: []const u8 = "",
 };
 
 /// Per-connection realtime state. In 7a this is the pure data model; 7b adds the live WS handle,

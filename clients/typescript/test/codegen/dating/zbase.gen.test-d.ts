@@ -3,7 +3,7 @@ import { createClient } from "./zbase.gen.js";
 import type {
   Profile, Tag, Photo, PrivatePhoto, Subscription,
   ProfileCreate, PhotoCreate, ProfileGender, SubscriptionPlan,
-  DeviceLinkInitiateResp, DeviceLinkCompleteReq, DeviceLinkSession,
+  DeviceLinkInitiateResp, DeviceLinkCompleteReq, DeviceLinkSession, PendingAuthentication,
   Note, NoteCreate, ProfileSort,
 } from "./zbase.gen.js";
 
@@ -118,7 +118,7 @@ async function typedCustomAuthMethod() {
   expectTypeOf(init).toEqualTypeOf<DeviceLinkInitiateResp>();
   // complete takes the typed request and resolves the typed session.
   const done = await zb.auth.profiles.deviceLink.complete({ deviceCode: "abc" } satisfies DeviceLinkCompleteReq);
-  expectTypeOf(done).toEqualTypeOf<DeviceLinkSession>();
+  expectTypeOf(done).toEqualTypeOf<DeviceLinkSession | PendingAuthentication>();
   // @ts-expect-error initiate takes no input argument (void Initiate.Input)
   await zb.auth.profiles.deviceLink.initiate({ nope: 1 });
 }

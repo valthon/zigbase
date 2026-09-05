@@ -173,6 +173,11 @@ pub fn consume(ctx: *http.RequestCtx) anyerror!http.Response {
         return ApiError.withCode(403, .email_not_verified, "Email not verified.").toResponse(ctx.allocator.a);
     }
 
+    if (try @import("../auth/two_factor.zig").beginAuthentication(ctx, w, col, claims.id, .magic_link)) |pending| {
+        try w.commit();
+        return pending;
+    }
+
     if (try auth.fireBeforeAuthSuccess(ctx, w, col.name, claims.id, .magic_link, rec)) |resp| {
         w.rollback() catch {};
         return resp;

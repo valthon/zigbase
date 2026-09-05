@@ -531,6 +531,7 @@ pub fn listSessions(alloc: std.mem.Allocator, conn: *db.Db, collection: []const 
 pub const Issued = struct { token: []const u8, cookies: [2]http.Cookie };
 
 pub fn issue(ctx: *http.RequestCtx, conn: *db.Db, collection: []const u8, rid: []const u8, token_key: []const u8, epoch: i64) !Issued {
+    try @import("../auth/two_factor.zig").guardIssue(ctx, conn, collection, rid);
     const app = ctx.app.?;
     const csrf = try crypto.genToken(app.io, ctx.allocator.a, 32);
     const now = try nowUnix(conn);
@@ -552,6 +553,7 @@ pub fn issue(ctx: *http.RequestCtx, conn: *db.Db, collection: []const u8, rid: [
         .id = rid,
         .collection = collection,
         .type = .auth,
+        .two_factor = if (ctx.two_factor_assurance != null) true else null,
         .csrf = csrf,
         .token_epoch = epoch,
         .sid = sid,
@@ -800,6 +802,12 @@ pub fn authWithPassword(ctx: *http.RequestCtx) anyerror!http.Response {
     // Optional verification gate: refuse to mint a session for an unverified record.
     if (col.options.auth.require_verified and !recordVerified(rec))
         return ApiError.withCode(403, .email_not_verified, "Email not verified.").toResponse(ctx.allocator.a);
+    if (@import("../auth/two_factor.zig").runtime(app) != null) {
+        const w = app.pool.acquireWriter();
+        defer app.pool.releaseWriter();
+        if (try @import("../auth/two_factor.zig").beginAuthentication(ctx, w, col, rid, .password)) |pending|
+            return pending;
+    }
     // Issuance (three paths):
     //  1. HOOK path (#80, 0.10.0): a registered `beforeAuthSuccess` runs inside a write
     //     transaction so its side-writes commit atomically with issuance and an abort blocks
@@ -870,6 +878,9 @@ pub fn authRefresh(ctx: *http.RequestCtx) anyerror!http.Response {
         return ApiError.withCode(401, .unauthorized, "Not authenticated.").toResponse(ctx.allocator.a);
 
     const rid = authed.record.object.get("id").?.string;
+
+    if (authed.two_factor) ctx.two_factor_assurance = .{ .collection = col_name, .principal = rid };
+    defer ctx.two_factor_assurance = null;
 
     // Transactional refresh (#98): a `beforeRefresh` hook's side-writes commit atomically
     // with the new session; an aborting hook rolls back and blocks issuance (fail closed).

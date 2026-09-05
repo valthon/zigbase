@@ -109,8 +109,11 @@ or mock-provider exercise and record only the live provider round trip as an out
 check; do not mark the auth route blocked and do not let it halt unrelated route implementation.
 Also distinguish WebAuthn login from post-login WebAuthn step-up. A source that issues an OAuth
 session and then requires a second-factor ceremony is not reproduced merely by enabling ZigBase's
-passkey login endpoints; preserve that journey through an explicit custom-auth/session design or
-record it as a launch blocker while the rest of the backend continues.
+passkey login endpoints. Use the compile-time-selected two-factor subsystem and its restricted
+pending-authentication contract, matching source enrollment, recovery, and user/group requirements;
+see the linked framework/API guidance in `references/migrate-rails-fullstack.md`. Prove pending
+capabilities cannot access protected routes. Record any source-specific behavior still unsupported
+as a route-local launch check while the rest of the backend continues.
 The resulting file still covers the route union so omissions remain detectable; duplicated source
 routes use their one-based occurrence.
 

@@ -144,6 +144,7 @@ error.**
 | `onError` | Consumer error handler, runs before the built-in backstop. | always — the backstop itself always ships. |
 | `routes` | Custom HTTP routes. | always — routing plumbing is core; a route's code is only in your binary because you wrote it. |
 | `onAuth` | Notify-only: fires *after* a session is issued (login / oauth2). | always — auth lifecycle plumbing is core. |
+| `auth.two_factor` | Selected TOTP/WebAuthn factors, recovery codes, and application requirement hook. See [Two-factor authentication](#two-factor-authentication). | excluded until explicitly configured; enrollment and requirement data remain runtime-configurable. |
 | `beforeAuthSuccess` | Writable, transactional, abortable hook that runs *before* the session is issued (claim records on first login; veto a login). | always — auth lifecycle plumbing is core. |
 | `auth` | Auth config group: `.hooks` (lifecycle hooks — before/after `register`/`logout`/`refresh`/`password-change`), `.methods` (built-in auth-method set + custom `AuthMethod` types), `.captcha` (`.{ .provider, .secret }`), and `.session` (`.store = .epoch`\|`.table`, `.gc_cron`, `.rotation_grace_s`). See [Auth methods](#auth-methods-pluggable), [CAPTCHA](#captcha-verification-ctxverifycaptcha), and [Revoking sessions](#revoking-sessions-99). | mixed — the hook dispatch is core (empty when unset); a deselected `.methods` built-in, `.captcha`, and `.session = .{ .store = .table }`'s extra store/GC machinery are each *excluded* until configured. |
 | `onFileServe` | Fires before serving a file download (may deny). | always — file-serving plumbing is core. |
@@ -1543,6 +1544,9 @@ subscriber (no per-record `viewRule`), keep private/per-subject state **signal-o
 must re-fetch the actual state over an authenticated GET. Use the payload-carrying
 `broadcast(topic, payload)` only for data that is safe for **every** subscriber of that
 topic, and use `.canSubscribe` to restrict who may join a private channel.
+The guard is reevaluated before custom-topic delivery as well as subscription;
+keep it read-only and inexpensive. Retained sessions are reverified before
+delivery, so changed two-factor requirements or revocation require reauthentication.
 
 #### Multi-instance realtime (Postgres)
 
@@ -2299,6 +2303,70 @@ fires on the legacy `/auth-with-password` / `/auth-refresh` endpoints (tag `.pas
 `.refresh`). The `ctx.auth()` session verbs also gained a REST surface — see [§6 Session
 verbs](#ctxauth--session-management).
 
+### Two-factor authentication
+
+Two-factor support is opt-in for embedded applications. Omission or `.disabled`
+excludes its routes and factor implementations. Select only the factors your
+application needs; primary authentication methods are configured independently.
+The shipped CLI explicitly selects both built-in second factors.
+
+```zig
+const App = zigbase.App(.{
+    .auth = .{
+        .two_factor = .{
+            .factors = .{ .totp, .webauthn },
+            .recovery_codes = true, // default when enabled
+            .policy = requireSecondFactor, // optional, selected at comptime
+        },
+    },
+    .collections = .{
+        .users = .{
+            .type = .auth,
+            .auth = .{ .two_factor = .optional },
+        },
+    },
+});
+
+fn requireSecondFactor(ctx: *zigbase.TwoFactorPolicyContext) !bool {
+    // Application-owned roles/groups remain runtime data.
+    const id = ctx.record.object.get("id").?.string;
+    const requirements = try ctx.list("security_requirements", .{
+        .filter = "principal = ? && required = true",
+        .filter_args = &.{.{ .string = id }},
+        .perPage = 1,
+    });
+    return requirements.items.len > 0;
+}
+```
+
+The example assumes an application-owned `security_requirements` collection;
+the [golfsim example](../examples/golfsim/README.md) provides its complete schema.
+The policy context offers `findById` and `list` read helpers. Its record and query
+results have request-arena lifetimes. Keep policy callbacks read-only and cheap:
+they run during login, completion, and session verification. Errors fail closed.
+
+Collection `.two_factor` is `disabled`, `optional`, or `required`. Requirements
+combine: collection-required, application-required, or enrolled voluntarily.
+A hook returning false cannot waive another requirement. Applications authorize
+group leaders' policy writes with their normal access rules; ZigBase does not
+impose a group model. A group change affects existing primary-only sessions on
+their next authorization check. Runtime data cannot enable a factor omitted
+from the binary, and a configured requirement with an unavailable subsystem
+fails closed.
+
+No ordinary session is issued while another factor is pending. `beforeAuthSuccess`
+and `onAuth` run at final session issuance, after factor verification. Custom
+primary routes call `zigbase.auth.beginAuthentication(request, writer, collection,
+record_id)` before `issueSession`, returning the non-null pending response.
+The existing issuer independently enforces the requirement.
+
+TOTP secrets use a dedicated authenticated-encryption key domain derived from the
+application JWT secret. Preserve that secret when moving an installation.
+Recovery codes are random, stored as digests, and consumed atomically. WebAuthn
+uses the configured RP/origin and separates second-factor credentials from
+primary passkeys. See the [wire contract](api.md#two-factor-authentication) for
+enrollment, management, recovery, expiry, and client handling.
+
 ### Auth methods overview
 
 ZigBase ships with a **pluggable auth-method system** that lets every auth collection enable built-in or custom login methods via config, with no route code. The system is built around a two-phase contract:
@@ -2387,7 +2455,15 @@ The dispatch enforces enablement: a disabled or unknown method slug returns `404
 | `otp` | `{ identity }` | `void` (204) | `{ identity, code }` | `{ token }` |
 | `webauthn` | `{ identity? }` | `{ challenge, rpId, ceremonyId, timeout }` | `{ ceremonyId, credentialId, authenticatorData, clientDataJSON, signature }` | `{ token }` |
 
-Every built-in `complete` resolves to `{ token }` (`AuthMethodResult`); the session cookies (`zb_auth`/`zb_csrf`) are also set on the response. **Custom methods** can be typed too: a bare-string slug (`.custom = .{"corp-sso"}`) stays on the untyped `Record<string, unknown>` / `unknown` stubs, while the **struct form** declares comptime I/O types the generator reflects into precise TS interfaces (named by the Zig type) — `.{ .slug = "corp-sso", .Initiate = .{ .Input = …, .Output = … }, .Complete = .{ .Input = …, .Output = … } }`. A `void` Input omits the input arg; a `void` Output maps to `Promise<void>`. See [typescript-sdk.md → Typed auth methods](typescript-sdk.md#typed-auth-methods--zbauth).
+Every built-in `complete` resolves to `{ token } | PendingAuthentication`
+(`AuthMethodResult`). Only the authenticated result sets session cookies
+(`zb_auth`/`zb_csrf`). **Custom methods** can be typed too: a bare-string slug
+(`.custom = .{"corp-sso"}`) stays on the untyped `Record<string, unknown>` /
+`unknown` stubs, while the struct form declares comptime I/O types:
+`.{ .slug = "corp-sso", .Initiate = .{ .Input = …, .Output = … }, .Complete = .{ .Input = …, .Output = … } }`.
+Generated custom completion types also include `PendingAuthentication`, since
+they share the same policy gate. A `void` Input omits the input argument.
+See [typed auth methods](typescript-sdk.md#typed-auth-methods--zbauth).
 
 ### Custom `AuthMethod` plugin (app-level `.auth.methods`)
 

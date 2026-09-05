@@ -31,6 +31,25 @@ CLI) comes straight from the framework via the public `zigbase.*` exports.
 
 ## What golfsim demonstrates
 
+### Two-factor authentication
+
+The binary selects TOTP and recovery codes at compile time; WebAuthn second-factor
+code is not selected. Members can enable an authenticator from **My bookings →
+Account security**, save their recovery codes, and subsequently complete a second
+step at sign-in. A pending primary login is never saved as an authenticated session.
+
+To require enrollment for a particular member (for example, a privileged host),
+an operator creates a `security_requirements` record with `principal` set to the
+user ID and `required` set to `true`. This collection is locked to ordinary clients.
+The server-side `requireSecondFactor` policy reads it on authentication and session
+verification, so an existing primary-only session cannot bypass a new requirement.
+Removing the row does not turn off a member's enrolled protection. Applications
+with teams can use this same policy hook to query memberships and group requirements;
+authorize group-leader edits through ordinary collection rules or trusted routes.
+
+See the [framework configuration](../../docs/framework.md#two-factor-authentication)
+and [factor management API](../../docs/api.md#two-factor-authentication).
+
 ### 1. Invariant-enforcing hooks
 
 #### `prepareBooking` — `beforeCreate` on `bookings`

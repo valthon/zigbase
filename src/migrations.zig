@@ -669,6 +669,8 @@ pub const all = [_]Migration{
     .{ .name = "0020_sessions_seq", .up = init_0020_sessions_seq },
     .{ .name = "0021_rt_broadcasts", .up = init_0021_rt_broadcasts },
     .{ .name = "0022_schema_state", .up = init_0022_schema_state },
+    .{ .name = "0023_two_factor_attempts", .up = @import("auth/two_factor_attempt.zig").migrate },
+    .{ .name = "0024_two_factor_credentials", .up = @import("auth/two_factor_store.zig").migrate },
 };
 
 /// Create the `_migrations` ledger table if it is absent (idempotent). The auto-increment PK

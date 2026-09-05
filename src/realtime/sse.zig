@@ -264,6 +264,7 @@ pub fn snapshotForDelivery(sc: *SseConn, a: std.mem.Allocator, channel: []const 
         .record = hub.cloneJson(a, ident.record) catch return null,
         .is_superuser = ident.is_superuser,
         .exp = ident.exp,
+        .token = a.dupe(u8, ident.token) catch return null,
     } else null;
     const account_copy = a.dupe(u8, sc.conn.account_id) catch return null;
     const memberships_copy = hub.cloneMemberships(a, sc.conn.memberships) catch return null;

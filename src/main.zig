@@ -9,6 +9,8 @@ const zigbase = @import("zigbase");
 pub const std_options = zigbase.std_options;
 
 /// The shipped binary: the framework with the `typegen` subcommand compiled in.
+/// It explicitly includes TOTP/WebAuthn second factors; collection policy stays
+/// disabled until configured. Embedders omit `.auth.two_factor` for exclusion.
 /// One binary serves both the GitHub release tarballs and the @zigbase/server
 /// npm packages. `enable_typegen` stays a framework option for embedders who
 /// want it off. Demo flags/experiments live in fixtures/features (test-only).
@@ -23,5 +25,5 @@ pub const std_options = zigbase.std_options;
 /// endpoint stays inert until its activating env/config is set (e.g. the
 /// unsubscribe route needs `ZIGBASE_UNSUBSCRIBE_BASE_URL`).
 pub fn main(init: std.process.Init) !void {
-    return zigbase.App(.{ .enable_typegen = true, .mail = .{} }).runCli(init);
+    return zigbase.App(.{ .enable_typegen = true, .mail = .{}, .auth = .{ .two_factor = .{ .factors = .{ .totp, .webauthn } } } }).runCli(init);
 }
