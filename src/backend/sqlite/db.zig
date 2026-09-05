@@ -261,6 +261,11 @@ pub const Stmt = struct {
         _ = c.sqlite3_reset(self.handle);
     }
 
+    /// Clear parameter values separately from reset, which preserves bindings.
+    pub fn clearBindings(self: *Stmt) DbError!void {
+        if (c.sqlite3_clear_bindings(self.handle) != c.SQLITE_OK) return DbError.BindFailed;
+    }
+
     pub fn finalize(self: *Stmt) void {
         _ = c.sqlite3_finalize(self.handle);
     }

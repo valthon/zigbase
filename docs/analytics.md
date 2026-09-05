@@ -24,6 +24,38 @@ stored as opaque JSON text (a `[]const u8` is taken as raw JSON). It is a single
 inside a hook / `ctx.tx` it reuses the in-transaction connection. Events are immutable appends —
 there is no update or delete.
 
+## Capture an atomic batch
+
+Use `ctx.trackBatch` for several events that should persist together:
+
+```zig
+try ctx.trackBatch(&.{
+    .{ .name = "checkout.completed", .payload_json = "{\"items\":3}" },
+    .{ .name = "receipt.requested" }, // default payload is {}
+});
+```
+
+A batch accepts at most 1024 events (`error.BatchTooLarge` otherwise); an empty
+batch is a no-op. Payloads are explicit JSON text, as with the raw-text form of
+`track`. Actor and tenant values are always taken from the current context.
+One writer acquisition, prepared statement, and transaction cover the batch.
+If any insert fails, none of the batch is retained. Inside a hook or `ctx.tx`, a
+savepoint isolates batch failure, and success remains subject to the outer
+transaction's final commit or rollback—even if the caller catches a batch error.
+Storage failures can abort the outer transaction itself; a caller catching such
+an error must check the bound connection's `inTransaction()` before continuing.
+This is synchronous capture: there is no memory queue, timer, background worker,
+or shutdown flush. Existing single-event `track` semantics are unchanged.
+
+For a runtime-sized batch, use the exported `zigbase.EventInput` element type:
+
+```zig
+var events: std.ArrayList(zigbase.EventInput) = .empty;
+defer events.deinit(ctx.arena.a);
+try events.append(ctx.arena.a, .{ .name = "receipt.requested" });
+try ctx.trackBatch(events.items);
+```
+
 ## Roll events up
 
 Declare named rollups; each registers one job on the existing scheduler that aggregates

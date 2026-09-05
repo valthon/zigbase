@@ -30,6 +30,22 @@ const pg = if (build_options.postgres) @import("backend/postgres/postgres.zig") 
 /// `-Dpostgres=true`; always `.sqlite` in the default build.
 pub const Backend = enum { sqlite, postgres };
 
+test "clearBindings clears values while reset preserves them" {
+    var d = try Db.openMemory();
+    defer d.close();
+    var st = try d.prepare("SELECT ?1;");
+    defer st.finalize();
+    try st.bindText(1, "retained by reset");
+    try std.testing.expect(try st.step());
+    st.reset();
+    try std.testing.expect(try st.step());
+    try std.testing.expectEqualStrings("retained by reset", st.columnText(0));
+    st.reset();
+    try st.clearBindings();
+    try std.testing.expect(try st.step());
+    try std.testing.expect(st.isNull(0));
+}
+
 pub const Dialect = dialect_mod.Dialect;
 /// The dialect/SQL-flavor tag (sqlite | postgres). Parallels `Backend`; kept distinct so the
 /// dialect layer stays independent of the database seam.
@@ -231,6 +247,12 @@ pub const Stmt = if (build_options.postgres) union(Backend) {
     pub fn reset(self: *Stmt) void {
         switch (self.*) {
             inline else => |*s| s.reset(),
+        }
+    }
+    /// Clear bound values and release their bytes; reset alone preserves them.
+    pub fn clearBindings(self: *Stmt) DbError!void {
+        switch (self.*) {
+            inline else => |*s| return s.clearBindings(),
         }
     }
     pub fn finalize(self: *Stmt) void {
