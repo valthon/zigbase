@@ -2987,10 +2987,70 @@ raw SQL on a migration-owned table acquire the pooled writer via
 
 ### Caveats
 
+#### Shared cron/interval jobs across replicas
+
+Opt a job into database-backed coordination at **compile time**:
+
+```zig
+.cron = .{
+    .{
+        .name = "billing-sweep-v1", // durable identity shared by every replica
+        .schedule = zigbase.schedule.Schedule{ .interval = .{ .minutes = 5 } },
+        .distributed = .{ .lease_seconds = 120 },
+        .handler = billingSweep,
+    },
+},
+```
+
+Only opted-in wrappers reference the coordination runtime. Jobs without
+`.distributed` retain their per-process behavior, and reactive jobs cannot opt in.
+The typed configuration is `zigbase.DistributedJobConfig`.
+
+All replicas sharing a database and job name observe one persisted cadence. A
+short transaction claims due work with an owner token, generation and expiry;
+handlers run **outside** that transaction. PostgreSQL uses row locks and its server
+clock after lock acquisition, while SQLite uses its immediate writer transaction.
+SQLite coordination applies to processes sharing the same local database file,
+not independent database copies or unsupported network filesystems.
+
+A new schedule first fires at its next scheduled time, never immediately on boot.
+Restarts retain that time. Missed cron occurrences coalesce into one pending run;
+after success the next cron time is calculated from completion. Intervals likewise
+advance from completion. Errors persist capped exponential retry backoff. The
+`JobEvent.scheduled_at` value remains stable across retries and crash recovery;
+combine it with `JobEvent.name` for an application idempotency key. `generation`
+identifies the current claim attempt; both fields are null for ordinary jobs.
+
+Expired leases can be recovered by another replica. An expired owner can still
+complete if no replacement has claimed that occurrence. Completion from a
+replaced owner cannot advance the schedule, reset failures, or clear the newer
+lease. This fences **dispatcher state**, not arbitrary application writes or
+external effects: a crashed/paused handler may execute more than once, and an
+overrun can overlap its replacement. Make handlers idempotent and set
+`lease_seconds` above worst-case handler duration. There is no automatic lease
+heartbeat or cancellation of application code.
+
+Distributed job names must be unique, nonempty, at most 200 bytes, and not start with `_`.
+Idle replicas probe readiness using readers every 15 seconds, acquiring the writer
+only when registration or claiming may be needed. Due jobs and expired leases
+can therefore wait up to roughly 15 seconds plus worker availability. Stopped
+schedules retire locally rather than polling forever. Claimed work still rechecks
+readiness under the database row lock.
+
+Replicas must deploy identical schedule definitions for a name; a
+mismatch fails closed with `DistributedScheduleMismatch`. To change a definition,
+drain old replicas and explicitly remove that job's `_scheduler_jobs` row in an
+application migration before restarting, or use a new versioned name after
+retiring the old job. Removing a declaration does not delete its saved state.
+Lease duration may differ between replicas and can be tuned during a rolling
+deployment; each claim stores its own expiry. All declared minute intervals
+(including per-process jobs) must be positive; reactive handlers can still request
+an immediate next tick explicitly.
+
 The scheduler is intentionally simple (see
 [../KNOWN_LIMITATIONS.md](../KNOWN_LIMITATIONS.md)):
 
-- **Single-process** — no distributed coordination.
+- **Per-process by default** — use `.distributed` for coordinated cron/interval jobs.
 - **UTC** — all cron/interval evaluation is in UTC.
 - **Cron** — UTC, minute-granularity; supports the full standard grammar: `*`, `a`,
   `a,b,c`, `a-b`, `*/n`, `a-b/n` (a step over a range, e.g. `0-23/2` for every other

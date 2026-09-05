@@ -1,6 +1,8 @@
 const std = @import("std");
 const zigbase = @import("zigbase");
 
+fn coordinatedJob(_: *zigbase.Ctx, _: *zigbase.JobEvent) anyerror!void {}
+
 /// The gating-invariant's POSITIVE control (companion to fixtures/minimal). Explored
 /// during Task 7: the stock `zigbase` binary (src/main.zig) does NOT configure `.mail`,
 /// `.webhooks`, or `.analytics` either — so their symbols (senders/inbound API, the
@@ -15,5 +17,11 @@ pub fn main(init: std.process.Init) !void {
         .analytics = .{},
         .mail = .{},
         .webhooks = true,
+        .cron = .{.{
+            .name = "gating-coordinated-job",
+            .schedule = zigbase.schedule.Schedule{ .interval = .hourly },
+            .distributed = .{},
+            .handler = coordinatedJob,
+        }},
     }).runCli(init);
 }

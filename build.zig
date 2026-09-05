@@ -375,6 +375,20 @@ pub fn build(b: *std.Build) void {
         invalid_exe.expect_errors = .{ .contains = invalid.expected };
         route_contracts.dependOn(&invalid_exe.step);
     }
+    const scheduler_contracts = b.step("check-scheduler-contracts", "Check distributed scheduler compile-time contracts");
+    inline for (&.{
+        .{ .name = "reactive", .expected = "distributed jobs require a cron or interval schedule" },
+        .{ .name = "zero-lease", .expected = "distributed lease_seconds must be positive" },
+        .{ .name = "duplicate", .expected = "distributed job names must be unique" },
+        .{ .name = "zero-interval", .expected = "scheduled minute intervals must be positive" },
+        .{ .name = "reserved-name", .expected = "distributed job names must contain 1..200 bytes and not start with '_'" },
+    }) |invalid| {
+        const mod = b.createModule(.{ .root_source_file = b.path("fixtures/invalid-scheduler/" ++ invalid.name ++ ".zig"), .target = target, .optimize = optimize, .link_libc = true });
+        mod.addImport("zigbase", zigbase_mod);
+        const invalid_scheduler_exe = b.addExecutable(.{ .name = "invalid-scheduler-" ++ invalid.name, .root_module = mod });
+        invalid_scheduler_exe.expect_errors = .{ .contains = invalid.expected };
+        scheduler_contracts.dependOn(&invalid_scheduler_exe.step);
+    }
     // --- minimal-server: gating-invariant fixture (R2-7) --------------------------
     // A consumer App with NOTHING optional configured. scripts/check-gating.sh nm-scans
     // this binary to prove deselected subsystems (webauthn/magic_link/oauth2, analytics,

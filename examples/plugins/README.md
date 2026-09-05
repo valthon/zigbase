@@ -66,7 +66,8 @@ configures in code:
    `.file_serve`) and `.message`. Logs a structured one-liner so operators can
    distinguish request errors from background-job failures.
 
-6. **Cron job** (`audit-sweep`) via `.cron`. Fires every minute
+6. **Cron job** (`audit-sweep`) via `.cron`, with comptime `.distributed` coordination
+   and a 120-second lease so replicas sharing a database share one schedule. Fires every minute
    (`"* * * * *"`, UTC, 5-field numeric). Demonstrates the full ctx-first job
    DB-access pattern: collection reads use `ctx.records()` (the pooled reader is
    managed for you); raw SQL on the migration-owned `plugin_audit_log` table uses

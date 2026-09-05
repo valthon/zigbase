@@ -638,7 +638,9 @@ Key points:
   connection, and holding it blocks all other writes.
 - Job allocations can use `ev.app.allocator` (the long-lived gpa) since there is no
   request arena here; free anything large yourself if the job runs often.
-- Scheduling is **single-process, UTC, minute-granularity**; cron fields accept numbers
+- Scheduling is **per-process by default, UTC, minute-granularity**; opt into
+  [distributed coordination](framework.md#shared-croninterval-jobs-across-replicas) for shared
+  database replicas. Cron fields accept numbers
   and case-insensitive 3-letter `JAN`..`DEC` / `SUN`..`SAT` names.
   See [framework.md → Scheduled jobs](framework.md#7-scheduled-jobs-cron--jobs) and
   its caveats.
