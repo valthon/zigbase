@@ -1,6 +1,7 @@
-import { describe, it, expect, beforeAll, afterAll } from "vitest";
+import { describe, it, expect, beforeAll, afterAll, vi } from "vitest";
 import { startGolfsim, type GolfServer } from "./harness.js";
 import { createClient, type Booking } from "../clients/typescript/zbase.gen.js";
+import * as browserApi from '../frontend/src/lib/api';
 
 let server: GolfServer;
 beforeAll(async () => { server = await startGolfsim(); });
@@ -30,6 +31,35 @@ async function host(email: string) {
 }
 
 describe("golfsim generated client (live golfsim server)", () => {
+  it('drives the browser API through server-owned booking and review hooks', async () => {
+    const { zb: owner, user } = await host('browser-host@golf.app');
+    const { zb: guest, user: guestUser } = await host('browser-guest@golf.app');
+    const simulator = await owner.db.simulators.create({ label: 'Browser bay', owner: user.id });
+    const listing = await owner.db.listings.create({
+      title: 'Browser listing', simulator: simulator.id, price_per_hour: 35, status: 'published',
+    });
+    const storage = new Map([['golfsim_token', guest.authStore.token!]]);
+    const nativeFetch = globalThis.fetch;
+    vi.stubGlobal('localStorage', { getItem: (key: string) => storage.get(key) ?? null });
+    vi.stubGlobal('fetch', (input: string | URL | Request, init?: RequestInit) =>
+      nativeFetch(typeof input === 'string' ? new URL(input, server.url) : input, init));
+    try {
+      expect((await browserApi.listListings()).find(l => l.id === listing.id)?.expand?.simulator?.label).toBe('Browser bay');
+      const booking = await browserApi.createBooking(listing.id, '2027-02-01 10:00:00.000Z', '2027-02-01 11:00:00.000Z');
+      expect(booking.guest).toBe(guestUser.id);
+      expect(booking.price_total).toBe(35);
+      expect(booking.status).toBe('pending');
+      expect((await browserApi.myBookings()).find(b => b.id === booking.id)?.expand?.listing?.title).toBe('Browser listing');
+      expect((await browserApi.getAvailability(listing.id)).some(b => b.id === booking.id)).toBe(true);
+      storage.set('golfsim_token', owner.authStore.token!);
+      expect((await browserApi.confirmBooking(booking.id)).status).toBe('confirmed');
+      storage.set('golfsim_token', guest.authStore.token!);
+      expect((await browserApi.createReview(booking.id, 5, 'Generated client')).author).toBe(guestUser.id);
+      expect((await browserApi.cancelBooking(booking.id)).status).toBe('cancelled');
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
   it("serves the Zigapagos islands release from the comptime static directory", async () => {
     const home = await fetch(`${server.url}/`);
     expect(home.status).toBe(200);

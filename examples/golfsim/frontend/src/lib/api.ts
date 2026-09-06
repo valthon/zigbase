@@ -1,41 +1,36 @@
+import {
+  createClient,
+  type Listing as ListingRecord, type ListingRelations,
+  type Booking as BookingRecord, type BookingRelations,
+  type BookingCreate, type ReviewCreate, type Review,
+} from '../../../clients/typescript/zbase.gen';
+import type { WithExpand } from '@zigbase/client/typed';
+export type { Review } from '../../../clients/typescript/zbase.gen';
+
 const TOKEN_KEY = 'golfsim_token';
 
-export type Listing = {
-  id: string;
-  title: string;
-  price_per_hour: number;
-  status: string;
-  simulator: string;
-  /** Stored filenames — build full URL with photoUrl(). */
-  photos?: string[];
-  expand?: { simulator?: { label: string } };
-};
+export type Listing = ListingRecord & Partial<Pick<WithExpand<ListingRecord, ListingRelations, 'simulator'>, 'expand'>>;
+export type Booking = BookingRecord & Partial<Pick<WithExpand<BookingRecord, BookingRelations, 'listing'>, 'expand'>>;
+export type AvailabilitySlot = Pick<BookingRecord, 'id' | 'starts_at' | 'ends_at' | 'status'>;
 
-export type Booking = {
-  id: string;
-  listing: string;
-  starts_at: string;
-  ends_at: string;
-  price_total: number;
-  status: string;
-  expand?: { listing?: Listing };
-};
-
-export type AvailabilitySlot = {
-  id: string;
-  starts_at: string;
-  ends_at: string;
-  status: string;
-};
-
-export type Review = {
-  id: string;
-  booking: string;
-  author: string;
-  rating: number;
-  body: string;
-  created: string;
-};
+/** Request-local facade: retain Golfsim's existing raw-token storage format
+ * and avoid a module-global auth store shared by SSR requests. The SDK owns
+ * request encoding/errors; this adapter supplies browser cookie/CSRF policy. */
+function client() {
+  const zb = createClient('', {
+    fetch: (input, init = {}) => {
+      const headers = new Headers(init.headers);
+      if (['POST', 'PATCH', 'PUT', 'DELETE'].includes((init.method ?? 'GET').toUpperCase())) {
+        const csrf = csrfToken();
+        if (csrf) headers.set('x-csrf-token', csrf);
+      }
+      return fetch(input, { ...init, headers, credentials: 'include' });
+    },
+  });
+  const t = token();
+  if (t) zb.authStore.save(t, null);
+  return zb;
+}
 
 export function token(): string | null {
   if (typeof localStorage === 'undefined') return null;
@@ -140,10 +135,7 @@ export async function login(email: string, password: string): Promise<void> {
 }
 
 export async function signup(email: string, password: string): Promise<void> {
-  await req('/api/collections/users/records', {
-    method: 'POST',
-    body: JSON.stringify({ email, password, passwordConfirm: password }),
-  });
+  await client().db.users.create({ email, password, passwordConfirm: password });
   // Immediately trigger the verification email. The server sends one automatically
   // on creation; this is belt-and-suspenders to ensure the user gets it.
   await requestVerification(email);
@@ -202,7 +194,7 @@ export async function otpComplete(email: string, code: string): Promise<void> {
 }
 
 export async function listListings(): Promise<Listing[]> {
-  const out = await req('/api/collections/listings/records?expand=simulator&sort=-created');
+  const out = await client().db.listings.getList({ expand: ['simulator'], sort: '-created' });
   return out.items;
 }
 
@@ -210,33 +202,38 @@ export async function createBooking(listingId: string, startsAt: string, endsAt:
   // The beforeCreate hook validates the listing, checks for overlapping bookings
   // (double-booking prevention), computes price_total, stamps the guest from the
   // auth token, and forces status=pending.
-  return req('/api/collections/bookings/records', {
-    method: 'POST',
-    body: JSON.stringify({ listing: listingId, starts_at: startsAt, ends_at: endsAt }),
+  // The generator describes schema-required fields, not hook-populated
+  // fields. Use its payload minus the server-owned guest, without sending a
+  // fabricated principal or casting an incomplete payload to BookingCreate.
+  const body = { listing: listingId, starts_at: startsAt, ends_at: endsAt } satisfies Omit<BookingCreate, 'guest'>;
+  return client().send<Booking>('POST', '/api/collections/bookings/records', {
+    body,
   });
 }
 
 export async function myBookings(): Promise<Booking[]> {
   // The list rule restricts results to the caller's own bookings (or listings
   // owned by the caller's simulator).
-  const out = await req('/api/collections/bookings/records?expand=listing&sort=-created');
+  const out = await client().db.bookings.getList({ expand: ['listing'], sort: '-created' });
   return out.items;
 }
 
 export async function confirmBooking(id: string): Promise<Booking> {
   // Custom route — verifies the caller is the simulator owner before confirming.
-  return req(`/api/bookings/${id}/confirm`, { method: 'POST' });
+  // These imperative routes currently expose unknown response types to
+  // gen-client; keep that boundary explicit instead of duplicating URLs.
+  return await client().rpc.bookingsConfirm({ id }) as Booking;
 }
 
 export async function cancelBooking(id: string): Promise<Booking> {
   // Custom route — verifies the caller is the booking's guest.
-  return req(`/api/bookings/${id}/cancel`, { method: 'POST' });
+  return await client().rpc.bookingsCancel({ id }) as Booking;
 }
 
 export async function getAvailability(listingId: string): Promise<AvailabilitySlot[]> {
   // Custom route — returns non-cancelled bookings for the listing so the UI
   // can show a calendar and warn on overlap before the user submits.
-  const out = await req(`/api/listings/${listingId}/availability`);
+  const out = await client().rpc.listingsAvailability({ id: listingId }) as { items: AvailabilitySlot[] };
   return out.items ?? [];
 }
 
@@ -244,25 +241,24 @@ export async function uploadListingPhotos(listingId: string, files: File[]): Pro
   // Photo upload uses multipart/form-data. Do NOT set Content-Type — the
   // browser sets it automatically with the correct multipart boundary.
   // Serve stored photos via photoUrl().
-  const form = new FormData();
-  for (const f of files) form.append('photos', f);
-  return req(`/api/collections/listings/records/${listingId}`, {
-    method: 'PATCH',
-    body: form,
-  });
+  const listings = client().db.listings;
+  await listings.update(listingId, { photos: files });
+  // Mutation responses do not include relations. Preserve the card's simulator
+  // label when the caller replaces its listing with the upload result.
+  return listings.getOne(listingId, { expand: ['simulator'] });
 }
 
 /** Build a URL for a stored listing photo. Published listings serve directly. */
 export function photoUrl(listingId: string, filename: string): string {
-  return `/api/files/listings/${listingId}/${filename}`;
+  return `/api/files/listings/${encodeURIComponent(listingId)}/${encodeURIComponent(filename)}`;
 }
 
 export async function createReview(bookingId: string, rating: number, body: string): Promise<Review> {
   // The prepareReview beforeCreate hook stamps the author from the auth token and
   // enforces that the booking is the caller's own AND confirmed (else HTTP 400).
-  return req('/api/collections/reviews/records', {
-    method: 'POST',
-    body: JSON.stringify({ booking: bookingId, rating, body }),
+  const payload = { booking: bookingId, rating, body } satisfies Omit<ReviewCreate, 'author'>;
+  return client().send<Review>('POST', '/api/collections/reviews/records', {
+    body: payload,
   });
 }
 

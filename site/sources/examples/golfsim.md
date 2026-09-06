@@ -24,6 +24,13 @@ parts** of building a real backend on ZigBase *as a library*.
 
 ## What it proves
 
+The browser frontend consumes Golfsim's `gen-client` output directly for
+collection queries, signup, file handling, RPC paths and record types.
+CI checks both generated-file freshness and the frontend API's types;
+browser transport tests preserve cookies, CSRF and pending-factor behavior.
+Hook-owned guest/author fields and untyped imperative-route responses remain
+explicit boundaries rather than duplicated handwritten collection models.
+
 The example also demonstrates **compile-time-selected TOTP two-factor authentication**:
 optional enrollment from Account security, required enrollment for operator-selected
 members, authenticator verification, and single-use recovery codes. Its server-side

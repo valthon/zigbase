@@ -8,5 +8,5 @@
     "skipLibCheck": true,
     "types": ["node"]
   },
-  "include": ["clients/typescript", "test"]
+  "include": ["clients/typescript", "frontend/src/lib", "test"]
 }

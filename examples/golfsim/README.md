@@ -24,6 +24,35 @@ webhook needs. See ["Two test surfaces, on purpose"](#two-test-surfaces-on-purpo
 Everything else (HTTP API, SQLite storage, auth, file storage, the admin UI, the
 CLI) comes straight from the framework via the public `zigbase.*` exports.
 
+### Generated client in the browser
+
+The Zigapagos frontend imports `clients/typescript/zbase.gen.ts` directly;
+it does not maintain a second copy of the collection record types. Listing
+and booking queries, signup, file updates/URLs and custom RPC paths use the
+generated facade and the local `@zigbase/client` package. The browser adapter
+keeps cookie credentials, CSRF headers and the existing `golfsim_token`
+storage format. Login, verification, two-factor UI flows and the existing
+WebSocket lifecycle remain application-owned.
+
+Two boundaries remain explicit: `BookingCreate.guest` and
+`ReviewCreate.author` are schema-required but filled by hooks, so those
+requests use the generated payload types minus the server-owned fields
+with `send`. Imperative routes whose output is `std.json.Value` generate
+`unknown`; their frontend response assertions use generated record types.
+Neither boundary invents a client-side authorization decision.
+
+After backend schema changes, run `zig build gen-client` in this directory
+and commit the regenerated file. `zig build gen-client-check` detects stale
+output in CI; `npm run typecheck` also checks the frontend API against that
+output. `frontend/build.sh` prepares the local SDK and app dependencies,
+runs that typecheck, then builds the islands site with strict props checking.
+The e2e harness uses `frontend/build.sh --no-install` when the site is missing,
+so prepare dependencies and build the SDK before starting tests; it never reinstalls packages
+under a running test process. SDK preparation uses `npm ci` deliberately:
+update and commit its lockfile when changing dependencies.
+`npm run test:frontend` covers browser transport policy and payloads, and
+`npm run test:e2e` drives the browser API against a real Golfsim server.
+
 > **Pre-1.0:** ZigBase is pre-1.0 — the hook/route/job config shapes and the module
 > API may change between releases.
 
