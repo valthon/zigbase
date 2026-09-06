@@ -279,6 +279,8 @@ environment variables, then `serve` command-line flags (where a flag exists).
 | `ZIGBASE_S3_KEY_PREFIX` | — | `""` | prefix prepended to every object key — namespace multiple apps in one bucket |
 | `ZIGBASE_S3_CACHE_DIR` | — | `""` | `""` → `<data-dir>/storage_cache`; local spool-cache directory downloads materialize through |
 | `ZIGBASE_S3_CACHE_MAX_BYTES` | — | `1073741824` (1 GiB) | spool-cache size cap; eviction reclaims down to a 3/4 low-water mark |
+| `ZIGBASE_S3_MULTIPART_THRESHOLD_BYTES` | — | `67108864` (64 MiB) | use multipart at this size; allowed 5 MiB–5 GiB; input remains fully buffered |
+| `ZIGBASE_S3_MULTIPART_PART_BYTES` | — | `8388608` (8 MiB) | preferred part size, 5 MiB–5 GiB; raised automatically to stay within 10,000 parts |
 | `ZIGBASE_VAPID_PUBLIC_KEY` | — | `""` | Web Push VAPID public key (base64url) for `ctx.push()`; also the browser `applicationServerKey`. Generate a pair with `zigbase vapid-keygen` |
 | `ZIGBASE_VAPID_PRIVATE_KEY` | — | `""` | Web Push VAPID private key (base64url) — **secret**. Both keys unset → `ctx.push()` is a no-op |
 | `ZIGBASE_LOG_FORMAT` | `--log-format` | `text` | log encoding: `text` or `json` (one JSON object per line on stderr) |

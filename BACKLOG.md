@@ -28,3 +28,12 @@ Development-workflow, realtime/scaling, and storage work is tracked by its own P
 
 - [x] Capture explicit atomic batches with server-stamped identity and bounded inputs.
 - [x] Preserve outer transaction ownership and provide a nameable runtime input type.
+
+## Files and storage
+
+- [x] Opt-in read-only storage inventory for local and S3 backends (#400).
+- [x] S3 multipart upload with bounded request scratch, retries, best-effort abort,
+  completion-error handling, and live S3-compatible integration coverage.
+- [ ] Resumable client uploads with principal-bound capabilities and commit reauthorization.
+- [ ] Image transforms/thumbnails with comptime support and resource budgets.
+- [ ] Durable post-commit replacement/deletion cleanup and scoped orphan reconciliation.

@@ -4,8 +4,8 @@
 //! `<prefix><col>/<rid>/<filename>` (col/rid are validated ids, filename is a
 //! naming-sanitized stored name; keys are additionally UriEncoded per SigV4).
 //!
-//! `S3Storage` (the vtable impl on top of `Client`) lands in Task 12; this file currently
-//! carries only the SigV4-signed request ops (put/get/delete/head/list).
+//! SigV4-signed request operations and the spool-cached Storage implementation.
+//! Large PUTs use sequential multipart transfers; input remains fully buffered.
 const std = @import("std");
 const config = @import("../config.zig");
 const files_storage = @import("storage.zig");
@@ -14,6 +14,19 @@ const http_client = @import("../http_client.zig");
 const clock = @import("../clock.zig");
 const testcapture = @import("../testcapture.zig");
 const mime = @import("mime.zig");
+
+const min_part_bytes: u64 = 5 << 20;
+const max_part_bytes: u64 = 5 << 30;
+const max_parts: u64 = 10_000;
+const max_object_bytes: u64 = max_part_bytes * max_parts;
+
+/// Pure sizing math: no large allocations required to exercise the service limits.
+fn multipartPlan(total: u64, preferred: u64) !struct { size: u64, count: u16 } {
+    if (preferred < min_part_bytes or preferred > max_part_bytes) return error.S3ConfigInvalid;
+    if (total > max_object_bytes) return error.S3UploadCapTooLarge;
+    const size = @max(preferred, (total + max_parts - 1) / max_parts);
+    return .{ .size = size, .count = @intCast(if (total == 0) 0 else (total - 1) / size + 1) };
+}
 
 pub const Client = struct {
     bucket: []const u8,
@@ -26,6 +39,8 @@ pub const Client = struct {
     secret_key: []const u8,
     key_prefix: []const u8,
     path_style: bool,
+    multipart_threshold_bytes: u64 = 64 << 20,
+    multipart_part_bytes: u64 = 8 << 20,
 
     /// Resolve endpoint defaults: "" endpoint => https://s3.<region>.amazonaws.com
     /// (virtual-hosted addressing unless forced); an explicit endpoint (MinIO/R2) =>
@@ -57,6 +72,8 @@ pub const Client = struct {
             .secret_key = cfg.s3_secret_access_key,
             .key_prefix = cfg.s3_key_prefix,
             .path_style = cfg.s3_force_path_style orelse (cfg.s3_endpoint.len > 0),
+            .multipart_threshold_bytes = cfg.s3_multipart_threshold_bytes,
+            .multipart_part_bytes = cfg.s3_multipart_part_bytes,
         };
     }
 
@@ -143,18 +160,151 @@ pub const Client = struct {
         return .{ .amz_date = amz_date, .authorization = authorization };
     }
 
-    /// PUT the object at `key`. Retries ONCE on a transport error or a 5xx response
-    /// (idempotent); any other non-200 status is a terminal `error.S3RequestFailed`.
+    /// Upload the object at `key`, automatically selecting multipart above the threshold.
+    /// Small single PUTs retry once on transport/5xx failures. Multipart retries parts and
+    /// transient completion failures once, never blindly re-initiating an upload.
     pub fn put(self: Client, io: std.Io, alloc: std.mem.Allocator, key: []const u8, bytes: []const u8, content_type: []const u8) !void {
+        if (bytes.len >= self.multipart_threshold_bytes) return self.putMultipart(io, alloc, key, bytes, content_type);
         var attempt: u8 = 0;
         while (true) : (attempt += 1) {
-            const status = self.putOnce(io, alloc, key, bytes, content_type) catch |err| {
+            var scratch = std.heap.ArenaAllocator.init(alloc);
+            defer scratch.deinit();
+            const status = self.putOnce(io, scratch.allocator(), key, bytes, content_type) catch |err| {
                 if (attempt == 0) continue;
                 return err;
             };
             if (status == 200) return;
             if (status >= 500 and attempt == 0) continue;
             return error.S3RequestFailed;
+        }
+    }
+
+    const MultipartResponse = struct {
+        status: u16,
+        body: []const u8,
+        etag: []const u8,
+        fn deinit(self: @This(), alloc: std.mem.Allocator) void {
+            alloc.free(self.body);
+            alloc.free(self.etag);
+        }
+    };
+
+    /// HTTP scratch is reclaimed per attempt, not accumulated for every part on the
+    /// upload's arena. Only bounded response text and ETag escape onto the caller allocator.
+    fn multipartRequest(self: Client, io: std.Io, alloc: std.mem.Allocator, method: http_client.Method, key: []const u8, query: []const u8, body: []const u8, content_type: []const u8) !MultipartResponse {
+        var scratch = std.heap.ArenaAllocator.init(alloc);
+        defer scratch.deinit();
+        const a = scratch.allocator();
+        const path = if (key.len == 0) try bucketPath(a, self) else try requestPath(a, self, key);
+        const host = try effectiveHost(a, self);
+        const url = try buildUrl(a, self, host, path, query);
+        const hash = try sigv4.sha256Hex(a, body);
+        const signed = try self.sign(a, io, @tagName(method), host, path, query, hash, content_type);
+        const client = http_client.HttpClient{ .alloc = a, .io = io };
+        const res = try client.request(.{
+            .method = method,
+            .url = url,
+            .body = if (method == .POST or method == .PUT) body else null,
+            .max_response_bytes = 64 << 10,
+            .headers = &.{
+                .{ .name = "Content-Type", .value = content_type },
+                .{ .name = "X-Amz-Date", .value = &signed.amz_date },
+                .{ .name = "X-Amz-Content-Sha256", .value = hash },
+                .{ .name = "Authorization", .value = signed.authorization },
+            },
+        });
+        var etag: []const u8 = "";
+        for (res.headers) |h| if (std.ascii.eqlIgnoreCase(h.name, "etag")) {
+            etag = h.value;
+            break;
+        };
+        if (res.body.len > 64 << 10 or etag.len > 256) return error.S3InvalidMultipartResponse;
+        const owned_body = try alloc.dupe(u8, res.body);
+        errdefer alloc.free(owned_body);
+        return .{ .status = res.status, .body = owned_body, .etag = try alloc.dupe(u8, etag) };
+    }
+
+    fn abortMultipart(self: Client, io: std.Io, alloc: std.mem.Allocator, key: []const u8, query: []const u8) !void {
+        for (0..2) |attempt| {
+            const res = self.multipartRequest(io, alloc, .DELETE, key, query, "", "application/xml") catch |err| {
+                if (attempt == 0 and err != error.OutOfMemory) continue;
+                return err;
+            };
+            defer res.deinit(alloc);
+            if (res.status == 204 or res.status == 404) return;
+            if (res.status < 500 or attempt == 1) return error.S3RequestFailed;
+        }
+    }
+
+    fn uploadPart(self: Client, io: std.Io, alloc: std.mem.Allocator, key: []const u8, query: []const u8, bytes: []const u8) ![]const u8 {
+        for (0..2) |attempt| {
+            const res = self.multipartRequest(io, alloc, .PUT, key, query, bytes, "application/octet-stream") catch |err| {
+                if (attempt == 0 and err != error.OutOfMemory) continue;
+                return err;
+            };
+            defer res.deinit(alloc);
+            if (res.status == 200) {
+                if (res.etag.len == 0) return error.S3InvalidMultipartResponse;
+                return alloc.dupe(u8, res.etag);
+            }
+            if (res.status < 500 or attempt == 1) return error.S3RequestFailed;
+        }
+        unreachable; // the second iteration always returns
+    }
+
+    /// Whole input is already resident per Storage.put's contract. Parts BORROW slices;
+    /// only bounded response scratch and the <=10,000-entry completion manifest allocate.
+    fn putMultipart(self: Client, io: std.Io, alloc: std.mem.Allocator, key: []const u8, bytes: []const u8, content_type: []const u8) !void {
+        const plan = try multipartPlan(bytes.len, self.multipart_part_bytes);
+        const initiated = try self.multipartRequest(io, alloc, .POST, key, "uploads=", "", content_type);
+        defer initiated.deinit(alloc);
+        if (initiated.status != 200 or !xmlRoot(initiated.body, "InitiateMultipartUploadResult")) return error.S3RequestFailed;
+        const raw_id = (try xmlText(initiated.body, "UploadId")) orelse return error.S3InvalidMultipartResponse;
+        const upload_id = try decodeXmlText(alloc, raw_id);
+        defer alloc.free(upload_id);
+        if (upload_id.len == 0 or upload_id.len > 4096) return error.S3InvalidMultipartResponse;
+        const encoded_id = try uriEncodeQueryValue(alloc, upload_id);
+        defer alloc.free(encoded_id);
+        const query = try std.fmt.allocPrint(alloc, "uploadId={s}", .{encoded_id});
+        defer alloc.free(query);
+        errdefer self.abortMultipart(io, alloc, key, query) catch |err|
+            std.log.warn("S3 multipart abort failed ({s}); configure incomplete-upload lifecycle cleanup", .{@errorName(err)});
+
+        var manifest: std.ArrayList(u8) = .empty;
+        defer manifest.deinit(alloc);
+        try manifest.appendSlice(alloc, "<CompleteMultipartUpload>");
+        var offset: usize = 0;
+        for (0..plan.count) |part| {
+            const end = offset + @min(bytes.len - offset, @as(usize, @intCast(plan.size)));
+            const part_query = try std.fmt.allocPrint(alloc, "partNumber={d}&{s}", .{ part + 1, query });
+            defer alloc.free(part_query);
+            const etag = try self.uploadPart(io, alloc, key, part_query, bytes[offset..end]);
+            defer alloc.free(etag);
+            try manifest.print(alloc, "<Part><PartNumber>{d}</PartNumber><ETag>", .{part + 1});
+            try appendXmlText(alloc, &manifest, etag);
+            try manifest.appendSlice(alloc, "</ETag></Part>");
+            offset = end;
+        }
+        try manifest.appendSlice(alloc, "</CompleteMultipartUpload>");
+        for (0..2) |attempt| {
+            const res = self.multipartRequest(io, alloc, .POST, key, query, manifest.items, "application/xml") catch |err| {
+                if (attempt == 0 and err != error.OutOfMemory) continue;
+                return err;
+            };
+            defer res.deinit(alloc);
+            if (res.status >= 500) {
+                if (attempt == 0) continue;
+                return error.S3RequestFailed;
+            }
+            const completion_etag: []const u8 = (try xmlText(res.body, "ETag")) orelse "";
+            if (res.status == 200 and xmlRoot(res.body, "CompleteMultipartUploadResult") and
+                std.mem.indexOf(u8, res.body, "<Error") == null and
+                completion_etag.len > 0) return;
+            // CompleteMultipartUpload may return an Error document after HTTP200 headers.
+            const code = (try xmlText(res.body, "Code")) orelse "";
+            const transient = std.mem.eql(u8, code, "InternalError") or
+                std.mem.eql(u8, code, "SlowDown") or std.mem.eql(u8, code, "ServiceUnavailable");
+            if (!transient or attempt == 1) return error.S3RequestFailed;
         }
     }
 
@@ -479,6 +629,29 @@ fn inventoryFromXml(alloc: std.mem.Allocator, xml: []const u8, prefix: []const u
     return .{ .items = try items.toOwnedSlice(alloc), .nextCursor = next };
 }
 
+fn xmlRoot(body: []const u8, comptime tag: []const u8) bool {
+    var text = std.mem.trim(u8, body, " \r\n\t");
+    if (std.mem.startsWith(u8, text, "<?xml")) {
+        const end = std.mem.indexOf(u8, text, "?>") orelse return false;
+        text = std.mem.trimStart(u8, text[end + 2 ..], " \r\n\t");
+    }
+    const prefix = "<" ++ tag;
+    if (!std.mem.startsWith(u8, text, prefix) or text.len <= prefix.len) return false;
+    if (text[prefix.len] != '>' and text[prefix.len] != ' ') return false;
+    return std.mem.endsWith(u8, text, "</" ++ tag ++ ">");
+}
+
+fn appendXmlText(alloc: std.mem.Allocator, out: *std.ArrayList(u8), value: []const u8) !void {
+    for (value) |c| switch (c) {
+        '&' => try out.appendSlice(alloc, "&amp;"),
+        '<' => try out.appendSlice(alloc, "&lt;"),
+        '>' => try out.appendSlice(alloc, "&gt;"),
+        '"' => try out.appendSlice(alloc, "&quot;"),
+        '\'' => try out.appendSlice(alloc, "&apos;"),
+        else => try out.append(alloc, c),
+    };
+}
+
 /// Extract an S3 scalar element without accepting nested markup or a truncated tag.
 fn xmlText(xml: []const u8, comptime tag: []const u8) !?[]const u8 {
     const open = "<" ++ tag ++ ">";
@@ -572,8 +745,8 @@ pub const S3Storage = struct {
                     std.log.err("refusing to start: ZIGBASE_S3_BUCKET is set but ZIGBASE_S3_ACCESS_KEY_ID is empty", .{})
                 else
                     std.log.err("refusing to start: ZIGBASE_S3_BUCKET is set but ZIGBASE_S3_SECRET_ACCESS_KEY is empty", .{}),
-                error.S3UploadCapTooLarge => std.log.err("refusing to start: ZIGBASE_MAX_UPLOAD_SIZE ({d}) exceeds the S3 single-PUT limit of 5 GiB", .{cfg.max_upload_size}),
-                error.S3ConfigInvalid => std.log.err("refusing to start: ZIGBASE_S3_BUCKET/REGION/ENDPOINT/KEY_PREFIX/ACCESS_KEY_ID/SECRET_ACCESS_KEY must not contain CR or LF", .{}),
+                error.S3UploadCapTooLarge => std.log.err("refusing to start: ZIGBASE_MAX_UPLOAD_SIZE ({d}) exceeds 10,000 S3 parts of 5 GiB", .{cfg.max_upload_size}),
+                error.S3ConfigInvalid => std.log.err("refusing to start: S3 settings must not contain CR/LF; multipart threshold and part size must each be 5 MiB through 5 GiB", .{}),
             }
             return err;
         };
@@ -612,10 +785,9 @@ pub const S3Storage = struct {
         inline for (.{ cfg.s3_bucket, cfg.s3_region, cfg.s3_endpoint, cfg.s3_key_prefix, cfg.s3_access_key_id, cfg.s3_secret_access_key }) |v| {
             if (std.mem.indexOfAny(u8, v, "\r\n") != null) return error.S3ConfigInvalid;
         }
-        // Request bodies are capped by the zap listener (ZIGBASE_MAX_UPLOAD_SIZE);
-        // a single PutObject tops out at 5 GiB — fail fast so the gap can never
-        // silently open (multipart upload is an explicit non-goal this round).
-        if (cfg.max_upload_size > (5 << 30)) return error.S3UploadCapTooLarge;
+        if (cfg.s3_multipart_threshold_bytes < min_part_bytes or cfg.s3_multipart_threshold_bytes > max_part_bytes)
+            return error.S3ConfigInvalid;
+        _ = try multipartPlan(cfg.max_upload_size, cfg.s3_multipart_part_bytes);
     }
 
     /// HeadObject on `<prefix>.zigbase/probe`; 200 or 404 both prove the round trip
@@ -676,7 +848,9 @@ pub const S3Storage = struct {
         defer arena.deinit();
         const a = arena.allocator();
         const key = try self.client.objectKey(a, col, record_id, filename);
-        try self.client.put(io, a, key, bytes, mime.sniff(bytes));
+        // Use the backing allocator, not the key arena: per-part response scratch must
+        // actually be reclaimed between requests rather than accumulating for the upload.
+        try self.client.put(io, self.gpa, key, bytes, mime.sniff(bytes));
     }
 
     /// §D.6 spool: cache hit -> path; miss -> stream GetObject to a .tmp<rand> then
@@ -943,17 +1117,8 @@ test "put: sends signed headers and the path-style, space-encoded URL" {
     defer testcapture.http.reset();
     testcapture.http.mock("zbtest/col/r1/a%20b.png", .{ .status = 200 });
 
-    // BLOCKED (contract-4, root cause outside this batch): `Client.put` -> `putOnce` ->
-    // `HttpClient.request` (src/http_client.zig) allocates its response scratch (the
-    // fixed `max_response_bytes` body buffer, the redirect buffer, and the captured
-    // header array/strings) on this allocator and never frees it — by house convention
-    // `HttpResponse` has no `deinit`; every production caller (S3Storage's putImpl et
-    // al.) wraps the call in its own disposable arena. A raw `std.testing.allocator`
-    // here would report that http_client.zig scratch as a leak; fixing it means
-    // changing http_client.zig, which is out of this batch's scope. Kept arena-wrapped.
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    // PUT now owns and frees the underlying HTTP client's arena-scoped scratch.
+    const a = testing.allocator;
 
     const client = testClient();
     try client.put(std.testing.io, a, "col/r1/a b.png", "hello", "image/png");
@@ -965,6 +1130,7 @@ test "put: sends signed headers and the path-style, space-encoded URL" {
     var found_auth = false;
     var found_sha = false;
     const expected_sha = try sigv4.sha256Hex(a, "hello");
+    defer a.free(expected_sha);
     for (rq.headers) |h| {
         if (std.ascii.eqlIgnoreCase(h.name, "Authorization")) {
             try testing.expect(std.mem.startsWith(u8, h.value, "AWS4-HMAC-SHA256 Credential=AKID"));
@@ -981,12 +1147,7 @@ test "put: sends signed headers and the path-style, space-encoded URL" {
 
 test "put: 500 retries once then errors; 200 succeeds with a single request" {
     if (!testcapture.enabled) return error.SkipZigTest;
-    // BLOCKED (contract-4, root cause outside this batch): see the identical arena note
-    // on "put: sends signed headers…" above — `HttpClient.request` (http_client.zig)
-    // scratch is never freed by the callee.
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    const a = testing.allocator;
     const client = testClient();
 
     testcapture.http.enable(true);
@@ -1253,13 +1414,100 @@ test "S3Storage.validateConfig: missing access key id / secret key -> S3ConfigMi
     try S3Storage.validateConfig(cfg); // both set, defaults otherwise valid
 }
 
-test "S3Storage.validateConfig: max_upload_size over the 5 GiB single-PUT limit -> S3UploadCapTooLarge" {
+test "S3Storage.validateConfig: multipart sizing validates boundaries without allocating objects" {
     var cfg = config.Config{};
     cfg.s3_bucket = "zbtest";
     cfg.s3_access_key_id = "AKID";
     cfg.s3_secret_access_key = "SECRET";
     cfg.max_upload_size = 6 << 30;
+    try S3Storage.validateConfig(cfg);
+    cfg.max_upload_size = max_object_bytes + 1;
     try testing.expectError(error.S3UploadCapTooLarge, S3Storage.validateConfig(cfg));
+    const limit = try multipartPlan(max_object_bytes, min_part_bytes);
+    try testing.expectEqual(max_part_bytes, limit.size);
+    try testing.expectEqual(@as(u16, 10_000), limit.count);
+    try testing.expectError(error.S3ConfigInvalid, multipartPlan(1, min_part_bytes - 1));
+    try testing.expectError(error.S3ConfigInvalid, multipartPlan(1, max_part_bytes + 1));
+    cfg.max_upload_size = 1024;
+    cfg.s3_multipart_threshold_bytes = 0;
+    try testing.expectError(error.S3ConfigInvalid, S3Storage.validateConfig(cfg));
+}
+
+test "multipart bucket requests use the canonical bucket path" {
+    if (!testcapture.enabled) return error.SkipZigTest;
+    testcapture.http.enable(true);
+    defer testcapture.http.reset();
+    testcapture.http.mock("?uploads=", .{ .status = 200 });
+    var client = testClient();
+    for ([_]bool{ true, false }) |path_style| {
+        client.path_style = path_style;
+        const res = try client.multipartRequest(testing.io, testing.allocator, .GET, "", "uploads=", "", "application/xml");
+        defer res.deinit(testing.allocator);
+        const rq = testcapture.http.requestAt(testcapture.http.requestCount() - 1).?;
+        const suffix = if (path_style) "/zbtest?uploads=" else "/?uploads=";
+        try testing.expect(std.mem.endsWith(u8, rq.url, suffix));
+    }
+}
+
+test "multipart PUT retries a part, encodes upload id, and completes ordered escaped ETags" {
+    if (!testcapture.enabled) return error.SkipZigTest;
+    const a = testing.allocator;
+    testcapture.http.enable(true);
+    defer testcapture.http.reset();
+    testcapture.http.mock("?uploadId=up%26%2F%2B", .{ .status = 200, .body = " <CompleteMultipartUploadResult><ETag>result</ETag></CompleteMultipartUploadResult>" });
+    testcapture.http.mockSequence("partNumber=1&", &.{ .{ .status = 503 }, .{ .status = 200, .headers = &.{.{ .name = "ETag", .value = "\"one&\"" }} } });
+    testcapture.http.mock("partNumber=2&", .{ .status = 200, .headers = &.{.{ .name = "ETag", .value = "\"two\"" }} });
+    testcapture.http.mock("?uploads=", .{ .status = 200, .body = "<InitiateMultipartUploadResult><UploadId>up&amp;/+</UploadId></InitiateMultipartUploadResult>" });
+    const bytes = try a.alloc(u8, min_part_bytes + 1);
+    defer a.free(bytes);
+    @memset(bytes, 'x');
+    var client = testClient();
+    client.multipart_threshold_bytes = min_part_bytes;
+    client.multipart_part_bytes = min_part_bytes;
+    try client.put(testing.io, a, "col/r1/x.bin", bytes, "image/png");
+    try testing.expectEqual(@as(usize, 5), testcapture.http.requestCount());
+    try testing.expectEqualStrings(testcapture.http.requestAt(1).?.url, testcapture.http.requestAt(2).?.url);
+    try testing.expectEqual(@as(usize, min_part_bytes), testcapture.http.requestAt(2).?.body.?.len);
+    try testing.expectEqual(@as(usize, 1), testcapture.http.requestAt(3).?.body.?.len);
+    try testing.expectEqualStrings("<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>&quot;one&amp;&quot;</ETag></Part><Part><PartNumber>2</PartNumber><ETag>&quot;two&quot;</ETag></Part></CompleteMultipartUpload>", testcapture.http.requestAt(4).?.body.?);
+}
+
+test "multipart completion HTTP200 embedded errors retry boundedly then abort" {
+    if (!testcapture.enabled) return error.SkipZigTest;
+    const a = testing.allocator;
+    testcapture.http.enable(true);
+    defer testcapture.http.reset();
+    testcapture.http.mockSequence("?uploadId=id", &.{
+        .{ .status = 200, .body = "<Error><Code>InternalError</Code></Error>" },
+        .{ .status = 503, .body = "<ETag>truncated gateway response" },
+        .{ .status = 204 },
+    });
+    testcapture.http.mock("partNumber=1&", .{ .status = 200, .headers = &.{.{ .name = "etag", .value = "part" }} });
+    testcapture.http.mock("?uploads=", .{ .status = 200, .body = "<InitiateMultipartUploadResult><UploadId>id</UploadId></InitiateMultipartUploadResult>" });
+    const client = testClient();
+    // Direct multipart helper exercises final-short-part semantics without allocating a huge body.
+    try testing.expectError(error.S3RequestFailed, client.putMultipart(testing.io, a, "x", "small", "text/plain"));
+    try testing.expectEqual(@as(usize, 5), testcapture.http.requestCount());
+    try testing.expectEqual(http_client.Method.DELETE, testcapture.http.requestAt(4).?.method);
+}
+
+test "multipart terminal part errors abort, initiation errors are not blindly retried" {
+    if (!testcapture.enabled) return error.SkipZigTest;
+    const a = testing.allocator;
+    const client = testClient();
+    testcapture.http.enable(true);
+    testcapture.http.mock("?uploadId=id", .{ .status = 204 });
+    testcapture.http.mock("partNumber=1&", .{ .status = 403 });
+    testcapture.http.mock("?uploads=", .{ .status = 200, .body = "<InitiateMultipartUploadResult><UploadId>id</UploadId></InitiateMultipartUploadResult>" });
+    try testing.expectError(error.S3RequestFailed, client.putMultipart(testing.io, a, "x", "small", "text/plain"));
+    try testing.expectEqual(@as(usize, 3), testcapture.http.requestCount());
+    try testing.expectEqual(http_client.Method.DELETE, testcapture.http.requestAt(2).?.method);
+    testcapture.http.reset();
+    testcapture.http.enable(true);
+    defer testcapture.http.reset();
+    testcapture.http.mock("?uploads=", .{ .status = 500 });
+    try testing.expectError(error.S3RequestFailed, client.putMultipart(testing.io, a, "x", "small", "text/plain"));
+    try testing.expectEqual(@as(usize, 1), testcapture.http.requestCount());
 }
 
 test "S3Storage.validateConfig: CR/LF in bucket/region/endpoint/key_prefix -> S3ConfigInvalid" {
@@ -1561,7 +1809,7 @@ test "LIVE MinIO: put/head/get/list/delete round-trip (object verifiably GONE)" 
     defer arena.deinit();
     const a = arena.allocator();
     var host_buf: [256]u8 = undefined;
-    const client = Client.init(.{
+    var client = Client.init(.{
         .s3_bucket = bucket,
         .s3_endpoint = endpoint,
         .s3_access_key_id = key_id,
@@ -1579,4 +1827,38 @@ test "LIVE MinIO: put/head/get/list/delete round-trip (object verifiably GONE)" 
     try std.testing.expectEqualStrings(key, keys[0]);
     try client.delete(std.testing.io, a, key);
     try std.testing.expectEqual(@as(u16, 404), try client.head(std.testing.io, a, key)); // GONE in MinIO
+
+    client.multipart_threshold_bytes = min_part_bytes;
+    client.multipart_part_bytes = min_part_bytes;
+    const large = try a.alloc(u8, min_part_bytes + 13);
+    @memset(large, 'M');
+    try client.put(std.testing.io, testing.allocator, key, large, "application/octet-stream");
+    const head_res = try client.multipartRequest(testing.io, testing.allocator, .HEAD, key, "", "", "application/xml");
+    defer head_res.deinit(testing.allocator);
+    try testing.expectEqual(@as(u16, 200), head_res.status);
+    try testing.expect(std.mem.endsWith(u8, head_res.etag, "-2\"")); // actual two-part object
+    const received = try a.alloc(u8, large.len);
+    var large_writer = std.Io.Writer.fixed(received);
+    try testing.expectEqual(@as(u16, 200), try client.getToWriter(testing.io, a, key, &large_writer));
+    try testing.expectEqualSlices(u8, large, large_writer.buffered());
+    try client.delete(testing.io, a, key);
+
+    // A real incomplete upload is visible in ListMultipartUploads, then disappears after abort.
+    const nonce = @import("../id.zig").collectionId(testing.io);
+    const abort_key = try std.fmt.allocPrint(a, "livetest/abort/{s}", .{nonce});
+    const begun = try client.multipartRequest(testing.io, a, .POST, abort_key, "uploads=", "", "application/octet-stream");
+    const raw_id = (try xmlText(begun.body, "UploadId")).?;
+    const uid = try decodeXmlText(a, raw_id);
+    const query = try std.fmt.allocPrint(a, "uploadId={s}", .{try uriEncodeQueryValue(a, uid)});
+    errdefer client.abortMultipart(testing.io, a, abort_key, query) catch |err| std.log.warn("live multipart cleanup: {s}", .{@errorName(err)});
+    const part_query = try std.fmt.allocPrint(a, "partNumber=1&{s}", .{query});
+    _ = try client.uploadPart(testing.io, a, abort_key, part_query, "incomplete");
+    const list_query = try std.fmt.allocPrint(a, "prefix={s}&uploads=", .{try uriEncodeQueryValue(a, abort_key)});
+    const before = try client.multipartRequest(testing.io, a, .GET, "", list_query, "", "application/xml");
+    try testing.expectEqual(@as(u16, 200), before.status);
+    try testing.expect(std.mem.indexOf(u8, before.body, "<Upload>") != null);
+    try client.abortMultipart(testing.io, testing.allocator, abort_key, query);
+    const after = try client.multipartRequest(testing.io, a, .GET, "", list_query, "", "application/xml");
+    try testing.expectEqual(@as(u16, 200), after.status);
+    try testing.expect(std.mem.indexOf(u8, after.body, "<Upload>") == null);
 }

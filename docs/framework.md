@@ -4401,6 +4401,28 @@ backend (AWS S3, MinIO, Cloudflare R2, and similar) — selected by
 | `ZIGBASE_S3_KEY_PREFIX` | `""` | prefix prepended to every object key (`<prefix><col>/<rid>/<name>`) — namespace multiple apps in one bucket |
 | `ZIGBASE_S3_CACHE_DIR` | `""` | `""` → `<data_dir>/storage_cache`; the local spool cache directory (see below) |
 | `ZIGBASE_S3_CACHE_MAX_BYTES` | `1073741824` (1 GiB) | spool cache size cap; eviction reclaims down to a 3/4 low-water mark |
+| `ZIGBASE_S3_MULTIPART_THRESHOLD_BYTES` | `67108864` (64 MiB) | upload objects at or above this size using multipart; range 5 MiB–5 GiB |
+| `ZIGBASE_S3_MULTIPART_PART_BYTES` | `8388608` (8 MiB) | preferred multipart part size, 5 MiB–5 GiB; increased automatically if needed to stay within 10,000 parts |
+
+Large uploads use sequential multipart transfers. Parts borrow slices of the already resident
+input; HTTP response scratch is reclaimed between attempts and the completion manifest is
+bounded to 10,000 ETags. **The HTTP request and `Storage.put` still hold the complete input in
+memory**: this is neither streaming request ingestion nor resumable client uploads. Keep
+`ZIGBASE_MAX_UPLOAD_SIZE` within the deployment's memory budget, even though the backend no
+longer imposes the single-PUT 5 GiB ceiling. AWS allows 5 MiB–5 GiB parts (the last may be
+smaller), at most 10,000 parts, and up to 48.8 TiB per object; compatible providers may impose
+lower limits. See [AWS multipart limits](https://docs.aws.amazon.com/AmazonS3/latest/userguide/qfacts.html).
+
+Part uploads and transient completion failures retry once using the same upload ID and part
+numbers. Completion checks the XML response: HTTP `200` can still carry an error, as documented
+by [AWS CompleteMultipartUpload](https://docs.aws.amazon.com/AmazonS3/latest/API/API_CompleteMultipartUpload.html).
+Initiation is not blindly retried because a lost response can leave an unknown upload ID.
+On subsequent failure the backend attempts to abort the known upload (also one retry).
+Grant multipart upload/abort permissions and configure the bucket's incomplete-multipart
+lifecycle expiration: crashes, allocation/transport failures, or failed aborts can leave
+unfinished uploads. An ambiguous completion may have created an object even if its response
+was lost; orphan reconciliation remains necessary. Retry bounds are attempt counts, not
+wall-clock deadlines (the shared HTTP client's socket-timeout limitation still applies).
 
 Downloads are never proxied straight from S3: `fetch` spools an object to a
 local cache file on first read (an atomic download-then-rename, safe under
@@ -4413,7 +4435,7 @@ else refuses to start) so a bad S3 config is caught at boot, not on first
 upload. Record cleanup follows every ListObjectsV2 continuation page, decodes XML
 key text, and refuses malformed or out-of-prefix listings. See
 [Known limitations](../KNOWN_LIMITATIONS.md) for best-effort cleanup, crash
-orphans, presigned-URL trade-offs, and the 5 GiB single-`PUT` cap.
+orphans and presigned-URL trade-offs.
 
 `zigbase.S3Storage` is exported alongside `zigbase.LocalStorage` (an empty
 placeholder type on a stock, non-`-Ds3` build — its `create`/`interface`
