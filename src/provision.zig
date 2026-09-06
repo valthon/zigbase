@@ -1202,6 +1202,202 @@ pub fn runMigrations(
     w: *db.Db,
     migs: []const Migration,
 ) !void {
+    try lockConsumerMigrations(w);
+    const result = runMigrationsLocked(alloc, io, w, migs);
+    unlockConsumerMigrations(w) catch |err| {
+        if (err == error.MigrationUnfinishedTransaction) try result;
+        return err;
+    };
+    return result;
+}
+
+// Session scope is intentional: a batch retains its lock across individual
+// commits and non-transactional callbacks. Acquisition precedes every ledger
+// read. PostgreSQL session-affine connections are required; SQLite deployments
+// continue to use one process. Old binaries do not participate in this lock.
+fn lockConsumerMigrations(w: *db.Db) !void {
+    if (w.inTransaction()) return error.MigrationCallerTransaction;
+    if (db.dbDialect(w).kind == .postgres)
+        try w.exec("SELECT pg_advisory_lock(1514294599, 2);");
+}
+
+test "consumer runners refuse caller-owned transactions without ending them" {
+    var w = try db.Db.openMemory();
+    defer w.close();
+    try @import("migrations.zig").run(&w);
+    try w.begin();
+    defer w.rollback() catch {};
+    try std.testing.expectError(error.MigrationCallerTransaction, runMigrations(std.testing.allocator, std.testing.io, &w, &.{}));
+    try std.testing.expectError(error.MigrationCallerTransaction, rollbackMigrations(std.testing.allocator, std.testing.io, &w, &.{}, 1));
+    try std.testing.expect(w.inTransaction());
+}
+
+test "consumer runner cleans a nontransactional callback's unfinished transaction" {
+    var w = try db.Db.openMemory();
+    defer w.close();
+    try @import("migrations.zig").run(&w);
+    const M = struct {
+        fn up(m: *Migrator) !void {
+            try m.db.begin();
+            try m.exec("CREATE TABLE unfinished_consumer (id INTEGER);");
+        }
+    };
+    try std.testing.expectError(error.MigrationUnfinishedTransaction, runMigrations(std.testing.allocator, std.testing.io, &w, &.{.{ .id = "unfinished", .up = M.up, .transactional = false }}));
+    try std.testing.expect(!w.inTransaction());
+    var st = try w.prepare("SELECT count(*) FROM _migrations WHERE name='prov:unfinished';");
+    defer st.finalize();
+    try std.testing.expect(try st.step());
+    try std.testing.expectEqual(@as(i64, 0), st.columnInt(0));
+}
+
+test "consumer apply and rollback preserve callback errors after transaction cleanup" {
+    const a = std.testing.allocator;
+    var w = try db.Db.openMemory();
+    defer w.close();
+    try @import("migrations.zig").run(&w);
+    const M = struct {
+        fn fail(m: *Migrator) !void {
+            try m.db.begin();
+            return error.ConsumerPrimaryFailure;
+        }
+        fn up(_: *Migrator) !void {}
+    };
+    try std.testing.expectError(error.ConsumerPrimaryFailure, runMigrations(a, std.testing.io, &w, &.{.{ .id = "bad_up", .up = M.fail, .transactional = false }}));
+    try std.testing.expect(!w.inTransaction());
+    const list = [_]Migration{.{ .id = "bad_down", .up = M.up, .down = M.fail, .transactional = false }};
+    try runMigrations(a, std.testing.io, &w, &list);
+    try std.testing.expectError(error.ConsumerPrimaryFailure, rollbackMigrations(a, std.testing.io, &w, &list, 1));
+    try std.testing.expect(!w.inTransaction());
+}
+
+test "consumer cleanup attempts advisory unlock even when rollback fails" {
+    const Fake = struct {
+        unlocked: bool = false,
+        fn inTransaction(_: *@This()) bool {
+            return true;
+        }
+        fn rollback(_: *@This()) error{RollbackFailure}!void {
+            return error.RollbackFailure;
+        }
+        fn exec(self: *@This(), sql: []const u8) !void {
+            try std.testing.expectEqualStrings("SELECT pg_advisory_unlock(1514294599, 2);", sql);
+            self.unlocked = true;
+        }
+    };
+    var fake = Fake{};
+    try std.testing.expectError(error.RollbackFailure, cleanupConsumerMigrations(&fake, true));
+    try std.testing.expect(fake.unlocked);
+}
+
+test "postgres consumer batches serialize callbacks and rollback selection" {
+    if (!@import("build_options").postgres) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const url = std.testing.environ.getPosix("ZIGBASE_PG_TEST_URL") orelse return error.SkipZigTest;
+    var first = try db.Db.openPostgres(a, io, url);
+    defer first.close();
+    var second = try db.Db.openPostgres(a, io, url);
+    defer second.close();
+    try first.exec("CREATE SCHEMA zb_consumer_coordination;");
+    defer first.exec("DROP SCHEMA zb_consumer_coordination CASCADE;") catch |err| std.log.err("consumer test cleanup: {s}", .{@errorName(err)});
+    try first.exec("SET search_path TO zb_consumer_coordination;");
+    try second.exec("SET search_path TO zb_consumer_coordination;");
+    try @import("migrations.zig").run(&first);
+    try first.exec("CREATE TABLE executions (value INTEGER);");
+    try first.exec("SET default_transaction_isolation = 'repeatable read';");
+    try second.exec("SET default_transaction_isolation = 'repeatable read';");
+    const M = struct {
+        fn up(m: *Migrator) !void {
+            try m.exec("INSERT INTO executions VALUES (1);");
+            try m.exec("SELECT pg_sleep(0.05);");
+        }
+        fn down(m: *Migrator) !void {
+            try m.exec("INSERT INTO executions VALUES (-1);");
+            try m.exec("SELECT pg_sleep(0.05);");
+        }
+    };
+    const Runner = struct {
+        w: *db.Db,
+        start: *std.atomic.Value(bool),
+        reverse: bool,
+        transactional: bool,
+        failure: ?anyerror = null,
+        fn execute(self: *@This()) void {
+            while (!self.start.load(.acquire)) std.atomic.spinLoopHint();
+            self.run() catch |err| {
+                self.failure = err;
+            };
+        }
+        fn run(self: *@This()) !void {
+            const list = [_]Migration{.{ .id = "coordinated", .up = M.up, .down = M.down, .transactional = self.transactional }};
+            if (self.reverse) {
+                const result = try rollbackMigrations(std.testing.allocator, std.testing.io, self.w, &list, 1);
+                defer result.deinit(std.testing.allocator);
+            } else try runMigrations(std.testing.allocator, std.testing.io, self.w, &list);
+        }
+    };
+    for ([_]bool{ false, true }) |transactional| {
+        for ([_]bool{ false, true }) |reverse| {
+            var start = std.atomic.Value(bool).init(false);
+            var one = Runner{ .w = &first, .start = &start, .reverse = reverse, .transactional = transactional };
+            var two = Runner{ .w = &second, .start = &start, .reverse = reverse, .transactional = transactional };
+            const thread = try std.Thread.spawn(.{}, Runner.execute, .{&one});
+            start.store(true, .release);
+            two.execute();
+            thread.join();
+            if (one.failure) |err| return err;
+            if (two.failure) |err| return err;
+        }
+    }
+    var count = try first.prepare("SELECT count(*), sum(value) FROM executions;");
+    defer count.finalize();
+    try std.testing.expect(try count.step());
+    try std.testing.expectEqual(@as(i64, 4), count.columnInt(0));
+    try std.testing.expectEqual(@as(i64, 0), count.columnInt(1));
+    const Failure = struct {
+        fn up(m: *Migrator) !void {
+            try m.exec("INSERT INTO executions VALUES (99);");
+            return error.ConsumerTestFailure;
+        }
+    };
+    try std.testing.expectError(error.ConsumerTestFailure, runMigrations(a, io, &first, &.{.{ .id = "failure", .up = Failure.up }}));
+    try std.testing.expect(!first.inTransaction());
+    try second.exec("SET lock_timeout = '100ms';");
+    try second.exec("SELECT pg_advisory_lock(1514294599, 2);");
+    try second.exec("SELECT pg_advisory_unlock(1514294599, 2);");
+}
+
+fn unlockConsumerMigrations(w: *db.Db) !void {
+    return cleanupConsumerMigrations(w, db.dbDialect(w).kind == .postgres);
+}
+
+// Structural test seam permits injecting rollback failure without corrupting a
+// real connection. Production uses only Db's existing transaction/exec surface.
+fn cleanupConsumerMigrations(w: anytype, postgres: bool) !void {
+    // The caller entered without a transaction. Clear a callback's unfinished
+    // or failed transaction before unlocking, including non-transactional jobs.
+    const unfinished = w.inTransaction();
+    var rollback_error: ?anyerror = null;
+    if (unfinished) w.rollback() catch |err| {
+        rollback_error = err;
+    };
+    if (postgres) w.exec("SELECT pg_advisory_unlock(1514294599, 2);") catch |err| {
+        if (rollback_error) |primary| {
+            std.log.err("consumer migration unlock also failed: {s}", .{@errorName(err)});
+            return primary;
+        }
+        return err;
+    };
+    if (rollback_error) |err| return err;
+    if (unfinished) return error.MigrationUnfinishedTransaction;
+}
+
+fn runMigrationsLocked(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    w: *db.Db,
+    migs: []const Migration,
+) !void {
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const a = arena.allocator();
@@ -1497,6 +1693,24 @@ pub const RollbackOutcome = union(enum) {
 /// unknowable without running reaches execution — and its per-migration tx undoes the partial work
 /// before the run reports it. `alloc` backs an internal arena; the returned ids are duped from it.
 pub fn rollbackMigrations(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    w: *db.Db,
+    migs: []const Migration,
+    n: usize,
+) !RollbackOutcome {
+    try lockConsumerMigrations(w);
+    const result = rollbackMigrationsLocked(alloc, io, w, migs, n);
+    unlockConsumerMigrations(w) catch |err| {
+        if (result) |outcome| outcome.deinit(alloc) else |primary| {
+            if (err == error.MigrationUnfinishedTransaction) return primary;
+        }
+        return err;
+    };
+    return result;
+}
+
+fn rollbackMigrationsLocked(
     alloc: std.mem.Allocator,
     io: std.Io,
     w: *db.Db,

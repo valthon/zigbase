@@ -15,8 +15,8 @@ Development-workflow, realtime/scaling, and storage work is tracked by its own P
 
 - [x] Serialize system migrations and public ledger bootstrap across PostgreSQL replicas.
 - [x] Preserve caller transactions on refusal and release locks on failure.
-- [ ] Coordinate consumer migrations automatically; these and older binaries still
-  require a single migration leader.
+- [x] Coordinate PostgreSQL consumer apply/rollback batches, including non-transactional callbacks.
+- [ ] Older binaries and multi-process SQLite migration workflows still require a single leader.
 
 ## Realtime fanout (#403)
 
