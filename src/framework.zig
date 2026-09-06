@@ -2360,6 +2360,8 @@ fn printUsage(io: std.Io, file: std.Io.File, show_serve_static: bool, show_stati
         \\  ZIGBASE_S3_KEY_PREFIX    Prefix prepended to every object key (namespace one bucket).
         \\  ZIGBASE_S3_CACHE_DIR     Local spool-cache dir; empty → <data-dir>/storage_cache.
         \\  ZIGBASE_S3_CACHE_MAX_BYTES   Spool-cache size cap, bytes. [default 1073741824 = 1 GiB]
+        \\  ZIGBASE_S3_MULTIPART_THRESHOLD_BYTES  Use multipart at this size. [default 67108864 = 64 MiB]
+        \\  ZIGBASE_S3_MULTIPART_PART_BYTES       Preferred multipart part size. [default 8388608 = 8 MiB]
         \\  ZIGBASE_VAPID_PUBLIC_KEY  Web Push VAPID public key (base64url) for ctx.push(); also the
         \\                           browser applicationServerKey. Generate with `zigbase vapid-keygen`.
         \\  ZIGBASE_VAPID_PRIVATE_KEY Web Push VAPID private key (base64url) — SECRET. Both keys unset
