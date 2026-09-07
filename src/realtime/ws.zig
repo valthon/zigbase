@@ -340,8 +340,76 @@ fn onClose(context: ?*LiveConn, uuid: isize) anyerror!void {
 /// SQLite. The NOTIFY carries only the token, never the (possibly encrypted) row data.
 pub fn broadcast(app: *App, col: schema.Collection, action: protocol.Action, record_id: []const u8, record: ?std.json.Value, notify_token: ?[]const u8) void {
     if (!active) return; // reactor not running (tests/CLI): no-op to avoid "cluster inactive" + UB
+    if (comptime @import("build_options").realtime_backfill) {
+        if (app.backfill) |store| captureInvalidation(app.allocator, store, db.poolBackend(app.pool), col, action, record_id, record);
+    }
     publishFrames(col.name, action, record_id, record);
     pg_bridge.emit(app, col.name, action, record_id, notify_token);
+}
+
+fn captureInvalidation(allocator: std.mem.Allocator, store: *@import("backfill.zig").Store, backend: db.Backend, col: schema.Collection, action: protocol.Action, record_id: []const u8, record: ?std.json.Value) void {
+    if (backend != .sqlite) return;
+    var scratch = std.heap.ArenaAllocator.init(allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    // Only deletes retain a private authorization snapshot. Historical create/update
+    // values must never be exposed after ownership or field visibility changes.
+    var id_record: std.json.ObjectMap = .empty;
+    id_record.put(a, "id", .{ .string = record_id }) catch |err| {
+        store.invalidate(col.id);
+        std.log.warn("realtime backfill capture failed: {s}", .{@errorName(err)});
+        return;
+    };
+    if (action == .delete) {
+        if (record) |snapshot| id_record.put(a, hub.delete_snapshot_key, snapshot) catch |err| {
+            store.invalidate(col.id);
+            std.log.warn("realtime backfill capture failed: {s}", .{@errorName(err)});
+            return;
+        };
+    }
+    // Capture needs only the collection frame, never the record-channel pair.
+    const frame = protocol.serializeEvent(a, col.name, action, .{ .object = id_record }) catch |err| {
+        store.invalidate(col.id);
+        std.log.warn("realtime backfill capture failed: {s}", .{@errorName(err)});
+        return;
+    };
+    store.append(col.id, frame) catch |err| {
+        std.log.warn("realtime backfill capture reset: {s}", .{@errorName(err)});
+    };
+}
+
+test "PostgreSQL capture ignores delete snapshots even with an installed store" {
+    var store = @import("backfill.zig").Store.init(std.testing.allocator, std.testing.io);
+    defer store.deinit();
+    // Any inspection/serialization of this snapshot would be invalid. The
+    // backend gate runs before allocating or inspecting event data.
+    captureInvalidation(undefined, &store, .postgres, undefined, .delete, undefined, undefined);
+    for (store.topics) |topic| try std.testing.expect(topic == null);
+}
+
+test "capture retains one id-only collection frame and private delete snapshot" {
+    var store = @import("backfill.zig").Store.init(std.testing.allocator, std.testing.io);
+    defer store.deinit();
+    var buffer: [4096]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buffer);
+    const arena = @import("../request_arena.zig").RequestArena{ .a = fba.allocator() };
+    const col = schema.Collection{ .id = "collection-id", .name = "posts", .fields = &.{} };
+    const checkpoint = try store.cursor(std.testing.allocator, try store.page(arena, col.id, null, 128));
+    defer std.testing.allocator.free(checkpoint);
+    var record: std.json.ObjectMap = .empty;
+    defer record.deinit(std.testing.allocator);
+    try record.put(std.testing.allocator, "id", .{ .string = "record-id" });
+    try record.put(std.testing.allocator, "secret", .{ .string = "snapshot-only" });
+    for ([_]protocol.Action{ .create, .update, .delete }) |action| {
+        captureInvalidation(std.testing.allocator, &store, .sqlite, col, action, "record-id", .{ .object = record });
+    }
+    const page = try store.page(arena, col.id, checkpoint, 128);
+    try std.testing.expectEqual(@as(usize, 3), page.items.len);
+    try std.testing.expectEqualStrings("{\"type\":\"event\",\"topic\":\"posts\",\"action\":\"create\",\"record\":{\"id\":\"record-id\"}}", page.items[0].frame);
+    try std.testing.expectEqualStrings("{\"type\":\"event\",\"topic\":\"posts\",\"action\":\"update\",\"record\":{\"id\":\"record-id\"}}", page.items[1].frame);
+    const expected = try hub.buildEventFrames(std.testing.allocator, col.name, .delete, "record-id", .{ .object = record });
+    defer expected.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(expected.frame_collection, page.items[2].frame);
 }
 
 /// Realtime metadata for a just-deleted row.

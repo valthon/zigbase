@@ -40,6 +40,7 @@ pub const App = struct {
     oauth_state_server: bool = true,
     oauth_state_ttl_s: i64 = 600,
     realtime_allowed_origins: []const u8 = "",
+    backfill: if (@import("build_options").realtime_backfill) ?*@import("realtime/backfill.zig").Store else void = if (@import("build_options").realtime_backfill) null else {},
     /// SSE heartbeat interval seconds (#188); 0 = inherit the listener ws_timeout tick.
     /// Applied per-connection via http_sse_set_timout at stream open. Startup-validated.
     sse_heartbeat_seconds: u8 = 0,

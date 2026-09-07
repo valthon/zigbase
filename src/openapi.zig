@@ -972,6 +972,7 @@ test "collection export maps constraints, access, auth writes, and deterministic
         .{ "get", "/api/realtime" },
         .{ "get", "/api/realtime/sse" },
     }) |expected| try std.testing.expect(reservedHasRoute(reserved, expected[0], expected[1]));
+    try std.testing.expectEqual(@import("build_options").realtime_backfill, reservedHasRoute(reserved, "get", "/api/realtime/backfill"));
     const builtins = root.get("x-zigbase-builtin-operations").?.array.items;
     try std.testing.expectEqual(@as(usize, engine_server.migration_builtin_operations.len), builtins.len);
     try std.testing.expect(root.get("paths").?.object.get("/api/collections/_private/records") == null);

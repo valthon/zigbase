@@ -15,6 +15,7 @@ pub const Code = enum {
     gone,
     internal,
     not_found,
+    not_implemented,
     payload_too_large,
     too_many_requests,
     unauthorized,
@@ -160,6 +161,16 @@ pub fn info(c: Code) Info {
             \\Also the default for any HTTP status this registry doesn't otherwise
             \\map (see `forStatus`) — receiving `internal` for a request that "should"
             \\have a specific code is itself a signal to check the server logs.
+            ,
+        },
+        .not_implemented => .{
+            .summary = "the operation is unavailable for this backend or configuration",
+            .explanation =
+            \\The requested operation is not implemented for the active backend or
+            \\configuration. For example, realtime invalidation backfill currently
+            \\supports single-process SQLite, not an active PostgreSQL backend.
+            \\Retrying the unchanged request will not help; consult the endpoint's
+            \\supported configurations or use an alternative operation.
             ,
         },
         .not_found => .{

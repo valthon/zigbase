@@ -338,6 +338,9 @@ pub fn Server(comptime gates: Gates) type {
                 .pattern = operation.pattern,
                 .handler = operation.handler,
             }};
+            if (@import("build_options").realtime_backfill) t = t ++ &[_]router.Route{
+                .{ .method = .GET, .pattern = "/api/realtime/backfill", .handler = @import("api/realtime_backfill.zig").get },
+            };
             if (gates.two_factor) t = &[_]router.Route{
                 .{ .method = .POST, .pattern = "/api/collections/:col/auth/two-factor/:action", .handler = @import("api/two_factor.zig").dispatch },
             } ++ t;

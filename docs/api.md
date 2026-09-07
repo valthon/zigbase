@@ -1402,6 +1402,97 @@ rewrites, consulted before the marker. See
 
 ## Realtime (WebSocket + SSE)
 
+### Optional record invalidation backfill (SQLite)
+
+Build with `-Drealtime-backfill=true` to register
+`GET /api/realtime/backfill?topic=notes&cursor=...&limit=128`. The default build
+omits the route, capture code and retained store. This first slice supports
+**single-process SQLite only**; an active PostgreSQL backend returns `501`.
+PostgreSQL does not allocate the backfill store or capture/retain invalidations,
+even when the binary includes this capability for SQLite deployments.
+The `501` uses the standard error envelope with code `not_implemented`. If an
+identity becomes invalid while a page is being authorized, the entire page is
+discarded and the endpoint returns `401` (`unauthorized`), without items or a
+new cursor. Reauthenticate and retry the previous checkpoint. Operational
+failures similarly return an error without advancing the checkpoint.
+It is not a durable log or a historical record-payload replay API.
+
+The endpoint accepts one collection name (`topic`), an optional opaque `cursor`,
+and `limit` from 1 to 128. Use an `Authorization: Bearer` token for private
+collections, plus `X-Account-Id` when selecting a tenant account. This endpoint
+does not authenticate from cookies. Custom channels and per-record topics are
+not supported. The response is
+`{items, nextCursor, hasNext, resetRequired}`. Items use the normal event envelope
+but contain **only `{id}`** in `record`; refetch current record data through REST.
+Current token/session/two-factor policy, view rules, abilities and tenant scope
+are checked for each item, including for retained deletion snapshots. Identity
+verification and reader acquisition are intentionally repeated per item so a
+revocation committed mid-page aborts the entire response, not merely the next
+request. Collection metadata is also reacquired to observe schema changes. Deletion
+snapshots are private and never returned. Collection identity is pinned so a
+dropped/recreated collection cannot expose its predecessor's events.
+
+Without a cursor the endpoint returns an empty page and a checkpoint at the
+current capture position. Clients should:
+
+1. Obtain this checkpoint **before** loading their initial REST snapshot.
+2. Load the snapshot, then consume pages from the checkpoint. Apply invalidations
+   idempotently: refetch creates/updates, remove deletes. An event may already
+   have been reflected in the snapshot.
+3. Save each `nextCursor`, even on empty pages; `limit` bounds this collection's scanned entries,
+   not the number of authorized matches. Continue while `hasNext` is true.
+4. Repeat periodically and after WS/SSE reconnect. Live transport frames do not
+   carry these cursors; keep the backfill checkpoint separately.
+
+The store has **16 collection slots**, each independently retaining at most
+**256 events or 64 KiB of encoded frames** (at most **1 MiB** encoded data across
+all slots). Rings are allocated lazily; on 64-bit targets their metadata is about
+6 KiB per active slot, plus the collection id and small store header. A busy
+collection cannot evict another slot's events or cause it to paginate over
+unrelated traffic. Pages copy only the requested collection's frames, at most
+128 before authorization. Serialization and concurrent requests require
+additional transient memory; these are retained-data limits, not an RSS cap.
+
+Only a **record write** can replace an occupied slot: when it needs a new slot
+and all 16 are occupied, the least recently captured/polled slot is replaced.
+A cursorless GET can allocate a free slot but never displaces an occupied one.
+If its collection has no slot and the table is full, even a cursorless GET
+returns the `409` reset envelope below. Fall back to snapshot reloads on reconnect;
+do not immediately retry checkpoint acquisition in a loop. A subsequent write
+to that collection can establish its slot.
+
+A replaced slot's cursors require reset even if that same
+collection later gets another slot: cursors bind the slot generation as well as
+the collection id and process epoch. Workloads actively using more than 16
+collections may therefore need frequent snapshot reloads. An oversized event
+or failed capture invalidates only that collection's older checkpoints rather
+than silently skipping a write. Restart, another process, relevant event/slot
+eviction, invalid cursors and failed capture return `409` with
+`{resetRequired:true, items:[], nextCursor:null, hasNext:false}`. Discard the old
+checkpoint and repeat the initial snapshot sequence. Capture positions and
+pagination are collection-local; slot replacement is still a shared capacity limit.
+
+**Maximum event size is 64 KiB, including the JSON envelope.** This is also the
+per-collection retention budget, deliberately kept small for bounded memory use.
+Create/update captures contain only an id, but a delete capture includes the
+entire private authorization snapshot. A **single delete frame over 64 KiB
+clears that collection's retained history and invalidates every older checkpoint**;
+every such large-record delete therefore requires all affected clients to reload
+their snapshot. The deletion itself still succeeds, and other collections' rings
+are unaffected. Applications regularly deleting large text/JSON records should
+expect this reset behavior; this small backfill buffer is not a substitute for a
+durable change log. The limit applies to encoded bytes, not just a field's length.
+
+This is a record-write invalidation feed, **not a materialized-query change feed**:
+authorization/tenant changes, relation changes, TTL expiry, raw SQL and external
+writers do not generate complete invalidations for previously visible results.
+Reload snapshots when identity, policy or query dependencies change. A currently
+unauthorized record is omitted, not emitted as a synthetic delete. Do not use
+this API as an audit trail, durable synchronization protocol, or an exactly-once
+side-effect trigger.
+
+### WebSocket connection
+
 Connect to `ws://<host>/api/realtime` (the upgrade is gated to that exact path and
 the connection Origin is validated against the server's allowlist). The allowlist is
 `ZIGBASE_REALTIME_ORIGINS` / `--realtime-origins` (CSV). It is **empty by default, which
