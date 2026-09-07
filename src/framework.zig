@@ -1956,6 +1956,14 @@ fn runCliImpl(init: std.process.Init, dispatch: *const events.Dispatch, jobs: []
     };
 
     switch (cmd) {
+        .capabilities => {
+            if (comptime devtools.enabled) {
+                var buf: [4096]u8 = undefined;
+                var out = std.Io.File.stdout().writer(init.io, &buf);
+                try @import("agent_capabilities.zig").write(&out.interface);
+                try out.interface.flush();
+            } else return error.DevToolsDisabled;
+        },
         .help => |topic| switch (topic) {
             .top => printUsage(init.io, std.Io.File.stdout(), std.meta.activeTag(opts.static_mode) == .default, std.meta.activeTag(opts.static_mode) != .disabled),
             .serve => printServeUsage(init.io, std.Io.File.stdout(), std.meta.activeTag(opts.static_mode) == .default, std.meta.activeTag(opts.static_mode) != .disabled),
@@ -1974,6 +1982,7 @@ fn runCliImpl(init: std.process.Init, dispatch: *const events.Dispatch, jobs: []
             .files => printFileInventoryUsage(init.io, std.Io.File.stdout()),
             .init => printInitUsage(init.io, std.Io.File.stdout()),
             .agents_md => printAgentsMdUsage(init.io, std.Io.File.stdout()),
+            .capabilities => if (comptime devtools.enabled) printCapabilitiesUsage(init.io, std.Io.File.stdout()),
         },
         .version => |va| if (va.json) printVersionJson(init.io, std.Io.File.stdout()) else printVersion(init.io, std.Io.File.stdout()),
         .serve => |sa_in| {
@@ -2244,6 +2253,7 @@ fn printUsage(io: std.Io, file: std.Io.File, show_serve_static: bool, show_stati
     // them there. Every published zigbase artifact builds at the default (dev-tools
     // on), so this only ever hides these lines for a consumer's own custom build.
     if (devtools.enabled) emit(io, file,
+        \\  capabilities        Versioned JSON discovery of agent-facing CLI operations.
         \\  init                Scaffold a starting-point project (--box or --framework).
         \\  agents-md           Write AGENTS.md + CLAUDE.md for an existing project.
         \\  typegen             Generate a typed client from the collection schema (see `zigbase typegen --help`).
@@ -2973,6 +2983,24 @@ fn printInitUsage(io: std.Io, file: std.Io.File) void {
         \\In framework mode, run `zig fetch --save git+https://github.com/valthon/zigbase`
         \\afterwards: that is what writes the dependency URL and its content hash into
         \\build.zig.zon.
+        \\
+    , .{});
+}
+
+fn printCapabilitiesUsage(io: std.Io, file: std.Io.File) void {
+    emit(io, file,
+        \\zigbase capabilities — offline discovery of agent-facing CLI operations.
+        \\
+        \\Usage:
+        \\  zigbase capabilities [--json]
+        \\  zigbase capabilities --help | -h
+        \\
+        \\Prints one versioned JSON operation catalog. --json is optional: JSON is
+        \\the default. --help/-h prints this usage text instead.
+        \\Does not execute catalog operations, load server configuration, open a
+        \\database, or start a server. Common CLI logging initialization still reads
+        \\log-format/level variables. Advertised operations have their own effects.
+        \\Compiled out with -Ddev-tools=false; rebuild with -Ddev-tools=true to use.
         \\
     , .{});
 }

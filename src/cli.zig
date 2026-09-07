@@ -210,13 +210,15 @@ pub const AgentsMdArgs = struct {
 };
 
 /// Identifies which command a per-command `--help` request targets.
-pub const HelpTopic = enum { top, serve, serve_control, migrate, superuser_create, typegen, rewrap, migrate_db, vapid_keygen, import, schema, openapi, explain_code, doctor, init, agents_md, files };
+pub const HelpTopic = enum { top, serve, serve_control, migrate, superuser_create, typegen, rewrap, migrate_db, vapid_keygen, import, schema, openapi, explain_code, doctor, init, agents_md, files, capabilities };
 
 pub const Command = union(enum) {
     /// `help`/`--help`/`-h`/no-args -> top-level usage; `<cmd> --help` -> that command's usage.
     help: HelpTopic,
     /// `version`/`--version`/`-V` -> print build provenance and exit.
     version: VersionArgs,
+    /// Versioned, read-only discovery of agent-facing CLI operations.
+    capabilities: void,
     serve: ServeArgs,
     migrate: MigrateArgs,
     superuser_create: SuperuserArgs,
@@ -261,6 +263,14 @@ pub const ParseOpts = struct {
 /// Parse argv (excluding the program name).
 pub fn parse(args: []const []const u8, popts: ParseOpts) ParseError!Command {
     if (args.len == 0) return .{ .help = .top };
+    if (std.mem.eql(u8, args[0], "capabilities")) {
+        if (!devtools.enabled) return ParseError.DevToolsDisabled;
+        for (args[1..]) |arg| {
+            if (isHelpFlag(arg)) return .{ .help = .capabilities };
+            if (!std.mem.eql(u8, arg, "--json")) return ParseError.UnknownFlag;
+        }
+        return .{ .capabilities = {} };
+    }
     if (std.mem.eql(u8, args[0], "help") or isHelpFlag(args[0]))
         return .{ .help = .top };
     if (std.mem.eql(u8, args[0], "files")) {
@@ -1479,4 +1489,14 @@ test "init/agents-md/typegen are rejected with DevToolsDisabled under -Ddev-tool
     try std.testing.expectError(ParseError.DevToolsDisabled, parse(&.{ "init", "--help" }, .{}));
     try std.testing.expectError(ParseError.DevToolsDisabled, parse(&.{"agents-md"}, .{}));
     try std.testing.expectError(ParseError.DevToolsDisabled, parse(&.{"typegen"}, .{}));
+    try std.testing.expectError(ParseError.DevToolsDisabled, parse(&.{"capabilities"}, .{}));
+    try std.testing.expectError(ParseError.DevToolsDisabled, parse(&.{ "capabilities", "--help" }, .{}));
+}
+
+test "capabilities parses only offline discovery arguments" {
+    if (!devtools.enabled) return error.SkipZigTest;
+    try std.testing.expectEqual(HelpTopic.capabilities, (try parse(&.{ "capabilities", "--help" }, .{})).help);
+    try std.testing.expectEqual(HelpTopic.capabilities, (try parse(&.{ "capabilities", "-h" }, .{})).help);
+    try std.testing.expectEqual(Command.capabilities, std.meta.activeTag(try parse(&.{ "capabilities", "--json" }, .{})));
+    try std.testing.expectError(ParseError.UnknownFlag, parse(&.{ "capabilities", "--execute" }, .{}));
 }

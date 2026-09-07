@@ -1,7 +1,25 @@
-# Schema hardening backlog
+# Engineering backlog
 
-Checked items describe work included in this branch, not a release.
-Development-workflow, realtime/scaling, and storage work is tracked by its own PRs.
+Checked items describe implemented work; consult release notes for availability.
+Keep each new capability independently reviewable, explicitly resource-bounded,
+and compiled out where disabled. Include canonical docs, relevant public-site
+copy, examples, and tests with the implementation rather than in follow-up PRs.
+
+## Development and resource efficiency
+
+- [ ] Transparent comptime resource profiles with explicit overrides and an effective-settings report.
+- [ ] Workload-driven tuning advisor comparing throughput, tail latency, and memory under explicit budgets.
+- [ ] Coordinated resource budgets, bounded queues, backpressure, and saturation diagnostics.
+- [ ] Agent-native development interface: versioned discovery, structured diagnostics,
+  schema/route inspection, migration previews, and focused test execution.
+  First slice: CLI discovery with explicit operation side effects; this is not a remote executor.
+- [ ] Opt-in bounded query performance workbench with route attribution and query-plan inspection.
+- [ ] Dependency-aware bounded response caching, starting with explicitly eligible public reads.
+- [ ] Application performance contracts: deterministic size/allocation gates and controlled latency trends.
+- [ ] Opt-in principal/operation-scoped idempotent mutations with atomic coordination and bounded retention.
+- [ ] Resolve intermittent test-runner diagnostics (#261); existing investigation is PR #355.
+
+## Schema hardening
 
 
 - [x] Reconcile index-only comptime schema changes transactionally without table rebuilds.

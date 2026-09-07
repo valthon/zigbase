@@ -119,3 +119,9 @@ scheduler is single-process, and the PostgreSQL backend is opt-in (build from so
 - **[PostgreSQL](./postgres)** — take the same app to Postgres when you outgrow one box.
 - **[Framework](./framework)** — the full hook / route / job / schema / plugin surface.
 - **[API](./api)** — the REST + WebSocket reference.
+## Agent-friendly discovery
+
+`zigbase capabilities --json` provides a versioned catalog of development CLI
+operations, their output formats, and their side effects. Discovery works offline
+without opening the database. Custom lean builds can omit it with
+`-Ddev-tools=false`. See the agent guide for the contract and inspection caveats.
