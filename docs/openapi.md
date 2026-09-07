@@ -4,6 +4,12 @@
 binary can describe exactly: live non-system collection CRUD plus that binary's declared consumer
 routes.
 
+For an offline method/path registration inventory **without an existing database**,
+run `zigbase routes --json` on that same application binary. It reports compiled
+route gates and redacted declarative auth metadata, but not request/response schemas,
+live collection names/rules, static files, or individual admin endpoints. See
+[Offline compiled routes](agents.md#offline-compiled-routes) for its versioned contract.
+
 The root `x-zigbase-reserved-routes` array is derived from the binary's actual built-in server route
 table and lists engine-owned method/path templates that dispatch before consumer routes. Optional
 groups follow that application's compile-time gates, and a remapped public feature-state route is

@@ -267,6 +267,7 @@ const box_commands =
     \\| `docker compose exec zigbase /zigbase doctor --production --data-dir /data` | Preflight before shipping — exit 0 clean, 1 error, 2 warnings-only |
     \\| `zigbase explain-code CODE`, e.g. `zigbase explain-code not_found` | Explain an API error `code` |
     \\| `zigbase help`, `zigbase <cmd> --help` | The authoritative flag list — trust it over this file |
+    \\| `docker compose exec zigbase /zigbase routes --json` | Offline compiled routes and redacted auth declarations; not runtime authorization (requires dev tools) |
     \\
     \\
 ;
@@ -286,6 +287,7 @@ const framework_commands =
     \\| `zig build run -- explain-code CODE` | Explain an API error `code` |
     \\| `zig build run -- schema dump` | The live collection model, as a schema document |
     \\| `zig build run -- openapi --out openapi.json` | Live collections plus this binary's declared consumer routes as OpenAPI 3.1.2 JSON |
+    \\| `zig build run -- routes --json` | Offline compiled routes and redacted auth declarations; not runtime authorization (requires dev tools) |
     \\| `zig build run -- help` | The authoritative flag list — trust it over this file |
     \\
     \\
@@ -351,7 +353,7 @@ pub const commands_named = [_][]const u8{
     "migrate",     "schema",             "serve status",
     "serve stop",  "serve logs",         "superuser create",
     "schema dump", "migrate status",     "schema apply",
-    "openapi",     "schema check-rules",
+    "openapi",     "schema check-rules", "routes",
 };
 
 /// The two literal prefixes after which a command token is expected: the CLI

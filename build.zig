@@ -270,6 +270,16 @@ pub fn build(b: *std.Build) void {
     const bench_step = b.step("bench", "Run the benchmark harness (ns/op + allocation profile)");
     bench_step.dependOn(&bench_run.step);
 
+    const discovery_mod = b.createModule(.{
+        .root_source_file = b.path("fixtures/route-discovery/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    discovery_mod.addImport("zigbase", zigbase_mod);
+    const discovery_exe = b.addExecutable(.{ .name = "route-discovery-fixture", .root_module = discovery_mod });
+    b.step("route-discovery-fixture", "Build offline custom-route discovery fixture").dependOn(&b.addInstallArtifact(discovery_exe, .{}).step);
+
     // --- dating-server: the dating fixture compiled as a runnable server ----------
     // Plan 2: the e2e harness spawns THIS binary so client and server share the exact
     // comptime schema the dating client was generated from. Links libc (facil.io C deps).

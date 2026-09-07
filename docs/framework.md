@@ -195,6 +195,13 @@ activation) endpoints exist only when their config key is set (`.analytics`, `.m
 `.tenancy.enabled`) — an unset key leaves no trace of those routes (or the handlers they'd
 call) in your binary; they aren't merely 404 at runtime.
 
+Inspect those compiled registrations and your custom route declarations with
+`<your-app-binary> routes --json`, without opening a database or starting the server.
+The command follows this application's gates and feature-route mapping; declarative
+auth metadata is redacted and is not a runtime authorization decision. See
+[Offline compiled routes](agents.md#offline-compiled-routes). It is development
+tooling, omitted by `-Ddev-tools=false`.
+
 ### Choosing a config plane
 
 **The assignment rule:** structure/behavior = comptime `App(.{…})` key; deploy-varying
@@ -5239,7 +5246,7 @@ code to comptime-dead when off, so a build that doesn't need a feature doesn't p
 | `-Dfile-inventory` | off | Read-only `files inventory` CLI plus optional local/S3 inventory callbacks. Bounded pages, page usage and reference candidates; no HTTP surface or deletion. S3 additionally needs `-Ds3=true`. |
 | `-Drealtime-backfill` | off | Single-process SQLite record invalidation backfill: 16 lazy collection slots, each 256 entries / 64 KiB (1 MiB encoded total), current authorization, explicit reset on gaps or slot replacement. No historical payloads or durable/cross-instance guarantee. See the API realtime section. |
 | `-Ddev-mode` | on in `Debug`, off in release | The dev-only, never-in-prod seams: `ZIGBASE_FAKE_NOW` / `ZIGBASE_FAKE_SEED` (§14 above), test-capture, and fake field-crypto; the release script forces it off for shipped binaries. |
-| `-Ddev-tools` | **on** | The `init`/`agents-md`/`typegen` CLI verbs (scaffolding + schema-to-client codegen — `src/scaffold*.zig` + `src/codegen/**`, ~24 files, none of it needed by a *deployed* server). **Every official artifact we publish builds at this default** — GitHub release tarballs, the Docker image, and the `@zigbase/server` npm packages all ship with the three verbs in. `-Ddev-tools=false` is an opt-out for a consumer compiling their **own** binary for their **own** deployment who wants to shed the ~490 KiB behind it; the stripped binary still recognizes the verb names but exits non-zero with a "rebuild with -Ddev-tools=true" message instead of running them. Distinct from `.enable_typegen` below — see §3b. |
+| `-Ddev-tools` | **on** | The `init`/`agents-md`/`typegen` scaffolding/codegen verbs and `capabilities`/`routes` offline discovery. Official release, Docker and npm artifacts include this tooling. Consumers can opt out for their deployment binary; stripped verbs exit nonzero with `-Ddev-tools=true` rebuild guidance. Distinct from `.enable_typegen` below — see §3b. |
 | `-Dstrip` | on except in `Debug` | Strip debug info from the binary (~7 MiB vs ~24 MiB unstripped in a release build). |
 
 ## Version transparency & dependency auditing
