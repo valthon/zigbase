@@ -12,6 +12,11 @@ repoPath: examples/plugins
 
 # Plugins & comptime config
 
+The example starts from the comptime `minimal` resource profile and explicitly
+overrides its reader, scheduler-worker, and SQLite-cache settings. Run the built
+binary with `resources` to inspect the compiled settings as JSON. Profiles select
+transparent defaults; they do not enable features or impose a process memory cap.
+
 This is the **advanced framework** example. It is a standalone package with a path
 dependency on the repo root (`../..`) and exercises — using **only public
 `zigbase.*` exports**, no reaching into ZigBase internals — the comptime-config

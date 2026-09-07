@@ -53,6 +53,7 @@ const import_mod = @import("import.zig");
 const import_manifest = @import("import_manifest.zig");
 const features = @import("features.zig");
 const doctor = @import("doctor.zig");
+const resource_profile = @import("resource_profile.zig");
 const doctor_run = @import("doctor_run.zig");
 const rules_lint = @import("rules_lint.zig");
 const ctx_mod = @import("ctx.zig");
@@ -525,7 +526,7 @@ pub fn App(comptime cfg: anytype) type {
             @setEvalBranchQuota(20_000);
             // Guard top-level cfg keys so a typo (e.g. `.hook`, `.on_error`) fails
             // loudly at comptime instead of silently producing an empty Dispatch.
-            const allowed = .{ "hooks", "onError", "routes", "onAuth", "beforeAuthSuccess", "auth", "onFileServe", "onFileUpload", "onBootstrap", "onBeforeServe", "onBeforeTerminate", "cron", "jobs", "storage", "mailer", "reporter", "reporter_dedup", "pools", "collections", "migrations", "static_files", "pagination", "enable_typegen", "flags", "experiments", "features", "onFeatureExposure", "experiment_assignment_ttl", "queues", "workers", "realtime", "tenancy", "abilities", "mail", "analytics", "static_routes", "enable_spa_marker", "static_cache_control", "admin", "webhooks", "ttl_gc_interval", "files", "push", "sms", "sms_provider", "collections_frozen", "app_context" };
+            const allowed = .{ "resource_profile", "hooks", "onError", "routes", "onAuth", "beforeAuthSuccess", "auth", "onFileServe", "onFileUpload", "onBootstrap", "onBeforeServe", "onBeforeTerminate", "cron", "jobs", "storage", "mailer", "reporter", "reporter_dedup", "pools", "collections", "migrations", "static_files", "pagination", "enable_typegen", "flags", "experiments", "features", "onFeatureExposure", "experiment_assignment_ttl", "queues", "workers", "realtime", "tenancy", "abilities", "mail", "analytics", "static_routes", "enable_spa_marker", "static_cache_control", "admin", "webhooks", "ttl_gc_interval", "files", "push", "sms", "sms_provider", "collections_frozen", "app_context" };
             const allowed_list = blk2: {
                 var s: []const u8 = "";
                 for (allowed, 0..) |name, i| s = s ++ (if (i == 0) "" else "/") ++ name;
@@ -863,18 +864,20 @@ pub fn App(comptime cfg: anytype) type {
         /// The full job table = consumer jobs ++ framework-internal jobs. The scheduler
         /// starts whenever this is non-empty, so a TTL collection alone starts it.
         pub const jobs: []const scheduler.RuntimeJob = scheduler.concatJobs(user_jobs, internal_jobs);
+        pub const selected_resource_profile: ?resource_profile.Profile = if (@hasField(@TypeOf(cfg), "resource_profile")) cfg.resource_profile else null;
+        const profile_pools = resource_profile.defaults(selected_resource_profile orelse .balanced);
         /// Worker pool size for the scheduler: `.pools = .{ .jobs = N }` (default 2).
         /// The pre-0.10 `.jobs = .{ .pool_size = N }` spelling is a compile error.
         pub const job_pool_size: usize = blk: {
             if (@hasField(@TypeOf(cfg), "jobs") and @hasField(@TypeOf(cfg.jobs), "pool_size"))
                 @compileError("'.jobs.pool_size' was removed; set '.pools = .{ .jobs = N }' instead");
             if (@hasField(@TypeOf(cfg), "pools") and @hasField(@TypeOf(cfg.pools), "jobs")) break :blk cfg.pools.jobs;
-            break :blk 2;
+            break :blk profile_pools.jobs;
         };
 
         /// Comptime warm-reader-pool cap (the `.pools.readers` lever). Defaults to 16,
         /// the historical hardcoded value; shrink it to reduce the connection footprint.
-        pub const reader_pool_size: usize = if (@hasField(@TypeOf(cfg), "pools") and @hasField(@TypeOf(cfg.pools), "readers")) cfg.pools.readers else 16;
+        pub const reader_pool_size: usize = if (@hasField(@TypeOf(cfg), "pools") and @hasField(@TypeOf(cfg.pools), "readers")) cfg.pools.readers else profile_pools.readers;
 
         /// Whether to compile the `typegen` CLI subcommand into the binary.
         /// Off by default so production builds carry no codegen weight.
@@ -951,7 +954,20 @@ pub fn App(comptime cfg: anytype) type {
         /// Per-connection SQLite page-cache budget in KiB (the `.pools.cache_kib` lever).
         /// Defaults to `db.default_cache_kib` (1024 KiB); shrink it to reduce the page-cache
         /// footprint across the writer + warm readers, or raise it for large working sets.
-        pub const cache_kib: u32 = if (@hasField(@TypeOf(cfg), "pools") and @hasField(@TypeOf(cfg.pools), "cache_kib")) cfg.pools.cache_kib else db.default_cache_kib;
+        pub const cache_kib: u32 = if (@hasField(@TypeOf(cfg), "pools") and @hasField(@TypeOf(cfg.pools), "cache_kib")) cfg.pools.cache_kib else profile_pools.cache_kib;
+
+        pub const resource_report: resource_profile.Report = .{
+            .profile = selected_resource_profile,
+            .reader_pool_cap = reader_pool_size,
+            .job_workers = job_pool_size,
+            .job_stack_bytes = job_stack_size,
+            .sqlite_cache_kib_per_connection = cache_kib,
+            .scheduler_enabled = jobs.len > 0,
+            .admin_enabled = enable_admin,
+            .postgres_compiled = build_options.postgres,
+            .s3_compiled = build_options.s3,
+            .file_inventory_compiled = build_options.file_inventory,
+        };
 
         /// Comptime-selected storage plugin type (defaults to `DefaultStoragePlugin`).
         /// A custom type missing a contract method fails with a contract-specific message.
@@ -1661,6 +1677,7 @@ pub fn App(comptime cfg: anytype) type {
             .auth_method_types = auth_method_types,
             .two_factor = two_factor_runtime,
             .reader_pool_size = reader_pool_size,
+            .resource_report = resource_report,
             .job_stack_size = job_stack_size,
             .cache_kib = cache_kib,
             .static_mode = static_mode,
@@ -1842,6 +1859,7 @@ pub const ServeOpts = struct {
     auth_method_types: []const type = &.{@import("auth/methods/password.zig").PasswordMethod},
     two_factor: ?*const @import("auth/two_factor.zig").Runtime = null,
     reader_pool_size: usize,
+    resource_report: ?resource_profile.Report = null,
     job_stack_size: usize = scheduler.default_job_stack_size,
     cache_kib: u32 = db.default_cache_kib,
     static_mode: static_files.Mode = .default,
@@ -1985,6 +2003,13 @@ fn runCliImpl(init: std.process.Init, dispatch: *const events.Dispatch, jobs: []
             .capabilities => if (comptime devtools.enabled) printCapabilitiesUsage(init.io, std.Io.File.stdout()),
         },
         .version => |va| if (va.json) printVersionJson(init.io, std.Io.File.stdout()) else printVersion(init.io, std.Io.File.stdout()),
+        .resources => {
+            var buf: [4096]u8 = undefined;
+            var out = std.Io.File.stdout().writer(init.io, &buf);
+            try std.json.Stringify.value(opts.resource_report, .{}, &out.interface);
+            try out.interface.writeByte('\n');
+            try out.interface.flush();
+        },
         .serve => |sa_in| {
             var sa = sa_in;
             // --ephemeral fills in ONLY what the user did not specify. This one
@@ -2262,6 +2287,7 @@ fn printUsage(io: std.Io, file: std.Io.File, show_serve_static: bool, show_stati
     emit(io, file,
         \\  help                Show this help. Also: --help, -h, or no arguments.
         \\  version             Print version + build provenance. Also: --version, -V. Add --json for one JSON object.
+        \\  resources           Print compiled resource settings as JSON (no database access).
         \\
         \\  Per-command help is available via `zigbase <command> --help`, e.g.
         \\  `zigbase serve --help` or `zigbase superuser create --help`.
@@ -5726,6 +5752,34 @@ test "App(cfg) carries comptime pool-size levers (readers + jobs)" {
     const B = App(.{ .pools = .{ .readers = 8 } });
     try std.testing.expectEqual(@as(usize, 8), B.reader_pool_size);
     try std.testing.expectEqual(@as(usize, 2), B.job_pool_size);
+}
+
+test "resource profiles preserve defaults and explicit pool overrides" {
+    const D = App(.{});
+    const B = App(.{ .resource_profile = .balanced });
+    try std.testing.expectEqual(D.reader_pool_size, B.reader_pool_size);
+    try std.testing.expectEqual(D.job_pool_size, B.job_pool_size);
+    try std.testing.expectEqual(D.cache_kib, B.cache_kib);
+    try std.testing.expectEqual(null, D.resource_report.profile);
+    const M = App(.{ .resource_profile = .minimal, .admin = .disabled });
+    try std.testing.expectEqual(@as(usize, 2), M.reader_pool_size);
+    try std.testing.expectEqual(@as(usize, 1), M.job_pool_size);
+    try std.testing.expectEqual(@as(u32, 256), M.cache_kib);
+    try std.testing.expect(!M.resource_report.admin_enabled);
+    try std.testing.expectEqual(D.jobs.len, M.jobs.len);
+    try std.testing.expectEqual(D.job_stack_size, M.job_stack_size);
+    const T = App(.{ .resource_profile = .throughput });
+    try std.testing.expectEqual(@as(usize, 64), T.reader_pool_size);
+    try std.testing.expectEqual(@as(usize, 8), T.job_pool_size);
+    try std.testing.expectEqual(@as(u32, 4096), T.cache_kib);
+    const O = App(.{ .resource_profile = .throughput, .pools = .{ .readers = 3, .jobs = 1, .cache_kib = 128, .stack_size = 0 } });
+    try std.testing.expectEqual(@as(usize, 3), O.resource_report.reader_pool_cap);
+    try std.testing.expectEqual(@as(usize, 1), O.resource_report.job_workers);
+    try std.testing.expectEqual(@as(u32, 128), O.resource_report.sqlite_cache_kib_per_connection);
+    try std.testing.expectEqual(scheduler.min_job_stack_size, O.resource_report.job_stack_bytes);
+    const P = App(.{ .resource_profile = .minimal, .pools = .{ .readers = 7 } });
+    try std.testing.expectEqual(@as(usize, 7), P.reader_pool_size);
+    try std.testing.expectEqual(@as(u32, 256), P.cache_kib);
 }
 
 test "App(cfg) carries comptime footprint levers (stack_size + cache_kib) with memory-conscious defaults" {
