@@ -164,6 +164,7 @@ error.**
 | `reporter` | Error-reporter plugin TYPE — the terminal backstop every framework-swallowed error routes through (defaults to `SentryReporter` when `ZIGBASE_SENTRY_DSN` is set, else `LogReporter`). | always — you always get a reporter plugin, default or custom. |
 | `reporter_dedup` | Error-report TTL dedup window: `.{ .window_s = N }` (seconds) suppresses a repeat of the same `(message, phase)` within `N`, or `.off` to report every swallowed error. Default (omitted): **on**, `60`s. | always — dedup is on by default; `.off` compiles the dedup map out entirely (a single null-pointer branch, no allocation). |
 | `pools` | Footprint levers: reader pool, job pool, thread stack size, SQLite page cache. | always — these are levers on core connection/thread machinery, not an optional subsystem. |
+| `resource_profile` | Optional `.minimal`, `.balanced`, or `.throughput` defaults for existing pool levers; explicit `.pools` fields win. | data-only — selects constants, never enables a subsystem. |
 | `pagination` | Enable/disable offset & cursor list paging and pick the cursor token format. | always — core list-response plumbing. |
 | `flags` | Declared boolean feature flags. See [Feature flags + experiments](#feature-flags--experiments-declared). | data-only — lowers to an empty slice + a zero-variant `Flag` enum when unset. |
 | `experiments` | Declared A/B/n experiments (variants + weights, optional `.sticky`). See [Feature flags + experiments](#feature-flags--experiments-declared). | data-only — lowers to an empty slice + a zero-variant `Experiment` enum when unset. |
@@ -4472,7 +4473,7 @@ methods only exist when compiled in), so a custom storage plugin built on an
 ## 10. Footprint levers (`.pools`)
 
 `.pools` tunes ZigBase's memory/connection footprint at comptime. All fields are
-optional; each defaults to the historical value:
+optional; without a resource profile each defaults to the historical value:
 
 | Field | Default | Meaning |
 | --- | --- | --- |
@@ -4490,6 +4491,50 @@ zigbase.App(.{
 `.pools = .{ .jobs = N }` is the ONE lever for the scheduler worker-pool size. The
 legacy `.jobs = .{ .pool_size = N }` spelling was removed; it is now a compile error
 naming the replacement.
+
+### Resource profiles and inspection
+
+Select `.resource_profile = .minimal`, `.balanced`, or `.throughput` as a
+comptime starting point. Every explicitly supplied `.pools` field wins over the
+profile; omitted fields inherit it. Omit the profile to keep historical defaults.
+
+| Profile | Reader cap | Scheduler workers | SQLite cache KiB per connection |
+| --- | --- | --- | --- |
+| `minimal` | 2 | 1 | 256 |
+| `balanced` | 16 | 2 | 1024 |
+| `throughput` | 64 | 8 | 4096 |
+
+All profiles keep the 1 MiB stack default and its existing safety floor. These
+are explicit starting points, not benchmark-derived optimal settings, automatic
+CPU detection, or process memory caps. More concurrency can hurt a workload;
+measure before adopting `throughput`. SQLite caches apply only to SQLite
+connections; they do not tune PostgreSQL's server cache. Reader counts are caps,
+not a promise that all connections are eagerly allocated. Scheduler settings
+apply when scheduled jobs exist; named queue-worker concurrency remains controlled
+by `.workers`, and HTTP server concurrency is unchanged.
+
+```zig
+const Backend = zigbase.App(.{
+    .resource_profile = .minimal,
+    .pools = .{ .readers = 4 }, // jobs=1, cache_kib=256 remain inherited
+});
+// Backend.resource_report is a typed zigbase.ResourceReport constant.
+```
+
+Run the resulting binary with `resources` (or `resources --json`) for a single
+JSON object, `schema_version: 1`, containing its effective compiled pool settings,
+profile (`null` when omitted), scheduler/admin state, and PostgreSQL/S3/file-inventory
+build gates. The command does not load or validate server configuration or open a
+database; common CLI logging initialization still reads log-format/level variables.
+It includes no secret values. This is a **compiled resource report**, not a complete live
+configuration dump: it does not identify the runtime-selected storage/database
+backend, report current allocations, or enumerate every optional subsystem.
+
+Profiles neither enable nor disable features. Keep using explicit comptime gates
+(for example `.admin = .disabled`) and build flags to exclude unwanted code;
+deployment environment variables retain their existing roles and do not override
+these comptime pool settings. Embedded consumers can use `Backend.resource_report`
+without compiling CLI reporting into their application.
 
 ## 10b. Pagination (`.pagination`)
 

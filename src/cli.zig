@@ -213,6 +213,7 @@ pub const AgentsMdArgs = struct {
 pub const HelpTopic = enum { top, serve, serve_control, migrate, superuser_create, typegen, rewrap, migrate_db, vapid_keygen, import, schema, openapi, explain_code, doctor, init, agents_md, files };
 
 pub const Command = union(enum) {
+    resources: void,
     /// `help`/`--help`/`-h`/no-args -> top-level usage; `<cmd> --help` -> that command's usage.
     help: HelpTopic,
     /// `version`/`--version`/`-V` -> print build provenance and exit.
@@ -302,6 +303,13 @@ pub fn parse(args: []const []const u8, popts: ParseOpts) ParseError!Command {
             } else return ParseError.UnknownFlag;
         }
         return .{ .version = va };
+    }
+    if (std.mem.eql(u8, args[0], "resources")) {
+        for (args[1..]) |arg| {
+            if (isHelpFlag(arg)) return .{ .help = .top };
+            if (!std.mem.eql(u8, arg, "--json")) return ParseError.UnknownFlag;
+        }
+        return .{ .resources = {} };
     }
     if (std.mem.eql(u8, args[0], "migrate-db")) {
         var ma = MigrateDbArgs{};
@@ -1330,6 +1338,13 @@ test "serve control --help routes to the serve_control help topic" {
     try std.testing.expectEqual(HelpTopic.serve_control, (try parse(&.{ "serve", "logs", "--help" }, .{})).help);
     // A bare `serve --help` still routes to the SERVE topic, not the control one.
     try std.testing.expectEqual(HelpTopic.serve, (try parse(&.{ "serve", "--help" }, .{})).help);
+}
+
+test "resources accepts JSON and rejects deployment flags" {
+    try std.testing.expectEqual(.resources, std.meta.activeTag(try parse(&.{"resources"}, .{})));
+    try std.testing.expectEqual(.resources, std.meta.activeTag(try parse(&.{ "resources", "--json" }, .{})));
+    try std.testing.expectEqual(HelpTopic.top, (try parse(&.{ "resources", "--help" }, .{})).help);
+    try std.testing.expectError(ParseError.UnknownFlag, parse(&.{ "resources", "--data-dir", "/tmp/db" }, .{}));
 }
 
 test "doctor parses --production/--json/--data-dir and routes --help" {

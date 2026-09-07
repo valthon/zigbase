@@ -701,6 +701,8 @@ const Backend = zigbase.App(.{
         },
 
         // 7. Pool footprint tuning levers.
+        .resource_profile = .minimal,
+        // Explicit fields override profile defaults; inspect with `resources`.
         .pools = .{ .readers = 4, .jobs = 1, .cache_kib = 512 },
 
         // 8. Fully embedded static frontend (see build.zig embedStaticDir).

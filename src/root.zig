@@ -9,6 +9,8 @@ comptime {
 
 // ---- Public API (grows over this plan) -------------------------------------
 pub const App = @import("framework.zig").App; // comptime application builder
+pub const ResourceProfile = @import("resource_profile.zig").Profile;
+pub const ResourceReport = @import("resource_profile.zig").Report;
 pub const Runtime = @import("app.zig").App; // runtime app context struct
 pub const Config = @import("config.zig").Config;
 pub const Server = @import("server.zig").Server;
