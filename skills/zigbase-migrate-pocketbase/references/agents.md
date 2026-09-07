@@ -93,6 +93,34 @@ use `serve status`/`serve logs`/`serve stop` to manage that session instead of
 waiting on a foreground process. `zigbase help` is the authoritative list —
 trust it over any document, including this one.
 
+## Machine-readable CLI discovery
+
+Run `zigbase capabilities --json` before choosing an inspection command. It returns
+one JSON object with `protocol_version: 1` and a bounded `operations` catalog.
+Each entry has a stable `id`, an `argv` array (arguments after the executable,
+not a shell command), `output` format, `effect`, `requires_database`, and `notes`.
+Consumers should reject unsupported protocol versions and ignore unknown fields.
+The catalog covers selected development operations, not every CLI command or API route.
+
+Discovery itself does not load or validate deployment settings, opens no database,
+and starts no server. CLI logging initialization still reads logging preferences.
+It is compiled out with `-Ddev-tools=false`; invoking it then exits
+nonzero with rebuild guidance. It does not execute the advertised operations.
+
+Do not treat every diagnostic command as read-only. `effect: "may_write"`
+means an operation can create or modify supporting state: `doctor` probes
+writability and may initialize a ledger, while schema dump and migration status
+open the database pool. Use an isolated development database unless those effects
+are authorized. `effect: "read_only"` describes the supplied argument vector;
+adding output-file options can introduce writes. Commands requiring a database
+may need `--data-dir`; they also honor their existing environment configuration.
+Diagnostic/status commands can exit nonzero while emitting valid structured output.
+
+For HTTP routes use the advertised OpenAPI operation, which includes the binary's
+declared consumer routes. For tuning, migration previews, and test selection,
+consult the relevant command documentation: this initial discovery protocol does
+not yet provide a unified execution or diagnostic-remediation interface.
+
 ## Which guide to load
 
 | If you are… | Load |

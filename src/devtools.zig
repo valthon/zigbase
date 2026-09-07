@@ -1,13 +1,13 @@
 //! The single dev-tools build gate. True by default — every official artifact we
 //! publish (GitHub release tarballs, the Docker image, the `@zigbase/server` npm
-//! packages) builds at this default, so those binaries always carry the three verbs
+//! packages) builds at this default, so those binaries always carry the verbs
 //! below. Comptime-FALSE only when a consumer explicitly opts out with
 //! `-Ddev-tools=false` while compiling their OWN binary for their OWN deployment.
 //!
-//! It gates the three pure development-time CLI verbs: `init` and `agents-md`
+//! It gates the development-time CLI verbs: `init` and `agents-md`
 //! (project scaffolding, `src/scaffold*.zig`) and `typegen` (schema-to-client
 //! codegen, `src/codegen/**` — ~24 files, the largest dev-only surface in the
-//! binary). None of the three has operational or runtime value on a *deployed*
+//! binary), plus `capabilities` (offline agent command discovery). None has runtime value on a *deployed*
 //! server — they are schema/toolchain-in, source-out generators a developer runs
 //! locally, never something a running instance needs to serve traffic. typegen's
 //! no-Zig-toolchain equivalent ships separately as `@zigbase/typegen` on npm, so
@@ -29,4 +29,4 @@ pub const enabled = build_options.dev_tools;
 /// framework.zig's dispatch-time fallback (unreachable in practice since parse
 /// rejects first, but keeps those arms from referencing scaffold/codegen in a
 /// stripped build). `{s}` is the verb name, e.g. "init".
-pub const disabled_note = "this binary was built without -Ddev-tools, so the scaffolding commands (init, agents-md, typegen) are not compiled in. Use an official release binary, or rebuild with -Ddev-tools=true.";
+pub const disabled_note = "this binary was built without -Ddev-tools, so the development commands (init, agents-md, typegen, capabilities) are not compiled in. Use an official release binary, or rebuild with -Ddev-tools=true.";
