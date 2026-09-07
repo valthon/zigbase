@@ -3227,9 +3227,9 @@ built-in itself is gated off.
 - **Upgrade coordinated workers together:** drain and stop older worker binaries
   before applying migration `0025_queue_rates` from one process, then start the
   upgraded instances. Older binaries neither enforce shared rate windows nor fence
-  completion, so mixed-version workers do not provide these guarantees. Consumer
-  migrations and older binaries still need a single migration leader; built-in system
-  migrations are serialized automatically (see §8).
+  completion, so mixed-version workers do not provide these guarantees. Older
+  binaries still need a single migration leader; current PostgreSQL consumer and
+  system migrations are serialized automatically (see §8).
 - Memory jobs run on a bounded worker pool that is drained and joined at shutdown (like `app.submit`); jobs still queued at a hard crash are lost (at-most-once), and a full ring rejects with `error.QueueFull`.
 
 ## 8. Define your schema in code (`.collections` + `.migrations`)
@@ -3243,12 +3243,34 @@ applied-state check; SQLite takes its immediate writer lock. Each migration reta
 commit boundary. Failure rolls back that migration and releases its lock, so another startup
 can retry; earlier committed migrations remain applied. A failed lock acquisition aborts
 startup rather than proceeding unlocked (PostgreSQL deployment `lock_timeout` applies).
-This does not coordinate consumer migrations or old binaries that lack the lock: use a
-single migration leader for those, and continue draining old workers before incompatible
-queue upgrades. The system runner and public ledger bootstrap (`ensureLedger`, also used
+Old binaries that lack the lock still require a single migration leader; continue
+draining old workers before incompatible queue upgrades. The system runner and public ledger bootstrap (`ensureLedger`, also used
 by status/rollback/doctor) share this lock and must run outside a caller-owned transaction.
 Nested use logs an explicit refusal and preserves the caller's transaction, returning
 `ExecFailed` for compatibility with the existing database error surface.
+
+**Consumer migrations on PostgreSQL also coordinate automatically.** Forward application
+and rollback acquire a separate database-scoped **session advisory lock before reading
+the ledger**, including rollback selection/preflight. The lock spans the entire batch,
+while each migration keeps its existing commit boundary and `.transactional = false`
+callbacks remain outside a transaction. This requires a direct PostgreSQL connection or
+a session-pooling proxy; transaction/statement-pooling proxies cannot preserve this lock.
+SQLite continues to require a single application/migration process.
+
+Consumer runners refuse caller-owned transactions with `MigrationCallerTransaction`.
+A callback that leaves a transaction open stops the batch at that migration with
+`MigrationUnfinishedTransaction` — checked immediately after the callback returns, so the
+offender is never recorded as applied and no later migration joins the transaction it left
+behind — and the transaction is rolled back before the lock is released. A callback's original
+error is preserved when transaction cleanup succeeds. Advisory unlock is attempted even
+if rollback fails, and real cleanup failures take precedence; the error a cleanup failure
+displaces is logged. The unlock's own result is checked, so a connection that does not hold
+the lock it acquired — the signature of a transaction-pooling proxy — fails with
+`MigrationLockSessionLost` instead of reporting coordination that silently did not happen. Locks are released on normal
+completion and callback errors; connection loss releases PostgreSQL session locks. Lock/cleanup failures propagate
+and abort framework startup; low-level callers must discard the connection after a cleanup
+failure. Set PostgreSQL `lock_timeout` to bound lock waits. This does not make external
+side effects atomic, coordinate old binaries, or make incompatible mixed-version schemas safe.
 
 ZigBase provisions the declarations at startup:
 
