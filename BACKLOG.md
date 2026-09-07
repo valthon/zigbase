@@ -7,12 +7,13 @@ copy, examples, and tests with the implementation rather than in follow-up PRs.
 
 ## Development and resource efficiency
 
-- [ ] Transparent comptime resource profiles with explicit overrides and an effective-settings report.
+- [x] Transparent comptime resource profiles with explicit overrides and an effective-settings report (#410).
 - [ ] Workload-driven tuning advisor comparing throughput, tail latency, and memory under explicit budgets.
 - [ ] Coordinated resource budgets, bounded queues, backpressure, and saturation diagnostics.
 - [ ] Agent-native development interface: versioned discovery, structured diagnostics,
   schema/route inspection, migration previews, and focused test execution.
-  First slice: CLI discovery with explicit operation side effects; this is not a remote executor.
+  Implemented first slice: CLI discovery with explicit operation side effects (#409);
+  this is not a remote executor. Structured diagnostics and focused execution remain.
 - [ ] Opt-in bounded query performance workbench with route attribution and query-plan inspection.
 - [ ] Dependency-aware bounded response caching, starting with explicitly eligible public reads.
 - [ ] Application performance contracts: deterministic size/allocation gates and controlled latency trends.
@@ -40,7 +41,8 @@ copy, examples, and tests with the implementation rather than in follow-up PRs.
 
 - [x] Measure actual delivery authorization, allocations, and subscriber fanout.
 - [x] Exercise benchmark correctness under ReleaseSafe in CI.
-- [ ] Design bounded replay/backfill with current authorization and explicit gap semantics.
+- [x] Bounded single-process SQLite backfill with current authorization and explicit gap semantics (#412).
+- [ ] Durable cross-instance replay with explicit resource and retention budgets.
 
 ## Analytics batching (#401)
 
@@ -54,4 +56,5 @@ copy, examples, and tests with the implementation rather than in follow-up PRs.
   completion-error handling, and live S3-compatible integration coverage.
 - [ ] Resumable client uploads with principal-bound capabilities and commit reauthorization.
 - [ ] Image transforms/thumbnails with comptime support and resource budgets.
-- [ ] Durable post-commit replacement/deletion cleanup and scoped orphan reconciliation.
+- [x] Opt-in durable HTTP replacement/deletion cleanup with physical reference checks (#411).
+- [ ] Scoped orphan reconciliation and cleanup for non-HTTP mutation paths.
