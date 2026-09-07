@@ -210,9 +210,10 @@ pub const AgentsMdArgs = struct {
 };
 
 /// Identifies which command a per-command `--help` request targets.
-pub const HelpTopic = enum { top, serve, serve_control, migrate, superuser_create, typegen, rewrap, migrate_db, vapid_keygen, import, schema, openapi, explain_code, doctor, init, agents_md, files, capabilities, routes };
+pub const HelpTopic = enum { top, serve, serve_control, migrate, superuser_create, typegen, rewrap, migrate_db, vapid_keygen, import, schema, openapi, explain_code, doctor, init, agents_md, files, capabilities, routes, tune };
 
 pub const Command = union(enum) {
+    tune: TuneArgs,
     resources: void,
     /// `help`/`--help`/`-h`/no-args -> top-level usage; `<cmd> --help` -> that command's usage.
     help: HelpTopic,
@@ -262,6 +263,8 @@ pub const ParseOpts = struct {
     static_cache_control: bool = true,
 };
 
+pub const TuneArgs = struct { input: []const u8 = "", as_of: ?i64 = null };
+
 /// Parse argv (excluding the program name).
 pub fn parse(args: []const []const u8, popts: ParseOpts) ParseError!Command {
     if (args.len == 0) return .{ .help = .top };
@@ -272,6 +275,30 @@ pub fn parse(args: []const []const u8, popts: ParseOpts) ParseError!Command {
             if (!std.mem.eql(u8, arg, "--json")) return ParseError.UnknownFlag;
         }
         return .{ .routes = {} };
+    }
+    if (std.mem.eql(u8, args[0], "tune")) {
+        if (!devtools.enabled) return ParseError.DevToolsDisabled;
+        var result = TuneArgs{};
+        var i: usize = 1;
+        while (i < args.len) : (i += 1) {
+            const arg = args[i];
+            if (isHelpFlag(arg)) return .{ .help = .tune };
+            if (std.mem.eql(u8, arg, "--json")) continue;
+            if (std.mem.eql(u8, arg, "--input")) {
+                if (result.input.len > 0) return ParseError.BadValue;
+                i += 1;
+                if (i == args.len) return ParseError.MissingValue;
+                result.input = args[i];
+            } else if (std.mem.eql(u8, arg, "--as-of")) {
+                if (result.as_of != null) return ParseError.BadValue;
+                i += 1;
+                if (i == args.len) return ParseError.MissingValue;
+                result.as_of = std.fmt.parseInt(i64, args[i], 10) catch return ParseError.BadValue;
+                if (result.as_of.? < 0) return ParseError.BadValue;
+            } else return ParseError.UnknownFlag;
+        }
+        if (result.input.len == 0) return ParseError.MissingValue;
+        return .{ .tune = result };
     }
     if (std.mem.eql(u8, args[0], "capabilities")) {
         if (!devtools.enabled) return ParseError.DevToolsDisabled;
@@ -1534,4 +1561,17 @@ test "capabilities parses only offline discovery arguments" {
     try std.testing.expectEqual(HelpTopic.capabilities, (try parse(&.{ "capabilities", "-h" }, .{})).help);
     try std.testing.expectEqual(Command.capabilities, std.meta.activeTag(try parse(&.{ "capabilities", "--json" }, .{})));
     try std.testing.expectError(ParseError.UnknownFlag, parse(&.{ "capabilities", "--execute" }, .{}));
+}
+
+test "tune has bounded explicit inputs and respects the dev-tools gate" {
+    if (!devtools.enabled) {
+        try std.testing.expectError(ParseError.DevToolsDisabled, parse(&.{ "tune", "--help" }, .{}));
+        return;
+    }
+    try std.testing.expectEqual(HelpTopic.tune, (try parse(&.{ "tune", "--help" }, .{})).help);
+    const result = (try parse(&.{ "tune", "--input", "measurements.json", "--as-of", "100" }, .{})).tune;
+    try std.testing.expectEqual(@as(?i64, 100), result.as_of);
+    try std.testing.expectError(ParseError.MissingValue, parse(&.{"tune"}, .{}));
+    try std.testing.expectError(ParseError.BadValue, parse(&.{ "tune", "--input", "x", "--as-of", "-1" }, .{}));
+    try std.testing.expectError(ParseError.BadValue, parse(&.{ "tune", "--input", "x", "--input", "y" }, .{}));
 }

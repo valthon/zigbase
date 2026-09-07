@@ -2009,6 +2009,21 @@ fn runCliImpl(init: std.process.Init, dispatch: *const events.Dispatch, jobs: []
                 try out.interface.flush();
             } else return error.DevToolsDisabled;
         },
+        .tune => |ta| {
+            if (comptime devtools.enabled) {
+                const tuning = @import("tuning.zig");
+                const input = try std.Io.Dir.cwd().readFileAlloc(init.io, ta.input, allocator, .limited(tuning.max_input_bytes));
+                defer allocator.free(input);
+                const now: i64 = ta.as_of orelse @as(i64, @intCast(@divTrunc(std.Io.Timestamp.now(init.io, .real).nanoseconds, std.time.ns_per_s)));
+                const report = try tuning.compare(allocator, input, now);
+                defer allocator.free(report);
+                var output_buffer: [4096]u8 = undefined;
+                var output = std.Io.File.stdout().writer(init.io, &output_buffer);
+                try output.interface.writeAll(report);
+                try output.interface.writeByte('\n');
+                try output.interface.flush();
+            } else return error.DevToolsDisabled;
+        },
         .help => |topic| switch (topic) {
             .top => printUsage(init.io, std.Io.File.stdout(), std.meta.activeTag(opts.static_mode) == .default, std.meta.activeTag(opts.static_mode) != .disabled),
             .serve => printServeUsage(init.io, std.Io.File.stdout(), std.meta.activeTag(opts.static_mode) == .default, std.meta.activeTag(opts.static_mode) != .disabled),
@@ -2029,6 +2044,7 @@ fn runCliImpl(init: std.process.Init, dispatch: *const events.Dispatch, jobs: []
             .agents_md => printAgentsMdUsage(init.io, std.Io.File.stdout()),
             .capabilities => if (comptime devtools.enabled) printCapabilitiesUsage(init.io, std.Io.File.stdout()),
             .routes => if (comptime devtools.enabled) printRoutesUsage(init.io, std.Io.File.stdout()),
+            .tune => if (comptime devtools.enabled) printTuneUsage(init.io, std.Io.File.stdout()),
         },
         .version => |va| if (va.json) printVersionJson(init.io, std.Io.File.stdout()) else printVersion(init.io, std.Io.File.stdout()),
         .resources => {
@@ -2308,6 +2324,7 @@ fn printUsage(io: std.Io, file: std.Io.File, show_serve_static: bool, show_stati
     if (devtools.enabled) emit(io, file,
         \\  capabilities        Versioned JSON discovery of agent-facing CLI operations.
         \\  routes              Offline JSON inventory of this binary's registered routes.
+        \\  tune                Compare measured workload candidates within explicit budgets.
         \\  init                Scaffold a starting-point project (--box or --framework).
         \\  agents-md           Write AGENTS.md + CLAUDE.md for an existing project.
         \\  typegen             Generate a typed client from the collection schema (see `zigbase typegen --help`).
@@ -3061,6 +3078,18 @@ fn printRoutesUsage(io: std.Io, file: std.Io.File) void {
     , .{});
 }
 
+fn printTuneUsage(io: std.Io, file: std.Io.File) void {
+    emit(io, file,
+        \\zigbase tune — compare supplied workload measurements within explicit budgets.
+        \\Usage: zigbase tune --input FILE [--as-of UNIX_SECONDS] [--json]
+        \\Prints JSON; never runs workloads or edits configuration. Input is capped at 1 MiB.
+        \\Budgets and comparison context are required in the versioned input document.
+        \\--as-of pins freshness checks for reproducibility; default: current wall clock.
+        \\A null recommendation means no eligible measured candidate fits the budgets.
+        \\Requires -Ddev-tools=true. See docs/framework.md resource tuning workflow.
+        \\
+    , .{});
+}
 fn printCapabilitiesUsage(io: std.Io, file: std.Io.File) void {
     emit(io, file,
         \\zigbase capabilities — offline discovery of agent-facing CLI operations.
