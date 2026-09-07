@@ -77,8 +77,9 @@ def test_paste_is_sanitized(page):
     page.click('[data-test=new-record]')
     page.wait_for_selector('[data-test=record-drawer]')
 
-    page.evaluate("""() => {
-      const el = document.querySelector('[data-test=in-body]');
+    # The drawer shell can render before its editor. Locator evaluation waits
+    # for the actual paste target instead of racing a null DOM query.
+    page.locator('[data-test=in-body]').evaluate("""el => {
       el.focus();
       const dt = new DataTransfer();
       dt.setData('text/html', '<img src=x onerror=alert(1)><script>alert(1)<\\/script><b>ok</b>');
