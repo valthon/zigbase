@@ -1,4 +1,4 @@
-//! File-serving runtime knobs, threaded from the comptime `App(.{ .files = ... })` config into
+//! File-serving and lifecycle knobs, threaded from the comptime `App(.{ .files = ... })` config into
 //! `app.App.files`. Every field defaults to the BACK-COMPAT, byte-identical-to-pre-feature value:
 //! presigned-redirect serving is OFF, so an app that does nothing keeps the proxy-only path where
 //! the server fetches (and, for S3, spool-caches) the bytes and streams them itself.
@@ -12,11 +12,16 @@
 //!   * `presign_ttl_s` — the validity window (seconds) of the issued presigned URL, the
 //!     `X-Amz-Expires` value. The URL is a BEARER capability (not bound to the authorized
 //!     requester) valid until it expires, so keep this short. Default 900s (15 min).
+//!   * `cleanup_queue` — resolved by App against its durable queue registry, which
+//!     installs the transactional enqueue callback and worker only when configured.
 
 const std = @import("std");
 
 /// The lowered runtime config stored on `app.App.files`.
 pub const Runtime = struct {
+    /// Installed only by an opt-in App; absent builds do not retain cleanup code.
+    cleanup: ?*const fn (std.mem.Allocator, *@import("../db.zig").Db, std.Io, @import("../queue/queue.zig").QueueDef, @import("../schema.zig").Collection, []const u8, std.json.Value, ?std.json.Value) anyerror!void = null,
+    cleanup_queue: ?@import("../queue/queue.zig").QueueDef = null,
     /// Serve authorized S3 downloads as a 302 redirect to a presigned GET URL instead of proxying
     /// the bytes. Default off = the byte-identical proxy-only path. No effect on non-presigning
     /// backends (local disk / non-`-Ds3` builds), where the storage vtable declines and the proxy
@@ -35,8 +40,8 @@ pub fn lower(comptime files_cfg: anytype) Runtime {
     if (@typeInfo(FC) != .@"struct")
         @compileError(".files must be a struct, e.g. '.{ .s3_presign_redirect = true, .s3_presign_ttl_s = 900 }'");
     inline for (std.meta.fields(FC)) |f| {
-        if (comptime !std.mem.eql(u8, f.name, "s3_presign_redirect") and !std.mem.eql(u8, f.name, "s3_presign_ttl_s"))
-            @compileError(".files: unknown key '." ++ f.name ++ "' (recognized: .s3_presign_redirect, .s3_presign_ttl_s)");
+        if (comptime !std.mem.eql(u8, f.name, "cleanup_queue") and !std.mem.eql(u8, f.name, "s3_presign_redirect") and !std.mem.eql(u8, f.name, "s3_presign_ttl_s"))
+            @compileError(".files: unknown key '." ++ f.name ++ "' (recognized: .cleanup_queue, .s3_presign_redirect, .s3_presign_ttl_s)");
     }
     var rt = Runtime{};
     if (@hasField(FC, "s3_presign_redirect")) {

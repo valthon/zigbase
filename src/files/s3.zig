@@ -947,15 +947,17 @@ pub const S3Storage = struct {
         const a = arena.allocator();
         const prefix = try std.fmt.allocPrint(a, "{s}{s}/{s}/", .{ self.client.key_prefix, col, record_id });
         const keys = try self.client.listKeys(io, a, prefix);
-        for (keys) |k| self.client.delete(io, a, k) catch |e| {
-            // Best-effort (a record delete must not fail on remote-cleanup hygiene), but log the
-            // orphaned key: a failed DELETE (expired creds / bucket-policy change / network blip)
-            // leaves an object billed + retained after its DB record is gone. Without this line
-            // the skip is undiscoverable — the key was enumerated but recorded nowhere (#34).
-            std.log.warn("[s3] failed to delete object '{s}': {s}; object orphaned", .{ k, @errorName(e) });
+        // Attempt the complete sweep for synchronous callers, while preserving
+        // an error for durable retries. Log each key needing operator attention.
+        var failed: ?anyerror = null;
+        for (keys) |k| self.client.delete(io, a, k) catch |err| {
+            std.log.warn("[s3] failed to delete object '{s}': {s}; object orphaned", .{ k, @errorName(err) });
+            failed = err;
         };
         const spool_dir = try std.fs.path.join(a, &.{ self.cache_dir, col, record_id });
-        std.Io.Dir.cwd().deleteTree(io, spool_dir) catch {};
+        std.Io.Dir.cwd().deleteTree(io, spool_dir) catch |err|
+            std.log.warn("[s3] failed to clear spool for {s}/{s}: {s}", .{ col, record_id, @errorName(err) });
+        if (failed) |err| return err;
     }
 
     /// Size-triggered eviction on miss-fill: when the spool exceeds the cap, delete
@@ -1620,6 +1622,47 @@ test "S3Storage.fetch: cache miss downloads+spools; cache hit skips the network;
     testcapture.http.enable(true);
     testcapture.http.mock("col/r1/bad.bin", .{ .status = 500 }); // sticky: both the initial try and the one retry see 500
     try testing.expectError(error.S3RequestFailed, st.fetch(std.testing.io, testing.allocator, "col", "r1", "bad.bin"));
+}
+
+test "S3Storage.deleteRecord propagates object failures and permits replay" {
+    if (!testcapture.enabled) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const a = testing.allocator;
+    const cache_dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(cache_dir);
+    testcapture.http.enable(true);
+    defer testcapture.http.reset();
+    testcapture.http.mock("zbtest", .{ .status = 404 });
+    var s3 = try S3Storage.create(a, std.testing.io, testCfg(cache_dir));
+    defer s3.deinit();
+    const st = s3.storage();
+    testcapture.http.reset();
+    testcapture.http.enable(true);
+    const listing = "<ListBucketResult><IsTruncated>false</IsTruncated><Key>col/r1/legacy.txt</Key><Key>col/r1/later.txt</Key></ListBucketResult>";
+    testcapture.http.mock("list-type=2", .{ .status = 200, .body = listing });
+    testcapture.http.mock("col/r1/legacy.txt", .{ .status = 500 });
+    testcapture.http.mock("col/r1/later.txt", .{ .status = 204 });
+    try testing.expectError(error.S3RequestFailed, st.deleteRecord(std.testing.io, "col", "r1"));
+    var attempted_later = false;
+    for (testcapture.http.requests()) |request| {
+        if (request.method == .DELETE and std.mem.indexOf(u8, request.url, "later.txt") != null) attempted_later = true;
+    }
+    try testing.expect(attempted_later);
+    testcapture.http.reset();
+    testcapture.http.enable(true);
+    testcapture.http.mock("list-type=2", .{ .status = 200, .body = listing });
+    testcapture.http.mock("col/r1/legacy.txt", .{ .status = 204 });
+    testcapture.http.mock("col/r1/later.txt", .{ .status = 204 });
+    try st.deleteRecord(std.testing.io, "col", "r1");
+    try st.deleteRecord(std.testing.io, "col", "r1");
+    // A non-directory cache parent deterministically fails local cleanup, even
+    // under root. Remote cleanup must still be acknowledged rather than retried.
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "col", .data = "not a directory" });
+    const spool = try std.fs.path.join(a, &.{ cache_dir, "col", "r1" });
+    defer a.free(spool);
+    try testing.expectError(error.NotDir, std.Io.Dir.cwd().deleteTree(std.testing.io, spool));
+    try st.deleteRecord(std.testing.io, "col", "r1");
 }
 
 test "S3Storage: put/delete round-trip through the vtable" {

@@ -324,6 +324,22 @@ pub fn getAtRest(alloc: std.mem.Allocator, r: *db.Db, col: schema.Collection, id
     return try rowToObjectAtRest(alloc, &st, col, null);
 }
 
+/// Internal blob ownership snapshot, not a user-visible read. Includes hidden
+/// file fields and physically present expired rows, without decrypting anything.
+/// Owned result: freeRecord; scratch is freed here under any allocator.
+pub fn getFilesPhysical(alloc: std.mem.Allocator, r: *db.Db, col: schema.Collection, id: []const u8) !?std.json.Value {
+    var fields: std.ArrayList(schema.Field) = .empty;
+    defer fields.deinit(alloc);
+    for (col.fields) |field| if (field.options == .file) {
+        var visible = field;
+        visible.hidden = false;
+        try fields.append(alloc, visible);
+    };
+    var physical = col;
+    physical.fields = fields.items;
+    return getAtRest(alloc, r, physical, id);
+}
+
 pub fn get(alloc: std.mem.Allocator, r: *db.Db, col: schema.Collection, id: []const u8) RecordError!?std.json.Value {
     const cols = try columnList(alloc, col);
     defer alloc.free(cols);

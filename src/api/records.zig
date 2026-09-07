@@ -244,6 +244,24 @@ fn lockUploadRecord(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection,
     _ = try lock.step();
 }
 
+/// Cleanup must enqueue from the exact snapshot the authorized mutation removes.
+/// Lock only after preauthorization; concurrent changes require a fresh request.
+fn lockCleanupSnapshot(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection, rid: []const u8, snapshot: std.json.Value) !bool {
+    try lockUploadRecord(alloc, w, col, rid);
+    const current = (try records.get(alloc, w, col, rid)) orelse return false;
+    defer records.freeRecord(alloc, current);
+    const before = try std.json.Stringify.valueAlloc(alloc, snapshot, .{});
+    defer alloc.free(before);
+    const after = try std.json.Stringify.valueAlloc(alloc, current, .{});
+    defer alloc.free(after);
+    return std.mem.eql(u8, before, after);
+}
+
+fn hasFileFields(col: schema.Collection) bool {
+    for (col.fields) |field| if (field.options == .file) return true;
+    return false;
+}
+
 pub fn view(ctx: *http.RequestCtx) anyerror!http.Response {
     const app = ctx.app.?;
     var r = try app.pool.acquireReader();
@@ -591,8 +609,9 @@ pub fn update(ctx: *http.RequestCtx) anyerror!http.Response {
     if (decision == .deny_locked) return forbidden(ctx);
 
     // Tenant pre-authorization (defense-in-depth, symmetric with delete's pre-hook authz): for a
-    // tenant-owned collection, confirm the TARGET row belongs to the active account BEFORE opening
-    // the txn / running the before_update hook, so a cross-tenant PUT never triggers hook side
+    // tenant-owned collection, confirm the TARGET row belongs to the active account before the
+    // before_update hook (and before BEGIN on non-upload requests). Uploads already preauthorized
+    // their snapshot before transfer. A cross-tenant PUT never triggers hook side
     // effects against another account's record. The in-txn `.check` guard still independently
     // rejects a cross-tenant MOVE (changing tenant_field on a row you DO own).
     if (app.tenancy.enabled and !rctx.is_superuser and !rctx.cross_tenant) {
@@ -611,6 +630,10 @@ pub fn update(ctx: *http.RequestCtx) anyerror!http.Response {
         try w.beginImmediate();
         txn_open = true;
     }
+    const cleanup_files = app.files.cleanup != null and hasFileFields(col);
+    if (cleanup_files and upload_plan == null and !try lockCleanupSnapshot(ctx.allocator.a, w, col, rid, existing))
+        return ApiError.conflict("Record changed before mutation; reload and retry.").toResponse(ctx.allocator.a);
+    const old_files = if (cleanup_files) (try records.getFilesPhysical(ctx.allocator.a, w, col, rid)).? else null;
 
     var data_mut = data2;
     emitRecord(app, &rctx, ctx.allocator, w, col.name, &data_mut, .before_update) catch {
@@ -665,12 +688,16 @@ pub fn update(ctx: *http.RequestCtx) anyerror!http.Response {
     // INSIDE the txn so no zombie rows outlive the rotation until GC.
     if (col.type == .auth and pw_change and app.session_store == .table)
         try api_auth.deleteSessionsForPrincipal(w, col.name, rid);
+    if (old_files) |old| {
+        const current_files = (try records.getFilesPhysical(ctx.allocator.a, w, col, rid)).?;
+        try app.files.cleanup.?(ctx.allocator.a, w, app.io, app.files.cleanup_queue.?, col, rid, old, current_files);
+    }
     try w.commit();
     txn_open = false;
     committed = true; // row is durable — the write-cleanup defer must NOT fire past here
 
     // Side effects AFTER commit: drop replaced files, fire file/after-update hooks, broadcast.
-    if (ctx.app.?.storage) |storage| for (all.deletes) |d| storage.delete(app.io, col.name, rid, d) catch |e|
+    if (app.files.cleanup == null) if (ctx.app.?.storage) |storage| for (all.deletes) |d| storage.delete(app.io, col.name, rid, d) catch |e|
         std.log.warn("replaced-file cleanup failed for {s}/{s}/{s}: {s}", .{ col.name, rid, d, @errorName(e) });
     emitFileUploads(app, &rctx, col.name, rid, all.writes);
     // Self-service password change: "keep this device, log out everywhere else". The old
@@ -714,6 +741,8 @@ pub fn delete(ctx: *http.RequestCtx) anyerror!http.Response {
     defer col_lease.release();
     const col = col_lease.col orelse return ApiError.notFound().toResponse(ctx.allocator.a);
     const rid = ctx.param("id") orelse return ApiError.notFound().toResponse(ctx.allocator.a);
+    var txn_open = false;
+    defer if (txn_open) w.rollback() catch |err| std.log.err("record delete rollback failed: {s}", .{@errorName(err)});
     const existing = (try records.get(ctx.allocator.a, w, col, rid)) orelse return ApiError.notFound().toResponse(ctx.allocator.a);
     const rctx = buildContext(ctx, w, null);
     // Gate FIRST (pre-delete authorization): the deleteRule is checked against the live
@@ -728,11 +757,12 @@ pub fn delete(ctx: *http.RequestCtx) anyerror!http.Response {
     // _externalAuths cleanup, so a before-hook side-write + the delete commit atomically
     // and a hook error rolls the whole thing back (see create() for the rollback rationale).
     try w.beginImmediate();
-    errdefer w.rollback() catch {};
+    txn_open = true;
+    if (app.files.cleanup != null and hasFileFields(col) and !try lockCleanupSnapshot(ctx.allocator.a, w, col, rid, existing))
+        return ApiError.conflict("Record changed before mutation; reload and retry.").toResponse(ctx.allocator.a);
 
     var ex_mut = existing;
     emitRecord(app, &rctx, ctx.allocator, w, col.name, &ex_mut, .before_delete) catch {
-        w.rollback() catch {};
         return hookRejected(ctx);
     };
     // Realtime delete prep (#159, PR-6/PR-6b), INSIDE this transaction so a Postgres side-table
@@ -743,7 +773,6 @@ pub fn delete(ctx: *http.RequestCtx) anyerror!http.Response {
     // fields this reuses `ex_mut` with no extra read (byte-identical).
     const rt = realtime_ws.prepareDelete(ctx.allocator.a, app, w, col, rid, ex_mut);
     if (!try records.deleteInTxn(ctx.allocator.a, w, col, rid)) {
-        w.rollback() catch {};
         return ApiError.notFound().toResponse(ctx.allocator.a);
     }
     if (col.type == .auth) {
@@ -753,12 +782,14 @@ pub fn delete(ctx: *http.RequestCtx) anyerror!http.Response {
         try st.bindText(2, rid);
         _ = try st.step();
     }
+    if (app.files.cleanup) |enqueue| try enqueue(ctx.allocator.a, w, app.io, app.files.cleanup_queue.?, col, rid, existing, null);
     try w.commit();
+    txn_open = false;
 
     // Side effects AFTER commit. Best-effort file removal: the row is already gone and the
     // request must succeed, but a silent failure (e.g. transient S3 error) would orphan the
     // record's files with no signal — log so orphan accumulation is diagnosable (NO_SLOP §2.3).
-    if (app.storage) |storage| storage.deleteRecord(app.io, col.name, rid) catch |e|
+    if (app.files.cleanup == null) if (app.storage) |storage| storage.deleteRecord(app.io, col.name, rid) catch |e|
         std.log.warn("orphaned file cleanup failed for deleted record {s}/{s}: {s}", .{ col.name, rid, @errorName(e) });
     emitRecord(app, &rctx, ctx.allocator, w, col.name, &ex_mut, .after_delete) catch {};
     // F4: pass the deleted row's snapshot so subscribers to an owner/expression-scoped collection
@@ -1755,6 +1786,256 @@ test "uploads release writer, reserve server ids, clean failed puts, and reject 
     try std.testing.expectEqual(@as(i64, 1), try countRows(env, "upload_checks"));
 }
 
+test "durable cleanup commits with HTTP delete and retries safely after reference reuse" {
+    const cleanup = @import("../files/cleanup.zig");
+    const q = @import("../queue/queue.zig");
+    const dq = @import("../queue/durable.zig");
+    var env = try TestEnv.init();
+    defer env.deinit();
+    try seedTyped(env, "cleanup_files");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        var col = (try collections.get(a, w, "cleanup_files")).?;
+        const fields_with_hidden = try a.alloc(schema.Field, col.fields.len + 2);
+        @memcpy(fields_with_hidden[0..col.fields.len], col.fields);
+        fields_with_hidden[col.fields.len] = .{ .id = "hidden1", .name = "secret_file", .hidden = true, .options = .{ .file = .{} } };
+        fields_with_hidden[col.fields.len + 1] = .{ .id = "expires1", .name = "expires_at", .options = .{ .date = .{} } };
+        col.fields = fields_with_hidden;
+        col.options.ttl_field = "expires_at";
+        _ = try collections.update(a, std.testing.io, w, col.name, col);
+    }
+    const root = try env.tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    var local = @import("../files/storage.zig").LocalStorage.init(root);
+    var storage = local.storage();
+    env.app.storage = &storage;
+    const def = q.QueueDef{ .name = "cleanup", .backend = .durable };
+    env.app.files.cleanup = cleanup.enqueueRemoved;
+    env.app.files.cleanup_queue = def;
+    var fields: std.json.ObjectMap = .empty;
+    try fields.put(a, "title", .{ .string = "hello" });
+    const uploads = [_]http.UploadedFile{.{ .field = "photos", .filename = "file.txt", .mimetype = "text/plain", .bytes = "hello" }};
+    var create_ctx = formCtx(env, RequestArena.from(&arena), .POST, fields, &uploads, &.{.{ .key = "col", .value = "cleanup_files" }});
+    const created = try create(&create_ctx);
+    try std.testing.expectEqual(@as(u16, 201), created.status);
+    const row = (try std.json.parseFromSlice(std.json.Value, a, created.body, .{})).value;
+    const rid = row.object.get("id").?.string;
+    const filename = row.object.get("photos").?.array.items[0].string;
+    try storage.put(std.testing.io, "cleanup_files", rid, "hidden.txt", "hidden bytes");
+    try storage.put(std.testing.io, "cleanup_files", rid, "legacy.txt", "removed field bytes");
+    {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        try w.exec("UPDATE cleanup_files SET secret_file='hidden.txt';");
+    }
+    var delete_ctx = ctxFor(env, RequestArena.from(&arena), .DELETE, "", &.{ .{ .key = "col", .value = "cleanup_files" }, .{ .key = "id", .value = rid } });
+    // An already-open transaction makes any premature BEGIN fail. Locked-rule
+    // requests must return their normal denial without touching that transaction.
+    {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        try w.exec("UPDATE _collections SET updateRule=NULL, deleteRule=NULL WHERE name='cleanup_files';");
+        try w.beginImmediate();
+    }
+    var denied_update = ctxFor(env, RequestArena.from(&arena), .PATCH, "{\"title\":\"denied\"}", delete_ctx.params);
+    try std.testing.expectEqual(@as(u16, 403), (try update(&denied_update)).status);
+    try std.testing.expectEqual(@as(u16, 403), (try delete(&delete_ctx)).status);
+    {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        try std.testing.expect(w.inTransaction());
+        try w.rollback();
+        try w.exec("UPDATE _collections SET updateRule='@public', deleteRule='@public' WHERE name='cleanup_files';");
+        const col = (try collections.get(a, w, "cleanup_files")).?;
+        try w.beginImmediate();
+        try std.testing.expect(try lockCleanupSnapshot(a, w, col, rid, row));
+        try w.exec("UPDATE cleanup_files SET title='changed';");
+        try std.testing.expect(!try lockCleanupSnapshot(a, w, col, rid, row));
+        try w.exec("DELETE FROM cleanup_files;");
+        try std.testing.expect(!try lockCleanupSnapshot(a, w, col, rid, row));
+        try w.rollback();
+    }
+    try std.testing.expectEqual(@as(u16, 204), (try delete(&delete_ctx)).status);
+    // Bytes are untouched until a committed queue job executes.
+    const stored_path = (try storage.fetch(std.testing.io, a, "cleanup_files", rid, filename)).?;
+    _ = try std.Io.Dir.cwd().statFile(std.testing.io, stored_path, .{});
+    const claims = blk: {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        break :blk try dq.claimBatch(a, w, &.{"cleanup"}, "test", 10, std.math.maxInt(i64));
+    };
+    try std.testing.expectEqual(@as(usize, 1), claims.len);
+    var job_ctx = @import("../ctx.zig").Ctx{ .app = &env.app, .arena = RequestArena.from(&arena) };
+    // A missing backend is a retryable failure, never an acknowledged deletion.
+    env.app.storage = null;
+    try std.testing.expectError(error.FileCleanupStorageUnavailable, cleanup.jobHandler(&job_ctx, claims[0].payload));
+    const Fault = struct {
+        fn remove(_: *anyopaque, _: std.Io, _: []const u8, _: []const u8, _: []const u8) anyerror!void {
+            return error.TransientStorage;
+        }
+        fn removeRecord(_: *anyopaque, _: std.Io, _: []const u8, _: []const u8) anyerror!void {
+            return error.TransientStorage;
+        }
+    };
+    var failing_vtable = storage.vtable.*;
+    failing_vtable.delete = Fault.remove;
+    failing_vtable.deleteRecord = Fault.removeRecord;
+    var failing_storage = storage;
+    failing_storage.vtable = &failing_vtable;
+    env.app.storage = &failing_storage;
+    try std.testing.expectError(error.TransientStorage, cleanup.jobHandler(&job_ctx, claims[0].payload));
+    _ = try std.Io.Dir.cwd().statFile(std.testing.io, stored_path, .{});
+    env.app.storage = &storage;
+    // Restore the old reference as a concurrent trusted writer could do.
+    {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        var st = try w.prepare("INSERT INTO cleanup_files (id, photos) VALUES (?1, ?2);");
+        defer st.finalize();
+        try st.bindText(1, rid);
+        try st.bindText(2, try std.json.Stringify.valueAlloc(a, row.object.get("photos").?, .{}));
+        _ = try st.step();
+    }
+    try cleanup.jobHandler(&job_ctx, claims[0].payload);
+    _ = try std.Io.Dir.cwd().statFile(std.testing.io, stored_path, .{});
+    // Hidden references and physically present TTL-expired rows still own bytes.
+    const hidden_payload = blk: {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        try w.exec("UPDATE cleanup_files SET secret_file='hidden.txt', expires_at='2000-01-01T00:00:00.000Z';");
+        const col = (try collections.get(a, w, "cleanup_files")).?;
+        try std.testing.expect((try records.get(a, w, col, rid)) == null);
+        const physical = (try records.getFilesPhysical(std.testing.allocator, w, col, rid)).?;
+        defer records.freeRecord(std.testing.allocator, physical);
+        try std.testing.expectEqualStrings("hidden.txt", physical.object.get("secret_file").?.string);
+        break :blk try std.json.Stringify.valueAlloc(a, .{ .collection = col.name, .collection_id = col.id, .record = rid, .filename = "hidden.txt" }, .{});
+    };
+    try cleanup.jobHandler(&job_ctx, claims[0].payload);
+    try cleanup.jobHandler(&job_ctx, hidden_payload);
+    const hidden_path = (try storage.fetch(std.testing.io, a, "cleanup_files", rid, "hidden.txt")).?;
+    _ = try std.Io.Dir.cwd().statFile(std.testing.io, hidden_path, .{});
+    {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        try w.exec("UPDATE cleanup_files SET expires_at=NULL;");
+    }
+    // Removing a hidden field must enqueue it even though HTTP responses omit it.
+    var hidden_update = ctxFor(env, RequestArena.from(&arena), .PATCH, "{\"secret_file\":\"\"}", delete_ctx.params);
+    try std.testing.expectEqual(@as(u16, 200), (try update(&hidden_update)).status);
+    {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        var st = try w.prepare("SELECT count(*) FROM _queue_jobs WHERE payload LIKE '%hidden.txt%';");
+        defer st.finalize();
+        try std.testing.expect(try st.step());
+        try std.testing.expectEqual(@as(i64, 1), st.columnInt(0));
+    }
+    const remove_body = try std.json.Stringify.valueAlloc(a, .{ .@"photos-" = [_][]const u8{filename} }, .{});
+    var update_ctx = ctxFor(env, RequestArena.from(&arena), .PATCH, remove_body, delete_ctx.params);
+    try std.testing.expectEqual(@as(u16, 200), (try update(&update_ctx)).status);
+    _ = try std.Io.Dir.cwd().statFile(std.testing.io, stored_path, .{});
+    try std.testing.expectEqual(@as(u16, 204), (try delete(&delete_ctx)).status);
+    try cleanup.jobHandler(&job_ctx, claims[0].payload);
+    try cleanup.jobHandler(&job_ctx, claims[0].payload); // replay after a lost acknowledgement
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(std.testing.io, stored_path, .{}));
+    const record_dir = try std.fs.path.join(a, &.{ root, "cleanup_files", rid });
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(std.testing.io, record_dir, .{}));
+    // Collection lookup also accepts IDs. Deletion must use the resolved name,
+    // not an unchecked alternative storage prefix from the queued payload.
+    const collection_id = blk: {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        break :blk (try collections.get(a, w, "cleanup_files")).?.id;
+    };
+    try storage.put(std.testing.io, "cleanup_files", rid, filename, "named prefix");
+    try storage.put(std.testing.io, collection_id, rid, filename, "unrelated prefix");
+    const id_payload = try std.json.Stringify.valueAlloc(a, .{ .collection = collection_id, .collection_id = collection_id, .record = rid, .filename = filename }, .{});
+    try cleanup.jobHandler(&job_ctx, id_payload);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(std.testing.io, stored_path, .{}));
+    const unrelated_path = (try storage.fetch(std.testing.io, a, collection_id, rid, filename)).?;
+    _ = try std.Io.Dir.cwd().statFile(std.testing.io, unrelated_path, .{});
+    // Enqueue belongs to the caller's transaction, including rollback.
+    {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        const col = (try collections.get(a, w, "cleanup_files")).?;
+        try w.beginImmediate();
+        try cleanup.enqueueRemoved(a, w, std.testing.io, def, col, rid, row, null);
+        try w.rollback();
+        var st = try w.prepare("SELECT count(*) FROM _queue_jobs WHERE kind='file_cleanup';");
+        defer st.finalize();
+        try std.testing.expect(try st.step());
+        try std.testing.expectEqual(@as(i64, 4), st.columnInt(0));
+    }
+    // A schema with no remaining file fields still needs schema-blind deletion
+    // for legacy keys. It does not need a file snapshot or cleanup row lock.
+    {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        var col = (try collections.get(a, w, "cleanup_files")).?;
+        var non_files: std.ArrayList(schema.Field) = .empty;
+        for (col.fields) |field| if (field.options != .file) try non_files.append(a, field);
+        col.fields = non_files.items;
+        try std.testing.expect(!hasFileFields(col));
+        _ = try collections.update(a, std.testing.io, w, col.name, col);
+    }
+    var bare_create = ctxFor(env, RequestArena.from(&arena), .POST, "{}", create_ctx.params);
+    const bare_response = try create(&bare_create);
+    try std.testing.expectEqual(@as(u16, 201), bare_response.status);
+    const bare_row = (try std.json.parseFromSlice(std.json.Value, a, bare_response.body, .{})).value;
+    const bare_id = bare_row.object.get("id").?.string;
+    try storage.put(std.testing.io, "cleanup_files", bare_id, "legacy.bin", "old schema bytes");
+    var bare_delete = ctxFor(env, RequestArena.from(&arena), .DELETE, "", &.{ .{ .key = "col", .value = "cleanup_files" }, .{ .key = "id", .value = bare_id } });
+    try std.testing.expectEqual(@as(u16, 204), (try delete(&bare_delete)).status);
+    const bare_payload = blk: {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        var st = try w.prepare("SELECT payload FROM _queue_jobs WHERE payload LIKE ?1;");
+        defer st.finalize();
+        try st.bindText(1, try std.fmt.allocPrint(a, "%{s}%", .{bare_id}));
+        try std.testing.expect(try st.step());
+        break :blk try a.dupe(u8, st.columnText(0));
+    };
+    try cleanup.jobHandler(&job_ctx, bare_payload);
+    const bare_dir = try std.fs.path.join(a, &.{ root, "cleanup_files", bare_id });
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(std.testing.io, bare_dir, .{}));
+    // Restore the schema used by the subsequent upload/rollback check.
+    {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        var col = (try collections.get(a, w, "cleanup_files")).?;
+        const restored = try a.alloc(schema.Field, col.fields.len + 1);
+        @memcpy(restored[0..col.fields.len], col.fields);
+        restored[col.fields.len] = .{ .id = "photos", .name = "photos", .options = .{ .file = .{ .maxSelect = 5 } } };
+        col.fields = restored;
+        _ = try collections.update(a, std.testing.io, w, col.name, col);
+    }
+    // A collection recreated under the same name must not inherit old cleanup.
+    try storage.put(std.testing.io, "cleanup_files", rid, filename, "new generation");
+    {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        try w.exec("UPDATE _collections SET id='newgeneration01' WHERE name='cleanup_files';");
+    }
+    try cleanup.jobHandler(&job_ctx, claims[0].payload);
+    _ = try std.Io.Dir.cwd().statFile(std.testing.io, stored_path, .{});
+    // Failed queue persistence must not commit a successful HTTP deletion.
+    const created_again = try create(&create_ctx);
+    try std.testing.expectEqual(@as(u16, 201), created_again.status);
+    const again = (try std.json.parseFromSlice(std.json.Value, a, created_again.body, .{})).value;
+    {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        try w.exec("DROP TABLE _queue_jobs;");
+    }
+    var failed_delete = ctxFor(env, RequestArena.from(&arena), .DELETE, "", &.{ .{ .key = "col", .value = "cleanup_files" }, .{ .key = "id", .value = again.object.get("id").?.string } });
+    try std.testing.expectError(error.PrepareFailed, delete(&failed_delete));
+    try std.testing.expectEqual(@as(i64, 1), try countRows(env, "cleanup_files"));
+}
+
 test "multipart create: schema coercion (bool/float/multi-select) + verbatim text/fixed" {
     var env = try TestEnv.init();
     defer env.deinit();
@@ -2068,11 +2349,24 @@ test "update pre-authorizes tenant ownership BEFORE the before_update hook fires
 
     // Cross-tenant PATCH (accB's row) -> 404, and the before_update hook MUST NOT have fired.
     {
+        app.files.cleanup = @import("../files/cleanup.zig").enqueueRemoved;
+        app.files.cleanup_queue = .{ .name = "cleanup", .backend = .durable };
+        {
+            const w = pool.acquireWriter();
+            defer pool.releaseWriter();
+            try w.beginImmediate(); // reject any premature cleanup BEGIN
+        }
         const params = [_]http.Param{ .{ .key = "col", .value = "projects" }, .{ .key = "id", .value = "rB" } };
         var uctx = http.RequestCtx{ .method = .PATCH, .path = "/", .body = "{\"title\":\"hax\"}", .allocator = RequestArena.from(&arena), .app = &app, .params = &params, .authorization = bearer, .headers = &hdrs };
         const res = try update(&uctx);
         try std.testing.expectEqual(@as(u16, 404), res.status);
         try std.testing.expectEqual(@as(usize, 0), TenantHooks.before_update_calls);
+        {
+            const w = pool.acquireWriter();
+            defer pool.releaseWriter();
+            try std.testing.expect(w.inTransaction());
+            try w.rollback();
+        }
     }
     // In-tenant PATCH (accA's row) -> 200, and the hook DID fire (proves the probe permits legit updates).
     {

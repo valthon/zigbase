@@ -355,6 +355,8 @@ pub const codegen = struct {
 // where main.zig's import graph reached them).
 test {
     if (@import("devtools.zig").enabled) _ = @import("agent_capabilities.zig");
+    _ = @import("files/cleanup.zig");
+    _ = @import("files/cleanup_pg_test.zig");
     if (@import("build_options").file_inventory) {
         _ = @import("files/inventory.zig");
         _ = @import("files/local_inventory.zig");

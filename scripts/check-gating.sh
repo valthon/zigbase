@@ -69,6 +69,8 @@ DEVTOOLS_OFF=zig-out-devtools-off/bin/zigbase
 # why every pattern below is namespaced past the Gates-struct field name (a
 # trailing "." into the real module path, not " = ").
 PATTERNS=(
+  "files.cleanup.jobHandler" # opt-in durable file deletion worker
+  "files.cleanup.enqueueRemoved" # opt-in transactional cleanup enqueue
   "scheduler_coordination.claim" # opted-in distributed scheduler dispatcher
   "two_factor.Subsystem" # optional second-factor dispatcher and verification
   "totp.verify"          # TOTP verification is absent when unselected

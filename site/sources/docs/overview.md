@@ -84,7 +84,8 @@ There are two ways to use ZigBase:
 - **CAPTCHA** — `ctx.verifyCaptcha` for reCAPTCHA, hCaptcha, and Turnstile.
   → [Recipes](./recipes#recipe-gate-a-public-form-with-captcha)
 - **Files** — local (pluggable) file storage with serving and short-lived file-access
-  tokens. → [API](./api#files)
+  tokens. Opt-in durable HTTP cleanup retries removed-file deletion after commit,
+  using the existing queue engine. → [API](./api#files), [Framework](./framework#durable-http-file-cleanup-opt-in)
 - **Admin UI** — embedded single-page app served at `/_/`, including a Settings screen
   for managing KV/feature flags.
 - **Framework** — comptime record hooks, custom routes, scheduled jobs, a comptime schema
