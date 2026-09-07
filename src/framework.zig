@@ -4523,11 +4523,13 @@ fn BootedApp(comptime opts: ServeOpts) type {
         spa_roots: []const []const u8,
         col_cache_inst: ?colcache.Cache,
         feature_cache_inst: feature_cache.FeatureOverrideCache,
+        backfill_store: if (build_options.realtime_backfill) ?*@import("realtime/backfill.zig").Store else void,
         /// The fully-assembled application. Interior pointers reference the sibling fields
         /// above. `serveImpl` takes `&self.app` for the server/scheduler/mem-pool.
         app: app_mod.App,
 
         pub fn deinit(self: *Self) void {
+            if (comptime build_options.realtime_backfill) if (self.backfill_store) |store| store.destroy();
             self.report_dedup_inst.deinit();
             self.feature_cache_inst.deinit();
             if (self.col_cache_inst) |*c| c.deinit();
@@ -4870,7 +4872,10 @@ fn bootApp(
     } else &.{};
     errdefer static_files.freeSpaRoots(allocator, holder.spa_roots);
 
+    holder.backfill_store = if (comptime build_options.realtime_backfill) try @import("realtime/backfill.zig").Store.create(allocator, io, db.poolBackend(&holder.pool)) else {};
+    errdefer if (comptime build_options.realtime_backfill) if (holder.backfill_store) |store| store.destroy();
     holder.app = app_mod.App{
+        .backfill = if (comptime build_options.realtime_backfill) holder.backfill_store else {},
         .allocator = allocator,
         .io = io,
         .pool = &holder.pool,

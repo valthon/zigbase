@@ -19,7 +19,7 @@ const Conn = connection.Conn;
 const App = @import("../app.zig").App;
 const Ctx = @import("../ctx.zig").Ctx;
 
-pub const DeliverError = policy.PolicyError;
+pub const DeliverError = policy.PolicyError || @typeInfo(@typeInfo(@TypeOf(matchesSnapshot)).@"fn".return_type.?).error_union.error_set;
 
 /// Fixed PUBLIC realtime channel for the feature-management "changed" signal (#128/#129/#130).
 /// (moved from ws.zig — the delivery chokepoint needs it; ws.zig re-exports it.)
@@ -256,14 +256,14 @@ pub fn shouldDeliver(
                 // rule clause). No snapshot -> deny.
                 if (!row_constrained) return true;
                 const snap = delete_snapshot orelse return false;
-                return matchesSnapshot(alloc, io, col, record_id, "", snap, &rctx) catch false;
+                return matchesSnapshot(alloc, io, col, record_id, "", snap, &rctx);
             },
             .check => {
                 // Owner/expression-scoped viewRule: authorize the deleted row against its
                 // snapshot (the live row is gone). The tenant predicate, when applicable, is
                 // composed in by `matchesSnapshot`->`policy.matchesRule`. No snapshot -> deny.
                 const snap = delete_snapshot orelse return false;
-                return matchesSnapshot(alloc, io, col, record_id, col.viewRule.?, snap, &rctx) catch false;
+                return matchesSnapshot(alloc, io, col, record_id, col.viewRule.?, snap, &rctx);
             },
         }
     }
@@ -363,7 +363,12 @@ fn matchesSnapshot(
     // ONLY the guarded SELECT is per-subscriber; the sandbox build above is shared across the
     // event's fan-out on this reactor thread (#18). `rctx` is this subscriber's identity, so the
     // decision stays per-subscriber even though the single-row input is shared.
-    return policy.matchesRule(alloc, &sandbox.db, sandbox.live_col, record_id, rule, rctx) catch false;
+    return policy.matchesRule(alloc, &sandbox.db, sandbox.live_col, record_id, rule, rctx) catch |err| switch (err) {
+        // Related collections are deliberately absent from the isolated delete
+        // sandbox. This is a known conservative denial, not an operational fault.
+        error.UnknownField => false,
+        else => return err,
+    };
 }
 
 /// Build — or reuse from the thread-local slot — the delete sandbox for (col, snapshot). The
@@ -572,18 +577,38 @@ pub fn frameForDelivery(
     channel: []const u8,
     message: []const u8,
 ) ?[]const u8 {
+    return frameForCollectionDelivery(a, app, conn, sub_filter, channel, message, null) catch |err| switch (err) {
+        error.AuthenticationChanged => null,
+        else => blk: {
+            std.log.err("realtime: dropped delivery on {s}: {s}", .{ channel, @errorName(err) });
+            break :blk null;
+        },
+    };
+}
+
+/// Backfill pins collection identity so a dropped/recreated collection cannot
+/// reinterpret a retained record frame as a public custom-topic message.
+pub fn frameForCollectionDelivery(
+    a: std.mem.Allocator,
+    app: *App,
+    conn: *const Conn,
+    sub_filter: ?[]const u8,
+    channel: []const u8,
+    message: []const u8,
+    expected_collection_id: ?[]const u8,
+) !?[]const u8 {
     // The public feature-signal channel carries a fixed, non-record frame: forward verbatim
     // (no per-record viewRule authorization, no collection lookup).
-    if (std.mem.eql(u8, channel, FEATURES_CHANNEL)) return message;
+    if (expected_collection_id == null and std.mem.eql(u8, channel, FEATURES_CHANNEL)) return message;
 
     const t = protocol.parseTopic(channel);
-    var r = app.pool.acquireReader() catch return null;
+    var r = try app.pool.acquireReader();
     var reader_held = true;
     defer if (reader_held) app.pool.releaseReader(&r);
     var scratch = std.heap.ArenaAllocator.init(a);
     defer scratch.deinit();
     const sa = scratch.allocator();
-    const current = currentIdentity(RequestArena.from(&scratch), app, &r, conn) orelse return null;
+    const current = currentIdentity(RequestArena.from(&scratch), app, &r, conn) orelse return error.AuthenticationChanged;
 
     // Resolve the topic to a collection FIRST. A non-collection topic is a consumer CUSTOM
     // channel (#143): forward its frame VERBATIM only while its subscription
@@ -592,16 +617,18 @@ pub fn frameForDelivery(
     // the per-delivery `_collections` SELECT + schema-JSON parse (and caches the NEGATIVE
     // result for custom non-collection topics). Falls back to a direct load when no cache
     // is installed (tests / Postgres backend).
-    var col_lease = colcache.lease(app.col_cache, &r, a, t.collection) catch return null;
+    var col_lease = try colcache.lease(app.col_cache, &r, a, t.collection);
     defer col_lease.release();
     const col = col_lease.col orelse {
-        const now = auth.nowUnixPub(&r) catch return null;
+        if (expected_collection_id != null) return null;
+        const now = try auth.nowUnixPub(&r);
         // A consumer predicate may acquire its own reader. Match subscribeCheck's
         // lock order rather than holding a pool reader across application code.
         app.pool.releaseReader(&r);
         reader_held = false;
         return if (canSubscribeTopic(app, RequestArena.from(&scratch), current.requestContext(now), channel)) message else null;
     };
+    if (expected_collection_id) |id| if (!std.mem.eql(u8, col.id, id)) return null;
 
     // #17: parse ONLY the three envelope fields the delivery decision needs — `action`,
     // `record.id`, and (delete only) the private `_deleteSnapshot` — with a TYPED parse +
@@ -614,7 +641,7 @@ pub fn frameForDelivery(
     // `parseFromSliceLeaky` never frees what it allocates, and nothing here needs `env` (or the
     // delete-snapshot subtree) to outlive this call — so it is parsed onto a THROWAWAY scratch
     // arena backed by `a`, reclaimed on return, rather than leaking per delivery.
-    const env = std.json.parseFromSliceLeaky(DeliveryEnvelope, sa, message, .{ .ignore_unknown_fields = true }) catch return null;
+    const env = try std.json.parseFromSliceLeaky(DeliveryEnvelope, sa, message, .{ .ignore_unknown_fields = true });
     const action: protocol.Action = if (std.mem.eql(u8, env.action, "create"))
         .create
     else if (std.mem.eql(u8, env.action, "update"))
@@ -631,8 +658,8 @@ pub fn frameForDelivery(
     // is id-only.
     const delete_snapshot: ?std.json.Value = if (action == .delete) env.record._deleteSnapshot else null;
 
-    const now = auth.nowUnixPub(&r) catch return null;
-    const deliver = shouldDeliver(a, app.io, &r, col, &current, now, action, record_id, sub_filter, delete_snapshot) catch return null;
+    const now = try auth.nowUnixPub(&r);
+    const deliver = try shouldDeliver(a, app.io, &r, col, &current, now, action, record_id, sub_filter, delete_snapshot);
     if (!deliver) return null;
 
     if (action == .delete and delete_snapshot != null) {
@@ -640,8 +667,8 @@ pub fn frameForDelivery(
         // `clean` is scratch too (serializeEvent stringifies it into a fresh, independent buffer
         // before this call returns) — build it on `sa` so `scratch.deinit()` reclaims it.
         var clean: std.json.ObjectMap = .empty;
-        clean.put(sa, "id", .{ .string = record_id }) catch return null;
-        return protocol.serializeEvent(a, channel, .delete, .{ .object = clean }) catch null;
+        try clean.put(sa, "id", .{ .string = record_id });
+        return try protocol.serializeEvent(a, channel, .delete, .{ .object = clean });
     }
     return message;
 }
@@ -1320,6 +1347,20 @@ test "frameForDelivery: custom topic rechecks its guard; public signals forward 
     // A cleared identity cannot retain a private custom-topic subscription.
     try std.testing.expect(frameForDelivery(a, &app, &anon, null, "orders", msg) == null);
     try std.testing.expectEqualStrings(sig, frameForDelivery(a, &app, &anon, null, FEATURES_CHANNEL, sig).?);
+}
+
+test "backfill delivery propagates allocation and identity uncertainty" {
+    var env = try PoolEnv.init();
+    defer env.deinit();
+    var app = App{ .allocator = std.testing.allocator, .io = std.testing.io, .pool = &env.pool };
+    const anon = Conn{};
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, frameForCollectionDelivery(failing.allocator(), &app, &anon, null, "posts", "{}", "expected-id"));
+    var revoked = Conn{};
+    revoked.auth = .{ .record = .null, .is_superuser = false, .exp = 0, .token = "invalid" };
+    try std.testing.expectError(error.AuthenticationChanged, frameForCollectionDelivery(std.testing.allocator, &app, &revoked, null, "posts", "{}", "expected-id"));
+    // Ordinary revocation stays a silent live-delivery denial (not an error log).
+    try std.testing.expect(frameForDelivery(std.testing.allocator, &app, &revoked, null, "posts", "{}") == null);
 }
 
 test "frameForDelivery: viewRule deny -> null; @public + matching filter -> frame; mismatching filter -> null" {

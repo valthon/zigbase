@@ -25,6 +25,7 @@ forbidden
 gone
 internal
 not_found
+not_implemented
 payload_too_large
 too_many_requests
 unauthorized
