@@ -87,7 +87,7 @@ def _s3_env(**overrides):
 
 
 @pytest.fixture()
-def s3_server():
+def s3_server(request):
     binary = resolve_binary("ZIGBASE_TEST_BINARY", REPO, "zigbase")
     data = tempfile.mkdtemp(prefix="zb_s3_")
     subprocess.run([str(binary), "superuser", "create", "--email", "admin@x.io",
@@ -98,6 +98,7 @@ def s3_server():
     # would otherwise auto-background it and leak the detached child).
     env = {**os.environ, **_s3_env(), "ZIGBASE_JWT_SECRET": "test-secret-not-default-0123456789abcdef",
            "ZIGBASE_SERVE_BACKGROUND": "0"}
+    env.update(getattr(request, "param", {}))
     proc = subprocess.Popen(
         [str(binary), "serve", "--insecure-cookies", "--http-port", str(port), "--data-dir", data],
         env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -123,6 +124,23 @@ def _setup_record(base, blob, view_rule="@public"):
     with urllib.request.urlopen(req, timeout=5) as r:
         rec = json.loads(r.read())
     return token, rec["id"], rec["clip"]  # stored name (suffixed)
+
+
+@pytest.mark.parametrize("s3_server", [{
+    "ZIGBASE_S3_MULTIPART_THRESHOLD_BYTES": str(5 << 20),
+    "ZIGBASE_S3_MULTIPART_PART_BYTES": str(5 << 20),
+}], indirect=True)
+def test_s3_multipart_record_upload_roundtrip(s3_server):
+    blob = b"M" * ((5 << 20) + 17)
+    token, record_id, filename = _setup_record(s3_server, blob)
+    url = f"{s3_server}/api/files/media/{record_id}/{filename}"
+    with urllib.request.urlopen(url, timeout=10) as response:
+        assert response.read() == blob
+    request = urllib.request.Request(
+        f"{s3_server}/api/collections/media/records/{record_id}",
+        headers={"Authorization": f"Bearer {token}"}, method="DELETE")
+    with urllib.request.urlopen(request, timeout=10) as response:
+        assert response.status == 204
 
 
 def test_s3_file_lifecycle(s3_server):

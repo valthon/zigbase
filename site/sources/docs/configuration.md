@@ -157,6 +157,8 @@ with a message pointing back at `-Ddev-tools=true` instead of running them.
 | `ZIGBASE_S3_KEY_PREFIX` | — | `""` | prefix prepended to every object key — namespace multiple apps in one bucket |
 | `ZIGBASE_S3_CACHE_DIR` | — | `""` | `""` → `<data-dir>/storage_cache`; the local spool cache directory downloads materialize through |
 | `ZIGBASE_S3_CACHE_MAX_BYTES` | — | `1073741824` (1 GiB) | spool cache size cap; eviction reclaims down to a 3/4 low-water mark |
+| `ZIGBASE_S3_MULTIPART_THRESHOLD_BYTES` | — | `67108864` (64 MiB) | use multipart at this object size; 5 MiB–5 GiB |
+| `ZIGBASE_S3_MULTIPART_PART_BYTES` | — | `8388608` (8 MiB) | preferred part size; 5 MiB–5 GiB, increased to stay within 10,000 parts |
 
 ## Database backend (experimental)
 
@@ -203,7 +205,7 @@ that file, so Range requests, conditional requests, `ETag`, and per-collection
 cacheability behave identically to local storage. Startup runs a fail-fast `HeadObject`
 probe so a bad config is caught at boot, not on first upload. See [Known
 limitations](./known-limitations) for the write-lock, best-effort-delete,
-proxy-only-serving, and 5 GiB single-`PUT` caveats.
+proxy-only-serving, and buffered-multipart caveats.
 
 ## Email delivery
 
