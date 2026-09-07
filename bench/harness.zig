@@ -23,8 +23,8 @@ pub const Result = struct {
 /// pattern already established in this repo (see `src/http_client.zig`,
 /// `src/feature_cache.zig`), which is why `run` takes an `io: std.Io` param.
 /// Measure `f` under a leak-detecting general-purpose allocator. The `ns` here is the
-/// raw-malloc cost; the allocation profile (allocs/bytes/buckets) is backing-independent and
-/// is the real signal. The DebugAllocator backing also catches a benchmarked `f` that leaks.
+/// raw-malloc cost; allocation totals count successful alloc calls and requested bytes,
+/// excluding resize/remap growth. The DebugAllocator backing catches leaked allocations.
 pub fn run(
     name: []const u8,
     warmup: usize,
@@ -63,13 +63,15 @@ pub fn run(
         .bytes = st.bytes,
         .buckets = st.buckets,
         .peak_live = st.peak_live,
+        .iterations = iters,
     };
 }
 
 /// Measure `f` under a request-style ARENA that is reset between iterations — the model
 /// this codebase actually uses on the per-request path, where a "free" is a no-op and the
-/// whole arena is dropped/reset at the request boundary. The allocs/bytes/buckets are the
-/// same as `run` (the CountingAllocator counts identically regardless of backing); the `ns`
+/// whole arena is dropped/reset at the request boundary. Child resize/remap behavior can
+/// change alloc counts relative to `run`; peak_live is logical requested live bytes within
+/// one request, NOT retained arena backing capacity or process RSS. The `ns`
 /// is the production-realistic cost, where many small allocations are cheap bumps. Pairing a
 /// `run` and a `runArena` on the same `f` shows how much of the raw-malloc `ns` is allocator
 /// overhead that the arena erases.
@@ -107,6 +109,8 @@ pub fn runArena(
         samples[i] = @intCast(t1.nanoseconds - t0.nanoseconds);
         // Model the per-request boundary: reset (retain capacity) rather than free per-op.
         _ = arena.reset(.retain_capacity);
+        // Counts requested logical bytes, not the arena's retained backing capacity.
+        counting.live = 0;
     }
 
     std.mem.sort(u64, samples, {}, std.sort.asc(u64));
@@ -119,6 +123,7 @@ pub fn runArena(
         .bytes = st.bytes,
         .buckets = st.buckets,
         .peak_live = st.peak_live,
+        .iterations = iters,
     };
 }
 
@@ -131,8 +136,8 @@ pub fn report(results: []const Result, json: bool, w: anytype) !void {
                 continue;
             }
             try w.print(
-                "{{\"name\":\"{s}\",\"ns_median\":{d},\"ns_p95\":{d},\"allocs\":{d},\"bytes\":{d},\"peak_live\":{d},\"buckets\":[{d},{d},{d},{d},{d}]}}\n",
-                .{ r.name, r.ns_median, r.ns_p95, r.allocs, r.bytes, r.peak_live, r.buckets[0], r.buckets[1], r.buckets[2], r.buckets[3], r.buckets[4] },
+                "{{\"name\":\"{s}\",\"iterations\":{d},\"ns_median\":{d},\"ns_p95\":{d},\"allocs\":{d},\"bytes\":{d},\"peak_live\":{d},\"buckets\":[{d},{d},{d},{d},{d}]}}\n",
+                .{ r.name, r.iterations, r.ns_median, r.ns_p95, r.allocs, r.bytes, r.peak_live, r.buckets[0], r.buckets[1], r.buckets[2], r.buckets[3], r.buckets[4] },
             );
         }
         return;
@@ -164,6 +169,26 @@ test "run reports a median, a p95, and the allocation profile" {
     try std.testing.expect(r.ns_p95 >= r.ns_median);
     try std.testing.expectEqual(@as(u64, 10), r.allocs); // measured iters only, warmup excluded
     try std.testing.expectEqual(@as(u64, 10), r.buckets[0]);
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    try report(&.{r}, true, &output.writer);
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, output.written(), .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(i64, 10), parsed.value.object.get("iterations").?.integer);
+}
+
+test "arena peak tracks one request while totals span measured iterations" {
+    const F = struct {
+        fn body(_: void, a: std.mem.Allocator) anyerror!void {
+            const bytes = try a.alloc(u8, 1024);
+            std.mem.doNotOptimizeAway(bytes);
+        }
+    };
+    const result = try runArena("arena", 2, 10, std.testing.io, {}, F.body);
+    try std.testing.expectEqual(@as(u64, 1024), result.peak_live);
+    try std.testing.expectEqual(@as(u64, 10240), result.bytes);
+    try std.testing.expectEqual(@as(u64, 10), result.allocs);
+    try std.testing.expectEqual(@as(usize, 10), result.iterations);
 }
 
 test "fanout JSON normalizes measured allocation totals and subscriber timing" {

@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "build": {
+    "target": "x86_64-linux-gnu; cpu=baseline",
+    "binary_optimize": "ReleaseSmall; dev-tools=false",
+    "benchmark_optimize": "ReleaseFast; cpu=baseline",
+    "zig_version": "0.16.0",
+    "workload": "bench/main.zig-v1"
+  },
+  "binary_max_bytes": 4000000,
+  "benchmarks": {
+    "smoke/alloc-16": {"iterations": 1000, "max": {"allocs": 1000, "bytes": 16000, "peak_live": 16}},
+    "jwt/verify": {"iterations": 2000, "max": {"allocs": 0, "bytes": 0, "peak_live": 0}},
+    "records/findById-json": {"iterations": 2000, "max": {"allocs": 40000, "bytes": 3500000, "peak_live": 1200}},
+    "query/filter-compile": {"iterations": 2000, "max": {"allocs": 36000, "bytes": 8500000, "peak_live": 5500}}
+  }
+}

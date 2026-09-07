@@ -107,6 +107,16 @@ jobs:
         run: ./scripts/check-allocator-contracts.sh
       - name: Realtime fanout benchmark correctness (no timing threshold)
         run: mise exec zig@0.16.0 -- zig build bench -Dbench-optimize=ReleaseSafe -- --realtime-only --json
+      - name: Performance contract parser and generated-report tests
+        run: mise exec python@3.13 -- python -m unittest discover -s tests/tools -p test_performance_contracts.py
+      - name: Binary size and allocation contracts (no timing threshold)
+        run: mise exec python@3.13 zig@0.16.0 -- bash scripts/check-performance.sh > performance-contract-report.json
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: performance-contract-report
+          path: performance-contract-report.json
+          if-no-files-found: ignore
       - name: Error-code ledger is append-only
         run: ./scripts/check-error-code-ledger.sh origin/main
       - name: Doctor check-id ledger is append-only
