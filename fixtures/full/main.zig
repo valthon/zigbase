@@ -17,6 +17,8 @@ pub fn main(init: std.process.Init) !void {
         .analytics = .{},
         .mail = .{},
         .webhooks = true,
+        .queues = .{ .cleanup = .{ .backend = .durable } },
+        .files = .{ .cleanup_queue = "cleanup" },
         .cron = .{.{
             .name = "gating-coordinated-job",
             .schedule = zigbase.schedule.Schedule{ .interval = .hourly },

@@ -186,7 +186,7 @@ error.**
 | `static_cache_control` | Comptime default `Cache-Control` for static responses (embedded + dir). Runtime `--static-cache-control` / `ZIGBASE_STATIC_CACHE_CONTROL` override it; unset → facil.io's stock `max-age=3600`. | data-only — a `?[]const u8` default feeding core static serving, not an optional subsystem. |
 | `admin` | `.admin = .disabled` removes the embedded admin SPA (route dispatch **and** the ~58 KiB of `@embedFile`-d assets) from your binary — useful for headless/embedded consumers. Default: served at `/_/`. | excluded, opt-**out** — the admin SPA ships by default; set `.admin = .disabled` to exclude it (the only key in this table where "unset" means *included*). |
 | `webhooks` | `.webhooks = true` registers the built-in `"webhook"` job kind, compiling in `ctx.webhook()`'s managed outbound delivery (`webhook.zig`, ~689 LOC). Default: off, so a consumer that never sends managed webhooks pays nothing for it. See [`ctx.webhook()`](#ctxwebhook--managed-outbound-webhooks-144). | excluded — off by default; `webhook.zig` is not compiled in unless `.webhooks = true`. |
-| `files` | File-serving knobs threaded into `app.files`: `.{ .s3_presign_redirect = false, .s3_presign_ttl_s = 900 }`. With `.s3_presign_redirect = true` **and** the S3 backend active (`-Ds3` + `ZIGBASE_S3_*`), an authorized download is answered with a 302 redirect to a time-limited presigned GET URL (`s3_presign_ttl_s` seconds, `1..=604800`) instead of proxying the bytes. On any other backend (local disk, or a non-`-Ds3` build) it has no effect — the proxy path is taken. Default `.{}` = proxy-only. | data-only — always compiled; the redirect only engages at runtime when the S3 backend is present. |
+| `files` | File-serving and cleanup knobs: `.{ .s3_presign_redirect = false, .s3_presign_ttl_s = 900 }`. Optional `.cleanup_queue = "cleanup"` selects a declared durable queue for [transactional HTTP cleanup](#durable-http-file-cleanup-opt-in). With `.s3_presign_redirect = true` and the S3 backend active, authorized downloads redirect to a presigned URL (`s3_presign_ttl_s`, `1..=604800` seconds); other backends keep proxy serving. Default `.{}` = proxy-only, synchronous cleanup. | cleanup handler excluded unless configured; redirect data is always compiled and engages with S3 at runtime. |
 | `push` | Web Push config (`.{ .subject = "mailto:ops@example.com" }`) — the VAPID `sub` contact. Registers the built-in `"push"` job kind backing `ctx.push().enqueue`, compiling in `push/*.zig`'s encrypted delivery. The VAPID keypair itself comes from `ZIGBASE_VAPID_PUBLIC_KEY`/`_PRIVATE_KEY` at runtime; without them `ctx.push()` is a no-op. See [`ctx.push()`](#ctxpush--web-push-notifications-223). | excluded — off by default; `push/send.zig`'s job handler is not compiled in unless `.push` is set. |
 | `app_context` | A **type** naming a consumer-owned app-scoped context struct. Set the handle once in `onBootstrap` (`try ctx.setAppData(T, &value)`) and read it anywhere via `ctx.appData(T)` (a `*T`). Declaring it makes setting it a boot contract: the server refuses to start if `onBootstrap` never calls `ctx.setAppData`. See [App-scoped context](#app-scoped-context-app_context--ctxappdata). | data-only — two `?*anyopaque`/`?[]const u8` fields on `App`; apps that don't declare it pay nothing. |
 
@@ -4354,6 +4354,62 @@ permission, and observes only the configured prefix. It lists current objects,
 not old object versions, delete markers, or unfinished multipart uploads.
 Neither backend offers snapshot isolation across pages; concurrent writes can
 change the observation. Inventory does not change record download authorization.
+
+### Durable HTTP file cleanup (opt-in)
+
+Move HTTP record replacement/deletion storage requests to the existing durable
+queue engine:
+
+```zig
+const MyApp = zigbase.App(.{
+    .queues = .{ .cleanup = .{ .backend = .durable } },
+    .files = .{ .cleanup_queue = "cleanup" },
+});
+```
+
+The named queue must be durable and drained by a worker (the implicit worker
+qualifies); invalid configuration fails compilation. Absent this setting, no
+cleanup handler or additional worker is registered and existing synchronous,
+best-effort cleanup remains unchanged. The reserved job kind is `file_cleanup`.
+
+Removed file references and their cleanup jobs commit in the same database
+transaction. Enqueue failure aborts the mutation. Non-upload requests run existing
+rule/tenancy prechecks before taking their cleanup row lock. If the locked record
+differs from that snapshot, the request returns `409`; reload
+and retry. Uploads retain their preflight and locked snapshot checks. These extra
+snapshots are skipped for collections without file fields. PATCH jobs delete
+individual objects and recheck physical references, including hidden fields and
+TTL-expired rows. DELETE jobs remove the whole record prefix only if the physical
+row is absent; this also removes unknown keys left by earlier schemas and local
+record directories. A reused record ID suppresses prefix deletion even when its
+row has expired. DELETE still queues cleanup when the current schema has no files.
+Local and S3 backends tolerate repeated deletion after a lost acknowledgement;
+custom backends must also make deleting an absent object or record prefix succeed. Storage failures
+follow the selected queue's retry policy and eventually appear as failed jobs;
+monitor those jobs and retry them after repairing storage access.
+S3 record sweeps attempt every listed key and log each remote deletion failure
+before returning an error for retry. Local S3 spool-cache removal failures are
+logged but do not fail a job whose remote objects have been removed.
+
+For safety, each deletion holds the SQLite writer or a PostgreSQL table write
+lock across the reference check and storage call. This removes remote I/O from
+the initiating request, but slow storage can still delay concurrent writes.
+PostgreSQL locks the data table before collection metadata, matching schema DDL,
+and revalidates the collection identity afterward. A transaction-local 250ms lock
+timeout makes contention retryable without changing the connection's usual limit.
+Storage plugins must not acquire database connections or invoke record hooks
+from `delete` or `deleteRecord`, must propagate storage failures, and should bound
+their I/O timeouts. Use a low-concurrency cleanup
+worker and an appropriate visibility timeout. Stored object keys must remain
+immutable; custom out-of-band uploads must not overwrite keys pending deletion
+or write into a deleted record's prefix without first creating its database row.
+
+Collection identity is checked: deleted, renamed, or recreated collections are
+conservatively skipped, leaving their objects for separate operator review.
+This first version covers HTTP record PATCH/DELETE only, not raw SQL, `Data`
+mutations, cascade/TTL deletes, collection deletion, failed upload cleanup, or
+orphan reconciliation. A crash before upload references commit can still orphan
+bytes. Inventory remains read-only and is not authority to delete objects.
 
 ### Presigned-redirect serving (S3)
 

@@ -724,6 +724,7 @@ pub fn App(comptime cfg: anytype) type {
         /// unconfigured built-in's code does not get pulled into the binary.
         const builtin_job_regs: []const queue.JobReg = blk: {
             var t: []const queue.JobReg = &.{};
+            if (files_config.cleanup != null) t = t ++ &[_]queue.JobReg{.{ .kind = "file_cleanup", .handler = @import("files/cleanup.zig").jobHandler }};
             // "report" (#244 stage 2) backs non-blocking error-report delivery. Registered
             // UNCONDITIONALLY — a reporter is always wired (SentryReporter or LogReporter) —
             // and reserved below so a consumer job can never collide. `dispatchError` enqueues
@@ -741,7 +742,7 @@ pub fn App(comptime cfg: anytype) type {
         /// Reserved built-in kind names — reserved UNCONDITIONALLY (even when the
         /// built-in is gated off) so enabling a capability later never collides
         /// with a consumer job kind.
-        const reserved_job_kinds: []const []const u8 = &.{ "report", "mail", "mail_batch_item", "webhook", "push", "sms" };
+        const reserved_job_kinds: []const []const u8 = &.{ "report", "mail", "mail_batch_item", "webhook", "push", "sms", "file_cleanup" };
 
         /// Declared job-kind → handler registry: the built-in kinds followed by the consumer
         /// `.jobs` bindings (the legacy `.jobs.pool_size` key is a compile error — see
@@ -1644,8 +1645,26 @@ pub fn App(comptime cfg: anytype) type {
         /// The comptime-lowered file-serving knobs, threaded into `app.files`. Validates the
         /// `.files` group's sub-keys with a loud `@compileError` (unknown key / bad ttl range);
         /// absent → `.{}` (proxy-only, back-compat).
-        pub const files_config: files_cfg.Runtime =
-            if (@hasField(@TypeOf(cfg), "files")) files_cfg.lower(cfg.files) else .{};
+        pub const files_config: files_cfg.Runtime = blk: {
+            if (!@hasField(@TypeOf(cfg), "files")) break :blk .{};
+            var result = files_cfg.lower(cfg.files);
+            if (@hasField(@TypeOf(cfg.files), "cleanup_queue")) {
+                const name: []const u8 = cfg.files.cleanup_queue;
+                for (queue_defs) |q| if (std.mem.eql(u8, q.name, name)) {
+                    if (q.backend != .durable) @compileError(".files.cleanup_queue requires a durable queue");
+                    var drained = false;
+                    for (worker_defs) |worker| for (worker.queues) |qn| {
+                        if (std.mem.eql(u8, qn, name)) drained = true;
+                    };
+                    if (!drained) @compileError(".files.cleanup_queue requires a worker");
+                    result.cleanup_queue = q;
+                    result.cleanup = @import("files/cleanup.zig").enqueueRemoved;
+                    break :blk result;
+                };
+                @compileError(".files.cleanup_queue must name a declared durable queue");
+            }
+            break :blk result;
+        };
 
         /// The comptime-lowered Web Push config (#223), threaded into `app.push`. Carries the
         /// VAPID `subject` (the `.push.subject` key); the VAPID KEYPAIR is resolved from env at
@@ -5374,6 +5393,14 @@ test "App(cfg) builds a record dispatcher only when hooks are present" {
 fn qTestHandler(ctx: *ctx_mod.Ctx, payload: []const u8) anyerror!void {
     _ = ctx;
     _ = payload;
+}
+
+test "file cleanup is absent by default and registered only for an explicit durable queue" {
+    try std.testing.expect(App(.{}).files_config.cleanup == null);
+    try std.testing.expect(App(.{}).queue_registry.jobByKind("file_cleanup") == null);
+    const A = App(.{ .queues = .{ .cleanup = .{ .backend = .durable } }, .files = .{ .cleanup_queue = "cleanup" } });
+    try std.testing.expect(A.files_config.cleanup != null);
+    try std.testing.expect(A.queue_registry.jobByKind("file_cleanup") != null);
 }
 
 test "App(cfg) synthesizes a default queue + implicit worker; no durable jobs for memory-only" {
