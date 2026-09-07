@@ -132,6 +132,8 @@ pub const Config = struct {
     s3_key_prefix: []const u8 = "",
     s3_cache_dir: []const u8 = "", // "" = <data_dir>/storage_cache
     s3_cache_max_bytes: u64 = 1 << 30, // 1 GiB spool cap
+    s3_multipart_threshold_bytes: u64 = 64 << 20,
+    s3_multipart_part_bytes: u64 = 8 << 20,
 
     // In-memory rate limiting for sensitive auth endpoints (login / password-reset /
     // email-verification). Fixed window: at most `rate_limit_max` requests per client
@@ -259,6 +261,8 @@ pub const Config = struct {
         if (getter.get("ZIGBASE_S3_KEY_PREFIX")) |v| cfg.s3_key_prefix = v;
         if (getter.get("ZIGBASE_S3_CACHE_DIR")) |v| cfg.s3_cache_dir = v;
         if (getter.get("ZIGBASE_S3_CACHE_MAX_BYTES")) |v| cfg.s3_cache_max_bytes = try envInt(u64, "ZIGBASE_S3_CACHE_MAX_BYTES", v, diag);
+        if (getter.get("ZIGBASE_S3_MULTIPART_THRESHOLD_BYTES")) |v| cfg.s3_multipart_threshold_bytes = try envInt(u64, "ZIGBASE_S3_MULTIPART_THRESHOLD_BYTES", v, diag);
+        if (getter.get("ZIGBASE_S3_MULTIPART_PART_BYTES")) |v| cfg.s3_multipart_part_bytes = try envInt(u64, "ZIGBASE_S3_MULTIPART_PART_BYTES", v, diag);
         if (getter.get("ZIGBASE_UNSUBSCRIBE_BASE_URL")) |v| cfg.unsubscribe_base_url = v;
         if (getter.get("ZIGBASE_RATE_LIMIT_MAX")) |v| cfg.rate_limit_max = try envInt(u32, "ZIGBASE_RATE_LIMIT_MAX", v, diag);
         if (getter.get("ZIGBASE_RATE_LIMIT_WINDOW")) |v| cfg.rate_limit_window_s = try envInt(i64, "ZIGBASE_RATE_LIMIT_WINDOW", v, diag);
@@ -348,6 +352,8 @@ pub const known_vars = [_][]const u8{
     "ZIGBASE_S3_ENDPOINT",
     "ZIGBASE_S3_FORCE_PATH_STYLE",
     "ZIGBASE_S3_KEY_PREFIX",
+    "ZIGBASE_S3_MULTIPART_PART_BYTES",
+    "ZIGBASE_S3_MULTIPART_THRESHOLD_BYTES",
     "ZIGBASE_S3_REGION",
     "ZIGBASE_S3_SECRET_ACCESS_KEY",
     "ZIGBASE_SENDMAIL_COMMAND",
@@ -645,6 +651,8 @@ test "s3_* config: defaults empty/us-east-1/null, overridable via env" {
     try std.testing.expectEqualStrings("", c0.s3_key_prefix);
     try std.testing.expectEqualStrings("", c0.s3_cache_dir);
     try std.testing.expectEqual(@as(u64, 1 << 30), c0.s3_cache_max_bytes);
+    try std.testing.expectEqual(@as(u64, 64 << 20), c0.s3_multipart_threshold_bytes);
+    try std.testing.expectEqual(@as(u64, 8 << 20), c0.s3_multipart_part_bytes);
 
     const G1 = struct {
         fn get(_: @This(), key: []const u8) ?[]const u8 {
@@ -657,6 +665,8 @@ test "s3_* config: defaults empty/us-east-1/null, overridable via env" {
             if (std.mem.eql(u8, key, "ZIGBASE_S3_KEY_PREFIX")) return "tenant-a/";
             if (std.mem.eql(u8, key, "ZIGBASE_S3_CACHE_DIR")) return "/var/cache/zigbase";
             if (std.mem.eql(u8, key, "ZIGBASE_S3_CACHE_MAX_BYTES")) return "2147483648";
+            if (std.mem.eql(u8, key, "ZIGBASE_S3_MULTIPART_THRESHOLD_BYTES")) return "16777216";
+            if (std.mem.eql(u8, key, "ZIGBASE_S3_MULTIPART_PART_BYTES")) return "5242880";
             return null;
         }
     };
@@ -670,6 +680,8 @@ test "s3_* config: defaults empty/us-east-1/null, overridable via env" {
     try std.testing.expectEqualStrings("tenant-a/", c1.s3_key_prefix);
     try std.testing.expectEqualStrings("/var/cache/zigbase", c1.s3_cache_dir);
     try std.testing.expectEqual(@as(u64, 1 << 31), c1.s3_cache_max_bytes);
+    try std.testing.expectEqual(@as(u64, 16 << 20), c1.s3_multipart_threshold_bytes);
+    try std.testing.expectEqual(@as(u64, 5 << 20), c1.s3_multipart_part_bytes);
 }
 
 test "sse heartbeat defaults 0 (inherit listener timeout), overridable via env" {
