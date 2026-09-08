@@ -248,6 +248,12 @@ from the same binary) are always allowed, so only a separate-origin frontend nee
 
 ## See also
 
+`zigbase tune --input measurements.json` compares observed throughput, p95 latency,
+and peak RSS against explicit budgets. Pair it with comptime resource profiles;
+the offline advisor never changes production settings. The framework guide includes
+a real local measurement workflow and explains its limits. This command requires
+`-Ddev-tools=true` (the default); custom builds with development tools disabled omit it.
+
 - [Quick start](./quick-start) — install and serve.
 - [API](./api) — the REST + WebSocket reference.
 - [Known limitations](./known-limitations) — caveats around email, rate limiting, and more.

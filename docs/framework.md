@@ -4599,6 +4599,82 @@ deployment environment variables retain their existing roles and do not override
 these comptime pool settings. Embedded consumers can use `Backend.resource_report`
 without compiling CLI reporting into their application.
 
+### Offline measurement advisor (`zigbase tune`)
+
+`zigbase tune --input measurements.json [--as-of UNIX_SECONDS] [--json]`
+compares **supplied measurements**, not predicted performance. It emits one JSON
+object, never starts workloads or edits configuration, and opens only the named
+input file (maximum 1 MiB). Common CLI logging initialization still reads log
+format/level variables. `-Ddev-tools=false` removes the advisor. JSON is the
+default output; `--as-of` makes freshness checks reproducible, otherwise the real
+wall clock is used (not the application test clock).
+
+Input `schema_version: 1` requires `workload`, `revision`, `environment`,
+`max_age_seconds`, `memory_budget_bytes`, `p95_budget_ms`, and `candidates`.
+There must be 1–128 uniquely named candidates. Each candidate requires:
+
+- `id`, `workload`, `revision`, `environment`, and `measured_at_unix`;
+- positive finite `throughput_rps`, `p95_ms`, and positive `peak_rss_bytes`;
+- `failed_requests` (any unsuccessful or semantically incorrect responses);
+- `resources`: the object emitted by that measured binary's `resources` command.
+
+Identifiers are nonempty, at most 256 bytes, without control characters. Unknown
+fields, invalid/nonfinite metrics or budgets, duplicate IDs, and unsupported
+document/resource versions are errors (nonzero exit). Context labels and the
+resource report are **caller-supplied provenance**, not independently verified
+build or hardware identities; capture them from your actual experiment. The
+advisor does not validate or synthesize deployable settings from the report.
+
+The output repeats the context/budgets and includes `items`, each containing the
+candidate and its first exclusion `reason`, in priority order: `failed_requests`,
+`context_mismatch`, `future_measurement`, `stale`, `memory_budget`,
+`latency_budget`, or `feasible`. Freshness and budget boundaries are inclusive.
+Among feasible observations, `recommendation` is the ID with highest throughput,
+then lowest peak RSS, then lowest p95, then lexically smallest ID. No feasible
+candidate produces `recommendation: null` with exit 0—not a made-up suggestion.
+
+Match workload data/response assertions, request count, concurrency, CPU limits,
+machine, toolchain, optimization, and all non-profile options across candidates.
+Use the environment label to identify that controlled setup. CPU is a controlled
+experiment input here, not an automatically detected/enforced budget. Repeat
+runs, inspect variability, and retain headroom: this first advisor does not
+aggregate trials or infer confidence intervals. Measured RSS is not a guaranteed
+production maximum. Allocator `peak_live` from `zig build bench` is **not RSS**;
+neither p95 nor median latency can substitute for measured wall-clock throughput.
+
+#### Reproducible local measurement example
+
+The Linux-only `tools/tuning/measure.py` helper starts each explicitly supplied
+binary against fresh temporary SQLite state on loopback, clears `ZIGBASE_*`
+environment variables, warms up ten requests, then measures a concurrent
+`/api/health` workload. Every response must be HTTP 200 with `status: ok` and
+`backend: sqlite`; any error aborts collection with no comparison document.
+It reports throughput from completed requests / load wall time, nearest-rank p95,
+and the server process's `/proc` RSS high-water mark (including startup). It stops
+its children and removes temporary state. Run only trusted test binaries: custom
+startup hooks can have side effects beyond their data directory.
+
+```sh
+zig build -Doptimize=ReleaseFast
+python3 tools/tuning/measure.py \
+  --candidate stock=./zig-out/bin/zigbase \
+  --revision YOUR_SOURCE_REVISION \
+  --environment linux-machineA-zig016-releasefast-unrestricted \
+  --requests 1000 --concurrency 4 \
+  --memory-budget-bytes 134217728 --p95-budget-ms 20 > measurements.json
+./zig-out/bin/zigbase tune --input measurements.json
+```
+
+To compare profiles, build the **same consumer revision** separately with
+`.resource_profile = .minimal` and `.throughput`, keeping all other options
+identical, then supply both `--candidate minimal=/path/to/minimal` and
+`--candidate throughput=/path/to/throughput`. The helper collects each sequentially.
+The health workload is an executable smoke example, not evidence about database,
+job, or application throughput; adapt the collection harness and response checks
+to representative seeded application traffic before choosing production settings.
+Use an external OS/container CPU limit consistently when CPU capacity is part of
+the experiment. The helper and advisor do not apply that limit themselves.
+
 ## 10b. Pagination (`.pagination`)
 
 `.pagination` chooses, at comptime, which list-pagination modes the records list endpoint

@@ -108,6 +108,7 @@ done
 # rule as PATTERNS above) so this can't false-positive on an unrelated identifier that
 # merely contains "scaffold" or "codegen" as a substring.
 DEVTOOLS_PATTERNS=(
+  "tuning\." # offline measurement advisor must disappear too
   "agent_capabilities\." # offline discovery catalog must disappear too
   "route_discovery\." # compiled route inventory is development-only
   "scaffold\."   # src/scaffold.zig + src/scaffold/** (init, agents-md)
