@@ -164,7 +164,7 @@ class ZigBase:
     ) -> Any:
         """Issue a request through the shared transport and return its
         parsed JSON body (or `None` for a 204/empty body): the auth header,
-        401 auto-refresh, and 429 backoff all apply, exactly as for every
+        401 auto-refresh, and 429/admission-overload backoff all apply, exactly as for every
         service call (they share this same transport)."""
         return self._transport.request(
             RequestSpec(method=method, path=path, query=query, body=body, headers=headers)
@@ -172,7 +172,7 @@ class ZigBase:
 
     def raw_request(self, method: str, path: str, **kw: Any) -> httpx.Response:
         """Escape hatch: returns the `httpx.Response` as-is -- no JSON
-        parsing, no error mapping, no 401 refresh, no 429 retry. Accepts the
+        parsing, no error mapping, no 401 refresh, no retries. Accepts the
         same `query`/`body`/`headers` keywords as `send`; auth/lang/account
         headers and body encoding still apply."""
         picked = _pluck(dict(kw), _SEND_OPT_KEYS)

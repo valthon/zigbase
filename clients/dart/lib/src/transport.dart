@@ -187,7 +187,8 @@ class Transport {
 
   /// Issue a request and return its parsed JSON body (or `null` for a 204 /
   /// empty body). Non-2xx responses throw a [ZigbaseException]; a 401 may
-  /// trigger a single auto-refresh + retry, and a 429 is retried with backoff.
+  /// trigger a single auto-refresh + retry. HTTP 429 and 503 with a JSON
+  /// `overloaded` code share the bounded backoff retry budget.
   ///
   /// For a non-GET request, [body] is always sent as `application/json`
   /// unless it contains an [http.MultipartFile] (which switches the whole
@@ -224,7 +225,7 @@ class Transport {
 
   /// Raw escape hatch: perform the request and return the [http.Response]
   /// as-is — no JSON *parse* of the response, no error mapping, no 401
-  /// refresh, no 429 retry. Auth/lang/account headers and the
+  /// refresh, no retries. Auth/lang/account headers and the
   /// [body]/[query]/[headers] all still apply, including [send]'s body
   /// encoding (see its dartdoc) — this only changes how the response is
   /// handled. Use for a binary/text response or custom status handling.
@@ -301,24 +302,33 @@ class Transport {
         }
       }
 
-      // 429 backoff: a numeric Retry-After is honored verbatim; otherwise an
+      // 429 retries are status-only: even decoding res.body may fail.
+      final error = status == 503
+          ? parseErrorResponse(status, res.body, url.toString(),
+              reasonPhrase: res.reasonPhrase)
+          : null;
+      // Only admission overload guarantees rejection before routing; generic
+      // 503 responses may follow a write and must not be retried.
+      final retryable = status == 429 || error?.code == 'overloaded';
+      // Backoff: a numeric Retry-After is honored verbatim; otherwise an
       // exponential delay capped at [_maxBackoff].
-      if (status == 429 && attempt < _maxRetries) {
+      if (retryable && attempt < _maxRetries) {
         final delay = _retryDelay(res, attempt);
         attempt += 1;
         await _sleep(delay);
         continue;
       }
 
-      throw parseErrorResponse(status, res.body, url.toString(),
-          reasonPhrase: res.reasonPhrase);
+      throw error ??
+          parseErrorResponse(status, res.body, url.toString(),
+              reasonPhrase: res.reasonPhrase);
     }
   }
 
   Duration _retryDelay(http.Response res, int attempt) {
     final header = res.headers['retry-after'];
     final seconds = header == null ? null : num.tryParse(header.trim());
-    if (seconds != null && seconds > 0) {
+    if (seconds != null && seconds.isFinite && seconds > 0) {
       return Duration(milliseconds: (seconds * 1000).round());
     }
     final ms = math.min(_maxBackoff.inMilliseconds, (1 << attempt) * 200);

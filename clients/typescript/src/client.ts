@@ -44,7 +44,7 @@ export interface Client {
    * Raw escape hatch — returns the underlying `Response` WITHOUT JSON-parsing it.
    * Use for binary/text bodies, custom headers, or streaming. The auth header,
    * `query`/`body`/`headers`/`signal`/`requestKey` all apply; non-2xx responses are
-   * returned as-is (no throw), and there is no auto-refresh/429-retry on this path.
+   * returned as-is (no throw), and there is no auto-refresh or retry on this path.
    */
   fetch(method: string, path: string, opts?: SendOptions): Promise<Response>;
   /** A view of this client whose every request carries `X-Account-Id: <id>`. Shares the

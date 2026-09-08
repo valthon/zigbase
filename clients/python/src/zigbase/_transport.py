@@ -1,5 +1,5 @@
 """Synchronous HTTP transport: header assembly, JSON/multipart bodies, the
-401 single-flight refresh state machine, and 429 backoff.
+401 single-flight refresh state machine, and 429/admission-overload backoff.
 
 Port of the `SyncTransport` half of clients/typescript/src/transport.ts
 (`Transport`), with the single-flight-lock shape mirroring
@@ -251,12 +251,12 @@ class SyncTransport:
 
     def raw_request(self, spec: RequestSpec) -> httpx.Response:
         """Escape hatch: perform exactly one HTTP call and return the
-        `httpx.Response` as-is -- no error mapping, no 401 refresh, no 429
-        retry. Auth/lang/account headers and body encoding still apply."""
+        `httpx.Response` as-is -- no error mapping, no 401 refresh, no
+        retries. Auth/lang/account headers and body encoding still apply."""
         return self._perform_once(spec)
 
     def request(self, spec: RequestSpec) -> Any:
-        """Perform `spec`, following the 401-refresh/429-backoff state
+        """Perform `spec`, following the refresh and bounded backoff state
         machine, and return the parsed JSON body (or `None` for a 204/empty
         body). Raises `ZigbaseError` for a non-2xx response that survives
         that state machine."""
@@ -300,13 +300,28 @@ class SyncTransport:
                     # request's ORIGINAL 401 below, not the refresh error.
                     pass
 
-            if response.status_code == 429 and attempt < self._max_retries:
+            error = (
+                parse_error_response(
+                    response.status_code,
+                    response.text,
+                    str(response.url),
+                    reason_phrase=response.reason_phrase or None,
+                )
+                if response.status_code == 503
+                else None
+            )
+            # Only admission overload guarantees rejection before routing.
+            # A generic 503 may follow a write and must not be retried.
+            retryable = response.status_code == 429 or (
+                error is not None and error.code == "overloaded"
+            )
+            if retryable and attempt < self._max_retries:
                 delay = _compute_backoff(response.headers.get("Retry-After"), attempt)
                 attempt += 1
                 _sleep(delay)
                 continue
 
-            raise parse_error_response(
+            raise error or parse_error_response(
                 response.status_code,
                 response.text,
                 str(response.url),
@@ -417,12 +432,12 @@ class AsyncTransport:
 
     async def raw_request(self, spec: RequestSpec) -> httpx.Response:
         """Escape hatch: perform exactly one HTTP call and return the
-        `httpx.Response` as-is -- no error mapping, no 401 refresh, no 429
-        retry. Auth/lang/account headers and body encoding still apply."""
+        `httpx.Response` as-is -- no error mapping, no 401 refresh, no
+        retries. Auth/lang/account headers and body encoding still apply."""
         return await self._perform_once(spec)
 
     async def request(self, spec: RequestSpec) -> Any:
-        """Perform `spec`, following the 401-refresh/429-backoff state
+        """Perform `spec`, following the refresh and bounded backoff state
         machine, and return the parsed JSON body (or `None` for a 204/empty
         body). Raises `ZigbaseError` for a non-2xx response that survives
         that state machine."""
@@ -466,13 +481,26 @@ class AsyncTransport:
                     # request's ORIGINAL 401 below, not the refresh error.
                     pass
 
-            if response.status_code == 429 and attempt < self._max_retries:
+            error = (
+                parse_error_response(
+                    response.status_code,
+                    response.text,
+                    str(response.url),
+                    reason_phrase=response.reason_phrase or None,
+                )
+                if response.status_code == 503
+                else None
+            )
+            retryable = response.status_code == 429 or (
+                error is not None and error.code == "overloaded"
+            )
+            if retryable and attempt < self._max_retries:
                 delay = _compute_backoff(response.headers.get("Retry-After"), attempt)
                 attempt += 1
                 await _asleep(delay)
                 continue
 
-            raise parse_error_response(
+            raise error or parse_error_response(
                 response.status_code,
                 response.text,
                 str(response.url),

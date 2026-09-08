@@ -278,7 +278,7 @@ class ZigbaseClient {
 
   /// Issues a request through the shared [Transport] and returns its parsed
   /// JSON body (or `null` for a 204/empty body). Non-2xx responses throw a
-  /// `ZigbaseException`; subject to the same 401 auto-refresh / 429 backoff
+  /// `ZigbaseException`; subject to the same 401 auto-refresh / 429 and admission backoff
   /// as every service call (they all go through this same transport). Throws
   /// [StateError] after [close].
   Future<dynamic> send(
@@ -301,7 +301,7 @@ class ZigbaseClient {
   }
 
   /// Raw escape hatch: returns the [http.Response] as-is — no JSON parse, no
-  /// error mapping, no 401 refresh, no 429 retry. Use for binary/text bodies
+  /// error mapping, no 401 refresh, no retries. Use for binary/text bodies
   /// or custom status handling. Throws [StateError] after [close].
   Future<http.Response> rawRequest(
     String method,

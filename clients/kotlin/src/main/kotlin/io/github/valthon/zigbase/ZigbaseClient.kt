@@ -180,7 +180,7 @@ class ZigbaseClient(
     /**
      * Issues a request through the shared [Transport] and returns its
      * parsed JSON body (or `null` for a 204/empty body): the auth header,
-     * 401 auto-refresh, and 429 backoff all apply, exactly as for every
+     * 401 auto-refresh, and 429/admission-overload backoff all apply, exactly as for every
      * service call (they share this same transport).
      */
     suspend fun send(
@@ -193,7 +193,7 @@ class ZigbaseClient(
 
     /**
      * Escape hatch: returns the [HttpResponse] as-is -- no JSON parsing, no
-     * error mapping, no 401 refresh, no 429 retry. Accepts the same
+     * error mapping, no 401 refresh, no retries. Accepts the same
      * `query`/`body`/`headers` as [send]; auth/lang/account headers and
      * body encoding still apply.
      */
