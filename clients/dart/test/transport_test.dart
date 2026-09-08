@@ -48,11 +48,13 @@ void main() {
     test('429 retries without decoding invalid UTF-8 JSON', () async {
       var calls = 0;
       final delays = <Duration>[];
+      final invalidUtf8 = http.Response.bytes([0xff], 429,
+          headers: {'content-type': 'application/json; charset=utf-8'});
+      expect(() => invalidUtf8.body, throwsFormatException);
       final t = _transport(
           MockClient((_) async {
             if (++calls == 1) {
-              return http.Response.bytes([0xff], 429,
-                  headers: {'content-type': 'application/json'});
+              return invalidUtf8;
             }
             return http.Response('', 204);
           }),

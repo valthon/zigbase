@@ -1763,6 +1763,10 @@ See also: [Health](#health) (liveness + component versions) and
 
 ## Health
 
+With [admission control](#admission-diagnostics) enabled, only exact `GET /api/health`
+bypasses the admission limit. `HEAD` and other methods or path variants can be
+shed under load; configure liveness probes to use GET.
+
 | Method | Path | Description |
 |---|---|---|
 | GET | `/api/health` | Liveness probe + the active database backend + component versions. No auth. |
