@@ -116,10 +116,45 @@ adding output-file options can introduce writes. Commands requiring a database
 may need `--data-dir`; they also honor their existing environment configuration.
 Diagnostic/status commands can exit nonzero while emitting valid structured output.
 
-For HTTP routes use the advertised OpenAPI operation, which includes the binary's
-declared consumer routes. For tuning, migration previews, and test selection,
+For HTTP registration discovery without a database, use `zigbase routes --json`.
+For request/response schemas and live collection metadata, use the advertised
+OpenAPI operation. For tuning, migration previews, and test selection,
 consult the relevant command documentation: this initial discovery protocol does
 not yet provide a unified execution or diagnostic-remediation interface.
+
+### Offline compiled routes
+
+`zigbase routes [--json]` emits one deterministic JSON object with
+`protocol_version: 1`, `scope: "compiled-route-registrations"`, `items`,
+`reserved_prefixes`, `coverage`, and `notes`. It shares the discovery command's
+offline/no-database behavior and `-Ddev-tools` gate. `routes --help` documents its
+arguments; server/deployment flags are not accepted.
+
+Each item contains an uppercase `method`, router `path` (captures use `:name`),
+`source` (`builtin`, `custom`, `realtime`, or `feature_state`), optional `name`,
+and redacted declarative auth metadata. Built-ins come from this binary's actual
+gated dispatch table, not a catalog of every feature ZigBase could support.
+The configured feature-state path is included for GET and HEAD; remapping or
+disabling it releases the old path. An admin-enabled build reports the `/_`
+reserved prefix, not a fabricated list of admin endpoints.
+
+`declared_access: null` means **unknown**, not public. For custom routes the
+value is the framework's declared `public`, `authed`, or `superuser` level;
+`authed_collection` adds the declared principal-collection constraint, and
+`path_secret` describes only the submitted parameter/location/mismatch behavior.
+Neither configured secret values nor KV/settings secret keys are exported.
+**A public level with `path_secret` still requires the secret.** Built-in access
+labels are supplied only where the engine already owns an explicit declaration.
+Handlers, hooks, collection rules and deployment configuration can impose
+additional checks or return unavailable; this inventory cannot authorize a request.
+
+Entries preserve declaration order within each source. The first matching custom
+route wins, so an earlier captured pattern can shadow a later literal. The array
+is not a cross-source dispatch priority list. Static assets/rewrites, individual
+admin endpoints and runtime authorization are explicitly excluded in `coverage`.
+Use the **application's compiled binary**, not a stock ZigBase executable, when
+inspecting its custom routes. Reject unsupported protocol versions and tolerate
+unknown fields/source kinds when reading the inventory.
 
 ## Which guide to load
 

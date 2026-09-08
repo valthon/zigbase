@@ -109,6 +109,7 @@ done
 # merely contains "scaffold" or "codegen" as a substring.
 DEVTOOLS_PATTERNS=(
   "agent_capabilities\." # offline discovery catalog must disappear too
+  "route_discovery\." # compiled route inventory is development-only
   "scaffold\."   # src/scaffold.zig + src/scaffold/** (init, agents-md)
   "codegen\."    # src/codegen/** (typegen — ~24 files, the largest of the three) — the
                  # dot is escaped (unlike PATTERNS above): "codegen"/"scaffold" alone are

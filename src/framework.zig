@@ -1993,6 +1993,14 @@ fn runCliImpl(init: std.process.Init, dispatch: *const events.Dispatch, jobs: []
     };
 
     switch (cmd) {
+        .routes => {
+            if (comptime devtools.enabled) {
+                var buf: [4096]u8 = undefined;
+                var out = std.Io.File.stdout().writer(init.io, &buf);
+                try @import("route_discovery.zig").write(opts.gates, opts.features_public_route, route_meta, &out.interface);
+                try out.interface.flush();
+            } else return error.DevToolsDisabled;
+        },
         .capabilities => {
             if (comptime devtools.enabled) {
                 var buf: [4096]u8 = undefined;
@@ -2020,6 +2028,7 @@ fn runCliImpl(init: std.process.Init, dispatch: *const events.Dispatch, jobs: []
             .init => printInitUsage(init.io, std.Io.File.stdout()),
             .agents_md => printAgentsMdUsage(init.io, std.Io.File.stdout()),
             .capabilities => if (comptime devtools.enabled) printCapabilitiesUsage(init.io, std.Io.File.stdout()),
+            .routes => if (comptime devtools.enabled) printRoutesUsage(init.io, std.Io.File.stdout()),
         },
         .version => |va| if (va.json) printVersionJson(init.io, std.Io.File.stdout()) else printVersion(init.io, std.Io.File.stdout()),
         .resources => {
@@ -2298,6 +2307,7 @@ fn printUsage(io: std.Io, file: std.Io.File, show_serve_static: bool, show_stati
     // on), so this only ever hides these lines for a consumer's own custom build.
     if (devtools.enabled) emit(io, file,
         \\  capabilities        Versioned JSON discovery of agent-facing CLI operations.
+        \\  routes              Offline JSON inventory of this binary's registered routes.
         \\  init                Scaffold a starting-point project (--box or --framework).
         \\  agents-md           Write AGENTS.md + CLAUDE.md for an existing project.
         \\  typegen             Generate a typed client from the collection schema (see `zigbase typegen --help`).
@@ -3028,6 +3038,25 @@ fn printInitUsage(io: std.Io, file: std.Io.File) void {
         \\In framework mode, run `zig fetch --save git+https://github.com/valthon/zigbase`
         \\afterwards: that is what writes the dependency URL and its content hash into
         \\build.zig.zon.
+        \\
+    , .{});
+}
+
+fn printRoutesUsage(io: std.Io, file: std.Io.File) void {
+    emit(io, file,
+        \\zigbase routes — offline discovery of compiled route registrations.
+        \\
+        \\Usage:
+        \\  zigbase routes [--json]
+        \\  zigbase routes --help | -h
+        \\
+        \\Prints one versioned JSON inventory; --json is optional.
+        \\Reports this binary's gated built-ins and declared custom routes.
+        \\Auth metadata describes declarations, not handler/hook decisions.
+        \\Static files and individual admin endpoints are not enumerated.
+        \\Does not load deployment configuration, open a database, invoke
+        \\handlers, or start a server. Common CLI logging still initializes.
+        \\Compiled out with -Ddev-tools=false; rebuild with -Ddev-tools=true.
         \\
     , .{});
 }

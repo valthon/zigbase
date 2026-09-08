@@ -1,0 +1,2 @@
+### Features
+- `zigbase routes --json` discovers the compiled application's registered built-in/custom routes and redacted auth declarations without opening a database. Conditional routes follow the actual dispatch tables; static assets, individual admin endpoints and runtime authorization remain explicitly outside its coverage. The command is omitted with `-Ddev-tools=false` and advertised by `capabilities`.

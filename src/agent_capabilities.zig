@@ -15,12 +15,13 @@ pub const Operation = struct {
 pub const Manifest = struct {
     protocol_version: u32 = 1,
     scope: []const u8 = "development-cli-discovery",
-    operations: [6]Operation,
+    operations: [7]Operation,
 };
 
 pub fn manifest() Manifest {
     return .{ .operations = .{
         .{ .id = "build-info", .argv = &.{ "version", "--json" }, .output = .json, .effect = .read_only, .requires_database = false },
+        .{ .id = "routes", .argv = &.{ "routes", "--json" }, .output = .json, .effect = .read_only, .requires_database = false, .notes = "Compiled route registrations and redacted declarative auth metadata; not runtime authorization or a complete static/admin endpoint inventory." },
         .{ .id = "diagnostics", .argv = &.{ "doctor", "--json" }, .output = .ndjson, .effect = .may_write, .requires_database = true, .notes = "Probes filesystem writability; may initialize the migration ledger. Nonzero exit can accompany valid diagnostic output." },
         .{ .id = "schema", .argv = &.{ "schema", "dump", "--json" }, .output = .json, .effect = .may_write, .requires_database = true, .notes = "Opens the database pool; may create local database state or configure journaling." },
         .{ .id = "migration-status", .argv = &.{ "migrate", "status", "--json" }, .output = .json, .effect = .may_write, .requires_database = true, .notes = "Opens the database pool and ensures the migration ledger exists. Nonzero exit can accompany valid status output." },
@@ -46,5 +47,5 @@ test "capability manifest has versioned unique operation identifiers" {
     try write(&out.writer);
     const parsed = try std.json.parseFromSlice(Manifest, std.testing.allocator, out.written(), .{});
     defer parsed.deinit();
-    try std.testing.expectEqual(@as(usize, 6), parsed.value.operations.len);
+    try std.testing.expectEqual(@as(usize, 7), parsed.value.operations.len);
 }

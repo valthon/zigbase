@@ -678,6 +678,9 @@ cd ..
 # 2. Build the backend
 mise exec zig@0.16.0 -- zig build          # -> ./zig-out/bin/golfsim
 
+# Inspect this application's registered backend routes without opening a database
+./zig-out/bin/golfsim routes --json
+
 # 3. Create a superuser (optional — admin UI at /_/)
 ./zig-out/bin/golfsim superuser create --email you@example.com --password "<pw>" --data-dir ./data
 
