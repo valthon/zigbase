@@ -165,6 +165,7 @@ error.**
 | `reporter_dedup` | Error-report TTL dedup window: `.{ .window_s = N }` (seconds) suppresses a repeat of the same `(message, phase)` within `N`, or `.off` to report every swallowed error. Default (omitted): **on**, `60`s. | always — dedup is on by default; `.off` compiles the dedup map out entirely (a single null-pointer branch, no allocation). |
 | `pools` | Footprint levers: reader pool, job pool, thread stack size, SQLite page cache. | always — these are levers on core connection/thread machinery, not an optional subsystem. |
 | `resource_profile` | Optional `.minimal`, `.balanced`, or `.throughput` defaults for existing pool levers; explicit `.pools` fields win. | data-only — selects constants, never enables a subsystem. |
+| `admission` | Optional `.{ .max_requests = N }`, positive `u32`: reject excess synchronous HTTP work with 503 instead of queuing. | excluded — no counters, checks, or diagnostics route when omitted; one null app pointer remains. |
 | `pagination` | Enable/disable offset & cursor list paging and pick the cursor token format. | always — core list-response plumbing. |
 | `flags` | Declared boolean feature flags. See [Feature flags + experiments](#feature-flags--experiments-declared). | data-only — lowers to an empty slice + a zero-variant `Flag` enum when unset. |
 | `experiments` | Declared A/B/n experiments (variants + weights, optional `.sticky`). See [Feature flags + experiments](#feature-flags--experiments-declared). | data-only — lowers to an empty slice + a zero-variant `Experiment` enum when unset. |
@@ -4556,6 +4557,50 @@ legacy `.jobs = .{ .pool_size = N }` spelling was removed; it is now a compile e
 naming the replacement.
 
 ### Resource profiles and inspection
+
+#### HTTP admission and backpressure
+
+Opt into `.admission = .{ .max_requests = 3 }` to cap concurrent synchronous
+HTTP callbacks per application process. This is independent of resource profiles
+and does not change the transport's four HTTP threads. Choose 1–3 to leave a
+thread available to reject excess work; a limit of 4 or higher cannot shed work
+with this transport configuration. Excess requests receive
+`503`, code `overloaded`, and `Retry-After: 1` (HEAD has no body). There is no
+additional waiting queue. Clients should use bounded retries with backoff/jitter;
+do not blindly retry non-idempotent operations after ambiguous transport failures.
+
+Admission happens before ZigBase's request arena, multipart parsing, and auth.
+A permit is released after synchronous response handling and teardown, including
+errors and file/HEAD responses. Bytes may reach a client before that teardown
+finishes, so even an immediate sequential request can briefly receive 503 at a
+limit of one. Rejections are access-logged without a request allocation.
+
+The exact built-in `GET /api/health` liveness probe is exempt and ignores request
+bodies, preventing intentional load shedding from triggering an orchestrator
+restart. Other methods (including HEAD), nearby paths, and diagnostics are not
+exempt. This is not a dedicated health worker: transport/thread saturation can
+still delay probes. Counter synchronization parks contending threads instead of
+busy-spinning, including on single-vCPU deployments.
+
+`GET /api/admission/stats` requires a superuser and returns `limit`, `active`,
+`high_water`, and `rejected` (saturating `u64`). Snapshots are coherent and
+process-local, reset on restart; `active` includes the diagnostics request itself.
+Diagnostics obey admission too and can receive 503. Application hooks may inspect
+`ctx.app.admission`, an optional borrowed state pointer, and call `snapshot()`
+without HTTP or database access. Do not mutate/release framework-owned permits.
+When omitted, the diagnostics route is absent and no state, atomics or per-request
+checks are retained (only the app's null pointer). The plugins example enables it.
+
+This is **not a total RSS cap** or protection against buffered request bodies:
+facil.io receives/buffers transport data before invoking ZigBase. Reverse-proxy
+connection/body/time limits remain necessary. WebSocket upgrades, long-lived
+WS/SSE connections, asynchronous file transmission and background jobs are outside
+this limit (an SSE setup callback, if routed through HTTP, only holds a permit
+during setup). It neither cancels slow accepted handlers nor limits durable queue
+depth. Existing memory-job ring (256 queued tasks, four workers, `QueueFull` on
+overflow) and scheduler bounds remain independent and unchanged.
+
+#### Profile defaults
 
 Select `.resource_profile = .minimal`, `.balanced`, or `.throughput` as a
 comptime starting point. Every explicitly supplied `.pools` field wins over the

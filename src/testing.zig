@@ -47,6 +47,27 @@ const capture_mod = @import("mail/capture.zig");
 const dev = @import("dev.zig");
 const field_policy = @import("field_policy.zig");
 
+test "admission liveness exemption retains permits and rejects other methods and paths" {
+    const TestApp = framework.App(.{ .admission = .{ .max_requests = 1 } });
+    var t = try start(TestApp, .{});
+    defer t.deinit();
+    const state = t.app().admission.?;
+    try std.testing.expect(state.acquire());
+    defer state.release();
+    const health_response = try t.request(.GET, "/api/health", .{});
+    try std.testing.expectEqual(@as(u16, 200), health_response.status);
+    try std.testing.expectEqual(@as(u32, 1), state.snapshot().active);
+    inline for (.{ .HEAD, .POST }) |method| {
+        const response = try t.request(method, "/api/health", .{});
+        try std.testing.expectEqual(@as(u16, 503), response.status);
+    }
+    for ([_][]const u8{ "/api/health/", "/api/health-extra", "/api/admission/stats" }) |path| {
+        const response = try t.request(.GET, path, .{});
+        try std.testing.expectEqual(@as(u16, 503), response.status);
+    }
+    try std.testing.expectEqual(@as(u64, 5), state.snapshot().rejected);
+}
+
 /// The runtime application-context type (what `ctx.app` / `t.app()` point at).
 pub const Runtime = app_mod.App;
 

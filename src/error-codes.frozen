@@ -26,6 +26,7 @@ gone
 internal
 not_found
 not_implemented
+overloaded
 payload_too_large
 too_many_requests
 unauthorized

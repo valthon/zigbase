@@ -182,6 +182,8 @@ pub const App = struct {
     /// set by `Pool.install` in serveImpl; null = not serving (tests/CLI). Memory-backend
     /// `ctx.enqueue` jobs AND `app.submit` tasks run on this bounded, shutdown-joined pool.
     memory_pool: ?*anyopaque = null,
+    /// Borrowed boot-owned state; null when HTTP admission is compiled out.
+    admission: ?*@import("admission.zig").State = null,
     /// #245 app-scoped context: type-erased pointer to the consumer's app-scoped value,
     /// declared via comptime `.app_context = T` and set ONCE in `onBootstrap` with
     /// `ctx.setAppData(T, &val)`; read anywhere via `ctx.appData(T)`. null until set.

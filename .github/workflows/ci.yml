@@ -79,6 +79,8 @@ jobs:
         run: mise exec zig@0.16.0 -- zig build auth2-server -Dcpu=baseline
       - name: Build features-fixture (demo flags/experiments browser fixture)
         run: mise exec zig@0.16.0 -- zig build features-fixture -Dcpu=baseline
+      - name: Build concurrent HTTP admission fixture
+        run: mise exec zig@0.16.0 -- zig build admission-fixture check-admission-contracts -Dcpu=baseline
       - name: Build configured feature-route fixtures
         run: |
           mise exec zig@0.16.0 -- zig build feature-remapped-fixture -Dcpu=baseline
@@ -188,6 +190,7 @@ jobs:
             zig-out/bin/feature-disabled-fixture
             zig-out/bin/import-fixture
             zig-out/bin/full-fixture
+            zig-out/bin/admission-fixture
             examples/blog/zig-out/bin/blog
             examples/golfsim/zig-out/bin/golfsim
             examples/golfsim/frontend/dist/
@@ -477,6 +480,8 @@ jobs:
           chmod +x artifacts/zig-out/bin/import-fixture
           echo "ZIGBASE_TEST_IMPORT_BINARY=$GITHUB_WORKSPACE/artifacts/zig-out/bin/import-fixture" >> "$GITHUB_ENV"
           chmod +x artifacts/zig-out/bin/full-fixture
+          chmod +x artifacts/zig-out/bin/admission-fixture
+          echo "ZIGBASE_TEST_ADMISSION_BINARY=$GITHUB_WORKSPACE/artifacts/zig-out/bin/admission-fixture" >> "$GITHUB_ENV"
           echo "ZIGBASE_TEST_FULL_BINARY=$GITHUB_WORKSPACE/artifacts/zig-out/bin/full-fixture" >> "$GITHUB_ENV"
       - name: Install Python test deps + resolve Playwright version
         id: pw

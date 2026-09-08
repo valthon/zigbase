@@ -526,7 +526,7 @@ pub fn App(comptime cfg: anytype) type {
             @setEvalBranchQuota(20_000);
             // Guard top-level cfg keys so a typo (e.g. `.hook`, `.on_error`) fails
             // loudly at comptime instead of silently producing an empty Dispatch.
-            const allowed = .{ "resource_profile", "hooks", "onError", "routes", "onAuth", "beforeAuthSuccess", "auth", "onFileServe", "onFileUpload", "onBootstrap", "onBeforeServe", "onBeforeTerminate", "cron", "jobs", "storage", "mailer", "reporter", "reporter_dedup", "pools", "collections", "migrations", "static_files", "pagination", "enable_typegen", "flags", "experiments", "features", "onFeatureExposure", "experiment_assignment_ttl", "queues", "workers", "realtime", "tenancy", "abilities", "mail", "analytics", "static_routes", "enable_spa_marker", "static_cache_control", "admin", "webhooks", "ttl_gc_interval", "files", "push", "sms", "sms_provider", "collections_frozen", "app_context" };
+            const allowed = .{ "admission", "resource_profile", "hooks", "onError", "routes", "onAuth", "beforeAuthSuccess", "auth", "onFileServe", "onFileUpload", "onBootstrap", "onBeforeServe", "onBeforeTerminate", "cron", "jobs", "storage", "mailer", "reporter", "reporter_dedup", "pools", "collections", "migrations", "static_files", "pagination", "enable_typegen", "flags", "experiments", "features", "onFeatureExposure", "experiment_assignment_ttl", "queues", "workers", "realtime", "tenancy", "abilities", "mail", "analytics", "static_routes", "enable_spa_marker", "static_cache_control", "admin", "webhooks", "ttl_gc_interval", "files", "push", "sms", "sms_provider", "collections_frozen", "app_context" };
             const allowed_list = blk2: {
                 var s: []const u8 = "";
                 for (allowed, 0..) |name, i| s = s ++ (if (i == 0) "" else "/") ++ name;
@@ -865,6 +865,7 @@ pub fn App(comptime cfg: anytype) type {
         /// The full job table = consumer jobs ++ framework-internal jobs. The scheduler
         /// starts whenever this is non-empty, so a TTL collection alone starts it.
         pub const jobs: []const scheduler.RuntimeJob = scheduler.concatJobs(user_jobs, internal_jobs);
+        pub const admission_config = @import("admission.zig").resolve(cfg);
         pub const selected_resource_profile: ?resource_profile.Profile = if (@hasField(@TypeOf(cfg), "resource_profile")) cfg.resource_profile else null;
         const profile_pools = resource_profile.defaults(selected_resource_profile orelse .balanced);
         /// Worker pool size for the scheduler: `.pools = .{ .jobs = N }` (default 2).
@@ -932,6 +933,7 @@ pub fn App(comptime cfg: anytype) type {
         /// a deselected built-in's route (and its ~thousands of LOC) never gets pulled
         /// into the binary by Zig's lazy analysis.
         pub const route_gates: server.Gates = .{
+            .admission = admission_config != null,
             .two_factor = two_factor_selection.enabled,
             .admin = enable_admin,
             .analytics = @hasField(@TypeOf(cfg), "analytics"),
@@ -1723,6 +1725,7 @@ pub fn App(comptime cfg: anytype) type {
             .push = push_config,
             .static_cache_control = static_cache_control,
             .gates = route_gates,
+            .admission_config = admission_config,
         };
 
         /// Parse argv and dispatch the CLI (serve / migrate / superuser create / help),
@@ -1863,6 +1866,7 @@ fn analyticsRollupRun(ctx: *ctx_mod.Ctx, ev: *events.JobEvent) anyerror!void {
 /// mailer plugin TYPES to instantiate, the assembled auth method type list,
 /// and the warm-reader-pool cap.
 pub const ServeOpts = struct {
+    admission_config: ?@import("admission.zig").Config = null,
     StoragePlugin: type,
     MailerPlugin: type,
     /// Comptime-selected error-reporter plugin TYPE (#244); defaults to `DefaultReporterPlugin`.
@@ -4550,6 +4554,7 @@ fn BootedApp(comptime opts: ServeOpts) type {
         const Self = @This();
 
         allocator: std.mem.Allocator,
+        admission_state: if (opts.admission_config != null) @import("admission.zig").State else void,
         /// Resolved config (jwt_secret already stamped). String slices still borrow the
         /// caller-owned backing exactly as the App fields do; this copy is a convenience so
         /// `serveImpl` can read http_host/http_port after boot.
@@ -4932,7 +4937,9 @@ fn bootApp(
 
     holder.backfill_store = if (comptime build_options.realtime_backfill) try @import("realtime/backfill.zig").Store.create(allocator, io, db.poolBackend(&holder.pool)) else {};
     errdefer if (comptime build_options.realtime_backfill) if (holder.backfill_store) |store| store.destroy();
+    holder.admission_state = if (comptime opts.admission_config) |cfg_admission| @import("admission.zig").State.init(io, cfg_admission) else {};
     holder.app = app_mod.App{
+        .admission = if (comptime opts.admission_config != null) &holder.admission_state else null,
         .backfill = if (comptime build_options.realtime_backfill) holder.backfill_store else {},
         .allocator = allocator,
         .io = io,
@@ -5870,6 +5877,17 @@ test "resource profiles preserve defaults and explicit pool overrides" {
     const P = App(.{ .resource_profile = .minimal, .pools = .{ .readers = 7 } });
     try std.testing.expectEqual(@as(usize, 7), P.reader_pool_size);
     try std.testing.expectEqual(@as(u32, 256), P.cache_kib);
+}
+
+test "HTTP admission is opt-in and reserves only its enabled diagnostics route" {
+    const Disabled = App(.{});
+    const Enabled = App(.{ .admission = .{ .max_requests = 3 } });
+    try std.testing.expectEqual(null, Disabled.admission_config);
+    try std.testing.expect(!Disabled.route_gates.admission);
+    try std.testing.expect(Enabled.route_gates.admission);
+    try std.testing.expectEqual(@as(u32, 3), Enabled.admission_config.?.max_requests);
+    try std.testing.expect(server.featureRouteAvailable(Disabled.route_gates, "/api/admission/stats"));
+    try std.testing.expect(!server.featureRouteAvailable(Enabled.route_gates, "/api/admission/stats"));
 }
 
 test "App(cfg) carries comptime footprint levers (stack_size + cache_kib) with memory-conscious defaults" {

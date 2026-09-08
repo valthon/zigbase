@@ -1640,6 +1640,26 @@ configured outbound high-water-mark). `401` unauthenticated, `403` non-superuser
 
 ---
 
+## Admission diagnostics
+
+`GET /api/admission/stats` is available only in applications compiled with
+`.admission = .{ .max_requests = N }`. It requires superuser authentication:
+`401` without a valid identity, `403` for other users, and `404` when disabled.
+
+```json
+{"limit":3,"active":1,"high_water":3,"rejected":42}
+```
+
+Counters are coherent and process-local, reset at restart. `active` includes
+this diagnostics request; `high_water` records peak admitted work and `rejected`
+is a saturating unsigned 64-bit count. The endpoint itself obeys admission and
+can return `503` with code `overloaded` and `Retry-After: 1` before authentication.
+Only the exact built-in `GET /api/health` liveness probe is exempt. See
+[HTTP admission and backpressure](framework.md#http-admission-and-backpressure)
+for configuration, scope, and retry guidance.
+
+---
+
 ## Meta
 
 | Method | Path | Description |

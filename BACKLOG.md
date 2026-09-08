@@ -10,6 +10,9 @@ copy, examples, and tests with the implementation rather than in follow-up PRs.
 - [x] Transparent comptime resource profiles with explicit overrides and an effective-settings report (#410).
 - [ ] Workload-driven tuning advisor comparing throughput, tail latency, and memory under explicit budgets.
 - [ ] Coordinated resource budgets, bounded queues, backpressure, and saturation diagnostics.
+  Implemented slice: opt-in synchronous HTTP admission, immediate overload rejection,
+  and saturation counters. Transport buffers, long-lived connections, and cross-subsystem
+  budget coordination remain outside this gate.
 - [ ] Agent-native development interface: versioned discovery, structured diagnostics,
   schema/route inspection, migration previews, and focused test execution.
   Implemented first slice: CLI discovery with explicit operation side effects (#409);

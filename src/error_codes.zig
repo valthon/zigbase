@@ -16,6 +16,7 @@ pub const Code = enum {
     internal,
     not_found,
     not_implemented,
+    overloaded,
     payload_too_large,
     too_many_requests,
     unauthorized,
@@ -76,6 +77,10 @@ pub const Info = struct {
 /// code is documented".
 pub fn info(c: Code) Info {
     return switch (c) {
+        .overloaded => .{
+            .summary = "synchronous HTTP request capacity is exhausted",
+            .explanation = "The configured admission limit is full. Retry with backoff after Retry-After; this is server capacity, not a per-user rate limit.",
+        },
         .bad_request => .{
             .summary = "the request was malformed or semantically invalid",
             .explanation =
