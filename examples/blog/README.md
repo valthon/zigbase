@@ -34,6 +34,18 @@ module into a downstream consumer package.
 
 ## Schema
 
+### Agent inspection of this binary
+
+After building, run `./zig-out/bin/blog capabilities` to
+discover executable inspection commands and separate required-input descriptors.
+For an authorized development deployment, run
+`./zig-out/bin/blog diagnostics --json --data-dir ./dev-data` to get one versioned
+JSON report. It uses doctor checks, including filesystem/database probes and
+possible migration-ledger initialization; it is not read-only. Exit 1 means errors,
+2 warnings, and 0 clean. The catalog's `diagnostics` operation uses this JSON
+adapter; ordinary doctor NDJSON remains unchanged.
+Both new interfaces require the default `-Ddev-tools=true` build.
+
 ```zig
 .posts = .{
     .fields = .{

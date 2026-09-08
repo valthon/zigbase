@@ -210,7 +210,7 @@ pub const AgentsMdArgs = struct {
 };
 
 /// Identifies which command a per-command `--help` request targets.
-pub const HelpTopic = enum { top, serve, serve_control, migrate, superuser_create, typegen, rewrap, migrate_db, vapid_keygen, import, schema, openapi, explain_code, doctor, init, agents_md, files, capabilities, routes, tune };
+pub const HelpTopic = enum { top, serve, serve_control, migrate, superuser_create, typegen, rewrap, migrate_db, vapid_keygen, import, schema, openapi, explain_code, doctor, init, agents_md, files, capabilities, routes, tune, diagnostics };
 
 pub const Command = union(enum) {
     tune: TuneArgs,
@@ -221,6 +221,7 @@ pub const Command = union(enum) {
     version: VersionArgs,
     /// Versioned, read-only discovery of agent-facing CLI operations.
     capabilities: void,
+    diagnostics: DiagnosticsArgs,
     routes: void,
     serve: ServeArgs,
     migrate: MigrateArgs,
@@ -265,9 +266,33 @@ pub const ParseOpts = struct {
 
 pub const TuneArgs = struct { input: []const u8 = "", as_of: ?i64 = null };
 
+/// Structured diagnostics always emits one JSON document, never doctor NDJSON.
+pub const DiagnosticsArgs = struct { data_dir: ?[]const u8 = null, production: bool = false };
+
 /// Parse argv (excluding the program name).
 pub fn parse(args: []const []const u8, popts: ParseOpts) ParseError!Command {
     if (args.len == 0) return .{ .help = .top };
+    if (std.mem.eql(u8, args[0], "diagnostics")) {
+        if (!devtools.enabled) return ParseError.DevToolsDisabled;
+        var result = DiagnosticsArgs{};
+        var i: usize = 1;
+        while (i < args.len) : (i += 1) {
+            const arg = args[i];
+            if (isHelpFlag(arg)) return .{ .help = .diagnostics };
+            if (std.mem.eql(u8, arg, "--json")) continue;
+            if (std.mem.eql(u8, arg, "--production")) {
+                result.production = true;
+            } else if (std.mem.eql(u8, arg, "--data-dir")) {
+                if (result.data_dir != null) return ParseError.BadValue;
+                i += 1;
+                if (i == args.len) return ParseError.MissingValue;
+                if (args[i].len == 0) return ParseError.BadValue;
+                if (std.mem.startsWith(u8, args[i], "-")) return ParseError.MissingValue;
+                result.data_dir = args[i];
+            } else return ParseError.UnknownFlag;
+        }
+        return .{ .diagnostics = result };
+    }
     if (std.mem.eql(u8, args[0], "routes")) {
         if (!devtools.enabled) return ParseError.DevToolsDisabled;
         for (args[1..]) |arg| {
@@ -304,7 +329,8 @@ pub fn parse(args: []const []const u8, popts: ParseOpts) ParseError!Command {
         if (!devtools.enabled) return ParseError.DevToolsDisabled;
         for (args[1..]) |arg| {
             if (isHelpFlag(arg)) return .{ .help = .capabilities };
-            if (!std.mem.eql(u8, arg, "--json")) return ParseError.UnknownFlag;
+            if (std.mem.eql(u8, arg, "--json")) continue;
+            return ParseError.UnknownFlag;
         }
         return .{ .capabilities = {} };
     }
@@ -1561,6 +1587,26 @@ test "capabilities parses only offline discovery arguments" {
     try std.testing.expectEqual(HelpTopic.capabilities, (try parse(&.{ "capabilities", "-h" }, .{})).help);
     try std.testing.expectEqual(Command.capabilities, std.meta.activeTag(try parse(&.{ "capabilities", "--json" }, .{})));
     try std.testing.expectError(ParseError.UnknownFlag, parse(&.{ "capabilities", "--execute" }, .{}));
+    try std.testing.expectEqual(Command.capabilities, std.meta.activeTag(try parse(&.{"capabilities"}, .{})));
+    try std.testing.expectError(ParseError.UnknownFlag, parse(&.{ "capabilities", "--protocol-version", "1" }, .{}));
+    try std.testing.expectError(ParseError.UnknownFlag, parse(&.{ "capabilities", "--protocol-version", "2" }, .{}));
+}
+
+test "structured diagnostics arguments and dev-tools gate" {
+    if (!devtools.enabled) {
+        try std.testing.expectError(ParseError.DevToolsDisabled, parse(&.{ "diagnostics", "--help" }, .{}));
+        return;
+    }
+    const parsed = (try parse(&.{ "diagnostics", "--production", "--data-dir", "test-data" }, .{})).diagnostics;
+    try std.testing.expect(parsed.production);
+    const json_flag = (try parse(&.{ "diagnostics", "--json" }, .{})).diagnostics;
+    try std.testing.expect(!json_flag.production and json_flag.data_dir == null);
+    try std.testing.expectEqualStrings("test-data", parsed.data_dir.?);
+    try std.testing.expectEqual(HelpTopic.diagnostics, (try parse(&.{ "diagnostics", "--help" }, .{})).help);
+    try std.testing.expectError(ParseError.MissingValue, parse(&.{ "diagnostics", "--data-dir" }, .{}));
+    for ([_][]const u8{ "--production", "--json", "--help", "-h", "--unknown" }) |option|
+        try std.testing.expectError(ParseError.MissingValue, parse(&.{ "diagnostics", "--data-dir", option }, .{}));
+    try std.testing.expectError(ParseError.BadValue, parse(&.{ "diagnostics", "--data-dir", "x", "--data-dir", "y" }, .{}));
 }
 
 test "tune has bounded explicit inputs and respects the dev-tools gate" {

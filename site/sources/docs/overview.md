@@ -128,3 +128,8 @@ scheduler is single-process, and the PostgreSQL backend is opt-in (build from so
 operations, their output formats, and their side effects. Discovery works offline
 without opening the database. Custom lean builds can omit it with
 `-Ddev-tools=false`. See the agent guide for the contract and inspection caveats.
+
+The catalog separates required-input descriptors from runnable arguments,
+so an agent can discover the tuning advisor's input contract. `zigbase diagnostics`
+wraps doctor checks in versioned JSON with structured failures; it retains doctor's
+deployment probes and possible database writes, not an offline safety guarantee.

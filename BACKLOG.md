@@ -8,15 +8,17 @@ copy, examples, and tests with the implementation rather than in follow-up PRs.
 ## Development and resource efficiency
 
 - [x] Transparent comptime resource profiles with explicit overrides and an effective-settings report (#410).
-- [ ] Workload-driven tuning advisor comparing throughput, tail latency, and memory under explicit budgets.
+- [x] Offline workload tuning advisor comparing supplied throughput, tail latency, and memory measurements under explicit budgets (#413).
 - [ ] Coordinated resource budgets, bounded queues, backpressure, and saturation diagnostics.
 - [ ] Agent-native development interface: versioned discovery, structured diagnostics,
   schema/route inspection, migration previews, and focused test execution.
-  Implemented first slice: CLI discovery with explicit operation side effects (#409);
-  this is not a remote executor. Structured diagnostics and focused execution remain.
+  Implemented slices: CLI discovery with explicit operation side effects (#409),
+  offline compiled-route inspection with declarative access metadata (#415), and
+  structured diagnostics with typed required-input descriptors (#416).
+  This is not a remote executor. Focused execution remains.
 - [ ] Opt-in bounded query performance workbench with route attribution and query-plan inspection.
 - [ ] Dependency-aware bounded response caching, starting with explicitly eligible public reads.
-- [ ] Application performance contracts: deterministic size/allocation gates and controlled latency trends.
+- [x] Opt-in application performance contracts: binary-size/allocation gates and advisory timing comparisons (#414).
 - [ ] Opt-in principal/operation-scoped idempotent mutations with atomic coordination and bounded retention.
 - [ ] Resolve intermittent test-runner diagnostics (#261); existing investigation is PR #355.
 

@@ -16,7 +16,8 @@ def test_capabilities_is_offline_and_explicit(binary, tmp_path):
     operations = {op["id"]: op for op in manifest["operations"]}
     assert operations["http-contract"]["effect"] == "read_only"
     assert operations["migration-status"]["effect"] == "may_write"
-    assert operations["diagnostics"]["output"] == "ndjson"
+    assert operations["diagnostics"]["output"] == "json"
+    assert operations["diagnostics"]["argv"] == ["diagnostics", "--json"]
     assert "DO-NOT-PRINT" not in result.stdout + result.stderr
     assert not data.exists()
     again = subprocess.run([binary, "capabilities"], env=env,
@@ -40,6 +41,8 @@ def test_capabilities_has_dedicated_help(binary, tmp_path):
         )
         assert "zigbase capabilities [--json]" in result.stdout
         assert "JSON is" in result.stdout
+        assert result.stdout.count("zigbase capabilities [--json]") == 1
+        assert "Version 2" not in result.stdout
         assert "Does not execute catalog operations" in result.stdout
         assert "-Ddev-tools=false" in result.stdout
         assert "zigbase serve" not in result.stdout

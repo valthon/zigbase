@@ -3,6 +3,8 @@ const std = @import("std");
 const ResourceReport = @import("resource_profile.zig").Report;
 
 pub const max_input_bytes = 1024 * 1024;
+pub const max_candidates = 128;
+pub const max_label_bytes = 256;
 pub const Candidate = struct {
     id: []const u8,
     workload: []const u8,
@@ -29,7 +31,7 @@ const Reason = enum { feasible, failed_requests, context_mismatch, stale, future
 const Item = struct { candidate: Candidate, reason: Reason };
 
 fn labelValid(value: []const u8) bool {
-    if (value.len == 0 or value.len > 256) return false;
+    if (value.len == 0 or value.len > max_label_bytes) return false;
     for (value) |c| if (c < 32 or c == 127) return false;
     return true;
 }
@@ -54,7 +56,7 @@ pub fn compare(allocator: std.mem.Allocator, bytes: []const u8, now: i64) ![]u8 
     if (input.schema_version != 1) return error.UnsupportedSchemaVersion;
     if (!labelValid(input.workload) or !labelValid(input.revision) or !labelValid(input.environment)) return error.InvalidContext;
     if (input.max_age_seconds == 0 or input.memory_budget_bytes == 0 or !positive(input.p95_budget_ms) or now < 0) return error.InvalidBudget;
-    if (input.candidates.len == 0 or input.candidates.len > 128) return error.InvalidCandidateCount;
+    if (input.candidates.len == 0 or input.candidates.len > max_candidates) return error.InvalidCandidateCount;
     const items = try allocator.alloc(Item, input.candidates.len);
     defer allocator.free(items);
     var selected: ?Candidate = null;

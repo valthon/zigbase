@@ -1974,6 +1974,15 @@ fn runCliImpl(init: std.process.Init, dispatch: *const events.Dispatch, jobs: []
         .serve_static = std.meta.activeTag(opts.static_mode) == .default,
         .static_cache_control = std.meta.activeTag(opts.static_mode) != .disabled,
     }) catch |err| {
+        if (comptime devtools.enabled) {
+            if (args.len >= 2 and std.mem.eql(u8, args[1], "diagnostics")) {
+                var buf: [4096]u8 = undefined;
+                var out = std.Io.File.stdout().writerStreaming(init.io, &buf);
+                try @import("agent_diagnostics.zig").writeError(&out.interface, "arguments", "invalid_arguments", null, null);
+                try out.interface.flush();
+                std.process.exit(1);
+            }
+        }
         if (err == cli.ParseError.DevToolsDisabled) {
             // Distinguishable from a plain usage error (docs the caller — often an
             // agent that read a doc written for the default, dev-tools-on binary —
@@ -2001,10 +2010,30 @@ fn runCliImpl(init: std.process.Init, dispatch: *const events.Dispatch, jobs: []
                 try out.interface.flush();
             } else return error.DevToolsDisabled;
         },
+        .diagnostics => |da| {
+            if (comptime devtools.enabled) {
+                const adapter = @import("agent_diagnostics.zig");
+                // Buffer the complete document before touching stdout: runtime
+                // failure cannot append an error to a partially emitted report.
+                var document: std.Io.Writer.Allocating = .init(allocator);
+                defer document.deinit();
+                const code = adapter.run(RequestArena.from(init.arena), init.io, init.environ_map, da, schema_migrations, &document.writer) catch {
+                    // Error output itself needs no allocation, including when
+                    // constructing the report failed due to exhausted memory.
+                    var buf: [4096]u8 = undefined;
+                    var out = std.Io.File.stdout().writerStreaming(init.io, &buf);
+                    try adapter.writeError(&out.interface, "runtime", "diagnostic_failed", null, null);
+                    try out.interface.flush();
+                    std.process.exit(1);
+                };
+                try adapter.output(init.io, document.written());
+                std.process.exit(code);
+            } else return error.DevToolsDisabled;
+        },
         .capabilities => {
             if (comptime devtools.enabled) {
                 var buf: [4096]u8 = undefined;
-                var out = std.Io.File.stdout().writer(init.io, &buf);
+                var out = std.Io.File.stdout().writerStreaming(init.io, &buf);
                 try @import("agent_capabilities.zig").write(&out.interface);
                 try out.interface.flush();
             } else return error.DevToolsDisabled;
@@ -2043,6 +2072,14 @@ fn runCliImpl(init: std.process.Init, dispatch: *const events.Dispatch, jobs: []
             .init => printInitUsage(init.io, std.Io.File.stdout()),
             .agents_md => printAgentsMdUsage(init.io, std.Io.File.stdout()),
             .capabilities => if (comptime devtools.enabled) printCapabilitiesUsage(init.io, std.Io.File.stdout()),
+            .diagnostics => if (comptime devtools.enabled) emit(init.io, std.Io.File.stdout(),
+                \\zigbase diagnostics [--json] [--production] [--data-dir PATH]
+                \\Versioned JSON doctor adapter. May probe filesystem writability and initialize
+                \\the deployment database migration ledger. Exit 0 clean, 1 errors, 2 warnings.
+                \\Argument/configuration/runtime failures emit a JSON error envelope; raw values
+                \\are omitted. Requires -Ddev-tools=true. doctor output remains unchanged.
+                \\
+            , .{}),
             .routes => if (comptime devtools.enabled) printRoutesUsage(init.io, std.Io.File.stdout()),
             .tune => if (comptime devtools.enabled) printTuneUsage(init.io, std.Io.File.stdout()),
         },
@@ -2323,6 +2360,7 @@ fn printUsage(io: std.Io, file: std.Io.File, show_serve_static: bool, show_stati
     // on), so this only ever hides these lines for a consumer's own custom build.
     if (devtools.enabled) emit(io, file,
         \\  capabilities        Versioned JSON discovery of agent-facing CLI operations.
+        \\  diagnostics         Versioned JSON doctor checks and structured failures.
         \\  routes              Offline JSON inventory of this binary's registered routes.
         \\  tune                Compare measured workload candidates within explicit budgets.
         \\  init                Scaffold a starting-point project (--box or --framework).
@@ -3100,6 +3138,8 @@ fn printCapabilitiesUsage(io: std.Io, file: std.Io.File) void {
         \\
         \\Prints one versioned JSON operation catalog. --json is optional: JSON is
         \\the default. --help/-h prints this usage text instead.
+        \\Runnable operations include structured diagnostics. Required-input
+        \\descriptors are separate from executable argv; there is no version selector.
         \\Does not execute catalog operations, load server configuration, open a
         \\database, or start a server. Common CLI logging initialization still reads
         \\log-format/level variables. Advertised operations have their own effects.

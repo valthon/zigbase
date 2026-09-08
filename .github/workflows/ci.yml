@@ -101,6 +101,8 @@ jobs:
       # builds at the default (-Ddev-tools on).
       - name: Build zigbase binary without dev-tools (custom-build proof; not a published artifact)
         run: mise exec zig@0.16.0 -- zig build -Dcpu=baseline -Ddev-tools=false -p zig-out-devtools-off
+      - name: Disabled agent CLI rejects discovery and diagnostics
+        run: mise exec python@3.13 -- python scripts/check-disabled-agent-cli.py zig-out-devtools-off/bin/zigbase
       - name: Gating invariant (absent-symbols check)
         run: ./scripts/check-gating.sh
       - name: Allocator ownership contracts (ratchet)
