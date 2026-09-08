@@ -14,6 +14,79 @@ If you are writing a Zig app on ZigBase, `zigbase.testing` is the default and
 most of your tests belong there. Reach for a spawned server for the things
 in-process testing structurally cannot see.
 
+## Performance contracts
+
+Performance contracts are offline build/CI tooling, not application runtime
+configuration. They enforce caller-owned binary-size and allocation ceilings;
+they do not add instrumentation to deployed binaries or gate wall-clock timing.
+
+Run the checked-in Linux x86_64 example with Zig 0.16.0 on PATH:
+
+```sh
+bash scripts/check-performance.sh > performance-report.json
+# Compare a later run using exactly the same contract/build/workload:
+bash scripts/check-performance.sh --baseline performance-report.json > next-report.json
+```
+
+The script builds the normal server with `ReleaseSmall`, baseline CPU,
+`x86_64-linux-gnu`, and `-Ddev-tools=false`, then runs the benchmark-only harness
+in `ReleaseFast` with the same target/CPU. Its temporary binary and JSONL inputs
+are removed afterward; the report retains their SHA-256 digests. CI runs this
+example and uploads the report. No noisy latency percentage determines success.
+
+For your own app, build its binary and emit JSONL in the `bench/harness.zig`
+format, then use the standalone standard-library Python command:
+
+```sh
+python3 tools/performance_contracts.py \
+  --contract my-contract.json --binary zig-out/bin/myapp \
+  --benchmarks my-benchmarks.jsonl > performance-report.json
+```
+
+Copy `bench/contracts/release-small-linux.json` as a starting point. Contract
+schema version 1 requires `build` labels, `binary_max_bytes`, and a nonempty
+`benchmarks` map. Each named benchmark declares its exact measured `iterations`
+and a nonempty `max` map selecting allocation metrics. Realtime entries also
+declare exact `subscribers` and `payload_bytes`. Unknown keys, missing metrics,
+duplicate workload identities/JSON keys, inconsistent buckets, noninteger/negative metrics,
+changed workload dimensions, and incompatible baselines fail closed. Extra
+uncontracted benchmark rows are validated but do not create implicit budgets.
+Realtime identity includes subscriber count and payload size; this first contract
+schema selects one such pairing per named realtime scenario.
+
+Exit status is **0** when all budgets pass, **1** for a budget violation (with
+the complete JSON report), and **2** for invalid/missing input (stderr diagnostic,
+no report). Version 1 reports contain artifact/contract hashes, declared build
+labels, each actual/limit/pass result, median timings in nanoseconds, and optional
+baseline deltas. Save them as CI artifacts; a zero baseline timing produces a
+null percentage, not a fabricated improvement. Baselines must use the identical
+contract bytes, including build/workload labels and limits.
+Binary inputs are capped at 256 MiB, and contract, benchmark JSONL and baseline
+files at 8 MiB each. Size preflight rejects oversized files before reading or
+hashing; bounded reads also reject files that grow past the cap during the check.
+Exceeding these input caps is invalid input (exit 2), not a budget violation (exit 1).
+
+**Units and limits matter.** Ordinary `allocs` and `bytes` are totals over all
+measured iterations, excluding warmup; bytes count successful allocation requests,
+not resize/remap growth. `peak_live` is the maximum logical requested live bytes
+in one invocation. Arena reset ends those logical lifetimes, even though backing
+capacity is retained. These are **not process RSS**, SQLite/libc allocation totals,
+or retained arena capacity. Realtime `allocs_per_event`/`bytes_per_event` are
+integer-normalized per-event values; `peak_live_bytes` remains an absolute logical
+peak. Median timings are advisory only; compare them on a controlled, otherwise
+idle host with matching workload, target, toolchain and build modes. The offline
+CLI trusts declared build labels: hashes bind files, not their build provenance.
+It neither rebuilds the app nor authenticates supplied benchmark observations.
+
+The example's ceilings are deliberate regression headroom, not universal promises.
+Initial x86_64 Linux measurements with Zig 0.16.0 were approximately 3.25 MB for
+the configured server (4 MB ceiling), 0 allocations for JWT verification,
+38,000 allocations / 3,214,000 requested bytes / 1,028 logical peak bytes for
+2,000 record reads, and 34,000 / 8,032,000 / 5,198 for 2,000 filter compilations.
+Record/filter ceilings allow roughly 5–17% headroom; the smoke fixture has exact
+known counts. Review changes to the workload or toolchain before recalibrating
+budgets. Different app features and targets need their own measured contract.
+
 ## The build wiring (copy this)
 
 `zigbase.addTest` gives you a test artifact wired with ZigBase's `.simple`-mode

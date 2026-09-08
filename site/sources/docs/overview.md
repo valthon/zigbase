@@ -95,6 +95,8 @@ There are two ways to use ZigBase:
 - **Deterministic testing** — freeze time (`ZIGBASE_FAKE_NOW`), fix randomness
   (`ZIGBASE_FAKE_SEED`), and capture outbound mail in test suites — all gated off in
   production builds.
+- **Performance contracts** — opt-in binary-size and allocation budgets with
+  versioned CI reports; timing comparisons stay advisory. → [Testing](./testing#performance-contracts)
 
 ## When to use ZigBase
 

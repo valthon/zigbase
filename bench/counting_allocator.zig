@@ -99,3 +99,19 @@ test "counts allocations into size buckets and tracks peak live bytes" {
     try std.testing.expectEqual(@as(u64, 1), s.buckets[4]);
     try std.testing.expectEqual(@as(u64, 100_008), s.peak_live);
 }
+
+test "logical arena lifetime reset does not release retained backing bytes" {
+    var backing = CountingAllocator.init(std.testing.allocator);
+    {
+        var arena = std.heap.ArenaAllocator.init(backing.allocator());
+        defer arena.deinit();
+        var logical = CountingAllocator.init(arena.allocator());
+        _ = try logical.allocator().alloc(u8, 1024);
+        _ = arena.reset(.retain_capacity);
+        logical.live = 0;
+        try logical.requireEmpty();
+        try std.testing.expect(backing.live > 0);
+        try std.testing.expectEqual(@as(u64, 1024), logical.stats().peak_live);
+    }
+    try backing.requireEmpty();
+}
