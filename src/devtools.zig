@@ -8,7 +8,8 @@
 //! (project scaffolding, `src/scaffold*.zig`) and `typegen` (schema-to-client
 //! codegen, `src/codegen/**` — ~24 files, the largest dev-only surface in the
 //! binary), plus `capabilities` and `routes` (offline discovery) and `tune`
-//! (measurement comparison). None has runtime value on a *deployed*
+//! (measurement comparison), and `diagnostics` (the versioned doctor adapter).
+//! None has runtime value on a *deployed*
 //! server — they are schema/toolchain-in, source-out generators a developer runs
 //! locally, never something a running instance needs to serve traffic. typegen's
 //! no-Zig-toolchain equivalent ships separately as `@zigbase/typegen` on npm, so
@@ -30,4 +31,4 @@ pub const enabled = build_options.dev_tools;
 /// framework.zig's dispatch-time fallback (unreachable in practice since parse
 /// rejects first, but keeps those arms from referencing scaffold/codegen in a
 /// stripped build). `{s}` is the verb name, e.g. "init".
-pub const disabled_note = "this binary was built without -Ddev-tools, so the development commands (init, agents-md, typegen, capabilities, routes, tune) are not compiled in. Use an official release binary, or rebuild with -Ddev-tools=true.";
+pub const disabled_note = "this binary was built without -Ddev-tools, so the development commands (init, agents-md, typegen, capabilities, routes, tune, diagnostics) are not compiled in. Use an official release binary, or rebuild with -Ddev-tools=true.";

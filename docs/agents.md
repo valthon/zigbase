@@ -118,9 +118,59 @@ Diagnostic/status commands can exit nonzero while emitting valid structured outp
 
 For HTTP registration discovery without a database, use `zigbase routes --json`.
 For request/response schemas and live collection metadata, use the advertised
-OpenAPI operation. For tuning, migration previews, and test selection,
-consult the relevant command documentation: this initial discovery protocol does
-not yet provide a unified execution or diagnostic-remediation interface.
+OpenAPI operation. For migration previews and test selection, consult their
+command documentation. Discovery does not execute operations or remediate issues.
+
+### Required inputs and structured diagnostics
+
+`zigbase capabilities [--json]` emits a single catalog with runnable `operations`
+and a separate `input_operations` array. The `diagnostics` operation invokes the
+structured `diagnostics` verb. There is no protocol-selection flag.
+
+Only `operations[].argv` is directly runnable. An input operation's `argv_prefix`
+is **not a complete invocation**: append each supplied `inputs[].flag` and value
+as separate arguments, never concatenate shell commands or execute placeholders.
+The `tune` descriptor identifies its required JSON file, schema version, 1 MiB
+limit, scalar types/constraints, candidate bounds and optional nonnegative
+`--as-of` timestamp. The captured `resources` object is intentionally not expanded
+into a complete schema; its `capture_argv` obtains the real report. These are
+bounded descriptors, **not JSON Schema**. Consult their canonical reference for
+measurement semantics. Integer `minimum_decimal`/`maximum_decimal` bounds are
+inclusive base-10 strings: parse them losslessly (for example with JavaScript
+`BigInt`), not as floating-point numbers. They describe numeric JSON input fields,
+not string-valued fields; serialize large input integers without rounding.
+`forbidden_byte_ranges` contains objects with inclusive numeric `minimum` and
+`maximum` byte values, applied to UTF-8 bytes (0–31 and 127 for labels).
+Tune retains its existing output/error behavior.
+
+`zigbase diagnostics [--json] [--production] [--data-dir PATH]` adapts existing
+doctor checks into one JSON document (`protocol_version: 1`,
+`scope: "development-diagnostics"`). JSON is the default. A completed run has
+`status: "complete"`, `findings`, the unchanged doctor `summary`, and `exit_code`:
+0 clean, 1 errors, 2 warnings only. Completed does not mean healthy. Existing
+doctor NDJSON and frozen check identifiers/severities remain unchanged.
+
+Argument, configuration or runtime failures instead have `status: "error"`,
+`exit_code: 1`, and `failure: {phase, code, subject, expected}`. Codes are
+`invalid_arguments`, `invalid_environment`, and `diagnostic_failed` respectively;
+nullable subject/expected provide context without including supplied bad values.
+An option after `--data-dir` is a missing value; prefix a path beginning with `-`
+with `./` to pass it as a directory.
+Findings' human messages are not stable identifiers and can include deployment
+paths or collection names: treat diagnostic reports as deployment information.
+Help is prose; disabled builds retain the existing nonzero stderr guidance, not
+a JSON error envelope. Output-device failures and process termination cannot
+guarantee a complete document.
+Keep stdout separate from stderr: merging log output into the same stream is not
+a JSON document contract. Diagnostics and capabilities respect the inherited
+stdout file offset when redirected; they do not overwrite earlier file content.
+
+The adapter is **not offline/read-only**: it loads deployment configuration,
+probes filesystem writability, opens the database and may initialize a migration
+ledger. Use an authorized isolated development data directory. Report memory
+scales with the existing doctor's deployment findings; buffering the document
+does not impose a global memory cap. The adapter and catalog compile out with
+`-Ddev-tools=false`; ordinary doctor remains available.
 
 ### Offline compiled routes
 

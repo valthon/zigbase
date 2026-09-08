@@ -110,6 +110,7 @@ done
 DEVTOOLS_PATTERNS=(
   "tuning\." # offline measurement advisor must disappear too
   "agent_capabilities\." # offline discovery catalog must disappear too
+  "agent_diagnostics\." # development diagnostic adapter must disappear too
   "route_discovery\." # compiled route inventory is development-only
   "scaffold\."   # src/scaffold.zig + src/scaffold/** (init, agents-md)
   "codegen\."    # src/codegen/** (typegen — ~24 files, the largest of the three) — the
