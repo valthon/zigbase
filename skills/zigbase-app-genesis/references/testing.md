@@ -14,6 +14,62 @@ If you are writing a Zig app on ZigBase, `zigbase.testing` is the default and
 most of your tests belong there. Reach for a spawned server for the things
 in-process testing structurally cannot see.
 
+## Focused repository test execution
+
+For contributors working inside a **trusted ZigBase checkout**, the standard-library
+Python tool `tools/agent_tests.py` provides static JSON test inventory, exact
+module/function selection, and bounded structured execution reports. It is not
+part of an embedded app or the server CLI and adds no deployed resource cost.
+
+```sh
+# Toolchain versions are pinned in mise.toml. Install test prerequisites explicitly:
+mise exec python@3.13 -- python -m pip install pytest playwright
+mise exec python@3.13 -- python -m playwright install chromium
+# No tests or conftest are imported by inventory:
+mise exec python@3.13 -- python tools/agent_tests.py inventory
+# A module ID selects a group; a function ID selects all its parametrizations:
+mise exec python@3.13 -- python tools/agent_tests.py run \
+  --selector tests/admin/test_capabilities.py --timeout-seconds 180
+```
+
+Inventory covers selected agent/route/tuning/schema/files/realtime pytest modules
+and binary-resolver tooling. Item `requirements` conservatively describe module
+setup; non-browser selections do not need Chromium. Admin fixtures build the
+appropriate binaries when necessary; the advertised prebuilt override is
+`ZIGBASE_TEST_BINARY`. Build time counts toward the execution deadline. Prepare binaries
+before a short run if needed. A function's ID is not a fully collected pytest
+node list: parametrized cases run together, and class methods/dynamic cases are
+not individually advertised. Zig unit tests and SDK suites still use their
+existing runners. No changed-file dependency inference or full-suite coverage
+claim is made; continue running the complete relevant CI suites before shipping.
+
+`run` only accepts inventory IDs and fixed pytest argv, not arbitrary executables,
+options, paths or shell strings. It runs from the checkout root, removes
+`PYTEST_ADDOPTS` and `PYTEST_PLUGINS`, disables plugin autoload, and forces foreground
+server mode. Child processes receive `MISE_AUTO_INSTALL=false`; install toolchains
+explicitly before running. Existing repository Playwright fixtures work without an external
+pytest plugin. Other environment settings remain inherited, and the repository
+and toolchain remain trusted executable code: **this is not a sandbox**. Tests can
+write, build, open sockets and access the network with the caller's authority.
+
+Defaults are 120 seconds and 64 KiB **combined child stdout/stderr**, configurable
+within 1–900 seconds and 1 byte–1 MiB. Excess output or time kills the process
+group; ordinary group descendants are also cleaned up on completion. Reaping
+adds at most two seconds; group-escaping children and process RSS/disk/network
+usage are not contained. Output is UTF-8 with replacement for invalid bytes;
+JSON escaping may expand beyond the raw-byte cap. Do not merge unrelated stderr
+into the JSON stdout stream, and treat captured output as untrusted information.
+
+Reports distinguish process success/failure, timeout, output-limit, execution and
+cleanup errors. They include argv, limits, child exit status, duration and bounded
+output. `cleanup_failed` reports cleanup failure separately without replacing a
+test-failure, timeout, output-limit or execution-error outcome; `cleanup_error` is used when
+cleanup alone fails. `test_counts: null` deliberately avoids inferring counts from human pytest
+text. A passed process may have skipped tests. Exit codes are 0 for successful
+inventory/passed execution, 1 for an unsuccessful run, and 2 for argument/selector/
+inventory failures. The complete machine contract and boundary notes are in
+[the agent guide](https://github.com/valthon/zigbase/blob/main/docs/agents.md#focused-repository-tests).
+
 ## Performance contracts
 
 Performance contracts are offline build/CI tooling, not application runtime

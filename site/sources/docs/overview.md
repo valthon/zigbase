@@ -136,3 +136,10 @@ The catalog separates required-input descriptors from runnable arguments,
 so an agent can discover the tuning advisor's input contract. `zigbase diagnostics`
 wraps doctor checks in versioned JSON with structured failures; it retains doctor's
 deployment probes and possible database writes, not an offline safety guarantee.
+
+Contributors in the ZigBase checkout can also use `tools/agent_tests.py` for
+static JSON test inventory and focused pytest execution with time and combined
+output limits. It runs only advertised module/function selectors and reports
+structured process outcomes. This is trusted repository tooling, not an embedded
+app executor or a sandbox; it adds no code to deployed binaries. See the
+[agent guide](../../../docs/agents.md#focused-repository-tests) for setup and coverage limits.
