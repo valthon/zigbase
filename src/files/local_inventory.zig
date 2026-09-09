@@ -22,6 +22,7 @@ const Scan = struct {
     }
 
     fn visit(self: *Scan, dir: std.Io.Dir, prefix: []const u8, depth: u8, name: []const u8, hint: std.Io.File.Kind) !void {
+        if (depth == 0 and std.mem.eql(u8, name, @import("maintenance.zig").lock_name)) return;
         if (hint != .file and hint != .directory and hint != .unknown) return;
         // d_type is only a hint (DT_UNKNOWN is common on network filesystems).
         // Resolve actual type without following links, including replacement races.

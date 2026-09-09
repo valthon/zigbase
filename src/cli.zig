@@ -37,6 +37,14 @@ pub const FileInventoryArgs = struct {
     limit: u16 = 100,
 };
 
+pub const FileReconcileArgs = struct {
+    data_dir: ?[]const u8 = null,
+    cursor: ?[]const u8 = null,
+    limit: u16 = 100,
+    min_age_seconds: u32 = 86400,
+    apply: bool = false,
+};
+
 pub const ServeControlArgs = struct {
     verb: ServeControlVerb,
     data_dir: ?[]const u8 = null,
@@ -240,6 +248,7 @@ pub const Command = union(enum) {
     /// `doctor` -> preflight checks over config/data-dir/schema.
     doctor: DoctorArgs,
     file_inventory: FileInventoryArgs,
+    file_reconcile: FileReconcileArgs,
     /// `init` -> scaffold a project into a directory and exit.
     init: InitArgs,
     /// `agents-md` -> write AGENTS.md + CLAUDE.md for an existing project and exit.
@@ -338,6 +347,33 @@ pub fn parse(args: []const []const u8, popts: ParseOpts) ParseError!Command {
         return .{ .help = .top };
     if (std.mem.eql(u8, args[0], "files")) {
         if (args.len == 1 or isHelpFlag(args[1])) return .{ .help = .files };
+        if (std.mem.eql(u8, args[1], "reconcile")) {
+            var fa = FileReconcileArgs{};
+            var i: usize = 2;
+            while (i < args.len) : (i += 1) {
+                const flag = args[i];
+                if (isHelpFlag(flag)) return .{ .help = .files };
+                if (std.mem.eql(u8, flag, "--json")) continue;
+                if (std.mem.eql(u8, flag, "--apply")) {
+                    fa.apply = true;
+                    continue;
+                }
+                if (!std.mem.eql(u8, flag, "--limit") and !std.mem.eql(u8, flag, "--cursor") and !std.mem.eql(u8, flag, "--data-dir") and !std.mem.eql(u8, flag, "--min-age-seconds")) return ParseError.UnknownFlag;
+                i += 1;
+                if (i == args.len) return ParseError.MissingValue;
+                if (std.mem.eql(u8, flag, "--data-dir")) fa.data_dir = args[i] else if (std.mem.eql(u8, flag, "--cursor")) {
+                    if (args[i].len == 0 or args[i].len > 4096) return ParseError.BadValue;
+                    fa.cursor = args[i];
+                } else if (std.mem.eql(u8, flag, "--min-age-seconds")) {
+                    fa.min_age_seconds = std.fmt.parseInt(u32, args[i], 10) catch return ParseError.BadValue;
+                    if (fa.min_age_seconds == 0 or fa.min_age_seconds > 31536000) return ParseError.BadValue;
+                } else {
+                    fa.limit = std.fmt.parseInt(u16, args[i], 10) catch return ParseError.BadValue;
+                    if (fa.limit == 0 or fa.limit > 1000) return ParseError.BadValue;
+                }
+            }
+            return .{ .file_reconcile = fa };
+        }
         if (!std.mem.eql(u8, args[1], "inventory")) return ParseError.UnknownCommand;
         var fa = FileInventoryArgs{};
         var i: usize = 2;
@@ -1348,6 +1384,20 @@ test "files inventory parses pagination and rejects unsafe bounds" {
         try std.testing.expectError(ParseError.BadValue, parse(&.{ "files", "inventory", "--limit", bad }, .{}));
     try std.testing.expectError(ParseError.UnknownFlag, parse(&.{ "files", "inventory", "--delete" }, .{}));
     try std.testing.expectError(ParseError.MissingValue, parse(&.{ "files", "inventory", "--cursor" }, .{}));
+}
+
+test "files reconcile is dry-run by default and validates destructive batch bounds" {
+    const plain = try parse(&.{ "files", "reconcile" }, .{});
+    try std.testing.expect(!plain.file_reconcile.apply);
+    try std.testing.expectEqual(@as(u32, 86400), plain.file_reconcile.min_age_seconds);
+    const explicit = try parse(&.{ "files", "reconcile", "--apply", "--limit", "2", "--min-age-seconds", "60" }, .{});
+    try std.testing.expect(explicit.file_reconcile.apply);
+    try std.testing.expectEqual(@as(u16, 2), explicit.file_reconcile.limit);
+    for ([_][]const u8{ "0", "1001", "-1" }) |value|
+        try std.testing.expectError(ParseError.BadValue, parse(&.{ "files", "reconcile", "--limit", value }, .{}));
+    for ([_][]const u8{ "0", "31536001", "-1" }) |value|
+        try std.testing.expectError(ParseError.BadValue, parse(&.{ "files", "reconcile", "--min-age-seconds", value }, .{}));
+    try std.testing.expectError(ParseError.UnknownFlag, parse(&.{ "files", "reconcile", "--delete-all" }, .{}));
 }
 
 test "serve wait validates its bounded timeout and output options" {

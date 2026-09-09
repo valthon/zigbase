@@ -98,6 +98,14 @@ trust it over any document, including this one.
 
 ## Machine-readable CLI discovery
 
+With `-Dfile-inventory=true`, the catalog includes separate
+`files-reconcile-preview` (`read_only`) and `files-reconcile-apply` (`may_write`)
+operations. Apply requires explicit operator authorization and stopped writers;
+never turn a preview candidate or pagination cursor into automatic approval.
+Both operations support only built-in local storage with SQLite. See
+[offline reconciliation](https://github.com/valthon/zigbase/blob/main/docs/framework.md#offline-orphan-reconciliation-opt-in-cli)
+for bounds, lease requirements and irreversible partial-failure semantics.
+
 Run `zigbase capabilities --json` before choosing an inspection command. It returns
 one JSON object with `protocol_version: 1` and a bounded `operations` catalog.
 Each entry has a stable `id`, an `argv` array (arguments after the executable,

@@ -612,7 +612,15 @@ def test_the_attachment_lands_where_the_file_api_looks_for_it(
         for path in storage.rglob("*")
         if path.is_file()
     }
-    assert on_disk == {"posts/1/morning-pages-cover.png"}
+    # Booted local storage also owns a permanent coordination file. Keep the
+    # whole-tree assertion exact: do not hide arbitrary dotfiles or extra blobs.
+    assert on_disk == {
+        ".zigbase-maintenance.lock",
+        "posts/1/morning-pages-cover.png",
+    }
+    maintenance = storage / ".zigbase-maintenance.lock"
+    assert not maintenance.is_symlink()
+    assert maintenance.read_bytes() == b""
 
     plan = json.loads((migrated.bundle / "files" / "manifest.json").read_text())[
         "files"

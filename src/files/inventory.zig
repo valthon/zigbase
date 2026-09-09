@@ -10,6 +10,17 @@ pub const Reference = enum { referenced, candidate_unreferenced, unknown };
 /// Self-freeing scratch: parsed collection/record graphs live only for this one
 /// lookup. Unknown layouts/read failures must not be promoted to orphan claims.
 pub fn reference(alloc: std.mem.Allocator, conn: *db.Db, key: []const u8) Reference {
+    return referenceWithPolicy(alloc, conn, key, .inventory);
+}
+
+/// Fresh lookup with stricter metadata eligibility for offline reconciliation.
+/// Shares one collection parse with the physical-record lookup; never caches
+/// across the observation and immediately-before-unlink revalidation calls.
+pub fn reconciliationReference(alloc: std.mem.Allocator, conn: *db.Db, key: []const u8) Reference {
+    return referenceWithPolicy(alloc, conn, key, .reconciliation);
+}
+
+fn referenceWithPolicy(alloc: std.mem.Allocator, conn: *db.Db, key: []const u8, policy: enum { inventory, reconciliation }) Reference {
     var parts = std.mem.splitScalar(u8, key, '/');
     const col_name = parts.next() orelse return .unknown;
     const rid = parts.next() orelse return .unknown;
@@ -21,7 +32,13 @@ pub fn reference(alloc: std.mem.Allocator, conn: *db.Db, key: []const u8) Refere
     var scratch = std.heap.ArenaAllocator.init(alloc);
     defer scratch.deinit();
     const a = scratch.allocator();
-    const col = (collections.get(a, conn, col_name) catch return .unknown) orelse return .candidate_unreferenced;
+    const col = (collections.get(a, conn, col_name) catch return .unknown) orelse return if (policy == .reconciliation) .unknown else .candidate_unreferenced;
+    if (policy == .reconciliation) {
+        // A collection ID alias is not its physical storage prefix. Missing or
+        // encrypted metadata cannot establish plaintext file ownership safely.
+        if (!std.mem.eql(u8, col.name, col_name)) return .unknown;
+        for (col.fields) |field| if (field.options == .file and field.encrypted) return .unknown;
+    }
     // Maintenance references are physical, not public visibility. Expired rows
     // still own blobs until GC deletes them; hidden file fields own blobs too.
     // Project only file columns, making their copies visible to the at-rest
@@ -130,4 +147,46 @@ test "reference classification and usage never treat unknown layouts as orphan p
     try std.testing.expect(std.mem.indexOf(u8, output, "\"bytes\":7") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "\"candidateUnreferenced\":1") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "not-snapshot") != null);
+}
+
+test "reconciliation parses metadata once per fresh check and preserves stricter eligibility" {
+    const a = std.testing.allocator;
+    const c = @import("../c.zig").c;
+    var conn = try db.Db.open(":memory:");
+    defer conn.close();
+    try @import("../migrations.zig").run(&conn);
+    const col = try collections.create(a, std.testing.io, &conn, .{
+        .id = "",
+        .name = "images",
+        .fields = &.{.{ .id = "photo", .name = "photo", .hidden = true, .options = .{ .file = .{} } }},
+    });
+    defer col.deinit(a);
+    try conn.exec("INSERT INTO images (id, created, updated, photo) VALUES ('r1','','','a.png');");
+    const Reads = struct {
+        fn callback(context: ?*anyopaque, action: c_int, table: [*c]const u8, column: [*c]const u8, _: [*c]const u8, _: [*c]const u8) callconv(.c) c_int {
+            const count: *usize = @ptrCast(@alignCast(context.?));
+            if (action == c.SQLITE_READ and table != null and column != null and
+                std.mem.eql(u8, std.mem.span(table), "_collections") and std.mem.eql(u8, std.mem.span(column), "schema")) count.* += 1;
+            return c.SQLITE_OK;
+        }
+    };
+    var metadata_reads: usize = 0;
+    // Count schema-column reads without enabling SQLite's omitted tracing code.
+    try std.testing.expectEqual(c.SQLITE_OK, c.sqlite3_set_authorizer(db.sqliteHandle(&conn), Reads.callback, &metadata_reads));
+    defer std.testing.expectEqual(c.SQLITE_OK, c.sqlite3_set_authorizer(db.sqliteHandle(&conn), null, null)) catch unreachable;
+    try std.testing.expectEqual(Reference.referenced, reconciliationReference(a, &conn, "images/r1/a.png"));
+    try std.testing.expectEqual(@as(usize, 1), metadata_reads);
+    try conn.exec("UPDATE _collections SET schema=replace(schema, '\"encrypted\":false', '\"encrypted\":true') WHERE name='images';");
+    metadata_reads = 0;
+    // A second check must observe schema drift, not reuse the first parse.
+    try std.testing.expectEqual(Reference.unknown, reconciliationReference(a, &conn, "images/r1/a.png"));
+    try std.testing.expectEqual(@as(usize, 1), metadata_reads);
+    // Inventory remains an observation with its original missing/alias semantics.
+    try std.testing.expectEqual(Reference.referenced, reference(a, &conn, "images/r1/a.png"));
+    try std.testing.expectEqual(Reference.candidate_unreferenced, reference(a, &conn, "missing/r1/a.png"));
+    try std.testing.expectEqual(Reference.unknown, reconciliationReference(a, &conn, "missing/r1/a.png"));
+    const alias = try std.fmt.allocPrint(a, "{s}/r1/a.png", .{col.id});
+    defer a.free(alias);
+    try std.testing.expectEqual(Reference.referenced, reference(a, &conn, alias));
+    try std.testing.expectEqual(Reference.unknown, reconciliationReference(a, &conn, alias));
 }

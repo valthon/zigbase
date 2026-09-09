@@ -19,7 +19,7 @@ cd "$(dirname "$0")/.."
 # A separate build-flag axis. The build job checks absence in its stock binary;
 # the S3 job invokes the paired mode against explicit off/on binaries as a
 # positive control, so renamed patterns cannot silently make the test vacuous.
-INVENTORY_PATTERNS=('files\.inventory\.' 'files\.local_inventory\.' 'fileInventoryRun')
+INVENTORY_PATTERNS=('files\.inventory\.' 'files\.local_inventory\.' 'fileInventoryRun' 'files\.reconcile\.' 'fileReconcileRun')
 check_inventory() {
   local off=$1 on=${2:-} symbols pattern
   symbols=$(nm --defined-only "$off")

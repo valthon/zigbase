@@ -22,6 +22,30 @@ So a flag overrides the matching environment variable, which overrides the defau
 
 ## CLI commands
 
+### Offline storage maintenance
+
+Build with `-Dfile-inventory=true` to include `zigbase files reconcile`. It emits
+JSON and defaults to a read-only preview; built-in local storage plus SQLite is
+required in both modes. S3/PostgreSQL/custom backends are refused.
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--data-dir PATH` | configured data directory | Existing database and storage root |
+| `--limit N` | `100` | Page size, 1–1,000 |
+| `--cursor KEY` | none | Previous `nextCursor`, not a deletion approval/snapshot |
+| `--min-age-seconds N` | `86400` | Grace period, 1–31,536,000 seconds |
+| `--apply` | off | Irreversible bounded deletion after exclusive root lease and database writer lock |
+| `--json` | JSON is always emitted | Explicit output-format spelling |
+
+Apply refuses cooperating running apps, including `serve --ignore-lock`. Stop
+older/external writers yourself and keep the root dedicated to one database.
+Every built-in local-storage app holds one boot-lifetime maintenance descriptor,
+even without this CLI enabled; never remove its permanent lock file. Age alone
+does not prove an upload has finished. See [offline reconciliation](./framework#offline-orphan-reconciliation-opt-in-cli)
+for retained unknown metadata, pagination bounds and partial-failure semantics.
+
+### Server and common commands
+
 ```text
 zigbase serve [--http-host H] [--http-port N] [--data-dir PATH] [--serve-static DIR]
               [--insecure-cookies] [--trust-proxy] [--realtime-origins CSV]
