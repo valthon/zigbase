@@ -36,7 +36,7 @@ import kotlinx.serialization.json.JsonPrimitive
 /*
  * The HTTP engine every ZigBase Kotlin service builds on: header assembly,
  * JSON/multipart bodies, the 401 single-flight refresh state machine, and
- * 429 backoff.
+ * 429/admission-overload backoff.
  *
  * Port of `SyncTransport`/`AsyncTransport` in
  * `clients/python/src/zigbase/_transport.py` (the normative reference --
@@ -104,13 +104,13 @@ internal class Transport internal constructor(
 
     /**
      * Escape hatch: performs exactly one HTTP call and returns the
-     * [HttpResponse] as-is -- no error mapping, no 401 refresh, no 429
-     * retry. Auth/lang/account headers and body encoding still apply.
+     * [HttpResponse] as-is -- no error mapping, no 401 refresh, no
+     * retries. Auth/lang/account headers and body encoding still apply.
      */
     suspend fun rawRequest(spec: RequestSpec): HttpResponse = performOnce(spec)
 
     /**
-     * Performs [spec], following the 401-refresh/429-backoff state machine,
+     * Performs [spec], following the refresh and bounded backoff state machine,
      * and returns the parsed JSON body (or `null` for a 204/empty body).
      * Throws [ZigbaseException] for a non-2xx response that survives that
      * state machine.
@@ -209,14 +209,32 @@ internal class Transport internal constructor(
                 }
             }
 
-            if (response.status == HttpStatusCode.TooManyRequests && attempt < maxRetries) {
+            // Preserve status-only 429 retries without decoding their bodies.
+            val error =
+                if (response.status == HttpStatusCode.ServiceUnavailable) {
+                    parseErrorResponse(
+                        response.status.value,
+                        response.bodyAsText(),
+                        response.call.request.url
+                            .toString(),
+                        response.status.description.ifBlank { null },
+                    )
+                } else {
+                    null
+                }
+            // Only admission overload guarantees rejection before routing.
+            // A generic 503 may follow a write and must not be retried.
+            val retryable =
+                response.status == HttpStatusCode.TooManyRequests ||
+                    error?.code == "overloaded"
+            if (retryable && attempt < maxRetries) {
                 val delayMs = computeBackoff(response.headers[HttpHeaders.RetryAfter], attempt)
                 attempt += 1
                 delayFn(delayMs)
                 continue
             }
 
-            throw parseErrorResponse(
+            throw error ?: parseErrorResponse(
                 response.status.value,
                 response.bodyAsText(),
                 response.call.request.url

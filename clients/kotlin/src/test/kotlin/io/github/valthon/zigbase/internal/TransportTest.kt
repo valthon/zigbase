@@ -43,6 +43,99 @@ import java.io.IOException
  */
 @OptIn(ExperimentalCoroutinesApi::class)
 class TransportTest {
+    @Test
+    fun `admission overload retries writes without duplicating effects`() =
+        runTest {
+            for (method in listOf(HttpMethod.Post, HttpMethod.Patch, HttpMethod.Delete)) {
+                var calls = 0
+                var effects = 0
+                val delays = mutableListOf<Long>()
+                val transport =
+                    makeTransport(maxRetries = 2, delayFn = { delays.add(it) }) { req ->
+                        assertEquals(method, req.method)
+                        assertEquals("{\"value\":1}", req.body.toByteArray().decodeToString())
+                        if (++calls <= 2) {
+                            respond(
+                                "{\"code\":\"overloaded\"}",
+                                HttpStatusCode.ServiceUnavailable,
+                                headersOf(HttpHeaders.RetryAfter, "1"),
+                            )
+                        } else {
+                            effects++
+                            respond("", HttpStatusCode.NoContent)
+                        }
+                    }
+                assertNull(transport.request(RequestSpec(method, "/api/write", body = buildJsonObject { put("value", 1) })))
+                assertEquals(3, calls)
+                assertEquals(1, effects)
+                assertEquals(listOf(1000L, 1000L), delays)
+            }
+        }
+
+    @Test
+    fun `admission overload retries are bounded and disabled by zero`() =
+        runTest {
+            for (maxRetries in listOf(0, 2)) {
+                var calls = 0
+                val delays = mutableListOf<Long>()
+                val transport =
+                    makeTransport(maxRetries = maxRetries, delayFn = { delays.add(it) }) {
+                        calls++
+                        respond("{\"code\":\"overloaded\"}", HttpStatusCode.ServiceUnavailable)
+                    }
+                val error =
+                    assertFailsWithSuspend<ZigbaseException> {
+                        transport.request(RequestSpec(HttpMethod.Post, "/api/write"))
+                    }
+                assertEquals(503, error.status)
+                assertEquals("overloaded", error.code)
+                assertEquals(maxRetries + 1, calls)
+                assertEquals(if (maxRetries == 0) emptyList<Long>() else listOf(200L, 400L), delays)
+            }
+        }
+
+    @Test
+    fun `generic and malformed 503 never retries writes`() =
+        runTest {
+            for (body in listOf(
+                "oops",
+                "null",
+                "[]",
+                "{\"code\":503}",
+                "{\"code\":\"unavailable\"}",
+                "{\"data\":{\"x\":{\"code\":\"overloaded\",\"message\":\"field\"}}}",
+            )) {
+                var calls = 0
+                val transport =
+                    makeTransport(delayFn = { throw AssertionError("must not sleep") }) {
+                        calls++
+                        respond(body, HttpStatusCode.ServiceUnavailable, headersOf(HttpHeaders.RetryAfter, "1"))
+                    }
+                val error =
+                    assertFailsWithSuspend<ZigbaseException> {
+                        transport.request(RequestSpec(HttpMethod.Post, "/api/write"))
+                    }
+                assertEquals(503, error.status)
+                assertEquals(1, calls)
+            }
+        }
+
+    @Test
+    fun `raw bypasses overload retries`() =
+        runTest {
+            var calls = 0
+            val transport =
+                makeTransport {
+                    calls++
+                    respond("{\"code\":\"overloaded\"}", HttpStatusCode.ServiceUnavailable)
+                }
+            assertEquals(
+                HttpStatusCode.ServiceUnavailable,
+                transport.rawRequest(RequestSpec(HttpMethod.Post, "/api/write")).status,
+            )
+            assertEquals(1, calls)
+        }
+
     /** Runs [block] and returns the thrown [T], or fails if nothing was thrown. Suspend-friendly [assertThrows]. */
     private suspend inline fun <reified T : Throwable> assertFailsWithSuspend(noinline block: suspend () -> Unit): T {
         try {

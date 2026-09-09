@@ -15,6 +15,22 @@ same cursor-pagination semantics — with a few deliberate divergences called ou
 WebSocket [realtime](#realtime) and a generated [typed tier](#typed-tier) both ship in this
 release; the TypeScript/Dart SDKs' live-store observables are **not** — see that section.
 
+## Admission overload and retries
+
+Normal SDK requests share one retry budget for HTTP 429 and ZigBase's admission
+rejection: HTTP 503 with a JSON envelope whose top-level string `code` is
+`"overloaded"`. Admission rejects before routing, so these recognized responses
+can be retried even for POST, PATCH, and DELETE without duplicating a write.
+Do not use this reserved code for application errors after side effects.
+
+Retries honor a positive numeric `Retry-After` in seconds; absent or invalid
+values use exponential backoff starting at 200 ms, capped at 30 seconds.
+The configured budget counts retries, not the initial attempt; exhaustion
+raises the final normal SDK error. Generic 503s, malformed envelopes, and
+body-less responses (including overloaded HEAD requests) are not recognized
+and are not retried. Raw requests always make one attempt without retry or
+error mapping.
+
 ## Install
 
 **Not yet published to PyPI.** The publishing workflow
@@ -95,7 +111,7 @@ zb = ZigBase(
 | `auth_collection` | `None` | The auth collection used for automatic refresh (e.g. `"users"`). |
 | `account_id` | `None` | Bakes `X-Account-Id` into every request from this client (multi-tenancy). |
 | `lang` | `None` | `Accept-Language` for localized server errors. |
-| `max_retries` | `3` | 429-backoff retry budget. |
+| `max_retries` | `3` | Shared retry budget for HTTP 429 and recognized admission overload (503 with JSON `code: "overloaded"`); `0` disables retries. |
 | `http_client` | a fresh `httpx.Client()` / `httpx.AsyncClient()` | Override the HTTP transport (tests, connection pooling, custom `timeout=`/proxies — see [Divergences](#divergences-from-the-typescriptdart-sdks)). |
 
 ### Ownership & `close()`

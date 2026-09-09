@@ -248,6 +248,13 @@ from the same binary) are always allowed, so only a separate-origin frontend nee
 
 ## See also
 
+For request backpressure, compile `.admission = .{ .max_requests = 3 }` into your
+app. Excess synchronous HTTP callbacks receive 503 with `Retry-After: 1`, not an
+additional waiting queue. Superusers can inspect `/api/admission/stats` for active,
+high-water and rejected counts; this endpoint obeys the same limit. Omission
+compiles out the checks and counters. This does not bound transport-buffered
+bodies, long-lived realtime sessions, background jobs, or total RSS.
+
 `zigbase tune --input measurements.json` compares observed throughput, p95 latency,
 and peak RSS against explicit budgets. Pair it with comptime resource profiles;
 the offline advisor never changes production settings. The framework guide includes

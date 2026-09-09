@@ -16,6 +16,22 @@ tier](#typed-tier): `zigbase typegen --lang kotlin` emits `@Serializable` record
 injection-safe fluent filter builder, and typed collection/realtime services over a new
 `io.github.valthon.zigbase.typed` runtime.
 
+## Admission overload and retries
+
+Normal SDK requests share one retry budget for HTTP 429 and ZigBase's admission
+rejection: HTTP 503 with a JSON envelope whose top-level string `code` is
+`"overloaded"`. Admission rejects before routing, so these recognized responses
+can be retried even for POST, PATCH, and DELETE without duplicating a write.
+Do not use this reserved code for application errors after side effects.
+
+Retries honor a positive numeric `Retry-After` in seconds; absent or invalid
+values use exponential backoff starting at 200 ms, capped at 30 seconds.
+The configured budget counts retries, not the initial attempt; exhaustion
+raises the final normal SDK error. Generic 503s, malformed envelopes, and
+body-less responses (including overloaded HEAD requests) are not recognized
+and are not retried. Raw requests always make one attempt without retry or
+error mapping.
+
 ## Install
 
 **Not yet published to Maven Central.** The publishing workflow (`release-kotlin-sdk.yml`)
@@ -104,7 +120,7 @@ val zb =
 | `authCollection` | `null` | The auth collection used for automatic refresh (e.g. `"users"`). |
 | `accountId` | `null` | Bakes `X-Account-Id` into every request from this client (multi-tenancy). |
 | `lang` | `null` | `Accept-Language` for localized server errors. |
-| `maxRetries` | `3` | 429-backoff retry budget. |
+| `maxRetries` | `3` | Shared retry budget for HTTP 429 and recognized admission overload (503 with JSON `code: "overloaded"`); `0` disables retries. |
 | `httpClient` | a fresh Ktor `HttpClient(CIO)` | Override the HTTP transport (tests, connection pooling, custom timeouts — see [Divergences](#divergences-and-whats-next)). |
 
 ### Ownership & `close()`

@@ -43,6 +43,135 @@ Transport _transport(
 }
 
 void main() {
+  group('admission overload', () {
+    const overload = '{"code":"overloaded","message":"busy"}';
+    test('429 retries without decoding invalid UTF-8 JSON', () async {
+      var calls = 0;
+      final delays = <Duration>[];
+      final invalidUtf8 = http.Response.bytes([0xff], 429,
+          headers: {'content-type': 'application/json; charset=utf-8'});
+      expect(() => invalidUtf8.body, throwsFormatException);
+      final t = _transport(
+          MockClient((_) async {
+            if (++calls == 1) {
+              return invalidUtf8;
+            }
+            return http.Response('', 204);
+          }),
+          maxRetries: 1,
+          sleep: (d) async {
+            delays.add(d);
+          });
+      expect(await t.send('/api/write', method: 'POST'), isNull);
+      expect(calls, 2);
+      expect(delays, [const Duration(milliseconds: 200)]);
+    });
+    for (final retryAfter in ['Infinity', '-Infinity', 'NaN', 'invalid']) {
+      test('invalid Retry-After $retryAfter uses fallback', () async {
+        var calls = 0;
+        final delays = <Duration>[];
+        final t = _transport(
+            MockClient((_) async {
+              if (++calls == 1) {
+                return http.Response(overload, 503,
+                    headers: {'retry-after': retryAfter});
+              }
+              return http.Response('', 204);
+            }),
+            maxRetries: 1,
+            sleep: (d) async {
+              delays.add(d);
+            });
+        expect(await t.send('/api/write', method: 'POST'), isNull);
+        expect(calls, 2);
+        expect(delays, [const Duration(milliseconds: 200)]);
+      });
+    }
+    for (final method in ['POST', 'PATCH', 'DELETE']) {
+      test('retries pre-routing rejection for $method', () async {
+        var calls = 0;
+        var effects = 0;
+        final delays = <Duration>[];
+        final t = _transport(
+            MockClient((req) async {
+              expect(req.method, method);
+              expect(req.body, '{"value":1}');
+              if (++calls <= 2) {
+                return http.Response(overload, 503,
+                    headers: {'retry-after': '1'});
+              }
+              effects++;
+              return http.Response('', 204);
+            }),
+            maxRetries: 2,
+            sleep: (d) async {
+              delays.add(d);
+            });
+        expect(await t.send('/api/write', method: method, body: {'value': 1}),
+            isNull);
+        expect([calls, effects], [3, 1]);
+        expect(
+            delays, [const Duration(seconds: 1), const Duration(seconds: 1)]);
+      });
+    }
+    for (final maxRetries in [0, 2]) {
+      test('bounds overload retries with maxRetries=$maxRetries', () async {
+        var calls = 0;
+        final delays = <Duration>[];
+        final t = _transport(
+            MockClient((_) async {
+              calls++;
+              return http.Response(overload, 503);
+            }),
+            maxRetries: maxRetries,
+            sleep: (d) async {
+              delays.add(d);
+            });
+        await expectLater(
+            t.send('/api/write', method: 'POST'),
+            throwsA(isA<ZigbaseException>()
+                .having((e) => e.status, 'status', 503)
+                .having((e) => e.code, 'code', 'overloaded')));
+        expect(calls, maxRetries + 1);
+        expect(delays.map((d) => d.inMilliseconds).toList(),
+            maxRetries == 0 ? <int>[] : [200, 400]);
+      });
+    }
+    for (final body in [
+      'oops',
+      'null',
+      '[]',
+      '{"code":503}',
+      '{"code":"unavailable"}',
+      '{"data":{"x":{"code":"overloaded","message":"field"}}}'
+    ]) {
+      test('does not retry generic or malformed 503: $body', () async {
+        var calls = 0;
+        final t = _transport(MockClient((_) async {
+          calls++;
+          return http.Response(body, 503, headers: {'retry-after': '1'});
+        }), sleep: (_) async {
+          fail('must not sleep');
+        });
+        await expectLater(
+            t.send('/api/write', method: 'POST'),
+            throwsA(isA<ZigbaseException>()
+                .having((e) => e.status, 'status', 503)));
+        expect(calls, 1);
+      });
+    }
+    test('raw preserves overload body without retry', () async {
+      var calls = 0;
+      final t = _transport(MockClient((_) async {
+        calls++;
+        return http.Response(overload, 503);
+      }));
+      final response = await t.raw('/api/write', method: 'POST');
+      expect(response.statusCode, 503);
+      expect(response.body, overload);
+      expect(calls, 1);
+    });
+  });
   group('buildUrl', () {
     test('joins base + path, skips null query values, url-encodes', () {
       final t = _transport(MockClient((_) async => http.Response('', 204)),

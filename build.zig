@@ -435,6 +435,29 @@ pub fn build(b: *std.Build) void {
     const full_fix_step = b.step("full-fixture", "Build the gating-invariant positive-control fixture (Debug, unstripped)");
     full_fix_step.dependOn(&b.addInstallArtifact(full_fix_exe, .{}).step);
 
+    const admission_mod = b.createModule(.{
+        .root_source_file = b.path("fixtures/admission/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    admission_mod.addImport("zigbase", zigbase_mod);
+    const admission_exe = b.addExecutable(.{ .name = "admission-fixture", .root_module = admission_mod });
+    b.step("admission-fixture", "Build concurrent HTTP admission fixture").dependOn(&b.addInstallArtifact(admission_exe, .{}).step);
+    const admission_contracts = b.step("check-admission-contracts", "Check HTTP admission compile-time contracts");
+    inline for (&.{
+        .{ .name = "nonstruct", .expected = ".admission must be a struct with .max_requests (positive u32)" },
+        .{ .name = "zero", .expected = ".admission.max_requests must be positive; omit .admission to disable" },
+        .{ .name = "missing", .expected = ".admission requires .max_requests (positive u32)" },
+        .{ .name = "unknown", .expected = "unknown .admission field: queue_size" },
+    }) |invalid| {
+        const mod = b.createModule(.{ .root_source_file = b.path("fixtures/admission/" ++ invalid.name ++ ".zig"), .target = target, .optimize = optimize, .link_libc = true });
+        mod.addImport("zigbase", zigbase_mod);
+        const invalid_admission_exe = b.addExecutable(.{ .name = "invalid-admission-" ++ invalid.name, .root_module = mod });
+        invalid_admission_exe.expect_errors = .{ .contains = invalid.expected };
+        admission_contracts.dependOn(&invalid_admission_exe.step);
+    }
+
     // Unit tests run against the library module (where all internal test{} live).
     const tests = b.addTest(.{ .root_module = zigbase_mod });
     const run_tests = b.addRunArtifact(tests);

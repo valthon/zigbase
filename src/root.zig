@@ -354,6 +354,7 @@ pub const codegen = struct {
 // so its `test {}` blocks are analyzed and run (matches pre-restructure behavior
 // where main.zig's import graph reached them).
 test {
+    _ = @import("admission.zig");
     if (@import("devtools.zig").enabled) _ = @import("agent_capabilities.zig");
     if (@import("devtools.zig").enabled) _ = @import("agent_diagnostics.zig");
     if (@import("devtools.zig").enabled) _ = @import("route_discovery.zig");

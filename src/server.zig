@@ -35,6 +35,14 @@ const static_files = @import("static_files.zig");
 
 const internal_error_envelope = "{\"status\":500,\"code\":\"internal\",\"message\":\"Something went wrong.\",\"data\":{}}";
 const ApiError = @import("api/error.zig").ApiError;
+
+fn overloadResponse() http.Response {
+    return .{
+        .status = 503,
+        .body = "{\"status\":503,\"code\":\"overloaded\",\"message\":\"Request capacity exhausted. Retry later.\",\"data\":{}}",
+        .extra_headers = &.{.{ .name = "retry-after", .value = "1" }},
+    };
+}
 const auth = @import("auth.zig");
 const events = @import("events.zig");
 const request = @import("request.zig");
@@ -48,6 +56,12 @@ fn healthHandler(ctx: *http.RequestCtx) anyerror!http.Response {
     return health.handle(ctx);
 }
 
+// Only this exact built-in GET is liveness. HEAD and other paths/methods
+// can reach consumer handlers, so must not bypass admission.
+fn isLivenessProbe(method: http.Method, path: []const u8) bool {
+    return method == .GET and std.mem.eql(u8, path, "/api/health");
+}
+
 fn metaHandler(ctx: *http.RequestCtx) anyerror!http.Response {
     return meta.handle(ctx);
 }
@@ -58,6 +72,7 @@ fn metaHandler(ctx: *http.RequestCtx) anyerror!http.Response {
 /// optional capabilities — fn-pointer tables are where Zig's lazy analysis dies,
 /// so every optional subsystem's routes concat in ONLY under its gate.
 pub const Gates = struct {
+    admission: bool = false,
     two_factor: bool = false,
     admin: bool = true,
     analytics: bool = true,
@@ -385,6 +400,9 @@ pub fn Server(comptime gates: Gates) type {
                 .{ .method = .GET, .pattern = "/api/analytics/events", .handler = analytics_api.events },
                 .{ .method = .GET, .pattern = "/api/analytics/rollups/:name", .handler = analytics_api.rollups },
             };
+            if (gates.admission) t = t ++ &[_]router.Route{
+                .{ .method = .GET, .pattern = "/api/admission/stats", .handler = admissionStats },
+            };
             break :blk t;
         };
 
@@ -452,6 +470,29 @@ pub fn Server(comptime gates: Gates) type {
         /// paths propagate as an error; `onRequest` writes the raw 500 envelope for them, exactly as
         /// the historical inline `catch { sendRawEnvelope(...); return; }` sites did.
         pub fn route(ctx: *http.RequestCtx) anyerror!http.Response {
+            if (comptime gates.admission) {
+                if (isLivenessProbe(ctx.method, ctx.path)) return routeAdmitted(ctx);
+                const state = ctx.app.?.admission.?;
+                if (!state.acquire()) return overloadResponse();
+                defer state.release();
+                return routeAdmitted(ctx);
+            }
+            return routeAdmitted(ctx);
+        }
+
+        fn admissionStats(ctx: *http.RequestCtx) anyerror!http.Response {
+            const app = ctx.app.?;
+            var reader = try app.pool.acquireReader();
+            defer app.pool.releaseReader(&reader);
+            var identity = (try auth.authenticate(app.io, ctx.allocator.a, app, ctx, &reader)) orelse
+                return ApiError.withCode(401, .unauthorized, "Authentication required.").toResponse(ctx.allocator.a);
+            defer identity.deinit(ctx.allocator.a);
+            if (!identity.is_superuser)
+                return ApiError.withCode(403, .forbidden, "Superuser only.").toResponse(ctx.allocator.a);
+            return .{ .status = 200, .body = try std.json.Stringify.valueAlloc(ctx.allocator.a, app.admission.?.snapshot(), .{}) };
+        }
+
+        fn routeAdmitted(ctx: *http.RequestCtx) anyerror!http.Response {
             const app = ctx.app.?;
             if (comptime gates.admin) {
                 if (adminRouteReserved(gates, ctx.path)) return admin.serve(ctx);
@@ -520,6 +561,19 @@ pub fn Server(comptime gates: Gates) type {
 
         fn onRequest(r: zap.Request) !void {
             const self = Self.instance.?;
+            const needs_permit = if (comptime gates.admission) !isLivenessProbe(methodFromZap(r), r.path orelse "/") else false;
+            if (comptime gates.admission) {
+                if (needs_permit and !self.app.admission.?.acquire()) {
+                    // Log before sending: facil.io may recycle path bytes on send.
+                    logging.request(.{ .method = @tagName(methodFromZap(r)), .path = r.path orelse "/", .status = 503, .duration_ms = 0 });
+                    r.setHeader("retry-after", "1") catch |err| std.log.warn("overload retry header: {s}", .{@errorName(err)});
+                    sendRawEnvelope(r, methodFromZap(r), 503, overloadResponse().body);
+                    return;
+                }
+            }
+            defer if (comptime gates.admission) {
+                if (needs_permit) self.app.admission.?.release();
+            };
             const started_ns = std.Io.Timestamp.now(self.app.io, .awake).nanoseconds;
             var arena = std.heap.ArenaAllocator.init(self.app.allocator);
             defer arena.deinit();
@@ -580,17 +634,19 @@ pub fn Server(comptime gates: Gates) type {
             // logs an uncaught error and NEVER writes a response — the client sees a
             // dropped connection and the access line records status 0, a status nothing
             // ever sent. Answer with the same raw 500 envelope every other escape uses.
-            const multipart_err = applyMultipart(&ctx) catch {
+            // The exempt liveness handler never consumes a body. Do not let
+            // arbitrary multipart parsing become an admission bypass.
+            const multipart_err = (if (gates.admission and !needs_permit) null else applyMultipart(&ctx)) catch {
                 sendRawEnvelope(r, ctx.method, 500, internal_error_envelope);
                 logged_status = 500;
                 return;
             };
             const routed = blk: {
                 if (multipart_err) |er| break :blk er;
-                // The full routing/fallback chain lives in the socketless `route` seam (#239
-                // stage 2). Its only escaping errors are the OOM-while-building-an-error-Response
-                // paths that historically wrote this exact raw 500 envelope inline and returned.
-                break :blk route(&ctx) catch {
+                // Share routeAdmitted's routing/fallback chain without acquiring
+                // admission again. If producing a response itself fails, retain
+                // the allocation-free raw 500 backstop.
+                break :blk routeAdmitted(&ctx) catch {
                     sendRawEnvelope(r, ctx.method, 500, internal_error_envelope);
                     logged_status = 500;
                     return;

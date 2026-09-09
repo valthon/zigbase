@@ -15,6 +15,7 @@ fn coordinatedJob(_: *zigbase.Ctx, _: *zigbase.JobEvent) anyerror!void {}
 pub fn main(init: std.process.Init) !void {
     return zigbase.App(.{
         .analytics = .{},
+        .admission = .{ .max_requests = 64 }, // symbol-gating fixture, not a load-shedding test
         .mail = .{},
         .webhooks = true,
         .queues = .{ .cleanup = .{ .backend = .durable } },

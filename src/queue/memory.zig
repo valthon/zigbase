@@ -370,6 +370,11 @@ test "pool overflow: full ring rejects with error.QueueFull (burst does not spaw
     var app = testApp();
     var pool = Pool.init(&app);
     pool.install(&app);
+    var stopped = false;
+    defer if (!stopped) {
+        g_gate.store(true, .release);
+        pool.stop();
+    };
     const def = QueueDef{ .name = "default", .backend = .memory, .retry = .{ .max_attempts = 1, .base_ms = 0, .jitter = false } };
     // Occupy every worker with a gated job, deterministically.
     for (0..Pool.num_workers) |_| try enqueue(&app, def, blockingH, "{}");
@@ -382,8 +387,16 @@ test "pool overflow: full ring rejects with error.QueueFull (burst does not spaw
     for (0..Pool.capacity) |_| try enqueue(&app, def, okH, "{}");
     try testing.expectError(error.QueueFull, enqueue(&app, def, okH, "{}"));
     g_gate.store(true, .release);
+    // Capacity is reusable after pressure subsides, before shutdown, without
+    // replacing the pool or starting another set of workers.
+    spins = 0;
+    while (m_runs.load(.acquire) < Pool.capacity and spins < 2000) : (spins += 1)
+        try app.io.sleep(std.Io.Duration.fromMilliseconds(1), .awake);
+    try testing.expectEqual(@as(usize, Pool.capacity), m_runs.load(.acquire));
+    try enqueue(&app, def, okH, "{}");
     pool.stop(); // drain: all capacity fillers run
-    try testing.expectEqual(@as(usize, Pool.capacity), m_runs.load(.monotonic));
+    stopped = true;
+    try testing.expectEqual(@as(usize, Pool.capacity + 1), m_runs.load(.monotonic));
 }
 
 test "submitThunk routes app.submit tasks through the pool (name copied, joined at stop)" {
