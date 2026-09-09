@@ -17,8 +17,10 @@ copy, examples, and tests with the implementation rather than in follow-up PRs.
   schema/route inspection, migration previews, and focused test execution.
   Implemented slices: CLI discovery with explicit operation side effects (#409),
   offline compiled-route inspection with declarative access metadata (#415), and
-  structured diagnostics with typed required-input descriptors (#416).
-  This is not a remote executor. Focused execution remains.
+  structured diagnostics with typed required-input descriptors (#416), and
+  bounded repository-only pytest inventory/selection with structured process results.
+  This is not a remote executor or arbitrary embedded-app test discovery. Broader
+  test-runner coverage and changed-file/dependency-aware selection remain.
 - [ ] Opt-in bounded query performance workbench with route attribution and query-plan inspection.
 - [ ] Dependency-aware bounded response caching, starting with explicitly eligible public reads.
 - [x] Opt-in application performance contracts: binary-size/allocation gates and advisory timing comparisons (#414).

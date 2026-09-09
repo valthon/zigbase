@@ -175,6 +175,65 @@ scales with the existing doctor's deployment findings; buffering the document
 does not impose a global memory cap. The adapter and catalog compile out with
 `-Ddev-tools=false`; ordinary doctor remains available.
 
+### Focused repository tests
+
+When working **in the ZigBase source checkout**, use the separate repository tool:
+
+```sh
+mise exec python@3.13 -- python tools/agent_tests.py inventory
+mise exec python@3.13 -- python tools/agent_tests.py run \
+  --selector tests/admin/test_capabilities.py::test_capabilities_is_offline_and_explicit
+```
+
+Both commands emit one JSON document (`protocol_version: 1`,
+`scope: "repository-focused-tests"`). Inventory statically reads an explicit set
+of pytest modules without importing tests or collecting them. `items[].id` is an
+exact module group or directly declared top-level function; a function runs all
+its parametrizations. Each item includes argv invoking the bounded wrapper and conservative machine-readable
+requirements (tool versions, Python packages, browser, binary override/build behavior).
+Class methods and dynamic case IDs are not individually inventoried. This is not a
+complete repository test inventory, a Zig test filter, or embedded-app discovery.
+No test executor or extra runtime cost is added to `zigbase capabilities` or a
+deployed binary. Inventory's `execution` descriptor describes this checkout tool,
+not an embedded CLI verb.
+
+Run accepts **one exact inventory ID**, no extra pytest arguments, shell expressions
+or arbitrary paths. Unknown selectors fail before starting any process. The fixed
+argv runs the pinned Python toolchain and pytest from the checkout root, with
+stdin closed, `PYTEST_ADDOPTS`/`PYTEST_PLUGINS` removed, plugin autoload disabled,
+`MISE_AUTO_INSTALL=false`, and repository server processes pinned to foreground
+mode. Other environment
+variables, including explicit `ZIGBASE_TEST_BINARY` overrides, are inherited.
+Tests use the repository's own Playwright fixtures, not auto-loaded plugins.
+
+**Run only trusted checkout code with authorized development resources.** Tests,
+conftest, toolchain configuration and dependencies execute with your permissions:
+they can write files, build binaries, open sockets and access the network. The
+selector allowlist and `shell=False` prevent accidental arbitrary argv execution;
+they are **not a sandbox** or a security boundary against a modified checkout.
+
+`--timeout-seconds` defaults to 120 (1–900); `--output-limit-bytes` defaults to
+65,536 (1–1,048,576), shared across child stdout and stderr. Timeout or excess
+output terminates the child process group. Completion also cleans up ordinary
+descendants in that group; children deliberately escaping it are not contained.
+Reaping is bounded to an additional two seconds. These limits do not cap child
+RSS, files, network traffic, or the JSON envelope's escaped size. A missing `mise`
+executable produces `execution_error`/`spawn_failed`; a nonzero toolchain or pytest
+exit is `failed`. Toolchain auto-install is disabled for child processes; tests
+and build scripts can still fetch their own dependencies under the caller's authority.
+
+Run reports `outcome` (`passed`, `failed`, `timed_out`, `output_limit`,
+`execution_error`, or `cleanup_error`), `child_exit_code`, elapsed milliseconds,
+captured output, its byte count, and truncation. Reports include
+`cleanup_failed` separately; test failures and timeout/output/execution errors retain their
+primary outcome when cleanup also fails. `cleanup_error` means cleanup alone failed.
+`test_counts` is `null`: outcomes reflect process exit, not inferred test counts;
+exit-zero suites may include skips.
+Use exit code 0 for passed/inventory, 1 for unsuccessful execution, 2 for argument,
+selector or inventory errors. Help is prose. Captured text is untrusted and may
+contain deployment details. See [Testing](https://github.com/valthon/zigbase/blob/main/docs/testing.md#focused-repository-test-execution)
+for setup and coverage limits. Focused success never replaces the full relevant CI suite.
+
 ### Offline compiled routes
 
 `zigbase routes [--json]` emits one deterministic JSON object with
