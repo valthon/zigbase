@@ -4363,6 +4363,78 @@ not old object versions, delete markers, or unfinished multipart uploads.
 Neither backend offers snapshot isolation across pages; concurrent writes can
 change the observation. Inventory does not change record download authorization.
 
+### Offline orphan reconciliation (opt-in CLI)
+
+The same `-Dfile-inventory=true` build includes a separate maintenance command for
+the built-in **local storage + SQLite** combination only:
+
+```sh
+# Observe a bounded page without changing the database or storage.
+zigbase files reconcile --data-dir ./zb_data --min-age-seconds 86400 --limit 100
+# Stop all application instances and other writers before explicitly deleting.
+zigbase files reconcile --data-dir ./zb_data --min-age-seconds 86400 --limit 100 --apply
+```
+
+Both modes refuse PostgreSQL, S3 configuration and custom storage plugins; they
+do not fall back to a local database or bucket copy. They require an existing
+database and storage root and run no migrations/provisioning. Dry-run opens
+SQLite read-only and creates no maintenance file. The default grace period is
+86,400 seconds; `--min-age-seconds` accepts 1–31,536,000. `--limit` defaults to 100
+and accepts 1–1,000. Each invocation uses the inventory scan bound of 100,000
+directory entries and retains at most one bounded page.
+
+Age is **not** proof that an upload has finished. Every booted application using
+built-in local storage holds a shared lease on the permanent
+`storage/.zigbase-maintenance.lock` file, including default builds without this
+CLI and `serve --ignore-lock`. This costs one open descriptor per booted app,
+with no per-request lock operation. Apply takes an exclusive, nonblocking lease
+using a writable descriptor; ordinary shared leases open existing lock files
+read-only. Exclusive apply retains write permission because some `flock`
+implementations require it. Neither mode replaces an existing lock inode.
+Apply holds its lease on that same actual storage root, then a SQLite writer transaction for the
+whole batch. An active app or database writer makes it refuse rather than wait.
+This covers an HTTP upload paused between its storage PUT and database commit;
+an age threshold alone would not. The lease also blocks new app boots until
+maintenance releases it. Root-directory symlink aliases share the lease;
+descendant symlinks are not followed. Never remove or replace the lock file:
+doing so breaks coordination between holders of different inodes.
+
+The root must belong exclusively to this database. Stop older ZigBase binaries,
+direct `Storage` users, raw filesystem/SQL writers and other processes that do
+not participate in the lease protocol before apply, and keep them stopped until
+it finishes. The lease cannot detect or restrain those writers. Use a local
+filesystem with working advisory locks; this is not an online garbage collector,
+shared-bucket reconciler, or distributed maintenance protocol.
+
+Only ordinary `collection/record/filename` files with known collection metadata
+can become candidates. Current physical references include hidden fields and
+expired TTL rows that have not been deleted. Missing/malformed collection
+metadata, encrypted file fields and unfamiliar layouts stay `unknown`; dropped
+collection prefixes are not automatically removed. Failed uploads and files
+left by non-HTTP mutations can be reclaimed when their collection remains known
+and no physical row refers to them. Immediately before each single-file unlink,
+apply checks the inode/size/timestamps, grace period and current references again
+under the writer transaction. It never recursively deletes a prefix.
+
+Each invocation emits one versioned JSON object with `mode`, `backend`, `items`,
+`minAgeSeconds`, `nextCursor`, `hasNext`, and `failures`. Items include `key`,
+`bytes`, `modifiedAt` (Unix seconds), `outcome` and an optional `failure` error
+name. Outcomes are `candidate`, `referenced`, `recent`, `unknown`, `changed`,
+`deleted`, `missing`, or `failed`. Pass `nextCursor` unchanged with the same
+database/root/settings to inspect the next page. A cursor is only a pagination
+position, **not a saved deletion approval or snapshot**: apply recomputes its
+own observations, and changes between runs can change the results.
+
+Exit 0 means the page completed without I/O failures, not that every file was
+deleted (`unknown` and protected files are retained). Exit 1 reports refusal or
+failure. All page keys and the output cursor must be UTF-8; invalid bytes reject
+the entire page before any deletion. Use byte-safe filesystem tooling to inspect
+such names. Per-file I/O failures appear in the JSON and processing continues within
+the bounded page. Filesystem deletions are irreversible and cannot be rolled
+back by SQLite. A later failure—including report output failure—can leave some
+files deleted; retain backups, inspect the report when available, and recompute
+a dry-run before retrying.
+
 ### Durable HTTP file cleanup (opt-in)
 
 Move HTTP record replacement/deletion storage requests to the existing durable
@@ -5364,7 +5436,7 @@ code to comptime-dead when off, so a build that doesn't need a feature doesn't p
 | `-Dfts5` | **on** | SQLite full-text search (FTS5). `-Dfts5=false` drops `-DSQLITE_ENABLE_FTS5` from the SQLite build (~250-400 KB smaller) for lean binaries with no `.searchable` field; `?search=` then 400s and the server refuses to start over a `.searchable` SQLite schema. Postgres full-text search is unaffected. → [docs/search.md](./search.md#build-requirement--dfts5-default-on) |
 | `-Dvector` | off | Opt-in nearest-neighbor `?vector=` KNN search — sqlite-vec on SQLite, pgvector on Postgres. → [docs/search.md](./search.md#vector-search-opt-in) |
 | `-Dpostgres` | off | Opt-in pure-Zig PostgreSQL wire-protocol backend, alongside the default SQLite one. → [docs/postgres.md](./postgres.md) |
-| `-Dfile-inventory` | off | Read-only `files inventory` CLI plus optional local/S3 inventory callbacks. Bounded pages, page usage and reference candidates; no HTTP surface or deletion. S3 additionally needs `-Ds3=true`. |
+| `-Dfile-inventory` | off | Read-only `files inventory` plus offline local/SQLite `files reconcile` (dry-run unless `--apply`). Bounded pages; no HTTP surface. Inventory supports S3 with `-Ds3=true`; reconciliation refuses S3/PostgreSQL/custom storage. The boot-lifetime local-storage maintenance lease remains in default builds. |
 | `-Drealtime-backfill` | off | Single-process SQLite record invalidation backfill: 16 lazy collection slots, each 256 entries / 64 KiB (1 MiB encoded total), current authorization, explicit reset on gaps or slot replacement. No historical payloads or durable/cross-instance guarantee. See the API realtime section. |
 | `-Dresumable-uploads` | off | Principal-bound network-resume for file fields on existing records. Process-local, fully buffered, configurable session/byte/chunk/expiry budgets; no restart or cross-instance durability. See [resumable uploads](resumable-uploads.md). |
 | `-Ddev-mode` | on in `Debug`, off in release | The dev-only, never-in-prod seams: `ZIGBASE_FAKE_NOW` / `ZIGBASE_FAKE_SEED` (§14 above), test-capture, and fake field-crypto; the release script forces it off for shipped binaries. |

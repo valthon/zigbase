@@ -364,7 +364,9 @@ test {
     if (@import("build_options").file_inventory) {
         _ = @import("files/inventory.zig");
         _ = @import("files/local_inventory.zig");
+        _ = @import("files/reconcile.zig");
     }
+    _ = @import("files/maintenance.zig");
     _ = @import("zig_compat.zig");
     _ = @import("app.zig");
     _ = @import("config.zig");

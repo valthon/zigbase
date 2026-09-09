@@ -2250,6 +2250,17 @@ fn runCliImpl(init: std.process.Init, dispatch: *const events.Dispatch, jobs: []
                 std.process.exit(1);
             }
         },
+        .file_reconcile => |fa| {
+            if (comptime build_options.file_inventory) {
+                fileReconcileRun(opts, allocator, init.io, init.environ_map, fa) catch |err| {
+                    std.log.err("files reconcile: {s}; apply needs idle built-in local storage and SQLite. Stop all old/external writers; no mutation is rolled back.", .{@errorName(err)});
+                    std.process.exit(1);
+                };
+            } else {
+                std.log.err("files reconcile is not compiled in; rebuild with -Dfile-inventory=true", .{});
+                std.process.exit(1);
+            }
+        },
         .migrate => |ma| switch (ma.action) {
             .apply => try migrateImpl(allocator, init.io, init.environ_map, ma, schema_migrations),
             .status => try migrateStatusImpl(allocator, init.io, init.environ_map, ma, schema_migrations),
@@ -2346,6 +2357,7 @@ fn printUsage(io: std.Io, file: std.Io.File, show_serve_static: bool, show_stati
         \\  serve stop|status|logs|wait   Manage a tracked `serve` session (see `zigbase serve status --help`).
         \\  doctor              Preflight checks; --production escalates, --json emits NDJSON. Exits 1 on any error.
         \\  files inventory     Read-only storage page, usage, and reference candidates (-Dfile-inventory).
+        \\  files reconcile     Local SQLite orphan dry-run / explicit offline deletion (-Dfile-inventory).
         \\  migrate             Apply database migrations, then exit. `status` reports; `rollback [N]` reverses; `dump` dumps the live schema.
         \\  rewrap              Re-encrypt all encrypted fields under the primary key (key rotation).
         \\  migrate-db          Copy an existing SQLite instance into PostgreSQL (requires -Dpostgres).
@@ -2975,14 +2987,20 @@ fn printServeControlUsage(io: std.Io, file: std.Io.File) void {
 
 fn printFileInventoryUsage(io: std.Io, file: std.Io.File) void {
     emit(io, file,
-        \\zigbase files inventory — read-only storage inventory, usage, and reference candidates.
+        \\zigbase files — read-only inventory and explicit offline reconciliation.
         \\
         \\USAGE:
         \\  zigbase files inventory [--limit 1..1000] [--cursor KEY] [--data-dir PATH]
+        \\  zigbase files reconcile [--min-age-seconds 1..31536000] [--limit 1..1000]
+        \\      [--cursor KEY] [--data-dir PATH] [--apply]
+        \\Reconcile defaults to dry-run and a 86400-second grace period. Local SQLite only.
+        \\Apply refuses active apps, rechecks physical references, and deletes single files.
+        \\Stop old binaries/external writers first. Storage must belong only to this database.
+        \\Age alone is NOT safety. Partial deletions are irreversible; take backups.
         \\
-        \\Requires -Dfile-inventory=true; S3 additionally requires -Ds3=true.
-        \\Prints one JSON page. Usage is PAGE-ONLY, not a bucket-wide total.
-        \\Unreferenced objects are candidates, including in-flight uploads; never auto-delete.
+        \\Both commands require -Dfile-inventory=true and print one JSON page.
+        \\Inventory alone supports S3 with -Ds3=true; its usage is PAGE-ONLY.
+        \\Inventory candidates include in-flight uploads and never authorize auto-deletion.
         \\
     , .{});
 }
@@ -4476,6 +4494,45 @@ fn fileInventoryRun(comptime opts: ServeOpts, allocator: std.mem.Allocator, io: 
     try writer.interface.flush();
 }
 
+fn fileReconcileRun(comptime opts: ServeOpts, allocator: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map, fa: cli.FileReconcileArgs) !void {
+    // No fallback to a different backend, including unsupported-build URLs.
+    if (comptime opts.StoragePlugin != DefaultStoragePlugin) return error.ReconciliationUnsupportedStorage;
+    const cfg = try loadCfg(environ, .{ .data_dir = fa.data_dir });
+    const db_url = (config.EnvGetter{ .environ = environ }).get("ZIGBASE_DB_URL");
+    if (db.chooseBackend(db_url) != .sqlite or cfg.s3_bucket.len != 0) return error.ReconciliationLocalSqliteOnly;
+    const root_path = try std.fmt.allocPrint(allocator, "{s}/storage", .{cfg.data_dir});
+    defer allocator.free(root_path);
+    // Do not create roots or databases as a side effect of a mistyped path.
+    var root_dir = try std.Io.Dir.cwd().openDir(io, root_path, .{ .iterate = true });
+    defer root_dir.close(io);
+    const lock: ?std.Io.File = if (fa.apply) try @import("files/maintenance.zig").acquire(io, root_dir, true) else null;
+    defer if (lock) |file| file.close(io);
+    const target = try std.fmt.allocPrintSentinel(allocator, "{s}/data.db", .{cfg.data_dir}, 0);
+    defer allocator.free(target);
+    var probe = try std.Io.Dir.cwd().openFile(io, target, .{});
+    probe.close(io);
+    var conn = if (fa.apply) try db.Db.open(target) else try db.Db.openReadOnly(target);
+    defer conn.close();
+    if (fa.apply) {
+        try conn.exec("PRAGMA busy_timeout=0;");
+        try conn.beginImmediate();
+    }
+    defer if (conn.inTransaction()) conn.rollback() catch |err| std.log.err("reconciliation rollback failed: {s}", .{@errorName(err)});
+    var local = files_storage.LocalStorage.init(root_path);
+    const page = try local.storage().inventory(io, allocator, fa.cursor, fa.limit);
+    defer page.deinit(allocator);
+    const result = try @import("files/reconcile.zig").run(allocator, io, &conn, root_dir, page, std.Io.Timestamp.now(io, .real).toSeconds(), fa.min_age_seconds, fa.apply);
+    defer result.deinit(allocator);
+    // This transaction protects references, not filesystem deletion rollback.
+    if (fa.apply) try conn.commit();
+    var buffer: [4096]u8 = undefined;
+    var writer = std.Io.File.stdout().writerStreaming(io, &buffer);
+    try writer.interface.writeAll(result.output);
+    try writer.interface.writeByte('\n');
+    try writer.interface.flush();
+    if (result.failures != 0) return error.ReconciliationPartialFailure;
+}
+
 /// Read-mostly preflight; may create the migration ledger. Its interlinked
 /// findings/render graph lives in one command-scoped arena (contract 4).
 fn doctorImpl(allocator: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map, da: cli.DoctorArgs, schema_migrations: []const provision.Migration) !void {
@@ -4605,6 +4662,7 @@ fn BootedApp(comptime opts: ServeOpts) type {
         /// Only meaningful when `cfg.field_key.len > 0`; the pool holds a pointer into it.
         field_cipher: field_policy.Cipher,
         storage_inst: opts.StoragePlugin,
+        storage_maintenance: if (opts.StoragePlugin == DefaultStoragePlugin) ?std.Io.File else void,
         storage_iface: files_storage.Storage,
         mailer_inst: opts.MailerPlugin,
         mailer_iface: mail.Mailer,
@@ -4646,6 +4704,9 @@ fn BootedApp(comptime opts: ServeOpts) type {
             self.mailer_inst.deinit();
             self.storage_inst.deinit();
             self.pool.deinit();
+            if (comptime opts.StoragePlugin == DefaultStoragePlugin) {
+                if (self.storage_maintenance) |file| file.close(self.app.io);
+            }
             self.allocator.free(self.jwt_secret);
             const alloc = self.allocator;
             alloc.destroy(self);
@@ -4718,6 +4779,20 @@ fn bootApp(
     errdefer allocator.free(jwt_secret);
     cfg.jwt_secret = jwt_secret;
     holder.jwt_secret = jwt_secret;
+    if (comptime opts.StoragePlugin == DefaultStoragePlugin) {
+        holder.storage_maintenance = null;
+        if (!build_options.s3 or cfg.s3_bucket.len == 0) {
+            const root_path = try std.fmt.allocPrint(allocator, "{s}/storage", .{cfg.data_dir});
+            defer allocator.free(root_path);
+            try std.Io.Dir.cwd().createDirPath(io, root_path);
+            var root_dir = try std.Io.Dir.cwd().openDir(io, root_path, .{});
+            defer root_dir.close(io);
+            holder.storage_maintenance = try @import("files/maintenance.zig").acquire(io, root_dir, false);
+        }
+    }
+    errdefer if (comptime opts.StoragePlugin == DefaultStoragePlugin) {
+        if (holder.storage_maintenance) |file| file.close(io);
+    };
     // Install the dev-only frozen clock (ZIGBASE_FAKE_NOW) so every framework "now" — token
     // expiry, scheduling, challenge/cursor TTLs — reads the override. No-op + null on a prod
     // build (the gate is comptime-off; see clock.zig).

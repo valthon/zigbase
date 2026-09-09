@@ -68,3 +68,7 @@ copy, examples, and tests with the implementation rather than in follow-up PRs.
 - [ ] Image transforms/thumbnails with comptime support and resource budgets.
 - [x] Opt-in durable HTTP replacement/deletion cleanup with physical reference checks (#411).
 - [ ] Scoped orphan reconciliation and cleanup for non-HTTP mutation paths.
+  Implemented slice: bounded offline local/SQLite reconciliation with read-only
+  dry-run, explicit deletion, boot-lifetime storage leases and fresh physical
+  reference checks. Older/external writers must be stopped. Online/distributed
+  cleanup, S3/PostgreSQL/custom storage and dropped-collection prefixes remain.

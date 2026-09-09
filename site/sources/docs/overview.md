@@ -88,6 +88,9 @@ There are two ways to use ZigBase:
   using the existing queue engine. Opt-in [resumable uploads](./resumable-uploads)
   resume interrupted transfers within one process, with bounded buffers and
   fresh authorization at commit; they are not restart-durable streaming.
+  Optional [offline reconciliation](./framework#offline-orphan-reconciliation-opt-in-cli)
+  previews and explicitly removes unreferenced local/SQLite files in bounded
+  maintenance batches; it refuses active cooperating apps, not arbitrary external writers.
   → [API](./api#files), [Framework](./framework#durable-http-file-cleanup-opt-in)
 - **Admin UI** — embedded single-page app served at `/_/`, including a Settings screen
   for managing KV/feature flags.

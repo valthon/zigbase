@@ -20,7 +20,10 @@ const operations = [_]Operation{
     .{ .id = "migration-status", .argv = &.{ "migrate", "status", "--json" }, .output = .json, .effect = .may_write, .requires_database = true, .notes = "Opens the database pool and ensures the migration ledger exists. Nonzero exit can accompany valid status output." },
     .{ .id = "http-contract", .argv = &.{"openapi"}, .output = .openapi, .effect = .read_only, .requires_database = true, .notes = "Requires an existing database; includes this binary's declared routes." },
     .{ .id = "error-codes", .argv = &.{ "explain-code", "--json" }, .output = .json, .effect = .read_only, .requires_database = false },
-};
+} ++ (if (@import("build_options").file_inventory) [_]Operation{
+    .{ .id = "files-reconcile-preview", .argv = &.{ "files", "reconcile", "--json" }, .output = .json, .effect = .read_only, .requires_database = true, .notes = "Bounded live orphan preview, not a saved deletion approval. Existing built-in local storage and SQLite only; no migrations. Optional --data-dir, --cursor, --limit and --min-age-seconds." },
+    .{ .id = "files-reconcile-apply", .argv = &.{ "files", "reconcile", "--json", "--apply" }, .output = .json, .effect = .may_write, .requires_database = true, .notes = "Explicit operator authorization required: irreversible bounded file deletion, not rolled back after partial failure. Offline local/SQLite only; exclusive root lease and database writer transaction. Stop old/external writers; dedicated storage root required. Optional --data-dir, --cursor, --limit and --min-age-seconds. Cursor is not approval." },
+} else [_]Operation{});
 
 pub fn write(writer: *std.Io.Writer) !void {
     // Only operations[].argv is directly runnable; input operations have a
@@ -93,7 +96,12 @@ test "capability catalog has versioned unique operation identifiers and inputs" 
     const root = parsed.value.object;
     try std.testing.expectEqual(@as(i64, 1), root.get("protocol_version").?.integer);
     const ops = root.get("operations").?.array.items;
-    try std.testing.expectEqual(@as(usize, 7), ops.len);
+    try std.testing.expectEqual(@as(usize, if (@import("build_options").file_inventory) 9 else 7), ops.len);
+    if (@import("build_options").file_inventory) {
+        try std.testing.expectEqualStrings("read_only", ops[7].object.get("effect").?.string);
+        try std.testing.expectEqualStrings("may_write", ops[8].object.get("effect").?.string);
+        try std.testing.expectEqualStrings("--apply", ops[8].object.get("argv").?.array.items[3].string);
+    }
     const inputs = root.get("input_operations").?.array.items;
     try std.testing.expectEqual(@as(usize, 1), inputs.len);
     for (inputs, 0..) |input, i| {

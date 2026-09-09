@@ -438,8 +438,8 @@ jobs:
           bash scripts/check-gating.sh --inventory zig-out-inventory-off/bin/zigbase zig-out/bin/zigbase
       - name: Install Python S3 and inventory test dependencies
         run: mise exec python@3.13 -- python -m pip install --quiet pytest
-      - name: Read-only inventory CLI (local and S3 fixture)
-        run: ZIGBASE_TEST_INVENTORY_BINARY="$PWD/zig-out/bin/zigbase" mise exec python@3.13 -- python -m pytest tests/cli/test_file_inventory.py -q
+      - name: Storage inventory and offline reconciliation CLI
+        run: ZIGBASE_TEST_INVENTORY_BINARY="$PWD/zig-out/bin/zigbase" mise exec python@3.13 -- python -m pytest tests/cli/test_file_inventory.py tests/cli/test_file_reconcile.py -q
       - name: S3 end-to-end (upload -> Range/304/416 -> delete)
         run: |
           ZIGBASE_TEST_BINARY="$PWD/zig-out/bin/zigbase" \
