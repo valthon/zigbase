@@ -37,6 +37,24 @@ DEFAULT_OUTPUT_BYTES = 65536
 MAX_OUTPUT_BYTES = 1048576
 MAX_SOURCE_BYTES = 1048576
 MAX_ITEMS = 2048
+MAX_CHANGED_PATHS = 4096
+MAX_PATH_BYTES = 4096
+GIT_TIMEOUT = 10
+# Curated dependency edges, not inferred imports or a complete dependency graph.
+# Shared runtime changes deliberately select every allowlisted admin module.
+DEPENDENCIES = (
+    ("tests/_bin.py", MODULES),
+    ("src/", MODULES[1:]),
+    ("tests/admin/conftest.py", MODULES[1:]),
+    ("tests/conftest.py", MODULES),
+    ("conftest.py", MODULES),
+    ("build.zig", MODULES[1:]),
+    ("build.zig.zon", MODULES[1:]),
+    ("zig-pkg/", MODULES[1:]),
+    ("mise.toml", MODULES),
+    ("pyproject.toml", MODULES),
+    ("tools/agent_tests.py", MODULES),
+)
 PREFIX = (
     "mise",
     "exec",
@@ -187,6 +205,7 @@ def execute(
     env: dict[str, str],
     timeout: float,
     output_limit: int,
+    decode_errors: str = "replace",
 ) -> dict:
     """Run a resolved argv; retain at most output_limit raw bytes in total.
 
@@ -267,8 +286,8 @@ def execute(
         "outcome": outcome,
         "child_exit_code": returncode,
         "duration_ms": round((time.monotonic() - started) * 1000),
-        "stdout": captured["stdout"].decode("utf-8", errors="replace"),
-        "stderr": captured["stderr"].decode("utf-8", errors="replace"),
+        "stdout": captured["stdout"].decode("utf-8", errors=decode_errors),
+        "stderr": captured["stderr"].decode("utf-8", errors=decode_errors),
         "captured_bytes": total,
         "output_truncated": truncated,
         "cleanup_failed": cleanup_error,
@@ -310,12 +329,151 @@ def run(selector: str, timeout: int, output_limit: int) -> dict:
     }
 
 
+def git_output(arguments: list[str]) -> str:
+    # Do not let an inherited GIT_DIR/INDEX_FILE redirect the inspected checkout.
+    env = {
+        key: value for key, value in os.environ.items() if not key.startswith("GIT_")
+    }
+    env.update(GIT_OPTIONAL_LOCKS="0", GIT_TERMINAL_PROMPT="0")
+    result = execute(
+        ["git", "-c", "core.fsmonitor=false", *arguments],
+        cwd=ROOT,
+        env=env,
+        timeout=GIT_TIMEOUT,
+        output_limit=MAX_OUTPUT_BYTES,
+        decode_errors="surrogateescape",
+    )
+    if result["outcome"] != "passed":
+        raise ContractError(
+            "git_failed",
+            "Git inspection failed or exceeded its time/output limits; no selection is available.",
+        )
+    return result["stdout"]
+
+
+def changed_paths(raw: str) -> list[str]:
+    if raw and not raw.endswith("\0"):
+        raise ContractError("invalid_changes", "Git path output is not NUL terminated.")
+    paths = raw.split("\0")[:-1] if raw else []
+    if len(paths) > MAX_CHANGED_PATHS:
+        raise ContractError(
+            "invalid_changes",
+            "Too many changed paths; no partial selection is returned.",
+        )
+    for path in paths:
+        if (
+            not path
+            or path.startswith("/")
+            or any(part in ("", ".", "..") for part in path.split("/"))
+            or len(path.encode("utf-8", "surrogateescape")) > MAX_PATH_BYTES
+        ):
+            raise ContractError(
+                "invalid_changes", "Invalid or oversized repository-relative Git path."
+            )
+    return paths
+
+
+def affected(base: str) -> dict:
+    if os.name != "posix":
+        raise ContractError(
+            "unsupported_platform",
+            "Selection requires POSIX process groups (Linux/macOS).",
+        )
+    if not base or len(base) > 256 or base.startswith("-") or "\0" in base:
+        raise ContractError(
+            "invalid_arguments",
+            "Base must be a commit-ish of 1–256 characters, not an option.",
+        )
+    catalog = inventory()
+    revision = git_output(
+        ["rev-parse", "--verify", "--end-of-options", base + "^{commit}"]
+    ).strip()
+    if len(revision) not in (40, 64) or any(
+        c not in "0123456789abcdef" for c in revision
+    ):
+        raise ContractError("git_failed", "Git did not resolve one commit object.")
+    tracked = git_output(
+        [
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-renames",
+            "--ignore-submodules=none",
+            "--name-only",
+            "-z",
+            revision,
+            "--",
+        ]
+    )
+    untracked = git_output(["ls-files", "--others", "--exclude-standard", "-z", "--"])
+    paths = sorted(set(changed_paths(tracked) + changed_paths(untracked)))
+    if len(paths) > MAX_CHANGED_PATHS:
+        raise ContractError(
+            "invalid_changes",
+            "Too many changed paths; no partial selection is returned.",
+        )
+    selected = set()
+    changes = []
+    for path in paths:
+        if path in MODULES:
+            modules, reason = (path,), "test_module"
+        else:
+            modules = tuple(
+                dict.fromkeys(
+                    module
+                    for dependency, targets in DEPENDENCIES
+                    if (
+                        path.startswith(dependency)
+                        if dependency.endswith("/")
+                        else path == dependency
+                    )
+                    for module in targets
+                )
+            )
+            reason = "curated_dependency" if modules else "unmapped_fallback"
+            if not modules:
+                modules = MODULES
+        selected.update(modules)
+        changes.append(
+            {
+                "path": path,
+                "path_bytes_hex": path.encode("utf-8", "surrogateescape").hex(),
+                "reason": reason,
+                "modules": list(modules),
+            }
+        )
+    return {
+        "selection_version": 1,
+        "base_commit": revision,
+        "comparison": "base_to_worktree_plus_untracked",
+        "changes": changes,
+        "items": [item for item in catalog["items"] if item["id"] in selected],
+        "fallback": any(change["reason"] == "unmapped_fallback" for change in changes),
+        "coverage_complete": False,
+        "coverage_gaps": [
+            "Curated module dependencies only; not an inferred or complete dependency graph.",
+            "Zig, SDK, non-allowlisted pytest, docs and other CI suites still require separate validation.",
+            "Ignored untracked files and files inside submodules are not enumerated; submodule changes use fallback.",
+            "Git snapshots are not atomic with each other or inventory; rerun after concurrent edits.",
+        ],
+        "limits": {
+            "git_timeout_seconds_per_command": GIT_TIMEOUT,
+            "git_output_bytes_per_command": MAX_OUTPUT_BYTES,
+            "changed_paths": MAX_CHANGED_PATHS,
+            "path_bytes": MAX_PATH_BYTES,
+        },
+        "notes": "Selection only; no tests run. Unknown paths select all allowlisted modules, not the full suite. Paths are untrusted data; JSON escapes preserve non-UTF-8 filename bytes using surrogateescape. Trusted checkout only, not a sandbox.",
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     envelope = {"protocol_version": 1, "scope": "repository-focused-tests"}
     try:
         parser = Parser(description=__doc__, allow_abbrev=False)
         sub = parser.add_subparsers(dest="action", required=True, parser_class=Parser)
         sub.add_parser("inventory", allow_abbrev=False)
+        selector = sub.add_parser("affected", allow_abbrev=False)
+        selector.add_argument("--base", required=True)
         runner = sub.add_parser("run", allow_abbrev=False)
         runner.add_argument("--selector", required=True)
         runner.add_argument("--timeout-seconds", type=int, default=DEFAULT_TIMEOUT)
@@ -325,6 +483,9 @@ def main(argv: list[str] | None = None) -> int:
         args = parser.parse_args(argv)
         if args.action == "inventory":
             envelope.update(status="complete", **inventory())
+            code = 0
+        elif args.action == "affected":
+            envelope.update(status="complete", **affected(args.base))
             code = 0
         else:
             result = run(args.selector, args.timeout_seconds, args.output_limit_bytes)

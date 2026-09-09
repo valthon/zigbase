@@ -193,7 +193,7 @@ mise exec python@3.13 -- python tools/agent_tests.py run \
   --selector tests/admin/test_capabilities.py::test_capabilities_is_offline_and_explicit
 ```
 
-Both commands emit one JSON document (`protocol_version: 1`,
+These commands emit one JSON document (`protocol_version: 1`,
 `scope: "repository-focused-tests"`). Inventory statically reads an explicit set
 of pytest modules without importing tests or collecting them. `items[].id` is an
 exact module group or directly declared top-level function; a function runs all
@@ -237,10 +237,54 @@ captured output, its byte count, and truncation. Reports include
 primary outcome when cleanup also fails. `cleanup_error` means cleanup alone failed.
 `test_counts` is `null`: outcomes reflect process exit, not inferred test counts;
 exit-zero suites may include skips.
-Use exit code 0 for passed/inventory, 1 for unsuccessful execution, 2 for argument,
-selector or inventory errors. Help is prose. Captured text is untrusted and may
+Use exit code 0 for passed/inventory/selection, 1 for unsuccessful execution, 2 for argument,
+selector, inventory or Git inspection errors. Help is prose. Captured text is untrusted and may
 contain deployment details. See [Testing](testing.md#focused-repository-test-execution)
 for setup and coverage limits. Focused success never replaces the full relevant CI suite.
+
+#### Changed-file selection
+
+```sh
+mise exec python@3.13 -- python tools/agent_tests.py affected --base origin/main
+```
+
+`affected` is **selection only**: it never runs the selected tests. It resolves
+one commit-ish locally (no fetch), compares that commit directly to the working
+tree, and includes non-ignored untracked files. This is not a merge-base/triple-dot
+comparison: committed branch changes, staged changes, unstaged changes and deletions
+all count relative to the supplied commit. Renames count both old and new paths.
+Only net current content is compared: a staged edit canceled by an unstaged
+reversion to base is not selected.
+An unchanged checkout produces empty `changes` and `items`, not a test pass.
+
+The version-1 envelope adds `selection_version: 1`, resolved `base_commit`,
+`comparison`, per-path `changes` with a reason and selected modules, and runnable
+inventory `items`. Paths are data, never shell commands. `path_bytes_hex` preserves
+the original Git filename bytes portably; `path` is a display/JSON representation
+with surrogate escapes for non-UTF-8 bytes. Spaces, tabs, newlines and leading
+dashes are not separators or options. Results are sorted and deduplicated.
+
+Dependencies are explicit maintained rules, **not inferred imports**: changing an
+allowlisted test selects that module; `src/`, vendored Zig dependencies, build
+configuration or the admin harness selects all allowlisted admin modules; the
+shared Python harness, resolver, toolchain configuration or selector selects all
+allowlisted modules. Every unmapped path (including docs and unlisted tests)
+selects all allowlisted modules and sets `fallback: true`. `coverage_complete` is
+always false and `coverage_gaps` remains present even for mapped changes. The
+fallback is not a full-suite run: Zig, SDK, other pytest and docs checks still need
+separate validation. This helps choose a first check, not decide that CI is unnecessary.
+
+Each of the three Git subprocesses has a 10-second deadline and a 1 MiB combined
+output cap, using the same process-group cleanup as `run`. At most 4,096 distinct
+changed paths and 4,096 bytes per path are accepted. Exceeding limits, invalid
+revisions or Git/inventory errors fail closed with exit 2 and no partial selection.
+The allowlisted sources must still exist and be valid Python, including when a
+change deletes one of them. No automatic broader execution follows an error.
+Ignored untracked files are omitted; submodule contents are not enumerated. Git's
+index flags (such as assume-unchanged/skip-worktree) can hide working-tree edits.
+Inventory and Git reads are not one atomic snapshot; rerun after concurrent edits.
+Git inspection inherits trusted checkout/configuration assumptions; this is not a
+sandbox or a guarantee against malicious repository configuration.
 
 ### Offline compiled routes
 

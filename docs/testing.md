@@ -70,6 +70,15 @@ inventory/passed execution, 1 for an unsuccessful run, and 2 for argument/select
 inventory failures. The complete machine contract and boundary notes are in
 [the agent guide](agents.md#focused-repository-tests).
 
+For a conservative first test selection after edits, run
+`mise exec python@3.13 -- python tools/agent_tests.py affected --base origin/main`.
+This compares the base commit to the working tree plus non-ignored untracked
+files, returning module selectors without executing them. Curated dependencies
+select related allowlisted modules; unknown paths select the entire allowlist.
+The JSON explicitly reports incomplete coverage: this never replaces the full
+relevant Zig, browser, SDK, docs or other CI suites. See the agent guide for Git
+limits, filename encoding and snapshot limitations.
+
 ## Performance contracts
 
 Performance contracts are offline build/CI tooling, not application runtime
