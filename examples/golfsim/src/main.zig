@@ -846,6 +846,7 @@ pub const App = zigbase.App(.{
     .routes = .{
         .{ .method = .POST, .path = "/api/bookings/:id/confirm", .handler = confirmBooking, .auth = .authed },
         .{ .method = .POST, .path = "/api/bookings/:id/cancel", .handler = cancelBooking, .auth = .authed },
+        .{ .method = .POST, .path = "/api/bookings/:id/cancel-idempotent", .handler = @import("idempotent_cancel.zig").handle, .auth = .authed },
         .{ .method = .GET, .path = "/api/listings/:id/availability", .handler = listingAvailability, .auth = .authed },
         // Atomic hold->booking convert (ctx.tx): create booking + delete hold together.
         .{ .method = .POST, .path = "/api/holds/:id/convert", .handler = convertHold, .auth = .authed },

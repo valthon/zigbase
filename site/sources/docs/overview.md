@@ -96,6 +96,11 @@ There are two ways to use ZigBase:
   for managing KV/feature flags.
 - **Framework** — comptime record hooks, custom routes, scheduled jobs, a comptime schema
   (with additive auto-migration), and pluggable storage/mailer backends. → [Framework](./framework)
+- **Retry-safe custom DB operations** — opt-in SQLite idempotency receipts bind
+  retry keys to authenticated principals, operations and payloads; replay still
+  checks current access. Comptime capacity, retention and result limits keep the
+  helper bounded, and unused apps pay no runtime cost. This does not promise
+  exactly-once external effects. → [Idempotent mutations](./framework#idempotent-custom-mutations-opt-in-sqlite)
 - **Email** — transactional mail with multipart HTML+text templates, SES / Postmark / SMTP
   providers, verified per-account senders, and bounce suppression. → [Email](./email)
 - **Deterministic testing** — freeze time (`ZIGBASE_FAKE_NOW`), fix randomness

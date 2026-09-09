@@ -458,6 +458,18 @@ pub fn build(b: *std.Build) void {
     full_fix_step.dependOn(&b.addInstallArtifact(full_fix_exe, .{}).step);
 
     const workbench_mod = b.createModule(.{ .root_source_file = b.path("fixtures/query-workbench/main.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    const cancel_example = b.createModule(.{ .root_source_file = b.path("examples/golfsim/src/idempotent_cancel.zig"), .target = target, .optimize = optimize });
+    cancel_example.addImport("zigbase", zigbase_mod);
+    const idempotency_mod = b.createModule(.{ .root_source_file = b.path("fixtures/idempotency/main.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    idempotency_mod.addImport("zigbase", zigbase_mod);
+    idempotency_mod.addImport("cancel_example", cancel_example);
+    const idempotency_exe = b.addExecutable(.{ .name = "idempotency-fixture", .root_module = idempotency_mod });
+    b.step("idempotency-fixture", "Build the golfsim idempotent cancellation HTTP fixture").dependOn(&b.addInstallArtifact(idempotency_exe, .{}).step);
+    const invalid_idempotency_mod = b.createModule(.{ .root_source_file = b.path("fixtures/idempotency/invalid.zig"), .target = target, .optimize = optimize });
+    invalid_idempotency_mod.addImport("zigbase", zigbase_mod);
+    const invalid_idempotency = b.addExecutable(.{ .name = "invalid-idempotency", .root_module = invalid_idempotency_mod });
+    invalid_idempotency.expect_errors = .{ .contains = "invalid idempotency limits: namespace 1..128, entries 1..1000000, retention 1..31536000, payload/result 1..1048576, cleanup 1..1024" };
+    b.step("check-idempotency-contracts", "Check invalid comptime idempotency limits are rejected").dependOn(&invalid_idempotency.step);
     workbench_mod.addImport("zigbase", zigbase_mod);
     const workbench_fixture_options = b.addOptions();
     workbench_fixture_options.addOption(bool, "enabled", query_workbench);
