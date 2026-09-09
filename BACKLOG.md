@@ -19,8 +19,10 @@ copy, examples, and tests with the implementation rather than in follow-up PRs.
   offline compiled-route inspection with declarative access metadata (#415), and
   structured diagnostics with typed required-input descriptors (#416), and
   bounded repository-only pytest inventory/selection with structured process results.
+  Selection-only changed-file inspection now maps curated dependencies to bounded
+  module checks, with whole-allowlist fallback and explicit coverage gaps.
   This is not a remote executor or arbitrary embedded-app test discovery. Broader
-  test-runner coverage and changed-file/dependency-aware selection remain.
+  test-runner coverage and inferred dependency graphs remain.
 - [ ] Opt-in bounded query performance workbench with route attribution and query-plan inspection.
   Implemented first slice: build-gated SQLite synchronous prepared-statement step
   metrics by route template/opaque structural shape; bounded slow/repeated counters
