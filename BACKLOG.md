@@ -22,6 +22,10 @@ copy, examples, and tests with the implementation rather than in follow-up PRs.
   This is not a remote executor or arbitrary embedded-app test discovery. Broader
   test-runner coverage and changed-file/dependency-aware selection remain.
 - [ ] Opt-in bounded query performance workbench with route attribution and query-plan inspection.
+  Implemented first slice: build-gated SQLite synchronous prepared-statement step
+  metrics by route template/opaque structural shape; bounded slow/repeated counters
+  and bearer-superuser-only generated SELECT-plan inspection. PostgreSQL, full
+  query/request latency, captured plans and automatic index advice remain deferred.
 - [ ] Dependency-aware bounded response caching, starting with explicitly eligible public reads.
 - [x] Opt-in application performance contracts: binary-size/allocation gates and advisory timing comparisons (#414).
 - [ ] Opt-in principal/operation-scoped idempotent mutations with atomic coordination and bounded retention.

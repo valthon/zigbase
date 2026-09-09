@@ -272,6 +272,13 @@ from the same binary) are always allowed, so only a separate-origin frontend nee
 
 ## See also
 
+For bounded query diagnostics, build with `-Dquery-workbench=true` and optionally
+set `.query_workbench = .{ .max_entries = 64, .slow_ms = 100 }`. The operator-only
+SQLite workbench reports route-template/structural-shape metrics without SQL or
+parameter capture, and plans schema-validated SELECT shapes without executing
+them. It is fully absent by default; PostgreSQL is outside this first slice.
+See [the framework workbench scope](./framework#bounded-sqlite-query-workbench-opt-in).
+
 For request backpressure, compile `.admission = .{ .max_requests = 3 }` into your
 app. Excess synchronous HTTP callbacks receive 503 with `Retry-After: 1`, not an
 additional waiting queue. Superusers can inspect `/api/admission/stats` for active,

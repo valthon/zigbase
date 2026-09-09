@@ -1670,6 +1670,27 @@ configured outbound high-water-mark). `401` unauthenticated, `403` non-superuser
 
 ---
 
+## Query workbench (SQLite, opt-in)
+
+Build with `-Dquery-workbench=true`; otherwise both endpoints return `404`.
+Both require a current superuser bearer token: `401` for absent/invalid bearer
+credentials (cookies alone are insufficient), `403` for a non-superuser.
+
+| Method | Path | Contract |
+| --- | --- | --- |
+| GET | `/api/query-workbench/stats` | Bounded `{items}` of method, route template, opaque structural shape, execution count, summed/max statement-step nanoseconds, slow/repeated/failed counts; includes capacity and dropped counts. |
+| POST | `/api/query-workbench/explain` | JSON `{collection, equalityField?, orderField?, descending?}`; `200 {items, backend, scope, executesQuery:false, includesAuthorizationPredicates:false, truncated}`. |
+
+Explain accepts schema-validated field names, not SQL, expressions or values.
+It only plans a generated limited SELECT; never executes that SELECT or ANALYZE.
+Input is capped at 4 KiB; output at 32 plan rows, 512 UTF-8 bytes per detail.
+Unknown keys/fields or invalid input return `400`; unknown collection `404`;
+PostgreSQL planning `501`. Plans intentionally reveal schema/index names to
+operators, not ordinary users. Metrics retain no SQL or parameter text; structural
+shape repetition is not proof of N+1. See [scope, tuning and privacy limits](framework.md#bounded-sqlite-query-workbench-opt-in).
+`GET /api/meta` includes `capabilities.queryWorkbench` and optional
+`endpoints.queryWorkbench`; this is compile-time discovery, not access authority.
+
 ## Admission diagnostics
 
 `GET /api/admission/stats` is available only in applications compiled with
@@ -1711,6 +1732,7 @@ for configuration, scope, and retry guidance.
     "mailWebhook": true,
     "oauth2": true,
     "postgres": false,
+    "queryWorkbench": false,
     "s3": false,
     "senders": true,
     "tenancy": true,
@@ -1720,7 +1742,8 @@ for configuration, scope, and retry guidance.
   "endpoints": {
     "health": "/api/health",
     "state": "/api/state",
-    "realtimeSse": "/api/realtime/sse"
+    "realtimeSse": "/api/realtime/sse",
+    "queryWorkbench": null
   },
   "limits": {
     "maxUploadSize": 52428800

@@ -13,6 +13,7 @@ const BuildOptionValues = struct {
     file_inventory: bool,
     realtime_backfill: bool,
     resumable_uploads: bool,
+    query_workbench: bool,
     fts5: bool,
     sqlite_version: []const u8,
     sqlite_source_id: []const u8,
@@ -114,6 +115,7 @@ pub fn build(b: *std.Build) void {
     const file_inventory = b.option(bool, "file-inventory", "Compile read-only local/S3 file inventory reporting (default: off)") orelse false;
     const realtime_backfill = b.option(bool, "realtime-backfill", "Compile bounded process-local record invalidation backfill (default: off)") orelse false;
     const resumable_uploads = b.option(bool, "resumable-uploads", "Compile bounded process-local resumable file uploads (default: off)") orelse false;
+    const query_workbench = b.option(bool, "query-workbench", "Compile bounded SQLite query diagnostics (default: off)") orelse false;
     // Opt-in vector search (#157; Postgres pgvector port #159). OFF by default: the default build
     // does NOT compile or link the sqlite-vec amalgamation, and every vector code path folds to
     // comptime-dead — the shipped binary is byte-for-byte unaffected. `-Dvector=true` enables vector
@@ -164,6 +166,7 @@ pub fn build(b: *std.Build) void {
         .file_inventory = file_inventory,
         .realtime_backfill = realtime_backfill,
         .resumable_uploads = resumable_uploads,
+        .query_workbench = query_workbench,
         .internal_api = false,
         .vector = vector,
         .postgres = postgres,
@@ -453,6 +456,27 @@ pub fn build(b: *std.Build) void {
     const full_fix_exe = b.addExecutable(.{ .name = "full-fixture", .root_module = full_fix_mod });
     const full_fix_step = b.step("full-fixture", "Build the gating-invariant positive-control fixture (Debug, unstripped)");
     full_fix_step.dependOn(&b.addInstallArtifact(full_fix_exe, .{}).step);
+
+    const workbench_mod = b.createModule(.{ .root_source_file = b.path("fixtures/query-workbench/main.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    workbench_mod.addImport("zigbase", zigbase_mod);
+    const workbench_fixture_options = b.addOptions();
+    workbench_fixture_options.addOption(bool, "enabled", query_workbench);
+    workbench_mod.addOptions("fixture_options", workbench_fixture_options);
+    const workbench_exe = b.addExecutable(.{ .name = "query-workbench-fixture", .root_module = workbench_mod });
+    b.step("query-workbench-fixture", "Build the opt-in SQLite workbench HTTP fixture").dependOn(&b.addInstallArtifact(workbench_exe, .{}).step);
+    const invalid_workbench_mod = b.createModule(.{ .root_source_file = b.path("fixtures/query-workbench/invalid.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    invalid_workbench_mod.addImport("zigbase", zigbase_mod);
+    const invalid_workbench = b.addExecutable(.{ .name = "invalid-query-workbench", .root_module = invalid_workbench_mod });
+    invalid_workbench.expect_errors = .{ .contains = if (query_workbench) "query workbench requires 1..256 entries and positive slow_ms" else ".query_workbench requires -Dquery-workbench=true" };
+    const workbench_contracts = b.step("check-query-workbench-contracts", "Check query workbench comptime budgets and gate");
+    workbench_contracts.dependOn(&invalid_workbench.step);
+    inline for (.{ .{ "unknown", "unknown .query_workbench limit: capture_sql" }, .{ "nonstruct", ".query_workbench must be a struct" } }) |invalid| {
+        const mod = b.createModule(.{ .root_source_file = b.path("fixtures/query-workbench/" ++ invalid[0] ++ ".zig"), .target = target, .optimize = optimize, .link_libc = true });
+        mod.addImport("zigbase", zigbase_mod);
+        const invalid_exe = b.addExecutable(.{ .name = "invalid-workbench-" ++ invalid[0], .root_module = mod });
+        invalid_exe.expect_errors = .{ .contains = if (query_workbench) invalid[1] else ".query_workbench requires -Dquery-workbench=true" };
+        workbench_contracts.dependOn(&invalid_exe.step);
+    }
 
     const admission_mod = b.createModule(.{
         .root_source_file = b.path("fixtures/admission/main.zig"),

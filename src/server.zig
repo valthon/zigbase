@@ -1,4 +1,5 @@
 const std = @import("std");
+const build_options = @import("build_options");
 const route_path = @import("route_path.zig");
 const RequestArena = @import("request_arena.zig").RequestArena;
 const zap = @import("zap");
@@ -355,6 +356,10 @@ pub fn Server(comptime gates: Gates) type {
             }};
             if (@import("build_options").realtime_backfill) t = t ++ &[_]router.Route{
                 .{ .method = .GET, .pattern = "/api/realtime/backfill", .handler = @import("api/realtime_backfill.zig").get },
+            };
+            if (build_options.query_workbench) t = t ++ &[_]router.Route{
+                .{ .method = .GET, .pattern = "/api/query-workbench/stats", .handler = @import("api/query_workbench.zig").stats },
+                .{ .method = .POST, .pattern = "/api/query-workbench/explain", .handler = @import("api/query_workbench.zig").explain },
             };
             if (@import("build_options").resumable_uploads) t = t ++ &[_]router.Route{
                 .{ .method = .POST, .pattern = "/api/collections/:col/records/:id/uploads", .handler = @import("api/resumable_uploads.zig").begin },
@@ -1040,6 +1045,12 @@ fn dispatchCustom(ctx: *http.RequestCtx) anyerror!?http.Response {
         if (rt.method != ctx.method) continue;
         if (try router.matchPath(ctx.allocator.a, rt.pattern, ctx.path)) |params| {
             ctx.params = params;
+            var measured: if (build_options.query_workbench) @import("query_workbench.zig").Scope else void = undefined;
+            if (comptime build_options.query_workbench) {
+                measured = @import("query_workbench.zig").Scope.init(app.query_workbench, @tagName(ctx.method), rt.pattern);
+                measured.enter();
+            }
+            defer if (comptime build_options.query_workbench) measured.leave();
             // Resolve auth on a fresh read-only connection (never the writer lock) — but ONLY
             // when a credential is actually present. `authenticate` returns null on its first
             // line (`bearer orelse cookie orelse return null`) when neither a bearer header nor a
