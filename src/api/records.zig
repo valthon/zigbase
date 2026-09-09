@@ -263,6 +263,9 @@ fn hasFileFields(col: schema.Collection) bool {
 }
 
 pub fn view(ctx: *http.RequestCtx) anyerror!http.Response {
+    if (comptime @import("build_options").public_response_cache) {
+        if (try @import("../public_response_cache.zig").view(ctx)) |response| return response;
+    }
     const app = ctx.app.?;
     var r = try app.pool.acquireReader();
     defer app.pool.releaseReader(&r);
@@ -270,15 +273,21 @@ pub fn view(ctx: *http.RequestCtx) anyerror!http.Response {
     defer col_lease.release();
     const col = col_lease.col orelse return ApiError.notFound().toResponse(ctx.allocator.a);
     const rid = ctx.param("id") orelse return ApiError.notFound().toResponse(ctx.allocator.a);
-    const rctx = buildContext(ctx, &r, null);
+    return viewResolved(ctx, &r, col, rid);
+}
+
+/// Shared renderer for the ordinary reader path and the opt-in cache's freshly
+/// resolved collection. The latter must never fall back to stale metadata leases.
+pub fn viewResolved(ctx: *http.RequestCtx, r: *db.Db, col: schema.Collection, rid: []const u8) anyerror!http.Response {
+    const rctx = buildContext(ctx, r, null);
     switch (policy.decide(col, .view, &rctx)) {
         .deny_locked => return ApiError.notFound().toResponse(ctx.allocator.a),
         .allow => {},
-        .check => if (!try policy.authorizes(ctx.allocator.a, &r, col, .view, rid, &rctx)) return ApiError.notFound().toResponse(ctx.allocator.a),
+        .check => if (!try policy.authorizes(ctx.allocator.a, r, col, .view, rid, &rctx)) return ApiError.notFound().toResponse(ctx.allocator.a),
     }
-    var rec = (try records.get(ctx.allocator.a, &r, col, rid)) orelse return ApiError.notFound().toResponse(ctx.allocator.a);
+    var rec = (try records.get(ctx.allocator.a, r, col, rid)) orelse return ApiError.notFound().toResponse(ctx.allocator.a);
     const qp = try params_mod.parse(ctx.allocator.a, ctx.query);
-    if (qp.get("expand")) |exp| if (exp.len > 0) try expand_mod.expand(ctx.allocator.a, &r, col, &rec, exp, 0, &rctx);
+    if (qp.get("expand")) |exp| if (exp.len > 0) try expand_mod.expand(ctx.allocator.a, r, col, &rec, exp, 0, &rctx);
     // `fields=` response projection: a PURE OUTPUT FILTER applied AFTER expand + authorization —
     // it can only narrow the record, never reveal a field it wouldn't otherwise return.
     if (qp.get("fields")) |f| if (f.len > 0) {
@@ -1075,6 +1084,116 @@ test "create then view a record over handlers" {
     var vctx = ctxFor(env, RequestArena.from(&arena), .GET, "", &view_params);
     const vres = try view(&vctx);
     try std.testing.expectEqual(@as(u16, 200), vres.status);
+    if (comptime @import("build_options").public_response_cache) {
+        const cache_mod = @import("../public_response_cache.zig");
+        const cache = try cache_mod.Store.create(std.testing.allocator, .{ .collections = &.{"posts"} });
+        defer cache.destroy();
+        env.app.public_response_cache = cache;
+        const c = @import("../c.zig").c;
+        const Probe = struct {
+            threadlocal var awake_ms: i96 = 1000;
+            reads: usize = 0,
+            finish_read_at: ?i96 = 5000,
+            external: ?*db.Db = null,
+            hit_external: ?*db.Db = null,
+            generation_reads: usize = 0,
+            allocations: ?*std.testing.FailingAllocator = null,
+            copied_before_validation: bool = false,
+            failed: bool = false,
+            fn now(userdata: ?*anyopaque, clock: std.Io.Clock) std.Io.Timestamp {
+                if (clock == .awake) return .{ .nanoseconds = awake_ms * std.time.ns_per_ms };
+                return std.testing.io.vtable.now(userdata, clock);
+            }
+            fn authorize(raw: ?*anyopaque, action: c_int, table: [*c]const u8, _: [*c]const u8, _: [*c]const u8, _: [*c]const u8) callconv(.c) c_int {
+                const self: *@This() = @ptrCast(@alignCast(raw.?));
+                if (action == c.SQLITE_PRAGMA and table != null and std.mem.eql(u8, std.mem.span(table), "data_version")) {
+                    self.generation_reads += 1;
+                    if (self.generation_reads == 2) if (self.hit_external) |external| {
+                        self.hit_external = null;
+                        self.copied_before_validation = self.allocations.?.allocated_bytes != 0;
+                        external.exec("UPDATE _collections SET viewRule=NULL WHERE name='posts'") catch {
+                            self.failed = true;
+                        };
+                    };
+                }
+                if (action == c.SQLITE_READ and table != null and std.mem.eql(u8, std.mem.span(table), "posts")) {
+                    self.reads += 1;
+                    if (self.finish_read_at) |finished| {
+                        awake_ms = finished;
+                        self.finish_read_at = null;
+                    }
+                    if (self.external) |external| {
+                        self.external = null;
+                        external.exec("UPDATE _collections SET viewRule=NULL WHERE name='posts'") catch {
+                            self.failed = true;
+                        };
+                    }
+                }
+                return c.SQLITE_OK;
+            }
+        };
+        var probe: Probe = .{};
+        Probe.awake_ms = 1000;
+        var fake_vtable = std.testing.io.vtable.*;
+        fake_vtable.now = Probe.now;
+        const original_vtable = env.app.io.vtable;
+        env.app.io.vtable = &fake_vtable;
+        defer env.app.io.vtable = original_vtable;
+        const handle = blk: {
+            const writer = env.pool.acquireWriter();
+            defer env.pool.releaseWriter();
+            const handle = if (comptime @import("build_options").postgres) switch (writer.*) {
+                .sqlite => |sqlite| sqlite.handle,
+                .postgres => return error.TestUnexpectedResult,
+            } else writer.handle;
+            try std.testing.expectEqual(c.SQLITE_OK, c.sqlite3_set_authorizer(handle, Probe.authorize, &probe));
+            break :blk handle;
+        };
+        defer {
+            _ = env.pool.acquireWriter();
+            defer env.pool.releaseWriter();
+            _ = c.sqlite3_set_authorizer(handle, null, null);
+        }
+        try std.testing.expectEqual(@as(u16, 200), (try view(&vctx)).status);
+        try std.testing.expect(probe.reads > 0);
+        // Simulate a read taking four TTLs: retention starts when it finishes,
+        // not at the earlier cache lookup. No scheduler or real sleep involved.
+        try std.testing.expectEqual(@as(i128, 6000), cache.entries[0].expires);
+        probe.reads = 0;
+        Probe.awake_ms = 5999;
+        try std.testing.expectEqualStrings((try view(&vctx)).body, vres.body);
+        try std.testing.expectEqual(@as(usize, 0), probe.reads); // genuine hit skips the record SELECT
+        Probe.awake_ms = 6000;
+        try std.testing.expectEqual(@as(u16, 200), (try view(&vctx)).status);
+        try std.testing.expect(probe.reads > 0); // expires exactly one TTL after insertion
+
+        const dir = try env.tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+        defer std.testing.allocator.free(dir);
+        const path = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/test.db", .{dir}, 0);
+        defer std.testing.allocator.free(path);
+        var external = try db.Db.open(path);
+        defer external.close();
+        // Revoke between a borrowed hit and its second generation read. The
+        // request must not allocate a cached-body copy before validation.
+        var allocations = std.testing.FailingAllocator.init(arena.allocator(), .{});
+        vctx.allocator = RequestArena.forTest(allocations.allocator());
+        probe.allocations = &allocations;
+        probe.generation_reads = 0;
+        probe.hit_external = &external;
+        try std.testing.expectEqual(@as(u16, 404), (try view(&vctx)).status);
+        try std.testing.expect(probe.hit_external == null);
+        try std.testing.expect(!probe.copied_before_validation);
+        try std.testing.expect(!probe.failed);
+        for (cache.entries) |entry| try std.testing.expect(entry.body == null);
+        vctx.allocator = RequestArena.from(&arena);
+        try external.exec("UPDATE _collections SET viewRule='@public' WHERE name='posts'");
+        // Force a miss, then revoke access during preparation of the record read.
+        try external.exec("UPDATE posts SET title='external'");
+        probe.external = &external;
+        try std.testing.expectEqual(@as(u16, 404), (try view(&vctx)).status);
+        try std.testing.expect(!probe.failed);
+        for (cache.entries) |entry| try std.testing.expect(entry.body == null);
+    }
 }
 
 test "view nonexistent collection -> 404" {

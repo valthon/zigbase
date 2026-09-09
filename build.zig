@@ -14,6 +14,7 @@ const BuildOptionValues = struct {
     realtime_backfill: bool,
     resumable_uploads: bool,
     query_workbench: bool,
+    public_response_cache: bool,
     fts5: bool,
     sqlite_version: []const u8,
     sqlite_source_id: []const u8,
@@ -116,6 +117,7 @@ pub fn build(b: *std.Build) void {
     const realtime_backfill = b.option(bool, "realtime-backfill", "Compile bounded process-local record invalidation backfill (default: off)") orelse false;
     const resumable_uploads = b.option(bool, "resumable-uploads", "Compile bounded process-local resumable file uploads (default: off)") orelse false;
     const query_workbench = b.option(bool, "query-workbench", "Compile bounded SQLite query diagnostics (default: off)") orelse false;
+    const public_response_cache = b.option(bool, "public-response-cache", "Compile explicitly eligible public record response caching (default: off)") orelse false;
     // Opt-in vector search (#157; Postgres pgvector port #159). OFF by default: the default build
     // does NOT compile or link the sqlite-vec amalgamation, and every vector code path folds to
     // comptime-dead — the shipped binary is byte-for-byte unaffected. `-Dvector=true` enables vector
@@ -167,6 +169,7 @@ pub fn build(b: *std.Build) void {
         .realtime_backfill = realtime_backfill,
         .resumable_uploads = resumable_uploads,
         .query_workbench = query_workbench,
+        .public_response_cache = public_response_cache,
         .internal_api = false,
         .vector = vector,
         .postgres = postgres,
@@ -470,6 +473,15 @@ pub fn build(b: *std.Build) void {
     const invalid_idempotency = b.addExecutable(.{ .name = "invalid-idempotency", .root_module = invalid_idempotency_mod });
     invalid_idempotency.expect_errors = .{ .contains = "invalid idempotency limits: namespace 1..128, entries 1..1000000, retention 1..31536000, payload/result 1..1048576, cleanup 1..1024" };
     b.step("check-idempotency-contracts", "Check invalid comptime idempotency limits are rejected").dependOn(&invalid_idempotency.step);
+    const response_cache_mod = b.createModule(.{ .root_source_file = b.path("fixtures/public-response-cache/main.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    response_cache_mod.addImport("zigbase", zigbase_mod);
+    const response_cache_exe = b.addExecutable(.{ .name = "public-response-cache-fixture", .root_module = response_cache_mod });
+    b.step("public-response-cache-fixture", "Build the opt-in public response cache HTTP fixture").dependOn(&b.addInstallArtifact(response_cache_exe, .{}).step);
+    const invalid_cache_mod = b.createModule(.{ .root_source_file = b.path("fixtures/public-response-cache/invalid.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    invalid_cache_mod.addImport("zigbase", zigbase_mod);
+    const invalid_cache = b.addExecutable(.{ .name = "invalid-public-response-cache", .root_module = invalid_cache_mod });
+    invalid_cache.expect_errors = .{ .contains = if (public_response_cache) "public response cache requires 1..256 entries, 1..65536 body bytes and 1..60000 ttl_ms" else ".public_response_cache requires -Dpublic-response-cache=true" };
+    b.step("check-public-response-cache-contracts", "Check public response cache comptime budgets and gate").dependOn(&invalid_cache.step);
     workbench_mod.addImport("zigbase", zigbase_mod);
     const workbench_fixture_options = b.addOptions();
     workbench_fixture_options.addOption(bool, "enabled", query_workbench);

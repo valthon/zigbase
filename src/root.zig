@@ -467,6 +467,7 @@ test {
     _ = @import("realtime/hub.zig");
     _ = @import("realtime/backfill.zig");
     _ = @import("api/realtime_backfill.zig");
+    if (@import("build_options").public_response_cache) _ = @import("public_response_cache.zig");
     if (@import("build_options").query_workbench) {
         _ = @import("query_workbench.zig");
         _ = @import("api/query_workbench.zig");

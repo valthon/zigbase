@@ -526,7 +526,7 @@ pub fn App(comptime cfg: anytype) type {
             @setEvalBranchQuota(20_000);
             // Guard top-level cfg keys so a typo (e.g. `.hook`, `.on_error`) fails
             // loudly at comptime instead of silently producing an empty Dispatch.
-            const allowed = .{ "query_workbench", "admission", "resource_profile", "hooks", "onError", "routes", "onAuth", "beforeAuthSuccess", "auth", "onFileServe", "onFileUpload", "onBootstrap", "onBeforeServe", "onBeforeTerminate", "cron", "jobs", "storage", "mailer", "reporter", "reporter_dedup", "pools", "collections", "migrations", "static_files", "pagination", "enable_typegen", "flags", "experiments", "features", "onFeatureExposure", "experiment_assignment_ttl", "queues", "workers", "realtime", "tenancy", "abilities", "mail", "analytics", "static_routes", "enable_spa_marker", "static_cache_control", "admin", "webhooks", "ttl_gc_interval", "files", "push", "sms", "sms_provider", "collections_frozen", "app_context" };
+            const allowed = .{ "public_response_cache", "query_workbench", "admission", "resource_profile", "hooks", "onError", "routes", "onAuth", "beforeAuthSuccess", "auth", "onFileServe", "onFileUpload", "onBootstrap", "onBeforeServe", "onBeforeTerminate", "cron", "jobs", "storage", "mailer", "reporter", "reporter_dedup", "pools", "collections", "migrations", "static_files", "pagination", "enable_typegen", "flags", "experiments", "features", "onFeatureExposure", "experiment_assignment_ttl", "queues", "workers", "realtime", "tenancy", "abilities", "mail", "analytics", "static_routes", "enable_spa_marker", "static_cache_control", "admin", "webhooks", "ttl_gc_interval", "files", "push", "sms", "sms_provider", "collections_frozen", "app_context" };
             const allowed_list = blk2: {
                 var s: []const u8 = "";
                 for (allowed, 0..) |name, i| s = s ++ (if (i == 0) "" else "/") ++ name;
@@ -1727,6 +1727,7 @@ pub fn App(comptime cfg: anytype) type {
             .gates = route_gates,
             .admission_config = admission_config,
             .query_workbench = @import("query_workbench.zig").resolve(cfg),
+            .public_response_cache = @import("public_response_cache.zig").resolve(cfg),
         };
 
         /// Parse argv and dispatch the CLI (serve / migrate / superuser create / help),
@@ -1868,6 +1869,7 @@ fn analyticsRollupRun(ctx: *ctx_mod.Ctx, ev: *events.JobEvent) anyerror!void {
 /// and the warm-reader-pool cap.
 pub const ServeOpts = struct {
     query_workbench: @import("query_workbench.zig").Limits = .{},
+    public_response_cache: @import("public_response_cache.zig").Config = .{},
     admission_config: ?@import("admission.zig").Config = null,
     StoragePlugin: type,
     MailerPlugin: type,
@@ -4689,6 +4691,7 @@ fn BootedApp(comptime opts: ServeOpts) type {
         backfill_store: if (build_options.realtime_backfill) ?*@import("realtime/backfill.zig").Store else void,
         resumable_store: if (build_options.resumable_uploads) *@import("files/resumable.zig").Store else void,
         query_workbench: if (build_options.query_workbench) *@import("query_workbench.zig").Store else void,
+        public_response_cache: if (build_options.public_response_cache) ?*@import("public_response_cache.zig").Store else void,
         /// The fully-assembled application. Interior pointers reference the sibling fields
         /// above. `serveImpl` takes `&self.app` for the server/scheduler/mem-pool.
         app: app_mod.App,
@@ -4697,6 +4700,7 @@ fn BootedApp(comptime opts: ServeOpts) type {
             if (comptime build_options.realtime_backfill) if (self.backfill_store) |store| store.destroy();
             if (comptime build_options.resumable_uploads) self.resumable_store.destroy();
             if (comptime build_options.query_workbench) self.query_workbench.destroy();
+            if (comptime build_options.public_response_cache) if (self.public_response_cache) |s| s.destroy();
             self.report_dedup_inst.deinit();
             self.feature_cache_inst.deinit();
             if (self.col_cache_inst) |*c| c.deinit();
@@ -4821,6 +4825,10 @@ fn bootApp(
     if (cfg.sse_heartbeat_seconds != 0 and cfg.sse_heartbeat_seconds > 255) {
         std.log.err("refusing to start: ZIGBASE_SSE_HEARTBEAT_SECONDS/--sse-heartbeat-seconds must be 0 (inherit) or 1..=255, got {d}", .{cfg.sse_heartbeat_seconds});
         return error.InvalidSseHeartbeat;
+    }
+    if (comptime build_options.public_response_cache) {
+        if (opts.public_response_cache.collections.len != 0 and db.chooseBackend(environ.get("ZIGBASE_DB_URL")) != .sqlite)
+            return error.PublicResponseCacheRequiresSqlite;
     }
     holder.pool = try openPoolSelect(allocator, io, cfg, .{ .reader_cap = opts.reader_pool_size, .cache_kib = opts.cache_kib }, environ);
     errdefer holder.pool.deinit();
@@ -5063,8 +5071,15 @@ fn bootApp(
     errdefer if (comptime build_options.resumable_uploads) holder.resumable_store.destroy();
     holder.query_workbench = if (comptime build_options.query_workbench) try @import("query_workbench.zig").Store.create(allocator, io, opts.query_workbench) else {};
     errdefer if (comptime build_options.query_workbench) holder.query_workbench.destroy();
+    holder.public_response_cache = if (comptime build_options.public_response_cache) blk: {
+        if (opts.public_response_cache.collections.len == 0) break :blk null;
+        if (db.poolBackend(&holder.pool) != .sqlite) return error.PublicResponseCacheRequiresSqlite;
+        break :blk try @import("public_response_cache.zig").Store.create(allocator, opts.public_response_cache);
+    } else {};
+    errdefer if (comptime build_options.public_response_cache) if (holder.public_response_cache) |s| s.destroy();
     holder.app = app_mod.App{
         .query_workbench = if (comptime build_options.query_workbench) holder.query_workbench else {},
+        .public_response_cache = if (comptime build_options.public_response_cache) holder.public_response_cache else {},
         .admission = if (comptime opts.admission_config != null) &holder.admission_state else null,
         .backfill = if (comptime build_options.realtime_backfill) holder.backfill_store else {},
         .resumable_uploads = if (comptime build_options.resumable_uploads) holder.resumable_store else {},
