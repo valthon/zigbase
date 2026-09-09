@@ -190,6 +190,13 @@ pub const Ctx = @import("ctx.zig").Ctx;
 /// runs writes on the in-transaction connection and `t.arena()` is the invocation arena.
 /// See the `ctx.tx()` section of docs/framework.md.
 pub const Tx = @import("ctx.zig").Tx;
+/// SQLite-only, opt-in database mutation receipts with comptime resource limits.
+pub const Idempotency = @import("idempotency.zig").Idempotency;
+pub const IdempotencyLimits = @import("idempotency.zig").Limits;
+pub const IdempotencyPrincipal = @import("idempotency.zig").Principal;
+pub const IdempotencyInput = @import("idempotency.zig").Input;
+pub const IdempotencyCallbacks = @import("idempotency.zig").Callbacks;
+pub const IdempotencyResult = @import("idempotency.zig").Result;
 /// Decoded URL query string returned by `ctx.query()` — `q.get("k") -> ?[]const u8`.
 pub const QueryParams = @import("query/params.zig").Params;
 /// Options for `ctx.subjectCookie(name, opts)` (read-or-mint opaque visitor id, #137).
@@ -428,6 +435,7 @@ test {
     _ = @import("static_files.zig");
     _ = @import("api/error.zig");
     _ = @import("api/health.zig");
+    _ = @import("idempotency.zig");
     _ = @import("api/meta.zig");
     _ = @import("api/collections.zig");
     _ = @import("api/records.zig");

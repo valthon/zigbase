@@ -1696,6 +1696,86 @@ return ctx.errorResponse(ctx.invalid(&.{
 }));
 ```
 
+### Idempotent custom mutations (opt-in SQLite)
+
+`zigbase.Idempotency(.{ .namespace = "booking-cancel-v1", .max_entries = 1024,
+.retention_seconds = 86400, .max_payload_bytes = 65536, .max_result_bytes = 4096,
+.cleanup_batch = 64 })` is a lazy generic helper, not global HTTP middleware.
+Instantiating and calling it opts in; unused applications have no receipt schema,
+state, timer, callback registration, or request overhead. There is no build flag
+or `App` configuration field for this helper. All its resource limits are comptime.
+
+Call `Receipts.execute(allocator, writer, input, callbacks)`. Acquire the pool
+writer once and defer its release; do not call from an existing `ctx.tx` or hook
+transaction. The helper refuses PostgreSQL and caller-owned transactions before
+doing any work. `IdempotencyInput` contains:
+
+- `principal = .{ .collection = authenticated_collection, .record = authenticated_id }`:
+  both come from verified server identity, never from submitted JSON.
+- `operation`: a stable, versioned server operation name; `key`: the client's retry key.
+- `payload`: exact bytes covering **all** mutation inputs, including resource IDs
+  in the URL. Different serialization means a different payload; JSON is not canonicalized.
+- `now`: trusted server Unix seconds captured for this attempt. Expiry is exactly
+  `now + retention_seconds`, not commit time. Writer wait and mutation duration
+  consume retention; choose an adequate interval, use short callbacks, and keep
+  participating process clocks synchronized. Expiry permits the operation to run again.
+
+Every principal component, operation and key must be 1..128 bytes. The namespace
+is 1..128 bytes, entries 1..1,000,000, retention 1..31,536,000 seconds, payload and
+result budgets 1..1,048,576 bytes, cleanup batch 1..1024. Runtime inputs are checked
+before hashing or SQL. Namespace separates capacity and cleanup; collection,
+record, operation and key are length-framed then SHA-256 hashed, so ambiguous
+concatenations cannot cross identities. Only hashes and result bytes are stored,
+not raw keys or payloads. Results may contain secrets: protect the database/backups.
+
+`IdempotencyCallbacks` holds an opaque context and two explicit callbacks:
+
+```zig
+fn authorize(conn: *zigbase.Db, context: *anyopaque) anyerror!void;
+fn mutate(conn: *zigbase.Db, context: *anyopaque, output: []u8) anyerror!usize;
+```
+
+`authorize` **must be read-only** and must recheck current access using the supplied
+writer, including on replay. Authentication and token validation still happen on
+every HTTP request before entering the helper. `mutate` uses only that connection,
+writes its response bytes into the supplied bounded buffer, and returns bytes used.
+Neither callback may end the transaction or reacquire the writer. These are trusted
+application callbacks, not a SQL sandbox; arbitrary callback memory/CPU is not bounded.
+The return owns its allocation: read `result.body()` / `result.replayed`, then
+`result.deinit(allocator)`. Copy the body into your response's lifetime before deinit.
+
+An SQLite `BEGIN IMMEDIATE` covers current authorization, lookup, DB mutation and
+receipt insertion. Independent writers cannot both execute an uncommitted key;
+lock contention may return a DB error and is safe to retry. If commit succeeds but
+the response is lost, the same authorized attempt returns the saved bytes without
+calling `mutate`. Changed payload under a live key returns `PayloadConflict`.
+Mutation, allocation, oversized-output and commit errors roll back effects and
+receipt together. A rollback failure is logged while the original operation error
+is returned. The helper does **not** discard, replace or reset a connection, and
+does not evict a pooled writer. Its transaction state is uncertain: the caller
+must stop reuse and recover the connection or pool (for example, stop the serving
+process and reopen it after diagnosing the storage failure), not merely release
+that writer back to normal service.
+
+Live receipts are never evicted to admit new keys. Capacity exhaustion returns
+`CapacityExceeded` before mutation. Each attempt deletes at most `cleanup_batch`
+expired receipts plus its own expired target, using an expiry index. Capacity
+refusals commit **housekeeping only**, so lowering capacity cannot permanently
+wedge cleanup. Other failures roll housekeeping back. No timer deletes idle data:
+expiry ends replay protection but physical receipts can remain until later attempts.
+All processes for a namespace should use the same limits. Lowering capacity refuses
+new keys until rows fit; lowering retention never changes stored expiries. Lowering
+result budget below an existing result refuses its replay, rather than rerunning it.
+The logical bound is per namespace (including retained result bytes); number of
+namespaces, SQLite pages/WAL, disk reclamation and total process RSS are not bounded.
+
+This is **database-only atomicity**, not exactly-once email, HTTP, files or realtime.
+Never perform these effects in a callback; use a transactional outbox if needed.
+The helper does not automatically invoke REST hooks/rules or serialize responses.
+The [golfsim example](../examples/golfsim/README.md#idempotent-cancellation) shows
+an authenticated custom route with current guest authorization and a bound `Ctx`.
+Built-in REST idempotency and PostgreSQL coordination are not implemented.
+
 ### `ctx.tx()` — multi-write transactions
 
 To write several records atomically — all commit or all roll back — define a
