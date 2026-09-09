@@ -5,6 +5,9 @@
 Start here, then load one or two of the linked guides. The full corpus is
 ~200k tokens; you almost never need it.
 
+For interrupted client file transfers, load [resumable uploads](resumable-uploads.md):
+opt-in, principal-bound, bounded and process-local; not restart-durable streaming.
+
 ## What ZigBase is
 
 A single binary: REST API, WebSocket realtime, file storage, argon2id + JWT

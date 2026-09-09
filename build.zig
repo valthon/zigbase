@@ -12,6 +12,7 @@ const BuildOptionValues = struct {
     s3: bool,
     file_inventory: bool,
     realtime_backfill: bool,
+    resumable_uploads: bool,
     fts5: bool,
     sqlite_version: []const u8,
     sqlite_source_id: []const u8,
@@ -112,6 +113,7 @@ pub fn build(b: *std.Build) void {
     const dev_tools = b.option(bool, "dev-tools", "Compile development CLI verbs: init, agents-md, typegen, capabilities, routes, tune (default: on)") orelse true;
     const file_inventory = b.option(bool, "file-inventory", "Compile read-only local/S3 file inventory reporting (default: off)") orelse false;
     const realtime_backfill = b.option(bool, "realtime-backfill", "Compile bounded process-local record invalidation backfill (default: off)") orelse false;
+    const resumable_uploads = b.option(bool, "resumable-uploads", "Compile bounded process-local resumable file uploads (default: off)") orelse false;
     // Opt-in vector search (#157; Postgres pgvector port #159). OFF by default: the default build
     // does NOT compile or link the sqlite-vec amalgamation, and every vector code path folds to
     // comptime-dead — the shipped binary is byte-for-byte unaffected. `-Dvector=true` enables vector
@@ -161,6 +163,7 @@ pub fn build(b: *std.Build) void {
         .dev_tools = dev_tools,
         .file_inventory = file_inventory,
         .realtime_backfill = realtime_backfill,
+        .resumable_uploads = resumable_uploads,
         .internal_api = false,
         .vector = vector,
         .postgres = postgres,
@@ -280,6 +283,14 @@ pub fn build(b: *std.Build) void {
     discovery_mod.addImport("zigbase", zigbase_mod);
     const discovery_exe = b.addExecutable(.{ .name = "route-discovery-fixture", .root_module = discovery_mod });
     b.step("route-discovery-fixture", "Build offline custom-route discovery fixture").dependOn(&b.addInstallArtifact(discovery_exe, .{}).step);
+    const resumable_mod = b.createModule(.{
+        .root_source_file = b.path("fixtures/resumable-uploads/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "zigbase", .module = zigbase_mod }},
+    });
+    const resumable_exe = b.addExecutable(.{ .name = "resumable-uploads-fixture", .root_module = resumable_mod });
+    b.step("resumable-uploads-fixture", "Build bounded upload HTTP fixture (-Dresumable-uploads=true)").dependOn(&b.addInstallArtifact(resumable_exe, .{}).step);
 
     // --- dating-server: the dating fixture compiled as a runnable server ----------
     // Plan 2: the e2e harness spawns THIS binary so client and server share the exact
@@ -390,6 +401,14 @@ pub fn build(b: *std.Build) void {
         route_contracts.dependOn(&invalid_exe.step);
     }
     const scheduler_contracts = b.step("check-scheduler-contracts", "Check distributed scheduler compile-time contracts");
+    const resumable_contracts = b.step("check-resumable-contracts", "Check resumable upload budget compile-time contracts");
+    inline for (&.{ "zero", "chunk", "unknown" }) |name| {
+        const mod = b.createModule(.{ .root_source_file = b.path("fixtures/invalid-resumable/" ++ name ++ ".zig"), .target = target, .optimize = optimize, .link_libc = true });
+        mod.addImport("zigbase", zigbase_mod);
+        const invalid = b.addExecutable(.{ .name = "invalid-resumable-" ++ name, .root_module = mod });
+        invalid.expect_errors = .{ .contains = if (!resumable_uploads) ".files.resumable requires -Dresumable-uploads=true" else if (std.mem.eql(u8, name, "unknown")) "Unknown .files.resumable limit: unknown_limit" else "Invalid .files.resumable budgets: positive limits, sessions<=1024, principal<=sessions, chunk<=upload<=total<=1GiB, TTL<=86400 required" };
+        resumable_contracts.dependOn(&invalid.step);
+    }
     inline for (&.{
         .{ .name = "reactive", .expected = "distributed jobs require a cron or interval schedule" },
         .{ .name = "zero-lease", .expected = "distributed lease_seconds must be positive" },

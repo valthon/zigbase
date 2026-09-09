@@ -740,3 +740,30 @@ exe_mod.addImport("zigbase", zigbase.module("zigbase"));
 ```
 
 Your executable module must `.link_libc = true` (SQLite needs libc).
+
+## Resume a listing-photo transfer
+
+Build this example with `zig build -Dresumable-uploads=true` to enable the
+[resumable upload protocol](../../docs/resumable-uploads.md). It buffers bounded
+uploads in this process, not on durable staging storage. Restart or another
+instance loses the session; keep the original photo and inspect the record before
+starting again after an uncertain commit. Existing listing ownership rules,
+photo count/size/MIME constraints, and file hooks still apply at commit.
+
+For an existing listing, begin with an authenticated
+`POST /api/collections/listings/records/{listingId}/uploads`:
+
+```json
+{"field":"photos","filename":"simulator.jpg","length":12345,"mimetype":"image/jpeg"}
+```
+
+Keep its returned `id`. Send binary chunks to `PATCH /api/uploads/{id}` with
+`Upload-Offset: 0` (then the acknowledged byte count) and your current bearer
+token. After an interrupted response, `GET /api/uploads/{id}` reports the offset
+from which to continue; repeat an acknowledged chunk only with identical bytes.
+Once `offset == length`, `POST /api/uploads/{id}/commit` returns `204` and the
+normal listing update publishes the photo. A repeated confirmed commit acknowledges
+the same mutation without another upload hook. `DELETE /api/uploads/{id}` aborts
+before commit. All verbs require your current bearer credentials; the session ID
+alone grants no access. See the protocol guide for fixed expiry, quota and terminal
+failure handling; this example leaves the feature off by default.

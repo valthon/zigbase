@@ -85,7 +85,10 @@ There are two ways to use ZigBase:
   → [Recipes](./recipes#recipe-gate-a-public-form-with-captcha)
 - **Files** — local (pluggable) file storage with serving and short-lived file-access
   tokens. Opt-in durable HTTP cleanup retries removed-file deletion after commit,
-  using the existing queue engine. → [API](./api#files), [Framework](./framework#durable-http-file-cleanup-opt-in)
+  using the existing queue engine. Opt-in [resumable uploads](./resumable-uploads)
+  resume interrupted transfers within one process, with bounded buffers and
+  fresh authorization at commit; they are not restart-durable streaming.
+  → [API](./api#files), [Framework](./framework#durable-http-file-cleanup-opt-in)
 - **Admin UI** — embedded single-page app served at `/_/`, including a Settings screen
   for managing KV/feature flags.
 - **Framework** — comptime record hooks, custom routes, scheduled jobs, a comptime schema

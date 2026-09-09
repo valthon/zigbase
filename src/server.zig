@@ -356,6 +356,13 @@ pub fn Server(comptime gates: Gates) type {
             if (@import("build_options").realtime_backfill) t = t ++ &[_]router.Route{
                 .{ .method = .GET, .pattern = "/api/realtime/backfill", .handler = @import("api/realtime_backfill.zig").get },
             };
+            if (@import("build_options").resumable_uploads) t = t ++ &[_]router.Route{
+                .{ .method = .POST, .pattern = "/api/collections/:col/records/:id/uploads", .handler = @import("api/resumable_uploads.zig").begin },
+                .{ .method = .GET, .pattern = "/api/uploads/:upload", .handler = @import("api/resumable_uploads.zig").status },
+                .{ .method = .PATCH, .pattern = "/api/uploads/:upload", .handler = @import("api/resumable_uploads.zig").append },
+                .{ .method = .DELETE, .pattern = "/api/uploads/:upload", .handler = @import("api/resumable_uploads.zig").abort },
+                .{ .method = .POST, .pattern = "/api/uploads/:upload/commit", .handler = @import("api/resumable_uploads.zig").commit },
+            };
             if (gates.two_factor) t = &[_]router.Route{
                 .{ .method = .POST, .pattern = "/api/collections/:col/auth/two-factor/:action", .handler = @import("api/two_factor.zig").dispatch },
             } ++ t;

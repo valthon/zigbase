@@ -39,6 +39,20 @@ if [ "${1:-}" = --inventory ]; then
   exit 0
 fi
 
+if [ "${1:-}" = --resumable-uploads ]; then
+  [ "$#" -eq 3 ] || { echo 'usage: check-gating.sh --resumable-uploads OFF_BINARY ON_BINARY'; exit 2; }
+  for pattern in 'files\.resumable\.' 'api\.resumable_uploads\.' 'updateResumable'; do
+    if nm --defined-only "$2" | grep -E "$pattern" >/dev/null; then
+      echo "LEAK: upload pattern '$pattern' in $2"; exit 1
+    fi
+    if ! nm --defined-only "$3" | grep -E "$pattern" >/dev/null; then
+      echo "DRIFT: upload pattern '$pattern' absent in $3"; exit 1
+    fi
+  done
+  echo 'resumable uploads gating: OK'
+  exit 0
+fi
+
 FULL=zig-out/bin/zigbase
 check_inventory "$FULL"
 FULL2=zig-out/bin/full-fixture
