@@ -17,8 +17,19 @@
 
 const std = @import("std");
 
+/// Comptime resource budgets for opt-in process-local upload sessions.
+pub const ResumableLimits = struct {
+    max_sessions: usize = 8,
+    max_upload_bytes: usize = 8 << 20,
+    max_total_bytes: usize = 32 << 20,
+    max_chunk_bytes: usize = 1 << 20,
+    ttl_seconds: u32 = 900,
+    max_sessions_per_principal: usize = 2,
+};
+
 /// The lowered runtime config stored on `app.App.files`.
 pub const Runtime = struct {
+    resumable: if (@import("build_options").resumable_uploads) ResumableLimits else void = if (@import("build_options").resumable_uploads) .{} else {},
     /// Installed only by an opt-in App; absent builds do not retain cleanup code.
     cleanup: ?*const fn (std.mem.Allocator, *@import("../db.zig").Db, std.Io, @import("../queue/queue.zig").QueueDef, @import("../schema.zig").Collection, []const u8, std.json.Value, ?std.json.Value) anyerror!void = null,
     cleanup_queue: ?@import("../queue/queue.zig").QueueDef = null,
@@ -40,10 +51,21 @@ pub fn lower(comptime files_cfg: anytype) Runtime {
     if (@typeInfo(FC) != .@"struct")
         @compileError(".files must be a struct, e.g. '.{ .s3_presign_redirect = true, .s3_presign_ttl_s = 900 }'");
     inline for (std.meta.fields(FC)) |f| {
-        if (comptime !std.mem.eql(u8, f.name, "cleanup_queue") and !std.mem.eql(u8, f.name, "s3_presign_redirect") and !std.mem.eql(u8, f.name, "s3_presign_ttl_s"))
-            @compileError(".files: unknown key '." ++ f.name ++ "' (recognized: .cleanup_queue, .s3_presign_redirect, .s3_presign_ttl_s)");
+        if (comptime !std.mem.eql(u8, f.name, "resumable") and !std.mem.eql(u8, f.name, "cleanup_queue") and !std.mem.eql(u8, f.name, "s3_presign_redirect") and !std.mem.eql(u8, f.name, "s3_presign_ttl_s"))
+            @compileError(".files: unknown key '." ++ f.name ++ "' (recognized: .resumable, .cleanup_queue, .s3_presign_redirect, .s3_presign_ttl_s)");
     }
     var rt = Runtime{};
+    if (@hasField(FC, "resumable")) {
+        if (!@import("build_options").resumable_uploads) @compileError(".files.resumable requires -Dresumable-uploads=true");
+        if (@typeInfo(@TypeOf(files_cfg.resumable)) != .@"struct") @compileError(".files.resumable must be a struct of resource budgets");
+        inline for (std.meta.fields(@TypeOf(files_cfg.resumable))) |field| {
+            if (!@hasField(ResumableLimits, field.name)) @compileError("Unknown .files.resumable limit: " ++ field.name);
+            @field(rt.resumable, field.name) = @field(files_cfg.resumable, field.name);
+        }
+        const r = rt.resumable;
+        if (r.max_sessions == 0 or r.max_sessions > 1024 or r.max_sessions_per_principal == 0 or r.max_sessions_per_principal > r.max_sessions or r.max_upload_bytes == 0 or r.max_upload_bytes > r.max_total_bytes or r.max_total_bytes > 1 << 30 or r.max_chunk_bytes == 0 or r.max_chunk_bytes > r.max_upload_bytes or r.ttl_seconds == 0 or r.ttl_seconds > 86400)
+            @compileError("Invalid .files.resumable budgets: positive limits, sessions<=1024, principal<=sessions, chunk<=upload<=total<=1GiB, TTL<=86400 required");
+    }
     if (@hasField(FC, "s3_presign_redirect")) {
         if (@TypeOf(files_cfg.s3_presign_redirect) != bool)
             @compileError(".files.s3_presign_redirect must be a bool (true/false)");
@@ -74,4 +96,15 @@ test "Runtime defaults are proxy-only" {
     const r = Runtime{};
     try std.testing.expect(!r.presign_redirect);
     try std.testing.expectEqual(@as(u32, 900), r.presign_ttl_s);
+}
+
+test "resumable budgets are compiled out or comptime configurable" {
+    if (comptime @import("build_options").resumable_uploads) {
+        const rt = comptime lower(.{ .resumable = .{ .max_sessions = 3, .max_sessions_per_principal = 1, .max_upload_bytes = 32, .max_total_bytes = 64, .max_chunk_bytes = 8, .ttl_seconds = 10 } });
+        try std.testing.expectEqual(@as(usize, 3), rt.resumable.max_sessions);
+        try std.testing.expectEqual(@as(usize, 64), rt.resumable.max_total_bytes);
+        try std.testing.expectEqual(@as(u32, 10), rt.resumable.ttl_seconds);
+    } else {
+        try std.testing.expectEqual(@as(usize, 0), @sizeOf(@FieldType(Runtime, "resumable")));
+    }
 }

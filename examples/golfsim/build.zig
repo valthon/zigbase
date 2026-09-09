@@ -5,7 +5,8 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const zigbase = b.dependency("zigbase", .{ .target = target, .optimize = optimize });
+    const resumable = b.option(bool, "resumable-uploads", "Enable bounded process-local photo upload resume") orelse false;
+    const zigbase = b.dependency("zigbase", .{ .target = target, .optimize = optimize, .@"resumable-uploads" = resumable });
 
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),

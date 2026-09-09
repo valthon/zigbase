@@ -488,6 +488,22 @@ pub fn create(ctx: *http.RequestCtx) anyerror!http.Response {
 }
 
 pub fn update(ctx: *http.RequestCtx) anyerror!http.Response {
+    return updateImpl(ctx, false, {});
+}
+
+/// Internal resumable adapter. The marker records DB commit, independent of
+/// post-commit hook/response failures; the binding may never degrade to anonymous.
+pub const ResumableCommit = struct {
+    collection: []const u8,
+    principal: []const u8,
+    target_collection_id: []const u8,
+    committed: *bool,
+};
+pub fn updateResumable(ctx: *http.RequestCtx, commit: ResumableCommit) anyerror!http.Response {
+    return updateImpl(ctx, true, commit);
+}
+
+fn updateImpl(ctx: *http.RequestCtx, comptime is_resumable: bool, resumable: if (is_resumable) ResumableCommit else void) anyerror!http.Response {
     const app = ctx.app.?;
     // F1 password-change gate (spec §F1). When an AUTH-collection PATCH carries a
     // `password`, authorize the change BEFORE the writer is acquired:
@@ -557,6 +573,11 @@ pub fn update(ctx: *http.RequestCtx) anyerror!http.Response {
             .plan => |p| p,
             .resp => |resp| return resp,
         };
+        if (comptime is_resumable) {
+            // Normal multipart ignores unknown file fields. A resumable commit
+            // must not acknowledge a removed/retyped target as a successful no-op.
+            if (planned.writes.len != 1) return ApiError.conflict("Upload file field no longer exists.").toResponse(ctx.allocator.a);
+        }
         const preflight = buildContext(ctx, &r, planned.data);
         switch (policy.decide(upload_col, .update, &preflight)) {
             .deny_locked => return forbidden(ctx),
@@ -586,6 +607,15 @@ pub fn update(ctx: *http.RequestCtx) anyerror!http.Response {
         return ApiError.conflict("Collection changed during upload; reload and retry.").toResponse(ctx.allocator.a);
     if (upload_plan != null) try lockUploadRecord(ctx.allocator.a, w, col, rid);
     const existing = (try records.get(ctx.allocator.a, w, col, rid)) orelse return ApiError.notFound().toResponse(ctx.allocator.a);
+    if (comptime is_resumable) {
+        const expected = resumable;
+        // A fresh verification on the writer also protects @public update rules
+        // from falling back to anonymous when credentials expire during storage.
+        const identity = (try auth.authenticate(app.io, ctx.allocator.a, app, ctx, w)) orelse return ApiError.unauthorized().toResponse(ctx.allocator.a);
+        const principal = identity.record.object.get("id").?.string;
+        if (!std.mem.eql(u8, identity.collection, expected.collection) or !std.mem.eql(u8, principal, expected.principal)) return ApiError.unauthorized().toResponse(ctx.allocator.a);
+        if (!std.mem.eql(u8, col.id, expected.target_collection_id)) return ApiError.conflict("Upload collection no longer exists.").toResponse(ctx.allocator.a);
+    }
     if (upload_plan != null) {
         const current = try std.json.Stringify.valueAlloc(ctx.allocator.a, existing, .{});
         if (!std.mem.eql(u8, upload_snapshot, current))
@@ -603,6 +633,12 @@ pub fn update(ctx: *http.RequestCtx) anyerror!http.Response {
         error.OutOfMemory => return e,
     };
     const rctx = buildContext(ctx, w, data);
+    if (comptime is_resumable) {
+        // buildContext independently resolves authorization. Never accept an
+        // anonymous fallback if an operational failure or revocation occurred.
+        const principal = if (rctx.auth) |identity| identity.object.get("id").?.string else "";
+        if (!std.mem.eql(u8, rctx.collection, resumable.collection) or !std.mem.eql(u8, principal, resumable.principal)) return ApiError.unauthorized().toResponse(ctx.allocator.a);
+    }
     // Gate FIRST: before-hooks must run only on already-authorized ops (matching delete).
     // decide() is pure (src/rules.zig) so computing it once and reusing is equivalent to inline.
     const decision = policy.decide(col, .update, &rctx);
@@ -695,6 +731,7 @@ pub fn update(ctx: *http.RequestCtx) anyerror!http.Response {
     try w.commit();
     txn_open = false;
     committed = true; // row is durable — the write-cleanup defer must NOT fire past here
+    if (comptime is_resumable) resumable.committed.* = true;
 
     // Side effects AFTER commit: drop replaced files, fire file/after-update hooks, broadcast.
     if (app.files.cleanup == null) if (ctx.app.?.storage) |storage| for (all.deletes) |d| storage.delete(app.io, col.name, rid, d) catch |e|
@@ -2509,6 +2546,42 @@ const F1Env = struct {
         return out.toOwnedSlice(a);
     }
 };
+
+test "resumable commit marker survives post-commit response allocation failure" {
+    if (comptime !@import("build_options").resumable_uploads) return error.SkipZigTest;
+    const Probe = struct {
+        var failing: ?*std.testing.FailingAllocator = null;
+        fn hook(_: *Ctx, event: *events.RecordEvent) !void {
+            if (event.phase == .after_update) {
+                const f = failing.?;
+                f.fail_index = f.alloc_index;
+                f.resize_fail_index = f.resize_index;
+            }
+        }
+    };
+    var env = try F1Env.init(&.{ .record = Probe.hook });
+    defer env.deinit();
+    const rid = try env.createUser("marker@x.io", "password123");
+    const bearer = try env.mintOwnerBearer(rid);
+    const col = blk: {
+        var reader = try env.pool.acquireReader();
+        defer env.pool.releaseReader(&reader);
+        break :blk (try collections.get(env.arena.allocator(), &reader, "users")).?;
+    };
+    var failing = std.testing.FailingAllocator.init(env.arena.allocator(), .{});
+    Probe.failing = &failing;
+    defer Probe.failing = null;
+    // Inject failure through the test constructor while keeping the entire
+    // interlinked handler graph owned and reclaimed by env.arena.
+    var ctx = http.RequestCtx{ .method = .PATCH, .path = "/", .allocator = RequestArena.forTest(failing.allocator()), .app = &env.app, .authorization = bearer, .body = "{\"username\":\"marker_changed\"}", .params = &.{ .{ .key = "col", .value = "users" }, .{ .key = "id", .value = rid } } };
+    var committed = false;
+    try std.testing.expectError(error.OutOfMemory, updateResumable(&ctx, .{ .collection = "users", .principal = rid, .target_collection_id = col.id, .committed = &committed }));
+    try std.testing.expect(committed);
+    var reader = try env.pool.acquireReader();
+    defer env.pool.releaseReader(&reader);
+    const current = (try records.get(env.arena.allocator(), &reader, col, rid)).?;
+    try std.testing.expectEqualStrings("marker_changed", current.object.get("username").?.string);
+}
 
 fn patchCtx(env: *F1Env, a: RequestArena, rid: []const u8, bearer: []const u8, body: []const u8) http.RequestCtx {
     const params = [_]http.Param{ .{ .key = "col", .value = "users" }, .{ .key = "id", .value = rid } };

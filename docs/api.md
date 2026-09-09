@@ -1328,6 +1328,36 @@ File downloads support HTTP range and conditional requests (0.10.0):
 
 ---
 
+### Resumable uploads (opt-in)
+
+Build with `-Dresumable-uploads=true` to register these endpoints (otherwise
+`404`). Every operation requires fresh bearer authentication; cookies alone
+do not authorize, and session IDs are bound to their original auth collection
+and principal. Transfers target one file field on an existing record.
+
+| Method | Path | Request / success |
+| --- | --- | --- |
+| POST | `/api/collections/{col}/records/{record}/uploads` | JSON `{field, filename, length, mimetype?}`; `201` status object. |
+| GET | `/api/uploads/{id}` | `200` status object: `{id, offset, length, expiresAt, state, durability}`. |
+| PATCH | `/api/uploads/{id}` | Raw bytes and unsigned decimal `Upload-Offset`; `204`. |
+| POST | `/api/uploads/{id}/commit` | Commit fully received bytes; `204`. Completed retries acknowledge the old commit without repeating hooks or writes. |
+| DELETE | `/api/uploads/{id}` | Abort a receiving session; `204`. Committing, completed, and failed sessions return `409`; mutations are never undone. |
+
+Begin checks update authorization before field shape and record lookup, and
+checks declared length against current file `maxSize` before reserving memory
+(`413 payload_too_large`). Commit rechecks current schema, rules, and file
+constraints through the normal record-update pipeline. Offset/state conflicts
+return `409`; invalid metadata/chunks return `400`; exhausted quotas return
+`429 too_many_requests`. Missing/expired/aborted sessions or a different
+principal return `404`; invalid authentication returns `401`.
+
+This is bounded, fully buffered, **process-local** network resume, not durable
+or cross-instance upload. Restart loses sessions; use sticky routing.
+Completed/failed tombstones release payloads immediately but retain slots
+until their fixed TTL expires (lazy reclamation on API calls). Abort cannot
+erase these acknowledgements. See [the full protocol and capacity tradeoffs](resumable-uploads.md)
+for retry uncertainty, configuration, and examples.
+
 ## Static files
 
 When static serving is configured (see [framework.md](framework.md) for the

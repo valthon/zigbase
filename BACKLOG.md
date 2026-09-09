@@ -60,6 +60,9 @@ copy, examples, and tests with the implementation rather than in follow-up PRs.
 - [x] S3 multipart upload with bounded request scratch, retries, best-effort abort,
   completion-error handling, and live S3-compatible integration coverage.
 - [ ] Resumable client uploads with principal-bound capabilities and commit reauthorization.
+  Implemented slice: opt-in bounded, process-local sessions for one file on an existing
+  record, with fresh authentication and commit reauthorization. Durable restart-safe
+  and cross-instance resume remain future work.
 - [ ] Image transforms/thumbnails with comptime support and resource budgets.
 - [x] Opt-in durable HTTP replacement/deletion cleanup with physical reference checks (#411).
 - [ ] Scoped orphan reconciliation and cleanup for non-HTTP mutation paths.

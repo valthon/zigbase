@@ -280,6 +280,16 @@
     }
   },
   {
+    "canonical": "docs/resumable-uploads.md",
+    "mirror": "resumable-uploads.md",
+    "frontmatter": {
+      "title": "Resumable uploads",
+      "description": "Bounded, principal-bound client file transfers with current commit authorization. Process-local and opt-in, not restart-durable streaming.",
+      "order": 10,
+      "group": "features"
+    }
+  },
+  {
     "canonical": "docs/realtime-broadcast.md",
     "mirror": "realtime-broadcast.md",
     "frontmatter": {
