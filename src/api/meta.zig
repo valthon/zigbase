@@ -46,6 +46,7 @@ pub fn handle(ctx: *http.RequestCtx) !http.Response {
             .mailWebhook = g.mail_webhook,
             .oauth2 = g.oauth2,
             .postgres = build_options.postgres,
+            .queryWorkbench = build_options.query_workbench,
             .s3 = build_options.s3,
             .senders = g.senders,
             .tenancy = g.tenancy,
@@ -56,6 +57,7 @@ pub fn handle(ctx: *http.RequestCtx) !http.Response {
             .health = "/api/health",
             .state = app.features_public_route,
             .realtimeSse = "/api/realtime/sse",
+            .queryWorkbench = if (build_options.query_workbench) "/api/query-workbench/stats" else @as(?[]const u8, null),
         },
         .limits = .{ .maxUploadSize = app.max_upload_size },
     }, .{});

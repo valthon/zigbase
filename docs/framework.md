@@ -166,6 +166,7 @@ error.**
 | `pools` | Footprint levers: reader pool, job pool, thread stack size, SQLite page cache. | always — these are levers on core connection/thread machinery, not an optional subsystem. |
 | `resource_profile` | Optional `.minimal`, `.balanced`, or `.throughput` defaults for existing pool levers; explicit `.pools` fields win. | data-only — selects constants, never enables a subsystem. |
 | `admission` | Optional `.{ .max_requests = N }`, positive `u32`: reject excess synchronous HTTP work with 503 instead of queuing. | excluded — no counters, checks, or diagnostics route when omitted; one null app pointer remains. |
+| `query_workbench` | Optional `.{ .max_entries = 64, .slow_ms = 100 }` budgets for the [SQLite query workbench](#bounded-sqlite-query-workbench-opt-in). Requires `-Dquery-workbench=true`. | build-flag gated — no statement fields, TLS, timestamps, state, or endpoints when off. |
 | `pagination` | Enable/disable offset & cursor list paging and pick the cursor token format. | always — core list-response plumbing. |
 | `flags` | Declared boolean feature flags. See [Feature flags + experiments](#feature-flags--experiments-declared). | data-only — lowers to an empty slice + a zero-variant `Flag` enum when unset. |
 | `experiments` | Declared A/B/n experiments (variants + weights, optional `.sticky`). See [Feature flags + experiments](#feature-flags--experiments-declared). | data-only — lowers to an empty slice + a zero-variant `Experiment` enum when unset. |
@@ -4600,6 +4601,85 @@ during setup). It neither cancels slow accepted handlers nor limits durable queu
 depth. Existing memory-job ring (256 queued tasks, four workers, `QueueFull` on
 overflow) and scheduler bounds remain independent and unchanged.
 
+#### Bounded SQLite query workbench (opt-in)
+
+Build with `-Dquery-workbench=true` to measure synchronous SQLite prepared
+statements inside matched built-in and consumer HTTP route handlers. The default
+build compiles out measurement calls, statement fields, thread-local attribution,
+counter storage and inspector routes. This is a diagnostic build cost, not an
+always-on logging feature. Enabled instrumentation has timestamp, fingerprinting
+and synchronization overhead; it is not zero-cost when enabled.
+
+```zig
+pub const App = zigbase.App(.{
+    .query_workbench = .{ .max_entries = 64, .slow_ms = 100 },
+});
+```
+
+These are also the standalone defaults when the build flag is on. Configuration
+is comptime: 1–256 entries and a positive `slow_ms`; unknown keys fail compilation.
+Each entry aggregates one method + **route template** + structural query shape.
+Only the first configured number of distinct entries is retained until restart;
+new keys are dropped (counted), never allowed to grow a map. Templates longer
+than 192 bytes and unsupported or greater-than-16-KiB statements are omitted.
+Only the first 32 distinct shapes per request are tracked for repetition. This
+can undercount repeats after saturation, but never expands storage. Counters
+saturate instead of wrapping. No telemetry is persisted or exported automatically.
+
+No raw SQL, parameter values, SQL literals, identifier text or request-path values
+are retained. A bounded lexer hashes only a fixed SQL-keyword allowlist and
+punctuation: identifiers become one marker, literal/bind contents another,
+comments disappear. Named binds (`$`, `:`, `@`, `#`, including SQLite Tcl suffix
+syntax) are omitted entirely; anonymous/numbered `?` binds are supported. Thus
+different tables/columns and parameter values can
+share one opaque shape ID. `repeatedShapes` means repeated **structural shapes within
+one matched handler**, not proof of an N+1 query bug. Route templates themselves
+are operator-supplied code metadata and are visible to the inspector; do not put
+secrets in route definitions. Reports are operator-only, not tenant-scoped.
+
+`GET /api/query-workbench/stats` requires a current **superuser bearer token**.
+Cookies alone do not authorize it. It returns bounded `{items}` plus limits,
+backend scope, threshold and dropped-execution count. Each item has `method`,
+`routeTemplate`, opaque hexadecimal `shape`, `executions`, `stepNanoseconds`,
+`maxStepNanoseconds`, `slowExecutions`, `repeatedShapes`, and `failedExecutions`.
+Timing is the sum of SQLite `step()` call durations per execution, including
+SQLite busy wait, but **excluding preparation, binding, pool wait, row decoding,
+application processing and response transmission**. Completion, error, reset or
+early finalization closes an execution; work retained past the originating
+scope is omitted, not attributed to the next request. Inspector requests exclude
+their own auth and plan queries. State snapshots are coherent and bounded.
+
+`POST /api/query-workbench/explain` accepts only a structured SELECT shape:
+
+```json
+{"collection":"posts","equalityField":"id","orderField":"created","descending":true}
+```
+
+Only `collection` is required. Field names must exist in the current collection
+schema (or be system `id`/`created`/`updated` fields). The generated shape selects
+`id`, optionally compares one field to a NULL parameter, optionally orders one
+field, and uses `LIMIT 100`. It runs **EXPLAIN QUERY PLAN**, never the SELECT or
+EXPLAIN ANALYZE; no caller SQL, functions, expressions, values or joins are
+accepted. Request body is capped at 4 KiB, output at 32 rows and 512 valid UTF-8
+bytes per detail, with explicit `truncated`. Schema/index names are deliberately
+visible to authenticated operators. This is NOT a captured-query plan or a
+simulation of access rules, tenant predicates, cursor/expansion queries, or
+value-dependent optimizer choices. Use it to inspect simple index/scan choices,
+not assert a real request's exact plan or cost. The same bearer-only superuser
+boundary applies before any planning. Inspect only trusted local/staging data
+when exposing schema names would be sensitive.
+
+Backend scope is **SQLite only**, even in binaries also built with PostgreSQL:
+PostgreSQL plan inspection returns `501`, and its statements are not measured.
+The SQLite `exec()` path, background jobs, async work, WebSocket/SSE delivery,
+unmatched/static routes and remapped feature-state dispatch are not covered.
+Nested synchronous dispatch restores outer attribution; cross-thread/cross-scope
+statement retention does not transfer attribution. This first slice is not a
+general SQL profiler, an automatic index adviser or a distributed tracing system.
+`/api/meta` advertises `capabilities.queryWorkbench` and the optional stats URL;
+compiled route discovery includes both inspector endpoints. The runnable
+`fixtures/query-workbench` example exercises repeated bound queries safely.
+
 #### Profile defaults
 
 Select `.resource_profile = .minimal`, `.balanced`, or `.throughput` as a
@@ -5367,6 +5447,7 @@ code to comptime-dead when off, so a build that doesn't need a feature doesn't p
 | `-Dfile-inventory` | off | Read-only `files inventory` CLI plus optional local/S3 inventory callbacks. Bounded pages, page usage and reference candidates; no HTTP surface or deletion. S3 additionally needs `-Ds3=true`. |
 | `-Drealtime-backfill` | off | Single-process SQLite record invalidation backfill: 16 lazy collection slots, each 256 entries / 64 KiB (1 MiB encoded total), current authorization, explicit reset on gaps or slot replacement. No historical payloads or durable/cross-instance guarantee. See the API realtime section. |
 | `-Dresumable-uploads` | off | Principal-bound network-resume for file fields on existing records. Process-local, fully buffered, configurable session/byte/chunk/expiry budgets; no restart or cross-instance durability. See [resumable uploads](resumable-uploads.md). |
+| `-Dquery-workbench` | off | Bounded SQLite prepared-statement step metrics attributed to route templates, repeated/slow shape counters and operator-only structural EXPLAIN. No SQL/parameter capture; PostgreSQL is excluded. |
 | `-Ddev-mode` | on in `Debug`, off in release | The dev-only, never-in-prod seams: `ZIGBASE_FAKE_NOW` / `ZIGBASE_FAKE_SEED` (§14 above), test-capture, and fake field-crypto; the release script forces it off for shipped binaries. |
 | `-Ddev-tools` | **on** | The `init`/`agents-md`/`typegen` scaffolding/codegen verbs, `capabilities`/`routes` offline discovery, `tune` offline measurement advisor, and `diagnostics` structured doctor adapter (which can probe filesystem writability and initialize the migration ledger). Ordinary `doctor` remains available. Official release, Docker and npm artifacts include this tooling. Consumers can opt out for their deployment binary; stripped verbs exit nonzero with `-Ddev-tools=true` rebuild guidance. Distinct from `.enable_typegen` below — see §3b. |
 | `-Dstrip` | on except in `Debug` | Strip debug info from the binary (~7 MiB vs ~24 MiB unstripped in a release build). |

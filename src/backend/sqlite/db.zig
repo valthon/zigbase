@@ -172,6 +172,7 @@ extern fn sqlite3_bind_text(stmt: ?*c.sqlite3_stmt, idx: c_int, text: [*c]const 
 
 pub const Stmt = struct {
     handle: *c.sqlite3_stmt,
+    measurement: if (build_options.query_workbench) @import("../../query_workbench.zig").Measurement else void = if (build_options.query_workbench) .{} else {},
     /// Copied from the originating `Db` (see Db.field_cipher). The records value
     /// layer reads this to decide whether to encrypt/decrypt a field value.
     field_cipher: ?*const anyopaque = null,
@@ -198,7 +199,21 @@ pub const Stmt = struct {
 
     /// Advances to the next row. Returns true if a row is available, false when done.
     pub fn step(self: *Stmt) DbError!bool {
-        return switch (c.sqlite3_step(self.handle)) {
+        const measured_start = if (comptime build_options.query_workbench) blk: {
+            var sql: []const u8 = "";
+            if (self.measurement.needsSql()) {
+                const ptr = c.sqlite3_sql(self.handle);
+                if (ptr != null) {
+                    var len: usize = 0;
+                    while (len <= 16384 and ptr[len] != 0) len += 1;
+                    sql = ptr[0..len];
+                }
+            }
+            break :blk self.measurement.before(sql);
+        } else {};
+        const result = c.sqlite3_step(self.handle);
+        if (comptime build_options.query_workbench) self.measurement.after(measured_start, result == c.SQLITE_ROW, result != c.SQLITE_ROW and result != c.SQLITE_DONE);
+        return switch (result) {
             c.SQLITE_ROW => true,
             c.SQLITE_DONE => false,
             // A constraint violation (UNIQUE / PRIMARY KEY / NOT NULL / CHECK / FK) is a
@@ -258,6 +273,7 @@ pub const Stmt = struct {
     }
 
     pub fn reset(self: *Stmt) void {
+        if (comptime build_options.query_workbench) self.measurement.finish();
         _ = c.sqlite3_reset(self.handle);
     }
 
@@ -267,9 +283,15 @@ pub const Stmt = struct {
     }
 
     pub fn finalize(self: *Stmt) void {
+        if (comptime build_options.query_workbench) self.measurement.finish();
         _ = c.sqlite3_finalize(self.handle);
     }
 };
+
+test "disabled workbench adds no statement storage" {
+    if (comptime !build_options.query_workbench)
+        try std.testing.expectEqual(@sizeOf(*c.sqlite3_stmt) + @sizeOf(?*const anyopaque), @sizeOf(Stmt));
+}
 
 test "open in-memory db, create a table, exec succeeds" {
     var db = try Db.openMemory();

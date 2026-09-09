@@ -457,6 +457,10 @@ test {
     _ = @import("realtime/hub.zig");
     _ = @import("realtime/backfill.zig");
     _ = @import("api/realtime_backfill.zig");
+    if (@import("build_options").query_workbench) {
+        _ = @import("query_workbench.zig");
+        _ = @import("api/query_workbench.zig");
+    }
     if (@import("build_options").resumable_uploads) {
         _ = @import("files/resumable.zig");
         _ = @import("api/resumable_uploads.zig");

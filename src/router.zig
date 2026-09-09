@@ -32,6 +32,14 @@ pub fn tryDispatch(routes: []const Route, ctx: *http.RequestCtx) anyerror!?http.
         if (rt.method != ctx.method) continue;
         if (try matchPath(ctx.allocator.a, rt.pattern, ctx.path)) |params| {
             ctx.params = params;
+            var measured: if (@import("build_options").query_workbench) @import("query_workbench.zig").Scope else void = undefined;
+            if (comptime @import("build_options").query_workbench) {
+                const store = if (ctx.app) |app| app.query_workbench else null;
+                // Inspector auth and EXPLAIN must not contaminate application metrics.
+                measured = @import("query_workbench.zig").Scope.init(if (std.mem.startsWith(u8, rt.pattern, "/api/query-workbench/")) null else store, @tagName(ctx.method), rt.pattern);
+                measured.enter();
+            }
+            defer if (comptime @import("build_options").query_workbench) measured.leave();
             return try rt.handler(ctx);
         }
     }
