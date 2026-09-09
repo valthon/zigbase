@@ -167,6 +167,7 @@ error.**
 | `resource_profile` | Optional `.minimal`, `.balanced`, or `.throughput` defaults for existing pool levers; explicit `.pools` fields win. | data-only — selects constants, never enables a subsystem. |
 | `admission` | Optional `.{ .max_requests = N }`, positive `u32`: reject excess synchronous HTTP work with 503 instead of queuing. | excluded — no counters, checks, or diagnostics route when omitted; one null app pointer remains. |
 | `query_workbench` | Optional `.{ .max_entries = 64, .slow_ms = 100 }` budgets for the [SQLite query workbench](#bounded-sqlite-query-workbench-opt-in). Requires `-Dquery-workbench=true`. | build-flag gated — no statement fields, TLS, timestamps, state, or endpoints when off. |
+| `public_response_cache` | Explicit collection names and bounded budgets for [anonymous record-view caching](#bounded-public-response-cache-opt-in). Requires `-Dpublic-response-cache=true`. | build-flag gated; no state, timestamps or cache lookup when off. |
 | `pagination` | Enable/disable offset & cursor list paging and pick the cursor token format. | always — core list-response plumbing. |
 | `flags` | Declared boolean feature flags. See [Feature flags + experiments](#feature-flags--experiments-declared). | data-only — lowers to an empty slice + a zero-variant `Flag` enum when unset. |
 | `experiments` | Declared A/B/n experiments (variants + weights, optional `.sticky`). See [Feature flags + experiments](#feature-flags--experiments-declared). | data-only — lowers to an empty slice + a zero-variant `Experiment` enum when unset. |
@@ -4753,6 +4754,75 @@ during setup). It neither cancels slow accepted handlers nor limits durable queu
 depth. Existing memory-job ring (256 queued tasks, four workers, `QueueFull` on
 overflow) and scheduler bounds remain independent and unchanged.
 
+#### Bounded public response cache (opt-in)
+
+For repeated anonymous reads of larger public records, compile with
+`-Dpublic-response-cache=true` and explicitly opt collections in:
+
+```zig
+const App = zigbase.App(.{
+    .public_response_cache = .{
+        .collections = &.{ "posts" },
+        .max_entries = 64,
+        .max_body_bytes = 16384,
+        .ttl_ms = 1000,
+    },
+});
+```
+
+Only successful built-in `GET /api/collections/:col/records/:id` responses with
+**no query string, Authorization header or Cookie header** are cached. Even empty
+or malformed credential headers bypass caching. The current collection must be
+a base collection with exactly `@public` view access, no abilities, no tenant
+field, and no record TTL. Tenancy-enabled apps bypass caching altogether. Lists,
+expansions, projections, custom routes, auth collections, SQL views, private and
+expression-rule reads remain uncached. No lifecycle hook runs on this built-in
+read path. The feature does not add public HTTP cache headers or cache failures.
+
+The cache has **coarse whole-database dependencies**, not collection-selective
+invalidation: SQLite's persistent writer-connection `data_version`,
+`total_changes64()` and pager data-version counters invalidate all entries after data/schema
+changes. This includes raw SQL against the main database, rollbacks
+(conservatively), and commits from
+other SQLite connections/processes; there is no polling window. Eligibility is
+read directly from current metadata on fills, bypassing metadata leases. Hits
+validate that complete database generation again, proving that the cached public
+policy and field visibility have not changed. A
+changed generation during a fill discards that fill and renders a fresh uncached
+response. Concurrent commits after the final check may naturally occur before
+network delivery; this is not a promise to freeze the database until delivery.
+Do not modify SQLite's schema/version pragmas or replace its database file while
+serving, or create connection-local TEMP objects that shadow system/collection
+tables; those alter name resolution outside this main-database contract.
+PostgreSQL configurations with a nonempty allowlist refuse startup, including
+PostgreSQL URLs supplied to a binary without PostgreSQL support.
+
+All cache operations and eligible reads hold the pool writer mutex until the
+response body is ready, **never during network transmission**. Hits save record
+fetch/decode/serialization and schema parsing but still perform generation reads.
+This can help read-heavy larger records but serializes eligible reads and waits
+behind writes: measure your workload before opting in, especially write-heavy
+or high-concurrency deployments. It is not a general throughput improvement.
+Bypassed requests retain the ordinary framework read path; this feature does not
+change the schema-cache semantics of authenticated or otherwise excluded reads.
+
+Limits are comptime validated: 1–256 entries, 1–65,536 body bytes per entry,
+1–60,000 ms monotonic TTL, and at most 64 collection names of at most 64 bytes.
+Keys are at most 256 bytes; larger paths bypass caching, oversized response
+bodies are served without retention. Retained body memory is at most
+`max_entries * max_body_bytes`, plus one fixed entry array (256-byte keys and
+bookkeeping) and store metadata; request-arena response copies are outside this
+retention budget. Replacement frees the previous body before allocating the new
+one. TTL starts at cache insertion after rendering and generation validation;
+time spent fetching or serializing the response does not consume retention.
+Entries are lazily expired, not refreshed by hits, and evicted round-robin.
+Default retained bodies are capped at 1 MiB; maximum configurable bodies at
+16 MiB. An empty allowlist allocates no cache. With the build flag off, the app
+field is `void` and no cache operations, timestamps or state are compiled in.
+
+`fixtures/public-response-cache` demonstrates this configuration and its HTTP
+regression harness; its protected probe route is test-only, not a shipped API.
+
 #### Bounded SQLite query workbench (opt-in)
 
 Build with `-Dquery-workbench=true` to measure synchronous SQLite prepared
@@ -5600,6 +5670,7 @@ code to comptime-dead when off, so a build that doesn't need a feature doesn't p
 | `-Drealtime-backfill` | off | Single-process SQLite record invalidation backfill: 16 lazy collection slots, each 256 entries / 64 KiB (1 MiB encoded total), current authorization, explicit reset on gaps or slot replacement. No historical payloads or durable/cross-instance guarantee. See the API realtime section. |
 | `-Dresumable-uploads` | off | Principal-bound network-resume for file fields on existing records. Process-local, fully buffered, configurable session/byte/chunk/expiry budgets; no restart or cross-instance durability. See [resumable uploads](resumable-uploads.md). |
 | `-Dquery-workbench` | off | Bounded SQLite prepared-statement step metrics attributed to route templates, repeated/slow shape counters and operator-only structural EXPLAIN. No SQL/parameter capture; PostgreSQL is excluded. |
+| `-Dpublic-response-cache` | off | Explicitly allowlisted anonymous public record views with bounded retention and coarse SQLite database-change invalidation. PostgreSQL is excluded. |
 | `-Ddev-mode` | on in `Debug`, off in release | The dev-only, never-in-prod seams: `ZIGBASE_FAKE_NOW` / `ZIGBASE_FAKE_SEED` (§14 above), test-capture, and fake field-crypto; the release script forces it off for shipped binaries. |
 | `-Ddev-tools` | **on** | The `init`/`agents-md`/`typegen` scaffolding/codegen verbs, `capabilities`/`routes` offline discovery, `tune` offline measurement advisor, and `diagnostics` structured doctor adapter (which can probe filesystem writability and initialize the migration ledger). Ordinary `doctor` remains available. Official release, Docker and npm artifacts include this tooling. Consumers can opt out for their deployment binary; stripped verbs exit nonzero with `-Ddev-tools=true` rebuild guidance. Distinct from `.enable_typegen` below — see §3b. |
 | `-Dstrip` | on except in `Debug` | Strip debug info from the binary (~7 MiB vs ~24 MiB unstripped in a release build). |

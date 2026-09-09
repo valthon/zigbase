@@ -135,6 +135,12 @@ scheduler is single-process, and the PostgreSQL backend is opt-in (build from so
 - **[API](./api)** — the REST + WebSocket reference.
 ## Agent-friendly discovery
 
+Read-heavy public record pages can opt into a [bounded anonymous response
+cache](./framework#bounded-public-response-cache-opt-in). It retains only explicitly
+eligible public record details, invalidates on SQLite database changes, and is
+entirely absent from default builds. Fresh policy checks and bounded memory take
+precedence over broad caching; authenticated, contextual and list reads bypass it.
+
 `zigbase capabilities --json` provides a versioned catalog of development CLI
 operations, their output formats, and their side effects. Discovery works offline
 without opening the database. Custom lean builds can omit it with

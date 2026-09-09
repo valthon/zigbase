@@ -28,7 +28,7 @@ copy, examples, and tests with the implementation rather than in follow-up PRs.
   metrics by route template/opaque structural shape; bounded slow/repeated counters
   and bearer-superuser-only generated SELECT-plan inspection. PostgreSQL, full
   query/request latency, captured plans and automatic index advice remain deferred.
-- [ ] Dependency-aware bounded response caching, starting with explicitly eligible public reads.
+- [x] Bounded explicitly eligible anonymous record-view caching with coarse SQLite database dependency invalidation. Collection-selective invalidation, lists and PostgreSQL remain future extensions.
 - [x] Opt-in application performance contracts: binary-size/allocation gates and advisory timing comparisons (#414).
 - [ ] Opt-in principal/operation-scoped idempotent mutations with atomic coordination and bounded retention.
   Implemented slice: lazy comptime-configured SQLite custom-operation receipts,

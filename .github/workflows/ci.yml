@@ -506,6 +506,13 @@ jobs:
         run: |
           mise exec zig@0.16.0 -- zig build -Drealtime-backfill=true --prefix zig-out/backfill
           ZIGBASE_TEST_BACKFILL_BINARY="$GITHUB_WORKSPACE/zig-out/backfill/bin/zigbase" mise exec python@3.13 -- python -m pytest tests/admin/test_realtime_backfill.py -q
+      - name: Opt-in bounded public response cache
+        run: |
+          mise exec zig@0.16.0 -- zig build check-public-response-cache-contracts
+          mise exec zig@0.16.0 -- zig build test -Dpublic-response-cache=true --summary all
+          mise exec zig@0.16.0 -- zig build public-response-cache-fixture check-public-response-cache-contracts -Dpublic-response-cache=true --prefix zig-out/public-cache
+          bash scripts/check-public-response-cache-gating.sh "$ZIGBASE_TEST_BINARY" zig-out/public-cache/bin/public-response-cache-fixture
+          ZIGBASE_TEST_PUBLIC_RESPONSE_CACHE_BINARY="$GITHUB_WORKSPACE/zig-out/public-cache/bin/public-response-cache-fixture" mise exec python@3.13 -- python -m pytest tests/admin/test_public_response_cache.py -q
       - name: Opt-in bounded SQLite query workbench
         run: |
           mise exec zig@0.16.0 -- zig build check-query-workbench-contracts

@@ -272,6 +272,14 @@ from the same binary) are always allowed, so only a separate-origin frontend nee
 
 ## See also
 
+For explicitly public record detail reads, `-Dpublic-response-cache=true` plus
+`.public_response_cache = .{ .collections = &.{ "posts" } }` enables a bounded
+anonymous response cache. It defaults to 64 entries, 16 KiB per body and a 1-second
+TTL. SQLite database changes invalidate entries; credential headers, query
+parameters, contextual rules and record TTL bypass caching. Hits still validate
+the database generation and acquire the writer mutex, so benchmark before enabling it.
+See [the complete scope and budgets](./framework#bounded-public-response-cache-opt-in).
+
 For bounded query diagnostics, build with `-Dquery-workbench=true` and optionally
 set `.query_workbench = .{ .max_entries = 64, .slow_ms = 100 }`. The operator-only
 SQLite workbench reports route-template/structural-shape metrics without SQL or

@@ -43,6 +43,7 @@ pub const App = struct {
     backfill: if (@import("build_options").realtime_backfill) ?*@import("realtime/backfill.zig").Store else void = if (@import("build_options").realtime_backfill) null else {},
     resumable_uploads: if (@import("build_options").resumable_uploads) ?*@import("files/resumable.zig").Store else void = if (@import("build_options").resumable_uploads) null else {},
     query_workbench: if (@import("build_options").query_workbench) ?*@import("query_workbench.zig").Store else void = if (@import("build_options").query_workbench) null else {},
+    public_response_cache: if (@import("build_options").public_response_cache) ?*@import("public_response_cache.zig").Store else void = if (@import("build_options").public_response_cache) null else {},
     /// SSE heartbeat interval seconds (#188); 0 = inherit the listener ws_timeout tick.
     /// Applied per-connection via http_sse_set_timout at stream open. Startup-validated.
     sse_heartbeat_seconds: u8 = 0,
