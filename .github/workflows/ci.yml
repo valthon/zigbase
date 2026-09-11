@@ -518,6 +518,22 @@ jobs:
           mise exec zig@0.16.0 -- zig build idempotency-fixture check-idempotency-contracts
           bash scripts/check-idempotency-gating.sh "$ZIGBASE_TEST_BINARY" zig-out/bin/idempotency-fixture
           ZIGBASE_TEST_IDEMPOTENCY_BINARY="$GITHUB_WORKSPACE/zig-out/bin/idempotency-fixture" mise exec python@3.13 -- python -m pytest tests/admin/test_idempotency.py -q
+      - name: Install optional thumbnail test dependency
+        run: sudo apt-get update && sudo apt-get install -y imagemagick
+      - name: Opt-in ImageMagick thumbnail regressions and gating
+        run: |
+          mise exec zig@0.16.0 -- zig build check-thumbnail-contracts
+          mise exec zig@0.16.0 -- zig build check-thumbnail-contracts -Dimage-thumbnails=true
+          mise exec zig@0.16.0 -- zig build test -Dimage-thumbnails=true --summary all
+          mise exec zig@0.16.0 -- zig build thumbnails-fixture -Dimage-thumbnails=true --prefix zig-out/thumbnails
+          bash scripts/check-gating.sh --image-thumbnails "$ZIGBASE_TEST_BINARY" zig-out/thumbnails/bin/thumbnails-fixture
+          ZIGBASE_TEST_THUMBNAILS_BINARY="$GITHUB_WORKSPACE/zig-out/thumbnails/bin/thumbnails-fixture" mise exec python@3.13 -- python -m pytest tests/admin/test_thumbnails.py -q
+          mise exec python@3.13 -- python -m pytest examples/golfsim/test/test_thumbnail_gallery.py -q
+      - name: Thumbnail-enabled Golfsim consumer
+        working-directory: examples/golfsim
+        run: |
+          mise exec zig@0.16.0 -- zig build -Dimage-thumbnails=true --summary all
+          mise exec zig@0.16.0 -- zig build test gen-client-check -Dimage-thumbnails=true --summary all
       - name: Opt-in resumable upload regressions and gating
         run: |
           mise exec zig@0.16.0 -- zig build check-resumable-contracts

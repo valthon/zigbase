@@ -180,6 +180,13 @@ client-side keyset predicate or `id` tiebreaker to reason about. Totals are skip
 
 ## File uploads & URLs
 
+The legacy SDK `thumb` option is deprecated for ZigBase use: it only appends
+`?thumb=...`, which does not invoke a server transform. Use the explicit
+`GET /api/files/:collection/:record/:filename/thumbnail/:profile` route for
+configured [named thumbnails](../../docs/thumbnails.md). Encode each path segment
+and put any scoped file token in the final URL's query string. SDK signatures
+are unchanged; there is not yet a named-profile URL helper.
+
 A `create`/`update` body containing a `File`/`Blob` (or an array of them) is sent as multipart
 automatically — no special method:
 
@@ -193,7 +200,7 @@ const rec = await posts.create<Post>({
 } as Record<string, unknown>);
 
 // Build a URL to the stored file (cover is typed string on Post):
-const url = zb.files.getUrl(rec, rec.cover, { thumb: "100x100" });
+const url = zb.files.getUrl(rec, rec.cover);
 
 // Protected files: mint a short-lived access token for <img src> / emails:
 const token = await zb.files.getToken();

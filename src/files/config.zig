@@ -29,6 +29,7 @@ pub const ResumableLimits = struct {
 
 /// The lowered runtime config stored on `app.App.files`.
 pub const Runtime = struct {
+    thumbnails: if (@import("build_options").image_thumbnails) @import("thumbnail_config.zig").Config else void = if (@import("build_options").image_thumbnails) .{} else {},
     resumable: if (@import("build_options").resumable_uploads) ResumableLimits else void = if (@import("build_options").resumable_uploads) .{} else {},
     /// Installed only by an opt-in App; absent builds do not retain cleanup code.
     cleanup: ?*const fn (std.mem.Allocator, *@import("../db.zig").Db, std.Io, @import("../queue/queue.zig").QueueDef, @import("../schema.zig").Collection, []const u8, std.json.Value, ?std.json.Value) anyerror!void = null,
@@ -51,10 +52,14 @@ pub fn lower(comptime files_cfg: anytype) Runtime {
     if (@typeInfo(FC) != .@"struct")
         @compileError(".files must be a struct, e.g. '.{ .s3_presign_redirect = true, .s3_presign_ttl_s = 900 }'");
     inline for (std.meta.fields(FC)) |f| {
-        if (comptime !std.mem.eql(u8, f.name, "resumable") and !std.mem.eql(u8, f.name, "cleanup_queue") and !std.mem.eql(u8, f.name, "s3_presign_redirect") and !std.mem.eql(u8, f.name, "s3_presign_ttl_s"))
-            @compileError(".files: unknown key '." ++ f.name ++ "' (recognized: .resumable, .cleanup_queue, .s3_presign_redirect, .s3_presign_ttl_s)");
+        if (comptime !std.mem.eql(u8, f.name, "thumbnails") and !std.mem.eql(u8, f.name, "resumable") and !std.mem.eql(u8, f.name, "cleanup_queue") and !std.mem.eql(u8, f.name, "s3_presign_redirect") and !std.mem.eql(u8, f.name, "s3_presign_ttl_s"))
+            @compileError(".files: unknown key '." ++ f.name ++ "' (recognized: .thumbnails, .resumable, .cleanup_queue, .s3_presign_redirect, .s3_presign_ttl_s)");
     }
     var rt = Runtime{};
+    if (@hasField(FC, "thumbnails")) {
+        if (!@import("build_options").image_thumbnails) @compileError(".files.thumbnails requires -Dimage-thumbnails=true");
+        rt.thumbnails = @import("thumbnail_config.zig").lower(files_cfg.thumbnails);
+    }
     if (@hasField(FC, "resumable")) {
         if (!@import("build_options").resumable_uploads) @compileError(".files.resumable requires -Dresumable-uploads=true");
         if (@typeInfo(@TypeOf(files_cfg.resumable)) != .@"struct") @compileError(".files.resumable must be a struct of resource budgets");

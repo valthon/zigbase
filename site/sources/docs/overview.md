@@ -84,7 +84,12 @@ There are two ways to use ZigBase:
 - **CAPTCHA** — `ctx.verifyCaptcha` for reCAPTCHA, hCaptcha, and Turnstile.
   → [Recipes](./recipes#recipe-gate-a-public-form-with-captcha)
 - **Files** — local (pluggable) file storage with serving and short-lived file-access
-  tokens. Opt-in durable HTTP cleanup retries removed-file deletion after commit,
+  tokens. Optional [image thumbnails](./thumbnails) use compile-time named
+  PNG/JPEG/WebP profiles and a trusted external ImageMagick executable, with
+  tunable process limits and bounded admission. Disabled builds exclude the
+  subprocess backend; no image codec is linked into ZigBase. Sources are local,
+  not remote storage.
+  Opt-in durable HTTP cleanup retries removed-file deletion after commit,
   using the existing queue engine. Opt-in [resumable uploads](./resumable-uploads)
   resume interrupted transfers within one process, with bounded buffers and
   fresh authorization at commit; they are not restart-durable streaming.

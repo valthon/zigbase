@@ -24,10 +24,12 @@ email_not_verified
 forbidden
 gone
 internal
+invalid_image
 not_found
 not_implemented
 overloaded
 payload_too_large
+thumbnail_busy
 too_many_requests
 unauthorized
 validation_date

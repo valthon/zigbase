@@ -1,12 +1,29 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   listListings, myBookings, createBooking, createReview, confirmBooking,
-  cancelBooking, getAvailability, uploadListingPhotos, photoUrl, signup,
+  cancelBooking, getAvailability, uploadListingPhotos, photoUrl, hasCardThumbnails, signup,
   login, otpComplete, finishSecondFactor, SecondFactorRequiredError,
 } from '../frontend/src/lib/api';
 
 const storage = new Map<string, string>();
 const request = vi.fn<Parameters<typeof fetch>, ReturnType<typeof fetch>>();
+
+describe('compiled listing thumbnails', () => {
+  it('uses encoded derivative paths only when enabled', () => {
+    expect(photoUrl('id/with ?', 'photo #1.jpeg', true)).toBe('/api/files/listings/id%2Fwith%20%3F/photo%20%231.jpeg/thumbnail/card');
+    expect(photoUrl('id', 'photo.webp', false)).toBe('/api/files/listings/id/photo.webp');
+  });
+  it('discovers the compiled card profile and otherwise keeps originals', async () => {
+    request.mockResolvedValueOnce(json({ status: 'ok', app: 'golfsim', thumbnail_profile: 'card' }));
+    expect(await hasCardThumbnails()).toBe(true);
+    request.mockResolvedValueOnce(json({ status: 'ok', app: 'golfsim', thumbnail_profile: null }));
+    expect(await hasCardThumbnails()).toBe(false);
+    request.mockResolvedValueOnce(json({ status: 'ok', app: 'golfsim' }));
+    expect(await hasCardThumbnails()).toBe(false);
+    request.mockRejectedValueOnce(new Error('offline'));
+    expect(await hasCardThumbnails()).toBe(false);
+  });
+});
 beforeEach(() => {
   storage.clear();
   request.mockReset();

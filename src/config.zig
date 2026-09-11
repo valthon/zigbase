@@ -27,6 +27,27 @@ pub const LoadDiag = struct {
 
 pub const LoadError = error{InvalidEnvValue};
 
+test "ImageMagick executable override is validated only in enabled builds" {
+    const Getter = struct {
+        path: []const u8,
+        pub fn get(self: @This(), key: []const u8) ?[]const u8 {
+            return if (std.mem.eql(u8, key, "ZIGBASE_IMAGEMAGICK_EXECUTABLE")) self.path else null;
+        }
+    };
+    var diag: LoadDiag = .{};
+    if (comptime @import("build_options").image_thumbnails) {
+        for ([_][]const u8{ "", "convert", "/usr/bin/convert\x00extra" }) |path| {
+            try std.testing.expectError(error.InvalidEnvValue, Config.loadDiag(Getter{ .path = path }, &diag));
+            try std.testing.expectEqualStrings("ZIGBASE_IMAGEMAGICK_EXECUTABLE", diag.var_name);
+        }
+        const cfg = try Config.load(Getter{ .path = "/opt/im/bin/magick" });
+        try std.testing.expectEqualStrings("/opt/im/bin/magick", cfg.imagemagick_executable);
+    } else {
+        const cfg = try Config.load(Getter{ .path = "relative-is-ignored" });
+        try std.testing.expect(@TypeOf(cfg.imagemagick_executable) == void);
+    }
+}
+
 fn envInt(comptime T: type, name: []const u8, v: []const u8, diag: *LoadDiag) LoadError!T {
     return std.fmt.parseInt(T, v, 10) catch {
         diag.* = .{ .var_name = name, .value = v, .expected = @typeName(T) ++ " (decimal integer)" };
@@ -52,6 +73,8 @@ fn envEnum(comptime T: type, name: []const u8, v: []const u8, comptime choices: 
 }
 
 pub const Config = struct {
+    /// Deployment override for an explicitly configured thumbnail backend.
+    imagemagick_executable: if (@import("build_options").image_thumbnails) []const u8 else void = if (@import("build_options").image_thumbnails) "" else {},
     // Secure-by-default bind: loopback only. The server only listens on all
     // interfaces when explicitly opted in (`--http-host 0.0.0.0` / ZIGBASE_HTTP_HOST).
     http_host: []const u8 = "127.0.0.1",
@@ -252,6 +275,15 @@ pub const Config = struct {
         if (getter.get("ZIGBASE_FILE_TOKEN_TTL")) |v| cfg.file_token_ttl_s = try envInt(i64, "ZIGBASE_FILE_TOKEN_TTL", v, diag);
         if (getter.get("ZIGBASE_SENTRY_DSN")) |v| cfg.sentry_dsn = v;
         if (getter.get("ZIGBASE_STATIC_CACHE_CONTROL")) |v| cfg.static_cache_control = v;
+        if (comptime @import("build_options").image_thumbnails) {
+            if (getter.get("ZIGBASE_IMAGEMAGICK_EXECUTABLE")) |v| {
+                if (!std.fs.path.isAbsolute(v) or std.mem.indexOfScalar(u8, v, 0) != null) {
+                    diag.* = .{ .var_name = "ZIGBASE_IMAGEMAGICK_EXECUTABLE", .value = v, .expected = "absolute executable path" };
+                    return error.InvalidEnvValue;
+                }
+                cfg.imagemagick_executable = v;
+            }
+        }
         if (getter.get("ZIGBASE_S3_BUCKET")) |v| cfg.s3_bucket = v;
         if (getter.get("ZIGBASE_S3_REGION")) |v| cfg.s3_region = v;
         if (getter.get("ZIGBASE_S3_ENDPOINT")) |v| cfg.s3_endpoint = v;
@@ -332,6 +364,7 @@ pub const known_vars = [_][]const u8{
     "ZIGBASE_FILE_TOKEN_TTL",
     "ZIGBASE_HTTP_HOST",
     "ZIGBASE_HTTP_PORT",
+    "ZIGBASE_IMAGEMAGICK_EXECUTABLE",
     "ZIGBASE_JWT_SECRET",
     "ZIGBASE_LOG_FORMAT",
     "ZIGBASE_LOG_LEVEL",

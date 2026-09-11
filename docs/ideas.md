@@ -399,11 +399,16 @@ Each idea: **What / Why / How it fits / Effort / Risk / Parity-or-Differentiator
   Enables C3/C4.
 
 #### C2. Image thumbnails / transforms — **Effort L, Risk Medium, Parity**
+- **Implemented slice:** [local ImageMagick thumbnails](thumbnails.md) use named
+  compile-time PNG/JPEG/WebP profiles, contain/cover resizing, bounded admission
+  and deployment resource controls. The feature is off by default and links no
+  image codec into ZigBase. Query-driven transforms, remote storage and retained
+  derivative storage below remain proposals, not the supported API.
 - **What:** On-the-fly or on-upload resize/crop/format, requested via `?thumb=100x100` on file URLs.
 - **Why:** The single most-requested PocketBase-parity file feature; avatars/galleries need it.
   Deferred in `KNOWN_LIMITATIONS.md`.
-- **How it fits:** Adds an image-decode/encode dependency (vendor a small C lib like stb_image, or
-  shell to libvips if present). Cache derived images via the `Storage` vtable (local or S3 via C1).
+- **How it fits:** The implemented backend launches a trusted ImageMagick binary
+  directly, without a shell. Future retained derivatives could use the `Storage` vtable (local or S3 via C1).
   A `thumb` query param on the file-serving handler (or the `onFileServe` hook) triggers
   generate-or-serve-cached.
 - **Risk:** Medium–High — image codecs are a memory/CPU/security surface; cache invalidation; a new C

@@ -249,8 +249,19 @@ export async function uploadListingPhotos(listingId: string, files: File[]): Pro
 }
 
 /** Build a URL for a stored listing photo. Published listings serve directly. */
-export function photoUrl(listingId: string, filename: string): string {
-  return `/api/files/listings/${encodeURIComponent(listingId)}/${encodeURIComponent(filename)}`;
+export function photoUrl(listingId: string, filename: string, card = false): string {
+  const original = `/api/files/listings/${encodeURIComponent(listingId)}/${encodeURIComponent(filename)}`;
+  return card ? `${original}/thumbnail/card` : original;
+}
+
+/** Optional optimization: deployment discovery failures leave originals usable. */
+export async function hasCardThumbnails(): Promise<boolean> {
+  try {
+    const health = await client().rpc.golfsimHealth({ signal: AbortSignal.timeout(2000) });
+    return health.thumbnail_profile === 'card';
+  } catch {
+    return false;
+  }
 }
 
 export async function createReview(bookingId: string, rating: number, body: string): Promise<Review> {

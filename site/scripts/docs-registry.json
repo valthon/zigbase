@@ -280,6 +280,16 @@
     }
   },
   {
+    "canonical": "docs/thumbnails.md",
+    "mirror": "thumbnails.md",
+    "frontmatter": {
+      "title": "Image thumbnails",
+      "description": "Named PNG, JPEG and WebP derivatives using opt-in ImageMagick with deployment resource controls.",
+      "order": 11,
+      "group": "features"
+    }
+  },
+  {
     "canonical": "docs/resumable-uploads.md",
     "mirror": "resumable-uploads.md",
     "frontmatter": {

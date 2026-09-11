@@ -74,9 +74,16 @@ for (const marker of [':focus-visible', 'prefers-reduced-motion', '@media(max-wi
 if (!read('robots.txt').includes('https://valthon.github.io/zigbase/sitemap.xml')) fail('robots sitemap URL drifted');
 if (!read('sitemap.xml').includes(`${htmlFiles.length > 0 ? 'https://valthon.github.io/zigbase/docs/api/' : ''}`)) fail('sitemap missing API route');
 const index = JSON.parse(read('docs-index.json'));
-if (index.docs.length !== 41) fail(`docs index expected 41 docs, found ${index.docs.length}`);
+if (index.docs.length !== 42) fail(`docs index expected 42 docs, found ${index.docs.length}`);
 if (!read('docs/resumable-uploads/index.html').includes('Commit retries and uncertain outcomes')) {
   fail('resumable upload limitations were not published');
+}
+const thumbnails = read('docs/thumbnails/index.html');
+for (const contract of ['Resource tuning', 'max_pixels', 'thumbnail_busy', 'ImageMagick', 'must-revalidate', 'ZIGBASE_IMAGEMAGICK_EXECUTABLE']) {
+  if (!thumbnails.includes(contract)) fail(`thumbnail contract missing from published page: ${contract}`);
+}
+if (!read('docs/framework/index.html').includes('image-thumbnails')) {
+  fail('thumbnail opt-in build flag missing from framework reference');
 }
 if (!read('docs/two-factor-design/index.html').includes('Compile-time and runtime configuration')) {
   fail('two-factor documentation was not published');

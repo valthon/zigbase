@@ -420,13 +420,20 @@ sends `limit` (defaulting to 30) — sending it with no `cursor` requests the fi
 
 ## Files
 
+The legacy SDK `thumb` option is deprecated for ZigBase use: it only appends
+`?thumb=...`, which does not invoke a server transform. Use the explicit
+`GET /api/files/:collection/:record/:filename/thumbnail/:profile` route for
+configured [named thumbnails](thumbnails.md). Encode each path segment and put any
+scoped file token in the final URL's query string. SDK signatures are unchanged;
+there is not yet a named-profile URL helper.
+
 A `create`/`update` body containing a `File`/`Blob` (or an array of them) is sent as multipart
 automatically — no special method. Note that on a plain `ZbRecord` the file field is typed
 `unknown`, so either type the record (`cover: string`) or cast the filename argument.
 
 ```ts
-// build a (optionally thumbnailed) file URL — `record.cover` is typed string on Post
-const url = zb.files.getUrl(record, record.cover, { thumb: "100x100" });
+// build an original-file URL — `record.cover` is typed string on Post
+const url = zb.files.getUrl(record, record.cover);
 
 // short-lived token for protected-file access (<img src>, emails)
 const token = await zb.files.getToken();

@@ -53,6 +53,25 @@ if [ "${1:-}" = --resumable-uploads ]; then
   exit 0
 fi
 
+if [ "${1:-}" = --image-thumbnails ]; then
+  [ "$#" -eq 3 ] || { echo 'usage: check-gating.sh --image-thumbnails OFF_BINARY ON_BINARY'; exit 2; }
+  for pattern in 'files\.thumbnail_imagemagick\.' 'files\.thumbnails\.' 'files\.thumbnail_source\.'; do
+    if nm --defined-only "$2" | grep -E "$pattern" >/dev/null; then
+      echo "LEAK: thumbnail pattern '$pattern' in $2"; exit 1
+    fi
+    if ! nm --defined-only "$3" | grep -E "$pattern" >/dev/null; then
+      echo "DRIFT: thumbnail pattern '$pattern' absent in $3"; exit 1
+    fi
+  done
+  for binary in "$2" "$3"; do
+    if nm --defined-only "$binary" | grep -E 'zb_png_transform|png_read_info' >/dev/null; then
+      echo "LEAK: embedded image codec in $binary"; exit 1
+    fi
+  done
+  echo 'image thumbnails gating: OK'
+  exit 0
+fi
+
 FULL=zig-out/bin/zigbase
 check_inventory "$FULL"
 FULL2=zig-out/bin/full-fixture

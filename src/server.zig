@@ -361,6 +361,10 @@ pub fn Server(comptime gates: Gates) type {
                 .{ .method = .GET, .pattern = "/api/query-workbench/stats", .handler = @import("api/query_workbench.zig").stats },
                 .{ .method = .POST, .pattern = "/api/query-workbench/explain", .handler = @import("api/query_workbench.zig").explain },
             };
+            if (@import("build_options").image_thumbnails) t = t ++ &[_]router.Route{
+                .{ .method = .GET, .pattern = "/api/files/:col/:rec/:name/thumbnail/:profile", .handler = files_api.serveThumbnail },
+                .{ .method = .HEAD, .pattern = "/api/files/:col/:rec/:name/thumbnail/:profile", .handler = files_api.serveThumbnail },
+            };
             if (@import("build_options").resumable_uploads) t = t ++ &[_]router.Route{
                 .{ .method = .POST, .pattern = "/api/collections/:col/records/:id/uploads", .handler = @import("api/resumable_uploads.zig").begin },
                 .{ .method = .GET, .pattern = "/api/uploads/:upload", .handler = @import("api/resumable_uploads.zig").status },
