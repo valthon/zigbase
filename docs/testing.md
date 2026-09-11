@@ -156,11 +156,13 @@ budgets. Different app features and targets need their own measured contract.
 
 `zigbase.addTest` gives you a test artifact wired with ZigBase's `.simple`-mode
 test runner. That runner matters: `zig build test` otherwise runs the test
-binary in server mode (`--listen=-`), and an app booted by the harness does
-enough work at process exit that Zig 0.16's build runner can mis-read a normal
-exit as a crash — printing `failed command: … --listen=-` and intermittently
-failing the build. The `.simple` runner rides the exit code instead, and fails
-the build on a leaked allocation.
+binary in server mode (`--listen=-`). In the reproduced Zig 0.16 case, facil.io's
+exit-time stderr newline is displayed with a stale `failed command` label even
+though every test passed and the child exited 0. This is a cosmetic diagnostic,
+not an app-boot race. The `.simple` runner uses the exit code instead and also
+fails the build on leaked allocations. Always inspect the final build summary
+and exit status: real failures or signals are not explained by the newline case.
+See the [dependency-free reproduction](../diagnostics/issue-261/README.md).
 
 ```zig
 const std = @import("std");

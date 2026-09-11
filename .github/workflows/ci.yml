@@ -113,6 +113,8 @@ jobs:
         run: mise exec zig@0.16.0 -- zig build bench -Dbench-optimize=ReleaseSafe -- --realtime-only --json
       - name: Performance contract parser and generated-report tests
         run: mise exec python@3.13 -- python -m unittest discover -s tests/tools -p test_performance_contracts.py
+      - name: Issue 261 standalone diagnostic regression
+        run: mise exec zig@0.16.0 python@3.13 -- python diagnostics/issue-261/verify.py
       - name: Binary size and allocation contracts (no timing threshold)
         run: mise exec python@3.13 zig@0.16.0 -- bash scripts/check-performance.sh > performance-contract-report.json
       - uses: actions/upload-artifact@v7
