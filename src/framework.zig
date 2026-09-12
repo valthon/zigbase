@@ -585,17 +585,17 @@ pub fn App(comptime cfg: anytype) type {
                     }
                 }
             }
-            // Validate the `.pools` group's own sub-keys: only the four tuning knobs are read
+            // Validate the `.pools` group's own sub-keys: only the named tuning knobs are read
             // (via `@hasField`), so a typo (e.g. `.stack_sizes`, `.reader`, `.cache_kb`) would
             // otherwise be silently dropped and the default kept — mirror the sibling groups.
             if (@hasField(@TypeOf(cfg), "pools")) {
                 const PT = @TypeOf(cfg.pools);
                 if (@typeInfo(PT) != .@"struct")
-                    @compileError(".pools must be a config group struct: .pools = .{ .jobs = N, .readers = N, .stack_size = N, .cache_kib = N }");
+                    @compileError(".pools must be a config group struct: .pools = .{ .jobs = N, .memory_jobs = N, .readers = N, .stack_size = N, .cache_kib = N }");
                 for (std.meta.fields(PT)) |pf| {
-                    const pok = std.mem.eql(u8, pf.name, "jobs") or std.mem.eql(u8, pf.name, "readers") or
+                    const pok = std.mem.eql(u8, pf.name, "jobs") or std.mem.eql(u8, pf.name, "memory_jobs") or std.mem.eql(u8, pf.name, "readers") or
                         std.mem.eql(u8, pf.name, "stack_size") or std.mem.eql(u8, pf.name, "cache_kib");
-                    if (!pok) @compileError(".pools: unknown key '." ++ pf.name ++ "' (recognized: .jobs, .readers, .stack_size, .cache_kib)");
+                    if (!pok) @compileError(".pools: unknown key '." ++ pf.name ++ "' (recognized: .jobs, .memory_jobs, .readers, .stack_size, .cache_kib)");
                 }
             }
             var d = events.Dispatch{};
@@ -872,6 +872,12 @@ pub fn App(comptime cfg: anytype) type {
             if (@hasField(@TypeOf(cfg), "pools") and @hasField(@TypeOf(cfg.pools), "jobs")) break :blk cfg.pools.jobs;
             break :blk profile_pools.jobs;
         };
+        /// Separate lazy memory-job/app.submit pool; omission preserves four workers.
+        pub const memory_job_pool_size: usize = blk: {
+            const n: usize = if (@hasField(@TypeOf(cfg), "pools") and @hasField(@TypeOf(cfg.pools), "memory_jobs")) cfg.pools.memory_jobs else profile_pools.memory_jobs;
+            if (n == 0 or n > queue_memory.Pool.max_workers) @compileError(std.fmt.comptimePrint(".pools.memory_jobs must be in 1..{d}", .{queue_memory.Pool.max_workers}));
+            break :blk n;
+        };
 
         /// Comptime warm-reader-pool cap (the `.pools.readers` lever). Defaults to 16,
         /// the historical hardcoded value; shrink it to reduce the connection footprint.
@@ -947,7 +953,7 @@ pub fn App(comptime cfg: anytype) type {
         /// (1 MiB), far below `std.Thread`'s 16 MiB default; raise it for unusually deep
         /// job handlers. Clamped up to `scheduler.min_job_stack_size` — a below-floor value
         /// would EINVAL-abort `pthread_create` in the full binary, so the lever can only
-        /// raise the stack, never crash the server. Only consumed when jobs are configured.
+        /// raise the stack. Memory-job/submit threads start lazily on their first push.
         pub const job_stack_size: usize = @max(scheduler.min_job_stack_size, if (@hasField(@TypeOf(cfg), "pools") and @hasField(@TypeOf(cfg.pools), "stack_size")) cfg.pools.stack_size else scheduler.default_job_stack_size);
 
         /// Per-connection SQLite page-cache budget in KiB (the `.pools.cache_kib` lever).
@@ -961,6 +967,7 @@ pub fn App(comptime cfg: anytype) type {
             .reader_pool_cap = reader_pool_size,
             .job_workers = job_pool_size,
             .job_stack_bytes = job_stack_size,
+            .memory_job_workers = memory_job_pool_size,
             .sqlite_cache_kib_per_connection = cache_kib,
             .scheduler_enabled = jobs.len > 0,
             .admin_enabled = enable_admin,
@@ -1697,6 +1704,7 @@ pub fn App(comptime cfg: anytype) type {
             .reader_pool_size = reader_pool_size,
             .resource_report = resource_report,
             .job_stack_size = job_stack_size,
+            .memory_job_pool_size = memory_job_pool_size,
             .cache_kib = cache_kib,
             .static_mode = static_mode,
             .static_routes = static_routes,
@@ -1885,6 +1893,7 @@ pub const ServeOpts = struct {
     reader_pool_size: usize,
     resource_report: ?resource_profile.Report = null,
     job_stack_size: usize = scheduler.default_job_stack_size,
+    memory_job_pool_size: usize = queue_memory.Pool.num_workers,
     cache_kib: u32 = db.default_cache_kib,
     static_mode: static_files.Mode = .default,
     /// Tier-2 comptime static rewrites (issue #183), threaded into `app.static_routes`.
@@ -5331,7 +5340,7 @@ fn serveImpl(
     // spawn lazily on first use (zero overhead when unused) and stop() drains + joins.
     // Its defer is registered BEFORE the scheduler's, so (LIFO) the scheduler stops FIRST
     // — a cron handler may still enqueue/submit during its final run.
-    var mem_pool = queue_memory.Pool.init(app);
+    var mem_pool = try queue_memory.Pool.initSized(app, opts.memory_job_pool_size, opts.job_stack_size);
     mem_pool.install(app);
     defer mem_pool.stop();
     // Start the scheduler only when jobs are configured. Registered LAST among the teardown
@@ -6005,11 +6014,14 @@ test "App(cfg) carries comptime pool-size levers (readers + jobs)" {
 test "resource profiles preserve defaults and explicit pool overrides" {
     const D = App(.{});
     const B = App(.{ .resource_profile = .balanced });
+    try std.testing.expectEqual(@as(usize, 4), D.memory_job_pool_size);
+    try std.testing.expectEqual(D.memory_job_pool_size, B.memory_job_pool_size);
     try std.testing.expectEqual(D.reader_pool_size, B.reader_pool_size);
     try std.testing.expectEqual(D.job_pool_size, B.job_pool_size);
     try std.testing.expectEqual(D.cache_kib, B.cache_kib);
     try std.testing.expectEqual(null, D.resource_report.profile);
     const M = App(.{ .resource_profile = .minimal, .admin = .disabled });
+    try std.testing.expectEqual(@as(usize, 1), M.memory_job_pool_size);
     try std.testing.expectEqual(@as(usize, 2), M.reader_pool_size);
     try std.testing.expectEqual(@as(usize, 1), M.job_pool_size);
     try std.testing.expectEqual(@as(u32, 256), M.cache_kib);
@@ -6017,6 +6029,7 @@ test "resource profiles preserve defaults and explicit pool overrides" {
     try std.testing.expectEqual(D.jobs.len, M.jobs.len);
     try std.testing.expectEqual(D.job_stack_size, M.job_stack_size);
     const T = App(.{ .resource_profile = .throughput });
+    try std.testing.expectEqual(@as(usize, 8), T.memory_job_pool_size);
     try std.testing.expectEqual(@as(usize, 64), T.reader_pool_size);
     try std.testing.expectEqual(@as(usize, 8), T.job_pool_size);
     try std.testing.expectEqual(@as(u32, 4096), T.cache_kib);
@@ -6028,6 +6041,18 @@ test "resource profiles preserve defaults and explicit pool overrides" {
     const P = App(.{ .resource_profile = .minimal, .pools = .{ .readers = 7 } });
     try std.testing.expectEqual(@as(usize, 7), P.reader_pool_size);
     try std.testing.expectEqual(@as(u32, 256), P.cache_kib);
+}
+
+test "memory worker tuning reaches serve options and backwards-compatible reports" {
+    const A = App(.{ .resource_profile = .minimal, .pools = .{ .memory_jobs = 6, .stack_size = 2 << 20 } });
+    try std.testing.expectEqual(@as(usize, 6), A.Opts.memory_job_pool_size);
+    try std.testing.expectEqual(@as(usize, 2 << 20), A.Opts.job_stack_size);
+    try std.testing.expectEqual(@as(?usize, 6), A.resource_report.memory_job_workers);
+    try std.testing.expectEqual(@as(usize, 2 << 20), A.resource_report.job_stack_bytes);
+    try std.testing.expectEqual(@as(usize, 1), A.job_pool_size);
+    const B = App(.{ .pools = .{ .memory_jobs = 64, .stack_size = 0 } });
+    try std.testing.expectEqual(@as(usize, 64), B.memory_job_pool_size);
+    try std.testing.expectEqual(scheduler.min_job_stack_size, B.resource_report.job_stack_bytes);
 }
 
 test "HTTP admission is opt-in and reserves only its enabled diagnostics route" {

@@ -433,6 +433,17 @@ pub fn build(b: *std.Build) void {
         invalid.expect_errors = .{ .contains = if (image_thumbnails) case.message else ".files.thumbnails requires -Dimage-thumbnails=true" };
         thumbnail_contracts.dependOn(&invalid.step);
     }
+    const memory_contracts = b.step("check-memory-job-contracts", "Check compile-time memory worker limits");
+    const memory_mod = b.createModule(.{ .root_source_file = b.path("fixtures/memory-jobs/main.zig"), .target = target, .optimize = optimize, .imports = &.{.{ .name = "zigbase", .module = zigbase_mod }} });
+    const memory_fixture = b.addExecutable(.{ .name = "memory-jobs-fixture", .root_module = memory_mod });
+    b.step("memory-jobs-fixture", "Build live memory-worker configuration fixture").dependOn(&b.addInstallArtifact(memory_fixture, .{}).step);
+    inline for (&.{ "zero", "too-many" }) |name| {
+        const mod = b.createModule(.{ .root_source_file = b.path("fixtures/invalid-memory-jobs/" ++ name ++ ".zig"), .target = target, .optimize = optimize, .link_libc = true });
+        mod.addImport("zigbase", zigbase_mod);
+        const invalid = b.addExecutable(.{ .name = "invalid-memory-jobs-" ++ name, .root_module = mod });
+        invalid.expect_errors = .{ .contains = std.fmt.comptimePrint(".pools.memory_jobs must be in 1..{d}", .{@import("src/resource_profile.zig").max_memory_workers}) };
+        memory_contracts.dependOn(&invalid.step);
+    }
     const resumable_contracts = b.step("check-resumable-contracts", "Check resumable upload budget compile-time contracts");
     inline for (&.{ "zero", "chunk", "unknown" }) |name| {
         const mod = b.createModule(.{ .root_source_file = b.path("fixtures/invalid-resumable/" ++ name ++ ".zig"), .target = target, .optimize = optimize, .link_libc = true });

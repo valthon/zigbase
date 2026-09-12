@@ -76,9 +76,11 @@ configures in code:
    row into `plugin_audit_log`. It also captures two analytics events together with
    `ctx.trackBatch`, demonstrating atomic multi-event capture without a background buffer.
 
-7. **Pool levers** via `.pools` (`.readers` / `.jobs` / `.cache_kib`) to tune
-   the warm-reader pool, scheduler worker count, and per-connection SQLite
-   page-cache budget.
+7. **Pool levers** via `.pools` (`.readers` / `.jobs` / `.memory_jobs` / `.cache_kib`)
+   to tune warm readers, scheduler workers, lazy memory-job/submit workers, and
+   SQLite page-cache targets. This example overrides the minimal profile's one
+   memory worker with two; inspect the requested configuration with `resources`.
+   The report's `job_stack_bytes` applies to both scheduler and memory workers.
 
 8. **Fully embedded static frontend** via `embedStaticDir`. The Zigapagos island
    build output in `frontend/dist` is compiled into the binary at build time via

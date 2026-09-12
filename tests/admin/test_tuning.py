@@ -58,6 +58,18 @@ def test_tuning_ranks_only_feasible_observations(binary, tmp_path):
     assert not (tmp_path / "untouched").exists()
 
 
+def test_tuning_accepts_reports_without_memory_worker_fields(binary, tmp_path):
+    value = document(binary)
+    for candidate in value["candidates"]:
+        candidate["resources"].pop("memory_job_workers", None)
+    result = run(binary, tmp_path, value)
+    assert result.returncode == 0, result.stderr
+    report = json.loads(result.stdout)
+    assert report["recommendation"] == "fast"
+    for item in report["items"]:
+        assert item["candidate"]["resources"]["memory_job_workers"] is None
+
+
 @pytest.mark.parametrize("change,reason", [
     ({"failed_requests": 1}, "failed_requests"),
     ({"revision": "old"}, "context_mismatch"),

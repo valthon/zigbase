@@ -14,6 +14,8 @@ copy, examples, and tests with the implementation rather than in follow-up PRs.
   and saturation counters; the shared WS/SSE connection cap is comptime-tunable
   with effective cap/count reporting. Transport buffers and cross-subsystem budget
   coordination remain outside these gates.
+  Memory-job/submit workers now have independent comptime counts and share the
+  configured job stack size, with lazy startup and unchanged bounded-ring rejection.
 - [ ] Agent-native development interface: versioned discovery, structured diagnostics,
   schema/route inspection, migration previews, and focused test execution.
   Implemented slices: CLI discovery with explicit operation side effects (#409),

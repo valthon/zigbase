@@ -96,7 +96,7 @@ const Task = struct {
 };
 
 /// Bounded worker pool for memory-backend jobs + `app.submit` tasks. Reuses the
-/// Scheduler's spinlock-ring pattern (scheduler.zig): all ring/started mutation under
+/// Scheduler's bounded-ring pattern: all ring/started mutation under a parking
 /// `mutex`; workers poll the ring (20 ms idle sleep, matching the scheduler's cadence).
 /// Threads spawn LAZILY on the first push (zero overhead when unused) and `stop()`
 /// drains the ring and joins every worker (tasks queued before shutdown complete;
@@ -105,22 +105,33 @@ pub const Pool = struct {
     /// Ring capacity. Overflow returns error.QueueFull — reject-not-block, because a
     /// handler may enqueue from a pool worker (block-on-full would self-deadlock).
     pub const capacity = 256;
-    /// Fixed worker count. Matches facil.io's 4 HTTP threads: a burst drains 4-wide
-    /// without reserving idle threads for the common no-queue deployment (lazy spawn).
-    pub const num_workers = 4;
+    /// Historical default, independent of the scheduler's worker count.
+    pub const num_workers = @import("../resource_profile.zig").default_memory_workers;
+    pub const max_workers = @import("../resource_profile.zig").max_memory_workers;
 
     app: *App,
     ring: [capacity]*Task = undefined,
     head: usize = 0,
     len: usize = 0,
-    mutex: std.atomic.Mutex = .unlocked,
+    mutex: std.Io.Mutex = .init,
     started: bool = false, // guarded by mutex
-    nworkers: usize = 0, // actually-spawned workers (== num_workers unless spawn failed)
+    nworkers: usize = 0, // actually-spawned workers; partial startup is supported
+    requested_workers: usize = num_workers,
+    stack_size: usize = scheduler_mod.min_job_stack_size,
     shutdown: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    workers: [num_workers]std.Thread = undefined,
+    // Allocate only the requested count on first push, nothing for an unused pool.
+    // len == requested; only [0..nworkers] hold live handles after partial startup.
+    workers: []std.Thread = &.{},
 
     pub fn init(app: *App) Pool {
         return .{ .app = app };
+    }
+
+    /// No allocation or threads until first push. Caller must stop the pool
+    /// before its app allocator is destroyed; stop joins and frees all handles.
+    pub fn initSized(app: *App, workers: usize, stack_size: usize) error{InvalidWorkerCount}!Pool {
+        if (workers < 1 or workers > max_workers) return error.InvalidWorkerCount;
+        return .{ .app = app, .requested_workers = workers, .stack_size = @max(stack_size, scheduler_mod.min_job_stack_size) };
     }
 
     /// Route this app's memory-queue jobs AND `app.submit` tasks through this pool. Call
@@ -147,6 +158,9 @@ pub const Pool = struct {
         self.started = false;
         self.unlockPool();
         for (self.workers[0..n]) |t| t.join();
+        self.app.allocator.free(self.workers);
+        self.workers = &.{};
+        self.nworkers = 0;
         if (self.app.memory_pool == @as(?*anyopaque, @ptrCast(self))) {
             // Clear order matters (mirrors install()'s safe write order): submit_fn gates
             // the `self.memory_pool.?` deref in App.submit, so it must go null FIRST — else
@@ -169,10 +183,12 @@ pub const Pool = struct {
     }
 
     fn lockPool(self: *Pool) void {
-        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+        // Startup spawns under this lock. New workers park instead of spending
+        // CPU spinning while the first submitter creates the remaining threads.
+        self.mutex.lockUncancelable(self.app.io);
     }
     fn unlockPool(self: *Pool) void {
-        self.mutex.unlock();
+        self.mutex.unlock(self.app.io);
     }
 
     fn dequeue(self: *Pool) ?*Task { // caller holds lock
@@ -189,26 +205,34 @@ pub const Pool = struct {
         self.lockPool();
         errdefer self.unlockPool();
         if (self.shutdown.load(.acquire)) return error.ShuttingDown;
-        if (!self.started) {
-            // One-time spawn under the spinlock: slow (a few syscalls) but happens once.
-            // 1 MiB stacks — same rationale + floor as the scheduler's threads.
-            var spawned: usize = 0;
-            for (self.workers[0..num_workers]) |*t| {
-                t.* = std.Thread.spawn(
-                    .{ .stack_size = scheduler_mod.min_job_stack_size },
-                    workerLoop,
-                    .{self},
-                ) catch break;
-                spawned += 1;
-            }
-            if (spawned == 0) return error.SystemResources;
-            self.nworkers = spawned;
-            self.started = true;
-        }
+        if (!self.started) try self.startWorkers(spawnWorker);
         if (self.len == capacity) return error.QueueFull;
         self.ring[(self.head + self.len) % capacity] = task;
         self.len += 1;
         self.unlockPool();
+    }
+
+    fn spawnWorker(config: std.Thread.SpawnConfig, self: *Pool) std.Thread.SpawnError!std.Thread {
+        return std.Thread.spawn(config, workerLoop, .{self});
+    }
+
+    /// Caller holds mutex: new workers cannot dequeue before startup publishes
+    /// its handles. A first-spawn failure frees the slice and permits retry;
+    /// later spawn failure retains the successfully started subset, as before.
+    fn startWorkers(self: *Pool, comptime spawn: fn (std.Thread.SpawnConfig, *Pool) std.Thread.SpawnError!std.Thread) !void {
+        const workers = try self.app.allocator.alloc(std.Thread, self.requested_workers);
+        errdefer self.app.allocator.free(workers);
+        var spawned: usize = 0;
+        for (workers) |*thread| {
+            thread.* = spawn(.{ .stack_size = self.stack_size }, self) catch break;
+            spawned += 1;
+        }
+        if (spawned < self.requested_workers)
+            std.log.warn("memory pool: started {d}/{d} workers", .{ spawned, self.requested_workers });
+        if (spawned == 0) return error.SystemResources;
+        self.workers = workers;
+        self.nworkers = spawned;
+        self.started = true;
     }
 
     fn workerLoop(self: *Pool) void {
@@ -308,6 +332,107 @@ fn testApp() App {
     return App{ .allocator = testing.allocator, .io = testing.io, .pool = undefined };
 }
 
+test "sized memory pool validates workers and remains allocation-free while unused" {
+    var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    var app = testApp();
+    app.allocator = failing.allocator();
+    try testing.expectError(error.InvalidWorkerCount, Pool.initSized(&app, 0, 0));
+    try testing.expectError(error.InvalidWorkerCount, Pool.initSized(&app, 65, 0));
+    var pool = try Pool.initSized(&app, 64, 0);
+    pool.install(&app);
+    try testing.expectEqual(scheduler_mod.min_job_stack_size, pool.stack_size);
+    try testing.expectEqual(@as(usize, 0), pool.workers.len);
+    try testing.expect(!pool.started);
+    pool.stop();
+    pool.stop();
+    try testing.expectEqual(@as(usize, 0), failing.alloc_index);
+}
+
+test "memory worker allocation and all-spawn failures retain no handles and permit retry" {
+    const S = struct {
+        var calls: usize = 0;
+        fn fail(_: std.Thread.SpawnConfig, _: *Pool) std.Thread.SpawnError!std.Thread {
+            calls += 1;
+            return error.SystemResources;
+        }
+    };
+    S.calls = 0;
+    var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    var app = testApp();
+    app.allocator = failing.allocator();
+    var pool = try Pool.initSized(&app, 3, 2 << 20);
+    pool.install(&app);
+    defer pool.stop();
+    {
+        pool.lockPool();
+        defer pool.unlockPool();
+        try testing.expectError(error.OutOfMemory, pool.startWorkers(S.fail));
+        try testing.expectEqual(@as(usize, 0), S.calls);
+        app.allocator = testing.allocator;
+        try testing.expectError(error.SystemResources, pool.startWorkers(S.fail));
+        try testing.expectEqual(@as(usize, 1), S.calls);
+        try testing.expect(!pool.started);
+        try testing.expectEqual(@as(usize, 0), pool.workers.len);
+        try testing.expectEqual(@as(usize, 0), pool.nworkers);
+    }
+    // The real first push retries startup, owning its task and payload normally.
+    try enqueue(&app, .{ .name = "default" }, okH, "{}");
+    try testing.expect(pool.started);
+    try testing.expectEqual(@as(usize, 3), pool.workers.len);
+    try testing.expectEqual(@as(usize, 3), pool.nworkers);
+}
+
+test "memory partial worker startup preserves its working subset and configured stacks" {
+    const S = struct {
+        var calls: usize = 0;
+        var stack: usize = 0;
+        fn spawn(config: std.Thread.SpawnConfig, pool: *Pool) std.Thread.SpawnError!std.Thread {
+            calls += 1;
+            stack = config.stack_size;
+            if (calls == 3) return error.ThreadQuotaExceeded;
+            return Pool.spawnWorker(config, pool);
+        }
+    };
+    S.calls = 0;
+    S.stack = 0;
+    m_runs.store(0, .monotonic);
+    var app = testApp();
+    var pool = try Pool.initSized(&app, 7, 2 << 20);
+    pool.install(&app);
+    defer pool.stop();
+    {
+        pool.lockPool();
+        defer pool.unlockPool();
+        try pool.startWorkers(S.spawn);
+    }
+    try testing.expectEqual(@as(usize, 2), pool.nworkers);
+    try testing.expectEqual(@as(usize, 7), pool.workers.len);
+    try testing.expectEqual(@as(usize, 2 << 20), S.stack);
+    for (0..12) |_| try enqueue(&app, .{ .name = "default" }, okH, "{}");
+    try testing.expectEqual(@as(usize, 3), S.calls); // no retry/extra workers after partial startup
+    pool.stop();
+    try testing.expectEqual(@as(usize, 12), m_runs.load(.acquire));
+    try testing.expectEqual(@as(usize, 0), pool.workers.len);
+    try testing.expectEqual(@as(usize, 0), pool.nworkers);
+}
+
+fn exercisePoolAllocations(allocator: std.mem.Allocator, submit: bool) !void {
+    const S = struct {
+        fn task(_: *Ctx, _: *events.JobEvent) !void {}
+    };
+    var app = testApp();
+    app.allocator = allocator;
+    var pool = try Pool.initSized(&app, 1, scheduler_mod.min_job_stack_size);
+    pool.install(&app);
+    defer pool.stop();
+    if (submit) try app.submit("owned-name", S.task) else try enqueue(&app, .{ .name = "default" }, innerH, "owned-payload");
+}
+
+test "memory first-push allocation failures free task payload name and worker handles" {
+    try testing.checkAllAllocationFailures(testing.allocator, exercisePoolAllocations, .{false});
+    try testing.checkAllAllocationFailures(testing.allocator, exercisePoolAllocations, .{true});
+}
+
 test "memory runWithRetry succeeds on first attempt" {
     m_runs.store(0, .monotonic);
     var app = testApp();
@@ -348,6 +473,32 @@ fn blockingH(ctx: *Ctx, payload: []const u8) anyerror!void {
     _ = g_blocked.fetchAdd(1, .monotonic);
     while (!g_gate.load(.acquire)) {
         ctx.app.io.sleep(std.Io.Duration.fromMilliseconds(1), .awake) catch {};
+    }
+}
+
+test "configured memory workers bound running tasks and drain queued work" {
+    for ([_]usize{ 1, 6 }) |workers| {
+        m_runs.store(0, .monotonic);
+        g_gate.store(false, .monotonic);
+        g_blocked.store(0, .monotonic);
+        var app = testApp();
+        var pool = try Pool.initSized(&app, workers, 1 << 20);
+        pool.install(&app);
+        defer {
+            g_gate.store(true, .release);
+            pool.stop();
+        }
+        for (0..workers) |_| try enqueue(&app, .{ .name = "default" }, blockingH, "{}");
+        var spins: usize = 0;
+        while (g_blocked.load(.acquire) < workers and spins < 2000) : (spins += 1)
+            try app.io.sleep(std.Io.Duration.fromMilliseconds(1), .awake);
+        try testing.expectEqual(workers, g_blocked.load(.acquire));
+        try testing.expectEqual(workers, pool.nworkers);
+        for (0..3) |_| try enqueue(&app, .{ .name = "default" }, okH, "{}");
+        try testing.expectEqual(@as(usize, 0), m_runs.load(.acquire));
+        g_gate.store(true, .release);
+        pool.stop();
+        try testing.expectEqual(@as(usize, 3), m_runs.load(.acquire));
     }
 }
 
