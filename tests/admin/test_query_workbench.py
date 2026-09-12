@@ -56,6 +56,9 @@ def test_bounded_private_route_template_attribution_and_concurrency(server):
     assert entry["method"] == "GET"
     assert re.fullmatch(r"[0-9a-f]{16}", entry["shape"])
     assert entry["stepNanoseconds"] >= entry["maxStepNanoseconds"] >= 0
+    assert entry["finalizedStatements"] == 72
+    assert entry["statementLifetimeNanoseconds"] >= entry["maxStatementLifetimeNanoseconds"] >= 0
+    assert entry["statementLifetimeNanoseconds"] == entry["measuredCallNanoseconds"] + entry["heldNanoseconds"]
     serialized = json.dumps(report)
     for forbidden in ["private-path", "private-literal", "admin@x.io", "SELECT", token]:
         assert forbidden not in serialized
@@ -64,6 +67,25 @@ def test_bounded_private_route_template_attribution_and_concurrency(server):
     meta = call(server, "GET", "/api/meta")[1]
     assert meta["capabilities"]["queryWorkbench"] is True
     assert meta["endpoints"]["queryWorkbench"] == "/api/query-workbench/stats"
+
+def test_statement_lifetime_separates_application_hold_and_reset_reuse(server):
+    token = admin(server)
+    assert call(server, "GET", "/held")[0] == 204
+    code, report = call(server, "GET", "/api/query-workbench/stats", token=token)
+    assert code == 200
+    assert report["measurement"] == "prepared-statement-step-time"
+    assert report["lifetimeMeasurement"] == "prepare-through-finalize"
+    assert report["measuredCalls"] == ["prepare", "step", "reset", "finalize"]
+    entries = [item for item in report["items"] if item["routeTemplate"] == "/held"]
+    assert len(entries) == 1, report
+    entry = entries[0]
+    assert entry["finalizedStatements"] == 1
+    assert entry["executions"] == 2
+    assert entry["repeatedShapes"] == 1
+    # Only a lower bound: scheduling can lengthen the hold, without making this flaky.
+    assert entry["heldNanoseconds"] >= 40_000_000
+    assert entry["statementLifetimeNanoseconds"] == entry["maxStatementLifetimeNanoseconds"]
+    assert entry["statementLifetimeNanoseconds"] == entry["measuredCallNanoseconds"] + entry["heldNanoseconds"]
 
 def test_operator_only_bearer_boundary(server):
     token = admin(server)

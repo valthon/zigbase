@@ -9,6 +9,7 @@ const c = @import("../../c.zig").c;
 const clock_sql = @import("../../clock_sql.zig");
 const clock_vfs = @import("../../clock_vfs.zig");
 const build_options = @import("build_options");
+const workbench = @import("../../query_workbench.zig");
 
 /// sqlite-vec's static entry point (#157). Declared unconditionally but only REFERENCED inside the
 /// `build_options.vector` comptime branch in `open`, so the default build neither links the symbol
@@ -120,10 +121,17 @@ pub const Db = struct {
     }
 
     pub fn prepare(self: *Db, sql: [:0]const u8) DbError!Stmt {
+        var lifetime = if (comptime build_options.query_workbench) workbench.Lifetime.begin() else {};
         var handle: ?*c.sqlite3_stmt = null;
         if (c.sqlite3_prepare_v2(self.handle, sql.ptr, -1, &handle, null) != c.SQLITE_OK)
             return DbError.PrepareFailed;
-        return .{ .handle = handle.?, .field_cipher = self.field_cipher };
+        if (comptime build_options.query_workbench) {
+            lifetime.afterCall(lifetime.started);
+            // SQLite compiles only the first statement: never fingerprint an
+            // unexecuted caller-supplied tail differently from the step metrics.
+            if (lifetime.scope_id != 0) lifetime.prepared(sqlForMeasurement(handle.?));
+        }
+        return .{ .handle = handle.?, .field_cipher = self.field_cipher, .lifetime = lifetime };
     }
 
     pub fn begin(self: *Db) DbError!void {
@@ -170,9 +178,18 @@ const SQLITE_TRANSIENT: ?*const anyopaque = @ptrFromInt(@as(usize, @bitCast(@as(
 /// Links to the same C symbol; ABI-identical.
 extern fn sqlite3_bind_text(stmt: ?*c.sqlite3_stmt, idx: c_int, text: [*c]const u8, n: c_int, destructor: ?*const anyopaque) callconv(.c) c_int;
 
+fn sqlForMeasurement(handle: *c.sqlite3_stmt) []const u8 {
+    const ptr = c.sqlite3_sql(handle);
+    if (ptr == null) return "";
+    var len: usize = 0;
+    while (len <= 16384 and ptr[len] != 0) len += 1;
+    return ptr[0..len];
+}
+
 pub const Stmt = struct {
     handle: *c.sqlite3_stmt,
-    measurement: if (build_options.query_workbench) @import("../../query_workbench.zig").Measurement else void = if (build_options.query_workbench) .{} else {},
+    measurement: if (build_options.query_workbench) workbench.Measurement else void = if (build_options.query_workbench) .{} else {},
+    lifetime: if (build_options.query_workbench) workbench.Lifetime else void = if (build_options.query_workbench) .{} else {},
     /// Copied from the originating `Db` (see Db.field_cipher). The records value
     /// layer reads this to decide whether to encrypt/decrypt a field value.
     field_cipher: ?*const anyopaque = null,
@@ -200,19 +217,20 @@ pub const Stmt = struct {
     /// Advances to the next row. Returns true if a row is available, false when done.
     pub fn step(self: *Stmt) DbError!bool {
         const measured_start = if (comptime build_options.query_workbench) blk: {
-            var sql: []const u8 = "";
-            if (self.measurement.needsSql()) {
-                const ptr = c.sqlite3_sql(self.handle);
-                if (ptr != null) {
-                    var len: usize = 0;
-                    while (len <= 16384 and ptr[len] != 0) len += 1;
-                    sql = ptr[0..len];
-                }
-            }
-            break :blk self.measurement.before(sql);
+            const key = if (self.measurement.needsKey())
+                // A prepared statement's SQL is immutable; reuse its fingerprint
+                // across execution/reset cycles while lifetime attribution exists.
+                if (self.lifetime.scope_id != 0) self.lifetime.key else workbench.fingerprint(sqlForMeasurement(self.handle))
+            else
+                null;
+            break :blk self.measurement.beforeKeyed(key);
         } else {};
         const result = c.sqlite3_step(self.handle);
-        if (comptime build_options.query_workbench) self.measurement.after(measured_start, result == c.SQLITE_ROW, result != c.SQLITE_ROW and result != c.SQLITE_DONE);
+        if (comptime build_options.query_workbench) {
+            const end = self.measurement.after(measured_start, result == c.SQLITE_ROW, result != c.SQLITE_ROW and result != c.SQLITE_DONE);
+            // Reuse the step timer: lifecycle accounting adds no per-row clock reads.
+            self.lifetime.observeCall(measured_start, end);
+        }
         return switch (result) {
             c.SQLITE_ROW => true,
             c.SQLITE_DONE => false,
@@ -274,7 +292,9 @@ pub const Stmt = struct {
 
     pub fn reset(self: *Stmt) void {
         if (comptime build_options.query_workbench) self.measurement.finish();
+        const start = if (comptime build_options.query_workbench) self.lifetime.now() else {};
         _ = c.sqlite3_reset(self.handle);
+        if (comptime build_options.query_workbench) self.lifetime.afterCall(start);
     }
 
     /// Clear parameter values separately from reset, which preserves bindings.
@@ -284,13 +304,97 @@ pub const Stmt = struct {
 
     pub fn finalize(self: *Stmt) void {
         if (comptime build_options.query_workbench) self.measurement.finish();
+        const start = if (comptime build_options.query_workbench) self.lifetime.now() else {};
         _ = c.sqlite3_finalize(self.handle);
+        if (comptime build_options.query_workbench) self.lifetime.finish(start);
     }
 };
 
 test "disabled workbench adds no statement storage" {
     if (comptime !build_options.query_workbench)
         try std.testing.expectEqual(@sizeOf(*c.sqlite3_stmt) + @sizeOf(?*const anyopaque), @sizeOf(Stmt));
+}
+
+test "workbench lifecycle finalizes once across reset reuse and unstepped statements" {
+    if (comptime !build_options.query_workbench) return error.SkipZigTest;
+    const store = try workbench.Store.create(std.testing.allocator, std.testing.io, .{});
+    defer store.destroy();
+    var database = try Db.openMemory();
+    defer database.close();
+    var scope = workbench.Scope.init(store, "GET", "/reuse");
+    scope.enter();
+    defer scope.leave();
+    {
+        var stmt = try database.prepare("SELECT 1; SELECT 'unexecuted tail';");
+        defer stmt.finalize();
+        try std.testing.expect(try stmt.step());
+        stmt.reset();
+        try std.testing.expect(try stmt.step());
+        try std.testing.expect(!try stmt.step());
+        try std.testing.expectEqual(@as(u64, 2), store.entries[0].executions);
+        try std.testing.expectEqual(@as(u64, 0), store.entries[0].statements);
+    }
+    try std.testing.expectEqual(@as(u64, 1), store.entries[0].statements);
+    try std.testing.expectEqual(@as(u64, 1), store.entries[0].repeated);
+    try std.testing.expectEqual(store.entries[0].lifetime_ns, store.entries[0].calls_ns + store.entries[0].held_ns);
+    {
+        var stmt = try database.prepare("SELECT 1, 2;");
+        defer stmt.finalize();
+    }
+    try std.testing.expectEqual(@as(usize, 2), store.count);
+    try std.testing.expectEqual(@as(u64, 0), store.entries[1].executions);
+    try std.testing.expectEqual(@as(u64, 1), store.entries[1].statements);
+    try std.testing.expectError(error.PrepareFailed, database.prepare("NOT SQL"));
+    try std.testing.expectEqual(@as(usize, 2), store.count);
+    try std.testing.expectEqual(@as(u64, 0), store.dropped_statements);
+}
+
+test "workbench prepared outside scope still measures reset executions" {
+    if (comptime !build_options.query_workbench) return error.SkipZigTest;
+    const store = try workbench.Store.create(std.testing.allocator, std.testing.io, .{});
+    defer store.destroy();
+    var database = try Db.openMemory();
+    defer database.close();
+    var stmt = try database.prepare("SELECT 1");
+    var scope = workbench.Scope.init(store, "GET", "/outside");
+    scope.enter();
+    defer scope.leave();
+    defer stmt.finalize();
+    for (0..2) |_| {
+        try std.testing.expect(try stmt.step());
+        try std.testing.expect(!try stmt.step());
+        stmt.reset();
+    }
+    try std.testing.expectEqual(@as(usize, 1), store.count);
+    try std.testing.expectEqual(@as(u64, 2), store.entries[0].executions);
+    try std.testing.expectEqual(@as(u64, 0), store.entries[0].statements);
+    try std.testing.expectEqual(@as(u64, 0), store.dropped);
+    try std.testing.expectEqual(@as(u64, 0), stmt.lifetime.scope_id);
+}
+
+test "workbench reuses rejected prepare fingerprint across resets" {
+    if (comptime !build_options.query_workbench) return error.SkipZigTest;
+    const store = try workbench.Store.create(std.testing.allocator, std.testing.io, .{});
+    defer store.destroy();
+    var database = try Db.openMemory();
+    defer database.close();
+    var scope = workbench.Scope.init(store, "GET", "/oversize");
+    scope.enter();
+    defer scope.leave();
+    const sql = "SELECT 1 /*" ++ ("x" ** 16384) ++ "*/";
+    {
+        var stmt = try database.prepare(sql);
+        defer stmt.finalize();
+        try std.testing.expectEqual(null, stmt.lifetime.key);
+        for (0..2) |_| {
+            try std.testing.expect(try stmt.step());
+            try std.testing.expect(!try stmt.step());
+            stmt.reset();
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), store.count);
+    try std.testing.expectEqual(@as(u64, 2), store.dropped);
+    try std.testing.expectEqual(@as(u64, 1), store.dropped_statements);
 }
 
 test "open in-memory db, create a table, exec succeeds" {

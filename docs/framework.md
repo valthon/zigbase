@@ -4809,6 +4809,44 @@ early finalization closes an execution; work retained past the originating
 scope is omitted, not attributed to the next request. Inspector requests exclude
 their own auth and plan queries. State snapshots are coherent and bounded.
 
+Completed statements also report a separate lifecycle family:
+
+- `finalizedStatements`: successful prepares finalized in their originating
+  scope, whether stepped or not. Reset/reuse still counts as one statement.
+- `statementLifetimeNanoseconds` and `maxStatementLifetimeNanoseconds`: sum/max
+  elapsed time from entry to SQLite prepare through return from finalize.
+- `measuredCallNanoseconds`: elapsed time in the measured prepare, step, reset,
+  and finalize calls for those finalized statements, including SQLite waits.
+- `heldNanoseconds`: lifetime minus those measured calls, clamped at zero. It
+  includes application pauses, scheduling, binding, column access/decoding and
+  instrumentation overhead. It is **not CPU time**, a pure application-time
+  measurement, or proof that a connection is being misused.
+
+The response identifies `lifetimeMeasurement: "prepare-through-finalize"` and
+`measuredCalls: ["prepare", "step", "reset", "finalize"]`. Existing step-time
+slow/repeat/failure counters keep their meanings; they are not lifecycle counts.
+A statement can have several executions, or none, and execution statistics can
+appear before its lifecycle is finalized. Do not subtract aggregate step timing
+from lifecycle timing: the populations can differ. Failed prepares, raw `exec`,
+pool acquisition and full request latency are not captured. A lifecycle whose
+measured calls or finalization leave the original scope is omitted rather than
+reattributed; no request/store pointers are retained in statements. Long-lived
+unfinalized statements do not appear in lifecycle aggregates.
+
+Lifecycle keys share the existing entry capacity. `droppedStatements` counts
+finalizations omitted for unsupported SQL or full/oversized keys, independently
+of `droppedExecutions`; cross-scope omissions cannot safely update the departed
+scope and are not counted. Five extra saturating `u64` counters per retained
+entry, one store-wide dropped counter, and fixed per-statement timestamp/identity
+state are the additional retained cost when enabled. Prepare/reset/finalize add
+clock reads, and each in-scope finalization performs one mutex-guarded store update
+with a bounded entry scan (at most `max_entries`). Step timing reuses existing
+reads, without extra per-row clocks.
+Successful in-scope prepares fingerprint the compiled SQL once; execution/reset
+cycles reuse that key. Statements prepared outside the active scope fall back
+to fingerprinting on execution, preserving execution attribution.
+Default-off builds retain none of this storage or instrumentation.
+
 `POST /api/query-workbench/explain` accepts only a structured SELECT shape:
 
 ```json
@@ -4838,7 +4876,9 @@ statement retention does not transfer attribution. This first slice is not a
 general SQL profiler, an automatic index adviser or a distributed tracing system.
 `/api/meta` advertises `capabilities.queryWorkbench` and the optional stats URL;
 compiled route discovery includes both inspector endpoints. The runnable
-`fixtures/query-workbench` example exercises repeated bound queries safely.
+`fixtures/query-workbench` exercises repeated bound queries and a deliberately
+held/reset statement: `/held` demonstrates why lifecycle and step durations
+answer different questions without retaining SQL or parameter text.
 
 #### Profile defaults
 
@@ -5608,7 +5648,7 @@ code to comptime-dead when off, so a build that doesn't need a feature doesn't p
 | `-Drealtime-backfill` | off | Single-process SQLite record invalidation backfill: 16 lazy collection slots, each 256 entries / 64 KiB (1 MiB encoded total), current authorization, explicit reset on gaps or slot replacement. No historical payloads or durable/cross-instance guarantee. See the API realtime section. |
 | `-Dimage-thumbnails` | off | Named PNG/JPEG/WebP derivatives on built-in local storage via a trusted external ImageMagick executable; configure `.files.thumbnails`. Subprocess support, routes and admission state are excluded when off; no image codec is linked. See [thumbnails](thumbnails.md). |
 | `-Dresumable-uploads` | off | Principal-bound network-resume for file fields on existing records. Process-local, fully buffered, configurable session/byte/chunk/expiry budgets; no restart or cross-instance durability. See [resumable uploads](resumable-uploads.md). |
-| `-Dquery-workbench` | off | Bounded SQLite prepared-statement step metrics attributed to route templates, repeated/slow shape counters and operator-only structural EXPLAIN. No SQL/parameter capture; PostgreSQL is excluded. |
+| `-Dquery-workbench` | off | Bounded SQLite prepared-statement step/lifecycle metrics attributed to route templates, repeated/slow shape counters and operator-only structural EXPLAIN. No SQL/parameter capture; PostgreSQL is excluded. |
 | `-Ddev-mode` | on in `Debug`, off in release | The dev-only, never-in-prod seams: `ZIGBASE_FAKE_NOW` / `ZIGBASE_FAKE_SEED` (§14 above), test-capture, and fake field-crypto; the release script forces it off for shipped binaries. |
 | `-Ddev-tools` | **on** | The `init`/`agents-md`/`typegen` scaffolding/codegen verbs, `capabilities`/`routes` offline discovery, `tune` offline measurement advisor, and `diagnostics` structured doctor adapter (which can probe filesystem writability and initialize the migration ledger). Ordinary `doctor` remains available. Official release, Docker and npm artifacts include this tooling. Consumers can opt out for their deployment binary; stripped verbs exit nonzero with `-Ddev-tools=true` rebuild guidance. Distinct from `.enable_typegen` below — see §3b. |
 | `-Dstrip` | on except in `Debug` | Strip debug info from the binary (~7 MiB vs ~24 MiB unstripped in a release build). |

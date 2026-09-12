@@ -6,7 +6,7 @@ if [ "$#" -ne 2 ]; then
 fi
 off=$(nm --defined-only "$1")
 on=$(nm --defined-only "$2")
-for pattern in 'query_workbench\.Measurement\.' 'query_workbench\.Scope\.' 'query_workbench\.Store\.' 'query_workbench\.current' 'query_workbench\.serial'; do
+for pattern in 'query_workbench\.Measurement\.' 'query_workbench\.Lifetime\.' 'query_workbench\.Scope\.' 'query_workbench\.Store\.' 'query_workbench\.current' 'query_workbench\.serial'; do
   if grep -E "$pattern" <<< "$off" >/dev/null; then
     echo "LEAK: $pattern" >&2; exit 1
   fi
@@ -14,4 +14,4 @@ for pattern in 'query_workbench\.Measurement\.' 'query_workbench\.Scope\.' 'quer
     echo "DRIFT: $pattern" >&2; exit 1
   fi
 done
-echo 'query workbench gating: OK (5 paired patterns)'
+echo 'query workbench gating: OK (6 paired patterns)'
