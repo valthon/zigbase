@@ -24,6 +24,7 @@ import urllib.parse
 import urllib.request
 
 import pytest
+from _bin import resolve_binary
 
 REPO = pathlib.Path(__file__).resolve().parents[2]
 ZIG = ["mise", "exec", "zig@0.16.0", "--", "zig"]
@@ -405,10 +406,7 @@ def test_invalid_handler_status_logs_the_normalized_wire_status(feature_route_bi
 
 @pytest.fixture(scope="session")
 def dating_binary():
-    subprocess.run(ZIG + ["build", "dating-server"], cwd=REPO, check=True)
-    path = REPO / "zig-out" / "bin" / "dating-server"
-    assert path.exists(), f"dating-server not built at {path}"
-    return str(path)
+    return resolve_binary("ZIGBASE_TEST_DATING_BINARY", REPO, "dating-server")
 
 
 @pytest.fixture()
