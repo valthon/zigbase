@@ -361,6 +361,12 @@ pub const codegen = struct {
 // so its `test {}` blocks are analyzed and run (matches pre-restructure behavior
 // where main.zig's import graph reached them).
 test {
+    if (@import("build_options").image_thumbnails) {
+        _ = @import("files/thumbnail_source.zig");
+        _ = @import("files/thumbnail_imagemagick.zig");
+        _ = @import("files/thumbnail_config.zig");
+        _ = @import("files/thumbnails.zig");
+    }
     _ = @import("admission.zig");
     if (@import("devtools.zig").enabled) _ = @import("agent_capabilities.zig");
     if (@import("devtools.zig").enabled) _ = @import("agent_diagnostics.zig");

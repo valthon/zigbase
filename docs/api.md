@@ -1272,6 +1272,13 @@ first scheduled run — until then the endpoint returns `{ "items": [] }`.
 
 ## Files
 
+Opt-in [ImageMagick thumbnails](thumbnails.md) add
+`GET`/`HEAD /api/files/:col/:rec/:name/thumbnail/:profile` for named compile-time
+profiles on built-in local storage. Original file authorization and hooks apply;
+derivatives do not support ranges and never redirect to S3.
+See the linked contract for PNG/JPEG/WebP formats, conditional caching,
+deployment requirements, resource limits and errors.
+
 File-type fields hold uploaded files.
 
 - **Upload:** files are submitted via `multipart/form-data` on record create

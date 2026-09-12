@@ -270,6 +270,7 @@ environment variables, then `serve` command-line flags (where a flag exists).
 | `ZIGBASE_TWILIO_ACCOUNT_SID` | — | `""` (log SMS) | Twilio Account SID; set (with token + from) to deliver `ctx.sms()` messages via Twilio instead of logging |
 | `ZIGBASE_TWILIO_AUTH_TOKEN` | — | `""` | Twilio auth token (used as the HTTP Basic-auth password) |
 | `ZIGBASE_TWILIO_FROM` | — | `""` | Twilio sender number in E.164 (e.g. `+15551234567`) |
+| `ZIGBASE_IMAGEMAGICK_EXECUTABLE` | — | Compiled thumbnail executable | Absolute executable path override for configured thumbnails in `-Dimage-thumbnails=true` builds. Must match the configured ImageMagick 6 `convert` or 7 `magick` command style; no PATH search. Ignored when the feature is compiled out |
 | `ZIGBASE_S3_BUCKET` | — | `""` (off) | **Opt-in.** Non-empty selects the S3-compatible storage backend instead of local disk. Only honored in a binary built with `-Ds3=true`; ignored otherwise |
 | `ZIGBASE_S3_REGION` | — | `us-east-1` | AWS region (SigV4 signing + default endpoint) |
 | `ZIGBASE_S3_ENDPOINT` | — | `""` | `""` → `https://s3.<region>.amazonaws.com`; set for MinIO/R2/other S3-compatible endpoints |

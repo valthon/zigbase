@@ -1,7 +1,7 @@
 import { useEffect, useState } from '@z/runtime';
 import {
   listListings, createBooking, getAvailability, uploadListingPhotos,
-  photoUrl, token, type Listing, type AvailabilitySlot,
+  photoUrl, hasCardThumbnails, token, type Listing, type AvailabilitySlot,
 } from '../lib/api';
 import Auth from './Auth';
 
@@ -55,9 +55,10 @@ function AvailabilityPanel({ listing }: { listing: Listing }) {
 // PhotoGallery — renders stored photos and (for authed users) an upload form.
 // The file field accepts up to 6 images (png/jpeg/webp, 5 MB each).
 // ---------------------------------------------------------------------------
-function PhotoGallery({ listing, canUpload, onUploaded }: {
+function PhotoGallery({ listing, canUpload, cardThumbnails, onUploaded }: {
   listing: Listing;
   canUpload: boolean;
+  cardThumbnails: boolean;
   onUploaded: (updated: Listing) => void;
 }) {
   const [busy, setBusy] = useState(false);
@@ -88,7 +89,15 @@ function PhotoGallery({ listing, canUpload, onUploaded }: {
           {photos.map((name) => (
             <img
               key={name}
-              src={photoUrl(listing.id, name)}
+              src={photoUrl(listing.id, name, cardThumbnails)}
+              onError={(event: Event) => {
+                const image = event.currentTarget as HTMLImageElement;
+                // A missing converter or exhausted queue must not break a gallery.
+                // Avoid retry loops when the original itself is unavailable.
+                if (image.getAttribute('src')?.endsWith('/thumbnail/card')) {
+                  image.src = photoUrl(listing.id, name);
+                }
+              }}
               alt={listing.title}
               style={{ width: 96, height: 72, objectFit: 'cover', borderRadius: 3, border: '1px solid var(--hairline)' }}
             />
@@ -157,10 +166,14 @@ export default function ListingsBrowser() {
   const [authed, setAuthed] = useState(() => token() !== null);
   const [listings, setListings] = useState<Listing[] | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [cardThumbnails, setCardThumbnails] = useState(false);
 
   useEffect(() => {
-    listListings()
-      .then(setListings)
+    Promise.all([listListings(), hasCardThumbnails()])
+      .then(([items, enabled]) => {
+        setCardThumbnails(enabled);
+        setListings(items);
+      })
       .catch((e: unknown) => setError(e instanceof Error ? e.message : String(e)));
   }, []);
 
@@ -187,7 +200,7 @@ export default function ListingsBrowser() {
             <span className="price">${l.price_per_hour}</span>/hour
           </p>
           {/* Photos — always shown; upload only for authed users */}
-          <PhotoGallery listing={l} canUpload={authed} onUploaded={updateListing} />
+          <PhotoGallery listing={l} canUpload={authed} cardThumbnails={cardThumbnails} onUploaded={updateListing} />
           {/* Availability calendar (lazy-loaded) — shown to authed users */}
           {authed && <AvailabilityPanel listing={l} />}
           {authed ? <BookForm listing={l} /> : <p className="muted">Sign in above to book.</p>}

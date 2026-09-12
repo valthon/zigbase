@@ -213,6 +213,13 @@ misbehaving server). Totals are skipped by default in cursor mode; pass `withTot
 
 ## File uploads & URLs
 
+The legacy SDK `thumb` option is deprecated for ZigBase use: it only appends
+`?thumb=...`, which does not invoke a server transform. Use the explicit
+`GET /api/files/:collection/:record/:filename/thumbnail/:profile` route for
+configured [named thumbnails](../../docs/thumbnails.md). Encode each path segment
+and put any scoped file token in the final URL's query string. SDK signatures
+are unchanged; there is not yet a named-profile URL helper.
+
 A `create`/`update` body value that is a `FileArg` — `FileArg.Bytes(filename, content,
 contentType?)` for in-memory bytes, or `FileArg.FromFile(file, contentType?)` for a
 filesystem `java.io.File` — or a `List` containing any of those, is sent as
@@ -230,7 +237,7 @@ val rec = posts.create(
 )
 
 // Build a URL to the stored file:
-val url = zb.files.getUrl(rec, rec.getString("cover")!!, thumb = "100x100")
+val url = zb.files.getUrl(rec, rec.getString("cover")!!)
 
 // Protected files: mint a short-lived access token for <img>/emails:
 val token = zb.files.getToken()

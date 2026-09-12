@@ -194,6 +194,38 @@ Upload via `PATCH /api/collections/listings/records/:id` with `multipart/form-da
 Do NOT set `Content-Type` — the browser sets the multipart boundary automatically.
 Serve stored photos at `/api/files/listings/:recId/:filename`.
 
+For optional local image thumbnails, build from this example directory with
+`zig build -Dimage-thumbnails=true`. The flag defaults to false and is forwarded
+to ZigBase. When enabled, Golfsim declares a 320×240 `card` profile with
+center-cropped `cover` sizing and WebP output at quality 85. Its conservative
+example policy uses one concurrent transform, up to 32 waiting requests and a
+five-second admission deadline; tune these values for your deployment.
+
+Use `GET` or `HEAD /api/files/listings/:recId/:filename/thumbnail/card` for a
+stored PNG, JPEG or WebP listing photo; supply the same credentials as the original URL.
+The original file's record reference, view rule, tenant scope and file hook
+still apply. The gallery reads `thumbnail_profile` from `/api/golfsim/health`
+and requests card derivatives when enabled. Disabled builds or failed discovery
+keep original URLs. An individual derivative failure falls back to its original
+once, without an image-error retry loop.
+
+Install and maintain a trusted ImageMagick executable before running an enabled
+build. The example config selects ImageMagick 6 `/usr/bin/convert`; ImageMagick 7
+uses an absolute `magick` path and `.command_style = .magick`. Set
+`ZIGBASE_IMAGEMAGICK_EXECUTABLE` to override the path for a deployment using the
+same compiled major-version style. No executable is
+searched on `PATH`, and no image codec is linked into ZigBase. The 32 MiB default
+source limit covers this field's 5 MiB upload ceiling. Other formats and remote
+source backends are unsupported. Conditional requests can skip repeat transforms;
+there is no persistent derivative store. See [thumbnail setup and resource tuning](../../docs/thumbnails.md#resource-tuning)
+for process limits, trusted system policy and the distinction from a hard RSS cap.
+
+After building the frontend, run
+`mise exec python@3.13 -- python -m pytest test/test_thumbnail_gallery.py -q`
+with Playwright Chromium installed. This loads the real island and checks both
+compiled-profile responses plus one-time fallback for failed derivatives; HTTP
+authorization and actual transforms are covered by the framework thumbnail suite.
+
 An `onFileUpload` handler logs every upload:
 
 ```zig
@@ -527,7 +559,8 @@ await zb.rpc.bookingsCancel({ id: booking.id });
 // listingsAvailability: GET /api/listings/:id/availability
 const avail = await zb.rpc.listingsAvailability({ id: listing.id });
 
-// golfsimHealth: GET /api/golfsim/health → typed HealthOut { status: string; app: string }
+// golfsimHealth: GET /api/golfsim/health → typed HealthOut
+// { status: string; app: string; thumbnail_profile: string | null }
 const health = await zb.rpc.golfsimHealth();
 ```
 

@@ -85,6 +85,13 @@ pub const LocalStorage = struct {
         return .{ .ctx = self, .vtable = &vtable };
     }
 
+    /// Recognize only this implementation; never invoke a plugin callback to
+    /// discover whether fetching would spool remote data or perform other work.
+    pub fn fromStorage(value: Storage) ?*const LocalStorage {
+        if (value.vtable != &vtable) return null;
+        return @ptrCast(@alignCast(value.ctx));
+    }
+
     const vtable = Storage.VTable{
         .put = put,
         .fetch = fetch,

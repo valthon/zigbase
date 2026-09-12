@@ -165,6 +165,13 @@ include `totalItems`.
 
 ## File uploads & URLs
 
+The legacy SDK `thumb` option is deprecated for ZigBase use: it only appends
+`?thumb=...`, which does not invoke a server transform. Use the explicit
+`GET /api/files/:collection/:record/:filename/thumbnail/:profile` route for
+configured [named thumbnails](../../docs/thumbnails.md). Encode each path segment
+and put any scoped file token in the final URL's query string. SDK signatures
+are unchanged; there is not yet a named-profile URL helper.
+
 A `create`/`update` body value that is an `http.MultipartFile` (or a `List` containing one) is
 sent as multipart automatically — no special method:
 
@@ -179,7 +186,7 @@ final rec = await posts.create({
 });
 
 // Build a URL to the stored file:
-final url = zb.files.getUrl(rec, rec.getString('cover')!, thumb: '100x100');
+final url = zb.files.getUrl(rec, rec.getString('cover')!);
 
 // Protected files: mint a short-lived access token for <img>/emails:
 final token = await zb.files.getToken();

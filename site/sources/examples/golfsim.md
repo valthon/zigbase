@@ -24,6 +24,16 @@ parts** of building a real backend on ZigBase *as a library*.
 
 ## What it proves
 
+Build with `zig build -Dimage-thumbnails=true` and configure a trusted
+ImageMagick executable to enable the 320×240 `card` profile for local
+PNG/JPEG/WebP listing photos. Request
+`/api/files/listings/:record/:filename/thumbnail/card` with the same file
+authorization as the original. The gallery discovers the compiled profile from
+the public health route and uses derivatives when enabled, with a one-time
+original-photo fallback on errors. Disabled builds serve original photos.
+See [image thumbnails](../docs/thumbnails) for executable setup, resource tuning
+and conditional caching. No image codec is linked into the application.
+
 The browser frontend consumes Golfsim's `gen-client` output directly for
 collection queries, signup, file handling, RPC paths and record types.
 CI checks both generated-file freshness and the frontend API's types;
@@ -211,7 +221,8 @@ await zb.rpc.bookingsCancel({ id: booking.id });
 // listingsAvailability: GET /api/listings/:id/availability
 const avail = await zb.rpc.listingsAvailability({ id: listing.id });
 
-// golfsimHealth: GET /api/golfsim/health → typed HealthOut { status: string; app: string }
+// golfsimHealth: GET /api/golfsim/health → typed HealthOut
+// { status: string; app: string; thumbnail_profile: string | null }
 const health = await zb.rpc.golfsimHealth();
 ```
 

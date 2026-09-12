@@ -13,6 +13,7 @@ const BuildOptionValues = struct {
     file_inventory: bool,
     realtime_backfill: bool,
     resumable_uploads: bool,
+    image_thumbnails: bool,
     query_workbench: bool,
     fts5: bool,
     sqlite_version: []const u8,
@@ -115,6 +116,7 @@ pub fn build(b: *std.Build) void {
     const file_inventory = b.option(bool, "file-inventory", "Compile read-only local/S3 file inventory reporting (default: off)") orelse false;
     const realtime_backfill = b.option(bool, "realtime-backfill", "Compile bounded process-local record invalidation backfill (default: off)") orelse false;
     const resumable_uploads = b.option(bool, "resumable-uploads", "Compile bounded process-local resumable file uploads (default: off)") orelse false;
+    const image_thumbnails = b.option(bool, "image-thumbnails", "Compile ImageMagick thumbnail integration (default: off)") orelse false;
     const query_workbench = b.option(bool, "query-workbench", "Compile bounded SQLite query diagnostics (default: off)") orelse false;
     // Opt-in vector search (#157; Postgres pgvector port #159). OFF by default: the default build
     // does NOT compile or link the sqlite-vec amalgamation, and every vector code path folds to
@@ -166,6 +168,7 @@ pub fn build(b: *std.Build) void {
         .file_inventory = file_inventory,
         .realtime_backfill = realtime_backfill,
         .resumable_uploads = resumable_uploads,
+        .image_thumbnails = image_thumbnails,
         .query_workbench = query_workbench,
         .internal_api = false,
         .vector = vector,
@@ -294,6 +297,14 @@ pub fn build(b: *std.Build) void {
     });
     const resumable_exe = b.addExecutable(.{ .name = "resumable-uploads-fixture", .root_module = resumable_mod });
     b.step("resumable-uploads-fixture", "Build bounded upload HTTP fixture (-Dresumable-uploads=true)").dependOn(&b.addInstallArtifact(resumable_exe, .{}).step);
+    const thumbnails_mod = b.createModule(.{
+        .root_source_file = b.path("fixtures/thumbnails/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "zigbase", .module = zigbase_mod }},
+    });
+    const thumbnails_exe = b.addExecutable(.{ .name = "thumbnails-fixture", .root_module = thumbnails_mod });
+    b.step("thumbnails-fixture", "Build thumbnail HTTP fixture (-Dimage-thumbnails=true)").dependOn(&b.addInstallArtifact(thumbnails_exe, .{}).step);
 
     // --- dating-server: the dating fixture compiled as a runnable server ----------
     // Plan 2: the e2e harness spawns THIS binary so client and server share the exact
@@ -404,6 +415,24 @@ pub fn build(b: *std.Build) void {
         route_contracts.dependOn(&invalid_exe.step);
     }
     const scheduler_contracts = b.step("check-scheduler-contracts", "Check distributed scheduler compile-time contracts");
+    const thumbnail_contracts = b.step("check-thumbnail-contracts", "Check thumbnail configuration and feature-gate contracts");
+    inline for (&.{
+        .{ .name = "empty", .message = ".files.thumbnails requires 1..32 named profiles" },
+        .{ .name = "name", .message = "Thumbnail profile names must start with a lowercase letter and contain only lowercase letters, digits and hyphens (1..64 bytes)" },
+        .{ .name = "dimensions", .message = "Invalid thumbnail profile: positive dimensions within max_dimension/max_pixels and quality in 1..100 required" },
+        .{ .name = "unknown", .message = "Unknown .files.thumbnails key: unexpected" },
+        .{ .name = "budget", .message = "Invalid thumbnail admission: max_concurrent and enabled wait timeout must be positive" },
+        .{ .name = "backend", .message = "Invalid thumbnail ImageMagick configuration: explicit absolute executable and positive resource limits required" },
+        .{ .name = "backend-empty", .message = "Invalid thumbnail ImageMagick configuration: explicit absolute executable and positive resource limits required" },
+        .{ .name = "quality", .message = "Invalid thumbnail profile: positive dimensions within max_dimension/max_pixels and quality in 1..100 required" },
+        .{ .name = "profile-key", .message = "Unknown thumbnail profile key: unknown" },
+    }) |case| {
+        const mod = b.createModule(.{ .root_source_file = b.path("fixtures/invalid-thumbnails/" ++ case.name ++ ".zig"), .target = target, .optimize = optimize, .link_libc = true });
+        mod.addImport("zigbase", zigbase_mod);
+        const invalid = b.addExecutable(.{ .name = "invalid-thumbnail-" ++ case.name, .root_module = mod });
+        invalid.expect_errors = .{ .contains = if (image_thumbnails) case.message else ".files.thumbnails requires -Dimage-thumbnails=true" };
+        thumbnail_contracts.dependOn(&invalid.step);
+    }
     const resumable_contracts = b.step("check-resumable-contracts", "Check resumable upload budget compile-time contracts");
     inline for (&.{ "zero", "chunk", "unknown" }) |name| {
         const mod = b.createModule(.{ .root_source_file = b.path("fixtures/invalid-resumable/" ++ name ++ ".zig"), .target = target, .optimize = optimize, .link_libc = true });
@@ -511,6 +540,12 @@ pub fn build(b: *std.Build) void {
         const invalid_admission_exe = b.addExecutable(.{ .name = "invalid-admission-" ++ invalid.name, .root_module = mod });
         invalid_admission_exe.expect_errors = .{ .contains = invalid.expected };
         admission_contracts.dependOn(&invalid_admission_exe.step);
+    }
+
+    if (image_thumbnails) {
+        const codec_tests_mod = b.createModule(.{ .root_source_file = b.path("src/files/thumbnail_imagemagick.zig"), .target = target, .optimize = optimize, .link_libc = true });
+        const codec_tests = b.addTest(.{ .root_module = codec_tests_mod });
+        b.step("test-thumbnail-backend", "Run isolated ImageMagick backend tests").dependOn(&b.addRunArtifact(codec_tests).step);
     }
 
     // Unit tests run against the library module (where all internal test{} live).

@@ -882,6 +882,7 @@ export interface RevokeOut {
 export interface HealthOut {
   status: string;
   app: string;
+  thumbnail_profile: string | null;
 }
 export interface PendingAuthentication {
   status: "factor_required" | "enrollment_required";

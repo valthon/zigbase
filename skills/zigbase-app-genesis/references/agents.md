@@ -7,6 +7,9 @@ Start here, then load one or two of the linked guides. The full corpus is
 
 For interrupted client file transfers, load [resumable uploads](https://github.com/valthon/zigbase/blob/main/docs/resumable-uploads.md):
 opt-in, principal-bound, bounded and process-local; not restart-durable streaming.
+For image derivatives, load [thumbnails](https://github.com/valthon/zigbase/blob/main/docs/thumbnails.md): named compile-time
+profiles, an opt-in ImageMagick subprocess, and explicit deployment resource
+limits. Do not assume an embedded codec or arbitrary transformation URLs.
 
 ## What ZigBase is
 

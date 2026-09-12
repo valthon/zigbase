@@ -384,6 +384,13 @@ handling](#error-handling).
 
 ## Files
 
+The legacy SDK `thumb` option is deprecated for ZigBase use: it only appends
+`?thumb=...`, which does not invoke a server transform. Use the explicit
+`GET /api/files/:collection/:record/:filename/thumbnail/:profile` route for
+configured [named thumbnails](thumbnails.md). Encode each path segment and put any
+scoped file token in the final URL's query string. SDK signatures are unchanged;
+there is not yet a named-profile URL helper.
+
 A `create`/`update` body value that is a file-like object (anything with `.read()`), or a
 `(filename, bytes)` / `(filename, bytes, content_type)` tuple — or a `list` containing any
 of those — is sent as `multipart/form-data` automatically. No special method call needed:
@@ -396,8 +403,8 @@ with open("cover.png", "rb") as f:
         "cover": (f.name, f.read(), "image/png"),
     })
 
-# build a (optionally thumbnailed) file URL from the record:
-url = zb.files.get_url(rec, rec["cover"], thumb="100x100")
+# build an original-file URL from the record:
+url = zb.files.get_url(rec, rec["cover"])
 
 # short-lived token for protected-file access (<img>, emails):
 token = zb.files.get_token()

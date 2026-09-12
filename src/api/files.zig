@@ -84,11 +84,33 @@ fn fileIdentity(ctx: *http.RequestCtx, conn: *db.Db) ?auth.Authed {
     return auth.authenticate(app.io, ctx.allocator.a, app, ctx, conn) catch null;
 }
 
-/// GET /api/files/:col/:rec/:name
+/// GET/HEAD /api/files/:col/:rec/:name/thumbnail/:profile
+pub fn serveThumbnail(ctx: *http.RequestCtx) anyerror!http.Response {
+    if (comptime @import("build_options").image_thumbnails) {
+        const name = ctx.param("profile") orelse return ApiError.notFound().toResponse(ctx.allocator.a);
+        if (@import("../files/thumbnails.zig").findProfile(ctx.app.?.files.thumbnails, name) == null) {
+            var missing = try ApiError.notFound().toResponse(ctx.allocator.a);
+            missing.extra_headers = &.{.{ .name = "Cache-Control", .value = "no-store" }};
+            return missing;
+        }
+    }
+    var response = try serve(ctx);
+    for (response.extra_headers) |header| {
+        if (std.ascii.eqlIgnoreCase(header.name, "cache-control")) return response;
+    }
+    const headers = try ctx.allocator.a.alloc(http.Header, response.extra_headers.len + 1);
+    @memcpy(headers[0..response.extra_headers.len], response.extra_headers);
+    headers[response.extra_headers.len] = .{ .name = "Cache-Control", .value = "no-store" };
+    response.extra_headers = headers;
+    return response;
+}
+
+/// Original and derivative routes share authorization, reference checks and hooks.
 pub fn serve(ctx: *http.RequestCtx) anyerror!http.Response {
     const app = ctx.app.?;
     var r = try app.pool.acquireReader();
-    defer app.pool.releaseReader(&r);
+    var reader_held = true;
+    defer if (reader_held) app.pool.releaseReader(&r);
     const col_name = ctx.param("col") orelse return ApiError.notFound().toResponse(ctx.allocator.a);
     const rid = ctx.param("rec") orelse return ApiError.notFound().toResponse(ctx.allocator.a);
     const name = ctx.param("name") orelse return ApiError.notFound().toResponse(ctx.allocator.a);
@@ -126,6 +148,12 @@ pub fn serve(ctx: *http.RequestCtx) anyerror!http.Response {
         .check => if (!try policy.authorizes(ctx.allocator.a, &r, col, .view, rid, &rctx)) return ApiError.notFound().toResponse(ctx.allocator.a),
     }
 
+    // Collection, record, identity and tenant scope are request-owned copies;
+    // no statements or borrowed database values escape these lookups. Release
+    // before application hooks (which may read) and bounded but CPU-heavy codecs.
+    app.pool.releaseReader(&r);
+    reader_held = false;
+
     // file.beforeServe runs only on files the requester may already access; a handler
     // returning an error denies the download as 404 (hides existence, like viewRule).
     if (app.dispatch) |d| if (d.on_file_serve) |h| {
@@ -134,6 +162,9 @@ pub fn serve(ctx: *http.RequestCtx) anyerror!http.Response {
     };
 
     const storage = app.storage orelse return ApiError.internal().toResponse(ctx.allocator.a);
+    if (comptime @import("build_options").image_thumbnails) {
+        if (ctx.param("profile")) |profile| return @import("../files/thumbnails.zig").serve(ctx, storage.*, col.name, rid, name, profile);
+    }
 
     // Presigned-redirect mode (opt-in via `App(.{ .files = .{ .s3_presign_redirect = true } })`,
     // S3-only). Authorization above has ALREADY run per-request; here we offload the byte transfer

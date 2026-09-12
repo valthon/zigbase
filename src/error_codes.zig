@@ -14,10 +14,12 @@ pub const Code = enum {
     forbidden,
     gone,
     internal,
+    invalid_image,
     not_found,
     not_implemented,
     overloaded,
     payload_too_large,
+    thumbnail_busy,
     too_many_requests,
     unauthorized,
     validation_failed,
@@ -77,6 +79,14 @@ pub const Info = struct {
 /// code is documented".
 pub fn info(c: Code) Info {
     return switch (c) {
+        .thumbnail_busy => .{
+            .summary = "the per-application thumbnail transform limit is full",
+            .explanation = "Retry this GET or HEAD after Retry-After. Thumbnail admission runs after file authorization and beforeServe hooks; it does not promise that application hooks had no side effects.",
+        },
+        .invalid_image => .{
+            .summary = "the image is malformed or outside the supported thumbnail profile",
+            .explanation = "Thumbnail generation accepts supported single-frame PNG, JPEG and WebP images. Supply a supported, valid image and check the installed ImageMagick policy if conversion fails; this code is not a transient-capacity signal.",
+        },
         .overloaded => .{
             .summary = "synchronous HTTP request capacity is exhausted",
             .explanation = "The configured admission limit is full. Retry with backoff after Retry-After; this is server capacity, not a per-user rate limit. Reserved for rejection before routing or side effects: SDKs may retry non-idempotent writes on this code, so application handlers must not emit it after performing work.",

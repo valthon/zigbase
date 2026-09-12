@@ -76,6 +76,10 @@ copy, examples, and tests with the implementation rather than in follow-up PRs.
   record, with fresh authentication and commit reauthorization. Durable restart-safe
   and cross-instance resume remain future work.
 - [ ] Image transforms/thumbnails with comptime support and resource budgets.
+  Implemented slice: default-off ImageMagick transforms for local PNG/JPEG/WebP
+  files, named comptime contain/cover/output profiles and tunable process/admission
+  budgets. Remote backends, persistent derivative storage and arbitrary
+  transformation pipelines remain future work.
 - [x] Opt-in durable HTTP replacement/deletion cleanup with physical reference checks (#411).
 - [ ] Scoped orphan reconciliation and cleanup for non-HTTP mutation paths.
   Implemented slice: bounded offline local/SQLite reconciliation with read-only

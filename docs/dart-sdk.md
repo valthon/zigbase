@@ -332,6 +332,13 @@ the first page.
 
 ## Files
 
+The legacy SDK `thumb` option is deprecated for ZigBase use: it only appends
+`?thumb=...`, which does not invoke a server transform. Use the explicit
+`GET /api/files/:collection/:record/:filename/thumbnail/:profile` route for
+configured [named thumbnails](thumbnails.md). Encode each path segment and put any
+scoped file token in the final URL's query string. SDK signatures are unchanged;
+there is not yet a named-profile URL helper.
+
 A `create`/`update` body value that is an `http.MultipartFile` (or a `List` containing one) is
 sent as multipart automatically — no special method. The outer map key, not whatever field
 name the `MultipartFile` was constructed with, becomes the form field name.
@@ -346,8 +353,8 @@ final rec = await posts.create({
   'cover': http.MultipartFile.fromBytes('cover', bytes, filename: 'cover.png'),
 });
 
-// build a (optionally thumbnailed) file URL from the record:
-final url = zb.files.getUrl(rec, rec.getString('cover')!, thumb: '100x100');
+// build an original-file URL from the record:
+final url = zb.files.getUrl(rec, rec.getString('cover')!);
 
 // short-lived token for protected-file access (<img>, emails):
 final token = await zb.files.getToken();

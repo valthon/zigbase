@@ -88,7 +88,7 @@ ZigBase v0.13.0 is an early release. The gaps below are known and tracked for fu
 
 ## Other deferred work
 - **Idempotency is opt-in custom-operation SQLite support, not global middleware.** `zigbase.Idempotency` coordinates database-only effects and saved result bytes; callbacks must be trusted, authorization read-only, and current access checked on every replay. Retention begins at the trusted attempt timestamp, not commit, and expired keys may execute again. Idle receipts are not physically deleted by a timer. No PostgreSQL, automatic REST hook/rule wrapper, external exactly-once guarantee, or database/WAL/RSS hard limit is provided. See [the contract](docs/framework.md#idempotent-custom-mutations-opt-in-sqlite).
-- Image thumbnails / transforms; durable/cross-instance or streaming resumable uploads; durable/cross-instance realtime replay and per-event-guard load-tuning. Opt-in SQLite record invalidation backfill is process-local, bounded, and requires full reloads for gaps and authorization/query-dependency changes (see `docs/api.md`).
+- Image transforms beyond [named local ImageMagick thumbnails](docs/thumbnails.md), including formats other than PNG/JPEG/WebP, remote source backends and persistent derivative storage. Thumbnail-enabled deployments must install and maintain a trusted ImageMagick executable; process limits are not a hard RSS sandbox. Durable/cross-instance or streaming resumable uploads; durable/cross-instance realtime replay and per-event-guard load-tuning. Opt-in SQLite record invalidation backfill is process-local, bounded, and requires full reloads for gaps and authorization/query-dependency changes (see `docs/api.md`).
 
 ---
 These are tracked for upcoming releases. Contributions welcome.

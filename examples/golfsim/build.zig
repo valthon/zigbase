@@ -6,7 +6,10 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     const resumable = b.option(bool, "resumable-uploads", "Enable bounded process-local photo upload resume") orelse false;
-    const zigbase = b.dependency("zigbase", .{ .target = target, .optimize = optimize, .@"resumable-uploads" = resumable });
+    const thumbnails = b.option(bool, "image-thumbnails", "Enable local ImageMagick listing-photo thumbnails") orelse false;
+    const zigbase = b.dependency("zigbase", .{ .target = target, .optimize = optimize, .@"resumable-uploads" = resumable, .@"image-thumbnails" = thumbnails });
+    const options = b.addOptions();
+    options.addOption(bool, "image_thumbnails", thumbnails);
 
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
@@ -15,6 +18,7 @@ pub fn build(b: *std.Build) void {
     });
     // Adds the import AND sets link_libc, which zigbase requires.
     zigbase_build.addTo(zigbase, exe_mod);
+    exe_mod.addOptions("golfsim_options", options);
 
     const exe = b.addExecutable(.{ .name = "golfsim", .root_module = exe_mod });
     b.installArtifact(exe);
@@ -35,6 +39,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     app_mod.addImport("zigbase", zigbase.module("zigbase"));
+    app_mod.addOptions("golfsim_options", options);
 
     const out = "clients/typescript/zbase.gen.ts";
     const gen = zigbase_build.genClientStep(b, zigbase, app_mod, .{ .out = out, .api_prefix = "/api" });

@@ -476,12 +476,12 @@ fn expireHolds(ctx: *zigbase.Ctx, ev: *zigbase.events.JobEvent) anyerror!void {
 // 6. Public smoke route: GET /api/golfsim/health.
 //
 //    A typed struct output (the client gets a typed health shape). The thunk
-//    serializes it to `{"status":"ok","app":"golfsim"}` (200) — identical body.
+//    exposes the compiled photo profile so one frontend works with both builds.
 // ---------------------------------------------------------------------------
-const HealthOut = struct { status: []const u8, app: []const u8 };
+const HealthOut = struct { status: []const u8, app: []const u8, thumbnail_profile: ?[]const u8 };
 fn health(req: *zigbase.Req(void)) zigbase.RouteError!HealthOut {
     _ = req;
-    return .{ .status = "ok", .app = "golfsim" };
+    return .{ .status = "ok", .app = "golfsim", .thumbnail_profile = if (@import("golfsim_options").image_thumbnails) "card" else null };
 }
 
 // ---------------------------------------------------------------------------
@@ -814,6 +814,15 @@ fn requireSecondFactor(ctx: *zigbase.TwoFactorPolicyContext) !bool {
 }
 
 pub const App = zigbase.App(.{
+    .files = if (@import("golfsim_options").image_thumbnails) .{
+        .thumbnails = .{
+            .imagemagick = .{ .executable = "/usr/bin/convert", .command_style = .convert },
+            .profiles = .{ .card = .{ .width = 320, .height = 240, .format = .webp, .fit = .cover, .quality = 85 } },
+            .max_concurrent = 1,
+            .max_waiting = 32,
+            .wait_timeout_ms = 5000,
+        },
+    } else .{},
     .hooks = .{
         .bookings = .{ .beforeCreate = prepareBooking },
         .reviews = .{ .beforeCreate = prepareReview },
@@ -1122,6 +1131,35 @@ fn setupGuest(t: *zigbase.testing.Harness(App), email: []const u8) !struct { id:
     const id = guest.object.get("id").?.string;
     const token = try t.mintSession("users", id);
     return .{ .id = id, .token = token };
+}
+
+test "listing thumbnail profile follows the opt-in build flag" {
+    if (comptime @import("golfsim_options").image_thumbnails) {
+        try std.testing.expectEqual(@as(usize, 1), App.files_config.thumbnails.profiles.len);
+        const profile = App.files_config.thumbnails.profiles[0];
+        try std.testing.expectEqualStrings("card", profile.name);
+        try std.testing.expectEqual(@as(u32, 320), profile.width);
+        try std.testing.expectEqual(@as(u32, 240), profile.height);
+        try std.testing.expectEqual(.webp, profile.format);
+        try std.testing.expectEqual(.cover, profile.fit);
+        try std.testing.expectEqual(@as(u8, 85), profile.quality);
+        try std.testing.expectEqual(@as(u32, 1), App.files_config.thumbnails.max_concurrent);
+    } else {
+        try std.testing.expect(@TypeOf(App.files_config.thumbnails) == void);
+    }
+}
+
+test "public health advertises the compiled listing thumbnail profile" {
+    var t = try zigbase.testing.start(App, .{});
+    defer t.deinit();
+    const response = try t.request(.GET, "/api/golfsim/health", .{});
+    try std.testing.expectEqual(@as(u16, 200), response.status);
+    const body = try response.json(HealthOut);
+    if (comptime @import("golfsim_options").image_thumbnails) {
+        try std.testing.expectEqualStrings("card", body.thumbnail_profile.?);
+    } else {
+        try std.testing.expect(body.thumbnail_profile == null);
+    }
 }
 
 test "application requirement revokes primary-only access without allowing member opt-out" {

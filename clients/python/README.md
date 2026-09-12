@@ -183,6 +183,13 @@ pass `with_total=True` to `get_page` to include `total_items`.
 
 ## File uploads & URLs
 
+The legacy SDK `thumb` option is deprecated for ZigBase use: it only appends
+`?thumb=...`, which does not invoke a server transform. Use the explicit
+`GET /api/files/:collection/:record/:filename/thumbnail/:profile` route for
+configured [named thumbnails](../../docs/thumbnails.md). Encode each path segment
+and put any scoped file token in the final URL's query string. SDK signatures
+are unchanged; there is not yet a named-profile URL helper.
+
 A `create`/`update` body value that is a file-like object (anything with `.read()`), or a
 `(filename, bytes)` / `(filename, bytes, content_type)` tuple — or a `list` containing any
 of those — is sent as `multipart/form-data` automatically. No special method call needed:
@@ -196,7 +203,7 @@ with open("cover.png", "rb") as f:
     })
 
 # Build a URL to the stored file:
-url = zb.files.get_url(rec, rec["cover"], thumb="100x100")
+url = zb.files.get_url(rec, rec["cover"])
 
 # Protected files: mint a short-lived access token for <img>/emails:
 token = zb.files.get_token()

@@ -50,6 +50,7 @@
           <li><a href="$site.page('docs/jobs-and-webhooks').link()">Jobs &amp; webhooks</a></li>
           <li><a href="$site.page('docs/realtime-broadcast').link()">Realtime broadcast</a></li>
           <li><a href="$site.page('docs/resumable-uploads').link()">Resumable uploads</a></li>
+          <li><a href="$site.page('docs/thumbnails').link()">Image thumbnails</a></li>
           <li><a href="$site.page('docs/two-factor-design').link()">Two-factor authentication</a></li>
         </ul>
         <p class="docs-group">Reference</p>

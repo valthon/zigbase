@@ -2457,6 +2457,8 @@ fn printUsage(io: std.Io, file: std.Io.File, show_serve_static: bool, show_stati
         \\  ZIGBASE_VERIFICATION_TTL  Email-verification token TTL, seconds. [default 604800 = 7 days]
         \\  ZIGBASE_PASSWORD_RESET_TTL Password-reset token TTL, seconds.    [default 3600 = 1 hour]
         \\  ZIGBASE_FILE_TOKEN_TTL    Short-lived file-access token TTL, seconds. [default 120 = 2 min]
+        \\  ZIGBASE_IMAGEMAGICK_EXECUTABLE  Absolute executable override for configured thumbnails
+        \\                           (-Dimage-thumbnails=true); must match compiled command style.
         \\  ZIGBASE_STATIC_CACHE_CONTROL  Cache-Control for static responses (embedded + dir). Flag
         \\                           --static-cache-control wins over env. [default max-age=3600]
         \\  ZIGBASE_FIELD_KEY         Key for at-rest field encryption (.encrypted fields). Never
@@ -5063,7 +5065,17 @@ fn bootApp(
     errdefer if (comptime build_options.resumable_uploads) holder.resumable_store.destroy();
     holder.query_workbench = if (comptime build_options.query_workbench) try @import("query_workbench.zig").Store.create(allocator, io, opts.query_workbench) else {};
     errdefer if (comptime build_options.query_workbench) holder.query_workbench.destroy();
+    var files_config = opts.files;
+    var thumbnail_cache_epoch: if (build_options.image_thumbnails) [16]u8 else void = if (build_options.image_thumbnails) @splat(0) else {};
+    if (comptime build_options.image_thumbnails) {
+        if (files_config.thumbnails.profiles.len != 0) {
+            if (cfg.imagemagick_executable.len != 0)
+                files_config.thumbnails.imagemagick.executable = cfg.imagemagick_executable;
+            io.random(&thumbnail_cache_epoch);
+        }
+    }
     holder.app = app_mod.App{
+        .thumbnail_cache_epoch = thumbnail_cache_epoch,
         .query_workbench = if (comptime build_options.query_workbench) holder.query_workbench else {},
         .admission = if (comptime opts.admission_config != null) &holder.admission_state else null,
         .backfill = if (comptime build_options.realtime_backfill) holder.backfill_store else {},
@@ -5105,7 +5117,7 @@ fn bootApp(
         .mail = opts.mail,
         .sms = opts.sms,
         .sms_sender = &holder.sms_iface,
-        .files = opts.files,
+        .files = files_config,
         .push = opts.push,
         .storage = &holder.storage_iface,
         .storage_info = .{
@@ -5259,6 +5271,13 @@ fn serveImpl(
     defer holder.deinit();
     const app = &holder.app;
     const cfg = holder.cfg;
+
+    // Offline imports/schema commands and socketless tests do not need the
+    // optional executable. Validate it only before starting the HTTP service.
+    if (comptime build_options.image_thumbnails) {
+        if (app.files.thumbnails.profiles.len != 0)
+            try @import("files/thumbnail_imagemagick.zig").probe(allocator, io, app.files.thumbnails.imagemagick);
+    }
 
     // Emit the baked-in component versions once at boot (#282) — the same block `--version`
     // and `GET /api/health` report, so an operator can see (and audit) what a running binary
