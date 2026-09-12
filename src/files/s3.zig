@@ -1831,9 +1831,9 @@ test "S3Storage: a cache hit bumps mtime so eviction approximates last-access LR
 }
 
 // ---------------------------------------------------------------------------
-// LIVE tests — real network I/O against a real S3-compatible server (MinIO in
+// LIVE tests — real network I/O against a real S3-compatible server (SeaweedFS in
 // CI's `s3` job). Gated on ZIGBASE_S3_TEST_* (the ZIGBASE_PG_TEST_URL / seam_test.zig
-// precedent): SkipZigTest when unset, so the default and -Ds3=true-without-MinIO
+// precedent): SkipZigTest when unset, so the default and -Ds3=true-without-a-server
 // unit runs stay green everywhere else.
 // ---------------------------------------------------------------------------
 
@@ -1843,7 +1843,7 @@ fn testEnv(name: []const u8) ?[]const u8 {
     return std.testing.environ.getPosix(name);
 }
 
-test "LIVE MinIO: put/head/get/list/delete round-trip (object verifiably GONE)" {
+test "LIVE S3: put/head/get/list/delete round-trip (object verifiably GONE)" {
     // Deletion-verification lives HERE, where the signer is available (the python
     // e2e can't issue signed S3 requests without a client library).
     const endpoint = testEnv("ZIGBASE_S3_TEST_ENDPOINT") orelse return error.SkipZigTest;
