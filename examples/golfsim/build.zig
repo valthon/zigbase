@@ -7,9 +7,11 @@ pub fn build(b: *std.Build) void {
 
     const resumable = b.option(bool, "resumable-uploads", "Enable bounded process-local photo upload resume") orelse false;
     const thumbnails = b.option(bool, "image-thumbnails", "Enable local ImageMagick listing-photo thumbnails") orelse false;
-    const zigbase = b.dependency("zigbase", .{ .target = target, .optimize = optimize, .@"resumable-uploads" = resumable, .@"image-thumbnails" = thumbnails });
+    const durable = b.option(bool, "durable-resumable-uploads", "Persist photo upload sessions across process restarts (requires resumable-uploads)") orelse false;
+    const zigbase = b.dependency("zigbase", .{ .target = target, .optimize = optimize, .@"resumable-uploads" = resumable, .@"image-thumbnails" = thumbnails, .@"durable-resumable-uploads" = durable });
     const options = b.addOptions();
     options.addOption(bool, "image_thumbnails", thumbnails);
+    options.addOption(bool, "durable_uploads", durable);
 
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),

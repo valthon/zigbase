@@ -56,6 +56,12 @@ test "read-only open inspects an existing database and cannot create or write" {
 
 pub const DbError = error{ OpenFailed, ExecFailed, PrepareFailed, BindFailed, StepFailed, Constraint, WalNotEnabled };
 
+test "durability adds no public SQLite error or connection state" {
+    const expected = error{ OpenFailed, ExecFailed, PrepareFailed, BindFailed, StepFailed, Constraint, WalNotEnabled };
+    comptime if (DbError != expected or @hasField(Db, "quarantined"))
+        @compileError("Durable uploads must not add SQLite quarantine machinery");
+}
+
 pub const Db = struct {
     handle: *c.sqlite3,
     /// Type-erased pointer to the resolved `field_policy.Cipher` (or null when no

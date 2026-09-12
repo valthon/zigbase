@@ -14,6 +14,7 @@ const BuildOptionValues = struct {
     realtime_backfill: bool,
     resumable_uploads: bool,
     image_thumbnails: bool,
+    durable_resumable_uploads: bool,
     query_workbench: bool,
     fts5: bool,
     sqlite_version: []const u8,
@@ -117,6 +118,8 @@ pub fn build(b: *std.Build) void {
     const realtime_backfill = b.option(bool, "realtime-backfill", "Compile bounded process-local record invalidation backfill (default: off)") orelse false;
     const resumable_uploads = b.option(bool, "resumable-uploads", "Compile bounded process-local resumable file uploads (default: off)") orelse false;
     const image_thumbnails = b.option(bool, "image-thumbnails", "Compile ImageMagick thumbnail integration (default: off)") orelse false;
+    const durable_resumable_uploads = b.option(bool, "durable-resumable-uploads", "Compile opt-in SQLite upload persistence (requires resumable-uploads)") orelse false;
+    if (durable_resumable_uploads and !resumable_uploads) @panic("durable-resumable-uploads requires resumable-uploads=true");
     const query_workbench = b.option(bool, "query-workbench", "Compile bounded SQLite query diagnostics (default: off)") orelse false;
     // Opt-in vector search (#157; Postgres pgvector port #159). OFF by default: the default build
     // does NOT compile or link the sqlite-vec amalgamation, and every vector code path folds to
@@ -169,6 +172,7 @@ pub fn build(b: *std.Build) void {
         .realtime_backfill = realtime_backfill,
         .resumable_uploads = resumable_uploads,
         .image_thumbnails = image_thumbnails,
+        .durable_resumable_uploads = durable_resumable_uploads,
         .query_workbench = query_workbench,
         .internal_api = false,
         .vector = vector,
@@ -316,6 +320,14 @@ pub fn build(b: *std.Build) void {
     });
     const thumbnails_exe = b.addExecutable(.{ .name = "thumbnails-fixture", .root_module = thumbnails_mod });
     b.step("thumbnails-fixture", "Build thumbnail HTTP fixture (-Dimage-thumbnails=true)").dependOn(&b.addInstallArtifact(thumbnails_exe, .{}).step);
+    const durable_mod = b.createModule(.{
+        .root_source_file = b.path("fixtures/durable-uploads/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "zigbase", .module = zigbase_mod }},
+    });
+    const durable_exe = b.addExecutable(.{ .name = "durable-uploads-fixture", .root_module = durable_mod });
+    b.step("durable-uploads-fixture", "Build restart-safe upload fixture (both upload flags required)").dependOn(&b.addInstallArtifact(durable_exe, .{}).step);
 
     // --- dating-server: the dating fixture compiled as a runnable server ----------
     // Plan 2: the e2e harness spawns THIS binary so client and server share the exact
@@ -456,11 +468,25 @@ pub fn build(b: *std.Build) void {
         memory_contracts.dependOn(&invalid.step);
     }
     const resumable_contracts = b.step("check-resumable-contracts", "Check resumable upload budget compile-time contracts");
+    if (durable_resumable_uploads) {
+        const mod = b.createModule(.{ .root_source_file = b.path("fixtures/invalid-resumable/sqlite-row.zig"), .target = target, .optimize = optimize, .link_libc = true });
+        mod.addImport("zigbase", zigbase_mod);
+        const invalid = b.addExecutable(.{ .name = "invalid-durable-sqlite-row", .root_module = mod });
+        invalid.expect_errors = .{ .contains = "Invalid .files.resumable budgets: positive limits, sessions<=1024, principal<=sessions, chunk<=upload<=total<=1GiB, TTL<=86400 required; durable upload<=999983360 bytes" };
+        resumable_contracts.dependOn(&invalid.step);
+    }
+    if (!durable_resumable_uploads) {
+        const mod = b.createModule(.{ .root_source_file = b.path("fixtures/invalid-resumable/durable.zig"), .target = target, .optimize = optimize, .link_libc = true });
+        mod.addImport("zigbase", zigbase_mod);
+        const invalid = b.addExecutable(.{ .name = "invalid-durable-without-build-flag", .root_module = mod });
+        invalid.expect_errors = .{ .contains = if (!resumable_uploads) ".files.resumable requires -Dresumable-uploads=true" else ".files.resumable.durable requires -Ddurable-resumable-uploads=true" };
+        resumable_contracts.dependOn(&invalid.step);
+    }
     inline for (&.{ "zero", "chunk", "unknown" }) |name| {
         const mod = b.createModule(.{ .root_source_file = b.path("fixtures/invalid-resumable/" ++ name ++ ".zig"), .target = target, .optimize = optimize, .link_libc = true });
         mod.addImport("zigbase", zigbase_mod);
         const invalid = b.addExecutable(.{ .name = "invalid-resumable-" ++ name, .root_module = mod });
-        invalid.expect_errors = .{ .contains = if (!resumable_uploads) ".files.resumable requires -Dresumable-uploads=true" else if (std.mem.eql(u8, name, "unknown")) "Unknown .files.resumable limit: unknown_limit" else "Invalid .files.resumable budgets: positive limits, sessions<=1024, principal<=sessions, chunk<=upload<=total<=1GiB, TTL<=86400 required" };
+        invalid.expect_errors = .{ .contains = if (!resumable_uploads) ".files.resumable requires -Dresumable-uploads=true" else if (std.mem.eql(u8, name, "unknown")) "Unknown .files.resumable limit: unknown_limit" else "Invalid .files.resumable budgets: positive limits, sessions<=1024, principal<=sessions, chunk<=upload<=total<=1GiB, TTL<=86400 required; durable upload<=999983360 bytes" };
         resumable_contracts.dependOn(&invalid.step);
     }
     inline for (&.{

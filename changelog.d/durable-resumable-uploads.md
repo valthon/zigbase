@@ -1,0 +1,2 @@
+### Features
+- Opt into SQLite/local upload-session persistence with `-Dresumable-uploads=true -Ddurable-resumable-uploads=true` and `.files.resumable.durable = true`: bounded receiving sessions and completion receipts survive process restarts under one owner, with fresh authorization and no uncertain hook replay. RAM remains the default; this is neither streaming nor power-loss or cross-instance durability.

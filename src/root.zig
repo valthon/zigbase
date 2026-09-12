@@ -484,6 +484,7 @@ test {
         _ = @import("files/resumable.zig");
         _ = @import("api/resumable_uploads.zig");
     }
+    if (@import("build_options").durable_resumable_uploads) _ = @import("files/resumable_durable.zig");
     _ = @import("realtime/ws.zig");
     _ = @import("realtime/pg_bridge.zig");
     _ = @import("realtime/sse_fio.zig");

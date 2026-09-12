@@ -85,6 +85,12 @@ for (const contract of ['Resource tuning', 'max_pixels', 'thumbnail_busy', 'Imag
 if (!read('docs/framework/index.html').includes('image-thumbnails')) {
   fail('thumbnail opt-in build flag missing from framework reference');
 }
+for (const path of ['docs/resumable-uploads/index.html', 'docs-index.json', 'llms.txt']) {
+  const content = read(path);
+  if (!content.includes('SQLite/local restart persistence') || content.includes('not restart-durable streaming')) {
+    fail(`${path}: resumable upload durability metadata is stale`);
+  }
+}
 if (!read('docs/two-factor-design/index.html').includes('Compile-time and runtime configuration')) {
   fail('two-factor documentation was not published');
 }

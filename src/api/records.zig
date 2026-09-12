@@ -494,6 +494,8 @@ pub fn update(ctx: *http.RequestCtx) anyerror!http.Response {
 /// Internal resumable adapter. The marker records DB commit, independent of
 /// post-commit hook/response failures; the binding may never degrade to anonymous.
 pub const ResumableCommit = struct {
+    auth_collection_id: if (@import("build_options").durable_resumable_uploads) []const u8 else void = if (@import("build_options").durable_resumable_uploads) "" else {},
+    durable_id: if (@import("build_options").durable_resumable_uploads) ?[]const u8 else void = if (@import("build_options").durable_resumable_uploads) null else {},
     collection: []const u8,
     principal: []const u8,
     target_collection_id: []const u8,
@@ -594,8 +596,17 @@ fn updateImpl(ctx: *http.RequestCtx, comptime is_resumable: bool, resumable: if 
     const w = app.pool.acquireWriter();
     defer app.pool.releaseWriter();
     var txn_open = false;
-    defer if (txn_open) w.rollback() catch |err|
-        std.log.err("record update rollback failed: {s}", .{@errorName(err)});
+    defer {
+        // SQLite can end this transaction itself (e.g. RAISE(ROLLBACK)).
+        const rollback_needed = txn_open and w.inTransaction();
+        if (rollback_needed) w.rollback() catch |err| {
+            std.log.err("record update rollback failed: {s}", .{@errorName(err)});
+            if (comptime is_resumable and @import("build_options").durable_resumable_uploads) {
+                if (resumable.durable_id != null)
+                    std.debug.panic("durable upload transaction rollback failed; restart required", .{});
+            }
+        };
+    }
     if (upload_plan != null) {
         try w.beginImmediate();
         txn_open = true;
@@ -614,6 +625,10 @@ fn updateImpl(ctx: *http.RequestCtx, comptime is_resumable: bool, resumable: if 
         const identity = (try auth.authenticate(app.io, ctx.allocator.a, app, ctx, w)) orelse return ApiError.unauthorized().toResponse(ctx.allocator.a);
         const principal = identity.record.object.get("id").?.string;
         if (!std.mem.eql(u8, identity.collection, expected.collection) or !std.mem.eql(u8, principal, expected.principal)) return ApiError.unauthorized().toResponse(ctx.allocator.a);
+        if (comptime @import("build_options").durable_resumable_uploads) if (expected.durable_id != null) {
+            const auth_col = (try collections.get(ctx.allocator.a, w, identity.collection)) orelse return ApiError.unauthorized().toResponse(ctx.allocator.a);
+            if (!std.mem.eql(u8, auth_col.id, expected.auth_collection_id)) return ApiError.unauthorized().toResponse(ctx.allocator.a);
+        };
         if (!std.mem.eql(u8, col.id, expected.target_collection_id)) return ApiError.conflict("Upload collection no longer exists.").toResponse(ctx.allocator.a);
     }
     if (upload_plan != null) {
@@ -728,6 +743,12 @@ fn updateImpl(ctx: *http.RequestCtx, comptime is_resumable: bool, resumable: if 
         const current_files = (try records.getFilesPhysical(ctx.allocator.a, w, col, rid)).?;
         try app.files.cleanup.?(ctx.allocator.a, w, app.io, app.files.cleanup_queue.?, col, rid, old, current_files);
     }
+    if (comptime is_resumable and @import("build_options").durable_resumable_uploads) if (resumable.durable_id) |id| {
+        @import("../files/resumable_durable.zig").markCompleted(w, id) catch |err| {
+            std.log.warn("upload completion receipt failed: {s}", .{@errorName(err)});
+            return ApiError.withCode(503, .internal, "Upload completion receipt could not be persisted; inspect upload status.").toResponse(ctx.allocator.a);
+        };
+    };
     try w.commit();
     txn_open = false;
     committed = true; // row is durable — the write-cleanup defer must NOT fire past here

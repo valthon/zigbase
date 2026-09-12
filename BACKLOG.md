@@ -84,8 +84,10 @@ copy, examples, and tests with the implementation rather than in follow-up PRs.
   completion-error handling, and live S3-compatible integration coverage.
 - [ ] Resumable client uploads with principal-bound capabilities and commit reauthorization.
   Implemented slice: opt-in bounded, process-local sessions for one file on an existing
-  record, with fresh authentication and commit reauthorization. Durable restart-safe
-  and cross-instance resume remain future work.
+  record, with fresh authentication and commit reauthorization. Additional opt-in
+  SQLite/local persistence survives process restarts under one owner, preserving
+  atomic completion receipts and never replaying uncertain hooks. Cross-instance,
+  power-loss durability and streaming remain future work.
 - [ ] Image transforms/thumbnails with comptime support and resource budgets.
   Implemented slice: default-off ImageMagick transforms for local PNG/JPEG/WebP
   files, named comptime contain/cover/output profiles and tunable process/admission

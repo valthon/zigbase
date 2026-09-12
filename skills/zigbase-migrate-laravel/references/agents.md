@@ -6,7 +6,9 @@ Start here, then load one or two of the linked guides. The full corpus is
 ~200k tokens; you almost never need it.
 
 For interrupted client file transfers, load [resumable uploads](https://github.com/valthon/zigbase/blob/main/docs/resumable-uploads.md):
-opt-in, principal-bound, bounded and process-local; not restart-durable streaming.
+opt-in, principal-bound and bounded. Default RAM sessions are process-local;
+explicit SQLite/local durability preserves sessions across process restarts.
+Neither mode provides streaming or cross-instance recovery.
 For image derivatives, load [thumbnails](https://github.com/valthon/zigbase/blob/main/docs/thumbnails.md): named compile-time
 profiles, an opt-in ImageMagick subprocess, and explicit deployment resource
 limits. Do not assume an embedded codec or arbitrary transformation URLs.
