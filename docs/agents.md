@@ -213,6 +213,23 @@ No test executor or extra runtime cost is added to `zigbase capabilities` or a
 deployed binary. Inventory's `execution` descriptor describes this checkout tool,
 not an embedded CLI verb.
 
+The explicit allowlist includes five local Python tooling modules: binary resolver,
+performance-contract validation, parity replay, bounded test execution and
+changed-file selection. These need no Zig compilation, browser installation or
+live migration source. Replay tests do open loopback HTTP sockets; changed-file
+tests require Git; executor tests launch local subprocesses and a nested resolver
+check through `mise`. Their advertised effect remains conservative, not a promise
+of filesystem/network isolation. Performance-contract tests use synthetic
+artifacts and reports, **not actual benchmark runs**. Their unittest class runs
+through the module selector; class-method IDs are still not inventoried.
+
+```sh
+mise exec python@3.13 -- python tools/agent_tests.py run \
+  --selector tests/tools/test_performance_contracts.py
+mise exec python@3.13 -- python tools/agent_tests.py run \
+  --selector tests/tools/test_replay.py::test_subset_matches_extra_keys_but_not_missing_or_different
+```
+
 Run accepts **one exact inventory ID**, no extra pytest arguments, shell expressions
 or arbitrary paths. Unknown selectors fail before starting any process. The fixed
 argv runs the pinned Python toolchain and pytest from the checkout root, with
@@ -276,7 +293,17 @@ Dependencies are explicit maintained rules, **not inferred imports**: changing a
 allowlisted test selects that module; `src/`, vendored Zig dependencies, build
 configuration or the admin harness selects all allowlisted admin modules; the
 shared Python harness, resolver, toolchain configuration or selector selects all
-allowlisted modules. Every unmapped path (including docs and unlisted tests)
+allowlisted modules. Tool-specific dependencies are narrower:
+
+| Changed dependency | Selected module |
+| --- | --- |
+| `tools/performance_contracts.py` or `bench/contracts/` | `tests/tools/test_performance_contracts.py` |
+| `tools/replay/` | `tests/tools/test_replay.py` |
+
+These checks validate the tools; changed benchmark budgets still need actual
+benchmark runs separately. New tools are never discovered or executed implicitly.
+The allowlist-expansion regression driver deliberately stays unlisted to prevent
+recursive self-execution. Every unmapped path (including docs and unlisted tests)
 selects all allowlisted modules and sets `fallback: true`. `coverage_complete` is
 always false and `coverage_gaps` remains present even for mapped changes. The
 fallback is not a full-suite run: Zig, SDK, other pytest and docs checks still need

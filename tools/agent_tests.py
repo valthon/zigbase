@@ -21,8 +21,7 @@ import time
 
 
 ROOT = Path(__file__).resolve().parents[1]
-MODULES = (
-    "tests/tools/test_bin_resolver.py",
+ADMIN_MODULES = (
     "tests/admin/test_agent_diagnostics.py",
     "tests/admin/test_capabilities.py",
     "tests/admin/test_routes_cli.py",
@@ -31,6 +30,20 @@ MODULES = (
     "tests/admin/test_files.py",
     "tests/admin/test_realtime.py",
 )
+TOOL_MODULES = (
+    "tests/tools/test_bin_resolver.py",
+    "tests/tools/test_performance_contracts.py",
+    "tests/tools/test_replay.py",
+    "tests/tools/test_agent_tests.py",
+    "tests/tools/test_agent_affected.py",
+)
+MODULES = (*TOOL_MODULES, *ADMIN_MODULES)
+MODULE_NOTES = {
+    "tests/tools/test_performance_contracts.py": "Local Python CLI and synthetic artifact fixtures; no Zig compiler, real benchmark run or browser. Class methods run through the module selector, not individual inventory ids.",
+    "tests/tools/test_replay.py": "Local Python CLI and loopback HTTP fixtures require local socket access; no live migration source, external service, Zig compiler or browser.",
+    "tests/tools/test_agent_tests.py": "Local Python subprocess/process-group fixtures and one nested allowlisted pytest check; requires mise on PATH, not Zig or a browser. Changes to that nested test_bin_resolver module select only itself, not this caller: affected selection is curated, not a transitive dependency graph.",
+    "tests/tools/test_agent_affected.py": "Local Git repositories and Python subprocess fixtures; requires git on PATH, not Zig or a browser.",
+}
 DEFAULT_TIMEOUT = 120
 MAX_TIMEOUT = 900
 DEFAULT_OUTPUT_BYTES = 65536
@@ -44,16 +57,19 @@ GIT_TIMEOUT = 10
 # Shared runtime changes deliberately select every allowlisted admin module.
 DEPENDENCIES = (
     ("tests/_bin.py", MODULES),
-    ("src/", MODULES[1:]),
-    ("tests/admin/conftest.py", MODULES[1:]),
+    ("src/", ADMIN_MODULES),
+    ("tests/admin/conftest.py", ADMIN_MODULES),
     ("tests/conftest.py", MODULES),
     ("conftest.py", MODULES),
-    ("build.zig", MODULES[1:]),
-    ("build.zig.zon", MODULES[1:]),
-    ("zig-pkg/", MODULES[1:]),
+    ("build.zig", ADMIN_MODULES),
+    ("build.zig.zon", ADMIN_MODULES),
+    ("zig-pkg/", ADMIN_MODULES),
     ("mise.toml", MODULES),
     ("pyproject.toml", MODULES),
     ("tools/agent_tests.py", MODULES),
+    ("tools/performance_contracts.py", ("tests/tools/test_performance_contracts.py",)),
+    ("bench/contracts/", ("tests/tools/test_performance_contracts.py",)),
+    ("tools/replay/", ("tests/tools/test_replay.py",)),
 )
 PREFIX = (
     "mise",
@@ -151,7 +167,10 @@ def inventory() -> dict:
                             if "/admin/" in module
                             else None,
                         },
-                        "notes": "Module-level conservative prerequisites, not dependency introspection; runtime fixtures may build additional binaries.",
+                        "notes": MODULE_NOTES.get(
+                            module,
+                            "Module-level conservative prerequisites, not dependency introspection; runtime fixtures may build additional binaries.",
+                        ),
                     },
                 }
             )

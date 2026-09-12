@@ -24,6 +24,8 @@ copy, examples, and tests with the implementation rather than in follow-up PRs.
   bounded repository-only pytest inventory/selection with structured process results.
   Selection-only changed-file inspection now maps curated dependencies to bounded
   module checks, with whole-allowlist fallback and explicit coverage gaps.
+  Local performance-contract, parity-replay and agent-tool regression modules are
+  also inventoried, with explicit tool/contract dependency mappings.
   This is not a remote executor or arbitrary embedded-app test discovery. Broader
   test-runner coverage and inferred dependency graphs remain.
   Offline migration preview now reports compiled consumer callback/transaction declarations
