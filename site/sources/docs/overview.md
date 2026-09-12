@@ -150,6 +150,12 @@ so an agent can discover the tuning advisor's input contract. `zigbase diagnosti
 wraps doctor checks in versioned JSON with structured failures; it retains doctor's
 deployment probes and possible database writes, not an offline safety guarantee.
 
+`zigbase migrate preview --json` inventories compiled consumer migration declarations
+without opening a database or running callbacks. Agents can inspect transaction and
+reverse-callback declarations while pending state, SQL, effects and runtime reversibility
+remain explicitly unknown. This is not an execution plan or safe-rollback guarantee.
+Like route discovery, it is compiled out with `-Ddev-tools=false`.
+
 Contributors in the ZigBase checkout can also use `tools/agent_tests.py` for
 static JSON test inventory and focused pytest execution with time and combined
 output limits. It runs only advertised module/function selectors and reports

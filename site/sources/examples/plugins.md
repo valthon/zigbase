@@ -29,6 +29,11 @@ virtual stacks for this example's two lazy memory workers, not current allocatio
 or RSS. Both calculations reject arithmetic overflow. Measure peak RSS under
 load before choosing a deployment size.
 
+Run `./zig-out/bin/plugins migrate preview --json` to inspect the two compiled
+consumer migration declarations without booting plugins or opening a database.
+Their `up` callbacks have no declared reverse; the inventory does not execute them
+or determine pending state, SQL, side effects or runtime reversibility.
+
 This is the **advanced framework** example. It is a standalone package with a path
 dependency on the repo root (`../..`) and exercises — using **only public
 `zigbase.*` exports**, no reaching into ZigBase internals — the comptime-config

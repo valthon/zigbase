@@ -100,7 +100,7 @@ pub fn build(b: *std.Build) void {
     // override code folds to comptime-dead. Override with -Ddev-mode=true to build a
     // debuggable binary that still honors the dev-only env vars (e2e dev).
     const dev_mode = b.option(bool, "dev-mode", "Compile in the dev-only, never-in-prod seams: ZIGBASE_FAKE_NOW clock, ZIGBASE_FAKE_SEED entropy, test-capture, and ZIGBASE_FIELD_CRYPTO fake crypto (default: on in Debug, off in release)") orelse (optimize == .Debug);
-    // Development-time CLI verbs: `init`, `agents-md`, `typegen`, `capabilities`, `routes`, `tune`.
+    // Development CLI: init, agents-md, typegen, capabilities, routes, migrate preview, tune, diagnostics.
     // ON by default — every
     // official artifact we publish (GitHub release tarballs, the Docker image, the
     // @zigbase/server npm packages) builds at this default and ships these tools.
@@ -112,7 +112,7 @@ pub fn build(b: *std.Build) void {
     // eliding the whole subtree (see src/devtools.zig). A stripped binary still parses the
     // verb names, but returns an actionable "rebuild with -Ddev-tools=true" error instead of
     // a bare UnknownCommand.
-    const dev_tools = b.option(bool, "dev-tools", "Compile development CLI verbs: init, agents-md, typegen, capabilities, routes, tune (default: on)") orelse true;
+    const dev_tools = b.option(bool, "dev-tools", "Compile development CLI verbs: init, agents-md, typegen, capabilities, routes, migrate preview, tune, diagnostics (default: on)") orelse true;
     const file_inventory = b.option(bool, "file-inventory", "Compile read-only local/S3 file inventory reporting (default: off)") orelse false;
     const realtime_backfill = b.option(bool, "realtime-backfill", "Compile bounded process-local record invalidation backfill (default: off)") orelse false;
     const resumable_uploads = b.option(bool, "resumable-uploads", "Compile bounded process-local resumable file uploads (default: off)") orelse false;

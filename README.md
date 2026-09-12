@@ -154,6 +154,7 @@ zigbase serve [--http-host H] [--http-port N] [--data-dir PATH] [--serve-static 
               [--background] [--ephemeral] [--ignore-lock] [--force]
 zigbase serve stop | status [--json] | wait [--json] [--timeout-ms N] | logs [--follow] [--data-dir PATH]
 zigbase migrate [status | rollback [N] | dump [--out FILE]] [--data-dir PATH]
+zigbase migrate preview [--json]
 zigbase migrate-db --from SQLITE_PATH --to POSTGRES_URL [--force]
 zigbase schema [dump [--json] [--out FILE] | apply FILE [--dry-run] [--allow-destructive] [--prune]] [--data-dir PATH]
 zigbase openapi [--data-dir PATH] [--out FILE] [--title TEXT] [--api-version VERSION] [--server URL]
@@ -172,7 +173,9 @@ zigbase help
 
 `migrate` defaults to applying pending migrations; `status` reports the ledger without
 changing anything, `rollback [N]` reverses the last N applied, and `dump` writes the live
-schema as a canonical migration.
+schema as a canonical migration. `preview [--json]` inventories compiled consumer
+declarations offline without opening a database or running callbacks; it requires
+`-Ddev-tools=true` (the default) and does not accept `--data-dir`.
 
 `serve --background` detaches and exits 0 only once the server answers; `serve
 stop|status|wait|logs` manage that session; `serve --ephemeral` starts a throwaway server on a
@@ -182,9 +185,10 @@ temp dir and a free port, printing one JSON object; `doctor` runs preflight chec
 `migrate-db` copies an existing SQLite database into a
 PostgreSQL target. `typegen` emits a typed SDK for a running (`--url`) or offline
 (`--data-dir`) server — `--lang` picks the target language, `--check` verifies the output is
-up to date without writing (run `zigbase typegen --help` for the full flag set). `init`,
-`agents-md`, and `typegen` are pure dev-time surfaces (scaffolding + codegen) compiled in by
-default (`-Ddev-tools`, on) — every binary we publish has them; `-Ddev-tools=false` is an
+up to date without writing (run `zigbase typegen --help` for the full flag set).
+The development commands (`init`, `agents-md`, `typegen`, `capabilities`, `routes`,
+`migrate preview`, `tune`, `diagnostics`) are compiled in by default (`-Ddev-tools`, on)
+— every binary we publish has them; `-Ddev-tools=false` is an
 opt-out for your own custom build that never needs them. `rewrap`
 rotates field-encryption keys (`--dry-run` reports without rewriting), and `vapid-keygen`
 prints a fresh Web Push VAPID keypair. `explain-code` looks up a frozen API error code

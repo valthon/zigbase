@@ -26,6 +26,9 @@ copy, examples, and tests with the implementation rather than in follow-up PRs.
   module checks, with whole-allowlist fallback and explicit coverage gaps.
   This is not a remote executor or arbitrary embedded-app test discovery. Broader
   test-runner coverage and inferred dependency graphs remain.
+  Offline migration preview now reports compiled consumer callback/transaction declarations
+  without configuration or database access. Pending state, SQL/effects and runtime
+  reversibility remain unknown; executable migration planning is not implemented.
 - [ ] Opt-in bounded query performance workbench with route attribution and query-plan inspection.
   Implemented first slice: build-gated SQLite synchronous prepared-statement step
   metrics by route template/opaque structural shape; bounded slow/repeated counters

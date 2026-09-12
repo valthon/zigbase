@@ -372,6 +372,7 @@ test {
     if (@import("devtools.zig").enabled) _ = @import("agent_capabilities.zig");
     if (@import("devtools.zig").enabled) _ = @import("agent_diagnostics.zig");
     if (@import("devtools.zig").enabled) _ = @import("route_discovery.zig");
+    if (@import("devtools.zig").enabled) _ = @import("migration_preview.zig");
     if (@import("devtools.zig").enabled) _ = @import("tuning.zig");
     _ = @import("files/cleanup.zig");
     _ = @import("files/cleanup_pg_test.zig");

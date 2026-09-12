@@ -37,7 +37,8 @@ is safe to run in a directory that already has work in it. It also writes an
 that already exists — it never overwrites, so delete the old one first or diff
 against `zigbase agents-md --stdout`.
 
-`init`, `agents-md`, and `typegen` are compiled in by default (`-Ddev-tools`); a
+The development commands (`init`, `agents-md`, `typegen`, `capabilities`, `routes`,
+`migrate preview`, `tune`, `diagnostics`) are compiled in by default (`-Ddev-tools`); a
 custom-built binary may omit them (`-Ddev-tools=false`) — the official release,
 Docker image, and npm packages always have them.
 
@@ -82,7 +83,7 @@ zigbase serve [--http-host H] [--http-port N] [--data-dir PATH] [--insecure-cook
               [--background] [--ephemeral]
 zigbase serve stop|status|wait|logs [--data-dir PATH]   # manage a tracked session
 zigbase doctor [--production] [--json] [--data-dir PATH]
-zigbase migrate [status|rollback N|dump]
+zigbase migrate [status|preview|rollback N|dump]
 zigbase schema dump [--out FILE] [--data-dir PATH]
 zigbase schema apply FILE [--dry-run] [--allow-destructive] [--prune]
 zigbase openapi [--data-dir PATH] [--out FILE] [--title TEXT] [--api-version VERSION] [--server URL]
@@ -131,6 +132,10 @@ may need `--data-dir`; they also honor their existing environment configuration.
 Diagnostic/status commands can exit nonzero while emitting valid structured output.
 
 For HTTP registration discovery without a database, use `zigbase routes --json`.
+For compiled consumer migration declarations, use `zigbase migrate preview --json`.
+It opens no database and invokes no callbacks; pending state, SQL, effects and runtime
+reversibility remain explicitly unknown. Declared reverse callbacks are not proof of
+safe rollback. See [the preview contract](https://github.com/valthon/zigbase/blob/main/docs/framework.md#offline-migration-declaration-preview).
 For request/response schemas and live collection metadata, use the advertised
 OpenAPI operation. For migration previews and test selection, consult their
 command documentation. Discovery does not execute operations or remediate issues.

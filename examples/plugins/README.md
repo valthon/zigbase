@@ -220,6 +220,19 @@ the exact Zigapagos v0.4.0 package through `npx`; the build enables its strict
 island-props gate and writes `frontend/dist` for `embedStaticDir`. The root
 package remains only for the example's TypeScript E2E and runtime-typegen tests.
 
+### Inspect migration declarations without booting the app
+
+```sh
+./zig-out/bin/plugins migrate preview --json
+```
+
+This reports `0001_create_audit_log` and `0002_index_audit_note` in declaration
+order, without creating a database, invoking the storage/mailer plugins or executing
+the migration callbacks. Both declare `up` without `down` (`missing_reverse`).
+It does not tell you whether they have been applied, what SQL they will execute, or
+whether their effects are safe to undo. Use `migrate status --json --data-dir ./zb_data`
+for ledger state; unlike preview, status can create supporting database state.
+
 ### Rotating the field-encryption key (`zigbase rewrap`)
 
 `ZIGBASE_FIELD_KEY` is the primary key (generation 1 by default). To rotate it without
