@@ -23,9 +23,22 @@ fn gateLogin(ctx: *zigbase.Ctx, ev: *zigbase.events.AuthSuccessEvent) anyerror!v
     };
 }
 
+fn readerScope(ctx: *zigbase.Ctx) !zigbase.http.Response {
+    const conn = try ctx.connForRead();
+    var stmt = try conn.prepare("SELECT 'handler read';");
+    defer stmt.finalize();
+    if (!try stmt.step()) return error.MissingRow;
+    return ctx.json(200, .{
+        .id = ctx.rctx.auth.?.object.get("id").?.string,
+        .collection = ctx.rctx.collection,
+        .session_id = ctx.rctx.session_id,
+    });
+}
+
 pub const App = zigbase.App(.{
     .auth = .{ .session = .{ .store = .table } },
     .beforeAuthSuccess = gateLogin,
+    .routes = .{.{ .method = .GET, .path = "/auth-reader-scope", .handler = readerScope, .auth = .authed }},
     .collections = .{
         .users = .{
             .type = .auth,
