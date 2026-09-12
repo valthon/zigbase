@@ -163,7 +163,7 @@ error.**
 | `mailer` | Mailer plugin TYPE (defaults to log/SMTP mailer). | always — you always get a mailer plugin, default or custom. Together with `.mail`, also enables the built-in `"mail"` job kind (see `.mail` below). |
 | `reporter` | Error-reporter plugin TYPE — the terminal backstop every framework-swallowed error routes through (defaults to `SentryReporter` when `ZIGBASE_SENTRY_DSN` is set, else `LogReporter`). | always — you always get a reporter plugin, default or custom. |
 | `reporter_dedup` | Error-report TTL dedup window: `.{ .window_s = N }` (seconds) suppresses a repeat of the same `(message, phase)` within `N`, or `.off` to report every swallowed error. Default (omitted): **on**, `60`s. | always — dedup is on by default; `.off` compiles the dedup map out entirely (a single null-pointer branch, no allocation). |
-| `pools` | Footprint levers: reader pool, job pool, thread stack size, SQLite page cache. | always — these are levers on core connection/thread machinery, not an optional subsystem. |
+| `pools` | Footprint levers: reader pool, scheduler workers (`.jobs`), lazy memory-job/submit workers (`.memory_jobs`), thread stack size, SQLite page cache. | always — these are levers on core connection/thread machinery, not an optional subsystem. |
 | `resource_profile` | Optional `.minimal`, `.balanced`, or `.throughput` defaults for existing pool levers; explicit `.pools` fields win. | data-only — selects constants, never enables a subsystem. |
 | `admission` | Optional `.{ .max_requests = N }`, positive `u32`: reject excess synchronous HTTP work with 503 instead of queuing. | excluded — no counters, checks, or diagnostics route when omitted; one null app pointer remains. |
 | `query_workbench` | Optional `.{ .max_entries = 64, .slow_ms = 100 }` budgets for the [SQLite query workbench](#bounded-sqlite-query-workbench-opt-in). Requires `-Dquery-workbench=true`. | build-flag gated — no statement fields, TLS, timestamps, state, or endpoints when off. |
@@ -175,7 +175,7 @@ error.**
 | `experiment_assignment_ttl` | TTL in **days** for sticky `_experiment_assignments` rows (default `90`). Only valid when a `.sticky` experiment is declared — setting it otherwise is a `@compileError`. | excluded — the sticky-assignment GC sweep installs no job/timer/writer touch unless a `.sticky` experiment is declared. |
 | `ttl_gc_interval` | Cadence (`schedule.Interval`) for the framework-internal `_ttl_gc` sweep that reaps expired `.ttl_field` rows (default `.{ .minutes = 5 }`). Only valid when a collection declares a `.ttl_field` — setting it otherwise, or to a degenerate `.{ .minutes = 0 }`, is a `@compileError`. Expired rows are hidden from reads immediately regardless of cadence. | excluded — the TTL GC sweep installs no job/timer/writer touch unless a collection declares a `.ttl_field`. |
 | `enable_typegen` | Enable the `typegen` CLI subcommand (default `false`). Set `true` only for client-generation builds. | excluded — off by default so production builds carry no codegen weight. |
-| `realtime` | Realtime broadcast guard: `.{ .canSubscribe = fn }` gates who may subscribe to a custom (non-collection) topic (default: custom topics are public). See [`ctx.realtime()`](#ctxrealtime--broadcast-on-custom-channels). | always — realtime (the WebSocket hub + per-record view-rule reapplication) is core, not optional; this key only adds a guard for custom topics. |
+| `realtime` | `.{ .max_connections = 10000, .canSubscribe = fn }`: positive `u32` shared WS/SSE connection cap and optional custom-topic guard. See [`ctx.realtime()`](#ctxrealtime--broadcast-on-custom-channels). | always — realtime is core; omitted cap preserves 10,000, omitted guard keeps custom topics public. |
 | `tenancy` | Multi-tenant account scoping: `.{ .enabled = true, .auth_collection = "...", .resolver = ..., .roles = .{...} }`. | excluded — the account-activation endpoints and membership-scoping code exist only when `.tenancy.enabled = true`. |
 | `abilities` | Declarative relationship-based row abilities per collection: `.{ .<col> = .{ .view = <rule>, … } }`. Requires `.tenancy.enabled = true`. | data-only — the composition code is core policy plumbing that always runs; unset just means every collection's ability predicate is `null` (a no-op). |
 | `mail` | Email-subsystem policy knobs (`.require_verified_sender`, `.webhook_secret`, …) threaded into `app.mail`. Together with `.mailer`, enables the built-in `"mail"` job kind backing `ctx.mail().enqueue`. | excluded — the `senders` API and inbound bounce/complaint webhook exist only when `.mail` is set. |
@@ -1530,6 +1530,25 @@ handler) where there is no HTTP request.
 **A custom topic is any topic name that is not a collection.** Subscribing to a *collection*
 name always goes through that collection's normal record-channel authorization (per-record
 `viewRule`); the custom-topic path can never be used to reach a collection's records.
+
+#### Connection capacity (`.realtime.max_connections`)
+
+Compile `.realtime = .{ .max_connections = 256 }` into a small deployment, or
+raise the positive `u32` cap for a larger machine. Omission preserves the existing
+10,000 default; zero is a compile error, not an unlimited mode. Like `.pools` and
+`.admission`, this is a comptime capacity lever: changing it requires a rebuild.
+Resource profiles
+do not silently change this cap. `resources --json` reports the compiled value as
+`realtime_connection_cap`; superuser `GET /api/realtime/stats` reports the effective
+`max_connections` and current `connections`.
+
+WebSocket and SSE share one process-wide atomic counter. Reservations include
+upgrades in progress and are released on failure or disconnect. New upgrades at
+capacity receive 503 before connection allocation; existing sessions are not
+evicted.
+This is not a per-user quota, cluster-wide cap, or total memory budget: transport
+buffers and each connection's subscriptions still consume resources. Keep the
+outbound high-water mark enabled and tune against representative workloads.
 
 #### Who may subscribe (`.realtime = .{ .canSubscribe = fn }`)
 
@@ -4702,20 +4721,32 @@ optional; without a resource profile each defaults to the historical value:
 
 | Field | Default | Meaning |
 | --- | --- | --- |
-| `.readers` | `16` | warm reader-connection pool cap — shrink to reduce the connection footprint. |
+| `.readers` | `16` | requested retained idle-reader cap, currently clamped to 16 by both backends; not a bound on active overflow connections. |
 | `.jobs` | `2` | scheduler worker-pool size. |
+| `.memory_jobs` | `4` | lazy worker count shared by memory queues and `app.submit`; positive `1..64`, separate from scheduled jobs. |
 | `.stack_size` | `1 MiB` | per-thread stack for scheduler/job/`submit` threads (vs `std.Thread`'s 16 MiB default). **Clamped up** to a safe floor — the lever can only *raise* the stack, e.g. for unusually deep job handlers. |
-| `.cache_kib` | `1024` | SQLite per-connection page cache (KiB), across the writer + warm readers — shrink to save memory, raise for large working sets. |
+| `.cache_kib` | `1024` | SQLite per-connection soft page-cache target (KiB), including overflow readers; 0 preserves SQLite's default, larger values clamp to `i32` max. |
 
 ```zig
 zigbase.App(.{
-    .pools = .{ .readers = 4, .jobs = 2, .stack_size = 2 << 20, .cache_kib = 256 },
+    .pools = .{ .readers = 4, .jobs = 2, .memory_jobs = 1, .stack_size = 2 << 20, .cache_kib = 256 },
 }).runCli(init);
 ```
 
 `.pools = .{ .jobs = N }` is the ONE lever for the scheduler worker-pool size. The
 legacy `.jobs = .{ .pool_size = N }` spelling was removed; it is now a compile error
 naming the replacement.
+
+The memory-job pool allocates its worker-handle slice and starts threads only on
+the first enqueue or `app.submit`; unused pools allocate neither. `.memory_jobs`
+sets its requested worker count, while `.stack_size` applies to these threads as
+well as the scheduler. The queue ring stays at 256 tasks and rejects overflow
+with `QueueFull` rather than waiting. Handler allocations and queued payload
+sizes are not bounded by worker or stack settings. Lower counts save requested
+thread stacks but can increase queueing; retry backoff occupies a worker.
+Shutdown drains work and joins the actual started threads. If startup spawns
+only some requested workers, that subset continues serving the pool until
+shutdown; if none start, the push fails and a subsequent push may retry.
 
 ### Resource profiles and inspection
 
@@ -4758,7 +4789,7 @@ connection/body/time limits remain necessary. WebSocket upgrades, long-lived
 WS/SSE connections, asynchronous file transmission and background jobs are outside
 this limit (an SSE setup callback, if routed through HTTP, only holds a permit
 during setup). It neither cancels slow accepted handlers nor limits durable queue
-depth. Existing memory-job ring (256 queued tasks, four workers, `QueueFull` on
+depth. Existing memory-job ring (256 queued tasks, configurable workers, `QueueFull` on
 overflow) and scheduler bounds remain independent and unchanged.
 
 #### Bounded SQLite query workbench (opt-in)
@@ -4846,37 +4877,75 @@ Select `.resource_profile = .minimal`, `.balanced`, or `.throughput` as a
 comptime starting point. Every explicitly supplied `.pools` field wins over the
 profile; omitted fields inherit it. Omit the profile to keep historical defaults.
 
-| Profile | Reader cap | Scheduler workers | SQLite cache KiB per connection |
-| --- | --- | --- | --- |
-| `minimal` | 2 | 1 | 256 |
-| `balanced` | 16 | 2 | 1024 |
-| `throughput` | 64 | 8 | 4096 |
+| Profile | Reader cap | Scheduler workers | Memory-job workers | SQLite cache KiB per connection |
+| --- | --- | --- | --- | --- |
+| `minimal` | 2 | 1 | 1 | 256 |
+| `balanced` | 16 | 2 | 4 | 1024 |
+| `throughput` | 64 | 8 | 8 | 4096 |
 
 All profiles keep the 1 MiB stack default and its existing safety floor. These
 are explicit starting points, not benchmark-derived optimal settings, automatic
 CPU detection, or process memory caps. More concurrency can hurt a workload;
 measure before adopting `throughput`. SQLite caches apply only to SQLite
-connections; they do not tune PostgreSQL's server cache. Reader counts are caps,
-not a promise that all connections are eagerly allocated. Scheduler settings
-apply when scheduled jobs exist; named queue-worker concurrency remains controlled
-by `.workers`, and HTTP server concurrency is unchanged.
+connections; they do not tune PostgreSQL's server cache. Reader counts request
+idle-retention caps, not total connection limits or eager allocation. Scheduler settings
+apply when scheduled jobs exist; memory-job settings apply lazily even without
+scheduled jobs. Durable queue-worker batches remain controlled by `.workers`,
+and HTTP server concurrency is unchanged.
 
 ```zig
 const Backend = zigbase.App(.{
     .resource_profile = .minimal,
-    .pools = .{ .readers = 4 }, // jobs=1, cache_kib=256 remain inherited
+    .pools = .{ .readers = 4 }, // jobs=1, memory_jobs=1, cache_kib=256 remain inherited
 });
 // Backend.resource_report is a typed zigbase.ResourceReport constant.
 ```
 
 Run the resulting binary with `resources` (or `resources --json`) for a single
-JSON object, `schema_version: 1`, containing its effective compiled pool settings,
+JSON object, `schema_version: 1`, containing its compiled pool settings,
 profile (`null` when omitted), scheduler/admin state, and PostgreSQL/S3/file-inventory
 build gates. The command does not load or validate server configuration or open a
 database; common CLI logging initialization still reads log-format/level variables.
 It includes no secret values. This is a **compiled resource report**, not a complete live
 configuration dump: it does not identify the runtime-selected storage/database
 backend, report current allocations, or enumerate every optional subsystem.
+`memory_job_workers` describes the requested lazy pool even when
+`scheduler_enabled` is false; `job_stack_bytes` is the shared effective stack
+size after the 1 MiB floor. The worker count is `null` when an older saved report
+omitted it, not zero workers. Actual worker count can be lower after partial
+thread-spawn failure; startup warns with the actual/requested counts. Stack sizes are requests to
+the platform, not resident-memory or total-process ceilings.
+
+Additive resource fields retain `schema_version: 1`. Compatibility is backward:
+a newer advisor can read older reports using defaults for fields they lacked
+(for example, the historical realtime connection cap is 10,000). This is not a
+forward-compatibility promise: an older strict advisor may reject newer fields.
+Use an advisor that recognizes every captured resource field, normally one from
+the same or a newer ZigBase release.
+
+The additive `envelope` object explains independent configured quantities, **not
+RSS predictions or a hard total-memory bound**. Older saved `tune` measurement
+documents without this field remain accepted (their envelope is `null`).
+
+| Envelope field | Interpretation |
+| --- | --- |
+| `http_admission_max_requests` | Concurrent admitted synchronous callbacks; `null` means admission disabled. Transport buffering happens before admission. |
+| `http_body_limit_source` | `runtime_ZIGBASE_MAX_UPLOAD_SIZE`: the body limit is deployment-configured and deliberately not read by this offline command. |
+| `retained_reader_cap` | Actual retained idle-reader cap after the shared SQLite/PostgreSQL clamp. The existing top-level `reader_pool_cap` remains the requested value. |
+| `sqlite_cache_target_bytes_per_connection` | Soft SQLite page-cache target after its clamp; `null` when 0 preserves the engine default. Not applicable to a PostgreSQL deployment. |
+| `sqlite_writer_and_retained_readers_cache_target_bytes` | Sum of those soft targets for one writer and a full idle pool; not a bound on total connections, cache memory or RSS. Overflow readers have additional caches. |
+| `scheduler_stack_bytes` | `(workers + tick thread) × effective stack bytes` after the 1 MiB floor when jobs exist, 0 otherwise. Overflow is a compile error. Virtual stack space, not resident memory; excludes named queue workers and other threads. |
+| `memory_job_stack_bytes` | Up to `memory_job_workers × job_stack_bytes` of virtual stack space for lazy memory-job/`submit` workers, using the shared effective stack floor. Overflow is a compile error. Not current allocation or RSS: unused pools start no threads, and partial startup can produce fewer workers. Independent of scheduler enablement. |
+| `resumable` | Compiled session, single-upload, total staged-payload and chunk ceilings, or `null` when excluded from the binary. No promise about commit copies, metadata or storage usage. |
+| `exclusions` | Costs outside these quantities: overflow connections/non-cache database memory, transport/realtime, request/response/commit allocations, queue workers/plugins/runtime/allocator overhead, and resumable metadata/storage. |
+
+For example, `minimal` yields two retained readers and a 256 KiB soft cache target
+per SQLite connection: 768 KiB for the writer plus a full idle pool. `throughput`
+requests 64 readers but currently retains only 16 on either backend; its SQLite
+retained-cache target is 68 MiB, not `65 × 4 MiB` and not a process memory cap.
+These quantities must not be summed into a total: measure actual peak RSS under
+representative workloads with `tune` instead. Reporting adds no server hot-path
+instrumentation and never changes admission, pool, stack or staging behavior.
 
 Profiles neither enable nor disable features. Keep using explicit comptime gates
 (for example `.admin = .disabled`) and build flags to exclude unwanted code;
@@ -4909,6 +4978,8 @@ document/resource versions are errors (nonzero exit). Context labels and the
 resource report are **caller-supplied provenance**, not independently verified
 build or hardware identities; capture them from your actual experiment. The
 advisor does not validate or synthesize deployable settings from the report.
+Unknown-field rejection also applies inside `resources`; the version number
+alone does not guarantee an older advisor understands a newer report.
 
 The output repeats the context/budgets and includes `items`, each containing the
 candidate and its first exclusion `reason`, in priority order: `failed_requests`,

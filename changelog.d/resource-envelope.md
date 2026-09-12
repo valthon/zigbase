@@ -1,0 +1,2 @@
+### Features
+- Offline `resources` reports now explain compiled admission, backend-neutral retained-reader capacity, SQLite soft cache targets, effective scheduler stack sizes, maximum configured lazy memory-worker virtual stacks and optional resumable staging ceilings, with explicit exclusions instead of a misleading total-memory estimate. Saved tuning measurements without the new envelope remain accepted.

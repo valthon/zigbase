@@ -13,9 +13,21 @@ repoPath: examples/plugins
 # Plugins & comptime config
 
 The example starts from the comptime `minimal` resource profile and explicitly
-overrides its reader, scheduler-worker, and SQLite-cache settings. Run the built
+overrides its reader, scheduler-worker, memory-job-worker, and SQLite-cache settings. Run the built
 binary with `resources` to inspect the compiled settings as JSON. Profiles select
 transparent defaults; they do not enable features or impose a process memory cap.
+`memory_job_workers` reports the lazy pool count, with `job_stack_bytes` shared
+by scheduler and memory workers after its floor.
+
+The report's `envelope` makes the tradeoffs explicit: this example retains up to
+four idle SQLite readers with 512 KiB soft cache targets (2.5 MiB including the
+writer), and admits at most three synchronous HTTP callbacks. Overflow reader
+connections and transport buffers are additional costs, not included in that
+cache target. `scheduler_stack_bytes` uses the effective stack size after the
+1 MiB floor. The separate `memory_job_stack_bytes` describes up to 2 MiB of
+virtual stacks for this example's two lazy memory workers, not current allocation
+or RSS. Both calculations reject arithmetic overflow. Measure peak RSS under
+load before choosing a deployment size.
 
 This is the **advanced framework** example. It is a standalone package with a path
 dependency on the repo root (`../..`) and exercises — using **only public
@@ -62,9 +74,10 @@ features a consumer configures in code.
    `ctx.records()` to count published posts, then writes an audit log row to a
    migration-owned table with raw SQL on the pooled writer (`ctx.app.pool`).
 
-7. **Pool levers** via `.pools` (`.readers` / `.jobs` / `.cache_kib`) to tune
-   the warm-reader pool, scheduler worker count, and per-connection SQLite
-   page-cache budget — i.e. the runtime footprint.
+7. **Pool levers** via `.pools` (`.readers` / `.jobs` / `.memory_jobs` / `.cache_kib`)
+   to tune warm readers, scheduled work, lazy memory-job/submit workers, and SQLite
+   cache targets. Choose fewer memory workers for a small deployment or more for
+   parallel background work; unused pools start no threads. This example uses two.
 
 8. **Fully embedded static frontend** via `embedStaticDir`. The Zigapagos frontend
    build output in `frontend/dist` is compiled into the binary at build time via

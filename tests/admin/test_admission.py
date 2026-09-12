@@ -2,12 +2,15 @@
 from concurrent.futures import ThreadPoolExecutor
 import json
 import pathlib
+import socket
 import time
 import urllib.error
 import urllib.request
+from urllib.parse import urlparse
 
 import pytest
 from _bin import resolve_binary
+from _ws import _recv_until
 
 REPO = pathlib.Path(__file__).resolve().parents[2]
 
@@ -56,6 +59,62 @@ def token(base):
                           {"identity": "admin@x.io", "password": "adminpassword"})
     assert status == 200, body
     return json.loads(body)["token"]
+
+
+def test_shared_realtime_cap_rejects_and_recovers(server):
+    admin = token(server)
+    parsed = urlparse(server)
+
+    def stats(expected):
+        deadline = time.monotonic() + 5
+        while True:
+            status, _, body = ready_call(server, "/api/realtime/stats", token=admin)
+            assert status == 200, body
+            value = json.loads(body)
+            assert value["max_connections"] == 2
+            if value["connections"] == expected:
+                return
+            assert time.monotonic() < deadline, value
+            time.sleep(.01)
+
+    def connect(transport, expected, version=13):
+        stream = socket.create_connection((parsed.hostname, parsed.port), timeout=5)
+        try:
+            path = "/api/realtime/sse" if transport == "sse" else "/api/realtime"
+            headers = ("Accept: text/event-stream\r\n" if transport == "sse" else
+                       "Connection: Upgrade\r\nUpgrade: websocket\r\n"
+                       "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+                       f"Sec-WebSocket-Version: {version}\r\n")
+            stream.sendall((f"GET {path} HTTP/1.1\r\nHost: {parsed.netloc}\r\n"
+                            f"{headers}\r\n").encode())
+            response = _recv_until(stream, b"\r\n\r\n", timeout=5)
+            assert f" {expected} ".encode() in response.split(b"\r\n", 1)[0], response
+            return stream
+        except BaseException:
+            stream.close()
+            raise
+
+    stats(0)
+    # A transport upgrade that reserves a slot then fails must return it.
+    with connect("ws", 400, version=999):
+        pass
+    stats(0)
+    with connect("ws", 101):
+        stats(1)
+        with connect("sse", 200):
+            stats(2)
+            for transport in ("ws", "sse"):
+                with connect(transport, 503):
+                    pass
+                stats(2)
+        stats(1)
+        with connect("sse", 200):
+            stats(2)
+        stats(1)
+    stats(0)
+    with connect("ws", 101):
+        stats(1)
+    stats(0)
 
 
 def test_reject_before_parsing_head_and_recover(server, gate):

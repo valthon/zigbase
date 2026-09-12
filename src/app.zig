@@ -40,6 +40,7 @@ pub const App = struct {
     oauth_state_server: bool = true,
     oauth_state_ttl_s: i64 = 600,
     realtime_allowed_origins: []const u8 = "",
+    realtime_max_connections: u32 = @import("realtime/connection.zig").MAX_CONNECTIONS,
     backfill: if (@import("build_options").realtime_backfill) ?*@import("realtime/backfill.zig").Store else void = if (@import("build_options").realtime_backfill) null else {},
     resumable_uploads: if (@import("build_options").resumable_uploads) ?*@import("files/resumable.zig").Store else void = if (@import("build_options").resumable_uploads) null else {},
     thumbnail_admission: if (@import("build_options").image_thumbnails) @import("files/thumbnails.zig").Admission else void = if (@import("build_options").image_thumbnails) .{} else {},

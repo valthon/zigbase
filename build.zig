@@ -433,6 +433,17 @@ pub fn build(b: *std.Build) void {
         invalid.expect_errors = .{ .contains = if (image_thumbnails) case.message else ".files.thumbnails requires -Dimage-thumbnails=true" };
         thumbnail_contracts.dependOn(&invalid.step);
     }
+    const memory_contracts = b.step("check-memory-job-contracts", "Check compile-time memory worker limits");
+    const memory_mod = b.createModule(.{ .root_source_file = b.path("fixtures/memory-jobs/main.zig"), .target = target, .optimize = optimize, .imports = &.{.{ .name = "zigbase", .module = zigbase_mod }} });
+    const memory_fixture = b.addExecutable(.{ .name = "memory-jobs-fixture", .root_module = memory_mod });
+    b.step("memory-jobs-fixture", "Build live memory-worker configuration fixture").dependOn(&b.addInstallArtifact(memory_fixture, .{}).step);
+    inline for (&.{ "zero", "too-many" }) |name| {
+        const mod = b.createModule(.{ .root_source_file = b.path("fixtures/invalid-memory-jobs/" ++ name ++ ".zig"), .target = target, .optimize = optimize, .link_libc = true });
+        mod.addImport("zigbase", zigbase_mod);
+        const invalid = b.addExecutable(.{ .name = "invalid-memory-jobs-" ++ name, .root_module = mod });
+        invalid.expect_errors = .{ .contains = std.fmt.comptimePrint(".pools.memory_jobs must be in 1..{d}", .{@import("src/resource_profile.zig").max_memory_workers}) };
+        memory_contracts.dependOn(&invalid.step);
+    }
     const resumable_contracts = b.step("check-resumable-contracts", "Check resumable upload budget compile-time contracts");
     inline for (&.{ "zero", "chunk", "unknown" }) |name| {
         const mod = b.createModule(.{ .root_source_file = b.path("fixtures/invalid-resumable/" ++ name ++ ".zig"), .target = target, .optimize = optimize, .link_libc = true });
@@ -529,6 +540,19 @@ pub fn build(b: *std.Build) void {
     const admission_exe = b.addExecutable(.{ .name = "admission-fixture", .root_module = admission_mod });
     b.step("admission-fixture", "Build concurrent HTTP admission fixture").dependOn(&b.addInstallArtifact(admission_exe, .{}).step);
     const admission_contracts = b.step("check-admission-contracts", "Check HTTP admission compile-time contracts");
+    const realtime_contracts = b.step("check-realtime-cap-contracts", "Check realtime connection cap compile-time contracts");
+    inline for (&.{
+        .{ .name = "nonstruct", .expected = ".realtime must be a struct" },
+        .{ .name = "zero", .expected = ".realtime.max_connections must be positive" },
+        .{ .name = "overflow", .expected = "type 'u32' cannot represent integer value '4294967296'" },
+        .{ .name = "unknown", .expected = ".realtime: unknown key '.max_connection' (recognized: .canSubscribe, .max_connections)" },
+    }) |invalid| {
+        const mod = b.createModule(.{ .root_source_file = b.path("fixtures/realtime-cap/" ++ invalid.name ++ ".zig"), .target = target, .optimize = optimize, .link_libc = true });
+        mod.addImport("zigbase", zigbase_mod);
+        const invalid_exe = b.addExecutable(.{ .name = "invalid-realtime-cap-" ++ invalid.name, .root_module = mod });
+        invalid_exe.expect_errors = .{ .contains = invalid.expected };
+        realtime_contracts.dependOn(&invalid_exe.step);
+    }
     inline for (&.{
         .{ .name = "nonstruct", .expected = ".admission must be a struct with .max_requests (positive u32)" },
         .{ .name = "zero", .expected = ".admission.max_requests must be positive; omit .admission to disable" },
@@ -552,6 +576,16 @@ pub fn build(b: *std.Build) void {
     const tests = b.addTest(.{ .root_module = zigbase_mod });
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run all tests");
+    // Two usize inputs cannot overflow u64 on a 32-bit target.
+    if (target.result.ptrBitWidth() == 64) {
+        for ([_][]const u8{ "overflow", "memory-overflow" }) |fixture| {
+            const envelope_overflow_mod = b.createModule(.{ .root_source_file = b.path(b.fmt("fixtures/invalid-resource-envelope/{s}.zig", .{fixture})), .target = target, .optimize = optimize });
+            envelope_overflow_mod.addImport("resources", b.createModule(.{ .root_source_file = b.path("src/resource_profile.zig"), .target = target, .optimize = optimize }));
+            const envelope_overflow = b.addExecutable(.{ .name = b.fmt("invalid-resource-envelope-{s}", .{fixture}), .root_module = envelope_overflow_mod });
+            envelope_overflow.expect_errors = .{ .contains = "overflow of integer type 'u64' with value '36893488147419103230'" };
+            test_step.dependOn(&envelope_overflow.step);
+        }
+    }
     test_step.dependOn(&run_tests.step);
 
     // Wire the bench harness's own test{} blocks (counting_allocator.zig, harness.zig)

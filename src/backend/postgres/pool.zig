@@ -16,7 +16,8 @@ const DbError = db_mod.DbError;
 const connstr = @import("connstr.zig");
 const tls_trust = @import("tls_trust.zig");
 
-const reader_pool_size = 16;
+const resources = @import("../../resource_profile.zig");
+const reader_pool_size = resources.reader_pool_size;
 
 pub const PoolOptions = struct {
     /// Warm-reader free-list cap (clamped to `reader_pool_size`).
@@ -87,7 +88,7 @@ pub const Pool = struct {
             .io = io,
             .uri = owned,
             .writer = writer,
-            .reader_cap = @min(options.reader_cap, reader_pool_size),
+            .reader_cap = resources.retainedReaderCap(options.reader_cap),
             .trust = trust,
         };
     }

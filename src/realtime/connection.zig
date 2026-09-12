@@ -5,14 +5,26 @@ const request = @import("../request.zig");
 /// Shared by BOTH realtime transports via hub.subscribeCheck.
 pub const MAX_SUBS: usize = 256;
 
-/// F9: global cap on concurrent realtime connections — ONE counter covering WebSocket AND SSE
-/// (issue #188: mirror WS knobs — it is the same knob). Deliberately a module-level constant in
-/// the realtime layer (NOT config.zig) so an operator can't accidentally disable it and a
-/// parallel config workstream doesn't conflict. New upgrades past this cap are rejected with 503.
-pub const MAX_CONNECTIONS: usize = 10_000;
+/// Default process-wide cap shared by WebSocket and SSE. Consumers may tune the
+/// positive bound with App(.realtime.max_connections); it cannot be disabled.
+pub const MAX_CONNECTIONS: u32 = 10_000;
 
-/// Live realtime connection count (WS + SSE). Bumped on a successful upgrade, decremented on
-/// close. Different sockets run on different threads, so this is an atomic.
+pub fn resolveLimit(comptime cfg: anytype) u32 {
+    if (!@hasField(@TypeOf(cfg), "realtime")) return MAX_CONNECTIONS;
+    if (@typeInfo(@TypeOf(cfg.realtime)) != .@"struct")
+        @compileError(".realtime must be a struct");
+    for (std.meta.fields(@TypeOf(cfg.realtime))) |field| {
+        if (!std.mem.eql(u8, field.name, "canSubscribe") and !std.mem.eql(u8, field.name, "max_connections"))
+            @compileError(".realtime: unknown key '." ++ field.name ++ "' (recognized: .canSubscribe, .max_connections)");
+    }
+    if (!@hasField(@TypeOf(cfg.realtime), "max_connections")) return MAX_CONNECTIONS;
+    const limit: u32 = cfg.realtime.max_connections;
+    if (limit == 0) @compileError(".realtime.max_connections must be positive");
+    return limit;
+}
+
+/// Reserved realtime slots (WS + SSE), including upgrades in progress. Released
+/// on upgrade failure or close. Different sockets run on different threads.
 var live_connections: std.atomic.Value(usize) = .init(0);
 
 /// Current live realtime connection count (test/introspection helper).
@@ -23,12 +35,21 @@ pub fn connectionCount() usize {
 /// Atomically reserve a global connection slot (F9). Returns false (and leaves the count
 /// unchanged) when the cap is already reached, so the caller must reject the upgrade. Pair a
 /// successful reservation with exactly one `releaseConnectionSlot`.
-pub fn reserveConnectionSlot() bool {
-    if (live_connections.fetchAdd(1, .monotonic) >= MAX_CONNECTIONS) {
-        _ = live_connections.fetchSub(1, .monotonic);
-        return false;
+pub fn reserveConnectionSlotWithLimit(limit: u32) bool {
+    std.debug.assert(limit > 0);
+    var current = live_connections.load(.monotonic);
+    while (current < limit) {
+        if (live_connections.cmpxchgWeak(current, current + 1, .monotonic, .monotonic)) |observed| {
+            current = observed;
+        } else return true;
     }
-    return true;
+    return false;
+}
+
+/// Test-only convenience using the compile-time default. Production admission
+/// must call reserveConnectionSlotWithLimit with the application's resolved cap.
+pub fn reserveConnectionSlot() bool {
+    return reserveConnectionSlotWithLimit(MAX_CONNECTIONS);
 }
 
 pub fn releaseConnectionSlot() void {
@@ -264,12 +285,56 @@ test "F9: global connection cap reserves/releases and rejects past MAX_CONNECTIO
     // Pre-load to one below the cap without spinning MAX_CONNECTIONS times.
     live_connections.store(MAX_CONNECTIONS - 1, .monotonic);
     try std.testing.expect(reserveConnectionSlot()); // fills the last slot
-    try std.testing.expectEqual(MAX_CONNECTIONS, connectionCount());
+    try std.testing.expectEqual(@as(usize, MAX_CONNECTIONS), connectionCount());
     try std.testing.expect(!reserveConnectionSlot()); // at cap -> rejected, count unchanged
-    try std.testing.expectEqual(MAX_CONNECTIONS, connectionCount());
+    try std.testing.expectEqual(@as(usize, MAX_CONNECTIONS), connectionCount());
     releaseConnectionSlot();
-    try std.testing.expectEqual(MAX_CONNECTIONS - 1, connectionCount());
+    try std.testing.expectEqual(@as(usize, MAX_CONNECTIONS - 1), connectionCount());
     try std.testing.expect(reserveConnectionSlot()); // a freed slot is reusable
     // Clean up the counter so a later test sees a clean slate.
     live_connections.store(0, .monotonic);
+}
+
+test "configured connection cap rejects at the u32 boundary without overflow" {
+    try std.testing.expectEqual(@as(usize, 0), connectionCount());
+    defer live_connections.store(0, .monotonic);
+    const limit = std.math.maxInt(u32);
+    live_connections.store(limit - 1, .monotonic);
+    try std.testing.expect(reserveConnectionSlotWithLimit(limit));
+    try std.testing.expect(!reserveConnectionSlotWithLimit(limit));
+    try std.testing.expectEqual(@as(usize, limit), connectionCount());
+    releaseConnectionSlot();
+    try std.testing.expectEqual(@as(usize, limit - 1), connectionCount());
+}
+
+test "concurrent realtime reservations respect a configured shared cap" {
+    const Harness = struct {
+        attempted: std.atomic.Value(u32) = .init(0),
+        finish: std.atomic.Value(bool) = .init(false),
+
+        fn run(self: *@This()) void {
+            const admitted = reserveConnectionSlotWithLimit(3);
+            _ = self.attempted.fetchAdd(1, .release);
+            if (!admitted) return;
+            defer releaseConnectionSlot();
+            while (!self.finish.load(.acquire)) std.atomic.spinLoopHint();
+        }
+    };
+    try std.testing.expectEqual(@as(usize, 0), connectionCount());
+    var harness: Harness = .{};
+    var threads: [16]std.Thread = undefined;
+    var started: usize = 0;
+    {
+        defer {
+            harness.finish.store(true, .release);
+            for (threads[0..started]) |thread| thread.join();
+        }
+        for (&threads) |*thread| {
+            thread.* = try std.Thread.spawn(.{}, Harness.run, .{&harness});
+            started += 1;
+        }
+        while (harness.attempted.load(.acquire) != threads.len) std.atomic.spinLoopHint();
+        try std.testing.expectEqual(@as(usize, 3), connectionCount());
+    }
+    try std.testing.expectEqual(@as(usize, 0), connectionCount());
 }

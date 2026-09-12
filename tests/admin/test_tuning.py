@@ -32,6 +32,18 @@ def run(binary, tmp_path, value, now=110):
                           capture_output=True, text=True)
 
 
+def test_tuning_accepts_older_reports_without_realtime_connection_cap(binary, tmp_path):
+    value = document(binary)
+    for candidate in value["candidates"]:
+        candidate["resources"].pop("realtime_connection_cap", None)
+    result = run(binary, tmp_path, value)
+    assert result.returncode == 0, result.stderr
+    report = json.loads(result.stdout)
+    assert report["recommendation"] == "fast"
+    for item in report["items"]:
+        assert item["candidate"]["resources"]["realtime_connection_cap"] == 10000
+
+
 def test_tuning_ranks_only_feasible_observations(binary, tmp_path):
     value = document(binary)
     result = run(binary, tmp_path, value)
@@ -44,6 +56,45 @@ def test_tuning_ranks_only_feasible_observations(binary, tmp_path):
     value["p95_budget_ms"] = 1
     assert json.loads(run(binary, tmp_path, value).stdout)["recommendation"] is None
     assert not (tmp_path / "untouched").exists()
+
+
+def test_tuning_accepts_reports_without_memory_worker_fields(binary, tmp_path):
+    value = document(binary)
+    for candidate in value["candidates"]:
+        candidate["resources"].pop("memory_job_workers", None)
+    result = run(binary, tmp_path, value)
+    assert result.returncode == 0, result.stderr
+    report = json.loads(result.stdout)
+    assert report["recommendation"] == "fast"
+    for item in report["items"]:
+        assert item["candidate"]["resources"]["memory_job_workers"] is None
+
+
+def test_tuning_accepts_saved_reports_without_envelope(binary, tmp_path):
+    value = document(binary)
+    for candidate in value["candidates"]:
+        candidate["resources"].pop("envelope", None)
+    result = run(binary, tmp_path, value)
+    assert result.returncode == 0, result.stderr
+    report = json.loads(result.stdout)
+    assert report["recommendation"] == "fast"
+    assert report["items"][0]["candidate"]["resources"]["envelope"] is None
+
+
+def test_tuning_accepts_reports_predating_all_additive_resource_fields(binary, tmp_path):
+    value = document(binary)
+    for candidate in value["candidates"]:
+        for field in ("realtime_connection_cap", "memory_job_workers", "envelope"):
+            candidate["resources"].pop(field, None)
+    result = run(binary, tmp_path, value)
+    assert result.returncode == 0, result.stderr
+    report = json.loads(result.stdout)
+    assert report["recommendation"] == "fast"
+    for item in report["items"]:
+        resources = item["candidate"]["resources"]
+        assert resources["realtime_connection_cap"] == 10000
+        assert resources["memory_job_workers"] is None
+        assert resources["envelope"] is None
 
 
 @pytest.mark.parametrize("change,reason", [

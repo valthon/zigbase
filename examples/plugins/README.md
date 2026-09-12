@@ -1,5 +1,13 @@
 # zigbase plugins example — the advanced framework surface
 
+Run the built binary with `resources --json` to inspect its compiled resource
+`envelope` without opening deployment state. The example's four retained SQLite
+readers and 512 KiB per-connection soft cache target yield a 2.5 MiB target for
+writer plus full idle pool. Admission limits synchronous callbacks to three;
+neither setting bounds transport buffering, overflow readers, or total RSS.
+Use measured workloads to size a deployment; `scheduler_stack_bytes`
+describes effective virtual stack space after the 1 MiB floor, not resident memory.
+
 This is the **advanced framework** example. The three examples form a ladder:
 
 | Example | What it proves |
@@ -76,9 +84,13 @@ configures in code:
    row into `plugin_audit_log`. It also captures two analytics events together with
    `ctx.trackBatch`, demonstrating atomic multi-event capture without a background buffer.
 
-7. **Pool levers** via `.pools` (`.readers` / `.jobs` / `.cache_kib`) to tune
-   the warm-reader pool, scheduler worker count, and per-connection SQLite
-   page-cache budget.
+7. **Pool levers** via `.pools` (`.readers` / `.jobs` / `.memory_jobs` / `.cache_kib`)
+   to tune warm readers, scheduler workers, lazy memory-job/submit workers, and
+   SQLite page-cache targets. This example overrides the minimal profile's one
+   memory worker with two; inspect the requested configuration with `resources`.
+   The report's `job_stack_bytes` applies to both scheduler and memory workers.
+   The envelope's separate `memory_job_stack_bytes` is up to 2 MiB of virtual
+   stacks for those two lazy workers, not current allocation or RSS.
 
 8. **Fully embedded static frontend** via `embedStaticDir`. The Zigapagos island
    build output in `frontend/dist` is compiled into the binary at build time via

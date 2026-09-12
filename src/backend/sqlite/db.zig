@@ -418,18 +418,20 @@ test "beginImmediate starts a write transaction that can be committed" {
 /// The actual warm-pool cap is a runtime `reader_cap` field (<= this), set from the
 /// comptime `.pools.readers` lever via `Pool.init`, defaulting to this value so the
 /// historical behavior (16 warm readers) is preserved.
-const reader_pool_size = 16;
+const resources = @import("../../resource_profile.zig");
+const reader_pool_size = resources.reader_pool_size;
 
 /// Per-connection SQLite page-cache size, in KiB, applied via `PRAGMA cache_size=-N`
 /// to the writer AND every reader (warm or fallback). SQLite's built-in default is
 /// 2000 KiB (~2 MiB) PER connection, so with the writer + up to `reader_cap` (16) warm
-/// readers the page cache alone can reach ~34 MiB. 1024 KiB halves that to ~17 MiB max
+/// readers the combined soft cache target is ~34 MiB. 1024 KiB halves it to ~17 MiB
 /// while keeping a healthy cache for the small-row record workloads ZigBase serves
 /// (rows are looked up by indexed id; hot pages stay resident). Tunable per-deploy via
 /// the `.pools.cache_kib` comptime lever -> `Pool.initOpts.cache_kib`. A larger value
 /// trades RAM for fewer page faults on big working sets; a smaller one shrinks a
-/// memory-constrained deploy. The negative form pins the cache to a byte budget
-/// (page-size independent), unlike a positive page count.
+/// memory-constrained deploy. Overflow readers add their own caches; this is not
+/// a total memory bound. The negative form expresses a soft target in KiB rather
+/// than a positive page count.
 pub const default_cache_kib: u32 = 1024;
 
 pub const PoolOptions = struct {
@@ -522,16 +524,15 @@ pub const Pool = struct {
             .path = owned,
             .writer = writer,
             .io = io,
-            .reader_cap = @min(reader_cap, reader_pool_size),
+            .reader_cap = resources.retainedReaderCap(reader_cap),
             .cache_kib = options.cache_kib,
         };
     }
 
-    /// Apply `PRAGMA cache_size=-kib` to `db` (negative pins a KiB byte budget rather
+    /// Apply `PRAGMA cache_size=-kib` to `db` (negative requests a KiB soft target rather
     /// than a page count). cache_kib is clamped to i32 range; 0 leaves SQLite's default.
     fn setCacheSize(db: *Db, cache_kib: u32) DbError!void {
-        if (cache_kib == 0) return;
-        const kib: i64 = @min(@as(i64, cache_kib), std.math.maxInt(i32));
+        const kib: i64 = resources.cacheTargetKib(cache_kib) orelse return;
         var buf: [64]u8 = undefined;
         const sql = std.fmt.bufPrintZ(&buf, "PRAGMA cache_size=-{d};", .{kib}) catch return DbError.ExecFailed;
         try db.exec(sql);
@@ -575,8 +576,8 @@ pub const Pool = struct {
         var db = Db{ .handle = handle.? };
         errdefer db.close();
         try db.exec("PRAGMA busy_timeout=5000;");
-        // Match the writer's page-cache budget on every reader (warm + fallback) so the
-        // pool's total page-cache footprint is bounded by (1 + reader_cap) * cache_kib.
+        // Match the writer's soft cache target on every reader, including overflow
+        // connections. reader_cap bounds idle retention, not total live caches.
         try setCacheSize(&db, self.cache_kib);
         // Dev-only: same date/time-builtin shadowing as the writer (#84). The reader path
         // opens via raw sqlite3_open_v2 (not Db.open), so register here too. comptime no-op

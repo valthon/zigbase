@@ -585,17 +585,17 @@ pub fn App(comptime cfg: anytype) type {
                     }
                 }
             }
-            // Validate the `.pools` group's own sub-keys: only the four tuning knobs are read
+            // Validate the `.pools` group's own sub-keys: only the named tuning knobs are read
             // (via `@hasField`), so a typo (e.g. `.stack_sizes`, `.reader`, `.cache_kb`) would
             // otherwise be silently dropped and the default kept — mirror the sibling groups.
             if (@hasField(@TypeOf(cfg), "pools")) {
                 const PT = @TypeOf(cfg.pools);
                 if (@typeInfo(PT) != .@"struct")
-                    @compileError(".pools must be a config group struct: .pools = .{ .jobs = N, .readers = N, .stack_size = N, .cache_kib = N }");
+                    @compileError(".pools must be a config group struct: .pools = .{ .jobs = N, .memory_jobs = N, .readers = N, .stack_size = N, .cache_kib = N }");
                 for (std.meta.fields(PT)) |pf| {
-                    const pok = std.mem.eql(u8, pf.name, "jobs") or std.mem.eql(u8, pf.name, "readers") or
+                    const pok = std.mem.eql(u8, pf.name, "jobs") or std.mem.eql(u8, pf.name, "memory_jobs") or std.mem.eql(u8, pf.name, "readers") or
                         std.mem.eql(u8, pf.name, "stack_size") or std.mem.eql(u8, pf.name, "cache_kib");
-                    if (!pok) @compileError(".pools: unknown key '." ++ pf.name ++ "' (recognized: .jobs, .readers, .stack_size, .cache_kib)");
+                    if (!pok) @compileError(".pools: unknown key '." ++ pf.name ++ "' (recognized: .jobs, .memory_jobs, .readers, .stack_size, .cache_kib)");
                 }
             }
             var d = events.Dispatch{};
@@ -637,13 +637,8 @@ pub fn App(comptime cfg: anytype) type {
             // unknown sub-key fails loudly (mirrors the `.features` guard). Absent → custom
             // topics default to public signal channels (the historical `__features` behavior).
             if (@hasField(@TypeOf(cfg), "realtime")) {
+                _ = realtime_max_connections;
                 const rcfg = cfg.realtime;
-                if (@typeInfo(@TypeOf(rcfg)) != .@"struct")
-                    @compileError(".realtime must be a struct, e.g. '.{ .canSubscribe = fn }'");
-                for (std.meta.fields(@TypeOf(rcfg))) |f| {
-                    if (!std.mem.eql(u8, f.name, "canSubscribe"))
-                        @compileError(".realtime: unknown key '." ++ f.name ++ "' (recognized: .canSubscribe)");
-                }
                 if (@hasField(@TypeOf(rcfg), "canSubscribe")) {
                     const _coerce: events.RealtimeCanSubscribeFn = rcfg.canSubscribe;
                     _ = _coerce;
@@ -866,6 +861,7 @@ pub fn App(comptime cfg: anytype) type {
         /// starts whenever this is non-empty, so a TTL collection alone starts it.
         pub const jobs: []const scheduler.RuntimeJob = scheduler.concatJobs(user_jobs, internal_jobs);
         pub const admission_config = @import("admission.zig").resolve(cfg);
+        pub const realtime_max_connections = @import("realtime/connection.zig").resolveLimit(cfg);
         pub const selected_resource_profile: ?resource_profile.Profile = if (@hasField(@TypeOf(cfg), "resource_profile")) cfg.resource_profile else null;
         const profile_pools = resource_profile.defaults(selected_resource_profile orelse .balanced);
         /// Worker pool size for the scheduler: `.pools = .{ .jobs = N }` (default 2).
@@ -875,6 +871,12 @@ pub fn App(comptime cfg: anytype) type {
                 @compileError("'.jobs.pool_size' was removed; set '.pools = .{ .jobs = N }' instead");
             if (@hasField(@TypeOf(cfg), "pools") and @hasField(@TypeOf(cfg.pools), "jobs")) break :blk cfg.pools.jobs;
             break :blk profile_pools.jobs;
+        };
+        /// Separate lazy memory-job/app.submit pool; omission preserves four workers.
+        pub const memory_job_pool_size: usize = blk: {
+            const n: usize = if (@hasField(@TypeOf(cfg), "pools") and @hasField(@TypeOf(cfg.pools), "memory_jobs")) cfg.pools.memory_jobs else profile_pools.memory_jobs;
+            if (n == 0 or n > queue_memory.Pool.max_workers) @compileError(std.fmt.comptimePrint(".pools.memory_jobs must be in 1..{d}", .{queue_memory.Pool.max_workers}));
+            break :blk n;
         };
 
         /// Comptime warm-reader-pool cap (the `.pools.readers` lever). Defaults to 16,
@@ -951,7 +953,7 @@ pub fn App(comptime cfg: anytype) type {
         /// (1 MiB), far below `std.Thread`'s 16 MiB default; raise it for unusually deep
         /// job handlers. Clamped up to `scheduler.min_job_stack_size` — a below-floor value
         /// would EINVAL-abort `pthread_create` in the full binary, so the lever can only
-        /// raise the stack, never crash the server. Only consumed when jobs are configured.
+        /// raise the stack. Memory-job/submit threads start lazily on their first push.
         pub const job_stack_size: usize = @max(scheduler.min_job_stack_size, if (@hasField(@TypeOf(cfg), "pools") and @hasField(@TypeOf(cfg.pools), "stack_size")) cfg.pools.stack_size else scheduler.default_job_stack_size);
 
         /// Per-connection SQLite page-cache budget in KiB (the `.pools.cache_kib` lever).
@@ -960,16 +962,33 @@ pub fn App(comptime cfg: anytype) type {
         pub const cache_kib: u32 = if (@hasField(@TypeOf(cfg), "pools") and @hasField(@TypeOf(cfg.pools), "cache_kib")) cfg.pools.cache_kib else profile_pools.cache_kib;
 
         pub const resource_report: resource_profile.Report = .{
+            .realtime_connection_cap = realtime_max_connections,
             .profile = selected_resource_profile,
             .reader_pool_cap = reader_pool_size,
             .job_workers = job_pool_size,
             .job_stack_bytes = job_stack_size,
+            .memory_job_workers = memory_job_pool_size,
             .sqlite_cache_kib_per_connection = cache_kib,
             .scheduler_enabled = jobs.len > 0,
             .admin_enabled = enable_admin,
             .postgres_compiled = build_options.postgres,
             .s3_compiled = build_options.s3,
             .file_inventory_compiled = build_options.file_inventory,
+            .envelope = resource_profile.envelope(.{
+                .readers = reader_pool_size,
+                .memory_job_workers = memory_job_pool_size,
+                .cache_kib = cache_kib,
+                .scheduler_enabled = jobs.len > 0,
+                .job_workers = job_pool_size,
+                .job_stack_bytes = job_stack_size,
+                .admission_max_requests = if (admission_config) |a| a.max_requests else null,
+                .resumable = if (build_options.resumable_uploads) .{
+                    .max_sessions = files_config.resumable.max_sessions,
+                    .max_upload_bytes = files_config.resumable.max_upload_bytes,
+                    .max_total_payload_bytes = files_config.resumable.max_total_bytes,
+                    .max_chunk_bytes = files_config.resumable.max_chunk_bytes,
+                } else null,
+            }),
         };
 
         /// Comptime-selected storage plugin type (defaults to `DefaultStoragePlugin`).
@@ -1700,6 +1719,7 @@ pub fn App(comptime cfg: anytype) type {
             .reader_pool_size = reader_pool_size,
             .resource_report = resource_report,
             .job_stack_size = job_stack_size,
+            .memory_job_pool_size = memory_job_pool_size,
             .cache_kib = cache_kib,
             .static_mode = static_mode,
             .static_routes = static_routes,
@@ -1726,6 +1746,7 @@ pub fn App(comptime cfg: anytype) type {
             .static_cache_control = static_cache_control,
             .gates = route_gates,
             .admission_config = admission_config,
+            .realtime_max_connections = realtime_max_connections,
             .query_workbench = @import("query_workbench.zig").resolve(cfg),
         };
 
@@ -1869,6 +1890,7 @@ fn analyticsRollupRun(ctx: *ctx_mod.Ctx, ev: *events.JobEvent) anyerror!void {
 pub const ServeOpts = struct {
     query_workbench: @import("query_workbench.zig").Limits = .{},
     admission_config: ?@import("admission.zig").Config = null,
+    realtime_max_connections: u32 = @import("realtime/connection.zig").MAX_CONNECTIONS,
     StoragePlugin: type,
     MailerPlugin: type,
     /// Comptime-selected error-reporter plugin TYPE (#244); defaults to `DefaultReporterPlugin`.
@@ -1886,6 +1908,7 @@ pub const ServeOpts = struct {
     reader_pool_size: usize,
     resource_report: ?resource_profile.Report = null,
     job_stack_size: usize = scheduler.default_job_stack_size,
+    memory_job_pool_size: usize = queue_memory.Pool.num_workers,
     cache_kib: u32 = db.default_cache_kib,
     static_mode: static_files.Mode = .default,
     /// Tier-2 comptime static rewrites (issue #183), threaded into `app.static_routes`.
@@ -5094,6 +5117,7 @@ fn bootApp(
         .oauth_state_server = cfg.oauth_state_server,
         .oauth_state_ttl_s = cfg.oauth_state_ttl_s,
         .realtime_allowed_origins = cfg.realtime_allowed_origins,
+        .realtime_max_connections = opts.realtime_max_connections,
         .sse_heartbeat_seconds = @intCast(cfg.sse_heartbeat_seconds),
         .realtime_outbound_hwm = cfg.realtime_outbound_hwm,
         .trust_proxy = cfg.trust_proxy,
@@ -5331,7 +5355,7 @@ fn serveImpl(
     // spawn lazily on first use (zero overhead when unused) and stop() drains + joins.
     // Its defer is registered BEFORE the scheduler's, so (LIFO) the scheduler stops FIRST
     // — a cron handler may still enqueue/submit during its final run.
-    var mem_pool = queue_memory.Pool.init(app);
+    var mem_pool = try queue_memory.Pool.initSized(app, opts.memory_job_pool_size, opts.job_stack_size);
     mem_pool.install(app);
     defer mem_pool.stop();
     // Start the scheduler only when jobs are configured. Registered LAST among the teardown
@@ -5750,6 +5774,11 @@ test "E3: grouped .auth lowers hooks/methods/captcha/session" {
 }
 
 test "App(cfg) wires the realtime canSubscribe guard onto dispatch (#143)" {
+    try std.testing.expectEqual(@as(u32, 10_000), App(.{}).realtime_max_connections);
+    const Bounded = App(.{ .realtime = .{ .max_connections = 2 } });
+    try std.testing.expectEqual(@as(u32, 2), Bounded.realtime_max_connections);
+    try std.testing.expectEqual(@as(u32, 2), Bounded.resource_report.realtime_connection_cap);
+    try std.testing.expectEqual(@as(u32, 2), Bounded.Opts.realtime_max_connections);
     // No `.realtime` → null: custom topics default to PUBLIC signal channels.
     try std.testing.expect(App(.{}).dispatch.realtime_can_subscribe == null);
     // Empty `.realtime = .{}` is allowed and still leaves the guard unset.
@@ -6000,11 +6029,14 @@ test "App(cfg) carries comptime pool-size levers (readers + jobs)" {
 test "resource profiles preserve defaults and explicit pool overrides" {
     const D = App(.{});
     const B = App(.{ .resource_profile = .balanced });
+    try std.testing.expectEqual(@as(usize, 4), D.memory_job_pool_size);
+    try std.testing.expectEqual(D.memory_job_pool_size, B.memory_job_pool_size);
     try std.testing.expectEqual(D.reader_pool_size, B.reader_pool_size);
     try std.testing.expectEqual(D.job_pool_size, B.job_pool_size);
     try std.testing.expectEqual(D.cache_kib, B.cache_kib);
     try std.testing.expectEqual(null, D.resource_report.profile);
     const M = App(.{ .resource_profile = .minimal, .admin = .disabled });
+    try std.testing.expectEqual(@as(usize, 1), M.memory_job_pool_size);
     try std.testing.expectEqual(@as(usize, 2), M.reader_pool_size);
     try std.testing.expectEqual(@as(usize, 1), M.job_pool_size);
     try std.testing.expectEqual(@as(u32, 256), M.cache_kib);
@@ -6012,6 +6044,7 @@ test "resource profiles preserve defaults and explicit pool overrides" {
     try std.testing.expectEqual(D.jobs.len, M.jobs.len);
     try std.testing.expectEqual(D.job_stack_size, M.job_stack_size);
     const T = App(.{ .resource_profile = .throughput });
+    try std.testing.expectEqual(@as(usize, 8), T.memory_job_pool_size);
     try std.testing.expectEqual(@as(usize, 64), T.reader_pool_size);
     try std.testing.expectEqual(@as(usize, 8), T.job_pool_size);
     try std.testing.expectEqual(@as(u32, 4096), T.cache_kib);
@@ -6023,6 +6056,35 @@ test "resource profiles preserve defaults and explicit pool overrides" {
     const P = App(.{ .resource_profile = .minimal, .pools = .{ .readers = 7 } });
     try std.testing.expectEqual(@as(usize, 7), P.reader_pool_size);
     try std.testing.expectEqual(@as(u32, 256), P.cache_kib);
+}
+
+test "memory worker tuning reaches serve options and backwards-compatible reports" {
+    const A = App(.{ .resource_profile = .minimal, .pools = .{ .memory_jobs = 6, .stack_size = 2 << 20 } });
+    try std.testing.expectEqual(@as(usize, 6), A.Opts.memory_job_pool_size);
+    try std.testing.expectEqual(@as(usize, 2 << 20), A.Opts.job_stack_size);
+    try std.testing.expectEqual(@as(?usize, 6), A.resource_report.memory_job_workers);
+    try std.testing.expectEqual(@as(usize, 2 << 20), A.resource_report.job_stack_bytes);
+    try std.testing.expectEqual(@as(u64, 6 * (2 << 20)), A.resource_report.envelope.?.memory_job_stack_bytes);
+    try std.testing.expectEqual(@as(usize, 1), A.job_pool_size);
+    const B = App(.{ .pools = .{ .memory_jobs = 64, .stack_size = 0 } });
+    try std.testing.expectEqual(@as(usize, 64), B.memory_job_pool_size);
+    try std.testing.expectEqual(scheduler.min_job_stack_size, B.resource_report.job_stack_bytes);
+    try std.testing.expectEqual(@as(u64, 64 * scheduler.min_job_stack_size), B.resource_report.envelope.?.memory_job_stack_bytes);
+}
+
+test "compiled resource envelope follows admission and resumable build gates" {
+    const D = App(.{}).resource_report.envelope.?;
+    try std.testing.expectEqual(null, D.http_admission_max_requests);
+    try std.testing.expectEqual(@as(u64, 0), D.scheduler_stack_bytes);
+    const A = App(.{ .resource_profile = .minimal, .admission = .{ .max_requests = 3 } }).resource_report.envelope.?;
+    try std.testing.expectEqual(@as(u32, 3), A.http_admission_max_requests.?);
+    try std.testing.expectEqual(@as(u64, 3 * 256 * 1024), A.sqlite_writer_and_retained_readers_cache_target_bytes.?);
+    if (comptime build_options.resumable_uploads) {
+        const U = App(.{ .files = .{ .resumable = .{ .max_sessions = 3, .max_total_bytes = 16 << 20 } } }).resource_report.envelope.?.resumable.?;
+        try std.testing.expectEqual(@as(usize, 3), U.max_sessions);
+        try std.testing.expectEqual(@as(usize, 16 << 20), U.max_total_payload_bytes);
+        try std.testing.expectEqual(@as(usize, 32 << 20), D.resumable.?.max_total_payload_bytes);
+    } else try std.testing.expectEqual(null, D.resumable);
 }
 
 test "HTTP admission is opt-in and reserves only its enabled diagnostics route" {

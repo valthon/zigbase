@@ -286,6 +286,12 @@ high-water and rejected counts; this endpoint obeys the same limit. Omission
 compiles out the checks and counters. This does not bound transport-buffered
 bodies, long-lived realtime sessions, background jobs, or total RSS.
 
+Bound long-lived realtime sessions separately with comptime
+`.realtime = .{ .max_connections = 256 }`. WS and SSE share the positive cap;
+the default remains 10,000 and excess upgrades receive 503. Inspect the effective
+cap and reserved slots through superuser `/api/realtime/stats`. The Golfsim
+example demonstrates a smaller cap; larger deployments can explicitly raise it.
+
 `zigbase tune --input measurements.json` compares observed throughput, p95 latency,
 and peak RSS against explicit budgets. Pair it with comptime resource profiles;
 the offline advisor never changes production settings. The framework guide includes

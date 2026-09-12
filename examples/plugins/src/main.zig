@@ -37,7 +37,8 @@
 //!      `ctx.records()` to count published posts, then writes an audit log row to a
 //!      migration-owned table with raw SQL on the pooled writer (`ctx.app.pool`).
 //!
-//!   7. POOL LEVERS via `.pools` -- reader/job pool sizes + page-cache budget.
+//!   7. POOL LEVERS via `.pools` -- readers, scheduler jobs, lazy memory-job/submit
+//!      workers (`.memory_jobs`), and the page-cache target.
 //!
 //!   8. FULLY EMBEDDED STATIC FRONTEND via `embedStaticDir` -- the Zigapagos build
 //!      output in `frontend/dist` is compiled into the binary at build time;
@@ -703,7 +704,7 @@ const Backend = zigbase.App(.{
         // 7. Pool footprint tuning levers.
         .resource_profile = .minimal,
         // Explicit fields override profile defaults; inspect with `resources`.
-        .pools = .{ .readers = 4, .jobs = 1, .cache_kib = 512 },
+        .pools = .{ .readers = 4, .jobs = 1, .memory_jobs = 2, .cache_kib = 512 },
         .admission = .{ .max_requests = 3 }, // leave one of four HTTP threads available to reject excess work
 
         // 8. Fully embedded static frontend (see build.zig embedStaticDir).

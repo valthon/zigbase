@@ -3,6 +3,7 @@ import re
 import socket
 import time
 import pytest
+from _ws import _recv_until
 from urllib.parse import urlparse
 from conftest import login, api_request
 
@@ -71,21 +72,6 @@ def test_malformed_ws_upgrade_does_not_crash_server(server):
     except OSError as e:
         raise AssertionError(f"server crashed after malformed upgrades (double-free?): {e}")
     assert b"200" in final, f"server not healthy after malformed upgrades: {final!r}"
-
-
-def _recv_until(sock, needle: bytes, timeout=8.0) -> bytes:
-    """Read from an already-open socket until `needle` appears or the peer closes/times out."""
-    sock.settimeout(timeout)
-    buf = b""
-    while needle not in buf:
-        try:
-            chunk = sock.recv(4096)
-        except socket.timeout:
-            break
-        if not chunk:
-            break
-        buf += chunk
-    return buf
 
 
 def test_sse_stream_and_uplink_end_to_end(server, page):
