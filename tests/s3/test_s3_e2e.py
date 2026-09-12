@@ -1,5 +1,5 @@
 """S3-backed storage e2e (§D) — runs ONLY against a real S3-compatible server
-(MinIO, started as a service container by CI's `s3` job; see .github/workflows/ci.yml).
+(SeaweedFS, started by CI's `s3` job; see .github/workflows/ci.yml).
 Not mocked: this is the raw-HTTP proof that a `-Ds3` binary configured via
 `ZIGBASE_S3_*` env serves record files byte-identically to local storage (§B —
 Range/ETag/conditional/tenancy), backed by a real bucket.
@@ -16,7 +16,7 @@ REPO = pathlib.Path(__file__).resolve().parents[2]
 
 pytestmark = pytest.mark.skipif(
     not os.environ.get("ZIGBASE_S3_TEST_ENDPOINT"),
-    reason="ZIGBASE_S3_TEST_ENDPOINT not set (MinIO CI job only)")
+    reason="ZIGBASE_S3_TEST_ENDPOINT not set (live S3 job only)")
 
 
 def _free_port():
