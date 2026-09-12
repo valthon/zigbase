@@ -26,7 +26,7 @@ pub fn stats(ctx: *http.RequestCtx) !http.Response {
     const snapshot = blk: {
         store.mutex.lockUncancelable(store.io);
         defer store.mutex.unlock(store.io);
-        break :blk .{ .entries = try ctx.allocator.a.dupe(workbench.Entry, store.entries[0..store.count]), .dropped = store.dropped };
+        break :blk .{ .entries = try ctx.allocator.a.dupe(workbench.Entry, store.entries[0..store.count]), .dropped = store.dropped, .dropped_statements = store.dropped_statements };
     };
     const Item = struct {
         method: []const u8,
@@ -38,6 +38,11 @@ pub fn stats(ctx: *http.RequestCtx) !http.Response {
         slowExecutions: u64,
         repeatedShapes: u64,
         failedExecutions: u64,
+        finalizedStatements: u64,
+        statementLifetimeNanoseconds: u64,
+        maxStatementLifetimeNanoseconds: u64,
+        measuredCallNanoseconds: u64,
+        heldNanoseconds: u64,
     };
     const items = try ctx.allocator.a.alloc(Item, snapshot.entries.len);
     for (snapshot.entries, items) |*entry, *item| {
@@ -53,16 +58,24 @@ pub fn stats(ctx: *http.RequestCtx) !http.Response {
             .slowExecutions = entry.slow,
             .repeatedShapes = entry.repeated,
             .failedExecutions = entry.failures,
+            .finalizedStatements = entry.statements,
+            .statementLifetimeNanoseconds = entry.lifetime_ns,
+            .maxStatementLifetimeNanoseconds = entry.max_lifetime_ns,
+            .measuredCallNanoseconds = entry.calls_ns,
+            .heldNanoseconds = entry.held_ns,
         };
     }
     return .{ .status = 200, .body = try std.json.Stringify.valueAlloc(ctx.allocator.a, .{
         .items = items,
         .backend = "sqlite",
         .measurement = "prepared-statement-step-time",
+        .lifetimeMeasurement = "prepare-through-finalize",
+        .measuredCalls = .{ "prepare", "step", "reset", "finalize" },
         .activeBackend = @tagName(db.poolBackend(ctx.app.?.pool)),
         .maxEntries = store.limits.max_entries,
         .slowMilliseconds = store.limits.slow_ms,
         .droppedExecutions = snapshot.dropped,
+        .droppedStatements = snapshot.dropped_statements,
         .repeatShapesPerRequest = 32,
     }, .{}) };
 }

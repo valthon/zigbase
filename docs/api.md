@@ -1687,7 +1687,7 @@ credentials (cookies alone are insufficient), `403` for a non-superuser.
 
 | Method | Path | Contract |
 | --- | --- | --- |
-| GET | `/api/query-workbench/stats` | Bounded `{items}` of method, route template, opaque structural shape, execution count, summed/max statement-step nanoseconds, slow/repeated/failed counts; includes capacity and dropped counts. |
+| GET | `/api/query-workbench/stats` | Bounded `{items}` of method, route template, opaque structural shape, execution count, summed/max statement-step nanoseconds, slow/repeated/failed counts, plus finalized-statement lifecycle/call/held timing; includes capacity and dropped counts. |
 | POST | `/api/query-workbench/explain` | JSON `{collection, equalityField?, orderField?, descending?}`; `200 {items, backend, scope, executesQuery:false, includesAuthorizationPredicates:false, truncated}`. |
 
 Explain accepts schema-validated field names, not SQL, expressions or values.
@@ -1697,6 +1697,15 @@ Unknown keys/fields or invalid input return `400`; unknown collection `404`;
 PostgreSQL planning `501`. Plans intentionally reveal schema/index names to
 operators, not ordinary users. Metrics retain no SQL or parameter text; structural
 shape repetition is not proof of N+1. See [scope, tuning and privacy limits](framework.md#bounded-sqlite-query-workbench-opt-in).
+Lifecycle items add `finalizedStatements`, `statementLifetimeNanoseconds`,
+`maxStatementLifetimeNanoseconds`, `measuredCallNanoseconds`, and `heldNanoseconds`.
+They cover successful prepare through finalize within one originating scope,
+including reset/reuse. Measured calls are prepare/step/reset/finalize; held time
+also includes binding, column access, scheduling and instrumentation, not just
+application work. These are elapsed durations, not CPU time. Existing execution
+counts and slow thresholds remain step-based; a statement may execute zero or
+many times. `droppedStatements` is independent of `droppedExecutions`. No raw
+`exec`, failed-prepare, pool-wait or full-request timing is implied.
 `GET /api/meta` includes `capabilities.queryWorkbench` and optional
 `endpoints.queryWorkbench`; this is compile-time discovery, not access authority.
 

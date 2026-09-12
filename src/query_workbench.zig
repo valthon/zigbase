@@ -1,4 +1,5 @@
-//! Bounded SQLite statement-step measurements. No SQL or parameter text retained.
+//! Bounded SQLite step and completed-statement lifecycle measurements.
+//! No SQL or parameter text retained.
 const std = @import("std");
 
 pub const Limits = struct { max_entries: u16 = 64, slow_ms: u32 = 100 };
@@ -27,6 +28,11 @@ pub const Entry = struct {
     slow: u64 = 0,
     repeated: u64 = 0,
     failures: u64 = 0,
+    statements: u64 = 0,
+    lifetime_ns: u64 = 0,
+    max_lifetime_ns: u64 = 0,
+    calls_ns: u64 = 0,
+    held_ns: u64 = 0,
 };
 pub const Store = struct {
     allocator: std.mem.Allocator,
@@ -36,6 +42,7 @@ pub const Store = struct {
     entries: []Entry,
     count: usize = 0,
     dropped: u64 = 0,
+    dropped_statements: u64 = 0,
 
     pub fn create(a: std.mem.Allocator, io: std.Io, limits: Limits) !*Store {
         const self = try a.create(Store);
@@ -60,18 +67,9 @@ pub const Store = struct {
         }
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        const entry = blk: {
-            for (self.entries[0..self.count]) |*e| if (e.fingerprint == key and
-                std.mem.eql(u8, e.route[0..e.route_len], scope.route) and std.mem.eql(u8, e.method, scope.method)) break :blk e;
-            if (self.count == self.entries.len or scope.route.len > 192) {
-                self.dropped +|= 1;
-                return;
-            }
-            const e = &self.entries[self.count];
-            self.count += 1;
-            e.* = .{ .method = scope.method, .fingerprint = key, .route_len = @intCast(scope.route.len) };
-            @memcpy(e.route[0..scope.route.len], scope.route);
-            break :blk e;
+        const entry = self.findEntry(scope, key) orelse {
+            self.dropped +|= 1;
+            return;
         };
         entry.executions +|= 1;
         entry.total_ns +|= ns;
@@ -79,6 +77,33 @@ pub const Store = struct {
         if (ns >= @as(u64, self.limits.slow_ms) * std.time.ns_per_ms) entry.slow +|= 1;
         if (repeated) entry.repeated +|= 1;
         if (failed) entry.failures +|= 1;
+    }
+
+    // Caller holds mutex. Both metric families share the same bounded key table.
+    fn findEntry(self: *Store, scope: *Scope, key: u64) ?*Entry {
+        for (self.entries[0..self.count]) |*e| if (e.fingerprint == key and
+            std.mem.eql(u8, e.route[0..e.route_len], scope.route) and std.mem.eql(u8, e.method, scope.method)) return e;
+        if (self.count == self.entries.len or scope.route.len > 192) return null;
+        const e = &self.entries[self.count];
+        self.count += 1;
+        e.* = .{ .method = scope.method, .fingerprint = key, .route_len = @intCast(scope.route.len) };
+        @memcpy(e.route[0..scope.route.len], scope.route);
+        return e;
+    }
+
+    fn recordLifetime(self: *Store, scope: *Scope, key: ?u64, lifetime: u64, calls: u64) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const e = if (key) |k| self.findEntry(scope, k) else null;
+        const value = e orelse {
+            self.dropped_statements +|= 1;
+            return;
+        };
+        value.statements +|= 1;
+        value.lifetime_ns +|= lifetime;
+        value.max_lifetime_ns = @max(value.max_lifetime_ns, lifetime);
+        value.calls_ns +|= calls;
+        value.held_ns +|= lifetime -| calls;
     }
 };
 
@@ -122,29 +147,32 @@ pub const Measurement = struct {
     ns: u64 = 0,
     failed: bool = false,
 
-    pub fn needsSql(self: *const Measurement) bool {
+    pub fn needsKey(self: *const Measurement) bool {
         const scope = current orelse return false;
         return scope.store != null and self.scope_id == 0;
     }
 
-    pub fn before(self: *Measurement, sql: []const u8) ?i96 {
+    pub fn beforeKeyed(self: *Measurement, key: ?u64) ?i96 {
         const scope = current orelse return null;
         const store = scope.store orelse return null;
         if (self.scope_id == 0) {
             self.scope_id = scope.id;
-            self.key = fingerprint(sql);
+            self.key = key;
         }
         if (self.scope_id != scope.id or self.key == null) return null;
         return std.Io.Timestamp.now(store.io, .awake).nanoseconds;
     }
-    pub fn after(self: *Measurement, started: ?i96, more: bool, failed: bool) void {
+    pub fn after(self: *Measurement, started: ?i96, more: bool, failed: bool) ?i96 {
+        var ended: ?i96 = null;
         if (started) |start| {
             const scope = current.?;
             const now = std.Io.Timestamp.now(scope.store.?.io, .awake).nanoseconds;
-            self.ns +|= @intCast(@min(std.math.maxInt(u64), @max(0, now - start)));
+            ended = now;
+            self.ns +|= elapsed(start, now);
             self.failed = self.failed or failed;
         }
         if (!more) self.finish();
+        return ended;
     }
     pub fn finish(self: *Measurement) void {
         defer self.* = .{};
@@ -158,6 +186,72 @@ pub const Measurement = struct {
             defer store.mutex.unlock(store.io);
             store.dropped +|= 1;
         }
+    }
+};
+
+fn elapsed(start: i96, end: i96) u64 {
+    return @intCast(@min(std.math.maxInt(u64), @max(0, end -| start)));
+}
+
+/// A successful prepare through finalize, including all reset/reuse cycles.
+/// Numeric scope identity only: no request/store pointer can escape in a Stmt.
+/// Each measured call must stay in the originating scope; otherwise omit the
+/// lifetime instead of guessing attribution. Scope exit itself retains no Stmts.
+pub const Lifetime = struct {
+    scope_id: u64 = 0,
+    key: ?u64 = null,
+    started: i96 = 0,
+    calls_ns: u64 = 0,
+
+    pub fn begin() Lifetime {
+        const scope = current orelse return .{};
+        const store = scope.store orelse return .{};
+        return .{ .scope_id = scope.id, .started = std.Io.Timestamp.now(store.io, .awake).nanoseconds };
+    }
+
+    pub fn prepared(self: *Lifetime, sql: []const u8) void {
+        _ = self.matchingScope() orelse return;
+        self.key = fingerprint(sql);
+    }
+
+    pub fn now(self: *Lifetime) ?i96 {
+        const scope = self.matchingScope() orelse return null;
+        return std.Io.Timestamp.now(scope.store.?.io, .awake).nanoseconds;
+    }
+
+    fn matchingScope(self: *Lifetime) ?*Scope {
+        const active = current orelse {
+            self.scope_id = 0;
+            return null;
+        };
+        if (self.scope_id == 0 or active.id != self.scope_id or active.store == null) {
+            self.scope_id = 0;
+            return null;
+        }
+        return active;
+    }
+
+    pub fn observeCall(self: *Lifetime, start: ?i96, end: ?i96) void {
+        _ = self.matchingScope() orelse return;
+        if (start) |s| if (end) |e| {
+            self.calls_ns +|= elapsed(s, e);
+        };
+    }
+
+    pub fn afterCall(self: *Lifetime, start: ?i96) void {
+        self.observeCall(start, self.now());
+    }
+
+    pub fn finish(self: *Lifetime, finalize_start: ?i96) void {
+        self.finishAt(finalize_start, self.now());
+    }
+
+    fn finishAt(self: *Lifetime, finalize_start: ?i96, ended: ?i96) void {
+        defer self.* = .{};
+        const active = self.matchingScope() orelse return;
+        const end = ended orelse return;
+        self.observeCall(finalize_start, end);
+        active.store.?.recordLifetime(active, self.key, elapsed(self.started, end), self.calls_ns);
     }
 };
 
@@ -274,24 +368,94 @@ test "cross-thread retained measurements cannot alias another request scope" {
     const store = try Store.create(std.testing.allocator, std.testing.io, .{});
     defer store.destroy();
     const H = struct {
-        fn begin(s: *Store, measurement: *Measurement) void {
+        fn begin(s: *Store, measurement: *Measurement, lifetime: *Lifetime) void {
             var scope = Scope.init(s, "GET", "/first/:id");
             scope.enter();
             defer scope.leave();
-            _ = measurement.before("SELECT ?1");
+            _ = measurement.beforeKeyed(fingerprint("SELECT ?1"));
+            lifetime.* = Lifetime.begin();
+            lifetime.prepared("SELECT ?1");
         }
-        fn finish(s: *Store, measurement: *Measurement) void {
+        fn finish(s: *Store, measurement: *Measurement, lifetime: *Lifetime) void {
             var scope = Scope.init(s, "GET", "/second/:id");
             scope.enter();
             defer scope.leave();
             measurement.finish();
+            lifetime.finish(null);
         }
     };
     var measurement: Measurement = .{};
-    const first = try std.Thread.spawn(.{}, H.begin, .{ store, &measurement });
+    var lifetime: Lifetime = .{};
+    const first = try std.Thread.spawn(.{}, H.begin, .{ store, &measurement, &lifetime });
     first.join();
-    const second = try std.Thread.spawn(.{}, H.finish, .{ store, &measurement });
+    const second = try std.Thread.spawn(.{}, H.finish, .{ store, &measurement, &lifetime });
     second.join();
     try std.testing.expectEqual(@as(usize, 0), store.count);
     try std.testing.expect(current == null);
+}
+
+test "lifetime separates measured calls and held intervals without changing executions" {
+    const store = try Store.create(std.testing.allocator, std.testing.io, .{});
+    defer store.destroy();
+    var scope = Scope.init(store, "GET", "/held");
+    scope.enter();
+    defer scope.leave();
+    // Synthetic monotonic timestamps keep this partition test deterministic.
+    var lifetime = Lifetime{ .scope_id = scope.id, .key = 1, .started = 1000 };
+    lifetime.observeCall(1000, 1010); // prepare
+    lifetime.observeCall(1200, 1210); // step
+    lifetime.observeCall(1400, 1410); // reset
+    lifetime.observeCall(1600, 1610); // second execution
+    lifetime.finishAt(1800, 1810); // finalize
+    const e = store.entries[0];
+    try std.testing.expectEqual(@as(u64, 1), e.statements);
+    try std.testing.expectEqual(@as(u64, 810), e.lifetime_ns);
+    try std.testing.expectEqual(@as(u64, 810), e.max_lifetime_ns);
+    try std.testing.expectEqual(@as(u64, 50), e.calls_ns);
+    try std.testing.expectEqual(@as(u64, 760), e.held_ns);
+    try std.testing.expectEqual(@as(u64, 0), e.executions);
+    try std.testing.expectEqual(@as(u64, 0), e.slow);
+    try std.testing.expectEqual(@as(usize, 0), scope.seen_count);
+    // Finishing twice cannot record the same statement again.
+    lifetime.finishAt(1900, 1910);
+    try std.testing.expectEqual(@as(u64, 1), store.entries[0].statements);
+}
+
+test "lifetime bounds cardinality and saturates elapsed durations and counters" {
+    try std.testing.expectEqual(@as(u64, 0), elapsed(20, 10));
+    try std.testing.expectEqual(std.math.maxInt(u64), elapsed(std.math.minInt(i96), std.math.maxInt(i96)));
+    const store = try Store.create(std.testing.allocator, std.testing.io, .{ .max_entries = 1 });
+    defer store.destroy();
+    var scope = Scope.init(store, "GET", "/bounded");
+    scope.enter();
+    defer scope.leave();
+    store.recordLifetime(&scope, 1, std.math.maxInt(u64), std.math.maxInt(u64));
+    store.entries[0].statements = std.math.maxInt(u64);
+    store.entries[0].held_ns = std.math.maxInt(u64);
+    store.recordLifetime(&scope, 1, 20, 10);
+    try std.testing.expectEqual(std.math.maxInt(u64), store.entries[0].statements);
+    try std.testing.expectEqual(std.math.maxInt(u64), store.entries[0].lifetime_ns);
+    try std.testing.expectEqual(std.math.maxInt(u64), store.entries[0].calls_ns);
+    try std.testing.expectEqual(std.math.maxInt(u64), store.entries[0].held_ns);
+    store.recordLifetime(&scope, 2, 20, 10);
+    store.recordLifetime(&scope, null, 20, 10);
+    try std.testing.expectEqual(@as(usize, 1), store.count);
+    try std.testing.expectEqual(@as(u64, 2), store.dropped_statements);
+    try std.testing.expectEqual(@as(u64, 0), store.dropped);
+}
+
+test "lifetime crossing scopes is omitted even when control returns to its origin" {
+    const store = try Store.create(std.testing.allocator, std.testing.io, .{});
+    defer store.destroy();
+    var outer = Scope.init(store, "GET", "/outer");
+    outer.enter();
+    defer outer.leave();
+    var lifetime = Lifetime.begin();
+    lifetime.prepared("SELECT 1");
+    var inner = Scope.init(store, "GET", "/inner");
+    inner.enter();
+    try std.testing.expectEqual(null, lifetime.now());
+    inner.leave();
+    lifetime.finish(null);
+    try std.testing.expectEqual(@as(usize, 0), store.count);
 }

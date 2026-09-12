@@ -279,6 +279,14 @@ set `.query_workbench = .{ .max_entries = 64, .slow_ms = 100 }`. The operator-on
 SQLite workbench reports route-template/structural-shape metrics without SQL or
 parameter capture, and plans schema-validated SELECT shapes without executing
 them. It is fully absent by default; PostgreSQL is outside this first slice.
+Completed-statement lifecycle timing separates measured prepare/step/cleanup
+calls from time held between them, including application pauses and row handling.
+In-scope prepares fingerprint compiled SQL once and reuse the key on reset;
+statements prepared outside scope retain execution-time fingerprinting.
+Each in-scope finalization adds one mutex-guarded store update with a bounded
+entry scan.
+This helps distinguish slow SQLite calls from long-lived statements without
+claiming CPU or full-request latency; enabled counters remain explicitly bounded.
 See [the framework workbench scope](./framework#bounded-sqlite-query-workbench-opt-in).
 
 For request backpressure, compile `.admission = .{ .max_requests = 3 }` into your
