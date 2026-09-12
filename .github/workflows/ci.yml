@@ -3,116 +3,167 @@ on:
   push:
     branches: [ main ]
   pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
 
 jobs:
+  # Only portable runtime artifacts belong on the browser/SDK dependency path.
+  # baseline CPU is required: producer and consumer runners can differ.
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        bundle: [core, examples]
     env:
       ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-global
-      # All zig builds in this job (main + every example, via inherited env) share
-      # ONE local cache dir, which is persisted across runs below. This is where the
-      # compiled vendored SQLite object actually lives.
       ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/.zig-local
     steps:
       - uses: actions/checkout@v7
-        with:
-          # The append-only ledger guards below compare against the merge base.
-          # A depth guess cannot reliably connect GitHub's synthetic PR merge
-          # commit after a force-push, so this job needs the actual history.
-          fetch-depth: 0
       - uses: jdx/mise-action@v4
-      # Global cache holds toolchain-shared artifacts (compiler_rt, translate-c, libc).
+        with:
+          install_args: ${{ matrix.bundle == 'examples' && 'zig node' || 'zig' }}
       - name: Cache zig global cache
         uses: actions/cache@v5
         with:
           path: ${{ github.workspace }}/.zig-global
           key: zig-global-${{ runner.os }}-zig0.16.0-${{ hashFiles('vendor/sqlite/sqlite3.c', 'build.zig', 'build.zig.zon') }}
           restore-keys: zig-global-${{ runner.os }}-zig0.16.0-
-      # Local cache holds the compiled SQLite amalgamation (the dominant clean-build
-      # cost — ~5-8s per `zig build`, recompiled for each example without this) plus
-      # every other build object. The sha-suffixed key writes a fresh entry each run;
-      # restore-keys fuzzy-match the most recent, and zig's content-addressed cache
-      # reuses any unchanged object (sqlite3.o) even when other sources changed.
-      - name: Cache zig local cache
-        uses: actions/cache@v5
-        with:
-          path: ${{ github.workspace }}/.zig-local
-          key: zig-local-build-${{ runner.os }}-zig0.16.0-${{ github.ref_name }}-${{ hashFiles('vendor/sqlite/sqlite3.c', 'build.zig', 'build.zig.zon') }}-${{ github.sha }}
-          restore-keys: |
-            zig-local-build-${{ runner.os }}-zig0.16.0-${{ github.ref_name }}-${{ hashFiles('vendor/sqlite/sqlite3.c', 'build.zig', 'build.zig.zon') }}-
-            zig-local-build-${{ runner.os }}-zig0.16.0-${{ github.ref_name }}-
       - name: Cache npm downloads
+        if: matrix.bundle == 'examples'
         uses: actions/cache@v5
         with:
           path: ~/.npm
           key: npm-${{ runner.os }}-${{ hashFiles('**/package-lock.json') }}
           restore-keys: npm-${{ runner.os }}-
       - name: Build plugins example frontend (embedded into the plugins binary)
+        if: matrix.bundle == 'examples'
         run: cd examples/plugins/frontend && ./build.sh
-      # Shared binaries are built once here and run on OTHER jobs' runners, so they
-      # must target a portable CPU — zig's default is -mcpu=native, which can emit
-      # instructions a different runner lacks (→ SIGILL on startup). -Dcpu=baseline
-      # keeps them runnable on any x86_64 runner. (gen-*-check below run the generator
-      # on THIS runner, so they don't need it.)
+      - name: Build Golfsim frontend
+        if: matrix.bundle == 'examples'
+        run: cd examples/golfsim/frontend && ./build.sh
+      - name: Build portable runtime fixtures (two compiler workers)
+        if: matrix.bundle == 'core'
+        run: >-
+          mise exec zig@0.16.0 -- zig build install dating-server auth2-server
+          features-fixture admission-fixture feature-remapped-fixture
+          feature-disabled-fixture import-fixture full-fixture
+          -Dcpu=baseline -j2 --summary all
+      - name: Build blog example consumer (dependency-graph proof)
+        if: matrix.bundle == 'examples'
+        run: cd examples/blog && mise exec zig@0.16.0 -- zig build -Dcpu=baseline
+      - name: Build golfsim example consumer (realistic app)
+        if: matrix.bundle == 'examples'
+        run: cd examples/golfsim && mise exec zig@0.16.0 -- zig build -Dcpu=baseline
+      - name: Build plugins example consumer (advanced framework surface)
+        if: matrix.bundle == 'examples'
+        run: cd examples/plugins && mise exec zig@0.16.0 -- zig build -Dcpu=baseline
+      - name: Pack core runtime paths
+        if: matrix.bundle == 'core'
+        run: tar -cf runtime-core.tar zig-out/bin
+      - name: Pack example runtime paths
+        if: matrix.bundle == 'examples'
+        run: >-
+          tar -cf runtime-examples.tar
+          examples/blog/zig-out/bin/blog
+          examples/golfsim/zig-out/bin/golfsim
+          examples/golfsim/frontend/dist
+          examples/plugins/zig-out/bin/plugins
+      - name: Upload prebuilt binaries
+        uses: actions/upload-artifact@v7
+        with:
+          name: zigbase-binaries-${{ matrix.bundle }}
+          path: runtime-${{ matrix.bundle }}.tar
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 1
+
+  contracts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-global
+      ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/.zig-local
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: jdx/mise-action@v4
+        with:
+          install_args: zig python node
+      - name: Cache zig global cache
+        uses: actions/cache@v5
+        with:
+          path: ${{ github.workspace }}/.zig-global
+          key: zig-global-${{ runner.os }}-zig0.16.0-${{ hashFiles('vendor/sqlite/sqlite3.c', 'build.zig', 'build.zig.zon') }}
+          restore-keys: zig-global-${{ runner.os }}-zig0.16.0-
+      - name: Cache npm downloads
+        uses: actions/cache@v5
+        with:
+          path: ~/.npm
+          key: npm-${{ runner.os }}-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: npm-${{ runner.os }}-
       - name: Build main zigbase binary
         run: mise exec zig@0.16.0 -- zig build -Dcpu=baseline
-      - name: Build blog example consumer (dependency-graph proof)
-        run: cd examples/blog && mise exec zig@0.16.0 -- zig build -Dcpu=baseline
-      # The examples are also the reference for how a consumer tests their app,
-      # so blog's in-process suite runs in CI rather than only compiling.
+      - name: Build lean gating fixture
+        run: mise exec zig@0.16.0 -- zig build minimal-server
+      - name: Build full gating fixture (positive control; also the browser suite's analytics-enabled fixture)
+        run: mise exec zig@0.16.0 -- zig build full-fixture -Dcpu=baseline
+      - name: Build zigbase binary without dev-tools (custom-build proof; not a published artifact)
+        run: mise exec zig@0.16.0 -- zig build -Dcpu=baseline -Ddev-tools=false -p zig-out-devtools-off
       - name: Blog example in-process tests (zigbase.testing)
         run: cd examples/blog && mise exec zig@0.16.0 -- zig build test --summary all
-      - name: Build golfsim example consumer (realistic app)
-        run: cd examples/golfsim && mise exec zig@0.16.0 -- zig build -Dcpu=baseline
-      # golfsim's `.static_files` dir is comptime-hardcoded (not --serve-static), so the app
-      # — including zigbase.testing's socketless boot below — refuses to boot at all unless
-      # frontend/dist already exists. Build it first (mirrors harness.ts's ensureFrontend()).
       - name: Golfsim example in-process tests (zigbase.testing)
         run: |
           cd examples/golfsim/frontend
           ./build.sh
           cd ../
           mise exec zig@0.16.0 -- zig build test --summary all
-      - name: Build dating-server (e2e fixture binary)
-        run: mise exec zig@0.16.0 -- zig build dating-server -Dcpu=baseline
-      - name: Build auth2-server (e2e fixture binary)
-        run: mise exec zig@0.16.0 -- zig build auth2-server -Dcpu=baseline
-      - name: Build features-fixture (demo flags/experiments browser fixture)
-        run: mise exec zig@0.16.0 -- zig build features-fixture -Dcpu=baseline
-      - name: Build concurrent HTTP admission fixture
-        run: mise exec zig@0.16.0 -- zig build admission-fixture check-admission-contracts check-realtime-cap-contracts -Dcpu=baseline
-      - name: Build configured feature-route fixtures
-        run: |
-          mise exec zig@0.16.0 -- zig build feature-remapped-fixture -Dcpu=baseline
-          mise exec zig@0.16.0 -- zig build feature-disabled-fixture -Dcpu=baseline
       - name: Consumer route compile-fail contracts
         run: mise exec zig@0.16.0 -- zig build check-route-contracts -Dcpu=baseline
       - name: Scheduler and memory-worker compile-fail contracts
         run: mise exec zig@0.16.0 -- zig build check-scheduler-contracts check-memory-job-contracts -Dcpu=baseline
-      - name: Build import-fixture (offline-import e2e fixture, #283)
-        run: mise exec zig@0.16.0 -- zig build import-fixture -Dcpu=baseline
-      - name: Build lean gating fixture
-        run: mise exec zig@0.16.0 -- zig build minimal-server
-      - name: Build full gating fixture (positive control; also the browser suite's analytics-enabled fixture)
-        run: mise exec zig@0.16.0 -- zig build full-fixture -Dcpu=baseline
-      # Fourth gating reference for check-gating.sh: the SAME zigbase binary rebuilt
-      # with -Ddev-tools=false, to a separate --prefix so it doesn't clobber the
-      # default one just built above. Proves init/agents-md/typegen (src/scaffold*.zig,
-      # src/codegen/**) actually disappear from a consumer's own custom build — NOT a
-      # published artifact; every GitHub release / Docker image / npm package we ship
-      # builds at the default (-Ddev-tools on).
-      - name: Build zigbase binary without dev-tools (custom-build proof; not a published artifact)
-        run: mise exec zig@0.16.0 -- zig build -Dcpu=baseline -Ddev-tools=false -p zig-out-devtools-off
+      - name: Admission and realtime compile contracts
+        run: mise exec zig@0.16.0 -- zig build check-admission-contracts check-realtime-cap-contracts
       - name: Disabled agent CLI rejects discovery and diagnostics
         run: mise exec python@3.13 -- python scripts/check-disabled-agent-cli.py zig-out-devtools-off/bin/zigbase
       - name: Gating invariant (absent-symbols check)
         run: ./scripts/check-gating.sh
       - name: Allocator ownership contracts (ratchet)
         run: ./scripts/check-allocator-contracts.sh
+      - name: Error-code ledger is append-only
+        run: ./scripts/check-error-code-ledger.sh origin/main
+      - name: Doctor check-id ledger is append-only
+        run: ./scripts/check-doctor-ledger.sh origin/main
+      - name: Changelog fragments are valid
+        run: ./scripts/assemble-changelog.sh --dry-run >/dev/null
+
+  performance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-global
+      ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/.zig-local
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v4
+        with:
+          install_args: zig python
+      - name: Cache zig global cache
+        uses: actions/cache@v5
+        with:
+          path: ${{ github.workspace }}/.zig-global
+          key: zig-global-${{ runner.os }}-zig0.16.0-${{ hashFiles('vendor/sqlite/sqlite3.c', 'build.zig', 'build.zig.zon') }}
+          restore-keys: zig-global-${{ runner.os }}-zig0.16.0-
       - name: Realtime fanout benchmark correctness (no timing threshold)
         run: mise exec zig@0.16.0 -- zig build bench -Dbench-optimize=ReleaseSafe -- --realtime-only --json
-      - name: Performance contract parser and generated-report tests
-        run: mise exec python@3.13 -- python -m unittest discover -s tests/tools -p test_performance_contracts.py
       - name: Binary size and allocation contracts (no timing threshold)
         run: mise exec python@3.13 zig@0.16.0 -- bash scripts/check-performance.sh > performance-contract-report.json
       - uses: actions/upload-artifact@v7
@@ -121,54 +172,39 @@ jobs:
           name: performance-contract-report
           path: performance-contract-report.json
           if-no-files-found: ignore
-      - name: Error-code ledger is append-only
-        run: ./scripts/check-error-code-ledger.sh origin/main
-      - name: Doctor check-id ledger is append-only
-        run: ./scripts/check-doctor-ledger.sh origin/main
-      - name: Changelog fragments are valid
-        run: ./scripts/assemble-changelog.sh --dry-run >/dev/null
+
+  codegen:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-global
+      ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/.zig-local
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v4
+        with:
+          install_args: zig python dart java gradle
+      - name: Cache zig global cache
+        uses: actions/cache@v5
+        with:
+          path: ${{ github.workspace }}/.zig-global
+          key: zig-global-${{ runner.os }}-zig0.16.0-${{ hashFiles('vendor/sqlite/sqlite3.c', 'build.zig', 'build.zig.zon') }}
+          restore-keys: zig-global-${{ runner.os }}-zig0.16.0-
       - name: Dating client snapshot is fresh
         run: mise exec zig@0.16.0 -- zig build gen-dating-client-check
       - name: Dating runtime client snapshot is fresh
         run: mise exec zig@0.16.0 -- zig build gen-dating-runtime-client-check
-      # Format-then-diff so the comparison can never fail on formatter style alone.
-      # --language-version pins the formatter's style (short, matching the package's
-      # `sdk: ^3.5.0` in clients/dart/pubspec.yaml) because this job never runs
-      # `dart pub get`, and without a package config `dart format` silently falls
-      # back to the LATEST language version (tall style) — a pure-formatting diff.
       - name: Dating Dart client snapshot is fresh
         run: |
           mise exec zig@0.16.0 -- zig build gen-dating-dart-client
           mise exec dart@3.12 -- dart format --language-version=3.5 clients/dart/test/codegen/dating/zbase.gen.dart
           git diff --exit-code clients/dart/test/codegen/dating/zbase.gen.dart
-      # Same format-then-diff shape as the Dart snapshot above: the Python
-      # golden is committed `ruff format`-clean, and the raw generator output
-      # differs from it only in blank-line normalization, so a byte-exact
-      # `--check` (unlike the TS/runtime `gen-*-check` steps) would false-
-      # positive on formatting alone. `ruff` is installed standalone here
-      # (not the full `zigbase[dev]` extra) since this job only needs the
-      # formatter, not the whole python-sdk toolchain (see the `python-sdk`
-      # job below for that). Version pinned for the same reason the Dart
-      # snapshot's `--language-version` above is pinned: this job never runs
-      # `pip install -e clients/python[dev]`, so nothing else constrains the
-      # version, and an unpinned `pip install ruff` could silently pick up a
-      # newer release whose formatter disagrees with the one that produced
-      # the committed golden — a pure tooling-version diff, not a real
-      # regression. Bump deliberately alongside `clients/python/pyproject.toml`'s
-      # `ruff>=0.8` dev-extra floor.
       - name: Dating Python client snapshot is fresh
         run: |
           mise exec zig@0.16.0 -- zig build gen-dating-python-client
           mise exec python@3.13 -- python -m pip install --quiet ruff==0.15.21
           mise exec python@3.13 -- python -m ruff format clients/python/tests/codegen/dating/zbase_gen.py
           git diff --exit-code clients/python/tests/codegen/dating/zbase_gen.py
-      # Same format-then-diff shape as the Dart/Python snapshots above: the
-      # committed Kotlin golden is Spotless (ktlint)-clean, but the raw
-      # generator output isn't formatted (compact form), so a byte-exact
-      # `--check` would false-positive on formatting alone. `spotlessApply`
-      # normalizes the regenerated file to exactly what a fresh, correct
-      # golden looks like; the scoped `--exit-code` diff then fails only on a
-      # real semantic drift (an emitter change that wasn't regenerated).
       - name: Dating Kotlin client snapshot is fresh
         run: |
           mise exec zig@0.16.0 -- zig build gen-dating-kotlin-client
@@ -177,28 +213,6 @@ jobs:
       - name: Golfsim client snapshot is fresh
         working-directory: examples/golfsim
         run: mise exec zig@0.16.0 -- zig build gen-client-check
-      - name: Build plugins example consumer (advanced framework surface)
-        run: cd examples/plugins && mise exec zig@0.16.0 -- zig build -Dcpu=baseline
-      - name: Upload prebuilt binaries
-        uses: actions/upload-artifact@v7
-        with:
-          name: zigbase-binaries
-          path: |
-            zig-out/bin/zigbase
-            zig-out/bin/dating-server
-            zig-out/bin/auth2-server
-            zig-out/bin/features-fixture
-            zig-out/bin/feature-remapped-fixture
-            zig-out/bin/feature-disabled-fixture
-            zig-out/bin/import-fixture
-            zig-out/bin/full-fixture
-            zig-out/bin/admission-fixture
-            examples/blog/zig-out/bin/blog
-            examples/golfsim/zig-out/bin/golfsim
-            examples/golfsim/frontend/dist/
-            examples/plugins/zig-out/bin/plugins
-          if-no-files-found: error
-          retention-days: 1
 
   unit:
     runs-on: ubuntu-latest
@@ -216,17 +230,6 @@ jobs:
           path: ${{ github.workspace }}/.zig-global
           key: zig-global-${{ runner.os }}-zig0.16.0-${{ hashFiles('vendor/sqlite/sqlite3.c', 'build.zig', 'build.zig.zon') }}
           restore-keys: zig-global-${{ runner.os }}-zig0.16.0-
-      # Persists the compiled SQLite object (and the test binary) across runs — see the
-      # build job for rationale. Separate key prefix: the test binary differs from the
-      # build job's artifacts, so they don't share cache entries.
-      - name: Cache zig local cache
-        uses: actions/cache@v5
-        with:
-          path: ${{ github.workspace }}/.zig-local
-          key: zig-local-unit-${{ runner.os }}-zig0.16.0-${{ github.ref_name }}-${{ hashFiles('vendor/sqlite/sqlite3.c', 'build.zig', 'build.zig.zon') }}-${{ github.sha }}
-          restore-keys: |
-            zig-local-unit-${{ runner.os }}-zig0.16.0-${{ github.ref_name }}-${{ hashFiles('vendor/sqlite/sqlite3.c', 'build.zig', 'build.zig.zon') }}-
-            zig-local-unit-${{ runner.os }}-zig0.16.0-${{ github.ref_name }}-
       - name: Formatting gate (zig fmt --check)
         run: mise exec zig@0.16.0 -- zig fmt --check src build.zig
       - name: Unit tests
@@ -256,6 +259,7 @@ jobs:
   # auth + extended-protocol query/transaction/pool tests. The container forces SCRAM
   # (POSTGRES_HOST_AUTH_METHOD=scram-sha-256); ZIGBASE_PG_TEST_URL points the live tests at
   # it. The default SQLite jobs above are untouched, so the default story can't regress.
+
   postgres:
     runs-on: ubuntu-latest
     env:
@@ -299,17 +303,6 @@ jobs:
           path: ${{ github.workspace }}/.zig-global
           key: zig-global-${{ runner.os }}-zig0.16.0-${{ hashFiles('vendor/sqlite/sqlite3.c', 'build.zig', 'build.zig.zon') }}
           restore-keys: zig-global-${{ runner.os }}-zig0.16.0-
-      - name: Cache zig local cache
-        uses: actions/cache@v5
-        with:
-          path: ${{ github.workspace }}/.zig-local
-          key: zig-local-postgres-${{ runner.os }}-zig0.16.0-${{ github.ref_name }}-${{ hashFiles('vendor/sqlite/sqlite3.c', 'build.zig', 'build.zig.zon') }}-${{ github.sha }}
-          restore-keys: |
-            zig-local-postgres-${{ runner.os }}-zig0.16.0-${{ github.ref_name }}-${{ hashFiles('vendor/sqlite/sqlite3.c', 'build.zig', 'build.zig.zon') }}-
-            zig-local-postgres-${{ runner.os }}-zig0.16.0-${{ github.ref_name }}-
-      # -Dvector=true so the live pgvector KNN parity + tenant/ability chokepoint tests run too
-      # (sqlite-vec is also compiled in; the SQLite vector tests run alongside). The pgvector image
-      # above makes `CREATE EXTENSION vector` succeed for the superuser test role.
       - name: Unit + PostgreSQL driver tests (-Dpostgres=true -Dvector=true)
         run: mise exec zig@0.16.0 -- zig build test --summary all -Dpostgres=true -Dvector=true
       - name: Rails PostgreSQL row-source integration
@@ -321,6 +314,7 @@ jobs:
   # exercising the TLS handshake, the dual-layer flushOut, and TLS partial-read framing (the
   # exact area a flush hang already bit). The stock service-container image has no TLS, so we
   # run our own PG via `docker run` with a generated self-signed cert + scram-sha-256.
+
   postgres-tls:
     runs-on: ubuntu-latest
     env:
@@ -340,14 +334,6 @@ jobs:
           path: ${{ github.workspace }}/.zig-global
           key: zig-global-${{ runner.os }}-zig0.16.0-${{ hashFiles('vendor/sqlite/sqlite3.c', 'build.zig', 'build.zig.zon') }}
           restore-keys: zig-global-${{ runner.os }}-zig0.16.0-
-      - name: Cache zig local cache
-        uses: actions/cache@v5
-        with:
-          path: ${{ github.workspace }}/.zig-local
-          key: zig-local-postgres-${{ runner.os }}-zig0.16.0-${{ github.ref_name }}-${{ hashFiles('vendor/sqlite/sqlite3.c', 'build.zig', 'build.zig.zon') }}-${{ github.sha }}
-          restore-keys: |
-            zig-local-postgres-${{ runner.os }}-zig0.16.0-${{ github.ref_name }}-${{ hashFiles('vendor/sqlite/sqlite3.c', 'build.zig', 'build.zig.zon') }}-
-            zig-local-postgres-${{ runner.os }}-zig0.16.0-${{ github.ref_name }}-
       - name: Start PostgreSQL with server TLS + SCRAM
         run: |
           mkdir -p "$PWD/pgtls"
@@ -386,6 +372,7 @@ jobs:
   # SeaweedFS started via `docker run` with a pre-created bucket. Default jobs
   # keep the stock flags, so both configurations compile on every PR (the
   # postgres two-config precedent).
+
   s3:
     runs-on: ubuntu-latest
     env:
@@ -406,14 +393,6 @@ jobs:
           path: ${{ github.workspace }}/.zig-global
           key: zig-global-${{ runner.os }}-zig0.16.0-${{ hashFiles('vendor/sqlite/sqlite3.c', 'build.zig', 'build.zig.zon') }}
           restore-keys: zig-global-${{ runner.os }}-zig0.16.0-
-      - name: Cache zig local cache
-        uses: actions/cache@v5
-        with:
-          path: ${{ github.workspace }}/.zig-local
-          key: zig-local-s3-${{ runner.os }}-zig0.16.0-${{ github.ref_name }}-${{ hashFiles('vendor/sqlite/sqlite3.c', 'build.zig', 'build.zig.zon') }}-${{ github.sha }}
-          restore-keys: |
-            zig-local-s3-${{ runner.os }}-zig0.16.0-${{ github.ref_name }}-${{ hashFiles('vendor/sqlite/sqlite3.c', 'build.zig', 'build.zig.zon') }}-
-            zig-local-s3-${{ runner.os }}-zig0.16.0-${{ github.ref_name }}-
       - name: Start SeaweedFS + wait for authenticated bucket access
         run: |
           # SeaweedFS 4.46; pin the manifest digest rather than a mutable tag.
@@ -459,134 +438,6 @@ jobs:
         if: always()
         run: docker rm -fv seaweedfs || true
 
-  browser:
-    runs-on: ubuntu-latest
-    needs: build
-    steps:
-      - uses: actions/checkout@v7
-      - uses: jdx/mise-action@v4
-        with:
-          install_args: node@24 python@3.13 zig@0.16.0
-      - name: Download prebuilt binaries
-        uses: actions/download-artifact@v8
-        with:
-          name: zigbase-binaries
-          path: artifacts
-      - name: Export prebuilt binary paths
-        run: |
-          chmod +x artifacts/zig-out/bin/zigbase \
-                   artifacts/zig-out/bin/auth2-server \
-                   artifacts/examples/blog/zig-out/bin/blog \
-                   artifacts/examples/plugins/zig-out/bin/plugins
-          echo "ZIGBASE_TEST_BINARY=$GITHUB_WORKSPACE/artifacts/zig-out/bin/zigbase" >> "$GITHUB_ENV"
-          echo "ZIGBASE_TEST_AUTH2_BINARY=$GITHUB_WORKSPACE/artifacts/zig-out/bin/auth2-server" >> "$GITHUB_ENV"
-          echo "ZIGBASE_TEST_BLOG_BINARY=$GITHUB_WORKSPACE/artifacts/examples/blog/zig-out/bin/blog" >> "$GITHUB_ENV"
-          chmod +x artifacts/examples/golfsim/zig-out/bin/golfsim
-          echo "ZIGBASE_TEST_GOLFSIM_BINARY=$GITHUB_WORKSPACE/artifacts/examples/golfsim/zig-out/bin/golfsim" >> "$GITHUB_ENV"
-          cp -R artifacts/examples/golfsim/frontend/dist examples/golfsim/frontend/dist
-          echo "ZIGBASE_TEST_PLUGINS_BINARY=$GITHUB_WORKSPACE/artifacts/examples/plugins/zig-out/bin/plugins" >> "$GITHUB_ENV"
-          chmod +x artifacts/zig-out/bin/features-fixture
-          echo "ZIGBASE_FEATURES_BINARY=$GITHUB_WORKSPACE/artifacts/zig-out/bin/features-fixture" >> "$GITHUB_ENV"
-          chmod +x artifacts/zig-out/bin/feature-remapped-fixture artifacts/zig-out/bin/feature-disabled-fixture
-          echo "ZIGBASE_TEST_FEATURE_REMAPPED_BINARY=$GITHUB_WORKSPACE/artifacts/zig-out/bin/feature-remapped-fixture" >> "$GITHUB_ENV"
-          echo "ZIGBASE_TEST_FEATURE_DISABLED_BINARY=$GITHUB_WORKSPACE/artifacts/zig-out/bin/feature-disabled-fixture" >> "$GITHUB_ENV"
-          chmod +x artifacts/zig-out/bin/import-fixture
-          echo "ZIGBASE_TEST_IMPORT_BINARY=$GITHUB_WORKSPACE/artifacts/zig-out/bin/import-fixture" >> "$GITHUB_ENV"
-          chmod +x artifacts/zig-out/bin/full-fixture
-          chmod +x artifacts/zig-out/bin/admission-fixture
-          echo "ZIGBASE_TEST_ADMISSION_BINARY=$GITHUB_WORKSPACE/artifacts/zig-out/bin/admission-fixture" >> "$GITHUB_ENV"
-          echo "ZIGBASE_TEST_FULL_BINARY=$GITHUB_WORKSPACE/artifacts/zig-out/bin/full-fixture" >> "$GITHUB_ENV"
-      - name: Install Python test deps + resolve Playwright version
-        id: pw
-        run: |
-          mise exec python@3.13 -- python -m pip install --quiet pytest pytest-xdist playwright aiosmtpd
-          echo "version=$(mise exec python@3.13 -- python -c 'import importlib.metadata as m; print(m.version("playwright"))')" >> "$GITHUB_OUTPUT"
-      - name: Cache Playwright browser (chromium headless shell)
-        id: pw-cache
-        uses: actions/cache@v5
-        with:
-          path: ~/.cache/ms-playwright
-          key: ${{ runner.os }}-playwright-${{ steps.pw.outputs.version }}-chromium-shell
-      - name: Install Chromium headless shell + OS deps (cache miss)
-        if: steps.pw-cache.outputs.cache-hit != 'true'
-        run: mise exec python@3.13 -- python -m playwright install --with-deps --only-shell chromium
-      - name: Install Playwright OS deps (cache hit)
-        if: steps.pw-cache.outputs.cache-hit == 'true'
-        run: mise exec python@3.13 -- python -m playwright install-deps chromium
-      - name: Opt-in realtime backfill regressions
-        run: |
-          mise exec zig@0.16.0 -- zig build -Drealtime-backfill=true --prefix zig-out/backfill
-          ZIGBASE_TEST_BACKFILL_BINARY="$GITHUB_WORKSPACE/zig-out/backfill/bin/zigbase" mise exec python@3.13 -- python -m pytest tests/admin/test_realtime_backfill.py -q
-      - name: Opt-in bounded SQLite query workbench
-        run: |
-          mise exec zig@0.16.0 -- zig build check-query-workbench-contracts
-          mise exec zig@0.16.0 -- zig build test -Dquery-workbench=true --summary all
-          mise exec zig@0.16.0 -- zig build query-workbench-fixture check-query-workbench-contracts -Dquery-workbench=true --prefix zig-out/workbench
-          bash scripts/check-query-workbench-gating.sh "$ZIGBASE_TEST_BINARY" zig-out/workbench/bin/query-workbench-fixture
-          ZIGBASE_TEST_QUERY_WORKBENCH_BINARY="$GITHUB_WORKSPACE/zig-out/workbench/bin/query-workbench-fixture" mise exec python@3.13 -- python -m pytest tests/admin/test_query_workbench.py -q
-      - name: SQLite consumer migration process coordination
-        run: |
-          mise exec zig@0.16.0 -- zig build migration-coordination-fixture
-          ZIGBASE_TEST_MIGRATION_COORDINATION_BINARY="$GITHUB_WORKSPACE/zig-out/bin/migration-coordination-fixture" mise exec python@3.13 -- python -m pytest tests/admin/test_migration_coordination.py -q
-      - name: Opt-in idempotent custom mutations
-        run: |
-          mise exec zig@0.16.0 -- zig build idempotency-fixture check-idempotency-contracts
-          bash scripts/check-idempotency-gating.sh "$ZIGBASE_TEST_BINARY" zig-out/bin/idempotency-fixture
-          ZIGBASE_TEST_IDEMPOTENCY_BINARY="$GITHUB_WORKSPACE/zig-out/bin/idempotency-fixture" mise exec python@3.13 -- python -m pytest tests/admin/test_idempotency.py -q
-      - name: Install optional thumbnail test dependency
-        run: sudo apt-get update && sudo apt-get install -y imagemagick
-      - name: Opt-in ImageMagick thumbnail regressions and gating
-        run: |
-          mise exec zig@0.16.0 -- zig build check-thumbnail-contracts
-          mise exec zig@0.16.0 -- zig build check-thumbnail-contracts -Dimage-thumbnails=true
-          mise exec zig@0.16.0 -- zig build test -Dimage-thumbnails=true --summary all
-          mise exec zig@0.16.0 -- zig build thumbnails-fixture -Dimage-thumbnails=true --prefix zig-out/thumbnails
-          bash scripts/check-gating.sh --image-thumbnails "$ZIGBASE_TEST_BINARY" zig-out/thumbnails/bin/thumbnails-fixture
-          ZIGBASE_TEST_THUMBNAILS_BINARY="$GITHUB_WORKSPACE/zig-out/thumbnails/bin/thumbnails-fixture" mise exec python@3.13 -- python -m pytest tests/admin/test_thumbnails.py -q
-          mise exec python@3.13 -- python -m pytest examples/golfsim/test/test_thumbnail_gallery.py -q
-      - name: Thumbnail-enabled Golfsim consumer
-        working-directory: examples/golfsim
-        run: |
-          mise exec zig@0.16.0 -- zig build -Dimage-thumbnails=true --summary all
-          mise exec zig@0.16.0 -- zig build test gen-client-check -Dimage-thumbnails=true --summary all
-      - name: Configurable memory-job worker resources
-        run: |
-          mise exec zig@0.16.0 -- zig build memory-jobs-fixture
-          ZIGBASE_TEST_MEMORY_JOBS_BINARY="$GITHUB_WORKSPACE/zig-out/bin/memory-jobs-fixture" mise exec python@3.13 -- python -m pytest tests/admin/test_memory_jobs.py -q
-      - name: Opt-in resumable upload regressions and gating
-        run: |
-          mise exec zig@0.16.0 -- zig build check-resumable-contracts
-          mise exec zig@0.16.0 -- zig build check-resumable-contracts -Dresumable-uploads=true
-          mise exec zig@0.16.0 -- zig build test -Dresumable-uploads=true --summary all
-          mise exec zig@0.16.0 -- zig build resumable-uploads-fixture -Dresumable-uploads=true --prefix zig-out/resumable
-          bash scripts/check-gating.sh --resumable-uploads "$ZIGBASE_TEST_BINARY" zig-out/resumable/bin/resumable-uploads-fixture
-          ZIGBASE_TEST_UPLOADS_OFF_BINARY="$ZIGBASE_TEST_BINARY" ZIGBASE_TEST_RESUMABLE_BINARY="$GITHUB_WORKSPACE/zig-out/resumable/bin/resumable-uploads-fixture" mise exec python@3.13 -- python -m pytest tests/admin/test_resumable_uploads.py -q
-      - name: SQLite upload restart recovery and persistence gating
-        run: |
-          mise exec zig@0.16.0 -- zig build test durable-uploads-fixture check-resumable-contracts -Dresumable-uploads=true -Ddurable-resumable-uploads=true --prefix zig-out/durable-uploads --summary all
-          bash scripts/check-gating.sh --durable-uploads zig-out/resumable/bin/resumable-uploads-fixture zig-out/durable-uploads/bin/durable-uploads-fixture
-          ZIGBASE_TEST_DURABLE_UPLOADS_BINARY="$GITHUB_WORKSPACE/zig-out/durable-uploads/bin/durable-uploads-fixture" mise exec python@3.13 -- python -m pytest tests/admin/test_durable_uploads.py -q
-      - name: Headless browser tests
-        # -n auto parallelizes across the runner's vCPUs (each test binds its own
-        # free port + tempdir, so the harness is parallel-safe). Keep tests/smtp
-        # serial below — it binds a real fixed TLS port.
-        run: mise exec python@3.13 -- python -m pytest tests/admin -q -n auto
-      - name: Blog Zigapagos browser flow
-        working-directory: examples/blog
-        run: |
-          mise exec node@24 -- npm install
-          mise exec node@24 -- npm run build:frontend
-          mise exec python@3.13 -- python test/frontend.browser.py
-      - name: Server lifecycle + doctor CLI e2e
-        # Serial on purpose: these tests assert on timing (the readiness
-        # handshake, the child-death path, the TERM/KILL escalation) and on
-        # process-table state, which -n auto makes flaky for reasons unrelated
-        # to the code. No browser or Playwright involvement.
-        run: mise exec python@3.13 -- python -m pytest tests/cli -q
-      - name: Replay-harness unit tests
-        run: mise exec python@3.13 -- python -m pytest tests/tools -q
-      - name: Live SMTP-over-TLS (STARTTLS) delivery test
-        run: mise exec python@3.13 -- python -m pytest tests/smtp -q
 
   ts-sdk:
     runs-on: ubuntu-latest
@@ -599,8 +450,14 @@ jobs:
       - name: Download prebuilt binaries
         uses: actions/download-artifact@v8
         with:
-          name: zigbase-binaries
+          pattern: zigbase-binaries-*
+          merge-multiple: true
           path: artifacts
+      - name: Unpack prebuilt runtime paths
+        run: |
+          for bundle in core examples; do
+            tar -xf "artifacts/runtime-$bundle.tar" -C artifacts
+          done
       - name: Export prebuilt binary path
         run: |
           chmod +x artifacts/zig-out/bin/zigbase \
@@ -653,6 +510,7 @@ jobs:
       - name: Bare `zigbase` alias install test
         run: cd clients/typescript/npm && mise exec node@24 -- node --test test-alias-install.mjs
 
+
   public-site:
     runs-on: ubuntu-latest
     steps:
@@ -676,6 +534,7 @@ jobs:
         working-directory: site
         run: mise exec node@24 -- npm run test:browser
 
+
   agent-evals:
     runs-on: ubuntu-latest
     needs: build
@@ -689,8 +548,10 @@ jobs:
       - name: Download prebuilt ZigBase binary
         uses: actions/download-artifact@v8
         with:
-          name: zigbase-binaries
+          name: zigbase-binaries-core
           path: artifacts
+      - name: Unpack prebuilt runtime paths
+        run: tar -xf artifacts/runtime-core.tar -C artifacts
       - name: Export prebuilt binary path
         run: |
           chmod +x artifacts/zig-out/bin/zigbase
@@ -718,6 +579,7 @@ jobs:
           mise exec python@3.13 -- python -m pytest tests/pocketbase tests/rails tests/rails_fullstack tests/agent_evals -q
           mise exec python@3.13 -- python -m pytest --noconftest tests/admin/test_skill_sync.py -q
 
+
   dart-sdk:
     runs-on: ubuntu-latest
     needs: build
@@ -729,8 +591,10 @@ jobs:
       - name: Download prebuilt binaries
         uses: actions/download-artifact@v8
         with:
-          name: zigbase-binaries
+          name: zigbase-binaries-core
           path: artifacts
+      - name: Unpack prebuilt runtime paths
+        run: tar -xf artifacts/runtime-core.tar -C artifacts
       - name: Export prebuilt binary path
         run: |
           chmod +x artifacts/zig-out/bin/zigbase artifacts/zig-out/bin/dating-server
@@ -758,6 +622,7 @@ jobs:
         working-directory: clients/dart
         run: mise exec dart@3.12 -- dart test --tags integration
 
+
   python-sdk:
     runs-on: ubuntu-latest
     needs: build
@@ -769,8 +634,10 @@ jobs:
       - name: Download prebuilt binaries
         uses: actions/download-artifact@v8
         with:
-          name: zigbase-binaries
+          name: zigbase-binaries-core
           path: artifacts
+      - name: Unpack prebuilt runtime paths
+        run: tar -xf artifacts/runtime-core.tar -C artifacts
       - name: Export prebuilt binary path
         run: |
           chmod +x artifacts/zig-out/bin/zigbase artifacts/zig-out/bin/dating-server
@@ -802,6 +669,7 @@ jobs:
         working-directory: clients/python
         run: mise exec python@3.13 -- python -m pytest -q -m integration tests/integration
 
+
   kotlin-sdk:
     runs-on: ubuntu-latest
     needs: build
@@ -813,8 +681,10 @@ jobs:
       - name: Download prebuilt binaries
         uses: actions/download-artifact@v8
         with:
-          name: zigbase-binaries
+          name: zigbase-binaries-core
           path: artifacts
+      - name: Unpack prebuilt runtime paths
+        run: tar -xf artifacts/runtime-core.tar -C artifacts
       - name: Export prebuilt binary path
         run: |
           chmod +x artifacts/zig-out/bin/zigbase artifacts/zig-out/bin/dating-server
@@ -832,3 +702,245 @@ jobs:
         run: mise exec gradle@9.6 -- gradle -p clients/kotlin spotlessCheck build
       - name: Integration tests
         run: mise exec gradle@9.6 -- gradle -p clients/kotlin integrationTest
+
+  browser-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: build
+    env:
+      ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-global
+      ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/.zig-local
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v4
+        with:
+          install_args: zig python node
+      - name: Download prebuilt binaries
+        uses: actions/download-artifact@v8
+        with:
+          pattern: zigbase-binaries-*
+          merge-multiple: true
+          path: artifacts
+      - name: Unpack prebuilt runtime paths
+        run: |
+          for bundle in core examples; do
+            tar -xf "artifacts/runtime-$bundle.tar" -C artifacts
+          done
+      - name: Export prebuilt binary paths
+        run: |
+          chmod +x artifacts/zig-out/bin/zigbase \
+                   artifacts/zig-out/bin/auth2-server \
+                   artifacts/examples/blog/zig-out/bin/blog \
+                   artifacts/examples/plugins/zig-out/bin/plugins
+          echo "ZIGBASE_TEST_BINARY=$GITHUB_WORKSPACE/artifacts/zig-out/bin/zigbase" >> "$GITHUB_ENV"
+          echo "ZIGBASE_TEST_AUTH2_BINARY=$GITHUB_WORKSPACE/artifacts/zig-out/bin/auth2-server" >> "$GITHUB_ENV"
+          chmod +x artifacts/zig-out/bin/dating-server
+          echo "ZIGBASE_TEST_DATING_BINARY=$GITHUB_WORKSPACE/artifacts/zig-out/bin/dating-server" >> "$GITHUB_ENV"
+          echo "ZIGBASE_TEST_BLOG_BINARY=$GITHUB_WORKSPACE/artifacts/examples/blog/zig-out/bin/blog" >> "$GITHUB_ENV"
+          chmod +x artifacts/examples/golfsim/zig-out/bin/golfsim
+          echo "ZIGBASE_TEST_GOLFSIM_BINARY=$GITHUB_WORKSPACE/artifacts/examples/golfsim/zig-out/bin/golfsim" >> "$GITHUB_ENV"
+          cp -R artifacts/examples/golfsim/frontend/dist examples/golfsim/frontend/dist
+          echo "ZIGBASE_TEST_PLUGINS_BINARY=$GITHUB_WORKSPACE/artifacts/examples/plugins/zig-out/bin/plugins" >> "$GITHUB_ENV"
+          chmod +x artifacts/zig-out/bin/features-fixture
+          echo "ZIGBASE_FEATURES_BINARY=$GITHUB_WORKSPACE/artifacts/zig-out/bin/features-fixture" >> "$GITHUB_ENV"
+          chmod +x artifacts/zig-out/bin/feature-remapped-fixture artifacts/zig-out/bin/feature-disabled-fixture
+          echo "ZIGBASE_TEST_FEATURE_REMAPPED_BINARY=$GITHUB_WORKSPACE/artifacts/zig-out/bin/feature-remapped-fixture" >> "$GITHUB_ENV"
+          echo "ZIGBASE_TEST_FEATURE_DISABLED_BINARY=$GITHUB_WORKSPACE/artifacts/zig-out/bin/feature-disabled-fixture" >> "$GITHUB_ENV"
+          chmod +x artifacts/zig-out/bin/import-fixture
+          echo "ZIGBASE_TEST_IMPORT_BINARY=$GITHUB_WORKSPACE/artifacts/zig-out/bin/import-fixture" >> "$GITHUB_ENV"
+          chmod +x artifacts/zig-out/bin/full-fixture
+          chmod +x artifacts/zig-out/bin/admission-fixture
+          echo "ZIGBASE_TEST_ADMISSION_BINARY=$GITHUB_WORKSPACE/artifacts/zig-out/bin/admission-fixture" >> "$GITHUB_ENV"
+          echo "ZIGBASE_TEST_FULL_BINARY=$GITHUB_WORKSPACE/artifacts/zig-out/bin/full-fixture" >> "$GITHUB_ENV"
+      - name: Install Python test deps + resolve Playwright version
+        id: pw
+        run: |
+          mise exec python@3.13 -- python -m pip install --quiet pytest pytest-xdist playwright
+          echo "version=$(mise exec python@3.13 -- python -c 'import importlib.metadata as m; print(m.version("playwright"))')" >> "$GITHUB_OUTPUT"
+      - name: Cache Playwright browser (chromium headless shell)
+        id: pw-cache
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-playwright-${{ steps.pw.outputs.version }}-chromium-shell
+      - name: Install Chromium headless shell + OS deps (cache miss)
+        if: steps.pw-cache.outputs.cache-hit != 'true'
+        run: mise exec python@3.13 -- python -m playwright install --with-deps --only-shell chromium
+      - name: Install Playwright OS deps (cache hit)
+        if: steps.pw-cache.outputs.cache-hit == 'true'
+        run: mise exec python@3.13 -- python -m playwright install-deps chromium
+      - name: Headless browser tests
+        run: mise exec python@3.13 -- python -m pytest tests/admin -q -n auto
+      - name: Blog Zigapagos browser flow
+        working-directory: examples/blog
+        run: |
+          mise exec node@24 -- npm install
+          mise exec node@24 -- npm run build:frontend
+          mise exec python@3.13 -- python test/frontend.browser.py
+
+  cli-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: build
+    env:
+      ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-global
+      ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/.zig-local
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v4
+        with:
+          install_args: zig python
+      - name: Download prebuilt binaries
+        uses: actions/download-artifact@v8
+        with:
+          name: zigbase-binaries-core
+          path: artifacts
+      - name: Unpack prebuilt runtime paths
+        run: tar -xf artifacts/runtime-core.tar -C artifacts
+      - name: Export prebuilt binary path
+        run: |
+          test -x artifacts/zig-out/bin/zigbase
+          echo "ZIGBASE_TEST_BINARY=$GITHUB_WORKSPACE/artifacts/zig-out/bin/zigbase" >> "$GITHUB_ENV"
+      - name: Install serial CLI and SMTP test dependencies
+        run: mise exec python@3.13 -- python -m pip install --quiet pytest aiosmtpd
+      - name: Server lifecycle + doctor CLI e2e
+        run: mise exec python@3.13 -- python -m pytest tests/cli -q
+      - name: Replay-harness unit tests
+        run: mise exec python@3.13 -- python -m pytest tests/tools -q
+      - name: Live SMTP-over-TLS (STARTTLS) delivery test
+        run: mise exec python@3.13 -- python -m pytest tests/smtp -q
+
+  feature-tests:
+    # These are distinct configuration checks, not duplicates of default units.
+    # Build locally so no feature lane waits for unrelated portable artifacts.
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        lane: [workbench, thumbnails, resumable, durable, coordination]
+    env:
+      ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-global
+      ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/.zig-local
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v4
+        with:
+          install_args: ${{ matrix.lane == 'thumbnails' && 'zig python node' || 'zig python' }}
+      - name: Cache zig global cache
+        uses: actions/cache@v5
+        with:
+          path: ${{ github.workspace }}/.zig-global
+          key: zig-global-${{ runner.os }}-zig0.16.0-${{ hashFiles('vendor/sqlite/sqlite3.c', 'build.zig', 'build.zig.zon') }}
+          restore-keys: zig-global-${{ runner.os }}-zig0.16.0-
+      - name: Install common feature test dependencies
+        run: mise exec python@3.13 -- python -m pip install --quiet pytest
+      - name: Install thumbnail browser dependency + resolve version
+        if: matrix.lane == 'thumbnails'
+        id: pw
+        run: |
+          mise exec python@3.13 -- python -m pip install --quiet playwright
+          echo "version=$(mise exec python@3.13 -- python -c 'import importlib.metadata as m; print(m.version("playwright"))')" >> "$GITHUB_OUTPUT"
+      - name: Install upload test workers
+        if: matrix.lane == 'resumable' || matrix.lane == 'durable'
+        run: mise exec python@3.13 -- python -m pip install --quiet pytest-xdist
+      - name: Build default symbol-gating control
+        if: matrix.lane != 'durable'
+        run: mise exec zig@0.16.0 -- zig build
+      - name: Export default binary path
+        if: matrix.lane != 'durable'
+        run: echo "ZIGBASE_TEST_BINARY=$GITHUB_WORKSPACE/zig-out/bin/zigbase" >> "$GITHUB_ENV"
+      - name: Build RAM upload symbol-gating control
+        if: matrix.lane == 'durable'
+        run: mise exec zig@0.16.0 -- zig build resumable-uploads-fixture -Dresumable-uploads=true --prefix zig-out/resumable
+      - name: Build Golfsim thumbnail frontend
+        if: matrix.lane == 'thumbnails'
+        run: cd examples/golfsim/frontend && ./build.sh
+      - name: Cache Playwright browser (chromium headless shell)
+        if: matrix.lane == 'thumbnails'
+        id: pw-cache
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-playwright-${{ steps.pw.outputs.version }}-chromium-shell
+      - name: Install Chromium headless shell + OS deps (cache miss)
+        if: matrix.lane == 'thumbnails' && steps.pw-cache.outputs.cache-hit != 'true'
+        run: mise exec python@3.13 -- python -m playwright install --with-deps --only-shell chromium
+      - name: Install Playwright OS deps (cache hit)
+        if: matrix.lane == 'thumbnails' && steps.pw-cache.outputs.cache-hit == 'true'
+        run: mise exec python@3.13 -- python -m playwright install-deps chromium
+      - name: Opt-in bounded SQLite query workbench
+        if: matrix.lane == 'workbench'
+        run: |
+          mise exec zig@0.16.0 -- zig build check-query-workbench-contracts
+          mise exec zig@0.16.0 -- zig build test -Dquery-workbench=true --summary all
+          mise exec zig@0.16.0 -- zig build query-workbench-fixture check-query-workbench-contracts -Dquery-workbench=true --prefix zig-out/workbench
+          bash scripts/check-query-workbench-gating.sh "$ZIGBASE_TEST_BINARY" zig-out/workbench/bin/query-workbench-fixture
+          ZIGBASE_TEST_QUERY_WORKBENCH_BINARY="$GITHUB_WORKSPACE/zig-out/workbench/bin/query-workbench-fixture" mise exec python@3.13 -- python -m pytest tests/admin/test_query_workbench.py -q
+      - name: Install optional thumbnail test dependency
+        if: matrix.lane == 'thumbnails'
+        run: sudo apt-get update && sudo apt-get install -y imagemagick
+      - name: Opt-in ImageMagick thumbnail regressions and gating
+        if: matrix.lane == 'thumbnails'
+        run: |
+          mise exec zig@0.16.0 -- zig build check-thumbnail-contracts
+          mise exec zig@0.16.0 -- zig build check-thumbnail-contracts -Dimage-thumbnails=true
+          mise exec zig@0.16.0 -- zig build test -Dimage-thumbnails=true --summary all
+          mise exec zig@0.16.0 -- zig build thumbnails-fixture -Dimage-thumbnails=true --prefix zig-out/thumbnails
+          bash scripts/check-gating.sh --image-thumbnails "$ZIGBASE_TEST_BINARY" zig-out/thumbnails/bin/thumbnails-fixture
+          ZIGBASE_TEST_THUMBNAILS_BINARY="$GITHUB_WORKSPACE/zig-out/thumbnails/bin/thumbnails-fixture" mise exec python@3.13 -- python -m pytest tests/admin/test_thumbnails.py -q
+          mise exec python@3.13 -- python -m pytest examples/golfsim/test/test_thumbnail_gallery.py -q
+      - name: Thumbnail-enabled Golfsim consumer
+        if: matrix.lane == 'thumbnails'
+        working-directory: examples/golfsim
+        run: |
+          mise exec zig@0.16.0 -- zig build -Dimage-thumbnails=true --summary all
+          mise exec zig@0.16.0 -- zig build test gen-client-check -Dimage-thumbnails=true --summary all
+      - name: Opt-in resumable upload regressions and gating
+        if: matrix.lane == 'resumable'
+        run: |
+          mise exec zig@0.16.0 -- zig build check-resumable-contracts
+          mise exec zig@0.16.0 -- zig build check-resumable-contracts -Dresumable-uploads=true
+          mise exec zig@0.16.0 -- zig build test -Dresumable-uploads=true --summary all
+          mise exec zig@0.16.0 -- zig build resumable-uploads-fixture -Dresumable-uploads=true --prefix zig-out/resumable
+          bash scripts/check-gating.sh --resumable-uploads "$ZIGBASE_TEST_BINARY" zig-out/resumable/bin/resumable-uploads-fixture
+          ZIGBASE_TEST_UPLOADS_OFF_BINARY="$ZIGBASE_TEST_BINARY" ZIGBASE_TEST_RESUMABLE_BINARY="$GITHUB_WORKSPACE/zig-out/resumable/bin/resumable-uploads-fixture" mise exec python@3.13 -- python -m pytest tests/admin/test_resumable_uploads.py -q -n 2 --dist load --durations=20
+      - name: SQLite upload restart recovery and persistence gating
+        if: matrix.lane == 'durable'
+        run: |
+          mise exec zig@0.16.0 -- zig build test durable-uploads-fixture check-resumable-contracts -Dresumable-uploads=true -Ddurable-resumable-uploads=true --prefix zig-out/durable-uploads --summary all
+          bash scripts/check-gating.sh --durable-uploads zig-out/resumable/bin/resumable-uploads-fixture zig-out/durable-uploads/bin/durable-uploads-fixture
+          ZIGBASE_TEST_DURABLE_UPLOADS_BINARY="$GITHUB_WORKSPACE/zig-out/durable-uploads/bin/durable-uploads-fixture" mise exec python@3.13 -- python -m pytest tests/admin/test_durable_uploads.py -q -n 2 --dist load --durations=20
+      - name: Opt-in realtime backfill regressions
+        if: matrix.lane == 'coordination'
+        run: |
+          mise exec zig@0.16.0 -- zig build -Drealtime-backfill=true --prefix zig-out/backfill
+          ZIGBASE_TEST_BACKFILL_BINARY="$GITHUB_WORKSPACE/zig-out/backfill/bin/zigbase" mise exec python@3.13 -- python -m pytest tests/admin/test_realtime_backfill.py -q
+      - name: SQLite consumer migration process coordination
+        if: matrix.lane == 'coordination'
+        run: |
+          mise exec zig@0.16.0 -- zig build migration-coordination-fixture
+          ZIGBASE_TEST_MIGRATION_COORDINATION_BINARY="$GITHUB_WORKSPACE/zig-out/bin/migration-coordination-fixture" mise exec python@3.13 -- python -m pytest tests/admin/test_migration_coordination.py -q
+      - name: Opt-in idempotent custom mutations
+        if: matrix.lane == 'coordination'
+        run: |
+          mise exec zig@0.16.0 -- zig build idempotency-fixture check-idempotency-contracts
+          bash scripts/check-idempotency-gating.sh "$ZIGBASE_TEST_BINARY" zig-out/bin/idempotency-fixture
+          ZIGBASE_TEST_IDEMPOTENCY_BINARY="$GITHUB_WORKSPACE/zig-out/bin/idempotency-fixture" mise exec python@3.13 -- python -m pytest tests/admin/test_idempotency.py -q
+      - name: Configurable memory-job worker resources
+        if: matrix.lane == 'coordination'
+        run: |
+          mise exec zig@0.16.0 -- zig build memory-jobs-fixture
+          ZIGBASE_TEST_MEMORY_JOBS_BINARY="$GITHUB_WORKSPACE/zig-out/bin/memory-jobs-fixture" mise exec python@3.13 -- python -m pytest tests/admin/test_memory_jobs.py -q
+
+  # Keep the existing required check fail-closed across all split lanes.
+  browser:
+    if: always()
+    needs: [build, browser-tests, cli-tests, feature-tests, contracts, performance, codegen]
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Require every lane to pass
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: jq -e 'all(.[]; .result == "success")' <<< "$RESULTS"

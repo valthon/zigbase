@@ -1,6 +1,5 @@
 import os, re, socket, subprocess, tempfile, time, shutil, pathlib, pytest
 import json, urllib.request, urllib.error
-from playwright.sync_api import sync_playwright
 from _bin import resolve_binary
 
 REPO = pathlib.Path(__file__).resolve().parents[2]
@@ -102,6 +101,8 @@ def server(binary, request):
 # cheap (~ms) to create.
 @pytest.fixture(scope="session")
 def _playwright():
+    from playwright.sync_api import sync_playwright
+
     with sync_playwright() as pw:
         yield pw
 

@@ -1,11 +1,13 @@
 """End-to-end contract for `zigbase openapi` against real SQLite metadata."""
 
 import json
+import importlib
 import os
 import pathlib
 import subprocess
 
 import pytest
+from _bin import resolve_binary
 
 from tools.rails.fullstack import load_operations
 
@@ -16,18 +18,25 @@ ZIG = ["mise", "exec", "zig@0.16.0", "--", "zig"]
 
 @pytest.fixture(scope="session")
 def dating_binary():
-    override = os.environ.get("ZIGBASE_TEST_DATING_BINARY")
-    if override:
-        path = pathlib.Path(override)
-        if not path.exists():
-            raise FileNotFoundError(
-                f"ZIGBASE_TEST_DATING_BINARY={override} does not exist"
-            )
-        return str(path)
-    subprocess.run(ZIG + ["build", "dating-server"], cwd=REPO, check=True)
-    path = REPO / "zig-out" / "bin" / "dating-server"
-    assert path.exists()
-    return str(path)
+    return resolve_binary("ZIGBASE_TEST_DATING_BINARY", REPO, "dating-server")
+
+
+@pytest.mark.parametrize("consumer", ["test_openapi_cli", "test_state"])
+def test_dating_fixture_override_never_rebuilds(consumer, monkeypatch, tmp_path):
+    import _bin
+
+    def unexpected_build(*args):
+        pytest.fail("a configured CI artifact must never trigger a local build")
+
+    monkeypatch.setattr(_bin, "_zig_build", unexpected_build)
+    artifact = tmp_path / "dating-server"
+    artifact.touch(mode=0o755)
+    monkeypatch.setenv("ZIGBASE_TEST_DATING_BINARY", str(artifact))
+    fixture = importlib.import_module(consumer).dating_binary.__wrapped__
+    assert fixture() == str(artifact)
+    artifact.unlink()
+    with pytest.raises(FileNotFoundError, match="ZIGBASE_TEST_DATING_BINARY"):
+        fixture()
 
 
 @pytest.fixture(scope="session")
