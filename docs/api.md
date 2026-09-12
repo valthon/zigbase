@@ -1358,8 +1358,18 @@ return `409`; invalid metadata/chunks return `400`; exhausted quotas return
 `429 too_many_requests`. Missing/expired/aborted sessions or a different
 principal return `404`; invalid authentication returns `401`.
 
-This is bounded, fully buffered, **process-local** network resume, not durable
-or cross-instance upload. Restart loses sessions; use sticky routing.
+The default is bounded, fully buffered, **process-local** network resume; restart
+loses RAM sessions. Additional `-Ddurable-resumable-uploads=true` and
+`.files.resumable.durable = true` enable SQLite/local single-owner process-restart
+persistence, returning `durability: "sqlite-restart"`. It remains fully buffered,
+not cross-instance or power-loss durability. A completion-receipt write failure
+returns `503 internal`; after successful rollback and failure cleanup, only that
+session is terminal and the store remains usable. Uncertain store persistence
+failures stop upload operations with `503 internal` until restart. A durable rollback failure additionally
+terminates the process rather than leave an unusable shared SQLite writer behind
+a healthy liveness response. Inspect and recover the database before restarting.
+Durable payload budgets also reserve
+whole-row headroom within SQLite's length limit (see the protocol guide).
 Completed/failed tombstones release payloads immediately but retain slots
 until their fixed TTL expires (lazy reclamation on API calls). Abort cannot
 erase these acknowledgements. See [the full protocol and capacity tradeoffs](resumable-uploads.md)

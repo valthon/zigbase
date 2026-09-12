@@ -17,8 +17,16 @@
 
 const std = @import("std");
 
+// SQLite bounds the entire encoded row, not only its BLOB. Reserve the bounded
+// metadata JSON plus id/state, three 64-bit integers and record-header varints.
+pub const durable_metadata_bytes = 16384;
+pub const durable_row_overhead = durable_metadata_bytes + 256;
+pub const durable_sqlite_max_length = 1_000_000_000; // vendored SQLITE_MAX_LENGTH
+pub const durable_max_upload_bytes = durable_sqlite_max_length - durable_row_overhead;
+
 /// Comptime resource budgets for opt-in process-local upload sessions.
 pub const ResumableLimits = struct {
+    durable: if (@import("build_options").durable_resumable_uploads) bool else void = if (@import("build_options").durable_resumable_uploads) false else {},
     max_sessions: usize = 8,
     max_upload_bytes: usize = 8 << 20,
     max_total_bytes: usize = 32 << 20,
@@ -26,6 +34,18 @@ pub const ResumableLimits = struct {
     ttl_seconds: u32 = 900,
     max_sessions_per_principal: usize = 2,
 };
+
+/// Shared by comptime configuration and runtime persisted-budget validation.
+pub fn validResumableLimits(r: ResumableLimits) bool {
+    if (@import("build_options").durable_resumable_uploads) {
+        if (r.durable and r.max_upload_bytes > durable_max_upload_bytes) return false;
+    }
+    return r.max_sessions > 0 and r.max_sessions <= 1024 and
+        r.max_sessions_per_principal > 0 and r.max_sessions_per_principal <= r.max_sessions and
+        r.max_upload_bytes > 0 and r.max_upload_bytes <= r.max_total_bytes and
+        r.max_total_bytes <= 1 << 30 and r.max_chunk_bytes > 0 and
+        r.max_chunk_bytes <= r.max_upload_bytes and r.ttl_seconds > 0 and r.ttl_seconds <= 86400;
+}
 
 /// The lowered runtime config stored on `app.App.files`.
 pub const Runtime = struct {
@@ -65,11 +85,12 @@ pub fn lower(comptime files_cfg: anytype) Runtime {
         if (@typeInfo(@TypeOf(files_cfg.resumable)) != .@"struct") @compileError(".files.resumable must be a struct of resource budgets");
         inline for (std.meta.fields(@TypeOf(files_cfg.resumable))) |field| {
             if (!@hasField(ResumableLimits, field.name)) @compileError("Unknown .files.resumable limit: " ++ field.name);
-            @field(rt.resumable, field.name) = @field(files_cfg.resumable, field.name);
+            if (comptime std.mem.eql(u8, field.name, "durable") and !@import("build_options").durable_resumable_uploads) {
+                if (files_cfg.resumable.durable) @compileError(".files.resumable.durable requires -Ddurable-resumable-uploads=true");
+            } else @field(rt.resumable, field.name) = @field(files_cfg.resumable, field.name);
         }
-        const r = rt.resumable;
-        if (r.max_sessions == 0 or r.max_sessions > 1024 or r.max_sessions_per_principal == 0 or r.max_sessions_per_principal > r.max_sessions or r.max_upload_bytes == 0 or r.max_upload_bytes > r.max_total_bytes or r.max_total_bytes > 1 << 30 or r.max_chunk_bytes == 0 or r.max_chunk_bytes > r.max_upload_bytes or r.ttl_seconds == 0 or r.ttl_seconds > 86400)
-            @compileError("Invalid .files.resumable budgets: positive limits, sessions<=1024, principal<=sessions, chunk<=upload<=total<=1GiB, TTL<=86400 required");
+        if (!validResumableLimits(rt.resumable))
+            @compileError("Invalid .files.resumable budgets: positive limits, sessions<=1024, principal<=sessions, chunk<=upload<=total<=1GiB, TTL<=86400 required; durable upload<=999983360 bytes");
     }
     if (@hasField(FC, "s3_presign_redirect")) {
         if (@TypeOf(files_cfg.s3_presign_redirect) != bool)
@@ -83,6 +104,36 @@ pub fn lower(comptime files_cfg: anytype) Runtime {
         rt.presign_ttl_s = ttl;
     }
     return rt;
+}
+
+test "resumable budget validity is shared across configuration and recovery" {
+    try std.testing.expect(validResumableLimits(.{}));
+    try std.testing.expect(validResumableLimits(.{ .max_sessions = 1024, .max_sessions_per_principal = 1024, .max_total_bytes = 1 << 30, .max_upload_bytes = 1 << 30, .max_chunk_bytes = 1 << 30, .ttl_seconds = 86400 }));
+    for ([_]ResumableLimits{
+        .{ .max_sessions = 0 },
+        .{ .max_sessions = 1025 },
+        .{ .max_sessions_per_principal = 0 },
+        .{ .max_sessions_per_principal = 9 },
+        .{ .max_upload_bytes = 0 },
+        .{ .max_upload_bytes = 33 << 20 },
+        .{ .max_total_bytes = (1 << 30) + 1 },
+        .{ .max_chunk_bytes = 0 },
+        .{ .max_chunk_bytes = 9 << 20 },
+        .{ .ttl_seconds = 0 },
+        .{ .ttl_seconds = 86401 },
+    }) |invalid| try std.testing.expect(!validResumableLimits(invalid));
+}
+
+test "durable upload budget leaves SQLite whole-row headroom without lowering RAM cap" {
+    if (comptime !@import("build_options").durable_resumable_uploads) return error.SkipZigTest;
+    var limits = ResumableLimits{ .durable = true, .max_upload_bytes = durable_max_upload_bytes, .max_total_bytes = 1 << 30 };
+    try std.testing.expect(validResumableLimits(limits));
+    limits.max_upload_bytes += 1;
+    try std.testing.expect(!validResumableLimits(limits));
+    limits.max_upload_bytes = 1 << 30;
+    try std.testing.expect(!validResumableLimits(limits));
+    limits.durable = false;
+    try std.testing.expect(validResumableLimits(limits));
 }
 
 test "lower defaults are the fully-off proxy path" {

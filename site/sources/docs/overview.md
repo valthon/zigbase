@@ -91,8 +91,9 @@ There are two ways to use ZigBase:
   not remote storage.
   Opt-in durable HTTP cleanup retries removed-file deletion after commit,
   using the existing queue engine. Opt-in [resumable uploads](./resumable-uploads)
-  resume interrupted transfers within one process, with bounded buffers and
-  fresh authorization at commit; they are not restart-durable streaming.
+  resume interrupted transfers with bounded buffers and fresh authorization at
+  commit. Optional SQLite/local persistence survives process restarts with a
+  single owner; neither mode is streaming or cross-instance resume.
   Optional [offline reconciliation](./framework#offline-orphan-reconciliation-opt-in-cli)
   previews and explicitly removes unreferenced local/SQLite files in bounded
   maintenance batches; it refuses active cooperating apps, not arbitrary external writers.

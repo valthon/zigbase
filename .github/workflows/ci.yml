@@ -561,6 +561,11 @@ jobs:
           mise exec zig@0.16.0 -- zig build resumable-uploads-fixture -Dresumable-uploads=true --prefix zig-out/resumable
           bash scripts/check-gating.sh --resumable-uploads "$ZIGBASE_TEST_BINARY" zig-out/resumable/bin/resumable-uploads-fixture
           ZIGBASE_TEST_UPLOADS_OFF_BINARY="$ZIGBASE_TEST_BINARY" ZIGBASE_TEST_RESUMABLE_BINARY="$GITHUB_WORKSPACE/zig-out/resumable/bin/resumable-uploads-fixture" mise exec python@3.13 -- python -m pytest tests/admin/test_resumable_uploads.py -q
+      - name: SQLite upload restart recovery and persistence gating
+        run: |
+          mise exec zig@0.16.0 -- zig build test durable-uploads-fixture check-resumable-contracts -Dresumable-uploads=true -Ddurable-resumable-uploads=true --prefix zig-out/durable-uploads --summary all
+          bash scripts/check-gating.sh --durable-uploads zig-out/resumable/bin/resumable-uploads-fixture zig-out/durable-uploads/bin/durable-uploads-fixture
+          ZIGBASE_TEST_DURABLE_UPLOADS_BINARY="$GITHUB_WORKSPACE/zig-out/durable-uploads/bin/durable-uploads-fixture" mise exec python@3.13 -- python -m pytest tests/admin/test_durable_uploads.py -q
       - name: Headless browser tests
         # -n auto parallelizes across the runner's vCPUs (each test binds its own
         # free port + tempdir, so the harness is parallel-safe). Keep tests/smtp

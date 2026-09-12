@@ -39,6 +39,20 @@ if [ "${1:-}" = --inventory ]; then
   exit 0
 fi
 
+if [ "${1:-}" = --durable-uploads ]; then
+  [ "$#" -eq 3 ] || { echo 'usage: check-gating.sh --durable-uploads RAM_BINARY DURABLE_BINARY'; exit 2; }
+  for pattern in 'files\.resumable_durable\.' 'files\.resumable_durable\.Durable\.acquire' 'files\.resumable_durable\.Durable\.restore' 'persistenceFailure'; do
+    if nm --defined-only "$2" | grep -E "$pattern" >/dev/null; then
+      echo "LEAK: persistence pattern '$pattern' in $2"; exit 1
+    fi
+    if ! nm --defined-only "$3" | grep -E "$pattern" >/dev/null; then
+      echo "DRIFT: persistence pattern '$pattern' absent in $3"; exit 1
+    fi
+  done
+  echo 'durable uploads gating: OK'
+  exit 0
+fi
+
 if [ "${1:-}" = --resumable-uploads ]; then
   [ "$#" -eq 3 ] || { echo 'usage: check-gating.sh --resumable-uploads OFF_BINARY ON_BINARY'; exit 2; }
   for pattern in 'files\.resumable\.' 'api\.resumable_uploads\.' 'updateResumable'; do

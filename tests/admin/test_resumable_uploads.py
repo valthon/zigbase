@@ -3,6 +3,7 @@ import concurrent.futures
 import json
 import os
 import shutil
+import sqlite3
 import subprocess
 import time
 import urllib.error
@@ -66,6 +67,52 @@ def setup(server):
 
 def begin(server, token, record, length=4, filename="a.txt"):
     return call(server, "POST", f"/api/collections/uploads/records/{record['id']}/uploads", {"field": "file", "filename": filename, "length": length, "mimetype": "text/plain"}, token)
+
+
+def test_automatic_rollback_does_not_retry_rollback(binary, tmp_path):
+    data = tmp_path / "data"
+    shutil.copytree(_su_template_for(binary), data)
+    port = _free_port()
+    base = f"http://127.0.0.1:{port}"
+    log_path = tmp_path / "server.log"
+    env = {**os.environ, "ZIGBASE_DATA_DIR": str(data),
+           "ZIGBASE_HTTP_PORT": str(port), "ZIGBASE_SERVE_BACKGROUND": "0"}
+    with log_path.open("wb") as log:
+        proc = subprocess.Popen([binary, "serve", "--insecure-cookies"], env=env,
+                                stdout=log, stderr=subprocess.STDOUT)
+    try:
+        _wait_reachable_or_fail(proc, port, str(log_path))
+        admin, tokens, _, record = setup(base)
+        code, upload = begin(base, tokens[0], record)
+        assert code == 201, upload
+        path = "/api/uploads/" + upload["id"]
+        assert call(base, "PATCH", path, b"abcd", tokens[0], 0)[0] == 204
+        with sqlite3.connect(data / "data.db") as conn:
+            conn.execute("CREATE TRIGGER automatic_rollback BEFORE UPDATE ON uploads "
+                         "BEGIN SELECT RAISE(ROLLBACK, 'injected automatic rollback'); END")
+        assert call(base, "POST", path + "/commit", token=tokens[0])[0] >= 400
+        with sqlite3.connect(data / "data.db") as conn:
+            conn.execute("DROP TRIGGER automatic_rollback")
+            assert conn.execute("SELECT file FROM uploads WHERE id=?",
+                                (record["id"],)).fetchone() == (None,)
+        assert call(base, "PATCH", "/api/collections/uploads/records/" + record["id"],
+                    {"title": "writer-still-usable"}, admin)[0] == 200
+        assert "record update rollback failed" not in log_path.read_text()
+        assert proc.poll() is None
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+        proc.wait(timeout=10)
+
+
+def wait_for_expiry(expires_at):
+    # Upload expiry uses CLOCK_REALTIME; sleep uses a monotonic duration. Host
+    # clock adjustments can advance the latter without reaching expiresAt.
+    deadline = time.monotonic() + 15
+    while time.time() < expires_at:
+        remaining = deadline - time.monotonic()
+        assert remaining > 0, ("wall clock did not reach expiry", expires_at, time.time())
+        time.sleep(min(0.05, remaining))
 
 
 def test_resume_current_record_and_completed_retry(server):
@@ -158,8 +205,10 @@ def test_abort_expiry_and_configured_limits(server):
     assert call(server, "DELETE", path, token=tokens[0])[0] == 204
     assert call(server, "GET", path, token=tokens[0])[0] == 404
     assert begin(server, tokens[1], record)[0] == 201
-    time.sleep(5.2)
-    assert call(server, "GET", "/api/uploads/" + second["id"], token=tokens[0])[0] == 404
+    before_sleep = (time.time(), time.monotonic())
+    wait_for_expiry(second["expiresAt"])
+    expired = call(server, "GET", "/api/uploads/" + second["id"], token=tokens[0])
+    assert expired[0] == 404, (second, expired, before_sleep, (time.time(), time.monotonic()))
     assert begin(server, tokens[0], record, 64)[0] == 201
 
 
@@ -240,10 +289,15 @@ def test_terminal_sessions_retain_slot_quota_until_expiry(server):
         assert call(server, "DELETE", path, token=tokens[0])[0] == 409
     assert begin(server, tokens[0], record)[0] == 429
     # Terminal payloads are freed immediately, despite retained session slots.
-    assert begin(server, tokens[1], record, 64)[0] == 201
-    assert begin(server, tokens[1], record, 64)[0] == 201
-    time.sleep(5.2)
-    assert begin(server, tokens[0], record, 64)[0] == 201
+    expiries = [upload["expiresAt"]]
+    for _ in range(2):
+        code, receiving = begin(server, tokens[1], record, 64)
+        assert code == 201, receiving
+        expiries.append(receiving["expiresAt"])
+    before_sleep = (time.time(), time.monotonic())
+    wait_for_expiry(max(expiries))
+    admitted = begin(server, tokens[0], record, 64)
+    assert admitted[0] == 201, (upload, admitted, before_sleep, (time.time(), time.monotonic()))
 
 
 def test_removed_file_field_does_not_acknowledge_a_noop(server):

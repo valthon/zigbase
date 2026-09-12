@@ -294,7 +294,7 @@
     "mirror": "resumable-uploads.md",
     "frontmatter": {
       "title": "Resumable uploads",
-      "description": "Bounded, principal-bound client file transfers with current commit authorization. Process-local and opt-in, not restart-durable streaming.",
+      "description": "Bounded, opt-in client file transfers with current commit authorization. Default process-local RAM or SQLite/local restart persistence; neither mode is streaming or cross-instance recovery.",
       "order": 10,
       "group": "features"
     }

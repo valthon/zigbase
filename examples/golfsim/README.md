@@ -783,6 +783,14 @@ instance loses the session; keep the original photo and inspect the record befor
 starting again after an uncertain commit. Existing listing ownership rules,
 photo count/size/MIME constraints, and file hooks still apply at commit.
 
+For SQLite/local process-restart recovery, build with both
+`-Dresumable-uploads=true -Ddurable-resumable-uploads=true`. The example then sets
+`.files.resumable.durable = true` at comptime. A single owner persists acknowledged
+chunks and completion receipts in the application database. Memory remains fully
+buffered; staged photo bytes enter database backups. This is not cross-instance
+or machine-power-loss durability. Keep the original file and inspect uncertain
+failed commits; hooks are never automatically replayed after a crash.
+
 For an existing listing, begin with an authenticated
 `POST /api/collections/listings/records/{listingId}/uploads`:
 

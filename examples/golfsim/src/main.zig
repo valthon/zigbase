@@ -813,16 +813,25 @@ fn requireSecondFactor(ctx: *zigbase.TwoFactorPolicyContext) !bool {
     return requirements.items.len > 0;
 }
 
+const photo_thumbnails = .{
+    .imagemagick = .{ .executable = "/usr/bin/convert", .command_style = .convert },
+    .profiles = .{ .card = .{ .width = 320, .height = 240, .format = .webp, .fit = .cover, .quality = 85 } },
+    .max_concurrent = 1,
+    .max_waiting = 32,
+    .wait_timeout_ms = 5000,
+};
+const file_options = if (@import("golfsim_options").image_thumbnails)
+    (if (@import("golfsim_options").durable_uploads)
+        .{ .thumbnails = photo_thumbnails, .resumable = .{ .durable = true } }
+    else
+        .{ .thumbnails = photo_thumbnails })
+else if (@import("golfsim_options").durable_uploads)
+    .{ .resumable = .{ .durable = true } }
+else
+    .{};
+
 pub const App = zigbase.App(.{
-    .files = if (@import("golfsim_options").image_thumbnails) .{
-        .thumbnails = .{
-            .imagemagick = .{ .executable = "/usr/bin/convert", .command_style = .convert },
-            .profiles = .{ .card = .{ .width = 320, .height = 240, .format = .webp, .fit = .cover, .quality = 85 } },
-            .max_concurrent = 1,
-            .max_waiting = 32,
-            .wait_timeout_ms = 5000,
-        },
-    } else .{},
+    .files = file_options,
     // Shared WS/SSE connection cap sized for one small venue.
     .realtime = .{ .max_connections = 256 },
     .hooks = .{

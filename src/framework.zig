@@ -4884,6 +4884,16 @@ fn bootApp(
     }
     holder.pool = try openPoolSelect(allocator, io, cfg, .{ .reader_cap = opts.reader_pool_size, .cache_kib = opts.cache_kib }, environ);
     errdefer holder.pool.deinit();
+    // Fence competing durable boots before migrations, provisioning or cleanup.
+    // Keep payload recovery at its later position to avoid overlapping its RAM
+    // budget with provisioning. Ownership transfers to Store only after restore.
+    const durable_uploads = comptime build_options.durable_resumable_uploads and opts.files.resumable.durable;
+    var upload_owner: if (durable_uploads) ?@import("files/resumable_durable.zig").Durable else void = if (durable_uploads) blk: {
+        if (comptime opts.StoragePlugin != DefaultStoragePlugin) @compileError("Durable uploads require built-in local storage");
+        if (build_options.s3 and cfg.s3_bucket.len != 0) return error.DurableUploadsRequireLocalStorage;
+        break :blk try @import("files/resumable_durable.zig").Durable.acquire(allocator, &holder.pool, io);
+    } else {};
+    errdefer if (durable_uploads) if (upload_owner) |*owner| owner.close();
     // Transparent at-rest field encryption (Theme B1). Resolve the cipher ONCE from
     // ZIGBASE_FIELD_KEY and stamp it onto the pool so every acquired connection carries
     // it (db.zig). FAIL-CLOSED: if any collection declares an `.encrypted` field but no
@@ -5118,8 +5128,13 @@ fn bootApp(
     holder.backfill_store = if (comptime build_options.realtime_backfill) try @import("realtime/backfill.zig").Store.create(allocator, io, db.poolBackend(&holder.pool)) else {};
     errdefer if (comptime build_options.realtime_backfill) if (holder.backfill_store) |store| store.destroy();
     holder.admission_state = if (comptime opts.admission_config) |cfg_admission| @import("admission.zig").State.init(io, cfg_admission) else {};
-    holder.resumable_store = if (comptime build_options.resumable_uploads) try @import("files/resumable.zig").Store.create(allocator, opts.files.resumable) else {};
+    holder.resumable_store = if (comptime build_options.resumable_uploads) try @import("files/resumable.zig").Store.create(allocator, io, opts.files.resumable) else {};
     errdefer if (comptime build_options.resumable_uploads) holder.resumable_store.destroy();
+    if (durable_uploads) {
+        try upload_owner.?.restore(allocator, holder.resumable_store, clock.nowUnix(io));
+        holder.resumable_store.durable = upload_owner;
+        upload_owner = null;
+    }
     holder.query_workbench = if (comptime build_options.query_workbench) try @import("query_workbench.zig").Store.create(allocator, io, opts.query_workbench) else {};
     errdefer if (comptime build_options.query_workbench) holder.query_workbench.destroy();
     var files_config = opts.files;
