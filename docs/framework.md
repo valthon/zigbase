@@ -609,7 +609,14 @@ An untyped route handler reaches the database through `ctx.records()` — the sa
 `Records` handle described in [§5b](#5b-handler-capabilities-ctx). It lazily checks
 out a pooled reader for reads and acquires the pool writer per write call, releasing
 both when the framework tears the ctx down, so there is no manual `acquireReader` /
-`acquireWriter` + `Data` wiring:
+`acquireWriter` + `Data` wiring.
+
+For custom HTTP routes, authentication and tenant resolution release their lookup
+reader before route guards and the handler run. Identity, session and membership
+values remain request-owned; handler reads acquire a pooled reader via
+`ctx.connForRead()`, typically the one authentication just returned. This does not
+reserve that connection for the handler, create a shared transaction, or cap
+concurrent database connections.
 
 ```zig
 // reads + writes both go through the same handle

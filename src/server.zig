@@ -1124,6 +1124,13 @@ fn dispatchCustom(ctx: *http.RequestCtx) anyerror!?http.Response {
                 rctx.tenancy_enabled = app.tenancy.enabled;
                 rctx.role_ranking = app.role_ranking;
             }
+            // Auth's record/collection/session and tenancy's membership strings are
+            // request-allocator-owned, not borrowed from this connection. Return it
+            // before guards/handlers can acquire their own reader via Ctx.
+            if (reader) |*r| {
+                app.pool.releaseReader(r);
+                reader = null; // earlier exits still use the deferred release above
+            }
             var cx = Ctx{ .app = app, .arena = ctx.allocator, .rctx = rctx, .request = ctx, .bound_conn = null };
             defer cx.deinit();
             // Ordered route-guard chain (#139/#142): path-secret + per-route rate limit, run
@@ -1377,6 +1384,66 @@ test "route: socketless seam dispatches a custom-route hit and falls back to 404
     try std.testing.expectEqual(@as(u16, 404), miss.status);
     // Built-in records/auth-path dispatch through `route()` is exercised end-to-end by the
     // Stage 3 harness (and the live browser suite); here we prove only the seam + fallback.
+}
+
+test "custom auth reader is returned before handler reads; identity and tenancy survive reuse" {
+    const db = @import("db.zig");
+    const H = struct {
+        fn read(cx: *Ctx) !http.Response {
+            // This single-thread test starts with no idle readers. Auth must have
+            // returned its one connection before the handler checks out a reader.
+            try std.testing.expectEqual(@as(usize, 1), db.poolReaderCount(cx.app.pool));
+            const r = try cx.connForRead();
+            try std.testing.expectEqual(@as(usize, 0), db.poolReaderCount(cx.app.pool));
+            var stmt = try r.prepare("SELECT 'handler read';");
+            defer stmt.finalize();
+            try std.testing.expect(try stmt.step());
+            try std.testing.expectEqualStrings("customers", cx.rctx.collection);
+            try std.testing.expectEqualStrings("c1", cx.rctx.auth.?.object.get("id").?.string);
+            try std.testing.expectEqualStrings("session-marker", cx.rctx.session_id);
+            try std.testing.expectEqualStrings("acc1", cx.rctx.account_id);
+            try std.testing.expectEqualStrings("owner", cx.rctx.account_role);
+            try std.testing.expectEqual(@as(usize, 1), cx.rctx.memberships.len);
+            try std.testing.expectEqualStrings("acc1", cx.rctx.memberships[0].account);
+            if (std.mem.endsWith(u8, cx.request.?.path, "fail")) return error.NotFound;
+            return .{ .status = 200, .body = "ok" };
+        }
+    };
+    var env = try GuardEnv.init(true);
+    defer env.deinit();
+    const a = env.arena.allocator();
+    {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        _ = try @import("collections.zig").create(a, std.testing.io, w, .{
+            .id = "",
+            .name = "customers",
+            .type = .auth,
+            .fields = &.{},
+            .listRule = "",
+            .viewRule = "",
+            .createRule = "",
+            .updateRule = "",
+            .deleteRule = "",
+        });
+        try w.exec("INSERT INTO customers (id,created,updated,email,tokenKey,verified) VALUES ('c1','','','c@x.io','key',1);");
+        try w.exec("INSERT INTO _memberships (id,created,updated,account,user_collection,user,role,status) VALUES ('m1','','','acc1','customers','c1','owner','active');");
+    }
+    const routes = [_]events.RuntimeRoute{
+        .{ .method = .GET, .pattern = "/scope/ok", .handler = H.read, .auth = .authed },
+        .{ .method = .GET, .pattern = "/scope/fail", .handler = H.read, .auth = .authed },
+        .{ .method = .GET, .pattern = "/scope/denied", .handler = H.read, .auth = .superuser },
+    };
+    const dispatch = events.Dispatch{ .routes = &routes };
+    var app = app_mod.App{ .allocator = a, .io = std.testing.io, .pool = &env.pool, .dispatch = &dispatch, .tenancy = .{ .enabled = true, .auth_collection = "customers" } };
+    const key = crypto.deriveKey(app.jwt_secret, "key");
+    const token = try @import("jwt.zig").sign(a, .{ .id = "c1", .collection = "customers", .type = .auth, .iat = 0, .exp = 9999999999, .sid = "session-marker" }, &key);
+    const bearer = try std.fmt.allocPrint(a, "Bearer {s}", .{token});
+    for ([_][]const u8{ "/scope/ok", "/scope/fail", "/scope/denied", "/scope/ok" }, [_]u16{ 200, 404, 403, 200 }) |path, expected| {
+        var ctx = http.RequestCtx{ .method = .GET, .path = path, .allocator = RequestArena.from(&env.arena), .app = &app, .authorization = bearer, .headers = &.{.{ .key = "X-Account-Id", .value = "acc1" }} };
+        try std.testing.expectEqual(expected, (try dispatchCustom(&ctx)).?.status);
+        try std.testing.expectEqual(@as(usize, 1), db.poolReaderCount(&env.pool));
+    }
 }
 
 test "dispatchCustom: .auth = .{ .authed = collection } gate is fail-closed (#243)" {

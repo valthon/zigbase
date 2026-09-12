@@ -37,6 +37,24 @@ def test_blocked_identity_is_vetoed_with_clean_rollback(auth2_page):
     assert not any(i["col"] == "users" for i in r.json()["items"])
 
 
+def test_custom_handler_reads_with_owned_table_session_identity(auth2_page):
+    pg = auth2_page
+    assert pg.request.get("/auth-reader-scope").status == 401
+    record_id = _signup(pg, "reader@x.io", "password123")
+    login = pg.request.post("/api/collections/users/auth-with-password",
+                            data=json.dumps({"identity": "reader@x.io", "password": "password123"}),
+                            headers={"Content-Type": "application/json"})
+    assert login.status == 200, login.text()
+    token = login.json()["token"]
+    response = pg.request.get("/auth-reader-scope", headers={"Authorization": f"Bearer {token}"})
+    assert response.status == 200, response.text()
+    assert response.json()["id"] == record_id
+    assert response.json()["collection"] == "users"
+    assert response.json()["session_id"]
+    audit = pg.request.get("/api/collections/loginAudit/records").json()["items"]
+    assert any(item["who"] == record_id and item["method"] == "password" for item in audit)
+
+
 def test_admin_spa_superuser_login_still_works_with_a_passing_hook(auth2_page):
     # Breaking-change pin: the hook NOW fires for _superusers (admin SPA login route);
     # a passing hook must not break the SPA, and the audit row records the tag.
