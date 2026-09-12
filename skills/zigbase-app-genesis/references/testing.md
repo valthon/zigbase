@@ -33,7 +33,8 @@ mise exec python@3.13 -- python tools/agent_tests.py run \
 ```
 
 Inventory covers selected agent/route/tuning/schema/files/realtime pytest modules
-and binary-resolver tooling. Item `requirements` conservatively describe module
+and the `tests/tools/` performance-contract, replay, executor, selection and
+binary-resolver modules. Item `requirements` conservatively describe module
 setup; non-browser selections do not need Chromium. Admin fixtures build the
 appropriate binaries when necessary; the advertised prebuilt override is
 `ZIGBASE_TEST_BINARY`. Build time counts toward the execution deadline. Prepare binaries
@@ -78,6 +79,14 @@ select related allowlisted modules; unknown paths select the entire allowlist.
 The JSON explicitly reports incomplete coverage: this never replaces the full
 relevant Zig, browser, SDK, docs or other CI suites. See the agent guide for Git
 limits, filename encoding and snapshot limitations.
+
+The focused allowlist also covers local performance-contract, parity-replay and
+agent-tool regressions under `tests/tools/`. They use synthetic artifacts and local
+fixtures rather than a Zig build or browser. Replay needs loopback socket access,
+affected-test fixtures need Git, and executor fixtures need `mise` for one nested
+resolver check. Module selectors run unittest classes too; individual class-method
+selectors remain outside the inventory. The separate inventory-expansion driver
+is intentionally not allowlisted, avoiding recursive wrapper tests.
 
 ## Performance contracts
 

@@ -156,6 +156,8 @@ output limits. It runs only advertised module/function selectors and reports
 structured process outcomes. Its selection-only `affected --base <commit>` command uses bounded
 Git inspection and explicit dependency rules to suggest module checks after edits;
 unmapped paths fall back to the whole allowlist with explicit coverage gaps. It
-does not infer complete test coverage or replace CI. This tooling is not an embedded
+does not infer complete test coverage or replace CI. The allowlist includes local performance-contract, parity-replay
+and agent-tool checks that need no Zig build or browser; local Git/subprocess and
+loopback fixtures still require their advertised development permissions. This is not an embedded
 app executor or a sandbox; it adds no code to deployed binaries. See the
 [agent guide](../../../docs/agents.md#focused-repository-tests) for setup and coverage limits.

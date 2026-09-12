@@ -94,8 +94,46 @@ def test_direct_module_selection_and_shared_dependency(repo):
     assert result["changes"][0]["reason"] == "test_module"
     (repo / "tests/admin/conftest.py").write_text("")
     result = agent.affected("HEAD")
+    assert {item["id"] for item in result["items"]} == {module, *agent.ADMIN_MODULES}
+    assert result["fallback"] is False
+
+
+@pytest.mark.parametrize(
+    "path,expected",
+    [
+        (
+            "tools/performance_contracts.py",
+            {"tests/tools/test_performance_contracts.py"},
+        ),
+        ("bench/contracts/example.json", {"tests/tools/test_performance_contracts.py"}),
+        ("tools/replay/zb_replay.py", {"tests/tools/test_replay.py"}),
+        ("src/records.zig", set(agent.ADMIN_MODULES)),
+        ("build.zig", set(agent.ADMIN_MODULES)),
+        ("zig-pkg/dependency/file.zig", set(agent.ADMIN_MODULES)),
+        ("tests/_bin.py", set(agent.MODULES)),
+    ],
+)
+def test_curated_tool_dependencies_and_admin_group(repo, path, expected):
+    target = repo / path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("changed dependency\n")
+    result = agent.affected("HEAD")
+    assert {item["id"] for item in result["items"]} == expected
+    assert result["changes"][0]["reason"] == "curated_dependency"
+    assert result["fallback"] is False
+    assert result["coverage_complete"] is False
+
+
+def test_selector_source_and_unmapped_file_keep_full_fallback(repo):
+    with (repo / "tools/agent_tests.py").open("a") as script:
+        script.write("\n# modified selector\n")
+    result = agent.affected("HEAD")
     assert {item["id"] for item in result["items"]} == set(agent.MODULES)
     assert result["fallback"] is False
+    (repo / "unmapped-tool.py").write_text("")
+    result = agent.affected("HEAD")
+    assert {item["id"] for item in result["items"]} == set(agent.MODULES)
+    assert result["fallback"] is True
 
 
 def test_rename_accounts_for_old_and_new_path(repo):
