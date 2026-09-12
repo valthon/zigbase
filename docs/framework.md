@@ -4721,11 +4721,11 @@ optional; without a resource profile each defaults to the historical value:
 
 | Field | Default | Meaning |
 | --- | --- | --- |
-| `.readers` | `16` | warm reader-connection pool cap — shrink to reduce the connection footprint. |
+| `.readers` | `16` | requested retained idle-reader cap, currently clamped to 16 by both backends; not a bound on active overflow connections. |
 | `.jobs` | `2` | scheduler worker-pool size. |
 | `.memory_jobs` | `4` | lazy worker count shared by memory queues and `app.submit`; positive `1..64`, separate from scheduled jobs. |
 | `.stack_size` | `1 MiB` | per-thread stack for scheduler/job/`submit` threads (vs `std.Thread`'s 16 MiB default). **Clamped up** to a safe floor — the lever can only *raise* the stack, e.g. for unusually deep job handlers. |
-| `.cache_kib` | `1024` | SQLite per-connection page cache (KiB), across the writer + warm readers — shrink to save memory, raise for large working sets. |
+| `.cache_kib` | `1024` | SQLite per-connection soft page-cache target (KiB), including overflow readers; 0 preserves SQLite's default, larger values clamp to `i32` max. |
 
 ```zig
 zigbase.App(.{
@@ -4887,8 +4887,8 @@ All profiles keep the 1 MiB stack default and its existing safety floor. These
 are explicit starting points, not benchmark-derived optimal settings, automatic
 CPU detection, or process memory caps. More concurrency can hurt a workload;
 measure before adopting `throughput`. SQLite caches apply only to SQLite
-connections; they do not tune PostgreSQL's server cache. Reader counts are caps,
-not a promise that all connections are eagerly allocated. Scheduler settings
+connections; they do not tune PostgreSQL's server cache. Reader counts request
+idle-retention caps, not total connection limits or eager allocation. Scheduler settings
 apply when scheduled jobs exist; memory-job settings apply lazily even without
 scheduled jobs. Durable queue-worker batches remain controlled by `.workers`,
 and HTTP server concurrency is unchanged.
@@ -4902,7 +4902,7 @@ const Backend = zigbase.App(.{
 ```
 
 Run the resulting binary with `resources` (or `resources --json`) for a single
-JSON object, `schema_version: 1`, containing its effective compiled pool settings,
+JSON object, `schema_version: 1`, containing its compiled pool settings,
 profile (`null` when omitted), scheduler/admin state, and PostgreSQL/S3/file-inventory
 build gates. The command does not load or validate server configuration or open a
 database; common CLI logging initialization still reads log-format/level variables.
@@ -4922,6 +4922,30 @@ a newer advisor can read older reports using defaults for fields they lacked
 forward-compatibility promise: an older strict advisor may reject newer fields.
 Use an advisor that recognizes every captured resource field, normally one from
 the same or a newer ZigBase release.
+
+The additive `envelope` object explains independent configured quantities, **not
+RSS predictions or a hard total-memory bound**. Older saved `tune` measurement
+documents without this field remain accepted (their envelope is `null`).
+
+| Envelope field | Interpretation |
+| --- | --- |
+| `http_admission_max_requests` | Concurrent admitted synchronous callbacks; `null` means admission disabled. Transport buffering happens before admission. |
+| `http_body_limit_source` | `runtime_ZIGBASE_MAX_UPLOAD_SIZE`: the body limit is deployment-configured and deliberately not read by this offline command. |
+| `retained_reader_cap` | Actual retained idle-reader cap after the shared SQLite/PostgreSQL clamp. The existing top-level `reader_pool_cap` remains the requested value. |
+| `sqlite_cache_target_bytes_per_connection` | Soft SQLite page-cache target after its clamp; `null` when 0 preserves the engine default. Not applicable to a PostgreSQL deployment. |
+| `sqlite_writer_and_retained_readers_cache_target_bytes` | Sum of those soft targets for one writer and a full idle pool; not a bound on total connections, cache memory or RSS. Overflow readers have additional caches. |
+| `scheduler_stack_bytes` | `(workers + tick thread) × effective stack bytes` after the 1 MiB floor when jobs exist, 0 otherwise. Overflow is a compile error. Virtual stack space, not resident memory; excludes named queue workers and other threads. |
+| `memory_job_stack_bytes` | Up to `memory_job_workers × job_stack_bytes` of virtual stack space for lazy memory-job/`submit` workers, using the shared effective stack floor. Overflow is a compile error. Not current allocation or RSS: unused pools start no threads, and partial startup can produce fewer workers. Independent of scheduler enablement. |
+| `resumable` | Compiled session, single-upload, total staged-payload and chunk ceilings, or `null` when excluded from the binary. No promise about commit copies, metadata or storage usage. |
+| `exclusions` | Costs outside these quantities: overflow connections/non-cache database memory, transport/realtime, request/response/commit allocations, queue workers/plugins/runtime/allocator overhead, and resumable metadata/storage. |
+
+For example, `minimal` yields two retained readers and a 256 KiB soft cache target
+per SQLite connection: 768 KiB for the writer plus a full idle pool. `throughput`
+requests 64 readers but currently retains only 16 on either backend; its SQLite
+retained-cache target is 68 MiB, not `65 × 4 MiB` and not a process memory cap.
+These quantities must not be summed into a total: measure actual peak RSS under
+representative workloads with `tune` instead. Reporting adds no server hot-path
+instrumentation and never changes admission, pool, stack or staging behavior.
 
 Profiles neither enable nor disable features. Keep using explicit comptime gates
 (for example `.admin = .disabled`) and build flags to exclude unwanted code;

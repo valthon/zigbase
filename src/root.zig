@@ -367,6 +367,7 @@ test {
         _ = @import("files/thumbnail_config.zig");
         _ = @import("files/thumbnails.zig");
     }
+    _ = @import("resource_profile.zig");
     _ = @import("admission.zig");
     if (@import("devtools.zig").enabled) _ = @import("agent_capabilities.zig");
     if (@import("devtools.zig").enabled) _ = @import("agent_diagnostics.zig");

@@ -576,6 +576,16 @@ pub fn build(b: *std.Build) void {
     const tests = b.addTest(.{ .root_module = zigbase_mod });
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run all tests");
+    // Two usize inputs cannot overflow u64 on a 32-bit target.
+    if (target.result.ptrBitWidth() == 64) {
+        for ([_][]const u8{ "overflow", "memory-overflow" }) |fixture| {
+            const envelope_overflow_mod = b.createModule(.{ .root_source_file = b.path(b.fmt("fixtures/invalid-resource-envelope/{s}.zig", .{fixture})), .target = target, .optimize = optimize });
+            envelope_overflow_mod.addImport("resources", b.createModule(.{ .root_source_file = b.path("src/resource_profile.zig"), .target = target, .optimize = optimize }));
+            const envelope_overflow = b.addExecutable(.{ .name = b.fmt("invalid-resource-envelope-{s}", .{fixture}), .root_module = envelope_overflow_mod });
+            envelope_overflow.expect_errors = .{ .contains = "overflow of integer type 'u64' with value '36893488147419103230'" };
+            test_step.dependOn(&envelope_overflow.step);
+        }
+    }
     test_step.dependOn(&run_tests.step);
 
     // Wire the bench harness's own test{} blocks (counting_allocator.zig, harness.zig)

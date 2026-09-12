@@ -17,6 +17,8 @@ def test_live_memory_pool_uses_configured_workers(tmp_path):
     report = json.loads(subprocess.check_output([binary, "resources"]))
     assert report["memory_job_workers"] == 1
     assert report["job_stack_bytes"] == 2 << 20
+    assert report["envelope"]["memory_job_stack_bytes"] == 2 << 20
+    assert report["envelope"]["scheduler_stack_bytes"] == 0
     assert report["job_workers"] == 8
     assert not report["scheduler_enabled"]
     port = _free_port()

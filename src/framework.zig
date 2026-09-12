@@ -974,6 +974,21 @@ pub fn App(comptime cfg: anytype) type {
             .postgres_compiled = build_options.postgres,
             .s3_compiled = build_options.s3,
             .file_inventory_compiled = build_options.file_inventory,
+            .envelope = resource_profile.envelope(.{
+                .readers = reader_pool_size,
+                .memory_job_workers = memory_job_pool_size,
+                .cache_kib = cache_kib,
+                .scheduler_enabled = jobs.len > 0,
+                .job_workers = job_pool_size,
+                .job_stack_bytes = job_stack_size,
+                .admission_max_requests = if (admission_config) |a| a.max_requests else null,
+                .resumable = if (build_options.resumable_uploads) .{
+                    .max_sessions = files_config.resumable.max_sessions,
+                    .max_upload_bytes = files_config.resumable.max_upload_bytes,
+                    .max_total_payload_bytes = files_config.resumable.max_total_bytes,
+                    .max_chunk_bytes = files_config.resumable.max_chunk_bytes,
+                } else null,
+            }),
         };
 
         /// Comptime-selected storage plugin type (defaults to `DefaultStoragePlugin`).
@@ -6049,10 +6064,27 @@ test "memory worker tuning reaches serve options and backwards-compatible report
     try std.testing.expectEqual(@as(usize, 2 << 20), A.Opts.job_stack_size);
     try std.testing.expectEqual(@as(?usize, 6), A.resource_report.memory_job_workers);
     try std.testing.expectEqual(@as(usize, 2 << 20), A.resource_report.job_stack_bytes);
+    try std.testing.expectEqual(@as(u64, 6 * (2 << 20)), A.resource_report.envelope.?.memory_job_stack_bytes);
     try std.testing.expectEqual(@as(usize, 1), A.job_pool_size);
     const B = App(.{ .pools = .{ .memory_jobs = 64, .stack_size = 0 } });
     try std.testing.expectEqual(@as(usize, 64), B.memory_job_pool_size);
     try std.testing.expectEqual(scheduler.min_job_stack_size, B.resource_report.job_stack_bytes);
+    try std.testing.expectEqual(@as(u64, 64 * scheduler.min_job_stack_size), B.resource_report.envelope.?.memory_job_stack_bytes);
+}
+
+test "compiled resource envelope follows admission and resumable build gates" {
+    const D = App(.{}).resource_report.envelope.?;
+    try std.testing.expectEqual(null, D.http_admission_max_requests);
+    try std.testing.expectEqual(@as(u64, 0), D.scheduler_stack_bytes);
+    const A = App(.{ .resource_profile = .minimal, .admission = .{ .max_requests = 3 } }).resource_report.envelope.?;
+    try std.testing.expectEqual(@as(u32, 3), A.http_admission_max_requests.?);
+    try std.testing.expectEqual(@as(u64, 3 * 256 * 1024), A.sqlite_writer_and_retained_readers_cache_target_bytes.?);
+    if (comptime build_options.resumable_uploads) {
+        const U = App(.{ .files = .{ .resumable = .{ .max_sessions = 3, .max_total_bytes = 16 << 20 } } }).resource_report.envelope.?.resumable.?;
+        try std.testing.expectEqual(@as(usize, 3), U.max_sessions);
+        try std.testing.expectEqual(@as(usize, 16 << 20), U.max_total_payload_bytes);
+        try std.testing.expectEqual(@as(usize, 32 << 20), D.resumable.?.max_total_payload_bytes);
+    } else try std.testing.expectEqual(null, D.resumable);
 }
 
 test "HTTP admission is opt-in and reserves only its enabled diagnostics route" {

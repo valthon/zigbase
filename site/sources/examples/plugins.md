@@ -19,6 +19,16 @@ transparent defaults; they do not enable features or impose a process memory cap
 `memory_job_workers` reports the lazy pool count, with `job_stack_bytes` shared
 by scheduler and memory workers after its floor.
 
+The report's `envelope` makes the tradeoffs explicit: this example retains up to
+four idle SQLite readers with 512 KiB soft cache targets (2.5 MiB including the
+writer), and admits at most three synchronous HTTP callbacks. Overflow reader
+connections and transport buffers are additional costs, not included in that
+cache target. `scheduler_stack_bytes` uses the effective stack size after the
+1 MiB floor. The separate `memory_job_stack_bytes` describes up to 2 MiB of
+virtual stacks for this example's two lazy memory workers, not current allocation
+or RSS. Both calculations reject arithmetic overflow. Measure peak RSS under
+load before choosing a deployment size.
+
 This is the **advanced framework** example. It is a standalone package with a path
 dependency on the repo root (`../..`) and exercises — using **only public
 `zigbase.*` exports**, no reaching into ZigBase internals — the comptime-config
