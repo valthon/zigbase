@@ -5581,18 +5581,22 @@ Pass the **same** module you passed to `addTo`: rooting a second module at
 (`src/simple_runner.zig`, resolved out of the dependency — you do not vendor
 anything). That matters for two reasons:
 
-- **It sidesteps an upstream Zig 0.16 build-runner race.** `zig build test`
-  otherwise runs the test binary in server mode (`--listen=-`) and polls its
-  stdio; an app booted by the harness does real work at process exit (closing
-  sqlite, removing a tempdir), and the runner can mis-read that normal exit as a
-  crash — printing `failed command: …--listen=-` and intermittently failing the
-  build under load. A `.simple` runner reports through its exit code instead, so
-  the race cannot occur.
+- **It avoids misleading Zig 0.16 server-mode diagnostics.** A passing child
+  can exit 0 after facil.io writes a newline to stderr; the build runner displays
+  that byte with a stale `failed command: …--listen=-` label. This reproduced
+  case is cosmetic, not an EOF race or app-boot failure. A `.simple` runner
+  reports through the exit code instead of the server protocol.
 - **It fails the build on a leak.** Each test runs under a fresh
   `std.testing.allocator` whose leak check runs on teardown.
 
-If you are not using `addTest`, that `--listen=-` line on an otherwise-passing
-suite is the race, not a bug in your app.
+When diagnosing `failed command`, run `zig build test --summary all` and inspect
+the shell exit status as well as the final summary. A nonzero status, signal or
+genuine assertion failure is not explained by the benign newline case. Native
+versus baseline CPU targeting did not change that case; incompatible native
+instructions in a transferred binary can independently cause real `SIGILL`.
+The dependency-free Zig+C reproduction and candidate upstream patch are in
+[diagnostics/issue-261](../diagnostics/issue-261/README.md). The installed compiler
+is unchanged; keep using `zigbase.addTest`, not a copied compiler test runner.
 
 ## Compile-time build flags
 
