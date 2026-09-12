@@ -3354,7 +3354,8 @@ built-in itself is gated off.
   upgraded instances. Older binaries neither enforce shared rate windows nor fence
   completion, so mixed-version workers do not provide these guarantees. Older
   binaries still need a single migration leader; current PostgreSQL consumer and
-  system migrations are serialized automatically (see §8).
+  system migrations, and SQLite consumer batches, are serialized automatically
+  (see §8).
 - Memory jobs run on a bounded worker pool that is drained and joined at shutdown (like `app.submit`); jobs still queued at a hard crash are lost (at-most-once), and a full ring rejects with `error.QueueFull`.
 
 ## 8. Define your schema in code (`.collections` + `.migrations`)
@@ -3380,7 +3381,32 @@ the ledger**, including rollback selection/preflight. The lock spans the entire 
 while each migration keeps its existing commit boundary and `.transactional = false`
 callbacks remain outside a transaction. This requires a direct PostgreSQL connection or
 a session-pooling proxy; transaction/statement-pooling proxies cannot preserve this lock.
-SQLite continues to require a single application/migration process.
+**SQLite consumer batches coordinate through an exclusive, nonblocking file lock.**
+For a file-backed main database, apply and rollback acquire
+`<canonical-main-database-path>.migrations.lock` before reading the consumer ledger,
+including rollback selection/preflight, and retain it across individual commits and
+non-transactional callbacks. Contention returns `MigrationBusy` immediately; retry the
+command after the other batch finishes. There is no background waiter, lease table,
+or per-request cost. Private memory/temporary databases need no cross-process lock
+(shared-cache SQLite is not compiled in).
+
+For framework apply/rollback commands and startup with declared consumer migrations,
+the SQLite lease is acquired after opening the pool but before prerequisite system
+migration or ledger setup, and retained through the consumer batch's cleanup. Pool
+opening/WAL initialization and later automatic collection provisioning are outside
+this lease. PostgreSQL retains its existing system-setup-before-consumer-lock order.
+
+The sidecar is a permanent, empty file; **never remove or replace it while migrations
+may run**. Closing its descriptor releases the lock, including when the process dies.
+Its parent directory must be writable, trusted, and on a local filesystem with working
+file locks. A symlink at the sidecar filename is refused, not followed. Open/locking
+failures propagate distinctly from `MigrationBusy`, without running the consumer
+callbacks. Canonicalization covers relative paths and symlinks,
+not hard-link aliases: all participants must use the same canonical database path.
+Do not rename/replace the database or lock file during use. This only coordinates
+cooperating current-version consumer runners, not old binaries, raw SQL writers,
+automatic collection provisioning, shared-cache memory databases, or distributed
+filesystems. These other workflows still need an external single-leader procedure.
 
 Consumer runners refuse caller-owned transactions with `MigrationCallerTransaction`.
 A callback that leaves a transaction open stops the batch at that migration with
@@ -3391,9 +3417,11 @@ error is preserved when transaction cleanup succeeds. Advisory unlock is attempt
 if rollback fails, and real cleanup failures take precedence; the error a cleanup failure
 displaces is logged. The unlock's own result is checked, so a connection that does not hold
 the lock it acquired — the signature of a transaction-pooling proxy — fails with
-`MigrationLockSessionLost` instead of reporting coordination that silently did not happen. Locks are released on normal
-completion and callback errors; connection loss releases PostgreSQL session locks. Lock/cleanup failures propagate
-and abort framework startup; low-level callers must discard the connection after a cleanup
+`MigrationLockSessionLost` instead of reporting coordination that silently did not
+happen. Locks are released on normal completion and callback errors; connection
+loss releases PostgreSQL session locks, and process exit releases SQLite file locks.
+SQLite retains its lock until transaction cleanup finishes. Lock/cleanup failures
+propagate and abort framework startup; low-level callers must discard the connection after a cleanup
 failure. Set PostgreSQL `lock_timeout` to bound lock waits. This does not make external
 side effects atomic, coordinate old binaries, or make incompatible mixed-version schemas safe.
 

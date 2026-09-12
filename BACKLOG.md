@@ -59,7 +59,9 @@ copy, examples, and tests with the implementation rather than in follow-up PRs.
 - [x] Serialize system migrations and public ledger bootstrap across PostgreSQL replicas.
 - [x] Preserve caller transactions on refusal and release locks on failure.
 - [x] Coordinate PostgreSQL consumer apply/rollback batches, including non-transactional callbacks.
-- [ ] Older binaries and multi-process SQLite migration workflows still require a single leader.
+- [x] Coordinate current-version SQLite consumer apply/rollback batches with a bounded, fail-fast sidecar lock.
+- [ ] Older binaries, automatic provisioning and external migration writers still require a single leader.
+- SQLite consumer batches deliberately fail fast with `MigrationBusy`; unlike PostgreSQL advisory-lock waits, supervisors must retry after the active batch finishes. Revisit bounded startup waiting only if deployments need it.
 
 ## Realtime fanout (#403)
 
