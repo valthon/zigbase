@@ -1604,7 +1604,7 @@ Malformed or unknown client frames produce
 
 Everything above — the frame grammar (`connect`/`auth`/`ack`/`event`/`signal`/`message`/`error`),
 per-record delivery authorization, subscription rules, the Origin policy, and the shared
-10,000-connection cap — applies identically over Server-Sent Events. SSE is a second pipe under
+connection cap (10,000 by default) — applies identically over Server-Sent Events. SSE is a second pipe under
 the same hub, not a second protocol.
 
 **Connect (downlink).** `GET /api/realtime/sse` with `Accept: text/event-stream` — the header
@@ -1639,7 +1639,8 @@ id only permits griefing that connection (unsubscribe/auth-clear), never data ex
 (invisible to `EventSource`). Default interval: the listener's 40s timeout; override with
 `--sse-heartbeat-seconds N` / `ZIGBASE_SSE_HEARTBEAT_SECONDS` (1..=255; validated at startup).
 
-**Limits.** WS and SSE share ONE global connection cap (10,000; upgrades past it → `503`) and
+**Limits.** WS and SSE share ONE process-wide connection cap (10,000 by default;
+comptime `.realtime.max_connections` accepts a positive `u32`; upgrades past it → `503`) and
 the 256-subscriptions-per-connection cap. Browser note: HTTP/1.1 `EventSource` is limited to
 ~6 streams per origin by browsers.
 
@@ -1672,8 +1673,9 @@ es.onmessage = async (e) => {
 
 **Admin stats.** `GET /api/realtime/stats` — **superuser-only**, read-only realtime
 health for the admin UI: `{ "connections": n, "max_connections": n, "max_subs": n,
-"outbound_hwm": n }` (live connection count, the two static caps above, and the
-configured outbound high-water-mark). `401` unauthenticated, `403` non-superuser.
+"outbound_hwm": n }` (reserved connections including upgrades in progress,
+the effective connection cap, static subscription cap, and configured outbound
+high-water-mark). `401` unauthenticated, `403` non-superuser.
 
 ---
 

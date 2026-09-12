@@ -823,6 +823,8 @@ pub const App = zigbase.App(.{
             .wait_timeout_ms = 5000,
         },
     } else .{},
+    // Shared WS/SSE connection cap sized for one small venue.
+    .realtime = .{ .max_connections = 256 },
     .hooks = .{
         .bookings = .{ .beforeCreate = prepareBooking },
         .reviews = .{ .beforeCreate = prepareReview },

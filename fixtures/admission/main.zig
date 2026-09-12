@@ -35,6 +35,7 @@ pub fn main(init: std.process.Init) !void {
     gate_dir = init.environ_map.get("ZIGBASE_TEST_GATE") orelse ".";
     return zigbase.App(.{
         .admission = .{ .max_requests = 1 },
+        .realtime = .{ .max_connections = 2 },
         .collections = .{ .members = .{ .type = .auth, .fields = .{} } },
         .routes = .{
             .{ .method = .GET, .path = "/hold", .handler = hold, .auth = .public },

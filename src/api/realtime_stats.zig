@@ -1,5 +1,5 @@
 //! GET /api/realtime/stats — superuser-only, read-only realtime health: the live
-//! connection count plus the static caps and configured outbound high-water-mark.
+//! reserved connection count plus effective caps and outbound high-water-mark.
 const std = @import("std");
 const http = @import("../http.zig");
 const auth = @import("../auth.zig");
@@ -17,7 +17,7 @@ pub fn get(ctx: *http.RequestCtx) anyerror!http.Response {
 
     var root: std.json.ObjectMap = .empty;
     try root.put(ctx.allocator.a, "connections", .{ .integer = @intCast(conn.connectionCount()) });
-    try root.put(ctx.allocator.a, "max_connections", .{ .integer = @intCast(conn.MAX_CONNECTIONS) });
+    try root.put(ctx.allocator.a, "max_connections", .{ .integer = app.realtime_max_connections });
     try root.put(ctx.allocator.a, "max_subs", .{ .integer = @intCast(conn.MAX_SUBS) });
     try root.put(ctx.allocator.a, "outbound_hwm", .{ .integer = @intCast(app.realtime_outbound_hwm) });
     return .{

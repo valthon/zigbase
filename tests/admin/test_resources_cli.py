@@ -23,6 +23,7 @@ def test_resources_is_read_only_and_secret_free(binary, tmp_path):
     assert report["schema_version"] == 1
     assert report["profile"] is None
     assert report["reader_pool_cap"] == 16
+    assert report["realtime_connection_cap"] == 10000
     assert report["job_workers"] == 2
     assert report["job_stack_bytes"] == 1048576
     assert report["sqlite_cache_kib_per_connection"] == 1024

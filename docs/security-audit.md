@@ -355,11 +355,12 @@ it remains a throttle, not a hard guarantee — documented in `KNOWN_LIMITATIONS
 is enforced at the listener. Filter nesting is bounded at depth 32 (`query/parser.zig`).
 
 **Fix.** All three memory-cost DoS caps are now enforced:
-- **Global WS connection cap.** `src/realtime/ws.zig` holds `pub const MAX_CONNECTIONS = 10_000`
-  (a realtime-layer constant, deliberately *not* in `config.zig`) and an atomic live-connection
-  counter. `handleUpgrade` reserves a slot before allocating the connection and rejects upgrades
+- **Shared WS/SSE connection cap.** `src/realtime/connection.zig` holds an atomic
+  reservation counter. The default is 10,000; consumers can compile a different positive
+  `u32` bound with `.realtime.max_connections` (zero cannot disable it).
+  `handleUpgrade` reserves a slot before allocating the connection and rejects upgrades
   past the cap with HTTP `503`; the slot is released on upgrade failure and on close. Tested pure
-  helper (`reserveConnectionSlot`/`releaseConnectionSlot`). Regression test:
+  helper (`reserveConnectionSlotWithLimit`/`releaseConnectionSlot`). Regression test:
   `F9: global connection cap reserves/releases and rejects past MAX_CONNECTIONS`.
 - **`perPage` clamp.** `records.list` clamps `perPage` to **500** (`@min(q.perPage, 500)`), so an
   oversized page can't drive a huge SQL `LIMIT` / allocation. Regression test (through the API
@@ -541,7 +542,7 @@ Access-control & realtime authz (PR A):
 - **F4** — realtime delete events authorized against a per-record deletion snapshot (owner-scoped
   collections no longer leak delete ids to unauthorized subscribers).
 - **F5** — WS `subscribe` requires auth for any non-`@public` collection.
-- **F9 (WS-cap portion)** — global concurrent-WebSocket-connection cap (`MAX_CONNECTIONS = 10_000`)
+- **F9 (WS/SSE-cap portion)** — shared concurrent-connection cap (default `10_000`, tunable via `.realtime.max_connections`)
   enforced at upgrade; over-cap upgrades get `503`.
 
 Deployment & DoS hardening (PR B):

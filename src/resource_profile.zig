@@ -22,6 +22,8 @@ pub const Report = struct {
     schema_version: u8 = 1,
     profile: ?Profile,
     reader_pool_cap: usize,
+    // Older saved tuning reports predate configurability and used this fixed cap.
+    realtime_connection_cap: u32 = 10_000,
     job_workers: usize,
     job_stack_bytes: usize,
     sqlite_cache_kib_per_connection: u32,

@@ -126,7 +126,7 @@ pub fn cookieValue(header: []const u8, name: []const u8) ?[]const u8 {
 ///   - anything else -> 404 + markAsFinished (fixes the old early-`return` that silently
 ///     swallowed "sse" targets without finishing the request).
 /// Shared gates, in order: originAllowed (F12), the ONE global connection slot (F9 — WS+SSE
-/// share MAX_CONNECTIONS), tenancy capture (inside each arm; zap.Request buffers are freed
+/// share app.realtime_max_connections), tenancy capture (inside each arm; zap.Request buffers are freed
 /// after this returns).
 pub fn handleUpgrade(r: zap.Request, target_protocol: []const u8) anyerror!void {
     const app = @import("../server.zig").active_app.?;
@@ -146,7 +146,7 @@ pub fn handleUpgrade(r: zap.Request, target_protocol: []const u8) anyerror!void 
         return;
     }
     // F9: reserve the SHARED (WS+SSE) global connection slot up front; reject past the cap.
-    if (!connection.reserveConnectionSlot()) {
+    if (!connection.reserveConnectionSlotWithLimit(app.realtime_max_connections)) {
         r.setStatus(.service_unavailable);
         r.markAsFinished(true);
         return;

@@ -80,7 +80,7 @@ jobs:
       - name: Build features-fixture (demo flags/experiments browser fixture)
         run: mise exec zig@0.16.0 -- zig build features-fixture -Dcpu=baseline
       - name: Build concurrent HTTP admission fixture
-        run: mise exec zig@0.16.0 -- zig build admission-fixture check-admission-contracts -Dcpu=baseline
+        run: mise exec zig@0.16.0 -- zig build admission-fixture check-admission-contracts check-realtime-cap-contracts -Dcpu=baseline
       - name: Build configured feature-route fixtures
         run: |
           mise exec zig@0.16.0 -- zig build feature-remapped-fixture -Dcpu=baseline

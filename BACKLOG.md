@@ -11,8 +11,9 @@ copy, examples, and tests with the implementation rather than in follow-up PRs.
 - [x] Offline workload tuning advisor comparing supplied throughput, tail latency, and memory measurements under explicit budgets (#413).
 - [ ] Coordinated resource budgets, bounded queues, backpressure, and saturation diagnostics.
   Implemented slice: opt-in synchronous HTTP admission, immediate overload rejection,
-  and saturation counters. Transport buffers, long-lived connections, and cross-subsystem
-  budget coordination remain outside this gate.
+  and saturation counters; the shared WS/SSE connection cap is comptime-tunable
+  with effective cap/count reporting. Transport buffers and cross-subsystem budget
+  coordination remain outside these gates.
 - [ ] Agent-native development interface: versioned discovery, structured diagnostics,
   schema/route inspection, migration previews, and focused test execution.
   Implemented slices: CLI discovery with explicit operation side effects (#409),

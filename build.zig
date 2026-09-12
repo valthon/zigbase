@@ -529,6 +529,19 @@ pub fn build(b: *std.Build) void {
     const admission_exe = b.addExecutable(.{ .name = "admission-fixture", .root_module = admission_mod });
     b.step("admission-fixture", "Build concurrent HTTP admission fixture").dependOn(&b.addInstallArtifact(admission_exe, .{}).step);
     const admission_contracts = b.step("check-admission-contracts", "Check HTTP admission compile-time contracts");
+    const realtime_contracts = b.step("check-realtime-cap-contracts", "Check realtime connection cap compile-time contracts");
+    inline for (&.{
+        .{ .name = "nonstruct", .expected = ".realtime must be a struct" },
+        .{ .name = "zero", .expected = ".realtime.max_connections must be positive" },
+        .{ .name = "overflow", .expected = "type 'u32' cannot represent integer value '4294967296'" },
+        .{ .name = "unknown", .expected = ".realtime: unknown key '.max_connection' (recognized: .canSubscribe, .max_connections)" },
+    }) |invalid| {
+        const mod = b.createModule(.{ .root_source_file = b.path("fixtures/realtime-cap/" ++ invalid.name ++ ".zig"), .target = target, .optimize = optimize, .link_libc = true });
+        mod.addImport("zigbase", zigbase_mod);
+        const invalid_exe = b.addExecutable(.{ .name = "invalid-realtime-cap-" ++ invalid.name, .root_module = mod });
+        invalid_exe.expect_errors = .{ .contains = invalid.expected };
+        realtime_contracts.dependOn(&invalid_exe.step);
+    }
     inline for (&.{
         .{ .name = "nonstruct", .expected = ".admission must be a struct with .max_requests (positive u32)" },
         .{ .name = "zero", .expected = ".admission.max_requests must be positive; omit .admission to disable" },

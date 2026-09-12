@@ -32,6 +32,18 @@ def run(binary, tmp_path, value, now=110):
                           capture_output=True, text=True)
 
 
+def test_tuning_accepts_older_reports_without_realtime_connection_cap(binary, tmp_path):
+    value = document(binary)
+    for candidate in value["candidates"]:
+        candidate["resources"].pop("realtime_connection_cap", None)
+    result = run(binary, tmp_path, value)
+    assert result.returncode == 0, result.stderr
+    report = json.loads(result.stdout)
+    assert report["recommendation"] == "fast"
+    for item in report["items"]:
+        assert item["candidate"]["resources"]["realtime_connection_cap"] == 10000
+
+
 def test_tuning_ranks_only_feasible_observations(binary, tmp_path):
     value = document(binary)
     result = run(binary, tmp_path, value)

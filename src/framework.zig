@@ -637,13 +637,8 @@ pub fn App(comptime cfg: anytype) type {
             // unknown sub-key fails loudly (mirrors the `.features` guard). Absent → custom
             // topics default to public signal channels (the historical `__features` behavior).
             if (@hasField(@TypeOf(cfg), "realtime")) {
+                _ = realtime_max_connections;
                 const rcfg = cfg.realtime;
-                if (@typeInfo(@TypeOf(rcfg)) != .@"struct")
-                    @compileError(".realtime must be a struct, e.g. '.{ .canSubscribe = fn }'");
-                for (std.meta.fields(@TypeOf(rcfg))) |f| {
-                    if (!std.mem.eql(u8, f.name, "canSubscribe"))
-                        @compileError(".realtime: unknown key '." ++ f.name ++ "' (recognized: .canSubscribe)");
-                }
                 if (@hasField(@TypeOf(rcfg), "canSubscribe")) {
                     const _coerce: events.RealtimeCanSubscribeFn = rcfg.canSubscribe;
                     _ = _coerce;
@@ -866,6 +861,7 @@ pub fn App(comptime cfg: anytype) type {
         /// starts whenever this is non-empty, so a TTL collection alone starts it.
         pub const jobs: []const scheduler.RuntimeJob = scheduler.concatJobs(user_jobs, internal_jobs);
         pub const admission_config = @import("admission.zig").resolve(cfg);
+        pub const realtime_max_connections = @import("realtime/connection.zig").resolveLimit(cfg);
         pub const selected_resource_profile: ?resource_profile.Profile = if (@hasField(@TypeOf(cfg), "resource_profile")) cfg.resource_profile else null;
         const profile_pools = resource_profile.defaults(selected_resource_profile orelse .balanced);
         /// Worker pool size for the scheduler: `.pools = .{ .jobs = N }` (default 2).
@@ -960,6 +956,7 @@ pub fn App(comptime cfg: anytype) type {
         pub const cache_kib: u32 = if (@hasField(@TypeOf(cfg), "pools") and @hasField(@TypeOf(cfg.pools), "cache_kib")) cfg.pools.cache_kib else profile_pools.cache_kib;
 
         pub const resource_report: resource_profile.Report = .{
+            .realtime_connection_cap = realtime_max_connections,
             .profile = selected_resource_profile,
             .reader_pool_cap = reader_pool_size,
             .job_workers = job_pool_size,
@@ -1726,6 +1723,7 @@ pub fn App(comptime cfg: anytype) type {
             .static_cache_control = static_cache_control,
             .gates = route_gates,
             .admission_config = admission_config,
+            .realtime_max_connections = realtime_max_connections,
             .query_workbench = @import("query_workbench.zig").resolve(cfg),
         };
 
@@ -1869,6 +1867,7 @@ fn analyticsRollupRun(ctx: *ctx_mod.Ctx, ev: *events.JobEvent) anyerror!void {
 pub const ServeOpts = struct {
     query_workbench: @import("query_workbench.zig").Limits = .{},
     admission_config: ?@import("admission.zig").Config = null,
+    realtime_max_connections: u32 = @import("realtime/connection.zig").MAX_CONNECTIONS,
     StoragePlugin: type,
     MailerPlugin: type,
     /// Comptime-selected error-reporter plugin TYPE (#244); defaults to `DefaultReporterPlugin`.
@@ -5094,6 +5093,7 @@ fn bootApp(
         .oauth_state_server = cfg.oauth_state_server,
         .oauth_state_ttl_s = cfg.oauth_state_ttl_s,
         .realtime_allowed_origins = cfg.realtime_allowed_origins,
+        .realtime_max_connections = opts.realtime_max_connections,
         .sse_heartbeat_seconds = @intCast(cfg.sse_heartbeat_seconds),
         .realtime_outbound_hwm = cfg.realtime_outbound_hwm,
         .trust_proxy = cfg.trust_proxy,
@@ -5750,6 +5750,11 @@ test "E3: grouped .auth lowers hooks/methods/captcha/session" {
 }
 
 test "App(cfg) wires the realtime canSubscribe guard onto dispatch (#143)" {
+    try std.testing.expectEqual(@as(u32, 10_000), App(.{}).realtime_max_connections);
+    const Bounded = App(.{ .realtime = .{ .max_connections = 2 } });
+    try std.testing.expectEqual(@as(u32, 2), Bounded.realtime_max_connections);
+    try std.testing.expectEqual(@as(u32, 2), Bounded.resource_report.realtime_connection_cap);
+    try std.testing.expectEqual(@as(u32, 2), Bounded.Opts.realtime_max_connections);
     // No `.realtime` → null: custom topics default to PUBLIC signal channels.
     try std.testing.expect(App(.{}).dispatch.realtime_can_subscribe == null);
     // Empty `.realtime = .{}` is allowed and still leaves the guard unset.

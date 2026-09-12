@@ -175,7 +175,7 @@ error.**
 | `experiment_assignment_ttl` | TTL in **days** for sticky `_experiment_assignments` rows (default `90`). Only valid when a `.sticky` experiment is declared — setting it otherwise is a `@compileError`. | excluded — the sticky-assignment GC sweep installs no job/timer/writer touch unless a `.sticky` experiment is declared. |
 | `ttl_gc_interval` | Cadence (`schedule.Interval`) for the framework-internal `_ttl_gc` sweep that reaps expired `.ttl_field` rows (default `.{ .minutes = 5 }`). Only valid when a collection declares a `.ttl_field` — setting it otherwise, or to a degenerate `.{ .minutes = 0 }`, is a `@compileError`. Expired rows are hidden from reads immediately regardless of cadence. | excluded — the TTL GC sweep installs no job/timer/writer touch unless a collection declares a `.ttl_field`. |
 | `enable_typegen` | Enable the `typegen` CLI subcommand (default `false`). Set `true` only for client-generation builds. | excluded — off by default so production builds carry no codegen weight. |
-| `realtime` | Realtime broadcast guard: `.{ .canSubscribe = fn }` gates who may subscribe to a custom (non-collection) topic (default: custom topics are public). See [`ctx.realtime()`](#ctxrealtime--broadcast-on-custom-channels). | always — realtime (the WebSocket hub + per-record view-rule reapplication) is core, not optional; this key only adds a guard for custom topics. |
+| `realtime` | `.{ .max_connections = 10000, .canSubscribe = fn }`: positive `u32` shared WS/SSE connection cap and optional custom-topic guard. See [`ctx.realtime()`](#ctxrealtime--broadcast-on-custom-channels). | always — realtime is core; omitted cap preserves 10,000, omitted guard keeps custom topics public. |
 | `tenancy` | Multi-tenant account scoping: `.{ .enabled = true, .auth_collection = "...", .resolver = ..., .roles = .{...} }`. | excluded — the account-activation endpoints and membership-scoping code exist only when `.tenancy.enabled = true`. |
 | `abilities` | Declarative relationship-based row abilities per collection: `.{ .<col> = .{ .view = <rule>, … } }`. Requires `.tenancy.enabled = true`. | data-only — the composition code is core policy plumbing that always runs; unset just means every collection's ability predicate is `null` (a no-op). |
 | `mail` | Email-subsystem policy knobs (`.require_verified_sender`, `.webhook_secret`, …) threaded into `app.mail`. Together with `.mailer`, enables the built-in `"mail"` job kind backing `ctx.mail().enqueue`. | excluded — the `senders` API and inbound bounce/complaint webhook exist only when `.mail` is set. |
@@ -1530,6 +1530,25 @@ handler) where there is no HTTP request.
 **A custom topic is any topic name that is not a collection.** Subscribing to a *collection*
 name always goes through that collection's normal record-channel authorization (per-record
 `viewRule`); the custom-topic path can never be used to reach a collection's records.
+
+#### Connection capacity (`.realtime.max_connections`)
+
+Compile `.realtime = .{ .max_connections = 256 }` into a small deployment, or
+raise the positive `u32` cap for a larger machine. Omission preserves the existing
+10,000 default; zero is a compile error, not an unlimited mode. Like `.pools` and
+`.admission`, this is a comptime capacity lever: changing it requires a rebuild.
+Resource profiles
+do not silently change this cap. `resources --json` reports the compiled value as
+`realtime_connection_cap`; superuser `GET /api/realtime/stats` reports the effective
+`max_connections` and current `connections`.
+
+WebSocket and SSE share one process-wide atomic counter. Reservations include
+upgrades in progress and are released on failure or disconnect. New upgrades at
+capacity receive 503 before connection allocation; existing sessions are not
+evicted.
+This is not a per-user quota, cluster-wide cap, or total memory budget: transport
+buffers and each connection's subscriptions still consume resources. Keep the
+outbound high-water mark enabled and tune against representative workloads.
 
 #### Who may subscribe (`.realtime = .{ .canSubscribe = fn }`)
 
@@ -4878,6 +4897,13 @@ It includes no secret values. This is a **compiled resource report**, not a comp
 configuration dump: it does not identify the runtime-selected storage/database
 backend, report current allocations, or enumerate every optional subsystem.
 
+Additive resource fields retain `schema_version: 1`. Compatibility is backward:
+a newer advisor can read older reports using defaults for fields they lacked
+(for example, the historical realtime connection cap is 10,000). This is not a
+forward-compatibility promise: an older strict advisor may reject newer fields.
+Use an advisor that recognizes every captured resource field, normally one from
+the same or a newer ZigBase release.
+
 Profiles neither enable nor disable features. Keep using explicit comptime gates
 (for example `.admin = .disabled`) and build flags to exclude unwanted code;
 deployment environment variables retain their existing roles and do not override
@@ -4909,6 +4935,8 @@ document/resource versions are errors (nonzero exit). Context labels and the
 resource report are **caller-supplied provenance**, not independently verified
 build or hardware identities; capture them from your actual experiment. The
 advisor does not validate or synthesize deployable settings from the report.
+Unknown-field rejection also applies inside `resources`; the version number
+alone does not guarantee an older advisor understands a newer report.
 
 The output repeats the context/budgets and includes `items`, each containing the
 candidate and its first exclusion `reason`, in priority order: `failed_requests`,
