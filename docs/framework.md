@@ -236,8 +236,9 @@ dependencies.
 This is a **different axis** from the `-Ddev-tools` build flag above: `.enable_typegen` is an
 `App(.{...})`-level comptime key that a *consumer's own binary* opts into (independent per
 build target — e.g. off in your main server, on in a dedicated codegen build); `-Ddev-tools`
-is a `build.zig` flag that governs whether `init`/`agents-md`/`typegen` compile into the CLI
-**at all**, regardless of `.enable_typegen`. A binary needs both `-Ddev-tools=true` (the
+is a `build.zig` flag that governs whether development commands compile into the
+CLI at all: `init`, `agents-md`, `typegen`, `capabilities`, `routes`, `migrate preview`,
+`tune` and `diagnostics`, regardless of `.enable_typegen`. A binary needs both `-Ddev-tools=true` (the
 default) *and* `.enable_typegen = true` for `typegen` to actually run; either one off makes it
 unavailable, each with its own actionable error.
 
@@ -4010,7 +4011,7 @@ half-done. Some statements can't run inside a transaction (e.g. SQLite `VACUUM`,
 **without** a wrapping transaction (it owns its own atomicity; it is recorded only after it
 succeeds).
 
-#### The `migrate` CLI (apply + status + rollback + dump)
+#### The `migrate` CLI (apply + status + preview + rollback + dump)
 
 `zigbase migrate` applies pending SYSTEM migrations, then the app's comptime `.migrations`, and
 exits — so a deploy step can migrate ahead of starting the server. It does **not** provision the
@@ -4053,6 +4054,36 @@ $ zigbase migrate status --json --data-dir ./zb_data
 Both forms share the same **exit code**: `migrate status` exits `1` when anything is pending or
 orphaned, `0` when the database is fully up to date (`ok` in the JSON body carries the same
 signal) — so it can gate a deploy step: `zigbase migrate status || zigbase migrate`.
+
+##### Offline migration declaration preview
+
+`zigbase migrate preview [--json]` emits one versioned JSON object on stdout, without
+loading deployment configuration, opening a database, or invoking migration callbacks.
+It requires `-Ddev-tools=true` (the default). CLI logging still reads logging preferences.
+Both forms emit JSON; success exits 0, invalid arguments or output failures exit nonzero.
+`--data-dir`, `--out` and rollback counts are rejected.
+
+The report has `protocol_version: 1`, `scope: "compiled-consumer-migrations"`, and
+`items` in declaration order. Each item contains `id`, `transactional`,
+`forward_callback` (`up` or `change`), `reverse_callback` (`down`, `change`, or `none`),
+and `rollback_declaration`:
+
+- `explicit_down`: a reverse callback was declared, not proven correct.
+- `change_requires_runtime_verification`: transactional `change` can be attempted in reverse;
+  its operations may still be irreversible or backend-incompatible.
+- `missing_reverse`: an `up` without a reverse callback.
+- `nontransactional_change_rejected`: rollback requires an explicit `down` for this declaration.
+
+`unknown` is `["pending_state", "sql", "effects", "runtime_reversibility"]` and
+`includes_system_migrations` is false. No SQL is predicted or callback body analyzed;
+neither `transactional: true` nor an explicit `down` proves safe rollback or reversible
+external effects. This is a declaration inventory, **not an execution plan or deploy gate**.
+Use `migrate status --json` for ledger state (that command can initialize database state).
+Consumers should reject unsupported protocol versions and ignore unknown fields.
+Output is streamed from borrowed declarations, with constant-sized writer buffering and
+no per-migration allocations. There is no runtime catalog or database-dependent row growth.
+
+##### Consumer migration rollback
 
 `zigbase migrate rollback [N]` reverses the **N most-recently-applied consumer migrations**, newest
 first (`N` is a positional integer, default `1`); system migrations are never touched:
@@ -5610,7 +5641,7 @@ code to comptime-dead when off, so a build that doesn't need a feature doesn't p
 | `-Dresumable-uploads` | off | Principal-bound network-resume for file fields on existing records. Process-local, fully buffered, configurable session/byte/chunk/expiry budgets; no restart or cross-instance durability. See [resumable uploads](resumable-uploads.md). |
 | `-Dquery-workbench` | off | Bounded SQLite prepared-statement step metrics attributed to route templates, repeated/slow shape counters and operator-only structural EXPLAIN. No SQL/parameter capture; PostgreSQL is excluded. |
 | `-Ddev-mode` | on in `Debug`, off in release | The dev-only, never-in-prod seams: `ZIGBASE_FAKE_NOW` / `ZIGBASE_FAKE_SEED` (§14 above), test-capture, and fake field-crypto; the release script forces it off for shipped binaries. |
-| `-Ddev-tools` | **on** | The `init`/`agents-md`/`typegen` scaffolding/codegen verbs, `capabilities`/`routes` offline discovery, `tune` offline measurement advisor, and `diagnostics` structured doctor adapter (which can probe filesystem writability and initialize the migration ledger). Ordinary `doctor` remains available. Official release, Docker and npm artifacts include this tooling. Consumers can opt out for their deployment binary; stripped verbs exit nonzero with `-Ddev-tools=true` rebuild guidance. Distinct from `.enable_typegen` below — see §3b. |
+| `-Ddev-tools` | **on** | The `init`/`agents-md`/`typegen` scaffolding/codegen verbs, `capabilities`/`routes`/`migrate preview` offline discovery, `tune` offline measurement advisor, and `diagnostics` structured doctor adapter (which can probe filesystem writability and initialize the migration ledger). Ordinary `doctor` and other migration actions remain available. Official release, Docker and npm artifacts include this tooling. Consumers can opt out for their deployment binary; stripped verbs exit nonzero with `-Ddev-tools=true` rebuild guidance. Distinct from `.enable_typegen` below — see §3b. |
 | `-Dstrip` | on except in `Debug` | Strip debug info from the binary (~7 MiB vs ~24 MiB unstripped in a release build). |
 
 ## Version transparency & dependency auditing

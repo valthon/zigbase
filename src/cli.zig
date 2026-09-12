@@ -64,13 +64,14 @@ pub const DoctorArgs = struct {
     json: bool = false,
 };
 
-/// `migrate` runs one of four actions: `apply` (the default — apply pending system + consumer
+/// `migrate` actions include `apply` (the default — apply pending system + consumer
 /// migrations), `status` (`migrate status` — read the ledger and report applied/pending/orphaned
 /// consumer migrations without changing anything), `rollback` (`migrate rollback [N]` — reverse
 /// the N most-recently-applied consumer migrations, newest first; N defaults to 1), or `dump`
 /// (`migrate dump [--out <file>]` — introspect the LIVE database and write a canonical, dialect-native
 /// `structure.sql` for inspection/diffing/test-setup; NOT a schema source, never loaded at boot).
-pub const MigrateAction = enum { apply, status, rollback, dump };
+/// `preview` inventories compiled consumer declarations without configuration or database access.
+pub const MigrateAction = enum { apply, status, rollback, dump, preview };
 
 pub const MigrateArgs = struct {
     data_dir: ?[]const u8 = null,
@@ -80,8 +81,7 @@ pub const MigrateArgs = struct {
     rollback_count: usize = 1,
     /// Output path for `.dump` (`--out <path>`). `null` = write to stdout. Ignored by the other actions.
     out: ?[]const u8 = null,
-    /// `--json` (status only, SP-1): emit one JSON object instead of the text report. An
-    /// unknown flag for every other action, mirroring how `--out` is gated to `.dump`.
+    /// `--json` for status or preview (preview always emits JSON).
     json: bool = false,
 };
 
@@ -449,6 +449,10 @@ pub fn parse(args: []const []const u8, popts: ParseOpts) ParseError!Command {
             if (std.mem.eql(u8, args[i], "status")) {
                 ma.action = .status;
                 i += 1;
+            } else if (std.mem.eql(u8, args[i], "preview")) {
+                if (!devtools.enabled) return ParseError.DevToolsDisabled;
+                ma.action = .preview;
+                i += 1;
             } else if (std.mem.eql(u8, args[i], "rollback")) {
                 ma.action = .rollback;
                 i += 1;
@@ -467,7 +471,7 @@ pub fn parse(args: []const []const u8, popts: ParseOpts) ParseError!Command {
             const a = args[i];
             if (isHelpFlag(a)) {
                 return .{ .help = .migrate };
-            } else if (std.mem.eql(u8, a, "--data-dir")) {
+            } else if (ma.action != .preview and std.mem.eql(u8, a, "--data-dir")) {
                 i += 1;
                 if (i >= args.len) return ParseError.MissingValue;
                 ma.data_dir = args[i];
@@ -475,7 +479,7 @@ pub fn parse(args: []const []const u8, popts: ParseOpts) ParseError!Command {
                 i += 1;
                 if (i >= args.len) return ParseError.MissingValue;
                 ma.out = args[i];
-            } else if (ma.action == .status and std.mem.eql(u8, a, "--json")) {
+            } else if ((ma.action == .status or ma.action == .preview) and std.mem.eql(u8, a, "--json")) {
                 ma.json = true;
             } else return ParseError.UnknownFlag;
         }
@@ -1543,6 +1547,20 @@ test "migrate status accepts --json; the other actions reject it" {
     // --json is a status-only flag: it means nothing for apply/rollback/dump.
     try std.testing.expectError(ParseError.UnknownFlag, parse(&.{ "migrate", "--json" }, .{}));
     try std.testing.expectError(ParseError.UnknownFlag, parse(&.{ "migrate", "dump", "--json" }, .{}));
+}
+
+test "migration preview accepts only offline arguments and respects dev-tools gate" {
+    if (!devtools.enabled) {
+        try std.testing.expectError(ParseError.DevToolsDisabled, parse(&.{ "migrate", "preview", "--json" }, .{}));
+        try std.testing.expectError(ParseError.DevToolsDisabled, parse(&.{ "migrate", "preview", "--help" }, .{}));
+        return;
+    }
+    try std.testing.expectEqual(MigrateAction.preview, (try parse(&.{ "migrate", "preview" }, .{})).migrate.action);
+    try std.testing.expect((try parse(&.{ "migrate", "preview", "--json" }, .{})).migrate.json);
+    try std.testing.expectEqual(HelpTopic.migrate, (try parse(&.{ "migrate", "preview", "--help" }, .{})).help);
+    inline for (.{ "--data-dir", "--out", "1" }) |arg| {
+        try std.testing.expectError(ParseError.UnknownFlag, parse(&.{ "migrate", "preview", arg }, .{}));
+    }
 }
 
 test "explain-code parses a bare code, --json, and both" {

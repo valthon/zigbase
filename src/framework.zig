@@ -1994,7 +1994,7 @@ fn runCliImpl(init: std.process.Init, dispatch: *const events.Dispatch, jobs: []
             // agent that read a doc written for the default, dev-tools-on binary —
             // straight at the fix) instead of falling into the generic "argument
             // error: UnknownCommand" + full-usage-dump path below.
-            const verb = if (args.len >= 2) args[1] else "?";
+            const verb = if (args.len >= 3 and std.mem.eql(u8, args[1], "migrate")) "migrate preview" else if (args.len >= 2) args[1] else "?";
             std.log.err("zigbase {s}: {s}", .{ verb, devtools.disabled_note });
             std.process.exit(1);
         }
@@ -2264,6 +2264,14 @@ fn runCliImpl(init: std.process.Init, dispatch: *const events.Dispatch, jobs: []
             }
         },
         .migrate => |ma| switch (ma.action) {
+            .preview => {
+                if (comptime devtools.enabled) {
+                    var buf: [4096]u8 = undefined;
+                    var out = std.Io.File.stdout().writerStreaming(init.io, &buf);
+                    try @import("migration_preview.zig").write(schema_migrations, &out.interface);
+                    try out.interface.flush();
+                } else return error.DevToolsDisabled;
+            },
             .apply => try migrateImpl(allocator, init.io, init.environ_map, ma, schema_migrations),
             .status => try migrateStatusImpl(allocator, init.io, init.environ_map, ma, schema_migrations),
             .rollback => try migrateRollbackImpl(allocator, init.io, init.environ_map, ma, schema_migrations),
@@ -2380,6 +2388,7 @@ fn printUsage(io: std.Io, file: std.Io.File, show_serve_static: bool, show_stati
         \\  capabilities        Versioned JSON discovery of agent-facing CLI operations.
         \\  diagnostics         Versioned JSON doctor checks and structured failures.
         \\  routes              Offline JSON inventory of this binary's registered routes.
+        \\  migrate preview     Inventory consumer migration declarations offline, without running callbacks.
         \\  tune                Compare measured workload candidates within explicit budgets.
         \\  init                Scaffold a starting-point project (--box or --framework).
         \\  agents-md           Write AGENTS.md + CLAUDE.md for an existing project.
@@ -2679,13 +2688,42 @@ fn printMigrateUsage(io: std.Io, file: std.Io.File) void {
         \\USAGE:
         \\  zigbase migrate [--data-dir PATH]           Apply pending migrations (default).
         \\  zigbase migrate status [--data-dir PATH]    Report applied/pending migrations; apply nothing.
+        \\
+    , .{});
+    if (devtools.enabled) emit(io, file,
+        \\  zigbase migrate preview [--json]           Offline consumer declarations (-Ddev-tools).
+        \\    Preview opens no database and runs no callbacks. It does not predict pending
+        \\    migrations, SQL, side effects, or runtime reversibility. JSON in both forms.
+        \\
+    , .{});
+    emit(io, file,
         \\  zigbase migrate rollback [N] [--data-dir P]  Reverse the N most-recent migrations (default 1).
         \\  zigbase migrate dump [--out FILE]           Dump the live DB structure as SQL (stdout by default).
         \\
         \\FLAGS:
-        \\  --data-dir PATH  SQLite db + file storage directory. [env ZIGBASE_DATA_DIR, default ./zb_data]
+        \\
+    , .{});
+    if (devtools.enabled) emit(io, file,
+        \\  --data-dir PATH  (not preview) SQLite db + file storage directory.
+        \\
+    , .{}) else emit(io, file,
+        \\  --data-dir PATH  SQLite db + file storage directory.
+        \\
+    , .{});
+    emit(io, file,
+        \\                   [env ZIGBASE_DATA_DIR, default ./zb_data]
         \\  --out FILE       (dump only) Write the SQL to FILE instead of stdout; parent dirs are created.
-        \\  --json           (status only) Emit one JSON object on stdout instead of the text report.
+        \\
+    , .{});
+    if (devtools.enabled) emit(io, file,
+        \\  --json           (status or preview) Emit one JSON object on stdout.
+        \\                   Preview always emits JSON, including when --json is omitted.
+        \\
+    , .{}) else emit(io, file,
+        \\  --json           (status only) Emit one JSON object on stdout.
+        \\
+    , .{});
+    emit(io, file,
         \\
         \\  `migrate status` exits 1 when any migration is pending or orphaned, so it can
         \\  gate a deploy: `zigbase migrate status || zigbase migrate`.

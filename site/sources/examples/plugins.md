@@ -17,6 +17,11 @@ overrides its reader, scheduler-worker, and SQLite-cache settings. Run the built
 binary with `resources` to inspect the compiled settings as JSON. Profiles select
 transparent defaults; they do not enable features or impose a process memory cap.
 
+Run `./zig-out/bin/plugins migrate preview --json` to inspect the two compiled
+consumer migration declarations without booting plugins or opening a database.
+Their `up` callbacks have no declared reverse; the inventory does not execute them
+or determine pending state, SQL, side effects or runtime reversibility.
+
 This is the **advanced framework** example. It is a standalone package with a path
 dependency on the repo root (`../..`) and exercises — using **only public
 `zigbase.*` exports**, no reaching into ZigBase internals — the comptime-config

@@ -18,6 +18,7 @@ const operations = [_]Operation{
     .{ .id = "diagnostics", .argv = &.{ "diagnostics", "--json" }, .output = .json, .effect = .may_write, .requires_database = true, .notes = "Doctor adapter: probes filesystem writability; may initialize the migration ledger. JSON remains valid on diagnostic failure; exit 0 clean, 1 errors, 2 warnings." },
     .{ .id = "schema", .argv = &.{ "schema", "dump", "--json" }, .output = .json, .effect = .may_write, .requires_database = true, .notes = "Opens the database pool; may create local database state or configure journaling." },
     .{ .id = "migration-status", .argv = &.{ "migrate", "status", "--json" }, .output = .json, .effect = .may_write, .requires_database = true, .notes = "Opens the database pool and ensures the migration ledger exists. Nonzero exit can accompany valid status output." },
+    .{ .id = "migration-preview", .argv = &.{ "migrate", "preview", "--json" }, .output = .json, .effect = .read_only, .requires_database = false, .notes = "Compiled consumer declarations only; no deployment configuration, database or callbacks. CLI logging preferences still apply. Pending state, SQL, effects and runtime reversibility are unknown." },
     .{ .id = "http-contract", .argv = &.{"openapi"}, .output = .openapi, .effect = .read_only, .requires_database = true, .notes = "Requires an existing database; includes this binary's declared routes." },
     .{ .id = "error-codes", .argv = &.{ "explain-code", "--json" }, .output = .json, .effect = .read_only, .requires_database = false },
 } ++ (if (@import("build_options").file_inventory) [_]Operation{
@@ -96,12 +97,28 @@ test "capability catalog has versioned unique operation identifiers and inputs" 
     const root = parsed.value.object;
     try std.testing.expectEqual(@as(i64, 1), root.get("protocol_version").?.integer);
     const ops = root.get("operations").?.array.items;
-    try std.testing.expectEqual(@as(usize, if (@import("build_options").file_inventory) 9 else 7), ops.len);
-    if (@import("build_options").file_inventory) {
-        try std.testing.expectEqualStrings("read_only", ops[7].object.get("effect").?.string);
-        try std.testing.expectEqualStrings("may_write", ops[8].object.get("effect").?.string);
-        try std.testing.expectEqualStrings("--apply", ops[8].object.get("argv").?.array.items[3].string);
+    try std.testing.expectEqual(@as(usize, if (@import("build_options").file_inventory) 10 else 8), ops.len);
+    var found_preview = false;
+    var found_apply = false;
+    var found_diagnostics = false;
+    for (ops) |op| {
+        const id = op.object.get("id").?.string;
+        if (std.mem.eql(u8, id, "files-reconcile-preview")) {
+            found_preview = true;
+            try std.testing.expectEqualStrings("read_only", op.object.get("effect").?.string);
+        } else if (std.mem.eql(u8, id, "files-reconcile-apply")) {
+            found_apply = true;
+            try std.testing.expectEqualStrings("may_write", op.object.get("effect").?.string);
+            try std.testing.expectEqualStrings("--apply", op.object.get("argv").?.array.items[3].string);
+        } else if (std.mem.eql(u8, id, "diagnostics")) {
+            found_diagnostics = true;
+            try std.testing.expectEqualStrings("diagnostics", op.object.get("argv").?.array.items[0].string);
+            try std.testing.expectEqualStrings("json", op.object.get("output").?.string);
+        }
     }
+    try std.testing.expectEqual(@import("build_options").file_inventory, found_preview);
+    try std.testing.expectEqual(@import("build_options").file_inventory, found_apply);
+    try std.testing.expect(found_diagnostics);
     const inputs = root.get("input_operations").?.array.items;
     try std.testing.expectEqual(@as(usize, 1), inputs.len);
     for (inputs, 0..) |input, i| {
@@ -111,6 +128,4 @@ test "capability catalog has versioned unique operation identifiers and inputs" 
         for (ops) |op| try std.testing.expect(!std.mem.eql(u8, id, op.object.get("id").?.string));
         for (inputs[i + 1 ..]) |other| try std.testing.expect(!std.mem.eql(u8, id, other.object.get("id").?.string));
     }
-    try std.testing.expectEqualStrings("diagnostics", ops[2].object.get("argv").?.array.items[0].string);
-    try std.testing.expectEqualStrings("json", ops[2].object.get("output").?.string);
 }

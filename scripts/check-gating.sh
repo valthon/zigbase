@@ -138,7 +138,7 @@ for p in "${PATTERNS[@]}"; do
   fi
 done
 
-# -Ddev-tools=false: init/agents-md/typegen's whole subtree (scaffold + codegen) must be
+# -Ddev-tools=false: development command modules, including scaffold/codegen, must be
 # gone. Namespaced past the module name (a trailing "." into the real decl path, same
 # rule as PATTERNS above) so this can't false-positive on an unrelated identifier that
 # merely contains "scaffold" or "codegen" as a substring.
@@ -147,8 +147,9 @@ DEVTOOLS_PATTERNS=(
   "agent_capabilities\." # offline discovery catalog must disappear too
   "agent_diagnostics\." # development diagnostic adapter must disappear too
   "route_discovery\." # compiled route inventory is development-only
+  "migration_preview\." # consumer declaration inventory is development-only
   "scaffold\."   # src/scaffold.zig + src/scaffold/** (init, agents-md)
-  "codegen\."    # src/codegen/** (typegen — ~24 files, the largest of the three) — the
+  "codegen\."    # src/codegen/** (typegen — ~24 files, the largest dev-only surface) — the
                  # dot is escaped (unlike PATTERNS above): "codegen"/"scaffold" alone are
                  # common enough substrings elsewhere (e.g. sqlite3ExprCodeGeneratedColumn)
                  # to false-LEAK on the plain-dot-as-wildcard behavior grep BRE gives "."
