@@ -524,6 +524,10 @@ jobs:
           mise exec zig@0.16.0 -- zig build query-workbench-fixture check-query-workbench-contracts -Dquery-workbench=true --prefix zig-out/workbench
           bash scripts/check-query-workbench-gating.sh "$ZIGBASE_TEST_BINARY" zig-out/workbench/bin/query-workbench-fixture
           ZIGBASE_TEST_QUERY_WORKBENCH_BINARY="$GITHUB_WORKSPACE/zig-out/workbench/bin/query-workbench-fixture" mise exec python@3.13 -- python -m pytest tests/admin/test_query_workbench.py -q
+      - name: SQLite consumer migration process coordination
+        run: |
+          mise exec zig@0.16.0 -- zig build migration-coordination-fixture
+          ZIGBASE_TEST_MIGRATION_COORDINATION_BINARY="$GITHUB_WORKSPACE/zig-out/bin/migration-coordination-fixture" mise exec python@3.13 -- python -m pytest tests/admin/test_migration_coordination.py -q
       - name: Opt-in idempotent custom mutations
         run: |
           mise exec zig@0.16.0 -- zig build idempotency-fixture check-idempotency-contracts

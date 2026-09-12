@@ -225,6 +225,17 @@ pub fn build(b: *std.Build) void {
     const exe = b.addExecutable(.{ .name = "zigbase", .root_module = exe_mod });
     b.installArtifact(exe);
 
+    const migration_coordination_mod = b.createModule(.{
+        .root_source_file = b.path("fixtures/migration-coordination/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    migration_coordination_mod.addImport("zigbase", zigbase_mod);
+    const migration_coordination_exe = b.addExecutable(.{ .name = "migration-coordination-fixture", .root_module = migration_coordination_mod });
+    b.step("migration-coordination-fixture", "Build the SQLite consumer migration process fixture")
+        .dependOn(&b.addInstallArtifact(migration_coordination_exe, .{}).step);
+
     const run_cmd = b.addRunArtifact(exe);
     if (b.args) |args| run_cmd.addArgs(args);
     const run_step = b.step("run", "Run zigbase");

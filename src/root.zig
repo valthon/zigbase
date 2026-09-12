@@ -380,6 +380,7 @@ test {
         _ = @import("files/reconcile.zig");
     }
     _ = @import("files/maintenance.zig");
+    _ = @import("fslock.zig");
     _ = @import("zig_compat.zig");
     _ = @import("app.zig");
     _ = @import("config.zig");

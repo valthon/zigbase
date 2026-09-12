@@ -47,7 +47,14 @@ features a consumer configures in code.
    relation at provisioning time (create-missing + additive field-add).
    Access rules are applied per-collection.
 
-4. **Explicit migrations** via `.migrations`. Two `zigbase.Migration` entries:
+4. **Explicit migrations** via `.migrations`. Current SQLite migration batches use
+   a fail-fast, permanent `data.db.migrations.lock` sidecar: a competing command
+   reports `MigrationBusy` before system/ledger setup and can be retried after the
+   active batch finishes. Pool opening and later collection provisioning remain
+   outside the consumer lease.
+   This protects batch selection across individual commits without a background
+   coordinator; it does not coordinate automatic provisioning or older writers.
+   Two `zigbase.Migration` entries:
    `0001_create_audit_log` creates a side table via `w.exec`, and
    `0002_index_audit_note` is a multi-statement migration that creates an
    index on the migration-owned `plugin_audit_log` table *and* seeds a

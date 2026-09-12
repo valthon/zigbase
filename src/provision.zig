@@ -1202,8 +1202,26 @@ pub fn runMigrations(
     w: *db.Db,
     migs: []const Migration,
 ) !void {
-    try lockConsumerMigrations(w);
-    const result = runMigrationsLocked(alloc, io, w, migs);
+    return runMigrationsImpl(alloc, io, w, migs, false);
+}
+
+/// Framework apply/startup entrypoint. SQLite retains its consumer lease across
+/// prerequisite system migration setup; PostgreSQL keeps system setup first so
+/// its distinct system/consumer advisory locks retain their established order.
+pub fn runMigrationsWithSystem(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, migs: []const Migration) !void {
+    return runMigrationsImpl(alloc, io, w, migs, true);
+}
+
+fn runMigrationsImpl(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, migs: []const Migration, comptime setup: bool) !void {
+    if (w.inTransaction()) return error.MigrationCallerTransaction;
+    const postgres = db.dbDialect(w).kind == .postgres;
+    if (setup and postgres) try @import("migrations.zig").run(w);
+    const sqlite_lock = try lockConsumerMigrations(alloc, io, w);
+    defer if (sqlite_lock) |file| file.close(io);
+    const result: anyerror!void = blk: {
+        if (setup and !postgres) @import("migrations.zig").run(w) catch |err| break :blk err;
+        break :blk runMigrationsLocked(alloc, io, w, migs);
+    };
     unlockConsumerMigrations(w) catch |err| {
         if (err == error.MigrationUnfinishedTransaction) try result;
         // A real cleanup failure outranks the batch's own error, but the batch's error is the
@@ -1223,12 +1241,35 @@ const consumer_migration_unlock_sql = "SELECT pg_advisory_unlock(1514294599, 2);
 
 // Session scope is intentional: a batch retains its lock across individual
 // commits and non-transactional callbacks. Acquisition precedes every ledger
-// read. PostgreSQL session-affine connections are required; SQLite deployments
-// continue to use one process. Old binaries do not participate in this lock.
-fn lockConsumerMigrations(w: *db.Db) !void {
+// read. SQLite uses a permanent sidecar flock: no DB transaction can span the
+// batch without changing individual commits and non-transactional callbacks.
+// The returned file belongs to the caller and must outlive transaction cleanup.
+// Old binaries and external writers do not participate in this lock.
+fn lockConsumerMigrations(alloc: std.mem.Allocator, io: std.Io, w: *db.Db) !?std.Io.File {
     if (w.inTransaction()) return error.MigrationCallerTransaction;
-    if (db.dbDialect(w).kind == .postgres)
+    if (db.dbDialect(w).kind == .postgres) {
         try w.exec(consumer_migration_lock_sql);
+        return null;
+    }
+    const filename = @import("c.zig").c.sqlite3_db_filename(db.sqliteHandle(w), "main");
+    if (filename == null) return error.MigrationDatabaseUnavailable;
+    // Private memory/temp databases have no persistent filename or other process
+    // sharing their contents. This does not support shared-cache memory databases.
+    if (filename[0] == 0) return null;
+    const canonical = try std.Io.Dir.cwd().realPathFileAlloc(io, std.mem.span(filename), alloc);
+    defer alloc.free(canonical);
+    const name = try std.fmt.allocPrint(alloc, "{s}.migrations.lock", .{std.fs.path.basename(canonical)});
+    defer alloc.free(name);
+    var dir = try std.Io.Dir.cwd().openDir(io, std.fs.path.dirname(canonical).?, .{});
+    defer dir.close(io);
+    // Never unlink or truncate: replacing this inode while another process holds
+    // it would allow two independent locks. The database directory is trusted.
+    // Fail fast rather than adding retry workers or an unbounded startup wait.
+    // Open/locking failures retain their real error, distinct from contention.
+    return @import("fslock.zig").acquirePermanent(io, dir, name, true) catch |err| switch (err) {
+        error.WouldBlock => error.MigrationBusy,
+        else => err,
+    };
 }
 
 test "consumer runners refuse caller-owned transactions without ending them" {
@@ -1239,7 +1280,110 @@ test "consumer runners refuse caller-owned transactions without ending them" {
     defer w.rollback() catch {};
     try std.testing.expectError(error.MigrationCallerTransaction, runMigrations(std.testing.allocator, std.testing.io, &w, &.{}));
     try std.testing.expectError(error.MigrationCallerTransaction, rollbackMigrations(std.testing.allocator, std.testing.io, &w, &.{}, 1));
+    try std.testing.expectError(error.MigrationCallerTransaction, runMigrationsWithSystem(std.testing.allocator, std.testing.io, &w, &.{}));
+    try std.testing.expectError(error.MigrationCallerTransaction, rollbackMigrationsWithLedger(std.testing.allocator, std.testing.io, &w, &.{}, 1));
     try std.testing.expect(w.inTransaction());
+}
+
+test "SQLite consumer lock refuses nested transactions before creating a sidecar and reports obstruction" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(dir);
+    const path = try std.fmt.allocPrintSentinel(a, "{s}/data.db", .{dir}, 0);
+    defer a.free(path);
+    var w = try db.Db.open(path);
+    defer w.close();
+    try w.exec("CREATE TABLE probe (id INTEGER);");
+    try w.begin();
+    try std.testing.expectError(error.MigrationCallerTransaction, lockConsumerMigrations(a, io, &w));
+    try std.testing.expect(w.inTransaction());
+    try w.rollback();
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "data.db.migrations.lock", .{}));
+    try tmp.dir.createDir(io, "data.db.migrations.lock", .default_dir);
+    // An unavailable path is not contention, and no ledger/callback has run.
+    try std.testing.expectError(error.IsDir, runMigrations(a, io, &w, &.{}));
+    try std.testing.expect(!w.inTransaction());
+    try tmp.dir.deleteDir(io, "data.db.migrations.lock");
+    try tmp.dir.writeFile(io, .{ .sub_path = "target", .data = "keep" });
+    try tmp.dir.symLink(io, "target", "data.db.migrations.lock", .{});
+    try std.testing.expectError(error.SymLinkLoop, runMigrations(a, io, &w, &.{}));
+    try std.testing.expect(!w.inTransaction());
+}
+
+test "SQLite setup failure rolls back and releases its consumer lease before retry" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(dir);
+    const path = try std.fmt.allocPrintSentinel(a, "{s}/data.db", .{dir}, 0);
+    defer a.free(path);
+    var first = try db.Db.open(path);
+    defer first.close();
+    var second = try db.Db.open(path);
+    defer second.close();
+    try first.exec("CREATE TABLE _migrations (broken INTEGER);");
+    try std.testing.expectError(error.PrepareFailed, runMigrationsWithSystem(a, io, &first, &.{}));
+    try std.testing.expect(!first.inTransaction());
+    try std.testing.expectError(error.PrepareFailed, rollbackMigrationsWithLedger(a, io, &first, &.{}, 1));
+    try std.testing.expect(!first.inTransaction());
+    // Keep the failed connection alive: retry success must depend on normal
+    // rollback/lease cleanup, not process exit or closing the original handle.
+    try second.exec("DROP TABLE _migrations;");
+    try runMigrationsWithSystem(a, io, &second, &.{});
+    const outcome = try rollbackMigrationsWithLedger(a, io, &second, &.{}, 1);
+    defer outcome.deinit(a);
+    try std.testing.expect(outcome == .ok);
+    try std.testing.expect(!second.inTransaction());
+}
+
+test "SQLite consumer lock releases after rollback preflight and callback failures" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(dir);
+    const path = try std.fmt.allocPrintSentinel(a, "{s}/data.db", .{dir}, 0);
+    defer a.free(path);
+    var first = try db.Db.open(path);
+    defer first.close();
+    var second = try db.Db.open(path);
+    defer second.close();
+    try @import("migrations.zig").run(&first);
+    const M = struct {
+        fn up(m: *Migrator) !void {
+            try m.exec("CREATE TABLE successful_consumer (id INTEGER);");
+        }
+        fn fail(m: *Migrator) !void {
+            try m.exec("CREATE TABLE failed_consumer (id INTEGER);");
+            return error.ConsumerTestFailure;
+        }
+    };
+    const list = [_]Migration{.{ .id = "not_reversible", .up = M.up }};
+    try runMigrations(a, io, &first, &list);
+    const outcome = try rollbackMigrations(a, io, &first, &list, 1);
+    defer outcome.deinit(a);
+    try std.testing.expect(outcome == .irreversible);
+    {
+        const held = (try lockConsumerMigrations(a, io, &second)).?;
+        defer held.close(io);
+        try std.testing.expectError(error.MigrationBusy, runMigrations(a, io, &first, &list));
+        try std.testing.expectError(error.MigrationBusy, rollbackMigrations(a, io, &first, &list, 1));
+    }
+    try std.testing.expectError(error.ConsumerTestFailure, runMigrations(a, io, &first, &.{.{ .id = "failed", .up = M.fail }}));
+    try std.testing.expect(!first.inTransaction());
+    try runMigrations(a, io, &second, &list);
+    var st = try second.prepare("SELECT count(*) FROM sqlite_master WHERE name='failed_consumer';");
+    defer st.finalize();
+    try std.testing.expect(try st.step());
+    try std.testing.expectEqual(@as(i64, 0), st.columnInt(0));
+    // A released sidecar stays present; future batches must reuse its inode.
+    _ = try tmp.dir.statFile(io, "data.db.migrations.lock", .{});
 }
 
 test "consumer runner cleans a nontransactional callback's unfinished transaction" {
@@ -1790,8 +1934,25 @@ pub fn rollbackMigrations(
     migs: []const Migration,
     n: usize,
 ) !RollbackOutcome {
-    try lockConsumerMigrations(w);
-    const result = rollbackMigrationsLocked(alloc, io, w, migs, n);
+    return rollbackMigrationsImpl(alloc, io, w, migs, n, false);
+}
+
+/// Framework rollback entrypoint; SQLite tests the consumer lease before ledger
+/// bootstrap can wait on an active transactional consumer callback.
+pub fn rollbackMigrationsWithLedger(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, migs: []const Migration, n: usize) !RollbackOutcome {
+    return rollbackMigrationsImpl(alloc, io, w, migs, n, true);
+}
+
+fn rollbackMigrationsImpl(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, migs: []const Migration, n: usize, comptime setup: bool) !RollbackOutcome {
+    if (w.inTransaction()) return error.MigrationCallerTransaction;
+    const postgres = db.dbDialect(w).kind == .postgres;
+    if (setup and postgres) try @import("migrations.zig").ensureLedger(w);
+    const sqlite_lock = try lockConsumerMigrations(alloc, io, w);
+    defer if (sqlite_lock) |file| file.close(io);
+    const result: anyerror!RollbackOutcome = blk: {
+        if (setup and !postgres) @import("migrations.zig").ensureLedger(w) catch |err| break :blk err;
+        break :blk rollbackMigrationsLocked(alloc, io, w, migs, n);
+    };
     unlockConsumerMigrations(w) catch |err| {
         if (result) |outcome| outcome.deinit(alloc) else |primary| {
             if (err == error.MigrationUnfinishedTransaction) return primary;

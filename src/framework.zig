@@ -3313,10 +3313,9 @@ fn migrateImpl(allocator: std.mem.Allocator, io: std.Io, environ: *const std.pro
     defer pool.deinit();
     const w = pool.acquireWriter();
     defer pool.releaseWriter();
-    try migrations.run(w);
     if (schema_migrations.len > 0) {
-        try provision.runMigrations(allocator, io, w, schema_migrations);
-    }
+        try provision.runMigrationsWithSystem(allocator, io, w, schema_migrations);
+    } else try migrations.run(w);
     std.log.info("migrations applied", .{});
 }
 
@@ -3991,10 +3990,8 @@ fn migrateRollbackImpl(allocator: std.mem.Allocator, io: std.Io, environ: *const
     defer pool.deinit();
     const w = pool.acquireWriter();
     defer pool.releaseWriter();
-    try migrations.ensureLedger(w);
-
     const out = std.Io.File.stdout();
-    const outcome = try provision.rollbackMigrations(allocator, io, w, schema_migrations, ma.rollback_count);
+    const outcome = try provision.rollbackMigrationsWithLedger(allocator, io, w, schema_migrations, ma.rollback_count);
     switch (outcome) {
         .ok => |reversed| {
             if (reversed.len == 0) {
@@ -4855,7 +4852,6 @@ fn bootApp(
     {
         const w = holder.pool.acquireWriter();
         defer holder.pool.releaseWriter();
-        try migrations.run(w);
         // Comptime-schema provisioning. When `.collections`/`.migrations` are absent
         // both slices are empty, so this whole block is a no-op and the binary behaves
         // exactly as before the feature. Otherwise: run the explicit escape-hatch
@@ -4863,8 +4859,8 @@ fn bootApp(
         // the comptime collections (create-missing + additive field-add + name->id
         // relation resolution; destructive diffs are logged and skipped).
         if (schema_migrations.len > 0) {
-            try provision.runMigrations(allocator, io, w, schema_migrations);
-        }
+            try provision.runMigrationsWithSystem(allocator, io, w, schema_migrations);
+        } else try migrations.run(w);
         if (schema_collections.len > 0) {
             // injectOAuthSecrets allocates a rewritten collections slice (+ provider arrays
             // and encrypted secret strings) only needed through provisioning; applySpecs

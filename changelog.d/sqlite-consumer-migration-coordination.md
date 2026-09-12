@@ -1,0 +1,2 @@
+### Features
+- Coordinate current-version SQLite consumer migration apply/rollback batches with a permanent, nonblocking sidecar file lock. Competing batches fail with `MigrationBusy` before consumer ledger reads or callbacks; retry after the active batch finishes. Per-migration commits and non-transactional callbacks remain unchanged. Old/external writers and automatic provisioning still require a single leader.

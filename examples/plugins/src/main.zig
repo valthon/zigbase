@@ -673,6 +673,8 @@ const Backend = zigbase.App(.{
         .enable_typegen = true,
 
         // 4. Explicit migrations -- escape hatch for non-additive / seeding changes.
+        // SQLite batches hold data.db.migrations.lock across these commits. A
+        // concurrent migration command fails with MigrationBusy; retry afterward.
         .migrations = &[_]zigbase.Migration{
             .{ .id = "0001_create_audit_log", .up = createAuditLog },
             .{ .id = "0002_index_audit_note", .up = addAuditNoteIndex },
