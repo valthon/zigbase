@@ -708,6 +708,9 @@ const Backend = zigbase.App(.{
         // Explicit fields override profile defaults; inspect with `resources`.
         .pools = .{ .readers = 4, .jobs = 1, .memory_jobs = 2, .cache_kib = 512 },
         .admission = .{ .max_requests = 3 }, // leave one of four HTTP threads available to reject excess work
+        // To share a work-count budget with memory jobs/app.submit, forward
+        // .@"coordinated-admission" = true to the zigbase dependency in build.zig,
+        // then add .max_work = 16 above. This is a work count, not a memory cap.
 
         // 8. Fully embedded static frontend (see build.zig embedStaticDir).
         .static_files = .{ .embedded = &@import("static_assets").files },

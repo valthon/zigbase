@@ -16,6 +16,7 @@ const BuildOptionValues = struct {
     image_thumbnails: bool,
     durable_resumable_uploads: bool,
     query_workbench: bool,
+    coordinated_admission: bool,
     fts5: bool,
     sqlite_version: []const u8,
     sqlite_source_id: []const u8,
@@ -121,6 +122,7 @@ pub fn build(b: *std.Build) void {
     const durable_resumable_uploads = b.option(bool, "durable-resumable-uploads", "Compile opt-in SQLite upload persistence (requires resumable-uploads)") orelse false;
     if (durable_resumable_uploads and !resumable_uploads) @panic("durable-resumable-uploads requires resumable-uploads=true");
     const query_workbench = b.option(bool, "query-workbench", "Compile bounded SQLite query diagnostics (default: off)") orelse false;
+    const coordinated_admission = b.option(bool, "coordinated-admission", "Compile shared HTTP and memory-job admission (default: off)") orelse false;
     // Opt-in vector search (#157; Postgres pgvector port #159). OFF by default: the default build
     // does NOT compile or link the sqlite-vec amalgamation, and every vector code path folds to
     // comptime-dead — the shipped binary is byte-for-byte unaffected. `-Dvector=true` enables vector
@@ -174,6 +176,7 @@ pub fn build(b: *std.Build) void {
         .image_thumbnails = image_thumbnails,
         .durable_resumable_uploads = durable_resumable_uploads,
         .query_workbench = query_workbench,
+        .coordinated_admission = coordinated_admission,
         .internal_api = false,
         .vector = vector,
         .postgres = postgres,
@@ -577,6 +580,19 @@ pub fn build(b: *std.Build) void {
     const admission_exe = b.addExecutable(.{ .name = "admission-fixture", .root_module = admission_mod });
     b.step("admission-fixture", "Build concurrent HTTP admission fixture").dependOn(&b.addInstallArtifact(admission_exe, .{}).step);
     const admission_contracts = b.step("check-admission-contracts", "Check HTTP admission compile-time contracts");
+    const shared_admission_mod = b.createModule(.{ .root_source_file = b.path("fixtures/admission/shared.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    shared_admission_mod.addImport("zigbase", zigbase_mod);
+    const shared_admission_exe = b.addExecutable(.{ .name = "shared-admission-fixture", .root_module = shared_admission_mod });
+    b.step("shared-admission-fixture", "Build shared HTTP and memory-job admission fixture").dependOn(&b.addInstallArtifact(shared_admission_exe, .{}).step);
+    if (!coordinated_admission) {
+        shared_admission_exe.expect_errors = .{ .contains = ".admission.max_work requires -Dcoordinated-admission=true" };
+        admission_contracts.dependOn(&shared_admission_exe.step);
+    }
+    const zero_work_mod = b.createModule(.{ .root_source_file = b.path("fixtures/admission/work-zero.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    zero_work_mod.addImport("zigbase", zigbase_mod);
+    const zero_work_exe = b.addExecutable(.{ .name = "invalid-admission-work-zero", .root_module = zero_work_mod });
+    zero_work_exe.expect_errors = .{ .contains = if (coordinated_admission) ".admission.max_work must be positive; omit it to disable shared admission" else ".admission.max_work requires -Dcoordinated-admission=true" };
+    admission_contracts.dependOn(&zero_work_exe.step);
     const realtime_contracts = b.step("check-realtime-cap-contracts", "Check realtime connection cap compile-time contracts");
     inline for (&.{
         .{ .name = "nonstruct", .expected = ".realtime must be a struct" },

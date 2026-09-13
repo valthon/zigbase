@@ -817,7 +817,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        lane: [workbench, thumbnails, resumable, durable, coordination]
+        lane: [workbench, thumbnails, resumable, durable, coordination, admission]
     env:
       ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-global
       ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/.zig-local
@@ -868,6 +868,12 @@ jobs:
       - name: Install Playwright OS deps (cache hit)
         if: matrix.lane == 'thumbnails' && steps.pw-cache.outputs.cache-hit == 'true'
         run: mise exec python@3.13 -- python -m playwright install-deps chromium
+      - name: Opt-in shared HTTP and memory-job admission
+        if: matrix.lane == 'admission'
+        run: |
+          mise exec zig@0.16.0 -- zig build test check-admission-contracts shared-admission-fixture -Dcoordinated-admission=true --summary all
+          bash scripts/check-shared-admission-gating.sh "$ZIGBASE_TEST_BINARY" zig-out/bin/shared-admission-fixture
+          ZIGBASE_TEST_SHARED_ADMISSION_BINARY="$GITHUB_WORKSPACE/zig-out/bin/shared-admission-fixture" mise exec python@3.13 -- python -m pytest tests/admin/test_shared_admission.py -q
       - name: Opt-in bounded SQLite query workbench
         if: matrix.lane == 'workbench'
         run: |

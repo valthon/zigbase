@@ -533,8 +533,8 @@ pub const Ctx = struct {
     //
     // `enqueue` is the generic public API: serialize `payload` to JSON and route
     // it to the named queue's backend (memory → the bounded in-process worker pool with
-    // retry, error.QueueFull when its ring is full; durable → persisted to
-    // `_queue_jobs`, drained by a worker poller). `q`/`job` are enum
+    // retry, error.QueueFull when its ring or shared admission budget is full;
+    // durable → persisted to `_queue_jobs`, drained by a worker poller). `q`/`job` are enum
     // literals (`.queue`, `.kind`). The typed, compile-checked `App.enqueue(ctx,
     // .queue, .kind, payload)` (mirroring `App.flag`) is the preferred call site — a
     // typo'd queue/kind is a compile error there; this method validates at runtime.

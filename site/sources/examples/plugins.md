@@ -19,6 +19,12 @@ transparent defaults; they do not enable features or impose a process memory cap
 `memory_job_workers` reports the lazy pool count, with `job_stack_bytes` shared
 by scheduler and memory workers after its floor.
 
+The example also limits synchronous HTTP admission to three callbacks. Its source
+shows how to opt into a shared HTTP/memory-job work-count budget: forward
+`coordinated-admission` to the ZigBase dependency and add `.admission.max_work`.
+The default example leaves that additional integration compiled out; a shared
+count does not imply a byte or RSS cap.
+
 The report's `envelope` makes the tradeoffs explicit: this example retains up to
 four idle SQLite readers with 512 KiB soft cache targets (2.5 MiB including the
 writer), and admits at most three synchronous HTTP callbacks. Overflow reader

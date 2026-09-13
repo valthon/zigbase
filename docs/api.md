@@ -1726,7 +1726,7 @@ many times. `droppedStatements` is independent of `droppedExecutions`. No raw
 `401` without a valid identity, `403` for other users, and `404` when disabled.
 
 ```json
-{"limit":3,"active":1,"high_water":3,"rejected":42}
+{"limit":3,"active":1,"high_water":3,"rejected":42,"work_limit":16,"jobs":2,"work_high_water":16,"jobs_rejected":5}
 ```
 
 Counters are coherent and process-local, reset at restart. `active` includes
@@ -1736,6 +1736,14 @@ can return `503` with code `overloaded` and `Retry-After: 1` before authenticati
 Only the exact built-in `GET /api/health` liveness probe is exempt. See
 [HTTP admission and backpressure](framework.md#http-admission-and-backpressure)
 for configuration, scope, and retry guidance.
+
+With `-Dcoordinated-admission=true` and `.admission.max_work`, `work_limit` is
+the shared ceiling for `active + jobs`; `jobs` counts queued/running memory jobs
+and `app.submit` tasks, including retry backoff. `work_high_water` records peak
+combined occupancy, and saturating `jobs_rejected` counts shared-budget job
+refusals, not independent ring-full errors. Without shared admission,
+`work_limit` is `null` and the three shared counters are zero. These are
+process-local work counts, not memory measurements; durable jobs are excluded.
 
 ---
 

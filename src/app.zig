@@ -230,7 +230,8 @@ pub const App = struct {
     /// workers JOINED — a task submitted near shutdown completes (at-most-once across a
     /// crash). Returns error.SchedulerUnavailable when no pool is installed (unit tests /
     /// CLI — the historical error name is kept for compatibility) and error.QueueFull when
-    /// the bounded ring is full (reject-not-block; see queue/memory.zig for the policy).
+    /// the bounded ring or optional shared .admission.max_work budget is full
+    /// (reject-not-block; see queue/memory.zig for the policy).
     /// `name` is copied before this function returns: the caller retains ownership of its
     /// slice, while the task borrows the queue-owned `JobEvent.name` only for that invocation.
     pub fn submit(self: *App, name: []const u8, task: @import("events.zig").JobTask) !void {

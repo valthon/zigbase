@@ -1,0 +1,2 @@
+### Features
+- Add opt-in coordinated admission across synchronous HTTP requests and queued/running memory jobs, including `app.submit`: build with `-Dcoordinated-admission=true` and configure `.admission.max_work`. Saturated requests receive the existing overload response and jobs return `error.QueueFull`; diagnostics and the offline resource report expose the shared work-count budget. This is process-local and does not cap bytes or RSS.

@@ -982,6 +982,7 @@ pub fn App(comptime cfg: anytype) type {
                 .job_workers = job_pool_size,
                 .job_stack_bytes = job_stack_size,
                 .admission_max_requests = if (admission_config) |a| a.max_requests else null,
+                .admission_max_work = if (admission_config) |a| a.max_work else null,
                 .resumable = if (build_options.resumable_uploads) .{
                     .max_sessions = files_config.resumable.max_sessions,
                     .max_upload_bytes = files_config.resumable.max_upload_bytes,
@@ -6615,4 +6616,15 @@ test "liveEncryptedCollection detects a RUNTIME-created encrypted collection (dr
     defer if (found) |f| a.free(f);
     try std.testing.expect(found != null);
     try std.testing.expectEqualStrings("vault", found.?);
+}
+
+test "resource envelope reports opt-in coordinated admission separately from HTTP" {
+    const HttpOnly = App(.{ .admission = .{ .max_requests = 3 } });
+    try std.testing.expectEqual(null, HttpOnly.resource_report.envelope.?.coordinated_admission_max_work);
+    if (comptime build_options.coordinated_admission) {
+        const Shared = App(.{ .admission = .{ .max_requests = 3, .max_work = 16 } });
+        try std.testing.expectEqual(@as(u32, 3), Shared.resource_report.envelope.?.http_admission_max_requests.?);
+        try std.testing.expectEqual(@as(u32, 16), Shared.resource_report.envelope.?.coordinated_admission_max_work.?);
+        try std.testing.expectEqual(@as(u32, 16), Shared.admission_config.?.max_work.?);
+    }
 }
