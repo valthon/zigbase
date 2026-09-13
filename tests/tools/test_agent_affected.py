@@ -111,9 +111,12 @@ def test_direct_module_selection_and_shared_dependency(repo):
         ("build.zig", set(agent.ADMIN_MODULES)),
         ("zig-pkg/dependency/file.zig", set(agent.ADMIN_MODULES)),
         ("tests/_bin.py", set(agent.MODULES)),
-        ("clients/typescript/src/client.ts", set(agent.SDK_SUITES)),
-        ("clients/typescript/package-lock.json", set(agent.SDK_SUITES)),
-        ("clients/typescript/vitest.config.ts", set(agent.SDK_SUITES)),
+        ("clients/typescript/src/client.ts", {"clients/typescript::unit"}),
+        ("clients/typescript/package-lock.json", {"clients/typescript::unit"}),
+        ("clients/typescript/vitest.config.ts", {"clients/typescript::unit"}),
+        ("clients/python/src/zigbase/client.py", {"clients/python::unit"}),
+        ("clients/python/pyproject.toml", {"clients/python::unit"}),
+        ("clients/python/tests/test_client.py", {"clients/python::unit"}),
     ],
 )
 def test_curated_tool_dependencies_and_admin_group(repo, path, expected):

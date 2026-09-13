@@ -3,10 +3,12 @@
 import importlib.util
 import json
 import os
+import re
 from pathlib import Path
 import subprocess
 import sys
 import time
+import tomllib
 
 import pytest
 
@@ -34,7 +36,7 @@ def test_inventory_is_static_and_has_exact_runnable_selectors(tmp_path, monkeypa
     source.write_text(f"open({str(marker)!r}, 'w').close()\ndef test_example(): pass\n")
     monkeypatch.setattr(agent, "ROOT", tmp_path)
     monkeypatch.setattr(agent, "MODULES", ("test_example.py",))
-    monkeypatch.setattr(agent, "SDK_SUITES", ())
+    monkeypatch.setattr(agent, "SDK_SUITES", {})
     inventory = agent.inventory()
     assert [item["id"] for item in inventory["items"]] == [
         "test_example.py",
@@ -66,6 +68,12 @@ def test_checkout_inventory_cli():
     assert suite["cwd"] == "clients/typescript"
     assert suite["requirements"]["tools"]["node"] == "24"
     assert not suite["requirements"]["binary"]["build_if_missing"]
+    python = next(item for item in items if item["id"] == "clients/python::unit")
+    assert python["kind"] == "suite" and python["runner"] == "pytest"
+    assert python["cwd"] == "clients/python"
+    assert python["requirements"]["tools"] == {"python": "3.13"}
+    assert "pytest-asyncio" in python["requirements"]["python_packages"]
+    assert not python["requirements"]["binary"]["build_if_missing"]
 
 
 @pytest.mark.parametrize(
@@ -80,6 +88,8 @@ def test_checkout_inventory_cli():
         "tests/admin/test_schema.py -k foo",
         "clients/typescript::unit --watch",
         "clients/typescript::integration",
+        "clients/python::unit -m integration",
+        "clients/python::integration",
     ],
 )
 def test_unknown_selector_never_starts_process(selector, monkeypatch):
@@ -267,6 +277,64 @@ def test_sdk_directory_escape_never_starts_process(tmp_path, monkeypatch):
     monkeypatch.setattr(agent, "execute", lambda *a, **kw: pytest.fail("spawned"))
     with pytest.raises(agent.ContractError, match="escapes"):
         agent.run("clients/typescript::unit", 1, 1024)
+
+
+def test_python_sdk_uses_explicit_plugin_source_and_excludes_integration(monkeypatch):
+    calls = []
+
+    def execute(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return {"outcome": "passed"}
+
+    monkeypatch.setattr(agent, "execute", execute)
+    monkeypatch.setenv("PYTHONPATH", "/tmp/caller-dependencies")
+    result = agent.run("clients/python::unit", 17, 1234)
+    argv, options = calls[0]
+    assert argv == [
+        *agent.PREFIX, "-p", "pytest_asyncio.plugin", "-c", "pyproject.toml",
+        "-o", "pythonpath=src", "-m", "not integration",
+        "--ignore=tests/integration", "--", "tests",
+    ]
+    assert options["cwd"] == ROOT / "clients/python"
+    assert options["env"]["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] == "1"
+    assert "PYTEST_PLUGINS" not in options["env"]
+    assert options["env"]["PYTHONPATH"] == str(ROOT / "clients/python/src") + os.pathsep + "/tmp/caller-dependencies"
+    assert options["timeout"] == 17 and options["output_limit"] == 1234
+    assert result["cwd"] == "clients/python"
+
+
+def test_python_sdk_source_escape_never_starts_process(tmp_path, monkeypatch):
+    checkout = tmp_path / "checkout"
+    (checkout / "clients/python").mkdir(parents=True)
+    (checkout / "clients/python/src").symlink_to(tmp_path, target_is_directory=True)
+    monkeypatch.setattr(agent, "ROOT", checkout)
+    monkeypatch.setattr(agent, "MODULES", ())
+    monkeypatch.setattr(agent, "execute", lambda *a, **kw: pytest.fail("spawned"))
+    with pytest.raises(agent.ContractError, match="SDK source directory"):
+        agent.run("clients/python::unit", 1, 1024)
+
+
+def test_python_sdk_dev_plugins_have_explicit_registration():
+    with (ROOT / "clients/python/pyproject.toml").open("rb") as source:
+        project = tomllib.load(source)["project"]
+    dependencies = project["optional-dependencies"]["dev"]
+    # Read distribution names only; no dependency imports or runtime autoload.
+    names = {re.match(r"[A-Za-z0-9_.-]+", dependency).group().lower().replace("_", "-")
+             for dependency in dependencies}
+    plugins = {name for name in names if name.startswith("pytest-")}
+    assert plugins == set(agent.PYTHON_SDK_PLUGINS), "Update explicit SDK plugin mapping when dev extras change"
+    argv = agent.command("clients/python::unit")
+    registered = {argv[index + 1] for index, arg in enumerate(argv[:-1]) if arg == "-p"}
+    assert registered == set(agent.PYTHON_SDK_PLUGINS.values())
+    advertised = set(agent.SDK_SUITES["clients/python::unit"]["requirements"]["python_packages"])
+    assert {"pytest", *plugins} <= advertised
+
+
+def test_sdk_spec_inventory_does_not_share_mutable_requirements():
+    catalog = agent.inventory()
+    item = next(item for item in catalog["items"] if item["id"] == "clients/python::unit")
+    item["requirements"]["python_packages"].clear()
+    assert "pytest" in agent.SDK_SUITES["clients/python::unit"]["requirements"]["python_packages"]
 
 
 def test_actual_allowlisted_pytest_execution():

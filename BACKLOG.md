@@ -31,6 +31,8 @@ copy, examples, and tests with the implementation rather than in follow-up PRs.
   also inventoried, with explicit tool/contract dependency mappings.
   TypeScript SDK unit execution now has an explicit suite selector with pinned
   Node, bounded worker count and structured evidence; SDK path changes select it.
+  Python SDK unit execution has a matching pinned, serial selector with explicit
+  async-test support and checkout-source isolation; live integration remains separate.
   This is not a remote executor or arbitrary embedded-app test discovery. Broader
   test-runner coverage and inferred dependency graphs remain.
   Offline migration preview now reports compiled consumer callback/transaction declarations

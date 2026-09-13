@@ -1,7 +1,7 @@
-"""Run only after installing clients/typescript dependencies (no pytest needed).
+"""Real Python SDK runner regression; install SDK dev/realtime extras first.
 
-This lives outside tests/tools so Python-only tooling checks never acquire SDK
-dependencies. CI runs it instead of a second, duplicate SDK unit-suite command.
+Kept outside dependency-light tests/tools. CI uses this instead of repeating
+the SDK unit suite. No missing-dependency skips or installation attempts.
 """
 
 import json
@@ -14,15 +14,12 @@ import unittest
 ROOT = Path(__file__).resolve().parents[2]
 
 
-class TypeScriptRunnerTest(unittest.TestCase):
+class PythonRunnerTest(unittest.TestCase):
     def test_actual_bounded_sdk_selector(self):
         completed = subprocess.run(
             [
-                sys.executable,
-                str(ROOT / "tools/agent_tests.py"),
-                "run",
-                "--selector", "clients/typescript::unit",
-                "--timeout-seconds", "180",
+                sys.executable, str(ROOT / "tools/agent_tests.py"), "run",
+                "--selector", "clients/python::unit", "--timeout-seconds", "180",
                 "--output-limit-bytes", "1048576",
             ],
             cwd=ROOT,
@@ -42,12 +39,13 @@ class TypeScriptRunnerTest(unittest.TestCase):
         self.assertEqual(report["exit_code"], 0, diagnostics)
         self.assertEqual(report["outcome"], "passed", diagnostics)
         self.assertEqual(report["child_exit_code"], 0, diagnostics)
-        self.assertEqual(report["selector"], "clients/typescript::unit")
-        self.assertEqual(report["cwd"], "clients/typescript")
+        self.assertEqual(report["selector"], "clients/python::unit")
+        self.assertEqual(report["cwd"], "clients/python")
         self.assertEqual(report["argv"], [
-            "mise", "exec", "node@24", "--", "node",
-            "node_modules/vitest/vitest.mjs", "run", "--config", "vitest.config.ts",
-            "--maxWorkers=2", "--minWorkers=1",
+            "mise", "exec", "python@3.13", "--", "python", "-m", "pytest",
+            "-q", "-o", "addopts=", "-p", "pytest_asyncio.plugin",
+            "-c", "pyproject.toml", "-o", "pythonpath=src", "-m", "not integration",
+            "--ignore=tests/integration", "--", "tests",
         ])
         self.assertEqual(report["limits"], {
             "timeout_seconds": 180, "output_limit_bytes": 1048576,
@@ -55,8 +53,8 @@ class TypeScriptRunnerTest(unittest.TestCase):
         self.assertFalse(report["output_truncated"], diagnostics)
         self.assertFalse(report["cleanup_failed"], diagnostics)
         self.assertIsNone(report["test_counts"])
-        # Confirm real SDK execution, not an empty/no-op successful command.
-        self.assertIn("test/smoke.test.ts", report["stdout"], diagnostics)
+        self.assertRegex(report["stdout"], r"\b[1-9][0-9]* passed\b", diagnostics)
+        self.assertNotIn("PytestUnhandledCoroutineWarning", report["stdout"], diagnostics)
 
 
 if __name__ == "__main__":

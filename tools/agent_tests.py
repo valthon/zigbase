@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import copy
 import json
 import os
 from pathlib import Path
@@ -38,7 +39,48 @@ TOOL_MODULES = (
     "tests/tools/test_agent_affected.py",
 )
 MODULES = (*TOOL_MODULES, *ADMIN_MODULES)
-SDK_SUITES = ("clients/typescript::unit",)
+PREFIX = (
+    "mise", "exec", "python@3.13", "--", "python", "-m", "pytest",
+    "-q", "-o", "addopts=",
+)
+# SDK dev-extra pytest plugins must be added explicitly; never autoload them.
+PYTHON_SDK_PLUGINS = {"pytest-asyncio": "pytest_asyncio.plugin"}
+SDK_SUITES = {
+    "clients/typescript::unit": {
+        "cwd": "clients/typescript",
+        "runner": "vitest",
+        "argv": (
+            "mise", "exec", "node@24", "--", "node",
+            "node_modules/vitest/vitest.mjs", "run", "--config", "vitest.config.ts",
+            "--maxWorkers=2", "--minWorkers=1",
+        ),
+        "requirements": {
+            "tools": {"python": "3.13", "node": "24"},
+            "python_packages": [],
+            "browser": None,
+            "binary": {"build_if_missing": False, "prebuilt_override": None},
+            "notes": "Requires clients/typescript dependencies already installed with npm ci. Runs the checked-in unit configuration with at most two workers; no installation, Zig compilation, browser or live integration suite. Vitest cases are not individually inventoried.",
+        },
+    },
+    "clients/python::unit": {
+        "cwd": "clients/python",
+        "runner": "pytest",
+        "prepend_pythonpath": True,
+        "argv": (
+            *PREFIX,
+            *(arg for plugin in PYTHON_SDK_PLUGINS.values() for arg in ("-p", plugin)),
+            "-c", "pyproject.toml", "-o", "pythonpath=src", "-m", "not integration",
+            "--ignore=tests/integration", "--", "tests",
+        ),
+        "requirements": {
+            "tools": {"python": "3.13"},
+            "python_packages": ["pytest", "pytest-asyncio", "httpx", "pydantic", "websockets"],
+            "browser": None,
+            "binary": {"build_if_missing": False, "prebuilt_override": None},
+            "notes": "Requires Python SDK dev/realtime dependencies already installed. Uses this checkout's src via pytest pythonpath, explicitly loads pytest-asyncio with plugin autoload disabled, and excludes integration collection. No installation, Zig compilation or browser; individual SDK cases are not inventoried.",
+        },
+    },
+}
 GROUPS = (*MODULES, *SDK_SUITES)
 MODULE_NOTES = {
     "tests/tools/test_performance_contracts.py": "Local Python CLI and synthetic artifact fixtures; no Zig compiler, real benchmark run or browser. Class methods run through the module selector, not individual inventory ids.",
@@ -69,22 +111,11 @@ DEPENDENCIES = (
     ("mise.toml", GROUPS),
     ("pyproject.toml", MODULES),
     ("tools/agent_tests.py", GROUPS),
-    ("clients/typescript/", SDK_SUITES),
+    ("clients/typescript/", ("clients/typescript::unit",)),
+    ("clients/python/", ("clients/python::unit",)),
     ("tools/performance_contracts.py", ("tests/tools/test_performance_contracts.py",)),
     ("bench/contracts/", ("tests/tools/test_performance_contracts.py",)),
     ("tools/replay/", ("tests/tools/test_replay.py",)),
-)
-PREFIX = (
-    "mise",
-    "exec",
-    "python@3.13",
-    "--",
-    "python",
-    "-m",
-    "pytest",
-    "-q",
-    "-o",
-    "addopts=",
 )
 BROWSER_MODULES = {
     "tests/admin/test_schema.py",
@@ -115,12 +146,8 @@ class Parser(argparse.ArgumentParser):
 
 def command(selector: str) -> list[str]:
     """Called only after exact inventory membership validation by run()."""
-    if selector == "clients/typescript::unit":
-        return [
-            "mise", "exec", "node@24", "--", "node",
-            "node_modules/vitest/vitest.mjs", "run",
-            "--config", "vitest.config.ts", "--maxWorkers=2", "--minWorkers=1",
-        ]
+    if selector in SDK_SUITES:
+        return list(SDK_SUITES[selector]["argv"])
     return [*PREFIX, "--", selector]
 
 
@@ -187,22 +214,16 @@ def inventory() -> dict:
             raise ContractError(
                 "invalid_inventory", "The inventory exceeds its item limit."
             )
-    for identifier in SDK_SUITES:
+    for identifier, suite in SDK_SUITES.items():
         items.append({
             "id": identifier,
             "kind": "suite",
-            "module": "clients/typescript",
-            "runner": "vitest",
-            "cwd": "clients/typescript",
+            "module": suite["cwd"],
+            "runner": suite["runner"],
+            "cwd": suite["cwd"],
             "argv": [*RUN_PREFIX, "--selector", identifier],
             "effect": "may_write_and_access_network",
-            "requirements": {
-                "tools": {"python": "3.13", "node": "24"},
-                "python_packages": [],
-                "browser": None,
-                "binary": {"build_if_missing": False, "prebuilt_override": None},
-                "notes": "Requires clients/typescript dependencies already installed with npm ci. Runs the checked-in unit configuration with at most two workers; no installation, Zig compilation, browser or live integration suite. Vitest cases are not individually inventoried.",
-            },
+            "requirements": copy.deepcopy(suite["requirements"]),
         })
     if len(items) > MAX_ITEMS:
         raise ContractError("invalid_inventory", "The inventory exceeds its item limit.")
@@ -212,7 +233,7 @@ def inventory() -> dict:
         )
     return {
         "items": items,
-        "coverage": "Allowlisted pytest modules and directly declared top-level test functions, plus the TypeScript SDK unit suite; not collected test cases. Function selectors include all parametrizations. Class methods, dynamic cases, Zig tests and individual SDK cases are not inventoried. Other SDK suites are not covered.",
+        "coverage": "Allowlisted pytest modules and directly declared top-level test functions, plus TypeScript and Python SDK unit suites; not collected test cases. Function selectors include all parametrizations. Class methods, dynamic cases, Zig tests and individual SDK cases are not inventoried. Other SDK suites are not covered.",
         "execution": {
             "argv_prefix": list(RUN_PREFIX),
             "selector_flag": "--selector",
@@ -367,10 +388,20 @@ def run(selector: str, timeout: int, output_limit: int) -> dict:
     cwd = ROOT / selected.get("cwd", "")
     if not cwd.resolve().is_relative_to(ROOT) or not cwd.is_dir():
         raise ContractError("invalid_inventory", "The runner directory is missing or escapes the checkout.")
+    env = child_environment()
+    if SDK_SUITES.get(selector, {}).get("prepend_pythonpath", False):
+        source = cwd / "src"
+        if not source.resolve().is_relative_to(ROOT) or not source.is_dir():
+            raise ContractError("invalid_inventory", "The SDK source directory is missing or escapes the checkout.")
+        # Match the checkout in fresh interpreters launched by SDK tests too,
+        # not just pytest's process (which has its own pythonpath override).
+        env["PYTHONPATH"] = str(source) + (
+            os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else ""
+        )
     result = execute(
         argv,
         cwd=cwd,
-        env=child_environment(),
+        env=env,
         timeout=timeout,
         output_limit=output_limit,
     )
@@ -506,7 +537,7 @@ def affected(base: str) -> dict:
         "coverage_complete": False,
         "coverage_gaps": [
             "Curated module dependencies only; not an inferred or complete dependency graph.",
-            "Zig, other SDK suites, TypeScript integration/typecheck/build, non-allowlisted pytest, docs and other CI suites still require separate validation.",
+            "Zig, other SDK suites, TypeScript and Python integration/typecheck/build/lint, non-allowlisted pytest, docs and other CI suites still require separate validation.",
             "Ignored untracked files and files inside submodules are not enumerated; submodule changes use fallback.",
             "Git snapshots are not atomic with each other or inventory; rerun after concurrent edits.",
         ],
