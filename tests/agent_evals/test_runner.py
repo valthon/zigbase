@@ -5,11 +5,13 @@ import stat
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
 
 from evals.agents import run as run_module
+from evals.agents import process as process_module
 from evals.agents.graders import GradeReport
 from evals.agents.process import ProcessResult, run_process
 from evals.agents.run import (
@@ -398,6 +400,7 @@ def test_process_logs_are_private(tmp_path):
 
 @pytest.mark.parametrize("linked_name", ["stdout.log", "stderr.log"])
 def test_process_refuses_preexisting_log_symlinks(tmp_path, linked_name):
+    previous = signal.getsignal(signal.SIGINT)
     victim = tmp_path / "victim"
     victim.write_text("unchanged")
     (tmp_path / linked_name).symlink_to(victim)
@@ -415,6 +418,7 @@ def test_process_refuses_preexisting_log_symlinks(tmp_path, linked_name):
             max_output_bytes=4096,
         )
     assert victim.read_text() == "unchanged"
+    assert signal.getsignal(signal.SIGINT) is previous
 
 
 def test_process_can_leave_captured_output_in_logs_without_reading_it_back(tmp_path):
@@ -460,6 +464,57 @@ def test_timeout_still_applies_when_agent_does_not_read_large_stdin(tmp_path):
     assert time.monotonic() - started < 3
 
 
+def test_cleanup_handles_real_buffered_stdin_broken_pipe(tmp_path, monkeypatch):
+    original_popen = subprocess.Popen
+    children = []
+
+    def exited_child_with_buffered_input(*args, **kwargs):
+        child = original_popen(*args, **kwargs)
+        children.append(child)
+        child.wait(timeout=2)
+        # Seed a real BufferedWriter tail. The feeder's next large write
+        # flushes it to the closed pipe, leaving it pending after EPIPE.
+        child.stdin.write(b"pending")
+        return child
+
+    monkeypatch.setattr(subprocess, "Popen", exited_child_with_buffered_input)
+    result = run_process(
+        [sys.executable, "-c", "pass"], cwd=tmp_path,
+        env=child_environment(tmp_path, [], {"PATH": os.environ["PATH"]}),
+        stdin=b"x" * 100_000,
+        stdout_path=tmp_path / "stdout.log", stderr_path=tmp_path / "stderr.log",
+        timeout_seconds=2, term_grace_seconds=1, max_output_bytes=4096,
+    )
+    assert result.exit_code == 0 and not result.timed_out and not result.interrupted
+    assert children[0].stdin.closed
+
+
+def test_cleanup_does_not_suppress_other_pipe_errors(tmp_path, monkeypatch):
+    original_popen = subprocess.Popen
+
+    class FailedClose:
+        closed = False
+
+        def close(self):
+            raise OSError("unexpected close failure")
+
+    def popen(*args, **kwargs):
+        child = original_popen(*args, **kwargs)
+        assert child.stdin is None
+        child.stdin = FailedClose()
+        return child
+
+    monkeypatch.setattr(subprocess, "Popen", popen)
+    with pytest.raises(OSError, match="unexpected close failure"):
+        run_process(
+            [sys.executable, "-c", "pass"], cwd=tmp_path,
+            env=child_environment(tmp_path, [], {"PATH": os.environ["PATH"]}),
+            stdin=None,
+            stdout_path=tmp_path / "stdout.log", stderr_path=tmp_path / "stderr.log",
+            timeout_seconds=2, term_grace_seconds=1, max_output_bytes=4096,
+        )
+
+
 def test_cli_interrupt_cleans_up_agent_and_emits_stable_result(tmp_path):
     env = os.environ.copy()
     env["ZIGBASE_AGENT_COMMAND_JSON"] = json.dumps(
@@ -496,6 +551,150 @@ def test_cli_interrupt_cleans_up_agent_and_emits_stable_result(tmp_path):
     assert payload["failures"][0]["code"] == "agent.interrupted"
     assert payload["timed_out"] is False
     assert "Traceback" not in stderr
+
+
+@pytest.mark.parametrize("boundary", ["stderr_log", "popen", "pump", "feeder"])
+def test_startup_interrupt_reaps_acquired_agent(tmp_path, monkeypatch, boundary):
+    """Deliver SIGINT at exact acquisition boundaries, not after a sleep."""
+    children = []
+    original_popen = subprocess.Popen
+    original_open = os.open
+    original_start = process_module.threading.Thread.start
+    starts = 0
+    previous = signal.getsignal(signal.SIGINT)
+
+    def popen(*args, **kwargs):
+        child = original_popen(*args, **kwargs)
+        children.append(child)
+        if boundary == "popen":
+            signal.raise_signal(signal.SIGINT)
+        return child
+
+    def open_log(path, *args, **kwargs):
+        descriptor = original_open(path, *args, **kwargs)
+        if boundary == "stderr_log" and Path(path).name == "stderr.log":
+            signal.raise_signal(signal.SIGINT)
+        return descriptor
+
+    def start(thread):
+        nonlocal starts
+        original_start(thread)
+        starts += 1
+        if (boundary == "pump" and starts == 1) or (boundary == "feeder" and starts == 3):
+            signal.raise_signal(signal.SIGINT)
+
+    monkeypatch.setattr(subprocess, "Popen", popen)
+    monkeypatch.setattr(os, "open", open_log)
+    monkeypatch.setattr(process_module.threading.Thread, "start", start)
+    try:
+        result = run_process(
+            [sys.executable, str(FAKE_AGENT), "sleep"],
+            cwd=tmp_path,
+            env=child_environment(tmp_path, [], {"PATH": os.environ["PATH"]}),
+            stdin=b"prompt",
+            stdout_path=tmp_path / "stdout.log",
+            stderr_path=tmp_path / "stderr.log",
+            timeout_seconds=2,
+            term_grace_seconds=1,
+            max_output_bytes=4096,
+        )
+        assert result.interrupted and not result.timed_out
+        assert len(children) == 1 and children[0].poll() is not None
+        with pytest.raises(ProcessLookupError):
+            os.kill(children[0].pid, 0)
+        assert signal.getsignal(signal.SIGINT) is previous
+    finally:
+        # A regression must not leave the deliberately acquired child behind.
+        for child in children:
+            if child.poll() is None:
+                child.kill()
+            child.wait()
+
+
+def test_startup_guard_restores_handler_after_acquisition_failure(tmp_path, monkeypatch):
+    previous = signal.getsignal(signal.SIGINT)
+
+    def fail(*_args, **_kwargs):
+        raise OSError("spawn failed")
+
+    monkeypatch.setattr(subprocess, "Popen", fail)
+    with pytest.raises(OSError, match="spawn failed"):
+        run_process(
+            ["unused"], cwd=tmp_path, env={}, stdin=None,
+            stdout_path=tmp_path / "stdout.log", stderr_path=tmp_path / "stderr.log",
+            timeout_seconds=1, term_grace_seconds=1, max_output_bytes=4096,
+        )
+    assert signal.getsignal(signal.SIGINT) is previous
+
+
+@pytest.mark.parametrize("failed_start", [1, 2, 3])
+def test_thread_start_failure_reaps_child_and_restores_signal(tmp_path, monkeypatch, failed_start):
+    children = []
+    original_popen = subprocess.Popen
+    original_start = process_module.threading.Thread.start
+    previous = signal.getsignal(signal.SIGINT)
+    starts = 0
+
+    def popen(*args, **kwargs):
+        child = original_popen(*args, **kwargs)
+        children.append(child)
+        return child
+
+    def start(thread):
+        nonlocal starts
+        starts += 1
+        if starts == failed_start:
+            signal.raise_signal(signal.SIGINT)
+            raise RuntimeError("thread unavailable")
+        original_start(thread)
+
+    monkeypatch.setattr(subprocess, "Popen", popen)
+    monkeypatch.setattr(process_module.threading.Thread, "start", start)
+    try:
+        with pytest.raises(RuntimeError, match="thread unavailable"):
+            run_process(
+                [sys.executable, str(FAKE_AGENT), "sleep"],
+                cwd=tmp_path, env=child_environment(tmp_path, [], {"PATH": os.environ["PATH"]}),
+                stdin=b"prompt", stdout_path=tmp_path / "stdout.log", stderr_path=tmp_path / "stderr.log",
+                timeout_seconds=2, term_grace_seconds=1, max_output_bytes=4096,
+            )
+        assert len(children) == 1 and children[0].poll() is not None
+        assert all(pipe.closed for pipe in (children[0].stdin, children[0].stdout, children[0].stderr))
+        assert signal.getsignal(signal.SIGINT) is previous
+    finally:
+        for child in children:
+            if child.poll() is None:
+                child.kill()
+            child.wait()
+
+
+@pytest.mark.parametrize("ignored", [False, True])
+def test_startup_guard_preserves_custom_signal_handlers(ignored):
+    calls = []
+    handler = signal.SIG_IGN if ignored else lambda *_: calls.append("called")
+    previous = signal.signal(signal.SIGINT, handler)
+    try:
+        with process_module._defer_startup_interrupt() as deliver:
+            signal.raise_signal(signal.SIGINT)
+            deliver()
+        assert signal.getsignal(signal.SIGINT) == handler
+        assert calls == ([] if ignored else ["called"])
+    finally:
+        signal.signal(signal.SIGINT, previous)
+
+
+def test_run_process_in_worker_thread_keeps_main_signal_handler(tmp_path):
+    previous = signal.getsignal(signal.SIGINT)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        result = executor.submit(
+            run_process, [sys.executable, "-c", "print('worker')"],
+            cwd=tmp_path, env=child_environment(tmp_path, [], {"PATH": os.environ["PATH"]}),
+            stdin=None, stdout_path=tmp_path / "stdout.log", stderr_path=tmp_path / "stderr.log",
+            timeout_seconds=2, term_grace_seconds=1, max_output_bytes=4096,
+        ).result(timeout=5)
+    assert result.exit_code == 0 and not result.interrupted
+    assert result.stdout == "worker\n"
+    assert signal.getsignal(signal.SIGINT) is previous
 
 
 def test_paths_with_spaces_are_literal(tmp_path):
