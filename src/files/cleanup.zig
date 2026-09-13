@@ -98,14 +98,14 @@ pub fn jobHandler(ctx: *Ctx, payload: []const u8) !void {
     // The request arena owns the record graph. The lock closes the gap between
     // checking references and deleting bytes, including across PostgreSQL instances.
     const row = try records.getFilesPhysical(ctx.arena.a, w, col, p.record);
-    // get accepts either an ID or a name; only the resolved name identifies
-    // the storage prefix whose references were checked above.
+    // Metadata references use the logical name; physical objects keep their
+    // immutable namespace even after an offline collection rename.
     if (p.filename) |name| {
         if (referenced(col, row, name)) return;
-        try storage.delete(ctx.app.io, col.name, p.record, name);
+        try storage.delete(ctx.app.io, col.storage_namespace, p.record, name);
     } else {
         if (row != null) return;
-        try storage.deleteRecord(ctx.app.io, col.name, p.record);
+        try storage.deleteRecord(ctx.app.io, col.storage_namespace, p.record);
     }
     try w.commit();
 }

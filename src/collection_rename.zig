@@ -1,5 +1,5 @@
-//! Offline collection rename. No storage objects are moved: file-bearing schemas
-//! and durable storage dependencies fail closed until namespaces are independent.
+//! Offline collection rename. Immutable storage namespaces keep all file objects
+//! in place while durable upload/cleanup ownership follows the logical name.
 const std = @import("std");
 const db = @import("db.zig");
 const schema = @import("schema.zig");
@@ -11,7 +11,6 @@ const fts = @import("search/fts.zig");
 pub const Error = collections.EngineError || fts.EnsureIndexError || error{
     InvalidRenameName,
     SystemCollectionRename,
-    FileCollectionRenameUnsupported,
     PendingStorageDependency,
     InvalidPendingMetadata,
     LegacyAlterTableEnabled,
@@ -83,38 +82,101 @@ fn changeReference(a: std.mem.Allocator, w: *db.Db, ref: Reference, old: []const
     _ = try st.step();
 }
 
-fn storageOwner(value: std.json.Value, old: schema.Collection, new: []const u8) Error!bool {
-    if (value != .object) return error.InvalidPendingMetadata;
-    const name = value.object.get("collection") orelse return error.InvalidPendingMetadata;
+fn remapStorageOwner(value: *std.json.Value, old: schema.Collection, new: []const u8) Error!bool {
+    if (value.* != .object) return error.InvalidPendingMetadata;
+    const name = value.object.getPtr("collection") orelse return error.InvalidPendingMetadata;
     const cid = value.object.get("collection_id") orelse return error.InvalidPendingMetadata;
-    if (name != .string or cid != .string) return error.InvalidPendingMetadata;
-    return std.mem.eql(u8, name.string, old.name) or std.mem.eql(u8, name.string, new) or std.mem.eql(u8, cid.string, old.id);
+    if (name.* != .string or cid != .string) return error.InvalidPendingMetadata;
+    const same_name = std.mem.eql(u8, name.string, old.name);
+    const same_id = std.mem.eql(u8, cid.string, old.id);
+    if (same_name != same_id) return error.InvalidPendingMetadata;
+    if (same_id) {
+        name.* = .{ .string = new };
+        return true;
+    }
+    if (std.mem.eql(u8, name.string, new)) return error.PendingStorageDependency;
+    return false;
 }
 
-fn checkStorage(a: std.mem.Allocator, w: *db.Db, old: schema.Collection, new: []const u8) Error!void {
-    for (old.fields) |field| if (field.options == .file) return error.FileCollectionRenameUnsupported;
-    for ([_]struct { table: []const u8, sql: []const u8, upload: bool }{
-        .{ .table = "_upload_sessions", .sql = "SELECT metadata FROM \"_upload_sessions\";", .upload = true },
-        .{ .table = "_queue_jobs", .sql = "SELECT payload FROM \"_queue_jobs\" WHERE kind='file_cleanup' AND status<>'done';", .upload = false },
+fn remapStorage(alloc: std.mem.Allocator, w: *db.Db, old: schema.Collection, new: []const u8) Error!void {
+    for ([_]struct { table: []const u8, column: []const u8, predicate: []const u8, update: []const u8, upload: bool }{
+        .{ .table = "_upload_sessions", .column = "metadata", .predicate = "1=1", .update = "UPDATE \"_upload_sessions\" SET metadata=?1 WHERE id=?2;", .upload = true },
+        .{ .table = "_queue_jobs", .column = "payload", .predicate = "kind='file_cleanup' AND status<>'done'", .update = "UPDATE \"_queue_jobs\" SET payload=?1 WHERE id=?2;", .upload = false },
     }) |source| {
-        if (!try objectExists(a, w, source.table)) continue;
-        var st = try prepare(a, w, source.sql);
-        defer st.finalize();
-        while (try st.step()) {
-            const raw = st.columnText(0);
-            if (raw.len > 65536) return error.InvalidPendingMetadata;
-            const parsed = std.json.parseFromSlice(std.json.Value, a, raw, .{}) catch |err| switch (err) {
-                error.OutOfMemory => return err,
-                else => return error.InvalidPendingMetadata,
-            };
-            defer parsed.deinit();
-            const value = parsed.value;
-            if (value != .object) return error.InvalidPendingMetadata;
-            if (source.upload) {
-                const binding = value.object.get("binding") orelse return error.InvalidPendingMetadata;
-                const target = value.object.get("target") orelse return error.InvalidPendingMetadata;
-                if (try storageOwner(binding, old, new) or try storageOwner(target, old, new)) return error.PendingStorageDependency;
-            } else if (try storageOwner(value, old, new)) return error.PendingStorageDependency;
+        if (!try objectExists(alloc, w, source.table)) continue;
+        // Return oversized payloads as invalid NULL, not a truncated JSON prefix.
+        // SQLite TEXT length/substr stop at NUL: measure raw bytes instead.
+        const length = if (db.dbDialect(w).kind == .sqlite)
+            try std.fmt.allocPrint(alloc, "length(CAST({s} AS BLOB))", .{source.column})
+        else
+            try std.fmt.allocPrint(alloc, "octet_length({s})", .{source.column});
+        defer alloc.free(length);
+        const sql = try std.fmt.allocPrint(alloc, "SELECT id,CASE WHEN {s}<=65536 THEN {s} ELSE NULL END FROM \"{s}\" WHERE {s}", .{ length, source.column, source.table, source.predicate });
+        defer alloc.free(sql);
+        const first_sql = try std.fmt.allocPrint(alloc, "{s} ORDER BY id LIMIT 64;", .{sql});
+        defer alloc.free(first_sql);
+        const next_sql = try std.fmt.allocPrint(alloc, "{s} AND id>?1 ORDER BY id LIMIT 64;", .{sql});
+        defer alloc.free(next_sql);
+        var first = try prepare(alloc, w, first_sql);
+        defer first.finalize();
+        var next = try prepare(alloc, w, next_sql);
+        defer next.finalize();
+        var update = try prepare(alloc, w, source.update);
+        defer update.finalize();
+        var last: std.ArrayList(u8) = .empty;
+        defer last.deinit(alloc);
+        var initial = true;
+        while (true) {
+            const st = if (initial) &first else &next;
+            if (!initial) {
+                st.reset();
+                try st.clearBindings();
+                try st.bindText(1, last.items);
+            }
+            var count: usize = 0;
+            while (try st.step()) {
+                // NULL cannot be addressed by equality and would also vanish
+                // from subsequent keyset pages. Never silently skip that row.
+                if (st.isNull(0)) return error.InvalidPendingMetadata;
+                count += 1;
+                last.clearRetainingCapacity();
+                try last.appendSlice(alloc, st.columnText(0));
+                // Parsing storage work is row-scoped, not retained in the migration
+                // arena when a large durable queue must be relinked.
+                var row = std.heap.ArenaAllocator.init(alloc);
+                defer row.deinit();
+                const a = row.allocator();
+                if (st.isNull(1)) return error.InvalidPendingMetadata;
+                const raw = st.columnText(1);
+                if (raw.len > 65536) return error.InvalidPendingMetadata;
+                const parsed = std.json.parseFromSlice(std.json.Value, a, raw, .{}) catch |err| switch (err) {
+                    error.OutOfMemory => return err,
+                    else => return error.InvalidPendingMetadata,
+                };
+                defer parsed.deinit();
+                var value = parsed.value;
+                if (value != .object) return error.InvalidPendingMetadata;
+                const changed = if (source.upload) blk: {
+                    const binding = value.object.getPtr("binding") orelse return error.InvalidPendingMetadata;
+                    const target = value.object.getPtr("target") orelse return error.InvalidPendingMetadata;
+                    const binding_changed = try remapStorageOwner(binding, old, new);
+                    const target_changed = try remapStorageOwner(target, old, new);
+                    break :blk binding_changed or target_changed;
+                } else try remapStorageOwner(&value, old, new);
+                if (changed) {
+                    update.reset();
+                    try update.clearBindings();
+                    try update.bindText(1, try std.json.Stringify.valueAlloc(a, value, .{}));
+                    try update.bindText(2, st.columnText(0));
+                    _ = try update.step();
+                    if (w.changesCount() != 1) return error.InvalidPendingMetadata;
+                }
+            }
+            // Payloads change, but IDs and selection predicates remain stable.
+            // Bound PostgreSQL's buffered SELECT and release the first page too.
+            st.reset();
+            if (count < 64) break;
+            initial = false;
         }
     }
 }
@@ -194,7 +256,6 @@ pub fn rename(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, from: []const u8,
             }
         }
     }
-    try checkStorage(a, w, old, to);
     // Receipt scopes are opaque hashes of principal, operation and key. Even a
     // base collection's name may occur in an application operation scope, so no
     // subset can be proven unrelated. Preserve their promised retention window.
@@ -210,6 +271,8 @@ pub fn rename(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, from: []const u8,
         defer pragma.finalize();
         if (try pragma.step() and pragma.columnInt(0) != 0) return error.LegacyAlterTableEnabled;
     }
+
+    try remapStorage(alloc, w, old, to);
 
     // Remove only the old collection's generated search objects before renaming;
     // otherwise SQLite triggers still address old FTS external-content metadata,
@@ -332,7 +395,7 @@ test "offline rename preserves identities and rows" {
     try std.testing.expectEqualStrings("hello", row.columnText(0));
 }
 
-test "offline rename rejects storage and collisions without changing generation" {
+test "offline rename rejects inconsistent storage metadata and collisions" {
     var d = try db.Db.openMemory();
     defer d.close();
     try @import("migrations.zig").run(&d);
@@ -345,17 +408,17 @@ test "offline rename rejects storage and collisions without changing generation"
     try d.exec("CREATE TABLE articles_fts_idx(id TEXT);");
     try std.testing.expectError(error.Conflict, rename(a, std.testing.io, &d, "posts", "articles"));
     try d.exec("DROP TABLE articles_fts_idx;");
-    try d.exec("CREATE TABLE _upload_sessions(metadata TEXT);");
-    try d.exec("INSERT INTO _upload_sessions VALUES ('{\"binding\":{\"collection\":\"posts\",\"collection_id\":\"other\"},\"target\":{\"collection\":\"photos\",\"collection_id\":\"photos_id\"}}');");
-    try std.testing.expectError(error.PendingStorageDependency, rename(a, std.testing.io, &d, "posts", "articles"));
+    try d.exec("CREATE TABLE _upload_sessions(id TEXT,metadata TEXT);");
+    try d.exec("INSERT INTO _upload_sessions VALUES ('u1','{\"binding\":{\"collection\":\"posts\",\"collection_id\":\"other\"},\"target\":{\"collection\":\"photos\",\"collection_id\":\"photos_id\"}}');");
+    try std.testing.expectError(error.InvalidPendingMetadata, rename(a, std.testing.io, &d, "posts", "articles"));
     try d.exec("DELETE FROM _upload_sessions;");
-    try d.exec("INSERT INTO _upload_sessions VALUES ('{\"binding\":{\"collection\":\"users\",\"collection_id\":\"users_id\"},\"target\":{\"collection\":\"posts\",\"collection_id\":\"other\"}}');");
-    try std.testing.expectError(error.PendingStorageDependency, rename(a, std.testing.io, &d, "posts", "articles"));
+    try d.exec("INSERT INTO _upload_sessions VALUES ('u1','{\"binding\":{\"collection\":\"users\",\"collection_id\":\"users_id\"},\"target\":{\"collection\":\"posts\",\"collection_id\":\"other\"}}');");
+    try std.testing.expectError(error.InvalidPendingMetadata, rename(a, std.testing.io, &d, "posts", "articles"));
     try d.exec("DELETE FROM _upload_sessions;");
     try d.exec("INSERT INTO _queue_jobs(id,queue,kind,status,payload,created) VALUES ('cleanup1','files','file_cleanup','failed','{\"collection\":\"posts\",\"collection_id\":\"other\"}','now');");
-    try std.testing.expectError(error.PendingStorageDependency, rename(a, std.testing.io, &d, "posts", "articles"));
+    try std.testing.expectError(error.InvalidPendingMetadata, rename(a, std.testing.io, &d, "posts", "articles"));
     try d.exec("DELETE FROM _queue_jobs;");
-    try d.exec("INSERT INTO _upload_sessions VALUES ('invalid');");
+    try d.exec("INSERT INTO _upload_sessions VALUES ('u1','invalid');");
     try std.testing.expectError(error.InvalidPendingMetadata, rename(a, std.testing.io, &d, "posts", "articles"));
     try std.testing.expectEqual(before, try generation.read(&d));
     try std.testing.expect(!d.inTransaction());
@@ -365,7 +428,11 @@ test "offline rename rejects storage and collisions without changing generation"
     try std.testing.expect((try collections.get(a, &d, "articles")) == null);
     const files = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "photos", .fields = &.{.{ .id = "file_id", .name = "photo", .options = .{ .file = .{} } }} });
     defer files.deinit(a);
-    try std.testing.expectError(error.FileCollectionRenameUnsupported, rename(a, std.testing.io, &d, "photos", "pictures"));
+    try d.exec("DELETE FROM _upload_sessions;");
+    try rename(a, std.testing.io, &d, "photos", "pictures");
+    const renamed = (try collections.get(a, &d, "pictures")).?;
+    defer renamed.deinit(a);
+    try std.testing.expectEqualStrings("photos", renamed.storage_namespace);
 }
 
 test "offline rename requires acknowledgement and reverses through migrator" {
@@ -417,6 +484,7 @@ test "offline rename accepts source names only even when IDs are valid names" {
     // create owns ID generation; force a deterministic valid-identifier ID in
     // this persisted fixture rather than relying on the random first byte.
     try d.exec("UPDATE _collections SET id='c12345678901234' WHERE name='comments';");
+    try d.exec("UPDATE _storage_namespaces SET collection_id='c12345678901234' WHERE namespace='comments';");
     const identifier = (try collections.get(a, &d, "comments")).?;
     defer identifier.deinit(a);
     try std.testing.expectEqualStrings("c12345678901234", identifier.id);
@@ -501,6 +569,7 @@ test "offline rename refuses ambiguous legacy relation names instead of retarget
     const links = try collections.create(a, std.testing.io, &w, .{ .id = "", .name = "links", .fields = &.{} });
     defer links.deinit(a);
     try w.exec("UPDATE _collections SET id='posts' WHERE name='other'; ALTER TABLE links ADD COLUMN target TEXT REFERENCES other(id);");
+    try w.exec("UPDATE _storage_namespaces SET collection_id='posts' WHERE namespace='other';");
     try w.exec("UPDATE _collections SET schema='[{\"id\":\"targetid\",\"name\":\"target\",\"type\":\"relation\",\"options\":{\"targetCollectionId\":\"posts\",\"maxSelect\":1}}]' WHERE name='links';");
     const before = try generation.read(&w);
     try std.testing.expectError(error.Conflict, rename(a, std.testing.io, &w, "posts", "articles"));
@@ -765,4 +834,175 @@ test "offline rename normalizes incoming name relations and survives additive pr
     var fk = try d.prepare("PRAGMA foreign_key_check;");
     defer fk.finalize();
     try std.testing.expect(!try fk.step());
+}
+
+fn storageBatchRegression(w: *db.Db) !void {
+    const a = std.testing.allocator;
+    try @import("migrations.zig").run(w);
+    const docs = try collections.create(a, std.testing.io, w, .{ .id = "", .name = "docs", .fields = &.{} });
+    defer docs.deinit(a);
+    try w.exec("CREATE TABLE _upload_sessions(id TEXT PRIMARY KEY,metadata TEXT);");
+    const owner = .{ .collection = "docs", .collection_id = docs.id };
+    const payload = try std.json.Stringify.valueAlloc(a, owner, .{});
+    defer a.free(payload);
+    const metadata = try std.json.Stringify.valueAlloc(a, .{ .binding = owner, .target = owner }, .{});
+    defer a.free(metadata);
+    var upload = try prepare(a, w, "INSERT INTO _upload_sessions VALUES (?1,?2);");
+    defer upload.finalize();
+    if (db.dbDialect(w).kind == .sqlite) {
+        var invalid = try w.prepare("INSERT INTO _upload_sessions VALUES(NULL,?1);");
+        defer invalid.finalize();
+        try invalid.bindText(1, metadata);
+        _ = try invalid.step();
+        const before_null = try generation.read(w);
+        try std.testing.expectError(error.InvalidPendingMetadata, rename(a, std.testing.io, w, "docs", "documents"));
+        try std.testing.expectEqual(before_null, try generation.read(w));
+        try w.exec("DELETE FROM _upload_sessions WHERE id IS NULL;");
+    }
+    var job = try prepare(a, w, "INSERT INTO _queue_jobs(id,queue,kind,payload,created) VALUES (?1,'files','file_cleanup',?2,'now');");
+    defer job.finalize();
+    // More than two 64-row pages, including the empty ID before every keyset.
+    for (0..129) |i| {
+        var buf: [32]u8 = undefined;
+        const id = if (i == 0) "" else try std.fmt.bufPrint(&buf, "{d:0>5}", .{i});
+        upload.reset();
+        try upload.clearBindings();
+        try upload.bindText(1, id);
+        try upload.bindText(2, metadata);
+        _ = try upload.step();
+        job.reset();
+        try job.clearBindings();
+        try job.bindText(1, id);
+        try job.bindText(2, payload);
+        _ = try job.step();
+    }
+    if (db.dbDialect(w).kind == .sqlite) {
+        try w.exec("CREATE TRIGGER ignore_session_relink BEFORE UPDATE ON _upload_sessions WHEN old.id='00128' BEGIN SELECT RAISE(IGNORE); END;");
+        try std.testing.expectError(error.InvalidPendingMetadata, rename(a, std.testing.io, w, "docs", "documents"));
+        var retained = try w.prepare("SELECT count(*) FROM _upload_sessions WHERE metadata=?1;");
+        defer retained.finalize();
+        try retained.bindText(1, metadata);
+        try std.testing.expect(try retained.step());
+        try std.testing.expectEqual(@as(i64, 129), retained.columnInt(0));
+        try w.exec("DROP TRIGGER ignore_session_relink;");
+    }
+    try w.exec("INSERT INTO _queue_jobs(id,queue,kind,payload,created) VALUES ('zzbad','files','file_cleanup','invalid','now');");
+    try std.testing.expectError(error.InvalidPendingMetadata, rename(a, std.testing.io, w, "docs", "documents"));
+    var unchanged = try prepare(a, w, "SELECT count(*) FROM _upload_sessions WHERE metadata=?1;");
+    defer unchanged.finalize();
+    try unchanged.bindText(1, metadata);
+    try std.testing.expect(try unchanged.step());
+    try std.testing.expectEqual(@as(i64, 129), unchanged.columnInt(0));
+    unchanged.reset();
+    const oversized = try a.alloc(u8, 65537);
+    defer a.free(oversized);
+    @memset(oversized, ' ');
+    @memcpy(oversized[0..payload.len], payload);
+    var bad = try prepare(a, w, "UPDATE _queue_jobs SET payload=?1 WHERE id='zzbad';");
+    defer bad.finalize();
+    try bad.bindText(1, oversized);
+    _ = try bad.step();
+    try std.testing.expectError(error.InvalidPendingMetadata, rename(a, std.testing.io, w, "docs", "documents"));
+    if (db.dbDialect(w).kind == .sqlite) {
+        const nul_payload = try std.mem.concat(a, u8, &.{ payload, "\x00" });
+        defer a.free(nul_payload);
+        bad.reset();
+        try bad.clearBindings();
+        try bad.bindText(1, nul_payload);
+        _ = try bad.step();
+        try std.testing.expectError(error.InvalidPendingMetadata, rename(a, std.testing.io, w, "docs", "documents"));
+    }
+    try w.exec("DELETE FROM _queue_jobs WHERE id='zzbad'; INSERT INTO _queue_jobs(id,queue,kind,payload,status,created) VALUES ('done','files','file_cleanup','invalid','done','now');");
+    try rename(a, std.testing.io, w, "docs", "documents");
+    var count = try w.prepare("SELECT count(*) FROM _upload_sessions WHERE metadata LIKE '%\"collection\":\"documents\"%';");
+    defer count.finalize();
+    try std.testing.expect(try count.step());
+    try std.testing.expectEqual(@as(i64, 129), count.columnInt(0));
+    var queued = try w.prepare("SELECT count(*) FROM _queue_jobs WHERE payload LIKE '%\"collection\":\"documents\"%';");
+    defer queued.finalize();
+    try std.testing.expect(try queued.step());
+    try std.testing.expectEqual(@as(i64, 129), queued.columnInt(0));
+}
+
+test "SQLite storage remap crosses keyset pages and rolls back late failures" {
+    var w = try db.Db.openMemory();
+    defer w.close();
+    try storageBatchRegression(&w);
+}
+
+test "pg: storage remap crosses keyset pages and rolls back late failures" {
+    if (comptime !@import("build_options").postgres) return error.SkipZigTest;
+    const url = std.testing.environ.getPosix("ZIGBASE_PG_TEST_URL") orelse return error.SkipZigTest;
+    var w = try db.Db.openPostgres(std.testing.allocator, std.testing.io, url);
+    defer w.close();
+    try w.exec("CREATE SCHEMA zb_namespace_batches;");
+    defer w.exec("DROP SCHEMA zb_namespace_batches CASCADE;") catch {};
+    try w.exec("SET search_path TO zb_namespace_batches;");
+    try storageBatchRegression(&w);
+}
+
+test "offline rename relinks durable targets auth bindings and cleanup without moving bytes" {
+    const CleanupPayload = struct { collection: []const u8, collection_id: []const u8, record: []const u8, filename: ?[]const u8 = null };
+    var w = try db.Db.openMemory();
+    defer w.close();
+    try @import("migrations.zig").run(&w);
+    const a = std.testing.allocator;
+    const users = try collections.create(a, std.testing.io, &w, .{ .id = "", .name = "users", .type = .auth, .fields = &.{} });
+    defer users.deinit(a);
+    const docs = try collections.create(a, std.testing.io, &w, .{ .id = "", .name = "docs", .fields = &.{.{ .id = "f1", .name = "file", .options = .{ .file = .{} } }} });
+    defer docs.deinit(a);
+    try w.exec("CREATE TABLE _upload_sessions(id TEXT PRIMARY KEY,metadata TEXT,length INTEGER,offset INTEGER,expires INTEGER,state TEXT);");
+    try w.exec("CREATE TABLE _upload_payloads(session TEXT,payload BLOB);");
+    const metadata = try std.json.Stringify.valueAlloc(a, .{
+        .binding = .{ .collection = "users", .collection_id = users.id, .principal = "u1" },
+        .target = .{ .collection = "docs", .collection_id = docs.id, .record = "r1", .field = "file", .filename = "a.txt", .mimetype = "text/plain" },
+    }, .{});
+    defer a.free(metadata);
+    var insert = try w.prepare("INSERT INTO _upload_sessions VALUES ('upload1',?1,3,3,9999999999,'receiving');");
+    defer insert.finalize();
+    try insert.bindText(1, metadata);
+    _ = try insert.step();
+    try w.exec("INSERT INTO _upload_payloads VALUES ('upload1',X'616263');");
+    try w.exec("INSERT INTO _queue_jobs(id,queue,kind,payload,status,created) VALUES ('bad','files','file_cleanup','invalid','failed','now');");
+    // Upload metadata is rewritten before the queue scan; a later malformed job
+    // must roll that change back along with the rest of the migration.
+    try std.testing.expectError(error.InvalidPendingMetadata, rename(a, std.testing.io, &w, "users", "people"));
+    var original = try w.prepare("SELECT metadata FROM _upload_sessions;");
+    defer original.finalize();
+    try std.testing.expect(try original.step());
+    try std.testing.expectEqualStrings(metadata, original.columnText(0));
+    _ = try original.step();
+    try w.exec("DELETE FROM _queue_jobs WHERE id='bad';");
+    const cleanup = try std.json.Stringify.valueAlloc(a, CleanupPayload{ .collection = "docs", .collection_id = docs.id, .record = "r1", .filename = "old.txt" }, .{});
+    defer a.free(cleanup);
+    var job = try w.prepare("INSERT INTO _queue_jobs(id,queue,kind,payload,status,created) VALUES ('cleanup','files','file_cleanup',?1,'failed','now');");
+    defer job.finalize();
+    try job.bindText(1, cleanup);
+    _ = try job.step();
+    try rename(a, std.testing.io, &w, "users", "people");
+    try rename(a, std.testing.io, &w, "docs", "documents");
+    var stored = try w.prepare("SELECT metadata,offset FROM _upload_sessions;");
+    defer stored.finalize();
+    try std.testing.expect(try stored.step());
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, stored.columnText(0), .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("people", parsed.value.object.get("binding").?.object.get("collection").?.string);
+    try std.testing.expectEqualStrings(users.id, parsed.value.object.get("binding").?.object.get("collection_id").?.string);
+    try std.testing.expectEqualStrings("documents", parsed.value.object.get("target").?.object.get("collection").?.string);
+    try std.testing.expectEqualStrings(docs.id, parsed.value.object.get("target").?.object.get("collection_id").?.string);
+    try std.testing.expectEqual(@as(i64, 3), stored.columnInt(1));
+    var blob = try w.prepare("SELECT hex(payload) FROM _upload_payloads;");
+    defer blob.finalize();
+    try std.testing.expect(try blob.step());
+    try std.testing.expectEqualStrings("616263", blob.columnText(0));
+    var queued = try w.prepare("SELECT payload FROM _queue_jobs WHERE id='cleanup';");
+    defer queued.finalize();
+    try std.testing.expect(try queued.step());
+    const queued_payload = try std.json.parseFromSlice(CleanupPayload, a, queued.columnText(0), .{});
+    defer queued_payload.deinit();
+    try std.testing.expectEqualStrings("documents", queued_payload.value.collection);
+    try std.testing.expectEqualStrings(docs.id, queued_payload.value.collection_id);
+    const renamed = (try collections.get(a, &w, "documents")).?;
+    defer renamed.deinit(a);
+    try std.testing.expectEqualStrings("docs", renamed.storage_namespace);
 }

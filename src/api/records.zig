@@ -180,7 +180,7 @@ fn writeUploads(ctx: *http.RequestCtx, col: schema.Collection, record_id: []cons
     const app = ctx.app.?;
     const storage = app.storage orelse return;
     for (writes) |wr| {
-        storage.put(app.io, col.name, record_id, wr.filename, wr.bytes) catch return error.StorageFailed;
+        storage.put(app.io, col.storage_namespace, record_id, wr.filename, wr.bytes) catch return error.StorageFailed;
     }
 }
 
@@ -376,7 +376,7 @@ pub fn create(ctx: *http.RequestCtx) anyerror!http.Response {
     // cannot expose them until the committed record references them.
     const upload_id = if (all.writes.len > 0) @import("../id.zig").collectionId(app.io) else [_]u8{0} ** 15;
     var committed = false;
-    defer if (!committed) deleteWrites(app, col.name, &upload_id, all.writes);
+    defer if (!committed) deleteWrites(app, col.storage_namespace, &upload_id, all.writes);
     if (all.writes.len > 0) {
         var r = try app.pool.acquireReader();
         defer app.pool.releaseReader(&r);
@@ -564,7 +564,7 @@ fn updateImpl(ctx: *http.RequestCtx, comptime is_resumable: bool, resumable: if 
     // Cleanup runs AFTER the writer defer below, so a slow remote DELETE does not
     // hold the writer either. The failed PUT itself may have persisted bytes.
     defer if (!committed) if (upload_plan) |p|
-        deleteWrites(app, upload_lease.col.?.name, rid, p.writes);
+        deleteWrites(app, upload_lease.col.?.storage_namespace, rid, p.writes);
     if (ctx.files.len > 0) {
         var r = try app.pool.acquireReader();
         defer app.pool.releaseReader(&r);
@@ -755,7 +755,7 @@ fn updateImpl(ctx: *http.RequestCtx, comptime is_resumable: bool, resumable: if 
     if (comptime is_resumable) resumable.committed.* = true;
 
     // Side effects AFTER commit: drop replaced files, fire file/after-update hooks, broadcast.
-    if (app.files.cleanup == null) if (ctx.app.?.storage) |storage| for (all.deletes) |d| storage.delete(app.io, col.name, rid, d) catch |e|
+    if (app.files.cleanup == null) if (ctx.app.?.storage) |storage| for (all.deletes) |d| storage.delete(app.io, col.storage_namespace, rid, d) catch |e|
         std.log.warn("replaced-file cleanup failed for {s}/{s}/{s}: {s}", .{ col.name, rid, d, @errorName(e) });
     emitFileUploads(app, &rctx, col.name, rid, all.writes);
     // Self-service password change: "keep this device, log out everywhere else". The old
@@ -847,7 +847,7 @@ pub fn delete(ctx: *http.RequestCtx) anyerror!http.Response {
     // Side effects AFTER commit. Best-effort file removal: the row is already gone and the
     // request must succeed, but a silent failure (e.g. transient S3 error) would orphan the
     // record's files with no signal — log so orphan accumulation is diagnosable (NO_SLOP §2.3).
-    if (app.files.cleanup == null) if (app.storage) |storage| storage.deleteRecord(app.io, col.name, rid) catch |e|
+    if (app.files.cleanup == null) if (app.storage) |storage| storage.deleteRecord(app.io, col.storage_namespace, rid) catch |e|
         std.log.warn("orphaned file cleanup failed for deleted record {s}/{s}: {s}", .{ col.name, rid, @errorName(e) });
     emitRecord(app, &rctx, ctx.allocator, w, col.name, &ex_mut, .after_delete) catch {};
     // F4: pass the deleted row's snapshot so subscribers to an owner/expression-scoped collection
@@ -1844,6 +1844,59 @@ test "uploads release writer, reserve server ids, clean failed puts, and reject 
     try std.testing.expectEqual(@as(i64, 1), try countRows(env, "upload_checks"));
 }
 
+test "uploads and immediate or queued deletion retain namespace after rename" {
+    inline for (.{ false, true }) |durable_cleanup| {
+        var env = try TestEnv.init();
+        defer env.deinit();
+        try seedTyped(env, "uploads");
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const root = try env.tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+        var local = @import("../files/storage.zig").LocalStorage.init(root);
+        var storage = local.storage();
+        env.app.storage = &storage;
+        defer env.app.storage = null;
+        {
+            const w = env.pool.acquireWriter();
+            defer env.pool.releaseWriter();
+            try @import("../collection_rename.zig").rename(a, std.testing.io, w, "uploads", "photos");
+        }
+        var fields: std.json.ObjectMap = .empty;
+        try fields.put(a, "title", .{ .string = "renamed" });
+        const files = [_]http.UploadedFile{.{ .field = "photos", .filename = "x.txt", .mimetype = "text/plain", .bytes = "kept prefix" }};
+        var ctx = formCtx(env, RequestArena.from(&arena), .POST, fields, &files, &.{.{ .key = "col", .value = "photos" }});
+        const response = try create(&ctx);
+        try std.testing.expectEqual(@as(u16, 201), response.status);
+        const record = (try std.json.parseFromSlice(std.json.Value, a, response.body, .{})).value;
+        const rid = record.object.get("id").?.string;
+        const filename = record.object.get("photos").?.array.items[0].string;
+        const path = (try storage.fetch(std.testing.io, a, "uploads", rid, filename)).?;
+        _ = try std.Io.Dir.cwd().statFile(std.testing.io, path, .{});
+        const wrong_path = (try storage.fetch(std.testing.io, a, "photos", rid, filename)).?;
+        try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(std.testing.io, wrong_path, .{}));
+        var del = ctxFor(env, RequestArena.from(&arena), .DELETE, "", &.{ .{ .key = "col", .value = "photos" }, .{ .key = "id", .value = rid } });
+        if (durable_cleanup) {
+            env.app.files.cleanup = @import("../files/cleanup.zig").enqueueRemoved;
+            env.app.files.cleanup_queue = .{ .name = "cleanup", .backend = .durable };
+        }
+        try std.testing.expectEqual(@as(u16, 204), (try delete(&del)).status);
+        if (durable_cleanup) {
+            _ = try std.Io.Dir.cwd().statFile(std.testing.io, path, .{});
+            const claims = blk: {
+                const w = env.pool.acquireWriter();
+                defer env.pool.releaseWriter();
+                try @import("../collection_rename.zig").rename(a, std.testing.io, w, "photos", "gallery");
+                break :blk try @import("../queue/durable.zig").claimBatch(a, w, &.{"cleanup"}, "worker", 10, std.math.maxInt(i64));
+            };
+            try std.testing.expectEqual(@as(usize, 1), claims.len);
+            var job_ctx = @import("../ctx.zig").Ctx{ .app = &env.app, .arena = RequestArena.from(&arena) };
+            try @import("../files/cleanup.zig").jobHandler(&job_ctx, claims[0].payload);
+        }
+        try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(std.testing.io, path, .{}));
+    }
+}
+
 test "durable cleanup commits with HTTP delete and retries safely after reference reuse" {
     const cleanup = @import("../files/cleanup.zig");
     const q = @import("../queue/queue.zig");
@@ -2076,7 +2129,7 @@ test "durable cleanup commits with HTTP delete and retries safely after referenc
     {
         const w = env.pool.acquireWriter();
         defer env.pool.releaseWriter();
-        try w.exec("UPDATE _collections SET id='newgeneration01' WHERE name='cleanup_files';");
+        try w.exec("UPDATE _storage_namespaces SET collection_id='newgeneration01' WHERE namespace='cleanup_files'; UPDATE _collections SET id='newgeneration01' WHERE name='cleanup_files';");
     }
     try cleanup.jobHandler(&job_ctx, claims[0].payload);
     _ = try std.Io.Dir.cwd().statFile(std.testing.io, stored_path, .{});

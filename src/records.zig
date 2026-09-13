@@ -2487,6 +2487,7 @@ test "gcExpiredRecords reaps a system ('_'-prefixed) collection's expired rows" 
         \\  '[{"id":"f1","name":"token","type":"text","options":{}},{"id":"f2","name":"expires_at","type":"date","options":{}}]',
         \\  '[]','{"ttl":{"field":"expires_at"}}',NULL,NULL,NULL,NULL,NULL,datetime('now'),datetime('now'));
     );
+    try @import("files/namespace.zig").reserve(a, &d, "_ttlprobe_____", "_ttlprobe");
     try d.exec("INSERT INTO \"_ttlprobe\" VALUES ('past','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','a','2000-01-01T00:00:00Z');");
     try d.exec("INSERT INTO \"_ttlprobe\" VALUES ('future','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','b','2999-01-01T00:00:00Z');");
     try d.exec("INSERT INTO \"_ttlprobe\" VALUES ('never','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','c',NULL);");

@@ -55,15 +55,20 @@ def inventory(binary, data, *args, env=None):
 
 @pytest.mark.parametrize("command", [("inventory",), ("reconcile",), ("reconcile", "--apply")])
 @pytest.mark.parametrize("empty", [False, True])
-def test_old_metadata_fails_explicitly_without_mutation(inventory_binary, inventory_data, command, empty):
+@pytest.mark.parametrize("missing", ["rename_epoch", "storage_namespaces"])
+def test_old_metadata_fails_explicitly_without_mutation(inventory_binary, inventory_data, command, empty, missing):
     data = inventory_data
     root = data / "storage" / "images" / "r1"
     root.mkdir(parents=True)
     blob = root / "a.png"
     blob.write_bytes(b"kept")
     with closing(sqlite3.connect(data / "data.db")) as conn, conn:
-        conn.execute("ALTER TABLE _collections DROP COLUMN rename_epoch")
-        conn.execute("DELETE FROM _migrations WHERE name='0027_collection_rename_epoch'")
+        if missing == "rename_epoch":
+            conn.execute("ALTER TABLE _collections DROP COLUMN rename_epoch")
+            conn.execute("DELETE FROM _migrations WHERE name='0027_collection_rename_epoch'")
+        else:
+            conn.execute("DROP TABLE _storage_namespaces")
+            conn.execute("DELETE FROM _migrations WHERE name='0028_storage_namespaces'")
         if empty:
             conn.execute("DELETE FROM _collections")
     before = (data / "data.db").read_bytes()

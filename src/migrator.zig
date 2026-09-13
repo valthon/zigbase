@@ -347,7 +347,7 @@ pub const Migrator = struct {
     /// Rename a registered collection, preserving stable IDs and dependencies.
     /// Both arguments are names; collection IDs are not accepted as lookup keys.
     /// Stop ALL serving/worker processes and update compiled name references first.
-    /// File schemas/pending storage work are rejected: no object-store move occurs.
+    /// File prefixes stay fixed; durable work is relinked by stable identity.
     /// Reverse mode renames back, but invalidated sessions/cursors are not restored.
     pub fn renameCollection(self: *Migrator, from: []const u8, to: []const u8, opts: struct { offline: bool }) (@import("collection_rename.zig").Error || error{OfflineRenameRequired})!void {
         if (!opts.offline) return error.OfflineRenameRequired;

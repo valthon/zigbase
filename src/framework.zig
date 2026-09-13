@@ -4438,6 +4438,10 @@ fn migrateDbImpl(allocator: std.mem.Allocator, io: std.Io, ma: cli.MigrateDbArgs
 
         std.log.info("migrate-db: migrating '{s}' -> PostgreSQL{s}", .{ from, if (ma.force) " (--force)" else "" });
         const report = dumpload.run(allocator, &source, &target, .{ .force = ma.force }) catch |e| switch (e) {
+            error.SourceNamespaceUpgradeRequired => {
+                std.log.err("migrate-db: run this version's system migrations against the stopped SQLite source before copying; its immutable storage namespace ledger is missing.", .{});
+                return e;
+            },
             error.TargetNotEmpty => {
                 std.log.err("migrate-db: the target already contains a ZigBase schema (refusing to overwrite). Pass --force to load into it anyway.", .{});
                 return e;

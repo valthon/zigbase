@@ -3,8 +3,7 @@
 - Explicit offline `Migrator.renameCollection` preserves collection/field/record IDs,
   relations, indexes, search, and persistent auth references atomically. Requires all
   processes stopped and compiled name references updated; no old URL/topic aliases.
-  File-bearing schemas and pending storage dependencies fail closed pending the
-  immutable storage namespace follow-on.
+  Durable dependencies are validated before their identities are relinked.
 
 ### Changed
 

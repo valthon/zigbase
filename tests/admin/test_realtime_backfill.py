@@ -108,7 +108,7 @@ def test_current_rules_hide_retained_delete_and_empty_page_advances(server):
     assert backfill(server, "stale:1", token=token)[0] == 409
 
 
-def test_collection_recreation_and_eviction_require_reset(server):
+def test_collection_deletion_replacement_and_eviction_require_reset(server):
     token, col = setup(server)
     _, initial = backfill(server)
     for i in range(257):
@@ -118,8 +118,11 @@ def test_collection_recreation_and_eviction_require_reset(server):
     _, checkpoint = backfill(server)
     assert call(server, "DELETE", "/api/collections/" + col["id"], token=token)[0] == 204
     status, new_col = call(server, "POST", "/api/collections", {"name": "notes", "type": "base", "fields": [], "viewRule": "@public"}, token)
-    assert status == 201, new_col
-    assert backfill(server, checkpoint["nextCursor"])[0] == 409
+    assert status == 409 and new_col["code"] == "conflict", new_col
+    assert backfill(server, checkpoint["nextCursor"])[0] == 404
+    status, replacement = call(server, "POST", "/api/collections", {"name": "replacement", "type": "base", "fields": [], "viewRule": "@public"}, token)
+    assert status == 201 and replacement["id"] != col["id"], replacement
+    assert backfill(server, checkpoint["nextCursor"], topic="replacement")[0] == 409
 
 
 def test_hot_collection_does_not_reset_or_paginate_quiet_collection(server):

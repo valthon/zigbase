@@ -566,8 +566,7 @@ test "OtpMethod: initiate auto_create=true creates record for unknown identity" 
         const w = env.pool.acquireWriter();
         defer env.pool.releaseWriter();
         const existing = (try collections.get(a, w, "otp_ac")).?;
-        try collections.delete(a, w, existing.id);
-        _ = try collections.create(a, std.testing.io, w, .{
+        _ = try collections.update(a, std.testing.io, w, existing.id, .{
             .id = "",
             .name = "otp_ac",
             .type = .auth,
@@ -620,8 +619,7 @@ test "OtpMethod: initiate auto_create=false creates nothing for unknown identity
         const w = env.pool.acquireWriter();
         defer env.pool.releaseWriter();
         const existing = (try collections.get(a, w, "otp_noac")).?;
-        try collections.delete(a, w, existing.id);
-        _ = try collections.create(a, std.testing.io, w, .{
+        _ = try collections.update(a, std.testing.io, w, existing.id, .{
             .id = "",
             .name = "otp_noac",
             .type = .auth,
@@ -674,8 +672,7 @@ test "OtpMethod: auto_create initiate then complete succeeds end-to-end" {
         const w = env.pool.acquireWriter();
         defer env.pool.releaseWriter();
         const existing = (try collections.get(a, w, "otp_e2e")).?;
-        try collections.delete(a, w, existing.id);
-        _ = try collections.create(a, std.testing.io, w, .{
+        _ = try collections.update(a, std.testing.io, w, existing.id, .{
             .id = "",
             .name = "otp_e2e",
             .type = .auth,

@@ -12,7 +12,7 @@ const schema_gen = @import("schema_gen.zig");
 const SchemaJsonError = @typeInfo(@typeInfo(@TypeOf(schema.fieldsFromJson)).@"fn".return_type.?).error_union.error_set ||
     @typeInfo(@typeInfo(@TypeOf(schema.indexesFromJson)).@"fn".return_type.?).error_union.error_set;
 
-pub const EngineError = error{ Validation, NotFound, Conflict } || db.DbError || std.mem.Allocator.Error || schema.ParseError || SchemaJsonError;
+pub const EngineError = error{ Validation, NotFound, Conflict, StorageNamespaceMissing } || @import("files/namespace.zig").Error || db.DbError || std.mem.Allocator.Error || schema.ParseError || SchemaJsonError;
 
 /// Validation details for the most recent failed create/update (2b surfaces these).
 pub threadlocal var last_errors: ?[]const schema.ValidationError = null;
@@ -119,6 +119,7 @@ pub fn create(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, def: schema.Colle
     const d = db.dbDialect(w);
     const tx = try Tx.begin(w);
     errdefer tx.rollback();
+    try @import("files/namespace.zig").reserve(sa, w, col.id, col.name);
     try w.exec(try sa.dupeZ(u8, try ddl.createTableSql(sa, ddl_col, null, d, &.{})));
     for (col.indexes) |idx| try w.exec(try sa.dupeZ(u8, try ddl.createIndexSql(sa, col.name, idx, d)));
     if (col.type == .auth) {
@@ -203,7 +204,7 @@ fn insertRow(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection) Engine
 }
 
 const select_cols =
-    \\SELECT "id","name","type","system","schema","indexes","listRule","viewRule","createRule","updateRule","deleteRule","created","updated","options","rename_epoch" FROM "_collections"
+    \\SELECT "id","name","type","system","schema","indexes","listRule","viewRule","createRule","updateRule","deleteRule","created","updated","options","rename_epoch",(SELECT "namespace" FROM "_storage_namespaces" WHERE "collection_id"="_collections"."id") FROM "_collections"
 ;
 
 /// Validate the current metadata projection without loading any collections.
@@ -223,6 +224,7 @@ fn dupOptText(alloc: std.mem.Allocator, st: *db.Stmt, idx: c_int) !?[]const u8 {
 /// Convert the current row of `st` (columns in `select_cols` order) into a Collection.
 /// Must be called before the next step()/finalize() (columnText pointers are transient).
 fn rowToCollection(alloc: std.mem.Allocator, st: *db.Stmt) EngineError!schema.Collection {
+    if (st.isNull(15)) return error.StorageNamespaceMissing;
     const col_id = try alloc.dupe(u8, st.columnText(0));
     const name = try alloc.dupe(u8, st.columnText(1));
     const ctype = std.meta.stringToEnum(schema.CollectionType, st.columnText(2)) orelse .base;
@@ -245,6 +247,7 @@ fn rowToCollection(alloc: std.mem.Allocator, st: *db.Stmt) EngineError!schema.Co
         .updated = try alloc.dupe(u8, st.columnText(12)),
         .options = try schema.optionsFromJson(alloc, st.columnText(13)),
         .rename_epoch = st.columnInt(14),
+        .storage_namespace = try alloc.dupe(u8, st.columnText(15)),
     };
 }
 

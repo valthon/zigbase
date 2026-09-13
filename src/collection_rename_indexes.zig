@@ -376,12 +376,14 @@ test "SQLite auth rename moves only verified engine indexes and preserves unique
         try std.testing.expectEqualStrings("idx_auth_people_email", indexes.columnText(0));
         try std.testing.expect(!try indexes.step());
     }
-    // A newly created auth collection can safely reuse the old logical name:
-    // its IF NOT EXISTS must not resolve an index on the renamed table.
-    const fresh = try collections.create(a, std.testing.io, &w, .{ .id = "", .name = "users", .type = .auth, .fields = &.{} });
-    defer fresh.deinit(a);
-    try w.exec("INSERT INTO users(id,email) VALUES('n1','fresh@example.com');");
-    try std.testing.expectError(error.ExecFailed, w.exec("INSERT INTO users(id,email) VALUES('n2','fresh@example.com');"));
+    // Immutable namespace reservations forbid a fresh owner adopting the old
+    // prefix, but no obsolete auth index may remain attached to the live table.
+    try std.testing.expectError(error.StorageNamespaceConflict, collections.create(a, std.testing.io, &w, .{ .id = "", .name = "users", .type = .auth, .fields = &.{} }));
+    {
+        var old_index = try w.prepare("SELECT 1 FROM sqlite_schema WHERE name='idx_auth_users_email';");
+        defer old_index.finalize();
+        try std.testing.expect(!try old_index.step());
+    }
     try rename(a, std.testing.io, &w, "people", "accounts");
     var indexes = try w.prepare("SELECT name FROM sqlite_schema WHERE type='index' AND tbl_name='accounts' AND name NOT LIKE 'sqlite_%' ORDER BY name;");
     defer indexes.finalize();

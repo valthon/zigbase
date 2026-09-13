@@ -6,6 +6,9 @@ const std = @import("std");
 /// (0.10.0, Breaking: was `localPath(ctx, alloc, …)` — the rename is forced anyway,
 /// since a remote backend needs the `io` for network/disk I/O.)
 pub const Storage = struct {
+    // Every `col` argument below is an immutable physical namespace, NOT the
+    // current collection name or a collection ID. Custom plugins must preserve
+    // that distinction; public URLs/hooks continue using logical names.
     ctx: *anyopaque,
     vtable: *const VTable,
 

@@ -652,7 +652,12 @@ def test_restart_preserves_stable_auth_collection_binding(running):
     # Preserve the principal and tokenKey deliberately: a name/principal-only
     # binding would incorrectly accept the old session in this replacement.
     with sqlite3.connect(data / "data.db") as conn:
+        old_id = conn.execute("SELECT id FROM _collections WHERE name='users'").fetchone()[0]
         conn.execute("UPDATE _collections SET id='replacementauth' WHERE name='users'")
+        # Simulate a distinct owner with its own physical namespace, retaining
+        # the old owner's reservation rather than adopting its files.
+        conn.execute("INSERT INTO _storage_namespaces(collection_id,namespace) VALUES ('replacementauth','replacement_auth_fixture')")
+        assert conn.execute("SELECT collection_id FROM _storage_namespaces WHERE namespace='users'").fetchone() == (old_id,)
     start()
     code, fresh = network.call(base, "POST", "/api/collections/users/auth-with-password",
                                {"identity": "one@x.io", "password": "userpassword"})

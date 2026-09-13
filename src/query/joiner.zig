@@ -201,6 +201,7 @@ test "joiner escapes an embedded quote in collection and field identifiers" {
         \\  '[{"id":"tf1","name":"na\"me","type":"text","options":{}}]',
         \\  '[]','{}',NULL,NULL,NULL,NULL,NULL,datetime('now'),datetime('now'));
     );
+    try @import("../files/namespace.zig").reserve(a, &d, "weird_target__", "we\"ird");
     const pf = [_]schema.Field{
         .{ .id = "f1", .name = "ti\"tle", .options = .{ .text = .{} } },
         .{ .id = "f2", .name = "au\"thor", .options = .{ .relation = .{ .targetCollectionId = "weird_target__", .maxSelect = 1 } } },

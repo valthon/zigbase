@@ -43,6 +43,8 @@ pub const Error = error{
     TargetNotEmpty,
     /// A copied table's row count on the target did not match the source after load.
     RowCountMismatch,
+    /// Upgrade the source with system migrations before copying namespace metadata.
+    SourceNamespaceUpgradeRequired,
 } || collections.EngineError || db.DbError || std.mem.Allocator.Error;
 
 pub const TableReport = struct {
@@ -81,13 +83,16 @@ pub fn run(gpa: std.mem.Allocator, source: *db.Db, target: *db.Db, opts: Options
     // (1) Clobber guard: a fresh target has no `_collections` table at all. The error is returned
     // (not logged) so callers — and tests — drive the messaging.
     if (!opts.force and try targetHasSchema(a, target)) return Error.TargetNotEmpty;
+    if (!try tableExists(a, source, "_storage_namespaces")) return error.SourceNamespaceUpgradeRequired;
+    // Validate every live collection's reservation before target migrations
+    // commit anything, including --force transfers into an existing target.
+    const src_cols = try collections.list(a, source);
 
     // (2) System schema on the target (idempotent; dialect-aware). Runs its own transactions.
     try migrations.run(target);
 
     // (3) Provision the record tables declared in the SOURCE `_collections` that the migrations
     // did not already create (i.e. the user collections — system collections come from migrations).
-    const src_cols = try collections.list(a, source);
     const collections_provisioned = try provisionRecordTables(a, target, src_cols);
 
     // (4) Bulk-load, ATOMICALLY. Drive the copy by the TARGET's tables so SQLite-only artifacts
@@ -588,6 +593,7 @@ fn tableExists(a: std.mem.Allocator, d: *db.Db, table: []const u8) Error!bool {
         .postgres => "SELECT 1 FROM information_schema.tables WHERE table_schema = current_schema() AND table_name = ?1;",
     };
     const sql = try db.dbDialect(d).renumberPlaceholders(a, raw);
+    defer a.free(sql);
     var st = try d.prepare(sql);
     defer st.finalize();
     try st.bindText(1, table);
@@ -762,6 +768,70 @@ test "dumpload: refuses a non-empty target without force" {
     const report = try run(a, &source, &target, .{ .force = true });
     defer report.deinit(a);
     try std.testing.expect(report.total_rows > 0);
+}
+
+test "dumpload rejects a missing source namespace ledger before mutating target" {
+    var source = try db.Db.openMemory();
+    defer source.close();
+    try migrations.run(&source);
+    try source.exec("DROP TABLE _storage_namespaces;");
+    var target = try db.Db.openMemory();
+    defer target.close();
+    try std.testing.expectError(error.SourceNamespaceUpgradeRequired, run(std.testing.allocator, &source, &target, .{}));
+    try std.testing.expect(!try tableExists(std.testing.allocator, &target, "_collections"));
+}
+
+test "dumpload preserves renamed file namespaces and retired reservations" {
+    const a = std.testing.allocator;
+    var source = try db.Db.openMemory();
+    defer source.close();
+    var target = try db.Db.openMemory();
+    defer target.close();
+    try migrations.run(&source);
+    const col = try collections.create(a, std.testing.io, &source, .{ .id = "", .name = "photos", .fields = &.{.{ .id = "file1", .name = "file", .options = .{ .file = .{} } }} });
+    defer col.deinit(a);
+    try source.exec("INSERT INTO photos(id,file) VALUES ('r1','kept.txt');");
+    try @import("collection_rename.zig").rename(a, std.testing.io, &source, "photos", "pictures");
+    const retired = try collections.create(a, std.testing.io, &source, .{ .id = "", .name = "retired", .fields = &.{} });
+    defer retired.deinit(a);
+    try collections.delete(a, &source, "retired");
+    const report = try run(a, &source, &target, .{});
+    defer report.deinit(a);
+    const loaded = (try collections.get(a, &target, "pictures")).?;
+    defer loaded.deinit(a);
+    try std.testing.expectEqualStrings(col.id, loaded.id);
+    try std.testing.expectEqualStrings("photos", loaded.storage_namespace);
+    try std.testing.expectError(error.StorageNamespaceConflict, collections.create(a, std.testing.io, &target, .{ .id = "", .name = "photos", .fields = &.{} }));
+    try std.testing.expectError(error.StorageNamespaceConflict, collections.create(a, std.testing.io, &target, .{ .id = "", .name = "retired", .fields = &.{} }));
+}
+
+test "dumpload rejects an incomplete source ledger before any target migrations" {
+    const a = std.testing.allocator;
+    var source = try db.Db.openMemory();
+    defer source.close();
+    try migrations.run(&source);
+    const col = try collections.create(a, std.testing.io, &source, .{ .id = "", .name = "photos", .fields = &.{} });
+    defer col.deinit(a);
+    try source.exec("DELETE FROM _storage_namespaces WHERE namespace='photos';");
+    inline for (.{ false, true }) |force| {
+        var target = try db.Db.openMemory();
+        defer target.close();
+        if (force) {
+            try migrations.run(&target);
+            try target.exec("CREATE TABLE sentinel(value TEXT); INSERT INTO sentinel VALUES('kept'); DROP TABLE _storage_namespaces; DELETE FROM _migrations WHERE name='0028_storage_namespaces';");
+        }
+        try std.testing.expectError(error.StorageNamespaceMissing, run(a, &source, &target, .{ .force = force }));
+        if (force) {
+            try std.testing.expect(!try tableExists(a, &target, "_storage_namespaces"));
+            var kept = try target.prepare("SELECT value FROM sentinel;");
+            defer kept.finalize();
+            try std.testing.expect(try kept.step());
+            try std.testing.expectEqualStrings("kept", kept.columnText(0));
+        } else {
+            try std.testing.expect(!try tableExists(a, &target, "_collections"));
+            try std.testing.expect(!try tableExists(a, &target, "_migrations"));
+        }
+    }
 }
 
 test "dumpload: rollup watermark reset counts migrated events correctly (H1)" {

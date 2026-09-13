@@ -146,19 +146,6 @@ def test_resume_current_record_and_completed_retry(server):
 
 def test_current_collection_identity_and_hook_failure_are_terminal(server):
     admin, tokens, col, record = setup(server)
-    _, upload = begin(server, tokens[0], record)
-    path = "/api/uploads/" + upload["id"]
-    assert call(server, "PATCH", path, b"abcd", tokens[0], 0)[0] == 204
-    assert call(server, "DELETE", "/api/collections/" + col["id"], token=admin)[0] == 204
-    body = {"name": "uploads", "type": "base", "fields": col["schema"], "updateRule": "@public", "viewRule": "@public"}
-    code, replacement = call(server, "POST", "/api/collections", body, admin)
-    assert code == 201 and replacement["id"] != col["id"], replacement
-    code, recreated = call(server, "POST", "/api/collections/uploads/records", {"title": "new collection"}, admin)
-    assert code == 201, recreated
-    assert call(server, "POST", path + "/commit", token=tokens[0])[0] == 409
-    assert call(server, "GET", path, token=tokens[0])[1]["state"] == "failed"
-    assert not call(server, "GET", "/api/collections/uploads/records/" + recreated["id"])[1]["file"]
-
     code, rejected = call(server, "POST", "/api/collections/uploads/records", {"title": "reject"}, admin)
     assert code == 201, rejected
     _, upload = begin(server, tokens[1], rejected, filename="reject.txt")
@@ -170,6 +157,22 @@ def test_current_collection_identity_and_hook_failure_are_terminal(server):
     assert call(server, "GET", path, token=tokens[1])[1]["state"] == "failed"
     assert call(server, "POST", path + "/commit", token=tokens[1])[0] == 409
     assert call(server, "GET", "/api/upload-probe", token=admin)[1] == {"before": before["before"] + 1, "after": before["after"]}
+
+    _, upload = begin(server, tokens[0], record)
+    path = "/api/uploads/" + upload["id"]
+    assert call(server, "PATCH", path, b"abcd", tokens[0], 0)[0] == 204
+    assert call(server, "DELETE", "/api/collections/" + col["id"], token=admin)[0] == 204
+    body = {"name": "uploads", "type": "base", "fields": col["schema"], "updateRule": "@public", "viewRule": "@public"}
+    code, replacement = call(server, "POST", "/api/collections", body, admin)
+    assert code == 409 and replacement["code"] == "conflict", replacement
+    body["name"] = "replacement_uploads"
+    code, replacement = call(server, "POST", "/api/collections", body, admin)
+    assert code == 201 and replacement["id"] != col["id"], replacement
+    code, recreated = call(server, "POST", "/api/collections/replacement_uploads/records", {"title": "new collection"}, admin)
+    assert code == 201, recreated
+    assert call(server, "POST", path + "/commit", token=tokens[0])[0] == 409
+    assert call(server, "GET", path, token=tokens[0])[1]["state"] == "failed"
+    assert not call(server, "GET", "/api/collections/replacement_uploads/records/" + recreated["id"])[1]["file"]
 
 
 def test_principal_required_for_every_operation_and_revocation(server):

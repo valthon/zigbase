@@ -32,11 +32,14 @@ fn referenceWithPolicy(alloc: std.mem.Allocator, conn: *db.Db, key: []const u8, 
     var scratch = std.heap.ArenaAllocator.init(alloc);
     defer scratch.deinit();
     const a = scratch.allocator();
-    const col = (collections.get(a, conn, col_name) catch return .unknown) orelse return if (policy == .reconciliation) .unknown else .candidate_unreferenced;
+    const id = (@import("namespace.zig").collectionId(a, conn, col_name) catch return .unknown) orelse return if (policy == .reconciliation) .unknown else .candidate_unreferenced;
+    const col = (collections.get(a, conn, id) catch return .unknown) orelse return if (policy == .reconciliation) .unknown else .candidate_unreferenced;
+    // get accepts logical names too: a retired owner's ID can become another
+    // collection's name. Never attribute that collection's rows to old blobs.
+    if (!std.mem.eql(u8, col.id, id) or !std.mem.eql(u8, col.storage_namespace, col_name)) return .unknown;
     if (policy == .reconciliation) {
         // A collection ID alias is not its physical storage prefix. Missing or
         // encrypted metadata cannot establish plaintext file ownership safely.
-        if (!std.mem.eql(u8, col.name, col_name)) return .unknown;
         for (col.fields) |field| if (field.options == .file and field.encrypted) return .unknown;
     }
     // Maintenance references are physical, not public visibility. Expired rows
@@ -67,6 +70,31 @@ fn referenceWithPolicy(alloc: std.mem.Allocator, conn: *db.Db, key: []const u8, 
         }
     }
     return .candidate_unreferenced;
+}
+
+test "retired namespace cannot resolve another collection through an ID name alias" {
+    const a = std.testing.allocator;
+    var conn = try db.Db.open(":memory:");
+    defer conn.close();
+    try @import("../migrations.zig").run(&conn);
+    const original = try collections.create(a, std.testing.io, &conn, .{ .id = "", .name = "photos", .fields = &.{} });
+    defer original.deinit(a);
+    // Collection IDs are random and may start with a digit, unlike valid names.
+    // Keep this deliberate ID/name alias fixture deterministic and consistent.
+    const retired_id = "c12345678901234";
+    try conn.exec("UPDATE _collections SET id='c12345678901234' WHERE name='photos'; UPDATE _storage_namespaces SET collection_id='c12345678901234' WHERE namespace='photos';");
+    try collections.delete(a, &conn, retired_id);
+    const alias = try collections.create(a, std.testing.io, &conn, .{
+        .id = "",
+        .name = retired_id,
+        .fields = &.{.{ .id = "photo", .name = "photo", .options = .{ .file = .{} } }},
+    });
+    defer alias.deinit(a);
+    const sql = try std.fmt.allocPrintSentinel(a, "INSERT INTO \"{s}\" (id,created,updated,photo) VALUES ('r1','','','a.png');", .{alias.name}, 0);
+    defer a.free(sql);
+    try conn.exec(sql);
+    try std.testing.expectEqual(Reference.unknown, reference(a, &conn, "photos/r1/a.png"));
+    try std.testing.expectEqual(Reference.unknown, reconciliationReference(a, &conn, "photos/r1/a.png"));
 }
 
 test "inventory preserves physical references on expired TTL rows and hidden file fields" {
@@ -137,6 +165,9 @@ test "reference classification and usage never treat unknown layouts as orphan p
     });
     defer col.deinit(a);
     try conn.exec("INSERT INTO images (id, created, updated, photo) VALUES ('r1','','','a.png');");
+    try @import("../collection_rename.zig").rename(a, std.testing.io, &conn, "images", "photos");
+    try std.testing.expectEqual(Reference.referenced, reconciliationReference(a, &conn, "images/r1/a.png"));
+    try std.testing.expectEqual(Reference.unknown, reconciliationReference(a, &conn, "photos/r1/a.png"));
     try std.testing.expectEqual(Reference.referenced, reference(a, &conn, "images/r1/a.png"));
     try std.testing.expectEqual(Reference.candidate_unreferenced, reference(a, &conn, "images/r1/new.png"));
     try std.testing.expectEqual(Reference.candidate_unreferenced, reference(a, &conn, "missing/r1/a.png"));
@@ -181,12 +212,13 @@ test "reconciliation parses metadata once per fresh check and preserves stricter
     // A second check must observe schema drift, not reuse the first parse.
     try std.testing.expectEqual(Reference.unknown, reconciliationReference(a, &conn, "images/r1/a.png"));
     try std.testing.expectEqual(@as(usize, 1), metadata_reads);
-    // Inventory remains an observation with its original missing/alias semantics.
+    // Inventory remains an observation; only physical namespace prefixes can
+    // establish ownership. An ID alias is not a reserved physical prefix.
     try std.testing.expectEqual(Reference.referenced, reference(a, &conn, "images/r1/a.png"));
     try std.testing.expectEqual(Reference.candidate_unreferenced, reference(a, &conn, "missing/r1/a.png"));
     try std.testing.expectEqual(Reference.unknown, reconciliationReference(a, &conn, "missing/r1/a.png"));
     const alias = try std.fmt.allocPrint(a, "{s}/r1/a.png", .{col.id});
     defer a.free(alias);
-    try std.testing.expectEqual(Reference.referenced, reference(a, &conn, alias));
+    try std.testing.expectEqual(Reference.candidate_unreferenced, reference(a, &conn, alias));
     try std.testing.expectEqual(Reference.unknown, reconciliationReference(a, &conn, alias));
 }

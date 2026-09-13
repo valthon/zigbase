@@ -163,7 +163,7 @@ pub fn serve(ctx: *http.RequestCtx) anyerror!http.Response {
 
     const storage = app.storage orelse return ApiError.internal().toResponse(ctx.allocator.a);
     if (comptime @import("build_options").image_thumbnails) {
-        if (ctx.param("profile")) |profile| return @import("../files/thumbnails.zig").serve(ctx, storage.*, col.name, rid, name, profile);
+        if (ctx.param("profile")) |profile| return @import("../files/thumbnails.zig").serve(ctx, storage.*, col.storage_namespace, rid, name, profile);
     }
 
     // Presigned-redirect mode (opt-in via `App(.{ .files = .{ .s3_presign_redirect = true } })`,
@@ -177,7 +177,7 @@ pub fn serve(ctx: *http.RequestCtx) anyerror!http.Response {
     // or a build without -Ds3), so we fall through to the unchanged proxy path. A HEAD is honored
     // too — the 302 carries no body. A signing failure propagates (→ 500), not a silent fallback.
     if (app.files.presign_redirect) {
-        if (try storage.presignGetUrl(app.io, ctx.allocator.a, col.name, rid, name, app.files.presign_ttl_s)) |url| {
+        if (try storage.presignGetUrl(app.io, ctx.allocator.a, col.storage_namespace, rid, name, app.files.presign_ttl_s)) |url| {
             const hs = try ctx.allocator.a.dupe(http.Header, &.{.{ .name = "Location", .value = url }});
             return .{ .status = 302, .body = "", .content_type = "text/plain", .extra_headers = hs };
         }
@@ -186,7 +186,7 @@ pub fn serve(ctx: *http.RequestCtx) anyerror!http.Response {
     // §D.5: null = the DB references an object the backend has lost — hide existence
     // (404) but SCREAM in the logs; a transport/backend error (post retry-once inside
     // the backend) = transient -> 500.
-    const maybe_path = storage.fetch(app.io, ctx.allocator.a, col.name, rid, name) catch |e| {
+    const maybe_path = storage.fetch(app.io, ctx.allocator.a, col.storage_namespace, rid, name) catch |e| {
         std.log.err("storage.fetch failed for {s}/{s}/{s}: {s}", .{ col.name, rid, name, @errorName(e) });
         return ApiError.internal().toResponse(ctx.allocator.a);
     };
@@ -533,7 +533,8 @@ const PresignStubStorage = struct {
     }
     fn deleteImpl(_: *anyopaque, _: std.Io, _: []const u8, _: []const u8, _: []const u8) anyerror!void {}
     fn deleteRecordImpl(_: *anyopaque, _: std.Io, _: []const u8, _: []const u8) anyerror!void {}
-    fn presignImpl(_: *anyopaque, _: std.Io, alloc: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: u32) anyerror!?[]const u8 {
+    fn presignImpl(_: *anyopaque, _: std.Io, alloc: std.mem.Allocator, namespace: []const u8, _: []const u8, _: []const u8, _: u32) anyerror!?[]const u8 {
+        try std.testing.expectEqualStrings("docs", namespace);
         return try alloc.dupe(u8, canned);
     }
     const vtable = @import("../files/storage.zig").Storage.VTable{
@@ -574,12 +575,17 @@ test "serve: presign_redirect issues a 302 Location; default (off) still proxies
     // A real on-disk object so the proxy fallback can succeed (200); the stub's fetch returns its path.
     var local = files_storage.LocalStorage.init(dir_path);
     try local.storage().put(std.testing.io, "docs", "r1", "a_0000000000.png", "x" ** 100);
+    {
+        const w = pool.acquireWriter();
+        defer pool.releaseWriter();
+        try @import("../collection_rename.zig").rename(a, std.testing.io, w, "docs", "documents");
+    }
 
     var stub = PresignStubStorage{ .root = dir_path };
     const storage_iface = stub.storage();
 
     const params = [_]http.Param{
-        .{ .key = "col", .value = "docs" }, .{ .key = "rec", .value = "r1" }, .{ .key = "name", .value = "a_0000000000.png" },
+        .{ .key = "col", .value = "documents" }, .{ .key = "rec", .value = "r1" }, .{ .key = "name", .value = "a_0000000000.png" },
     };
 
     // presign_redirect = true → 302 to the presigned URL (authorization ran first).

@@ -105,11 +105,15 @@ test "pg: the data-dir codegen adapter opens a postgres:// source and reads _col
     setup.exec("DROP TABLE IF EXISTS \"users\" CASCADE;") catch {};
     setup.exec("DELETE FROM \"_collections\" WHERE name IN ('posts','users');") catch {};
     try migrations.run(&setup);
+    // This test deliberately replaces its public-schema fixtures between runs;
+    // remove their engine tombstones too (not an application deletion pattern).
+    try setup.exec("DELETE FROM \"_storage_namespaces\" WHERE namespace IN ('posts','users');");
     // Register cleanup BEFORE provisioning so a mid-provision failure still leaves public clean.
     defer {
         setup.exec("DROP TABLE IF EXISTS \"posts\" CASCADE;") catch {};
         setup.exec("DROP TABLE IF EXISTS \"users\" CASCADE;") catch {};
         setup.exec("DELETE FROM \"_collections\" WHERE name IN ('posts','users');") catch {};
+        setup.exec("DELETE FROM \"_storage_namespaces\" WHERE namespace IN ('posts','users');") catch {};
     }
     const specs = demoSpecs();
     try provision.applySpecs(al, io, &setup, &specs);

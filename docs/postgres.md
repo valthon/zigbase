@@ -89,6 +89,19 @@ See the full environment-variable reference at
 Once you have a `-Dpostgres` binary, the `migrate-db` subcommand copies an existing SQLite-backed
 instance — schema **and** data — into a fresh PostgreSQL database:
 
+First stop the source application and apply this version's system migrations to
+its SQLite database. The copy requires the immutable storage namespace ledger;
+it carries both live reservations and deletion tombstones without moving blobs.
+An older source missing that ledger is rejected before the target is modified.
+An existing ledger must also contain a reservation for every live collection;
+this validation precedes target migrations, including forced transfers. Namespace
+upgrade refuses legacy collection names that differ only by case. Resolve their
+ambiguous storage ownership manually before retrying; unambiguous prefixes retain
+their original spelling and no blobs are moved automatically.
+Both SQLite and PostgreSQL index the folded reservation key as well as exact
+prefixes and collection IDs, so retained tombstones do not require a full-ledger
+scan when checking a new collection's namespace.
+
 ```sh
 zigbase migrate-db \
   --from ./data.db \

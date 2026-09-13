@@ -196,7 +196,7 @@ test "durable auth binding uses the credential verification snapshot across coll
                 self.fired = true;
                 // auth already read _collections; commit replacement before its
                 // principal lookup and the later stable-binding lookup finish.
-                self.other.exec("UPDATE _collections SET id='replacementauth' WHERE name='users';") catch {
+                self.other.exec("UPDATE _storage_namespaces SET collection_id='replacementauth' WHERE namespace='users'; UPDATE _collections SET id='replacementauth' WHERE name='users';") catch {
                     self.failed = true;
                     return c.SQLITE_DENY;
                 };

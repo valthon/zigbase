@@ -316,6 +316,69 @@ test "partial store and session allocation failures release ownership" {
     try std.testing.expectEqual(@as(usize, 0), store.allocated_bytes);
 }
 
+test "durable uploads resume after offline auth and file collection renames" {
+    if (comptime !durable_enabled) return error.SkipZigTest;
+    const db = @import("../db.zig");
+    const collections = @import("../collections.zig");
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(dir);
+    const path = try std.fmt.allocPrintSentinel(allocator, "{s}/uploads.db", .{dir}, 0);
+    defer allocator.free(path);
+    var pool = try db.Pool.init(allocator, std.testing.io, path);
+    defer pool.deinit();
+    const w = pool.acquireWriter();
+    try @import("../migrations.zig").run(w);
+    const auth_col = try collections.create(allocator, std.testing.io, w, .{ .id = "", .name = "users", .type = .auth, .fields = &.{} });
+    defer auth_col.deinit(allocator);
+    const files = try collections.create(allocator, std.testing.io, w, .{
+        .id = "",
+        .name = "photos",
+        .fields = &.{.{ .id = "image", .name = "image", .options = .{ .file = .{} } }},
+    });
+    defer files.deinit(allocator);
+    pool.releaseWriter();
+    const limits = Limits{ .durable = true, .max_sessions = 2, .max_upload_bytes = 4, .max_total_bytes = 4, .max_chunk_bytes = 4 };
+    const old_binding = Binding{ .collection = "users", .principal = "alice", .collection_id = auth_col.id };
+    var session_id: [32]u8 = undefined;
+    {
+        var seed = try Store.init(allocator, std.testing.io, limits);
+        defer seed.deinit();
+        try seed.enableDurability(&pool, std.testing.io, 0);
+        const session = try seed.begin(0, old_binding, .{
+            .collection = "photos",
+            .collection_id = files.id,
+            .record = "r1",
+            .field = "image",
+            .filename = "a.png",
+            .mimetype = "image/png",
+        }, 4);
+        session_id = session.id;
+        try seed.append(0, &session_id, old_binding, 0, "ab");
+    }
+    {
+        const writer = pool.acquireWriter();
+        defer pool.releaseWriter();
+        try @import("../collection_rename.zig").rename(allocator, std.testing.io, writer, "users", "people");
+        try @import("../collection_rename.zig").rename(allocator, std.testing.io, writer, "photos", "pictures");
+    }
+    var restored = try Store.init(allocator, std.testing.io, limits);
+    defer restored.deinit();
+    try restored.enableDurability(&pool, std.testing.io, 1);
+    try std.testing.expectError(error.NotFound, restored.status(1, &session_id, old_binding));
+    const binding = Binding{ .collection = "people", .principal = "alice", .collection_id = auth_col.id };
+    try std.testing.expectEqual(@as(usize, 2), (try restored.status(1, &session_id, binding)).offset);
+    try restored.append(1, &session_id, binding, 2, "cd");
+    const lease = (try restored.commit(1, &session_id, binding)).?;
+    try std.testing.expectEqualStrings("abcd", lease.bytes);
+    try std.testing.expectEqualStrings("pictures", lease.target.collection);
+    try std.testing.expectEqualStrings(files.id, lease.target.collection_id);
+    restored.finish(lease, true);
+    try std.testing.expectEqual(State.completed, (try restored.status(1, &session_id, binding)).state);
+}
+
 test "durable restart allocation failures release restored graphs and ownership lock" {
     if (comptime !durable_enabled) return error.SkipZigTest;
     const db = @import("../db.zig");

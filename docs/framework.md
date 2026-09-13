@@ -4089,15 +4089,30 @@ mutation. Their scopes hash application-selected principal/operation names, so t
 engine cannot prove a receipt unrelated to a rename. Stop new operations and wait
 out the existing retention windows; receipts are not discarded or silently rebound.
 
-This first slice deliberately does **not** rename storage namespaces. File-bearing
-collections return `FileCollectionRenameUnsupported` before mutation. Durable
-uploads targeting the collection **or authenticated through it**, and unfinished
-file-cleanup jobs, return `PendingStorageDependency`; drain those operations first.
-Malformed pending metadata fails closed with `InvalidPendingMetadata`. An immutable
-storage namespace is the prerequisite follow-on for file-bearing renames; local,
-S3, and custom backends are not moved by this API. Audit storage left behind by
-previously removed file fields yourself before reusing a name. Take a backup and
-test both directions on a copy before a production migration.
+File-bearing collections keep an **immutable storage namespace**. Upgrading seeds
+the engine-owned reservation ledger from existing collection IDs and names; no
+local, S3, or custom-backend objects are copied or renamed. File reads/writes,
+thumbnails, presigning, cleanup, inventory, and reconciliation resolve that physical
+prefix independently of the current public collection name. Generic collection
+input, schema import, and update cannot override another collection's namespace.
+
+Durable uploads targeting the collection **or authenticated through it**, and
+unfinished file-cleanup jobs, are relinked in the same database transaction. Both
+the stored name and stable collection ID must agree. Malformed or inconsistent
+metadata fails closed with `InvalidPendingMetadata`; orphan destination-name
+dependencies return `PendingStorageDependency`. Payload bytes and upload offsets
+are untouched. In-memory uploads are lost when their process stops, as usual.
+Metadata scans use 64-row keyset batches with row-scoped parsing and cleared
+statement bindings, including on PostgreSQL; payloads larger than 64 KiB fail closed.
+
+**Namespace reservations survive collection deletion.** Creating a collection whose
+name is already reserved as a physical prefix fails with `StorageNamespaceConflict`
+(HTTP 409), even if the former collection was renamed or deleted. There is no
+automatic reclamation: leftover objects must never become a new collection's files.
+New reservations also reject ASCII case variants of existing prefixes, on every
+backend, to protect case-insensitive local filesystems. Existing physical prefixes
+and inventory lookups remain exact; this does not rename or normalize legacy objects.
+Take a backup and test both migration directions on a copy before production.
 
 #### Data transforms (`m.records()`)
 
@@ -4434,6 +4449,10 @@ field (the pattern the example apps use). One nuance: Postgres `lower()` is loca
 Once you have built a `-Dpostgres` binary, the `migrate-db` subcommand copies an
 existing SQLite-backed instance into a fresh PostgreSQL database — schema **and** data:
 
+Stop the source and apply this version's system migrations first. The copy requires
+the immutable storage namespace ledger and preserves its live and retired reservations;
+an older source missing the ledger is rejected before modifying the target.
+
 ```sh
 # Build with the PostgreSQL backend compiled in.
 zig build -Dpostgres=true
@@ -4536,7 +4555,11 @@ zigbase.App(.{ .mailer = AuditMailer }).runCli(init);
 ```
 
 A custom storage plugin follows the same shape, returning a `zigbase.Storage`
-view from `interface()`. The `zigbase.Storage` vtable has **four** required
+view from `interface()`. Its `col` argument is an **immutable physical namespace**,
+not necessarily the current collection name. Forward it unchanged; do not derive
+it from request URLs. Hooks and public routes still use the logical collection
+name. Inventory keys must use the same physical namespace. The `zigbase.Storage`
+vtable has **four** required
 methods — `put` / `fetch` / `delete` / `deleteRecord` — plus **optional**
 `presignGetUrl` and `inventory` (both default to `null`, so existing four-method backends stay
 valid) — so a custom backend wraps or replaces them. `fetch(ctx, io, alloc,
@@ -4735,8 +4758,10 @@ worker and an appropriate visibility timeout. Stored object keys must remain
 immutable; custom out-of-band uploads must not overwrite keys pending deletion
 or write into a deleted record's prefix without first creating its database row.
 
-Collection identity is checked: deleted, renamed, or recreated collections are
+Collection identity is checked: deleted or recreated collections are
 conservatively skipped, leaving their objects for separate operator review.
+Coordinated `renameCollection` migrations relink pending jobs by stable ID while
+preserving their physical namespace; uncoordinated name changes are not supported.
 This first version covers HTTP record PATCH/DELETE only, not raw SQL, `Data`
 mutations, cascade/TTL deletes, collection deletion, failed upload cleanup, or
 orphan reconciliation. A crash before upload references commit can still orphan

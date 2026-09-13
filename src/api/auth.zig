@@ -1587,13 +1587,12 @@ test "require_verified gates password login: unverified 403, verified 200" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    // Recreate the collection with require_verified = true (initAuth made a default one).
+    // Update require_verified (initAuth made a default collection).
     {
         const w = env.pool.acquireWriter();
         defer env.pool.releaseWriter();
         const existing = (try collections.get(a, w, "gated")).?;
-        try collections.delete(a, w, existing.id);
-        _ = try collections.create(a, std.testing.io, w, .{
+        _ = try collections.update(a, std.testing.io, w, existing.id, .{
             .id = "",
             .name = "gated",
             .type = .auth,
