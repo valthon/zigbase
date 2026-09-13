@@ -16,6 +16,17 @@ in-process testing structurally cannot see.
 
 ## Focused repository test execution
 
+The repository also tests the lean SQLite configuration without FTS5:
+
+```sh
+mise exec zig@0.16.0 -- zig build install test -Dfts5=false -Dpostgres=false --summary all
+```
+
+This builds the stripped binary and runs the full unit suite. SQLite search-only
+cases are gated, while disabled-search rejection, ordinary access controls, key
+rotation and client generation remain covered. PostgreSQL search is independent
+of the SQLite FTS5 flag.
+
 For contributors working inside a **trusted ZigBase checkout**, the standard-library
 Python tool `tools/agent_tests.py` provides static JSON test inventory, exact
 module/function and TypeScript/Python SDK unit-suite selection, and bounded structured execution reports. It is not
