@@ -608,6 +608,10 @@ pub const Pool = struct {
         errdefer allocator.free(owned);
         var writer = try Db.open(owned);
         errdefer writer.close();
+        // Negotiating WAL needs an exclusive lock on a legacy DELETE-journal
+        // database. Install the bounded wait before that first locking query,
+        // not afterwards, so a short-lived reader cannot randomly fail boot.
+        try writer.exec("PRAGMA busy_timeout=5000;");
         // WAL + sane durability defaults. sqlite3_exec reports OK even when WAL
         // was not actually applied, so read back the journal_mode and verify.
         {
@@ -619,7 +623,6 @@ pub const Pool = struct {
         }
         try writer.exec("PRAGMA synchronous=NORMAL;");
         try writer.exec("PRAGMA foreign_keys=ON;");
-        try writer.exec("PRAGMA busy_timeout=5000;");
         // Checkpoint less often than the 1000-page default. Each checkpoint briefly
         // blocks the (single) writer; doubling the threshold cut checkpoint-induced
         // stalls and raised sustained single-writer INSERT throughput by ~50% in
