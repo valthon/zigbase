@@ -68,7 +68,7 @@ def test_expanded_inventory_is_static_and_explicit(monkeypatch):
             }
             assert item["effect"] == "may_write_and_access_network"
     assert all(
-        target in agent.MODULES
+        target in agent.GROUPS
         for _, targets in agent.DEPENDENCIES
         for target in targets
     )

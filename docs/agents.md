@@ -207,7 +207,8 @@ These commands emit one JSON document (`protocol_version: 1`,
 `scope: "repository-focused-tests"`). Inventory statically reads an explicit set
 of pytest modules without importing tests or collecting them. `items[].id` is an
 exact module group or directly declared top-level function; a function runs all
-its parametrizations. Each item includes argv invoking the bounded wrapper and conservative machine-readable
+its parametrizations. The explicit `clients/typescript::unit` suite is also advertised,
+without loading Vitest or enumerating its cases. Each item includes argv invoking the bounded wrapper and conservative machine-readable
 requirements (tool versions, Python packages, browser, binary override/build behavior).
 Class methods and dynamic case IDs are not individually inventoried. This is not a
 complete repository test inventory, a Zig test filter, or embedded-app discovery.
@@ -224,6 +225,26 @@ check through `mise`. Their advertised effect remains conservative, not a promis
 of filesystem/network isolation. Performance-contract tests use synthetic
 artifacts and reports, **not actual benchmark runs**. Their unittest class runs
 through the module selector; class-method IDs are still not inventoried.
+
+The TypeScript SDK selector runs the checked-in `vitest.config.ts` from
+`clients/typescript` using pinned Node 24, at most two workers, and the same
+time/output/process-group limits. Install dependencies explicitly first:
+
+```sh
+(cd clients/typescript && mise exec node@24 -- npm ci)
+mise exec python@3.13 -- python tools/agent_tests.py run \
+  --selector clients/typescript::unit --timeout-seconds 180
+```
+
+The wrapper never installs dependencies or invokes npm lifecycle scripts. It runs
+the installed Vitest entrypoint directly; missing dependencies produce unsuccessful
+structured process evidence, not an installation attempt. Inventory marks this item
+`kind: "suite"`, `runner: "vitest"`, with a repository-relative `cwd` override;
+run reports its `cwd` (existing pytest items run from `"."`). The config excludes
+live integration tests. Type checking, package builds, other SDKs and individual
+Vitest case selection remain separate. `NODE_OPTIONS` is removed from child
+environments, alongside pytest argument/plugin overrides. Repository config,
+tests, dependencies and the remaining inherited environment are still trusted code.
 
 ```sh
 mise exec python@3.13 -- python tools/agent_tests.py run \
@@ -294,21 +315,25 @@ dashes are not separators or options. Results are sorted and deduplicated.
 Dependencies are explicit maintained rules, **not inferred imports**: changing an
 allowlisted test selects that module; `src/`, vendored Zig dependencies, build
 configuration or the admin harness selects all allowlisted admin modules; the
-shared Python harness, resolver, toolchain configuration or selector selects all
-allowlisted modules. Tool-specific dependencies are narrower:
+shared Python harness or resolver selects all allowlisted pytest modules;
+toolchain configuration or selector changes select all groups, including the SDK
+suite. Tool-specific dependencies are narrower:
 
 | Changed dependency | Selected module |
 | --- | --- |
 | `tools/performance_contracts.py` or `bench/contracts/` | `tests/tools/test_performance_contracts.py` |
 | `tools/replay/` | `tests/tools/test_replay.py` |
+| `clients/typescript/` | `clients/typescript::unit` (unit suite only) |
 
 These checks validate the tools; changed benchmark budgets still need actual
 benchmark runs separately. New tools are never discovered or executed implicitly.
 The allowlist-expansion regression driver deliberately stays unlisted to prevent
 recursive self-execution. Every unmapped path (including docs and unlisted tests)
-selects all allowlisted modules and sets `fallback: true`. `coverage_complete` is
+selects all allowlisted groups and sets `fallback: true`. For compatibility,
+`changes[].modules` contains both module and suite IDs. `coverage_complete` is
 always false and `coverage_gaps` remains present even for mapped changes. The
-fallback is not a full-suite run: Zig, SDK, other pytest and docs checks still need
+fallback is not a full-suite run: Zig, other SDK suites, TypeScript integration,
+typecheck/build, other pytest and docs checks still need
 separate validation. This helps choose a first check, not decide that CI is unnecessary.
 
 Each of the three Git subprocesses has a 10-second deadline and a 1 MiB combined

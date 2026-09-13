@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Bounded, allowlisted pytest selection for a trusted ZigBase checkout.
+"""Bounded, allowlisted test selection for a trusted ZigBase checkout.
 
 Inventory uses syntax trees, never pytest collection/import. Execution is not a
 sandbox: repository tests, conftest, the pinned toolchain and dependencies run
@@ -38,6 +38,8 @@ TOOL_MODULES = (
     "tests/tools/test_agent_affected.py",
 )
 MODULES = (*TOOL_MODULES, *ADMIN_MODULES)
+SDK_SUITES = ("clients/typescript::unit",)
+GROUPS = (*MODULES, *SDK_SUITES)
 MODULE_NOTES = {
     "tests/tools/test_performance_contracts.py": "Local Python CLI and synthetic artifact fixtures; no Zig compiler, real benchmark run or browser. Class methods run through the module selector, not individual inventory ids.",
     "tests/tools/test_replay.py": "Local Python CLI and loopback HTTP fixtures require local socket access; no live migration source, external service, Zig compiler or browser.",
@@ -64,9 +66,10 @@ DEPENDENCIES = (
     ("build.zig", ADMIN_MODULES),
     ("build.zig.zon", ADMIN_MODULES),
     ("zig-pkg/", ADMIN_MODULES),
-    ("mise.toml", MODULES),
+    ("mise.toml", GROUPS),
     ("pyproject.toml", MODULES),
-    ("tools/agent_tests.py", MODULES),
+    ("tools/agent_tests.py", GROUPS),
+    ("clients/typescript/", SDK_SUITES),
     ("tools/performance_contracts.py", ("tests/tools/test_performance_contracts.py",)),
     ("bench/contracts/", ("tests/tools/test_performance_contracts.py",)),
     ("tools/replay/", ("tests/tools/test_replay.py",)),
@@ -112,6 +115,12 @@ class Parser(argparse.ArgumentParser):
 
 def command(selector: str) -> list[str]:
     """Called only after exact inventory membership validation by run()."""
+    if selector == "clients/typescript::unit":
+        return [
+            "mise", "exec", "node@24", "--", "node",
+            "node_modules/vitest/vitest.mjs", "run",
+            "--config", "vitest.config.ts", "--maxWorkers=2", "--minWorkers=1",
+        ]
     return [*PREFIX, "--", selector]
 
 
@@ -178,17 +187,37 @@ def inventory() -> dict:
             raise ContractError(
                 "invalid_inventory", "The inventory exceeds its item limit."
             )
+    for identifier in SDK_SUITES:
+        items.append({
+            "id": identifier,
+            "kind": "suite",
+            "module": "clients/typescript",
+            "runner": "vitest",
+            "cwd": "clients/typescript",
+            "argv": [*RUN_PREFIX, "--selector", identifier],
+            "effect": "may_write_and_access_network",
+            "requirements": {
+                "tools": {"python": "3.13", "node": "24"},
+                "python_packages": [],
+                "browser": None,
+                "binary": {"build_if_missing": False, "prebuilt_override": None},
+                "notes": "Requires clients/typescript dependencies already installed with npm ci. Runs the checked-in unit configuration with at most two workers; no installation, Zig compilation, browser or live integration suite. Vitest cases are not individually inventoried.",
+            },
+        })
+    if len(items) > MAX_ITEMS:
+        raise ContractError("invalid_inventory", "The inventory exceeds its item limit.")
     if len({item["id"] for item in items}) != len(items):
         raise ContractError(
             "invalid_inventory", "Duplicate test identifiers in an allowlisted source."
         )
     return {
         "items": items,
-        "coverage": "Allowlisted pytest modules and directly declared top-level test functions; not collected test cases. Function selectors include all parametrizations. Class methods, dynamic cases, Zig and SDK suites are not individually inventoried.",
+        "coverage": "Allowlisted pytest modules and directly declared top-level test functions, plus the TypeScript SDK unit suite; not collected test cases. Function selectors include all parametrizations. Class methods, dynamic cases, Zig tests and individual SDK cases are not inventoried. Other SDK suites are not covered.",
         "execution": {
             "argv_prefix": list(RUN_PREFIX),
             "selector_flag": "--selector",
             "cwd": "repository_root",
+            "cwd_override": "items[].cwd when present, relative to repository_root",
             "shell": False,
             "timeout_seconds": {
                 "default": DEFAULT_TIMEOUT,
@@ -211,6 +240,7 @@ def child_environment() -> dict[str, str]:
     env = dict(os.environ)
     env.pop("PYTEST_ADDOPTS", None)
     env.pop("PYTEST_PLUGINS", None)
+    env.pop("NODE_OPTIONS", None)
     env["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
     env["MISE_AUTO_INSTALL"] = "false"
     env["ZIGBASE_SERVE_BACKGROUND"] = "0"
@@ -333,9 +363,13 @@ def run(selector: str, timeout: int, output_limit: int) -> dict:
             "Selector must exactly match an inventory id; arbitrary paths, expressions and arguments are not accepted.",
         )
     argv = command(selector)
+    selected = next(item for item in catalog["items"] if item["id"] == selector)
+    cwd = ROOT / selected.get("cwd", "")
+    if not cwd.resolve().is_relative_to(ROOT) or not cwd.is_dir():
+        raise ContractError("invalid_inventory", "The runner directory is missing or escapes the checkout.")
     result = execute(
         argv,
-        cwd=ROOT,
+        cwd=cwd,
         env=child_environment(),
         timeout=timeout,
         output_limit=output_limit,
@@ -343,6 +377,7 @@ def run(selector: str, timeout: int, output_limit: int) -> dict:
     return {
         "selector": selector,
         "argv": argv,
+        "cwd": selected.get("cwd", "."),
         "limits": {"timeout_seconds": timeout, "output_limit_bytes": output_limit},
         **result,
     }
@@ -451,7 +486,7 @@ def affected(base: str) -> dict:
             )
             reason = "curated_dependency" if modules else "unmapped_fallback"
             if not modules:
-                modules = MODULES
+                modules = GROUPS
         selected.update(modules)
         changes.append(
             {
@@ -471,7 +506,7 @@ def affected(base: str) -> dict:
         "coverage_complete": False,
         "coverage_gaps": [
             "Curated module dependencies only; not an inferred or complete dependency graph.",
-            "Zig, SDK, non-allowlisted pytest, docs and other CI suites still require separate validation.",
+            "Zig, other SDK suites, TypeScript integration/typecheck/build, non-allowlisted pytest, docs and other CI suites still require separate validation.",
             "Ignored untracked files and files inside submodules are not enumerated; submodule changes use fallback.",
             "Git snapshots are not atomic with each other or inventory; rerun after concurrent edits.",
         ],
@@ -481,7 +516,7 @@ def affected(base: str) -> dict:
             "changed_paths": MAX_CHANGED_PATHS,
             "path_bytes": MAX_PATH_BYTES,
         },
-        "notes": "Selection only; no tests run. Unknown paths select all allowlisted modules, not the full suite. Paths are untrusted data; JSON escapes preserve non-UTF-8 filename bytes using surrogateescape. Trusted checkout only, not a sandbox.",
+        "notes": "Selection only; no tests run. Unknown paths select all allowlisted groups, not the full suite. Changes[].modules contains module or suite selectors for compatibility. Paths are untrusted data; JSON escapes preserve non-UTF-8 filename bytes using surrogateescape. Trusted checkout only, not a sandbox.",
     }
 
 

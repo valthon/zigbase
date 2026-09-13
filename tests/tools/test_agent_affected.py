@@ -83,7 +83,7 @@ def test_tracked_staged_unstaged_deleted_and_untracked(repo):
     result = agent.affected("HEAD")
     assert "src/deleted.zig" in {item["path"] for item in result["changes"]}
     assert result["fallback"] is True
-    assert {item["id"] for item in result["items"]} == set(agent.MODULES)
+    assert {item["id"] for item in result["items"]} == set(agent.GROUPS)
 
 
 def test_direct_module_selection_and_shared_dependency(repo):
@@ -111,6 +111,9 @@ def test_direct_module_selection_and_shared_dependency(repo):
         ("build.zig", set(agent.ADMIN_MODULES)),
         ("zig-pkg/dependency/file.zig", set(agent.ADMIN_MODULES)),
         ("tests/_bin.py", set(agent.MODULES)),
+        ("clients/typescript/src/client.ts", set(agent.SDK_SUITES)),
+        ("clients/typescript/package-lock.json", set(agent.SDK_SUITES)),
+        ("clients/typescript/vitest.config.ts", set(agent.SDK_SUITES)),
     ],
 )
 def test_curated_tool_dependencies_and_admin_group(repo, path, expected):
@@ -128,11 +131,11 @@ def test_selector_source_and_unmapped_file_keep_full_fallback(repo):
     with (repo / "tools/agent_tests.py").open("a") as script:
         script.write("\n# modified selector\n")
     result = agent.affected("HEAD")
-    assert {item["id"] for item in result["items"]} == set(agent.MODULES)
+    assert {item["id"] for item in result["items"]} == set(agent.GROUPS)
     assert result["fallback"] is False
     (repo / "unmapped-tool.py").write_text("")
     result = agent.affected("HEAD")
-    assert {item["id"] for item in result["items"]} == set(agent.MODULES)
+    assert {item["id"] for item in result["items"]} == set(agent.GROUPS)
     assert result["fallback"] is True
 
 

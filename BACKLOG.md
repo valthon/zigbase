@@ -26,6 +26,8 @@ copy, examples, and tests with the implementation rather than in follow-up PRs.
   module checks, with whole-allowlist fallback and explicit coverage gaps.
   Local performance-contract, parity-replay and agent-tool regression modules are
   also inventoried, with explicit tool/contract dependency mappings.
+  TypeScript SDK unit execution now has an explicit suite selector with pinned
+  Node, bounded worker count and structured evidence; SDK path changes select it.
   This is not a remote executor or arbitrary embedded-app test discovery. Broader
   test-runner coverage and inferred dependency graphs remain.
   Offline migration preview now reports compiled consumer callback/transaction declarations
