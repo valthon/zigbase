@@ -25,7 +25,7 @@ pub fn preflight(alloc: std.mem.Allocator, w: *db.Db, old: schema.Collection, to
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     if (db.dbDialect(w).kind == .sqlite) {
-        try sqliteSearch(&arena, w, old, to);
+        try @import("search/ownership.zig").verify(alloc, w, old, to);
         return sqliteAuthIndexes(&arena, w, old, to, false);
     }
     const a = arena.allocator();
@@ -45,7 +45,7 @@ pub fn preflight(alloc: std.mem.Allocator, w: *db.Db, old: schema.Collection, to
         try destination.bindText(2, try fts.tableName(a, to));
         if (try destination.step()) return error.Conflict;
     }
-    try postgresSearch(&arena, w, old);
+    try @import("search/ownership.zig").verify(alloc, w, old, to);
     try authIndexes(&arena, w, old, to, false);
 }
 
@@ -60,58 +60,6 @@ fn prepare(a: std.mem.Allocator, w: *db.Db, sql: []const u8) Error!db.Stmt {
     const lowered = try db.dbDialect(w).renumberPlaceholders(a, sql);
     defer a.free(lowered);
     return w.prepare(lowered);
-}
-
-fn sqliteObjects(a: std.mem.Allocator, w: *db.Db, ft: []const u8) Error!db.Stmt {
-    var st = try prepare(a, w, "SELECT name,type,tbl_name,sql FROM sqlite_schema WHERE name=?1 COLLATE NOCASE OR substr(name,1,length(?1)+1)=?1||'_' COLLATE NOCASE OR tbl_name=?1 COLLATE NOCASE OR substr(tbl_name,1,length(?1)+1)=?1||'_' COLLATE NOCASE ORDER BY name;");
-    errdefer st.finalize();
-    try st.bindText(1, ft);
-    return st;
-}
-
-fn sqliteSearch(scratch: *std.heap.ArenaAllocator, w: *db.Db, old: schema.Collection, to: []const u8) Error!void {
-    const a = scratch.allocator();
-    // sqlite_schema reports virtual tables as 'table'. table_list distinguishes
-    // ordinary engine tables from extension-owned virtual and shadow tables.
-    var source = try prepare(a, w, "SELECT 1 FROM pragma_table_list WHERE schema='main' AND type='table' AND name=?1;");
-    defer source.finalize();
-    try source.bindText(1, old.name);
-    if (!try source.step()) return error.Conflict;
-    const ft = try fts.tableName(a, old.name);
-    // SQLite rewrites references to the renamed *base* table, not references
-    // to the FTS table we drop and rebuild. Conservatively reject mentions in
-    // arbitrary SQL definitions, including quoted names, comments and literals:
-    // proving arbitrary user SQL's dependency semantics is not this helper's job.
-    // Destination mentions can be dangling today; creating that generated
-    // table would silently attach application SQL to the engine's new index.
-    var dependent = try prepare(a, w, "SELECT 1 FROM main.sqlite_schema WHERE type IN ('trigger','view') AND name NOT IN (?1||'_ai',?1||'_ad',?1||'_au') AND (instr(lower(sql),lower(?1))>0 OR instr(lower(sql),lower(?2))>0) LIMIT 1;");
-    defer dependent.finalize();
-    try dependent.bindText(1, ft);
-    try dependent.bindText(2, try fts.tableName(a, to));
-    if (try dependent.step()) return error.Conflict;
-    var actual = try sqliteObjects(a, w, ft);
-    defer actual.finalize();
-    if (!try actual.step()) return;
-    if (!fts.enabled or !fts.isSearchable(old)) return error.Conflict;
-
-    // Generate the expected catalog with the engine itself, on an empty private
-    // database. This includes the FTS5 shadow tables and exact trigger bodies,
-    // without duplicating their DDL here or treating an ordinary table as FTS.
-    var model = try db.Db.openMemory();
-    defer model.close();
-    try model.exec(try a.dupeZ(u8, try ddl.createTableSql(a, old, null, db.dbDialect(&model), &.{})));
-    try fts.ensureIndex(a, &model, old);
-    var expected = try sqliteObjects(a, &model, ft);
-    defer expected.finalize();
-    while (true) {
-        if (!try expected.step()) return error.Conflict;
-        for (0..4) |i| {
-            const n: c_int = @intCast(i);
-            if (actual.isNull(n) != expected.isNull(n) or !std.mem.eql(u8, actual.columnText(n), expected.columnText(n))) return error.Conflict;
-        }
-        if (!try actual.step()) break;
-    }
-    if (try expected.step()) return error.Conflict;
 }
 
 fn sqliteAuthIndexes(scratch: *std.heap.ArenaAllocator, w: *db.Db, old: schema.Collection, to: []const u8, mutate: bool) Error!void {
@@ -154,98 +102,6 @@ fn sqliteAuthIndexes(scratch: *std.heap.ArenaAllocator, w: *db.Db, old: schema.C
             if (exists) try w.exec(try std.fmt.allocPrintSentinel(a, "DROP INDEX main.{s};", .{try ddl.quoteIdent(a, source_name)}, 0));
         }
     }
-}
-
-fn postgresSearch(scratch: *std.heap.ArenaAllocator, w: *db.Db, old: schema.Collection) Error!void {
-    const a = scratch.allocator();
-    const table = try ddl.quoteIdent(a, old.name);
-    const ft = try fts.tableName(a, old.name);
-    const index = try std.fmt.allocPrint(a, "{s}_idx", .{ft});
-    var column = try prepare(a, w, "SELECT a.attnum,a.attgenerated='s' AND a.atttypid='pg_catalog.tsvector'::regtype,col_description(a.attrelid,a.attnum),d.oid " ++
-        "FROM pg_attribute a LEFT JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum " ++
-        "WHERE a.attrelid=to_regclass(?1) AND a.attname=?2 AND a.attnum>0 AND NOT a.attisdropped;");
-    defer column.finalize();
-    try column.bindText(1, table);
-    try column.bindText(2, ft);
-    const present = try column.step();
-    const idx = try indexOid(a, w, table, index);
-    var visible = try prepare(a, w, "SELECT to_regclass(?1)::oid;");
-    defer visible.finalize();
-    try visible.bindText(1, try ddl.quoteIdent(a, index));
-    if (!try visible.step()) return error.Conflict;
-    // DROP INDEX resolves through search_path even when this table's expected
-    // index is absent. A visible unrelated relation must never be dropped.
-    if (!visible.isNull(0) and (idx == null or visible.columnInt(0) != idx.?)) return error.Conflict;
-    if (!present) {
-        if (idx != null) return error.Conflict;
-        return;
-    }
-    if (!fts.isSearchable(old) or column.columnInt(1) != 1 or column.isNull(3)) return error.Conflict;
-    var names: std.ArrayList([]const u8) = .empty;
-    for (old.fields) |field| if (field.searchable and schema.isSearchableType(field.fieldType()) and schema.isValidIdentifier(field.name) and !field.encrypted) try names.append(a, field.name);
-    // Expression order is declaration order. Only sort after it has been
-    // verified: the separate marker intentionally represents an unordered set.
-    try postgresExpression(scratch, w, table, column.columnInt(0), names.items);
-    std.mem.sort([]const u8, names.items, {}, struct {
-        fn less(_: void, x: []const u8, y: []const u8) bool {
-            return std.mem.lessThan(u8, x, y);
-        }
-    }.less);
-    const marker = try std.fmt.allocPrint(a, "zbfts:{s}", .{try std.mem.join(a, ",", names.items)});
-    if (!std.mem.eql(u8, column.columnText(2), marker)) return error.Conflict;
-    if (idx) |oid| {
-        var check = try prepare(a, w, "SELECT 1 FROM pg_index i JOIN pg_class c ON c.oid=i.indexrelid JOIN pg_am am ON am.oid=c.relam " ++
-            "JOIN pg_opclass op ON op.oid=i.indclass[0] WHERE i.indexrelid=?1 AND i.indrelid=to_regclass(?2) " ++
-            "AND NOT i.indisunique AND i.indisvalid AND i.indnatts=1 AND i.indnkeyatts=1 AND i.indkey[0]=?3 " ++
-            "AND i.indexprs IS NULL AND i.indpred IS NULL AND am.amname='gin' AND op.opcname='tsvector_ops' AND op.opcnamespace='pg_catalog'::regnamespace;");
-        defer check.finalize();
-        try check.bindInt(1, oid);
-        try check.bindText(2, table);
-        try check.bindInt(3, column.columnInt(0));
-        if (!try check.step()) return error.Conflict;
-    }
-    // DROP COLUMN implicitly drops dependent indexes/constraints, even without
-    // CASCADE. Only its own generated expression and the validated engine GIN
-    // may depend on this column; migration-owned dependents must survive.
-    var deps = try prepare(a, w, "SELECT 1 FROM pg_depend WHERE refclassid='pg_class'::regclass AND refobjid=to_regclass(?1) AND refobjsubid=?2 " ++
-        "AND NOT (classid='pg_attrdef'::regclass AND objid=?3) AND NOT (classid='pg_class'::regclass AND objid=?4) LIMIT 1;");
-    defer deps.finalize();
-    try deps.bindText(1, table);
-    try deps.bindInt(2, column.columnInt(0));
-    try deps.bindInt(3, column.columnInt(3));
-    try deps.bindInt(4, idx orelse 0);
-    if (try deps.step()) return error.Conflict;
-}
-
-fn postgresExpression(scratch: *std.heap.ArenaAllocator, w: *db.Db, table: []const u8, attnum: i64, names: []const []const u8) Error!void {
-    const a = scratch.allocator();
-    // Ask this server to canonicalize the engine expression, rather than bake in
-    // pg_get_expr whitespace/cast/parenthesis formatting across server versions.
-    // No rows are copied. A name collision fails CREATE without touching that
-    // object; any failure is rolled back by the caller's schema transaction.
-    var create: std.ArrayList(u8) = .empty;
-    try create.appendSlice(a, "CREATE TEMP TABLE zb_rename_fts_probe (");
-    var expr: std.ArrayList(u8) = .empty;
-    try expr.appendSlice(a, "to_tsvector('simple', ");
-    for (names, 0..) |name, i| {
-        try create.appendSlice(a, try std.fmt.allocPrint(a, "{s} TEXT,", .{try ddl.quoteIdent(a, name)}));
-        if (i > 0) try expr.appendSlice(a, " || ' ' || ");
-        try expr.appendSlice(a, try std.fmt.allocPrint(a, "coalesce({s},'')", .{try ddl.quoteIdent(a, name)}));
-    }
-    try expr.appendSlice(a, ")");
-    // The engine reserves underscore-prefixed field names, avoiding collision
-    // with any searchable field copied into this private probe table.
-    try create.appendSlice(a, try std.fmt.allocPrint(a, "_expected TSVECTOR GENERATED ALWAYS AS ({s}) STORED) ON COMMIT DROP;", .{expr.items}));
-    try w.exec(try a.dupeZ(u8, create.items));
-    var compare = try prepare(a, w, "SELECT pg_get_expr(actual.adbin,actual.adrelid)=pg_get_expr(expected.adbin,expected.adrelid) " ++
-        "FROM pg_attrdef actual,pg_attrdef expected WHERE actual.adrelid=to_regclass(?1) AND actual.adnum=?2 " ++
-        "AND expected.adrelid='pg_temp.zb_rename_fts_probe'::regclass;");
-    defer compare.finalize();
-    try compare.bindText(1, table);
-    try compare.bindInt(2, attnum);
-    const matches = try compare.step() and compare.columnInt(0) == 1;
-    try w.exec("DROP TABLE pg_temp.zb_rename_fts_probe;");
-    if (!matches) return error.Conflict;
 }
 
 fn indexOid(a: std.mem.Allocator, w: *db.Db, table: []const u8, name: []const u8) Error!?i64 {

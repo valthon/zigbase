@@ -14,14 +14,15 @@ pub const panic = std.debug.FullPanic(struct {
 }.fail);
 
 const Fault = enum { transaction, rollback_savepoint, release_savepoint, normal, nested_normal };
-fn authorize(context: ?*anyopaque, action: c_int, first: ?[*:0]const u8, _: ?[*:0]const u8, _: ?[*:0]const u8, _: ?[*:0]const u8) callconv(.c) c_int {
+fn authorize(context: ?*anyopaque, action: c_int, first: ?[*:0]const u8, second: ?[*:0]const u8, _: ?[*:0]const u8, _: ?[*:0]const u8) callconv(.c) c_int {
     const fault: *const Fault = @ptrCast(@alignCast(context.?));
     const operation = std.mem.span(first orelse return 0);
     // SQLite's stable public authorizer action codes: TRANSACTION=22, SAVEPOINT=32.
+    const rename_savepoint = action == 32 and std.mem.eql(u8, std.mem.span(second orelse ""), "zb_collection_rename");
     const deny = switch (fault.*) {
         .transaction => action == 22 and std.mem.eql(u8, operation, "ROLLBACK"),
-        .rollback_savepoint => action == 32 and std.mem.eql(u8, operation, "ROLLBACK"),
-        .release_savepoint => action == 32 and std.mem.eql(u8, operation, "RELEASE"),
+        .rollback_savepoint => rename_savepoint and std.mem.eql(u8, operation, "ROLLBACK"),
+        .release_savepoint => rename_savepoint and std.mem.eql(u8, operation, "RELEASE"),
         .normal, .nested_normal => false,
     };
     return if (deny) 1 else 0; // SQLITE_DENY / SQLITE_OK

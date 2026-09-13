@@ -280,7 +280,7 @@ pub fn sanitize(alloc: std.mem.Allocator, raw: []const u8) !?[]const u8 {
 /// `ensureIndex`'s error set is EXPLICIT for the same reason as `SearchError` above: the default
 /// (`-Dfts5` ON) build comptime-prunes the `SearchDisabled` guard, so an inferred `!void` would
 /// silently drop it from the type and break `provision.zig`'s `catch |err| switch (err) { … }`.
-pub const EnsureIndexError = error{SearchDisabled} ||
+pub const EnsureIndexError = error{SearchDisabled} || @import("ownership.zig").Error ||
     @typeInfo(@typeInfo(@TypeOf(ensureIndexSqliteImpl)).@"fn".return_type.?).error_union.error_set ||
     @typeInfo(@typeInfo(@TypeOf(ensureIndexPg)).@"fn".return_type.?).error_union.error_set;
 
@@ -290,6 +290,16 @@ pub const EnsureIndexError = error{SearchDisabled} ||
 /// missing (e.g. after an additive table rebuild dropped them). Called from `provision.ensureCollection`
 /// at startup — NOT a numbered migration. Identifiers are gated through `schema.isValidIdentifier`.
 pub fn ensureIndex(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection) EnsureIndexError!void {
+    return inspectIndex(alloc, w, col, true);
+}
+
+/// Self-freeing. Validate the current physical search objects without reconciling
+/// the desired fields, which may not exist until additive provisioning finishes.
+pub fn validateIndex(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection) EnsureIndexError!void {
+    return inspectIndex(alloc, w, col, false);
+}
+
+fn inspectIndex(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection, reconcile: bool) EnsureIndexError!void {
     // ONE identifier gate for both backends (the per-backend impls below therefore need none). A
     // `_`-prefixed engine-owned name fails `isValidIdentifier`, and the provisioner does not index
     // such a collection — correct, because the read path already refuses `?search=` on it with
@@ -310,19 +320,38 @@ pub fn ensureIndex(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection) 
         );
         return;
     }
+    if (comptime !enabled) {
+        // SQLite builds without FTS must not pay for a schema transaction on
+        // the no-search path. PostgreSQL search is independent of this flag.
+        if (db.dbDialect(w).kind == .sqlite) {
+            if (isSearchable(col)) return error.SearchDisabled;
+            return;
+        }
+    }
+    // Ownership probes and reconciliation share one transaction. A collision or
+    // failed rebuild cannot leave partially dropped search objects behind.
+    const nested = w.inTransaction();
+    if (nested) try w.exec("SAVEPOINT zb_fts_provision;") else try w.begin();
+    errdefer {
+        if (nested) {
+            w.exec("ROLLBACK TO SAVEPOINT zb_fts_provision;") catch |err| std.debug.panic("search provisioning rollback failed: {s}", .{@errorName(err)});
+            w.exec("RELEASE SAVEPOINT zb_fts_provision;") catch |err| std.debug.panic("search provisioning cleanup failed: {s}", .{@errorName(err)});
+        } else w.rollback() catch |err| std.debug.panic("search provisioning rollback failed: {s}", .{@errorName(err)});
+    }
+    try @import("ownership.zig").verify(alloc, w, col, null);
+    if (reconcile) try ensureIndexImpl(alloc, w, col);
+    if (nested) try w.exec("RELEASE SAVEPOINT zb_fts_provision;") else try w.commit();
+}
+
+fn ensureIndexImpl(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection) EnsureIndexError!void {
     // Backend split: the FTS5 external-content vtable + sync triggers + sqlite_master probes below
     // are SQLite-only. Postgres provisions a STORED `tsvector` generated column + GIN index instead
     // (same `?search=` read surface, lowered by `buildPostgres`). Both are idempotent and called
     // from `provision.ensureCollection` at startup — NOT numbered migrations.
-    if (db.dbDialect(w).kind == .postgres) return ensureIndexPg(alloc, w, col);
-    if (comptime !enabled) {
-        // fts5 compiled out (-Dfts5=false): a searchable SQLite schema can't be served — fail
-        // LOUDLY here so the caller (provision.zig) can refuse to start, rather than silently
-        // skipping the index and letting `?search=` surface as a runtime 500 later. A collection
-        // with no searchable fields is unaffected — nothing to provision either way.
-        if (isSearchable(col)) return error.SearchDisabled;
-        return;
+    if (db.dbDialect(w).kind == .postgres) {
+        return ensureIndexPg(alloc, w, col);
     }
+    if (comptime !enabled) unreachable; // ensureIndex handled SQLite's disabled arm.
     return ensureIndexSqliteImpl(alloc, w, col);
 }
 
@@ -385,7 +414,8 @@ fn ensureIndexSqliteImpl(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collec
 /// no searchable fields (any stale column/index from a prior schema is dropped). Decides off the
 /// column's three-state probe (`pgColumnState`): absent → create; present+matching-marker → no-op
 /// (or recreate JUST the GIN index if only it is missing, NEVER re-touching the costly generated
-/// column); present+mismatched/absent-marker (a searchable-column-SET drift) → drop + recreate. All
+/// column); present+different valid marker (a searchable-column-SET drift) → drop + recreate.
+/// The shared ownership preflight rejects missing markers and application-owned objects. All
 /// identifiers are gated through `schema.isValidIdentifier`; the column set is embedded only after
 /// that gate, never from user input. Search-path-aware (`to_regclass`) so it targets the
 /// collection's table in the active schema.
@@ -412,7 +442,7 @@ fn ensureIndexPg(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection) !v
 
     if (cols.len == 0) {
         // Not searchable: drop a stale column/index only if the column actually exists.
-        if (state == .present) try dropIndexPg(alloc, w, col.name, tsv, idx);
+        if (state == .present) try dropIndexPg(alloc, w, col.name, tsv);
         return;
     }
 
@@ -429,9 +459,9 @@ fn ensureIndexPg(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection) !v
                 std.log.info("provision: recreated missing GIN index '{s}' on '{s}'.'{s}'", .{ idx, col.name, tsv });
                 return;
             }
-            // Column present but marker missing/different → drift → DROP the column+index, then
+            // Proven engine column with a different marker → drift → DROP column+index, then
             // recreate below (never `ADD COLUMN` onto the existing one).
-            try dropIndexPg(alloc, w, col.name, tsv, idx);
+            try dropIndexPg(alloc, w, col.name, tsv);
         },
         .absent => {}, // nothing to drop — create below
     }
@@ -500,7 +530,7 @@ fn pgMarker(alloc: std.mem.Allocator, cols: []const []const u8) ![]const u8 {
 /// `ADD COLUMN` on an already-existing column → a hard "column already exists" startup failure):
 ///   * `.absent` — no `<col>_fts` column → safe to `ADD COLUMN`.
 ///   * `.present` with `marker == want` — fully provisioned (only the GIN index might be missing).
-///   * `.present` with `marker != want` (incl. a missing/empty COMMENT) — drift → DROP + recreate.
+///   * `.present` with `marker != want` — drift, only after shared ownership verification.
 const PgColumnState = union(enum) {
     absent,
     /// The generated column exists; `marker` is its drift-marker COMMENT (owned by `alloc`), or
@@ -550,15 +580,19 @@ fn createGinIndexPg(alloc: std.mem.Allocator, w: *db.Db, col_name: []const u8, t
     try w.exec(sql);
 }
 
-/// DROP the Postgres GIN index + the generated tsvector column if present (idempotent). Dropping
-/// the column cascades the index, but the explicit DROP INDEX keeps it robust to either existing
-/// alone. (`col_name` is the base table.)
-fn dropIndexPg(alloc: std.mem.Allocator, w: *db.Db, col_name: []const u8, tsv: []const u8, idx: []const u8) !void {
-    {
-        const sql = try std.fmt.allocPrintSentinel(alloc, "DROP INDEX IF EXISTS \"{s}\";", .{idx}, 0);
-        defer alloc.free(sql);
-        try w.exec(sql);
-    }
+/// Drop the proved generated column and its dependent GIN index. Ownership checks
+/// reject orphan indexes, so never DROP an index by a separately resolved name.
+fn dropIndexPg(alloc: std.mem.Allocator, w: *db.Db, col_name: []const u8, tsv: []const u8) !void {
+    // Trigger-function bodies can reference NEW.<fts> dynamically, without a
+    // pg_depend edge to the column. Proving arbitrary bodies is not possible;
+    // reject user triggers only when removing/replacing the generated column.
+    // Harmless no-op reconciliation and missing-index repair remain available.
+    var triggers = try w.prepare("SELECT 1 FROM pg_trigger WHERE tgrelid=to_regclass($1) AND NOT tgisinternal LIMIT 1;");
+    defer triggers.finalize();
+    const table = try @import("../ddl.zig").quoteIdent(alloc, col_name);
+    defer alloc.free(table);
+    try triggers.bindText(1, table);
+    if (try triggers.step()) return error.Conflict;
     {
         const sql = try std.fmt.allocPrintSentinel(alloc, "ALTER TABLE \"{s}\" DROP COLUMN IF EXISTS \"{s}\";", .{ col_name, tsv }, 0);
         defer alloc.free(sql);
@@ -630,6 +664,197 @@ fn toZ(alloc: std.mem.Allocator, s: []const u8) ![:0]const u8 {
 const collections = @import("../collections.zig");
 const migrations = @import("../migrations.zig");
 const records = @import("../records.zig");
+
+test "search no-op gates issue no transaction statements" {
+    const c = @import("../c.zig").c;
+    const Counter = struct {
+        fn authorize(context: ?*anyopaque, action: c_int, _: [*c]const u8, _: [*c]const u8, _: [*c]const u8, _: [*c]const u8) callconv(.c) c_int {
+            const count: *usize = @ptrCast(@alignCast(context.?));
+            if (action == c.SQLITE_TRANSACTION or action == c.SQLITE_SAVEPOINT) count.* += 1;
+            return c.SQLITE_OK;
+        }
+    };
+    var w = try db.Db.openMemory();
+    defer w.close();
+    const handle = db.sqliteHandle(&w);
+    inline for (.{ false, true }) |nested| {
+        if (nested) try w.begin();
+        defer if (nested) w.rollback() catch unreachable;
+        var count: usize = 0;
+        try std.testing.expectEqual(c.SQLITE_OK, c.sqlite3_set_authorizer(handle, Counter.authorize, &count));
+        defer std.debug.assert(c.sqlite3_set_authorizer(handle, null, null) == c.SQLITE_OK);
+        const a = std.testing.allocator;
+        try ensureIndex(a, &w, .{ .id = "c", .name = "_system", .fields = &.{} });
+        try ensureIndex(a, &w, .{ .id = "c", .name = "invalid name", .fields = &.{} });
+        if (comptime !enabled) {
+            try ensureIndex(a, &w, .{ .id = "c", .name = "articles", .fields = &.{} });
+            try std.testing.expectError(error.SearchDisabled, ensureIndex(a, &w, .{ .id = "c", .name = "articles", .fields = &.{.{ .id = "t", .name = "title", .searchable = true, .options = .{ .text = .{} } }} }));
+        }
+        try std.testing.expectEqual(@as(usize, 0), count);
+        try std.testing.expectEqual(nested, w.inTransaction());
+    }
+}
+
+test "additive provisioning creates searchable fields before reconciling SQLite FTS" {
+    if (comptime !enabled) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var w = try db.Db.openMemory();
+    defer w.close();
+    try migrations.run(&w);
+    const fields = [_]schema.Field{
+        .{ .id = "t", .name = "title", .searchable = true, .options = .{ .text = .{} } },
+        .{ .id = "b", .name = "body", .searchable = true, .options = .{ .text = .{} } },
+    };
+    const col = try collections.create(a, std.testing.io, &w, .{ .id = "", .name = "articles", .fields = fields[0..1] });
+    defer col.deinit(a);
+    try ensureIndex(a, &w, col);
+    try w.exec("INSERT INTO articles(id,title) VALUES('r1','kept');");
+    var desired = col;
+    desired.fields = &fields;
+    try @import("../provision.zig").applySpecs(a, std.testing.io, &w, &.{desired});
+    try w.exec("UPDATE articles SET body='added';");
+    var found = try w.prepare("SELECT title FROM articles_fts WHERE articles_fts MATCH 'added';");
+    defer found.finalize();
+    try std.testing.expect(try found.step());
+    try std.testing.expectEqualStrings("kept", found.columnText(0));
+}
+
+test "generic search provisioning preserves an application-owned FTS name" {
+    if (comptime !enabled) return error.SkipZigTest;
+    var w = try db.Db.openMemory();
+    defer w.close();
+    try migrations.run(&w);
+    const a = std.testing.allocator;
+    const col = try collections.create(a, std.testing.io, &w, .{ .id = "", .name = "articles", .fields = &.{} });
+    defer col.deinit(a);
+    try w.exec("CREATE TABLE articles_fts(sentinel TEXT); INSERT INTO articles_fts VALUES('must survive');");
+    var boot = std.heap.ArenaAllocator.init(a);
+    defer boot.deinit();
+    try std.testing.expectError(error.Conflict, @import("../provision.zig").ensureCollection(boot.allocator(), std.testing.io, &w, col));
+    var searchable = col;
+    searchable.fields = &.{.{ .id = "t", .name = "title", .searchable = true, .options = .{ .text = .{} } }};
+    try std.testing.expectError(error.Conflict, ensureIndex(a, &w, searchable));
+    var row = try w.prepare("SELECT sentinel FROM articles_fts;");
+    defer row.finalize();
+    try std.testing.expect(try row.step());
+    try std.testing.expectEqualStrings("must survive", row.columnText(0));
+}
+
+test "search provisioning preserves a temporary FTS name shadow" {
+    if (comptime !enabled) return error.SkipZigTest;
+    var w = try db.Db.openMemory();
+    defer w.close();
+    try migrations.run(&w);
+    const a = std.testing.allocator;
+    const col = try collections.create(a, std.testing.io, &w, .{ .id = "", .name = "articles", .fields = &.{} });
+    defer col.deinit(a);
+    try w.exec("CREATE TEMP TABLE articles_fts(sentinel TEXT); INSERT INTO temp.articles_fts VALUES('must survive');");
+    try std.testing.expectError(error.Conflict, ensureIndex(a, &w, col));
+    var row = try w.prepare("SELECT sentinel FROM temp.articles_fts;");
+    defer row.finalize();
+    try std.testing.expect(try row.step());
+    try std.testing.expectEqualStrings("must survive", row.columnText(0));
+}
+
+test "search removal preserves temporary SQL dependents and their target" {
+    if (comptime !enabled) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var w = try db.Db.openMemory();
+    defer w.close();
+    try migrations.run(&w);
+    const col = try collections.create(a, std.testing.io, &w, .{ .id = "", .name = "articles", .fields = &.{.{ .id = "t", .name = "title", .searchable = true, .options = .{ .text = .{} } }} });
+    defer col.deinit(a);
+    try ensureIndex(a, &w, col);
+    try w.exec("INSERT INTO articles(id,title) VALUES('r1','kept'); CREATE TEMP VIEW keep_search AS SELECT title FROM main.articles_fts;");
+    var disabled = col;
+    disabled.fields = &.{};
+    try std.testing.expectError(error.Conflict, ensureIndex(a, &w, disabled));
+    {
+        var kept = try w.prepare("SELECT title FROM keep_search;");
+        defer kept.finalize();
+        try std.testing.expect(try kept.step());
+        try std.testing.expectEqualStrings("kept", kept.columnText(0));
+    }
+    try w.exec("DROP VIEW keep_search; CREATE TEMP TRIGGER keep_search AFTER INSERT ON main.articles BEGIN SELECT title FROM articles_fts; END;");
+    try std.testing.expectError(error.Conflict, ensureIndex(a, &w, disabled));
+    try w.exec("INSERT INTO articles(id,title) VALUES('r2','retained');");
+    var kept = try w.prepare("SELECT title FROM articles_fts WHERE articles_fts MATCH 'retained';");
+    defer kept.finalize();
+    try std.testing.expect(try kept.step());
+    try std.testing.expectEqualStrings("retained", kept.columnText(0));
+}
+
+test "SQLite search rejects missing and nontext physical content columns" {
+    if (comptime !enabled) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    for ([_][:0]const u8{
+        "DROP TABLE articles; CREATE TABLE articles(id TEXT,other TEXT); INSERT INTO articles VALUES('r1','kept');",
+        "DROP TABLE articles; CREATE TABLE articles(id TEXT,title INTEGER); INSERT INTO articles VALUES('r1',42);",
+    }) |replacement| {
+        var w = try db.Db.openMemory();
+        defer w.close();
+        try migrations.run(&w);
+        const col = try collections.create(a, std.testing.io, &w, .{ .id = "", .name = "articles", .fields = &.{.{ .id = "t", .name = "title", .searchable = true, .options = .{ .text = .{} } }} });
+        defer col.deinit(a);
+        try ensureIndex(a, &w, col);
+        try w.exec("INSERT INTO articles(id,title) VALUES('r1','sentinel');");
+        // Leave exact engine-shaped FTS objects behind a migration-owned base
+        // shape. Missing sync triggers alone are repairable, invalid operands
+        // are not: removal must preserve these unproved indexed terms.
+        try w.exec(replacement);
+        var disabled = col;
+        disabled.fields = &.{};
+        try std.testing.expectError(error.Conflict, ensureIndex(a, &w, disabled));
+        var kept = try w.prepare("SELECT count(*) FROM articles_fts WHERE articles_fts MATCH 'sentinel';");
+        defer kept.finalize();
+        try std.testing.expect(try kept.step());
+        try std.testing.expectEqual(@as(i64, 1), kept.columnInt(0));
+        var row = try w.prepare("SELECT id FROM articles;");
+        defer row.finalize();
+        try std.testing.expect(try row.step());
+        try std.testing.expectEqualStrings("r1", row.columnText(0));
+    }
+}
+
+test "owned SQLite search survives missing triggers and searchable-set changes" {
+    if (comptime !enabled) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var w = try db.Db.openMemory();
+    defer w.close();
+    try migrations.run(&w);
+    const fields = [_]schema.Field{
+        .{ .id = "t", .name = "title", .searchable = true, .options = .{ .text = .{} } },
+        .{ .id = "b", .name = "body", .options = .{ .text = .{} } },
+    };
+    const col = try collections.create(a, std.testing.io, &w, .{ .id = "", .name = "articles", .fields = &fields });
+    defer col.deinit(a);
+    try ensureIndex(a, &w, col);
+    try w.exec("INSERT INTO articles(id,title,body) VALUES('r1','hello','world'); DROP TRIGGER articles_fts_ai;");
+    try ensureIndex(a, &w, col);
+    var changed_fields = fields;
+    changed_fields[1].searchable = true;
+    var changed = col;
+    changed.fields = &changed_fields;
+    try ensureIndex(a, &w, changed);
+    {
+        var match = try w.prepare("SELECT count(*) FROM articles_fts WHERE articles_fts MATCH 'world';");
+        defer match.finalize();
+        try std.testing.expect(try match.step());
+        try std.testing.expectEqual(@as(i64, 1), match.columnInt(0));
+    }
+    changed.fields = &.{};
+    try ensureIndex(a, &w, changed);
+    {
+        var absent = try w.prepare("SELECT 1 FROM sqlite_schema WHERE name='articles_fts';");
+        defer absent.finalize();
+        try std.testing.expect(!try absent.step());
+    }
+    var row = try w.prepare("SELECT title,body FROM articles;");
+    defer row.finalize();
+    try std.testing.expect(try row.step());
+    try std.testing.expectEqualStrings("hello", row.columnText(0));
+    try std.testing.expectEqualStrings("world", row.columnText(1));
+}
 
 /// sanitize returns an owned `?[]const u8` on the passed allocator; assert then free it, so the
 /// test runs under the raw leak detector (sanitize is self-freeing / contract-1 already).
