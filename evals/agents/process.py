@@ -7,7 +7,7 @@ import signal
 import stat
 import subprocess
 import threading
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -73,6 +73,43 @@ def _terminate_group(process: subprocess.Popen[bytes], grace_seconds: int) -> No
         process.wait()
 
 
+@contextmanager
+def _defer_startup_interrupt():
+    """Acquire the child and its I/O threads before delivering Ctrl-C.
+
+    Interrupting Popen before it returns loses the child handle. A log file
+    can already be visible then, so defer rather than treating it as readiness.
+    Non-main-thread callers cannot receive Python's SIGINT handler.
+    """
+    if threading.current_thread() is not threading.main_thread():
+        yield lambda: None
+        return
+    previous = signal.getsignal(signal.SIGINT)
+    if previous is not signal.default_int_handler:
+        yield lambda: None
+        return
+    interrupted = False
+    restored = False
+
+    def defer_interrupt(_signum, _frame):
+        nonlocal interrupted
+        interrupted = True
+
+    def deliver():
+        nonlocal restored
+        signal.signal(signal.SIGINT, previous)
+        restored = True
+        if interrupted:
+            raise KeyboardInterrupt
+
+    signal.signal(signal.SIGINT, defer_interrupt)
+    try:
+        yield deliver
+    finally:
+        if not restored:
+            signal.signal(signal.SIGINT, previous)
+
+
 def run_process(
     argv: list[str],
     *,
@@ -111,6 +148,7 @@ def run_process(
             raise
 
     with ExitStack() as stack:
+        deliver_interrupt = stack.enter_context(_defer_startup_interrupt())
         stdout_file = stack.enter_context(private_log(stdout_path))
         stderr_file = stack.enter_context(private_log(stderr_path))
         process = subprocess.Popen(
@@ -122,28 +160,30 @@ def run_process(
             stderr=subprocess.PIPE,
             start_new_session=True,
         )
-        assert process.stdout is not None
-        assert process.stderr is not None
-        pumps = [
-            threading.Thread(
-                target=_pump, args=(process.stdout, stdout_file, budget), daemon=True
-            ),
-            threading.Thread(
-                target=_pump, args=(process.stderr, stderr_file, budget), daemon=True
-            ),
-        ]
-        for pump in pumps:
-            pump.start()
-
+        pumps = []
         feeder = None
-        if stdin is not None:
-            assert process.stdin is not None
-            feeder = threading.Thread(
-                target=_feed, args=(process.stdin, stdin), daemon=True
-            )
-            feeder.start()
-
         try:
+            assert process.stdout is not None
+            assert process.stderr is not None
+            pumps = [
+                threading.Thread(
+                    target=_pump, args=(process.stdout, stdout_file, budget), daemon=True
+                ),
+                threading.Thread(
+                    target=_pump, args=(process.stderr, stderr_file, budget), daemon=True
+                ),
+            ]
+            for pump in pumps:
+                pump.start()
+
+            if stdin is not None:
+                assert process.stdin is not None
+                feeder = threading.Thread(
+                    target=_feed, args=(process.stdin, stdin), daemon=True
+                )
+                feeder.start()
+
+            deliver_interrupt()
             process.wait(timeout=timeout_seconds)
         except subprocess.TimeoutExpired:
             timed_out = True
@@ -151,17 +191,31 @@ def run_process(
         except KeyboardInterrupt:
             interrupted = True
             _terminate_group(process, term_grace_seconds)
+        except BaseException:
+            # Startup failures after Popen still own a live child and pipes.
+            _terminate_group(process, term_grace_seconds)
+            raise
         finally:
             # Clean up ordinary helpers that remain in the command's process group.
             _signal_group(process.pid, signal.SIGTERM)
             for pump in pumps:
-                pump.join(timeout=term_grace_seconds)
+                if pump.ident is not None:
+                    pump.join(timeout=term_grace_seconds)
             if any(pump.is_alive() for pump in pumps):
                 _signal_group(process.pid, signal.SIGKILL)
                 for pump in pumps:
-                    pump.join(timeout=term_grace_seconds)
-            if feeder is not None:
+                    if pump.ident is not None:
+                        pump.join(timeout=term_grace_seconds)
+            if feeder is not None and feeder.ident is not None:
                 feeder.join(timeout=term_grace_seconds)
+            for pipe in (process.stdin, process.stdout, process.stderr):
+                if pipe is not None and not pipe.closed:
+                    try:
+                        pipe.close()
+                    except BrokenPipeError:
+                        # A feeder write can leave buffered stdin pending after
+                        # EPIPE; close still releases it even if flushing fails.
+                        pass
 
         stdout_file.flush()
         stderr_file.flush()
