@@ -305,6 +305,10 @@ jobs:
         run: |
           mise exec python@3.13 -- python -m pip install --quiet pytest -r tools/rails/requirements-postgres.txt
           mise exec python@3.13 -- python -m pytest tests/rails/test_postgres_source.py -q
+      - name: PostgreSQL and SQLite CLI operator provisioning
+        run: |
+          mise exec zig@0.16.0 -- zig build -Dpostgres=true
+          ZIGBASE_TEST_BINARY="$GITHUB_WORKSPACE/zig-out/bin/zigbase" mise exec python@3.13 -- python -m pytest tests/admin/test_superuser_cli.py -q
 
   # PostgreSQL with server TLS, so the suite runs over a REAL sslmode=require connection —
   # exercising the TLS handshake, the dual-layer flushOut, and TLS partial-read framing (the

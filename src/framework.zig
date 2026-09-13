@@ -5645,18 +5645,29 @@ fn superuserCreateImpl(allocator: std.mem.Allocator, io: std.Io, environ: *const
     defer allocator.free(tk);
     var rid = id_gen.collectionId(io);
 
-    var st = try w.prepare(
+    const dialect = db.dbDialect(w);
+    var placeholders: [4][db.Dialect.placeholder_buf_len]u8 = undefined;
+    const sql = try std.fmt.allocPrintSentinel(allocator,
         \\INSERT INTO "_superusers" ("id","created","updated","email","username","passwordHash","tokenKey","verified")
-        \\ VALUES (?1, datetime('now'), datetime('now'), ?2, '', ?3, ?4, 1);
-    );
+        \\ VALUES ({s}, {s}, {s}, {s}, '', {s}, {s}, 1);
+    , .{
+        dialect.placeholder(&placeholders[0], 1),
+        dialect.nowTextExpr(),
+        dialect.nowTextExpr(),
+        dialect.placeholder(&placeholders[1], 2),
+        dialect.placeholder(&placeholders[2], 3),
+        dialect.placeholder(&placeholders[3], 4),
+    }, 0);
+    defer allocator.free(sql);
+    var st = try w.prepare(sql);
     defer st.finalize();
     try st.bindText(1, &rid);
     try st.bindText(2, email);
     try st.bindText(3, phc);
     try st.bindText(4, tk);
-    _ = st.step() catch {
-        std.log.err("could not create superuser (email already exists?)", .{});
-        return;
+    _ = st.step() catch |err| {
+        std.log.err("could not create superuser: {s} (email may already exist)", .{@errorName(err)});
+        return err;
     };
     std.log.info("superuser created: {s}", .{email});
 }

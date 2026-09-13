@@ -52,6 +52,17 @@ export ZIGBASE_DB_URL="postgres://user:pass@host:5432/db"
 
 The backend is chosen once, by connection string alone: switch via configuration, no code changes.
 
+Provision the first operator with the same database URL and PostgreSQL-enabled
+binary used by the server:
+
+```sh
+./zig-out/bin/zigbase superuser create --email you@example.com --password '<a strong password>'
+```
+
+The CLI uses backend-native bound parameters and timestamps. An insertion failure
+(including an existing email) exits unsuccessfully; it never replaces that
+operator's password. Only a successful insertion prints `superuser created:`.
+
 **TLS is verified by default** (since 0.10.0): an unqualified `postgres://` URL gets
 `sslmode=verify-full` — the server certificate chain is verified against the system root
 store and the certificate must match the URL's host name. The full matrix:
