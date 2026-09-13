@@ -396,9 +396,8 @@ pub fn Harness(comptime AppType: type) type {
             }
 
             // Match production upload pre-parsing: populate form_fields/files,
-            // or return 400 for malformed multipart. This socketless harness
-            // always parses; production skips it for the exact GET health probe
-            // only when admission is enabled. Exercise that exemption over HTTP.
+            // or return 400 for malformed multipart. The shared pre-parser also
+            // skips unused bodies for the exact built-in GET health probe.
             const routed = if (try server.applyMultipart(&ctx)) |multipart_err|
                 multipart_err
             else
@@ -810,6 +809,34 @@ test "harness: query + headers + cookie opts reach the handler; Response.header/
     try std.testing.expectEqual(@as(u16, 200), r2.status);
     const echoed2 = try r2.json(struct { h: []const u8 });
     try std.testing.expectEqualStrings("from-slice", echoed2.h);
+}
+
+fn expectMultipartLivenessParity(comptime TestApp: type) !void {
+    var t = try start(TestApp, .{});
+    defer t.deinit();
+    const malformed = .{ .body = "invalid multipart", .content_type = "multipart/form-data; boundary=broken" };
+    const health_response = try t.request(.GET, "/api/health", malformed);
+    try std.testing.expectEqual(@as(u16, 200), health_response.status);
+    const value = try health_response.json(struct { status: []const u8 });
+    try std.testing.expectEqualStrings("ok", value.status);
+    inline for (.{ .HEAD, .POST }) |method| {
+        const response = try t.request(method, "/api/health", malformed);
+        try std.testing.expectEqual(@as(u16, 400), response.status);
+    }
+    for ([_][]const u8{ "/api/health/", "/api/health-extra" }) |path| {
+        const response = try t.request(.GET, path, malformed);
+        try std.testing.expectEqual(@as(u16, 400), response.status);
+    }
+}
+
+test "harness: exact GET health skips multipart with default and HTTP admission" {
+    try expectMultipartLivenessParity(framework.App(.{}));
+    try expectMultipartLivenessParity(framework.App(.{ .admission = .{ .max_requests = 1 } }));
+}
+
+test "harness: exact GET health skips multipart with byte-only admission" {
+    if (!@import("build_options").coordinated_admission) return error.SkipZigTest;
+    try expectMultipartLivenessParity(framework.App(.{ .admission = .{ .max_job_bytes = 4 } }));
 }
 
 test "harness: HEAD matches live body suppression for success and error responses" {

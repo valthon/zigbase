@@ -936,6 +936,7 @@ pub fn App(comptime cfg: anytype) type {
         /// into the binary by Zig's lazy analysis.
         pub const route_gates: server.Gates = .{
             .admission = admission_config != null,
+            .admission_http = if (admission_config) |a| a.max_requests != null else false,
             .two_factor = two_factor_selection.enabled,
             .admin = enable_admin,
             .analytics = @hasField(@TypeOf(cfg), "analytics"),
@@ -983,6 +984,7 @@ pub fn App(comptime cfg: anytype) type {
                 .job_stack_bytes = job_stack_size,
                 .admission_max_requests = if (admission_config) |a| a.max_requests else null,
                 .admission_max_work = if (admission_config) |a| a.max_work else null,
+                .admission_max_job_bytes = if (admission_config) |a| a.max_job_bytes else null,
                 .resumable = if (build_options.resumable_uploads) .{
                     .max_sessions = files_config.resumable.max_sessions,
                     .max_upload_bytes = files_config.resumable.max_upload_bytes,
@@ -6143,7 +6145,7 @@ test "HTTP admission is opt-in and reserves only its enabled diagnostics route" 
     try std.testing.expectEqual(null, Disabled.admission_config);
     try std.testing.expect(!Disabled.route_gates.admission);
     try std.testing.expect(Enabled.route_gates.admission);
-    try std.testing.expectEqual(@as(u32, 3), Enabled.admission_config.?.max_requests);
+    try std.testing.expectEqual(@as(u32, 3), Enabled.admission_config.?.max_requests.?);
     try std.testing.expect(server.featureRouteAvailable(Disabled.route_gates, "/api/admission/stats"));
     try std.testing.expect(!server.featureRouteAvailable(Enabled.route_gates, "/api/admission/stats"));
 }
@@ -6621,10 +6623,17 @@ test "liveEncryptedCollection detects a RUNTIME-created encrypted collection (dr
 test "resource envelope reports opt-in coordinated admission separately from HTTP" {
     const HttpOnly = App(.{ .admission = .{ .max_requests = 3 } });
     try std.testing.expectEqual(null, HttpOnly.resource_report.envelope.?.coordinated_admission_max_work);
+    try std.testing.expectEqual(null, HttpOnly.resource_report.envelope.?.coordinated_admission_max_job_bytes);
     if (comptime build_options.coordinated_admission) {
         const Shared = App(.{ .admission = .{ .max_requests = 3, .max_work = 16 } });
         try std.testing.expectEqual(@as(u32, 3), Shared.resource_report.envelope.?.http_admission_max_requests.?);
         try std.testing.expectEqual(@as(u32, 16), Shared.resource_report.envelope.?.coordinated_admission_max_work.?);
         try std.testing.expectEqual(@as(u32, 16), Shared.admission_config.?.max_work.?);
+        const Bytes = App(.{ .admission = .{ .max_job_bytes = 4096 } });
+        try std.testing.expectEqual(@as(usize, 4096), Bytes.resource_report.envelope.?.coordinated_admission_max_job_bytes.?);
+        try std.testing.expectEqual(null, Bytes.resource_report.envelope.?.coordinated_admission_max_work);
+        try std.testing.expectEqual(null, Bytes.resource_report.envelope.?.http_admission_max_requests);
+        try std.testing.expect(Bytes.route_gates.admission);
+        try std.testing.expect(!Bytes.route_gates.admission_http);
     }
 }

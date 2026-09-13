@@ -36,6 +36,8 @@ def wait_for(path):
 
 def test_jobs_and_http_share_capacity_and_recover(server, gate):
     admin = token(server)
+    status, _, body = ready_call(server, "/oversized", method="POST")
+    assert (status, body) == (200, b"byte-budget-rejected")
     status, _, body = ready_call(server, "/submit", method="POST")
     assert (status, body) == (200, b"second-job-rejected")
     wait_for(gate / "entered")
@@ -46,6 +48,10 @@ def test_jobs_and_http_share_capacity_and_recover(server, gate):
     assert value["work_limit"] == 2
     assert value["jobs_rejected"] == 1
     assert value["work_high_water"] == 2
+    assert value["job_bytes_limit"] == 4
+    assert value["job_bytes"] == 4
+    assert value["job_bytes_high_water"] == 4
+    assert value["job_bytes_rejected"] == 1
     with ThreadPoolExecutor(max_workers=1) as executor:
         request = executor.submit(ready_call, server, "/hold")
         try:
@@ -70,4 +76,5 @@ def test_jobs_and_http_share_capacity_and_recover(server, gate):
         assert time.monotonic() < deadline, value
         time.sleep(.01)
     assert value["active"] == 1
+    assert value["job_bytes"] == 0
     assert value["rejected"] >= 1

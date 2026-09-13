@@ -2,28 +2,31 @@
 const std = @import("std");
 const coordinated = @import("build_options").coordinated_admission;
 
-pub const Config = struct { max_requests: u32, max_work: ?u32 = null };
+pub const Config = struct { max_requests: ?u32 = null, max_work: ?u32 = null, max_job_bytes: ?usize = null };
 
 pub fn resolve(comptime cfg: anytype) ?Config {
     if (!@hasField(@TypeOf(cfg), "admission")) return null;
     if (@typeInfo(@TypeOf(cfg.admission)) != .@"struct")
-        @compileError(".admission must be a struct with .max_requests (positive u32)");
+        @compileError(".admission must be a struct with admission limits");
     for (std.meta.fields(@TypeOf(cfg.admission))) |field| {
-        if (!std.mem.eql(u8, field.name, "max_requests") and !std.mem.eql(u8, field.name, "max_work"))
+        if (!std.mem.eql(u8, field.name, "max_requests") and !std.mem.eql(u8, field.name, "max_work") and !std.mem.eql(u8, field.name, "max_job_bytes"))
             @compileError("unknown .admission field: " ++ field.name);
     }
-    if (!@hasField(@TypeOf(cfg.admission), "max_requests"))
-        @compileError(".admission requires .max_requests (positive u32)");
-    const value: u32 = cfg.admission.max_requests;
-    if (value == 0) @compileError(".admission.max_requests must be positive; omit .admission to disable");
+    const value: ?u32 = if (@hasField(@TypeOf(cfg.admission), "max_requests")) cfg.admission.max_requests else null;
+    if (value != null and value.? == 0) @compileError(".admission.max_requests must be positive; omit .max_requests to disable HTTP admission");
     const work: ?u32 = if (@hasField(@TypeOf(cfg.admission), "max_work")) cfg.admission.max_work else null;
     if (work != null and !coordinated) @compileError(".admission.max_work requires -Dcoordinated-admission=true");
     if (work != null and work.? == 0) @compileError(".admission.max_work must be positive; omit it to disable shared admission");
-    return .{ .max_requests = value, .max_work = work };
+    const bytes: ?usize = if (@hasField(@TypeOf(cfg.admission), "max_job_bytes")) cfg.admission.max_job_bytes else null;
+    if (bytes != null and !coordinated) @compileError(".admission.max_job_bytes requires -Dcoordinated-admission=true");
+    if (bytes != null and bytes.? == 0) @compileError(".admission.max_job_bytes must be positive; omit it to disable retained-byte admission");
+    if (work != null and value == null) @compileError(".admission.max_work requires .max_requests");
+    if (value == null and bytes == null) @compileError(".admission requires .max_requests or .max_job_bytes");
+    return .{ .max_requests = value, .max_work = work, .max_job_bytes = bytes };
 }
 
 pub const Snapshot = struct {
-    limit: u32,
+    limit: ?u32,
     active: u32,
     high_water: u32,
     rejected: u64,
@@ -31,6 +34,10 @@ pub const Snapshot = struct {
     jobs: u32 = 0,
     work_high_water: u32 = 0,
     jobs_rejected: u64 = 0,
+    job_bytes_limit: ?usize = null,
+    job_bytes: usize = 0,
+    job_bytes_high_water: usize = 0,
+    job_bytes_rejected: u64 = 0,
 };
 
 /// Caller-owned state; no allocation, teardown or background thread. All fields
@@ -42,9 +49,11 @@ pub const State = struct {
     value: Snapshot,
 
     pub fn init(io: std.Io, config: Config) State {
-        std.debug.assert(config.max_requests > 0);
+        std.debug.assert(config.max_requests == null or config.max_requests.? > 0);
+        std.debug.assert(config.max_work == null or config.max_requests != null);
         std.debug.assert(config.max_work == null or config.max_work.? > 0);
-        return .{ .io = io, .value = .{ .limit = config.max_requests, .active = 0, .high_water = 0, .rejected = 0, .work_limit = config.max_work } };
+        std.debug.assert(config.max_job_bytes == null or config.max_job_bytes.? > 0);
+        return .{ .io = io, .value = .{ .limit = config.max_requests, .active = 0, .high_water = 0, .rejected = 0, .work_limit = config.max_work, .job_bytes_limit = config.max_job_bytes } };
     }
 
     fn lock(self: *State) void {
@@ -54,9 +63,10 @@ pub const State = struct {
     }
 
     pub fn acquire(self: *State) bool {
+        if (self.value.limit == null) return true;
         self.lock();
         defer self.mutex.unlock(self.io);
-        if (self.value.active == self.value.limit or self.workFull()) {
+        if (self.value.active == self.value.limit.? or self.workFull()) {
             self.value.rejected +|= 1;
             return false;
         }
@@ -82,30 +92,51 @@ pub const State = struct {
 
     /// Reserve before copying a queued payload; keep the reservation through
     /// retries and cleanup. Never wait: a caller may already own an HTTP permit.
-    pub fn acquireJob(self: *State) bool {
+    /// Atomically reserve a work slot and precisely the retained copy length.
+    /// Zero bytes is appropriate for inline execution, which borrows its payload.
+    pub fn acquireJobBytes(self: *State, bytes: usize) bool {
         // Immutable after init: HTTP-only admission adds no lock to memory work.
-        if (self.value.work_limit == null) return true;
+        if (self.value.work_limit == null and (bytes == 0 or self.value.job_bytes_limit == null)) return true;
         self.lock();
         defer self.mutex.unlock(self.io);
         if (self.workFull()) {
             self.value.jobs_rejected +|= 1;
             return false;
         }
-        self.value.jobs += 1;
+        if (self.value.job_bytes_limit) |limit| {
+            // Invariant: job_bytes <= limit. Subtract before comparing so even
+            // a caller requesting maxInt(usize) bytes cannot overflow the sum.
+            if (bytes > limit - self.value.job_bytes) {
+                self.value.job_bytes_rejected +|= 1;
+                return false;
+            }
+            self.value.job_bytes += bytes;
+            self.value.job_bytes_high_water = @max(self.value.job_bytes_high_water, self.value.job_bytes);
+        }
+        if (self.value.work_limit != null) self.value.jobs += 1;
         self.recordWorkHighWater();
         return true;
     }
 
-    pub fn releaseJob(self: *State) void {
-        if (self.value.work_limit == null) return;
+    /// Release exactly the lengths reserved by acquireJobBytes, after freeing
+    /// the owned payload/name. No per-task accounting allocation is required.
+    pub fn releaseJobBytes(self: *State, bytes: usize) void {
+        if (self.value.work_limit == null and (bytes == 0 or self.value.job_bytes_limit == null)) return;
         self.lock();
         defer self.mutex.unlock(self.io);
-        std.debug.assert(self.value.jobs > 0);
-        self.value.jobs -= 1;
+        if (self.value.work_limit != null) {
+            std.debug.assert(self.value.jobs > 0);
+            self.value.jobs -= 1;
+        }
+        if (self.value.job_bytes_limit != null) {
+            std.debug.assert(self.value.job_bytes >= bytes);
+            self.value.job_bytes -= bytes;
+        }
     }
 
     /// Exactly once per successful acquire, after synchronous response handling.
     pub fn release(self: *State) void {
+        if (self.value.limit == null) return;
         self.lock();
         defer self.mutex.unlock(self.io);
         std.debug.assert(self.value.active > 0);
@@ -138,11 +169,11 @@ test "shared admission counts requests and jobs without overcommitting or waitin
     if (!coordinated) return error.SkipZigTest;
     var state = State.init(std.testing.io, .{ .max_requests = 2, .max_work = 3 });
     try std.testing.expect(state.acquire());
-    try std.testing.expect(state.acquireJob());
-    try std.testing.expect(state.acquireJob());
+    try std.testing.expect(state.acquireJobBytes(0));
+    try std.testing.expect(state.acquireJobBytes(0));
     try std.testing.expect(!state.acquire());
-    try std.testing.expect(!state.acquireJob());
-    state.releaseJob();
+    try std.testing.expect(!state.acquireJobBytes(0));
+    state.releaseJobBytes(0);
     try std.testing.expect(state.acquire());
     try std.testing.expect(!state.acquire());
     const value = state.snapshot();
@@ -153,7 +184,7 @@ test "shared admission counts requests and jobs without overcommitting or waitin
     try std.testing.expectEqual(@as(u64, 1), value.jobs_rejected);
     state.release();
     state.release();
-    state.releaseJob();
+    state.releaseJobBytes(0);
     try std.testing.expectEqual(@as(u32, 0), state.snapshot().jobs);
     try std.testing.expectEqual(@as(u32, 0), state.snapshot().active);
 }
@@ -161,8 +192,8 @@ test "shared admission counts requests and jobs without overcommitting or waitin
 test "HTTP-only admission does not count or limit jobs" {
     var state = State.init(std.testing.io, .{ .max_requests = 1 });
     try std.testing.expect(state.acquire());
-    try std.testing.expect(state.acquireJob());
-    state.releaseJob();
+    try std.testing.expect(state.acquireJobBytes(0));
+    state.releaseJobBytes(0);
     try std.testing.expectEqual(@as(u32, 0), state.snapshot().jobs);
     state.release();
 }
@@ -175,18 +206,71 @@ test "shared admission preserves its invariant at the u32 ceiling" {
     state.value.active = limit - 1;
     state.value.high_water = limit - 1;
     state.value.work_high_water = limit - 1;
-    try std.testing.expect(state.acquireJob());
+    try std.testing.expect(state.acquireJobBytes(0));
     try std.testing.expectEqual(limit, state.snapshot().work_high_water);
     try std.testing.expect(!state.acquire());
-    try std.testing.expect(!state.acquireJob());
-    state.releaseJob();
+    try std.testing.expect(!state.acquireJobBytes(0));
+    state.releaseJobBytes(0);
     try std.testing.expect(state.acquire());
     try std.testing.expectEqual(limit, state.snapshot().active);
-    try std.testing.expect(!state.acquireJob());
+    try std.testing.expect(!state.acquireJobBytes(0));
     try std.testing.expect(!state.acquire());
     state.release();
-    try std.testing.expect(state.acquireJob());
+    try std.testing.expect(state.acquireJobBytes(0));
     try std.testing.expectEqual(limit, state.snapshot().work_high_water);
+}
+
+test "retained job bytes reserve atomically with work and reject overflowing requests" {
+    if (!coordinated) return error.SkipZigTest;
+    var state = State.init(std.testing.io, .{ .max_requests = 2, .max_work = 3, .max_job_bytes = 8 });
+    try std.testing.expect(state.acquire());
+    try std.testing.expect(state.acquireJobBytes(8));
+    try std.testing.expect(!state.acquireJobBytes(1));
+    try std.testing.expectEqual(@as(u32, 1), state.snapshot().jobs);
+    try std.testing.expectEqual(@as(usize, 8), state.snapshot().job_bytes);
+    try std.testing.expect(state.acquireJobBytes(0));
+    try std.testing.expect(!state.acquireJobBytes(0));
+    state.releaseJobBytes(0);
+    state.releaseJobBytes(8);
+    try std.testing.expect(!state.acquireJobBytes(std.math.maxInt(usize)));
+    try std.testing.expectEqual(@as(usize, 0), state.snapshot().job_bytes);
+    try std.testing.expectEqual(@as(u32, 0), state.snapshot().jobs);
+    state.value.job_bytes_rejected = std.math.maxInt(u64);
+    try std.testing.expect(!state.acquireJobBytes(9));
+    try std.testing.expectEqual(std.math.maxInt(u64), state.snapshot().job_bytes_rejected);
+    try std.testing.expectEqual(@as(usize, 8), state.snapshot().job_bytes_high_water);
+    state.release();
+}
+
+test "byte-only budget leaves HTTP and shared job counts independent" {
+    if (!coordinated) return error.SkipZigTest;
+    const limit = std.math.maxInt(usize);
+    var state = State.init(std.testing.io, .{ .max_job_bytes = limit });
+    try std.testing.expect(state.acquireJobBytes(limit));
+    try std.testing.expect(!state.acquireJobBytes(1));
+    try std.testing.expect(state.acquire());
+    try std.testing.expectEqual(null, state.snapshot().limit);
+    try std.testing.expectEqual(@as(u32, 0), state.snapshot().active);
+    try std.testing.expectEqual(@as(u32, 0), state.snapshot().jobs);
+    try std.testing.expectEqual(limit, state.snapshot().job_bytes_high_water);
+    state.releaseJobBytes(limit);
+    state.release();
+    try std.testing.expectEqual(@as(usize, 0), state.snapshot().job_bytes);
+}
+
+test "byte-only HTTP and zero-byte reservations never touch the lock" {
+    if (!coordinated) return error.SkipZigTest;
+    // No usable Io: any lock attempt would fail. Disabled HTTP and borrowed
+    // zero-byte work must take their immutable-config fast paths instead.
+    var state = State.init(undefined, .{ .max_job_bytes = 8 });
+    for (0..16) |_| {
+        try std.testing.expect(state.acquire());
+        try std.testing.expect(state.acquireJobBytes(0));
+        state.releaseJobBytes(0);
+        state.release();
+    }
+    try std.testing.expectEqual(@as(u32, 0), state.value.active);
+    try std.testing.expectEqual(@as(usize, 0), state.value.job_bytes);
 }
 
 test "concurrent admission never exceeds its limit" {
@@ -228,10 +312,10 @@ test "concurrent HTTP and job admission share one atomic ceiling" {
         attempted: std.atomic.Value(u32) = .init(0),
         finish: std.atomic.Value(bool) = .init(false),
         fn run(self: *@This(), job: bool) void {
-            const admitted = if (job) self.state.acquireJob() else self.state.acquire();
+            const admitted = if (job) self.state.acquireJobBytes(0) else self.state.acquire();
             _ = self.attempted.fetchAdd(1, .release);
             if (!admitted) return;
-            defer if (job) self.state.releaseJob() else self.state.release();
+            defer if (job) self.state.releaseJobBytes(0) else self.state.release();
             while (!self.finish.load(.acquire)) std.atomic.spinLoopHint();
         }
     };
@@ -251,4 +335,36 @@ test "concurrent HTTP and job admission share one atomic ceiling" {
     try std.testing.expectEqual(@as(u32, 3), value.active + value.jobs);
     try std.testing.expectEqual(@as(u32, 3), value.work_high_water);
     try std.testing.expectEqual(@as(u64, 13), value.rejected + value.jobs_rejected);
+}
+
+test "concurrent retained-byte admission never overcommits without a work cap" {
+    if (!coordinated) return error.SkipZigTest;
+    const Harness = struct {
+        state: State = State.init(std.testing.io, .{ .max_requests = 1, .max_job_bytes = 3 }),
+        attempted: std.atomic.Value(u32) = .init(0),
+        finish: std.atomic.Value(bool) = .init(false),
+        fn run(self: *@This()) void {
+            const admitted = self.state.acquireJobBytes(1);
+            _ = self.attempted.fetchAdd(1, .release);
+            if (!admitted) return;
+            defer self.state.releaseJobBytes(1);
+            while (!self.finish.load(.acquire)) std.atomic.spinLoopHint();
+        }
+    };
+    var harness: Harness = .{};
+    var threads: [16]std.Thread = undefined;
+    var started: usize = 0;
+    defer {
+        harness.finish.store(true, .release);
+        for (threads[0..started]) |thread| thread.join();
+    }
+    for (&threads) |*thread| {
+        thread.* = try std.Thread.spawn(.{}, Harness.run, .{&harness});
+        started += 1;
+    }
+    while (harness.attempted.load(.acquire) != threads.len) std.atomic.spinLoopHint();
+    const value = harness.state.snapshot();
+    try std.testing.expectEqual(@as(usize, 3), value.job_bytes);
+    try std.testing.expectEqual(@as(usize, 3), value.job_bytes_high_water);
+    try std.testing.expectEqual(@as(u64, 13), value.job_bytes_rejected);
 }

@@ -187,7 +187,8 @@ pub const App = struct {
     /// set by `Pool.install` in serveImpl; null = not serving (tests/CLI). Memory-backend
     /// `ctx.enqueue` jobs AND `app.submit` tasks run on this bounded, shutdown-joined pool.
     memory_pool: ?*anyopaque = null,
-    /// Borrowed boot-owned state; null when HTTP admission is compiled out.
+    /// Borrowed boot-owned state; null when the entire admission config is omitted.
+    /// Byte-only admission retains this state without enabling HTTP admission.
     admission: ?*@import("admission.zig").State = null,
     /// #245 app-scoped context: type-erased pointer to the consumer's app-scoped value,
     /// declared via comptime `.app_context = T` and set ONCE in `onBootstrap` with
@@ -230,7 +231,7 @@ pub const App = struct {
     /// workers JOINED — a task submitted near shutdown completes (at-most-once across a
     /// crash). Returns error.SchedulerUnavailable when no pool is installed (unit tests /
     /// CLI — the historical error name is kept for compatibility) and error.QueueFull when
-    /// the bounded ring or optional shared .admission.max_work budget is full
+    /// the bounded ring or optional .admission.max_work or .max_job_bytes budget is full
     /// (reject-not-block; see queue/memory.zig for the policy).
     /// `name` is copied before this function returns: the caller retains ownership of its
     /// slice, while the task borrows the queue-owned `JobEvent.name` only for that invocation.

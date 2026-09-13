@@ -307,6 +307,21 @@ work and handle rejection. Shared diagnostics expose `work_limit`, `jobs`,
 This optional integration compiles out without its build flag. It counts work,
 not bytes, and excludes durable jobs, transport buffers and long-lived realtime.
 
+The same build gate also offers an independent retained-copy byte ceiling:
+`.admission = .{ .max_job_bytes = 64 * 1024 }`. No `max_requests` is required:
+HTTP counting and admission checks compile out, but diagnostics remain available
+with `limit: null` and zero HTTP counters. It charges memory-job payload and
+`app.submit` name copies before allocation, across queued/running tasks and retries;
+full capacity returns `error.QueueFull`. It does not count inline borrowed
+payloads, pre-enqueue serialization, handler allocations, task headers or allocator
+overhead, so it is not an RSS cap. Diagnostics expose `job_bytes_limit`, `job_bytes`,
+`job_bytes_high_water` and `job_bytes_rejected`; the offline envelope exposes
+`coordinated_admission_max_job_bytes`. Omission leaves byte counters untouched.
+For Zig embedders, `App.admission_config.?.max_requests` and the admission
+snapshot's `limit` are now `?u32`: handle `null` as no HTTP cap, or unwrap only
+when your configuration guarantees one. Omit `.max_requests` rather than setting
+it to zero to retain a byte-only budget.
+
 Bound long-lived realtime sessions separately with comptime
 `.realtime = .{ .max_connections = 256 }`. WS and SSE share the positive cap;
 the default remains 10,000 and excess upgrades receive 503. Inspect the effective

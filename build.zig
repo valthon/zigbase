@@ -593,6 +593,26 @@ pub fn build(b: *std.Build) void {
     const zero_work_exe = b.addExecutable(.{ .name = "invalid-admission-work-zero", .root_module = zero_work_mod });
     zero_work_exe.expect_errors = .{ .contains = if (coordinated_admission) ".admission.max_work must be positive; omit it to disable shared admission" else ".admission.max_work requires -Dcoordinated-admission=true" };
     admission_contracts.dependOn(&zero_work_exe.step);
+    const job_bytes_mod = b.createModule(.{ .root_source_file = b.path("fixtures/admission/bytes-only.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    job_bytes_mod.addImport("zigbase", zigbase_mod);
+    const job_bytes_exe = b.addExecutable(.{ .name = "job-byte-admission-fixture", .root_module = job_bytes_mod });
+    b.step("job-byte-admission-fixture", "Build byte-only job admission fixture").dependOn(&b.addInstallArtifact(job_bytes_exe, .{}).step);
+    if (!coordinated_admission) {
+        job_bytes_exe.expect_errors = .{ .contains = ".admission.max_job_bytes requires -Dcoordinated-admission=true" };
+        admission_contracts.dependOn(&job_bytes_exe.step);
+    }
+    inline for (&.{
+        .{ .name = "bytes-zero", .expected = if (coordinated_admission) ".admission.max_job_bytes must be positive; omit it to disable retained-byte admission" else ".admission.max_job_bytes requires -Dcoordinated-admission=true" },
+        .{ .name = "bytes-negative", .expected = "type 'usize' cannot represent value '-1'" },
+        .{ .name = "bytes-type", .expected = "expected type '?usize', found 'bool'" },
+        .{ .name = "work-without-http", .expected = if (coordinated_admission) ".admission.max_work requires .max_requests" else ".admission.max_work requires -Dcoordinated-admission=true" },
+    }) |invalid| {
+        const mod = b.createModule(.{ .root_source_file = b.path("fixtures/admission/" ++ invalid.name ++ ".zig"), .target = target, .optimize = optimize, .link_libc = true });
+        mod.addImport("zigbase", zigbase_mod);
+        const invalid_exe = b.addExecutable(.{ .name = "invalid-admission-" ++ invalid.name, .root_module = mod });
+        invalid_exe.expect_errors = .{ .contains = invalid.expected };
+        admission_contracts.dependOn(&invalid_exe.step);
+    }
     const realtime_contracts = b.step("check-realtime-cap-contracts", "Check realtime connection cap compile-time contracts");
     inline for (&.{
         .{ .name = "nonstruct", .expected = ".realtime must be a struct" },
@@ -607,9 +627,9 @@ pub fn build(b: *std.Build) void {
         realtime_contracts.dependOn(&invalid_exe.step);
     }
     inline for (&.{
-        .{ .name = "nonstruct", .expected = ".admission must be a struct with .max_requests (positive u32)" },
-        .{ .name = "zero", .expected = ".admission.max_requests must be positive; omit .admission to disable" },
-        .{ .name = "missing", .expected = ".admission requires .max_requests (positive u32)" },
+        .{ .name = "nonstruct", .expected = ".admission must be a struct with admission limits" },
+        .{ .name = "zero", .expected = ".admission.max_requests must be positive; omit .max_requests to disable HTTP admission" },
+        .{ .name = "missing", .expected = ".admission requires .max_requests or .max_job_bytes" },
         .{ .name = "unknown", .expected = "unknown .admission field: queue_size" },
     }) |invalid| {
         const mod = b.createModule(.{ .root_source_file = b.path("fixtures/admission/" ++ invalid.name ++ ".zig"), .target = target, .optimize = optimize, .link_libc = true });
