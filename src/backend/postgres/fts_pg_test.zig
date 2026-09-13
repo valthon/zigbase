@@ -27,7 +27,170 @@ const pgtests = @import("tests.zig");
 
 const Dialect = dialect_mod.Dialect;
 
+test "pg additive provisioning creates searchable fields before reconciling FTS" {
+    const a = std.testing.allocator;
+    var d = (try openOrSkip(a, std.testing.io)) orelse return error.SkipZigTest;
+    defer d.close();
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    const ns = try enterTempSchema(scratch.allocator(), &d);
+    defer dropTempSchema(scratch.allocator(), &d, ns);
+    try migrations.run(&d);
+    const fields = [_]schema.Field{
+        .{ .id = "t", .name = "title", .searchable = true, .options = .{ .text = .{} } },
+        .{ .id = "b", .name = "body", .searchable = true, .options = .{ .text = .{} } },
+    };
+    const col = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "articles", .fields = fields[0..1] });
+    defer col.deinit(a);
+    try fts.ensureIndex(a, &d, col);
+    try d.exec("INSERT INTO articles(id,title) VALUES('r1','kept');");
+    var desired = col;
+    desired.fields = &fields;
+    try @import("../../provision.zig").applySpecs(a, std.testing.io, &d, &.{desired});
+    try d.exec("UPDATE articles SET body='added';");
+    var found = try d.prepare("SELECT title FROM articles WHERE articles_fts @@ plainto_tsquery('simple','added');");
+    defer found.finalize();
+    try std.testing.expect(try found.step());
+    try std.testing.expectEqualStrings("kept", found.columnText(0));
+}
+
+test "pg search rejects registry shadowing probe collisions and empty ownership markers" {
+    const a = std.testing.allocator;
+    var d = (try openOrSkip(a, std.testing.io)) orelse return error.SkipZigTest;
+    defer d.close();
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    const al = scratch.allocator();
+    const ns = try enterTempSchema(al, &d);
+    defer dropTempSchema(al, &d, ns);
+    try migrations.run(&d);
+    const col = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "articles", .fields = &.{.{ .id = "t", .name = "title", .searchable = true, .options = .{ .text = .{} } }} });
+    defer col.deinit(a);
+    try fts.ensureIndex(a, &d, col);
+    try d.exec("INSERT INTO articles(id,title) VALUES('r1','kept');");
+    const shadow = try std.fmt.allocPrint(al, "{s}_shadow", .{ns});
+    try d.exec(try std.fmt.allocPrintSentinel(al, "CREATE SCHEMA \"{s}\"; CREATE TABLE \"{s}\".articles(title TEXT); INSERT INTO \"{s}\".articles VALUES('untouched'); SET search_path TO \"{s}\",\"{s}\";", .{ shadow, shadow, shadow, shadow, ns }, 0));
+    defer dropTempSchema(al, &d, shadow);
+    try std.testing.expectError(error.Conflict, fts.ensureIndex(a, &d, col));
+    {
+        var untouched = try d.prepare("SELECT title FROM articles;");
+        defer untouched.finalize();
+        try std.testing.expect(try untouched.step());
+        try std.testing.expectEqualStrings("untouched", untouched.columnText(0));
+        var added = try d.prepare("SELECT 1 FROM pg_attribute WHERE attrelid='articles'::regclass AND attname='articles_fts';");
+        defer added.finalize();
+        try std.testing.expect(!try added.step());
+    }
+    try d.exec(try std.fmt.allocPrintSentinel(al, "SET search_path TO \"{s}\";", .{ns}, 0));
+    try d.exec("CREATE TEMP TABLE zb_rename_fts_probe(value TEXT); INSERT INTO zb_rename_fts_probe VALUES('sentinel');");
+    try std.testing.expectError(error.Conflict, fts.ensureIndex(a, &d, col));
+    {
+        var kept = try d.prepare("SELECT value FROM pg_temp.zb_rename_fts_probe;");
+        defer kept.finalize();
+        try std.testing.expect(try kept.step());
+        try std.testing.expectEqualStrings("sentinel", kept.columnText(0));
+    }
+    try d.exec("DROP TABLE pg_temp.zb_rename_fts_probe; COMMENT ON COLUMN articles.articles_fts IS 'zbfts:';");
+    // splitScalar emits one empty component; identifier validation rejects it
+    // before generating probe SQL. No redundant empty-marker branch is needed.
+    try std.testing.expectError(error.Conflict, fts.ensureIndex(a, &d, col));
+    try d.exec("COMMENT ON COLUMN articles.articles_fts IS 'zbfts:title';");
+    try fts.ensureIndex(a, &d, col);
+}
+
+test "pg runtime trigger references block destructive search changes but not repair" {
+    const a = std.testing.allocator;
+    var d = (try openOrSkip(a, std.testing.io)) orelse return error.SkipZigTest;
+    defer d.close();
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    const ns = try enterTempSchema(scratch.allocator(), &d);
+    defer dropTempSchema(scratch.allocator(), &d, ns);
+    try migrations.run(&d);
+    const fields = [_]schema.Field{
+        .{ .id = "t", .name = "title", .searchable = true, .options = .{ .text = .{} } },
+        .{ .id = "b", .name = "body", .options = .{ .text = .{} } },
+    };
+    const col = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "articles", .fields = &fields });
+    defer col.deinit(a);
+    try fts.ensureIndex(a, &d, col);
+    try d.exec("CREATE FUNCTION observe_search() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM NEW.articles_fts; RETURN NEW; END $$; CREATE TRIGGER observe_search AFTER INSERT ON articles FOR EACH ROW EXECUTE FUNCTION observe_search();");
+    try fts.ensureIndex(a, &d, col);
+    try d.exec("DROP INDEX articles_fts_idx;");
+    try fts.ensureIndex(a, &d, col);
+    var disabled = col;
+    disabled.fields = &.{};
+    try std.testing.expectError(error.Conflict, fts.ensureIndex(a, &d, disabled));
+    var changed_fields = fields;
+    changed_fields[1].searchable = true;
+    var changed = col;
+    changed.fields = &changed_fields;
+    try std.testing.expectError(error.Conflict, fts.ensureIndex(a, &d, changed));
+    try d.exec("INSERT INTO articles(id,title) VALUES('r1','retained');");
+    var kept = try d.prepare("SELECT title FROM articles WHERE articles_fts @@ plainto_tsquery('simple','retained');");
+    defer kept.finalize();
+    try std.testing.expect(try kept.step());
+    try std.testing.expectEqualStrings("retained", kept.columnText(0));
+}
+
+test "pg generic provisioning preserves custom FTS column and foreign index" {
+    const a = std.testing.allocator;
+    var d = (try openOrSkip(a, std.testing.io)) orelse return error.SkipZigTest;
+    defer d.close();
+    var schema_arena = std.heap.ArenaAllocator.init(a);
+    defer schema_arena.deinit();
+    const ns = try enterTempSchema(schema_arena.allocator(), &d);
+    defer dropTempSchema(schema_arena.allocator(), &d, ns);
+    try migrations.run(&d);
+    const col = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "articles", .fields = &.{.{ .id = "t", .name = "title", .options = .{ .text = .{} } }} });
+    defer col.deinit(a);
+    try d.exec("ALTER TABLE articles ADD COLUMN articles_fts TEXT; INSERT INTO articles(id,title,articles_fts) VALUES('r1','hello','must survive');");
+    var boot = std.heap.ArenaAllocator.init(a);
+    defer boot.deinit();
+    try std.testing.expectError(error.Conflict, @import("../../provision.zig").ensureCollection(boot.allocator(), std.testing.io, &d, col));
+    var searchable = col;
+    const fields = [_]schema.Field{.{ .id = "t", .name = "title", .searchable = true, .options = .{ .text = .{} } }};
+    searchable.fields = &fields;
+    try std.testing.expectError(error.Conflict, fts.ensureIndex(a, &d, searchable));
+    {
+        var row = try d.prepare("SELECT articles_fts FROM articles;");
+        defer row.finalize();
+        try std.testing.expect(try row.step());
+        try std.testing.expectEqualStrings("must survive", row.columnText(0));
+    }
+    try d.exec("ALTER TABLE articles DROP COLUMN articles_fts; CREATE TABLE other(id TEXT); CREATE INDEX articles_fts_idx ON other(id);");
+    try std.testing.expectError(error.Conflict, fts.ensureIndex(a, &d, searchable));
+    var index = try d.prepare("SELECT 1 FROM pg_indexes WHERE schemaname=current_schema() AND tablename='other' AND indexname='articles_fts_idx';");
+    defer index.finalize();
+    try std.testing.expect(try index.step());
+}
+
 // ---- connection + schema plumbing (mirrors crud_tests.zig) ------------------
+
+test "pg search ownership holds a schema lock without blocking record writes" {
+    const a = std.testing.allocator;
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    const al = scratch.allocator();
+    var d = (try openOrSkip(a, std.testing.io)) orelse return error.SkipZigTest;
+    defer d.close();
+    const ns = try enterTempSchema(al, &d);
+    defer dropTempSchema(al, &d, ns);
+    const col = schema.Collection{ .id = "c1", .name = "articles", .fields = &.{.{ .id = "t", .name = "title", .searchable = true, .options = .{ .text = .{} } }} };
+    try provisionFts(al, &d, col);
+    try d.begin();
+    defer d.rollback() catch unreachable;
+    try fts.ensureIndex(a, &d, col);
+    {
+        var lock = try d.prepare("SELECT 1 FROM pg_locks WHERE pid=pg_backend_pid() AND relation='articles'::regclass AND mode='ShareUpdateExclusiveLock' AND granted;");
+        defer lock.finalize();
+        try std.testing.expect(try lock.step());
+    }
+    var writer = (try openOrSkip(a, std.testing.io)) orelse return error.SkipZigTest;
+    defer writer.close();
+    try writer.exec("SET statement_timeout='1000ms';");
+    try writer.exec(try std.fmt.allocPrintSentinel(al, "INSERT INTO \"{s}\".articles(id,title) VALUES('r1','hello');", .{ns}, 0));
+}
 
 fn openOrSkip(a: std.mem.Allocator, io: std.Io) !?dbm.Db {
     return dbm.Db.openPostgres(a, io, pgtests.testUrl()) catch |e| switch (e) {
@@ -354,7 +517,7 @@ test "pg-fts: a >256-byte search term ending mid-codepoint does not error (UTF-8
     try std.testing.expectEqual(@as(usize, 0), res.items.len); // no row contains the long token
 }
 
-test "pg-fts: a pre-existing tsvector column WITHOUT the marker is rebuilt, not ADD-errored" {
+test "pg-fts: an unmarked generated column is preserved until ownership is resolved" {
     const a = std.testing.allocator;
     const io = std.testing.io;
     var arena = std.heap.ArenaAllocator.init(a);
@@ -377,15 +540,14 @@ test "pg-fts: a pre-existing tsvector column WITHOUT the marker is rebuilt, not 
     try std.testing.expect((try colAttnum(al, &d, "docs", "docs_fts")) != null); // column is present, unmarked
     _ = try records.create(al, io, &d, col, try obj(al, .{.{ "title", std.json.Value{ .string = "hello world" } }}));
 
-    // Must NOT raise "column already exists" — the unmarked column is treated as drift and rebuilt.
-    try fts.ensureIndex(al, &d, col);
-
-    // After the rebuild: the GIN index exists and search works.
-    try std.testing.expect(try relExists(al, &d, "docs_fts_idx"));
+    // Even an engine-shaped expression is not proof that an unmarked column is ours.
+    const before = (try colAttnum(al, &d, "docs", "docs_fts")).?;
+    try std.testing.expectError(error.Conflict, fts.ensureIndex(al, &d, col));
+    try std.testing.expectEqual(before, (try colAttnum(al, &d, "docs", "docs_fts")).?);
+    try std.testing.expect(!try relExists(al, &d, "docs_fts_idx"));
     const res = try records.list(al, &d, col, .{ .search = "hello", .perPage = 50 });
     try std.testing.expectEqual(@as(usize, 1), res.items.len);
-    // Idempotent on a second call (now the marker is present → no-op).
-    try fts.ensureIndex(al, &d, col);
+    try std.testing.expectError(error.Conflict, fts.ensureIndex(al, &d, col));
     try std.testing.expectEqual(@as(usize, 1), (try records.list(al, &d, col, .{ .search = "world", .perPage = 50 })).items.len);
 }
 

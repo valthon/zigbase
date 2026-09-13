@@ -26,6 +26,32 @@ it's a `STORED` `tsvector` **generated column** (`to_tsvector('simple', …)` ov
 columns) plus a **GIN index**. `searchable` is mutually exclusive with `encrypted` — ciphertext
 is not searchable.
 
+Startup reconciles only search objects whose catalog definitions prove they belong to
+ZigBase. A conflicting application table, column, index, trigger, or dependent object
+causes `Conflict` before search DDL; its data is preserved, even when the collection
+has no searchable fields. Proven engine indexes still support searchable-field changes,
+removal, and missing-index repair. Reconciliation is transactional.
+
+Additive provisioning validates existing search objects before changing fields,
+then reconciles search after the new columns exist. The search reconciliation is
+transactional; this does not make the entire collection provision operation atomic.
+PostgreSQL resolves search tables only in the current schema, matching the registry
+schema when a registry exists. A conflicting temporary validation-probe relation
+is rejected without replacing it. Because runtime trigger functions can refer to
+generated columns without catalog dependencies, PostgreSQL refuses to remove or
+replace a search column while the table has user triggers. Unchanged search and
+missing-GIN-index repair remain supported; explicitly migrate affected triggers
+before changing the searchable field set.
+SQLite external-content search operands must still exist as text-storage columns
+in the physical base table; a missing or non-text operand requires explicit repair
+before its search objects can be adopted or removed.
+
+Reserve `<col>_fts` and its suffixed object names for the engine. PostgreSQL ownership
+also requires the engine's `zbfts:` column comment and matching generated expression.
+Legacy unmarked columns are no longer automatically deleted: inspect and back up the
+object, then explicitly migrate or rename conflicting application objects before retrying
+startup. Do not attach an ownership marker to an unverified column.
+
 ## Build requirement (`-Dfts5`, default on)
 
 SQLite FTS5 is compiled in **by default** — it's a core feature, not an experiment. Lean custom

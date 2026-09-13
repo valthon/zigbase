@@ -145,6 +145,7 @@ test "revalidation keeps newly reused references, changed objects, future timest
         .fields = &.{.{ .id = "file", .name = "file", .hidden = true, .options = .{ .file = .{} } }},
     });
     defer col.deinit(a);
+    try @import("../collection_rename.zig").rename(a, io, &conn, "photos", "images");
     try tmp.dir.createDirPath(io, "photos/r1");
     try tmp.dir.writeFile(io, .{ .sub_path = "photos/r1/a.txt", .data = "old" });
     const initial = try File.open(io, tmp.dir, "photos/r1/a.txt");
@@ -158,9 +159,9 @@ test "revalidation keeps newly reused references, changed objects, future timest
     try conn.beginImmediate();
     defer if (conn.inTransaction()) conn.rollback() catch unreachable;
     // The dry-run candidate is reused before deletion: fresh physical lookup wins.
-    try conn.exec("INSERT INTO photos(id,created,updated,file) VALUES('r1','','','a.txt');");
+    try conn.exec("INSERT INTO images(id,created,updated,file) VALUES('r1','','','a.txt');");
     try std.testing.expectEqual(Outcome.referenced, try removeCandidate(a, io, &conn, tmp.dir, "photos/r1/a.txt", initial.stat, now, 1));
-    try conn.exec("DELETE FROM photos;");
+    try conn.exec("DELETE FROM images;");
     try tmp.dir.writeFile(io, .{ .sub_path = "photos/r1/a.txt", .data = "replacement bytes" });
     try std.testing.expectEqual(Outcome.changed, try removeCandidate(a, io, &conn, tmp.dir, "photos/r1/a.txt", initial.stat, now, 1));
     const replacement = try File.open(io, tmp.dir, "photos/r1/a.txt");

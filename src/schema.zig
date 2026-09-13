@@ -112,6 +112,11 @@ pub const Collection = struct {
     options: CollectionOptions = .{},
     created: []const u8 = "",
     updated: []const u8 = "",
+    /// Engine-owned capability epoch; not accepted or exported by schema JSON.
+    rename_epoch: i64 = 0,
+    /// Engine-owned physical file prefix. Loaded from the reservation ledger;
+    /// generic schema input/JSON never controls or exports this internal value.
+    storage_namespace: []const u8 = "",
 
     /// Free a FULLY-OWNED collection graph — exactly the shape returned by
     /// `collections.get`/`create`/`update` (every string/slice duped onto `alloc`
@@ -132,6 +137,7 @@ pub const Collection = struct {
         alloc.free(self.name);
         alloc.free(self.created);
         alloc.free(self.updated);
+        alloc.free(self.storage_namespace);
         freeOptStrOwned(alloc, self.listRule);
         freeOptStrOwned(alloc, self.viewRule);
         freeOptStrOwned(alloc, self.createRule);

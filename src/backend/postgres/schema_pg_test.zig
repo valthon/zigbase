@@ -54,6 +54,75 @@ fn scalarCount(w: *db.Db, sql: [:0]const u8) !i64 {
     return st.columnInt(0);
 }
 
+test "pg: auth rename rotates all principal tokens with bounded bindings" {
+    const a = std.testing.allocator;
+    var ctx = (try Ctx.open(a, std.testing.io, "rename_auth_tokens")) orelse return error.SkipZigTest;
+    defer ctx.deinit();
+    const w = ctx.w();
+    try migrations.run(w);
+    const collections = @import("../../collections.zig");
+    const old = try collections.create(a, std.testing.io, w, .{ .id = "", .name = "users", .type = .auth, .fields = &.{} });
+    defer old.deinit(a);
+    try w.exec("INSERT INTO users(id,\"tokenKey\",token_epoch) SELECT 'u'||n::text,'old',0 FROM generate_series(1,777) n;");
+    try @import("../../collection_rename.zig").rename(a, std.testing.io, w, "users", "people");
+    try std.testing.expectEqual(@as(i64, 777), try scalarCount(w, "SELECT count(*) FROM people WHERE length(\"tokenKey\")=32 AND \"tokenKey\"<>'old' AND token_epoch=1;"));
+    try std.testing.expectEqual(@as(i64, 777), try scalarCount(w, "SELECT count(DISTINCT \"tokenKey\") FROM people;"));
+}
+
+test "pg: offline rename rejects dangling destination relation metadata" {
+    const a = std.testing.allocator;
+    var ctx = (try Ctx.open(a, std.testing.io, "rename_dangling_metadata")) orelse return error.SkipZigTest;
+    defer ctx.deinit();
+    const w = ctx.w();
+    try migrations.run(w);
+    const collections = @import("../../collections.zig");
+    const old = try collections.create(a, std.testing.io, w, .{ .id = "", .name = "posts", .fields = &.{} });
+    defer old.deinit(a);
+    try w.exec("UPDATE _collections SET schema='[{\"id\":\"targetid\",\"name\":\"target\",\"type\":\"relation\",\"options\":{\"targetCollectionId\":\"articles\",\"maxSelect\":1}}]' WHERE name='posts';");
+    const gen = @import("../../schema_gen.zig");
+    const before = try gen.read(w);
+    try std.testing.expectError(error.Conflict, @import("../../collection_rename.zig").rename(a, std.testing.io, w, "posts", "articles"));
+    try std.testing.expectEqual(before, try gen.read(w));
+    try std.testing.expect(!w.inTransaction());
+    try std.testing.expect((try collections.getByName(a, w, "articles")) == null);
+    const unchanged = (try collections.getByName(a, w, "posts")).?;
+    defer unchanged.deinit(a);
+    try std.testing.expectEqual(@as(i64, 0), unchanged.rename_epoch);
+    try std.testing.expectEqualStrings("articles", unchanged.fields[0].options.relation.targetCollectionId);
+    try w.exec("INSERT INTO posts(id) VALUES ('still_posts');");
+}
+
+test "pg: offline collection rename preserves relations search and caller rollback" {
+    const a = std.testing.allocator;
+    var ctx = (try Ctx.open(a, std.testing.io, "rename")) orelse return error.SkipZigTest;
+    defer ctx.deinit();
+    const w = ctx.w();
+    try migrations.run(w);
+    const collections = @import("../../collections.zig");
+    const fields = [_]schema.Field{.{ .id = "title_id", .name = "title", .searchable = true, .options = .{ .text = .{} } }};
+    const old = try collections.create(a, std.testing.io, w, .{ .id = "", .name = "posts", .fields = &fields });
+    defer old.deinit(a);
+    try @import("../../search/fts.zig").ensureIndex(a, w, old);
+    try w.exec("CREATE TABLE comments(id TEXT PRIMARY KEY, parent TEXT REFERENCES posts(id));");
+    try w.exec("INSERT INTO posts(id,title) VALUES ('r1','before');");
+    try w.exec("INSERT INTO comments(id,parent) VALUES ('c1','r1');");
+    try @import("../../collection_rename.zig").rename(a, std.testing.io, w, "posts", "articles");
+    const renamed = (try collections.get(a, w, "articles")).?;
+    defer renamed.deinit(a);
+    try std.testing.expectEqualStrings(old.id, renamed.id);
+    try std.testing.expectEqualStrings("title_id", renamed.fields[0].id);
+    try w.exec("UPDATE articles SET title='after' WHERE id='r1';");
+    try std.testing.expectEqual(@as(i64, 1), try scalarCount(w, "SELECT COUNT(*) FROM articles WHERE articles_fts @@ plainto_tsquery('simple','after');"));
+    try std.testing.expectEqual(@as(i64, 1), try scalarCount(w, "SELECT COUNT(*) FROM articles JOIN comments ON articles.id=comments.parent;"));
+    try w.begin();
+    try @import("../../collection_rename.zig").rename(a, std.testing.io, w, "articles", "stories");
+    try w.rollback();
+    try std.testing.expect((try collections.get(a, w, "stories")) == null);
+    const restored = (try collections.get(a, w, "articles")).?;
+    defer restored.deinit(a);
+    try std.testing.expectEqualStrings(old.id, restored.id);
+}
+
 test "pg: all system migrations apply on a fresh database (tables + seeds + ledger)" {
     const a = std.testing.allocator;
     var ctx = (try Ctx.open(a, std.testing.io, "mig")) orelse return error.SkipZigTest;

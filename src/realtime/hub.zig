@@ -408,6 +408,7 @@ fn snapshotSandbox(io: std.Io, col: schema.Collection, snapshot: std.json.Value)
     // `_collections` (conservative deny) because user collections were never present in the sandbox.
     try tmp.exec(migrations.collections_table_sql);
     try tmp.exec(migrations.collections_options_column_sql);
+    try tmp.exec(migrations.collections_rename_epoch_column_sql);
     // `collections.create` below bumps the schema-generation marker inside its transaction, so
     // the sandbox needs that table too. The bump is deliberately STRICT — it propagates rather
     // than tolerating a missing table — because a "table missing -> skip" fallback would mask a
@@ -417,6 +418,7 @@ fn snapshotSandbox(io: std.Io, col: schema.Collection, snapshot: std.json.Value)
     // marker table were absent, every delete-event authorization would fail.)
     try tmp.exec(migrations.schema_state_table_sql);
     try tmp.exec(migrations.schema_state_seed_sql);
+    try tmp.exec(@import("../files/namespace.zig").table_sql);
     // Recreate the collection table (fresh id; we never persist relation FKs, so an isolated
     // schema is enough to evaluate column/macro comparisons).
     var spec = col;
@@ -1074,20 +1076,22 @@ test "F4: delete frame carries the private authz snapshot (stripped before clien
     // WS.write, so the client never sees the snapshot — covered by the hub authz tests above.)
 }
 
-test "R1-3: delete sandbox schema is minimal — 4 DDLs, not the migration suite" {
+test "R1-3: delete sandbox schema is minimal — 6 statements, not the migration suite" {
     var tmp = try db.Db.openMemory();
     defer tmp.close();
     try tmp.exec(migrations.collections_table_sql);
     try tmp.exec(migrations.collections_options_column_sql);
+    try tmp.exec(migrations.collections_rename_epoch_column_sql);
     try tmp.exec(migrations.schema_state_table_sql);
     try tmp.exec(migrations.schema_state_seed_sql);
+    try tmp.exec(@import("../files/namespace.zig").table_sql);
     var st = try tmp.prepare("SELECT COUNT(*) FROM sqlite_master WHERE type='table';");
     defer st.finalize();
     try std.testing.expect(try st.step());
     // The _collections registry plus the schema-generation marker that collections.create bumps.
     // This pins the per-subscriber-per-delete cost: the full suite (migrations.run) creates
-    // dozens of tables; the sandbox needs two.
-    try std.testing.expectEqual(@as(i64, 2), st.columnInt(0));
+    // dozens of tables; the sandbox needs three, including namespace reservations.
+    try std.testing.expectEqual(@as(i64, 3), st.columnInt(0));
 }
 
 test "R1-3: the delete sandbox can actually run collections.create (marker table seeded)" {
@@ -1101,8 +1105,10 @@ test "R1-3: the delete sandbox can actually run collections.create (marker table
     defer tmp.close();
     try tmp.exec(migrations.collections_table_sql);
     try tmp.exec(migrations.collections_options_column_sql);
+    try tmp.exec(migrations.collections_rename_epoch_column_sql);
     try tmp.exec(migrations.schema_state_table_sql);
     try tmp.exec(migrations.schema_state_seed_sql);
+    try tmp.exec(@import("../files/namespace.zig").table_sql);
 
     const created = try collections.create(a, std.testing.io, &tmp, .{
         .id = "",

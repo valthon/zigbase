@@ -35,7 +35,9 @@ configures in code:
 
    Each wrapper function `@ptrCast/@alignCast`s `ctx` → `*AuditStorage`, logs
    the operation, then delegates to `self.inner.vtable.<method>(self.inner.ctx, ...)`.
-   Registered via `App(.{ .storage = AuditStorage })`.
+   Registered via `App(.{ .storage = AuditStorage })`. The callback `col` is an
+   immutable physical namespace, so the wrapper forwards it unchanged even after
+   a collection rename; it must not reconstruct prefixes from public route names.
 
 2. **Custom mailer plugin** (`AuditMailer`). Implements the same plugin contract
    for `zigbase.Mailer` / `zigbase.Email`, logging every outbound email and

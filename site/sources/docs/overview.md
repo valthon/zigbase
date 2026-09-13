@@ -33,7 +33,9 @@ There are two ways to use ZigBase:
 
 ## Features
 
-- **Collections & schema** — define collections with typed fields; schema migrations run
+- **Collections & schema** — define collections with typed fields; explicit offline
+  collection renames preserve database identities and file prefixes without copying
+  local or remote objects; schema migrations run
   on startup.
 - **Records & query API** — typed CRUD with `filter`, `sort`, and `expand` on relations.
   → [API](./api)

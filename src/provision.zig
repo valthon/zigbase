@@ -87,13 +87,14 @@ fn ensureTenantIndex(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection
     std.log.info("provision: ensured tenant index on '{s}'.'{s}'", .{ col.name, tf });
 }
 
-/// Wrap `fts.ensureIndex`: on SQLite, a build compiled with `-Dfts5=false` cannot serve a
+/// Wrap search validation/reconciliation: a SQLite build with `-Dfts5=false` cannot serve a
 /// `.searchable` schema. Rather than let that surface as a silent no-op (and a later `?search=`
 /// 500), fail LOUDLY at startup with an actionable message — the fail-fast-at-boot principle
 /// (better a clear boot error than a runtime surprise). Postgres is never affected (the flag
 /// doesn't gate `ensureIndexPg`).
-fn ensureSearchIndex(alloc: std.mem.Allocator, w: *db.Db, spec: schema.Collection) ProvisionError!void {
-    fts.ensureIndex(alloc, w, spec) catch |err| switch (err) {
+fn inspectSearchIndex(alloc: std.mem.Allocator, w: *db.Db, spec: schema.Collection, reconcile: bool) ProvisionError!void {
+    const result = if (reconcile) fts.ensureIndex(alloc, w, spec) else fts.validateIndex(alloc, w, spec);
+    result catch |err| switch (err) {
         error.SearchDisabled => {
             std.log.err(
                 "refusing to start: collection '{s}' declares .searchable fields but this binary was built with -Dfts5=false — rebuild with -Dfts5 (or its default) to enable full-text search",
@@ -1027,17 +1028,12 @@ pub fn ensureCollection(
         _ = try collections.create(alloc, io, w, spec);
         std.log.info("provision: created collection '{s}'", .{spec.name});
         try ensureTenantIndex(alloc, w, spec);
-        try ensureSearchIndex(alloc, w, spec);
+        try inspectSearchIndex(alloc, w, spec, true);
         return;
     }
     const live = existing.?;
     // The physical table exists now; ensure the tenant_field is indexed (idempotent).
     try ensureTenantIndex(alloc, w, spec);
-    // Provision/refresh the FTS5 full-text index (#157) — idempotent; rebuilds if the searchable
-    // column set drifted or an earlier additive rebuild dropped the sync triggers. Runs every
-    // startup so an upgrade that adds `.searchable` builds the index without a migration.
-    try ensureSearchIndex(alloc, w, spec);
-
     // Diff user fields. `live.fields` from get() includes injected auth system
     // fields for auth collections; compare only against non-system field names.
     // (additions/merged below skip .deinit(): this fn runs under applySpecs'
@@ -1103,9 +1099,15 @@ pub fn ensureCollection(
     }
 
     if (!changed) {
+        try inspectSearchIndex(alloc, w, spec, true);
         try collections.updateIndexes(alloc, w, live.id, spec.indexes);
         return;
     }
+
+    // Validate the old physical search objects before an additive rebuild can
+    // remove their triggers. Desired searchable fields may not exist yet.
+    // The unchanged path above needs only its single reconciliation pass.
+    try inspectSearchIndex(alloc, w, spec, false);
 
     // Additive auto-migration: rebuild the table with the union of live + new
     // fields, matching existing columns by id (rebuildPlan preserves their data),
@@ -1130,7 +1132,7 @@ pub fn ensureCollection(
     std.log.info("provision: collection '{s}' added {d} field(s)", .{ spec.name, additions.items.len });
     // The additive rebuild drops triggers tied to the old table; re-ensure the FTS index so its
     // sync triggers (and any newly-searchable column) are restored.
-    try ensureSearchIndex(alloc, w, spec);
+    try inspectSearchIndex(alloc, w, spec, true);
 }
 
 /// `spec`'s access rules overlaid on `live`'s: a `null` spec rule means "unspecified —

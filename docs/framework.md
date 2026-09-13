@@ -4011,6 +4011,7 @@ The v1 op set (each `m.<op>(...) anyerror!void`):
 | `addIndex(table, cols, .{ .name?, .unique? })` | `CREATE [UNIQUE] INDEX` | `DROP INDEX` (same derived name) |
 | `dropIndex(name, .{ .was = .{ table, cols, unique } })` | `DROP INDEX` | re-`CREATE` from `.was` |
 | `renameTable(from, to)` | `RENAME TO` | rename back (self-inverse) |
+| `renameCollection(from, to, .{ .offline = true })` | Atomic collection metadata/table/dependency rename | Rename back; revoked sessions are not restored |
 | `renameColumn(table, from, to)` | `RENAME COLUMN` | rename back (self-inverse) |
 | `addForeignKey(table, col, ref_table, .{ .ref_column?, .on_delete_cascade?, .name? })` | `ADD CONSTRAINT … FOREIGN KEY` (**Postgres only**) | `DROP CONSTRAINT` (same derived name) |
 
@@ -4027,6 +4028,91 @@ keyword). An index/FK name defaults deterministically (`idx_<table>_<cols…>`,
 `addForeignKey` is **Postgres-only** (SQLite has no `ALTER TABLE ADD CONSTRAINT`; it returns
 `error.WrongBackend` — declare the FK inline in `createTable`, or use `m.raw`). Whenever a
 step is irreversible, write it as an explicit `up` and supply your own `down`.
+
+#### Offline collection rename
+
+Use `try m.renameCollection("posts", "articles", .{ .offline = true });` in an
+explicit migration, not `renameTable`: the latter changes only a physical table.
+Both arguments must be collection **names**, not collection IDs.
+Stop **every** serving process and worker before migrating. The flag acknowledges
+that coordination; it cannot stop remote processes for you. Deploy changed
+`.collections` declarations together with the migration, and update all name
+literals in policies, auth configuration, hooks, routes, SDKs, and integrations.
+SQLite (with `legacy_alter_table` disabled) rewrites dependent trigger/view SQL
+references during its table rename; PostgreSQL maintains catalog-bound dependencies.
+The helper does not rewrite arbitrary SQL name literals, serialized payloads, or
+rule strings; review and migrate those explicitly in the same maintenance window.
+There are no old-name URL or realtime-topic aliases.
+
+Use a migration connection without pre-existing temporary relations: they can
+shadow data or engine metadata tables, so the operation rejects them before taking
+the schema lock. PostgreSQL collections and their registry must resolve in the
+current persistent schema. Ambiguous legacy relation names that also identify
+another collection's stable ID are rejected instead of silently retargeted.
+Destination-name relation metadata or dangling SQLite foreign keys likewise
+return `Conflict` and require explicit repair before retrying.
+
+The operation takes the schema lock and commits as one transaction (or joins the
+caller's transaction through a savepoint). It preserves collection, field, and
+record IDs. If rollback or savepoint cleanup itself fails, the offline migration
+terminates the process rather than returning an unsafe writer to its pool; recover
+the database before restarting migrations. Normal failures roll back and return
+their original error. The successful operation rewrites incoming/self relation
+metadata to stable IDs, retains user
+index names, and rebuilds generated search indexes. Subsequent additive provisioning
+under the new declaration retains existing field IDs. Destination names must be
+valid identifiers of at most 55 bytes (as must the source, so reversal remains
+possible); existing names and generated search-object
+collisions are rejected rather than overwritten.
+
+Generated search objects must match the current searchable schema exactly before
+the rename removes them. Stale objects after search was disabled, or custom
+objects using generated names, cause a conflict and remain untouched; reconcile
+those objects explicitly before retrying the rename.
+SQLite also rejects arbitrary trigger/view definitions mentioning the old or destination
+generated FTS name (conservatively including comments or literals), because rebuilding that
+table cannot rewrite those references safely. Verified engine auth indexes are
+recreated under the new name on SQLite and renamed in place on PostgreSQL;
+application-owned indexes retain their names.
+
+OAuth links, WebAuthn/TOTP credentials, rate budgets, memberships, and actor
+attribution follow the renamed identity. Signing keys rotate, sessions and pending
+auth challenges are revoked, and stateful cursors are deleted. Users must sign in
+again; a reverse rename does not restore those capabilities. Stateless/signed
+cursor fingerprints now include collection identity, name, and an engine-owned
+monotonic rename epoch. Renaming back cannot revive a previous cursor, while
+unrelated collection renames leave it valid. **Upgrading to this
+version invalidates previously issued cursors**, and clients must restart pagination.
+
+Unexpired `_idempotency_receipts` return `PendingIdempotencyReceipts` before any
+mutation. Their scopes hash application-selected principal/operation names, so the
+engine cannot prove a receipt unrelated to a rename. Stop new operations and wait
+out the existing retention windows; receipts are not discarded or silently rebound.
+
+File-bearing collections keep an **immutable storage namespace**. Upgrading seeds
+the engine-owned reservation ledger from existing collection IDs and names; no
+local, S3, or custom-backend objects are copied or renamed. File reads/writes,
+thumbnails, presigning, cleanup, inventory, and reconciliation resolve that physical
+prefix independently of the current public collection name. Generic collection
+input, schema import, and update cannot override another collection's namespace.
+
+Durable uploads targeting the collection **or authenticated through it**, and
+unfinished file-cleanup jobs, are relinked in the same database transaction. Both
+the stored name and stable collection ID must agree. Malformed or inconsistent
+metadata fails closed with `InvalidPendingMetadata`; orphan destination-name
+dependencies return `PendingStorageDependency`. Payload bytes and upload offsets
+are untouched. In-memory uploads are lost when their process stops, as usual.
+Metadata scans use 64-row keyset batches with row-scoped parsing and cleared
+statement bindings, including on PostgreSQL; payloads larger than 64 KiB fail closed.
+
+**Namespace reservations survive collection deletion.** Creating a collection whose
+name is already reserved as a physical prefix fails with `StorageNamespaceConflict`
+(HTTP 409), even if the former collection was renamed or deleted. There is no
+automatic reclamation: leftover objects must never become a new collection's files.
+New reservations also reject ASCII case variants of existing prefixes, on every
+backend, to protect case-insensitive local filesystems. Existing physical prefixes
+and inventory lookups remain exact; this does not rename or normalize legacy objects.
+Take a backup and test both migration directions on a copy before production.
 
 #### Data transforms (`m.records()`)
 
@@ -4363,6 +4449,10 @@ field (the pattern the example apps use). One nuance: Postgres `lower()` is loca
 Once you have built a `-Dpostgres` binary, the `migrate-db` subcommand copies an
 existing SQLite-backed instance into a fresh PostgreSQL database — schema **and** data:
 
+Stop the source and apply this version's system migrations first. The copy requires
+the immutable storage namespace ledger and preserves its live and retired reservations;
+an older source missing the ledger is rejected before modifying the target.
+
 ```sh
 # Build with the PostgreSQL backend compiled in.
 zig build -Dpostgres=true
@@ -4465,7 +4555,11 @@ zigbase.App(.{ .mailer = AuditMailer }).runCli(init);
 ```
 
 A custom storage plugin follows the same shape, returning a `zigbase.Storage`
-view from `interface()`. The `zigbase.Storage` vtable has **four** required
+view from `interface()`. Its `col` argument is an **immutable physical namespace**,
+not necessarily the current collection name. Forward it unchanged; do not derive
+it from request URLs. Hooks and public routes still use the logical collection
+name. Inventory keys must use the same physical namespace. The `zigbase.Storage`
+vtable has **four** required
 methods — `put` / `fetch` / `delete` / `deleteRecord` — plus **optional**
 `presignGetUrl` and `inventory` (both default to `null`, so existing four-method backends stay
 valid) — so a custom backend wraps or replaces them. `fetch(ctx, io, alloc,
@@ -4519,6 +4613,12 @@ proven safe to delete. The command has **no deletion mode**, runs no migrations 
 provisioning, and opens SQLite read-only or PostgreSQL with read-only transactions.
 Builtin storage initialization performs no writes; custom plugin initialization
 and its `inventory` callback must honor the same read-only contract.
+
+Inventory and reconciliation require this binary's current collection metadata
+schema. After upgrading, run migrations explicitly before these commands. An
+incompatible or unreadable metadata schema fails the command with
+`CollectionMetadataUnavailable` and no JSON page, rather than silently reporting
+every file as `unknown`. Neither command applies migrations automatically.
 
 Keys and cursors must be UTF-8; otherwise the command fails without a partial
 JSON page and directs operators to byte-safe backend-native tooling. This keeps
@@ -4658,8 +4758,10 @@ worker and an appropriate visibility timeout. Stored object keys must remain
 immutable; custom out-of-band uploads must not overwrite keys pending deletion
 or write into a deleted record's prefix without first creating its database row.
 
-Collection identity is checked: deleted, renamed, or recreated collections are
+Collection identity is checked: deleted or recreated collections are
 conservatively skipped, leaving their objects for separate operator review.
+Coordinated `renameCollection` migrations relink pending jobs by stable ID while
+preserving their physical namespace; uncoordinated name changes are not supported.
 This first version covers HTTP record PATCH/DELETE only, not raw SQL, `Data`
 mutations, cascade/TTL deletes, collection deletion, failed upload cleanup, or
 orphan reconciliation. A crash before upload references commit can still orphan

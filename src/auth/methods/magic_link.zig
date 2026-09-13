@@ -476,8 +476,7 @@ test "MagicLinkMethod: initiate auto_create=true creates record for unknown iden
         const w = env.pool.acquireWriter();
         defer env.pool.releaseWriter();
         const existing = (try collections.get(a, w, "ml_ac")).?;
-        try collections.delete(a, w, existing.id);
-        _ = try collections.create(a, std.testing.io, w, .{
+        _ = try collections.update(a, std.testing.io, w, existing.id, .{
             .id = "",
             .name = "ml_ac",
             .type = .auth,
@@ -530,8 +529,7 @@ test "MagicLinkMethod: initiate auto_create=false creates nothing for unknown id
         const w = env.pool.acquireWriter();
         defer env.pool.releaseWriter();
         const existing = (try collections.get(a, w, "ml_noac")).?;
-        try collections.delete(a, w, existing.id);
-        _ = try collections.create(a, std.testing.io, w, .{
+        _ = try collections.update(a, std.testing.io, w, existing.id, .{
             .id = "",
             .name = "ml_noac",
             .type = .auth,
@@ -584,8 +582,7 @@ test "MagicLinkMethod: auto_create initiate then complete succeeds end-to-end" {
         const w = env.pool.acquireWriter();
         defer env.pool.releaseWriter();
         const existing = (try collections.get(a, w, "ml_e2e")).?;
-        try collections.delete(a, w, existing.id);
-        _ = try collections.create(a, std.testing.io, w, .{
+        _ = try collections.update(a, std.testing.io, w, existing.id, .{
             .id = "",
             .name = "ml_e2e",
             .type = .auth,

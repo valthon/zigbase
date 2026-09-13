@@ -137,6 +137,7 @@ pub fn create(ctx: *http.RequestCtx) anyerror!http.Response {
         error.Validation => return validationResponse(ctx),
         // The pre-check (`get() != null`) catches the common duplicate; error.Constraint covers a
         // duplicate that races in between the pre-check and the write — still a 409, never a 500.
+        error.StorageNamespaceConflict => return ApiError.conflict("Storage namespace remains reserved by an existing or deleted collection.").toResponse(ctx.allocator.a),
         error.Conflict, error.Constraint => return ApiError.conflict("Collection already exists.").toResponse(ctx.allocator.a),
         else => return e,
     };

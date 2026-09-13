@@ -344,6 +344,16 @@ pub const Migrator = struct {
         return self.exec(sql);
     }
 
+    /// Rename a registered collection, preserving stable IDs and dependencies.
+    /// Both arguments are names; collection IDs are not accepted as lookup keys.
+    /// Stop ALL serving/worker processes and update compiled name references first.
+    /// File prefixes stay fixed; durable work is relinked by stable identity.
+    /// Reverse mode renames back, but invalidated sessions/cursors are not restored.
+    pub fn renameCollection(self: *Migrator, from: []const u8, to: []const u8, opts: struct { offline: bool }) (@import("collection_rename.zig").Error || error{OfflineRenameRequired})!void {
+        if (!opts.offline) return error.OfflineRenameRequired;
+        return @import("collection_rename.zig").rename(self.arena, self.io, self.db, if (self.direction == .reverse) to else from, if (self.direction == .reverse) from else to);
+    }
+
     /// Rename a column. Self-inverse: reverse mode renames `to` back to `from` (no extra args).
     pub fn renameColumn(self: *Migrator, table: []const u8, from: []const u8, to: []const u8) OpError!void {
         const src = if (self.direction == .reverse) to else from;

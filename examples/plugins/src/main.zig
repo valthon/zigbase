@@ -76,6 +76,8 @@ const zigbase = @import("zigbase");
 //    `AuditStorage` wraps a `zigbase.LocalStorage` backend (rooted at
 //    `<cfg.data_dir>/storage`), intercepting every vtable call to emit a
 //    structured log line BEFORE delegating to the inner backend.
+//    `col` is the immutable physical namespace, not the public collection name;
+//    forward it unchanged so renaming a collection never relocates its objects.
 //
 //    The `zigbase.Storage.VTable` has exactly four function pointers:
 //      put(ctx, io, col, record_id, filename, bytes) anyerror!void

@@ -1,4 +1,5 @@
 """Opt-in read-only inventory against actual SQLite and local/S3 storage."""
+from contextlib import closing
 import hashlib
 import json
 import os
@@ -19,16 +20,27 @@ def inventory_binary():
 
 
 @pytest.fixture
-def inventory_data(tmp_path):
-    # A minimal live schema, without running the server or its migrations.
-    with sqlite3.connect(tmp_path / "data.db") as conn:
-        conn.execute('''CREATE TABLE _collections (
-            id TEXT PRIMARY KEY, name TEXT, type TEXT, system INTEGER,
-            schema TEXT, indexes TEXT, listRule TEXT, viewRule TEXT, createRule TEXT,
-            updateRule TEXT, deleteRule TEXT, created TEXT, updated TEXT, options TEXT)''')
-        fields = json.dumps([{"id": "photo", "name": "photo", "type": "file", "options": {"maxSelect": 1}}])
-        conn.execute("INSERT INTO _collections VALUES ('images','images','base',0,?,'[]',NULL,NULL,NULL,NULL,NULL,'','','{}')", (fields,))
-        conn.execute("CREATE TABLE images (id TEXT PRIMARY KEY, created TEXT, updated TEXT, photo TEXT)")
+def inventory_data(tmp_path, inventory_binary):
+    # Build genuine engine metadata so new internal columns/migrations cannot
+    # silently turn every reference lookup into the fail-closed unknown case.
+    schema = tmp_path / "schema.json"
+    schema.write_text(json.dumps({"zigbaseSchema": 1, "collections": [{
+        "name": "images", "type": "base", "fields": [
+            {"id": "photo", "name": "photo", "type": "file", "options": {"maxSelect": 1}},
+        ], "indexes": [], "listRule": None, "viewRule": None,
+        "createRule": None, "updateRule": None, "deleteRule": None, "options": {},
+    }]}))
+    result = subprocess.run(
+        [inventory_binary, "schema", "apply", str(schema), "--data-dir", str(tmp_path)],
+        env={**{key: value for key, value in os.environ.items() if not key.startswith("ZIGBASE_")},
+             "ZIGBASE_JWT_SECRET": "inventory-fixture-secret-not-for-production"},
+        capture_output=True, text=True, timeout=10,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    # Bootstrap has exited; preserve its maintenance lock outside the test root
+    # so tests can choose a fresh directory or a storage-root symlink.
+    (tmp_path / "storage").rename(tmp_path / "bootstrap-storage")
+    with closing(sqlite3.connect(tmp_path / "data.db")) as conn, conn:
         conn.execute("INSERT INTO images VALUES ('r1','','','a.png')")
     return tmp_path
 
@@ -39,6 +51,38 @@ def inventory(binary, data, *args, env=None):
                             capture_output=True, text=True, timeout=10)
     assert result.returncode == 0, result.stderr
     return json.loads(result.stdout)
+
+
+@pytest.mark.parametrize("command", [("inventory",), ("reconcile",), ("reconcile", "--apply")])
+@pytest.mark.parametrize("empty", [False, True])
+@pytest.mark.parametrize("missing", ["rename_epoch", "storage_namespaces"])
+def test_old_metadata_fails_explicitly_without_mutation(inventory_binary, inventory_data, command, empty, missing):
+    data = inventory_data
+    root = data / "storage" / "images" / "r1"
+    root.mkdir(parents=True)
+    blob = root / "a.png"
+    blob.write_bytes(b"kept")
+    with closing(sqlite3.connect(data / "data.db")) as conn, conn:
+        if missing == "rename_epoch":
+            conn.execute("ALTER TABLE _collections DROP COLUMN rename_epoch")
+            conn.execute("DELETE FROM _migrations WHERE name='0027_collection_rename_epoch'")
+        else:
+            conn.execute("DROP TABLE _storage_namespaces")
+            conn.execute("DELETE FROM _migrations WHERE name='0028_storage_namespaces'")
+        if empty:
+            conn.execute("DELETE FROM _collections")
+    before = (data / "data.db").read_bytes()
+    result = subprocess.run(
+        [inventory_binary, "files", *command, "--data-dir", str(data)],
+        env={**os.environ, "ZIGBASE_DB_URL": "", "ZIGBASE_S3_BUCKET": ""},
+        capture_output=True, text=True, timeout=10,
+    )
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert result.stdout == ""
+    assert "CollectionMetadataUnavailable" in result.stderr
+    assert "run migrations" in result.stderr
+    assert (data / "data.db").read_bytes() == before
+    assert blob.read_bytes() == b"kept"
 
 
 def test_local_inventory_is_paginated_scoped_and_read_only(inventory_binary, inventory_data):
@@ -144,7 +188,7 @@ def test_inventory_counts_expired_hidden_file_references(inventory_binary, inven
     record = data / "storage" / "images" / "r1"
     record.mkdir(parents=True)
     (record / "a.png").write_bytes(b"abc")
-    with sqlite3.connect(data / "data.db") as conn:
+    with closing(sqlite3.connect(data / "data.db")) as conn, conn:
         conn.execute("ALTER TABLE images ADD COLUMN expires TEXT")
         conn.execute("UPDATE images SET expires='1970-01-01T00:00:00Z'")
         fields = [

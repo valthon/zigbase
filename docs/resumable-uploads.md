@@ -31,6 +31,12 @@ The aggregate bound covers retained payloads, **not total RSS**: HTTP bodies, re
 
 ## Protocol
 
+Offline `renameCollection` migrations relink both durable target names and auth
+collection bindings, checking stable IDs before mutation. Offsets and payload bytes
+remain unchanged; physical file prefixes are immutable. Stop every process before
+the migration, restart, sign in again, and continue the upload with fresh auth.
+Process-local sessions do not survive that restart.
+
 Every operation requires a fresh `Authorization: Bearer …` authentication. Cookie credentials alone are ignored. Session IDs contain OS randomness but **are not bearer authorization**: only the same authenticated principal in the same auth collection can use them. IDs appear in request paths and may appear in normal access logs; protect bearer credentials and never log Authorization headers. No stored privileges or tenant roles are reused at commit.
 
 1. `POST /api/collections/{collection}/records/{record}/uploads` with JSON `{ "field": "attachment", "filename": "report.txt", "length": 4, "mimetype": "text/plain" }`. `mimetype` is optional and advisory; normal content sniffing applies at commit. Creation preauthorizes the existing record with an empty proposed update, before field-shape validation and reserving memory. Declared length exceeding the current file field's `maxSize` returns `413` without consuming slots or payload quota; commit checks current constraints again. Rules that require proposed body fields may deny creation; this slice does not accept accompanying record edits. Success is `201` with `{id, offset, length, expiresAt, state, durability}`. `offset` starts at zero, `state` is `receiving`, and `durability` is `process-local` for RAM sessions or `sqlite-restart` with SQLite persistence enabled.

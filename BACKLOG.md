@@ -61,7 +61,7 @@ copy, examples, and tests with the implementation rather than in follow-up PRs.
 - [x] Log authoritative index changes and diagnose startup failures by collection/index.
 - [x] Validate prospective access-rule field/relation references in schema apply and REST.
 - [x] Cover retained cross-collection rules and explain whole-snapshot validation.
-- [ ] Explicit collection rename spanning tables, relations, FTS, storage keys, and URLs.
+- [x] Explicit offline collection rename: database/auth/search references and immutable storage namespaces across file consumers, durable uploads/cleanup, thumbnails, and reconciliation. Old URLs/topics intentionally break pre-v1; reserved physical prefixes are never automatically reclaimed.
 
 ## System migrations (#398)
 
