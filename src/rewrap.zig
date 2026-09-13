@@ -538,7 +538,12 @@ test "rewrapColumn succeeds on a searchable+encrypted collection (FTS triggers i
         },
     };
     const col = try collections.create(a, io, &d, def);
-    try fts.ensureIndex(a, &d, col); // provision the FTS5 shadow table + AFTER UPDATE trigger
+    if (fts.enabled) {
+        try fts.ensureIndex(a, &d, col); // provision the FTS5 shadow table + AFTER UPDATE trigger
+    } else {
+        // Disabling search must not disable encrypted-field key rotation.
+        try std.testing.expectError(error.SearchDisabled, fts.ensureIndex(a, &d, col));
+    }
 
     // Seed a v1 envelope in the encrypted column (with a searchable title present).
     const old = field_policy.Cipher.fromEnv(io, "oldkey");

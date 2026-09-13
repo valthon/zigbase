@@ -655,6 +655,7 @@ fn searchableBase(a: std.mem.Allocator, d: *db.Db) !schema.Collection {
 }
 
 test "records.list full-text search on a tenant-owned collection returns only the caller's account rows" {
+    if (comptime !fts.enabled) return error.SkipZigTest;
     var d = try db.Db.openMemory();
     defer d.close();
     const a = std.testing.allocator;
@@ -690,6 +691,7 @@ test "records.list full-text search on a tenant-owned collection returns only th
 }
 
 test "records.list full-text search respects the view ability (denied rows absent from results)" {
+    if (comptime !fts.enabled) return error.SkipZigTest;
     var d = try db.Db.openMemory();
     defer d.close();
     const a = std.testing.allocator;
@@ -723,6 +725,7 @@ test "records.list full-text search respects the view ability (denied rows absen
 }
 
 test "records.list full-text search ranks by bm25 and binds a basic-operator query safely" {
+    if (comptime !fts.enabled) return error.SkipZigTest;
     var d = try db.Db.openMemory();
     defer d.close();
     const a = std.testing.allocator;
@@ -758,6 +761,7 @@ test "records.list full-text search ranks by bm25 and binds a basic-operator que
 }
 
 test "records.list full-text search intersects with the filter (search still constrains)" {
+    if (comptime !fts.enabled) return error.SkipZigTest;
     var d = try db.Db.openMemory();
     defer d.close();
     const a = std.testing.allocator;
@@ -790,6 +794,7 @@ test "records.list full-text search intersects with the filter (search still con
 }
 
 test "records.list search that sanitizes to empty returns no rows (not the full scoped list)" {
+    if (comptime !fts.enabled) return error.SkipZigTest;
     var d = try db.Db.openMemory();
     defer d.close();
     const a = std.testing.allocator;
@@ -811,4 +816,38 @@ test "records.list search that sanitizes to empty returns no rows (not the full 
     var real = try records.list(a, &d, col, .{ .search = "hello", .rule = listRuleFilter(col, &anon), .rctx = &anon });
     defer real.deinit(a);
     try std.testing.expectEqual(@as(usize, 1), real.items.len);
+}
+
+test "SQLite without FTS rejects search while ordinary lists retain tenant and ability scopes" {
+    if (comptime fts.enabled) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try std.testing.expectError(error.SearchDisabled, searchableBase(a, &d));
+    const base = (try collections.getByName(a, &d, "posts")).?;
+    defer base.deinit(a);
+    var col = withRule(withAbility(base, "editor"), "@public");
+    col.options.tenant_field = "owner";
+    try d.exec("INSERT INTO posts(id,title,owner) VALUES ('r1','budget','acc1'),('r2','budget','acc2');");
+    var index = try d.prepare("SELECT 1 FROM sqlite_schema WHERE name='posts_fts';");
+    defer index.finalize();
+    try std.testing.expect(!try index.step());
+    const memberships = [_]request.Membership{.{ .account = "acc1", .role = "editor" }};
+    const allowed = request.RequestContext{ .tenancy_enabled = true, .account_id = "acc1", .memberships = &memberships };
+    const denied = request.RequestContext{ .tenancy_enabled = true, .account_id = "acc1" };
+    for ([_]*const request.RequestContext{ &allowed, &denied }) |ctx| {
+        for ([_][]const u8{ "budget", "budget OR report", "AND" }) |term| {
+            try std.testing.expectError(error.SearchDisabled, records.list(a, &d, col, .{
+                .search = term,
+                .filter = "owner = \"acc1\"",
+                .rule = listRuleFilter(col, ctx),
+                .rctx = ctx,
+            }));
+        }
+        // Empty search is ordinary listing, not an accidental unscoped fallback.
+        var rows = try records.list(a, &d, col, .{ .search = " ", .rule = listRuleFilter(col, ctx), .rctx = ctx });
+        defer rows.deinit(a);
+        try std.testing.expectEqual(@as(usize, if (ctx == &allowed) 1 else 0), rows.items.len);
+        if (rows.items.len > 0) try std.testing.expectEqualStrings("r1", rows.items[0].object.get("id").?.string);
+    }
 }
