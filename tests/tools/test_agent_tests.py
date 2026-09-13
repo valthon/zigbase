@@ -34,6 +34,7 @@ def test_inventory_is_static_and_has_exact_runnable_selectors(tmp_path, monkeypa
     source.write_text(f"open({str(marker)!r}, 'w').close()\ndef test_example(): pass\n")
     monkeypatch.setattr(agent, "ROOT", tmp_path)
     monkeypatch.setattr(agent, "MODULES", ("test_example.py",))
+    monkeypatch.setattr(agent, "SDK_SUITES", ())
     inventory = agent.inventory()
     assert [item["id"] for item in inventory["items"]] == [
         "test_example.py",
@@ -60,6 +61,11 @@ def test_checkout_inventory_cli():
     assert any(item["requirements"]["browser"] == "chromium" for item in items)
     assert any(item["kind"] == "module" for item in items)
     assert any(item["kind"] == "function" for item in items)
+    suite = next(item for item in items if item["id"] == "clients/typescript::unit")
+    assert suite["kind"] == "suite" and suite["runner"] == "vitest"
+    assert suite["cwd"] == "clients/typescript"
+    assert suite["requirements"]["tools"]["node"] == "24"
+    assert not suite["requirements"]["binary"]["build_if_missing"]
 
 
 @pytest.mark.parametrize(
@@ -72,6 +78,8 @@ def test_checkout_inventory_cli():
         "tests/admin/test_schema.py;touch x",
         "tests/admin/test_schema.py::test_missing",
         "tests/admin/test_schema.py -k foo",
+        "clients/typescript::unit --watch",
+        "clients/typescript::integration",
     ],
 )
 def test_unknown_selector_never_starts_process(selector, monkeypatch):
@@ -221,11 +229,44 @@ def test_child_environment_is_explicit(monkeypatch):
     monkeypatch.setenv("PYTEST_PLUGINS", "surprise")
     monkeypatch.setenv("ZIGBASE_SERVE_BACKGROUND", "1")
     monkeypatch.setenv("MISE_AUTO_INSTALL", "true")
+    monkeypatch.setenv("NODE_OPTIONS", "--require surprise")
     env = agent.child_environment()
     assert "PYTEST_ADDOPTS" not in env and "PYTEST_PLUGINS" not in env
     assert env["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] == "1"
     assert env["ZIGBASE_SERVE_BACKGROUND"] == "0"
     assert env["MISE_AUTO_INSTALL"] == "false"
+    assert "NODE_OPTIONS" not in env
+
+
+def test_sdk_suite_uses_fixed_command_and_package_directory(monkeypatch):
+    calls = []
+
+    def execute(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return {"outcome": "passed"}
+
+    monkeypatch.setattr(agent, "execute", execute)
+    result = agent.run("clients/typescript::unit", 17, 1234)
+    argv, options = calls[0]
+    assert argv == [
+        "mise", "exec", "node@24", "--", "node",
+        "node_modules/vitest/vitest.mjs", "run", "--config", "vitest.config.ts",
+        "--maxWorkers=2", "--minWorkers=1",
+    ]
+    assert options["cwd"] == ROOT / "clients/typescript"
+    assert options["timeout"] == 17 and options["output_limit"] == 1234
+    assert result["cwd"] == "clients/typescript"
+
+
+def test_sdk_directory_escape_never_starts_process(tmp_path, monkeypatch):
+    checkout = tmp_path / "checkout"
+    (checkout / "clients").mkdir(parents=True)
+    (checkout / "clients/typescript").symlink_to(tmp_path, target_is_directory=True)
+    monkeypatch.setattr(agent, "ROOT", checkout)
+    monkeypatch.setattr(agent, "MODULES", ())
+    monkeypatch.setattr(agent, "execute", lambda *a, **kw: pytest.fail("spawned"))
+    with pytest.raises(agent.ContractError, match="escapes"):
+        agent.run("clients/typescript::unit", 1, 1024)
 
 
 def test_actual_allowlisted_pytest_execution():
