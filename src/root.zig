@@ -401,6 +401,8 @@ test {
     _ = @import("server.zig");
     _ = @import("schema.zig");
     _ = @import("collections.zig");
+    _ = @import("collection_rename.zig");
+    _ = @import("collection_rename_indexes.zig");
     _ = @import("colcache.zig");
     _ = @import("schema_gen.zig");
     _ = @import("feature_cache.zig");

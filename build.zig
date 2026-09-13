@@ -629,6 +629,25 @@ pub fn build(b: *std.Build) void {
     const tests = b.addTest(.{ .root_module = zigbase_mod });
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run all tests");
+    const rollback_probe_mod = b.createModule(.{ .root_source_file = b.path("fixtures/rename-rollback/main.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    rollback_probe_mod.addImport("zigbase", bench_zigbase_mod);
+    const rollback_probe = b.addExecutable(.{ .name = "rename-rollback-probe", .root_module = rollback_probe_mod });
+    const rollback_step = b.step("test-rename-rollback", "Verify rename rollback failures stop the process before writer reuse");
+    for ([_]struct { fault: []const u8, message: ?[]const u8 }{
+        .{ .fault = "transaction", .message = "collection rename rollback failed:" },
+        .{ .fault = "rollback_savepoint", .message = "collection rename savepoint rollback failed:" },
+        .{ .fault = "release_savepoint", .message = "collection rename savepoint release failed:" },
+        .{ .fault = "normal", .message = null },
+        .{ .fault = "nested_normal", .message = null },
+    }) |case| {
+        const run = b.addRunArtifact(rollback_probe);
+        run.setEnvironmentVariable("ZIGBASE_ROLLBACK_FAULT", case.fault);
+        run.expectExitCode(if (case.message != null) 86 else 0);
+        if (case.message) |message| run.expectStdErrMatch(message) else run.expectStdErrEqual("");
+        run.expectStdOutEqual("");
+        rollback_step.dependOn(&run.step);
+    }
+    test_step.dependOn(rollback_step);
     // Two usize inputs cannot overflow u64 on a 32-bit target.
     if (target.result.ptrBitWidth() == 64) {
         for ([_][]const u8{ "overflow", "memory-overflow" }) |fixture| {

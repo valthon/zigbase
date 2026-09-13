@@ -59,7 +59,7 @@ copy, examples, and tests with the implementation rather than in follow-up PRs.
 - [x] Log authoritative index changes and diagnose startup failures by collection/index.
 - [x] Validate prospective access-rule field/relation references in schema apply and REST.
 - [x] Cover retained cross-collection rules and explain whole-snapshot validation.
-- [ ] Explicit collection rename spanning tables, relations, FTS, storage keys, and URLs.
+- [ ] Collection rename follow-on: immutable storage namespaces across local/S3/custom file consumers, resumable uploads, cleanup, thumbnails, and reconciliation. Offline database/auth/search rename is implemented; file-bearing collections remain explicitly rejected. Old URLs/topics intentionally break pre-v1.
 
 ## System migrations (#398)
 

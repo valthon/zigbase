@@ -408,6 +408,7 @@ fn snapshotSandbox(io: std.Io, col: schema.Collection, snapshot: std.json.Value)
     // `_collections` (conservative deny) because user collections were never present in the sandbox.
     try tmp.exec(migrations.collections_table_sql);
     try tmp.exec(migrations.collections_options_column_sql);
+    try tmp.exec(migrations.collections_rename_epoch_column_sql);
     // `collections.create` below bumps the schema-generation marker inside its transaction, so
     // the sandbox needs that table too. The bump is deliberately STRICT — it propagates rather
     // than tolerating a missing table — because a "table missing -> skip" fallback would mask a
@@ -1074,11 +1075,12 @@ test "F4: delete frame carries the private authz snapshot (stripped before clien
     // WS.write, so the client never sees the snapshot — covered by the hub authz tests above.)
 }
 
-test "R1-3: delete sandbox schema is minimal — 4 DDLs, not the migration suite" {
+test "R1-3: delete sandbox schema is minimal — 5 DDLs, not the migration suite" {
     var tmp = try db.Db.openMemory();
     defer tmp.close();
     try tmp.exec(migrations.collections_table_sql);
     try tmp.exec(migrations.collections_options_column_sql);
+    try tmp.exec(migrations.collections_rename_epoch_column_sql);
     try tmp.exec(migrations.schema_state_table_sql);
     try tmp.exec(migrations.schema_state_seed_sql);
     var st = try tmp.prepare("SELECT COUNT(*) FROM sqlite_master WHERE type='table';");
@@ -1101,6 +1103,7 @@ test "R1-3: the delete sandbox can actually run collections.create (marker table
     defer tmp.close();
     try tmp.exec(migrations.collections_table_sql);
     try tmp.exec(migrations.collections_options_column_sql);
+    try tmp.exec(migrations.collections_rename_epoch_column_sql);
     try tmp.exec(migrations.schema_state_table_sql);
     try tmp.exec(migrations.schema_state_seed_sql);
 

@@ -203,8 +203,17 @@ fn insertRow(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection) Engine
 }
 
 const select_cols =
-    \\SELECT "id","name","type","system","schema","indexes","listRule","viewRule","createRule","updateRule","deleteRule","created","updated","options" FROM "_collections"
+    \\SELECT "id","name","type","system","schema","indexes","listRule","viewRule","createRule","updateRule","deleteRule","created","updated","options","rename_epoch" FROM "_collections"
 ;
+
+/// Validate the current metadata projection without loading any collections.
+/// Read-only maintenance commands must reject an unmigrated schema before
+/// reporting per-object unknown references or invoking storage callbacks.
+pub fn checkReadSchema(w: *db.Db) db.DbError!void {
+    var st = try w.prepare(select_cols ++ " LIMIT 0;");
+    defer st.finalize();
+    _ = try st.step();
+}
 
 fn dupOptText(alloc: std.mem.Allocator, st: *db.Stmt, idx: c_int) !?[]const u8 {
     if (st.isNull(idx)) return null;
@@ -235,6 +244,7 @@ fn rowToCollection(alloc: std.mem.Allocator, st: *db.Stmt) EngineError!schema.Co
         .created = try alloc.dupe(u8, st.columnText(11)),
         .updated = try alloc.dupe(u8, st.columnText(12)),
         .options = try schema.optionsFromJson(alloc, st.columnText(13)),
+        .rename_epoch = st.columnInt(14),
     };
 }
 
@@ -267,6 +277,17 @@ pub fn get(alloc: std.mem.Allocator, w: *db.Db, id_or_name: []const u8) EngineEr
     var st = try w.prepare(sql);
     defer st.finalize();
     try st.bindText(1, id_or_name);
+    if (!try st.step()) return null;
+    return try loadOwned(alloc, &st);
+}
+
+/// Exact logical-name lookup, excluding the ID alias accepted by get.
+pub fn getByName(alloc: std.mem.Allocator, w: *db.Db, name: []const u8) EngineError!?schema.Collection {
+    const sql = try db.dbDialect(w).renumberPlaceholders(alloc, select_cols ++ " WHERE name = ?1 LIMIT 1;");
+    defer alloc.free(sql);
+    var st = try w.prepare(sql);
+    defer st.finalize();
+    try st.bindText(1, name);
     if (!try st.step()) return null;
     return try loadOwned(alloc, &st);
 }
@@ -364,7 +385,7 @@ pub fn update(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, id_or_name: []con
         try w.exec("PRAGMA foreign_keys=ON;");
     }
 
-    // Return a fully-owned reload on `alloc` (keyed on old.id — rename is unsupported), matching
+    // Return a fully-owned reload on `alloc` (name changes require Migrator.renameCollection), matching
     // the former hand-assembled `newc_full` but with every string/slice owned.
     return (try get(alloc, w, old.id)).?;
 }

@@ -2279,6 +2279,8 @@ fn runCliImpl(init: std.process.Init, dispatch: *const events.Dispatch, jobs: []
         .file_reconcile => |fa| {
             if (comptime build_options.file_inventory) {
                 fileReconcileRun(opts, allocator, init.io, init.environ_map, fa) catch |err| {
+                    if (err == error.CollectionMetadataUnavailable)
+                        std.log.err("cannot read current collection metadata; verify database permissions and run migrations before files reconcile", .{});
                     std.log.err("files reconcile: {s}; apply needs idle built-in local storage and SQLite. Stop all old/external writers; no mutation is rolled back.", .{@errorName(err)});
                     std.process.exit(1);
                 };
@@ -4524,6 +4526,7 @@ fn fileInventoryImpl(comptime opts: ServeOpts, allocator: std.mem.Allocator, io:
             error.S3InventoryRequiresS3Build => "S3 is configured; rebuild with -Ds3=true together with -Dfile-inventory=true",
             error.PostgresInventoryRequiresPostgresBuild => "PostgreSQL is configured; rebuild with -Dpostgres=true together with -Dfile-inventory=true",
             error.InvalidInventoryUtf8 => "an object key or cursor is not UTF-8; use backend-native byte-safe inventory to inspect it",
+            error.CollectionMetadataUnavailable => "cannot read current collection metadata; verify database permissions and run migrations before files inventory",
             else => "inspection failed; check database and storage configuration, read permissions, and backend availability",
         };
         std.log.err("files inventory: {s} ({s})", .{ advice, @errorName(err) });
@@ -4543,6 +4546,7 @@ fn fileInventoryRun(comptime opts: ServeOpts, allocator: std.mem.Allocator, io: 
     var conn = try db.openInspectionConnection(allocator, io, target);
     defer conn.close();
     if (backend == .postgres) try conn.exec("SET default_transaction_read_only = on;");
+    @import("collections.zig").checkReadSchema(&conn) catch return error.CollectionMetadataUnavailable;
     var plugin = try opts.StoragePlugin.create(allocator, io, cfg);
     defer plugin.deinit();
     const storage = plugin.interface();
@@ -4581,6 +4585,7 @@ fn fileReconcileRun(comptime opts: ServeOpts, allocator: std.mem.Allocator, io: 
         try conn.beginImmediate();
     }
     defer if (conn.inTransaction()) conn.rollback() catch |err| std.log.err("reconciliation rollback failed: {s}", .{@errorName(err)});
+    @import("collections.zig").checkReadSchema(&conn) catch return error.CollectionMetadataUnavailable;
     var local = files_storage.LocalStorage.init(root_path);
     const page = try local.storage().inventory(io, allocator, fa.cursor, fa.limit);
     defer page.deinit(allocator);

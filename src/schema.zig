@@ -112,6 +112,8 @@ pub const Collection = struct {
     options: CollectionOptions = .{},
     created: []const u8 = "",
     updated: []const u8 = "",
+    /// Engine-owned capability epoch; not accepted or exported by schema JSON.
+    rename_epoch: i64 = 0,
 
     /// Free a FULLY-OWNED collection graph — exactly the shape returned by
     /// `collections.get`/`create`/`update` (every string/slice duped onto `alloc`

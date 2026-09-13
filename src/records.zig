@@ -3095,7 +3095,14 @@ pub fn list(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, q: L
         // rejected when replayed with a different search (else the boundary would straddle a
         // different result set). Vector + cursor is rejected earlier, so the vector spec can't reach
         // here. `q.filter`/`q.rule` already bind the rest of the result-set shape.
-        const fh = keyset.filterHash(q.filter, q.rule, search_term_hash);
+        var cursor_scope = std.hash.Wyhash.init(keyset.filterHash(q.filter, q.rule, search_term_hash));
+        cursor_scope.update(col.id);
+        cursor_scope.update(&.{0});
+        cursor_scope.update(col.name);
+        var epoch: [8]u8 = undefined;
+        std.mem.writeInt(i64, &epoch, col.rename_epoch, .little);
+        cursor_scope.update(&epoch);
+        const fh = cursor_scope.final();
 
         // Decode the boundary cursor (if any). first_page = no token supplied.
         // `decodeCursor` runs on the scratch arena: the decoded boundary keys are read below to
@@ -3509,6 +3516,65 @@ test "cursor: signed token round-trips across pages and rejects tampering" {
     defer a.free(bad);
     bad[0] = if (bad[0] == 'A') 'B' else 'A';
     try std.testing.expectError(error.CursorSig, list(a, &d, col, .{ .sort = "created", .limit = 2, .cursor = bad, .cursorToken = .signed, .signingSecret = secret }));
+}
+
+test "cursor: offline rename rejects old stateless signed and stateful tokens" {
+    inline for (.{ .stateless, .signed, .stateful }) |mode| {
+        var d = try db.Db.openMemory();
+        defer d.close();
+        const a = std.testing.allocator;
+        const col = try seedPosts(&d, a);
+        defer col.deinit(a);
+        try seedSeq(&d, 4);
+        const secret = "a-32-byte-minimum-test-secret!!!!";
+        var first = try list(a, &d, col, .{ .sort = "created", .limit = 2, .cursorMode = true, .cursorToken = mode, .signingSecret = secret, .io = std.testing.io, .writer = &d });
+        defer first.deinit(a);
+        try @import("collection_rename.zig").rename(a, std.testing.io, &d, "posts", "articles");
+        const renamed = (try collections.get(a, &d, "articles")).?;
+        defer renamed.deinit(a);
+        try std.testing.expectError(if (mode == .stateful) error.CursorState else error.CursorFilter, list(a, &d, renamed, .{ .sort = "created", .limit = 2, .cursor = first.nextCursor.?, .cursorToken = mode, .signingSecret = secret, .io = std.testing.io, .writer = &d }));
+        var fresh = try list(a, &d, renamed, .{ .sort = "created", .limit = 2, .cursorMode = true, .cursorToken = mode, .signingSecret = secret, .io = std.testing.io, .writer = &d });
+        defer fresh.deinit(a);
+        try std.testing.expectEqualStrings("r001", fresh.items[0].object.get("id").?.string);
+        try @import("collection_rename.zig").rename(a, std.testing.io, &d, "articles", "posts");
+        const reversed = (try collections.getByName(a, &d, "posts")).?;
+        defer reversed.deinit(a);
+        try std.testing.expectEqual(@as(i64, 2), reversed.rename_epoch);
+        for ([_][]const u8{ first.nextCursor.?, fresh.nextCursor.? }) |token| {
+            try std.testing.expectError(if (mode == .stateful) error.CursorState else error.CursorFilter, list(a, &d, reversed, .{ .sort = "created", .limit = 2, .cursor = token, .cursorToken = mode, .signingSecret = secret, .io = std.testing.io, .writer = &d }));
+        }
+        var reverse_first = try list(a, &d, reversed, .{ .sort = "created", .limit = 2, .cursorMode = true, .cursorToken = mode, .signingSecret = secret, .io = std.testing.io, .writer = &d });
+        defer reverse_first.deinit(a);
+        var reverse_next = try list(a, &d, reversed, .{ .sort = "created", .limit = 2, .cursor = reverse_first.nextCursor.?, .cursorToken = mode, .signingSecret = secret, .io = std.testing.io, .writer = &d });
+        defer reverse_next.deinit(a);
+        try std.testing.expectEqualStrings("r003", reverse_next.items[0].object.get("id").?.string);
+    }
+}
+
+test "cursor: rollback and unrelated renames preserve capability epoch" {
+    inline for (.{ .stateless, .signed, .stateful }) |mode| {
+        var d = try db.Db.openMemory();
+        defer d.close();
+        const a = std.testing.allocator;
+        const col = try seedPosts(&d, a);
+        defer col.deinit(a);
+        try seedSeq(&d, 4);
+        const secret = "a-32-byte-minimum-test-secret!!!!";
+        var first = try list(a, &d, col, .{ .sort = "created", .limit = 2, .cursorMode = true, .cursorToken = mode, .signingSecret = secret, .io = std.testing.io, .writer = &d });
+        defer first.deinit(a);
+        try d.begin();
+        try @import("collection_rename.zig").rename(a, std.testing.io, &d, "posts", "articles");
+        try d.rollback();
+        const other = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "other", .fields = &.{} });
+        defer other.deinit(a);
+        try @import("collection_rename.zig").rename(a, std.testing.io, &d, "other", "elsewhere");
+        const unchanged = (try collections.getByName(a, &d, "posts")).?;
+        defer unchanged.deinit(a);
+        try std.testing.expectEqual(@as(i64, 0), unchanged.rename_epoch);
+        var next = try list(a, &d, unchanged, .{ .sort = "created", .limit = 2, .cursor = first.nextCursor.?, .cursorToken = mode, .signingSecret = secret, .io = std.testing.io, .writer = &d });
+        defer next.deinit(a);
+        try std.testing.expectEqualStrings("r003", next.items[0].object.get("id").?.string);
+    }
 }
 
 test "cursor: stateful token stores state, walks pages, and 410s on unknown id" {
