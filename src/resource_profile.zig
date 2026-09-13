@@ -58,6 +58,8 @@ pub const Report = struct {
 pub const Envelope = struct {
     basis: []const u8 = "compiled_configuration_not_rss",
     http_admission_max_requests: ?u32,
+    /// Shared count of synchronous HTTP callbacks and outstanding memory jobs.
+    coordinated_admission_max_work: ?u32 = null,
     http_body_limit_source: []const u8 = "runtime_ZIGBASE_MAX_UPLOAD_SIZE",
     retained_reader_cap: usize,
     sqlite_cache_target_bytes_per_connection: ?u64,
@@ -90,6 +92,7 @@ pub const EnvelopeInput = struct {
     memory_job_workers: usize,
     job_stack_bytes: usize,
     admission_max_requests: ?u32 = null,
+    admission_max_work: ?u32 = null,
     resumable: ?Envelope.Resumable = null,
 };
 
@@ -98,6 +101,7 @@ pub fn envelope(comptime input: EnvelopeInput) Envelope {
     const cache_bytes: ?u64 = if (cacheTargetKib(input.cache_kib)) |kib| @as(u64, kib) * 1024 else null;
     return .{
         .http_admission_max_requests = input.admission_max_requests,
+        .coordinated_admission_max_work = input.admission_max_work,
         .retained_reader_cap = retained,
         .sqlite_cache_target_bytes_per_connection = cache_bytes,
         .sqlite_writer_and_retained_readers_cache_target_bytes = if (cache_bytes) |bytes| bytes * (retained + 1) else null,

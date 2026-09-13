@@ -296,6 +296,17 @@ high-water and rejected counts; this endpoint obeys the same limit. Omission
 compiles out the checks and counters. This does not bound transport-buffered
 bodies, long-lived realtime sessions, background jobs, or total RSS.
 
+To coordinate HTTP with outstanding memory jobs and `app.submit`, additionally
+build with `-Dcoordinated-admission=true` and set `.admission.max_work = 16`
+alongside `.max_requests`. Embedded builds forward `.@"coordinated-admission" = true`
+to the ZigBase dependency. Queued/running jobs retain one permit through retries;
+saturation immediately returns `error.QueueFull` for jobs or the HTTP overload
+response. Jobs can consume all capacity, so allow room for handlers that enqueue
+work and handle rejection. Shared diagnostics expose `work_limit`, `jobs`,
+`work_high_water`, and `jobs_rejected`; `resources` reports the compiled ceiling.
+This optional integration compiles out without its build flag. It counts work,
+not bytes, and excludes durable jobs, transport buffers and long-lived realtime.
+
 Bound long-lived realtime sessions separately with comptime
 `.realtime = .{ .max_connections = 256 }`. WS and SSE share the positive cap;
 the default remains 10,000 and excess upgrades receive 503. Inspect the effective

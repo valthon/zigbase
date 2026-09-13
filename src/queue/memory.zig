@@ -4,7 +4,9 @@
 //! lives only in RAM, so a crash drops it. The ring is bounded: when it is full, enqueue
 //! returns error.QueueFull instead of blocking (a blocking policy could deadlock when a
 //! handler enqueues from a pool worker) or spawning unbounded threads. `Pool.submitThunk`
-//! also carries `app.submit` tasks on this same pool — `install()` wires it onto
+//! and enqueue also return error.QueueFull when the optional shared .admission.max_work
+//! budget is full, even if the ring has space. `Pool.submitThunk` also carries
+//! `app.submit` tasks on this same pool — `install()` wires it onto
 //! `app.submit_fn`, and `App.submit` passes `self.memory_pool.?` (both landed together in
 //! Task 4 so they can never be observed out of sync). A retrying job holds one worker for
 //! the whole backoff — size retry policies accordingly; use a `durable` queue when a job
@@ -20,6 +22,7 @@ const App = @import("../app.zig").App;
 const Ctx = @import("../ctx.zig").Ctx;
 const entropy = @import("../entropy.zig");
 const scheduler_mod = @import("../scheduler.zig");
+const coordinated_admission = @import("build_options").coordinated_admission;
 
 const QueueDef = queue.QueueDef;
 const RetryPolicy = queue.RetryPolicy;
@@ -87,6 +90,8 @@ const Task = struct {
 
     fn destroy(self: *Task) void {
         const a = self.app.allocator;
+        const admission = if (comptime coordinated_admission) self.app.admission else null;
+        defer if (admission) |state| state.releaseJob();
         switch (self.kind) {
             .job => |j| a.free(j.payload),
             .submit => |s| a.free(s.name),
@@ -251,10 +256,14 @@ pub const Pool = struct {
     }
 
     /// `app.submit` entry point — matches `app.submit_fn`'s signature; `install()` wires it
-    /// on. Copies `name` (the caller's slice may be request-arena-backed and dead before
+    /// on. Returns error.QueueFull if the ring or optional shared admission budget is
+    /// full. Copies `name` (the caller's slice may be request-arena-backed and dead before
     /// the task runs — the old detached-thread code captured it unsafely).
     pub fn submitThunk(ptr: *anyopaque, name: []const u8, task: events.JobTask) anyerror!void {
         const self: *Pool = @ptrCast(@alignCast(ptr));
+        const admission = if (comptime coordinated_admission) self.app.admission else null;
+        if (admission) |state| if (!state.acquireJob()) return error.QueueFull;
+        errdefer if (admission) |state| state.releaseJob();
         const t = try self.app.allocator.create(Task);
         errdefer self.app.allocator.destroy(t);
         const name_copy = try self.app.allocator.dupe(u8, name);
@@ -269,10 +278,14 @@ fn poolFrom(app: *App) ?*Pool {
 }
 
 /// Enqueue a memory job. With an installed Pool (serving): copy `payload`, queue it on the
-/// bounded worker ring, return immediately (error.QueueFull when the ring is full — reject,
-/// never block). Without a pool (unit tests / CLI helpers): run the job INLINE, synchronously.
+/// bounded worker ring, return immediately. error.QueueFull means the ring or optional
+/// shared .admission.max_work budget is full (reject, never block). Without a pool
+/// (unit tests / CLI helpers): run INLINE, still subject to any shared admission budget.
 /// At-most-once across restart either way.
 pub fn enqueue(app: *App, def: QueueDef, handler: queue.JobHandler, payload: []const u8) !void {
+    const admission = if (comptime coordinated_admission) app.admission else null;
+    if (admission) |state| if (!state.acquireJob()) return error.QueueFull;
+    errdefer if (admission) |state| state.releaseJob();
     if (poolFrom(app)) |p| {
         const t = try app.allocator.create(Task);
         errdefer app.allocator.destroy(t);
@@ -281,6 +294,7 @@ pub fn enqueue(app: *App, def: QueueDef, handler: queue.JobHandler, payload: []c
         t.* = .{ .app = app, .kind = .{ .job = .{ .handler = handler, .policy = def.retry, .payload = pcopy } } };
         return p.push(t);
     }
+    defer if (admission) |state| state.releaseJob();
     _ = runWithRetry(app, handler, payload, def.retry);
 }
 
@@ -330,6 +344,86 @@ fn onErrM(ev: *events.ErrorEvent) void {
 
 fn testApp() App {
     return App{ .allocator = testing.allocator, .io = testing.io, .pool = undefined };
+}
+
+test "shared admission returns reservations on allocation and shutdown failures" {
+    if (!coordinated_admission) return error.SkipZigTest;
+    var state = @import("../admission.zig").State.init(testing.io, .{ .max_requests = 1, .max_work = 2 });
+    var app = testApp();
+    app.admission = &state;
+    var pool = Pool.init(&app);
+    pool.install(&app);
+    defer pool.stop();
+    const def = QueueDef{ .name = "default", .backend = .memory };
+    for (0..2) |fail_index| {
+        var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = fail_index });
+        app.allocator = failing.allocator();
+        defer app.allocator = testing.allocator;
+        try testing.expectError(error.OutOfMemory, enqueue(&app, def, okH, "payload"));
+        try testing.expectEqual(@as(u32, 0), state.snapshot().jobs);
+    }
+    app.allocator = testing.allocator;
+    pool.shutdown.store(true, .release);
+    try testing.expectError(error.ShuttingDown, enqueue(&app, def, okH, "payload"));
+    try testing.expectEqual(@as(u32, 0), state.snapshot().jobs);
+}
+
+test "shared admission bounds queued and running jobs then recovers on drain" {
+    if (!coordinated_admission) return error.SkipZigTest;
+    var state = @import("../admission.zig").State.init(testing.io, .{ .max_requests = 2, .max_work = 3 });
+    var app = testApp();
+    app.admission = &state;
+    var pool = try Pool.initSized(&app, 1, 0);
+    pool.install(&app);
+    g_gate.store(false, .release);
+    g_blocked.store(0, .release);
+    defer {
+        g_gate.store(true, .release);
+        pool.stop();
+    }
+    const def = QueueDef{ .name = "default", .backend = .memory };
+    try testing.expect(state.acquire());
+    defer state.release();
+    try enqueue(&app, def, blockingH, "{}");
+    try enqueue(&app, def, okH, "{}");
+    try testing.expectError(error.QueueFull, enqueue(&app, def, okH, "{}"));
+    try testing.expectEqual(@as(u32, 2), state.snapshot().jobs);
+    try testing.expect(!state.acquire());
+    g_gate.store(true, .release);
+    pool.stop();
+    try testing.expectEqual(@as(u32, 0), state.snapshot().jobs);
+    try testing.expect(state.acquire());
+    state.release();
+}
+
+test "shared submit and ring rejection return exactly their own reservations" {
+    if (!coordinated_admission) return error.SkipZigTest;
+    const S = struct {
+        fn task(_: *Ctx, _: *events.JobEvent) anyerror!void {}
+    };
+    var state = @import("../admission.zig").State.init(testing.io, .{ .max_requests = 1, .max_work = Pool.capacity + 4 });
+    var app = testApp();
+    app.admission = &state;
+    var pool = try Pool.initSized(&app, 1, 0);
+    pool.install(&app);
+    g_gate.store(false, .release);
+    g_blocked.store(0, .release);
+    defer {
+        g_gate.store(true, .release);
+        pool.stop();
+    }
+    try enqueue(&app, .{ .name = "default" }, blockingH, "{}");
+    for (0..2000) |_| {
+        if (g_blocked.load(.acquire) == 1) break;
+        try app.io.sleep(std.Io.Duration.fromMilliseconds(1), .awake);
+    }
+    try testing.expectEqual(@as(usize, 1), g_blocked.load(.acquire));
+    for (0..Pool.capacity) |_| try app.submit("queued", S.task);
+    try testing.expectError(error.QueueFull, app.submit("overflow", S.task));
+    try testing.expectEqual(@as(u32, Pool.capacity + 1), state.snapshot().jobs);
+    g_gate.store(true, .release);
+    pool.stop();
+    try testing.expectEqual(@as(u32, 0), state.snapshot().jobs);
 }
 
 test "sized memory pool validates workers and remains allocation-free while unused" {

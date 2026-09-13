@@ -12,7 +12,10 @@ copy, examples, and tests with the implementation rather than in follow-up PRs.
 - [ ] Coordinated resource budgets, bounded queues, backpressure, and saturation diagnostics.
   Implemented slice: opt-in synchronous HTTP admission, immediate overload rejection,
   and saturation counters; the shared WS/SSE connection cap is comptime-tunable
-  with effective cap/count reporting. Transport buffers and cross-subsystem budget
+  with effective cap/count reporting. Build-gated `.admission.max_work` now shares
+  a process-local count across synchronous HTTP and outstanding memory-job/submit
+  work, including queued tasks and retries, with immediate rejection and counters.
+  Transport buffers, byte/RSS budgets, durable jobs and broader cross-subsystem
   coordination remain outside these gates.
   Memory-job/submit workers now have independent comptime counts and share the
   configured job stack size, with lazy startup and unchanged bounded-ring rejection.
