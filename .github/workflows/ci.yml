@@ -661,9 +661,8 @@ jobs:
       - name: Typecheck
         working-directory: clients/python
         run: mise exec python@3.13 -- python -m mypy src
-      - name: Unit tests
-        working-directory: clients/python
-        run: mise exec python@3.13 -- python -m pytest -q -m "not integration"
+      - name: Unit tests through bounded agent wrapper
+        run: mise exec python@3.13 -- python tests/sdk_runner/test_agent_python.py
       - name: Integration tests
         working-directory: clients/python
         run: mise exec python@3.13 -- python -m pytest -q -m integration tests/integration

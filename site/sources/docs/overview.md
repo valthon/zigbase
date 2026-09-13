@@ -158,7 +158,7 @@ remain explicitly unknown. This is not an execution plan or safe-rollback guaran
 Like route discovery, it is compiled out with `-Ddev-tools=false`.
 
 Contributors in the ZigBase checkout can also use `tools/agent_tests.py` for
-static JSON test inventory and focused pytest or TypeScript SDK unit-suite execution with time and combined
+static JSON test inventory and focused pytest or TypeScript/Python SDK unit-suite execution with time and combined
 output limits. It runs only advertised module/function/suite selectors and reports
 structured process outcomes. Its selection-only `affected --base <commit>` command uses bounded
 Git inspection and explicit dependency rules to suggest module checks after edits;
@@ -166,7 +166,9 @@ unmapped paths fall back to the whole allowlist with explicit coverage gaps. It
 does not infer complete test coverage or replace CI. The allowlist includes local performance-contract, parity-replay
 and agent-tool checks that need no Zig build or browser; local Git/subprocess and
 loopback fixtures still require their advertised development permissions. The SDK
-unit selector uses pinned Node with at most two workers and already-installed
-dependencies; it does not install packages or replace SDK integration/typecheck/build checks. This is not an embedded
+unit selectors use pinned runtimes and already-installed dependencies: TypeScript
+uses at most two workers; Python runs serially with explicit async-test support
+and this checkout's SDK source. Neither installs packages or replaces SDK
+integration/typecheck/build checks. This is not an embedded
 app executor or a sandbox; it adds no code to deployed binaries. See the
 [agent guide](../../../docs/agents.md#focused-repository-tests) for setup and coverage limits.

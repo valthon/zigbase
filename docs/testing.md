@@ -18,7 +18,7 @@ in-process testing structurally cannot see.
 
 For contributors working inside a **trusted ZigBase checkout**, the standard-library
 Python tool `tools/agent_tests.py` provides static JSON test inventory, exact
-module/function and TypeScript SDK unit-suite selection, and bounded structured execution reports. It is not
+module/function and TypeScript/Python SDK unit-suite selection, and bounded structured execution reports. It is not
 part of an embedded app or the server CLI and adds no deployed resource cost.
 
 ```sh
@@ -35,8 +35,11 @@ mise exec python@3.13 -- python tools/agent_tests.py run \
 Inventory covers selected agent/route/tuning/schema/files/realtime pytest modules
 and the `tests/tools/` performance-contract, replay, executor, selection and
 binary-resolver modules, plus `clients/typescript::unit` (pinned Node 24/Vitest,
-at most two workers). Install that SDK's dependencies with `npm ci` in
-`clients/typescript` first; the wrapper does not install anything. SDK integration,
+at most two workers) and `clients/python::unit` (pinned Python 3.13, serial pytest
+with explicit pytest-asyncio support). Install TypeScript dependencies with `npm ci`
+in `clients/typescript`, and Python dependencies with pinned Python's
+`python -m pip install -e 'clients/python[dev,realtime]'` first;
+the wrapper does not install anything. SDK integration,
 type checking and builds still need separate checks. Item `requirements` conservatively describe module
 setup; non-browser selections do not need Chromium. Admin fixtures build the
 appropriate binaries when necessary; the advertised prebuilt override is
@@ -53,9 +56,21 @@ reusing the lane's installed npm dependencies. This non-skipping, standard-libra
 test remains outside `tests/tools`, whose Python-only checks need no Node or SDK
 installation.
 
+`clients/python::unit` runs the Python SDK's unit suite serially with explicit
+pytest-asyncio loading and integration collection excluded. First install
+`clients/python[dev,realtime]` into pinned Python 3.13; the wrapper does not install
+dependencies. Python CI replaces its direct unit command with
+`mise exec python@3.13 -- python tests/sdk_runner/test_agent_python.py`, a real
+non-skipping wrapper regression that reuses those dependencies. Its lint,
+typecheck and live integration checks remain separate.
+Both CI wrapper regressions request the maximum 1 MiB output budget for failure
+diagnostics; interactive runs retain the smaller 64 KiB default. Overflow still
+terminates the child and reports `output_limit`, rather than claiming full evidence.
+
 `run` only accepts inventory IDs and fixed runner argv, not arbitrary executables,
-options, paths or shell strings. Pytest runs from the checkout root; the SDK suite
-runs from `clients/typescript`. It removes `NODE_OPTIONS`,
+options, paths or shell strings. Repository pytest modules run from the checkout
+root; SDK suites run from their package directories. The Python SDK prepends its
+checkout source to child `PYTHONPATH` and pytest's module path. The wrapper removes `NODE_OPTIONS`,
 `PYTEST_ADDOPTS` and `PYTEST_PLUGINS`, disables plugin autoload, and forces foreground
 server mode. Child processes receive `MISE_AUTO_INSTALL=false`; install toolchains
 explicitly before running. Existing repository Playwright fixtures work without an external
