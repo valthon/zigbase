@@ -365,20 +365,39 @@ class SyncTransport:
         self._auth_store.save(*_parse_refresh_result(result, spec.path))
 
 
+class _KeyedRequest:
+    """Public completion is independent of a custom transport's cancellation."""
+
+    def __init__(self) -> None:
+        self.result: asyncio.Future[httpx.Response] = asyncio.get_running_loop().create_future()
+        self.task: asyncio.Task[httpx.Response] | None = None
+        self.cancelled = False
+
+
 class _AsyncRefreshFlight:
     """`_RefreshFlight`'s `asyncio.Event` counterpart -- a single in-flight
     refresh, joinable by any number of waiting coroutines."""
 
-    def __init__(self) -> None:
+    def __init__(self, owner: _KeyedRequest | None = None) -> None:
         self._done = asyncio.Event()
         self.error: BaseException | None = None
+        self.owner = owner
 
-    async def wait(self) -> None:
+    async def wait(self) -> bool:
+        """False means the owner was cancelled; a waiter can elect a new owner.
+
+        Cancellation of this waiter still propagates from Event.wait itself.
+        """
         await self._done.wait()
+        if isinstance(self.error, asyncio.CancelledError):
+            return False
         if self.error is not None:
             raise self.error
+        return True
 
     def finish(self, error: BaseException | None) -> None:
+        if self._done.is_set():
+            return
         self.error = error
         self._done.set()
 
@@ -417,6 +436,8 @@ class AsyncTransport:
         # call or a waiter's `flight.wait()`.
         self._refresh_guard = asyncio.Lock()
         self._refresh_flight: _AsyncRefreshFlight | None = None
+        self._keyed_requests: dict[str, _KeyedRequest] = {}
+        self._keyed_tasks: set[asyncio.Task[httpx.Response]] = set()
 
     @property
     def auth_store(self) -> AuthStore:
@@ -426,7 +447,18 @@ class AsyncTransport:
     async def aclose(self) -> None:
         """Close the underlying `httpx.AsyncClient`, but only if this
         transport created it -- a caller-supplied client outlives this
-        transport."""
+        transport. Invalidate keyed calls first without waiting for custom
+        transport code to acknowledge cancellation."""
+        pending = list(self._keyed_requests.values())
+        detached = self._keyed_tasks.difference(request.task for request in pending)
+        self._keyed_requests.clear()
+        for request in pending:
+            self._cancel_keyed(request)
+        # Older calls may have left the ownership map after their transport
+        # swallowed cancellation. Close gives retained work another cancellation
+        # opportunity, without issuing two cancels to newly cancelled owners.
+        for task in detached:
+            task.cancel()
         if self._owns_client:
             await self._client.aclose()
 
@@ -434,31 +466,111 @@ class AsyncTransport:
         """Escape hatch: perform exactly one HTTP call and return the
         `httpx.Response` as-is -- no error mapping, no 401 refresh, no
         retries. Auth/lang/account headers and body encoding still apply."""
-        return await self._perform_once(spec)
+        return await self._keyed_exchange(spec, raw=True)
 
     async def request(self, spec: RequestSpec) -> Any:
         """Perform `spec`, following the refresh and bounded backoff state
         machine, and return the parsed JSON body (or `None` for a 204/empty
         body). Raises `ZigbaseError` for a non-2xx response that survives
         that state machine."""
-        response = await self._exchange(spec)
+        response = await self._keyed_exchange(spec, raw=False)
         return _decode_response(response)
 
     # --- internals -------------------------------------------------------
 
-    async def _perform_once(self, spec: RequestSpec) -> httpx.Response:
-        url = self._base_url + spec.path
-        kwargs = _prepare_request(
-            spec, token=self._auth_store.token, lang=self._lang, account_id=self._account_id
+    async def _keyed_exchange(self, spec: RequestSpec, *, raw: bool) -> httpx.Response:
+        key = spec.request_key
+        if key is None:
+            return (
+                await self._perform_once(spec, token=self._auth_store.token)
+                if raw
+                else await self._exchange(spec)
+            )
+        if not isinstance(key, str):
+            raise TypeError("request_key must be a string or None")
+
+        # Only keyed requests allocate a task and completion future. Await the
+        # future so transport code that suppresses cancellation cannot hold the
+        # public caller or other refresh waiters hostage.
+        previous = self._keyed_requests.get(key)
+        request = _KeyedRequest()
+        self._keyed_requests[key] = request
+        if previous is not None:
+            self._cancel_keyed(previous)
+        task = asyncio.create_task(
+            self._perform_once(spec, token=self._auth_store.token)
+            if raw
+            else self._exchange(spec, owner=request)
         )
+        request.task = task
+        if request.cancelled:
+            task.cancel()  # an eager task factory can run user code before returning
+        self._keyed_tasks.add(task)
+
+        def completed(done: asyncio.Task[httpx.Response]) -> None:
+            self._keyed_tasks.discard(done)
+            # Retrieve every eventual outcome, even for detached stale work,
+            # so exceptions are not leaked to the event loop's error handler.
+            try:
+                response = done.result()
+            except asyncio.CancelledError:
+                request.result.cancel()
+            except BaseException as error:
+                if not request.result.done():
+                    request.result.set_exception(error)
+            else:
+                if not request.result.done():
+                    request.result.set_result(response)
+
+        task.add_done_callback(completed)
+        try:
+            try:
+                response = await request.result
+            except BaseException:
+                if request.cancelled:
+                    raise asyncio.CancelledError from None
+                raise
+            if request.cancelled:
+                raise asyncio.CancelledError
+            return response
+        finally:
+            if self._keyed_requests.get(key) is request:
+                del self._keyed_requests[key]
+            if not task.done():
+                self._cancel_keyed(request)
+            if request.result.done() and not request.result.cancelled():
+                request.result.exception()
+
+    def _cancel_keyed(self, request: _KeyedRequest) -> None:
+        if request.cancelled:
+            return
+        request.cancelled = True
+        request.result.cancel()
+        flight = self._refresh_flight
+        if flight is not None and flight.owner is request:
+            self._refresh_flight = None
+            flight.finish(asyncio.CancelledError())
+        if request.task is not None:
+            request.task.cancel()
+
+    async def _perform_once(self, spec: RequestSpec, *, token: str | None) -> httpx.Response:
+        url = self._base_url + spec.path
+        kwargs = _prepare_request(spec, token=token, lang=self._lang, account_id=self._account_id)
         return await self._client.request(spec.method, url, **kwargs)
 
-    async def _exchange(self, spec: RequestSpec) -> httpx.Response:
+    async def _exchange(
+        self, spec: RequestSpec, *, owner: _KeyedRequest | None = None
+    ) -> httpx.Response:
         did_refresh = False
         attempt = 0
 
         while True:
-            response = await self._perform_once(spec)
+            # Bind refresh decisions to the token actually sent, not the store
+            # value after a concurrent request has already completed a refresh.
+            attempt_token = self._auth_store.token
+            response = await self._perform_once(spec, token=attempt_token)
+            if owner is not None and owner.cancelled:
+                raise asyncio.CancelledError
 
             if response.is_success:
                 return response
@@ -474,7 +586,7 @@ class AsyncTransport:
             ):
                 did_refresh = True
                 try:
-                    await self._await_refresh()
+                    await self._await_refresh(attempt_token, owner)
                     continue
                 except Exception:
                     # Refresh failed -- fall through and raise this
@@ -507,40 +619,48 @@ class AsyncTransport:
                 reason_phrase=response.reason_phrase or None,
             )
 
-    async def _await_refresh(self) -> None:
+    async def _await_refresh(
+        self, attempt_token: str | None, owner: _KeyedRequest | None = None
+    ) -> None:
         """Join the in-flight refresh, or become its owner and start it."""
-        async with self._refresh_guard:
-            flight = self._refresh_flight
-            if flight is not None:
-                is_owner = False
-            else:
-                flight = _AsyncRefreshFlight()
-                self._refresh_flight = flight
-                is_owner = True
-
-        if not is_owner:
-            await flight.wait()
-            return
+        while True:
+            async with self._refresh_guard:
+                if owner is not None and owner.cancelled:
+                    raise asyncio.CancelledError
+                if self._auth_store.token != attempt_token:
+                    return
+                flight = self._refresh_flight
+                if flight is None:
+                    flight = _AsyncRefreshFlight(owner)
+                    self._refresh_flight = flight
+                    break
+            if await flight.wait():
+                return
+            # Superseding a keyed request may cancel the refresh owner. It
+            # must not cancel unrelated waiters or the replacement request.
 
         error: BaseException | None = None
         try:
-            await self._perform_refresh()
+            await self._perform_refresh(owner)
         except BaseException as exc:
             error = exc
             raise
         finally:
             async with self._refresh_guard:
-                self._refresh_flight = None
+                if self._refresh_flight is flight:
+                    self._refresh_flight = None
             flight.finish(error)
 
-    async def _perform_refresh(self) -> None:
+    async def _perform_refresh(self, owner: _KeyedRequest | None = None) -> None:
         assert self._auth_collection is not None
         spec = RequestSpec(
             method="POST",
             path=f"/api/collections/{self._auth_collection}/auth-refresh",
             is_refresh=True,
         )
-        result = await self.request(spec)
+        result = _decode_response(await self._exchange(spec, owner=owner))
+        if owner is not None and owner.cancelled:
+            raise asyncio.CancelledError
         self._auth_store.save(*_parse_refresh_result(result, spec.path))
 
 

@@ -886,6 +886,7 @@ class AsyncCollectionService:
         search: str | None = None,
         skip_total: bool = False,
         vector: str | None = None,
+        request_key: str | None = None,
     ) -> ListResult:
         """`GET /records` (offset pagination)."""
         query = _get_list_query(
@@ -900,17 +901,29 @@ class AsyncCollectionService:
             vector=vector,
         )
         body = await self._transport.request(
-            RequestSpec(method="GET", path=_records_base(self.name), query=query)
+            RequestSpec(
+                method="GET", path=_records_base(self.name), query=query, request_key=request_key
+            )
         )
         return _parse_list_result(body, "get_list")
 
     async def get_one(
-        self, record_id: str, *, expand: str | None = None, fields: str | None = None
+        self,
+        record_id: str,
+        *,
+        expand: str | None = None,
+        fields: str | None = None,
+        request_key: str | None = None,
     ) -> dict[str, Any]:
         """`GET /records/:id`."""
         query = build_list_params(expand=expand, fields=fields)
         body = await self._transport.request(
-            RequestSpec(method="GET", path=_record_path(self.name, record_id), query=query)
+            RequestSpec(
+                method="GET",
+                path=_record_path(self.name, record_id),
+                query=query,
+                request_key=request_key,
+            )
         )
         return _as_dict(body, "get_one")
 
@@ -919,7 +932,7 @@ class AsyncCollectionService:
 
         Raises a synthesized 404 `ZigbaseError` when nothing matches.
         """
-        picked = _pluck(dict(opts), _FIRST_ITEM_OPT_KEYS)
+        picked = _pluck(dict(opts), _FIRST_ITEM_OPT_KEYS | {"request_key"})
         picked.pop("skip_total", None)  # always forced True below
         result = await self.get_list(1, 1, filter=filter, skip_total=True, **picked)
         if not result.items:
@@ -985,6 +998,7 @@ class AsyncCollectionService:
         cursor: str | None = None,
         limit: int | None = None,
         with_total: bool = False,
+        request_key: str | None = None,
         **opts: Any,
     ) -> CursorPage:
         """Native server-side cursor (keyset) pagination. See
@@ -992,7 +1006,9 @@ class AsyncCollectionService:
         picked = _pluck(dict(opts), _CURSOR_OPT_KEYS)
         query = _get_page_query(cursor=cursor, limit=limit, with_total=with_total, **picked)
         body = await self._transport.request(
-            RequestSpec(method="GET", path=_records_base(self.name), query=query)
+            RequestSpec(
+                method="GET", path=_records_base(self.name), query=query, request_key=request_key
+            )
         )
         return _parse_cursor_page(body, "get_page")
 

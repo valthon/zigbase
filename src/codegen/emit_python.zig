@@ -855,6 +855,7 @@ pub fn emitAsyncService(alloc: std.mem.Allocator, w: *W, cols: []const schema.Co
         \\        fields: str | None = None,
         \\        skip_total: bool = False,
         \\        search: str | None = None,
+        \\        request_key: str | None = None,
         \\    ) -> zbt.TypedList[{1s}]:
         \\        return await self._c.get_list(
         \\            page,
@@ -865,12 +866,14 @@ pub fn emitAsyncService(alloc: std.mem.Allocator, w: *W, cols: []const schema.Co
         \\            fields=fields,
         \\            skip_total=skip_total,
         \\            search=search,
+        \\            request_key=request_key,
         \\        )
         \\
         \\    async def get_one(
-        \\        self, record_id: str, *, expand: Sequence[str] | None = None, fields: str | None = None
+        \\        self, record_id: str, *, expand: Sequence[str] | None = None, fields: str | None = None,
+        \\        request_key: str | None = None,
         \\    ) -> {1s}:
-        \\        return await self._c.get_one(record_id, expand=expand, fields=fields)
+        \\        return await self._c.get_one(record_id, expand=expand, fields=fields, request_key=request_key)
         \\
         \\    async def get_first_list_item(
         \\        self,
@@ -880,9 +883,11 @@ pub fn emitAsyncService(alloc: std.mem.Allocator, w: *W, cols: []const schema.Co
         \\        expand: Sequence[str] | None = None,
         \\        fields: str | None = None,
         \\        search: str | None = None,
+        \\        request_key: str | None = None,
         \\    ) -> {1s}:
         \\        return await self._c.get_first_list_item(
-        \\            where({3s}()).compile(), sort=sort, expand=expand, fields=fields, search=search
+        \\            where({3s}()).compile(), sort=sort, expand=expand, fields=fields, search=search,
+        \\            request_key=request_key,
         \\        )
         \\
         \\    async def get_page(
@@ -896,6 +901,7 @@ pub fn emitAsyncService(alloc: std.mem.Allocator, w: *W, cols: []const schema.Co
         \\        with_total: bool = False,
         \\        fields: str | None = None,
         \\        search: str | None = None,
+        \\        request_key: str | None = None,
         \\    ) -> zbt.TypedCursorPage[{1s}]:
         \\        return await self._c.get_page(
         \\            cursor=cursor,
@@ -906,6 +912,7 @@ pub fn emitAsyncService(alloc: std.mem.Allocator, w: *W, cols: []const schema.Co
         \\            with_total=with_total,
         \\            fields=fields,
         \\            search=search,
+        \\            request_key=request_key,
         \\        )
         \\
         \\    def iterate(
@@ -1100,8 +1107,9 @@ pub fn emitAsyncClient(alloc: std.mem.Allocator, w: *W, cols: []const schema.Col
         \\        query: dict[str, str] | None = None,
         \\        body: Mapping[str, Any] | None = None,
         \\        headers: dict[str, str] | None = None,
+        \\        request_key: str | None = None,
         \\    ) -> Any:
-        \\        return await self.raw.send(method, path, query=query, body=body, headers=headers)
+        \\        return await self.raw.send(method, path, query=query, body=body, headers=headers, request_key=request_key)
         \\
         \\    async def aclose(self) -> None:
         \\        if self.owned:

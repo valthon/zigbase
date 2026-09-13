@@ -37,6 +37,7 @@ class RequestSpec:
     is_refresh: bool = False
     headers: dict[str, str] | None = None
     timeout: float | None = None
+    request_key: str | None = None
 
 
 def encode_path_segment(s: str) -> str:

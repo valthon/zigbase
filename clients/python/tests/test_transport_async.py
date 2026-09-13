@@ -554,11 +554,15 @@ async def test_401_single_flight_concurrent_refresh_exactly_once(
     both_entered = asyncio.Event()
     original_await_refresh = AsyncTransport._await_refresh
 
-    async def instrumented_await_refresh(self: AsyncTransport) -> None:
+    async def instrumented_await_refresh(
+        self: AsyncTransport,
+        attempt_token: str | None,
+        owner: _transport._KeyedRequest | None = None,
+    ) -> None:
         entered["n"] += 1
         if entered["n"] == 2:
             both_entered.set()
-        await original_await_refresh(self)
+        await original_await_refresh(self, attempt_token, owner)
 
     monkeypatch.setattr(AsyncTransport, "_await_refresh", instrumented_await_refresh)
 

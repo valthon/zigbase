@@ -788,6 +788,7 @@ class AsyncTypedCollection(Generic[T]):
         fields: str | None = None,
         skip_total: bool = False,
         search: str | None = None,
+        request_key: str | None = None,
     ) -> TypedList[T]:
         """See `TypedCollection.get_list`."""
         result = await self._svc.get_list(
@@ -799,6 +800,7 @@ class AsyncTypedCollection(Generic[T]):
             fields=fields,
             skip_total=skip_total,
             search=search,
+            request_key=request_key,
         )
         return TypedList(
             items=[self.from_record(item) for item in result.items],
@@ -814,10 +816,13 @@ class AsyncTypedCollection(Generic[T]):
         *,
         expand: Sequence[str] | None = None,
         fields: str | None = None,
+        request_key: str | None = None,
     ) -> T:
         """See `TypedCollection.get_one`."""
         return self.from_record(
-            await self._svc.get_one(record_id, expand=join_csv(expand), fields=fields)
+            await self._svc.get_one(
+                record_id, expand=join_csv(expand), fields=fields, request_key=request_key
+            )
         )
 
     async def get_first_list_item(
@@ -828,6 +833,7 @@ class AsyncTypedCollection(Generic[T]):
         expand: Sequence[str] | None = None,
         fields: str | None = None,
         search: str | None = None,
+        request_key: str | None = None,
     ) -> T:
         """See `TypedCollection.get_first_list_item`."""
         return self.from_record(
@@ -837,6 +843,7 @@ class AsyncTypedCollection(Generic[T]):
                 expand=join_csv(expand),
                 fields=fields,
                 search=search,
+                request_key=request_key,
             )
         )
 
@@ -851,6 +858,7 @@ class AsyncTypedCollection(Generic[T]):
         fields: str | None = None,
         with_total: bool = False,
         search: str | None = None,
+        request_key: str | None = None,
     ) -> TypedCursorPage[T]:
         """See `TypedCollection.get_page`."""
         page = await self._svc.get_page(
@@ -862,6 +870,7 @@ class AsyncTypedCollection(Generic[T]):
             expand=join_csv(expand),
             fields=fields,
             search=search,
+            request_key=request_key,
         )
         return TypedCursorPage(
             items=[self.from_record(item) for item in page.items],

@@ -12,6 +12,7 @@ Not marked `integration` (no server binary needed).
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import Callable
 
@@ -65,6 +66,96 @@ PROFILE_RECORD = {
     "created": "2024-01-01T00:00:00Z",
     "updated": "2024-01-02T00:00:00Z",
 }
+
+
+@pytest.mark.parametrize("method", ["get_list", "get_one", "get_first_list_item", "get_page"])
+async def test_generated_async_reads_forward_request_keys(method):
+    started = asyncio.Event()
+    calls = 0
+
+    async def handler(request):
+        nonlocal calls
+        calls += 1
+        assert "request_key" not in str(request.url)
+        if calls == 1:
+            started.set()
+            await asyncio.Event().wait()
+        return json_response({**PROFILE_RECORD, "items": [PROFILE_RECORD]})
+
+    async with (
+        httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http,
+        AsyncZigBase("http://localhost", http_client=http) as zb,
+    ):
+        service = AsyncProfilesService(zb)
+        call = getattr(service, method)
+        args = (
+            ("prof123",)
+            if method == "get_one"
+            else ((lambda fields: fields.name.eq("Alice")),)
+            if method == "get_first_list_item"
+            else ()
+        )
+        old = asyncio.create_task(call(*args, request_key="profiles"))
+        await started.wait()
+        result = await call(*args, request_key="profiles")
+        assert isinstance(result, (Profile, TypedList, TypedCursorPage))
+        with pytest.raises(asyncio.CancelledError):
+            await old
+
+
+@pytest.mark.parametrize("replacement", ["send", "collection", "raw_request"])
+async def test_generated_async_client_send_shares_request_keys(replacement):
+    started = asyncio.Event()
+
+    async def handler(request):
+        assert "request_key" not in str(request.url)
+        if request.url.path == "/old":
+            started.set()
+            await asyncio.Event().wait()
+        return json_response(PROFILE_RECORD)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = create_async_client("http://localhost", http_client=http)
+        old = asyncio.create_task(client.send("GET", "/old", request_key="profile"))
+        try:
+            await asyncio.wait_for(started.wait(), 1)
+            if replacement == "send":
+                result = await client.send("GET", "/new", request_key="profile")
+                assert result == PROFILE_RECORD
+            elif replacement == "collection":
+                result = await client.profiles.get_one("prof123", request_key="profile")
+                assert result.id == "prof123"
+            else:
+                response = await client.raw.raw_request("GET", "/new", request_key="profile")
+                assert response.json() == PROFILE_RECORD
+            with pytest.raises(asyncio.CancelledError):
+                await old
+        finally:
+            await client.aclose()
+            await asyncio.gather(old, return_exceptions=True)
+
+
+async def test_generated_async_client_send_preserves_all_options():
+    async def handler(request):
+        assert request.method == "POST"
+        assert dict(request.url.params) == {"expand": "author"}
+        assert request.headers["X-Custom"] == "value"
+        assert json.loads(request.content) == {"title": "Example"}
+        return json_response({"ok": True})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = create_async_client("http://localhost", http_client=http)
+        try:
+            assert await client.send(
+                "POST",
+                "/custom",
+                query={"expand": "author"},
+                body={"title": "Example"},
+                headers={"X-Custom": "value"},
+                request_key="custom",
+            ) == {"ok": True}
+        finally:
+            await client.aclose()
 
 
 # ---------------------------------------------------------------------------

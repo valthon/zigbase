@@ -736,17 +736,64 @@ This is a straight behavioral port, but a few things differ by design, not overs
   `realtime.collection()`/`LiveRecord`/`LiveList` observables that stay in sync
   automatically, this SDK's [realtime](#realtime) tier is subscribe/stream only — deferred to
   a follow-up SDK milestone.
-- **No `requestKey` de-duplication.** The TypeScript/Dart SDKs' opt-in last-write-wins
-  request cancellation (`requestKey=`) has no Python equivalent. For the async facade, use
-  `asyncio` task cancellation (e.g. cancel the previous `asyncio.Task` before issuing a new
-  one) at the call site; there is no sync-facade analogue since `httpx.Client` calls block
-  the calling thread.
+- **Async-only request cancellation.** Python's `request_key=` provides opt-in
+  latest-request-wins cancellation on async `send`, `raw_request`, `get_list`, `get_one`,
+  `get_first_list_item`, and `get_page` (including typed reads). Other helpers and the
+  blocking sync facade do not accept this option. See [Request keys](#request-keys).
 - **No per-call `timeout=`/`signal=`.** Where the TypeScript SDK takes a per-request
   `AbortSignal` and the Dart SDK a `requestKey`-based cancel, this SDK follows `httpx`'s own
   convention: configure timeouts (and any other transport policy — proxies, connection
   limits) by constructing your own `httpx.Client(timeout=...)` /
   `httpx.AsyncClient(timeout=...)` and passing it as `http_client=` to `ZigBase`/
   `AsyncZigBase`, rather than a bespoke per-call kwarg.
+
+## Request keys
+
+Pass the same `request_key` when a newer read supersedes an older in-flight read,
+for example a search input. A replacement cancels the previous request, including
+any retry backoff; its caller receives `asyncio.CancelledError`, not `ZigbaseError`.
+The key is local SDK state: it is never sent to the server and is not an
+idempotency key. Cancellation cannot undo a server-side write already accepted.
+
+```python
+import asyncio
+from contextlib import suppress
+
+async with AsyncZigBase("http://127.0.0.1:8090") as zb:
+    old = asyncio.create_task(
+        zb.collection("posts").get_list(search="zi", request_key="post-search")
+    )
+    await asyncio.sleep(0)  # let the first request start
+    newest = await zb.collection("posts").get_list(
+        search="zigbase", request_key="post-search"
+    )
+    with suppress(asyncio.CancelledError):
+        await old
+```
+
+Keys are shared by all collections and generic requests on one `AsyncZigBase`
+instance; `with_account()` siblings have independent namespaces. A key may be
+any string, including `""`; `None` (the default) disables cancellation and avoids
+the extra request task. Completed, failed, and cancelled requests release their
+key. Closing the client cancels its keyed requests without closing a caller-owned
+HTTP client. Unkeyed requests keep their existing lifecycle.
+
+Cancellation of a keyed call is independent of the HTTP transport acknowledging
+it: supersession, caller cancellation, and client close release the public caller
+without waiting for custom transport cleanup. The SDK retains unfinished exchange
+tasks and consumes their eventual results/errors; Python cannot forcibly stop a
+custom transport that ignores cancellation forever. Custom transports must still
+provide bounded cleanup to release their own resources. Cancelling a keyed
+refresh owner releases other refresh waiters immediately, and a late response
+from that cancelled refresh cannot replace the current auth token.
+
+Use this option for individual async reads, including the generated typed
+collection helpers (regenerate existing clients with the updated ZigBase
+generator to expose the new keyword). `iterate`/`get_full_list` deliberately do not accept it: one
+key on a single page would not cancel an entire multi-page traversal while it is
+between requests. Cancel the traversal's task explicitly instead. Auth, write,
+and other service helpers also retain explicit task cancellation; generic
+`send`/`raw_request` accept `request_key` for custom endpoints.
 
 ## Integration-test recipe
 
@@ -982,8 +1029,8 @@ and Dart SDKs have do not exist here yet:
 - **Typed `rpc.*` / auth-method / feature-flag surfaces.** The typed tier covers the
   collection/record/where/expand/realtime/files surface (see [Typed tier](#typed-tier)); typed
   custom routes, pluggable auth methods, and feature flags are TypeScript-only for now.
-- **`requestKey` de-duplication.** Use `asyncio` task cancellation on the async facade
-  instead; see [Divergences](#divergences-from-the-typescriptdart-sdks).
+- **Request keys outside individual async reads and generic requests.** See
+  [Request keys](#request-keys) for the supported surface and traversal boundary.
 
 These are planned follow-ups, not permanent gaps — track them alongside the TypeScript and
 Dart SDKs, which reached them first.

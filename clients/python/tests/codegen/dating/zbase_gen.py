@@ -1219,6 +1219,7 @@ class AsyncProfilesService:
         fields: str | None = None,
         skip_total: bool = False,
         search: str | None = None,
+        request_key: str | None = None,
     ) -> zbt.TypedList[Profile]:
         return await self._c.get_list(
             page,
@@ -1229,12 +1230,20 @@ class AsyncProfilesService:
             fields=fields,
             skip_total=skip_total,
             search=search,
+            request_key=request_key,
         )
 
     async def get_one(
-        self, record_id: str, *, expand: Sequence[str] | None = None, fields: str | None = None
+        self,
+        record_id: str,
+        *,
+        expand: Sequence[str] | None = None,
+        fields: str | None = None,
+        request_key: str | None = None,
     ) -> Profile:
-        return await self._c.get_one(record_id, expand=expand, fields=fields)
+        return await self._c.get_one(
+            record_id, expand=expand, fields=fields, request_key=request_key
+        )
 
     async def get_first_list_item(
         self,
@@ -1244,9 +1253,15 @@ class AsyncProfilesService:
         expand: Sequence[str] | None = None,
         fields: str | None = None,
         search: str | None = None,
+        request_key: str | None = None,
     ) -> Profile:
         return await self._c.get_first_list_item(
-            where(ProfileFields()).compile(), sort=sort, expand=expand, fields=fields, search=search
+            where(ProfileFields()).compile(),
+            sort=sort,
+            expand=expand,
+            fields=fields,
+            search=search,
+            request_key=request_key,
         )
 
     async def get_page(
@@ -1260,6 +1275,7 @@ class AsyncProfilesService:
         with_total: bool = False,
         fields: str | None = None,
         search: str | None = None,
+        request_key: str | None = None,
     ) -> zbt.TypedCursorPage[Profile]:
         return await self._c.get_page(
             cursor=cursor,
@@ -1270,6 +1286,7 @@ class AsyncProfilesService:
             with_total=with_total,
             fields=fields,
             search=search,
+            request_key=request_key,
         )
 
     def iterate(
@@ -1507,6 +1524,7 @@ class AsyncTagsService:
         fields: str | None = None,
         skip_total: bool = False,
         search: str | None = None,
+        request_key: str | None = None,
     ) -> zbt.TypedList[Tag]:
         return await self._c.get_list(
             page,
@@ -1517,12 +1535,20 @@ class AsyncTagsService:
             fields=fields,
             skip_total=skip_total,
             search=search,
+            request_key=request_key,
         )
 
     async def get_one(
-        self, record_id: str, *, expand: Sequence[str] | None = None, fields: str | None = None
+        self,
+        record_id: str,
+        *,
+        expand: Sequence[str] | None = None,
+        fields: str | None = None,
+        request_key: str | None = None,
     ) -> Tag:
-        return await self._c.get_one(record_id, expand=expand, fields=fields)
+        return await self._c.get_one(
+            record_id, expand=expand, fields=fields, request_key=request_key
+        )
 
     async def get_first_list_item(
         self,
@@ -1532,9 +1558,15 @@ class AsyncTagsService:
         expand: Sequence[str] | None = None,
         fields: str | None = None,
         search: str | None = None,
+        request_key: str | None = None,
     ) -> Tag:
         return await self._c.get_first_list_item(
-            where(TagFields()).compile(), sort=sort, expand=expand, fields=fields, search=search
+            where(TagFields()).compile(),
+            sort=sort,
+            expand=expand,
+            fields=fields,
+            search=search,
+            request_key=request_key,
         )
 
     async def get_page(
@@ -1548,6 +1580,7 @@ class AsyncTagsService:
         with_total: bool = False,
         fields: str | None = None,
         search: str | None = None,
+        request_key: str | None = None,
     ) -> zbt.TypedCursorPage[Tag]:
         return await self._c.get_page(
             cursor=cursor,
@@ -1558,6 +1591,7 @@ class AsyncTagsService:
             with_total=with_total,
             fields=fields,
             search=search,
+            request_key=request_key,
         )
 
     def iterate(
@@ -1798,6 +1832,7 @@ class AsyncPhotosService:
         fields: str | None = None,
         skip_total: bool = False,
         search: str | None = None,
+        request_key: str | None = None,
     ) -> zbt.TypedList[Photo]:
         return await self._c.get_list(
             page,
@@ -1808,12 +1843,20 @@ class AsyncPhotosService:
             fields=fields,
             skip_total=skip_total,
             search=search,
+            request_key=request_key,
         )
 
     async def get_one(
-        self, record_id: str, *, expand: Sequence[str] | None = None, fields: str | None = None
+        self,
+        record_id: str,
+        *,
+        expand: Sequence[str] | None = None,
+        fields: str | None = None,
+        request_key: str | None = None,
     ) -> Photo:
-        return await self._c.get_one(record_id, expand=expand, fields=fields)
+        return await self._c.get_one(
+            record_id, expand=expand, fields=fields, request_key=request_key
+        )
 
     async def get_first_list_item(
         self,
@@ -1823,9 +1866,15 @@ class AsyncPhotosService:
         expand: Sequence[str] | None = None,
         fields: str | None = None,
         search: str | None = None,
+        request_key: str | None = None,
     ) -> Photo:
         return await self._c.get_first_list_item(
-            where(PhotoFields()).compile(), sort=sort, expand=expand, fields=fields, search=search
+            where(PhotoFields()).compile(),
+            sort=sort,
+            expand=expand,
+            fields=fields,
+            search=search,
+            request_key=request_key,
         )
 
     async def get_page(
@@ -1839,6 +1888,7 @@ class AsyncPhotosService:
         with_total: bool = False,
         fields: str | None = None,
         search: str | None = None,
+        request_key: str | None = None,
     ) -> zbt.TypedCursorPage[Photo]:
         return await self._c.get_page(
             cursor=cursor,
@@ -1849,6 +1899,7 @@ class AsyncPhotosService:
             with_total=with_total,
             fields=fields,
             search=search,
+            request_key=request_key,
         )
 
     def iterate(
@@ -2122,6 +2173,7 @@ class AsyncPrivatePhotosService:
         fields: str | None = None,
         skip_total: bool = False,
         search: str | None = None,
+        request_key: str | None = None,
     ) -> zbt.TypedList[PrivatePhoto]:
         return await self._c.get_list(
             page,
@@ -2132,12 +2184,20 @@ class AsyncPrivatePhotosService:
             fields=fields,
             skip_total=skip_total,
             search=search,
+            request_key=request_key,
         )
 
     async def get_one(
-        self, record_id: str, *, expand: Sequence[str] | None = None, fields: str | None = None
+        self,
+        record_id: str,
+        *,
+        expand: Sequence[str] | None = None,
+        fields: str | None = None,
+        request_key: str | None = None,
     ) -> PrivatePhoto:
-        return await self._c.get_one(record_id, expand=expand, fields=fields)
+        return await self._c.get_one(
+            record_id, expand=expand, fields=fields, request_key=request_key
+        )
 
     async def get_first_list_item(
         self,
@@ -2147,6 +2207,7 @@ class AsyncPrivatePhotosService:
         expand: Sequence[str] | None = None,
         fields: str | None = None,
         search: str | None = None,
+        request_key: str | None = None,
     ) -> PrivatePhoto:
         return await self._c.get_first_list_item(
             where(PrivatePhotoFields()).compile(),
@@ -2154,6 +2215,7 @@ class AsyncPrivatePhotosService:
             expand=expand,
             fields=fields,
             search=search,
+            request_key=request_key,
         )
 
     async def get_page(
@@ -2167,6 +2229,7 @@ class AsyncPrivatePhotosService:
         with_total: bool = False,
         fields: str | None = None,
         search: str | None = None,
+        request_key: str | None = None,
     ) -> zbt.TypedCursorPage[PrivatePhoto]:
         return await self._c.get_page(
             cursor=cursor,
@@ -2177,6 +2240,7 @@ class AsyncPrivatePhotosService:
             with_total=with_total,
             fields=fields,
             search=search,
+            request_key=request_key,
         )
 
     def iterate(
@@ -2417,6 +2481,7 @@ class AsyncMessagesService:
         fields: str | None = None,
         skip_total: bool = False,
         search: str | None = None,
+        request_key: str | None = None,
     ) -> zbt.TypedList[Message]:
         return await self._c.get_list(
             page,
@@ -2427,12 +2492,20 @@ class AsyncMessagesService:
             fields=fields,
             skip_total=skip_total,
             search=search,
+            request_key=request_key,
         )
 
     async def get_one(
-        self, record_id: str, *, expand: Sequence[str] | None = None, fields: str | None = None
+        self,
+        record_id: str,
+        *,
+        expand: Sequence[str] | None = None,
+        fields: str | None = None,
+        request_key: str | None = None,
     ) -> Message:
-        return await self._c.get_one(record_id, expand=expand, fields=fields)
+        return await self._c.get_one(
+            record_id, expand=expand, fields=fields, request_key=request_key
+        )
 
     async def get_first_list_item(
         self,
@@ -2442,9 +2515,15 @@ class AsyncMessagesService:
         expand: Sequence[str] | None = None,
         fields: str | None = None,
         search: str | None = None,
+        request_key: str | None = None,
     ) -> Message:
         return await self._c.get_first_list_item(
-            where(MessageFields()).compile(), sort=sort, expand=expand, fields=fields, search=search
+            where(MessageFields()).compile(),
+            sort=sort,
+            expand=expand,
+            fields=fields,
+            search=search,
+            request_key=request_key,
         )
 
     async def get_page(
@@ -2458,6 +2537,7 @@ class AsyncMessagesService:
         with_total: bool = False,
         fields: str | None = None,
         search: str | None = None,
+        request_key: str | None = None,
     ) -> zbt.TypedCursorPage[Message]:
         return await self._c.get_page(
             cursor=cursor,
@@ -2468,6 +2548,7 @@ class AsyncMessagesService:
             with_total=with_total,
             fields=fields,
             search=search,
+            request_key=request_key,
         )
 
     def iterate(
@@ -2679,6 +2760,7 @@ class AsyncWinksService:
         fields: str | None = None,
         skip_total: bool = False,
         search: str | None = None,
+        request_key: str | None = None,
     ) -> zbt.TypedList[Wink]:
         return await self._c.get_list(
             page,
@@ -2689,12 +2771,20 @@ class AsyncWinksService:
             fields=fields,
             skip_total=skip_total,
             search=search,
+            request_key=request_key,
         )
 
     async def get_one(
-        self, record_id: str, *, expand: Sequence[str] | None = None, fields: str | None = None
+        self,
+        record_id: str,
+        *,
+        expand: Sequence[str] | None = None,
+        fields: str | None = None,
+        request_key: str | None = None,
     ) -> Wink:
-        return await self._c.get_one(record_id, expand=expand, fields=fields)
+        return await self._c.get_one(
+            record_id, expand=expand, fields=fields, request_key=request_key
+        )
 
     async def get_first_list_item(
         self,
@@ -2704,9 +2794,15 @@ class AsyncWinksService:
         expand: Sequence[str] | None = None,
         fields: str | None = None,
         search: str | None = None,
+        request_key: str | None = None,
     ) -> Wink:
         return await self._c.get_first_list_item(
-            where(WinkFields()).compile(), sort=sort, expand=expand, fields=fields, search=search
+            where(WinkFields()).compile(),
+            sort=sort,
+            expand=expand,
+            fields=fields,
+            search=search,
+            request_key=request_key,
         )
 
     async def get_page(
@@ -2720,6 +2816,7 @@ class AsyncWinksService:
         with_total: bool = False,
         fields: str | None = None,
         search: str | None = None,
+        request_key: str | None = None,
     ) -> zbt.TypedCursorPage[Wink]:
         return await self._c.get_page(
             cursor=cursor,
@@ -2730,6 +2827,7 @@ class AsyncWinksService:
             with_total=with_total,
             fields=fields,
             search=search,
+            request_key=request_key,
         )
 
     def iterate(
@@ -2949,6 +3047,7 @@ class AsyncSubscriptionsService:
         fields: str | None = None,
         skip_total: bool = False,
         search: str | None = None,
+        request_key: str | None = None,
     ) -> zbt.TypedList[Subscription]:
         return await self._c.get_list(
             page,
@@ -2959,12 +3058,20 @@ class AsyncSubscriptionsService:
             fields=fields,
             skip_total=skip_total,
             search=search,
+            request_key=request_key,
         )
 
     async def get_one(
-        self, record_id: str, *, expand: Sequence[str] | None = None, fields: str | None = None
+        self,
+        record_id: str,
+        *,
+        expand: Sequence[str] | None = None,
+        fields: str | None = None,
+        request_key: str | None = None,
     ) -> Subscription:
-        return await self._c.get_one(record_id, expand=expand, fields=fields)
+        return await self._c.get_one(
+            record_id, expand=expand, fields=fields, request_key=request_key
+        )
 
     async def get_first_list_item(
         self,
@@ -2974,6 +3081,7 @@ class AsyncSubscriptionsService:
         expand: Sequence[str] | None = None,
         fields: str | None = None,
         search: str | None = None,
+        request_key: str | None = None,
     ) -> Subscription:
         return await self._c.get_first_list_item(
             where(SubscriptionFields()).compile(),
@@ -2981,6 +3089,7 @@ class AsyncSubscriptionsService:
             expand=expand,
             fields=fields,
             search=search,
+            request_key=request_key,
         )
 
     async def get_page(
@@ -2994,6 +3103,7 @@ class AsyncSubscriptionsService:
         with_total: bool = False,
         fields: str | None = None,
         search: str | None = None,
+        request_key: str | None = None,
     ) -> zbt.TypedCursorPage[Subscription]:
         return await self._c.get_page(
             cursor=cursor,
@@ -3004,6 +3114,7 @@ class AsyncSubscriptionsService:
             with_total=with_total,
             fields=fields,
             search=search,
+            request_key=request_key,
         )
 
     def iterate(
@@ -3248,6 +3359,7 @@ class AsyncNotesService:
         fields: str | None = None,
         skip_total: bool = False,
         search: str | None = None,
+        request_key: str | None = None,
     ) -> zbt.TypedList[Note]:
         return await self._c.get_list(
             page,
@@ -3258,12 +3370,20 @@ class AsyncNotesService:
             fields=fields,
             skip_total=skip_total,
             search=search,
+            request_key=request_key,
         )
 
     async def get_one(
-        self, record_id: str, *, expand: Sequence[str] | None = None, fields: str | None = None
+        self,
+        record_id: str,
+        *,
+        expand: Sequence[str] | None = None,
+        fields: str | None = None,
+        request_key: str | None = None,
     ) -> Note:
-        return await self._c.get_one(record_id, expand=expand, fields=fields)
+        return await self._c.get_one(
+            record_id, expand=expand, fields=fields, request_key=request_key
+        )
 
     async def get_first_list_item(
         self,
@@ -3273,9 +3393,15 @@ class AsyncNotesService:
         expand: Sequence[str] | None = None,
         fields: str | None = None,
         search: str | None = None,
+        request_key: str | None = None,
     ) -> Note:
         return await self._c.get_first_list_item(
-            where(NoteFields()).compile(), sort=sort, expand=expand, fields=fields, search=search
+            where(NoteFields()).compile(),
+            sort=sort,
+            expand=expand,
+            fields=fields,
+            search=search,
+            request_key=request_key,
         )
 
     async def get_page(
@@ -3289,6 +3415,7 @@ class AsyncNotesService:
         with_total: bool = False,
         fields: str | None = None,
         search: str | None = None,
+        request_key: str | None = None,
     ) -> zbt.TypedCursorPage[Note]:
         return await self._c.get_page(
             cursor=cursor,
@@ -3299,6 +3426,7 @@ class AsyncNotesService:
             with_total=with_total,
             fields=fields,
             search=search,
+            request_key=request_key,
         )
 
     def iterate(
@@ -3504,8 +3632,11 @@ class AsyncZbClient:
         query: dict[str, str] | None = None,
         body: Mapping[str, Any] | None = None,
         headers: dict[str, str] | None = None,
+        request_key: str | None = None,
     ) -> Any:
-        return await self.raw.send(method, path, query=query, body=body, headers=headers)
+        return await self.raw.send(
+            method, path, query=query, body=body, headers=headers, request_key=request_key
+        )
 
     async def aclose(self) -> None:
         if self.owned:
