@@ -1722,20 +1722,27 @@ many times. `droppedStatements` is independent of `droppedExecutions`. No raw
 ## Admission diagnostics
 
 `GET /api/admission/stats` is available only in applications compiled with
-`.admission = .{ .max_requests = N }`. It requires superuser authentication:
+`.admission = .{ .max_requests = N }` or byte-only `.admission = .{ .max_job_bytes = N }`
+(the latter requires `-Dcoordinated-admission=true`). It requires superuser authentication:
 `401` without a valid identity, `403` for other users, and `404` when disabled.
 
 ```json
-{"limit":3,"active":1,"high_water":3,"rejected":42,"work_limit":16,"jobs":2,"work_high_water":16,"jobs_rejected":5}
+{"limit":3,"active":1,"high_water":3,"rejected":42,"work_limit":16,"jobs":2,"work_high_water":16,"jobs_rejected":5,"job_bytes_limit":null,"job_bytes":0,"job_bytes_high_water":0,"job_bytes_rejected":0}
 ```
 
-Counters are coherent and process-local, reset at restart. `active` includes
-this diagnostics request; `high_water` records peak admitted work and `rejected`
+Counters are coherent and process-local, reset at restart. With HTTP admission,
+`active` includes this diagnostics request; `high_water` records peak admitted HTTP work and `rejected`
 is a saturating unsigned 64-bit count. The endpoint itself obeys admission and
 can return `503` with code `overloaded` and `Retry-After: 1` before authentication.
 Only the exact built-in `GET /api/health` liveness probe is exempt. See
 [HTTP admission and backpressure](framework.md#http-admission-and-backpressure)
 for configuration, scope, and retry guidance.
+This exact liveness GET also skips unused multipart-body parsing independently
+of admission configuration; HEAD, POST, and similar paths do not get that bypass.
+
+Byte-only configuration omits `max_requests`: `limit` is `null` and `active`,
+`high_water`, and `rejected` stay zero. Its diagnostics and other HTTP callbacks
+do not acquire admission permits, even when the retained-byte budget is full.
 
 With `-Dcoordinated-admission=true` and `.admission.max_work`, `work_limit` is
 the shared ceiling for `active + jobs`; `jobs` counts queued/running memory jobs
@@ -1744,6 +1751,15 @@ combined occupancy, and saturating `jobs_rejected` counts shared-budget job
 refusals, not independent ring-full errors. Without shared admission,
 `work_limit` is `null` and the three shared counters are zero. These are
 process-local work counts, not memory measurements; durable jobs are excluded.
+
+Optional `.admission.max_job_bytes` adds `job_bytes_limit` (nullable), `job_bytes`,
+`job_bytes_high_water`, and saturating `job_bytes_rejected`. These count precisely
+queue-owned payload/name copy lengths; they exclude inline borrowed payloads,
+pre-enqueue serialization, handler allocations and allocator overhead. Byte
+refusals return `error.QueueFull` to enqueue/submit, not HTTP overload by themselves.
+Without this ceiling its counters remain zero. It is independent of `max_work`:
+byte-only configuration leaves shared work counters zero. If both limits are
+full, only the work-count rejection is counted because it is checked first.
 
 ---
 

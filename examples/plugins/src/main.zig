@@ -713,6 +713,8 @@ const Backend = zigbase.App(.{
         // To share a work-count budget with memory jobs/app.submit, forward
         // .@"coordinated-admission" = true to the zigbase dependency in build.zig,
         // then add .max_work = 16 above. This is a work count, not a memory cap.
+        // Optionally add .max_job_bytes = 64 * 1024 for retained payload/name
+        // copies only; it excludes serialization, handler memory and total RSS.
 
         // 8. Fully embedded static frontend (see build.zig embedStaticDir).
         .static_files = .{ .embedded = &@import("static_assets").files },

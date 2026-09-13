@@ -60,6 +60,8 @@ pub const Envelope = struct {
     http_admission_max_requests: ?u32,
     /// Shared count of synchronous HTTP callbacks and outstanding memory jobs.
     coordinated_admission_max_work: ?u32 = null,
+    /// Configured ceiling for queue-owned copy lengths, not total job memory.
+    coordinated_admission_max_job_bytes: ?usize = null,
     http_body_limit_source: []const u8 = "runtime_ZIGBASE_MAX_UPLOAD_SIZE",
     retained_reader_cap: usize,
     sqlite_cache_target_bytes_per_connection: ?u64,
@@ -93,6 +95,7 @@ pub const EnvelopeInput = struct {
     job_stack_bytes: usize,
     admission_max_requests: ?u32 = null,
     admission_max_work: ?u32 = null,
+    admission_max_job_bytes: ?usize = null,
     resumable: ?Envelope.Resumable = null,
 };
 
@@ -102,6 +105,7 @@ pub fn envelope(comptime input: EnvelopeInput) Envelope {
     return .{
         .http_admission_max_requests = input.admission_max_requests,
         .coordinated_admission_max_work = input.admission_max_work,
+        .coordinated_admission_max_job_bytes = input.admission_max_job_bytes,
         .retained_reader_cap = retained,
         .sqlite_cache_target_bytes_per_connection = cache_bytes,
         .sqlite_writer_and_retained_readers_cache_target_bytes = if (cache_bytes) |bytes| bytes * (retained + 1) else null,

@@ -24,6 +24,9 @@ shows how to opt into a shared HTTP/memory-job work-count budget: forward
 `coordinated-admission` to the ZigBase dependency and add `.admission.max_work`.
 The default example leaves that additional integration compiled out; a shared
 count does not imply a byte or RSS cap.
+The same source comment illustrates optional `.admission.max_job_bytes` for
+retained memory-job payload and `app.submit` name copies, independently of the
+work-count limit. This narrower byte ceiling still does not bound total RSS.
 
 The report's `envelope` makes the tradeoffs explicit: this example retains up to
 four idle SQLite readers with 512 KiB soft cache targets (2.5 MiB including the

@@ -15,7 +15,9 @@ copy, examples, and tests with the implementation rather than in follow-up PRs.
   with effective cap/count reporting. Build-gated `.admission.max_work` now shares
   a process-local count across synchronous HTTP and outstanding memory-job/submit
   work, including queued tasks and retries, with immediate rejection and counters.
-  Transport buffers, byte/RSS budgets, durable jobs and broader cross-subsystem
+  Optional `.admission.max_job_bytes` now bounds precisely retained memory-job
+  payload/submit-name copies, with atomic reservation and byte diagnostics.
+  Transport buffers, broader byte/RSS budgets, durable jobs and cross-subsystem
   coordination remain outside these gates.
   Memory-job/submit workers now have independent comptime counts and share the
   configured job stack size, with lazy startup and unchanged bounded-ring rejection.

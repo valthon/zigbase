@@ -74,6 +74,8 @@ fn metaHandler(ctx: *http.RequestCtx) anyerror!http.Response {
 /// so every optional subsystem's routes concat in ONLY under its gate.
 pub const Gates = struct {
     admission: bool = false,
+    /// Keep diagnostics for job-only admission without retaining HTTP checks.
+    admission_http: bool = true,
     two_factor: bool = false,
     admin: bool = true,
     analytics: bool = true,
@@ -299,6 +301,7 @@ pub const OnListening = struct {
 };
 
 pub fn Server(comptime gates: Gates) type {
+    const http_admission = gates.admission and gates.admission_http;
     return struct {
         const Self = @This();
 
@@ -486,7 +489,7 @@ pub fn Server(comptime gates: Gates) type {
         /// paths propagate as an error; `onRequest` writes the raw 500 envelope for them, exactly as
         /// the historical inline `catch { sendRawEnvelope(...); return; }` sites did.
         pub fn route(ctx: *http.RequestCtx) anyerror!http.Response {
-            if (comptime gates.admission) {
+            if (comptime http_admission) {
                 if (isLivenessProbe(ctx.method, ctx.path)) return routeAdmitted(ctx);
                 const state = ctx.app.?.admission.?;
                 if (!state.acquire()) return overloadResponse();
@@ -577,8 +580,8 @@ pub fn Server(comptime gates: Gates) type {
 
         fn onRequest(r: zap.Request) !void {
             const self = Self.instance.?;
-            const needs_permit = if (comptime gates.admission) !isLivenessProbe(methodFromZap(r), r.path orelse "/") else false;
-            if (comptime gates.admission) {
+            const needs_permit = if (comptime http_admission) !isLivenessProbe(methodFromZap(r), r.path orelse "/") else false;
+            if (comptime http_admission) {
                 if (needs_permit and !self.app.admission.?.acquire()) {
                     // Log before sending: facil.io may recycle path bytes on send.
                     logging.request(.{ .method = @tagName(methodFromZap(r)), .path = r.path orelse "/", .status = 503, .duration_ms = 0 });
@@ -587,7 +590,7 @@ pub fn Server(comptime gates: Gates) type {
                     return;
                 }
             }
-            defer if (comptime gates.admission) {
+            defer if (comptime http_admission) {
                 if (needs_permit) self.app.admission.?.release();
             };
             const started_ns = std.Io.Timestamp.now(self.app.io, .awake).nanoseconds;
@@ -650,9 +653,7 @@ pub fn Server(comptime gates: Gates) type {
             // logs an uncaught error and NEVER writes a response — the client sees a
             // dropped connection and the access line records status 0, a status nothing
             // ever sent. Answer with the same raw 500 envelope every other escape uses.
-            // The exempt liveness handler never consumes a body. Do not let
-            // arbitrary multipart parsing become an admission bypass.
-            const multipart_err = (if (gates.admission and !needs_permit) null else applyMultipart(&ctx)) catch {
+            const multipart_err = applyMultipart(&ctx) catch {
                 sendRawEnvelope(r, ctx.method, 500, internal_error_envelope);
                 logged_status = 500;
                 return;
@@ -1612,6 +1613,10 @@ test "dispatchCustom merges ctx.setCookie/addHeader on success AND error paths (
 /// real `ctx.form_fields`/`ctx.files` (and the identical malformed-body 400).
 pub fn applyMultipart(ctx: *http.RequestCtx) error{OutOfMemory}!?http.Response {
     if (!std.mem.startsWith(u8, ctx.content_type, "multipart/form-data")) return null;
+    // Both live sockets and the socketless harness use this pre-parse boundary.
+    // Only exact built-in GET liveness ignores its unused body, regardless of
+    // whether HTTP admission, job-byte admission, or neither is configured.
+    if (isLivenessProbe(ctx.method, ctx.path)) return null;
     // Hand-rolled parser over the raw body: facil.io's param parsing type-guesses
     // multipart values (text "123" -> int), so it must never see this body.
     const ex = files_multipart.parse(ctx.allocator, ctx.content_type, ctx.body) catch |e| switch (e) {

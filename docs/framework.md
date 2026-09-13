@@ -165,7 +165,7 @@ error.**
 | `reporter_dedup` | Error-report TTL dedup window: `.{ .window_s = N }` (seconds) suppresses a repeat of the same `(message, phase)` within `N`, or `.off` to report every swallowed error. Default (omitted): **on**, `60`s. | always — dedup is on by default; `.off` compiles the dedup map out entirely (a single null-pointer branch, no allocation). |
 | `pools` | Footprint levers: reader pool, scheduler workers (`.jobs`), lazy memory-job/submit workers (`.memory_jobs`), thread stack size, SQLite page cache. | always — these are levers on core connection/thread machinery, not an optional subsystem. |
 | `resource_profile` | Optional `.minimal`, `.balanced`, or `.throughput` defaults for existing pool levers; explicit `.pools` fields win. | data-only — selects constants, never enables a subsystem. |
-| `admission` | Optional `.{ .max_requests = N }`, positive `u32`: reject excess synchronous HTTP work with 503 instead of queuing. Optional positive `u32` `.max_work` shares capacity with outstanding memory jobs/`app.submit` and requires `-Dcoordinated-admission=true`. | HTTP state/checks/diagnostics excluded when omitted; shared job accounting excluded without its build flag; one null app pointer remains. |
+| `admission` | Optional positive `u32` `.max_requests` rejects excess synchronous HTTP work with 503. Optional positive `u32` `.max_work` shares capacity with outstanding memory jobs/`app.submit` and requires `.max_requests`. Optional positive `usize` `.max_job_bytes` independently bounds retained payload/name copies, without requiring HTTP admission. At least `.max_requests` or `.max_job_bytes` is required; both job budgets require `-Dcoordinated-admission=true`. | HTTP checks compile out without `.max_requests`; all state/diagnostics excluded when `.admission` is omitted; job accounting excluded without its build flag; one null app pointer remains. |
 | `query_workbench` | Optional `.{ .max_entries = 64, .slow_ms = 100 }` budgets for the [SQLite query workbench](#bounded-sqlite-query-workbench-opt-in). Requires `-Dquery-workbench=true`. | build-flag gated — no statement fields, TLS, timestamps, state, or endpoints when off. |
 | `pagination` | Enable/disable offset & cursor list paging and pick the cursor token format. | always — core list-response plumbing. |
 | `flags` | Declared boolean feature flags. See [Feature flags + experiments](#feature-flags--experiments-declared). | data-only — lowers to an empty slice + a zero-variant `Flag` enum when unset. |
@@ -4945,6 +4945,7 @@ busy-spinning, including on single-vCPU deployments.
 `GET /api/admission/stats` requires a superuser and returns `limit`, `active`,
 `high_water`, and `rejected` (saturating `u64`). Snapshots are coherent and
 process-local, reset on restart; `active` includes the diagnostics request itself.
+With byte-only admission, `limit` is `null` and HTTP counters stay zero instead.
 Additive shared-budget fields are `work_limit` (nullable), `jobs`,
 `work_high_water`, and `jobs_rejected` (saturating `u64`); these job counters remain
 zero when shared admission is disabled.
@@ -5002,6 +5003,58 @@ scheduler work itself, transport buffers, long-lived realtime sessions and
 arbitrary plugin work are not counted. Existing ring/worker bounds still apply.
 The offline `resources` envelope exposes `coordinated_admission_max_work`, or
 `null` when not configured; it does not measure current occupancy.
+
+#### Retained memory-job byte budget
+
+Under the same `-Dcoordinated-admission=true` build gate, opt into a separate
+positive `usize` ceiling with `.admission.max_job_bytes`:
+
+```zig
+.admission = .{ .max_job_bytes = 64 * 1024 },
+```
+
+This charges exactly the lengths of the queue-owned payload copies for memory
+jobs and name copies for `app.submit`, across queued and running tasks. Work-count
+and byte reservations are atomic: either both fit or neither is acquired.
+Reservations precede copying; allocation, startup, ring-full and shutdown errors
+return them. Retries retain bytes until final task cleanup. The inline no-pool
+fallback borrows its payload and therefore charges **zero bytes**, while retaining
+any configured work-count permit. Empty payloads/names also charge zero bytes.
+
+Byte exhaustion returns `error.QueueFull`, including a single copy larger than
+the entire budget. This byte-only configuration neither counts nor caps HTTP:
+HTTP admission calls compile out, while the superuser diagnostics route remains.
+Its `limit` is `null`, and `active`, `high_water`, and `rejected` remain zero.
+**Embedder migration:** `admission.Config.max_requests` (exposed through
+`App.admission_config`) and `admission.Snapshot.limit` (returned by
+`Runtime.admission.snapshot()`) changed from `u32` to `?u32`. Use optional capture
+(`if (snapshot.limit) |limit| { ... }`) and handle `null` as no HTTP cap. Existing
+HTTP-capped integrations may use `.?` only when their configuration guarantees a
+limit. Do not substitute zero for `null`: zero is not a valid configured cap.
+Omit `.max_requests` to keep byte-only admission; omitting `.admission` disables
+all its budgets.
+Add `.max_requests = 3` to cap HTTP separately, and optionally `.max_work = 16`
+to share work-count capacity; `max_work` still requires `max_requests` because
+it coordinates HTTP and job counts. Without `max_work`, the bounded ring/workers
+remain the task-count protection. When both job ceilings are full, the work-count
+check runs first and records the rejection only in `jobs_rejected`.
+
+Diagnostics add `job_bytes_limit` (nullable), `job_bytes`, `job_bytes_high_water`
+and saturating `job_bytes_rejected`. The last counter records only byte-budget
+refusals, not independent ring-full errors. Without the byte ceiling its counters
+remain zero; without `max_work`, `jobs` and `work_high_water` remain zero even when
+bytes are tracked. `resources.envelope.coordinated_admission_max_job_bytes` reports the
+configured ceiling, not current occupancy.
+
+This is **not an RSS or total job-memory bound**: it excludes task headers,
+allocator overhead, handler arenas/allocations, stacks, caller-owned data,
+durable queues and transport buffers. `Ctx` serializes payloads before admission;
+that serialization is not covered. No new per-task accounting field or allocation
+is added. The build flag off excludes queue accounting calls; an omitted byte
+ceiling leaves byte counters untouched and adds no separate lock to work-count
+admission. HTTP-only configuration performs no job-accounting lock.
+Byte-only zero-byte reservations (including inline borrowed payloads) also take
+no admission lock.
 
 #### Bounded SQLite query workbench (opt-in)
 
@@ -5182,6 +5235,7 @@ documents without this field remain accepted (their envelope is `null`).
 | --- | --- |
 | `http_admission_max_requests` | Concurrent admitted synchronous callbacks; `null` means admission disabled. Transport buffering happens before admission. |
 | `coordinated_admission_max_work` | Shared count of admitted synchronous HTTP callbacks plus queued/running memory jobs and `app.submit` tasks, including retry backoff; `null` when disabled. Not a byte/RSS budget and excludes durable jobs. |
+| `coordinated_admission_max_job_bytes` | Ceiling for queue-owned memory-job payload and `app.submit` name copy lengths; `null` when disabled. Excludes inline borrowed payloads, pre-enqueue serialization, task/allocator overhead, and handler allocations. |
 | `http_body_limit_source` | `runtime_ZIGBASE_MAX_UPLOAD_SIZE`: the body limit is deployment-configured and deliberately not read by this offline command. |
 | `retained_reader_cap` | Actual retained idle-reader cap after the shared SQLite/PostgreSQL clamp. The existing top-level `reader_pool_cap` remains the requested value. |
 | `sqlite_cache_target_bytes_per_connection` | Soft SQLite page-cache target after its clamp; `null` when 0 preserves the engine default. Not applicable to a PostgreSQL deployment. |
@@ -5933,7 +5987,7 @@ code to comptime-dead when off, so a build that doesn't need a feature doesn't p
 | `-Dresumable-uploads` | off | Principal-bound network-resume for file fields on existing records. Process-local by default, fully buffered, configurable session/byte/chunk/expiry budgets. SQLite restart persistence requires the additional `-Ddurable-resumable-uploads` flag and `.files.resumable.durable = true`; neither mode provides cross-instance durability. See [resumable uploads](resumable-uploads.md). |
 | `-Ddurable-resumable-uploads` | off | Compile SQLite/local upload persistence; requires `-Dresumable-uploads=true` and `.files.resumable.durable = true` to activate. Single-owner process-restart recovery with atomic completion receipts; still fully buffered, not cross-instance or power-loss durability. See [persistence limits](resumable-uploads.md#sqlite-process-restart-persistence). |
 | `-Dquery-workbench` | off | Bounded SQLite prepared-statement step/lifecycle metrics attributed to route templates, repeated/slow shape counters and operator-only structural EXPLAIN. No SQL/parameter capture; PostgreSQL is excluded. |
-| `-Dcoordinated-admission` | off | Compile shared HTTP and outstanding memory-job/`app.submit` work-count admission; activate with `.admission.max_work` alongside `.max_requests`. No byte/RSS cap or durable-job accounting. |
+| `-Dcoordinated-admission` | off | Compile job admission: `.admission.max_work` shares HTTP/memory-job work capacity and requires `.max_requests`; independent `.max_job_bytes` bounds retained payload/name copy lengths without enabling HTTP admission. No RSS cap or durable-job accounting. |
 | `-Ddev-mode` | on in `Debug`, off in release | The dev-only, never-in-prod seams: `ZIGBASE_FAKE_NOW` / `ZIGBASE_FAKE_SEED` (§14 above), test-capture, and fake field-crypto; the release script forces it off for shipped binaries. |
 | `-Ddev-tools` | **on** | The `init`/`agents-md`/`typegen` scaffolding/codegen verbs, `capabilities`/`routes`/`migrate preview` offline discovery, `tune` offline measurement advisor, and `diagnostics` structured doctor adapter (which can probe filesystem writability and initialize the migration ledger). Ordinary `doctor` and other migration actions remain available. Official release, Docker and npm artifacts include this tooling. Consumers can opt out for their deployment binary; stripped verbs exit nonzero with `-Ddev-tools=true` rebuild guidance. Distinct from `.enable_typegen` below — see §3b. |
 | `-Dstrip` | on except in `Debug` | Strip debug info from the binary (~7 MiB vs ~24 MiB unstripped in a release build). |

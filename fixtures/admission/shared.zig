@@ -22,6 +22,11 @@ fn hold(ctx: *zigbase.Ctx, marker: []const u8) !void {
 }
 
 fn submit(ctx: *zigbase.Ctx) anyerror!zigbase.http.Response {
+    // A preceding response may still be tearing down after its bytes reached
+    // the test client. Retry before reserving jobs so that overlap does not
+    // change which budget this fixture exercises.
+    if (ctx.app.admission.?.snapshot().active != 1)
+        return .{ .status = 503, .body = "previous-callback-finishing" };
     try ctx.app.submit("held", job);
     ctx.app.submit("rejected", job) catch |err| {
         if (err != error.QueueFull) return err;
@@ -35,14 +40,25 @@ fn holdHttp(ctx: *zigbase.Ctx) anyerror!zigbase.http.Response {
     return .{ .status = 204, .body = "" };
 }
 
+fn oversized(ctx: *zigbase.Ctx) anyerror!zigbase.http.Response {
+    if (ctx.app.admission.?.snapshot().active != 1)
+        return .{ .status = 503, .body = "previous-callback-finishing" };
+    ctx.app.submit("oversized-name", job) catch |err| {
+        if (err != error.QueueFull) return err;
+        return .{ .status = 200, .body = "byte-budget-rejected" };
+    };
+    return error.ExpectedQueueFull;
+}
+
 pub fn main(init: std.process.Init) !void {
     gate_dir = init.environ_map.get("ZIGBASE_TEST_GATE") orelse ".";
     return zigbase.App(.{
-        .admission = .{ .max_requests = 2, .max_work = 2 },
+        .admission = .{ .max_requests = 2, .max_work = 2, .max_job_bytes = 4 },
         .pools = .{ .memory_jobs = 1 },
         .routes = .{
             .{ .method = .POST, .path = "/submit", .handler = submit, .auth = .public },
             .{ .method = .GET, .path = "/hold", .handler = holdHttp, .auth = .public },
+            .{ .method = .POST, .path = "/oversized", .handler = oversized, .auth = .public },
         },
     }).runCli(init);
 }
