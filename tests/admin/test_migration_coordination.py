@@ -1,5 +1,5 @@
 """Separate-process SQLite consumer batches: contention, retry and crash release."""
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 import fcntl
 import os
 from pathlib import Path
@@ -41,6 +41,31 @@ def sql(directory, query, parameters=()):
 def prepare(directory, *, hold=1, fail=0):
     sql(directory, "CREATE TABLE coordination_control (hold INTEGER, fail INTEGER)")
     sql(directory, "INSERT INTO coordination_control VALUES (?, ?)", (hold, fail))
+
+
+def test_boot_waits_for_reader_before_enabling_wal(migration_binary, tmp_path):
+    prepare(tmp_path, hold=0)
+    with closing(sqlite3.connect(tmp_path / "data.db")) as reader:
+        assert reader.execute("PRAGMA journal_mode").fetchone() == ("delete",)
+        reader.execute("BEGIN")
+        reader.execute("SELECT * FROM coordination_control").fetchall()
+        process = subprocess.Popen(command(migration_binary, tmp_path), env=environment(),
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            # The first WAL negotiation must wait for this read transaction,
+            # rather than failing before the pool installs its busy timeout.
+            with pytest.raises(subprocess.TimeoutExpired):
+                process.communicate(timeout=0.25)
+            reader.rollback()
+            _, stderr = process.communicate(timeout=8)
+            assert process.returncode == 0, stderr
+        finally:
+            reader.rollback()
+            if process.poll() is None:
+                process.kill()
+            process.communicate(timeout=5)
+    assert sql(tmp_path, "PRAGMA journal_mode") == [("wal",)]
+    assert sql(tmp_path, "SELECT direction FROM coordination_events") == [(1,)]
 
 
 @contextmanager
