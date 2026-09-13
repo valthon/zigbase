@@ -18,6 +18,11 @@ Initial development of the official Python client for ZigBase — a behavioral p
 
 ### Added
 
+- **Async request keys.** Opt-in `request_key` cancellation on async `send`,
+  `raw_request`, and individual collection reads, including generated typed
+  services and the generated async client's `send`. Keys are client-local;
+  newer calls cancel older callers without waiting for custom transport cleanup.
+  Client close cancels active and retained keyed work before realtime teardown.
 - `ZigbaseError.code` — the error envelope's frozen machine code (`"not_found"`,
   `"validation_failed"`, `"email_not_verified"`, …). Branch on this instead of matching
   `message` text, whose wording is explicitly not part of the API contract. It is `""`
@@ -79,9 +84,8 @@ Initial development of the official Python client for ZigBase — a behavioral p
 - **No live-store tier yet.** The Dart/TypeScript SDKs'
   `realtime.collection()`/`LiveRecord`/`LiveList` observables have no Python equivalent yet;
   only the base subscribe/stream/topic API ships in this release.
-- **No request-key de-duplication.** The TypeScript/Dart SDKs' opt-in `requestKey`
-  last-write-wins cancellation has no Python equivalent yet; use `httpx`'s own
-  cancellation (e.g. `asyncio.wait_for`/task cancellation for `AsyncZigBase`) at the call
-  site instead.
+- **Async-only request keys.** Blocking calls and helpers other than individual
+  async reads and generic requests do not accept request keys; use explicit
+  caller cancellation where applicable.
 
 [Unreleased]: https://github.com/valthon/zigbase/tree/main/clients/python

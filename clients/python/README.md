@@ -369,11 +369,12 @@ This is a straight behavioral port, but a few things differ by design, not overs
   [Realtime](#realtime)), but not the Dart/TypeScript SDKs'
   `realtime.collection()`/`LiveRecord`/`LiveList` observables — deferred to a follow-up SDK
   milestone.
-- **No `requestKey` de-duplication.** The TypeScript/Dart SDKs' opt-in last-write-wins
-  request cancellation (`requestKey=`) has no Python equivalent. For the async facade, use
-  `asyncio` task cancellation (e.g. cancel the previous `asyncio.Task` before issuing a new
-  one) at the call site; there is no sync-facade analogue since `httpx.Client` calls block
-  the calling thread.
+- **Async request keys.** Pass `request_key="post-search"` to async `get_list`,
+  `get_one`, `get_first_list_item`, `get_page` (including typed reads), `send`, or
+  `raw_request` to cancel the previous in-flight request with that key. Its caller
+  receives `asyncio.CancelledError`. Keys are local to one client; account siblings
+  are isolated. Sync calls, other service helpers, and multi-page traversals do not
+  accept keys. See the [search example and cancellation contract](../../docs/python-sdk.md#request-keys).
 - **No per-call `timeout=`/`signal=`.** Where the TypeScript SDK takes a per-request
   `AbortSignal` and the Dart SDK a `requestKey`-based cancel, this SDK follows `httpx`'s own
   convention: configure timeouts (and any other transport policy) by constructing your own

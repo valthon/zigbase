@@ -26,10 +26,9 @@ client for every sibling. Using a closed client raises httpx's own
 
 Realtime (Task 6) is `asyncio`-only: `AsyncZigBase.realtime` lazily builds
 ONE `RealtimeService` per client instance (bound to `base_url`/`auth_store`,
-same instance on every later access) and `aclose()` tears it down first --
-before the transport -- since `RealtimeService.close()` needs the running
-loop and cancels its own tasks, while closing the transport is just an
-`httpx` client shutdown. `with_account` siblings each get their own lazily-
+same instance on every later access). `aclose()` cancels keyed HTTP work
+before awaiting realtime teardown, then closes any owned `httpx` client even
+if realtime teardown raises. `with_account` siblings each get their own lazily-
 built `realtime` service (subscriptions are tied to one connection, not
 shared across account-scoped siblings), constructed with the same injected
 `realtime_connector`/`on_realtime_error` as the parent. `ZigBase.realtime`
@@ -330,15 +329,25 @@ class AsyncZigBase:
         query: dict[str, str] | None = None,
         body: Mapping[str, Any] | None = None,
         headers: dict[str, str] | None = None,
+        request_key: str | None = None,
     ) -> Any:
-        """See `ZigBase.send`."""
+        """See `ZigBase.send`. A string `request_key` cancels the previous
+        in-flight request with that key on this client; its caller receives
+        `asyncio.CancelledError`. `None` leaves requests independent."""
         return await self._transport.request(
-            RequestSpec(method=method, path=path, query=query, body=body, headers=headers)
+            RequestSpec(
+                method=method,
+                path=path,
+                query=query,
+                body=body,
+                headers=headers,
+                request_key=request_key,
+            )
         )
 
     async def raw_request(self, method: str, path: str, **kw: Any) -> httpx.Response:
-        """See `ZigBase.raw_request`."""
-        picked = _pluck(dict(kw), _SEND_OPT_KEYS)
+        """See `ZigBase.raw_request`; also accepts `request_key` as in `send`."""
+        picked = _pluck(dict(kw), _SEND_OPT_KEYS | {"request_key"})
         return await self._transport.raw_request(
             RequestSpec(
                 method=method,
@@ -346,6 +355,7 @@ class AsyncZigBase:
                 query=picked.get("query"),
                 body=picked.get("body"),
                 headers=picked.get("headers"),
+                request_key=picked.get("request_key"),
             )
         )
 
@@ -371,14 +381,17 @@ class AsyncZigBase:
         )
 
     async def aclose(self) -> None:
-        """See `ZigBase.close`. Closes the `realtime` service first, if one
-        was ever built -- it needs the running loop to cancel its own tasks,
-        so it must run before the transport's `httpx` client (which doesn't)
-        is torn down."""
-        if self._realtime is not None:
-            await self._realtime.close()
-        if self._owns_client:
-            await self._http_client.aclose()
+        """Cancel keyed HTTP calls before awaiting custom realtime cleanup.
+        The transport borrows our HTTP client, so this first step does not
+        close it. Tear down owned HTTP resources even if realtime close fails;
+        unkeyed requests retain their existing lifecycle."""
+        await self._transport.aclose()
+        try:
+            if self._realtime is not None:
+                await self._realtime.close()
+        finally:
+            if self._owns_client:
+                await self._http_client.aclose()
 
     async def __aenter__(self) -> AsyncZigBase:
         return self
