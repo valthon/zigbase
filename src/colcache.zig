@@ -268,15 +268,18 @@ test "colcache: negative entries are cached and cleared by invalidate" {
     defer cache.deinit();
 
     var miss1 = try lease(&cache, &d, testing.allocator, "nope");
+    defer miss1.release();
     try testing.expect(miss1.col == null);
     const neg_entry = miss1.entry.?;
-    miss1.release();
     var miss2 = try lease(&cache, &d, testing.allocator, "nope");
+    defer miss2.release();
     try testing.expect(miss2.entry.? == neg_entry); // negative HIT
-    miss2.release();
     cache.invalidate();
     var miss3 = try lease(&cache, &d, testing.allocator, "nope");
     defer miss3.release();
+    try testing.expect(miss3.col == null);
+    // Retain the old leases through this comparison: a freed entry's address
+    // may legitimately be reused, but two simultaneously live entries cannot alias.
     try testing.expect(miss3.entry.? != neg_entry); // reloaded after DDL
 }
 
