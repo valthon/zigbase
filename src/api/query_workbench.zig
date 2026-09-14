@@ -29,6 +29,8 @@ pub fn stats(ctx: *http.RequestCtx) !http.Response {
         break :blk .{ .entries = try ctx.allocator.a.dupe(workbench.Entry, store.entries[0..store.count]), .dropped = store.dropped, .dropped_statements = store.dropped_statements };
     };
     const Item = struct {
+        backend: []const u8,
+        measurement: []const u8,
         method: []const u8,
         routeTemplate: []const u8,
         shape: []const u8,
@@ -49,6 +51,8 @@ pub fn stats(ctx: *http.RequestCtx) !http.Response {
         var bytes: [8]u8 = undefined;
         std.mem.writeInt(u64, &bytes, entry.fingerprint, .big);
         item.* = .{
+            .backend = @tagName(entry.backend),
+            .measurement = if (entry.backend == .sqlite) "prepared-statement-step-time" else "client-extended-protocol-exchange-time",
             .method = entry.method,
             .routeTemplate = entry.route[0..entry.route_len],
             .shape = try ctx.allocator.a.dupe(u8, &std.fmt.bytesToHex(bytes, .lower)),
@@ -67,8 +71,8 @@ pub fn stats(ctx: *http.RequestCtx) !http.Response {
     }
     return .{ .status = 200, .body = try std.json.Stringify.valueAlloc(ctx.allocator.a, .{
         .items = items,
-        .backend = "sqlite",
-        .measurement = "prepared-statement-step-time",
+        .backend = @tagName(db.poolBackend(ctx.app.?.pool)),
+        .measurement = "backend-specific-see-items",
         .lifetimeMeasurement = "prepare-through-finalize",
         .measuredCalls = .{ "prepare", "step", "reset", "finalize" },
         .activeBackend = @tagName(db.poolBackend(ctx.app.?.pool)),

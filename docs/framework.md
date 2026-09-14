@@ -166,7 +166,7 @@ error.**
 | `pools` | Footprint levers: reader pool, scheduler workers (`.jobs`), lazy memory-job/submit workers (`.memory_jobs`), thread stack size, SQLite page cache. | always — these are levers on core connection/thread machinery, not an optional subsystem. |
 | `resource_profile` | Optional `.minimal`, `.balanced`, or `.throughput` defaults for existing pool levers; explicit `.pools` fields win. | data-only — selects constants, never enables a subsystem. |
 | `admission` | Optional positive `u32` `.max_requests` rejects excess synchronous HTTP work with 503. Optional positive `u32` `.max_work` shares capacity with outstanding memory jobs/`app.submit` and requires `.max_requests`. Optional positive `usize` `.max_job_bytes` independently bounds retained payload/name copies, without requiring HTTP admission. At least `.max_requests` or `.max_job_bytes` is required; both job budgets require `-Dcoordinated-admission=true`. | HTTP checks compile out without `.max_requests`; all state/diagnostics excluded when `.admission` is omitted; job accounting excluded without its build flag; one null app pointer remains. |
-| `query_workbench` | Optional `.{ .max_entries = 64, .slow_ms = 100 }` budgets for the [SQLite query workbench](#bounded-sqlite-query-workbench-opt-in). Requires `-Dquery-workbench=true`. | build-flag gated — no statement fields, TLS, timestamps, state, or endpoints when off. |
+| `query_workbench` | Optional `.{ .max_entries = 64, .slow_ms = 100 }` budgets for the [query workbench](#bounded-query-workbench-opt-in). Requires `-Dquery-workbench=true`. | build-flag gated — no statement fields, TLS, timestamps, state, or endpoints when off. |
 | `pagination` | Enable/disable offset & cursor list paging and pick the cursor token format. | always — core list-response plumbing. |
 | `flags` | Declared boolean feature flags. See [Feature flags + experiments](#feature-flags--experiments-declared). | data-only — lowers to an empty slice + a zero-variant `Flag` enum when unset. |
 | `experiments` | Declared A/B/n experiments (variants + weights, optional `.sticky`). See [Feature flags + experiments](#feature-flags--experiments-declared). | data-only — lowers to an empty slice + a zero-variant `Experiment` enum when unset. |
@@ -5056,9 +5056,9 @@ admission. HTTP-only configuration performs no job-accounting lock.
 Byte-only zero-byte reservations (including inline borrowed payloads) also take
 no admission lock.
 
-#### Bounded SQLite query workbench (opt-in)
+#### Bounded query workbench (opt-in)
 
-Build with `-Dquery-workbench=true` to measure synchronous SQLite prepared
+Build with `-Dquery-workbench=true` to measure synchronous SQLite and PostgreSQL prepared
 statements inside matched built-in and consumer HTTP route handlers. The default
 build compiles out measurement calls, statement fields, thread-local attribution,
 counter storage and inspector routes. This is a diagnostic build cost, not an
@@ -5073,7 +5073,7 @@ pub const App = zigbase.App(.{
 
 These are also the standalone defaults when the build flag is on. Configuration
 is comptime: 1–256 entries and a positive `slow_ms`; unknown keys fail compilation.
-Each entry aggregates one method + **route template** + structural query shape.
+Each entry aggregates one backend + method + **route template** + structural query shape.
 Only the first configured number of distinct entries is retained until restart;
 new keys are dropped (counted), never allowed to grow a map. Templates longer
 than 192 bytes and unsupported or greater-than-16-KiB statements are omitted.
@@ -5085,7 +5085,10 @@ No raw SQL, parameter values, SQL literals, identifier text or request-path valu
 are retained. A bounded lexer hashes only a fixed SQL-keyword allowlist and
 punctuation: identifiers become one marker, literal/bind contents another,
 comments disappear. Named binds (`$`, `:`, `@`, `#`, including SQLite Tcl suffix
-syntax) are omitted entirely; anonymous/numbered `?` binds are supported. Thus
+syntax) are omitted entirely for SQLite; anonymous/numbered `?` binds are supported.
+PostgreSQL supports numbered `$N` binds and `::` casts. Dollar-quoted strings,
+escape/Unicode string prefixes, backslashes in quoted tokens and nested block
+comments are conservatively omitted rather than risking literal-content capture. Thus
 different tables/columns and parameter values can
 share one opaque shape ID. `repeatedShapes` means repeated **structural shapes within
 one matched handler**, not proof of an N+1 query bug. Route templates themselves
@@ -5094,7 +5097,8 @@ secrets in route definitions. Reports are operator-only, not tenant-scoped.
 
 `GET /api/query-workbench/stats` requires a current **superuser bearer token**.
 Cookies alone do not authorize it. It returns bounded `{items}` plus limits,
-backend scope, threshold and dropped-execution count. Each item has `method`,
+backend scope, threshold and dropped-execution count. Each item has `backend`,
+`measurement`, `method`,
 `routeTemplate`, opaque hexadecimal `shape`, `executions`, `stepNanoseconds`,
 `maxStepNanoseconds`, `slowExecutions`, `repeatedShapes`, and `failedExecutions`.
 Timing is the sum of SQLite `step()` call durations per execution, including
@@ -5104,14 +5108,30 @@ early finalization closes an execution; work retained past the originating
 scope is omitted, not attributed to the next request. Inspector requests exclude
 their own auth and plan queries. State snapshots are coherent and bounded.
 
+For PostgreSQL, those same `stepNanoseconds` fields measure **client elapsed time
+for the first step's entire extended-protocol exchange**, including parameter
+marshalling, network/server waits and result materialization. Buffered subsequent
+steps add no timestamps or execution counts. This is not server CPU or pool-wait
+time. Zero-row results, errors and partial consumption still count one exchange;
+reset permits another execution. The report's top-level `measurement` is
+`backend-specific-see-items`; item labels distinguish `prepared-statement-step-time`
+from `client-extended-protocol-exchange-time`. Top-level `backend`/`activeBackend`
+identify the application pool; individual items can also describe another backend
+opened by a custom handler. Backend identity also separates repeat accounting.
+Telemetry storage is bounded; PostgreSQL's pre-existing whole-result buffering
+is **not** bounded by these telemetry limits, and instrumentation copies no rows.
+
 Completed statements also report a separate lifecycle family:
 
 - `finalizedStatements`: successful prepares finalized in their originating
   scope, whether stepped or not. Reset/reuse still counts as one statement.
 - `statementLifetimeNanoseconds` and `maxStatementLifetimeNanoseconds`: sum/max
-  elapsed time from entry to SQLite prepare through return from finalize.
+  elapsed time from entry to prepare through return from finalize (PostgreSQL
+  prepare copies SQL locally; server parsing happens in the first step).
 - `measuredCallNanoseconds`: elapsed time in the measured prepare, step, reset,
-  and finalize calls for those finalized statements, including SQLite waits.
+  and finalize calls for those finalized statements, including backend waits.
+  PostgreSQL measures only the execution-bearing step; buffered row handling
+  remains in held time.
 - `heldNanoseconds`: lifetime minus those measured calls, clamped at zero. It
   includes application pauses, scheduling, binding, column access/decoding and
   instrumentation overhead. It is **not CPU time**, a pure application-time
@@ -5140,6 +5160,11 @@ reads, without extra per-row clocks.
 Successful in-scope prepares fingerprint the compiled SQL once; execution/reset
 cycles reuse that key. Statements prepared outside the active scope fall back
 to fingerprinting on execution, preserving execution attribution.
+For PostgreSQL, that fallback applies only to originally unscoped statements.
+A statement prepared inside a collecting scope loses execution attribution
+permanently when used in another scope (or outside a scope); reset or returning
+to its original scope does not revive it. These omissions do not increment the
+next scope's dropped or execution counters.
 Default-off builds retain none of this storage or instrumentation.
 
 `POST /api/query-workbench/explain` accepts only a structured SELECT shape:
@@ -5162,9 +5187,8 @@ not assert a real request's exact plan or cost. The same bearer-only superuser
 boundary applies before any planning. Inspect only trusted local/staging data
 when exposing schema names would be sensitive.
 
-Backend scope is **SQLite only**, even in binaries also built with PostgreSQL:
-PostgreSQL plan inspection returns `501`, and its statements are not measured.
-The SQLite `exec()` path, background jobs, async work, WebSocket/SSE delivery,
+PostgreSQL plan inspection still returns `501`; only SQLite supports plans.
+The raw `exec()` paths, background jobs, async work, WebSocket/SSE delivery,
 unmatched/static routes and remapped feature-state dispatch are not covered.
 Nested synchronous dispatch restores outer attribution; cross-thread/cross-scope
 statement retention does not transfer attribution. This first slice is not a
@@ -5986,7 +6010,7 @@ code to comptime-dead when off, so a build that doesn't need a feature doesn't p
 | `-Dimage-thumbnails` | off | Named PNG/JPEG/WebP derivatives on built-in local storage via a trusted external ImageMagick executable; configure `.files.thumbnails`. Subprocess support, routes and admission state are excluded when off; no image codec is linked. See [thumbnails](thumbnails.md). |
 | `-Dresumable-uploads` | off | Principal-bound network-resume for file fields on existing records. Process-local by default, fully buffered, configurable session/byte/chunk/expiry budgets. SQLite restart persistence requires the additional `-Ddurable-resumable-uploads` flag and `.files.resumable.durable = true`; neither mode provides cross-instance durability. See [resumable uploads](resumable-uploads.md). |
 | `-Ddurable-resumable-uploads` | off | Compile SQLite/local upload persistence; requires `-Dresumable-uploads=true` and `.files.resumable.durable = true` to activate. Single-owner process-restart recovery with atomic completion receipts; still fully buffered, not cross-instance or power-loss durability. See [persistence limits](resumable-uploads.md#sqlite-process-restart-persistence). |
-| `-Dquery-workbench` | off | Bounded SQLite prepared-statement step/lifecycle metrics attributed to route templates, repeated/slow shape counters and operator-only structural EXPLAIN. No SQL/parameter capture; PostgreSQL is excluded. |
+| `-Dquery-workbench` | off | Bounded SQLite step and PostgreSQL client-exchange metrics, statement lifecycle timing, route attribution and repeated/slow shape counters. Structural EXPLAIN remains SQLite-only; no SQL/parameter capture. |
 | `-Dcoordinated-admission` | off | Compile job admission: `.admission.max_work` shares HTTP/memory-job work capacity and requires `.max_requests`; independent `.max_job_bytes` bounds retained payload/name copy lengths without enabling HTTP admission. No RSS cap or durable-job accounting. |
 | `-Ddev-mode` | on in `Debug`, off in release | The dev-only, never-in-prod seams: `ZIGBASE_FAKE_NOW` / `ZIGBASE_FAKE_SEED` (§14 above), test-capture, and fake field-crypto; the release script forces it off for shipped binaries. |
 | `-Ddev-tools` | **on** | The `init`/`agents-md`/`typegen` scaffolding/codegen verbs, `capabilities`/`routes`/`migrate preview` offline discovery, `tune` offline measurement advisor, and `diagnostics` structured doctor adapter (which can probe filesystem writability and initialize the migration ledger). Ordinary `doctor` and other migration actions remain available. Official release, Docker and npm artifacts include this tooling. Consumers can opt out for their deployment binary; stripped verbs exit nonzero with `-Ddev-tools=true` rebuild guidance. Distinct from `.enable_typegen` below — see §3b. |

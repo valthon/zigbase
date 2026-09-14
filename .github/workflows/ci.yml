@@ -300,7 +300,14 @@ jobs:
           key: zig-global-${{ runner.os }}-zig0.16.0-${{ hashFiles('vendor/sqlite/sqlite3.c', 'build.zig', 'build.zig.zon') }}
           restore-keys: zig-global-${{ runner.os }}-zig0.16.0-
       - name: Unit + PostgreSQL driver tests (-Dpostgres=true -Dvector=true)
-        run: mise exec zig@0.16.0 -- zig build test --summary all -Dpostgres=true -Dvector=true
+        run: mise exec zig@0.16.0 -- zig build test --summary all -Dpostgres=true -Dvector=true -Dquery-workbench=true
+      - name: PostgreSQL workbench paired gating and live HTTP
+        run: |
+          mise exec zig@0.16.0 -- zig build query-workbench-fixture -Dpostgres=true --prefix zig-out/workbench-off
+          mise exec zig@0.16.0 -- zig build query-workbench-fixture -Dpostgres=true -Dquery-workbench=true --prefix zig-out/workbench-on
+          bash scripts/check-query-workbench-gating.sh zig-out/workbench-off/bin/query-workbench-fixture zig-out/workbench-on/bin/query-workbench-fixture
+          mise exec python@3.13 -- python -m pip install --quiet pytest
+          ZIGBASE_TEST_QUERY_WORKBENCH_OFF_BINARY="$GITHUB_WORKSPACE/zig-out/workbench-off/bin/query-workbench-fixture" ZIGBASE_TEST_QUERY_WORKBENCH_BINARY="$GITHUB_WORKSPACE/zig-out/workbench-on/bin/query-workbench-fixture" mise exec python@3.13 -- python -m pytest tests/admin/test_query_workbench_postgres.py -q
       - name: Rails PostgreSQL row-source integration
         run: |
           mise exec python@3.13 -- python -m pip install --quiet pytest -r tools/rails/requirements-postgres.txt

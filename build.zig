@@ -121,7 +121,7 @@ pub fn build(b: *std.Build) void {
     const image_thumbnails = b.option(bool, "image-thumbnails", "Compile ImageMagick thumbnail integration (default: off)") orelse false;
     const durable_resumable_uploads = b.option(bool, "durable-resumable-uploads", "Compile opt-in SQLite upload persistence (requires resumable-uploads)") orelse false;
     if (durable_resumable_uploads and !resumable_uploads) @panic("durable-resumable-uploads requires resumable-uploads=true");
-    const query_workbench = b.option(bool, "query-workbench", "Compile bounded SQLite query diagnostics (default: off)") orelse false;
+    const query_workbench = b.option(bool, "query-workbench", "Compile bounded SQLite/PostgreSQL query diagnostics (default: off)") orelse false;
     const coordinated_admission = b.option(bool, "coordinated-admission", "Compile shared HTTP and memory-job admission (default: off)") orelse false;
     // Opt-in vector search (#157; Postgres pgvector port #159). OFF by default: the default build
     // does NOT compile or link the sqlite-vec amalgamation, and every vector code path folds to
@@ -555,7 +555,7 @@ pub fn build(b: *std.Build) void {
     workbench_fixture_options.addOption(bool, "enabled", query_workbench);
     workbench_mod.addOptions("fixture_options", workbench_fixture_options);
     const workbench_exe = b.addExecutable(.{ .name = "query-workbench-fixture", .root_module = workbench_mod });
-    b.step("query-workbench-fixture", "Build the opt-in SQLite workbench HTTP fixture").dependOn(&b.addInstallArtifact(workbench_exe, .{}).step);
+    b.step("query-workbench-fixture", "Build the opt-in query workbench HTTP fixture").dependOn(&b.addInstallArtifact(workbench_exe, .{}).step);
     const invalid_workbench_mod = b.createModule(.{ .root_source_file = b.path("fixtures/query-workbench/invalid.zig"), .target = target, .optimize = optimize, .link_libc = true });
     invalid_workbench_mod.addImport("zigbase", zigbase_mod);
     const invalid_workbench = b.addExecutable(.{ .name = "invalid-query-workbench", .root_module = invalid_workbench_mod });

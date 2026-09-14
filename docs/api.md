@@ -1689,7 +1689,7 @@ high-water-mark). `401` unauthenticated, `403` non-superuser.
 
 ---
 
-## Query workbench (SQLite, opt-in)
+## Query workbench (opt-in)
 
 Build with `-Dquery-workbench=true`; otherwise both endpoints return `404`.
 Both require a current superuser bearer token: `401` for absent/invalid bearer
@@ -1706,7 +1706,13 @@ Input is capped at 4 KiB; output at 32 plan rows, 512 UTF-8 bytes per detail.
 Unknown keys/fields or invalid input return `400`; unknown collection `404`;
 PostgreSQL planning `501`. Plans intentionally reveal schema/index names to
 operators, not ordinary users. Metrics retain no SQL or parameter text; structural
-shape repetition is not proof of N+1. See [scope, tuning and privacy limits](framework.md#bounded-sqlite-query-workbench-opt-in).
+shape repetition is not proof of N+1. See [scope, tuning and privacy limits](framework.md#bounded-query-workbench-opt-in).
+Each item includes `backend` and `measurement`; the top-level measurement is
+`backend-specific-see-items`. SQLite step durations retain their existing meaning.
+PostgreSQL step durations cover the first step's complete client protocol exchange,
+including network/server wait and result buffering, not CPU or pool-wait time.
+Buffered row iteration adds no clock reads or execution counts. Backend identity
+separates shape/repeat aggregation; telemetry limits do not cap query result memory.
 Lifecycle items add `finalizedStatements`, `statementLifetimeNanoseconds`,
 `maxStatementLifetimeNanoseconds`, `measuredCallNanoseconds`, and `heldNanoseconds`.
 They cover successful prepare through finalize within one originating scope,
