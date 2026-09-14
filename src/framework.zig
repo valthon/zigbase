@@ -4440,6 +4440,14 @@ fn migrateDbImpl(allocator: std.mem.Allocator, io: std.Io, ma: cli.MigrateDbArgs
 
         std.log.info("migrate-db: migrating '{s}' -> PostgreSQL{s}", .{ from, if (ma.force) " (--force)" else "" });
         const report = dumpload.run(allocator, &source, &target, .{ .force = ma.force }) catch |e| switch (e) {
+            error.InvalidReceiptLedger => {
+                std.log.err("migrate-db: idempotency ledger must be an ordinary table in SQLite main or a permanent table in PostgreSQL current_schema(); remove temporary, attached or search-path ambiguity before copying. No target writes performed.", .{});
+                return e;
+            },
+            error.IdempotencyReceiptsPresent => {
+                std.log.err("migrate-db: source or target contains idempotency receipts; drain operations, wait for all retention windows, then explicitly remove verified-expired receipts before copying. No target writes performed.", .{});
+                return e;
+            },
             error.SourceNamespaceUpgradeRequired => {
                 std.log.err("migrate-db: run this version's system migrations against the stopped SQLite source before copying; its immutable storage namespace ledger is missing.", .{});
                 return e;

@@ -312,6 +312,10 @@ jobs:
         run: |
           mise exec python@3.13 -- python -m pip install --quiet pytest -r tools/rails/requirements-postgres.txt
           mise exec python@3.13 -- python -m pytest tests/rails/test_postgres_source.py -q
+      - name: PostgreSQL idempotency HTTP positive control
+        run: |
+          mise exec zig@0.16.0 -- zig build idempotency-fixture -Dpostgres=true --prefix zig-out/idempotency-pg
+          ZIGBASE_DB_URL="$ZIGBASE_PG_TEST_URL" ZIGBASE_TEST_IDEMPOTENCY_BINARY="$GITHUB_WORKSPACE/zig-out/idempotency-pg/bin/idempotency-fixture" mise exec python@3.13 -- python -m pytest tests/admin/test_idempotency.py::test_concurrent_replay_payload_binding_and_current_guest_guard -q
       - name: PostgreSQL and SQLite CLI operator provisioning
         run: |
           mise exec zig@0.16.0 -- zig build -Dpostgres=true

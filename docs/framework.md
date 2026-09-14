@@ -1731,7 +1731,7 @@ return ctx.errorResponse(ctx.invalid(&.{
 }));
 ```
 
-### Idempotent custom mutations (opt-in SQLite)
+### Idempotent custom mutations (opt-in SQLite/PostgreSQL)
 
 `zigbase.Idempotency(.{ .namespace = "booking-cancel-v1", .max_entries = 1024,
 .retention_seconds = 86400, .max_payload_bytes = 65536, .max_result_bytes = 4096,
@@ -1742,8 +1742,8 @@ or `App` configuration field for this helper. All its resource limits are compti
 
 Call `Receipts.execute(allocator, writer, input, callbacks)`. Acquire the pool
 writer once and defer its release; do not call from an existing `ctx.tx` or hook
-transaction. The helper refuses PostgreSQL and caller-owned transactions before
-doing any work. `IdempotencyInput` contains:
+transaction. Caller-owned transactions are refused before doing any work.
+PostgreSQL requires the existing `-Dpostgres=true` build. `IdempotencyInput` contains:
 
 - `principal = .{ .collection = authenticated_collection, .record = authenticated_id }`:
   both come from verified server identity, never from submitted JSON.
@@ -1780,7 +1780,18 @@ The return owns its allocation: read `result.body()` / `result.replayed`, then
 `result.deinit(allocator)`. Copy the body into your response's lifetime before deinit.
 
 An SQLite `BEGIN IMMEDIATE` covers current authorization, lookup, DB mutation and
-receipt insertion. Independent writers cannot both execute an uncommitted key;
+receipt insertion. PostgreSQL uses a helper-owned `READ COMMITTED` transaction
+and a fail-fast, transaction-scoped advisory lock per namespace. Namespace-lock
+contention returns `IdempotencyBusy` before authorization or mutation; retry the
+same key later.
+All operations within one namespace serialize, including distinct keys, to enforce
+strict capacity. Different namespaces can proceed independently after first-use
+schema creation. Cold creation uses a separate fail-fast advisory lock, so a
+concurrent first attempt in another namespace may also return `IdempotencyBusy`
+after read-only authorization but before mutation.
+Locks release on commit, rollback or connection loss; no session lock leaks into
+the pool. Hash collisions can cause conservative contention, never shared receipts.
+Independent writers cannot both execute an uncommitted key;
 lock contention may return a DB error and is safe to retry. If commit succeeds but
 the response is lost, the same authorized attempt returns the saved bytes without
 calling `mutate`. Changed payload under a live key returns `PayloadConflict`.
@@ -1802,14 +1813,37 @@ All processes for a namespace should use the same limits. Lowering capacity refu
 new keys until rows fit; lowering retention never changes stored expiries. Lowering
 result budget below an existing result refuses its replay, rather than rerunning it.
 The logical bound is per namespace (including retained result bytes); number of
-namespaces, SQLite pages/WAL, disk reclamation and total process RSS are not bounded.
+namespaces, database pages/WAL, disk reclamation and total process RSS are not bounded.
+PostgreSQL stores namespace and result bytes as `BYTEA` (including NUL and non-UTF8
+bytes) and expiry as `BIGINT`. Its text-protocol binding uses bounded hexadecimal
+scratch (twice the result length); replay queries limit result bytes before the
+driver buffers a row, even after lowering the configured result budget.
+The ledger must resolve to a permanent ordinary table in `current_schema()`;
+temporary/unlogged objects, views and fallback schemas fail closed with
+`InvalidReceiptLedger`, before mutation. Database copying applies the same check
+to both connections; configure their search paths deliberately.
+Quoted schema names are supported; cold creation revalidates the new ledger's
+ownership before cleanup or mutation, rolling back temporary-schema creation.
+SQLite requires an ordinary ledger table in `main`; temporary objects, views,
+virtual tables and any attached-database ledger with the same name (even when
+`main` also owns one) are refused before mutation or copying. Name checks are
+case-insensitive, matching SQLite identifier resolution.
 
 This is **database-only atomicity**, not exactly-once email, HTTP, files or realtime.
 Never perform these effects in a callback; use a transactional outbox if needed.
 The helper does not automatically invoke REST hooks/rules or serialize responses.
 The [golfsim example](../examples/golfsim/README.md#idempotent-cancellation) shows
 an authenticated custom route with current guest authorization and a bound `Ctx`.
-Built-in REST idempotency and PostgreSQL coordination are not implemented.
+Built-in REST idempotency and external side-effect orchestration are not implemented.
+
+**Database copying:** `migrate-db`/`dumpload.run` refuse any source or target with
+non-empty `_idempotency_receipts`, even with `--force` or same-backend copies,
+before writing target schema or data (`IdempotencyReceiptsPresent`). Lazy ledgers
+cannot otherwise be copied safely by the target-driven transfer. Drain all
+participating applications, wait out stored retention windows, verify receipt
+expiry against trusted server time, and explicitly delete only verified-expired
+receipts before retrying the copy. The copier never expires or deletes them for
+you. An empty ledger does not prevent migration.
 
 ### `ctx.tx()` — multi-write transactions
 
@@ -4088,6 +4122,10 @@ Unexpired `_idempotency_receipts` return `PendingIdempotencyReceipts` before any
 mutation. Their scopes hash application-selected principal/operation names, so the
 engine cannot prove a receipt unrelated to a rename. Stop new operations and wait
 out the existing retention windows; receipts are not discarded or silently rebound.
+Rename uses the same ledger-ownership validation as idempotent execution and
+database copying; ambiguous or non-durable ownership returns `InvalidReceiptLedger`.
+The existing offline precondition still rejects any temporary relation with
+`Conflict` before this check.
 
 File-bearing collections keep an **immutable storage namespace**. Upgrading seeds
 the engine-owned reservation ledger from existing collection IDs and names; no

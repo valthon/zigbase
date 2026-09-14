@@ -190,7 +190,7 @@ pub const Ctx = @import("ctx.zig").Ctx;
 /// runs writes on the in-transaction connection and `t.arena()` is the invocation arena.
 /// See the `ctx.tx()` section of docs/framework.md.
 pub const Tx = @import("ctx.zig").Tx;
-/// SQLite-only, opt-in database mutation receipts with comptime resource limits.
+/// SQLite/PostgreSQL, opt-in database mutation receipts with comptime resource limits.
 pub const Idempotency = @import("idempotency.zig").Idempotency;
 pub const IdempotencyLimits = @import("idempotency.zig").Limits;
 pub const IdempotencyPrincipal = @import("idempotency.zig").Principal;
