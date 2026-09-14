@@ -37,6 +37,74 @@ pub const Options = struct {
     force: bool = false,
 };
 
+test "receipt preflight preserves both databases before forced or fresh copies" {
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |on_target| {
+        for ([_]bool{ false, true }) |force| {
+            var source = try db.Db.openMemory();
+            defer source.close();
+            var target = try db.Db.openMemory();
+            defer target.close();
+            try target.exec("CREATE TABLE sentinel(value TEXT); INSERT INTO sentinel VALUES('unchanged');");
+            const receipt_conn = if (on_target) &target else &source;
+            try receipt_conn.exec("CREATE TABLE _idempotency_receipts(expires BIGINT); INSERT INTO _idempotency_receipts VALUES(1);");
+            // Even already-expired receipts require deliberate operator cleanup;
+            // the copier has no authority to erase retry protection.
+            try std.testing.expectError(error.IdempotencyReceiptsPresent, run(a, &source, &target, .{ .force = force }));
+            var value = try target.prepare("SELECT value FROM sentinel;");
+            defer value.finalize();
+            try std.testing.expect(try value.step());
+            try std.testing.expectEqualStrings("unchanged", value.columnText(0));
+            try std.testing.expect(!try tableExists(a, &target, "_migrations"));
+            var retained = try receipt_conn.prepare("SELECT count(*) FROM _idempotency_receipts;");
+            defer retained.finalize();
+            _ = try retained.step();
+            try std.testing.expectEqual(@as(i64, 1), retained.columnInt(0));
+        }
+    }
+}
+
+test "SQLite receipt shadows and non-table ledgers refuse every copy before writes" {
+    const a = std.testing.allocator;
+    const cases = [_]struct { sql: [:0]const u8, main_receipt: bool = false }{
+        .{ .sql = "CREATE TABLE _idempotency_receipts(expires INTEGER); INSERT INTO _idempotency_receipts VALUES(9999999999); CREATE TEMP TABLE _IDEMPOTENCY_RECEIPTS(expires INTEGER);", .main_receipt = true },
+        .{ .sql = "CREATE TABLE _idempotency_receipts(expires INTEGER); INSERT INTO _idempotency_receipts VALUES(9999999999); CREATE TEMP VIEW _idempotency_receipts AS SELECT * FROM main._idempotency_receipts WHERE 0;", .main_receipt = true },
+        .{ .sql = "CREATE TEMP TABLE _idempotency_receipts(expires INTEGER);" },
+        .{ .sql = "CREATE VIEW _idempotency_receipts AS SELECT 1 AS expires;" },
+        .{ .sql = "CREATE VIRTUAL TABLE _idempotency_receipts USING fts5(value);" },
+        .{ .sql = "ATTACH DATABASE ':memory:' AS extra; CREATE TABLE extra._idempotency_receipts(expires INTEGER);" },
+        .{ .sql = "CREATE TABLE _idempotency_receipts(expires INTEGER); INSERT INTO _idempotency_receipts VALUES(9999999999); ATTACH DATABASE ':memory:' AS extra; CREATE TABLE extra._idempotency_receipts(expires INTEGER);", .main_receipt = true },
+    };
+    for (cases) |case| {
+        if (!@import("search/fts.zig").enabled and std.mem.indexOf(u8, case.sql, "VIRTUAL") != null) continue;
+        for ([_]bool{ false, true }) |on_target| {
+            for ([_]bool{ false, true }) |force| {
+                var source = try db.Db.openMemory();
+                defer source.close();
+                var target = try db.Db.openMemory();
+                defer target.close();
+                try target.exec("CREATE TABLE sentinel(value INTEGER); INSERT INTO sentinel VALUES(42);");
+                const conn = if (on_target) &target else &source;
+                // Even a user object named like the TVF cannot replace introspection.
+                try conn.exec("CREATE TABLE pragma_table_list(schema TEXT,name TEXT,type TEXT);");
+                try conn.exec(case.sql);
+                try std.testing.expectError(error.InvalidReceiptLedger, run(a, &source, &target, .{ .force = force }));
+                try std.testing.expect(!try tableExists(a, &target, "_migrations"));
+                var sentinel = try target.prepare("SELECT value FROM main.sentinel;");
+                defer sentinel.finalize();
+                try std.testing.expect(try sentinel.step());
+                try std.testing.expectEqual(@as(i64, 42), sentinel.columnInt(0));
+                if (case.main_receipt) {
+                    var receipt = try conn.prepare("SELECT expires FROM main._idempotency_receipts;");
+                    defer receipt.finalize();
+                    try std.testing.expect(try receipt.step());
+                    try std.testing.expectEqual(@as(i64, 9999999999), receipt.columnInt(0));
+                }
+            }
+        }
+    }
+}
+
 pub const Error = error{
     /// The target already has a ZigBase schema (a `_collections` table with rows) and `--force`
     /// was not given.
@@ -45,6 +113,9 @@ pub const Error = error{
     RowCountMismatch,
     /// Upgrade the source with system migrations before copying namespace metadata.
     SourceNamespaceUpgradeRequired,
+    /// Drain operations and explicitly clean expired lazy receipts before copying.
+    IdempotencyReceiptsPresent,
+    InvalidReceiptLedger,
 } || collections.EngineError || db.DbError || std.mem.Allocator.Error;
 
 pub const TableReport = struct {
@@ -83,6 +154,19 @@ pub fn run(gpa: std.mem.Allocator, source: *db.Db, target: *db.Db, opts: Options
     // (1) Clobber guard: a fresh target has no `_collections` table at all. The error is returned
     // (not logged) so callers — and tests — drive the messaging.
     if (!opts.force and try targetHasSchema(a, target)) return Error.TargetNotEmpty;
+    // A target-driven copy can omit lazy ledgers; --force can erase a target's
+    // protected operations. Refuse even same-backend copies before target writes.
+    for ([_]*db.Db{ source, target }) |conn| {
+        const ledger_exists = if (db.dbBackend(conn) == .postgres)
+            try @import("idempotency.zig").pgLedgerExists(conn)
+        else
+            try @import("idempotency.zig").sqliteLedgerExists(conn);
+        if (ledger_exists) {
+            var receipt = try conn.prepare("SELECT 1 FROM _idempotency_receipts LIMIT 1;");
+            defer receipt.finalize();
+            if (try receipt.step()) return error.IdempotencyReceiptsPresent;
+        }
+    }
     if (!try tableExists(a, source, "_storage_namespaces")) return error.SourceNamespaceUpgradeRequired;
     // Validate every live collection's reservation before target migrations
     // commit anything, including --force transfers into an existing target.

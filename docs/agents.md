@@ -164,6 +164,16 @@ not string-valued fields; serialize large input integers without rounding.
 `maximum` byte values, applied to UTF-8 bytes (0–31 and 127 for labels).
 Tune retains its existing output/error behavior.
 
+For opt-in database timing evidence, `-Dquery-workbench=true` exposes bounded,
+superuser-bearer-only route/shape statistics without retaining SQL or values.
+SQLite measures prepared step calls; PostgreSQL measures client protocol exchanges
+including network/server wait and result buffering, not server CPU or pool wait.
+PostgreSQL buffered rows add no per-row timestamps or telemetry copies. These
+telemetry budgets do not cap PostgreSQL result memory. Read each item's backend
+and measurement label; PostgreSQL plan inspection remains `501`. See the
+[query-workbench contract](framework.md#bounded-query-workbench-opt-in) before
+interpreting repeated shapes as evidence of an N+1 problem.
+
 `zigbase diagnostics [--json] [--production] [--data-dir PATH]` adapts existing
 doctor checks into one JSON document (`protocol_version: 1`,
 `scope: "development-diagnostics"`). JSON is the default. A completed run has

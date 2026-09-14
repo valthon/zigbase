@@ -818,7 +818,8 @@ current authentication plus an `Idempotency-Key` header (1..128 bytes). The
 current guest authorization on the transaction writer. Replays return the same
 `{"cancelled":true}` receipt and `Idempotency-Replayed: true`; changing the booking
 ID with a live key returns 409. Reassigning the guest denies the old guest's replay.
-Capacity refuses new keys with 503; PostgreSQL returns 501. The existing `/cancel`
+Capacity refuses new keys with 503; PostgreSQL namespace contention also returns
+503 and can be retried with the same key. The existing `/cancel`
 route is unchanged. The receipt interval starts when the server captures time,
 and the key may run again after expiry. No email/realtime is emitted in this DB-only
-callback. See the full [framework contract](../../docs/framework.md#idempotent-custom-mutations-opt-in-sqlite).
+callback. See the full [framework contract](../../docs/framework.md#idempotent-custom-mutations-opt-in-sqlitepostgresql).

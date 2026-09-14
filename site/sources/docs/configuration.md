@@ -276,9 +276,12 @@ from the same binary) are always allowed, so only a separate-origin frontend nee
 
 For bounded query diagnostics, build with `-Dquery-workbench=true` and optionally
 set `.query_workbench = .{ .max_entries = 64, .slow_ms = 100 }`. The operator-only
-SQLite workbench reports route-template/structural-shape metrics without SQL or
+SQLite/PostgreSQL workbench reports route-template/structural-shape metrics without SQL or
 parameter capture, and plans schema-validated SELECT shapes without executing
-them. It is fully absent by default; PostgreSQL is outside this first slice.
+them on SQLite. PostgreSQL reports client-side protocol-exchange durations including
+network/server wait and result buffering; PostgreSQL plans still return 501.
+Buffered rows add no per-row clocks or telemetry copies. Telemetry bounds do not
+limit the backend's existing result buffering. It is fully absent by default.
 Completed-statement lifecycle timing separates measured prepare/step/cleanup
 calls from time held between them, including application pauses and row handling.
 In-scope prepares fingerprint compiled SQL once and reuse the key on reset;
@@ -287,7 +290,7 @@ Each in-scope finalization adds one mutex-guarded store update with a bounded
 entry scan.
 This helps distinguish slow SQLite calls from long-lived statements without
 claiming CPU or full-request latency; enabled counters remain explicitly bounded.
-See [the framework workbench scope](./framework#bounded-sqlite-query-workbench-opt-in).
+See [the framework workbench scope](./framework#bounded-query-workbench-opt-in).
 
 For request backpressure, compile `.admission = .{ .max_requests = 3 }` into your
 app. Excess synchronous HTTP callbacks receive 503 with `Retry-After: 1`, not an

@@ -2,6 +2,13 @@
 
 # PostgreSQL backend
 
+Opt-in `zigbase.Idempotency` custom operations support PostgreSQL with atomic
+database effects and binary receipt replay. Namespace-scoped transaction advisory
+locks fail fast with `IdempotencyBusy`; capacities, byte budgets and retention stay
+comptime-configured. See the framework's idempotent custom mutations section.
+Database copies refuse non-empty source or target receipt ledgers before target
+writes; drain operations and explicitly clean verified-expired receipts first.
+
 ZigBase defaults to embedded SQLite — the single-binary story. When you need several app
 instances sharing one database, or you'd rather operate a managed Postgres than a file on disk,
 an opt-in pure-Zig **PostgreSQL backend** is available behind a build flag. This guide covers
@@ -51,6 +58,17 @@ export ZIGBASE_DB_URL="postgres://user:pass@host:5432/db"
 ```
 
 The backend is chosen once, by connection string alone: switch via configuration, no code changes.
+
+Provision the first operator with the same database URL and PostgreSQL-enabled
+binary used by the server:
+
+```sh
+./zig-out/bin/zigbase superuser create --email you@example.com --password '<a strong password>'
+```
+
+The CLI uses backend-native bound parameters and timestamps. An insertion failure
+(including an existing email) exits unsuccessfully; it never replaces that
+operator's password. Only a successful insertion prints `superuser created:`.
 
 **TLS is verified by default** (since 0.10.0): an unqualified `postgres://` URL gets
 `sslmode=verify-full` — the server certificate chain is verified against the system root

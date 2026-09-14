@@ -15,6 +15,7 @@ pub const Error = collections.EngineError || fts.EnsureIndexError || error{
     InvalidPendingMetadata,
     LegacyAlterTableEnabled,
     PendingIdempotencyReceipts,
+    InvalidReceiptLedger,
     RenameEpochExhausted,
 } || @import("collection_rename_indexes.zig").Error;
 
@@ -259,7 +260,11 @@ pub fn rename(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, from: []const u8,
     // Receipt scopes are opaque hashes of principal, operation and key. Even a
     // base collection's name may occur in an application operation scope, so no
     // subset can be proven unrelated. Preserve their promised retention window.
-    if (try objectExists(a, w, "_idempotency_receipts")) {
+    const receipts_exist = if (db.dbDialect(w).kind == .postgres)
+        try @import("idempotency.zig").pgLedgerExists(w)
+    else
+        try @import("idempotency.zig").sqliteLedgerExists(w);
+    if (receipts_exist) {
         var receipts = try prepare(a, w, "SELECT 1 FROM \"_idempotency_receipts\" WHERE expires>?1 LIMIT 1;");
         defer receipts.finalize();
         try receipts.bindInt(1, try @import("clock.zig").sqlNowUnix(w));
@@ -472,6 +477,80 @@ test "offline rename rejects irreversible source names and unexpired opaque rece
     try rename(a, std.testing.io, &d, "posts", "articles");
 }
 
+test "SQLite rename refuses ambiguous receipt ownership before schema effects" {
+    const a = std.testing.allocator;
+    const cases = [_]struct { setup: [:0]const u8, inspect: [:0]const u8 }{
+        .{ .setup = "ATTACH DATABASE ':memory:' AS extra; CREATE TABLE extra._idempotency_receipts(expires INTEGER); INSERT INTO extra._idempotency_receipts VALUES(9223372036854775807);", .inspect = "SELECT expires FROM extra._idempotency_receipts;" },
+        .{ .setup = "CREATE VIEW _idempotency_receipts AS SELECT 9223372036854775807 AS expires;", .inspect = "SELECT expires FROM main._idempotency_receipts;" },
+        .{ .setup = "CREATE TABLE _idempotency_receipts(expires INTEGER); ATTACH DATABASE ':memory:' AS extra; CREATE TABLE extra._idempotency_receipts(expires INTEGER); INSERT INTO extra._idempotency_receipts VALUES(9223372036854775807);", .inspect = "SELECT expires FROM extra._idempotency_receipts;" },
+    };
+    for (cases) |case| {
+        var w = try db.Db.openMemory();
+        defer w.close();
+        try @import("migrations.zig").run(&w);
+        const old = try collections.create(a, std.testing.io, &w, .{ .id = "", .name = "posts", .fields = &.{} });
+        defer old.deinit(a);
+        try w.exec(case.setup);
+        const before = try generation.read(&w);
+        try std.testing.expectError(error.InvalidReceiptLedger, rename(a, std.testing.io, &w, "posts", "articles"));
+        try std.testing.expectEqual(before, try generation.read(&w));
+        try std.testing.expect(!w.inTransaction());
+        const retained = (try collections.getByName(a, &w, "posts")).?;
+        defer retained.deinit(a);
+        try std.testing.expectEqualStrings(old.id, retained.id);
+        try std.testing.expectEqual(old.rename_epoch, retained.rename_epoch);
+        try std.testing.expect((try collections.getByName(a, &w, "articles")) == null);
+        var receipt = try w.prepare(case.inspect);
+        defer receipt.finalize();
+        try std.testing.expect(try receipt.step());
+        try std.testing.expectEqual(std.math.maxInt(i64), receipt.columnInt(0));
+    }
+}
+
+test "pg rename refuses fallback and view ledgers but respects valid receipt retention" {
+    if (comptime !@import("build_options").postgres) return error.SkipZigTest;
+    const url = std.testing.environ.getPosix("ZIGBASE_PG_TEST_URL") orelse return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var w = try db.Db.openPostgres(a, std.testing.io, url);
+    defer w.close();
+    const token = try @import("crypto.zig").genToken(std.testing.io, a, 12);
+    defer a.free(token);
+    const create = try std.fmt.allocPrintSentinel(a, "CREATE SCHEMA rename_receipt_{s}; CREATE SCHEMA fallback_receipt_{s}; SET search_path TO rename_receipt_{s},fallback_receipt_{s};", .{ token, token, token, token }, 0);
+    defer a.free(create);
+    const drop = try std.fmt.allocPrintSentinel(a, "DROP SCHEMA rename_receipt_{s},fallback_receipt_{s} CASCADE;", .{ token, token }, 0);
+    defer a.free(drop);
+    const fallback = try std.fmt.allocPrintSentinel(a, "CREATE TABLE fallback_receipt_{s}._idempotency_receipts(expires BIGINT); INSERT INTO fallback_receipt_{s}._idempotency_receipts VALUES(9223372036854775807);", .{ token, token }, 0);
+    defer a.free(fallback);
+    try w.exec(create);
+    defer w.exec(drop) catch |err| std.log.err("rename receipt test cleanup: {s}", .{@errorName(err)});
+    try @import("migrations.zig").run(&w);
+    const old = try collections.create(a, std.testing.io, &w, .{ .id = "", .name = "posts", .fields = &.{} });
+    defer old.deinit(a);
+    try w.exec(fallback);
+    const before = try generation.read(&w);
+    try std.testing.expectError(error.InvalidReceiptLedger, rename(a, std.testing.io, &w, "posts", "articles"));
+    try w.exec("CREATE VIEW _idempotency_receipts AS SELECT 0::BIGINT AS expires;");
+    try std.testing.expectError(error.InvalidReceiptLedger, rename(a, std.testing.io, &w, "posts", "articles"));
+    try w.exec("DROP VIEW _idempotency_receipts; CREATE TABLE _idempotency_receipts(expires BIGINT); INSERT INTO _idempotency_receipts VALUES(9223372036854775807);");
+    try std.testing.expectError(error.PendingIdempotencyReceipts, rename(a, std.testing.io, &w, "posts", "articles"));
+    try std.testing.expectEqual(before, try generation.read(&w));
+    const retained = (try collections.getByName(a, &w, "posts")).?;
+    defer retained.deinit(a);
+    try std.testing.expectEqualStrings(old.id, retained.id);
+    try std.testing.expectEqual(old.rename_epoch, retained.rename_epoch);
+    try std.testing.expect((try collections.getByName(a, &w, "articles")) == null);
+    var receipt = try w.prepare("SELECT expires FROM _idempotency_receipts;");
+    defer receipt.finalize();
+    try std.testing.expect(try receipt.step());
+    try std.testing.expectEqual(std.math.maxInt(i64), receipt.columnInt(0));
+    receipt.reset();
+    try w.exec("UPDATE _idempotency_receipts SET expires=0;");
+    try rename(a, std.testing.io, &w, "posts", "articles");
+    const renamed = (try collections.getByName(a, &w, "articles")).?;
+    defer renamed.deinit(a);
+    try std.testing.expectEqualStrings(old.id, renamed.id);
+}
+
 test "offline rename accepts source names only even when IDs are valid names" {
     var d = try db.Db.openMemory();
     defer d.close();
@@ -528,7 +607,7 @@ test "offline rename rejects temporary shadows and destination FTS shadow tables
     const old = try collections.create(a, std.testing.io, &w, .{ .id = "", .name = "posts", .fields = &.{} });
     defer old.deinit(a);
     const before = try generation.read(&w);
-    for ([_][]const u8{ "posts", "articles", "_schema_state", "_collections" }) |name| {
+    for ([_][]const u8{ "posts", "articles", "_schema_state", "_collections", "_idempotency_receipts" }) |name| {
         const quoted = try ddl.quoteIdent(a, name);
         defer a.free(quoted);
         const create = try std.fmt.allocPrintSentinel(a, "CREATE TEMP TABLE {s}(note TEXT);", .{quoted}, 0);

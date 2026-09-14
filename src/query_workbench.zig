@@ -1,6 +1,8 @@
-//! Bounded SQLite step and completed-statement lifecycle measurements.
+//! Bounded backend-labelled execution and completed-statement lifecycle measurements.
 //! No SQL or parameter text retained.
 const std = @import("std");
+pub const Backend = enum { sqlite, postgres };
+const Seen = struct { backend: Backend, key: u64 };
 
 pub const Limits = struct { max_entries: u16 = 64, slow_ms: u32 = 100 };
 pub fn resolve(comptime cfg: anytype) Limits {
@@ -18,6 +20,7 @@ pub fn resolve(comptime cfg: anytype) Limits {
 }
 
 pub const Entry = struct {
+    backend: Backend = .sqlite,
     route: [192]u8 = undefined,
     route_len: u8 = 0,
     method: []const u8,
@@ -55,19 +58,19 @@ pub const Store = struct {
         a.free(self.entries);
         a.destroy(self);
     }
-    fn record(self: *Store, scope: *Scope, key: u64, ns: u64, failed: bool) void {
+    fn record(self: *Store, scope: *Scope, backend: Backend, key: u64, ns: u64, failed: bool) void {
         var repeated = false;
-        for (scope.seen[0..scope.seen_count]) |seen| if (seen == key) {
+        for (scope.seen[0..scope.seen_count]) |seen| if (seen.key == key and seen.backend == backend) {
             repeated = true;
             break;
         };
         if (!repeated and scope.seen_count < scope.seen.len) {
-            scope.seen[scope.seen_count] = key;
+            scope.seen[scope.seen_count] = .{ .backend = backend, .key = key };
             scope.seen_count += 1;
         }
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        const entry = self.findEntry(scope, key) orelse {
+        const entry = self.findEntry(scope, backend, key) orelse {
             self.dropped +|= 1;
             return;
         };
@@ -80,21 +83,21 @@ pub const Store = struct {
     }
 
     // Caller holds mutex. Both metric families share the same bounded key table.
-    fn findEntry(self: *Store, scope: *Scope, key: u64) ?*Entry {
-        for (self.entries[0..self.count]) |*e| if (e.fingerprint == key and
+    fn findEntry(self: *Store, scope: *Scope, backend: Backend, key: u64) ?*Entry {
+        for (self.entries[0..self.count]) |*e| if (e.backend == backend and e.fingerprint == key and
             std.mem.eql(u8, e.route[0..e.route_len], scope.route) and std.mem.eql(u8, e.method, scope.method)) return e;
         if (self.count == self.entries.len or scope.route.len > 192) return null;
         const e = &self.entries[self.count];
         self.count += 1;
-        e.* = .{ .method = scope.method, .fingerprint = key, .route_len = @intCast(scope.route.len) };
+        e.* = .{ .backend = backend, .method = scope.method, .fingerprint = key, .route_len = @intCast(scope.route.len) };
         @memcpy(e.route[0..scope.route.len], scope.route);
         return e;
     }
 
-    fn recordLifetime(self: *Store, scope: *Scope, key: ?u64, lifetime: u64, calls: u64) void {
+    fn recordLifetime(self: *Store, scope: *Scope, backend: Backend, key: ?u64, lifetime: u64, calls: u64) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        const e = if (key) |k| self.findEntry(scope, k) else null;
+        const e = if (key) |k| self.findEntry(scope, backend, k) else null;
         const value = e orelse {
             self.dropped_statements +|= 1;
             return;
@@ -115,7 +118,7 @@ pub const Scope = struct {
     method: []const u8,
     previous: ?*Scope = null,
     id: u64 = 0,
-    seen: [32]u64 = undefined,
+    seen: [32]Seen = undefined,
     seen_count: usize = 0,
 
     pub fn init(store: ?*Store, method: []const u8, route: []const u8) Scope {
@@ -142,6 +145,7 @@ pub const Scope = struct {
 };
 
 pub const Measurement = struct {
+    backend: Backend = .sqlite,
     scope_id: u64 = 0,
     key: ?u64 = null,
     ns: u64 = 0,
@@ -180,7 +184,7 @@ pub const Measurement = struct {
         const store = scope.store orelse return;
         if (scope.id != self.scope_id) return;
         if (self.key) |key| {
-            store.record(scope, key, self.ns, self.failed);
+            store.record(scope, self.backend, key, self.ns, self.failed);
         } else if (self.scope_id != 0) {
             store.mutex.lockUncancelable(store.io);
             defer store.mutex.unlock(store.io);
@@ -198,6 +202,10 @@ fn elapsed(start: i96, end: i96) u64 {
 /// Each measured call must stay in the originating scope; otherwise omit the
 /// lifetime instead of guessing attribution. Scope exit itself retains no Stmts.
 pub const Lifetime = struct {
+    backend: Backend = .sqlite,
+    // Distinguish never-scoped prepares from an origin that was lost. The latter
+    // must not regain execution attribution through an unscoped fallback.
+    invalidated: bool = false,
     scope_id: u64 = 0,
     key: ?u64 = null,
     started: i96 = 0,
@@ -211,7 +219,7 @@ pub const Lifetime = struct {
 
     pub fn prepared(self: *Lifetime, sql: []const u8) void {
         _ = self.matchingScope() orelse return;
-        self.key = fingerprint(sql);
+        self.key = fingerprintBackend(sql, self.backend);
     }
 
     pub fn now(self: *Lifetime) ?i96 {
@@ -219,12 +227,20 @@ pub const Lifetime = struct {
         return std.Io.Timestamp.now(scope.store.?.io, .awake).nanoseconds;
     }
 
+    /// Validate a buffered-only call without reading a clock.
+    pub fn touch(self: *Lifetime) void {
+        _ = self.matchingScope();
+    }
+
     fn matchingScope(self: *Lifetime) ?*Scope {
         const active = current orelse {
+            if (self.scope_id != 0) self.invalidated = true;
             self.scope_id = 0;
             return null;
         };
-        if (self.scope_id == 0 or active.id != self.scope_id or active.store == null) {
+        if (self.scope_id == 0) return null;
+        if (active.id != self.scope_id or active.store == null) {
+            self.invalidated = true;
             self.scope_id = 0;
             return null;
         }
@@ -251,7 +267,7 @@ pub const Lifetime = struct {
         const active = self.matchingScope() orelse return;
         const end = ended orelse return;
         self.observeCall(finalize_start, end);
-        active.store.?.recordLifetime(active, self.key, elapsed(self.started, end), self.calls_ns);
+        active.store.?.recordLifetime(active, self.backend, self.key, elapsed(self.started, end), self.calls_ns);
     }
 };
 
@@ -259,6 +275,10 @@ pub const Lifetime = struct {
 /// names, identifiers and comments never reach the hash. Only a small keyword
 /// allowlist and punctuation survive. Unsupported/oversized input is omitted.
 pub fn fingerprint(sql: []const u8) ?u64 {
+    return fingerprintBackend(sql, .sqlite);
+}
+
+pub fn fingerprintBackend(sql: []const u8, backend: Backend) ?u64 {
     if (sql.len == 0 or sql.len > 16384) return null;
     var hash = std.hash.Wyhash.init(0);
     var i: usize = 0;
@@ -274,14 +294,19 @@ pub fn fingerprint(sql: []const u8) ?u64 {
         }
         if (ch == '/' and i + 1 < sql.len and sql[i + 1] == '*') {
             const end = std.mem.indexOf(u8, sql[i + 2 ..], "*/") orelse return null;
+            if (backend == .postgres and std.mem.indexOf(u8, sql[i + 2 ..][0..end], "/*") != null) return null;
             i += end + 4;
             continue;
         }
         if (ch == '\'' or ch == '"' or ch == '`' or ch == '[') {
+            if (backend == .postgres and (ch == '`' or ch == '[')) return null;
             const end_ch: u8 = if (ch == '[') ']' else ch;
             i += 1;
             var closed = false;
             while (i < sql.len) {
+                // PostgreSQL escape-string settings can change quote handling.
+                // Omit backslashes rather than interpret literal contents.
+                if (backend == .postgres and sql[i] == '\\') return null;
                 if (sql[i] == end_ch) {
                     i += 1;
                     if (ch != '[' and i < sql.len and sql[i] == end_ch) {
@@ -299,6 +324,19 @@ pub fn fingerprint(sql: []const u8) ?u64 {
         }
         // SQLite's named binds can contain Tcl-style ::suffix(...) with
         // SQL-looking contents. Omit them entirely, never hash their suffix.
+        if (backend == .postgres and ch == '$') {
+            i += 1;
+            const start = i;
+            while (i < sql.len and std.ascii.isDigit(sql[i])) : (i += 1) {}
+            if (i == start or (i < sql.len and (std.ascii.isAlphabetic(sql[i]) or sql[i] == '_' or sql[i] == '$'))) return null;
+            hash.update("V ");
+            continue;
+        }
+        if (backend == .postgres and ch == ':' and i + 1 < sql.len and sql[i + 1] == ':') {
+            hash.update(":: ");
+            i += 2;
+            continue;
+        }
         if (ch == '$' or ch == ':' or ch == '@' or ch == '#') return null;
         if (std.ascii.isDigit(ch) or ch == '?') {
             i += 1;
@@ -310,6 +348,9 @@ pub fn fingerprint(sql: []const u8) ?u64 {
             const start = i;
             while (i < sql.len and (std.ascii.isAlphanumeric(sql[i]) or sql[i] == '_')) : (i += 1) {}
             const word = sql[start..i];
+            // These prefixes introduce alternate quoting/escape grammars.
+            if (backend == .postgres and (std.ascii.eqlIgnoreCase(word, "E") or std.ascii.eqlIgnoreCase(word, "U")) and
+                i < sql.len and (sql[i] == '\'' or sql[i] == '&')) return null;
             var keyword = false;
             inline for (.{ "SELECT", "INSERT", "UPDATE", "DELETE", "FROM", "WHERE", "JOIN", "LEFT", "INNER", "ON", "AND", "OR", "IN", "NOT", "NULL", "ORDER", "BY", "GROUP", "LIMIT", "OFFSET", "ASC", "DESC", "SET", "VALUES", "RETURNING", "IS", "LIKE", "EXISTS", "DISTINCT" }) |known| {
                 if (std.ascii.eqlIgnoreCase(word, known)) {
@@ -343,15 +384,44 @@ test "fingerprints exclude literal identifier parameter and comment contents" {
     try std.testing.expectEqual(null, fingerprint("SELECT #x::name(private)"));
 }
 
+test "PostgreSQL fingerprints accept positional binds and omit alternate literal grammars" {
+    const a = fingerprintBackend("SELECT secret FROM accounts WHERE email=$1::text", .postgres);
+    const b = fingerprintBackend("select other FROM customers WHERE name=$99::varchar", .postgres);
+    try std.testing.expect(a != null);
+    try std.testing.expectEqual(a, b);
+    try std.testing.expectEqual(fingerprintBackend("SELECT 'private SELECT'", .postgres), fingerprintBackend("SELECT 'private DELETE'", .postgres));
+    for ([_][]const u8{ "SELECT $$private SELECT$$", "SELECT $tag$private DELETE$tag$", "SELECT E'private\\' SELECT'", "SELECT U&'private'", "SELECT 'private\\' DELETE'", "SELECT /* outer /* inner */ SELECT */ 1", "SELECT $name", "SELECT $1suffix" }) |sql| {
+        try std.testing.expectEqual(null, fingerprintBackend(sql, .postgres));
+    }
+    try std.testing.expectEqual(null, fingerprint("SELECT $1::text"));
+}
+
+test "backend identity separates aggregates and repeat accounting under one route" {
+    const store = try Store.create(std.testing.allocator, std.testing.io, .{});
+    defer store.destroy();
+    var scope = Scope.init(store, "GET", "/mixed");
+    scope.enter();
+    defer scope.leave();
+    store.record(&scope, .sqlite, 42, 10, false);
+    store.record(&scope, .postgres, 42, 20, false);
+    store.record(&scope, .postgres, 42, 30, true);
+    store.recordLifetime(&scope, .postgres, 42, 100, 50);
+    try std.testing.expectEqual(@as(usize, 2), store.count);
+    try std.testing.expectEqual(@as(u64, 0), store.entries[0].repeated);
+    try std.testing.expectEqual(@as(u64, 1), store.entries[1].repeated);
+    try std.testing.expectEqual(@as(u64, 50), store.entries[1].total_ns);
+    try std.testing.expectEqual(@as(u64, 1), store.entries[1].statements);
+}
+
 test "bounded aggregates repeats slow errors and nested scope restoration" {
     const store = try Store.create(std.testing.allocator, std.testing.io, .{ .max_entries = 1, .slow_ms = 1 });
     defer store.destroy();
     var outer = Scope.init(store, "GET", "/items/:id");
     outer.enter();
     defer outer.leave();
-    store.record(&outer, 1, 2_000_000, false);
-    store.record(&outer, 1, 1, true);
-    store.record(&outer, 2, 1, false);
+    store.record(&outer, .sqlite, 1, 2_000_000, false);
+    store.record(&outer, .sqlite, 1, 1, true);
+    store.record(&outer, .sqlite, 2, 1, false);
     var nested = Scope.init(null, "GET", "/inspect");
     nested.enter();
     nested.leave();
@@ -429,16 +499,16 @@ test "lifetime bounds cardinality and saturates elapsed durations and counters" 
     var scope = Scope.init(store, "GET", "/bounded");
     scope.enter();
     defer scope.leave();
-    store.recordLifetime(&scope, 1, std.math.maxInt(u64), std.math.maxInt(u64));
+    store.recordLifetime(&scope, .sqlite, 1, std.math.maxInt(u64), std.math.maxInt(u64));
     store.entries[0].statements = std.math.maxInt(u64);
     store.entries[0].held_ns = std.math.maxInt(u64);
-    store.recordLifetime(&scope, 1, 20, 10);
+    store.recordLifetime(&scope, .sqlite, 1, 20, 10);
     try std.testing.expectEqual(std.math.maxInt(u64), store.entries[0].statements);
     try std.testing.expectEqual(std.math.maxInt(u64), store.entries[0].lifetime_ns);
     try std.testing.expectEqual(std.math.maxInt(u64), store.entries[0].calls_ns);
     try std.testing.expectEqual(std.math.maxInt(u64), store.entries[0].held_ns);
-    store.recordLifetime(&scope, 2, 20, 10);
-    store.recordLifetime(&scope, null, 20, 10);
+    store.recordLifetime(&scope, .sqlite, 2, 20, 10);
+    store.recordLifetime(&scope, .sqlite, null, 20, 10);
     try std.testing.expectEqual(@as(usize, 1), store.count);
     try std.testing.expectEqual(@as(u64, 2), store.dropped_statements);
     try std.testing.expectEqual(@as(u64, 0), store.dropped);

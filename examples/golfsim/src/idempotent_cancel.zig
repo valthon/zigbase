@@ -55,7 +55,7 @@ pub fn handle(ctx: *zb.Ctx) !zb.http.Response {
         error.PayloadConflict => ctx.fail(409, "Key already used for a different booking."),
         error.CapacityExceeded => ctx.fail(503, "Cancellation receipts are at capacity; retry later."),
         error.InvalidScope, error.PayloadTooLarge => ctx.fail(400, "Invalid key or booking id."),
-        error.UnsupportedBackend => ctx.fail(501, "Idempotent cancellation requires SQLite."),
+        error.IdempotencyBusy => ctx.fail(503, "Cancellation receipts are busy; retry later."),
         else => err,
     };
     defer result.deinit(ctx.arena.a);

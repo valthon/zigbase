@@ -9,6 +9,8 @@ const std = @import("std");
 const conn_mod = @import("conn.zig");
 const Conn = conn_mod.Conn;
 const proto = @import("protocol.zig");
+const build_options = @import("build_options");
+const workbench = @import("../../query_workbench.zig");
 
 pub const StmtError = error{ BindFailed, StepFailed, Constraint, OutOfMemory };
 
@@ -28,9 +30,17 @@ pub const Stmt = struct {
     row_idx: usize = 0,
     cur_row: ?[]?[]const u8 = null,
     field_cipher: ?*const anyopaque = null,
+    lifetime: if (build_options.query_workbench) workbench.Lifetime else void = if (build_options.query_workbench) .{} else {},
 
     pub fn init(conn: *Conn, gpa: std.mem.Allocator, sql: []const u8, field_cipher: ?*const anyopaque) StmtError!Stmt {
+        var lifetime = if (comptime build_options.query_workbench) workbench.Lifetime.begin() else {};
+        const started = if (comptime build_options.query_workbench) lifetime.started else {};
         const owned = gpa.dupe(u8, sql) catch return StmtError.OutOfMemory;
+        if (comptime build_options.query_workbench) {
+            lifetime.backend = .postgres;
+            lifetime.afterCall(started);
+            lifetime.prepared(sql);
+        }
         return .{
             .conn = conn,
             .gpa = gpa,
@@ -38,6 +48,7 @@ pub const Stmt = struct {
             .param_arena = std.heap.ArenaAllocator.init(gpa),
             .result_arena = std.heap.ArenaAllocator.init(gpa),
             .field_cipher = field_cipher,
+            .lifetime = lifetime,
         };
     }
 
@@ -79,7 +90,22 @@ pub const Stmt = struct {
     /// Advance to the next row. The first call runs the query. Returns true if a row is
     /// available, false when exhausted (including immediately for non-SELECT statements).
     pub fn step(self: *Stmt) StmtError!bool {
+        if (comptime build_options.query_workbench) self.lifetime.touch();
         if (self.result == null) {
+            // One timed client exchange, not one clock read per buffered row.
+            // Parameters and result materialization are part of this call.
+            var measurement = if (comptime build_options.query_workbench) workbench.Measurement{ .backend = .postgres } else {};
+            const started = if (comptime build_options.query_workbench) if (self.lifetime.invalidated) null else measurement.beforeKeyed(if (measurement.needsKey())
+                (if (self.lifetime.scope_id != 0) self.lifetime.key else workbench.fingerprintBackend(self.sql, .postgres))
+            else
+                null) else {};
+            var failed = if (comptime build_options.query_workbench) true else {};
+            defer if (comptime build_options.query_workbench) {
+                if (!self.lifetime.invalidated) {
+                    const ended = measurement.after(started, false, failed);
+                    self.lifetime.observeCall(started, ended);
+                }
+            };
             const params = self.gpa.alloc(conn_mod.Param, self.params.items.len) catch return StmtError.OutOfMemory;
             defer self.gpa.free(params);
             for (self.params.items, 0..) |v, k| params[k] = .{ .value = v };
@@ -90,6 +116,7 @@ pub const Stmt = struct {
                 else => return StmtError.StepFailed,
             };
             self.row_idx = 0;
+            if (comptime build_options.query_workbench) failed = false;
         }
         const res = self.result.?;
         if (self.row_idx >= res.rows.len) {
@@ -177,10 +204,12 @@ pub const Stmt = struct {
     /// Re-arm the statement to be executed again (with the current or new bindings).
     /// Discards the buffered result; bindings are preserved.
     pub fn reset(self: *Stmt) void {
+        const started = if (comptime build_options.query_workbench) self.lifetime.now() else {};
         self.result = null;
         self.row_idx = 0;
         self.cur_row = null;
         _ = self.result_arena.reset(.free_all);
+        if (comptime build_options.query_workbench) self.lifetime.afterCall(started);
     }
 
     /// Forget all bindings and release their owned bytes. Unlike reset(), this
@@ -192,10 +221,12 @@ pub const Stmt = struct {
     }
 
     pub fn finalize(self: *Stmt) void {
+        const started = if (comptime build_options.query_workbench) self.lifetime.now() else {};
         self.params.deinit(self.gpa);
         self.param_arena.deinit();
         self.result_arena.deinit();
         self.gpa.free(self.sql);
+        if (comptime build_options.query_workbench) self.lifetime.finish(started);
     }
 };
 
@@ -213,4 +244,163 @@ test "clearBindings releases repeated large parameter copies without changing re
         try std.testing.expectEqual(@as(usize, 0), st.param_arena.queryCapacity());
         try std.testing.expectEqual(@as(?[]const u8, null), st.params.items[0]);
     }
+}
+
+test "workbench statement storage compiles away when disabled" {
+    if (comptime !build_options.query_workbench) {
+        try std.testing.expectEqual(void, @FieldType(Stmt, "lifetime"));
+    }
+}
+
+test "pg workbench omits retained statements after scope changes but accepts unscoped prepares" {
+    if (comptime !build_options.query_workbench) return error.SkipZigTest;
+    const url = std.testing.environ.getPosix("ZIGBASE_PG_TEST_URL") orelse return error.SkipZigTest;
+    var database = try @import("db.zig").Db.open(std.testing.allocator, std.testing.io, url);
+    defer database.close();
+    const store = try workbench.Store.create(std.testing.allocator, std.testing.io, .{});
+    defer store.destroy();
+    var a = workbench.Scope.init(store, "GET", "/origin");
+    var b = workbench.Scope.init(store, "GET", "/other");
+    var unscoped = try database.prepare("SELECT 1;");
+    defer unscoped.finalize();
+    var retained = blk: {
+        a.enter();
+        defer a.leave();
+        break :blk try database.prepare("SELECT 1;");
+    };
+    defer retained.finalize();
+    {
+        b.enter();
+        defer b.leave();
+        try std.testing.expect(try retained.step());
+        try std.testing.expectEqual(@as(usize, 0), store.count);
+        try std.testing.expectEqual(@as(u64, 0), store.dropped);
+        try std.testing.expect(try unscoped.step());
+        try std.testing.expectEqual(@as(u64, 1), store.entries[0].executions);
+    }
+    {
+        a.enter();
+        defer a.leave();
+        var st = try database.prepare("SELECT 1;");
+        defer st.finalize();
+        try std.testing.expect(try st.step());
+        {
+            b.enter();
+            defer b.leave();
+            st.reset();
+            try std.testing.expect(try st.step());
+        }
+        st.reset();
+        try std.testing.expect(try st.step()); // returning to origin cannot revive it
+    }
+    try std.testing.expectEqual(@as(usize, 2), store.count);
+    try std.testing.expectEqual(@as(u64, 1), store.entries[0].executions);
+    try std.testing.expectEqual(@as(u64, 1), store.entries[1].executions);
+    try std.testing.expectEqual(@as(u64, 0), store.entries[1].statements);
+    var outside = blk: {
+        a.enter();
+        defer a.leave();
+        break :blk try database.prepare("SELECT 1;");
+    };
+    defer outside.finalize();
+    try std.testing.expect(try outside.step()); // losing the scope entirely also invalidates
+    {
+        b.enter();
+        defer b.leave();
+        outside.reset();
+        try std.testing.expect(try outside.step());
+    }
+    try std.testing.expectEqual(@as(u64, 1), store.entries[0].executions);
+    var threaded = blk: {
+        a.enter();
+        defer a.leave();
+        break :blk try database.prepare("SELECT 1;");
+    };
+    defer threaded.finalize();
+    const H = struct {
+        fn execute(st: *Stmt, target: *workbench.Store, result: *?StmtError) void {
+            var scope = workbench.Scope.init(target, "GET", "/thread");
+            scope.enter();
+            defer scope.leave();
+            _ = st.step() catch |err| {
+                result.* = err;
+                return;
+            };
+        }
+    };
+    var result: ?StmtError = null;
+    const thread = try std.Thread.spawn(.{}, H.execute, .{ &threaded, store, &result });
+    thread.join();
+    try std.testing.expectEqual(null, result);
+    try std.testing.expectEqual(@as(usize, 2), store.count);
+    try std.testing.expectEqual(@as(u64, 0), store.dropped);
+    try std.testing.expectEqual(@as(u64, 0), store.dropped_statements);
+}
+
+test "pg workbench measures buffered execution once and preserves errors and reset" {
+    if (comptime !build_options.query_workbench) return error.SkipZigTest;
+    const url = std.testing.environ.getPosix("ZIGBASE_PG_TEST_URL") orelse return error.SkipZigTest;
+    var database = try @import("db.zig").Db.open(std.testing.allocator, std.testing.io, url);
+    defer database.close();
+    try database.exec("CREATE TEMP TABLE workbench_unique(n INTEGER UNIQUE); INSERT INTO workbench_unique VALUES (1);");
+    const store = try workbench.Store.create(std.testing.allocator, std.testing.io, .{});
+    defer store.destroy();
+    var scope = workbench.Scope.init(store, "GET", "/pg-metrics");
+    scope.enter();
+    defer scope.leave();
+    {
+        var st = try database.prepare("SELECT n FROM generate_series(1, 100) n WHERE n > $1;");
+        defer st.finalize();
+        try st.bindInt(1, 0);
+        try std.testing.expect(try st.step());
+        const ns = store.entries[0].total_ns;
+        var count: usize = 1;
+        while (try st.step()) count += 1;
+        try std.testing.expectEqual(@as(usize, 100), count);
+        try std.testing.expectEqual(ns, store.entries[0].total_ns);
+        try std.testing.expectEqual(@as(u64, 1), store.entries[0].executions);
+        st.reset();
+        try st.bindInt(1, 100);
+        try std.testing.expect(!try st.step());
+        try std.testing.expectEqual(@as(u64, 2), store.entries[0].executions);
+        st.reset();
+        try st.bindInt(1, 0);
+        try std.testing.expect(try st.step()); // partial consumption still one exchange
+    }
+    try std.testing.expectEqual(@as(u64, 3), store.entries[0].executions);
+    try std.testing.expectEqual(@as(u64, 1), store.entries[0].statements);
+    try std.testing.expectEqual(workbench.Backend.postgres, store.entries[0].backend);
+    {
+        var st = try database.prepare("INSERT INTO workbench_unique VALUES ($1);");
+        defer st.finalize();
+        try st.bindInt(1, 1);
+        try std.testing.expectError(error.Constraint, st.step());
+    }
+    try std.testing.expectEqual(@as(u64, 1), store.entries[1].failures);
+    try std.testing.expectEqual(@as(u64, 1), store.entries[1].executions);
+    {
+        var st = try database.prepare("SELECT 1;");
+        st.finalize(); // preparation alone must not invent an execution
+    }
+    try std.testing.expectEqual(@as(u64, 0), store.entries[2].executions);
+    try std.testing.expectEqual(@as(u64, 1), store.entries[2].statements);
+    {
+        var st = try database.prepare("SELECT 1 / 0;");
+        defer st.finalize();
+        try std.testing.expectError(error.StepFailed, st.step());
+    }
+    try std.testing.expectEqual(@as(u64, 1), store.entries[3].failures);
+    {
+        var st = try database.prepare("SELECT 1;");
+        defer st.finalize(); // buffered access elsewhere invalidates the lifetime
+        try std.testing.expect(try st.step());
+        {
+            var nested = workbench.Scope.init(store, "GET", "/nested");
+            nested.enter();
+            defer nested.leave();
+            try std.testing.expect(!try st.step()); // no new exchange or clock
+        }
+    }
+    try std.testing.expectEqual(@as(u64, 1), store.entries[2].statements);
+    try std.testing.expectEqual(@as(usize, 4), store.count);
 }

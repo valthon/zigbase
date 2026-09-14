@@ -73,7 +73,7 @@ def test_statement_lifetime_separates_application_hold_and_reset_reuse(server):
     assert call(server, "GET", "/held")[0] == 204
     code, report = call(server, "GET", "/api/query-workbench/stats", token=token)
     assert code == 200
-    assert report["measurement"] == "prepared-statement-step-time"
+    assert report["measurement"] == "backend-specific-see-items"
     assert report["lifetimeMeasurement"] == "prepare-through-finalize"
     assert report["measuredCalls"] == ["prepare", "step", "reset", "finalize"]
     entries = [item for item in report["items"] if item["routeTemplate"] == "/held"]

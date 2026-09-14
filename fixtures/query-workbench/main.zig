@@ -5,7 +5,8 @@ fn work(ctx: *zigbase.Ctx) !zigbase.http.Response {
     var reader = try ctx.app.pool.acquireReader();
     defer ctx.app.pool.releaseReader(&reader);
     for (0..3) |_| {
-        var stmt = try reader.prepare("SELECT ?1, 'private-literal';");
+        const postgres = if (comptime @typeInfo(zigbase.Db) == .@"union") std.meta.activeTag(reader) == .postgres else false;
+        var stmt = try reader.prepare(if (postgres) "SELECT $1::text, 'private-literal';" else "SELECT ?1, 'private-literal';");
         defer stmt.finalize();
         try stmt.bindText(1, ctx.request.?.param("id") orelse "missing");
         _ = try stmt.step();
@@ -19,7 +20,7 @@ fn held(ctx: *zigbase.Ctx) !zigbase.http.Response {
     var stmt = try reader.prepare("SELECT 1;");
     defer stmt.finalize();
     _ = try stmt.step();
-    // Deliberately retain the statement outside SQLite. This is not a slow query.
+    // Deliberately retain the statement outside the backend. This is not a slow query.
     try ctx.app.io.sleep(std.Io.Duration.fromMilliseconds(50), .awake);
     stmt.reset();
     _ = try stmt.step();

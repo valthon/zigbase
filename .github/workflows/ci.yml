@@ -300,11 +300,26 @@ jobs:
           key: zig-global-${{ runner.os }}-zig0.16.0-${{ hashFiles('vendor/sqlite/sqlite3.c', 'build.zig', 'build.zig.zon') }}
           restore-keys: zig-global-${{ runner.os }}-zig0.16.0-
       - name: Unit + PostgreSQL driver tests (-Dpostgres=true -Dvector=true)
-        run: mise exec zig@0.16.0 -- zig build test --summary all -Dpostgres=true -Dvector=true
+        run: mise exec zig@0.16.0 -- zig build test --summary all -Dpostgres=true -Dvector=true -Dquery-workbench=true
+      - name: PostgreSQL workbench paired gating and live HTTP
+        run: |
+          mise exec zig@0.16.0 -- zig build query-workbench-fixture -Dpostgres=true --prefix zig-out/workbench-off
+          mise exec zig@0.16.0 -- zig build query-workbench-fixture -Dpostgres=true -Dquery-workbench=true --prefix zig-out/workbench-on
+          bash scripts/check-query-workbench-gating.sh zig-out/workbench-off/bin/query-workbench-fixture zig-out/workbench-on/bin/query-workbench-fixture
+          mise exec python@3.13 -- python -m pip install --quiet pytest
+          ZIGBASE_TEST_QUERY_WORKBENCH_OFF_BINARY="$GITHUB_WORKSPACE/zig-out/workbench-off/bin/query-workbench-fixture" ZIGBASE_TEST_QUERY_WORKBENCH_BINARY="$GITHUB_WORKSPACE/zig-out/workbench-on/bin/query-workbench-fixture" mise exec python@3.13 -- python -m pytest tests/admin/test_query_workbench_postgres.py -q
       - name: Rails PostgreSQL row-source integration
         run: |
           mise exec python@3.13 -- python -m pip install --quiet pytest -r tools/rails/requirements-postgres.txt
           mise exec python@3.13 -- python -m pytest tests/rails/test_postgres_source.py -q
+      - name: PostgreSQL idempotency HTTP positive control
+        run: |
+          mise exec zig@0.16.0 -- zig build idempotency-fixture -Dpostgres=true --prefix zig-out/idempotency-pg
+          ZIGBASE_DB_URL="$ZIGBASE_PG_TEST_URL" ZIGBASE_TEST_IDEMPOTENCY_BINARY="$GITHUB_WORKSPACE/zig-out/idempotency-pg/bin/idempotency-fixture" mise exec python@3.13 -- python -m pytest tests/admin/test_idempotency.py::test_concurrent_replay_payload_binding_and_current_guest_guard -q
+      - name: PostgreSQL and SQLite CLI operator provisioning
+        run: |
+          mise exec zig@0.16.0 -- zig build -Dpostgres=true
+          ZIGBASE_TEST_BINARY="$GITHUB_WORKSPACE/zig-out/bin/zigbase" mise exec python@3.13 -- python -m pytest tests/admin/test_superuser_cli.py -q
 
   # PostgreSQL with server TLS, so the suite runs over a REAL sslmode=require connection —
   # exercising the TLS handshake, the dual-layer flushOut, and TLS partial-read framing (the
