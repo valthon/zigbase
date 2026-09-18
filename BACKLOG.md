@@ -127,7 +127,11 @@ product priority and acceptance evidence; it does not create duplicate implement
   Implemented first slice: build-gated SQLite synchronous prepared-statement step
   metrics by route template/opaque structural shape; bounded slow/repeated counters
   and bearer-superuser-only generated SELECT-plan inspection. Completed-statement
-  lifecycle timing separates measured calls from held intervals. PostgreSQL now
+  lifecycle timing separates measured calls from held intervals. A separate bounded
+  method/template table now reports completed synchronous dispatch counts, total/max
+  duration and slow scopes, including SQL-free/error/denied handlers. It does not
+  classify status or measure transport, detached jobs, or exclusive pool-wait time.
+  PostgreSQL now
   measures bounded client-side prepared exchanges with backend-aware attribution;
   PostgreSQL plans, full request/pool-wait latency, captured plans and automatic
   index advice remain deferred.

@@ -26,7 +26,7 @@ pub fn stats(ctx: *http.RequestCtx) !http.Response {
     const snapshot = blk: {
         store.mutex.lockUncancelable(store.io);
         defer store.mutex.unlock(store.io);
-        break :blk .{ .entries = try ctx.allocator.a.dupe(workbench.Entry, store.entries[0..store.count]), .dropped = store.dropped, .dropped_statements = store.dropped_statements };
+        break :blk .{ .entries = try ctx.allocator.a.dupe(workbench.Entry, store.entries[0..store.count]), .dropped = store.dropped, .dropped_statements = store.dropped_statements, .routes = try ctx.allocator.a.dupe(workbench.RouteEntry, store.routes[0..store.route_count]), .dropped_routes = store.dropped_routes };
     };
     const Item = struct {
         backend: []const u8,
@@ -69,8 +69,31 @@ pub fn stats(ctx: *http.RequestCtx) !http.Response {
             .heldNanoseconds = entry.held_ns,
         };
     }
+    const RouteItem = struct {
+        method: []const u8,
+        routeTemplate: []const u8,
+        completedScopes: u64,
+        totalNanoseconds: u64,
+        maxNanoseconds: u64,
+        slowScopes: u64,
+    };
+    const routes = try ctx.allocator.a.alloc(RouteItem, snapshot.routes.len);
+    for (snapshot.routes, routes) |*entry, *item| {
+        item.* = .{
+            .method = entry.method,
+            .routeTemplate = entry.route[0..entry.route_len],
+            .completedScopes = entry.completed,
+            .totalNanoseconds = entry.total_ns,
+            .maxNanoseconds = entry.max_ns,
+            .slowScopes = entry.slow,
+        };
+    }
     return .{ .status = 200, .body = try std.json.Stringify.valueAlloc(ctx.allocator.a, .{
         .items = items,
+        .routes = routes,
+        .routeMeasurement = "matched-handler-scope",
+        .maxRouteEntries = store.limits.max_entries,
+        .droppedRouteScopes = snapshot.dropped_routes,
         .backend = @tagName(db.poolBackend(ctx.app.?.pool)),
         .measurement = "backend-specific-see-items",
         .lifetimeMeasurement = "prepare-through-finalize",

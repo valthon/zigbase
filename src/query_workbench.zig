@@ -37,6 +37,16 @@ pub const Entry = struct {
     calls_ns: u64 = 0,
     held_ns: u64 = 0,
 };
+/// One bounded method/template aggregate, independent of query-shape cardinality.
+pub const RouteEntry = struct {
+    route: [192]u8 = undefined,
+    route_len: u8 = 0,
+    method: []const u8,
+    completed: u64 = 0,
+    total_ns: u64 = 0,
+    max_ns: u64 = 0,
+    slow: u64 = 0,
+};
 pub const Store = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -44,20 +54,50 @@ pub const Store = struct {
     mutex: std.Io.Mutex = .init,
     entries: []Entry,
     count: usize = 0,
+    routes: []RouteEntry,
+    route_count: usize = 0,
+    dropped_routes: u64 = 0,
     dropped: u64 = 0,
     dropped_statements: u64 = 0,
 
     pub fn create(a: std.mem.Allocator, io: std.Io, limits: Limits) !*Store {
         const self = try a.create(Store);
         errdefer a.destroy(self);
-        self.* = .{ .allocator = a, .io = io, .limits = limits, .entries = try a.alloc(Entry, limits.max_entries) };
+        const entries = try a.alloc(Entry, limits.max_entries);
+        errdefer a.free(entries);
+        self.* = .{ .allocator = a, .io = io, .limits = limits, .entries = entries, .routes = try a.alloc(RouteEntry, limits.max_entries) };
         return self;
     }
     pub fn destroy(self: *Store) void {
         const a = self.allocator;
+        a.free(self.routes);
         a.free(self.entries);
         a.destroy(self);
     }
+    fn recordRoute(self: *Store, scope: *const Scope, ns: u64) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const entry: *RouteEntry = blk: {
+            for (self.routes[0..self.route_count]) |*entry| {
+                if (std.mem.eql(u8, entry.route[0..entry.route_len], scope.route) and
+                    std.mem.eql(u8, entry.method, scope.method)) break :blk entry;
+            }
+            if (self.route_count == self.routes.len or scope.route.len > 192) {
+                self.dropped_routes +|= 1;
+                return;
+            }
+            const entry = &self.routes[self.route_count];
+            self.route_count += 1;
+            entry.* = .{ .method = scope.method, .route_len = @intCast(scope.route.len) };
+            @memcpy(entry.route[0..scope.route.len], scope.route);
+            break :blk entry;
+        };
+        entry.completed +|= 1;
+        entry.total_ns +|= ns;
+        entry.max_ns = @max(entry.max_ns, ns);
+        if (ns >= @as(u64, self.limits.slow_ms) * std.time.ns_per_ms) entry.slow +|= 1;
+    }
+
     fn record(self: *Store, scope: *Scope, backend: Backend, key: u64, ns: u64, failed: bool) void {
         var repeated = false;
         for (scope.seen[0..scope.seen_count]) |seen| if (seen.key == key and seen.backend == backend) {
@@ -120,6 +160,7 @@ pub const Scope = struct {
     id: u64 = 0,
     seen: [32]Seen = undefined,
     seen_count: usize = 0,
+    started: ?i96 = null,
 
     pub fn init(store: ?*Store, method: []const u8, route: []const u8) Scope {
         return .{ .store = store, .method = method, .route = route };
@@ -136,11 +177,18 @@ pub const Scope = struct {
             };
         }
         if (self.id == 0) self.store = null;
+        self.started = if (self.store) |store| std.Io.Timestamp.now(store.io, .awake).nanoseconds else null;
         current = self;
     }
     pub fn leave(self: *Scope) void {
         std.debug.assert(current == self);
         current = self.previous;
+        if (self.started) |started| {
+            const store = self.store.?;
+            const ended = std.Io.Timestamp.now(store.io, .awake).nanoseconds;
+            store.recordRoute(self, elapsed(started, ended));
+        }
+        self.started = null;
     }
 };
 
@@ -528,4 +576,63 @@ test "lifetime crossing scopes is omitted even when control returns to its origi
     inner.leave();
     lifetime.finish(null);
     try std.testing.expectEqual(@as(usize, 0), store.count);
+}
+
+test "route aggregates bound independent cardinality and saturate counters" {
+    const store = try Store.create(std.testing.allocator, std.testing.io, .{ .max_entries = 1, .slow_ms = 1 });
+    defer store.destroy();
+    const scope = Scope.init(store, "GET", "/work/:id");
+    store.recordRoute(&scope, 10);
+    store.recordRoute(&scope, 2 * std.time.ns_per_ms);
+    const entry = &store.routes[0];
+    try std.testing.expectEqual(@as(u64, 2), entry.completed);
+    try std.testing.expectEqual(@as(u64, 2 * std.time.ns_per_ms + 10), entry.total_ns);
+    try std.testing.expectEqual(@as(u64, 2 * std.time.ns_per_ms), entry.max_ns);
+    try std.testing.expectEqual(@as(u64, 1), entry.slow);
+    try std.testing.expectEqual(@as(usize, 0), store.count);
+    entry.completed = std.math.maxInt(u64);
+    entry.total_ns = std.math.maxInt(u64);
+    entry.slow = std.math.maxInt(u64);
+    store.recordRoute(&scope, std.math.maxInt(u64));
+    try std.testing.expectEqual(std.math.maxInt(u64), entry.completed);
+    try std.testing.expectEqual(std.math.maxInt(u64), entry.total_ns);
+    try std.testing.expectEqual(std.math.maxInt(u64), entry.slow);
+    const other_method = Scope.init(store, "POST", "/work/:id");
+    store.recordRoute(&other_method, 1);
+    try std.testing.expectEqual(@as(u64, 1), store.dropped_routes);
+    // A full table still updates existing routes.
+    store.recordRoute(&scope, 1);
+    try std.testing.expectEqual(@as(u64, 1), store.dropped_routes);
+}
+
+test "route scopes include no-query work and omit disabled scopes" {
+    const store = try Store.create(std.testing.allocator, std.testing.io, .{});
+    defer store.destroy();
+    var scope = Scope.init(store, "GET", "/outer");
+    scope.enter();
+    var disabled = Scope.init(null, "GET", "/api/query-workbench/stats");
+    disabled.enter();
+    try std.testing.expectEqual(null, disabled.started);
+    disabled.leave();
+    try std.testing.expectEqual(@as(usize, 0), store.route_count);
+    scope.leave();
+    try std.testing.expectEqual(@as(usize, 1), store.route_count);
+    try std.testing.expectEqual(@as(u64, 1), store.routes[0].completed);
+    try std.testing.expectEqual(@as(usize, 0), store.count);
+    try std.testing.expect(current == null);
+    const long_route = [_]u8{'x'} ** 193;
+    const oversized = Scope.init(store, "GET", &long_route);
+    store.recordRoute(&oversized, 1);
+    try std.testing.expectEqual(@as(u64, 1), store.dropped_routes);
+    try std.testing.expectEqual(@as(usize, 1), store.route_count);
+}
+
+test "route table allocation failures release all prior allocations" {
+    const H = struct {
+        fn create(a: std.mem.Allocator) !void {
+            const store = try Store.create(a, std.testing.io, .{});
+            defer store.destroy();
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, H.create, .{});
 }

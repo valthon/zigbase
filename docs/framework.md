@@ -5165,6 +5165,31 @@ opened by a custom handler. Backend identity also separates repeat accounting.
 Telemetry storage is bounded; PostgreSQL's pre-existing whole-result buffering
 is **not** bounded by these telemetry limits, and instrumentation copies no rows.
 
+The additive `routes` array measures **completed synchronous matched-dispatch
+scopes**, including routes that execute no SQL. Each method/template aggregate has
+`completedScopes`, `totalNanoseconds`, `maxNanoseconds`, and `slowScopes` (elapsed
+at least `slowMilliseconds`). `routeMeasurement` is `matched-handler-scope`.
+`maxRouteEntries` equals the configured `max_entries`, but the route table and
+`droppedRouteScopes` counter are independent of the query-shape table. Each table
+retains its first keys until restart; a full table still updates known keys.
+Route labels over 192 bytes are omitted. Storage adds at most `max_entries`
+fixed-size route aggregates; capture allocates nothing per completed scope.
+
+The awake-clock interval starts after route matching and ends as synchronous
+dispatch unwinds, before taking the aggregation lock. It includes in-scope auth,
+guards, pool waits, handler processing, and deferred cleanup. Consumer dispatch
+also includes its own error conversion; built-in dispatch ends before the outer
+server error backstop. It excludes parsing/routing and admission before dispatch,
+response transmission, streaming connection lifetime, and detached background work.
+Failed or denied matched handlers count, but status/error classification is not
+recorded. Inspector scopes read no timing clock and do not enter either table.
+
+This is elapsed time, not CPU time or end-to-end request latency. Two additional
+clock reads and a bounded locked update occur per measured scope. Nested scopes
+are inclusive; do not subtract aggregated query/lifecycle totals to infer exclusive
+application time, and do not add route totals to obtain process busy time. Concurrent
+requests overlap. Active/incomplete scopes are absent until they finish.
+
 Completed statements also report a separate lifecycle family:
 
 - `finalizedStatements`: successful prepares finalized in their originating
@@ -5187,7 +5212,7 @@ slow/repeat/failure counters keep their meanings; they are not lifecycle counts.
 A statement can have several executions, or none, and execution statistics can
 appear before its lifecycle is finalized. Do not subtract aggregate step timing
 from lifecycle timing: the populations can differ. Failed prepares, raw `exec`,
-pool acquisition and full request latency are not captured. A lifecycle whose
+pool acquisition and full request latency are not captured by statement metrics. A lifecycle whose
 measured calls or finalization leave the original scope is omitted rather than
 reattributed; no request/store pointers are retained in statements. Long-lived
 unfinalized statements do not appear in lifecycle aggregates.

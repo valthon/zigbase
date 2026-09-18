@@ -116,6 +116,10 @@ not API-compatible.
 - **Deterministic testing** — freeze time (`ZIGBASE_FAKE_NOW`), fix randomness
   (`ZIGBASE_FAKE_SEED`), and capture outbound mail in test suites — all gated off in
   production builds.
+- **Route and query diagnostics** — opt-in bounded method/template duration aggregates,
+  SQLite/PostgreSQL query measurements, and operator-only inspection. SQL-free handlers
+  are measured too; synchronous dispatch duration is not end-to-end request latency.
+  → [Query workbench](./framework#bounded-query-workbench-opt-in)
 - **Performance contracts** — opt-in binary-size and allocation budgets with
   versioned CI reports; timing comparisons stay advisory. → [Testing](./testing#performance-contracts)
 

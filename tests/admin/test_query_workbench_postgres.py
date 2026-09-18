@@ -55,6 +55,9 @@ def test_postgres_workbench_live(enabled, tmp_path):
         assert call(base, "GET", "/held")[0] == 204
         code, report = call(base, "GET", "/api/query-workbench/stats", token=token)
         assert code == 200 and report["activeBackend"] == "postgres"
+        route = next(row for row in report["routes"] if row["routeTemplate"] == "/work/:id")
+        assert route["completedScopes"] == 1
+        assert route["totalNanoseconds"] == route["maxNanoseconds"]
         work = next(item for item in report["items"] if item["routeTemplate"] == "/work/:id")
         assert work["backend"] == "postgres"
         assert work["measurement"] == "client-extended-protocol-exchange-time"

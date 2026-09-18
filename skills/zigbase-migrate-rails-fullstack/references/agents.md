@@ -168,6 +168,9 @@ For opt-in database timing evidence, `-Dquery-workbench=true` exposes bounded,
 superuser-bearer-only route/shape statistics without retaining SQL or values.
 SQLite measures prepared step calls; PostgreSQL measures client protocol exchanges
 including network/server wait and result buffering, not server CPU or pool wait.
+The separate bounded `routes` aggregates measure synchronous matched-dispatch
+elapsed time, including SQL-free handlers and in-scope pool waits, but not transport
+or detached work. They are not CPU or end-to-end request timings.
 PostgreSQL buffered rows add no per-row timestamps or telemetry copies. These
 telemetry budgets do not cap PostgreSQL result memory. Read each item's backend
 and measurement label; PostgreSQL plan inspection remains `501`. See the
