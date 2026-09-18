@@ -298,6 +298,15 @@ pub fn build(b: *std.Build) void {
     const bench_step = b.step("bench", "Run the benchmark harness (ns/op + allocation profile)");
     bench_step.dependOn(&bench_run.step);
 
+    const capacity_mod = b.createModule(.{
+        .root_source_file = b.path("fixtures/application-capacity/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "zigbase", .module = zigbase_mod }},
+    });
+    const capacity_exe = b.addExecutable(.{ .name = "application-capacity", .root_module = capacity_mod });
+    b.step("application-capacity", "Build the tenant project/task capacity application").dependOn(&b.addInstallArtifact(capacity_exe, .{}).step);
+
     const discovery_mod = b.createModule(.{
         .root_source_file = b.path("fixtures/route-discovery/main.zig"),
         .target = target,

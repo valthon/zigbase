@@ -54,7 +54,7 @@ jobs:
         run: >-
           mise exec zig@0.16.0 -- zig build install dating-server auth2-server
           features-fixture admission-fixture feature-remapped-fixture
-          feature-disabled-fixture import-fixture full-fixture
+          feature-disabled-fixture import-fixture full-fixture application-capacity
           -Dcpu=baseline -j2 --summary all
       - name: Build blog example consumer (dependency-graph proof)
         if: matrix.bundle == 'examples'
@@ -816,6 +816,10 @@ jobs:
         run: mise exec python@3.13 -- python -m pip install --quiet pytest aiosmtpd
       - name: Server lifecycle + doctor CLI e2e
         run: mise exec python@3.13 -- python -m pytest tests/cli -q
+      - name: Export application capacity fixture
+        run: |
+          test -x artifacts/zig-out/bin/application-capacity
+          echo "ZIGBASE_TEST_CAPACITY_BINARY=$GITHUB_WORKSPACE/artifacts/zig-out/bin/application-capacity" >> "$GITHUB_ENV"
       - name: Replay-harness unit tests
         run: mise exec python@3.13 -- python -m pytest tests/tools -q
       - name: Live SMTP-over-TLS (STARTTLS) delivery test

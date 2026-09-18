@@ -28,6 +28,11 @@ implementation. [Why ZigBase](docs/why-zigbase.md) connects this work to the pro
   build flags, load generator, warmup, duration, errors, throughput, p50/p95/p99 latency,
   process RSS, CPU, and disk use. Report saturation and recovery, not only a peak RPS.
   Include a reproducible small-machine baseline before broader enterprise-scale claims.
+  First chapter implemented: a [bounded project/task runner](docs/testing.md#application-capacity)
+  exercises authenticated native-tenant lists, writes, and relation expansion with
+  semantic/isolation checks, client latency distributions, process RSS/CPU, and binary/resource
+  provenance. CI runs its correctness smoke without timing gates. Realtime/background
+  work, saturation/recovery, and the reproducible small-machine baseline remain open.
 - [ ] **Coordinated resource envelope.** Extend existing HTTP/memory-job admission and
   retained-payload byte limits to the uncovered resource paths below. Demonstrate bounded queues and
   predictable degradation under mixed overload; report which subsystem saturated and
