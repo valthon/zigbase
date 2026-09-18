@@ -2,11 +2,17 @@
 
 > 📖 This documentation is also published, web-native, at <https://valthon.github.io/zigbase/docs/framework> — the site is the canonical reading experience.
 
-ZigBase is not only a standalone backend binary — it is an **embeddable Zig
-framework**. You `zig fetch --save` it, `@import("zigbase")`, and configure
+ZigBase is an **embeddable Zig framework** for building custom applications with
+integrated backend services and explicit control over resources. You `zig fetch --save`
+it, `@import("zigbase")`, and configure
 `zigbase.App(.{...})` with comptime hooks, custom routes, scheduled jobs, and
 lifecycle/auth/file event handlers. Your app *is* the ZigBase server, plus your
 extensions.
+
+Write these integrations directly or build them with a coding agent: the same typed
+API, compiler checks, and local tests support both. Start with [Why ZigBase](why-zigbase.md)
+for the design rationale, or jump to [footprint levers](#10-footprint-levers-pools)
+for resource profiles, effective settings, and measurement-driven tuning.
 
 > For runnable, end-to-end usage of these APIs (hooks, a custom route with a path
 > param, and a DB-touching cron job), see the [tutorial](tutorial.md) and the

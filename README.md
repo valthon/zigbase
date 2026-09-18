@@ -1,13 +1,29 @@
 # ZigBase
 
-ZigBase is a single-binary, PocketBase-inspired (but **not** API-compatible) backend in
-**Zig 0.16**. It bundles a collections + schema engine, a typed records query API
-(filter / sort / expand), per-collection access rules, authentication (argon2id password
-plus OAuth2 with PKCE), realtime updates over WebSocket and SSE, local file storage, and an
-embedded admin UI at `/_/` — all in one statically-linked executable, backed by embedded
-SQLite by default with PostgreSQL as an opt-in build flag.
-It is also an **embeddable Zig framework**: import it as a library and extend the server
-with comptime record hooks, custom HTTP routes, and scheduled jobs.
+**Build beyond your team size.**
+
+ZigBase is an open-source backend and embeddable **Zig 0.16 framework** for ambitious
+web applications built by individuals and small teams. Integrated application services,
+explicit resource controls, and a single-binary deployment let you spend more effort
+on your product and make deliberate use of your hardware.
+
+Write the code yourself, work with a frontier coding agent, or combine both. Typed
+hooks, custom routes, scheduled jobs, compile-time configuration, and in-process tests
+are first-class developer tools. Scaffolding, machine-readable diagnostics, and agent
+instructions make the same framework accessible to coding agents. No AI service is
+required.
+
+Start with embedded SQLite; build with PostgreSQL support when your workload needs it.
+Collections, auth, access rules, files, realtime, and an embedded admin UI come together
+in one executable. Extend it in Zig to implement your own business logic and integrations.
+Pair it with [Zigapagos](docs/zigapagos-pairing.md) for a complete application, or bring
+another frontend.
+
+**[Why ZigBase](docs/why-zigbase.md)** · **[Build an app](docs/tutorial.md)** ·
+**[Framework reference](docs/framework.md)** · **[Build with an agent](docs/agents.md)** ·
+**[Engineering backlog](BACKLOG.md)**
+
+ZigBase draws inspiration from PocketBase but is not API-compatible.
 
 [![Release](https://img.shields.io/github/v/release/valthon/zigbase)](https://github.com/valthon/zigbase/releases) · `early release` · `License: Apache-2.0` · see [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md)
 

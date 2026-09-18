@@ -8,7 +8,21 @@ group: getting-started
 # Quick start
 
 Get a ZigBase server running in a few minutes — either from a prebuilt binary or by
-building from source.
+building from source. This path uses the stock backend; to write custom Zig hooks,
+routes, and jobs, follow the [framework tutorial](./tutorial). Both paths work with
+or without a coding agent.
+
+## Scaffold a project
+
+```sh
+npx zigbase init
+```
+
+This creates a Compose configuration, schema document, and project instructions.
+For a Zig framework project, use `npx zigbase init --framework`, then follow the
+[framework setup](./framework) to add the dependency and run its tests.
+
+The commands below show how to run the server directly.
 
 ## Build from source
 

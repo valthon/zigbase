@@ -8,7 +8,8 @@ const read = (path) => readFileSync(join(out, path), 'utf8');
 const required = [
   'index.html', 'compare/index.html', 'download/index.html', 'docs/index.html',
   'docs/overview/index.html', 'docs/quick-start/index.html', 'docs/tutorial/index.html',
-  'docs/api/index.html', 'examples/index.html', 'examples/blog/index.html',
+  'docs/api/index.html', 'docs/why-zigbase/index.html', 'docs/roadmap/index.html',
+  'examples/index.html', 'examples/blog/index.html',
   'examples/golfsim/index.html', 'examples/plugins/index.html', 'llms.txt',
   'docs-index.json', 'sitemap.xml', 'robots.txt',
 ];
@@ -58,7 +59,7 @@ const repoVersion = readFileSync(join(out, '..', '..', '..', 'build.zig.zon'), '
 if (!repoVersion || !home.includes(`v${repoVersion}`) || !read('download/index.html').includes(`v${repoVersion}`)) {
   fail(`published version drifted from build.zig.zon (${repoVersion ?? 'unknown'})`);
 }
-for (const phrase of ['single binary', 'SQLite', 'Postgres', 'Ready out of the box', 'Real apps', 'TypeScript SDK']) {
+for (const phrase of ['team size.', 'single binary', 'SQLite', 'Postgres', 'Ready out of the box', 'Real apps', 'TypeScript SDK']) {
   if (!home.includes(phrase)) fail(`landing page lost: ${phrase}`);
 }
 if (!home.includes('application/ld+json')) fail('landing page missing JSON-LD');
@@ -74,7 +75,7 @@ for (const marker of [':focus-visible', 'prefers-reduced-motion', '@media(max-wi
 if (!read('robots.txt').includes('https://valthon.github.io/zigbase/sitemap.xml')) fail('robots sitemap URL drifted');
 if (!read('sitemap.xml').includes(`${htmlFiles.length > 0 ? 'https://valthon.github.io/zigbase/docs/api/' : ''}`)) fail('sitemap missing API route');
 const index = JSON.parse(read('docs-index.json'));
-if (index.docs.length !== 42) fail(`docs index expected 42 docs, found ${index.docs.length}`);
+if (index.docs.length !== 44) fail(`docs index expected 44 docs, found ${index.docs.length}`);
 if (!read('docs/resumable-uploads/index.html').includes('Commit retries and uncertain outcomes')) {
   fail('resumable upload limitations were not published');
 }
