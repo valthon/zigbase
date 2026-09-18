@@ -200,12 +200,23 @@ budgets. Different app features and targets need their own measured contract.
 ## The build wiring (copy this)
 
 `zigbase.addTest` gives you a test artifact wired with ZigBase's `.simple`-mode
-test runner. That runner matters: `zig build test` otherwise runs the test
-binary in server mode (`--listen=-`), and an app booted by the harness does
-enough work at process exit that Zig 0.16's build runner can mis-read a normal
-exit as a crash — printing `failed command: … --listen=-` and intermittently
-failing the build. The `.simple` runner rides the exit code instead, and fails
-the build on a leaked allocation.
+runner. It reports through the process exit code and fails on assertions, leaked
+allocations, logged errors, and abnormal process exits.
+
+Zig 0.16.0's default server-mode runner (`--listen=-`) can print a misleading
+`failed command:` label after successful tests when the child leaves stderr output
+at exit. A single newline from facil.io's destructor is sufficient; the reproduced
+case exits zero and reports all tests passed. This is a diagnostic bug, not evidence
+of an app crash or a runner race. Check **both the command exit status and the final
+build summary**. A nonzero exit, signal, failed test, or leak is a real failure and
+must be investigated separately.
+
+The supported `addTest` wiring avoids this label on successful runs. Contributors
+can reproduce the distinction and verify real failure handling with
+`mise exec zig@0.16.0 python@3.13 -- python tests/test_runner/verify.py`. The
+[regression fixture](../tests/test_runner/README.md) checks the installed compiler
+and the shipped runner without patching either. Upstream diagnosis remains tracked
+in [#261](https://github.com/valthon/zigbase/issues/261).
 
 ```zig
 const std = @import("std");

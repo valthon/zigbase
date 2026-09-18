@@ -6051,18 +6051,20 @@ Pass the **same** module you passed to `addTo`: rooting a second module at
 (`src/simple_runner.zig`, resolved out of the dependency — you do not vendor
 anything). That matters for two reasons:
 
-- **It sidesteps an upstream Zig 0.16 build-runner race.** `zig build test`
-  otherwise runs the test binary in server mode (`--listen=-`) and polls its
-  stdio; an app booted by the harness does real work at process exit (closing
-  sqlite, removing a tempdir), and the runner can mis-read that normal exit as a
-  crash — printing `failed command: …--listen=-` and intermittently failing the
-  build under load. A `.simple` runner reports through its exit code instead, so
-  the race cannot occur.
-- **It fails the build on a leak.** Each test runs under a fresh
-  `std.testing.allocator` whose leak check runs on teardown.
+- **It avoids a misleading Zig 0.16.0 diagnostic.** The default server-mode
+  runner (`--listen=-`) can print `failed command:` after a successful child leaves
+  stderr output at exit. The reproduced trigger is facil.io's destructor newline;
+  the command exits zero and the summary reports passing tests. This does not
+  establish a crash or a runner race. A `.simple` runner reports through its exit
+  code instead and does not print that stale label on success.
+- **It rejects real failures.** Each test runs under a fresh
+  `std.testing.allocator` with leak checking. Failed tests, logged errors, and
+  abnormal process exits still fail the build.
 
-If you are not using `addTest`, that `--listen=-` line on an otherwise-passing
-suite is the race, not a bug in your app.
+For default-runner output, check both the command exit status and final build
+summary. Never dismiss a nonzero exit or signal as the newline diagnostic. See
+[testing](testing.md#the-build-wiring-copy-this) for the reproducible runner checks
+and [#261](https://github.com/valthon/zigbase/issues/261) for the investigation.
 
 ## Compile-time build flags
 

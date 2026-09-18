@@ -1124,11 +1124,10 @@ pub const TestOptions = struct {
 
 /// A test artifact for a consumer app, wired with ZigBase's `.simple`-mode runner.
 ///
-/// The runner matters: `zig build test` otherwise runs the test binary in server mode
-/// (`--listen=-`), and an app booted by `zigbase.testing` does enough work at process
-/// exit that Zig 0.16's build runner can mis-read a normal exit as a crash. `.simple`
-/// mode rides the exit code instead. The runner also fails the build on a leaked
-/// allocation.
+/// The default server-mode runner (`--listen=-`) in Zig 0.16.0 can label a
+/// successful command as failed when stderr remains at exit (issue #261).
+/// `.simple` mode reports through the exit code instead. Assertions, leaks,
+/// logged errors, and abnormal process exits still fail the build.
 ///
 ///     const tests = zigbase.addTest(b, dep, .{ .root_module = app_mod });
 ///     b.step("test", "run tests").dependOn(&b.addRunArtifact(tests).step);

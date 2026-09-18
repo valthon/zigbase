@@ -52,8 +52,8 @@ implementation. [Why ZigBase](docs/why-zigbase.md) connects this work to the pro
   result lifetimes, transaction boundaries, custom routes, and plugin contracts. Improve
   public APIs or diagnostics where failures recur; retain explicit resource control.
   Completion requires runnable examples and useful errors, not an AI-only workaround.
-- [ ] **Reproducible test feedback.** Resolve #261 before relying on unattended test
-  success; extend the existing structured diagnostics and focused execution to cover
+- [ ] **Reproducible test feedback.** Preserve command status and test summaries in
+  unattended runs; extend the existing structured diagnostics and focused execution to cover
   more application workflows. Keep CLI commands useful from an ordinary terminal and CI.
 
 ### P2 — Demonstrate the growth path and reduce operating effort
@@ -143,7 +143,13 @@ product priority and acceptance evidence; it does not create duplicate implement
   capacity and expiry cleanup. PostgreSQL coordinates namespaces across replicas
   with fail-fast transaction locks. Built-in REST mutations and external
   side-effect orchestration remain outside this helper.
-- [ ] Resolve intermittent test-runner diagnostics (#261); existing investigation is PR #355.
+- [ ] Complete upstream test-runner diagnostic follow-up (#261; investigation PR #355).
+  The reproduced Zig 0.16.0 symptom is a stale failed-command label after successful
+  exit-time stderr, not a demonstrated race. Supported `zigbase.addTest` avoids it.
+  A dependency-free 14-case stock/simple-runner regression verifies success, meaningful
+  stderr, skips, assertions, leaks, logged errors, and post-test signals in CI.
+  Upstream compiler correction/submission remains open; nonzero exits still require
+  independent diagnosis.
 
 ## Schema hardening
 
