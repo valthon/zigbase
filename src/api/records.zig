@@ -111,7 +111,7 @@ fn jsonResponse(ctx: *http.RequestCtx, status: u16, v: std.json.Value) !http.Res
 /// — when tenancy is enabled — resolves the active account scope (`account_id`/`account_role`/
 /// `memberships`) from a verified `_memberships` row. Resolution is cached on the returned context
 /// (one indexed SELECT per request) and fails closed: any error leaves the scope empty.
-fn buildContext(ctx: *http.RequestCtx, conn: *db.Db, data: ?std.json.Value) request.RequestContext {
+pub fn buildContext(ctx: *http.RequestCtx, conn: *db.Db, data: ?std.json.Value) request.RequestContext {
     var rctx = request.RequestContext{ .auth = null, .is_superuser = false, .collection = "", .data = data, .method = @tagName(ctx.method) };
     const app = ctx.app orelse return rctx;
     rctx.tenancy_enabled = app.tenancy.enabled;
@@ -345,6 +345,10 @@ fn prepareRecordData(ctx: *http.RequestCtx, col: schema.Collection, existing: ?s
 }
 
 pub fn create(ctx: *http.RequestCtx) anyerror!http.Response {
+    if (ctx.header("idempotency-key") != null) {
+        if (comptime @import("build_options").rest_idempotency) if (ctx.app.?.rest_idempotency) |handle| return handle(ctx);
+        return ApiError.badRequest("REST idempotency is not configured.").toResponse(ctx.allocator.a);
+    }
     const app = ctx.app.?;
     // The collection lease must OUTLIVE the reader block below: `col` is borrowed from the
     // cache entry's arena and used through the whole handler, so it is released only on
@@ -471,6 +475,7 @@ pub fn create(ctx: *http.RequestCtx) anyerror!http.Response {
         }
     }
     const rid = rec.object.get("id").?.string;
+    if (comptime @import("build_options").durable_realtime) try @import("../realtime/durable.zig").capture(ctx.allocator.a, app.io, w, col, .create, rid, null);
     // Bytes already exist; only a successful commit makes their references visible.
     try w.commit();
     committed = true;
@@ -488,6 +493,10 @@ pub fn create(ctx: *http.RequestCtx) anyerror!http.Response {
 }
 
 pub fn update(ctx: *http.RequestCtx) anyerror!http.Response {
+    if (ctx.header("idempotency-key") != null) {
+        if (comptime @import("build_options").rest_idempotency) if (ctx.app.?.rest_idempotency) |handle| return handle(ctx);
+        return ApiError.badRequest("REST idempotency is not configured.").toResponse(ctx.allocator.a);
+    }
     return updateImpl(ctx, false, {});
 }
 
@@ -749,6 +758,7 @@ fn updateImpl(ctx: *http.RequestCtx, comptime is_resumable: bool, resumable: if 
             return ApiError.withCode(503, .internal, "Upload completion receipt could not be persisted; inspect upload status.").toResponse(ctx.allocator.a);
         };
     };
+    if (comptime @import("build_options").durable_realtime) try @import("../realtime/durable.zig").capture(ctx.allocator.a, app.io, w, col, .update, rid, null);
     try w.commit();
     txn_open = false;
     committed = true; // row is durable — the write-cleanup defer must NOT fire past here
@@ -792,6 +802,10 @@ fn updateImpl(ctx: *http.RequestCtx, comptime is_resumable: bool, resumable: if 
 }
 
 pub fn delete(ctx: *http.RequestCtx) anyerror!http.Response {
+    if (ctx.header("idempotency-key") != null) {
+        if (comptime @import("build_options").rest_idempotency) if (ctx.app.?.rest_idempotency) |handle| return handle(ctx);
+        return ApiError.badRequest("REST idempotency is not configured.").toResponse(ctx.allocator.a);
+    }
     const app = ctx.app.?;
     const w = app.pool.acquireWriter();
     defer app.pool.releaseWriter();
@@ -829,6 +843,7 @@ pub fn delete(ctx: *http.RequestCtx) anyerror!http.Response {
     // create/update path (all compare ciphertext) — plus the cross-instance NOTIFY token (Postgres
     // only; the wire carries only the token, never the row data). On SQLite with no encrypted
     // fields this reuses `ex_mut` with no extra read (byte-identical).
+    const durable_snapshot = if (comptime @import("build_options").durable_realtime) try records.getAtRest(ctx.allocator.a, w, col, rid) else null;
     const rt = realtime_ws.prepareDelete(ctx.allocator.a, app, w, col, rid, ex_mut);
     if (!try records.deleteInTxn(ctx.allocator.a, w, col, rid)) {
         return ApiError.notFound().toResponse(ctx.allocator.a);
@@ -841,6 +856,7 @@ pub fn delete(ctx: *http.RequestCtx) anyerror!http.Response {
         _ = try st.step();
     }
     if (app.files.cleanup) |enqueue| try enqueue(ctx.allocator.a, w, app.io, app.files.cleanup_queue.?, col, rid, existing, null);
+    if (comptime @import("build_options").durable_realtime) try @import("../realtime/durable.zig").capture(ctx.allocator.a, app.io, w, col, .delete, rid, durable_snapshot);
     try w.commit();
     txn_open = false;
 
@@ -1047,6 +1063,7 @@ const TestEnv = struct {
             const w = env.pool.acquireWriter();
             defer env.pool.releaseWriter();
             try migrations.run(w);
+            if (comptime @import("build_options").durable_realtime) try @import("../realtime/durable.zig").initialize(std.testing.allocator, std.testing.io, w);
             var setup_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
             defer setup_arena.deinit();
             const sa = setup_arena.allocator();
@@ -2395,6 +2412,7 @@ test "update pre-authorizes tenant ownership BEFORE the before_update hook fires
         const w = pool.acquireWriter();
         defer pool.releaseWriter();
         try migrations.run(w);
+        if (comptime @import("build_options").durable_realtime) try @import("../realtime/durable.zig").initialize(std.testing.allocator, std.testing.io, w);
         _ = try collections.create(a, std.testing.io, w, .{ .id = "", .name = "users", .type = .auth, .fields = &.{} });
         const users_col = (try collections.get(a, w, "users")).?;
         var ud: std.json.ObjectMap = .empty;
@@ -2521,6 +2539,7 @@ const F1Env = struct {
             const w = env.pool.acquireWriter();
             defer env.pool.releaseWriter();
             try migrations.run(w);
+            if (comptime @import("build_options").durable_realtime) try @import("../realtime/durable.zig").initialize(std.testing.allocator, std.testing.io, w);
             _ = try collections.create(a, std.testing.io, w, .{
                 .id = "",
                 .name = "users",

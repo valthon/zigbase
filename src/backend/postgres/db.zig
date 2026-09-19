@@ -16,6 +16,7 @@ pub const Stmt = stmt_mod.Stmt;
 
 pub const DbError = error{
     OpenFailed,
+    WriterUnavailable,
     ExecFailed,
     PrepareFailed,
     BindFailed,
@@ -98,10 +99,12 @@ pub const Db = struct {
 
     /// Execute one or more statements with no bound parameters (simple protocol).
     pub fn exec(self: *Db, sql: [:0]const u8) DbError!void {
+        if (self.conn.broken) return error.WriterUnavailable;
         self.conn.simpleExec(sql) catch return DbError.ExecFailed;
     }
 
     pub fn prepare(self: *Db, sql: [:0]const u8) DbError!Stmt {
+        if (self.conn.broken) return error.WriterUnavailable;
         return stmt_mod.Stmt.init(self.conn, self.gpa, sql, self.field_cipher) catch return DbError.PrepareFailed;
     }
 
@@ -126,6 +129,20 @@ pub const Db = struct {
     /// the latter mean a nested `BEGIN` would be rejected.
     pub fn inTransaction(self: *Db) bool {
         return self.conn.tx_status != 'I';
+    }
+
+    /// Roll back a failed/open transaction once. A broken wire cannot safely be
+    /// reused or resynchronized; preserve the session for shutdown and fail closed.
+    pub fn recoverTransaction(self: *Db) DbError!void {
+        if (self.conn.broken) return error.WriterUnavailable;
+        if (self.inTransaction()) self.rollback() catch {
+            self.conn.broken = true;
+            return error.WriterUnavailable;
+        };
+        if (!self.isHealthy() or self.inTransaction()) {
+            self.conn.broken = true;
+            return error.WriterUnavailable;
+        }
     }
 
     /// Rows changed/inserted/deleted by the most recent DML on this connection. Parsed from

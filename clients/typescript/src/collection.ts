@@ -6,6 +6,8 @@ import {
   type ListResult,
   type ListOpts,
   type RecordCrudOpts,
+  type RecordMutationOpts,
+  type RecordDeleteOpts,
   hasBlob,
   toFormData,
 } from "./records.js";
@@ -366,7 +368,7 @@ export class CollectionService {
   }
 
   /** Create a record. Auto-switches to multipart when the body contains a Blob/File. */
-  create<T = ZbRecord>(body: Record<string, unknown>, opts: RecordCrudOpts = {}): Promise<T> {
+  create<T = ZbRecord>(body: Record<string, unknown>, opts: RecordMutationOpts = {}): Promise<T> {
     const payload = hasBlob(body) ? toFormData(body) : body;
     return this.transport.send<T>(this.recordsBase(), {
       method: "POST",
@@ -374,13 +376,14 @@ export class CollectionService {
       query: { expand: opts.expand, fields: opts.fields },
       signal: opts.signal,
       requestKey: opts.requestKey,
+      headers: opts.idempotencyKey === undefined ? undefined : { "Idempotency-Key": opts.idempotencyKey },
     });
   }
 
   update<T = ZbRecord>(
     id: string,
     body: Record<string, unknown>,
-    opts: RecordCrudOpts = {},
+    opts: RecordMutationOpts = {},
   ): Promise<T> {
     const payload = hasBlob(body) ? toFormData(body) : body;
     return this.transport.send<T>(`${this.recordsBase()}/${encodeURIComponent(id)}`, {
@@ -389,12 +392,16 @@ export class CollectionService {
       query: { expand: opts.expand, fields: opts.fields },
       signal: opts.signal,
       requestKey: opts.requestKey,
+      headers: opts.idempotencyKey === undefined ? undefined : { "Idempotency-Key": opts.idempotencyKey },
     });
   }
 
-  async delete(id: string): Promise<void> {
+  async delete(id: string, opts: RecordDeleteOpts = {}): Promise<void> {
     await this.transport.send<void>(`${this.recordsBase()}/${encodeURIComponent(id)}`, {
       method: "DELETE",
+      signal: opts.signal,
+      requestKey: opts.requestKey,
+      headers: opts.idempotencyKey === undefined ? undefined : { "Idempotency-Key": opts.idempotencyKey },
     });
   }
 

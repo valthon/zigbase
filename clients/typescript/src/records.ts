@@ -41,6 +41,13 @@ export interface RecordCrudOpts {
   requestKey?: string;
 }
 
+/** Explicit retry identity for server-enabled record mutations; never generates keys or retries. */
+export interface RecordMutationOpts extends RecordCrudOpts {
+  idempotencyKey?: string;
+}
+
+export type RecordDeleteOpts = Pick<RecordMutationOpts, "signal" | "requestKey" | "idempotencyKey">;
+
 function isBlobLike(v: unknown): v is Blob {
   return typeof Blob !== "undefined" && v instanceof Blob;
 }

@@ -372,14 +372,14 @@ export interface SecurityRequirementsService {
   }): Promise<SecurityRequirement[]>;
   create<K extends SecurityRequirementExpand = never>(
     data: SecurityRequirementCreate,
-    opts?: { expand?: K[]; fields?: string; signal?: AbortSignal; requestKey?: string },
+    opts?: { expand?: K[]; fields?: string; signal?: AbortSignal; requestKey?: string; idempotencyKey?: string },
   ): Promise<WithExpand<SecurityRequirement, SecurityRequirementRelations, K>>;
   update<K extends SecurityRequirementExpand = never>(
     id: string,
     data: SecurityRequirementUpdate,
-    opts?: { expand?: K[]; fields?: string; signal?: AbortSignal; requestKey?: string },
+    opts?: { expand?: K[]; fields?: string; signal?: AbortSignal; requestKey?: string; idempotencyKey?: string },
   ): Promise<WithExpand<SecurityRequirement, SecurityRequirementRelations, K>>;
-  delete(id: string): Promise<void>;
+  delete(id: string, opts?: { signal?: AbortSignal; requestKey?: string; idempotencyKey?: string }): Promise<void>;
   filter(fn: (f: SecurityRequirementFields) => Expr): string;
   getAbilities(id: string, opts?: { signal?: AbortSignal; requestKey?: string }): Promise<RecordAbilities>;
 }
@@ -426,14 +426,14 @@ export interface UsersService {
   }): Promise<User[]>;
   create(
     data: UserCreate,
-    opts?: { fields?: string; signal?: AbortSignal; requestKey?: string },
+    opts?: { fields?: string; signal?: AbortSignal; requestKey?: string; idempotencyKey?: string },
   ): Promise<User>;
   update(
     id: string,
     data: UserUpdate,
-    opts?: { fields?: string; signal?: AbortSignal; requestKey?: string },
+    opts?: { fields?: string; signal?: AbortSignal; requestKey?: string; idempotencyKey?: string },
   ): Promise<User>;
-  delete(id: string): Promise<void>;
+  delete(id: string, opts?: { signal?: AbortSignal; requestKey?: string; idempotencyKey?: string }): Promise<void>;
   filter(fn: (f: UserFields) => Expr): string;
   getAbilities(id: string, opts?: { signal?: AbortSignal; requestKey?: string }): Promise<RecordAbilities>;
   auth: ReturnType<Client["collection"]>;
@@ -490,14 +490,14 @@ export interface SimulatorsService {
   }): Promise<Simulator[]>;
   create<K extends SimulatorExpand = never>(
     data: SimulatorCreate,
-    opts?: { expand?: K[]; fields?: string; signal?: AbortSignal; requestKey?: string },
+    opts?: { expand?: K[]; fields?: string; signal?: AbortSignal; requestKey?: string; idempotencyKey?: string },
   ): Promise<WithExpand<Simulator, SimulatorRelations, K>>;
   update<K extends SimulatorExpand = never>(
     id: string,
     data: SimulatorUpdate,
-    opts?: { expand?: K[]; fields?: string; signal?: AbortSignal; requestKey?: string },
+    opts?: { expand?: K[]; fields?: string; signal?: AbortSignal; requestKey?: string; idempotencyKey?: string },
   ): Promise<WithExpand<Simulator, SimulatorRelations, K>>;
-  delete(id: string): Promise<void>;
+  delete(id: string, opts?: { signal?: AbortSignal; requestKey?: string; idempotencyKey?: string }): Promise<void>;
   filter(fn: (f: SimulatorFields) => Expr): string;
   getAbilities(id: string, opts?: { signal?: AbortSignal; requestKey?: string }): Promise<RecordAbilities>;
 }
@@ -549,14 +549,14 @@ export interface ListingsService {
   }): Promise<Listing[]>;
   create<K extends ListingExpand = never>(
     data: ListingCreate,
-    opts?: { expand?: K[]; fields?: string; signal?: AbortSignal; requestKey?: string },
+    opts?: { expand?: K[]; fields?: string; signal?: AbortSignal; requestKey?: string; idempotencyKey?: string },
   ): Promise<WithExpand<Listing, ListingRelations, K>>;
   update<K extends ListingExpand = never>(
     id: string,
     data: ListingUpdate,
-    opts?: { expand?: K[]; fields?: string; signal?: AbortSignal; requestKey?: string },
+    opts?: { expand?: K[]; fields?: string; signal?: AbortSignal; requestKey?: string; idempotencyKey?: string },
   ): Promise<WithExpand<Listing, ListingRelations, K>>;
-  delete(id: string): Promise<void>;
+  delete(id: string, opts?: { signal?: AbortSignal; requestKey?: string; idempotencyKey?: string }): Promise<void>;
   filter(fn: (f: ListingFields) => Expr): string;
   getAbilities(id: string, opts?: { signal?: AbortSignal; requestKey?: string }): Promise<RecordAbilities>;
 }
@@ -608,14 +608,14 @@ export interface BookingsService {
   }): Promise<Booking[]>;
   create<K extends BookingExpand = never>(
     data: BookingCreate,
-    opts?: { expand?: K[]; fields?: string; signal?: AbortSignal; requestKey?: string },
+    opts?: { expand?: K[]; fields?: string; signal?: AbortSignal; requestKey?: string; idempotencyKey?: string },
   ): Promise<WithExpand<Booking, BookingRelations, K>>;
   update<K extends BookingExpand = never>(
     id: string,
     data: BookingUpdate,
-    opts?: { expand?: K[]; fields?: string; signal?: AbortSignal; requestKey?: string },
+    opts?: { expand?: K[]; fields?: string; signal?: AbortSignal; requestKey?: string; idempotencyKey?: string },
   ): Promise<WithExpand<Booking, BookingRelations, K>>;
-  delete(id: string): Promise<void>;
+  delete(id: string, opts?: { signal?: AbortSignal; requestKey?: string; idempotencyKey?: string }): Promise<void>;
   filter(fn: (f: BookingFields) => Expr): string;
   getAbilities(id: string, opts?: { signal?: AbortSignal; requestKey?: string }): Promise<RecordAbilities>;
 }
@@ -667,14 +667,14 @@ export interface ReviewsService {
   }): Promise<Review[]>;
   create<K extends ReviewExpand = never>(
     data: ReviewCreate,
-    opts?: { expand?: K[]; fields?: string; signal?: AbortSignal; requestKey?: string },
+    opts?: { expand?: K[]; fields?: string; signal?: AbortSignal; requestKey?: string; idempotencyKey?: string },
   ): Promise<WithExpand<Review, ReviewRelations, K>>;
   update<K extends ReviewExpand = never>(
     id: string,
     data: ReviewUpdate,
-    opts?: { expand?: K[]; fields?: string; signal?: AbortSignal; requestKey?: string },
+    opts?: { expand?: K[]; fields?: string; signal?: AbortSignal; requestKey?: string; idempotencyKey?: string },
   ): Promise<WithExpand<Review, ReviewRelations, K>>;
-  delete(id: string): Promise<void>;
+  delete(id: string, opts?: { signal?: AbortSignal; requestKey?: string; idempotencyKey?: string }): Promise<void>;
   filter(fn: (f: ReviewFields) => Expr): string;
   getAbilities(id: string, opts?: { signal?: AbortSignal; requestKey?: string }): Promise<RecordAbilities>;
 }
@@ -726,14 +726,14 @@ export interface HoldsService {
   }): Promise<Hold[]>;
   create<K extends HoldExpand = never>(
     data: HoldCreate,
-    opts?: { expand?: K[]; fields?: string; signal?: AbortSignal; requestKey?: string },
+    opts?: { expand?: K[]; fields?: string; signal?: AbortSignal; requestKey?: string; idempotencyKey?: string },
   ): Promise<WithExpand<Hold, HoldRelations, K>>;
   update<K extends HoldExpand = never>(
     id: string,
     data: HoldUpdate,
-    opts?: { expand?: K[]; fields?: string; signal?: AbortSignal; requestKey?: string },
+    opts?: { expand?: K[]; fields?: string; signal?: AbortSignal; requestKey?: string; idempotencyKey?: string },
   ): Promise<WithExpand<Hold, HoldRelations, K>>;
-  delete(id: string): Promise<void>;
+  delete(id: string, opts?: { signal?: AbortSignal; requestKey?: string; idempotencyKey?: string }): Promise<void>;
   filter(fn: (f: HoldFields) => Expr): string;
   getAbilities(id: string, opts?: { signal?: AbortSignal; requestKey?: string }): Promise<RecordAbilities>;
 }

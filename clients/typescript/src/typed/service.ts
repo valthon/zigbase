@@ -1,6 +1,6 @@
 import type { Client } from "../client.js";
 import type { CollectionService, RecordAbilities } from "../collection.js";
-import type { ListResult, ZbRecord } from "../records.js";
+import type { ListResult, ZbRecord, RecordDeleteOpts } from "../records.js";
 import type { CursorPage } from "../cursor.js";
 import type { VectorQuery } from "../query.js";
 import { ZigbaseError } from "../errors.js";
@@ -30,6 +30,10 @@ export interface TypedReadOptions {
   requestKey?: string;
 }
 
+export interface TypedMutationOptions extends TypedReadOptions {
+  idempotencyKey?: string;
+}
+
 export interface TypedPageOptions {
   where?: unknown;
   /** Sort expression(s); an array is joined with "," (multi-key sort). */
@@ -55,9 +59,9 @@ export interface RawTypedService {
   getPage(opts?: TypedPageOptions): Promise<CursorPage<ZbRecord>>;
   iterate(opts?: TypedListOptions): AsyncIterableIterator<ZbRecord>;
   getFullList(opts?: TypedListOptions): Promise<ZbRecord[]>;
-  create(data: Record<string, unknown>, opts?: TypedReadOptions): Promise<ZbRecord>;
-  update(id: string, data: Record<string, unknown>, opts?: TypedReadOptions): Promise<ZbRecord>;
-  delete(id: string): Promise<void>;
+  create(data: Record<string, unknown>, opts?: TypedMutationOptions): Promise<ZbRecord>;
+  update(id: string, data: Record<string, unknown>, opts?: TypedMutationOptions): Promise<ZbRecord>;
+  delete(id: string, opts?: RecordDeleteOpts): Promise<void>;
   getAbilities(id: string, opts?: { signal?: AbortSignal; requestKey?: string }): Promise<RecordAbilities>;
   filter(fn: (b: FilterRoot) => Expr): string;
 }
@@ -226,13 +230,13 @@ export function makeRecordService(
       return list.map(coerceRead);
     },
     async create(data, opts) {
-      return coerceRead(await inner.create(coerceWrite(data as Record<string, unknown>), readOpts(opts)));
+      return coerceRead(await inner.create(coerceWrite(data as Record<string, unknown>), { ...readOpts(opts), idempotencyKey: opts?.idempotencyKey }));
     },
     async update(id, data, opts) {
-      return coerceRead(await inner.update(id, coerceWrite(data as Record<string, unknown>), readOpts(opts)));
+      return coerceRead(await inner.update(id, coerceWrite(data as Record<string, unknown>), { ...readOpts(opts), idempotencyKey: opts?.idempotencyKey }));
     },
-    delete(id) {
-      return inner.delete(id);
+    delete(id, opts) {
+      return inner.delete(id, opts);
     },
     getAbilities(id, opts) {
       return inner.getAbilities(id, opts);

@@ -40,6 +40,86 @@ pub const gc_batch: usize = 1000;
 /// value is the SCHEDULING primitive — `claimBatch` only claims `run_at <= now`, indexed).
 /// The writer must be held by the caller.
 pub fn enqueue(w: *db.Db, io: std.Io, def: QueueDef, kind: []const u8, payload: []const u8, run_at: i64) ![15]u8 {
+    const limits = def.capacity orelse return enqueueUnchecked(w, io, def, kind, payload, run_at);
+    try validateCapacity(limits);
+    if (limits.max_payload_bytes) |bytes| if (payload.len > bytes) return error.QueueFull;
+    const pg = db.dbDialect(w).kind == .postgres;
+    const owns = !w.inTransaction();
+    if (owns) {
+        if (pg) try w.exec("BEGIN ISOLATION LEVEL READ COMMITTED;") else try w.beginImmediate();
+    } else {
+        try w.exec("SAVEPOINT zigbase_queue_capacity;");
+    }
+    errdefer rollbackCapacity(w, owns);
+    if (pg) {
+        // A repeatable-read snapshot could predate another producer's commit,
+        // even after its advisory lock is released. Never admit from that view.
+        var isolation = try w.prepare("SHOW transaction_isolation;");
+        defer isolation.finalize();
+        _ = try isolation.step();
+        if (!std.mem.eql(u8, isolation.columnText(0), "read committed")) return error.QueueCapacityIsolation;
+        var hash = std.hash.Wyhash.init(0);
+        hash.update("zigbase-durable-capacity-v1:");
+        hash.update(def.name);
+        var lock = try w.prepare("SELECT pg_try_advisory_xact_lock($1::bigint);");
+        defer lock.finalize();
+        try lock.bindInt(1, @bitCast(hash.final()));
+        _ = try lock.step();
+        if (!std.mem.eql(u8, lock.columnText(0), "t")) return error.QueueAdmissionBusy;
+    }
+    const snapshot = try capacitySnapshot(w, def);
+    if (!snapshot.exact or snapshot.retained_jobs >= limits.max_jobs) return error.QueueFull;
+    if (limits.max_payload_bytes) |bytes| {
+        const retained = snapshot.retained_payload_bytes.?;
+        if (retained > bytes or payload.len > bytes - retained) return error.QueueFull;
+    }
+    const jid = try enqueueUnchecked(w, io, def, kind, payload, run_at);
+    if (owns) try w.commit() else try w.exec("RELEASE SAVEPOINT zigbase_queue_capacity;");
+    return jid;
+}
+
+fn rollbackCapacity(w: *db.Db, owns: bool) void {
+    if (owns) {
+        w.rollback() catch |err| std.log.err("queue admission rollback failed: {s}", .{@errorName(err)});
+    } else {
+        w.exec("ROLLBACK TO SAVEPOINT zigbase_queue_capacity;") catch |err| {
+            std.log.err("queue admission savepoint rollback failed: {s}", .{@errorName(err)});
+            return;
+        };
+        w.exec("RELEASE SAVEPOINT zigbase_queue_capacity;") catch |err|
+            std.log.err("queue admission savepoint release failed: {s}", .{@errorName(err)});
+    }
+}
+
+fn validateCapacity(limits: queue.CapacityLimits) error{InvalidQueueCapacity}!void {
+    if (limits.max_jobs == 0 or limits.max_jobs > 1_000_000) return error.InvalidQueueCapacity;
+    if (limits.max_payload_bytes) |bytes| if (bytes == 0 or bytes > std.math.maxInt(i64)) return error.InvalidQueueCapacity;
+}
+
+/// Bounded, single-statement database snapshot. Reads at most max_jobs + 1 index
+/// entries first; oversized legacy/shrunken queues omit payload measurement. No
+/// payload contents escape. The caller may use a reader; snapshots reserve nothing.
+pub fn capacitySnapshot(w: *db.Db, def: QueueDef) !queue.CapacitySnapshot {
+    const limits = def.capacity orelse return error.QueueCapacityDisabled;
+    try validateCapacity(limits);
+    const prefix = "SELECT n, CASE WHEN n <= ?2 THEN (SELECT COALESCE(SUM(";
+    const suffix = "),0) FROM \"_queue_jobs\" WHERE \"queue\"=?1) ELSE NULL END FROM (SELECT COUNT(*) AS n FROM (SELECT 1 FROM \"_queue_jobs\" WHERE \"queue\"=?1 LIMIT ?3) bounded) counted;";
+    var st = try prepareStatic(w, if (db.dbDialect(w).kind == .postgres)
+        prefix ++ "octet_length(\"payload\")" ++ suffix
+    else
+        prefix ++ "length(CAST(\"payload\" AS BLOB))" ++ suffix);
+    defer st.finalize();
+    try st.bindText(1, def.name);
+    try st.bindInt(2, limits.max_jobs);
+    try st.bindInt(3, @as(i64, limits.max_jobs) + 1);
+    if (!try st.step()) return error.QueueCapacityUnavailable;
+    const count: u64 = @intCast(st.columnInt(0));
+    const exact = count <= limits.max_jobs;
+    const bytes: ?u64 = if (exact) @intCast(st.columnInt(1)) else null;
+    return .{ .limits = limits, .retained_jobs = count, .exact = exact, .retained_payload_bytes = bytes, .full = count >= limits.max_jobs or (if (limits.max_payload_bytes) |limit| bytes == null or bytes.? >= limit else false) };
+}
+
+fn enqueueUnchecked(w: *db.Db, io: std.Io, def: QueueDef, kind: []const u8, payload: []const u8, run_at: i64) ![15]u8 {
     const jid = id.collectionId(io);
     var st = try prepareStatic(w,
         \\INSERT INTO "_queue_jobs"
@@ -341,6 +421,12 @@ pub fn gcDoneJobs(w: *db.Db, queue_name: []const u8, ttl_s: i64) !usize {
 /// handler may take the writer), then record each outcome (done / retry / terminal). A
 /// terminal failure fires `.onError` (phase `.job`). Returns the number of jobs processed.
 pub fn pollOnce(app: *App, reg: *const Registry, worker: WorkerDef) !usize {
+    // One permit per serial poll batch, reserved before claiming any rows. Saturation
+    // leaves jobs pending (no attempt/rate token spent). This is process execution
+    // coordination, independent of persisted per-queue capacity and payload storage.
+    const admission = if (comptime @import("build_options").coordinated_admission) app.admission else null;
+    if (admission) |state| if (!state.acquireJobBytes(0)) return 0;
+    defer if (admission) |state| state.releaseJobBytes(0);
     const io = app.io;
     const now = clock.nowUnix(io);
 
@@ -1059,4 +1145,168 @@ test "pollOnce claims <= tokens on a rated queue while an unrated queue drains u
     clock.setForTest(1_000_002);
     try testing.expectEqual(@as(usize, 1), try pollOnce(&env.app, &reg, worker));
     try testing.expectEqual(@as(usize, 8), th_runs);
+}
+
+test "durable capacity retains retries cancellations and terminal history until GC" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try migrations.run(&d);
+    const def = QueueDef{ .name = "bounded", .backend = .durable, .capacity = .{ .max_jobs = 2, .max_payload_bytes = 5 } };
+    const first = try enqueue(&d, testing.io, def, "k", "é", 0); // two UTF-8 bytes
+    _ = try enqueue(&d, testing.io, def, "k", "abc", 0);
+    const snap = try capacitySnapshot(&d, def);
+    try testing.expectEqual(@as(u64, 2), snap.retained_jobs);
+    try testing.expectEqual(@as(?u64, 5), snap.retained_payload_bytes);
+    try testing.expect(snap.full and snap.exact);
+    try testing.expectError(error.QueueFull, enqueue(&d, testing.io, def, "k", "x", 0));
+    try testing.expect(!d.inTransaction());
+    try testing.expect(try cancelJob(&d, &first));
+    const claims = try claimBatch(testing.allocator, &d, &.{def.name}, "worker", 1, 0);
+    defer freeClaimed(testing.allocator, claims);
+    try testing.expect(try finishClaim(&d, claims[0], .retry, 1, 0, "retry"));
+    try testing.expectError(error.QueueFull, enqueue(&d, testing.io, def, "k", "x", 0));
+    const retry = try claimBatch(testing.allocator, &d, &.{def.name}, "worker", 1, 0);
+    defer freeClaimed(testing.allocator, retry);
+    try testing.expect(try finishClaim(&d, retry[0], .failed, 2, 0, "failed"));
+    try testing.expectEqual(@as(?u64, 5), (try capacitySnapshot(&d, def)).retained_payload_bytes);
+    try d.exec("UPDATE _queue_jobs SET created='2000-01-01';");
+    try testing.expectEqual(@as(usize, 2), try gcDoneJobs(&d, def.name, 1));
+    _ = try enqueue(&d, testing.io, def, "k", "fresh", 0);
+    // Bytes alone reject before the independent count ceiling is reached.
+    try testing.expectError(error.QueueFull, enqueue(&d, testing.io, def, "k", "x", 0));
+    try testing.expectEqual(@as(u64, 1), (try capacitySnapshot(&d, def)).retained_jobs);
+    // Empty payloads spend a row but no bytes, even at the exact byte ceiling.
+    _ = try enqueue(&d, testing.io, def, "k", "", 0);
+    try testing.expectEqual(@as(u64, 2), (try capacitySnapshot(&d, def)).retained_jobs);
+}
+
+test "durable capacity composes with rollback and bounds shrunken legacy snapshots" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try migrations.run(&d);
+    const def = QueueDef{ .name = "bound", .backend = .durable, .capacity = .{ .max_jobs = 1 } };
+    try d.beginImmediate();
+    _ = try enqueue(&d, testing.io, def, "k", "x", 0);
+    try testing.expectError(error.QueueFull, enqueue(&d, testing.io, def, "k", "y", 0));
+    try testing.expect(d.inTransaction());
+    try d.rollback();
+    try testing.expectEqual(@as(u64, 0), (try capacitySnapshot(&d, def)).retained_jobs);
+    const unlimited = QueueDef{ .name = def.name, .backend = .durable };
+    for (0..4) |_| _ = try enqueue(&d, testing.io, unlimited, "k", "legacy", 0);
+    const over = try capacitySnapshot(&d, def);
+    try testing.expectEqual(@as(u64, 2), over.retained_jobs);
+    try testing.expect(!over.exact and over.full);
+    try testing.expectEqual(null, over.retained_payload_bytes);
+    try testing.expectError(error.QueueFull, enqueue(&d, testing.io, def, "k", "", 0));
+    const separate = QueueDef{ .name = "other", .backend = .durable, .capacity = def.capacity };
+    _ = try enqueue(&d, testing.io, separate, "k", "other", 0);
+}
+
+test "durable shared process permit prevents claims then recovers without spending attempts" {
+    if (comptime !@import("build_options").coordinated_admission) return error.SkipZigTest;
+    const env = try PollTestEnv.init();
+    defer env.deinit();
+    var state = @import("../admission.zig").State.init(testing.io, .{ .max_requests = 1, .max_work = 1 });
+    env.app.admission = &state;
+    const reg = Registry{ .queues = &.{.{ .name = "q", .backend = .durable, .capacity = .{ .max_jobs = 2 } }}, .jobs = &.{.{ .kind = "ok", .handler = okHandler }} };
+    const worker = WorkerDef{ .name = "w", .queues = &.{"q"}, .concurrency = 2 };
+    {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        _ = try enqueue(w, testing.io, reg.queues[0], "ok", "{}", 0);
+    }
+    try testing.expect(state.acquire());
+    try testing.expectEqual(@as(usize, 0), try pollOnce(&env.app, &reg, worker));
+    {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        try testing.expectEqual(@as(i64, 1), try countStatus(w, "pending"));
+    }
+    state.release();
+    try testing.expectEqual(@as(usize, 1), try pollOnce(&env.app, &reg, worker));
+    try testing.expectEqual(@as(u32, 0), state.snapshot().jobs);
+    // Terminal rows still retain the durable reservation.
+    const w = env.pool.acquireWriter();
+    defer env.pool.releaseWriter();
+    try testing.expectEqual(@as(u64, 1), (try capacitySnapshot(w, reg.queues[0])).retained_jobs);
+}
+
+test "pg durable capacity coordinates replicas and rejects stale caller snapshots" {
+    if (comptime !@import("build_options").postgres) return error.SkipZigTest;
+    var env = try PgQueueTest.init();
+    defer env.deinit();
+    const def = QueueDef{ .name = "bounded", .backend = .durable, .capacity = .{ .max_jobs = 1, .max_payload_bytes = 4 } };
+    try env.first.beginImmediate();
+    _ = try enqueue(&env.first, testing.io, def, "k", "éé", 0);
+    // The first enqueue returned but its caller transaction still owns the lock.
+    try testing.expectError(error.QueueAdmissionBusy, enqueue(&env.second, testing.io, def, "k", "x", 0));
+    try testing.expect(!env.second.inTransaction());
+    try env.first.commit();
+    try testing.expectError(error.QueueFull, enqueue(&env.second, testing.io, def, "k", "x", 0));
+    try testing.expectEqual(@as(?u64, 4), (try capacitySnapshot(&env.second, def)).retained_payload_bytes);
+    try env.first.exec("DELETE FROM _queue_jobs;");
+    try env.second.exec("BEGIN ISOLATION LEVEL REPEATABLE READ;");
+    try testing.expectError(error.QueueCapacityIsolation, enqueue(&env.second, testing.io, def, "k", "x", 0));
+    try testing.expect(env.second.inTransaction());
+    try env.second.rollback();
+    // Standalone admission uses fresh READ COMMITTED even when the connection default differs.
+    try env.second.exec("SET default_transaction_isolation='repeatable read';");
+    _ = try enqueue(&env.second, testing.io, def, "k", "x", 0);
+    try env.first.exec("DELETE FROM _queue_jobs;");
+    try env.first.beginImmediate();
+    _ = try enqueue(&env.first, testing.io, def, "k", "x", 0);
+    try env.first.rollback();
+    _ = try enqueue(&env.second, testing.io, def, "k", "free", 0);
+    const claims = try claimBatch(testing.allocator, &env.second, &.{def.name}, "dead-worker", 1, 1);
+    defer freeClaimed(testing.allocator, claims);
+    try testing.expectEqual(@as(usize, 1), try reclaimStale(&env.first, def.name, 3, 1));
+    try testing.expectError(error.QueueFull, enqueue(&env.first, testing.io, def, "k", "x", 0));
+    try testing.expect(try cancelJob(&env.first, claims[0].id));
+    try env.first.exec("UPDATE _queue_jobs SET created='2000-01-01';");
+    try testing.expectEqual(@as(usize, 1), try gcDoneJobs(&env.first, def.name, 1));
+    _ = try enqueue(&env.second, testing.io, def, "k", "free", 0);
+}
+
+test "durable capacity serializes independent SQLite producers and survives reopen" {
+    const env = try PollTestEnv.init();
+    defer env.deinit();
+    const S = struct {
+        const def = QueueDef{ .name = "concurrent", .backend = .durable, .capacity = .{ .max_jobs = 3, .max_payload_bytes = 6 } };
+        fn produce(path: [:0]const u8, failures: *std.atomic.Value(u32), successes: *std.atomic.Value(u32)) void {
+            var conn = db.Db.open(path) catch {
+                _ = failures.fetchAdd(1, .monotonic);
+                return;
+            };
+            defer conn.close();
+            // Match pooled writer busy handling on these independent connections.
+            conn.exec("PRAGMA busy_timeout=5000;") catch {
+                _ = failures.fetchAdd(1, .monotonic);
+                return;
+            };
+            _ = enqueue(&conn, testing.io, def, "k", "xx", 0) catch |err| {
+                if (err != error.QueueFull) _ = failures.fetchAdd(1, .monotonic);
+                return;
+            };
+            _ = successes.fetchAdd(1, .monotonic);
+        }
+    };
+    var failures: std.atomic.Value(u32) = .init(0);
+    var successes: std.atomic.Value(u32) = .init(0);
+    var threads: [8]std.Thread = undefined;
+    var started: usize = 0;
+    defer for (threads[0..started]) |thread| thread.join();
+    for (&threads) |*thread| {
+        thread.* = try std.Thread.spawn(.{}, S.produce, .{ env.db_path, &failures, &successes });
+        started += 1;
+    }
+    for (threads) |thread| thread.join();
+    started = 0;
+    try testing.expectEqual(@as(u32, 0), failures.load(.monotonic));
+    try testing.expectEqual(@as(u32, 3), successes.load(.monotonic));
+    var reopened = try db.Db.open(env.db_path);
+    defer reopened.close();
+    const snapshot = try capacitySnapshot(&reopened, S.def);
+    try testing.expectEqual(@as(u64, 3), snapshot.retained_jobs);
+    try testing.expectEqual(@as(?u64, 6), snapshot.retained_payload_bytes);
+    try testing.expectError(error.QueueFull, enqueue(&reopened, testing.io, S.def, "k", "x", 0));
 }

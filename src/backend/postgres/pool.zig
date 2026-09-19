@@ -136,6 +136,11 @@ pub const Pool = struct {
         return &self.writer;
     }
 
+    /// Caller holds the writer lock; all statements must already be finalized.
+    pub fn recoverWriter(self: *Pool) DbError!void {
+        try self.writer.recoverTransaction();
+    }
+
     pub fn releaseWriter(self: *Pool) void {
         self.writer_mutex.unlock(self.io);
     }

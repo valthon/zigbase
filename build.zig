@@ -12,10 +12,16 @@ const BuildOptionValues = struct {
     s3: bool,
     file_inventory: bool,
     realtime_backfill: bool,
+    durable_realtime: bool,
+    replay_max_entries: u32,
+    replay_max_bytes: u32,
+    replay_max_frame_bytes: u32,
+    replay_retention_seconds: u32,
     resumable_uploads: bool,
     image_thumbnails: bool,
     durable_resumable_uploads: bool,
     query_workbench: bool,
+    rest_idempotency: bool,
     coordinated_admission: bool,
     fts5: bool,
     sqlite_version: []const u8,
@@ -116,11 +122,20 @@ pub fn build(b: *std.Build) void {
     // a bare UnknownCommand.
     const dev_tools = b.option(bool, "dev-tools", "Compile development CLI verbs: init, agents-md, typegen, capabilities, routes, migrate preview, tune, diagnostics (default: on)") orelse true;
     const file_inventory = b.option(bool, "file-inventory", "Compile read-only local/S3 file inventory reporting (default: off)") orelse false;
-    const realtime_backfill = b.option(bool, "realtime-backfill", "Compile bounded process-local record invalidation backfill (default: off)") orelse false;
+    const replay_max_entries = b.option(u32, "replay-max-entries", "Durable journal entry budget (1..65536)") orelse 4096;
+    const replay_max_bytes = b.option(u32, "replay-max-bytes", "Durable journal frame byte budget (1..1073741824)") orelse 4194304;
+    const replay_max_frame_bytes = b.option(u32, "replay-max-frame-bytes", "Durable journal per-frame byte budget (1..1048576)") orelse 65536;
+    const replay_retention_seconds = b.option(u32, "replay-retention-seconds", "Durable journal retention (1..31536000 seconds)") orelse 86400;
+    if (replay_max_entries == 0 or replay_max_entries > 65536 or replay_max_bytes == 0 or replay_max_bytes > 1073741824 or replay_max_frame_bytes == 0 or replay_max_frame_bytes > 1048576 or replay_max_frame_bytes > replay_max_bytes or replay_retention_seconds == 0 or replay_retention_seconds > 31536000)
+        @panic("invalid durable replay budgets; frame bytes must not exceed total bytes");
+    const durable_realtime = b.option(bool, "durable-realtime", "Compile transactional durable REST record replay (default: off)") orelse false;
+    const local_backfill = b.option(bool, "realtime-backfill", "Compile bounded process-local record invalidation backfill (default: off)") orelse false;
+    const realtime_backfill = durable_realtime or local_backfill;
     const resumable_uploads = b.option(bool, "resumable-uploads", "Compile bounded process-local resumable file uploads (default: off)") orelse false;
     const image_thumbnails = b.option(bool, "image-thumbnails", "Compile ImageMagick thumbnail integration (default: off)") orelse false;
     const durable_resumable_uploads = b.option(bool, "durable-resumable-uploads", "Compile opt-in SQLite upload persistence (requires resumable-uploads)") orelse false;
     if (durable_resumable_uploads and !resumable_uploads) @panic("durable-resumable-uploads requires resumable-uploads=true");
+    const rest_idempotency = b.option(bool, "rest-idempotency", "Compile opt-in transactional REST retry receipts") orelse false;
     const query_workbench = b.option(bool, "query-workbench", "Compile bounded SQLite/PostgreSQL query diagnostics (default: off)") orelse false;
     const coordinated_admission = b.option(bool, "coordinated-admission", "Compile shared HTTP and memory-job admission (default: off)") orelse false;
     // Opt-in vector search (#157; Postgres pgvector port #159). OFF by default: the default build
@@ -172,10 +187,16 @@ pub fn build(b: *std.Build) void {
         .dev_tools = dev_tools,
         .file_inventory = file_inventory,
         .realtime_backfill = realtime_backfill,
+        .durable_realtime = durable_realtime,
+        .replay_max_entries = replay_max_entries,
+        .replay_max_bytes = replay_max_bytes,
+        .replay_max_frame_bytes = replay_max_frame_bytes,
+        .replay_retention_seconds = replay_retention_seconds,
         .resumable_uploads = resumable_uploads,
         .image_thumbnails = image_thumbnails,
         .durable_resumable_uploads = durable_resumable_uploads,
         .query_workbench = query_workbench,
+        .rest_idempotency = rest_idempotency,
         .coordinated_admission = coordinated_admission,
         .internal_api = false,
         .vector = vector,
@@ -449,6 +470,23 @@ pub fn build(b: *std.Build) void {
         invalid_exe.expect_errors = .{ .contains = invalid.expected };
         route_contracts.dependOn(&invalid_exe.step);
     }
+    const durable_capacity_mod = b.createModule(.{ .root_source_file = b.path("fixtures/durable-capacity/main.zig"), .target = target, .optimize = optimize, .imports = &.{.{ .name = "zigbase", .module = zigbase_mod }} });
+    const durable_capacity_exe = b.addExecutable(.{ .name = "durable-capacity-fixture", .root_module = durable_capacity_mod });
+    b.step("durable-capacity-fixture", "Build durable backlog capacity consumer").dependOn(&b.addInstallArtifact(durable_capacity_exe, .{}).step);
+    const capacity_contracts = b.step("check-durable-capacity-contracts", "Check durable queue capacity configuration");
+    inline for (&.{
+        .{ .name = "zero", .expected = "queue capacity .max_jobs must be in 1..1000000" },
+        .{ .name = "too-many", .expected = "queue capacity .max_jobs must be in 1..1000000" },
+        .{ .name = "memory", .expected = "queue capacity requires .backend = .durable" },
+        .{ .name = "bytes-zero", .expected = "queue capacity .max_payload_bytes must be in 1..maxInt(i64)" },
+        .{ .name = "missing-count", .expected = "queue capacity requires .{ .max_jobs = N, .max_payload_bytes = N }" },
+        .{ .name = "unknown", .expected = "unknown queue capacity field: typo" },
+    }) |invalid| {
+        const mod = b.createModule(.{ .root_source_file = b.path("fixtures/durable-capacity/" ++ invalid.name ++ ".zig"), .target = target, .optimize = optimize, .imports = &.{.{ .name = "zigbase", .module = zigbase_mod }} });
+        const invalid_exe = b.addExecutable(.{ .name = "invalid-durable-capacity-" ++ invalid.name, .root_module = mod });
+        invalid_exe.expect_errors = .{ .contains = invalid.expected };
+        capacity_contracts.dependOn(&invalid_exe.step);
+    }
     const scheduler_contracts = b.step("check-scheduler-contracts", "Check distributed scheduler compile-time contracts");
     const thumbnail_contracts = b.step("check-thumbnail-contracts", "Check thumbnail configuration and feature-gate contracts");
     inline for (&.{
@@ -549,6 +587,15 @@ pub fn build(b: *std.Build) void {
     const workbench_mod = b.createModule(.{ .root_source_file = b.path("fixtures/query-workbench/main.zig"), .target = target, .optimize = optimize, .link_libc = true });
     const cancel_example = b.createModule(.{ .root_source_file = b.path("examples/golfsim/src/idempotent_cancel.zig"), .target = target, .optimize = optimize });
     cancel_example.addImport("zigbase", zigbase_mod);
+    const rest_idempotency_mod = b.createModule(.{ .root_source_file = b.path("fixtures/rest-idempotency/main.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    rest_idempotency_mod.addImport("zigbase", zigbase_mod);
+    const rest_idempotency_exe = b.addExecutable(.{ .name = "rest-idempotency-fixture", .root_module = rest_idempotency_mod });
+    b.step("rest-idempotency-fixture", "Build transactional REST receipt fixture").dependOn(&b.addInstallArtifact(rest_idempotency_exe, .{}).step);
+    const rest_contract_mod = b.createModule(.{ .root_source_file = b.path("fixtures/rest-idempotency/invalid.zig"), .target = target, .optimize = optimize });
+    rest_contract_mod.addImport("zigbase", zigbase_mod);
+    const rest_contract = b.addExecutable(.{ .name = "rest-idempotency-invalid", .root_module = rest_contract_mod });
+    rest_contract.expect_errors = .{ .contains = if (rest_idempotency) "invalid idempotency limits: namespace 1..128, entries 1..1000000, retention 1..31536000, payload/result 1..1048576, cleanup 1..1024" else ".rest_idempotency requires -Drest-idempotency=true" };
+    b.step("check-rest-idempotency-contracts", "Reject unavailable or invalid REST receipt configuration").dependOn(&rest_contract.step);
     const idempotency_mod = b.createModule(.{ .root_source_file = b.path("fixtures/idempotency/main.zig"), .target = target, .optimize = optimize, .link_libc = true });
     idempotency_mod.addImport("zigbase", zigbase_mod);
     idempotency_mod.addImport("cancel_example", cancel_example);

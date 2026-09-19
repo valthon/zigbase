@@ -577,6 +577,23 @@ pub const Ctx = struct {
         }
     }
 
+    /// Inspect retained durable backlog under its configured capacity. Bounded
+    /// database occupancy, not process memory. No permission bypass: expose this
+    /// only through an appropriately authorized operator route.
+    pub fn queueCapacity(self: *Ctx, comptime name: anytype) !queue_mod.CapacitySnapshot {
+        return self.queueCapacityByName(@tagName(name));
+    }
+
+    pub fn queueCapacityByName(self: *Ctx, name: []const u8) !queue_mod.CapacitySnapshot {
+        const reg = queue_mod.registryFromApp(self.app) orelse return error.QueuesUnavailable;
+        const def = reg.queueByName(name) orelse return error.UnknownQueue;
+        if (def.backend != .durable) return error.QueueCapacityDisabled;
+        if (self.bound_conn) |w| return queue_durable.capacitySnapshot(w, def);
+        var reader = try self.app.pool.acquireReader();
+        defer self.app.pool.releaseReader(&reader);
+        return queue_durable.capacitySnapshot(&reader, def);
+    }
+
     // -----------------------------------------------------------------------
     // Consumer realtime broadcast (#143). SELF-CONTAINED section (accessor + the
     // RealtimeApi struct below) so sibling Wave-2 PRs that also append to ctx.zig

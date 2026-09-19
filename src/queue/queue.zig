@@ -51,6 +51,23 @@ pub const RetryPolicy = struct {
 /// @compileError at lowering).
 pub const Rate = struct { per_second: u16 };
 
+/// Retained durable rows, including pending, claimed and terminal history. Null
+/// capacity preserves unbounded legacy admission. Bytes measure stored UTF-8 payload,
+/// not allocator usage, database file size, or process RSS.
+pub const CapacityLimits = struct {
+    max_jobs: u32,
+    max_payload_bytes: ?u64 = null,
+};
+
+pub const CapacitySnapshot = struct {
+    limits: CapacityLimits,
+    retained_jobs: u64,
+    /// False means retained_jobs is a lower bound (max_jobs + 1); bytes omitted.
+    exact: bool,
+    retained_payload_bytes: ?u64,
+    full: bool,
+};
+
 /// One declared queue (lowered from a `.queues` entry, or the synthesized `.default`).
 pub const QueueDef = struct {
     name: []const u8,
@@ -68,6 +85,7 @@ pub const QueueDef = struct {
     done_ttl_s: i64 = 7 * 24 * 3600,
     /// Sustained per-queue claim-rate ceiling (durable only). See `Rate`.
     rate: ?Rate = null,
+    capacity: ?CapacityLimits = null,
 };
 
 /// One declared worker (lowered from a `.workers` entry, or the implicit

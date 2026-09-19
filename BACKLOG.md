@@ -105,8 +105,12 @@ product priority and acceptance evidence; it does not create duplicate implement
   work, including queued tasks and retries, with immediate rejection and counters.
   Optional `.admission.max_job_bytes` now bounds precisely retained memory-job
   payload/submit-name copies, with atomic reservation and byte diagnostics.
-  Transport buffers, broader byte/RSS budgets, durable jobs and cross-subsystem
-  coordination remain outside these gates.
+  Optional durable queue capacity now rejects retained row/payload overflow atomically
+  across configured SQLite/PostgreSQL producers, with bounded database snapshots.
+  All retained statuses count until GC/deletion, and shared execution admission
+  reserves one permit per serial durable poll batch before claiming. Transport
+  buffers, durable claim allocations, broader byte/RSS budgets and remaining
+  cross-subsystem coordination are still outside these gates.
   Memory-job/submit workers now have independent comptime counts and share the
   configured job stack size, with lazy startup and unchanged bounded-ring rejection.
 - [ ] Agent-native development interface: versioned discovery, structured diagnostics,
@@ -145,9 +149,11 @@ product priority and acceptance evidence; it does not create duplicate implement
 - [ ] Opt-in principal/operation-scoped idempotent mutations with atomic coordination and bounded retention.
   Implemented slice: lazy comptime-configured SQLite/PostgreSQL custom-operation receipts,
   mandatory current authorization, atomic DB effects/results, bounded per-namespace
-  capacity and expiry cleanup. PostgreSQL coordinates namespaces across replicas
-  with fail-fast transaction locks. Built-in REST mutations and external
-  side-effect orchestration remain outside this helper.
+  capacity and expiry cleanup. Opt-in authenticated JSON REST create/update/delete now
+  reuse transactional receipts with explicit collection eligibility, current replay
+  authorization, schema/body binding and bounded refusal. PostgreSQL coordinates namespaces across replicas
+  with fail-fast transaction locks. Hook/file/auth collection workflows and external
+  side-effect orchestration remain outside the REST adapter.
 - [ ] Complete upstream test-runner diagnostic follow-up (#261; investigation PR #355).
   The reproduced Zig 0.16.0 symptom is a stale failed-command label after successful
   exit-time stderr, not a demonstrated race. Supported `zigbase.addTest` avoids it.
@@ -181,6 +187,11 @@ product priority and acceptance evidence; it does not create duplicate implement
 - [x] Exercise benchmark correctness under ReleaseSafe in CI.
 - [x] Bounded single-process SQLite backfill with current authorization and explicit gap semantics (#412).
 - [ ] Durable cross-instance replay with explicit resource and retention budgets.
+  Implemented: opt-in transactional SQLite/PostgreSQL built-in REST invalidations,
+  shared 4096-entry / 4 MiB / 24-hour retention, commit-ordered checkpoints,
+  restart/cross-instance recovery, and current per-item authorization. Data/raw-SQL,
+  hook side-writes and custom-channel capture remain outside this REST scope;
+  end-to-end replay coverage and configurable per-workload retention remain open.
 
 ## Analytics batching (#401)
 

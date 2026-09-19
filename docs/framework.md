@@ -172,6 +172,7 @@ error.**
 | `pools` | Footprint levers: reader pool, scheduler workers (`.jobs`), lazy memory-job/submit workers (`.memory_jobs`), thread stack size, SQLite page cache. | always — these are levers on core connection/thread machinery, not an optional subsystem. |
 | `resource_profile` | Optional `.minimal`, `.balanced`, or `.throughput` defaults for existing pool levers; explicit `.pools` fields win. | data-only — selects constants, never enables a subsystem. |
 | `admission` | Optional positive `u32` `.max_requests` rejects excess synchronous HTTP work with 503. Optional positive `u32` `.max_work` shares capacity with outstanding memory jobs/`app.submit` and requires `.max_requests`. Optional positive `usize` `.max_job_bytes` independently bounds retained payload/name copies, without requiring HTTP admission. At least `.max_requests` or `.max_job_bytes` is required; both job budgets require `-Dcoordinated-admission=true`. | HTTP checks compile out without `.max_requests`; all state/diagnostics excluded when `.admission` is omitted; job accounting excluded without its build flag; one null app pointer remains. |
+| `rest_idempotency` | Explicit collection allowlist and receipt limits for [authenticated REST retries](#rest-record-idempotency). Requires `-Drest-idempotency=true`. | excluded when disabled; keyed requests are refused when unavailable. |
 | `query_workbench` | Optional `.{ .max_entries = 64, .slow_ms = 100 }` budgets for the [query workbench](#bounded-query-workbench-opt-in). Requires `-Dquery-workbench=true`. | build-flag gated — no statement fields, TLS, timestamps, state, or endpoints when off. |
 | `pagination` | Enable/disable offset & cursor list paging and pick the cursor token format. | always — core list-response plumbing. |
 | `flags` | Declared boolean feature flags. See [Feature flags + experiments](#feature-flags--experiments-declared). | data-only — lowers to an empty slice + a zero-variant `Flag` enum when unset. |
@@ -1769,7 +1770,7 @@ record, operation and key are length-framed then SHA-256 hashed, so ambiguous
 concatenations cannot cross identities. Only hashes and result bytes are stored,
 not raw keys or payloads. Results may contain secrets: protect the database/backups.
 
-`IdempotencyCallbacks` holds an opaque context and two explicit callbacks:
+`IdempotencyCallbacks` holds an opaque context and two required callbacks:
 
 ```zig
 fn authorize(conn: *zigbase.Db, context: *anyopaque) anyerror!void;
@@ -1780,7 +1781,10 @@ fn mutate(conn: *zigbase.Db, context: *anyopaque, output: []u8) anyerror!usize;
 writer, including on replay. Authentication and token validation still happen on
 every HTTP request before entering the helper. `mutate` uses only that connection,
 writes its response bytes into the supplied bounded buffer, and returns bytes used.
-Neither callback may end the transaction or reacquire the writer. These are trusted
+An optional `authorize_replay(conn, context, stored_result)` read-only callback
+can additionally authorize the stored result before a replay commits; its error
+rolls back and releases the owned replay buffer. It does not run on a new mutation.
+No callback may end the transaction or reacquire the writer. These are trusted
 application callbacks, not a SQL sandbox; arbitrary callback memory/CPU is not bounded.
 The return owns its allocation: read `result.body()` / `result.replayed`, then
 `result.deinit(allocator)`. Copy the body into your response's lifetime before deinit.
@@ -1840,7 +1844,7 @@ Never perform these effects in a callback; use a transactional outbox if needed.
 The helper does not automatically invoke REST hooks/rules or serialize responses.
 The [golfsim example](../examples/golfsim/README.md#idempotent-cancellation) shows
 an authenticated custom route with current guest authorization and a bound `Ctx`.
-Built-in REST idempotency and external side-effect orchestration are not implemented.
+Built-in REST retries are separately opt-in; see [REST record idempotency](#rest-record-idempotency). External side-effect orchestration remains outside this helper.
 
 **Database copying:** `migrate-db`/`dumpload.run` refuse any source or target with
 non-empty `_idempotency_receipts`, even with `--force` or same-backend copies,
@@ -1850,6 +1854,93 @@ participating applications, wait out stored retention windows, verify receipt
 expiry against trusted server time, and explicitly delete only verified-expired
 receipts before retrying the copy. The copier never expires or deletes them for
 you. An empty ledger does not prevent migration.
+
+### REST record idempotency
+
+Compile with `-Drest-idempotency=true`, then opt specific base collections into
+persistent retry receipts:
+
+```zig
+const App = zigbase.App(.{
+    .rest_idempotency = .{
+        .collections = .{ "posts", "tasks" },
+        .limits = .{
+            .namespace = "my-app-rest-v1",
+            .max_entries = 1024,
+            .retention_seconds = 86400,
+            .max_payload_bytes = 65536,
+            .max_result_bytes = 4096,
+            .cleanup_batch = 64,
+        },
+    },
+});
+```
+
+An authenticated `POST`, `PATCH`, or `DELETE` to the built-in records endpoint
+can carry `Idempotency-Key: <opaque-key>`. Keep the same key and exact body bytes
+when retrying the same logical operation. No automatic retry is performed.
+The receipt and database mutation commit in one transaction on SQLite or PostgreSQL;
+a retry after a lost response or process restart returns the original status/body
+without repeating the write. Concurrent PostgreSQL attempts can return retryable
+503 while another process holds the namespace lock. Unkeyed requests keep their
+ordinary behavior. Keyed requests are refused with 400 if support is not compiled
+or configured, rather than silently executing without retry protection.
+
+Keys are scoped by the authenticated collection's stable ID, principal record ID,
+operation, target collection ID and target record ID. The fingerprint also binds
+the exact request body, active account and full current collection metadata. A key
+is 1–128 bytes. A changed body, schema, account or existing record representation
+returns 409; changes that make the collection ineligible (such as adding a hidden
+field) are refused with 400 before receipt lookup. Changing the namespace or waiting
+past retention permits new execution.
+All replicas sharing a namespace must agree on limits. Live receipts are never
+capacity-evicted: a full namespace returns 503 before mutation. Expired cleanup is
+bounded by `cleanup_batch`; retention starts at attempt time, including lock wait.
+Receipt storage is bounded per namespace by `max_entries` and `max_result_bytes`
+plus ledger metadata; request/schema scratch and database page overhead are separate.
+`max_payload_bytes` also covers the schema/target fingerprint input, so large schemas
+may require a larger budget. Limits follow the custom `Idempotency` helper's ranges.
+
+Authentication and current collection rules are checked inside every transaction,
+including replay. Replay view rules use an ordinary GET context (no mutation body),
+while action rules retain the mutation method and body. The transaction holds the schema-generation lock through commit,
+so concurrent schema/rule writers cannot invalidate that authorization mid-mutation.
+Create/update replay additionally requires current action and view
+permission and an unchanged surviving record; deleted or no-longer-authorized targets
+return 404. Deletes only support a current rule that permits the operation without
+per-row predicates (for example `@public`, or a superuser). Predicate-constrained
+deletes are refused because the deleted row cannot establish current authorization.
+This intentionally makes replay stricter than ordinary unkeyed CRUD.
+
+Supported keyed POST/PATCH requests use JSON objects; keyed DELETE requires an empty
+body. All keyed requests are without query parameters, on allowlisted
+base collections without TTL, file, hidden or encrypted fields. Apps with any record hooks (including hooks on unrelated collections)
+refuse keyed operations: the adapter does not skip hooks or pretend arbitrary effects
+are transactionally replayable. Auth collections, multipart uploads and resumable
+commits retain their own workflows. Use custom `Idempotency` callbacks for trusted
+application operations with richer transactional authorization.
+
+The ordinary record validation, transactional writes, tenant stamping and composed
+access rules are reused. Successful first attempts emit realtime notifications once
+after commit; replay emits none. A crash between commit and notification can lose the
+notification. With `-Ddurable-realtime=true`, the first mutation also captures a
+journal entry in the record/receipt transaction; journal failure rolls back both,
+and retries append no duplicate. Clients can recover that invalidation through
+[durable backfill](api.md#durable-record-invalidation-replay-sqlite-and-postgresql). This is database retry protection,
+not exactly-once external delivery.
+If transaction recovery cannot restore an idle, healthy writer, the pool refuses
+further SQL on that writer and keyed requests return 503. Operator recovery requires
+replacing the pool or restarting the process; the framework does not silently reopen
+the connection or discard an in-memory database.
+
+Receipt response bodies are stored as plaintext in the database; use database backup
+and access policies appropriate to those records. Removing or hiding fields invalidates
+existing fingerprints rather than replaying the old response.
+
+For browser applications, configure your reverse proxy's CORS policy to allow
+`Idempotency-Key` where cross-origin requests are permitted. ZigBase does not add a new
+CORS policy for this feature. The [TypeScript SDK](typescript-sdk.md) accepts an explicit
+`idempotencyKey` option on record create/update/delete.
 
 ### `ctx.tx()` — multi-write transactions
 
@@ -3338,6 +3429,71 @@ helper (or `ctx.enqueueByName(queue, kind, payload)`), not the compile-checked `
 which reflects only your declared `.jobs`. The kind names `mail`/`webhook` are reserved
 either way, so a consumer `.jobs` entry with either name is a compile error even when the
 built-in itself is gated off.
+
+### Durable backlog capacity
+
+Bound retained jobs separately from in-process execution:
+
+```zig
+.queues = .{
+    .emails = .{
+        .backend = .durable,
+        .capacity = .{ .max_jobs = 10000, .max_payload_bytes = 32 * 1024 * 1024 },
+    },
+},
+```
+
+Omit `capacity` for legacy unbounded admission. It requires durable storage and a
+`max_jobs` in `1..1000000`; optional `max_payload_bytes` must be positive and fit
+`i64`. These limits apply to each database/queue name across producers using the
+same configuration. All producers must enable the same limits before relying on
+this contract: older binaries, unconfigured producers, or direct SQL can bypass
+admission. Apply migrations before starting the upgraded fleet.
+
+Every retained `_queue_jobs` row counts: pending, delayed, claimed, retrying, done,
+failed/dead-letter, and canceled. Payload bytes are the stored UTF-8 byte length,
+including embedded NUL bytes on SQLite. Claim/retry/reclaim/cancel/completion does
+not free capacity; the existing terminal-history GC or deliberate operator deletion
+must remove rows. Choose `done_ttl_s` and capacity together. No automatic eviction
+of unfinished jobs occurs. Shrinking a limit below existing occupancy fails closed
+until enough retained rows are removed. This is not a disk-size or process-memory
+limit; indexes, row metadata, WAL, serialization, and claimed payload allocations
+are outside it.
+
+`ctx.enqueue`, built-in mail/webhook enqueueing, scheduled mail, and transactional
+file cleanup all use this admission point. `error.QueueFull` means no row was
+inserted. SQLite serializes the check and insert in a writer transaction.
+PostgreSQL uses a per-queue transaction advisory lock and fresh READ COMMITTED
+snapshot; contention returns `error.QueueAdmissionBusy` without waiting. Standalone
+enqueues select READ COMMITTED explicitly. Enqueues inside `ctx.tx`/hooks retain
+atomicity with the caller transaction through a savepoint; a PostgreSQL caller
+using stronger snapshot isolation receives `error.QueueCapacityIsolation`. SQLite
+busy/connection errors still propagate. Use bounded retry/backoff outside the
+transaction, or map capacity refusal to an application-specific overload response.
+Never acknowledge an enqueue that failed, and do not busy-wait while holding HTTP
+or database resources. A successful bound enqueue remains subject to caller commit.
+
+Inspect from a suitably authorized operator route or trusted handler:
+
+```zig
+const snapshot = try ctx.queueCapacity(.emails);
+// Dynamic equivalent: try ctx.queueCapacityByName("emails")
+return ctx.json(200, snapshot);
+```
+
+`QueueCapacitySnapshot` reports `limits`, `retained_jobs`,
+`retained_payload_bytes`, `exact`, and `full`; it reserves no capacity. `full` means
+no row or byte headroom; an empty payload may still fit at an exact byte ceiling
+if row capacity remains. Snapshots
+and admission first inspect at most `max_jobs + 1` indexed rows. When that count
+exceeds the limit, `exact` is false, the count is a lower bound, and bytes are null
+without scanning payload lengths. Otherwise bytes are summed over at most
+`max_jobs` rows in the same statement snapshot. No payload content is returned.
+These are database-derived observations, so restart and worker recovery cannot
+lose accounting; a snapshot can become stale immediately under concurrent work.
+Disabled capacities return `error.QueueCapacityDisabled` rather than scanning an
+unbounded queue. This API is a trusted framework capability, not a built-in public
+HTTP endpoint; the fixture demonstrates an operator-authenticated route.
 
 ### Backends, priority, and reliability
 
@@ -5008,7 +5164,7 @@ during setup). It neither cancels slow accepted handlers nor limits durable queu
 depth. Existing memory-job ring (256 queued tasks, configurable workers, `QueueFull` on
 overflow) and scheduler bounds remain independent and unchanged.
 
-#### Coordinated HTTP and memory-job admission
+#### Coordinated HTTP and job admission
 
 Build with `-Dcoordinated-admission=true` and configure both ceilings:
 
@@ -5023,26 +5179,37 @@ the optional positive `u32` `max_work` activates its per-application ceiling.
 accounting code; specifying `max_work` without it is a compile error.
 
 One work permit covers each admitted synchronous HTTP callback, each queued or
-running memory job, and each `app.submit` task. A memory job retains its permit
+running memory job, each `app.submit` task, and each serial durable poll batch.
+A memory job retains its permit
 through retry backoff and final cleanup. HTTP still obeys `max_requests`, while
-HTTP plus outstanding memory work must also fit `max_work`. Full shared capacity
+HTTP plus outstanding memory work and active durable batches must also fit
+`max_work`. Full shared capacity
 returns HTTP `503 overloaded` with `Retry-After: 1`, or `error.QueueFull` from a
-job enqueue/submit. No waiting queue is added and work is never evicted.
+memory-job enqueue/submit. Durable polls defer claiming until a later tick.
+No waiting queue is added and work is never evicted.
 
-An HTTP handler that enqueues a job needs a second permit while it still owns its
+An HTTP handler that enqueues a memory job needs a second permit while it still owns its
 HTTP permit. Size the shared ceiling for that overlap and handle enqueue failure;
 do not spin or wait for capacity from inside a handler. Jobs may use all shared
 permits: there is no reserved HTTP capacity or fairness guarantee. The exact
 `GET /api/health` exemption still applies, but diagnostics can be rejected.
 
 `work_limit` reports the configured ceiling; `jobs` counts outstanding admitted
-memory work, `work_high_water` is the peak of `active + jobs`, and `jobs_rejected`
-counts shared-capacity job refusals (not independent ring-full refusals).
+memory work plus active serial durable batches; `work_high_water` is the peak of
+`active + jobs`. `jobs_rejected` counts memory-job refusals and deferred durable
+poll batches, not independent ring-full refusals or lost durable jobs.
 Reservation precedes the retained payload/name copy and is returned on allocation
 or enqueue failure. The inline memory-job fallback also holds a permit through
 execution. `Ctx` payload serialization occurs before this reservation.
 
-This is a process-local **work-count limit, not a byte or RSS cap**. Durable jobs,
+A durable poller reserves one permit before any claim, and holds it through its
+serial batch and cleanup (not one permit per prefetched row). Saturation leaves
+jobs pending without spending attempts or rate tokens; that poll also skips its
+reclaim pass, while the independent scheduled GC/reclaim sweep remains active.
+Polls with no available work briefly acquire/release a permit. Durable claimed
+payload allocations are not charged to `max_job_bytes`.
+
+This is a process-local **work-count limit, not a byte or RSS cap**. Other
 scheduler work itself, transport buffers, long-lived realtime sessions and
 arbitrary plugin work are not counted. Existing ring/worker bounds still apply.
 The offline `resources` envelope exposes `coordinated_admission_max_work`, or
@@ -6077,12 +6244,18 @@ code to comptime-dead when off, so a build that doesn't need a feature doesn't p
 | `-Dvector` | off | Opt-in nearest-neighbor `?vector=` KNN search — sqlite-vec on SQLite, pgvector on Postgres. → [docs/search.md](./search.md#vector-search-opt-in) |
 | `-Dpostgres` | off | Opt-in pure-Zig PostgreSQL wire-protocol backend, alongside the default SQLite one. → [docs/postgres.md](./postgres.md) |
 | `-Dfile-inventory` | off | Read-only `files inventory` plus offline local/SQLite `files reconcile` (dry-run unless `--apply`). Bounded pages; no HTTP surface. Inventory supports S3 with `-Ds3=true`; reconciliation refuses S3/PostgreSQL/custom storage. The boot-lifetime local-storage maintenance lease remains in default builds. |
+| `-Ddurable-realtime` | off | Transactional built-in REST record replay on SQLite/PostgreSQL; implies realtime-backfill. Shared 4096-entry / 4 MiB journal, 64 KiB frame ceiling, 24-hour retention; restart/cross-instance checkpoints and current authorization. Raw SQL/Data/hook side-writes are outside capture scope. See API realtime section. |
+| `-Dreplay-max-entries` | 4096 | Durable journal global entry budget, 1..65536. All replicas must agree. |
+| `-Dreplay-max-bytes` | 4194304 | Durable journal encoded-frame byte budget, 1..1073741824. |
+| `-Dreplay-max-frame-bytes` | 65536 | Maximum individual durable frame bytes, 1..1048576, at most total byte budget. |
+| `-Dreplay-retention-seconds` | 86400 | Durable event lifetime stamped on capture, 1..31536000 seconds; physical expiry cleanup occurs on writes. |
 | `-Drealtime-backfill` | off | Single-process SQLite record invalidation backfill: 16 lazy collection slots, each 256 entries / 64 KiB (1 MiB encoded total), current authorization, explicit reset on gaps or slot replacement. No historical payloads or durable/cross-instance guarantee. See the API realtime section. |
 | `-Dimage-thumbnails` | off | Named PNG/JPEG/WebP derivatives on built-in local storage via a trusted external ImageMagick executable; configure `.files.thumbnails`. Subprocess support, routes and admission state are excluded when off; no image codec is linked. See [thumbnails](thumbnails.md). |
 | `-Dresumable-uploads` | off | Principal-bound network-resume for file fields on existing records. Process-local by default, fully buffered, configurable session/byte/chunk/expiry budgets. SQLite restart persistence requires the additional `-Ddurable-resumable-uploads` flag and `.files.resumable.durable = true`; neither mode provides cross-instance durability. See [resumable uploads](resumable-uploads.md). |
 | `-Ddurable-resumable-uploads` | off | Compile SQLite/local upload persistence; requires `-Dresumable-uploads=true` and `.files.resumable.durable = true` to activate. Single-owner process-restart recovery with atomic completion receipts; still fully buffered, not cross-instance or power-loss durability. See [persistence limits](resumable-uploads.md#sqlite-process-restart-persistence). |
+| `-Drest-idempotency` | off | Compile opt-in persistent REST retry receipts. |
 | `-Dquery-workbench` | off | Bounded SQLite step and PostgreSQL client-exchange metrics, statement lifecycle timing, route attribution and repeated/slow shape counters. Structural EXPLAIN remains SQLite-only; no SQL/parameter capture. |
-| `-Dcoordinated-admission` | off | Compile job admission: `.admission.max_work` shares HTTP/memory-job work capacity and requires `.max_requests`; independent `.max_job_bytes` bounds retained payload/name copy lengths without enabling HTTP admission. No RSS cap or durable-job accounting. |
+| `-Dcoordinated-admission` | off | Compile memory/durable job admission: `.admission.max_work` shares HTTP/memory-job/durable-batch work capacity and requires `.max_requests`; independent `.max_job_bytes` bounds retained payload/name copy lengths without enabling HTTP admission. No RSS cap; durable claim payloads are not charged to `.max_job_bytes`. |
 | `-Ddev-mode` | on in `Debug`, off in release | The dev-only, never-in-prod seams: `ZIGBASE_FAKE_NOW` / `ZIGBASE_FAKE_SEED` (§14 above), test-capture, and fake field-crypto; the release script forces it off for shipped binaries. |
 | `-Ddev-tools` | **on** | The `init`/`agents-md`/`typegen` scaffolding/codegen verbs, `capabilities`/`routes`/`migrate preview` offline discovery, `tune` offline measurement advisor, and `diagnostics` structured doctor adapter (which can probe filesystem writability and initialize the migration ledger). Ordinary `doctor` and other migration actions remain available. Official release, Docker and npm artifacts include this tooling. Consumers can opt out for their deployment binary; stripped verbs exit nonzero with `-Ddev-tools=true` rebuild guidance. Distinct from `.enable_typegen` below — see §3b. |
 | `-Dstrip` | on except in `Debug` | Strip debug info from the binary (~7 MiB vs ~24 MiB unstripped in a release build). |

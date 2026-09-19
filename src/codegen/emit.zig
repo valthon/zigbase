@@ -481,14 +481,14 @@ pub fn emitService(alloc: std.mem.Allocator, w: *W, c: schema.Collection) !void 
             \\  }}): Promise<{1s}[]>;
             \\  create<K extends {0s} = never>(
             \\    data: {4s},
-            \\    opts?: {{ expand?: K[]; fields?: string; signal?: AbortSignal; requestKey?: string }},
+            \\    opts?: {{ expand?: K[]; fields?: string; signal?: AbortSignal; requestKey?: string; idempotencyKey?: string }},
             \\  ): Promise<WithExpand<{1s}, {2s}, K>>;
             \\  update<K extends {0s} = never>(
             \\    id: string,
             \\    data: {5s},
-            \\    opts?: {{ expand?: K[]; fields?: string; signal?: AbortSignal; requestKey?: string }},
+            \\    opts?: {{ expand?: K[]; fields?: string; signal?: AbortSignal; requestKey?: string; idempotencyKey?: string }},
             \\  ): Promise<WithExpand<{1s}, {2s}, K>>;
-            \\  delete(id: string): Promise<void>;
+            \\  delete(id: string, opts?: {{ signal?: AbortSignal; requestKey?: string; idempotencyKey?: string }}): Promise<void>;
             \\  filter(fn: (f: {6s}) => Expr): string;
             \\
         , .{ exp, rec, rel, wn, cn, un, fld, sort_ty, search, vector });
@@ -536,14 +536,14 @@ pub fn emitService(alloc: std.mem.Allocator, w: *W, c: schema.Collection) !void 
             \\  }}): Promise<{0s}[]>;
             \\  create(
             \\    data: {2s},
-            \\    opts?: {{ fields?: string; signal?: AbortSignal; requestKey?: string }},
+            \\    opts?: {{ fields?: string; signal?: AbortSignal; requestKey?: string; idempotencyKey?: string }},
             \\  ): Promise<{0s}>;
             \\  update(
             \\    id: string,
             \\    data: {3s},
-            \\    opts?: {{ fields?: string; signal?: AbortSignal; requestKey?: string }},
+            \\    opts?: {{ fields?: string; signal?: AbortSignal; requestKey?: string; idempotencyKey?: string }},
             \\  ): Promise<{0s}>;
-            \\  delete(id: string): Promise<void>;
+            \\  delete(id: string, opts?: {{ signal?: AbortSignal; requestKey?: string; idempotencyKey?: string }}): Promise<void>;
             \\  filter(fn: (f: {4s}) => Expr): string;
             \\
         , .{ rec, wn, cn, un, fld, sort_ty, search, vector });
@@ -1179,6 +1179,8 @@ test "emitService: search/vector gating, narrowed sort, unconditional getAbiliti
     try std.testing.expect(contains(out, "vector?: { field: \"embedding\" | \"metadata\"; metric?: \"cosine\" | \"l2\"; values: number[] };"));
     try std.testing.expect(contains(out, "sort?: DocSort | DocSort[];"));
     try std.testing.expect(contains(out, "getAbilities(id: string, opts?: { signal?: AbortSignal; requestKey?: string }): Promise<RecordAbilities>;"));
+    // Retry identity is available only on the three mutation methods.
+    try std.testing.expectEqual(@as(usize, 3), countOccurrences(out, "idempotencyKey?:"));
     // vector appears ONLY in getList (one occurrence)
     try std.testing.expectEqual(@as(usize, 1), countOccurrences(out, "vector?:"));
     // search appears in all five list-ish blocks

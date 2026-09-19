@@ -54,16 +54,18 @@ test "read-only open inspects an existing database and cannot create or write" {
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(io, missing, .{}));
 }
 
-pub const DbError = error{ OpenFailed, ExecFailed, PrepareFailed, BindFailed, StepFailed, Constraint, WalNotEnabled };
+pub const DbError = error{ OpenFailed, ExecFailed, PrepareFailed, BindFailed, StepFailed, Constraint, WalNotEnabled, WriterUnavailable };
 
-test "durability adds no public SQLite error or connection state" {
-    const expected = error{ OpenFailed, ExecFailed, PrepareFailed, BindFailed, StepFailed, Constraint, WalNotEnabled };
-    comptime if (DbError != expected or @hasField(Db, "quarantined"))
-        @compileError("Durable uploads must not add SQLite quarantine machinery");
+test "SQLite health errors are explicit and independent of upload durability" {
+    const expected = error{ OpenFailed, ExecFailed, PrepareFailed, BindFailed, StepFailed, Constraint, WalNotEnabled, WriterUnavailable };
+    comptime if (DbError != expected)
+        @compileError("SQLite error surface must stay explicit");
 }
 
 pub const Db = struct {
     handle: *c.sqlite3,
+    /// Failed rollback: preserve this connection for shutdown, but refuse further SQL.
+    quarantined: bool = false,
     /// Type-erased pointer to the resolved `field_policy.Cipher` (or null when no
     /// ZIGBASE_FIELD_KEY is configured). Stamped onto pooled connections at acquire
     /// time and copied into every Stmt by `prepare`, so the records value layer can
@@ -121,12 +123,14 @@ pub const Db = struct {
 
     /// Execute one or more SQL statements with no bound parameters.
     pub fn exec(self: *Db, sql: [:0]const u8) DbError!void {
+        if (self.quarantined) return error.WriterUnavailable;
         if (c.sqlite3_exec(self.handle, sql.ptr, null, null, null) != c.SQLITE_OK) {
             return DbError.ExecFailed;
         }
     }
 
     pub fn prepare(self: *Db, sql: [:0]const u8) DbError!Stmt {
+        if (self.quarantined) return error.WriterUnavailable;
         var lifetime = if (comptime build_options.query_workbench) workbench.Lifetime.begin() else {};
         var handle: ?*c.sqlite3_stmt = null;
         if (c.sqlite3_prepare_v2(self.handle, sql.ptr, -1, &handle, null) != c.SQLITE_OK)
@@ -161,6 +165,24 @@ pub const Db = struct {
     /// our idea of the state disagreeing with SQLite's.
     pub fn inTransaction(self: *Db) bool {
         return c.sqlite3_get_autocommit(self.handle) == 0;
+    }
+
+    pub fn isHealthy(self: *const Db) bool {
+        return !self.quarantined;
+    }
+
+    /// One recovery attempt. Never reopen: that could lose an in-memory database
+    /// or connection-local settings. Failure requires operator pool replacement.
+    pub fn recoverTransaction(self: *Db) DbError!void {
+        if (self.quarantined) return error.WriterUnavailable;
+        if (self.inTransaction()) self.rollback() catch {
+            self.quarantined = true;
+            return error.WriterUnavailable;
+        };
+        if (self.inTransaction()) {
+            self.quarantined = true;
+            return error.WriterUnavailable;
+        }
     }
 
     /// Number of rows changed/inserted/deleted by the most recent DML statement on this
@@ -671,6 +693,11 @@ pub const Pool = struct {
         self.writer_acquires += 1;
         self.writer.field_cipher = self.field_cipher;
         return &self.writer;
+    }
+
+    /// Caller holds the writer lock; all statements must already be finalized.
+    pub fn recoverWriter(self: *Pool) DbError!void {
+        try self.writer.recoverTransaction();
     }
 
     pub fn releaseWriter(self: *Pool) void {

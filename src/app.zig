@@ -45,6 +45,7 @@ pub const App = struct {
     resumable_uploads: if (@import("build_options").resumable_uploads) ?*@import("files/resumable.zig").Store else void = if (@import("build_options").resumable_uploads) null else {},
     thumbnail_admission: if (@import("build_options").image_thumbnails) @import("files/thumbnails.zig").Admission else void = if (@import("build_options").image_thumbnails) .{} else {},
     thumbnail_cache_epoch: if (@import("build_options").image_thumbnails) [16]u8 else void = if (@import("build_options").image_thumbnails) .{0} ** 16 else {},
+    rest_idempotency: if (@import("build_options").rest_idempotency) ?*const fn (*@import("http.zig").RequestCtx) anyerror!@import("http.zig").Response else void = if (@import("build_options").rest_idempotency) null else {},
     query_workbench: if (@import("build_options").query_workbench) ?*@import("query_workbench.zig").Store else void = if (@import("build_options").query_workbench) null else {},
     /// SSE heartbeat interval seconds (#188); 0 = inherit the listener ws_timeout tick.
     /// Applied per-connection via http_sse_set_timout at stream open. Startup-validated.

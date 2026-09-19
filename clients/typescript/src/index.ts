@@ -19,7 +19,7 @@ export { createPkceChallenge, randomState } from "./pkce.js";
 
 // --- Plan 2: records, pagination, files ---
 export { hasBlob, toFormData } from "./records.js";
-export type { ZbRecord, ListResult, ListOpts, RecordCrudOpts } from "./records.js";
+export type { ZbRecord, ListResult, ListOpts, RecordCrudOpts, RecordMutationOpts, RecordDeleteOpts } from "./records.js";
 export { filter, filterValue, quoteFilterValue, vectorSpec, parseSort, compareBySort } from "./query.js";
 export type { SortTerm, VectorQuery } from "./query.js";
 export type { CursorPage } from "./cursor.js";

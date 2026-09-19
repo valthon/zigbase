@@ -1449,6 +1449,79 @@ rewrites, consulted before the marker. See
 
 ## Realtime (WebSocket + SSE)
 
+### Durable record invalidation replay (SQLite and PostgreSQL)
+
+Build with `-Ddurable-realtime=true` (and `-Dpostgres=true` for PostgreSQL).
+This also enables `GET /api/realtime/backfill` with the checkpoint protocol and
+current authorization described below, replacing the process-local store with a
+transactional database journal. Checkpoints survive application restarts and work
+on other instances connected to the same database and PostgreSQL schema.
+Cursor positions are encrypted and authenticated with a persistent journal secret
+and fresh random nonces; they bind collection identity and rename generation
+without exposing other collections' aggregate write positions.
+
+Built-in REST record create, update and delete operations append invalidations
+**inside the record transaction**, including resumable record updates. A journal
+failure rolls back the mutation; an oversized delete snapshot also rejects the
+mutation. Response serialization, after-hooks and live transport run after commit,
+so failure there does not remove the committed invalidation. Create/update entries
+retain only record IDs. Deletes retain private at-rest authorization snapshots;
+replay never returns these snapshots or historical field values.
+
+A single metadata row serializes journal positions through commit on both
+backends. PostgreSQL sequence allocation cannot run ahead of an earlier uncommitted
+writer. This introduces a shared lock across journaled mutations: capacity should
+be measured for the application, especially transactions that also perform slow
+work. Replay reads a consistent database snapshot, releases that reader, then
+rechecks current authorization independently for each item.
+
+By default the journal has a global ceiling of **4096 entries and 4 MiB of encoded frames**,
+with **64 KiB per frame** and **24-hour retention**. Build-time controls are
+`-Dreplay-max-entries` (1..65536), `-Dreplay-max-bytes` (1..1073741824),
+`-Dreplay-max-frame-bytes` (1..1048576, no greater than total bytes), and
+`-Dreplay-retention-seconds` (1..31536000). Successful replay responses report
+these effective budgets as `retention: {maxEntries,maxBytes,maxFrameBytes,seconds}`.
+All writer replicas must use the same budgets. Expiry is stamped when captured;
+changing retention does not recompute existing event expiry. Lowering size budgets
+prunes on the next write; lowering frame budgets can reject older larger frames,
+requiring a new checkpoint and snapshot. `/api/meta` exposes `realtimeBackfill`
+and `durableRealtime` capability booleans, distinguishing the two modes.
+These budgets bound
+retained logical data, not total database/WAL size or process RSS. Indexes, database
+pages and transient serialization/authorization memory add overhead. Each write
+prunes expired entries and evicts the oldest prefix until both size budgets fit;
+idle expired rows are reclaimed on the next write. Cursors represent the last consumed
+sequence: a cursor strictly below the discarded/expired prefix requires reset, while
+a cursor equal to its last sequence is still caught up. This also keeps fresh head
+checkpoints usable on an idle journal after every retained entry expires. Reads reject stale checkpoints
+even before physical cleanup. Clock differences can shorten useful retention;
+keep replica clocks synchronized. A backwards clock never revives a pruned cursor.
+Pages copy at most 128 frames (8 MiB encoded with default frame budget), plus temporary database and JSON
+storage. Admission/concurrency budgets remain application responsibilities.
+
+Unlike the local store, retention is shared across collections: a busy collection
+can cause another collection's checkpoint to require reset. Invalid, expired,
+evicted, collection-renamed or wrong-collection checkpoints return the same `409 resetRequired`
+envelope below. Obtain a new checkpoint before reloading a snapshot. A cursorless
+request does not reserve retention. Snapshot reload and idempotent application of
+invalidations are still required; WS/SSE messages do not carry journal cursors.
+
+Enable this option on **every writer** in the deployment. Writes from older or
+non-enabled binaries, raw SQL, migrations, the `Data` facade, hook side-writes,
+authentication helpers and custom channels are outside this journal's REST scope.
+Changing capture coverage requires clients to discard checkpoints and reload;
+the journal cannot detect writes performed by code that bypasses it. This is durable
+REST invalidation recovery, not exactly-once delivery or an audit/event-sourcing log.
+Database backups must include the journal tables. Restoring or rewinding a database
+requires clients to discard checkpoints and reload snapshots; restored history can
+reuse earlier journal positions. Before serving a restored database, with all
+instances stopped, replace `_replay_state.secret` with a newly generated
+cryptographically random 32-byte secret encoded as 64 hexadecimal characters.
+This forces old cursors to return `409`, including clients unaware of the restore. Normal database durability settings
+apply. Startup creates `_replay_state` and `_replay_events` in SQLite `main` or the
+PostgreSQL current schema; internal SQL qualifies that schema so temporary tables
+and search-path fallbacks cannot redirect journal operations.
+
 ### Optional record invalidation backfill (SQLite)
 
 Build with `-Drealtime-backfill=true` to register
@@ -1791,6 +1864,8 @@ full, only the work-count rejection is counted because it is checked first.
     "oauth2": true,
     "postgres": false,
     "queryWorkbench": false,
+    "realtimeBackfill": false,
+    "durableRealtime": false,
     "s3": false,
     "senders": true,
     "tenancy": true,
@@ -1801,6 +1876,7 @@ full, only the work-count rejection is counted because it is checked first.
     "health": "/api/health",
     "state": "/api/state",
     "realtimeSse": "/api/realtime/sse",
+    "realtimeBackfill": null,
     "queryWorkbench": null
   },
   "limits": {
@@ -1837,6 +1913,8 @@ binary carries:
 | `mailWebhook` | The mail bounce/complaint webhook route is mounted. |
 | `oauth2` | The OAuth2+PKCE auth method route group is mounted. |
 | `postgres` | The binary was compiled with `-Dpostgres` (the pure-Zig PostgreSQL backend is linked in). |
+| `realtimeBackfill` | The backfill route is compiled in (process-local SQLite unless durableRealtime is true). |
+| `durableRealtime` | Transactional REST replay is enabled, with database-backed cross-instance checkpoints. |
 | `s3` | The binary was compiled with `-Ds3` (the S3-compatible storage backend is linked in). |
 | `senders` | The verified-senders email route group is mounted. |
 | `tenancy` | Multi-tenancy is configured (`App(.{ .tenancy = ... })`). |

@@ -48,8 +48,9 @@ pub fn queueMeta(comptime queues_cfg: anytype) []const QueueDef {
                     !std.mem.eql(u8, sf.name, "retry") and
                     !std.mem.eql(u8, sf.name, "visibility_timeout_s") and
                     !std.mem.eql(u8, sf.name, "done_ttl_s") and
-                    !std.mem.eql(u8, sf.name, "rate"))
-                    @compileError("queue '" ++ f.name ++ "': unknown key '." ++ sf.name ++ "' (recognized keys: .backend, .priority, .retry, .visibility_timeout_s, .done_ttl_s, .rate)");
+                    !std.mem.eql(u8, sf.name, "rate") and
+                    !std.mem.eql(u8, sf.name, "capacity"))
+                    @compileError("queue '" ++ f.name ++ "': unknown key '." ++ sf.name ++ "' (recognized keys: .backend, .priority, .retry, .visibility_timeout_s, .done_ttl_s, .rate, .capacity)");
             }
             var def = QueueDef{ .name = f.name };
             if (@hasField(ST, "backend")) {
@@ -81,6 +82,23 @@ pub fn queueMeta(comptime queues_cfg: anytype) []const QueueDef {
                 if (rs.per_second == 0)
                     @compileError("queue '" ++ f.name ++ "': .rate.per_second must be >= 1");
                 def.rate = .{ .per_second = rs.per_second };
+            }
+            if (@hasField(ST, "capacity")) {
+                const cap = spec.capacity;
+                const CT = @TypeOf(cap);
+                if (@typeInfo(CT) != .@"struct" or !@hasField(CT, "max_jobs"))
+                    @compileError("queue capacity requires .{ .max_jobs = N, .max_payload_bytes = N }");
+                for (std.meta.fields(CT)) |cf| {
+                    if (!std.mem.eql(u8, cf.name, "max_jobs") and !std.mem.eql(u8, cf.name, "max_payload_bytes"))
+                        @compileError("unknown queue capacity field: " ++ cf.name);
+                }
+                if (cap.max_jobs < 1 or cap.max_jobs > 1_000_000)
+                    @compileError("queue capacity .max_jobs must be in 1..1000000");
+                const bytes: ?u64 = if (@hasField(CT, "max_payload_bytes")) cap.max_payload_bytes else null;
+                if (bytes) |n| if (n == 0 or n > std.math.maxInt(i64))
+                    @compileError("queue capacity .max_payload_bytes must be in 1..maxInt(i64)");
+                if (def.backend != .durable) @compileError("queue capacity requires .backend = .durable");
+                def.capacity = .{ .max_jobs = cap.max_jobs, .max_payload_bytes = bytes };
             }
             if (def.rate != null and def.backend != .durable)
                 @compileError("queue '" ++ f.name ++ "': .rate requires .backend = .durable (memory jobs dispatch inline and cannot be throttled)");
@@ -405,4 +423,11 @@ test "JobEnum members are the declared kinds" {
     const J = JobEnum(.{ .resize = testHandler });
     try testing.expectEqualStrings("resize", @tagName(@as(J, .resize)));
     try testing.expectEqual(@as(usize, 1), std.meta.fields(J).len);
+}
+
+test "queue capacity is explicitly bounded and absent by default" {
+    const defs = comptime queueMeta(.{ .durable = .{ .backend = .durable, .capacity = .{ .max_jobs = 20, .max_payload_bytes = 4096 } } });
+    try std.testing.expectEqual(null, defs[0].capacity);
+    try std.testing.expectEqual(@as(u32, 20), defs[1].capacity.?.max_jobs);
+    try std.testing.expectEqual(@as(?u64, 4096), defs[1].capacity.?.max_payload_bytes);
 }

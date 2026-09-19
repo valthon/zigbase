@@ -105,6 +105,10 @@ not API-compatible.
   for managing KV/feature flags.
 - **Framework** — comptime record hooks, custom routes, scheduled jobs, a comptime schema
   (with additive auto-migration), and pluggable storage/mailer backends. → [Framework](./framework)
+- **Persistent REST retry receipts** — explicitly keyed, authenticated JSON record
+  create/update/delete can commit their receipt with the SQLite/PostgreSQL mutation.
+  Bound retention and capacity, recheck current authorization on replay, and reject
+  unsupported hook/file/auth collection workflows. → [REST record idempotency](./framework#rest-record-idempotency)
 - **Retry-safe custom DB operations** — opt-in SQLite/PostgreSQL idempotency receipts bind
   retry keys to authenticated principals, operations and payloads; replay still
   checks current access. Comptime capacity, retention and result limits keep the

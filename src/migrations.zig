@@ -683,6 +683,7 @@ pub const all = [_]Migration{
     .{ .name = "0026_scheduler_coordination", .up = init_0026_scheduler_coordination },
     .{ .name = "0027_collection_rename_epoch", .up = init_0027_collection_rename_epoch },
     .{ .name = "0028_storage_namespaces", .up = @import("files/namespace.zig").migrate },
+    .{ .name = "0029_queue_capacity_index", .up = init_0029_queue_capacity_index },
 };
 
 fn init_0027_collection_rename_epoch(m: *Migrator) db.DbError!void {
@@ -1351,4 +1352,8 @@ test "0003 creates _externalAuths with unique provider/providerId and per-record
     try std.testing.expectError(error.ExecFailed, d.exec("INSERT INTO \"_externalAuths\" (\"id\",\"collectionRef\",\"recordRef\",\"provider\",\"providerId\",\"created\",\"updated\") VALUES ('e2','users','r2','google','G1','','');"));
     try d.exec("INSERT INTO \"_externalAuths\" (\"id\",\"collectionRef\",\"recordRef\",\"provider\",\"providerId\",\"created\",\"updated\") VALUES ('e3','users','r1','github','H1','','');");
     try std.testing.expectError(error.ExecFailed, d.exec("INSERT INTO \"_externalAuths\" (\"id\",\"collectionRef\",\"recordRef\",\"provider\",\"providerId\",\"created\",\"updated\") VALUES ('e4','users','r1','github','H2','','');"));
+}
+
+fn init_0029_queue_capacity_index(m: *Migrator) db.DbError!void {
+    try m.exec("CREATE INDEX IF NOT EXISTS idx_queue_jobs_queue ON \"_queue_jobs\" (\"queue\");");
 }
