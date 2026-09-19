@@ -302,7 +302,7 @@ jobs:
           key: zig-global-${{ runner.os }}-zig0.16.0-${{ hashFiles('vendor/sqlite/sqlite3.c', 'build.zig', 'build.zig.zon') }}
           restore-keys: zig-global-${{ runner.os }}-zig0.16.0-
       - name: Unit + PostgreSQL driver tests (-Dpostgres=true -Dvector=true)
-        run: mise exec zig@0.16.0 -- zig build test --summary all -Dpostgres=true -Dvector=true -Dquery-workbench=true
+        run: mise exec zig@0.16.0 -- zig build test --summary all -Dpostgres=true -Dvector=true -Dquery-workbench=true -Ddurable-realtime=true
       - name: PostgreSQL workbench paired gating and live HTTP
         run: |
           mise exec zig@0.16.0 -- zig build query-workbench-fixture -Dpostgres=true --prefix zig-out/workbench-off
@@ -310,6 +310,10 @@ jobs:
           bash scripts/check-query-workbench-gating.sh zig-out/workbench-off/bin/query-workbench-fixture zig-out/workbench-on/bin/query-workbench-fixture
           mise exec python@3.13 -- python -m pip install --quiet pytest
           ZIGBASE_TEST_QUERY_WORKBENCH_OFF_BINARY="$GITHUB_WORKSPACE/zig-out/workbench-off/bin/query-workbench-fixture" ZIGBASE_TEST_QUERY_WORKBENCH_BINARY="$GITHUB_WORKSPACE/zig-out/workbench-on/bin/query-workbench-fixture" mise exec python@3.13 -- python -m pytest tests/admin/test_query_workbench_postgres.py -q
+      - name: Durable realtime PostgreSQL cross-instance recovery
+        run: |
+          mise exec zig@0.16.0 -- zig build -Dpostgres=true -Ddurable-realtime=true --prefix zig-out/replay-pg
+          ZIGBASE_TEST_DURABLE_REALTIME_BINARY="$GITHUB_WORKSPACE/zig-out/replay-pg/bin/zigbase" mise exec python@3.13 -- python -m pytest tests/admin/test_durable_realtime.py::test_postgres_cross_instance_replay -q
       - name: Rails PostgreSQL row-source integration
         run: |
           mise exec python@3.13 -- python -m pip install --quiet pytest -r tools/rails/requirements-postgres.txt
@@ -935,6 +939,11 @@ jobs:
           mise exec zig@0.16.0 -- zig build test durable-uploads-fixture check-resumable-contracts -Dresumable-uploads=true -Ddurable-resumable-uploads=true --prefix zig-out/durable-uploads --summary all
           bash scripts/check-gating.sh --durable-uploads zig-out/resumable/bin/resumable-uploads-fixture zig-out/durable-uploads/bin/durable-uploads-fixture
           ZIGBASE_TEST_DURABLE_UPLOADS_BINARY="$GITHUB_WORKSPACE/zig-out/durable-uploads/bin/durable-uploads-fixture" mise exec python@3.13 -- python -m pytest tests/admin/test_durable_uploads.py -q -n 2 --dist load --durations=20
+      - name: Durable realtime replay regressions
+        if: matrix.lane == 'coordination'
+        run: |
+          mise exec zig@0.16.0 -- zig build -Ddurable-realtime=true -Drealtime-backfill=true --prefix zig-out/durable-realtime
+          ZIGBASE_TEST_DURABLE_REALTIME_BINARY="$GITHUB_WORKSPACE/zig-out/durable-realtime/bin/zigbase" mise exec python@3.13 -- python -m pytest tests/admin/test_durable_realtime.py -q
       - name: Opt-in realtime backfill regressions
         if: matrix.lane == 'coordination'
         run: |

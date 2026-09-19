@@ -185,6 +185,11 @@ product priority and acceptance evidence; it does not create duplicate implement
 - [x] Exercise benchmark correctness under ReleaseSafe in CI.
 - [x] Bounded single-process SQLite backfill with current authorization and explicit gap semantics (#412).
 - [ ] Durable cross-instance replay with explicit resource and retention budgets.
+  Implemented: opt-in transactional SQLite/PostgreSQL built-in REST invalidations,
+  shared 4096-entry / 4 MiB / 24-hour retention, commit-ordered checkpoints,
+  restart/cross-instance recovery, and current per-item authorization. Data/raw-SQL,
+  hook side-writes and custom-channel capture remain outside this REST scope;
+  end-to-end replay coverage and configurable per-workload retention remain open.
 
 ## Analytics batching (#401)
 

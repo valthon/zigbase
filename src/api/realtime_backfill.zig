@@ -16,8 +16,8 @@ pub fn get(ctx: *http.RequestCtx) !http.Response {
     const app = ctx.app orelse return ApiError.notFound().toResponse(a);
     // LISTEN/NOTIFY is best-effort, not a durable ordered log. Do not imply a
     // complete backfill on PostgreSQL even when requests stick to one instance.
-    if (db.poolBackend(app.pool) != .sqlite) return unsupported_backend.toResponse(a);
-    const store = app.backfill orelse return ApiError.notFound().toResponse(a);
+    if (!@import("build_options").durable_realtime and db.poolBackend(app.pool) != .sqlite) return unsupported_backend.toResponse(a);
+    if (!@import("build_options").durable_realtime and app.backfill == null) return ApiError.notFound().toResponse(a);
     if (ctx.query.len > 4096) return ApiError.badRequest("Backfill query too large.").toResponse(a);
     const params = try @import("../query/params.zig").parse(a, ctx.query);
     defer params.deinit(a);
@@ -45,16 +45,36 @@ pub fn get(ctx: *http.RequestCtx) !http.Response {
     if (col == null) return ApiError.notFound().toResponse(a);
     if (hub.subscribeCheck(app, &conn, ctx.allocator, input.topic) != .ok) return ApiError.withCode(403, .forbidden, "Subscription denied.").toResponse(a);
     const collection = col.?;
+    const cursor_scope = if (comptime @import("build_options").durable_realtime)
+        try std.fmt.allocPrint(a, "{s}:{d}", .{ collection.id, collection.rename_epoch })
+    else
+        collection.id;
     const checkpoint: ?[]const u8 = if (input.cursor) |cursor| blk: {
-        if (cursor.len <= collection.id.len or !std.mem.startsWith(u8, cursor, collection.id) or cursor[collection.id.len] != ':') return resetRequired(a);
-        break :blk cursor[collection.id.len + 1 ..];
+        if (cursor.len <= cursor_scope.len or !std.mem.startsWith(u8, cursor, cursor_scope) or cursor[cursor_scope.len] != ':') return resetRequired(a);
+        break :blk cursor[cursor_scope.len + 1 ..];
     } else null;
-    const page = store.page(ctx.allocator, collection.id, checkpoint, input.limit) catch |err| switch (err) {
-        error.ResetRequired => return resetRequired(a),
-        else => return err,
+    const result = blk: {
+        if (comptime @import("build_options").durable_realtime) {
+            var journal_reader = try app.pool.acquireReader();
+            defer app.pool.releaseReader(&journal_reader);
+            const page = @import("../realtime/durable.zig").readPage(ctx.allocator, app.io, &journal_reader, collection.id, cursor_scope, checkpoint, input.limit, @import("../clock.zig").nowUnix(app.io)) catch |err| switch (err) {
+                error.ResetRequired, error.ReplayFrameTooLarge => return resetRequired(a),
+                else => return err,
+            };
+            break :blk page;
+        } else {
+            const store = app.backfill.?;
+            const page = store.page(ctx.allocator, collection.id, checkpoint, input.limit) catch |err| switch (err) {
+                error.ResetRequired => return resetRequired(a),
+                else => return err,
+            };
+            const entries = try a.alloc(@import("../realtime/durable.zig").Entry, page.items.len);
+            for (page.items, entries) |source, *dest| dest.* = .{ .frame = source.frame };
+            break :blk @import("../realtime/durable.zig").Page{ .items = entries, .position = try store.cursor(a, page), .has_next = page.has_next };
+        }
     };
     var items: std.ArrayList(std.json.Value) = .empty;
-    for (page.items) |e| {
+    for (result.items) |e| {
         // Deliberately revalidate identity and reacquire current collection metadata
         // per item: a revocation committed mid-page discards the entire response.
         // A request-wide identity/schema snapshot would weaken that guarantee.
@@ -64,9 +84,13 @@ pub fn get(ctx: *http.RequestCtx) !http.Response {
             try items.append(a, value);
         }
     }
-    const position = try store.cursor(a, page);
-    const next_cursor = try std.fmt.allocPrint(a, "{s}:{s}", .{ collection.id, position });
-    return .{ .status = 200, .body = try std.json.Stringify.valueAlloc(a, .{ .items = items.items, .nextCursor = next_cursor, .hasNext = page.has_next, .resetRequired = false }, .{}) };
+    const position = result.position;
+    const next_cursor = try std.fmt.allocPrint(a, "{s}:{s}", .{ cursor_scope, position });
+    if (comptime @import("build_options").durable_realtime) {
+        const durable = @import("../realtime/durable.zig");
+        return .{ .status = 200, .body = try std.json.Stringify.valueAlloc(a, .{ .items = items.items, .nextCursor = next_cursor, .hasNext = result.has_next, .resetRequired = false, .retention = .{ .maxEntries = durable.max_entries, .maxBytes = durable.max_bytes, .maxFrameBytes = durable.max_frame_bytes, .seconds = durable.retention_seconds } }, .{}) };
+    }
+    return .{ .status = 200, .body = try std.json.Stringify.valueAlloc(a, .{ .items = items.items, .nextCursor = next_cursor, .hasNext = result.has_next, .resetRequired = false }, .{}) };
 }
 
 /// The shared delivery path can fail after earlier items were authorized. Return

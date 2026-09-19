@@ -5145,7 +5145,12 @@ fn bootApp(
     } else &.{};
     errdefer static_files.freeSpaRoots(allocator, holder.spa_roots);
 
-    holder.backfill_store = if (comptime build_options.realtime_backfill) try @import("realtime/backfill.zig").Store.create(allocator, io, db.poolBackend(&holder.pool)) else {};
+    if (comptime build_options.durable_realtime) {
+        const writer = holder.pool.acquireWriter();
+        defer holder.pool.releaseWriter();
+        try @import("realtime/durable.zig").initialize(allocator, io, writer);
+    }
+    holder.backfill_store = if (comptime build_options.realtime_backfill) (if (comptime build_options.durable_realtime) null else try @import("realtime/backfill.zig").Store.create(allocator, io, db.poolBackend(&holder.pool))) else {};
     errdefer if (comptime build_options.realtime_backfill) if (holder.backfill_store) |store| store.destroy();
     holder.admission_state = if (comptime opts.admission_config) |cfg_admission| @import("admission.zig").State.init(io, cfg_admission) else {};
     holder.resumable_store = if (comptime build_options.resumable_uploads) try @import("files/resumable.zig").Store.create(allocator, io, opts.files.resumable) else {};

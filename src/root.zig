@@ -481,6 +481,7 @@ test {
     _ = @import("realtime/connection.zig");
     _ = @import("realtime/hub.zig");
     _ = @import("realtime/backfill.zig");
+    _ = @import("realtime/durable.zig");
     _ = @import("api/realtime_backfill.zig");
     if (@import("build_options").query_workbench) {
         _ = @import("query_workbench.zig");
