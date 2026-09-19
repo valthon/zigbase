@@ -164,3 +164,18 @@ gated off, so turning it on later can never collide with your own job kinds.
 - [ctx.webhook()](./framework.md#ctxwebhook--managed-outbound-webhooks-144)
 - [Scheduled jobs (§7)](./framework.md#7-scheduled-jobs-cron--jobs)
 - [Email guide](./email.md)
+
+## Retained durable capacity
+
+Opt into `.capacity = .{ .max_jobs = 10000, .max_payload_bytes = 33554432 }` on a
+durable queue to reject new rows with `QueueFull` when retained count or payload
+bytes would exceed the budget. All retained statuses count, including completed
+and failed history; cancellation or retry does not release capacity. Existing GC
+or deliberate deletion frees it. SQLite and PostgreSQL coordinate configured
+producers atomically; PostgreSQL contention returns `QueueAdmissionBusy`, and bound
+transactions require READ COMMITTED. Every producer must use the same budgets.
+
+`ctx.queueCapacity(.emails)` exposes bounded database occupancy to trusted code.
+It is separate from `.admission.max_work`, which now reserves one process-local
+permit per serial durable poll batch, and from `max_job_bytes`, which only counts
+memory-job/submit copies. See [capacity semantics and operator inspection](framework.md#durable-backlog-capacity).

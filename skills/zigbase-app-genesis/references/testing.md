@@ -469,3 +469,19 @@ free-port dance.
 - [framework.md §15](https://github.com/valthon/zigbase/blob/main/docs/framework.md#15-testing-your-app-zigbasetesting) — the full `zigbase.testing` API
 - [framework.md §14](https://github.com/valthon/zigbase/blob/main/docs/framework.md#14-test--dev-mode-determinism-seams) — determinism seams for a spawned server (`ZIGBASE_FAKE_NOW`, `ZIGBASE_FAKE_SEED`, `zigbase.testcapture`)
 - [recipes.md](https://github.com/valthon/zigbase/blob/main/docs/recipes.md) — task-oriented recipes, including a deterministic-test recipe
+
+## Durable queue capacity checks
+
+`zig build durable-capacity-fixture check-durable-capacity-contracts` builds a
+consumer with operator-only enqueue/inspection routes and rejects invalid budgets.
+Run `ZIGBASE_TEST_DURABLE_CAPACITY_BINARY="$PWD/zig-out/bin/durable-capacity-fixture"
+python -m pytest tests/admin/test_durable_capacity.py -q` for concurrent HTTP count
+and UTF-8 byte limits. Unit tests cover retained retry/dead-letter/canceled rows,
+GC recovery, rollback, shrunken legacy queues, independent SQLite producers and
+reopen. `zig build test -Dcoordinated-admission=true` also verifies that saturation
+prevents durable claims and releases the batch permit after completion.
+
+With `-Dpostgres=true` and a dedicated `ZIGBASE_PG_TEST_URL`, live tests use two
+connections to verify transaction-held admission contention, post-commit limits,
+rollback recovery, READ COMMITTED enforcement, reclaim and GC. The database role
+needs schema creation permission; individual queue tests isolate their own schema.

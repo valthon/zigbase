@@ -449,6 +449,23 @@ pub fn build(b: *std.Build) void {
         invalid_exe.expect_errors = .{ .contains = invalid.expected };
         route_contracts.dependOn(&invalid_exe.step);
     }
+    const durable_capacity_mod = b.createModule(.{ .root_source_file = b.path("fixtures/durable-capacity/main.zig"), .target = target, .optimize = optimize, .imports = &.{.{ .name = "zigbase", .module = zigbase_mod }} });
+    const durable_capacity_exe = b.addExecutable(.{ .name = "durable-capacity-fixture", .root_module = durable_capacity_mod });
+    b.step("durable-capacity-fixture", "Build durable backlog capacity consumer").dependOn(&b.addInstallArtifact(durable_capacity_exe, .{}).step);
+    const capacity_contracts = b.step("check-durable-capacity-contracts", "Check durable queue capacity configuration");
+    inline for (&.{
+        .{ .name = "zero", .expected = "queue capacity .max_jobs must be in 1..1000000" },
+        .{ .name = "too-many", .expected = "queue capacity .max_jobs must be in 1..1000000" },
+        .{ .name = "memory", .expected = "queue capacity requires .backend = .durable" },
+        .{ .name = "bytes-zero", .expected = "queue capacity .max_payload_bytes must be in 1..maxInt(i64)" },
+        .{ .name = "missing-count", .expected = "queue capacity requires .{ .max_jobs = N, .max_payload_bytes = N }" },
+        .{ .name = "unknown", .expected = "unknown queue capacity field: typo" },
+    }) |invalid| {
+        const mod = b.createModule(.{ .root_source_file = b.path("fixtures/durable-capacity/" ++ invalid.name ++ ".zig"), .target = target, .optimize = optimize, .imports = &.{.{ .name = "zigbase", .module = zigbase_mod }} });
+        const invalid_exe = b.addExecutable(.{ .name = "invalid-durable-capacity-" ++ invalid.name, .root_module = mod });
+        invalid_exe.expect_errors = .{ .contains = invalid.expected };
+        capacity_contracts.dependOn(&invalid_exe.step);
+    }
     const scheduler_contracts = b.step("check-scheduler-contracts", "Check distributed scheduler compile-time contracts");
     const thumbnail_contracts = b.step("check-thumbnail-contracts", "Check thumbnail configuration and feature-gate contracts");
     inline for (&.{

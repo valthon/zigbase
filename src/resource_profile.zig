@@ -58,7 +58,7 @@ pub const Report = struct {
 pub const Envelope = struct {
     basis: []const u8 = "compiled_configuration_not_rss",
     http_admission_max_requests: ?u32,
-    /// Shared count of synchronous HTTP callbacks and outstanding memory jobs.
+    /// Shared count of HTTP callbacks, outstanding memory work, and serial durable poll batches.
     coordinated_admission_max_work: ?u32 = null,
     /// Configured ceiling for queue-owned copy lengths, not total job memory.
     coordinated_admission_max_job_bytes: ?usize = null,

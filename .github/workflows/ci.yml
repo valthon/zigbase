@@ -887,7 +887,8 @@ jobs:
       - name: Opt-in shared HTTP and memory-job admission
         if: matrix.lane == 'admission'
         run: |
-          mise exec zig@0.16.0 -- zig build test check-admission-contracts shared-admission-fixture job-byte-admission-fixture -Dcoordinated-admission=true --summary all
+          mise exec zig@0.16.0 -- zig build test check-admission-contracts check-durable-capacity-contracts durable-capacity-fixture shared-admission-fixture job-byte-admission-fixture -Dcoordinated-admission=true --summary all
+          ZIGBASE_TEST_DURABLE_CAPACITY_BINARY="$GITHUB_WORKSPACE/zig-out/bin/durable-capacity-fixture" mise exec python@3.13 -- python -m pytest tests/admin/test_durable_capacity.py -q
           bash scripts/check-shared-admission-gating.sh "$ZIGBASE_TEST_BINARY" zig-out/bin/shared-admission-fixture
           bash scripts/check-job-byte-admission-gating.sh zig-out/bin/job-byte-admission-fixture zig-out/bin/shared-admission-fixture
           ZIGBASE_TEST_SHARED_ADMISSION_BINARY="$GITHUB_WORKSPACE/zig-out/bin/shared-admission-fixture" mise exec python@3.13 -- python -m pytest tests/admin/test_shared_admission.py -q

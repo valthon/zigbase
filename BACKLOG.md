@@ -105,8 +105,12 @@ product priority and acceptance evidence; it does not create duplicate implement
   work, including queued tasks and retries, with immediate rejection and counters.
   Optional `.admission.max_job_bytes` now bounds precisely retained memory-job
   payload/submit-name copies, with atomic reservation and byte diagnostics.
-  Transport buffers, broader byte/RSS budgets, durable jobs and cross-subsystem
-  coordination remain outside these gates.
+  Optional durable queue capacity now rejects retained row/payload overflow atomically
+  across configured SQLite/PostgreSQL producers, with bounded database snapshots.
+  All retained statuses count until GC/deletion, and shared execution admission
+  reserves one permit per serial durable poll batch before claiming. Transport
+  buffers, durable claim allocations, broader byte/RSS budgets and remaining
+  cross-subsystem coordination are still outside these gates.
   Memory-job/submit workers now have independent comptime counts and share the
   configured job stack size, with lazy startup and unchanged bounded-ring rejection.
 - [ ] Agent-native development interface: versioned discovery, structured diagnostics,

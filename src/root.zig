@@ -146,6 +146,8 @@ pub const CaptchaResult = @import("captcha.zig").Result;
 // Types a consumer names when declaring `.queues`/`.workers`/`.jobs`. The typed,
 // compile-checked accessor (App.enqueue) and the generated Queue/Job enums live on
 // the App(cfg) type; the runtime escape hatch is ctx.enqueue / ctx.enqueueByName.
+pub const QueueCapacityLimits = @import("queue/queue.zig").CapacityLimits;
+pub const QueueCapacitySnapshot = @import("queue/queue.zig").CapacitySnapshot;
 pub const QueueDef = @import("queue/queue.zig").QueueDef;
 pub const WorkerDef = @import("queue/queue.zig").WorkerDef;
 pub const RetryPolicy = @import("queue/queue.zig").RetryPolicy;

@@ -3339,6 +3339,71 @@ which reflects only your declared `.jobs`. The kind names `mail`/`webhook` are r
 either way, so a consumer `.jobs` entry with either name is a compile error even when the
 built-in itself is gated off.
 
+### Durable backlog capacity
+
+Bound retained jobs separately from in-process execution:
+
+```zig
+.queues = .{
+    .emails = .{
+        .backend = .durable,
+        .capacity = .{ .max_jobs = 10000, .max_payload_bytes = 32 * 1024 * 1024 },
+    },
+},
+```
+
+Omit `capacity` for legacy unbounded admission. It requires durable storage and a
+`max_jobs` in `1..1000000`; optional `max_payload_bytes` must be positive and fit
+`i64`. These limits apply to each database/queue name across producers using the
+same configuration. All producers must enable the same limits before relying on
+this contract: older binaries, unconfigured producers, or direct SQL can bypass
+admission. Apply migrations before starting the upgraded fleet.
+
+Every retained `_queue_jobs` row counts: pending, delayed, claimed, retrying, done,
+failed/dead-letter, and canceled. Payload bytes are the stored UTF-8 byte length,
+including embedded NUL bytes on SQLite. Claim/retry/reclaim/cancel/completion does
+not free capacity; the existing terminal-history GC or deliberate operator deletion
+must remove rows. Choose `done_ttl_s` and capacity together. No automatic eviction
+of unfinished jobs occurs. Shrinking a limit below existing occupancy fails closed
+until enough retained rows are removed. This is not a disk-size or process-memory
+limit; indexes, row metadata, WAL, serialization, and claimed payload allocations
+are outside it.
+
+`ctx.enqueue`, built-in mail/webhook enqueueing, scheduled mail, and transactional
+file cleanup all use this admission point. `error.QueueFull` means no row was
+inserted. SQLite serializes the check and insert in a writer transaction.
+PostgreSQL uses a per-queue transaction advisory lock and fresh READ COMMITTED
+snapshot; contention returns `error.QueueAdmissionBusy` without waiting. Standalone
+enqueues select READ COMMITTED explicitly. Enqueues inside `ctx.tx`/hooks retain
+atomicity with the caller transaction through a savepoint; a PostgreSQL caller
+using stronger snapshot isolation receives `error.QueueCapacityIsolation`. SQLite
+busy/connection errors still propagate. Use bounded retry/backoff outside the
+transaction, or map capacity refusal to an application-specific overload response.
+Never acknowledge an enqueue that failed, and do not busy-wait while holding HTTP
+or database resources. A successful bound enqueue remains subject to caller commit.
+
+Inspect from a suitably authorized operator route or trusted handler:
+
+```zig
+const snapshot = try ctx.queueCapacity(.emails);
+// Dynamic equivalent: try ctx.queueCapacityByName("emails")
+return ctx.json(200, snapshot);
+```
+
+`QueueCapacitySnapshot` reports `limits`, `retained_jobs`,
+`retained_payload_bytes`, `exact`, and `full`; it reserves no capacity. `full` means
+no row or byte headroom; an empty payload may still fit at an exact byte ceiling
+if row capacity remains. Snapshots
+and admission first inspect at most `max_jobs + 1` indexed rows. When that count
+exceeds the limit, `exact` is false, the count is a lower bound, and bytes are null
+without scanning payload lengths. Otherwise bytes are summed over at most
+`max_jobs` rows in the same statement snapshot. No payload content is returned.
+These are database-derived observations, so restart and worker recovery cannot
+lose accounting; a snapshot can become stale immediately under concurrent work.
+Disabled capacities return `error.QueueCapacityDisabled` rather than scanning an
+unbounded queue. This API is a trusted framework capability, not a built-in public
+HTTP endpoint; the fixture demonstrates an operator-authenticated route.
+
 ### Backends, priority, and reliability
 
 - **Backend `memory`** (default): the job runs in-process on the bounded background worker pool with backoff
@@ -5008,7 +5073,7 @@ during setup). It neither cancels slow accepted handlers nor limits durable queu
 depth. Existing memory-job ring (256 queued tasks, configurable workers, `QueueFull` on
 overflow) and scheduler bounds remain independent and unchanged.
 
-#### Coordinated HTTP and memory-job admission
+#### Coordinated HTTP and job admission
 
 Build with `-Dcoordinated-admission=true` and configure both ceilings:
 
@@ -5023,26 +5088,37 @@ the optional positive `u32` `max_work` activates its per-application ceiling.
 accounting code; specifying `max_work` without it is a compile error.
 
 One work permit covers each admitted synchronous HTTP callback, each queued or
-running memory job, and each `app.submit` task. A memory job retains its permit
+running memory job, each `app.submit` task, and each serial durable poll batch.
+A memory job retains its permit
 through retry backoff and final cleanup. HTTP still obeys `max_requests`, while
-HTTP plus outstanding memory work must also fit `max_work`. Full shared capacity
+HTTP plus outstanding memory work and active durable batches must also fit
+`max_work`. Full shared capacity
 returns HTTP `503 overloaded` with `Retry-After: 1`, or `error.QueueFull` from a
-job enqueue/submit. No waiting queue is added and work is never evicted.
+memory-job enqueue/submit. Durable polls defer claiming until a later tick.
+No waiting queue is added and work is never evicted.
 
-An HTTP handler that enqueues a job needs a second permit while it still owns its
+An HTTP handler that enqueues a memory job needs a second permit while it still owns its
 HTTP permit. Size the shared ceiling for that overlap and handle enqueue failure;
 do not spin or wait for capacity from inside a handler. Jobs may use all shared
 permits: there is no reserved HTTP capacity or fairness guarantee. The exact
 `GET /api/health` exemption still applies, but diagnostics can be rejected.
 
 `work_limit` reports the configured ceiling; `jobs` counts outstanding admitted
-memory work, `work_high_water` is the peak of `active + jobs`, and `jobs_rejected`
-counts shared-capacity job refusals (not independent ring-full refusals).
+memory work plus active serial durable batches; `work_high_water` is the peak of
+`active + jobs`. `jobs_rejected` counts memory-job refusals and deferred durable
+poll batches, not independent ring-full refusals or lost durable jobs.
 Reservation precedes the retained payload/name copy and is returned on allocation
 or enqueue failure. The inline memory-job fallback also holds a permit through
 execution. `Ctx` payload serialization occurs before this reservation.
 
-This is a process-local **work-count limit, not a byte or RSS cap**. Durable jobs,
+A durable poller reserves one permit before any claim, and holds it through its
+serial batch and cleanup (not one permit per prefetched row). Saturation leaves
+jobs pending without spending attempts or rate tokens; that poll also skips its
+reclaim pass, while the independent scheduled GC/reclaim sweep remains active.
+Polls with no available work briefly acquire/release a permit. Durable claimed
+payload allocations are not charged to `max_job_bytes`.
+
+This is a process-local **work-count limit, not a byte or RSS cap**. Other
 scheduler work itself, transport buffers, long-lived realtime sessions and
 arbitrary plugin work are not counted. Existing ring/worker bounds still apply.
 The offline `resources` envelope exposes `coordinated_admission_max_work`, or
@@ -6082,7 +6158,7 @@ code to comptime-dead when off, so a build that doesn't need a feature doesn't p
 | `-Dresumable-uploads` | off | Principal-bound network-resume for file fields on existing records. Process-local by default, fully buffered, configurable session/byte/chunk/expiry budgets. SQLite restart persistence requires the additional `-Ddurable-resumable-uploads` flag and `.files.resumable.durable = true`; neither mode provides cross-instance durability. See [resumable uploads](resumable-uploads.md). |
 | `-Ddurable-resumable-uploads` | off | Compile SQLite/local upload persistence; requires `-Dresumable-uploads=true` and `.files.resumable.durable = true` to activate. Single-owner process-restart recovery with atomic completion receipts; still fully buffered, not cross-instance or power-loss durability. See [persistence limits](resumable-uploads.md#sqlite-process-restart-persistence). |
 | `-Dquery-workbench` | off | Bounded SQLite step and PostgreSQL client-exchange metrics, statement lifecycle timing, route attribution and repeated/slow shape counters. Structural EXPLAIN remains SQLite-only; no SQL/parameter capture. |
-| `-Dcoordinated-admission` | off | Compile job admission: `.admission.max_work` shares HTTP/memory-job work capacity and requires `.max_requests`; independent `.max_job_bytes` bounds retained payload/name copy lengths without enabling HTTP admission. No RSS cap or durable-job accounting. |
+| `-Dcoordinated-admission` | off | Compile memory/durable job admission: `.admission.max_work` shares HTTP/memory-job/durable-batch work capacity and requires `.max_requests`; independent `.max_job_bytes` bounds retained payload/name copy lengths without enabling HTTP admission. No RSS cap; durable claim payloads are not charged to `.max_job_bytes`. |
 | `-Ddev-mode` | on in `Debug`, off in release | The dev-only, never-in-prod seams: `ZIGBASE_FAKE_NOW` / `ZIGBASE_FAKE_SEED` (§14 above), test-capture, and fake field-crypto; the release script forces it off for shipped binaries. |
 | `-Ddev-tools` | **on** | The `init`/`agents-md`/`typegen` scaffolding/codegen verbs, `capabilities`/`routes`/`migrate preview` offline discovery, `tune` offline measurement advisor, and `diagnostics` structured doctor adapter (which can probe filesystem writability and initialize the migration ledger). Ordinary `doctor` and other migration actions remain available. Official release, Docker and npm artifacts include this tooling. Consumers can opt out for their deployment binary; stripped verbs exit nonzero with `-Ddev-tools=true` rebuild guidance. Distinct from `.enable_typegen` below — see §3b. |
 | `-Dstrip` | on except in `Debug` | Strip debug info from the binary (~7 MiB vs ~24 MiB unstripped in a release build). |
