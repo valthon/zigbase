@@ -26,7 +26,7 @@ CLI subcommands: `serve`, `migrate`, `superuser create --email … --password �
 
 ### Tests — there are two suites, both run in CI (`.github/workflows/ci.yml`)
 
-1. **Zig unit tests** (`zig build test`). **Caveat:** `zig build test` prints a spurious `failed command: …` line even when everything passes; the authoritative signal is the `Build Summary: N/N tests passed` line (hence `--summary all`). To run the suite against a fresh tree, build the test binary directly. There is no per-test filter wired into `build.zig`.
+1. **Zig unit tests** (`zig build test`). **Caveat:** Zig 0.16.0 can print a stale `failed command: …` label after successful tests emit stderr at exit (#261). Check both the shell exit status and final `Build Summary` (hence `--summary all`); never ignore a nonzero exit, signal, or failed test. Consumer apps should use `zigbase.addTest`. `tests/test_runner/verify.py` reproduces the diagnostic and verifies that the shipped simple runner rejects real failures. To run the suite against a fresh tree, build the test binary directly. There is no per-test filter wired into `build.zig`.
 2. **Python/Playwright "browser" suite** (`tests/admin/`) + a live SMTP-TLS test (`tests/smtp/`). These build the binary, launch a real server, and drive the admin SPA with a headless Chromium. Run one:
    ```sh
    mise exec python@3.13 -- python -m pytest tests/admin/test_schema.py::test_edit_rules_lock_toggle -q

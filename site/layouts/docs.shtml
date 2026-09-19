@@ -9,6 +9,7 @@
         <p class="docs-group">Getting started</p>
         <ul>
           <li><a href="$site.page('docs/overview').link()">Overview</a></li>
+          <li><a href="$site.page('docs/why-zigbase').link()">Why ZigBase</a></li>
           <li><a href="$site.page('docs/quick-start').link()">Quick start</a></li>
           <li><a href="$site.page('docs/tutorial').link()">Tutorial</a></li>
           <li><a href="$site.page('docs/agents').link()">For coding agents</a></li>
@@ -61,6 +62,7 @@
           <li><a href="$site.page('docs/observability').link()">Observability</a></li>
           <li><a href="$site.page('docs/agent-evals').link()">Agent evaluations</a></li>
           <li><a href="$site.page('docs/known-limitations').link()">Known limitations</a></li>
+          <li><a href="$site.page('docs/roadmap').link()">Roadmap</a></li>
           <li><a href="$site.page('docs/changelog').link()">Changelog</a></li>
         </ul>
       </nav>

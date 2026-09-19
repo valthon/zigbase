@@ -1,5 +1,5 @@
 ---
-.title = "ZigBase — open-source backend in a single binary",
-.description = "ZigBase is an open-source, single-binary backend with collections, auth, realtime, search, multi-tenancy, jobs, email, admin UI, SQLite or PostgreSQL, and an embeddable Zig framework.",
+.title = "ZigBase — Build beyond your team size",
+.description = "An extensible Zig backend for ambitious apps and small teams. Integrated services, explicit resource control, and single-binary deployment. Build by hand or with AI.",
 .layout = "index.shtml",
 ---

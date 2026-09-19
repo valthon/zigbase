@@ -1,6 +1,11 @@
 # Zigapagos + ZigBase full-stack pairing
 
-ZigBase and Zigapagos pair at a narrow, explicit seam: Zigapagos builds a static frontend, and the
+ZigBase and Zigapagos give an individual or small team an integrated path from frontend
+to custom backend, with one deployable origin. Write the application yourself, use a
+coding agent, or combine both; the build, tests, and deployment remain ordinary project
+tools. ZigBase also works with other frontends.
+
+The two projects pair at a narrow, explicit seam: Zigapagos builds a static frontend, and the
 application's ZigBase binary serves that release after its API, admin, and custom routes. The
 result is one deployable origin with server-enforced policy and no production CORS requirement.
 

@@ -9,5 +9,5 @@ Site {
     .auto_heading_ids = true,
     .speculation_rules = true,
     .asset_fingerprint = true,
-    .static_assets = ["robots.txt", "sitemap.xml", "llms.txt", "docs-index.json", "og.png"],
+    .static_assets = ["robots.txt", "sitemap.xml", "llms.txt", "docs-index.json", "og.png", "og-team.png"],
 }

@@ -21,7 +21,7 @@ const TREE = 'https://github.com/valthon/zigbase/tree/main/';
 const REGISTRY: Entry[] = JSON.parse(readFileSync(join(SITE, 'scripts/docs-registry.json'), 'utf8'));
 
 const AUTHORED = [
-  { slug: 'overview', title: 'Overview', description: 'What ZigBase is — a single-binary backend and an embeddable Zig framework — and when to reach for it.', group: 'getting-started', order: 1 },
+  { slug: 'overview', title: 'Overview', description: 'An extensible Zig backend for ambitious applications, small teams, and development with or without coding agents.', group: 'getting-started', order: 1 },
   { slug: 'quick-start', title: 'Quick start', description: 'Install ZigBase, create a superuser, start the server, hit the health endpoint, and open the admin UI.', group: 'getting-started', order: 2 },
   { slug: 'tutorial', title: 'Tutorial', description: 'Build a backend end to end through the embedded admin UI or the terminal: collections, rules, auth, files, OAuth2, a route, and a cron job.', group: 'getting-started', order: 3 },
   { slug: 'configuration', title: 'Configuration', description: 'The full environment-variable reference, CLI commands, and configuration precedence rules for the ZigBase server.', group: 'guides', order: 3 },
@@ -190,7 +190,7 @@ const groups: Record<string, string> = {
 };
 const llms = [
   '# ZigBase', '',
-  '> A single-binary backend for AI-built and human-built apps: REST API, realtime, storage, auth, an admin UI, SQLite or PostgreSQL, and an embeddable Zig framework.', '',
+  '> Build beyond your team size. ZigBase is an extensible Zig backend with integrated application services, explicit resource controls, and single-binary deployment. Build directly or with coding agents; no AI service is required.', '',
   `Version ${version}. Linux and macOS; Windows is served by the Docker image.`, '',
   'Access rules default to locked, and local plain-HTTP development needs --insecure-cookies. Start with the coding-agent orientation below.', '',
   '## Start here', '',

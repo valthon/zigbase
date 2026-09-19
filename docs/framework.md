@@ -2,11 +2,17 @@
 
 > 📖 This documentation is also published, web-native, at <https://valthon.github.io/zigbase/docs/framework> — the site is the canonical reading experience.
 
-ZigBase is not only a standalone backend binary — it is an **embeddable Zig
-framework**. You `zig fetch --save` it, `@import("zigbase")`, and configure
+ZigBase is an **embeddable Zig framework** for building custom applications with
+integrated backend services and explicit control over resources. You `zig fetch --save`
+it, `@import("zigbase")`, and configure
 `zigbase.App(.{...})` with comptime hooks, custom routes, scheduled jobs, and
 lifecycle/auth/file event handlers. Your app *is* the ZigBase server, plus your
 extensions.
+
+Write these integrations directly or build them with a coding agent: the same typed
+API, compiler checks, and local tests support both. Start with [Why ZigBase](why-zigbase.md)
+for the design rationale, or jump to [footprint levers](#10-footprint-levers-pools)
+for resource profiles, effective settings, and measurement-driven tuning.
 
 > For runnable, end-to-end usage of these APIs (hooks, a custom route with a path
 > param, and a DB-touching cron job), see the [tutorial](tutorial.md) and the
@@ -5159,6 +5165,31 @@ opened by a custom handler. Backend identity also separates repeat accounting.
 Telemetry storage is bounded; PostgreSQL's pre-existing whole-result buffering
 is **not** bounded by these telemetry limits, and instrumentation copies no rows.
 
+The additive `routes` array measures **completed synchronous matched-dispatch
+scopes**, including routes that execute no SQL. Each method/template aggregate has
+`completedScopes`, `totalNanoseconds`, `maxNanoseconds`, and `slowScopes` (elapsed
+at least `slowMilliseconds`). `routeMeasurement` is `matched-handler-scope`.
+`maxRouteEntries` equals the configured `max_entries`, but the route table and
+`droppedRouteScopes` counter are independent of the query-shape table. Each table
+retains its first keys until restart; a full table still updates known keys.
+Route labels over 192 bytes are omitted. Storage adds at most `max_entries`
+fixed-size route aggregates; capture allocates nothing per completed scope.
+
+The awake-clock interval starts after route matching and ends as synchronous
+dispatch unwinds, before taking the aggregation lock. It includes in-scope auth,
+guards, pool waits, handler processing, and deferred cleanup. Consumer dispatch
+also includes its own error conversion; built-in dispatch ends before the outer
+server error backstop. It excludes parsing/routing and admission before dispatch,
+response transmission, streaming connection lifetime, and detached background work.
+Failed or denied matched handlers count, but status/error classification is not
+recorded. Inspector scopes read no timing clock and do not enter either table.
+
+This is elapsed time, not CPU time or end-to-end request latency. Two additional
+clock reads and a bounded locked update occur per measured scope. Nested scopes
+are inclusive; do not subtract aggregated query/lifecycle totals to infer exclusive
+application time, and do not add route totals to obtain process busy time. Concurrent
+requests overlap. Active/incomplete scopes are absent until they finish.
+
 Completed statements also report a separate lifecycle family:
 
 - `finalizedStatements`: successful prepares finalized in their originating
@@ -5181,7 +5212,7 @@ slow/repeat/failure counters keep their meanings; they are not lifecycle counts.
 A statement can have several executions, or none, and execution statistics can
 appear before its lifecycle is finalized. Do not subtract aggregate step timing
 from lifecycle timing: the populations can differ. Failed prepares, raw `exec`,
-pool acquisition and full request latency are not captured. A lifecycle whose
+pool acquisition and full request latency are not captured by statement metrics. A lifecycle whose
 measured calls or finalization leave the original scope is omitted rather than
 reattributed; no request/store pointers are retained in statements. Long-lived
 unfinalized statements do not appear in lifecycle aggregates.
@@ -6020,18 +6051,20 @@ Pass the **same** module you passed to `addTo`: rooting a second module at
 (`src/simple_runner.zig`, resolved out of the dependency — you do not vendor
 anything). That matters for two reasons:
 
-- **It sidesteps an upstream Zig 0.16 build-runner race.** `zig build test`
-  otherwise runs the test binary in server mode (`--listen=-`) and polls its
-  stdio; an app booted by the harness does real work at process exit (closing
-  sqlite, removing a tempdir), and the runner can mis-read that normal exit as a
-  crash — printing `failed command: …--listen=-` and intermittently failing the
-  build under load. A `.simple` runner reports through its exit code instead, so
-  the race cannot occur.
-- **It fails the build on a leak.** Each test runs under a fresh
-  `std.testing.allocator` whose leak check runs on teardown.
+- **It avoids a misleading Zig 0.16.0 diagnostic.** The default server-mode
+  runner (`--listen=-`) can print `failed command:` after a successful child leaves
+  stderr output at exit. The reproduced trigger is facil.io's destructor newline;
+  the command exits zero and the summary reports passing tests. This does not
+  establish a crash or a runner race. A `.simple` runner reports through its exit
+  code instead and does not print that stale label on success.
+- **It rejects real failures.** Each test runs under a fresh
+  `std.testing.allocator` with leak checking. Failed tests, logged errors, and
+  abnormal process exits still fail the build.
 
-If you are not using `addTest`, that `--listen=-` line on an otherwise-passing
-suite is the race, not a bug in your app.
+For default-runner output, check both the command exit status and final build
+summary. Never dismiss a nonzero exit or signal as the newline diagnostic. See
+[testing](testing.md#the-build-wiring-copy-this) for the reproducible runner checks
+and [#261](https://github.com/valthon/zigbase/issues/261) for the investigation.
 
 ## Compile-time build flags
 

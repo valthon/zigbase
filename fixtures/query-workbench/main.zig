@@ -26,8 +26,19 @@ fn held(ctx: *zigbase.Ctx) !zigbase.http.Response {
     _ = try stmt.step();
     return .{ .status = 204, .body = "" };
 }
+fn noQuery(ctx: *zigbase.Ctx) !zigbase.http.Response {
+    try ctx.app.io.sleep(std.Io.Duration.fromMilliseconds(50), .awake);
+    return .{ .status = 204, .body = "" };
+}
+fn failed(_: *zigbase.Ctx) !zigbase.http.Response {
+    return error.TestRouteFailure;
+}
 pub fn main(init: std.process.Init) !void {
     const routes = .{
+        .{ .method = .GET, .path = "/no-query/:id", .auth = .public, .handler = noQuery },
+        .{ .name = "postNoQuery", .method = .POST, .path = "/no-query/:id", .auth = .public, .handler = noQuery },
+        .{ .name = "denied", .method = .GET, .path = "/denied", .auth = .authed, .handler = noQuery },
+        .{ .method = .GET, .path = "/failed", .auth = .public, .handler = failed },
         .{ .method = .GET, .path = "/work/:id", .auth = .public, .handler = work },
         .{ .method = .GET, .path = "/held", .auth = .public, .handler = held },
     };

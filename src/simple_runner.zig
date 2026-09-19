@@ -1,12 +1,12 @@
 //! A `.simple`-mode test runner for apps built on ZigBase, handed to consumers by
 //! `zigbase.addTest` in build.zig.
 //!
-//! `zig build test` normally runs the test binary in SERVER mode (`--listen=-`) and
-//! reads results off its stdio. An app booted by `zigbase.testing` does real work at
-//! process exit (closing sqlite, removing a tempdir), and Zig 0.16's build runner can
-//! mis-read that exit-time output as a crash — printing `failed command: … --listen=-`
-//! and intermittently failing the build under load. A `.simple` runner runs the tests
-//! when spawned and communicates only through its exit code, so the race cannot occur.
+//! Zig 0.16.0's default server-mode runner (`--listen=-`) can print a stale
+//! `failed command:` label after a successful child leaves stderr output at exit.
+//! facil.io's destructor newline reproduces it; no crash or race is established
+//! by that diagnostic (issue #261). A `.simple` runner reports through the exit
+//! code instead. tests/test_runner/verify.py checks successful stderr and real
+//! assertion, leak, logged-error, and post-test signal failures.
 //!
 //! It still fails the build on a real failure, a leaked allocation, or a logged
 //! `.err`-or-worse message: every test gets a fresh `std.testing.allocator` whose leak

@@ -124,6 +124,80 @@ resolver check. Module selectors run unittest classes too; individual class-meth
 selectors remain outside the inventory. The separate inventory-expansion driver
 is intentionally not allowlisted, avoiding recursive wrapper tests.
 
+## Application capacity
+
+The project/task fixture is a first application-workload measurement, beyond isolated
+microbenchmarks. It runs the real HTTP records API with authenticated users, native
+account tenancy, indexed task lists, relation expansion, and writes. It is not yet a
+mixed realtime/job workload or a saturation and recovery report.
+
+From a clean checkout, preserve the revision and build command alongside each report:
+
+```sh
+mise exec zig@0.16.0 -- zig build application-capacity -Doptimize=ReleaseFast -Dcpu=baseline
+mise exec python@3.13 -- python tools/application_capacity.py \
+  --binary zig-out/bin/application-capacity --tenants 2 --tasks 100 \
+  --concurrency 4 --warmup 2 --seconds 10 > application-capacity.json
+# Small live correctness check, also run in CI (no latency thresholds):
+ZIGBASE_TEST_CAPACITY_BINARY="$PWD/zig-out/bin/application-capacity" \
+  mise exec python@3.13 -- python -m unittest discover \
+  -s tests/tools -p test_application_capacity.py
+```
+
+The runner owns a temporary directory and loopback server. It never accepts an existing
+server URL or database. Inherited `ZIGBASE_*` variables are removed; plain-HTTP cookies,
+foreground serving, disabled auth rate limiting, and disabled request logging are set
+explicitly. This isolates the fixture from production credentials and settings. The
+process is terminated and its data removed on completion or failure.
+
+**Dataset and operation contract.** Each tenant has one member, one project, and the
+requested number of tasks. Accounts and memberships are seeded directly in SQLite
+outside timing; users, projects, and tasks are provisioned through the HTTP API as a
+superuser. Measured requests use member bearer tokens and `X-Account-Id`, never the
+superuser. Each worker owns a distinct task and repeatedly:
+
+1. Lists up to 20 tasks, sorted by ID, with `expand=project`.
+2. Updates its task title to a unique worker/sequence value.
+3. Reads that task with project expansion and verifies the acknowledged title.
+
+Every response is checked for tenant, task, and project identity. Lists must have the
+expected length, sorted unique IDs, and correct expanded projects. Pre/post checks reject
+foreign task reads/writes, nonmember account selection, and unauthenticated access.
+After each phase the last acknowledged title is read again outside timing. Incorrect
+HTTP or application results count as errors; setup or final verification failure emits
+a failure object and exits nonzero. A fast empty response cannot qualify as useful work.
+
+**Bounds and measurement.** Inputs cap tenants at 16, tasks per tenant at 1,000,
+concurrency at 64, warmup at 30 seconds, measurement at 300 seconds, and measured requests
+at 200,000. Warmup has a separate cap of 10,000 requests. Each worker has one outstanding
+request, a five-second socket timeout, and a 2 MiB response cap; it starts no new request
+after the phase deadline. In-flight requests drain, so elapsed time can exceed the
+requested duration. `limit_reached` indicates that the request cap shortened a phase.
+The finite client stores at most one latency per attempted request.
+
+The JSON report includes successful throughput; attempted and successful counts; bounded
+error categories; per-operation nearest-rank p50/p95/p99/max client latency including
+failed requests; effective compiled `resources`; binary digest, size, version/build/target;
+runner and fixture source digests; machine/CPU affinity; dataset/index definitions; and
+post-run SQLite/WAL file sizes. Linux additionally reports server-process CPU seconds and
+RSS sampled every 50 ms during each phase. Other platforms emit null CPU/RSS values.
+
+**Interpretation.** These are warm-cache, closed-loop observations, including HTTP
+connection setup and client-side semantic validation, on shared client/server hardware.
+Python or connection churn can be the bottleneck. CPU is process time, not normalized
+host utilization; RSS sampling can miss short peaks. File sizes are not disk I/O rates.
+The binary's embedded commit and the checkout's source digests are separate provenance:
+a dirty build or a binary from elsewhere must not be labeled a clean revision. Preserve
+all build flags and the raw report before comparing runs. The runner does not claim a
+maximum user count, production SLO, comparative cost advantage, or small-machine baseline.
+
+The [capacity backlog](../BACKLOG.md) retains realtime, background work, uploads, open-loop
+load, saturation/recovery, cold-cache behavior, PostgreSQL, replicas, and a reproducible
+small-machine report as future work. Use [performance contracts](#performance-contracts)
+for allocation/binary gates and the [tuning advisor](framework.md#offline-measurement-advisor-zigbase-tune)
+for comparing supported measurement inputs; this richer report is not the advisor's
+input schema.
+
 ## Performance contracts
 
 Performance contracts are offline build/CI tooling, not application runtime
@@ -200,12 +274,23 @@ budgets. Different app features and targets need their own measured contract.
 ## The build wiring (copy this)
 
 `zigbase.addTest` gives you a test artifact wired with ZigBase's `.simple`-mode
-test runner. That runner matters: `zig build test` otherwise runs the test
-binary in server mode (`--listen=-`), and an app booted by the harness does
-enough work at process exit that Zig 0.16's build runner can mis-read a normal
-exit as a crash — printing `failed command: … --listen=-` and intermittently
-failing the build. The `.simple` runner rides the exit code instead, and fails
-the build on a leaked allocation.
+runner. It reports through the process exit code and fails on assertions, leaked
+allocations, logged errors, and abnormal process exits.
+
+Zig 0.16.0's default server-mode runner (`--listen=-`) can print a misleading
+`failed command:` label after successful tests when the child leaves stderr output
+at exit. A single newline from facil.io's destructor is sufficient; the reproduced
+case exits zero and reports all tests passed. This is a diagnostic bug, not evidence
+of an app crash or a runner race. Check **both the command exit status and the final
+build summary**. A nonzero exit, signal, failed test, or leak is a real failure and
+must be investigated separately.
+
+The supported `addTest` wiring avoids this label on successful runs. Contributors
+can reproduce the distinction and verify real failure handling with
+`mise exec zig@0.16.0 python@3.13 -- python tests/test_runner/verify.py`. The
+[regression fixture](../tests/test_runner/README.md) checks the installed compiler
+and the shipped runner without patching either. Upstream diagnosis remains tracked
+in [#261](https://github.com/valthon/zigbase/issues/261).
 
 ```zig
 const std = @import("std");

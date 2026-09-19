@@ -51,6 +51,9 @@ def test_bounded_private_route_template_attribution_and_concurrency(server):
     entries = [item for item in report["items"] if item["routeTemplate"] == "/work/:id"]
     assert len(entries) == 1, report
     entry = entries[0]
+    route = next(row for row in report["routes"] if row["routeTemplate"] == "/work/:id")
+    assert route["completedScopes"] == 24
+    assert route["totalNanoseconds"] >= route["maxNanoseconds"] >= 0
     assert entry["executions"] == 72
     assert entry["repeatedShapes"] == 48
     assert entry["method"] == "GET"
@@ -122,3 +125,29 @@ def test_structural_explain_search_scan_and_rejected_sql(server):
                   {"collection": "posts", "descending": "false"}, b"x" * 4097]:
         assert call(server, "POST", endpoint, value, token)[0] == 400
     assert call(server, "GET", "/api/collections/posts/records", token=token)[1]["items"] == []
+
+
+def test_route_scope_measures_no_sql_errors_denials_and_methods(server):
+    token = admin(server)
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        codes = list(executor.map(lambda n: call(server, "GET", f"/no-query/private-{n}")[0], range(8)))
+    assert codes == [204] * 8
+    assert call(server, "POST", "/no-query/private-post")[0] == 204
+    assert call(server, "GET", "/failed")[0] == 500
+    assert call(server, "GET", "/denied")[0] == 401
+    code, report = call(server, "GET", "/api/query-workbench/stats", token=token)
+    assert code == 200
+    assert report["routeMeasurement"] == "matched-handler-scope"
+    assert len(report["routes"]) <= report["maxRouteEntries"] == 8
+    rows = {(row["method"], row["routeTemplate"]): row for row in report["routes"]}
+    row = rows[("GET", "/no-query/:id")]
+    assert row["completedScopes"] == row["slowScopes"] == 8
+    assert row["totalNanoseconds"] >= row["maxNanoseconds"] >= 40_000_000
+    assert rows[("POST", "/no-query/:id")]["completedScopes"] == 1
+    assert rows[("GET", "/failed")]["completedScopes"] == 1
+    assert rows[("GET", "/denied")]["completedScopes"] == 1
+    assert not any(item["routeTemplate"] == "/no-query/:id" for item in report["items"])
+    assert "private-" not in json.dumps(report)
+    # Even unauthorized inspector requests cannot change application observations.
+    assert call(server, "GET", "/api/query-workbench/stats")[0] == 401
+    assert call(server, "GET", "/api/query-workbench/stats", token=token)[1] == report

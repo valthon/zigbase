@@ -378,5 +378,25 @@
       "order": 5,
       "group": "guides"
     }
+  },
+  {
+    "canonical": "docs/why-zigbase.md",
+    "mirror": "why-zigbase.md",
+    "frontmatter": {
+      "title": "Why ZigBase",
+      "description": "Application leverage and systems control for small teams: why Zig, two development workflows, and the evidence behind the ambition.",
+      "order": 0,
+      "group": "getting-started"
+    }
+  },
+  {
+    "canonical": "BACKLOG.md",
+    "mirror": "roadmap.md",
+    "frontmatter": {
+      "title": "Engineering backlog",
+      "description": "Priorities, implemented foundations, and acceptance criteria for resource efficiency, developer leverage, and measured growth.",
+      "order": 20,
+      "group": "guides"
+    }
   }
 ]

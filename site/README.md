@@ -35,6 +35,19 @@ The site is a GitHub project page. `zigapagos.ziggy` owns the `zigbase` URL
 prefix; internal links should use `$site.page(...)` or `$site.asset(...)`, not
 hand-authored root-relative paths.
 
+## Positioning and social preview
+
+The homepage and onboarding lead with “Build beyond your team size”: an extensible
+Zig framework, integrated application services, and explicit resource control.
+Direct development and coding-agent workflows share the same APIs and tests. Keep
+both paths visible; distinguish measured results from future objectives in
+`docs/why-zigbase.md` and `BACKLOG.md`.
+
+`assets/og-team.png` is the social preview. Its editable source is
+`scripts/social-card.html`; regenerate it with `python3 scripts/render-social-card.py`
+using the same Playwright/Chromium dependency as the browser smoke. The old `og.png`
+remains available for previously shared URLs.
+
 ## Deployment
 
 The Pages workflow runs `build.sh` directly and uploads `site/zig-out/site`.

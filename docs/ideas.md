@@ -1,6 +1,11 @@
 # ZigBase — Post-v0.1 Functionality Ideas (Roadmap Ideation)
 
-**Status:** Ideation / not committed scope. **Date:** 2026-06-09.
+**Status:** Historical ideation, retained for context. **Date:** 2026-06-09.
+
+This is a snapshot of the early project, not the current capability list or priorities.
+Several proposals have since shipped and some behavior described below has changed.
+Use the [engineering backlog](../BACKLOG.md) for active work and
+[Why ZigBase](why-zigbase.md) for current product direction.
 
 This document is a roadmap-discussion artifact: an opinionated, prioritized set of
 features ZigBase should consider building *on top of* the v0.1 line (Foundation →

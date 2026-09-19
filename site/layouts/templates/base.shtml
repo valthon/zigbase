@@ -11,14 +11,14 @@
     <meta property="og:title" content="$page.title">
     <meta property="og:description" content="$page.description">
     <meta property="og:url" content="$site.host_url.addPath($page.link())">
-    <meta property="og:image" content="$site.host_url.addPath($site.asset('og.png').link())">
+    <meta property="og:image" content="$site.host_url.addPath($site.asset('og-team.png').link())">
     <meta property="og:image:width" content="1200">
     <meta property="og:image:height" content="630">
-    <meta property="og:image:alt" content="ZigBase — open-source backend in a single binary. SQLite to start, Postgres when you grow.">
+    <meta property="og:image:alt" content="ZigBase — Build beyond your team size. An extensible Zig backend for ambitious applications.">
     <meta name="twitter:card" content="summary_large_image">
     <meta name="twitter:title" content="$page.title">
     <meta name="twitter:description" content="$page.description">
-    <meta name="twitter:image" content="$site.host_url.addPath($site.asset('og.png').link())">
+    <meta name="twitter:image" content="$site.host_url.addPath($site.asset('og-team.png').link())">
     <link rel="icon" type="image/svg+xml" href="$site.asset('favicon.svg').link()">
     <link rel="stylesheet" href="$site.asset('site.css').link()">
     <link rel="stylesheet" href="$site.asset('shell.css').link()">
@@ -43,7 +43,7 @@
         <nav class="nav-primary" aria-label="Primary">
           <a href="$site.page('docs').link()">Docs</a>
           <a href="$site.page('examples').link()">Examples</a>
-          <a href="$site.page('compare').link()">Compare</a>
+          <a href="$site.page('docs/why-zigbase').link()">Why ZigBase</a>
           <a href="$site.page('download').link()">Download</a>
           <a href="https://github.com/valthon/zigbase">GitHub</a>
         </nav>
@@ -55,8 +55,8 @@
     </main>
     <footer class="site-footer">
       <div class="footer-inner">
-        <p><strong>ZigBase</strong> is an open-source backend and embeddable Zig framework. Apache-2.0.</p>
-        <p><a href="$site.page('docs/agents').link()">For coding agents</a> · <a href="$site.asset('llms.txt').link()">llms.txt</a> · <a href="https://github.com/valthon/zigbase">Source</a></p>
+        <p><strong>ZigBase</strong> — Build beyond your team size. Open-source backend. Extensible Zig framework. Apache-2.0.</p>
+        <p><a href="$site.page('docs/framework').link()">Framework</a> · <a href="$site.page('docs/roadmap').link()">Backlog</a> · <a href="$site.page('compare').link()">Compare</a> · <a href="$site.page('docs/agents').link()">For coding agents</a> · <a href="$site.asset('llms.txt').link()">llms.txt</a> · <a href="https://github.com/valthon/zigbase">Source</a></p>
         <p class="footer-meta">This site is built with the published Zigapagos v0.4.0 release.</p>
       </div>
     </footer>

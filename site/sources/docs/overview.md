@@ -1,35 +1,36 @@
 ---
 title: Overview
-description: What ZigBase is — a single-binary backend and an embeddable Zig framework — and when to reach for it.
+description: An extensible Zig backend for ambitious applications, small teams, and development with or without coding agents.
 order: 1
 group: getting-started
 ---
 
 # Overview
 
-**ZigBase is a single-binary, open-source backend** — collections and schema, a typed
-records query API, per-collection access rules, authentication (argon2id password plus
-OAuth2 with PKCE), realtime updates over WebSocket and SSE, local file storage, and an embedded
-admin UI — all in one statically-linked executable — embedded SQLite by default,
-PostgreSQL opt-in — written in **Zig 0.16**.
+**ZigBase is a backend and an embeddable Zig framework for building beyond your team
+size.** It combines application services with control over custom logic, resource use,
+and deployment. Start on embedded SQLite, extend the server in Zig, and use the opt-in
+PostgreSQL backend when your workload calls for it.
 
-It is PocketBase-*inspired* but **not** API-compatible.
+Write your application directly or work with a coding agent. Both use the same public
+APIs, examples, and local tests; no AI service is required. Read
+[Why ZigBase](./why-zigbase) for the design choices, evidence, and scaling boundaries.
 
-> ZigBase is two things at once. Out of the box it is a backend you run as a binary. But
-> it is also an **embeddable Zig framework**: import it as a library and extend the server
-> with comptime record hooks, custom HTTP routes, scheduled jobs, a comptime schema, and
-> pluggable storage/mailer backends. The framework angle is the differentiator.
+## Choose how to build
 
-## Backend-first, framework-second
+1. **Build with the framework.** Configure `zigbase.App(.{...})` with typed hooks,
+   routes, jobs, schema, migrations, and plugins. Your application includes the backend
+   and its extensions in one executable. Start with the [tutorial](./tutorial) or
+   [framework reference](./framework).
+2. **Run the stock backend.** Use its collections, REST API, clients, realtime, and
+   admin UI without writing Zig. Start with the [quick start](./quick-start).
+3. **Work with a coding agent.** Use generated project instructions and the same
+   framework or stock backend, with structured CLI feedback and local verification.
+   Start with the [agent orientation](./agents).
 
-There are two ways to use ZigBase:
-
-1. **Run the binary.** Download a release (or build from source), create a superuser,
-   point clients at the REST + WebSocket API, and manage data in the admin UI. No Zig
-   required. → [Quick start](./quick-start)
-2. **Build an app on it.** `zig fetch --save` ZigBase, `@import("zigbase")`, and configure
-   `zigbase.App(.{...})` with your hooks, routes, and jobs. Your binary *is* the ZigBase
-   server, plus your extensions. → [Framework](./framework)
+Pair either mode with [Zigapagos](./zigapagos-pairing) for a frontend served from the
+same origin, or bring your preferred frontend. ZigBase is PocketBase-inspired but is
+not API-compatible.
 
 ## Features
 
@@ -115,24 +116,37 @@ There are two ways to use ZigBase:
 - **Deterministic testing** — freeze time (`ZIGBASE_FAKE_NOW`), fix randomness
   (`ZIGBASE_FAKE_SEED`), and capture outbound mail in test suites — all gated off in
   production builds.
+- **Route and query diagnostics** — opt-in bounded method/template duration aggregates,
+  SQLite/PostgreSQL query measurements, and operator-only inspection. SQL-free handlers
+  are measured too; synchronous dispatch duration is not end-to-end request latency.
+  → [Query workbench](./framework#bounded-query-workbench-opt-in)
 - **Performance contracts** — opt-in binary-size and allocation budgets with
   versioned CI reports; timing comparisons stay advisory. → [Testing](./testing#performance-contracts)
 
+## An admin UI for direct operation
+
+Inspect records, manage collections, and configure access rules in the embedded admin
+UI at `/_/`. The dashboard complements code and CLI workflows; no agent is needed to
+explore or operate the backend.
+
+![ZigBase admin dashboard showing collections and records](../../assets/screenshots/admin-dashboard.png)
+
 ## When to use ZigBase
 
-ZigBase fits when you want a backend that ships as **one file** — embedded SQLite to
-start, the same code on **PostgreSQL** when you outgrow one box — and either (a) gives
-you a REST/realtime/auth surface with zero glue, or (b) lets you grow custom server logic
-**in Zig** without standing up a separate service. The architecture favors a small
-footprint: a warm reader-connection pool, a blocking-mutex writer, and comptime
-"footprint levers" you can tune.
+Choose ZigBase when you want integrated backend capabilities and the ability to extend
+them in compiled Zig, with inspectable resource settings and control over deployment.
+The framework supports both small initial deployments and deliberate growth through
+measurement, tuning, and an opt-in PostgreSQL backend.
 
-It is an **early release** (Apache-2.0). Read the
-[known limitations](./known-limitations) before deploying — notably that SMTP must be
-configured for email delivery in production, rate limiting ignores proxy-supplied client
-IPs unless `--trust-proxy` is set, comptime auto-migration is additive-only, and the
-scheduler is single-process, and the PostgreSQL backend is opt-in (build from source with
--Dpostgres).
+Run one SQLite writer process. Before adding application replicas, review database
+migration, shared file storage, and job coordination in the [deployment guide](./deployment).
+Compile-time schema auto-migration is additive-only; other changes need explicit migrations.
+Cron and interval jobs are per-process by default, with opt-in distributed coordination.
+
+ZigBase is an early release under Apache-2.0. Read the
+[known limitations](./known-limitations) and [engineering backlog](./roadmap) for current
+boundaries and planned work. Explicit resource controls are tools for performance
+engineering, not a promise of a fixed memory footprint or universal scale.
 
 ## Where to go next
 
