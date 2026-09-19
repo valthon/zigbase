@@ -21,6 +21,7 @@ const BuildOptionValues = struct {
     image_thumbnails: bool,
     durable_resumable_uploads: bool,
     query_workbench: bool,
+    rest_idempotency: bool,
     coordinated_admission: bool,
     fts5: bool,
     sqlite_version: []const u8,
@@ -134,6 +135,7 @@ pub fn build(b: *std.Build) void {
     const image_thumbnails = b.option(bool, "image-thumbnails", "Compile ImageMagick thumbnail integration (default: off)") orelse false;
     const durable_resumable_uploads = b.option(bool, "durable-resumable-uploads", "Compile opt-in SQLite upload persistence (requires resumable-uploads)") orelse false;
     if (durable_resumable_uploads and !resumable_uploads) @panic("durable-resumable-uploads requires resumable-uploads=true");
+    const rest_idempotency = b.option(bool, "rest-idempotency", "Compile opt-in transactional REST retry receipts") orelse false;
     const query_workbench = b.option(bool, "query-workbench", "Compile bounded SQLite/PostgreSQL query diagnostics (default: off)") orelse false;
     const coordinated_admission = b.option(bool, "coordinated-admission", "Compile shared HTTP and memory-job admission (default: off)") orelse false;
     // Opt-in vector search (#157; Postgres pgvector port #159). OFF by default: the default build
@@ -194,6 +196,7 @@ pub fn build(b: *std.Build) void {
         .image_thumbnails = image_thumbnails,
         .durable_resumable_uploads = durable_resumable_uploads,
         .query_workbench = query_workbench,
+        .rest_idempotency = rest_idempotency,
         .coordinated_admission = coordinated_admission,
         .internal_api = false,
         .vector = vector,
@@ -584,6 +587,15 @@ pub fn build(b: *std.Build) void {
     const workbench_mod = b.createModule(.{ .root_source_file = b.path("fixtures/query-workbench/main.zig"), .target = target, .optimize = optimize, .link_libc = true });
     const cancel_example = b.createModule(.{ .root_source_file = b.path("examples/golfsim/src/idempotent_cancel.zig"), .target = target, .optimize = optimize });
     cancel_example.addImport("zigbase", zigbase_mod);
+    const rest_idempotency_mod = b.createModule(.{ .root_source_file = b.path("fixtures/rest-idempotency/main.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    rest_idempotency_mod.addImport("zigbase", zigbase_mod);
+    const rest_idempotency_exe = b.addExecutable(.{ .name = "rest-idempotency-fixture", .root_module = rest_idempotency_mod });
+    b.step("rest-idempotency-fixture", "Build transactional REST receipt fixture").dependOn(&b.addInstallArtifact(rest_idempotency_exe, .{}).step);
+    const rest_contract_mod = b.createModule(.{ .root_source_file = b.path("fixtures/rest-idempotency/invalid.zig"), .target = target, .optimize = optimize });
+    rest_contract_mod.addImport("zigbase", zigbase_mod);
+    const rest_contract = b.addExecutable(.{ .name = "rest-idempotency-invalid", .root_module = rest_contract_mod });
+    rest_contract.expect_errors = .{ .contains = if (rest_idempotency) "invalid idempotency limits: namespace 1..128, entries 1..1000000, retention 1..31536000, payload/result 1..1048576, cleanup 1..1024" else ".rest_idempotency requires -Drest-idempotency=true" };
+    b.step("check-rest-idempotency-contracts", "Reject unavailable or invalid REST receipt configuration").dependOn(&rest_contract.step);
     const idempotency_mod = b.createModule(.{ .root_source_file = b.path("fixtures/idempotency/main.zig"), .target = target, .optimize = optimize, .link_libc = true });
     idempotency_mod.addImport("zigbase", zigbase_mod);
     idempotency_mod.addImport("cancel_example", cancel_example);

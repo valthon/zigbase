@@ -451,6 +451,7 @@ test {
     _ = @import("api/error.zig");
     _ = @import("api/health.zig");
     _ = @import("idempotency.zig");
+    if (@import("build_options").rest_idempotency) _ = @import("rest_idempotency.zig");
     _ = @import("api/meta.zig");
     _ = @import("api/collections.zig");
     _ = @import("api/records.zig");

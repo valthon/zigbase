@@ -149,9 +149,11 @@ product priority and acceptance evidence; it does not create duplicate implement
 - [ ] Opt-in principal/operation-scoped idempotent mutations with atomic coordination and bounded retention.
   Implemented slice: lazy comptime-configured SQLite/PostgreSQL custom-operation receipts,
   mandatory current authorization, atomic DB effects/results, bounded per-namespace
-  capacity and expiry cleanup. PostgreSQL coordinates namespaces across replicas
-  with fail-fast transaction locks. Built-in REST mutations and external
-  side-effect orchestration remain outside this helper.
+  capacity and expiry cleanup. Opt-in authenticated JSON REST create/update/delete now
+  reuse transactional receipts with explicit collection eligibility, current replay
+  authorization, schema/body binding and bounded refusal. PostgreSQL coordinates namespaces across replicas
+  with fail-fast transaction locks. Hook/file/auth collection workflows and external
+  side-effect orchestration remain outside the REST adapter.
 - [ ] Complete upstream test-runner diagnostic follow-up (#261; investigation PR #355).
   The reproduced Zig 0.16.0 symptom is a stale failed-command label after successful
   exit-time stderr, not a demonstrated race. Supported `zigbase.addTest` avoids it.

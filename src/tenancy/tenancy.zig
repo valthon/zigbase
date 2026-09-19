@@ -158,7 +158,10 @@ pub fn resolve(
     var list: std.ArrayList(request.Membership) = .empty;
     defer list.deinit(alloc); // no-op after toOwnedSlice (success); frees on an OOM error path
     var st = try conn.prepare(
-        "SELECT \"account\",\"role\" FROM \"_memberships\" WHERE \"user_collection\"=?1 AND \"user\"=?2 AND \"status\"=?3;",
+        if (db.dbDialect(conn).kind == .postgres)
+            "SELECT \"account\",\"role\" FROM \"_memberships\" WHERE \"user_collection\"=$1 AND \"user\"=$2 AND \"status\"=$3;"
+        else
+            "SELECT \"account\",\"role\" FROM \"_memberships\" WHERE \"user_collection\"=?1 AND \"user\"=?2 AND \"status\"=?3;",
     );
     defer st.finalize();
     try st.bindText(1, user_collection);
@@ -556,4 +559,44 @@ test "signAccount/verifyAccount round-trip; tamper fails closed" {
     try std.testing.expect(verifyAccount(secret, tampered) == null);
     // Malformed (no dot) -> null.
     try std.testing.expect(verifyAccount(secret, "nodothere") == null);
+}
+
+test "PostgreSQL membership resolution uses bound parameters inside a transaction" {
+    if (comptime !@import("build_options").postgres) return error.SkipZigTest;
+    const url = std.testing.environ.getPosix("ZIGBASE_PG_TEST_URL") orelse return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var conn = try db.Db.openPostgres(a, std.testing.io, url);
+    defer conn.close();
+    const token = try @import("../crypto.zig").genHex(std.testing.io, a, 24);
+    defer a.free(token);
+    const create = try std.fmt.allocPrintSentinel(a, "CREATE SCHEMA tenant_retry_{s};", .{token}, 0);
+    defer a.free(create);
+    const drop = try std.fmt.allocPrintSentinel(a, "DROP SCHEMA tenant_retry_{s} CASCADE;", .{token}, 0);
+    defer a.free(drop);
+    const path = try std.fmt.allocPrintSentinel(a, "SET search_path TO tenant_retry_{s};", .{token}, 0);
+    defer a.free(path);
+    try conn.exec(create);
+    defer conn.exec(drop) catch |err| std.log.err("tenant resolution test schema cleanup failed: {s}", .{@errorName(err)});
+    try conn.exec(path);
+    try conn.exec("CREATE TABLE _memberships (account TEXT NOT NULL, user_collection TEXT NOT NULL, \"user\" TEXT NOT NULL, role TEXT NOT NULL, status TEXT NOT NULL);");
+    try conn.exec("INSERT INTO _memberships VALUES ('account-a','users','user-a','owner','active'),('account-b','users','user-a','viewer','invited'),('account-c','other-users','user-a','owner','active');");
+    try conn.beginImmediate();
+    defer if (conn.inTransaction()) conn.rollback() catch |err| std.log.err("tenant resolution test rollback failed: {s}", .{@errorName(err)});
+    const active = try resolve(a, &conn, "users", "user-a", "account-a");
+    defer active.deinit(a);
+    try std.testing.expectEqualStrings("account-a", active.account_id);
+    try std.testing.expectEqualStrings("owner", active.account_role);
+    try std.testing.expectEqual(@as(usize, 1), active.memberships.len);
+    const invited = try resolve(a, &conn, "users", "user-a", "account-b");
+    defer invited.deinit(a);
+    try std.testing.expectEqualStrings("", invited.account_id);
+    try conn.exec("UPDATE _memberships SET status='suspended' WHERE user_collection='users';");
+    const revoked = try resolve(a, &conn, "users", "user-a", "account-a");
+    defer revoked.deinit(a);
+    try std.testing.expectEqual(@as(usize, 0), revoked.memberships.len);
+    try std.testing.expectEqualStrings("", revoked.account_id);
+    try conn.rollback();
+    const restored = try resolve(a, &conn, "users", "user-a", "account-a");
+    defer restored.deinit(a);
+    try std.testing.expectEqualStrings("account-a", restored.account_id);
 }

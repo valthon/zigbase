@@ -16,6 +16,19 @@ function decodeQuery(url: string): string {
 }
 
 describe("blog.gen fixture wiring", () => {
+  it("forwards explicit retry keys through the fixture mutation services", async () => {
+    const fetchMock = vi.fn(async (_url: string, init?: RequestInit) => {
+      expect(new Headers(init?.headers).get("Idempotency-Key")).toBe("logical-write");
+      return init?.method === "DELETE" ? new Response(null, { status: 204 }) : jsonResponse({ id: "p1" });
+    }) as unknown as typeof fetch;
+    const zb = createClient("http://api.test", { fetch: fetchMock });
+    const opts = { idempotencyKey: "logical-write" };
+    await zb.db.posts.create({ title: "Hi" }, opts);
+    await zb.db.posts.update("p1", { title: "Updated" }, opts);
+    await zb.db.posts.delete("p1", opts);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+
   it("db.posts.getList compiles where -> filter and hits the records endpoint", async () => {
     const fetchMock = vi.fn(async (url: string) => {
       expect(url).toContain("/api/collections/posts/records");

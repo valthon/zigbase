@@ -313,6 +313,29 @@ await posts.delete("REC123");
 const draft = await posts.getFirstListItem<Post>("status = 'draft'");
 ```
 
+For a server-enabled record mutation, pass an explicit `idempotencyKey` to
+`create`, `update`, or `delete` (including generated typed services):
+
+```ts
+const input = { title: "Hi", status: "draft", author: "u1" };
+const key = crypto.randomUUID(); // preserve with the input until the outcome is known
+const made = await posts.create<Post>(input, { idempotencyKey: key });
+// After an uncertain network failure, retry the same call with the same key/input.
+```
+
+The SDK sends `Idempotency-Key`; it never generates a key. Supplying the key does
+not add automatic retries for network failures or receipt conflicts. Normal SDK
+retry behavior still applies: HTTP 429 and recognized admission-overload responses
+share the configured `maxRetries` budget, and an eligible 401 may trigger session
+refresh and a retry. The same key is preserved on those attempts. This differs from
+`requestKey`, which cancels duplicate in-flight client requests. Reuse a key only for the same operation and exact serialized body,
+within the server's retention window. Authorization is checked again on replay;
+conflicts or revoked access must be handled by the application. Keyed mutations require
+the server's explicit collection opt-in and supported JSON-only operation contract;
+files, auth records, and side-effect hooks are not covered. See
+[REST record idempotency](framework.md#rest-record-idempotency) for configuration and
+replay restrictions.
+
 > Without a type parameter, `posts.getOne("REC123")` returns a `ZbRecord` whose fields are
 > `unknown`. That is the right shape for generic tooling, but to read `.title` you must supply
 > `<Post>` (as above) or cast — TypeScript will reject a bare field access on `unknown`.

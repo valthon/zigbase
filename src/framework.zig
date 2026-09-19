@@ -526,7 +526,7 @@ pub fn App(comptime cfg: anytype) type {
             @setEvalBranchQuota(20_000);
             // Guard top-level cfg keys so a typo (e.g. `.hook`, `.on_error`) fails
             // loudly at comptime instead of silently producing an empty Dispatch.
-            const allowed = .{ "query_workbench", "admission", "resource_profile", "hooks", "onError", "routes", "onAuth", "beforeAuthSuccess", "auth", "onFileServe", "onFileUpload", "onBootstrap", "onBeforeServe", "onBeforeTerminate", "cron", "jobs", "storage", "mailer", "reporter", "reporter_dedup", "pools", "collections", "migrations", "static_files", "pagination", "enable_typegen", "flags", "experiments", "features", "onFeatureExposure", "experiment_assignment_ttl", "queues", "workers", "realtime", "tenancy", "abilities", "mail", "analytics", "static_routes", "enable_spa_marker", "static_cache_control", "admin", "webhooks", "ttl_gc_interval", "files", "push", "sms", "sms_provider", "collections_frozen", "app_context" };
+            const allowed = .{ "rest_idempotency", "query_workbench", "admission", "resource_profile", "hooks", "onError", "routes", "onAuth", "beforeAuthSuccess", "auth", "onFileServe", "onFileUpload", "onBootstrap", "onBeforeServe", "onBeforeTerminate", "cron", "jobs", "storage", "mailer", "reporter", "reporter_dedup", "pools", "collections", "migrations", "static_files", "pagination", "enable_typegen", "flags", "experiments", "features", "onFeatureExposure", "experiment_assignment_ttl", "queues", "workers", "realtime", "tenancy", "abilities", "mail", "analytics", "static_routes", "enable_spa_marker", "static_cache_control", "admin", "webhooks", "ttl_gc_interval", "files", "push", "sms", "sms_provider", "collections_frozen", "app_context" };
             const allowed_list = blk2: {
                 var s: []const u8 = "";
                 for (allowed, 0..) |name, i| s = s ++ (if (i == 0) "" else "/") ++ name;
@@ -1750,6 +1750,7 @@ pub fn App(comptime cfg: anytype) type {
             .gates = route_gates,
             .admission_config = admission_config,
             .realtime_max_connections = realtime_max_connections,
+            .rest_idempotency = @import("rest_idempotency.zig").resolve(cfg),
             .query_workbench = @import("query_workbench.zig").resolve(cfg),
         };
 
@@ -1891,6 +1892,7 @@ fn analyticsRollupRun(ctx: *ctx_mod.Ctx, ev: *events.JobEvent) anyerror!void {
 /// mailer plugin TYPES to instantiate, the assembled auth method type list,
 /// and the warm-reader-pool cap.
 pub const ServeOpts = struct {
+    rest_idempotency: if (build_options.rest_idempotency) ?*const fn (*@import("http.zig").RequestCtx) anyerror!@import("http.zig").Response else void = if (build_options.rest_idempotency) null else {},
     query_workbench: @import("query_workbench.zig").Limits = .{},
     admission_config: ?@import("admission.zig").Config = null,
     realtime_max_connections: u32 = @import("realtime/connection.zig").MAX_CONNECTIONS,
@@ -5173,6 +5175,7 @@ fn bootApp(
     }
     holder.app = app_mod.App{
         .thumbnail_cache_epoch = thumbnail_cache_epoch,
+        .rest_idempotency = opts.rest_idempotency,
         .query_workbench = if (comptime build_options.query_workbench) holder.query_workbench else {},
         .admission = if (comptime opts.admission_config != null) &holder.admission_state else null,
         .backfill = if (comptime build_options.realtime_backfill) holder.backfill_store else {},

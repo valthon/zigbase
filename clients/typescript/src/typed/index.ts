@@ -40,6 +40,7 @@ export type {
   RawTypedService,
   TypedListOptions,
   TypedReadOptions,
+  TypedMutationOptions,
   TypedPageOptions,
 } from "./service.js";
 export { makeTypedRealtime } from "./realtime.js";

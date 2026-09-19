@@ -186,14 +186,14 @@ export interface PostsService {
   }): Promise<Post[]>;
   create<K extends PostExpand = never>(
     data: PostCreate,
-    opts?: { expand?: K[]; fields?: string; signal?: AbortSignal; requestKey?: string },
+    opts?: { expand?: K[]; fields?: string; signal?: AbortSignal; requestKey?: string; idempotencyKey?: string },
   ): Promise<WithExpand<Post, PostRelations, K>>;
   update<K extends PostExpand = never>(
     id: string,
     data: PostUpdate,
-    opts?: { expand?: K[]; fields?: string; signal?: AbortSignal; requestKey?: string },
+    opts?: { expand?: K[]; fields?: string; signal?: AbortSignal; requestKey?: string; idempotencyKey?: string },
   ): Promise<WithExpand<Post, PostRelations, K>>;
-  delete(id: string): Promise<void>;
+  delete(id: string, opts?: { signal?: AbortSignal; requestKey?: string; idempotencyKey?: string }): Promise<void>;
   filter(fn: (f: PostFields) => Expr): string;
 }
 
@@ -240,14 +240,14 @@ export interface UsersService {
   }): Promise<User[]>;
   create(
     data: UserCreate,
-    opts?: { fields?: string; signal?: AbortSignal; requestKey?: string },
+    opts?: { fields?: string; signal?: AbortSignal; requestKey?: string; idempotencyKey?: string },
   ): Promise<User>;
   update(
     id: string,
     data: UserUpdate,
-    opts?: { fields?: string; signal?: AbortSignal; requestKey?: string },
+    opts?: { fields?: string; signal?: AbortSignal; requestKey?: string; idempotencyKey?: string },
   ): Promise<User>;
-  delete(id: string): Promise<void>;
+  delete(id: string, opts?: { signal?: AbortSignal; requestKey?: string; idempotencyKey?: string }): Promise<void>;
   filter(fn: (f: UserFields) => Expr): string;
   authWithPassword(
     identity: string,
@@ -277,14 +277,14 @@ export interface TagsService {
   getFullList(opts?: { where?: TagWhere; sort?: string }): Promise<Tag[]>;
   create(
     data: TagCreate,
-    opts?: { fields?: string; signal?: AbortSignal; requestKey?: string },
+    opts?: { fields?: string; signal?: AbortSignal; requestKey?: string; idempotencyKey?: string },
   ): Promise<Tag>;
   update(
     id: string,
     data: TagUpdate,
-    opts?: { fields?: string; signal?: AbortSignal; requestKey?: string },
+    opts?: { fields?: string; signal?: AbortSignal; requestKey?: string; idempotencyKey?: string },
   ): Promise<Tag>;
-  delete(id: string): Promise<void>;
+  delete(id: string, opts?: { signal?: AbortSignal; requestKey?: string; idempotencyKey?: string }): Promise<void>;
   filter(fn: (f: TagFields) => Expr): string;
 }
 

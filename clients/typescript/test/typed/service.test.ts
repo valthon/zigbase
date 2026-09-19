@@ -99,7 +99,7 @@ describe("makeRecordService", () => {
     await svc.delete("p1");
     expect(inner.create).toHaveBeenCalledWith({ title: "Hi" }, expect.objectContaining({}));
     expect(inner.update).toHaveBeenCalledWith("p1", { title: "Yo" }, expect.objectContaining({}));
-    expect(inner.delete).toHaveBeenCalledWith("p1");
+    expect(inner.delete).toHaveBeenCalledWith("p1", undefined);
   });
 
   it("create forwards expand string[] as a comma-joined string to inner.create", async () => {
@@ -470,4 +470,16 @@ describe("makeRecordService", () => {
     expect((collected[0] as Record<string, unknown>).count).toBe(55);
     expect((collected[1] as Record<string, unknown>).count).toBe(66);
   });
+});
+
+
+it("typed mutations preserve explicit retry keys", async () => {
+  const { client, inner } = mockClient();
+  const service = makeRecordService(client, postsMeta);
+  await service.create({ title: "new" }, { idempotencyKey: "create-key" });
+  await service.update("p1", { title: "edited" }, { idempotencyKey: "update-key" });
+  await service.delete("p1", { idempotencyKey: "delete-key" });
+  expect(inner.create).toHaveBeenCalledWith({ title: "new" }, expect.objectContaining({ idempotencyKey: "create-key" }));
+  expect(inner.update).toHaveBeenCalledWith("p1", { title: "edited" }, expect.objectContaining({ idempotencyKey: "update-key" }));
+  expect(inner.delete).toHaveBeenCalledWith("p1", { idempotencyKey: "delete-key" });
 });

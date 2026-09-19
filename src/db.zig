@@ -146,6 +146,11 @@ pub const Db = if (build_options.postgres) union(Backend) {
             inline else => |*d| return d.inTransaction(),
         }
     }
+    pub fn isHealthy(self: *const Db) bool {
+        return switch (self.*) {
+            inline else => |*d| d.isHealthy(),
+        };
+    }
     pub fn changesCount(self: *Db) i64 {
         switch (self.*) {
             inline else => |*d| return d.changesCount(),
@@ -308,6 +313,17 @@ pub const Pool = if (build_options.postgres) struct {
                 self.writer_acquires += 1;
                 self.writer_view = @unionInit(Db, @tagName(tag), inner.*);
                 return &self.writer_view;
+            },
+        }
+    }
+    /// Recover while still holding the writer mutex, after finalizing statements.
+    /// Refresh the borrowed union view even on failure so quarantine cannot be
+    /// lost between the seam's value copy and the backend-owned writer.
+    pub fn recoverWriter(self: *Pool) DbError!void {
+        switch (self.impl) {
+            inline else => |*p, tag| {
+                defer self.writer_view = @unionInit(Db, @tagName(tag), p.writer);
+                try p.recoverWriter();
             },
         }
     }
@@ -566,4 +582,141 @@ test "I-1: chooseBackend never silently misdirects a postgres:// URL to SQLite" 
     } else {
         try std.testing.expectEqual(BackendChoice.postgres_url_without_build, pg_choice);
     }
+}
+
+test "writer recovery rolls back a failed commit and preserves connection state" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(dir);
+    const path = try std.fmt.allocPrintSentinel(a, "{s}/recovery.db", .{dir}, 0);
+    defer a.free(path);
+    var pool = try Pool.init(a, std.testing.io, path);
+    defer pool.deinit();
+    {
+        const writer = pool.acquireWriter();
+        defer pool.releaseWriter();
+        try writer.exec("CREATE TABLE parent(id INTEGER PRIMARY KEY); CREATE TABLE child(id INTEGER REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED); CREATE TEMP TABLE session_state(value); INSERT INTO session_state VALUES(7);");
+        try writer.begin();
+        try writer.exec("INSERT INTO child VALUES(99);");
+        try std.testing.expectError(error.ExecFailed, writer.commit());
+        try std.testing.expect(writer.inTransaction());
+        try pool.recoverWriter();
+        try std.testing.expect(!writer.inTransaction());
+        try std.testing.expect(writer.isHealthy());
+    }
+    const writer = pool.acquireWriter();
+    defer pool.releaseWriter();
+    var check = try writer.prepare("SELECT (SELECT COUNT(*) FROM child), (SELECT value FROM session_state);");
+    defer check.finalize();
+    try std.testing.expect(try check.step());
+    try std.testing.expectEqual(@as(i64, 0), check.columnInt(0));
+    try std.testing.expectEqual(@as(i64, 7), check.columnInt(1));
+}
+
+test "writer recovery quarantines a ledger rollback failure across seam views and acquisitions" {
+    const c = @import("c.zig").c;
+    const DenyRollback = struct {
+        fn authorize(_: ?*anyopaque, action: c_int, first: [*c]const u8, _: [*c]const u8, _: [*c]const u8, _: [*c]const u8) callconv(.c) c_int {
+            if (action == c.SQLITE_TRANSACTION and first != null and std.mem.eql(u8, std.mem.span(first), "ROLLBACK")) return c.SQLITE_DENY;
+            return c.SQLITE_OK;
+        }
+        fn allow(_: *Db, _: *anyopaque) !void {}
+        fn mutate(conn: *Db, _: *anyopaque, _: []u8) !usize {
+            try conn.exec("INSERT INTO retained VALUES(8);");
+            const inner = if (comptime build_options.postgres) &conn.sqlite else conn;
+            try std.testing.expectEqual(c.SQLITE_OK, c.sqlite3_set_authorizer(inner.handle, authorize, null));
+            return error.IntentionalMutationFailure;
+        }
+    };
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(dir);
+    const path = try std.fmt.allocPrintSentinel(a, "{s}/poison.db", .{dir}, 0);
+    defer a.free(path);
+    var pool = try Pool.init(a, std.testing.io, path);
+    defer pool.deinit();
+    {
+        const writer = pool.acquireWriter();
+        defer pool.releaseWriter();
+        try writer.exec("CREATE TABLE retained(value); INSERT INTO retained VALUES(7);");
+        const inner = if (comptime build_options.postgres) &writer.sqlite else writer;
+        defer _ = c.sqlite3_set_authorizer(inner.handle, null, null);
+        const Ledger = @import("idempotency.zig").Idempotency(.{ .namespace = "pool-health" });
+        var context: u8 = 0;
+        try std.testing.expectError(error.IntentionalMutationFailure, Ledger.execute(a, writer, .{
+            .principal = .{ .collection = "users", .record = "u1" },
+            .operation = "write",
+            .key = "retry",
+            .payload = "payload",
+            .now = 100,
+        }, .{ .context = &context, .authorize = DenyRollback.allow, .mutate = DenyRollback.mutate }));
+        try std.testing.expect(writer.inTransaction());
+        try std.testing.expectError(error.WriterUnavailable, pool.recoverWriter());
+        try std.testing.expect(!writer.isHealthy());
+        try std.testing.expectError(error.WriterUnavailable, writer.exec("COMMIT;"));
+    }
+    const writer = pool.acquireWriter();
+    defer pool.releaseWriter();
+    try std.testing.expect(!writer.isHealthy());
+    try std.testing.expectError(error.WriterUnavailable, writer.prepare("SELECT * FROM retained;"));
+    try std.testing.expectError(error.WriterUnavailable, pool.recoverWriter());
+    // The old transaction has not been committed, and committed data survives.
+    var reader = try pool.acquireReader();
+    defer pool.releaseReader(&reader);
+    var check = try reader.prepare("SELECT COUNT(*) FROM retained;");
+    defer check.finalize();
+    try std.testing.expect(try check.step());
+    try std.testing.expectEqual(@as(i64, 1), check.columnInt(0));
+}
+
+test "PostgreSQL writer recovery refuses a terminated transaction without resetting its session" {
+    if (comptime !build_options.postgres) return error.SkipZigTest;
+    const url = std.testing.environ.getPosix("ZIGBASE_PG_TEST_URL") orelse return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const target = try a.dupeZ(u8, url);
+    defer a.free(target);
+    var pool = try Pool.init(a, std.testing.io, target);
+    defer pool.deinit();
+    {
+        const writer = pool.acquireWriter();
+        defer pool.releaseWriter();
+        try writer.exec("CREATE TEMP TABLE recovery_state(value INTEGER); INSERT INTO recovery_state VALUES(7);");
+        try writer.begin();
+        try std.testing.expectError(error.ExecFailed, writer.exec("SELECT 1/0;"));
+        try std.testing.expect(!writer.isHealthy());
+        try pool.recoverWriter();
+        try std.testing.expect(writer.isHealthy());
+        try std.testing.expect(!writer.inTransaction());
+        var state_check = try writer.prepare("SELECT value FROM recovery_state;");
+        {
+            defer state_check.finalize();
+            try std.testing.expect(try state_check.step());
+            try std.testing.expectEqual(@as(i64, 7), state_check.columnInt(0));
+        }
+        var pid_query = try writer.prepare("SELECT pg_backend_pid();");
+        const pid = blk: {
+            defer pid_query.finalize();
+            try std.testing.expect(try pid_query.step());
+            break :blk pid_query.columnInt(0);
+        };
+        try writer.begin();
+        var killer = try Db.openPostgres(a, std.testing.io, url);
+        defer killer.close();
+        var kill = try killer.prepare("SELECT pg_terminate_backend($1::integer);");
+        defer kill.finalize();
+        try kill.bindInt(1, pid);
+        try std.testing.expect(try kill.step());
+        try std.testing.expectError(error.ExecFailed, writer.commit());
+        try std.testing.expectError(error.WriterUnavailable, pool.recoverWriter());
+        try std.testing.expect(!writer.isHealthy());
+    }
+    const writer = pool.acquireWriter();
+    defer pool.releaseWriter();
+    try std.testing.expectError(error.WriterUnavailable, writer.exec("SELECT 1;"));
+    try std.testing.expectError(error.WriterUnavailable, writer.prepare("SELECT 1;"));
+    try std.testing.expectError(error.WriterUnavailable, pool.recoverWriter());
 }

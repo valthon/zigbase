@@ -48,6 +48,8 @@ pub const Callbacks = struct {
     /// Read-only, current authorization on the supplied writer, also on replay.
     authorize: *const fn (*db.Db, *anyopaque) anyerror!void,
     mutate: *const fn (*db.Db, *anyopaque, []u8) anyerror!usize,
+    /// Optional current authorization of a stored result, inside the transaction.
+    authorize_replay: ?*const fn (*db.Db, *anyopaque, []const u8) anyerror!void = null,
 };
 
 pub fn Idempotency(comptime limits: Limits) type {
@@ -116,6 +118,7 @@ pub fn Idempotency(comptime limits: Limits) type {
                         _ = try std.fmt.hexToBytes(owned, body);
                     } else @memcpy(owned, body);
                     previous.reset();
+                    if (callbacks.authorize_replay) |authorize| try authorize(conn, callbacks.context, owned);
                     try conn.commit();
                     return .{ .storage = owned, .len = owned.len, .replayed = true };
                 }
@@ -790,4 +793,29 @@ test "independent SQLite writers cannot execute a concurrent duplicate" {
     defer retry.deinit(a);
     try std.testing.expect(retry.replayed);
     try std.testing.expectEqual(@as(i64, 1), try counter(&second));
+}
+
+test "stored-result authorization failure rolls back and frees replay copy" {
+    const a = std.testing.allocator;
+    const I = Idempotency(.{ .namespace = "replay-auth" });
+    var conn = try db.Db.openMemory();
+    defer conn.close();
+    try conn.exec("CREATE TABLE counter(n INTEGER); INSERT INTO counter VALUES(0);");
+    var op: TestOperation = .{};
+    (try I.execute(a, &conn, test_input, op.callbacks())).deinit(a);
+    const Deny = struct {
+        fn authorize(cn: *db.Db, _: *anyopaque, result: []const u8) !void {
+            try std.testing.expect(cn.inTransaction());
+            try std.testing.expectEqualStrings("o\x00k", result);
+            return error.Forbidden;
+        }
+    };
+    var callbacks = op.callbacks();
+    callbacks.authorize_replay = Deny.authorize;
+    try std.testing.expectError(error.Forbidden, I.execute(a, &conn, test_input, callbacks));
+    try std.testing.expect(!conn.inTransaction());
+    try std.testing.expectEqual(@as(i64, 1), try counter(&conn));
+    const replay = try I.execute(a, &conn, test_input, op.callbacks());
+    defer replay.deinit(a);
+    try std.testing.expect(replay.replayed);
 }

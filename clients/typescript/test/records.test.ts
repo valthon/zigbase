@@ -112,3 +112,26 @@ describe("record CRUD", () => {
     await expect(zb.collection("posts").delete("x1")).resolves.toBeUndefined();
   });
 });
+
+
+describe("explicit mutation retry keys", () => {
+  it("forwards explicit retry keys without generating keys or automatically retrying", async () => {
+    const seen: { method: string; key: string | null; body: unknown }[] = [];
+    let fail = true;
+    const fetchMock = vi.fn(async (_url: string, init: RequestInit) => {
+      seen.push({ method: init.method!, key: new Headers(init.headers).get("Idempotency-Key"), body: init.body });
+      if (fail) { fail = false; throw new TypeError("connection lost"); }
+      return init.method === "DELETE" ? new Response(null, { status: 204 }) : jsonResponse({ id: "new" });
+    }) as unknown as typeof fetch;
+    const posts = createClient("http://api.test", { fetch: fetchMock }).collection("posts");
+    const body = { title: "same mutation" };
+    await expect(posts.create(body, { idempotencyKey: "create-1" })).rejects.toThrow();
+    expect(seen).toHaveLength(1);
+    await posts.create(body, { idempotencyKey: "create-1" });
+    expect(seen[1]).toEqual(seen[0]);
+    await posts.update("new", body, { idempotencyKey: "update-1" });
+    await posts.delete("new", { idempotencyKey: "delete-1" });
+    await posts.create(body);
+    expect(seen.map(r => r.key)).toEqual(["create-1", "create-1", "update-1", "delete-1", null]);
+  });
+});
