@@ -6263,7 +6263,9 @@ anything). That matters for two reasons:
 For default-runner output, check both the command exit status and final build
 summary. Never dismiss a nonzero exit or signal as the newline diagnostic. See
 [testing](testing.md#the-build-wiring-copy-this) for the reproducible runner checks
-and [#261](https://github.com/valthon/zigbase/issues/261) for the investigation.
+and [#261](https://github.com/valthon/zigbase/issues/261) for the investigation. The
+[standalone reproduction and candidate upstream patch](../diagnostics/issue-261/README.md)
+are contributor diagnostics; keep using `zigbase.addTest` in consumer apps.
 
 ## Compile-time build flags
 

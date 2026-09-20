@@ -1,0 +1,17 @@
+--- a/std/Build/Step/Run.zig
++++ b/std/Build/Step/Run.zig
+@@ -1745,6 +1745,14 @@
+                 // Report an error if the child terminated uncleanly or if we were still trying to run more tests.
+                 run.step.result_stderr = stderr_owned;
+                 const tests_done = test_metadata != null and test_metadata.?.next_index == std.math.maxInt(u32);
++                if (tests_done and termMatches(.{ .exited = 0 }, term) and test_results.isSuccess()) {
++                    // Only a successful run can discard its stale failed-command label.
++                    // In particular, a destructor may signal after the last test passed.
++                    if (std.mem.trim(u8, stderr_owned, &std.ascii.whitespace).len == 0)
++                        run.step.result_stderr = "";
++                    if (run.step.result_failed_command) |command| options.gpa.free(command);
++                    run.step.result_failed_command = null;
++                }
+                 if (!tests_done or !termMatches(.{ .exited = 0 }, term)) {
+                     // The individual unit test results are irrelevant: the test runner itself broke!
+                     // Fail immediately without populating `s.test_results`.

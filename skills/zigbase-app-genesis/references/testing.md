@@ -342,7 +342,10 @@ can reproduce the distinction and verify real failure handling with
 `mise exec zig@0.16.0 python@3.13 -- python tests/test_runner/verify.py`. The
 [regression fixture](https://github.com/valthon/zigbase/blob/main/tests/test_runner/README.md) checks the installed compiler
 and the shipped runner without patching either. Upstream diagnosis remains tracked
-in [#261](https://github.com/valthon/zigbase/issues/261).
+in [#261](https://github.com/valthon/zigbase/issues/261). The
+[standalone Zig+C reproduction](https://github.com/valthon/zigbase/blob/main/diagnostics/issue-261/README.md) also verifies
+a candidate upstream diagnostic patch against a private compiler-library copy;
+it does not modify the installed compiler.
 
 ```zig
 const std = @import("std");

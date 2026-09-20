@@ -1,0 +1,26 @@
+diff --git a/std/Build/Step/Run.zig b/std/Build/Step/Run.zig
+--- a/std/Build/Step/Run.zig
++++ b/std/Build/Step/Run.zig
+@@ -1681 +1681 @@
+-        switch (try waitZigTest(
++        const issue261_wait_result = try waitZigTest(
+@@ -1688 +1688,2 @@
+-        )) {
++        );
++        switch (issue261_wait_result) {
+@@ -1714,0 +1716,5 @@
++                std.debug.print("ISSUE261 waitZigTest=no_poll active_test_index={?d} stdout_buffered={d} stderr_buffered={d}\n", .{
++                    no_poll.active_test_index,
++                    multi_reader.reader(0).buffered().len,
++                    multi_reader.reader(1).buffered().len,
++                });
+@@ -1725,0 +1732 @@
++                std.debug.print("ISSUE261 child.wait term={f}\n", .{fmtTerm(term)});
+@@ -1988,0 +1996,5 @@
++                std.debug.print("ISSUE261 received test_results index={d} status={s}; requesting exit/next test\n", .{
++                    tr_hdr.index,
++                    @tagName(tr_hdr.flags.status),
++                });
++
+@@ -2557,0 +2570 @@
++        std.debug.print("ISSUE261 requestNextTest: all tests done; sending exit\n", .{});
