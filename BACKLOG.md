@@ -28,11 +28,13 @@ implementation. [Why ZigBase](docs/why-zigbase.md) connects this work to the pro
   build flags, load generator, warmup, duration, errors, throughput, p50/p95/p99 latency,
   process RSS, CPU, and disk use. Report saturation and recovery, not only a peak RPS.
   Include a reproducible small-machine baseline before broader enterprise-scale claims.
-  First chapter implemented: a [bounded project/task runner](docs/testing.md#application-capacity)
-  exercises authenticated native-tenant lists, writes, and relation expansion with
-  semantic/isolation checks, client latency distributions, process RSS/CPU, and binary/resource
-  provenance. CI runs its correctness smoke without timing gates. Realtime/background
-  work, saturation/recovery, and the reproducible small-machine baseline remain open.
+  Implemented: a [bounded mixed project/task runner](docs/testing.md#application-capacity)
+  exercises authenticated native-tenant lists, writes, relation expansion, live SSE
+  delivery, and transactional durable digest jobs. Normal-load, stress, and recovery
+  phases retain semantic/isolation checks, client latency distributions, job drain,
+  process RSS/CPU, and binary/resource provenance. CI runs correctness checks without
+  timing gates. Offered load alone is not evidence of saturation; a controlled
+  small-machine saturation/recovery report and external-service jobs remain open.
 - [ ] **Coordinated resource envelope.** Extend existing HTTP/memory-job admission and
   retained-payload byte limits to the uncovered resource paths below. Demonstrate bounded queues and
   predictable degradation under mixed overload; report which subsystem saturated and
@@ -43,6 +45,9 @@ implementation. [Why ZigBase](docs/why-zigbase.md) connects this work to the pro
   result with `resources`, `tune`, and performance contracts. Preserve raw observations
   and label measured results separately from recommendations. Complete when a developer
   can reproduce the decision without AI and an agent can follow the same procedure.
+  First worked example: [durable batch sizing](diagnostics/application-capacity/batch-sizing/README.md)
+  preserves paired mixed-workload reports and explains observed polling/drain latency.
+  Dedicated-machine performance qualification and advisor/contract integration remain open.
 
 ### P1 — Make custom applications productive in both workflows
 
@@ -113,6 +118,12 @@ product priority and acceptance evidence; it does not create duplicate implement
   cross-subsystem coordination are still outside these gates.
   Memory-job/submit workers now have independent comptime counts and share the
   configured job stack size, with lazy startup and unchanged bounded-ring rejection.
+- [ ] **Durable worker wakeup and batch policy.** The mixed-capacity experiment
+  exposed polling delay with small serial claim batches. Evaluate bounded wakeups
+  or adaptive batching against mixed HTTP/job workloads, including fairness,
+  retained claim memory, idle cost, and cross-instance coordination. Preserve the
+  current explicit batch semantics; do not infer parallelism from its legacy
+  `concurrency` name or optimize solely for maximum queue throughput.
 - [ ] Agent-native development interface: versioned discovery, structured diagnostics,
   schema/route inspection, migration previews, and focused test execution.
   Implemented slices: CLI discovery with explicit operation side effects (#409),
@@ -138,13 +149,20 @@ product priority and acceptance evidence; it does not create duplicate implement
   and bearer-superuser-only generated SELECT-plan inspection. Completed-statement
   lifecycle timing separates measured calls from held intervals. A separate bounded
   method/template table now reports completed synchronous dispatch counts, total/max
-  duration and slow scopes, including SQL-free/error/denied handlers. It does not
-  classify status or measure transport, detached jobs, or exclusive pool-wait time.
+  duration and slow scopes, including SQL-free/error/denied handlers. HTTP outcome
+  classes and handler errors now distinguish returned statuses from escaped errors.
+  Four fixed backend/role buckets measure pool mutex acquisition; declared durable
+  and scheduled job attempts share bounded scope storage with separate attribution.
+  The capacity runner can retain cumulative workbench snapshots outside timed load.
+  Transport, connection creation, queue residence, memory jobs and app.submit remain
+  outside these measurements.
   PostgreSQL now
   measures bounded client-side prepared exchanges with backend-aware attribution;
-  PostgreSQL plans, full request/pool-wait latency, captured plans and automatic
+  PostgreSQL plans, full request/connection-acquisition latency, captured plans and automatic
   index advice remain deferred.
-- [ ] Dependency-aware bounded response caching, starting with explicitly eligible public reads.
+- [ ] **Deferred:** dependency-aware bounded response caching. PR #425 was evaluated
+  and did not justify further investment. Revisit only if representative application
+  measurements establish a concrete need; no additional cache work is planned now.
 - [x] Opt-in application performance contracts: binary-size/allocation gates and advisory timing comparisons (#414).
 - [ ] Opt-in principal/operation-scoped idempotent mutations with atomic coordination and bounded retention.
   Implemented slice: lazy comptime-configured SQLite/PostgreSQL custom-operation receipts,

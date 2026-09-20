@@ -5270,7 +5270,8 @@ no admission lock.
 #### Bounded query workbench (opt-in)
 
 Build with `-Dquery-workbench=true` to measure synchronous SQLite and PostgreSQL prepared
-statements inside matched built-in and consumer HTTP route handlers. The default
+statements inside matched built-in and consumer HTTP route handlers and declared
+durable/scheduled job handlers. The default
 build compiles out measurement calls, statement fields, thread-local attribution,
 counter storage and inspector routes. This is a diagnostic build cost, not an
 always-on logging feature. Enabled instrumentation has timestamp, fingerprinting
@@ -5284,7 +5285,8 @@ pub const App = zigbase.App(.{
 
 These are also the standalone defaults when the build flag is on. Configuration
 is comptime: 1–256 entries and a positive `slow_ms`; unknown keys fail compilation.
-Each entry aggregates one backend + method + **route template** + structural query shape.
+Each entry aggregates attribution kind + backend + method + **route template**
+(or declared job name) + structural query shape.
 Only the first configured number of distinct entries is retained until restart;
 new keys are dropped (counted), never allowed to grow a map. Templates longer
 than 192 bytes and unsupported or greater-than-16-KiB statements are omitted.
@@ -5308,10 +5310,12 @@ secrets in route definitions. Reports are operator-only, not tenant-scoped.
 
 `GET /api/query-workbench/stats` requires a current **superuser bearer token**.
 Cookies alone do not authorize it. It returns bounded `{items}` plus limits,
-backend scope, threshold and dropped-execution count. Each item has `backend`,
+backend scope, threshold and dropped-execution count. Each item has `attribution` (`http`, `scheduled_job`, or `durable_job`), `backend`,
 `measurement`, `method`,
 `routeTemplate`, opaque hexadecimal `shape`, `executions`, `stepNanoseconds`,
 `maxStepNanoseconds`, `slowExecutions`, `repeatedShapes`, and `failedExecutions`.
+For job SQL items, `method` is `JOB`, `routeTemplate` is null, and `jobName`
+holds the declared job name.
 Timing is the sum of SQLite `step()` call durations per execution, including
 SQLite busy wait, but **excluding preparation, binding, pool wait, row decoding,
 application processing and response transmission**. Completion, error, reset or
@@ -5336,11 +5340,15 @@ The additive `routes` array measures **completed synchronous matched-dispatch
 scopes**, including routes that execute no SQL. Each method/template aggregate has
 `completedScopes`, `totalNanoseconds`, `maxNanoseconds`, and `slowScopes` (elapsed
 at least `slowMilliseconds`). `routeMeasurement` is `matched-handler-scope`.
-`maxRouteEntries` equals the configured `max_entries`, but the route table and
-`droppedRouteScopes` counter are independent of the query-shape table. Each table
+`maxScopeEntries` equals the configured `max_entries`: HTTP routes and jobs share
+this scope table, independently of the query-shape table. `maxRouteEntries` remains
+an upper bound on HTTP routes, not a separate reservation. `droppedRouteScopes`
+and `droppedJobScopes` count omitted HTTP and job completions separately. Each table
 retains its first keys until restart; a full table still updates known keys.
 Route labels over 192 bytes are omitted. Storage adds at most `max_entries`
-fixed-size route aggregates; capture allocates nothing per completed scope.
+fixed-size scope aggregates, including six status counters, one error counter, and
+four three-counter pool-wait buckets per entry; capture allocates nothing per
+completed scope. HTTP and job SQL shapes also share the existing query-entry cap.
 
 The awake-clock interval starts after route matching and ends as synchronous
 dispatch unwinds, before taking the aggregation lock. It includes in-scope auth,
@@ -5348,14 +5356,38 @@ guards, pool waits, handler processing, and deferred cleanup. Consumer dispatch
 also includes its own error conversion; built-in dispatch ends before the outer
 server error backstop. It excludes parsing/routing and admission before dispatch,
 response transmission, streaming connection lifetime, and detached background work.
-Failed or denied matched handlers count, but status/error classification is not
-recorded. Inspector scopes read no timing clock and do not enter either table.
+Failed or denied matched handlers count. `responseStatusClasses` classifies returned
+responses as `informational`, `success`, `redirection`, `clientError`, `serverError`,
+or `other`. `handlerErrors` counts errors escaping the measured handler separately:
+it does not assume the status an outer error handler will eventually send. A consumer
+handler error mapped to a response inside dispatch increments both the error counter
+and the actual returned status class. Inspector
+scopes read no timing clock and do not enter either table.
 
 This is elapsed time, not CPU time or end-to-end request latency. Two additional
 clock reads and a bounded locked update occur per measured scope. Nested scopes
 are inclusive; do not subtract aggregated query/lifecycle totals to infer exclusive
 application time, and do not add route totals to obtain process busy time. Concurrent
 requests overlap. Active/incomplete scopes are absent until they finish.
+
+Each completed scope also reports four fixed `poolWaits` buckets: SQLite/PostgreSQL
+reader/writer mutex acquisition counts, total nanoseconds, and maximum nanoseconds.
+`poolWaitMeasurement` is `pool-mutex-acquisition`. The timer brackets acquiring the
+pool mutex (including a reader free-list spin lock), not the whole connection
+acquisition operation. Connection creation, PostgreSQL handshake, database locks,
+SQL execution, and time holding a connection are excluded. Uncontended lock calls
+also count; a nonzero duration alone does not prove contention. No pool/store pointer
+is retained on a returned connection, and out-of-scope acquisitions are unmeasured.
+
+The `jobs` array reports declared durable and scheduled handler attempts, including
+SQL-free handlers, under `jobMeasurement: "handler-attempt-scope"`. Each aggregate
+identifies `attribution` (`scheduled_job` or `durable_job`) and `jobName`. An attempt's
+`handlerErrors` does not mean the logical job exhausted its retries. Handler duration
+excludes queue residence, scheduler delay, claim/acknowledgment bookkeeping, and retry
+backoff. Compiled handler names are metadata visible to operators; payloads, tenant
+IDs, and dynamic submitted names are never retained. Memory-queue handlers and
+`app.submit` are not measured in this chapter. Inline memory execution masks the
+calling HTTP scope so its SQL cannot be mistaken for the request's SQL.
 
 Completed statements also report a separate lifecycle family:
 
@@ -5424,7 +5456,7 @@ boundary applies before any planning. Inspect only trusted local/staging data
 when exposing schema names would be sensitive.
 
 PostgreSQL plan inspection still returns `501`; only SQLite supports plans.
-The raw `exec()` paths, background jobs, async work, WebSocket/SSE delivery,
+The raw `exec()` paths, memory jobs, `app.submit`, async work, WebSocket/SSE delivery,
 unmatched/static routes and remapped feature-state dispatch are not covered.
 Nested synchronous dispatch restores outer attribution; cross-thread/cross-scope
 statement retention does not transfer attribution. This first slice is not a

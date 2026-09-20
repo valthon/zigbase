@@ -40,8 +40,21 @@ def admin(base):
     assert code == 200, body
     return body["token"]
 
+def workbench_admin(base):
+    token = admin(base)
+    # The fixture has a single boot-time scheduled handler. Wait for its scope to
+    # close before asserting exact snapshots in the tests below.
+    import time
+    deadline = time.monotonic() + 5
+    while True:
+        report = call(base, "GET", "/api/query-workbench/stats", token=token)[1]
+        if any(row["jobName"] == "workbench-once" for row in report["jobs"]):
+            return token
+        assert time.monotonic() < deadline, report
+        time.sleep(0.02)
+
 def test_bounded_private_route_template_attribution_and_concurrency(server):
-    token = admin(server)
+    token = workbench_admin(server)
     with ThreadPoolExecutor(max_workers=8) as executor:
         codes = list(executor.map(lambda n: call(server, "GET", f"/work/private-path-{n}")[0], range(24)))
     assert codes == [204] * 24
@@ -72,7 +85,7 @@ def test_bounded_private_route_template_attribution_and_concurrency(server):
     assert meta["endpoints"]["queryWorkbench"] == "/api/query-workbench/stats"
 
 def test_statement_lifetime_separates_application_hold_and_reset_reuse(server):
-    token = admin(server)
+    token = workbench_admin(server)
     assert call(server, "GET", "/held")[0] == 204
     code, report = call(server, "GET", "/api/query-workbench/stats", token=token)
     assert code == 200
@@ -91,7 +104,7 @@ def test_statement_lifetime_separates_application_hold_and_reset_reuse(server):
     assert entry["statementLifetimeNanoseconds"] == entry["measuredCallNanoseconds"] + entry["heldNanoseconds"]
 
 def test_operator_only_bearer_boundary(server):
-    token = admin(server)
+    token = workbench_admin(server)
     code, _ = call(server, "POST", "/api/collections", {"name": "members", "type": "auth", "fields": []}, token)
     assert code == 201
     assert call(server, "POST", "/api/collections/members/records", {"email": "member@x.io", "password": "memberpassword"}, token)[0] == 201
@@ -107,7 +120,7 @@ def test_operator_only_bearer_boundary(server):
         assert call(server, method, path, data, token)[0] == 200
 
 def test_structural_explain_search_scan_and_rejected_sql(server):
-    token = admin(server)
+    token = workbench_admin(server)
     assert call(server, "POST", "/api/collections", {"name": "posts", "type": "base", "fields": [{"id": "", "name": "title", "type": "text", "options": {}}]}, token)[0] == 201
     endpoint = "/api/query-workbench/explain"
     code, report = call(server, "POST", endpoint, {"collection": "posts", "equalityField": "id"}, token)
@@ -128,7 +141,7 @@ def test_structural_explain_search_scan_and_rejected_sql(server):
 
 
 def test_route_scope_measures_no_sql_errors_denials_and_methods(server):
-    token = admin(server)
+    token = workbench_admin(server)
     with ThreadPoolExecutor(max_workers=4) as executor:
         codes = list(executor.map(lambda n: call(server, "GET", f"/no-query/private-{n}")[0], range(8)))
     assert codes == [204] * 8
@@ -146,8 +159,40 @@ def test_route_scope_measures_no_sql_errors_denials_and_methods(server):
     assert rows[("POST", "/no-query/:id")]["completedScopes"] == 1
     assert rows[("GET", "/failed")]["completedScopes"] == 1
     assert rows[("GET", "/denied")]["completedScopes"] == 1
+    assert row["responseStatusClasses"]["success"] == 8
+    assert rows[("GET", "/denied")]["responseStatusClasses"]["clientError"] == 1
+    # Custom handler errors are mapped inside their scope; retain both outcomes.
+    assert rows[("GET", "/failed")]["handlerErrors"] == 1
+    assert rows[("GET", "/failed")]["responseStatusClasses"]["serverError"] == 1
     assert not any(item["routeTemplate"] == "/no-query/:id" for item in report["items"])
     assert "private-" not in json.dumps(report)
     # Even unauthorized inspector requests cannot change application observations.
     assert call(server, "GET", "/api/query-workbench/stats")[0] == 401
     assert call(server, "GET", "/api/query-workbench/stats", token=token)[1] == report
+
+def test_pool_mutex_wait_and_scheduled_job_attribution(server):
+    import time
+    token = workbench_admin(server)
+    assert call(server, "GET", "/pool-wait")[0] == 204
+    deadline = time.monotonic() + 5
+    while True:
+        report = call(server, "GET", "/api/query-workbench/stats", token=token)[1]
+        jobs = [row for row in report["jobs"] if row["jobName"] == "workbench-once"]
+        if jobs or time.monotonic() >= deadline:
+            break
+        time.sleep(0.05)
+    assert report["poolWaitMeasurement"] == "pool-mutex-acquisition"
+    row = next(row for row in report["routes"] if row["routeTemplate"] == "/pool-wait")
+    writer = next(wait for wait in row["poolWaits"] if wait["backend"] == report["backend"] and wait["role"] == "writer")
+    assert writer["acquisitions"] == 1
+    assert writer["totalNanoseconds"] == writer["maxNanoseconds"] >= 50_000_000
+    assert row["responseStatusClasses"]["success"] == 1
+    assert not any(item["routeTemplate"] == "/pool-wait" for item in report["items"])
+    assert len(jobs) == 1
+    job = jobs[0]
+    assert job["attribution"] == "scheduled_job"
+    assert job["completedScopes"] == 1 and job["handlerErrors"] == 0
+    entries = [item for item in report["items"] if item["jobName"] == "workbench-once"]
+    assert len(entries) == 1
+    assert entries[0]["attribution"] == "scheduled_job" and entries[0]["executions"] == 1
+    assert entries[0]["routeTemplate"] is None

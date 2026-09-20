@@ -1041,7 +1041,8 @@ fn guardRateLimit(cx: *Ctx, ctx: *http.RequestCtx, rt: events.RuntimeRoute) !?ht
 
 /// Try the consumer's custom routes (after built-ins). Resolves auth on a fresh reader,
 /// enforces the route's AuthLevel, then calls the handler. Returns null if no custom route
-/// matches the path+method. A handler error routes to the error backstop and yields 500.
+/// matches the path+method. Handler errors use Ctx.errorResponse; genuine 5xx
+/// failures additionally reach the error backstop.
 fn dispatchCustom(ctx: *http.RequestCtx) anyerror!?http.Response {
     const app = ctx.app orelse return null;
     const d = app.dispatch orelse return null;
@@ -1056,110 +1057,121 @@ fn dispatchCustom(ctx: *http.RequestCtx) anyerror!?http.Response {
                 measured.enter();
             }
             defer if (comptime build_options.query_workbench) measured.leave();
-            // Resolve auth on a fresh read-only connection (never the writer lock) — but ONLY
-            // when a credential is actually present. `authenticate` returns null on its first
-            // line (`bearer orelse cookie orelse return null`) when neither a bearer header nor a
-            // `zb_auth` cookie is set, so a credential-less request — the common anonymous/public
-            // shape — can skip the pool acquire entirely, removing a guaranteed reader round-trip
-            // (and its contention) from the framework's per-request floor on anonymous traffic
-            // (#231). `authed == null` whenever `reader == null`, so the invariant "authed implies
-            // reader" holds below.
-            const has_creds = ctx.bearerToken() != null or ctx.cookie("zb_auth") != null;
-            var reader: ?@import("db.zig").Db = if (has_creds)
-                (app.pool.acquireReader() catch return try ApiError.internal().toResponse(ctx.allocator.a))
-            else
-                null;
-            defer if (reader) |*r| app.pool.releaseReader(r);
-            const authed = if (reader) |*r| (auth.authenticate(app.io, ctx.allocator.a, app, ctx, r) catch null) else null;
-            switch (rt.auth) {
-                .public => {},
-                .authed => if (authed == null) return try ApiError.withCode(401, .unauthorized, "Not authenticated.").toResponse(ctx.allocator.a),
-                .superuser => if (authed == null or !authed.?.is_superuser) return try forbiddenResp(ctx),
-            }
-            // #243: collection-scoped `.authed` gate. A non-null `authed_collection` implies the
-            // route was lowered to `.authed`, so the switch above already required a token (else
-            // we returned 401 — `authed.?` is safe here). The principal is accepted ONLY if it
-            // has a non-empty id AND (belongs to the gated collection OR is a superuser with the
-            // gate opted into `allow_superuser`). Every other case — a token from a different
-            // collection, an empty-id principal (superuser or not), or a superuser without
-            // opt-in — gets the SAME fail-closed 401 as no token at all (no oracle, no
-            // distinguishing response).
-            if (rt.authed_collection) |gate| {
-                // Self-contained fail-closed: lowering guarantees `authed_collection != null` ⇒
-                // `auth == .authed` (so the no-token 401 already fired above), but `RuntimeRoute`
-                // is public — a hand-built route pairing `.authed_collection` with a non-`.authed`
-                // level must deny, not panic on a null principal. Reuse the SAME 401 (no oracle).
-                const u = authed orelse return try ApiError.withCode(401, .unauthorized, "Not authenticated.").toResponse(ctx.allocator.a);
-                const uid: []const u8 = switch (u.record) {
-                    .object => |o| if (o.get("id")) |v| (switch (v) {
-                        .string => |sv| sv,
-                        else => "",
-                    }) else "",
-                    else => "",
-                };
-                const collection_ok = std.mem.eql(u8, u.collection, gate.collection) and uid.len > 0;
-                const super_ok = u.is_superuser and gate.allow_superuser and uid.len > 0;
-                if (!(collection_ok or super_ok))
-                    return try ApiError.withCode(401, .unauthorized, "Not authenticated.").toResponse(ctx.allocator.a);
-            }
-            var rctx = request.RequestContext{
-                .auth = if (authed) |a| a.record else null,
-                .is_superuser = if (authed) |a| a.is_superuser else false,
-                .collection = if (authed) |a| a.collection else "",
-                .method = @tagName(ctx.method),
-                .session_id = if (authed) |a| a.sid else "",
+            const response = dispatchCustomMatched(ctx, rt) catch |err| {
+                if (comptime build_options.query_workbench) measured.failed = true;
+                return err;
             };
-            // Resolve the active tenant scope via tenancy.resolveRequest, the same
-            // chokepoint api/records.zig and api/files.zig call, so a custom route's
-            // `ctx.track`/`ctx.can`/any tenant-scoped ability check sees the caller's
-            // verified active account instead of always stamping account "". (Note:
-            // api/senders.zig and analytics/api.zig do NOT call resolveRequest — they
-            // share its underlying primitives but apply their own scope policy.)
-            // Anonymous requests (authed == null) still get `tenancy_enabled`/
-            // `role_ranking` copied (an unresolved, fail-closed scope), matching an
-            // anonymous REST request.
-            if (authed) |a| {
-                // `authed` is non-null only when `reader` was acquired (see above), so `.?` is safe.
-                tenancy.resolveRequest(ctx, &reader.?, app, a, &rctx);
-            } else {
-                rctx.tenancy_enabled = app.tenancy.enabled;
-                rctx.role_ranking = app.role_ranking;
-            }
-            // Auth's record/collection/session and tenancy's membership strings are
-            // request-allocator-owned, not borrowed from this connection. Return it
-            // before guards/handlers can acquire their own reader via Ctx.
-            if (reader) |*r| {
-                app.pool.releaseReader(r);
-                reader = null; // earlier exits still use the deferred release above
-            }
-            var cx = Ctx{ .app = app, .arena = ctx.allocator, .rctx = rctx, .request = ctx, .bound_conn = null };
-            defer cx.deinit();
-            // Ordered route-guard chain (#139/#142): path-secret + per-route rate limit, run
-            // AFTER the AuthLevel check above and BEFORE the handler. The first guard to deny
-            // returns its response (bare-404 / 403 / 429) and the handler never runs.
-            if (try runRouteGuards(&cx, ctx, rt)) |deny| return deny;
-            // One chokepoint for typed thunks + untyped handlers: any cookies/headers a
-            // handler accumulated via `ctx.setCookie`/`ctx.addHeader` (e.g. `ctx.subjectCookie`)
-            // are merged onto the Response in BOTH the success and the error path, so a
-            // deferred Set-Cookie survives even when the handler returns an error.
-            const resp = rt.handler(&cx) catch |e| {
-                // Map the error to a response via A1's Ctx.errorResponse (error.NotFound -> 404,
-                // error.Forbidden -> 403, error.Handled -> stashed status, etc.) instead of the
-                // old always-500 mapping. Only GENUINE server errors (mapped status >= 500) go to
-                // the consumer onError + Sentry/log backstop: a handler returning a deliberate 4xx
-                // (NotFound/Forbidden/ctx.fail) is ordinary client-error control flow, not an
-                // incident, so it must not emit a Sentry event.
-                const er = cx.errorResponse(e);
-                if (er.status >= 500) {
-                    var err_ev = events.ErrorEvent{ .app = app, .ctx = &rctx, .err = e, .phase = .request, .message = @errorName(e) };
-                    events.dispatchError(app, app.dispatch, &err_ev);
-                }
-                return try mergePending(ctx.allocator.a, &cx, er);
-            };
-            return try mergePending(ctx.allocator.a, &cx, resp);
+            if (comptime build_options.query_workbench) measured.status = response.status;
+            return response;
         }
     }
     return null;
+}
+
+fn dispatchCustomMatched(ctx: *http.RequestCtx, rt: events.RuntimeRoute) anyerror!http.Response {
+    const app = ctx.app.?;
+    // Resolve auth on a fresh read-only connection (never the writer lock) — but ONLY
+    // when a credential is actually present. `authenticate` returns null on its first
+    // line (`bearer orelse cookie orelse return null`) when neither a bearer header nor a
+    // `zb_auth` cookie is set, so a credential-less request — the common anonymous/public
+    // shape — can skip the pool acquire entirely, removing a guaranteed reader round-trip
+    // (and its contention) from the framework's per-request floor on anonymous traffic
+    // (#231). `authed == null` whenever `reader == null`, so the invariant "authed implies
+    // reader" holds below.
+    const has_creds = ctx.bearerToken() != null or ctx.cookie("zb_auth") != null;
+    var reader: ?@import("db.zig").Db = if (has_creds)
+        (app.pool.acquireReader() catch return try ApiError.internal().toResponse(ctx.allocator.a))
+    else
+        null;
+    defer if (reader) |*r| app.pool.releaseReader(r);
+    const authed = if (reader) |*r| (auth.authenticate(app.io, ctx.allocator.a, app, ctx, r) catch null) else null;
+    switch (rt.auth) {
+        .public => {},
+        .authed => if (authed == null) return try ApiError.withCode(401, .unauthorized, "Not authenticated.").toResponse(ctx.allocator.a),
+        .superuser => if (authed == null or !authed.?.is_superuser) return try forbiddenResp(ctx),
+    }
+    // #243: collection-scoped `.authed` gate. A non-null `authed_collection` implies the
+    // route was lowered to `.authed`, so the switch above already required a token (else
+    // we returned 401 — `authed.?` is safe here). The principal is accepted ONLY if it
+    // has a non-empty id AND (belongs to the gated collection OR is a superuser with the
+    // gate opted into `allow_superuser`). Every other case — a token from a different
+    // collection, an empty-id principal (superuser or not), or a superuser without
+    // opt-in — gets the SAME fail-closed 401 as no token at all (no oracle, no
+    // distinguishing response).
+    if (rt.authed_collection) |gate| {
+        // Self-contained fail-closed: lowering guarantees `authed_collection != null` ⇒
+        // `auth == .authed` (so the no-token 401 already fired above), but `RuntimeRoute`
+        // is public — a hand-built route pairing `.authed_collection` with a non-`.authed`
+        // level must deny, not panic on a null principal. Reuse the SAME 401 (no oracle).
+        const u = authed orelse return try ApiError.withCode(401, .unauthorized, "Not authenticated.").toResponse(ctx.allocator.a);
+        const uid: []const u8 = switch (u.record) {
+            .object => |o| if (o.get("id")) |v| (switch (v) {
+                .string => |sv| sv,
+                else => "",
+            }) else "",
+            else => "",
+        };
+        const collection_ok = std.mem.eql(u8, u.collection, gate.collection) and uid.len > 0;
+        const super_ok = u.is_superuser and gate.allow_superuser and uid.len > 0;
+        if (!(collection_ok or super_ok))
+            return try ApiError.withCode(401, .unauthorized, "Not authenticated.").toResponse(ctx.allocator.a);
+    }
+    var rctx = request.RequestContext{
+        .auth = if (authed) |a| a.record else null,
+        .is_superuser = if (authed) |a| a.is_superuser else false,
+        .collection = if (authed) |a| a.collection else "",
+        .method = @tagName(ctx.method),
+        .session_id = if (authed) |a| a.sid else "",
+    };
+    // Resolve the active tenant scope via tenancy.resolveRequest, the same
+    // chokepoint api/records.zig and api/files.zig call, so a custom route's
+    // `ctx.track`/`ctx.can`/any tenant-scoped ability check sees the caller's
+    // verified active account instead of always stamping account "". (Note:
+    // api/senders.zig and analytics/api.zig do NOT call resolveRequest — they
+    // share its underlying primitives but apply their own scope policy.)
+    // Anonymous requests (authed == null) still get `tenancy_enabled`/
+    // `role_ranking` copied (an unresolved, fail-closed scope), matching an
+    // anonymous REST request.
+    if (authed) |a| {
+        // `authed` is non-null only when `reader` was acquired (see above), so `.?` is safe.
+        tenancy.resolveRequest(ctx, &reader.?, app, a, &rctx);
+    } else {
+        rctx.tenancy_enabled = app.tenancy.enabled;
+        rctx.role_ranking = app.role_ranking;
+    }
+    // Auth's record/collection/session and tenancy's membership strings are
+    // request-allocator-owned, not borrowed from this connection. Return it
+    // before guards/handlers can acquire their own reader via Ctx.
+    if (reader) |*r| {
+        app.pool.releaseReader(r);
+        reader = null; // earlier exits still use the deferred release above
+    }
+    var cx = Ctx{ .app = app, .arena = ctx.allocator, .rctx = rctx, .request = ctx, .bound_conn = null };
+    defer cx.deinit();
+    // Ordered route-guard chain (#139/#142): path-secret + per-route rate limit, run
+    // AFTER the AuthLevel check above and BEFORE the handler. The first guard to deny
+    // returns its response (bare-404 / 403 / 429) and the handler never runs.
+    if (try runRouteGuards(&cx, ctx, rt)) |deny| return deny;
+    // One chokepoint for typed thunks + untyped handlers: any cookies/headers a
+    // handler accumulated via `ctx.setCookie`/`ctx.addHeader` (e.g. `ctx.subjectCookie`)
+    // are merged onto the Response in BOTH the success and the error path, so a
+    // deferred Set-Cookie survives even when the handler returns an error.
+    const resp = rt.handler(&cx) catch |e| {
+        if (comptime build_options.query_workbench) @import("query_workbench.zig").markFailure();
+        // Map the error to a response via A1's Ctx.errorResponse (error.NotFound -> 404,
+        // error.Forbidden -> 403, error.Handled -> stashed status, etc.) instead of the
+        // old always-500 mapping. Only GENUINE server errors (mapped status >= 500) go to
+        // the consumer onError + Sentry/log backstop: a handler returning a deliberate 4xx
+        // (NotFound/Forbidden/ctx.fail) is ordinary client-error control flow, not an
+        // incident, so it must not emit a Sentry event.
+        const er = cx.errorResponse(e);
+        if (er.status >= 500) {
+            var err_ev = events.ErrorEvent{ .app = app, .ctx = &rctx, .err = e, .phase = .request, .message = @errorName(e) };
+            events.dispatchError(app, app.dispatch, &err_ev);
+        }
+        return try mergePending(ctx.allocator.a, &cx, er);
+    };
+    return try mergePending(ctx.allocator.a, &cx, resp);
 }
 
 test "dispatchCustom: deliberate 4xx is NOT reported to onError; genuine 5xx is" {

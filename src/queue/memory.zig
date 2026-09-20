@@ -36,6 +36,14 @@ pub const Outcome = enum { done, failed };
 /// is reported via `.onError` (phase `.job`) and `.failed` is returned. Between attempts
 /// it sleeps `backoffMs` (honoring the frozen dev-mode clock via `io.sleep`).
 pub fn runWithRetry(app: *App, handler: queue.JobHandler, payload: []const u8, policy: RetryPolicy) Outcome {
+    // This API has no trusted declared job name. Mask an inline caller scope so
+    // its handler SQL cannot be mistaken for request work.
+    var measured: if (@import("build_options").query_workbench) @import("../query_workbench.zig").Scope else void = undefined;
+    if (comptime @import("build_options").query_workbench) {
+        measured = @import("../query_workbench.zig").Scope.init(null, "JOB", "");
+        measured.enter();
+    }
+    defer if (comptime @import("build_options").query_workbench) measured.leave();
     var attempt: u32 = 1;
     const max: u32 = if (policy.max_attempts == 0) 1 else policy.max_attempts;
     while (true) : (attempt += 1) {

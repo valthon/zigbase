@@ -395,7 +395,19 @@ pub const Scheduler = struct {
             defer arena.deinit();
             var cx = Ctx{ .app = self.app, .arena = RequestArena.from(&arena), .rctx = .{}, .request = null, .bound_conn = null };
             defer cx.deinit();
-            if (job.run(&cx, &ev)) |result| {
+            const outcome = blk: {
+                var measured: if (@import("build_options").query_workbench) @import("query_workbench.zig").Scope else void = undefined;
+                if (comptime @import("build_options").query_workbench) {
+                    measured = @import("query_workbench.zig").Scope.initJob(self.app.query_workbench, .scheduled_job, job.name);
+                    measured.enter();
+                }
+                defer if (comptime @import("build_options").query_workbench) measured.leave();
+                break :blk job.run(&cx, &ev) catch |err| {
+                    if (comptime @import("build_options").query_workbench) measured.failed = true;
+                    break :blk err;
+                };
+            };
+            if (outcome) |result| {
                 // SUCCESS: resume the normal schedule (resets the backoff counter).
                 const now = unixNow(self.app.io);
                 self.lock();
@@ -604,6 +616,7 @@ test "Scheduler runs a due reactive job then stops cleanly" {
     app.dispatch = null;
     app.scheduler = null;
     app.submit_fn = null;
+    if (comptime @import("build_options").query_workbench) app.query_workbench = null;
 
     var sched = try Scheduler.init(std.testing.allocator, &app, jobs, 2);
     defer sched.deinit();
@@ -641,6 +654,7 @@ test "Scheduler initSized clamps a too-small stack to the safe floor and still r
     app.dispatch = null;
     app.scheduler = null;
     app.submit_fn = null;
+    if (comptime @import("build_options").query_workbench) app.query_workbench = null;
 
     // A below-floor request (256 KiB) is clamped UP to min_job_stack_size, so it can't
     // trigger a pthread EINVAL abort in the real binary; the job still runs on the threads.

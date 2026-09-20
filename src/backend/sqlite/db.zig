@@ -689,7 +689,9 @@ pub const Pool = struct {
     /// Blocks on the writer mutex (futex-backed; waiters sleep, not spin) and returns
     /// the writer connection. Caller MUST call releaseWriter() when done.
     pub fn acquireWriter(self: *Pool) *Db {
+        const measurement = if (comptime build_options.query_workbench) workbench.PoolMeasurement.begin() else {};
         self.writer_mutex.lockUncancelable(self.io);
+        if (comptime build_options.query_workbench) measurement.finish(.sqlite, .writer);
         self.writer_acquires += 1;
         self.writer.field_cipher = self.field_cipher;
         return &self.writer;
@@ -734,7 +736,9 @@ pub const Pool = struct {
     /// freshly opened reader. Returns a `Db` by value (same shape as openReader());
     /// caller MUST hand it back via releaseReader() instead of close().
     pub fn acquireReader(self: *Pool) DbError!Db {
+        const measurement = if (comptime build_options.query_workbench) workbench.PoolMeasurement.begin() else {};
         while (!self.reader_mutex.tryLock()) std.atomic.spinLoopHint();
+        if (comptime build_options.query_workbench) measurement.finish(.sqlite, .reader);
         if (self.reader_count > 0) {
             self.reader_count -= 1;
             var db = self.readers[self.reader_count];

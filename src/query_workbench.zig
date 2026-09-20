@@ -2,6 +2,15 @@
 //! No SQL or parameter text retained.
 const std = @import("std");
 pub const Backend = enum { sqlite, postgres };
+pub const Attribution = enum { http, scheduled_job, durable_job };
+pub const PoolKind = enum { reader, writer };
+/// Fixed backend/role buckets; time only covers locking the pool mutex, not
+/// opening connections, backend locks, query execution, or connection ownership.
+pub const PoolWait = struct {
+    acquisitions: u64 = 0,
+    total_ns: u64 = 0,
+    max_ns: u64 = 0,
+};
 const Seen = struct { backend: Backend, key: u64 };
 
 pub const Limits = struct { max_entries: u16 = 64, slow_ms: u32 = 100 };
@@ -20,6 +29,7 @@ pub fn resolve(comptime cfg: anytype) Limits {
 }
 
 pub const Entry = struct {
+    attribution: Attribution = .http,
     backend: Backend = .sqlite,
     route: [192]u8 = undefined,
     route_len: u8 = 0,
@@ -39,6 +49,7 @@ pub const Entry = struct {
 };
 /// One bounded method/template aggregate, independent of query-shape cardinality.
 pub const RouteEntry = struct {
+    attribution: Attribution = .http,
     route: [192]u8 = undefined,
     route_len: u8 = 0,
     method: []const u8,
@@ -46,6 +57,9 @@ pub const RouteEntry = struct {
     total_ns: u64 = 0,
     max_ns: u64 = 0,
     slow: u64 = 0,
+    status_classes: [6]u64 = @splat(0), // other, 1xx, 2xx, 3xx, 4xx, 5xx
+    failures: u64 = 0, // handler returned an error; not an assumed HTTP status
+    pool_waits: [4]PoolWait = @splat(.{}),
 };
 pub const Store = struct {
     allocator: std.mem.Allocator,
@@ -57,6 +71,7 @@ pub const Store = struct {
     routes: []RouteEntry,
     route_count: usize = 0,
     dropped_routes: u64 = 0,
+    dropped_jobs: u64 = 0,
     dropped: u64 = 0,
     dropped_statements: u64 = 0,
 
@@ -80,19 +95,29 @@ pub const Store = struct {
         const entry: *RouteEntry = blk: {
             for (self.routes[0..self.route_count]) |*entry| {
                 if (std.mem.eql(u8, entry.route[0..entry.route_len], scope.route) and
-                    std.mem.eql(u8, entry.method, scope.method)) break :blk entry;
+                    std.mem.eql(u8, entry.method, scope.method) and entry.attribution == scope.attribution) break :blk entry;
             }
             if (self.route_count == self.routes.len or scope.route.len > 192) {
-                self.dropped_routes +|= 1;
+                if (scope.attribution == .http) self.dropped_routes +|= 1 else self.dropped_jobs +|= 1;
                 return;
             }
             const entry = &self.routes[self.route_count];
             self.route_count += 1;
-            entry.* = .{ .method = scope.method, .route_len = @intCast(scope.route.len) };
+            entry.* = .{ .attribution = scope.attribution, .method = scope.method, .route_len = @intCast(scope.route.len) };
             @memcpy(entry.route[0..scope.route.len], scope.route);
             break :blk entry;
         };
         entry.completed +|= 1;
+        if (scope.status) |status| {
+            const class: usize = if (status >= 100 and status < 600) status / 100 else 0;
+            entry.status_classes[class] +|= 1;
+        }
+        if (scope.failed) entry.failures +|= 1;
+        for (&entry.pool_waits, scope.pool_waits) |*total, observed| {
+            total.acquisitions +|= observed.acquisitions;
+            total.total_ns +|= observed.total_ns;
+            total.max_ns = @max(total.max_ns, observed.max_ns);
+        }
         entry.total_ns +|= ns;
         entry.max_ns = @max(entry.max_ns, ns);
         if (ns >= @as(u64, self.limits.slow_ms) * std.time.ns_per_ms) entry.slow +|= 1;
@@ -124,12 +149,12 @@ pub const Store = struct {
 
     // Caller holds mutex. Both metric families share the same bounded key table.
     fn findEntry(self: *Store, scope: *Scope, backend: Backend, key: u64) ?*Entry {
-        for (self.entries[0..self.count]) |*e| if (e.backend == backend and e.fingerprint == key and
+        for (self.entries[0..self.count]) |*e| if (e.attribution == scope.attribution and e.backend == backend and e.fingerprint == key and
             std.mem.eql(u8, e.route[0..e.route_len], scope.route) and std.mem.eql(u8, e.method, scope.method)) return e;
         if (self.count == self.entries.len or scope.route.len > 192) return null;
         const e = &self.entries[self.count];
         self.count += 1;
-        e.* = .{ .backend = backend, .method = scope.method, .fingerprint = key, .route_len = @intCast(scope.route.len) };
+        e.* = .{ .attribution = scope.attribution, .backend = backend, .method = scope.method, .fingerprint = key, .route_len = @intCast(scope.route.len) };
         @memcpy(e.route[0..scope.route.len], scope.route);
         return e;
     }
@@ -153,6 +178,10 @@ pub const Store = struct {
 threadlocal var current: ?*Scope = null;
 var serial: std.atomic.Value(u64) = .init(0);
 pub const Scope = struct {
+    attribution: Attribution = .http,
+    status: ?u16 = null,
+    failed: bool = false,
+    pool_waits: [4]PoolWait = @splat(.{}),
     store: ?*Store,
     route: []const u8,
     method: []const u8,
@@ -164,6 +193,10 @@ pub const Scope = struct {
 
     pub fn init(store: ?*Store, method: []const u8, route: []const u8) Scope {
         return .{ .store = store, .method = method, .route = route };
+    }
+    pub fn initJob(store: ?*Store, kind: Attribution, name: []const u8) Scope {
+        std.debug.assert(kind != .http);
+        return .{ .store = store, .method = "JOB", .route = name, .attribution = kind };
     }
     pub fn enter(self: *Scope) void {
         self.previous = current;
@@ -191,6 +224,31 @@ pub const Scope = struct {
         self.started = null;
     }
 };
+
+/// Stack-local lock timer; never retains the store or request in a pooled Db.
+pub const PoolMeasurement = struct {
+    scope_id: u64 = 0,
+    started: i96 = 0,
+    pub fn begin() PoolMeasurement {
+        const scope = current orelse return .{};
+        const store = scope.store orelse return .{};
+        return .{ .scope_id = scope.id, .started = std.Io.Timestamp.now(store.io, .awake).nanoseconds };
+    }
+    pub fn finish(self: PoolMeasurement, backend: Backend, kind: PoolKind) void {
+        const scope = current orelse return;
+        const store = scope.store orelse return;
+        if (self.scope_id == 0 or self.scope_id != scope.id) return;
+        const ns = elapsed(self.started, std.Io.Timestamp.now(store.io, .awake).nanoseconds);
+        const bucket = &scope.pool_waits[@as(usize, @intFromEnum(backend)) * 2 + @intFromEnum(kind)];
+        bucket.acquisitions +|= 1;
+        bucket.total_ns +|= ns;
+        bucket.max_ns = @max(bucket.max_ns, ns);
+    }
+};
+
+pub fn markFailure() void {
+    if (current) |scope| scope.failed = true;
+}
 
 pub const Measurement = struct {
     backend: Backend = .sqlite,
@@ -635,4 +693,37 @@ test "route table allocation failures release all prior allocations" {
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, H.create, .{});
+}
+
+test "scope status classes and job names stay distinct and bounded" {
+    const store = try Store.create(std.testing.allocator, std.testing.io, .{ .max_entries = 2 });
+    defer store.destroy();
+    var request = Scope.init(store, "JOB", "same");
+    for ([_]u16{ 99, 101, 204, 302, 404, 503 }) |status| {
+        request.status = status;
+        store.recordRoute(&request, 1);
+    }
+    request.status = null;
+    request.failed = true;
+    store.recordRoute(&request, 1);
+    for (store.routes[0].status_classes) |count| try std.testing.expectEqual(@as(u64, 1), count);
+    try std.testing.expectEqual(@as(u64, 1), store.routes[0].failures);
+    var job = Scope.initJob(store, .durable_job, "same");
+    job.failed = true;
+    job.pool_waits[1] = .{ .acquisitions = 1, .total_ns = 20, .max_ns = 20 };
+    store.recordRoute(&job, 30);
+    store.record(&request, .sqlite, 1, 10, false);
+    store.record(&job, .sqlite, 1, 10, false);
+    try std.testing.expectEqual(@as(usize, 2), store.count);
+    try std.testing.expectEqual(Attribution.durable_job, store.entries[1].attribution);
+    try std.testing.expectEqual(@as(u64, 20), store.routes[1].pool_waits[1].total_ns);
+    const overflow = Scope.initJob(store, .scheduled_job, "same");
+    store.recordRoute(&overflow, 1);
+    try std.testing.expectEqual(@as(u64, 1), store.dropped_jobs);
+    try std.testing.expectEqual(@as(u64, 0), store.dropped_routes);
+    // Existing identities keep accumulating after saturation.
+    store.routes[1].pool_waits[1].total_ns = std.math.maxInt(u64);
+    store.recordRoute(&job, 1);
+    try std.testing.expectEqual(std.math.maxInt(u64), store.routes[1].pool_waits[1].total_ns);
+    try std.testing.expectEqual(@as(u64, 2), store.routes[1].failures);
 }

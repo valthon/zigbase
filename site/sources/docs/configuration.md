@@ -290,6 +290,10 @@ Each in-scope finalization adds one mutex-guarded store update with a bounded
 entry scan.
 This helps distinguish slow SQLite calls from long-lived statements without
 claiming CPU or full-request latency; enabled counters remain explicitly bounded.
+HTTP scopes also classify returned status codes and escaping handler errors. Fixed
+reader/writer buckets measure pool mutex acquisition, excluding connection creation
+and time holding a connection. Declared durable/scheduled jobs have separate attempt
+aggregates; queue residence, retry backoff, memory jobs, and `app.submit` are excluded.
 See [the framework workbench scope](./framework#bounded-query-workbench-opt-in).
 
 For request backpressure, compile `.admission = .{ .max_requests = 3 }` into your

@@ -40,7 +40,12 @@ pub fn tryDispatch(routes: []const Route, ctx: *http.RequestCtx) anyerror!?http.
                 measured.enter();
             }
             defer if (comptime @import("build_options").query_workbench) measured.leave();
-            return try rt.handler(ctx);
+            const response = rt.handler(ctx) catch |err| {
+                if (comptime @import("build_options").query_workbench) measured.failed = true;
+                return err;
+            };
+            if (comptime @import("build_options").query_workbench) measured.status = response.status;
+            return response;
         }
     }
     return null;

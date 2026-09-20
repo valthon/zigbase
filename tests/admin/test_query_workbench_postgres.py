@@ -53,6 +53,7 @@ def test_postgres_workbench_live(enabled, tmp_path):
             assert call(base, method, endpoint, headers={"Cookie": f"zb_auth={token}"})[0] == 401
         assert call(base, "POST", "/api/query-workbench/explain", {"collection": "_superusers"}, token)[0] == 501
         assert call(base, "GET", "/held")[0] == 204
+        assert call(base, "GET", "/pool-wait")[0] == 204
         code, report = call(base, "GET", "/api/query-workbench/stats", token=token)
         assert code == 200 and report["activeBackend"] == "postgres"
         route = next(row for row in report["routes"] if row["routeTemplate"] == "/work/:id")
@@ -63,6 +64,11 @@ def test_postgres_workbench_live(enabled, tmp_path):
         assert work["measurement"] == "client-extended-protocol-exchange-time"
         assert work["executions"] == work["finalizedStatements"] == 3
         assert work["repeatedShapes"] == 2
+        wait_route = next(row for row in report["routes"] if row["routeTemplate"] == "/pool-wait")
+        wait = next(row for row in wait_route["poolWaits"] if row["backend"] == "postgres" and row["role"] == "writer")
+        assert wait["acquisitions"] == 1
+        assert wait["totalNanoseconds"] == wait["maxNanoseconds"] >= 50_000_000
+        assert wait_route["responseStatusClasses"]["success"] == 1
         held = next(item for item in report["items"] if item["routeTemplate"] == "/held")
         assert held["executions"] == 2 and held["finalizedStatements"] == 1
         assert held["heldNanoseconds"] >= 40_000_000
