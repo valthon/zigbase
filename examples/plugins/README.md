@@ -218,7 +218,7 @@ ZIGBASE_PUBLIC_URL=http://localhost:8090 ./zig-out/bin/plugins serve --insecure-
 ```
 
 The frontend has no local Node dependencies. The repository launcher fetches
-the exact Zigapagos v0.4.0 package through `npx`; the build enables its strict
+the exact Zigapagos v0.5.0 package through `npx`; the build enables its strict
 island-props gate and writes `frontend/dist` for `embedStaticDir`. The root
 package remains only for the example's TypeScript E2E and runtime-typegen tests.
 

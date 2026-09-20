@@ -1,7 +1,7 @@
 # ZigBase website
 
 The public marketing and documentation site for ZigBase, built with the
-published Zigapagos **v0.4.0** release and deployed at
+published Zigapagos **v0.5.0** release and deployed at
 <https://valthon.github.io/zigbase/>.
 
 ## Source of truth
@@ -18,7 +18,7 @@ published Zigapagos **v0.4.0** release and deployed at
 
 Node 24 is pinned in the repository root. The site has no installed npm
 dependencies; `package.json` only provides command aliases. The repository
-launcher fetches the exact Zigapagos v0.4.0 package through `npx`.
+launcher fetches the exact Zigapagos v0.5.0 package through `npx`.
 
 ```sh
 cd site
