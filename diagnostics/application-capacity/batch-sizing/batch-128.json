@@ -1,0 +1,456 @@
+{
+  "schema_version": 2,
+  "scenario": "tenant-project-tasks-mixed-v2",
+  "passed": true,
+  "recorded_at": "2026-09-20T00:29:38.949797+00:00",
+  "harness": {
+    "python": "3.13.15",
+    "source_sha256": "3e7efedaecf15657ed64d91989e61d60b578e2ec802ec92c232f5fdb5142ba14",
+    "fixture_source_sha256": "2982bbbee4a1b57fda8333fac30cf5c4c04c7d0891602f013ec214104d094ff1"
+  },
+  "binary": {
+    "sha256": "46b52d2940f5d7f640348cec25f37cd98021f09b721e6e6d1beedc9273b63dca",
+    "bytes": 84196768,
+    "version": {
+      "zigbase": "0.13.0",
+      "commit": "59ac830bd6c1",
+      "build": "Debug",
+      "target": "x86_64-linux-gnu",
+      "zig": "0.16.0",
+      "components": {
+        "sqlite": "3.53.2",
+        "sqlite_source_id": "2026-06-03 19:12:13 d6e03d8c777cfa2d35e3b60d8ec3e0187f3e9f99d8e2ee9cac695fd6fcdf1a24",
+        "sqlite_vec": "v0.1.6",
+        "sqlite_vec_linked": false,
+        "zap": "0.10.6",
+        "zap_commit": "1d7cb3b8cf288f9f78d767d19159b491d208a051",
+        "facil": "0.7.4"
+      }
+    },
+    "resources": {
+      "schema_version": 1,
+      "profile": null,
+      "reader_pool_cap": 16,
+      "realtime_connection_cap": 10000,
+      "job_workers": 2,
+      "job_stack_bytes": 1048576,
+      "memory_job_workers": 4,
+      "sqlite_cache_kib_per_connection": 1024,
+      "scheduler_enabled": true,
+      "admin_enabled": true,
+      "postgres_compiled": false,
+      "s3_compiled": false,
+      "file_inventory_compiled": false,
+      "envelope": {
+        "basis": "compiled_configuration_not_rss",
+        "http_admission_max_requests": null,
+        "coordinated_admission_max_work": null,
+        "coordinated_admission_max_job_bytes": null,
+        "http_body_limit_source": "runtime_ZIGBASE_MAX_UPLOAD_SIZE",
+        "retained_reader_cap": 16,
+        "sqlite_cache_target_bytes_per_connection": 1048576,
+        "sqlite_writer_and_retained_readers_cache_target_bytes": 17825792,
+        "scheduler_stack_bytes": 3145728,
+        "memory_job_stack_bytes": 4194304,
+        "resumable": null,
+        "exclusions": [
+          "overflow_database_connections_and_non_cache_database_memory",
+          "transport_buffers_before_admission_and_realtime_connections",
+          "request_arenas_responses_and_upload_commit_copies",
+          "queue_workers_plugins_runtime_and_allocator_overhead",
+          "resumable_metadata_and_storage"
+        ]
+      }
+    }
+  },
+  "machine": {
+    "platform": "Linux-6.18.33.2-microsoft-standard-WSL2-x86_64-with-glibc2.39",
+    "machine": "x86_64",
+    "logical_cpus": 32,
+    "cpu_affinity_count": 32,
+    "cpu_model": "13th Gen Intel(R) Core(TM) i9-13900K",
+    "system_memory_bytes": 101243826176,
+    "cgroup_root": {}
+  },
+  "dataset": {
+    "tenants": 2,
+    "projects": 2,
+    "tasks_per_tenant": 8,
+    "indexes": [
+      [
+        "capacity_tasks_account_id",
+        "CREATE INDEX \"capacity_tasks_account_id\" ON \"tasks\" (\"account\",\"id\")"
+      ],
+      [
+        "idx_projects_account_tenant",
+        "CREATE INDEX \"idx_projects_account_tenant\" ON \"projects\" (\"account\")"
+      ],
+      [
+        "idx_tasks_account_tenant",
+        "CREATE INDEX \"idx_tasks_account_tenant\" ON \"tasks\" (\"account\")"
+      ],
+      [
+        "sqlite_autoindex_projects_1",
+        null
+      ],
+      [
+        "sqlite_autoindex_tasks_1",
+        null
+      ]
+    ]
+  },
+  "load": {
+    "concurrency": 2,
+    "model": "closed-loop, one connection per request",
+    "mix": [
+      "list 20 tasks + project expansion",
+      "update one task",
+      "read task + project expansion",
+      "one transactional durable digest job per update",
+      "tenant-scoped SSE delivery"
+    ],
+    "timeout_seconds": 5,
+    "response_limit_bytes": 2097152
+  },
+  "isolation_before_and_after": "passed",
+  "warmup": {
+    "concurrency": 2,
+    "elapsed_seconds_including_drain": 0.11098331902758218,
+    "requested_seconds": 1,
+    "request_limit": 120,
+    "limit_reached": true,
+    "attempts": 120,
+    "successful_requests": 120,
+    "successful_requests_per_second": 1081.2435693167272,
+    "errors": {},
+    "latency_ms_including_failures": {
+      "list_expand": {
+        "count": 40,
+        "nearest_rank": {
+          "p50": 1.841789,
+          "p95": 2.3017,
+          "p99": 2.809329,
+          "max": 2.809329
+        }
+      },
+      "update": {
+        "count": 40,
+        "nearest_rank": {
+          "p50": 1.856601,
+          "p95": 2.321482,
+          "p99": 2.444205,
+          "max": 2.444205
+        }
+      },
+      "read_expand": {
+        "count": 40,
+        "nearest_rank": {
+          "p50": 1.615855,
+          "p95": 2.104753,
+          "p99": 2.336148,
+          "max": 2.336148
+        }
+      }
+    },
+    "server": {
+      "sample_interval_ms": 50,
+      "rss_samples": 4,
+      "peak_sampled_rss_bytes": 52809728,
+      "cpu_seconds": 0.20999999999999996
+    },
+    "drain": {
+      "elapsed_seconds": 0.4156580119743012,
+      "passed": true,
+      "realtime": {
+        "transport": "SSE",
+        "subscribers": 2,
+        "expected_events": 40,
+        "received_events": 40,
+        "missing_events": 0,
+        "unexpected_events": 0,
+        "wrong_task_events": 0,
+        "errors": {},
+        "update_start_to_delivery_ms": {
+          "p50": 2.449385,
+          "p95": 2.930823,
+          "p99": 3.436957,
+          "max": 3.436957
+        }
+      },
+      "server": {
+        "peak_sampled_rss_bytes": 52817920,
+        "cpu_seconds": 0.020000000000000018
+      },
+      "jobs": {
+        "expected": 40,
+        "completed": 40,
+        "retained_by_status": {
+          "done": 40
+        },
+        "missing_jobs": 0,
+        "unexpected_jobs": 0,
+        "work": "SHA-256 of account/revision payload followed by 64 digest rounds; no external I/O"
+      }
+    }
+  },
+  "measurement": {
+    "concurrency": 2,
+    "elapsed_seconds_including_drain": 0.15496970800450072,
+    "requested_seconds": 2,
+    "request_limit": 120,
+    "limit_reached": true,
+    "attempts": 120,
+    "successful_requests": 120,
+    "successful_requests_per_second": 774.3448803330964,
+    "errors": {},
+    "latency_ms_including_failures": {
+      "list_expand": {
+        "count": 40,
+        "nearest_rank": {
+          "p50": 2.509756,
+          "p95": 3.216547,
+          "p99": 4.115968,
+          "max": 4.115968
+        }
+      },
+      "update": {
+        "count": 40,
+        "nearest_rank": {
+          "p50": 2.604069,
+          "p95": 3.626305,
+          "p99": 4.146658,
+          "max": 4.146658
+        }
+      },
+      "read_expand": {
+        "count": 40,
+        "nearest_rank": {
+          "p50": 2.672036,
+          "p95": 3.333381,
+          "p99": 3.741975,
+          "max": 3.741975
+        }
+      }
+    },
+    "server": {
+      "sample_interval_ms": 50,
+      "rss_samples": 5,
+      "peak_sampled_rss_bytes": 52912128,
+      "cpu_seconds": 0.18000000000000016
+    },
+    "drain": {
+      "elapsed_seconds": 0.3508564159856178,
+      "passed": true,
+      "realtime": {
+        "transport": "SSE",
+        "subscribers": 2,
+        "expected_events": 40,
+        "received_events": 40,
+        "missing_events": 0,
+        "unexpected_events": 0,
+        "wrong_task_events": 0,
+        "errors": {},
+        "update_start_to_delivery_ms": {
+          "p50": 3.402833,
+          "p95": 4.814218,
+          "p99": 4.85604,
+          "max": 4.85604
+        }
+      },
+      "server": {
+        "peak_sampled_rss_bytes": 52932608,
+        "cpu_seconds": 0.010000000000000231
+      },
+      "jobs": {
+        "expected": 40,
+        "completed": 40,
+        "retained_by_status": {
+          "done": 80
+        },
+        "missing_jobs": 0,
+        "unexpected_jobs": 0,
+        "work": "SHA-256 of account/revision payload followed by 64 digest rounds; no external I/O"
+      }
+    }
+  },
+  "stress": {
+    "concurrency": 4,
+    "elapsed_seconds_including_drain": 0.12262812300468795,
+    "requested_seconds": 2,
+    "request_limit": 120,
+    "limit_reached": true,
+    "attempts": 120,
+    "successful_requests": 120,
+    "successful_requests_per_second": 978.5683500628361,
+    "errors": {},
+    "latency_ms_including_failures": {
+      "list_expand": {
+        "count": 40,
+        "nearest_rank": {
+          "p50": 3.236184,
+          "p95": 6.232299,
+          "p99": 6.713526,
+          "max": 6.713526
+        }
+      },
+      "update": {
+        "count": 40,
+        "nearest_rank": {
+          "p50": 3.831068,
+          "p95": 7.272304,
+          "p99": 7.604034,
+          "max": 7.604034
+        }
+      },
+      "read_expand": {
+        "count": 40,
+        "nearest_rank": {
+          "p50": 3.513486,
+          "p95": 7.008417,
+          "p99": 7.217629,
+          "max": 7.217629
+        }
+      }
+    },
+    "server": {
+      "sample_interval_ms": 50,
+      "rss_samples": 4,
+      "peak_sampled_rss_bytes": 53018624,
+      "cpu_seconds": 0.20000000000000018
+    },
+    "drain": {
+      "elapsed_seconds": 0.3633837519737426,
+      "passed": true,
+      "realtime": {
+        "transport": "SSE",
+        "subscribers": 2,
+        "expected_events": 40,
+        "received_events": 40,
+        "missing_events": 0,
+        "unexpected_events": 0,
+        "wrong_task_events": 0,
+        "errors": {},
+        "update_start_to_delivery_ms": {
+          "p50": 5.222041,
+          "p95": 10.626701,
+          "p99": 11.322293,
+          "max": 11.322293
+        }
+      },
+      "server": {
+        "peak_sampled_rss_bytes": 52998144,
+        "cpu_seconds": 0.020000000000000018
+      },
+      "jobs": {
+        "expected": 40,
+        "completed": 40,
+        "retained_by_status": {
+          "done": 120
+        },
+        "missing_jobs": 0,
+        "unexpected_jobs": 0,
+        "work": "SHA-256 of account/revision payload followed by 64 digest rounds; no external I/O"
+      }
+    }
+  },
+  "recovery": {
+    "concurrency": 2,
+    "elapsed_seconds_including_drain": 0.12793375001638196,
+    "requested_seconds": 2,
+    "request_limit": 120,
+    "limit_reached": true,
+    "attempts": 120,
+    "successful_requests": 120,
+    "successful_requests_per_second": 937.9854806463029,
+    "errors": {},
+    "latency_ms_including_failures": {
+      "list_expand": {
+        "count": 40,
+        "nearest_rank": {
+          "p50": 1.949716,
+          "p95": 3.191149,
+          "p99": 3.399354,
+          "max": 3.399354
+        }
+      },
+      "update": {
+        "count": 40,
+        "nearest_rank": {
+          "p50": 2.142546,
+          "p95": 3.512631,
+          "p99": 3.747804,
+          "max": 3.747804
+        }
+      },
+      "read_expand": {
+        "count": 40,
+        "nearest_rank": {
+          "p50": 1.646338,
+          "p95": 3.053711,
+          "p99": 3.164949,
+          "max": 3.164949
+        }
+      }
+    },
+    "server": {
+      "sample_interval_ms": 50,
+      "rss_samples": 4,
+      "peak_sampled_rss_bytes": 53051392,
+      "cpu_seconds": 0.18999999999999995
+    },
+    "drain": {
+      "elapsed_seconds": 0.39301110501401126,
+      "passed": true,
+      "realtime": {
+        "transport": "SSE",
+        "subscribers": 2,
+        "expected_events": 40,
+        "received_events": 40,
+        "missing_events": 0,
+        "unexpected_events": 0,
+        "wrong_task_events": 0,
+        "errors": {},
+        "update_start_to_delivery_ms": {
+          "p50": 2.735323,
+          "p95": 4.681911,
+          "p99": 5.000189,
+          "max": 5.000189
+        }
+      },
+      "server": {
+        "peak_sampled_rss_bytes": 53055488,
+        "cpu_seconds": 0.020000000000000018
+      },
+      "jobs": {
+        "expected": 40,
+        "completed": 40,
+        "retained_by_status": {
+          "done": 160
+        },
+        "missing_jobs": 0,
+        "unexpected_jobs": 0,
+        "work": "SHA-256 of account/revision payload followed by 64 digest rounds; no external I/O"
+      }
+    }
+  },
+  "pressure": {
+    "rejections_observed": false,
+    "qualification": "Higher concurrency is an offered-load probe, not proof of server saturation."
+  },
+  "data_files_bytes_after": {
+    "data.db-shm": 32768,
+    "data.db": 389120,
+    "data.db-wal": 6023472
+  },
+  "limitations": [
+    "local SQLite, one server process; no PostgreSQL or replicas",
+    "client and server share hardware; Python client may bottleneck",
+    "closed-loop load omits queue delay from an open-loop arrival stream",
+    "no uploads, login churn, external job I/O, crash/restart or durable replay qualification",
+    "SSE delivery latency starts before the update request; includes mutation and network/client scheduling",
+    "job completion is verified after each phase; drain timing includes worker polling and client observation",
+    "RSS samples may miss transient peaks; CPU/RSS are Linux process-only",
+    "dataset and page cache are warm; setup and verification excluded from timing",
+    "fixture/harness source hashes describe the runner checkout, not proof of binary provenance; preserve your build command and clean revision"
+  ]
+}

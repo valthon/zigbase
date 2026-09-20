@@ -128,8 +128,9 @@ is intentionally not allowlisted, avoiding recursive wrapper tests.
 
 The project/task fixture is a first application-workload measurement, beyond isolated
 microbenchmarks. It runs the real HTTP records API with authenticated users, native
-account tenancy, indexed task lists, relation expansion, and writes. It is not yet a
-mixed realtime/job workload or a saturation and recovery report.
+account tenancy, indexed task lists, relation expansion, and writes. Every update also
+enqueues a transactional durable digest job and produces a live tenant-scoped SSE event.
+Warmup, normal measurement, higher-load stress, and recovery run against the same server.
 
 From a clean checkout, preserve the revision and build command alongside each report:
 
@@ -137,7 +138,8 @@ From a clean checkout, preserve the revision and build command alongside each re
 mise exec zig@0.16.0 -- zig build application-capacity -Doptimize=ReleaseFast -Dcpu=baseline
 mise exec python@3.13 -- python tools/application_capacity.py \
   --binary zig-out/bin/application-capacity --tenants 2 --tasks 100 \
-  --concurrency 4 --warmup 2 --seconds 10 > application-capacity.json
+  --concurrency 4 --stress-concurrency 8 --warmup 2 --seconds 10 \
+  --recovery-seconds 5 --drain-seconds 15 > application-capacity.json
 # Small live correctness check, also run in CI (no latency thresholds):
 ZIGBASE_TEST_CAPACITY_BINARY="$PWD/zig-out/bin/application-capacity" \
   mise exec python@3.13 -- python -m unittest discover \
@@ -167,20 +169,50 @@ After each phase the last acknowledged title is read again outside timing. Incor
 HTTP or application results count as errors; setup or final verification failure emits
 a failure object and exits nonzero. A fast empty response cannot qualify as useful work.
 
+**Realtime and background work.** One authenticated SSE subscriber per tenant observes
+updates to `tasks`. The runner matches each acknowledged task/revision to its event,
+rejecting missing, duplicate, unexpected, malformed, or foreign-tenant deliveries.
+Delivery latency starts immediately before the update request, so it includes mutation
+time and client scheduling as well as delivery; it is not transport-only latency.
+The update hook atomically enqueues one durable job containing the resolved account
+and unique revision title. The job hashes that payload and performs 64 additional SHA-256 rounds, without external I/O.
+After each phase, bounded observation verifies the completed job's payload identity
+against every acknowledged update, not merely a matching aggregate count. Rejected
+writes must leave both the task and job count unchanged.
+
+Reports use schema version 2 and retain `measurement` alongside `warmup`, `stress`,
+and `recovery`. Stress defaults to twice normal concurrency, capped at 64; set
+`--stress-concurrency` explicitly for comparisons. Recovery returns to normal
+concurrency for `--recovery-seconds` (default 5). Each phase allows up to
+`--drain-seconds` (default 15) for events/jobs to complete before the next phase.
+Completion requires another 250 ms of SSE observation within that drain deadline;
+late duplicates or unexpected frames observed in that window fail the phase. This
+is a bounded observation, not a guarantee against arbitrarily delayed delivery.
+Durable identities include the registered `digest` kind, tenant, revision, and done status.
+The drain has separate timing and resource observations; request throughput excludes
+it. Thus recovery measures return to ordinary load **after** backlog drain, not
+requests competing with the old backlog. Any phase error or incomplete semantic
+check makes `passed` false and the command exit nonzero, with phase evidence retained.
+
 **Bounds and measurement.** Inputs cap tenants at 16, tasks per tenant at 1,000,
-concurrency at 64, warmup at 30 seconds, measurement at 300 seconds, and measured requests
-at 200,000. Warmup has a separate cap of 10,000 requests. Each worker has one outstanding
+normal/stress concurrency at 64, warmup at 30 seconds, measurement/stress/recovery
+at 300 seconds each, drain at 60 seconds per phase, and requests at 200,000 per
+phase. Warmup has a separate cap of 10,000 requests. Each worker needs a distinct
+task, and the request budget must allow a three-operation cycle for every worker. Each worker has one outstanding
 request, a five-second socket timeout, and a 2 MiB response cap; it starts no new request
 after the phase deadline. In-flight requests drain, so elapsed time can exceed the
 requested duration. `limit_reached` indicates that the request cap shortened a phase.
-The finite client stores at most one latency per attempted request.
+The finite client stores at most one latency per attempted request, one acknowledged
+revision per successful update, and at most the phase request budget of events per
+subscriber. Completed jobs remain in the temporary database for verification; the
+fixture caps retained jobs at 1,000,000 and payload bytes at 256 MiB.
 
 The JSON report includes successful throughput; attempted and successful counts; bounded
 error categories; per-operation nearest-rank p50/p95/p99/max client latency including
 failed requests; effective compiled `resources`; binary digest, size, version/build/target;
 runner and fixture source digests; machine/CPU affinity; dataset/index definitions; and
 post-run SQLite/WAL file sizes. Linux additionally reports server-process CPU seconds and
-RSS sampled every 50 ms during each phase. Other platforms emit null CPU/RSS values.
+RSS sampled every 50 ms during request phases, plus observations during drain polling. Other platforms emit null CPU/RSS values.
 
 **Interpretation.** These are warm-cache, closed-loop observations, including HTTP
 connection setup and client-side semantic validation, on shared client/server hardware.
@@ -191,12 +223,20 @@ a dirty build or a binary from elsewhere must not be labeled a clean revision. P
 all build flags and the raw report before comparing runs. The runner does not claim a
 maximum user count, production SLO, comparative cost advantage, or small-machine baseline.
 
-The [capacity backlog](https://github.com/valthon/zigbase/blob/main/BACKLOG.md) retains realtime, background work, uploads, open-loop
-load, saturation/recovery, cold-cache behavior, PostgreSQL, replicas, and a reproducible
-small-machine report as future work. Use [performance contracts](#performance-contracts)
+The [capacity backlog](https://github.com/valthon/zigbase/blob/main/BACKLOG.md) retains uploads, open-loop load, cold-cache
+behavior, PostgreSQL, replicas, and a reproducible small-machine report as future work.
+Increasing concurrency is a pressure probe; it does not establish that the server
+saturated. Preserve error counts and the recovery phase when interpreting a run. Use [performance contracts](#performance-contracts)
 for allocation/binary gates and the [tuning advisor](https://github.com/valthon/zigbase/blob/main/docs/framework.md#offline-measurement-advisor-zigbase-tune)
 for comparing supported measurement inputs; this richer report is not the advisor's
 input schema.
+
+A [worked batch-sizing investigation](https://github.com/valthon/zigbase/blob/main/diagnostics/application-capacity/batch-sizing/README.md)
+preserves paired raw reports: the original two-job serial claim batch produced
+roughly ten-second drains for 40 jobs; batch 128 drained them in roughly 0.4 seconds
+on the same shared Debug test host. The walkthrough explains the polling mechanism,
+reproduction commands, and retained-work tradeoff. It is a configuration example,
+not a small-machine capacity claim.
 
 ## Performance contracts
 

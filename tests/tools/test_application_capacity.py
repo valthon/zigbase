@@ -9,6 +9,10 @@ from pathlib import Path
 import subprocess
 import sys
 import unittest
+import threading
+import sqlite3
+import tempfile
+from collections import Counter
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -55,7 +59,9 @@ class Capacity(unittest.TestCase):
     def test_limits_reject_unbounded_or_conflicting_workloads(self):
         for flag, value in [("--seconds", "0"), ("--seconds", "301"), ("--tasks", "1001"),
                             ("--tenants", "1"), ("--concurrency", "65"),
-                            ("--max-requests", "200001"), ("--warmup", "31")]:
+                            ("--max-requests", "200001"), ("--warmup", "31"),
+                            ("--stress-concurrency", "1"), ("--drain-seconds", "61"),
+                            ("--recovery-seconds", "301")]:
             with self.subTest(flag=flag), redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                 CAPACITY.arguments(["--binary", "/unused", flag, value])
         with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
@@ -85,14 +91,138 @@ class Capacity(unittest.TestCase):
              self.assertRaisesRegex(CAPACITY.InvalidResponse, "write_not_observed"):
             CAPACITY.workload("http://unused", [tenant], args, 1, 3, 1, "test")
 
+    def test_mixed_drain_rejects_missing_foreign_or_duplicate_delivery_and_unfinished_jobs(self):
+        observer = SimpleNamespace(lock=threading.Lock(), events={"revision": ("t", 2000000)}, errors=Counter())
+        updates = [("t", "revision", 1000000, "a")]
+        with patch.object(CAPACITY, "queue_counts", return_value={"done": 4}), \
+             patch.object(CAPACITY, "queue_payloads", return_value=Counter({("digest", "a", "revision", "done"): 1})):
+            result = CAPACITY.drain_mixed([observer], updates, Path("/unused"), 3, 1)
+        self.assertTrue(result["passed"])
+        self.assertEqual(result["realtime"]["update_start_to_delivery_ms"]["p99"], 1)
+        for events, errors, counts in [({}, {}, {"done": 4}),
+                                      ({"revision": ("other", 2000000)}, {}, {"done": 4}),
+                                      ({"foreign": ("t", 2000000)}, {}, {"done": 4}),
+                                      ({"revision": ("t", 2000000)}, {"duplicate_sse_event": 1}, {"done": 4}),
+                                      ({"revision": ("t", 2000000)}, {}, {"done": 3, "pending": 1}),
+                                      ({"revision": ("t", 2000000)}, {}, {"done": 4, "failed": 1})]:
+            observer.events, observer.errors = events, Counter(errors)
+            with patch.object(CAPACITY, "queue_counts", return_value=counts), \
+                 patch.object(CAPACITY, "queue_payloads", return_value=Counter({("digest", "a", "revision", "done"): 1})):
+                self.assertFalse(CAPACITY.drain_mixed([observer], updates, Path("/unused"), 3, 1)["passed"])
+
+    def test_wrong_job_kind_cannot_satisfy_digest_identity(self):
+        observer = SimpleNamespace(lock=threading.Lock(), events={"test-worker-0": ("t", 2)}, errors=Counter())
+        with tempfile.TemporaryDirectory() as directory:
+            data = Path(directory)
+            with sqlite3.connect(data / "data.db") as db:
+                db.execute("CREATE TABLE _queue_jobs (queue,kind,payload,status)")
+                db.execute("INSERT INTO _queue_jobs VALUES (?,?,?,?)",
+                           ("capacity", "other", json.dumps({"account": "a", "title": "test-worker-0"}), "done"))
+            result = CAPACITY.drain_mixed([observer], [("t", "test-worker-0", 1, "a")], data, 0, 1)
+        self.assertTrue(result["realtime"]["settled"])
+        self.assertFalse(result["passed"])
+        self.assertEqual(result["jobs"]["missing_jobs"], 1)
+        self.assertEqual(result["jobs"]["unexpected_jobs"], 1)
+
+    def test_settling_observes_late_duplicate_and_unexpected_events(self):
+        for late in ("duplicate", "unexpected", "none"):
+            observer = SimpleNamespace(lock=threading.Lock(), events={"revision": ("t", 2)}, errors=Counter())
+            clock = [0.0]
+            def advance(seconds):
+                clock[0] += seconds
+                if clock[0] >= .1:
+                    if late == "duplicate":
+                        observer.errors["duplicate_sse_event"] = 1
+                    elif late == "unexpected":
+                        observer.events["unexpected"] = ("t", 3)
+            with self.subTest(late=late), \
+                 patch.object(CAPACITY.time, "monotonic", side_effect=lambda: clock[0]), \
+                 patch.object(CAPACITY.time, "sleep", side_effect=advance), \
+                 patch.object(CAPACITY, "queue_counts", return_value={"done": 1}), \
+                 patch.object(CAPACITY, "queue_payloads", return_value=Counter({("digest", "a", "revision", "done"): 1})):
+                result = CAPACITY.drain_mixed([observer], [("t", "revision", 1, "a")], Path("/unused"), 0, 1)
+            self.assertEqual(result["passed"], late == "none")
+            self.assertTrue(result["realtime"]["settled"])
+
+    def test_settling_includes_events_received_during_queue_poll(self):
+        observer = SimpleNamespace(lock=threading.Lock(), events={"revision": ("t", 2)}, errors=Counter())
+        polls = [0]
+        def counts(_):
+            polls[0] += 1
+            if polls[0] == 2:
+                observer.errors["duplicate_sse_event"] = 1
+            return {"done": 1}
+        with patch.object(CAPACITY.time, "monotonic", side_effect=[0, 0, .3, .3]), \
+             patch.object(CAPACITY.time, "sleep"), \
+             patch.object(CAPACITY, "queue_counts", side_effect=counts), \
+             patch.object(CAPACITY, "queue_payloads", return_value=Counter({("digest", "a", "revision", "done"): 1})):
+            result = CAPACITY.drain_mixed([observer], [("t", "revision", 1, "a")], Path("/unused"), 0, 1)
+        self.assertTrue(result["realtime"]["settled"])
+        self.assertFalse(result["passed"])
+        self.assertEqual(result["realtime"]["errors"], {"duplicate_sse_event": 1})
+
+    def test_completion_near_deadline_cannot_skip_settling(self):
+        observer = SimpleNamespace(lock=threading.Lock(), events={"revision": ("t", 2)}, errors=Counter())
+        # Completion first observed at .76; a slow poll returns at 1.02. Although
+        # .26 seconds elapsed, the required window extends past the 1s deadline.
+        with patch.object(CAPACITY.time, "monotonic", side_effect=[0, .76, 1.02, 1.02]), \
+             patch.object(CAPACITY.time, "sleep"), \
+             patch.object(CAPACITY, "queue_counts", return_value={"done": 1}), \
+             patch.object(CAPACITY, "queue_payloads", return_value=Counter({("digest", "a", "revision", "done"): 1})):
+            result = CAPACITY.drain_mixed([observer], [("t", "revision", 1, "a")], Path("/unused"), 0, 1)
+        self.assertFalse(result["passed"])
+        self.assertFalse(result["realtime"]["settled"])
+
+    def test_realtime_observer_rejects_cross_tenant_record(self):
+        observer = object.__new__(CAPACITY.RealtimeObserver)
+        observer.tenant = self.tenant
+        observer.stopping, observer.lock = threading.Event(), threading.Lock()
+        observer.events, observer.errors, observer.limit = {}, Counter(), 10
+        observer.read_frame = lambda: {"type": "event", "topic": "tasks", "action": "update",
+                                       "record": {**self.record, "account": "foreign"}}
+        observer.read_events()
+        self.assertEqual(observer.errors, {"wrong_task_account": 1})
+        self.assertEqual(observer.events, {})
+
+    def test_equal_job_count_with_wrong_revision_fails(self):
+        observer = SimpleNamespace(lock=threading.Lock(), events={"revision": ("t", 2000000)}, errors=Counter())
+        with patch.object(CAPACITY, "queue_counts", return_value={"done": 1}), \
+             patch.object(CAPACITY, "queue_payloads", return_value=Counter({("digest", "a", "other-revision", "done"): 1})):
+            result = CAPACITY.drain_mixed([observer], [("t", "revision", 1000000, "a")], Path("/unused"), 0, 1)
+        self.assertFalse(result["passed"])
+        self.assertEqual(result["jobs"]["missing_jobs"], 1)
+        self.assertEqual(result["jobs"]["unexpected_jobs"], 1)
+
+    def test_malformed_idle_sse_records_sticky_error(self):
+        for frame in (None, [], "unexpected"):
+            observer = object.__new__(CAPACITY.RealtimeObserver)
+            observer.stopping, observer.lock = threading.Event(), threading.Lock()
+            observer.events, observer.errors = {}, Counter()
+            observer.read_frame = lambda: frame
+            observer.read_events()
+            observer.reset()
+            self.assertEqual(observer.errors, {"unexpected_sse_frame": 1})
+            with patch.object(CAPACITY, "queue_counts", return_value={}), \
+                 patch.object(CAPACITY, "queue_payloads", return_value=Counter()):
+                self.assertFalse(CAPACITY.drain_mixed([observer], [], Path("/unused"), 0, 0)["passed"])
+
     @unittest.skipUnless(os.environ.get("ZIGBASE_TEST_CAPACITY_BINARY"), "set ZIGBASE_TEST_CAPACITY_BINARY for live app")
     def test_real_tenant_workload_and_provenance(self):
         result = subprocess.run([sys.executable, str(SCRIPT), "--binary", os.environ["ZIGBASE_TEST_CAPACITY_BINARY"],
-                                 "--tasks", "4", "--seconds", "30", "--warmup", "30", "--max-requests", "24"],
+                                 "--tasks", "4", "--seconds", "30", "--warmup", "30", "--max-requests", "24", "--recovery-seconds", "1"],
                                 text=True, capture_output=True, timeout=120)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         report = json.loads(result.stdout)
         self.assertTrue(report["passed"])
+        self.assertEqual(report["schema_version"], 2)
+        for phase in ("warmup", "measurement", "stress", "recovery"):
+            self.assertTrue(report[phase]["drain"]["passed"], report[phase])
+            self.assertEqual(report[phase]["drain"]["realtime"]["expected_events"], 8)
+            self.assertEqual(report[phase]["drain"]["realtime"]["received_events"], 8)
+            self.assertEqual(report[phase]["drain"]["jobs"]["completed"], 8)
+        self.assertEqual(report["stress"]["concurrency"], 8)
+        self.assertEqual(report["recovery"]["concurrency"], 4)
+        self.assertFalse(report["pressure"]["rejections_observed"])
         self.assertEqual(report["isolation_before_and_after"], "passed")
         self.assertEqual(report["measurement"]["attempts"], 24)
         self.assertEqual(report["measurement"]["successful_requests"], 24)
