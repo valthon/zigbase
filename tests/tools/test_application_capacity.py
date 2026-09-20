@@ -42,6 +42,14 @@ class Capacity(unittest.TestCase):
             with self.assertRaises(CAPACITY.InvalidResponse):
                 CAPACITY.checked_list({"items": rows}, self.tenant, len(rows) or 1)
 
+    def test_workbench_capture_requires_enabled_current_contract(self):
+        with patch.object(CAPACITY.Client, "call", side_effect=CAPACITY.InvalidResponse("http_404_expected_200")):
+            with self.assertRaisesRegex(CAPACITY.InvalidResponse, "workbench_not_enabled"):
+                CAPACITY.workbench_snapshot(CAPACITY.Client("http://unused"))
+        with patch.object(CAPACITY.Client, "call", return_value={"routes": []}):
+            with self.assertRaisesRegex(CAPACITY.InvalidResponse, "unsupported_workbench_report"):
+                CAPACITY.workbench_snapshot(CAPACITY.Client("http://unused"))
+
     def test_nearest_rank_handles_small_runs_without_interpolation(self):
         self.assertIsNone(CAPACITY.distribution([]))
         self.assertEqual(CAPACITY.distribution([9]), dict(p50=9, p95=9, p99=9, max=9))
@@ -235,6 +243,30 @@ class Capacity(unittest.TestCase):
         if sys.platform == "linux":
             self.assertGreater(report["measurement"]["server"]["peak_sampled_rss_bytes"], 0)
         self.assertTrue(any(row[0] == "capacity_tasks_account_id" for row in report["dataset"]["indexes"]))
+
+
+    @unittest.skipUnless(os.environ.get("ZIGBASE_TEST_CAPACITY_WORKBENCH_BINARY"), "set instrumented capacity binary")
+    def test_live_workbench_snapshots_include_http_and_durable_attempts(self):
+        result = subprocess.run([sys.executable, str(SCRIPT), "--binary",
+                                 os.environ["ZIGBASE_TEST_CAPACITY_WORKBENCH_BINARY"], "--workbench",
+                                 "--tasks", "4", "--concurrency", "2", "--stress-concurrency", "4",
+                                 "--seconds", "2", "--warmup", "0", "--recovery-seconds", "2",
+                                 "--max-requests", "24"], text=True, capture_output=True, timeout=90)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        report = json.loads(result.stdout)
+        self.assertTrue(report["workbench"]["enabled"])
+        completed = 0
+        for phase in ["measurement", "stress", "recovery"]:
+            snapshot = report[phase]["workbench_after"]
+            jobs = [row for row in snapshot["jobs"] if row["jobName"] == "digest"]
+            self.assertEqual(len(jobs), 1)
+            self.assertEqual(jobs[0]["attribution"], "durable_job")
+            self.assertEqual(jobs[0]["handlerErrors"], 0)
+            completed += report[phase]["drain"]["jobs"]["completed"]
+            self.assertEqual(jobs[0]["completedScopes"], completed)
+            self.assertGreater(sum(row["responseStatusClasses"]["success"] for row in snapshot["routes"]), 0)
+            self.assertTrue(any(wait["acquisitions"] > 0 for row in snapshot["routes"]
+                                for wait in row["poolWaits"] if wait["role"] == "writer"))
 
 
 if __name__ == "__main__":

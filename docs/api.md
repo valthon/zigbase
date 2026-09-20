@@ -1794,7 +1794,22 @@ also includes binding, column access, scheduling and instrumentation, not just
 application work. These are elapsed durations, not CPU time. Existing execution
 counts and slow thresholds remain step-based; a statement may execute zero or
 many times. `droppedStatements` is independent of `droppedExecutions`. No raw
-`exec`, failed-prepare, pool-wait or full-request timing is implied.
+`exec`, failed-prepare or full-request timing is implied by statement metrics.
+Scope aggregates add `responseStatusClasses` (returned HTTP status classes),
+`handlerErrors` (errors escaping a measured handler), and four fixed `poolWaits`
+buckets for SQLite/PostgreSQL reader/writer mutex acquisition. Each wait bucket has
+`backend`, `role`, `acquisitions`, `totalNanoseconds`, and `maxNanoseconds`.
+`poolWaitMeasurement` is `pool-mutex-acquisition`: it excludes connection creation,
+SQL/database locks, and connection ownership time. These counts include uncontended
+acquisitions and are not proof of contention on their own.
+The additive `jobs` array covers declared durable/scheduled handler attempts under
+`jobMeasurement: "handler-attempt-scope"`; retry backoff and queue residence are excluded.
+Job aggregates identify `attribution` and `jobName`; SQL items use the same attribution
+kind with `method: "JOB"`, `routeTemplate: null`, and the declared `jobName`. HTTP and job
+aggregates share `maxScopeEntries`, while `droppedRouteScopes` and `droppedJobScopes`
+count omissions separately. SQL shapes share `maxEntries`.
+An error count does not mean retries are exhausted. No job payloads or dynamic
+`app.submit` names are captured; memory jobs and submit handlers are unmeasured.
 `GET /api/meta` includes `capabilities.queryWorkbench` and optional
 `endpoints.queryWorkbench`; this is compile-time discovery, not access authority.
 

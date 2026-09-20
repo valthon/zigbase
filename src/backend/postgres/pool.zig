@@ -10,6 +10,8 @@
 //! API. Connections are opened lazily; released readers are parked up to `reader_cap`.
 
 const std = @import("std");
+const build_options = @import("build_options");
+const workbench = @import("../../query_workbench.zig");
 const db_mod = @import("db.zig");
 const Db = db_mod.Db;
 const DbError = db_mod.DbError;
@@ -130,7 +132,9 @@ pub const Pool = struct {
     /// Blocks on the writer mutex and returns the writer connection. Caller MUST call
     /// `releaseWriter` when done.
     pub fn acquireWriter(self: *Pool) *Db {
+        const measurement = if (comptime build_options.query_workbench) workbench.PoolMeasurement.begin() else {};
         self.writer_mutex.lockUncancelable(self.io);
+        if (comptime build_options.query_workbench) measurement.finish(.postgres, .writer);
         self.writer_acquires += 1;
         self.writer.field_cipher = self.field_cipher;
         return &self.writer;
@@ -158,7 +162,9 @@ pub const Pool = struct {
     /// skipped, so a poisoned free-list can never be handed back to a caller. (I-2.)
     pub fn acquireReader(self: *Pool) DbError!Db {
         while (true) {
+            const measurement = if (comptime build_options.query_workbench) workbench.PoolMeasurement.begin() else {};
             while (!self.reader_mutex.tryLock()) std.atomic.spinLoopHint();
+            if (comptime build_options.query_workbench) measurement.finish(.postgres, .reader);
             if (self.reader_count > 0) {
                 self.reader_count -= 1;
                 var db = self.readers[self.reader_count];

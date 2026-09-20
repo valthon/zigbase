@@ -26,13 +26,15 @@ pub fn stats(ctx: *http.RequestCtx) !http.Response {
     const snapshot = blk: {
         store.mutex.lockUncancelable(store.io);
         defer store.mutex.unlock(store.io);
-        break :blk .{ .entries = try ctx.allocator.a.dupe(workbench.Entry, store.entries[0..store.count]), .dropped = store.dropped, .dropped_statements = store.dropped_statements, .routes = try ctx.allocator.a.dupe(workbench.RouteEntry, store.routes[0..store.route_count]), .dropped_routes = store.dropped_routes };
+        break :blk .{ .entries = try ctx.allocator.a.dupe(workbench.Entry, store.entries[0..store.count]), .dropped = store.dropped, .dropped_statements = store.dropped_statements, .routes = try ctx.allocator.a.dupe(workbench.RouteEntry, store.routes[0..store.route_count]), .dropped_routes = store.dropped_routes, .dropped_jobs = store.dropped_jobs };
     };
     const Item = struct {
+        attribution: []const u8,
         backend: []const u8,
         measurement: []const u8,
         method: []const u8,
-        routeTemplate: []const u8,
+        routeTemplate: ?[]const u8,
+        jobName: ?[]const u8,
         shape: []const u8,
         executions: u64,
         stepNanoseconds: u64,
@@ -51,10 +53,12 @@ pub fn stats(ctx: *http.RequestCtx) !http.Response {
         var bytes: [8]u8 = undefined;
         std.mem.writeInt(u64, &bytes, entry.fingerprint, .big);
         item.* = .{
+            .attribution = @tagName(entry.attribution),
             .backend = @tagName(entry.backend),
             .measurement = if (entry.backend == .sqlite) "prepared-statement-step-time" else "client-extended-protocol-exchange-time",
             .method = entry.method,
-            .routeTemplate = entry.route[0..entry.route_len],
+            .routeTemplate = if (entry.attribution == .http) entry.route[0..entry.route_len] else null,
+            .jobName = if (entry.attribution != .http) entry.route[0..entry.route_len] else null,
             .shape = try ctx.allocator.a.dupe(u8, &std.fmt.bytesToHex(bytes, .lower)),
             .executions = entry.executions,
             .stepNanoseconds = entry.total_ns,
@@ -69,28 +73,67 @@ pub fn stats(ctx: *http.RequestCtx) !http.Response {
             .heldNanoseconds = entry.held_ns,
         };
     }
+    const PoolWaitItem = struct {
+        backend: []const u8,
+        role: []const u8,
+        acquisitions: u64,
+        totalNanoseconds: u64,
+        maxNanoseconds: u64,
+    };
     const RouteItem = struct {
+        attribution: []const u8,
         method: []const u8,
         routeTemplate: []const u8,
         completedScopes: u64,
         totalNanoseconds: u64,
         maxNanoseconds: u64,
         slowScopes: u64,
+        responseStatusClasses: struct { other: u64, informational: u64, success: u64, redirection: u64, clientError: u64, serverError: u64 },
+        handlerErrors: u64,
+        poolWaits: [4]PoolWaitItem,
     };
-    const routes = try ctx.allocator.a.alloc(RouteItem, snapshot.routes.len);
-    for (snapshot.routes, routes) |*entry, *item| {
-        item.* = .{
+    const JobItem = struct {
+        attribution: []const u8,
+        jobName: []const u8,
+        completedScopes: u64,
+        totalNanoseconds: u64,
+        maxNanoseconds: u64,
+        slowScopes: u64,
+        handlerErrors: u64,
+        poolWaits: [4]PoolWaitItem,
+    };
+    var routes: std.ArrayList(RouteItem) = .empty;
+    var jobs: std.ArrayList(JobItem) = .empty;
+    for (snapshot.routes) |*entry| {
+        var item: RouteItem = .{
             .method = entry.method,
             .routeTemplate = entry.route[0..entry.route_len],
+            .attribution = @tagName(entry.attribution),
             .completedScopes = entry.completed,
             .totalNanoseconds = entry.total_ns,
             .maxNanoseconds = entry.max_ns,
             .slowScopes = entry.slow,
+            .handlerErrors = entry.failures,
+            .responseStatusClasses = .{ .other = entry.status_classes[0], .informational = entry.status_classes[1], .success = entry.status_classes[2], .redirection = entry.status_classes[3], .clientError = entry.status_classes[4], .serverError = entry.status_classes[5] },
+            .poolWaits = undefined,
         };
+        for (entry.pool_waits, &item.poolWaits, 0..) |wait, *out, index| {
+            out.* = .{ .backend = if (index < 2) "sqlite" else "postgres", .role = if (index % 2 == 0) "reader" else "writer", .acquisitions = wait.acquisitions, .totalNanoseconds = wait.total_ns, .maxNanoseconds = wait.max_ns };
+        }
+        if (entry.attribution == .http) {
+            try routes.append(ctx.allocator.a, item);
+        } else {
+            try jobs.append(ctx.allocator.a, .{ .attribution = item.attribution, .jobName = item.routeTemplate, .completedScopes = item.completedScopes, .totalNanoseconds = item.totalNanoseconds, .maxNanoseconds = item.maxNanoseconds, .slowScopes = item.slowScopes, .handlerErrors = item.handlerErrors, .poolWaits = item.poolWaits });
+        }
     }
     return .{ .status = 200, .body = try std.json.Stringify.valueAlloc(ctx.allocator.a, .{
         .items = items,
-        .routes = routes,
+        .routes = routes.items,
+        .jobs = jobs.items,
+        .jobMeasurement = "handler-attempt-scope",
+        .poolWaitMeasurement = "pool-mutex-acquisition",
+        .maxScopeEntries = store.limits.max_entries,
+        .droppedJobScopes = snapshot.dropped_jobs,
         .routeMeasurement = "matched-handler-scope",
         .maxRouteEntries = store.limits.max_entries,
         .droppedRouteScopes = snapshot.dropped_routes,

@@ -118,6 +118,12 @@ product priority and acceptance evidence; it does not create duplicate implement
   cross-subsystem coordination are still outside these gates.
   Memory-job/submit workers now have independent comptime counts and share the
   configured job stack size, with lazy startup and unchanged bounded-ring rejection.
+- [ ] **Durable worker wakeup and batch policy.** The mixed-capacity experiment
+  exposed polling delay with small serial claim batches. Evaluate bounded wakeups
+  or adaptive batching against mixed HTTP/job workloads, including fairness,
+  retained claim memory, idle cost, and cross-instance coordination. Preserve the
+  current explicit batch semantics; do not infer parallelism from its legacy
+  `concurrency` name or optimize solely for maximum queue throughput.
 - [ ] Agent-native development interface: versioned discovery, structured diagnostics,
   schema/route inspection, migration previews, and focused test execution.
   Implemented slices: CLI discovery with explicit operation side effects (#409),
@@ -143,11 +149,16 @@ product priority and acceptance evidence; it does not create duplicate implement
   and bearer-superuser-only generated SELECT-plan inspection. Completed-statement
   lifecycle timing separates measured calls from held intervals. A separate bounded
   method/template table now reports completed synchronous dispatch counts, total/max
-  duration and slow scopes, including SQL-free/error/denied handlers. It does not
-  classify status or measure transport, detached jobs, or exclusive pool-wait time.
+  duration and slow scopes, including SQL-free/error/denied handlers. HTTP outcome
+  classes and handler errors now distinguish returned statuses from escaped errors.
+  Four fixed backend/role buckets measure pool mutex acquisition; declared durable
+  and scheduled job attempts share bounded scope storage with separate attribution.
+  The capacity runner can retain cumulative workbench snapshots outside timed load.
+  Transport, connection creation, queue residence, memory jobs and app.submit remain
+  outside these measurements.
   PostgreSQL now
   measures bounded client-side prepared exchanges with backend-aware attribution;
-  PostgreSQL plans, full request/pool-wait latency, captured plans and automatic
+  PostgreSQL plans, full request/connection-acquisition latency, captured plans and automatic
   index advice remain deferred.
 - [ ] **Deferred:** dependency-aware bounded response caching. PR #425 was evaluated
   and did not justify further investment. Revisit only if representative application

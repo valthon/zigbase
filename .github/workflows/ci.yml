@@ -919,9 +919,10 @@ jobs:
         run: |
           mise exec zig@0.16.0 -- zig build check-query-workbench-contracts
           mise exec zig@0.16.0 -- zig build test -Dquery-workbench=true --summary all
-          mise exec zig@0.16.0 -- zig build query-workbench-fixture check-query-workbench-contracts -Dquery-workbench=true --prefix zig-out/workbench
+          mise exec zig@0.16.0 -- zig build query-workbench-fixture application-capacity check-query-workbench-contracts -Dquery-workbench=true --prefix zig-out/workbench
           bash scripts/check-query-workbench-gating.sh "$ZIGBASE_TEST_BINARY" zig-out/workbench/bin/query-workbench-fixture
           ZIGBASE_TEST_QUERY_WORKBENCH_BINARY="$GITHUB_WORKSPACE/zig-out/workbench/bin/query-workbench-fixture" mise exec python@3.13 -- python -m pytest tests/admin/test_query_workbench.py -q
+          ZIGBASE_TEST_CAPACITY_WORKBENCH_BINARY="$GITHUB_WORKSPACE/zig-out/workbench/bin/application-capacity" mise exec python@3.13 -- python -m pytest tests/tools/test_application_capacity.py -k live_workbench -q
       - name: Install optional thumbnail test dependency
         if: matrix.lane == 'thumbnails'
         run: sudo apt-get update && sudo apt-get install -y imagemagick

@@ -483,7 +483,14 @@ pub fn pollOnce(app: *App, reg: *const Registry, worker: WorkerDef) !usize {
             defer arena.deinit();
             var cx = Ctx{ .app = app, .arena = RequestArena.from(&arena), .rctx = .{}, .request = null, .bound_conn = null };
             defer cx.deinit();
+            var measured: if (@import("build_options").query_workbench) @import("../query_workbench.zig").Scope else void = undefined;
+            if (comptime @import("build_options").query_workbench) {
+                measured = @import("../query_workbench.zig").Scope.initJob(app.query_workbench, .durable_job, rj.kind);
+                measured.enter();
+            }
+            defer if (comptime @import("build_options").query_workbench) measured.leave();
             rj.handler(&cx, job.payload) catch |e| {
+                if (comptime @import("build_options").query_workbench) measured.failed = true;
                 run_err = e;
             };
         } else {
@@ -1309,4 +1316,60 @@ test "durable capacity serializes independent SQLite producers and survives reop
     try testing.expectEqual(@as(u64, 3), snapshot.retained_jobs);
     try testing.expectEqual(@as(?u64, 6), snapshot.retained_payload_bytes);
     try testing.expectError(error.QueueFull, enqueue(&reopened, testing.io, S.def, "k", "x", 0));
+}
+
+test "workbench isolates consecutive durable attempts from claim and acknowledgement SQL" {
+    if (comptime !@import("build_options").query_workbench) return error.SkipZigTest;
+    const workbench = @import("../query_workbench.zig");
+    const env = try PollTestEnv.init();
+    defer env.deinit();
+    const store = try workbench.Store.create(std.testing.allocator, std.testing.io, .{});
+    defer store.destroy();
+    env.app.query_workbench = store;
+    const Handler = struct {
+        fn run(ctx: *Ctx, payload: []const u8) !void {
+            const writer = ctx.app.pool.acquireWriter();
+            defer ctx.app.pool.releaseWriter();
+            var stmt = try writer.prepare("SELECT 42;");
+            defer stmt.finalize();
+            _ = try stmt.step();
+            if (std.mem.eql(u8, payload, "fail")) return error.AttemptFailed;
+        }
+    };
+    const reg = Registry{
+        .queues = &.{.{ .name = "default", .backend = .durable }},
+        .jobs = &.{ .{ .kind = "fails", .handler = Handler.run }, .{ .kind = "succeeds", .handler = Handler.run } },
+    };
+    {
+        const writer = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        _ = try enqueue(writer, env.app.io, reg.queues[0], "fails", "fail", clock.nowUnix(env.app.io));
+        _ = try enqueue(writer, env.app.io, reg.queues[0], "succeeds", "private payload", clock.nowUnix(env.app.io));
+    }
+    try testing.expectEqual(@as(usize, 2), try pollOnce(&env.app, &reg, .{ .name = "w", .queues = &.{"default"}, .concurrency = 2 }));
+    try testing.expectEqual(@as(usize, 2), store.route_count);
+    try testing.expectEqual(@as(usize, 2), store.count);
+    for (store.routes[0..store.route_count]) |scope| {
+        try testing.expectEqual(workbench.Attribution.durable_job, scope.attribution);
+        try testing.expectEqual(@as(u64, 1), scope.completed);
+        try testing.expectEqual(@as(u64, 1), scope.pool_waits[1].acquisitions);
+        const failed = std.mem.eql(u8, scope.route[0..scope.route_len], "fails");
+        if (!failed) try testing.expectEqualStrings("succeeds", scope.route[0..scope.route_len]);
+        try testing.expectEqual(@as(u64, if (failed) 1 else 0), scope.failures);
+    }
+    for (store.entries[0..store.count]) |entry| {
+        try testing.expectEqual(workbench.Attribution.durable_job, entry.attribution);
+        try testing.expectEqual(@as(u64, 1), entry.executions);
+        try testing.expectEqual(@as(u64, 1), entry.statements);
+        try testing.expectEqual(workbench.fingerprint("SELECT 42;").?, entry.fingerprint);
+    }
+    // Both acknowledgement paths ran, but neither their SQL nor their writer
+    // checkout entered a handler aggregate. No previous handler survives the
+    // next loop iteration or remains active for subsequent caller SQL.
+    const writer = env.pool.acquireWriter();
+    defer env.pool.releaseWriter();
+    try testing.expectEqual(@as(i64, 1), try countStatus(writer, "done"));
+    try testing.expectEqual(@as(i64, 1), try countStatus(writer, "pending"));
+    try testing.expectEqual(@as(usize, 2), store.count);
+    for (store.entries[0..store.count]) |entry| try testing.expectEqual(@as(u64, 1), entry.executions);
 }

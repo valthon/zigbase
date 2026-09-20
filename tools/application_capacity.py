@@ -259,6 +259,21 @@ def drain_mixed(observers, updates, data, jobs_before, timeout, pid=None, phase=
                      "work": "SHA-256 of account/revision payload followed by 64 digest rounds; no external I/O"}}
 
 
+def workbench_snapshot(client):
+    """Bounded operator snapshot outside timing; no inference of exclusive durations."""
+    try:
+        report = client.call("GET", "/api/query-workbench/stats")
+    except InvalidResponse as error:
+        if str(error) == "http_404_expected_200":
+            raise InvalidResponse("workbench_not_enabled_build_with_Dquery-workbench=true") from error
+        raise
+    require(isinstance(report, dict) and isinstance(report.get("routes"), list)
+            and isinstance(report.get("jobs"), list)
+            and report.get("poolWaitMeasurement") == "pool-mutex-acquisition",
+            "unsupported_workbench_report")
+    return report
+
+
 def command_json(binary, verb, env):
     result = subprocess.run([str(binary), verb, "--json"], env=env, capture_output=True,
                             text=True, timeout=30, check=True)
@@ -506,6 +521,8 @@ def arguments(argv=None):
                         help="higher-load phase workers (default: twice concurrency, at most 64)")
     parser.add_argument("--recovery-seconds", type=bounded_int(1, 300), default=5)
     parser.add_argument("--drain-seconds", type=bounded_int(1, 60), default=15)
+    parser.add_argument("--workbench", action="store_true",
+                        help="include cumulative operator snapshots; requires -Dquery-workbench=true")
     args = parser.parse_args(argv)
     args.stress_concurrency = args.stress_concurrency or min(64, args.concurrency * 2)
     if args.stress_concurrency < args.concurrency:
@@ -524,6 +541,13 @@ def run(args):
         version = command_json(binary, "version", env)
         tenants = seed(client, data, args.tenants, args.tasks)
         isolation(client.base, tenants, args.tasks, data)
+        inspector = None
+        initial_workbench = None
+        if args.workbench:
+            token = client.call("POST", "/api/collections/_superusers/auth-with-password",
+                                {"identity": "admin@capacity.test", "password": PASSWORD})["token"]
+            inspector = Client(client.base, token)
+            initial_workbench = workbench_snapshot(inspector)
         with ExitStack() as stack:
             observers = []
             for tenant in tenants:
@@ -538,6 +562,8 @@ def run(args):
                 phase_args = SimpleNamespace(**{**vars(args), "concurrency": concurrency})
                 result = workload(client.base, tenants, phase_args, seconds, limit, process.pid, name)
                 result["drain"] = drain_mixed(observers, result.pop("acknowledged_updates"), data, before, args.drain_seconds, process.pid, name)
+                if inspector is not None:
+                    result["workbench_after"] = workbench_snapshot(inspector)
                 return result
 
             warmup = phase("warmup", args.warmup, args.concurrency, min(10000, args.max_requests)) if args.warmup else None
@@ -566,6 +592,8 @@ def run(args):
                            "timeout_seconds": 5, "response_limit_bytes": MAX_RESPONSE},
                   "isolation_before_and_after": "passed", "warmup": warmup, "measurement": measured,
                   "stress": stress, "recovery": recovery,
+                  "workbench": {"enabled": args.workbench, "initial": initial_workbench,
+                                "measurement": "cumulative process snapshots including setup, outside request timing"},
                   "pressure": {"rejections_observed": any("http_503_" in key or "http_429_" in key for key in stress["errors"]),
                                "qualification": "Higher concurrency is an offered-load probe, not proof of server saturation."},
                   "data_files_bytes_after": {p.name: p.stat().st_size for p in data.iterdir() if p.name.startswith("data.db")},

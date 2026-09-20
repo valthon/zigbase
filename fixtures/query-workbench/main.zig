@@ -33,8 +33,34 @@ fn noQuery(ctx: *zigbase.Ctx) !zigbase.http.Response {
 fn failed(_: *zigbase.Ctx) !zigbase.http.Response {
     return error.TestRouteFailure;
 }
+fn poolWait(ctx: *zigbase.Ctx) !zigbase.http.Response {
+    const Holder = struct {
+        fn run(app: *zigbase.Runtime, ready: *std.atomic.Value(bool)) void {
+            _ = app.pool.acquireWriter();
+            defer app.pool.releaseWriter();
+            ready.store(true, .release);
+            app.io.sleep(std.Io.Duration.fromMilliseconds(100), .awake) catch return;
+        }
+    };
+    var ready: std.atomic.Value(bool) = .init(false);
+    const thread = try std.Thread.spawn(.{}, Holder.run, .{ ctx.app, &ready });
+    defer thread.join();
+    while (!ready.load(.acquire)) try ctx.app.io.sleep(std.Io.Duration.fromMilliseconds(1), .awake);
+    _ = ctx.app.pool.acquireWriter();
+    defer ctx.app.pool.releaseWriter();
+    return .{ .status = 204, .body = "" };
+}
+fn measuredJob(ctx: *zigbase.Ctx, _: *zigbase.JobEvent) !zigbase.schedule.Reactive {
+    var reader = try ctx.app.pool.acquireReader();
+    defer ctx.app.pool.releaseReader(&reader);
+    var stmt = try reader.prepare("SELECT 42;");
+    defer stmt.finalize();
+    _ = try stmt.step();
+    return .stop;
+}
 pub fn main(init: std.process.Init) !void {
     const routes = .{
+        .{ .method = .GET, .path = "/pool-wait", .auth = .public, .handler = poolWait },
         .{ .method = .GET, .path = "/no-query/:id", .auth = .public, .handler = noQuery },
         .{ .name = "postNoQuery", .method = .POST, .path = "/no-query/:id", .auth = .public, .handler = noQuery },
         .{ .name = "denied", .method = .GET, .path = "/denied", .auth = .authed, .handler = noQuery },
@@ -45,6 +71,7 @@ pub fn main(init: std.process.Init) !void {
     const App = if (@import("fixture_options").enabled) zigbase.App(.{
         .query_workbench = .{ .max_entries = 8, .slow_ms = 1 },
         .routes = routes,
+        .cron = .{.{ .name = "workbench-once", .schedule = zigbase.schedule.Schedule.reactive, .handler = measuredJob }},
     }) else zigbase.App(.{ .routes = routes });
     return App.runCli(init);
 }

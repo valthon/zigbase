@@ -214,6 +214,18 @@ runner and fixture source digests; machine/CPU affinity; dataset/index definitio
 post-run SQLite/WAL file sizes. Linux additionally reports server-process CPU seconds and
 RSS sampled every 50 ms during request phases, plus observations during drain polling. Other platforms emit null CPU/RSS values.
 
+**Correlate with the workbench.** Build the same fixture with
+`-Dquery-workbench=true` and add `--workbench` to the runner command. It captures
+an initial operator snapshot and each phase's `workbench_after`, outside request
+timing. A disabled or older unsupported workbench fails explicitly. Snapshots are
+cumulative for the process, including setup and verification traffic; compare
+matching keys across snapshots and inspect dropped counters before attributing a
+change. A missing key after the table fills is not zero activity. Timing families
+are inclusive and cannot be subtracted to infer exclusive CPU time. Instrumentation
+has overhead: compare runs with the same build flags, and keep uninstrumented
+capacity observations separate. The workbench stores neither SQL parameters nor
+job payloads, and the report does not retain the operator token.
+
 **Interpretation.** These are warm-cache, closed-loop observations, including HTTP
 connection setup and client-side semantic validation, on shared client/server hardware.
 Python or connection churn can be the bottleneck. CPU is process time, not normalized
