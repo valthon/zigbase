@@ -6,7 +6,7 @@ import {
 } from '../frontend/src/lib/api';
 
 const storage = new Map<string, string>();
-const request = vi.fn<Parameters<typeof fetch>, ReturnType<typeof fetch>>();
+const request = vi.fn<typeof fetch>();
 
 describe('compiled listing thumbnails', () => {
   it('uses encoded derivative paths only when enabled', () => {

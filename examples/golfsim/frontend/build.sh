@@ -13,7 +13,7 @@ if [[ "${1:-}" == "--no-install" ]]; then
 else
   npm --prefix ../../../clients/typescript ci
   npm --prefix ../../../clients/typescript run build
-  npm --prefix .. install
+  npm --prefix .. ci
 fi
 npm --prefix .. run typecheck
 

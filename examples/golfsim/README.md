@@ -459,7 +459,7 @@ For raw SQL on a migration-owned table, acquire the pooled writer directly:
 
 ---
 
-## Frontend (Zigapagos v0.4.0 islands)
+## Frontend (Zigapagos v0.5.0 islands)
 
 `frontend/` is a Zigapagos site with `@z/runtime` islands. The release command is
 pinned through [`scripts/zigapagos.sh`](../../scripts/zigapagos.sh), and its output
@@ -701,7 +701,7 @@ Two indexes are provisioned at startup via comptime `.indexes`:
 ## Building and running
 
 ```sh
-# 1. Validate and build the pinned Zigapagos v0.4.0 frontend
+# 1. Validate and build the pinned Zigapagos v0.5.0 frontend
 cd frontend
 ../../../scripts/zigapagos.sh validate --format=json
 ./build.sh

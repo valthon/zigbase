@@ -288,7 +288,7 @@ implies the others.
 
 ## Frontend (Zigapagos islands)
 
-`frontend/` is a Zigapagos v0.4.0 site with four `@z/runtime` TSX islands: a
+`frontend/` is a Zigapagos v0.5.0 site with four `@z/runtime` TSX islands: a
 public post list with live updates, post detail, a magic-link login form ("Send
 magic link" → "Check your email"), and a post-write form. The nav displays
 logged-in state via a small `AuthStatus` island after a magic-link consume
@@ -297,7 +297,7 @@ redirect. Static page shells come from SuperMD content and SuperHTML layouts.
 ```sh
 cd frontend
 ../../../scripts/zigapagos.sh validate --format=json
-./build.sh                   # pinned Zigapagos v0.4.0 -> frontend/dist
+./build.sh                   # pinned Zigapagos v0.5.0 -> frontend/dist
 ../../../scripts/zigapagos.sh doctor dist --format=json
 cd ..
 mise exec zig@0.16.0 -- zig build

@@ -61,7 +61,7 @@ cd app
 zig fetch --save git+https://github.com/valthon/zigbase
 mkdir frontend
 cd frontend
-npx --yes --package zigapagos@0.4.0 -- zigapagos init
+npx --yes --package zigapagos@0.5.0 -- zigapagos init
 ```
 
 Pin Zigapagos in the repository's launcher or package scripts. Pin ZigBase through
@@ -73,7 +73,7 @@ Build the frontend release into `frontend/dist`, then build the application bina
 
 ```sh
 cd frontend
-npx --yes --package zigapagos@0.4.0 -- zigapagos release --output=dist --force
+npx --yes --package zigapagos@0.5.0 -- zigapagos release --output=dist --force
 cd ..
 mise exec zig@0.16.0 -- zig build
 ```
@@ -104,7 +104,7 @@ Zigapagos can run the built consumer binary rather than its stock backend:
 mise exec zig@0.16.0 -- zig build
 cd frontend
 ZIGAPAGOS_DEV_BACKGROUND=0 ZIGBASE_SERVE_BACKGROUND=0 \
-  npx --yes --package zigapagos@0.4.0 -- zigapagos dev \
+  npx --yes --package zigapagos@0.5.0 -- zigapagos dev \
   --site=dist --data-dir=../zb_data --zigbase=../zig-out/bin/app \
   --watch-dir=content --watch-dir=layouts --watch-dir=assets
 ```
@@ -147,9 +147,9 @@ mise exec zig@0.16.0 -- zig build test --summary all
 
 # Frontend static analysis and release integrity
 cd frontend
-npx --yes --package zigapagos@0.4.0 -- zigapagos validate --format=json
-npx --yes --package zigapagos@0.4.0 -- zigapagos release --output=dist --force
-npx --yes --package zigapagos@0.4.0 -- zigapagos doctor dist --format=json
+npx --yes --package zigapagos@0.5.0 -- zigapagos validate --format=json
+npx --yes --package zigapagos@0.5.0 -- zigapagos release --output=dist --force
+npx --yes --package zigapagos@0.5.0 -- zigapagos doctor dist --format=json
 cd ..
 
 # SDK type safety and real HTTP transport
@@ -170,7 +170,7 @@ For a generic command runner, Zigapagos can own the temporary server lifecycle:
 ```sh
 cd frontend
 ZIGBASE_SERVE_BACKGROUND=0 \
-  npx --yes --package zigapagos@0.4.0 -- zigapagos e2e \
+  npx --yes --package zigapagos@0.5.0 -- zigapagos e2e \
   --site=dist --zigbase=../zig-out/bin/app -- node ../test/smoke.mjs
 ```
 
