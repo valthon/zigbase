@@ -395,6 +395,15 @@ A `create`/`update` body value that is a file-like object (anything with `.read(
 `(filename, bytes)` / `(filename, bytes, content_type)` tuple — or a `list` containing any
 of those — is sent as `multipart/form-data` automatically. No special method call needed:
 
+File contents are buffered once per logical request so retries can replay
+non-seekable streams. There is no separate SDK upload byte limit; allow memory
+for the complete file payload and apply application-level size checks before
+passing large files. The async facade also reads file-like objects synchronously
+during encoding. Async applications can read bounded files in a worker thread
+(for example with `asyncio.to_thread`) and pass a `(filename, bytes, content_type)`
+tuple to avoid blocking the event loop on file reads. Bounded streaming and
+replayable upload sources remain a separate transport improvement.
+
 ```python
 with open("cover.png", "rb") as f:
     rec = posts.create({

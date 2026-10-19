@@ -122,12 +122,15 @@ internal class Transport internal constructor(
 
     // --- internals ---------------------------------------------------------
 
-    private suspend fun performOnce(spec: RequestSpec): HttpResponse {
+    private suspend fun performOnce(
+        spec: RequestSpec,
+        token: String? = authStore.token,
+    ): HttpResponse {
         val url = baseUrl + spec.path
         val headerMap =
             buildHeaders(
                 spec.headers,
-                token = authStore.token,
+                token = token,
                 skipAuth = spec.skipAuth,
                 lang = lang,
                 accountId = accountId,
@@ -183,7 +186,8 @@ internal class Transport internal constructor(
         var attempt = 0
 
         while (true) {
-            val response = performOnce(spec)
+            val attemptToken = authStore.token
+            val response = performOnce(spec, attemptToken)
 
             if (response.status.isSuccess()) {
                 return response
@@ -199,7 +203,7 @@ internal class Transport internal constructor(
             ) {
                 didRefresh = true
                 try {
-                    awaitRefresh()
+                    awaitRefresh(attemptToken)
                     continue
                 } catch (e: CancellationException) {
                     throw e
@@ -245,13 +249,14 @@ internal class Transport internal constructor(
     }
 
     /** Joins the in-flight refresh, or becomes its owner and starts it. */
-    private suspend fun awaitRefresh() {
+    private suspend fun awaitRefresh(attemptToken: String?) {
         val (flight, isOwner) =
             refreshGuard.withLock {
                 val existing = refreshFlight
                 if (existing != null) {
                     existing to false
                 } else {
+                    if (authStore.token != attemptToken) return
                     val created = CompletableDeferred<Unit>()
                     refreshFlight = created
                     created to true

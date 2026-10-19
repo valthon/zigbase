@@ -40,7 +40,7 @@ function tokenize(input: string): Token[] {
   const n = input.length;
   while (i < n) {
     const c = input[i]!;
-    if (c === " " || c === "\t" || c === "\n") {
+    if (c === " " || c === "\t" || c === "\n" || c === "\r") {
       i += 1;
       continue;
     }
@@ -69,14 +69,20 @@ function tokenize(input: string): Token[] {
       let j = i + 1;
       let str = "";
       while (j < n && input[j] !== quote) {
-        if (input[j] === "\\" && j + 1 < n) {
-          str += input[j + 1];
+        if (input[j] === "\\") {
+          const escaped = input[j + 1];
+          if (escaped === "n") str += "\n";
+          else if (escaped === "t") str += "\t";
+          else if (escaped === "r") str += "\r";
+          else if (escaped === "\\" || escaped === "'" || escaped === '"') str += escaped;
+          else throw new Error("invalid escape in filter string literal");
           j += 2;
         } else {
           str += input[j];
           j += 1;
         }
       }
+      if (j >= n) throw new Error("unterminated string literal in filter");
       tokens.push({ t: "lit", v: str });
       i = j + 1;
       continue;
@@ -98,14 +104,16 @@ function tokenize(input: string): Token[] {
     }
     // bareword: number, bool, null, or a (dotted) field path.
     let j = i;
-    while (j < n && !" \t\n()&|=!<>~'\"".includes(input[j]!)) j += 1;
+    while (j < n && !" \t\n\r()&|=!<>~'\"".includes(input[j]!)) j += 1;
     const word = input.slice(i, j);
     i = j;
     if (word === "true") tokens.push({ t: "lit", v: true });
     else if (word === "false") tokens.push({ t: "lit", v: false });
     else if (word === "null") tokens.push({ t: "lit", v: null });
     else if (/^-?\d+(\.\d+)?$/.test(word)) tokens.push({ t: "lit", v: Number(word) });
-    else tokens.push({ t: "field", v: word });
+    else if (word !== "in" && /^[A-Za-z_@][A-Za-z0-9_@.]*$/.test(word)) {
+      tokens.push({ t: "field", v: word });
+    } else throw new Error(`unsupported filter token near "${input.slice(i - word.length)}"`);
   }
   return tokens;
 }
@@ -258,6 +266,7 @@ export function analyzeFilter(node: FilterNode | undefined): FilterAnalysis {
   }
   let referencesRelations = false;
   let referencesMacros = false;
+  let referencesFields = false;
 
   const classify = (path: string[]): void => {
     if (isMacroPath(path)) referencesMacros = true;
@@ -267,7 +276,12 @@ export function analyzeFilter(node: FilterNode | undefined): FilterAnalysis {
   const walk = (n: FilterNode): void => {
     if (n.kind === "compare") {
       classify(n.path);
-      if (n.valuePath) classify(n.valuePath);
+      if (n.valuePath) {
+        // Column comparisons need server coercion/collation rules, even for
+        // single-component own-field paths. Use the refetch fallback.
+        referencesFields = true;
+        classify(n.valuePath);
+      }
       return;
     }
     walk(n.left);
@@ -276,7 +290,7 @@ export function analyzeFilter(node: FilterNode | undefined): FilterAnalysis {
   walk(node);
 
   return {
-    locallyEvaluable: !referencesRelations && !referencesMacros,
+    locallyEvaluable: !referencesRelations && !referencesMacros && !referencesFields,
     referencesRelations,
     referencesMacros,
   };
