@@ -262,6 +262,9 @@ pub fn resolveRecordFromIdentity(ctx: *http.RequestCtx, conn: *db.Db, col: schem
         null;
 
     if (try findLink(ctx.allocator.a, conn, provider_name, identity.providerUserId)) |link| {
+        // Record IDs are unique only within a collection, including imported IDs.
+        if (!std.mem.eql(u8, link.collectionRef, col.name))
+            return Outcome{ .fail = .{ .status = 409, .message = "Provider already linked to another account." } };
         if (authed_rid) |arid| {
             if (!std.mem.eql(u8, arid, link.recordRef))
                 return Outcome{ .fail = .{ .status = 409, .message = "Provider already linked to another account." } };
@@ -598,4 +601,48 @@ test "deleting an auth record removes its external-auth links" {
         _ = try st.step();
         try std.testing.expectEqual(@as(i64, 0), try linkCount(a, w, "users", "r3"));
     }
+}
+
+test "OAuth identity cannot cross auth collections with overlapping imported IDs" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const request_arena = RequestArena.from(&arena);
+    const jwt_mod = @import("../jwt.zig");
+    var env = try TestEnv.init();
+    defer env.deinit();
+    const a = request_arena.a;
+    try env.seedOAuthCollection(a, "oauth_owner");
+    try env.seedOAuthCollection(a, "oauth_other");
+    const w = env.pool.acquireWriter();
+    defer env.pool.releaseWriter();
+    try w.exec("INSERT INTO oauth_owner (id,created,updated,email,tokenKey,verified) VALUES ('sameid','','','a@example.test','tk',1);");
+    try w.exec("INSERT INTO oauth_other (id,created,updated,email,tokenKey,verified) VALUES ('sameid','','','b@example.test','tk',1);");
+    try insertLink(std.testing.io, a, w, "oauth_owner", "sameid", "google", "provider-subject");
+    const owner = (try collections.get(a, w, "oauth_owner")).?;
+    const other = (try collections.get(a, w, "oauth_other")).?;
+    const identity = providers.Identity{ .providerUserId = "provider-subject", .email = "a@example.test", .emailVerified = true };
+    var ctx = env.ctx(request_arena, .POST, "", &.{});
+    const key = crypto.deriveKey(env.app.jwt_secret, "tk");
+    const tok = try jwt_mod.sign(a, .{ .id = "sameid", .collection = other.name, .type = .auth, .iat = 0, .exp = 9999999999 }, &key);
+    const bearer = try std.fmt.allocPrint(a, "Bearer {s}", .{tok});
+    for ([_][]const u8{ "", bearer }) |authorization| {
+        ctx.authorization = authorization;
+        const result = try resolveRecordFromIdentity(&ctx, w, other, "google", identity);
+        try std.testing.expect(result == .fail);
+        try std.testing.expectEqual(@as(u16, 409), result.fail.status);
+    }
+    ctx.authorization = "";
+    for ([_][]const u8{ owner.name, owner.id }) |alias| {
+        const loaded = (try collections.get(a, w, alias)).?;
+        const result = try resolveRecordFromIdentity(&ctx, w, loaded, "google", identity);
+        try std.testing.expect(result == .record);
+        try std.testing.expectEqualStrings("sameid", result.record.rid);
+    }
+    var count = try w.prepare("SELECT (SELECT COUNT(*) FROM _externalAuths), (SELECT COUNT(*) FROM oauth_owner), (SELECT COUNT(*) FROM oauth_other), (SELECT COUNT(*) FROM _sessions);");
+    defer count.finalize();
+    try std.testing.expect(try count.step());
+    try std.testing.expectEqual(@as(i64, 1), count.columnInt(0));
+    try std.testing.expectEqual(@as(i64, 1), count.columnInt(1));
+    try std.testing.expectEqual(@as(i64, 1), count.columnInt(2));
+    try std.testing.expectEqual(@as(i64, 0), count.columnInt(3));
 }

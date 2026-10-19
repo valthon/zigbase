@@ -326,7 +326,9 @@ fn applyExternalAuths(
         // raw constraint failure, and NEVER an upsert: silently re-pointing an existing
         // identity at a different record is account takeover.
         if (try oauth.findLink(a, w, pv.string, iv.string)) |link| {
-            last_error_detail = if (std.mem.eql(u8, link.recordRef, idv.string))
+            defer a.free(link.collectionRef);
+            defer a.free(link.recordRef);
+            last_error_detail = if (std.mem.eql(u8, link.collectionRef, col.name) and std.mem.eql(u8, link.recordRef, idv.string))
                 "this identity is already linked to this record"
             else
                 "this identity is already linked to a different record";
@@ -1810,6 +1812,32 @@ test "import: a duplicate identity is refused, never re-pointed" {
     defer a.free(link.collectionRef);
     defer a.free(link.recordRef);
     try std.testing.expectEqualStrings("member000000001", link.recordRef);
+}
+
+test "import: duplicate identity diagnostics compare collection as well as record ID" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    const a = std.testing.allocator;
+    try migrations.run(&d);
+    const members = try seedLinkable(&d, a, std.testing.io);
+    defer members.deinit(a);
+    const other = try collections.create(a, std.testing.io, &d, .{
+        .id = "",
+        .name = "other_members",
+        .type = .auth,
+        .fields = &.{},
+        .options = members.options,
+    });
+    defer other.deinit(a);
+    try oauth.insertLink(std.testing.io, a, &d, members.name, "sameid", "google", "same-subject");
+    const parsed = try std.json.parseFromSlice(std.json.Value, a,
+        \\{"id":"sameid","externalAuths":[{"provider":"google","providerId":"same-subject"}]}
+    , .{});
+    defer parsed.deinit();
+    try std.testing.expectError(ImportError.DuplicateExternalAuth, applyExternalAuths(std.testing.io, &d, a, members, parsed.value));
+    try std.testing.expectEqualStrings("this identity is already linked to this record", last_error_detail);
+    try std.testing.expectError(ImportError.DuplicateExternalAuth, applyExternalAuths(std.testing.io, &d, a, other, parsed.value));
+    try std.testing.expectEqualStrings("this identity is already linked to a different record", last_error_detail);
 }
 
 test "import: a malformed linkage entry is refused" {

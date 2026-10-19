@@ -98,6 +98,24 @@ pub const ChallengeStore = struct {
         return try alloc.dupe(u8, sel.columnText(0));
     }
 
+    /// Redeem an authenticated ceremony only for its original collection and owner.
+    /// Scope mismatches leave the challenge available for its rightful owner.
+    pub fn takeScoped(self: ChallengeStore, alloc: std.mem.Allocator, id: []const u8, method: []const u8, collection: []const u8, identity: []const u8) !?[]const u8 {
+        var st = try prep(self.conn,
+            \\UPDATE "_authChallenges" SET "consumed"=1
+            \\ WHERE "id"=?1 AND "method"=?2 AND "collectionRef"=?3 AND "identity"=?4
+            \\   AND "consumed"=0 AND "expires" > ?5 RETURNING "payload";
+        );
+        defer st.finalize();
+        try st.bindText(1, id);
+        try st.bindText(2, method);
+        try st.bindText(3, collection);
+        try st.bindText(4, identity);
+        try st.bindInt(5, try nowUnixDb(self.conn));
+        if (!try st.step()) return null;
+        return try alloc.dupe(u8, st.columnText(0));
+    }
+
     /// Atomically fetch-and-consume the NEWEST unexpired, unconsumed challenge for the
     /// given (collection, method, identity) triple. Useful for OTP flows where the client
     /// returns a code and an id is not needed.
@@ -336,4 +354,24 @@ test "gcAuthChallenges removes expired and consumed rows, leaves live ones" {
         _ = try st.step();
         try std.testing.expectEqualStrings(live_id, st.columnText(0));
     }
+}
+
+test "takeScoped preserves a registration ceremony on owner collection or method mismatch" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try @import("../migrations.zig").run(&d);
+    const a = std.testing.allocator;
+    const store = ChallengeStore{ .conn = &d };
+    const cid = try store.put(a, std.testing.io, "users", "webauthn_reg", "owner", "challenge", 300);
+    defer a.free(cid);
+    try std.testing.expect(try store.takeScoped(a, cid, "webauthn_reg", "other", "owner") == null);
+    try std.testing.expect(try store.takeScoped(a, cid, "webauthn_reg", "users", "other") == null);
+    try std.testing.expect(try store.takeScoped(a, cid, "webauthn", "users", "owner") == null);
+    const payload = (try store.takeScoped(a, cid, "webauthn_reg", "users", "owner")).?;
+    defer a.free(payload);
+    try std.testing.expectEqualStrings("challenge", payload);
+    try std.testing.expect(try store.takeScoped(a, cid, "webauthn_reg", "users", "owner") == null);
+    const expired = try store.put(a, std.testing.io, "users", "webauthn_reg", "owner", "expired", -1);
+    defer a.free(expired);
+    try std.testing.expect(try store.takeScoped(a, expired, "webauthn_reg", "users", "owner") == null);
 }

@@ -755,8 +755,14 @@ For every auth collection that enables a method (built-in or custom), two endpoi
 
 | Method | Path | Description |
 |---|---|---|
-| POST | `/api/collections/:col/auth/webauthn/register/begin` | Returns WebAuthn creation options (challenge, rpId, rpName). |
+| POST | `/api/collections/:col/auth/webauthn/register/begin` | Returns WebAuthn creation options (`rp`, `user`, `challenge`, `pubKeyCredParams`, `timeout`) and `ceremonyId`. |
 | POST | `/api/collections/:col/auth/webauthn/register/finish` | Stores the new passkey bound to the authenticated user. `204` (no body) on success. |
+
+Both registration endpoints return **403** when the session belongs to another
+auth collection, including a superuser session targeting a different collection.
+Collection names and IDs identify the same canonical collection. `finish` returns
+**400** for an expired, consumed, invalid or differently owned ceremony. An owner
+mismatch leaves the ceremony available for its original account to finish.
 
 **magic_link initiate:**
 ```json
@@ -843,7 +849,17 @@ The `redirect` target is validated **server-side** so each app does not re-imple
 ```json
 // request: empty body or {}
 // response (200)
-{ "challenge": "<base64url>", "rpId": "app.example.com", "rpName": "My App", "ceremonyId": "<opaque>" }
+{
+  "rp": { "id": "app.example.com", "name": "My App" },
+  "user": { "id": "<record-id>", "name": "<record-id>", "displayName": "<record-id>" },
+  "challenge": "<base64url>",
+  "pubKeyCredParams": [
+    { "type": "public-key", "alg": -7 },
+    { "type": "public-key", "alg": -8 }
+  ],
+  "timeout": 300000,
+  "ceremonyId": "<opaque>"
+}
 ```
 
 **webauthn register/finish (authed):**
@@ -851,14 +867,10 @@ The `redirect` target is validated **server-side** so each app does not re-imple
 // request
 {
   "ceremonyId": "<opaque>",
-  "id": "<base64url>",
-  "rawId": "<base64url>",
-  "response": {
-    "clientDataJSON": "<base64url>",
-    "attestationObject": "<base64url>"
-  }
+  "clientDataJSON": "<base64url>",
+  "attestationObject": "<base64url>"
 }
-// response (200): {}
+// response: 204 (no body)
 ```
 
 ### The `onAuth` hook — fires on every login
@@ -1044,6 +1056,10 @@ carrying existing social-login accounts over from another backend — see
 
 `state` is required by default; omitted only when `ZIGBASE_OAUTH_STATE_SERVER=false`.
 `redirectUrl` must be in the provider's configured allowlist.
+
+An identity already linked to another auth collection returns **409 Conflict**,
+including when the two collections contain matching record IDs. The identity is
+not reinterpreted as an account in the requested collection.
 
 ```json
 // response (200) — sets zb_auth and zb_csrf cookies
