@@ -284,7 +284,10 @@ fn parsePayload(alloc: std.mem.Allocator, json_bytes: []const u8) DecodeError!Cu
 pub fn encodeStateless(alloc: std.mem.Allocator, c: Cursor) ![]u8 {
     const payload = try payloadBytes(alloc, c);
     defer alloc.free(payload); // scratch: b64Encode copies it into the returned token
-    return b64Encode(alloc, payload);
+    const token = try b64Encode(alloc, payload);
+    errdefer alloc.free(token);
+    if (token.len > max_cursor_len) return error.CursorTooLarge;
+    return token;
 }
 
 /// Decode a STATELESS token. Enforces the length cap before decode; maps all structural
@@ -308,7 +311,10 @@ pub fn encodeSigned(alloc: std.mem.Allocator, c: Cursor, secret: []const u8) ![]
     HmacSha256.create(&mac, p_b64, secret);
     const mac_b64 = try b64Encode(alloc, &mac);
     defer alloc.free(mac_b64); // scratch: copied into the returned token by allocPrint
-    return std.fmt.allocPrint(alloc, "{s}.{s}", .{ p_b64, mac_b64 });
+    const token = try std.fmt.allocPrint(alloc, "{s}.{s}", .{ p_b64, mac_b64 });
+    errdefer alloc.free(token);
+    if (token.len > max_cursor_len) return error.CursorTooLarge;
+    return token;
 }
 
 /// Decode + verify a SIGNED token. A missing/short/non-matching MAC -> `error.CursorSig`;
@@ -625,4 +631,37 @@ test "filterHash: stable, whitespace-normalized, order-sensitive between filter 
     // The search term participates: same filter+rule but a different search => a different hash.
     try testing.expect(filterHash("a = 1", null, "zig") != filterHash("a = 1", null, "rust"));
     try testing.expectEqual(filterHash("a = 1", null, null), filterHash("a = 1", null, ""));
+}
+
+test "cursor codecs never mint a token beyond their decode limit" {
+    const a = std.testing.allocator;
+    var text: [2048]u8 = @splat('x');
+    for ([_]bool{ false, true }) |signed| {
+        var last_len: usize = 0;
+        var saw_limit = false;
+        for (0..text.len) |len| {
+            var keys = [_]std.json.Value{.{ .string = text[0..len] }};
+            const cursor = Cursor{ .forward = true, .keys = &keys, .sort_str = "title,id", .filter_hash = 0 };
+            const token = (if (signed) encodeSigned(a, cursor, "secret") else encodeStateless(a, cursor)) catch |err| {
+                try std.testing.expectEqual(error.CursorTooLarge, err);
+                // Check the actual next wire size: JSON escapes can add multiple
+                // bytes per character. Signed tokens also include a dot + 43-byte MAC.
+                const payload = try payloadBytes(a, cursor);
+                defer a.free(payload);
+                const wire_len = b64.Encoder.calcSize(payload.len) + @as(usize, if (signed) 44 else 0);
+                try std.testing.expect(wire_len > max_cursor_len);
+                try std.testing.expect(last_len <= max_cursor_len);
+                saw_limit = true;
+                break;
+            };
+            defer a.free(token);
+            try std.testing.expect(token.len <= max_cursor_len);
+            last_len = token.len;
+            var decoded = if (signed) try decodeSigned(a, token, "secret") else try decodeStateless(a, token);
+            defer decoded.deinit();
+            try std.testing.expectEqualStrings(text[0..len], decoded.keys[0].string);
+        }
+        try std.testing.expect(saw_limit);
+        @memset(&text, '\n'); // JSON escaping counts toward the bound as well.
+    }
 }

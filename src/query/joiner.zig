@@ -3,8 +3,10 @@ const db = @import("../db.zig");
 const schema = @import("../schema.zig");
 const collections = @import("../collections.zig");
 const ddl = @import("../ddl.zig");
+const request = @import("../request.zig");
+const policy = @import("../policy.zig");
 
-pub const JoinError = error{ UnknownField, NotARelation, MultiRelationTraversal, EncryptedField, HiddenField } || db.DbError || std.mem.Allocator.Error || @typeInfo(@typeInfo(@TypeOf(collections.get)).@"fn".return_type.?).error_union.error_set;
+pub const JoinError = error{ UnknownField, NotARelation, MultiRelationTraversal, EncryptedField, HiddenField, RestrictedRelation } || db.DbError || std.mem.Allocator.Error || @typeInfo(@typeInfo(@TypeOf(collections.get)).@"fn".return_type.?).error_union.error_set;
 
 /// A resolved column reference. `nocase` is true when the column is covered by a `.nocase` index
 /// on its (possibly joined) collection — the compiler then lowers an equality/IN compare so it
@@ -34,6 +36,13 @@ pub const Joiner = struct {
     /// is no boolean oracle). Client-controlled `?filter=`/`?sort=` leave this false so a hidden field
     /// is still rejected closed. Encrypted fields stay rejected regardless (they can never match).
     allow_hidden: bool = false,
+    /// Set for client filter/sort compilation. Restricted target rows cannot be
+    /// queried through a relation until joins can carry their full view policy.
+    /// Trusted operator rules opt into unrestricted traversal separately.
+    client_rctx: ?*const request.RequestContext = null,
+    /// Operator-authored rules may traverse private targets. Independent of
+    /// `allow_hidden`, which controls only whether hidden field names resolve.
+    trusted: bool = false,
 
     const Seen = struct { prefix: []const u8, alias: []const u8, col: schema.Collection };
 
@@ -94,6 +103,7 @@ pub const Joiner = struct {
             try prefix_buf.appendSlice(sa, seg);
             const prefix = prefix_buf.items;
             if (self.find(prefix)) |s| {
+                try self.checkClientTarget(s.col);
                 // `s.alias` already lives in the scratch arena and cur_alias is only ever READ
                 // (into an allocPrint) — never mutated in place — so alias it directly (mirrors the
                 // new-join branch below, which also assigns `cur_alias = alias` without a dupe).
@@ -108,6 +118,7 @@ pub const Joiner = struct {
                     }
                     return error.UnknownField;
                 } else (try collections.get(sa, self.conn, rf.options.relation.targetCollectionId)) orelse return error.UnknownField;
+                try self.checkClientTarget(target);
                 self.counter += 1;
                 const alias = try std.fmt.allocPrint(sa, "j{d}", .{self.counter});
                 const join = try std.fmt.allocPrint(sa, "LEFT JOIN {s} AS {s} ON {s}.{s} = {s}.\"id\"", .{ try ddl.quoteIdent(sa, target.name), alias, cur_alias, try ddl.quoteIdent(sa, seg), alias });
@@ -118,6 +129,16 @@ pub const Joiner = struct {
             }
             seg = nxt.?;
         }
+    }
+
+    fn checkClientTarget(self: *Joiner, target: schema.Collection) JoinError!void {
+        const rctx = self.client_rctx orelse return;
+        if (self.trusted) return;
+        // Validate cached hops too: a trusted list rule may have introduced the
+        // join before a client sort reuses it. TTL restrictions also need an
+        // aliased predicate, even for superusers, so reject those hops for now.
+        if (policy.decide(target, .view, rctx) != .allow or target.options.ttl_field != null)
+            return error.RestrictedRelation;
     }
 
     fn find(self: *Joiner, prefix: []const u8) ?Seen {
@@ -272,4 +293,55 @@ test "joiner rejects filtering/sorting on a hidden field (no boolean oracle over
     defer jr.deinit();
     jr.allow_hidden = true;
     _ = try jr.resolve("secret");
+}
+
+test "client traversal checks every hop including cached trusted joins" {
+    const a = std.testing.allocator;
+    var d = try db.Db.openMemory();
+    defer d.close();
+    const leaf: schema.Collection = .{ .id = "leaf", .name = "leaf", .fields = &.{}, .viewRule = "@public" };
+    const base: schema.Collection = .{ .id = "base", .name = "base", .fields = &.{.{ .id = "r", .name = "target", .options = .{ .relation = .{ .targetCollectionId = "target", .maxSelect = 1 } } }} };
+    const public: schema.Collection = .{ .id = "target", .name = "target", .viewRule = "@public", .fields = &.{.{ .id = "r", .name = "next", .options = .{ .relation = .{ .targetCollectionId = "leaf", .maxSelect = 1 } } }} };
+    const anon = request.RequestContext{ .tenancy_enabled = true, .account_id = "account" };
+    const su = request.RequestContext{ .is_superuser = true };
+    // Snapshots isolate policy combinations without mutating collection metadata.
+    for (0..6) |mode| {
+        var target = public;
+        switch (mode) {
+            0 => {},
+            1 => target.viewRule = null,
+            2 => target.viewRule = "owner = @request.auth.id",
+            3 => target.options.tenant_field = "owner",
+            4 => target.options.abilities = .{ .view = .{ .relationship = .{ .via = "owner" } } },
+            5 => target.options.ttl_field = "expires",
+            else => unreachable,
+        }
+        const snapshot = [_]schema.Collection{ target, leaf };
+        var j = Joiner.init(a, &d, base);
+        defer j.deinit();
+        j.schema_snapshot = &snapshot;
+        j.client_rctx = &anon;
+        if (mode == 0) {
+            _ = try j.resolve("target.next.id");
+        } else {
+            try std.testing.expectError(error.RestrictedRelation, j.resolve("target.id"));
+            try std.testing.expectError(error.RestrictedRelation, j.resolve("target.next.id"));
+        }
+        // Allowing hidden field names alone must not bypass target policy.
+        j.allow_hidden = true;
+        if (mode != 0) try std.testing.expectError(error.RestrictedRelation, j.resolve("target.next.id"));
+        // Trusted operator rules retain private traversal and can create cached prefixes.
+        j.trusted = true;
+        _ = try j.resolve("target.next.id");
+        j.trusted = false;
+        j.allow_hidden = false;
+        if (mode != 0) try std.testing.expectError(error.RestrictedRelation, j.resolve("target.next.id"));
+        j.client_rctx = &su;
+        if (mode == 5) {
+            try std.testing.expectError(error.RestrictedRelation, j.resolve("target.id"));
+        } else _ = try j.resolve("target.next.id");
+        // Context-free internal queries preserve trusted traversal.
+        j.client_rctx = null;
+        _ = try j.resolve("target.next.id");
+    }
 }

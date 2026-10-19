@@ -440,6 +440,25 @@ account in @request.account.ids
 > access rule** *may* still gate on a hidden field: a rule is a server-side `WHERE`
 > clause whose truth is never returned to the client, so it is no oracle.
 
+### Relation traversal and cursor limits
+
+Client filters and sorts may traverse single relations only when every target
+collection is unconditionally viewable by the caller. Locked or conditional view
+rules, active tenant/ability restrictions, and TTL-enabled targets return `400` ("Cannot
+filter or sort through a relation with restricted target visibility."). Trusted
+access rules and server-authored queries through `Ctx.records().list` (including
+hooks, jobs, queues and webhooks) retain trusted traversal. Request identity
+continues to scope these queries; client-query validation is an explicit query
+mode, independent of whether a request context is present. Server code forwarding
+untrusted filters must set `.client_query = true` in `Ctx.ListOptions` or
+`records.ListQuery`. `expand` continues to
+check each target record's view policy.
+Supporting restricted targets requires policy predicates scoped to each JOIN.
+
+Stateless and signed cursors have a 2048-byte wire limit. A sort boundary too
+large to encode returns `400` with guidance to shorten sort keys or configure
+stateful pagination; the server never returns an unusable oversized cursor.
+
 ### sort
 
 Comma-separated field list. Prefix a field with `-` for descending; ascending is the
@@ -1663,6 +1682,12 @@ A topic is either a whole collection (`<collection>`) or a single record
 `{ "action": "unsubscribe", "topic": "..." }`. The server acknowledges subscribe/
 unsubscribe with `{ "type": "ack", "action": "...", "topic": "..." }`. On connect it
 sends `{ "type": "connect", "clientId": "..." }`.
+
+For collection and record topics, filters are validated before a subscription is
+installed or replaced. Malformed filters, hidden fields, and restricted relation
+traversal return an `error` frame instead of an acknowledgement. An invalid
+replacement leaves the previous subscription intact. Both transports repeat
+visibility checks at delivery because schema and authentication can change.
 
 **Authentication is required to subscribe** to any collection whose `viewRule` is not
 `"@public"`. A socket may subscribe anonymously *only* to a public (`@public`) collection;
