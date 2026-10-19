@@ -602,12 +602,12 @@ def test_401_single_flight_concurrent_refresh_exactly_once(
     both_entered = threading.Event()
     original_await_refresh = SyncTransport._await_refresh
 
-    def instrumented_await_refresh(self: SyncTransport) -> None:
+    def instrumented_await_refresh(self: SyncTransport, attempt_token: str | None) -> None:
         with lock:
             entered["n"] += 1
             if entered["n"] == 2:
                 both_entered.set()
-        original_await_refresh(self)
+        original_await_refresh(self, attempt_token)
 
     monkeypatch.setattr(SyncTransport, "_await_refresh", instrumented_await_refresh)
 

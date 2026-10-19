@@ -6,6 +6,7 @@ const db = @import("../db.zig");
 const migrations = @import("../migrations.zig");
 const policy = @import("../policy.zig");
 const request = @import("../request.zig");
+const values = @import("../values.zig");
 
 const max_depth = 6;
 
@@ -63,72 +64,87 @@ fn canView(alloc: std.mem.Allocator, conn: *db.Db, pc: ?*PageCache, target: sche
     return policy.authorizes(alloc, conn, target, .view, id, rctx);
 }
 
-/// Expand the given comma-separated, dot-nested expand-spec ("author,tags.owner") into
-/// `rec.object`'s "expand" key. `rec` must be a `.object`. Single relations nest an object;
-/// multi nest an array. Depth-guarded.
-///
-/// For a whole LIST page prefer `expandItems`, which shares metadata/decision caches across items;
-/// this single-record entry is the `view` path (and the cache-less base case of the recursion).
-///
-/// LIMITATION: when multiple expand paths share a head (e.g. "author.org,author.name"),
-/// `head` is expanded once per comma-segment and the later segment overwrites the earlier.
+/// Expand a self-contained record. All inserted keys and values are owned by `alloc`.
 pub fn expand(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, rec: *std.json.Value, spec: []const u8, depth: usize, rctx: *const request.RequestContext) ExpandError!void {
-    return expandInner(alloc, conn, col, rec, spec, depth, rctx, null);
-}
-
-/// Expand `spec` into EVERY item of a list-result page, sharing a per-page metadata cache (#15) and
-/// per-`(target,id)` view-decision cache (#16) so the target schema is parsed once per page and each
-/// distinct relation's view decision is made once — instead of once per row. Output for each item is
-/// byte-identical to calling `expand` on it individually (records are re-fetched fresh per item).
-pub fn expandItems(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, items: []std.json.Value, spec: []const u8, depth: usize, rctx: *const request.RequestContext) ExpandError!void {
+    var scratch = std.heap.ArenaAllocator.init(alloc);
+    defer scratch.deinit();
     var pc: PageCache = .{};
-    // `cols` keys are borrowed collection ids; `views` keys are owned (allocPrint'd), so free them.
-    // A no-op under a request arena, but keeps the cache correct under any allocator (jobs/CLI/tests).
-    defer {
-        var it = pc.views.keyIterator();
-        while (it.next()) |k| alloc.free(k.*);
-        pc.views.deinit(alloc);
-        pc.cols.deinit(alloc);
-    }
-    for (items) |*item| try expandInner(alloc, conn, col, item, spec, depth, rctx, &pc);
+    return expandInner(alloc, scratch.allocator(), conn, col, rec, spec, depth, rctx, &pc, true);
 }
 
-fn expandInner(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, rec: *std.json.Value, spec: []const u8, depth: usize, rctx: *const request.RequestContext, pc: ?*PageCache) ExpandError!void {
+/// Expand interned-key list items. Their top-level keys remain borrowed, matching
+/// ListResult.deinit; every nested expansion key/value is independently owned.
+/// Metadata and authorization caches are temporary; mutable records are never shared.
+pub fn expandItems(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, items: []std.json.Value, spec: []const u8, depth: usize, rctx: *const request.RequestContext) ExpandError!void {
+    var scratch = std.heap.ArenaAllocator.init(alloc);
+    defer scratch.deinit();
+    var pc: PageCache = .{};
+    for (items) |*item| try expandInner(alloc, scratch.allocator(), conn, col, item, spec, depth, rctx, &pc, false);
+}
+
+fn expandInner(alloc: std.mem.Allocator, scratch: std.mem.Allocator, conn: *db.Db, col: schema.Collection, rec: *std.json.Value, spec: []const u8, depth: usize, rctx: *const request.RequestContext, pc: *PageCache, owned_keys: bool) ExpandError!void {
     if (depth >= max_depth or rec.* != .object) return;
     var it = std.mem.splitScalar(u8, spec, ',');
     var expand_obj: std.json.ObjectMap = .empty;
-    var any = false;
+    errdefer values.freeValue(alloc, .{ .object = expand_obj });
     while (it.next()) |raw| {
         const path = std.mem.trim(u8, raw, " ");
         if (path.len == 0) continue;
         const dot = std.mem.indexOfScalar(u8, path, '.');
         const head = if (dot) |i| path[0..i] else path;
-        const rest = if (dot) |i| path[i + 1 ..] else "";
+        if (expand_obj.contains(head)) continue;
         const field = schema.fieldByName(col, head) orelse continue;
         if (field.fieldType() != .relation) continue;
-        const target = (try resolveTarget(alloc, conn, pc, field.options.relation.targetCollectionId)) orelse continue;
         const id_val = rec.object.get(head) orelse continue;
-        const nested = try expandField(alloc, conn, target, id_val, rest, depth, rctx, pc);
-        try expand_obj.put(alloc, head, nested);
-        any = true;
+        const target = (try resolveTarget(scratch, conn, pc, field.options.relation.targetCollectionId)) orelse continue;
+        // Coalesce all descendants before fetching this relation. This preserves siblings,
+        // duplicates, and direct + descendant requests independently of their input order.
+        var descendants: std.ArrayList(u8) = .empty;
+        var paths = std.mem.splitScalar(u8, spec, ',');
+        while (paths.next()) |candidate_raw| {
+            const candidate = std.mem.trim(u8, candidate_raw, " ");
+            const split = std.mem.indexOfScalar(u8, candidate, '.') orelse continue;
+            if (!std.mem.eql(u8, candidate[0..split], head) or split + 1 == candidate.len) continue;
+            if (descendants.items.len > 0) try descendants.append(scratch, ',');
+            try descendants.appendSlice(scratch, candidate[split + 1 ..]);
+        }
+        const nested = try expandField(alloc, scratch, conn, target, id_val, descendants.items, depth, rctx, pc);
+        errdefer values.freeValue(alloc, nested);
+        const key = try alloc.dupe(u8, head);
+        errdefer alloc.free(key);
+        try expand_obj.put(alloc, key, nested);
     }
-    if (any) try rec.object.put(alloc, "expand", .{ .object = expand_obj });
+    if (expand_obj.count() == 0) {
+        expand_obj.deinit(alloc);
+        return;
+    }
+    if (rec.object.getPtr("expand")) |old| {
+        values.freeValue(alloc, old.*);
+        old.* = .{ .object = expand_obj };
+    } else {
+        const key = if (owned_keys) try alloc.dupe(u8, "expand") else "expand";
+        errdefer if (owned_keys) alloc.free(key);
+        try rec.object.put(alloc, key, .{ .object = expand_obj });
+    }
 }
 
-fn expandField(alloc: std.mem.Allocator, conn: *db.Db, target: schema.Collection, id_val: std.json.Value, rest: []const u8, depth: usize, rctx: *const request.RequestContext, pc: ?*PageCache) ExpandError!std.json.Value {
+fn expandField(alloc: std.mem.Allocator, scratch: std.mem.Allocator, conn: *db.Db, target: schema.Collection, id_val: std.json.Value, rest: []const u8, depth: usize, rctx: *const request.RequestContext, pc: *PageCache) ExpandError!std.json.Value {
     switch (id_val) {
         .string => |id| {
-            if (!try canView(alloc, conn, pc, target, id, rctx)) return .null;
+            if (!try canView(scratch, conn, pc, target, id, rctx)) return .null;
             var sub = (try records.get(alloc, conn, target, id)) orelse return .null;
-            if (rest.len > 0) try expandInner(alloc, conn, target, &sub, rest, depth + 1, rctx, pc);
+            errdefer records.freeRecord(alloc, sub);
+            if (rest.len > 0) try expandInner(alloc, scratch, conn, target, &sub, rest, depth + 1, rctx, pc, true);
             return sub;
         },
         .array => |arr| {
             var out = std.json.Array.init(alloc);
+            errdefer values.freeValue(alloc, .{ .array = out });
             for (arr.items) |item| if (item == .string) {
-                if (!try canView(alloc, conn, pc, target, item.string, rctx)) continue;
+                if (!try canView(scratch, conn, pc, target, item.string, rctx)) continue;
                 var sub = (try records.get(alloc, conn, target, item.string)) orelse continue;
-                if (rest.len > 0) try expandInner(alloc, conn, target, &sub, rest, depth + 1, rctx, pc);
+                errdefer records.freeRecord(alloc, sub);
+                if (rest.len > 0) try expandInner(alloc, scratch, conn, target, &sub, rest, depth + 1, rctx, pc, true);
                 try out.append(sub);
             };
             return .{ .array = out };
@@ -416,4 +432,72 @@ test "expandItems is byte-identical to per-item expand (shared metadata + decisi
     // multi-relation tag arrays are fully expanded (public target).
     try std.testing.expect(got[1].object.get("expand").?.object.get("author").? == .null);
     try std.testing.expectEqual(@as(usize, 2), got[0].object.get("expand").?.object.get("tags").?.array.items.len);
+}
+
+const OwnershipFixture = struct { conn: *db.Db, col: schema.Collection };
+
+fn expansionAllocationCase(a: std.mem.Allocator, fixture: OwnershipFixture) !void {
+    const su = request.RequestContext{ .is_superuser = true };
+    var rec = (try records.get(a, fixture.conn, fixture.col, "p1")).?;
+    defer records.freeRecord(a, rec);
+    try expand(a, fixture.conn, fixture.col, &rec, "author.org,author.manager,authors.org,authors.manager", 0, &su);
+    // Replacement must preserve the original top-level key's ownership.
+    try expand(a, fixture.conn, fixture.col, &rec, "author,author.org", 0, &su);
+    var result = try records.list(a, fixture.conn, fixture.col, .{});
+    defer result.deinit(a);
+    try expandItems(a, fixture.conn, fixture.col, result.items, "author.org,authors.manager", 0, &su);
+    try expandItems(a, fixture.conn, fixture.col, result.items, "author.manager,authors.org", 0, &su);
+}
+
+test "expansion owns nested output and coalesces shared paths under raw allocators" {
+    const a = std.testing.allocator;
+    var conn = try db.Db.openMemory();
+    defer conn.close();
+    try migrations.run(&conn);
+    const groups = try collections.create(a, std.testing.io, &conn, .{ .id = "", .name = "groups", .fields = &.{} });
+    defer groups.deinit(a);
+    const people = try collections.create(a, std.testing.io, &conn, .{ .id = "", .name = "people", .fields = &.{
+        .{ .id = "f1", .name = "org", .options = .{ .relation = .{ .targetCollectionId = groups.id, .maxSelect = 1 } } },
+        .{ .id = "f2", .name = "manager", .options = .{ .relation = .{ .targetCollectionId = groups.id, .maxSelect = 1 } } },
+    } });
+    defer people.deinit(a);
+    const posts = try collections.create(a, std.testing.io, &conn, .{ .id = "", .name = "posts", .fields = &.{
+        .{ .id = "f1", .name = "author", .options = .{ .relation = .{ .targetCollectionId = people.id, .maxSelect = 1 } } },
+        .{ .id = "f2", .name = "authors", .options = .{ .relation = .{ .targetCollectionId = people.id, .maxSelect = 9 } } },
+    } });
+    defer posts.deinit(a);
+    try conn.exec("INSERT INTO groups (id,created,updated) VALUES ('g1','t','t'),('g2','t','t');");
+    try conn.exec("INSERT INTO people (id,created,updated,org,manager) VALUES ('u1','t','t','g1','g2');");
+    try conn.exec("INSERT INTO posts (id,created,updated,author,authors) VALUES ('p1','t','t','u1','[\"u1\"]'),('p2','t','t','u1','[\"u1\"]');");
+    const su = request.RequestContext{ .is_superuser = true };
+    for ([_][]const u8{
+        "author.org,author.manager,authors.org,authors.manager",
+        "author.manager,author.org,author.org,authors.manager,authors.org",
+        "author,author.org,author.manager,authors,authors.org,authors.manager",
+        "author.org,author.manager,author,authors.org,authors.manager,authors",
+    }) |spec| {
+        var rec = (try records.get(a, &conn, posts, "p1")).?;
+        defer records.freeRecord(a, rec);
+        try expand(a, &conn, posts, &rec, spec, 0, &su);
+        const expanded = rec.object.get("expand").?.object;
+        const author = expanded.get("author").?.object.get("expand").?.object;
+        try std.testing.expect(author.contains("org") and author.contains("manager"));
+        const authors = expanded.get("authors").?.array.items[0].object.get("expand").?.object;
+        try std.testing.expect(authors.contains("org") and authors.contains("manager"));
+    }
+    var result = try records.list(a, &conn, posts, .{});
+    defer result.deinit(a);
+    try expandItems(a, &conn, posts, result.items, "author.org", 0, &su);
+    const first = result.items[0].object.get("expand").?.object.get("author").?;
+    const second = result.items[1].object.get("expand").?.object.get("author").?;
+    try std.testing.expect(first.object.entries.items(.value).ptr != second.object.entries.items(.value).ptr);
+    // A locked target and a no-op path must also be safely destructible.
+    var denied = (try records.get(a, &conn, posts, "p1")).?;
+    defer records.freeRecord(a, denied);
+    const anon = request.RequestContext{};
+    try expand(a, &conn, posts, &denied, "missing", 0, &anon);
+    try std.testing.expect(!denied.object.contains("expand"));
+    try expand(a, &conn, posts, &denied, "author", 0, &anon);
+    try std.testing.expect(denied.object.get("expand").?.object.get("author").? == .null);
+    try std.testing.checkAllAllocationFailures(a, expansionAllocationCase, .{OwnershipFixture{ .conn = &conn, .col = posts }});
 }

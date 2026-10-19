@@ -545,7 +545,7 @@ pub fn verifyTokenOfTypes(alloc: std.mem.Allocator, app: anytype, conn: *db.Db, 
     }
     // Dupe the two escaping strings onto `alloc` so nothing aliases the scratch parse (which is
     // about to drop), the input token, or a literal. On an OOM here, free what we already own.
-    const collection = alloc.dupe(u8, claims.collection) catch {
+    const collection = alloc.dupe(u8, table) catch {
         @import("records.zig").freeRecord(alloc, rec);
         return null;
     };
@@ -702,6 +702,16 @@ test "authenticate resolves a valid bearer token to its record" {
     try std.testing.expectEqual(false, authed.is_superuser);
     try std.testing.expectEqualStrings("rec1", authed.record.object.get("id").?.string);
     try std.testing.expect(authed.record.object.get("tokenKey") == null);
+    // Collection-ID token claims resolve to the same canonical name as normal issuers.
+    const alias_token = try jwt.sign(a, .{ .id = "rec1", .collection = created.id, .type = .auth, .iat = 0, .exp = 9999999999 }, &key);
+    defer a.free(alias_token);
+    const alias_authz = try std.fmt.allocPrint(a, "Bearer {s}", .{alias_token});
+    defer a.free(alias_authz);
+    ctx.authorization = alias_authz;
+    var alias_authed = (try authenticate(app.io, a, &app, &ctx, &d)) orelse return error.TestUnexpectedNull;
+    defer alias_authed.deinit(a);
+    try std.testing.expectEqualStrings("users", alias_authed.collection);
+    try std.testing.expectEqualStrings("rec1", alias_authed.record.object.get("id").?.string);
 }
 
 test "authenticate rejects a token signed with the wrong key (returns null)" {

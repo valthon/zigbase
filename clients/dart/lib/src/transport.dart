@@ -248,7 +248,10 @@ class Transport {
   // --- internals -----------------------------------------------------------
 
   /// Join (or start) the single-flight refresh.
-  Future<void> _awaitRefresh() {
+  Future<void> _awaitRefresh(String? attemptToken) {
+    final flight = _refreshInFlight;
+    if (flight != null) return flight;
+    if (_authStore.token != attemptToken) return Future.value();
     return _refreshInFlight ??= Future.sync(() => _refresh!()).whenComplete(() {
       _refreshInFlight = null;
     });
@@ -271,6 +274,7 @@ class Transport {
     final multipart = await _maybeBufferMultipart(method, body);
 
     for (;;) {
+      final attemptToken = _authStore.token;
       final res =
           await _perform(url, method, body, headers, skipAuth, multipart);
       final status = res.statusCode;
@@ -295,7 +299,7 @@ class Transport {
           !isRefreshCall) {
         didRefresh = true;
         try {
-          await _awaitRefresh();
+          await _awaitRefresh(attemptToken);
           continue;
         } catch (_) {
           // Refresh failed — fall through and throw the original 401 error.

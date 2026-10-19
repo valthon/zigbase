@@ -6,7 +6,7 @@
 ///
 /// SECURITY REQUIREMENTS enforced here:
 /// 1. Both endpoints require an authenticated session (auth=.authed in router).
-/// 2. The credential's record_ref is ALWAYS the authenticated user's id — never body-supplied.
+/// 2. Credentials and challenges are bound to the authenticated collection and user.
 /// 3. Registration challenges use method key "webauthn_reg" so they cannot be replayed for login.
 /// 4. `existsCredentialId` is checked before insert; duplicates return 409.
 const std = @import("std");
@@ -57,14 +57,14 @@ fn loadWebAuthnCollection(ctx: *http.RequestCtx, conn: *db.Db) !?struct { col: s
     return .{ .col = col, .opts = opts };
 }
 
-/// Authenticate the request and extract the authed user's id.
-/// Returns null (with a response already returned to the caller) when unauthenticated.
-fn requireAuthed(ctx: *http.RequestCtx, conn: *db.Db) !?[]const u8 {
+/// Authenticate without losing the collection boundary around the user ID.
+/// Returns null when unauthenticated.
+fn requireAuthed(ctx: *http.RequestCtx, conn: *db.Db) !?struct { id: []const u8, collection: []const u8 } {
     const app = ctx.app orelse return null;
     const authed = (try auth.authenticate(app.io, ctx.allocator.a, app, ctx, conn)) orelse return null;
     const id = authed.record.object.get("id") orelse return null;
     if (id != .string) return null;
-    return id.string;
+    return .{ .id = id.string, .collection = authed.collection };
 }
 
 /// POST /api/collections/:col/auth/webauthn/register/begin
@@ -78,13 +78,16 @@ pub fn begin(ctx: *http.RequestCtx) anyerror!http.Response {
     defer app.pool.releaseWriter();
 
     // Authenticate the caller.
-    const user_id = (try requireAuthed(ctx, w)) orelse
+    const caller = (try requireAuthed(ctx, w)) orelse
         return ApiError.withCode(401, .unauthorized, "Not authenticated.").toResponse(ctx.allocator.a);
 
     // Load the collection + webauthn opts.
     const load = (try loadWebAuthnCollection(ctx, w)) orelse
         return (ApiError.notFound()).toResponse(ctx.allocator.a);
     const col = load.col;
+    if (!std.mem.eql(u8, caller.collection, col.name))
+        return ApiError.forbidden().toResponse(ctx.allocator.a);
+    const user_id = caller.id;
     const wa_opts = load.opts;
 
     // Guard: reject mis-configured webauthn (empty rp_id or origin).
@@ -115,11 +118,17 @@ pub fn begin(ctx: *http.RequestCtx) anyerror!http.Response {
 
     // Build PublicKeyCredentialCreationOptions JSON.
     // pubKeyCredParams: ES256 (-7) and EdDSA (-8).
-    const body = try std.fmt.allocPrint(
-        ctx.allocator.a,
-        "{{\"rp\":{{\"id\":\"{s}\",\"name\":\"{s}\"}},\"user\":{{\"id\":\"{s}\",\"name\":\"{s}\",\"displayName\":\"{s}\"}},\"challenge\":\"{s}\",\"pubKeyCredParams\":[{{\"type\":\"public-key\",\"alg\":-7}},{{\"type\":\"public-key\",\"alg\":-8}}],\"ceremonyId\":\"{s}\",\"timeout\":300000}}",
-        .{ wa_opts.rp_id, wa_opts.rp_name, user_id, user_id, user_id, challenge_b64, cid },
-    );
+    const body = try std.json.Stringify.valueAlloc(ctx.allocator.a, .{
+        .rp = .{ .id = wa_opts.rp_id, .name = wa_opts.rp_name },
+        .user = .{ .id = user_id, .name = user_id, .displayName = user_id },
+        .challenge = challenge_b64,
+        .pubKeyCredParams = .{
+            .{ .type = "public-key", .alg = @as(i32, -7) },
+            .{ .type = "public-key", .alg = @as(i32, -8) },
+        },
+        .ceremonyId = cid,
+        .timeout = @as(u32, 300000),
+    }, .{});
 
     return http.Response{ .status = 200, .body = body };
 }
@@ -162,13 +171,16 @@ pub fn finish(ctx: *http.RequestCtx) anyerror!http.Response {
         const w = app.pool.acquireWriter();
         defer app.pool.releaseWriter();
 
-        user_id = (try requireAuthed(ctx, w)) orelse
+        const caller = (try requireAuthed(ctx, w)) orelse
             return ApiError.withCode(401, .unauthorized, "Not authenticated.").toResponse(ctx.allocator.a);
 
         const load = (try loadWebAuthnCollection(ctx, w)) orelse
             return (ApiError.notFound()).toResponse(ctx.allocator.a);
         wa_opts = load.opts;
         col_name = load.col.name;
+        if (!std.mem.eql(u8, caller.collection, col_name))
+            return ApiError.forbidden().toResponse(ctx.allocator.a);
+        user_id = caller.id;
 
         // Guard: reject mis-configured webauthn (empty rp_id or origin).
         if (wa_opts.rp_id.len == 0 or wa_opts.origin.len == 0) {
@@ -176,10 +188,9 @@ pub fn finish(ctx: *http.RequestCtx) anyerror!http.Response {
         }
 
         // Atomically take (consume) the registration challenge.
-        // SECURITY: take() filters by method, so a "webauthn" login challenge cannot be consumed
-        // by this registration take() that passes "webauthn_reg", and vice versa.
+        // Bind redemption to the authenticated account and canonical collection as well as method.
         const cs = ChallengeStore{ .conn = w };
-        challenge_raw_bytes = (try cs.take(ctx.allocator.a, ceremony_id, "webauthn_reg")) orelse {
+        challenge_raw_bytes = (try cs.takeScoped(ctx.allocator.a, ceremony_id, "webauthn_reg", col_name, user_id)) orelse {
             return (ApiError.badRequest("Invalid or expired ceremony.")).toResponse(ctx.allocator.a);
         };
     } // writer released — verifyRegistration below runs OFF the lock.
@@ -248,7 +259,7 @@ pub fn finish(ctx: *http.RequestCtx) anyerror!http.Response {
 // Tests
 // ---------------------------------------------------------------------------
 
-test "webauthn_register begin: returns 200 with challenge + ceremonyId for authed user" {
+test "webauthn_register begin: returns options for the authenticated user" {
     const api_auth = @import("auth.zig");
     const jwt = @import("../jwt.zig");
     const crypto = @import("../crypto.zig");
@@ -310,7 +321,7 @@ test "webauthn_register begin: unauthenticated returns 401" {
     try std.testing.expectEqual(@as(u16, 401), res.status);
 }
 
-test "webauthn_register finish: stores credential and returns 204" {
+test "webauthn_register finish: wrong account leaves challenge redeemable by real owner" {
     const api_auth = @import("auth.zig");
     const jwt = @import("../jwt.zig");
     const crypto = @import("../crypto.zig");
@@ -325,6 +336,7 @@ test "webauthn_register finish: stores credential and returns 204" {
     const a = arena.allocator();
 
     try env.createUser(a, "wrusers3", "fin@x.io", "longenough");
+    try env.createUser(a, "wrusers3", "other@x.io", "longenough");
 
     // Build a real registration ceremony.
     const rp_id = "example.test";
@@ -355,7 +367,7 @@ test "webauthn_register finish: stores credential and returns 204" {
 
     // Scoped block: acquire writer for setup (mint JWT + store challenge), release BEFORE
     // calling finish() — finish() acquires the pool writer internally (non-reentrant mutex).
-    const token, const cid, const rid = blk: {
+    const token, const cid, const rid, const other_token = blk: {
         const w = env.pool.acquireWriter();
         defer env.pool.releaseWriter();
         const r = (try api_auth.findByIdentity(a, w, (try collections.get(a, w, "wrusers3")).?, "fin@x.io")).?;
@@ -373,7 +385,17 @@ test "webauthn_register finish: stores credential and returns 204" {
         const challenge_raw = [_]u8{0x33} ** 32;
         const cs = ChallengeStore{ .conn = w };
         const c = try cs.put(a, std.testing.io, "wrusers3", "webauthn_reg", r, &challenge_raw, 300);
-        break :blk .{ tkn, c, r };
+        const other_id = (try api_auth.findByIdentity(a, w, (try collections.get(a, w, "wrusers3")).?, "other@x.io")).?;
+        const other_tk = (try api_auth.tokenKeyFor(a, w, "wrusers3", other_id)).?;
+        const other_key = crypto.deriveKey(env.app.jwt_secret, other_tk);
+        const other = try jwt.sign(a, .{
+            .id = other_id,
+            .collection = "wrusers3",
+            .type = .auth,
+            .iat = now_ts,
+            .exp = now_ts + 86400,
+        }, &other_key);
+        break :blk .{ tkn, c, r, other };
     };
 
     // Build clientDataJSON now that cid is known (challenge bytes are fixed above).
@@ -396,9 +418,21 @@ test "webauthn_register finish: stores credential and returns 204" {
 
     const params = [_]http.Param{.{ .key = "col", .value = "wrusers3" }};
     var ctx = env.ctx(RequestArena.from(&arena), .POST, body_str, &params);
-    ctx.authorization = try std.fmt.allocPrint(a, "Bearer {s}", .{token});
 
-    // Writer is released; finish() can now acquire it without deadlocking.
+    // Another authenticated account submits the owner's valid attestation first.
+    ctx.authorization = try std.fmt.allocPrint(a, "Bearer {s}", .{other_token});
+    try std.testing.expectEqual(@as(u16, 400), (try finish(&ctx)).status);
+    {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        var st = try w.prepare("SELECT consumed FROM _authChallenges WHERE id=?1;");
+        defer st.finalize();
+        try st.bindText(1, cid);
+        try std.testing.expect(try st.step());
+        try std.testing.expectEqual(@as(i64, 0), st.columnInt(0));
+    }
+    // The real owner can still finish the same valid ceremony and store the credential.
+    ctx.authorization = try std.fmt.allocPrint(a, "Bearer {s}", .{token});
     const res = try finish(&ctx);
     try std.testing.expectEqual(@as(u16, 204), res.status);
     try std.testing.expectEqualStrings("", res.body);
@@ -658,4 +692,69 @@ fn buildAttestationObj(alloc: std.mem.Allocator, auth_data: []const u8) ![]u8 {
     }
     try buf.appendSlice(alloc, auth_data);
     return buf.toOwnedSlice(alloc);
+}
+
+test "webauthn_register: collection and account isolation preserve ceremonies and escape RP options" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const request_arena = RequestArena.from(&arena);
+    const api_auth = @import("auth.zig");
+    const jwt_mod = @import("../jwt.zig");
+    const crypto_mod = @import("../crypto.zig");
+    var env = try api_auth.TestEnv.initWebAuthn("scope_owner");
+    defer env.deinit();
+    const a = request_arena.a;
+    const rp_name = "Team \"quoted\" \\ passkeys\n";
+    const foreign, const owner_bearer, const foreign_bearer, const other_bearer, const ceremony = blk: {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        const target = try collections.create(a, std.testing.io, w, .{
+            .id = "",
+            .name = "scope_foreign",
+            .type = .auth,
+            .fields = &.{},
+            .options = .{ .auth = .{ .methods = .{ .webauthn = .{
+                .rp_id = "example.test",
+                .rp_name = rp_name,
+                .origin = "https://example.test",
+            } } } },
+        });
+        try w.exec("INSERT INTO scope_owner (id,created,updated,email,tokenKey,verified) VALUES ('sameid','','','a@example.test','tk',1);");
+        try w.exec("INSERT INTO scope_foreign (id,created,updated,email,tokenKey,verified) VALUES ('sameid','','','b@example.test','tk',1), ('otherid','','','c@example.test','tk',1);");
+        const key = crypto_mod.deriveKey(env.app.jwt_secret, "tk");
+        const t1 = try jwt_mod.sign(a, .{ .id = "sameid", .collection = "scope_owner", .type = .auth, .iat = 0, .exp = 9999999999 }, &key);
+        const t2 = try jwt_mod.sign(a, .{ .id = "sameid", .collection = "scope_foreign", .type = .auth, .iat = 0, .exp = 9999999999 }, &key);
+        const t3 = try jwt_mod.sign(a, .{ .id = "otherid", .collection = "scope_foreign", .type = .auth, .iat = 0, .exp = 9999999999 }, &key);
+        const cid = try (ChallengeStore{ .conn = w }).put(a, std.testing.io, target.name, "webauthn_reg", "sameid", "challenge", 300);
+        break :blk .{ target, try std.fmt.allocPrint(a, "Bearer {s}", .{t1}), try std.fmt.allocPrint(a, "Bearer {s}", .{t2}), try std.fmt.allocPrint(a, "Bearer {s}", .{t3}), cid };
+    };
+    const body = try std.json.Stringify.valueAlloc(a, .{ .ceremonyId = ceremony, .attestationObject = "invalid", .clientDataJSON = "invalid" }, .{});
+    for ([_][]const u8{ foreign.name, foreign.id }) |alias| {
+        const params = [_]http.Param{.{ .key = "col", .value = alias }};
+        var ctx = env.ctx(request_arena, .POST, body, &params);
+        ctx.authorization = owner_bearer;
+        try std.testing.expectEqual(@as(u16, 403), (try begin(&ctx)).status);
+        try std.testing.expectEqual(@as(u16, 403), (try finish(&ctx)).status);
+        ctx.authorization = foreign_bearer;
+        const started = try begin(&ctx);
+        try std.testing.expectEqual(@as(u16, 200), started.status);
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, started.body, .{});
+        try std.testing.expectEqualStrings(rp_name, parsed.value.object.get("rp").?.object.get("name").?.string);
+        try std.testing.expectEqual(@as(i64, 300000), parsed.value.object.get("timeout").?.integer);
+        try std.testing.expectEqual(@as(usize, 2), parsed.value.object.get("pubKeyCredParams").?.array.items.len);
+        ctx.authorization = other_bearer;
+        try std.testing.expectEqual(@as(u16, 400), (try finish(&ctx)).status);
+    }
+    {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        // All denials precede ceremony consumption and credential insertion.
+        const payload = (try (ChallengeStore{ .conn = w }).takeScoped(a, ceremony, "webauthn_reg", foreign.name, "sameid")).?;
+        try std.testing.expectEqualStrings("challenge", payload);
+        var counts = try w.prepare("SELECT (SELECT COUNT(*) FROM _authChallenges), (SELECT COUNT(*) FROM _webauthnCredentials);");
+        defer counts.finalize();
+        try std.testing.expect(try counts.step());
+        try std.testing.expectEqual(@as(i64, 3), counts.columnInt(0)); // original plus two legitimate begin calls
+        try std.testing.expectEqual(@as(i64, 0), counts.columnInt(1));
+    }
 }

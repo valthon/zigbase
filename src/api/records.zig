@@ -929,6 +929,7 @@ pub fn list(ctx: *http.RequestCtx) anyerror!http.Response {
     const conn = writer orelse &r;
 
     const result = records.list(ctx.allocator.a, conn, col, .{
+        .client_query = true,
         .filter = qp.get("filter"),
         .sort = qp.get("sort"),
         // Full-text search (#157): `?search=` (alias `?q=`) composes a bound FTS5 MATCH into the
@@ -959,8 +960,10 @@ pub fn list(ctx: *http.RequestCtx) anyerror!http.Response {
             error.CursorSort => return ApiError.badRequest("Cursor does not match the requested sort.").toResponse(ctx.allocator.a),
             error.CursorFilter => return ApiError.badRequest("Cursor does not match the requested filter.").toResponse(ctx.allocator.a),
             error.BadCursor => return ApiError.badRequest("Invalid cursor.").toResponse(ctx.allocator.a),
+            error.CursorTooLarge => return ApiError.badRequest("Cursor exceeds the size limit. Use a shorter sort key or configured stateful pagination.").toResponse(ctx.allocator.a),
             error.EncryptedField => return ApiError.badRequest("Cannot filter or sort by an encrypted field.").toResponse(ctx.allocator.a),
             error.HiddenField => return ApiError.badRequest("Cannot filter or sort by a hidden field.").toResponse(ctx.allocator.a),
+            error.RestrictedRelation => return ApiError.badRequest("Cannot filter or sort through a relation with restricted target visibility.").toResponse(ctx.allocator.a),
             error.NotSearchable => return ApiError.badRequest("This collection has no searchable fields; `search` is not supported here.").toResponse(ctx.allocator.a),
             error.SearchDisabled => return ApiError.badRequest("Full-text search is not enabled in this build.").toResponse(ctx.allocator.a),
             error.VectorDisabled => return ApiError.badRequest("Vector search is not enabled in this build.").toResponse(ctx.allocator.a),
@@ -1315,6 +1318,46 @@ test "cursor handler: garbage cursor -> 400; changed sort -> 400" {
     const q2 = try std.fmt.allocPrint(a, "sort=-created&limit=1&cursor={s}", .{tok});
     var second = http.RequestCtx{ .method = .GET, .path = "/", .query = q2, .allocator = RequestArena.from(&arena), .app = &env.app, .params = &col_param };
     try std.testing.expectEqual(@as(u16, 400), (try list(&second)).status);
+    // Client relation predicates are rejected even when a trusted list rule already
+    // introduced the same join. Public target fields remain queryable.
+    {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        const target = try collections.create(a, std.testing.io, w, .{ .id = "", .name = "targets", .fields = &.{.{ .id = "f1", .name = "secret", .options = .{ .text = .{} } }}, .viewRule = null });
+        _ = try collections.create(a, std.testing.io, w, .{ .id = "", .name = "sources", .fields = &.{.{ .id = "f1", .name = "target", .options = .{ .relation = .{ .targetCollectionId = target.id, .maxSelect = 1 } } }}, .listRule = "target.secret = 'value'" });
+        try w.exec("INSERT INTO targets (id,created,updated,secret) VALUES ('t1','t','t','value');");
+        try w.exec("INSERT INTO sources (id,created,updated,target) VALUES ('s1','t','t','t1');");
+    }
+    const source_params = [_]http.Param{.{ .key = "col", .value = "sources" }};
+    for ([_][]const u8{ "filter=target.secret%3D'value'", "sort=target.secret" }) |query| {
+        var restricted = http.RequestCtx{ .method = .GET, .path = "/", .query = query, .allocator = RequestArena.from(&arena), .app = &env.app, .params = &source_params };
+        const response = try list(&restricted);
+        try std.testing.expectEqual(@as(u16, 400), response.status);
+        try std.testing.expect(std.mem.indexOf(u8, response.body, "restricted target visibility") != null);
+    }
+    // The operator-authored source rule can still use a private target.
+    env.app.pagination = .{};
+    var trusted = http.RequestCtx{ .method = .GET, .path = "/", .allocator = RequestArena.from(&arena), .app = &env.app, .params = &source_params };
+    const trusted_response = try list(&trusted);
+    try std.testing.expectEqual(@as(u16, 200), trusted_response.status);
+    try std.testing.expect(std.mem.indexOf(u8, trusted_response.body, "s1") != null);
+    env.app.pagination = .{ .offset_enabled = false, .cursor_enabled = true };
+
+    // A long text sort boundary must fail as a client error, never mint an unusable token.
+    const long_title = try a.alloc(u8, 2048);
+    @memset(long_title, 'x');
+    const body = try std.fmt.allocPrint(a, "{{\"title\":\"{s}\"}}", .{long_title});
+    for (0..2) |_| {
+        var c = ctxFor(env, RequestArena.from(&arena), .POST, body, &col_param);
+        try std.testing.expectEqual(@as(u16, 201), (try create(&c)).status);
+    }
+    inline for (.{ @import("../pagination.zig").CursorToken.stateless, @import("../pagination.zig").CursorToken.signed }) |mode| {
+        env.app.pagination.cursor_token = mode;
+        var large = http.RequestCtx{ .method = .GET, .path = "/", .query = "sort=-title&limit=1", .allocator = RequestArena.from(&arena), .app = &env.app, .params = &col_param };
+        const response = try list(&large);
+        try std.testing.expectEqual(@as(u16, 400), response.status);
+        try std.testing.expect(std.mem.indexOf(u8, response.body, "Cursor exceeds the size limit") != null);
+    }
     env.app.pagination = .{};
 }
 

@@ -59,7 +59,9 @@ export class Transport {
   constructor(private readonly cfg: TransportConfig) {}
 
   /** Join (or start) the single-flight refresh. */
-  private awaitRefresh(): Promise<void> {
+  private awaitRefresh(attemptToken: string | null | undefined): Promise<void> {
+    if (this.refreshInFlight) return this.refreshInFlight;
+    if (this.cfg.authStore.token !== attemptToken) return Promise.resolve();
     this.refreshInFlight ??= Promise.resolve()
       .then(() => this.cfg.refresh!())
       .finally(() => {
@@ -175,6 +177,7 @@ export class Transport {
     let attempt = 0;
 
     for (;;) {
+      const attemptToken = this.cfg.authStore.token;
       const res = await this.cfg.fetch(url, this.buildRequestInit(opts, signal));
 
       if (res.ok) {
@@ -199,7 +202,7 @@ export class Transport {
       ) {
         didRefresh = true;
         try {
-          await this.awaitRefresh();
+          await this.awaitRefresh(attemptToken);
           continue;
         } catch {
           // refresh failed — fall through to the original 401 error
