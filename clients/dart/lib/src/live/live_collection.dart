@@ -249,6 +249,7 @@ class LiveList implements Observable<List<LiveRecord>> {
     this._cache,
     List<ZbRecord> seed, {
     FilterNode? filterAst,
+    bool forceRefetch = false,
     String? sort,
     required Future<List<ZbRecord>> Function() onRefetch,
     required Duration debounce,
@@ -256,7 +257,7 @@ class LiveList implements Observable<List<LiveRecord>> {
     required ClearRefetch clear,
   })  : _sortTerms = _appendIdTiebreaker(parseSort(sort ?? '')),
         _filterAst = filterAst,
-        _precise = analyzeFilter(filterAst).locallyEvaluable,
+        _precise = !forceRefetch && analyzeFilter(filterAst).locallyEvaluable,
         _onRefetch = onRefetch,
         _debounce = debounce,
         _schedule = schedule,
@@ -655,11 +656,20 @@ class LiveCollection {
   }) async {
     // Parse the filter exactly once; the AST feeds both the membership
     // evaluator and the precise-vs-refetch analysis inside LiveList.
-    final filterAst = filter != null ? parseFilter(filter) : null;
+    FilterNode? filterAst;
+    var forceRefetch = false;
+    try {
+      filterAst = filter != null ? parseFilter(filter) : null;
+    } on FormatException {
+      // Server-valid grammar outside the local subset needs server membership.
+      // Keep this catch scoped to parsing so HTTP/subscription errors propagate.
+      forceRefetch = true;
+    }
     final list = LiveList._(
       _cache,
       seed,
       filterAst: filterAst,
+      forceRefetch: forceRefetch,
       sort: sort,
       onRefetch: onRefetch,
       debounce: refetchDebounce,

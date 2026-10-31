@@ -232,20 +232,10 @@ fn onMessage(context: ?*LiveConn, handle: zap.WebSockets.WsHandle, message: []co
             WS.write(handle, try protocol.authFrame(fa, ok), true) catch {};
         },
         .subscribe => |m| {
-            switch (hub.subscribeCheck(lc.app, &lc.conn, RequestArena.from(&lc.frame), m.topic)) {
-                .limit => {
-                    WS.write(handle, try protocol.errorFrame(fa, "subscription limit reached"), true) catch {};
-                    return;
-                },
-                .unknown => {
-                    WS.write(handle, try protocol.errorFrame(fa, "unknown collection"), true) catch {};
-                    return;
-                },
-                .auth_required => {
-                    WS.write(handle, try protocol.errorFrame(fa, "authentication required to subscribe"), true) catch {};
-                    return;
-                },
-                .ok => {},
+            const decision = hub.subscribeFilterCheck(lc.app, &lc.conn, RequestArena.from(&lc.frame), m.topic, m.filter);
+            if (decision.errorMessage()) |reason| {
+                WS.write(handle, try protocol.errorFrame(fa, reason), true) catch {};
+                return;
             }
             // #3: a re-subscribe to a topic we already hold REPLACES in place — update only the
             // stored filter (no new durable allocation for an identical re-subscribe, no second fio

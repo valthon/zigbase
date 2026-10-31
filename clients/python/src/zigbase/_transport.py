@@ -26,7 +26,7 @@ from typing import Any
 
 import httpx
 
-from zigbase._multipart import encode_body, has_file
+from zigbase._multipart import EncodedBody, encode_body
 from zigbase._request import RequestSpec
 from zigbase.auth_store import AuthStore
 from zigbase.errors import ZigbaseError, parse_error_response
@@ -99,11 +99,12 @@ def _prepare_request(
     token: str | None,
     lang: str | None,
     account_id: str | None,
+    encoded_body: EncodedBody | None = None,
 ) -> dict[str, Any]:
     """Build the keyword arguments for `httpx.Client.request` /
-    `httpx.AsyncClient.request` from a `RequestSpec` -- pure aside from
-    reading `token` (already resolved by the caller), so both transports
-    share it verbatim."""
+    `httpx.AsyncClient.request` from a `RequestSpec`. Retrying exchanges
+    supply a body encoded once, so file streams are never read again.
+    Raw one-shot calls encode here instead."""
     kwargs: dict[str, Any] = {
         "headers": _build_headers(
             spec.headers, token=token, skip_auth=spec.skip_auth, lang=lang, account_id=account_id
@@ -117,14 +118,14 @@ def _prepare_request(
     # transport.dart's `_perform`/`_maybeBufferMultipart` (both gate on
     # `!isGet`).
     if spec.body is not None and spec.method.upper() != "GET":
-        if has_file(spec.body):
-            encoded = encode_body(spec.body)
+        encoded = encoded_body if encoded_body is not None else encode_body(spec.body)
+        if encoded.files is not None:
             # Never set Content-Type manually (rule 6): httpx derives the
             # multipart boundary from files= being present.
             kwargs["data"] = _to_multipart_data(encoded.fields or [])
             kwargs["files"] = encoded.files or []
         else:
-            kwargs["json"] = encode_body(spec.body).json_body
+            kwargs["json"] = encoded.json_body
     return kwargs
 
 
@@ -253,7 +254,7 @@ class SyncTransport:
         """Escape hatch: perform exactly one HTTP call and return the
         `httpx.Response` as-is -- no error mapping, no 401 refresh, no
         retries. Auth/lang/account headers and body encoding still apply."""
-        return self._perform_once(spec)
+        return self._perform_once(spec, token=self._auth_store.token)
 
     def request(self, spec: RequestSpec) -> Any:
         """Perform `spec`, following the refresh and bounded backoff state
@@ -265,19 +266,35 @@ class SyncTransport:
 
     # --- internals -------------------------------------------------------
 
-    def _perform_once(self, spec: RequestSpec) -> httpx.Response:
+    def _perform_once(
+        self,
+        spec: RequestSpec,
+        *,
+        token: str | None,
+        encoded_body: EncodedBody | None = None,
+    ) -> httpx.Response:
         url = self._base_url + spec.path
         kwargs = _prepare_request(
-            spec, token=self._auth_store.token, lang=self._lang, account_id=self._account_id
+            spec,
+            token=token,
+            lang=self._lang,
+            account_id=self._account_id,
+            encoded_body=encoded_body,
         )
         return self._client.request(spec.method, url, **kwargs)
 
     def _exchange(self, spec: RequestSpec) -> httpx.Response:
         did_refresh = False
         attempt = 0
+        encoded_body = (
+            encode_body(spec.body)
+            if spec.body is not None and spec.method.upper() != "GET"
+            else None
+        )
 
         while True:
-            response = self._perform_once(spec)
+            attempt_token = self._auth_store.token
+            response = self._perform_once(spec, token=attempt_token, encoded_body=encoded_body)
 
             if response.is_success:
                 return response
@@ -293,7 +310,7 @@ class SyncTransport:
             ):
                 did_refresh = True
                 try:
-                    self._await_refresh()
+                    self._await_refresh(attempt_token)
                     continue
                 except Exception:
                     # Refresh failed -- fall through and raise this
@@ -328,13 +345,15 @@ class SyncTransport:
                 reason_phrase=response.reason_phrase or None,
             )
 
-    def _await_refresh(self) -> None:
+    def _await_refresh(self, attempt_token: str | None) -> None:
         """Join the in-flight refresh, or become its owner and start it."""
         with self._refresh_guard:
             flight = self._refresh_flight
             if flight is not None:
                 is_owner = False
             else:
+                if self._auth_store.token != attempt_token:
+                    return
                 flight = _RefreshFlight()
                 self._refresh_flight = flight
                 is_owner = True
@@ -378,10 +397,11 @@ class _AsyncRefreshFlight:
     """`_RefreshFlight`'s `asyncio.Event` counterpart -- a single in-flight
     refresh, joinable by any number of waiting coroutines."""
 
-    def __init__(self, owner: _KeyedRequest | None = None) -> None:
+    def __init__(self, attempt_token: str | None, owner: _KeyedRequest | None = None) -> None:
         self._done = asyncio.Event()
         self.error: BaseException | None = None
         self.owner = owner
+        self.attempt_token = attempt_token
 
     async def wait(self) -> bool:
         """False means the owner was cancelled; a waiter can elect a new owner.
@@ -553,9 +573,21 @@ class AsyncTransport:
         if request.task is not None:
             request.task.cancel()
 
-    async def _perform_once(self, spec: RequestSpec, *, token: str | None) -> httpx.Response:
+    async def _perform_once(
+        self,
+        spec: RequestSpec,
+        *,
+        token: str | None,
+        encoded_body: EncodedBody | None = None,
+    ) -> httpx.Response:
         url = self._base_url + spec.path
-        kwargs = _prepare_request(spec, token=token, lang=self._lang, account_id=self._account_id)
+        kwargs = _prepare_request(
+            spec,
+            token=token,
+            lang=self._lang,
+            account_id=self._account_id,
+            encoded_body=encoded_body,
+        )
         return await self._client.request(spec.method, url, **kwargs)
 
     async def _exchange(
@@ -563,12 +595,19 @@ class AsyncTransport:
     ) -> httpx.Response:
         did_refresh = False
         attempt = 0
+        encoded_body = (
+            encode_body(spec.body)
+            if spec.body is not None and spec.method.upper() != "GET"
+            else None
+        )
 
         while True:
             # Bind refresh decisions to the token actually sent, not the store
             # value after a concurrent request has already completed a refresh.
             attempt_token = self._auth_store.token
-            response = await self._perform_once(spec, token=attempt_token)
+            response = await self._perform_once(
+                spec, token=attempt_token, encoded_body=encoded_body
+            )
             if owner is not None and owner.cancelled:
                 raise asyncio.CancelledError
 
@@ -627,13 +666,17 @@ class AsyncTransport:
             async with self._refresh_guard:
                 if owner is not None and owner.cancelled:
                     raise asyncio.CancelledError
-                if self._auth_store.token != attempt_token:
-                    return
                 flight = self._refresh_flight
                 if flight is None:
-                    flight = _AsyncRefreshFlight(owner)
+                    if self._auth_store.token != attempt_token:
+                        return
+                    flight = _AsyncRefreshFlight(attempt_token, owner)
                     self._refresh_flight = flight
                     break
+                # If this owner is superseded, retry refresh for the token
+                # whose flight we joined, even when our response used an
+                # older token. A later auth change still takes the shortcut.
+                attempt_token = flight.attempt_token
             if await flight.wait():
                 return
             # Superseding a keyed request may cancel the refresh owner. It

@@ -133,7 +133,7 @@ pub const Db = struct {
         if (self.quarantined) return error.WriterUnavailable;
         var lifetime = if (comptime build_options.query_workbench) workbench.Lifetime.begin() else {};
         var handle: ?*c.sqlite3_stmt = null;
-        if (c.sqlite3_prepare_v2(self.handle, sql.ptr, -1, &handle, null) != c.SQLITE_OK)
+        if (c.sqlite3_prepare_v2(self.handle, sql.ptr, -1, &handle, null) != c.SQLITE_OK or handle == null)
             return DbError.PrepareFailed;
         if (comptime build_options.query_workbench) {
             lifetime.afterCall(lifetime.started);
@@ -944,4 +944,11 @@ test "pool: default cache_kib applies the memory-conscious default to connection
     var reader = try pool.openReader();
     defer reader.close();
     try std.testing.expectEqual(expected, try readCacheSize(&reader));
+}
+
+test "prepare rejects empty whitespace and comment-only SQL" {
+    var database = try Db.openMemory();
+    defer database.close();
+    for ([_][:0]const u8{ "", " \t\n", "-- comment", "/* comment */;" }) |sql|
+        try std.testing.expectError(error.PrepareFailed, database.prepare(sql));
 }

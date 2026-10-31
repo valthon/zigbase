@@ -69,8 +69,9 @@ class _Token {
 }
 
 const _opChars = {'=', '!', '>', '<', '~'};
-const _wordStops = ' \t\n()&|=!<>~\'"';
+const _wordStops = ' \t\n\r()&|=!<>~\'"';
 final RegExp _numberPattern = RegExp(r'^-?\d+(\.\d+)?$');
+final RegExp _fieldPattern = RegExp(r'^[A-Za-z_@][A-Za-z0-9_@.]*$');
 
 List<_Token> _tokenize(String input) {
   final tokens = <_Token>[];
@@ -78,7 +79,7 @@ List<_Token> _tokenize(String input) {
   final n = input.length;
   while (i < n) {
     final c = input[i];
-    if (c == ' ' || c == '\t' || c == '\n') {
+    if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
       i += 1;
       continue;
     }
@@ -107,8 +108,21 @@ List<_Token> _tokenize(String input) {
       var j = i + 1;
       final buf = StringBuffer();
       while (j < n && input[j] != quote) {
-        if (input[j] == r'\' && j + 1 < n) {
-          buf.write(input[j + 1]);
+        if (input[j] == r'\') {
+          final escaped = j + 1 < n ? input[j + 1] : null;
+          switch (escaped) {
+            case 'n':
+              buf.write('\n');
+            case 't':
+              buf.write('\t');
+            case 'r':
+              buf.write('\r');
+            case r'\' || "'" || '"':
+              buf.write(escaped);
+            default:
+              throw const FormatException(
+                  'invalid escape in filter string literal');
+          }
           j += 2;
         } else {
           buf.write(input[j]);
@@ -152,8 +166,11 @@ List<_Token> _tokenize(String input) {
       tokens.add(const _Token(_TokKind.lit, null));
     } else if (_numberPattern.hasMatch(word)) {
       tokens.add(_Token(_TokKind.lit, num.parse(word)));
-    } else {
+    } else if (word != 'in' && _fieldPattern.hasMatch(word)) {
       tokens.add(_Token(_TokKind.field, word));
+    } else {
+      throw FormatException(
+          'unsupported filter token near "${input.substring(i - word.length)}"');
     }
   }
   return tokens;
@@ -324,6 +341,7 @@ FilterAnalysis analyzeFilter(FilterNode? node) {
   }
   var referencesRelations = false;
   var referencesMacros = false;
+  var referencesFields = false;
 
   void classify(List<String> path) {
     if (_isMacroPath(path)) {
@@ -338,7 +356,11 @@ FilterAnalysis analyzeFilter(FilterNode? node) {
       case CompareNode():
         classify(n.path);
         final vp = n.valuePath;
-        if (vp != null) classify(vp);
+        if (vp != null) {
+          // Own-field RHS comparisons also require server coercion/collation.
+          referencesFields = true;
+          classify(vp);
+        }
       case LogicNode():
         walk(n.left);
         walk(n.right);
@@ -348,7 +370,8 @@ FilterAnalysis analyzeFilter(FilterNode? node) {
   walk(node);
 
   return FilterAnalysis(
-    locallyEvaluable: !referencesRelations && !referencesMacros,
+    locallyEvaluable:
+        !referencesRelations && !referencesMacros && !referencesFields,
     referencesRelations: referencesRelations,
     referencesMacros: referencesMacros,
   );

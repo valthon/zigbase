@@ -890,6 +890,9 @@ fn isWellFormedSubject(v: []const u8) bool {
 
 pub const GetOptions = struct { expand: ?[]const u8 = null };
 pub const ListOptions = struct {
+    /// Enable client filter/sort visibility checks when forwarding untrusted input.
+    /// Server-authored queries are trusted by default; row scoping still applies.
+    client_query: bool = false,
     filter: ?[]const u8 = null,
     /// Bound values for `?` placeholders in `filter` (0-based, left-to-right). Each `?` binds its
     /// value as a literal SQL parameter — never re-parsed as filter grammar — so this is the
@@ -920,6 +923,7 @@ pub const Records = struct {
 
     pub fn list(self: Records, collection: []const u8, opts: ListOptions) !records_engine.ListResult {
         const q = records_engine.ListQuery{
+            .client_query = opts.client_query,
             .filter = opts.filter,
             .filter_args = opts.filter_args,
             .sort = opts.sort,
@@ -3026,4 +3030,50 @@ test "#244 ctx.reportError never fails even on a pathological/failing arena (fal
     try std.testing.expectEqual(@as(usize, 1), ReportCapture.count);
     try std.testing.expectEqualStrings("app", ReportCapture.phase);
     try std.testing.expectEqualStrings("Boom", ReportCapture.msg); // fell back to @errorName
+}
+
+test "job ctx relation queries remain trusted while client opt-in and row scopes are enforced" {
+    const env = try CtxTestEnv.init();
+    defer env.deinit();
+    const a = env.arena.allocator();
+    {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        const authors = try collections.create(a, env.app.io, w, .{ .id = "", .name = "authors", .fields = &.{
+            .{ .id = "f1", .name = "name", .options = .{ .text = .{} } },
+        }, .viewRule = null });
+        const fields = &[_]schema.Field{
+            .{ .id = "f1", .name = "author", .options = .{ .relation = .{ .targetCollectionId = authors.id, .maxSelect = 1 } } },
+            .{ .id = "f2", .name = "owner", .options = .{ .relation = .{ .targetCollectionId = authors.id, .maxSelect = 1 } } },
+        };
+        _ = try collections.create(a, env.app.io, w, .{ .id = "", .name = "sources", .fields = fields });
+        _ = try collections.create(a, env.app.io, w, .{ .id = "", .name = "scoped_sources", .fields = fields, .options = .{
+            .tenant_field = "owner",
+            .abilities = .{ .view = .{ .relationship = .{ .via = "owner" } } },
+        } });
+        try w.exec("INSERT INTO authors (id,created,updated,name) VALUES ('acc1','t','t','Ada'),('acc2','t','t','Bert');");
+        try w.exec("INSERT INTO sources (id,created,updated,author,owner) VALUES ('s1','t','t','acc1','acc1'),('s2','t','t','acc2','acc2');");
+        try w.exec("INSERT INTO scoped_sources (id,created,updated,author,owner) VALUES ('s1','t','t','acc1','acc1'),('s2','t','t','acc1','acc2');");
+    }
+    // This is the empty request context used for jobs/queues/webhooks, not a superuser.
+    var job = Ctx{ .app = &env.app, .arena = RequestArena.from(&env.arena), .rctx = .{} };
+    defer job.deinit();
+    const page = try job.records().list("sources", .{ .filter = "author.name = ?", .filter_args = &.{.{ .string = "Ada" }}, .sort = "author.name" });
+    try std.testing.expectEqual(@as(usize, 1), page.items.len);
+    try std.testing.expectEqualStrings("s1", page.items[0].object.get("id").?.string);
+    try std.testing.expectError(error.RestrictedRelation, job.records().list("sources", .{ .client_query = true, .filter = "author.name = 'Ada'" }));
+    try std.testing.expectError(error.RestrictedRelation, job.records().list("sources", .{ .client_query = true, .sort = "author.name" }));
+
+    // Trusted relation traversal does not bypass source-row tenancy or abilities.
+    job.rctx = .{ .tenancy_enabled = true, .account_id = "acc1", .memberships = &.{.{ .account = "acc1", .role = "member" }} };
+    const scoped = try job.records().list("scoped_sources", .{ .filter = "author.name = 'Ada'", .sort = "author.name" });
+    try std.testing.expectEqual(@as(usize, 1), scoped.items.len);
+    try std.testing.expectEqualStrings("s1", scoped.items[0].object.get("id").?.string);
+    job.rctx.memberships = &.{};
+    const denied = try job.records().list("scoped_sources", .{ .filter = "author.name = 'Ada'" });
+    try std.testing.expectEqual(@as(usize, 0), denied.items.len);
+
+    // The low-level opt-in also fails closed when no principal was provided.
+    const data = try job.records().dataRead();
+    try std.testing.expectError(error.RestrictedRelation, data.list("sources", .{ .client_query = true, .sort = "author.name" }));
 }

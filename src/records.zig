@@ -2000,6 +2000,10 @@ pub const FilterArg = compiler.FilterArg;
 pub const ListMode = enum { offset, cursor };
 
 pub const ListQuery = struct {
+    /// Client-controlled filter/sort input must respect relation target visibility.
+    /// Set by HTTP entry points; trusted server code retains private traversal even
+    /// when `rctx` is present for tenant and ability scoping.
+    client_query: bool = false,
     filter: ?[]const u8 = null,
     /// Bound values for `?` placeholders in `filter` (0-based, left-to-right). Each `?` binds its
     /// value as a literal SQL parameter — NEVER re-parsed as filter grammar (the injection-safe way
@@ -2878,6 +2882,8 @@ pub fn list(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, q: L
     const sa = scratch.allocator();
     const dialect = db.dbDialect(conn);
     var j = joiner.Joiner.init(sa, conn, col);
+    const anonymous = request.RequestContext{};
+    j.client_rctx = if (q.client_query) q.rctx orelse &anonymous else null;
     var where_sql: []const u8 = "";
     var params: []const compiler.Param = &.{};
 
@@ -2965,7 +2971,11 @@ pub fn list(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, q: L
         // server-side WHERE clause, never serialized), then restore the client-input default so the
         // sort below still rejects a hidden sort key.
         j.allow_hidden = true;
-        defer j.allow_hidden = false;
+        j.trusted = true;
+        defer {
+            j.allow_hidden = false;
+            j.trusted = false;
+        }
         const rtoks = try lexer.lex(sa, rstr);
         const rast = try parser.parse(sa, rtoks);
         const rc = try compiler.compile(sa, &j, rast, q.rctx, dialect, &.{});

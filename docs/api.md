@@ -440,6 +440,25 @@ account in @request.account.ids
 > access rule** *may* still gate on a hidden field: a rule is a server-side `WHERE`
 > clause whose truth is never returned to the client, so it is no oracle.
 
+### Relation traversal and cursor limits
+
+Client filters and sorts may traverse single relations only when every target
+collection is unconditionally viewable by the caller. Locked or conditional view
+rules, active tenant/ability restrictions, and TTL-enabled targets return `400` ("Cannot
+filter or sort through a relation with restricted target visibility."). Trusted
+access rules and server-authored queries through `Ctx.records().list` (including
+hooks, jobs, queues and webhooks) retain trusted traversal. Request identity
+continues to scope these queries; client-query validation is an explicit query
+mode, independent of whether a request context is present. Server code forwarding
+untrusted filters must set `.client_query = true` in `Ctx.ListOptions` or
+`records.ListQuery`. `expand` continues to
+check each target record's view policy.
+Supporting restricted targets requires policy predicates scoped to each JOIN.
+
+Stateless and signed cursors have a 2048-byte wire limit. A sort boundary too
+large to encode returns `400` with guidance to shorten sort keys or configure
+stateful pagination; the server never returns an unusable oversized cursor.
+
 ### sort
 
 Comma-separated field list. Prefix a field with `-` for descending; ascending is the
@@ -755,8 +774,14 @@ For every auth collection that enables a method (built-in or custom), two endpoi
 
 | Method | Path | Description |
 |---|---|---|
-| POST | `/api/collections/:col/auth/webauthn/register/begin` | Returns WebAuthn creation options (challenge, rpId, rpName). |
+| POST | `/api/collections/:col/auth/webauthn/register/begin` | Returns WebAuthn creation options (`rp`, `user`, `challenge`, `pubKeyCredParams`, `timeout`) and `ceremonyId`. |
 | POST | `/api/collections/:col/auth/webauthn/register/finish` | Stores the new passkey bound to the authenticated user. `204` (no body) on success. |
+
+Both registration endpoints return **403** when the session belongs to another
+auth collection, including a superuser session targeting a different collection.
+Collection names and IDs identify the same canonical collection. `finish` returns
+**400** for an expired, consumed, invalid or differently owned ceremony. An owner
+mismatch leaves the ceremony available for its original account to finish.
 
 **magic_link initiate:**
 ```json
@@ -843,7 +868,17 @@ The `redirect` target is validated **server-side** so each app does not re-imple
 ```json
 // request: empty body or {}
 // response (200)
-{ "challenge": "<base64url>", "rpId": "app.example.com", "rpName": "My App", "ceremonyId": "<opaque>" }
+{
+  "rp": { "id": "app.example.com", "name": "My App" },
+  "user": { "id": "<record-id>", "name": "<record-id>", "displayName": "<record-id>" },
+  "challenge": "<base64url>",
+  "pubKeyCredParams": [
+    { "type": "public-key", "alg": -7 },
+    { "type": "public-key", "alg": -8 }
+  ],
+  "timeout": 300000,
+  "ceremonyId": "<opaque>"
+}
 ```
 
 **webauthn register/finish (authed):**
@@ -851,14 +886,10 @@ The `redirect` target is validated **server-side** so each app does not re-imple
 // request
 {
   "ceremonyId": "<opaque>",
-  "id": "<base64url>",
-  "rawId": "<base64url>",
-  "response": {
-    "clientDataJSON": "<base64url>",
-    "attestationObject": "<base64url>"
-  }
+  "clientDataJSON": "<base64url>",
+  "attestationObject": "<base64url>"
 }
-// response (200): {}
+// response: 204 (no body)
 ```
 
 ### The `onAuth` hook — fires on every login
@@ -1044,6 +1075,10 @@ carrying existing social-login accounts over from another backend — see
 
 `state` is required by default; omitted only when `ZIGBASE_OAUTH_STATE_SERVER=false`.
 `redirectUrl` must be in the provider's configured allowlist.
+
+An identity already linked to another auth collection returns **409 Conflict**,
+including when the two collections contain matching record IDs. The identity is
+not reinterpreted as an account in the requested collection.
 
 ```json
 // response (200) — sets zb_auth and zb_csrf cookies
@@ -1647,6 +1682,12 @@ A topic is either a whole collection (`<collection>`) or a single record
 `{ "action": "unsubscribe", "topic": "..." }`. The server acknowledges subscribe/
 unsubscribe with `{ "type": "ack", "action": "...", "topic": "..." }`. On connect it
 sends `{ "type": "connect", "clientId": "..." }`.
+
+For collection and record topics, filters are validated before a subscription is
+installed or replaced. Malformed filters, hidden fields, and restricted relation
+traversal return an `error` frame instead of an acknowledgement. An invalid
+replacement leaves the previous subscription intact. Both transports repeat
+visibility checks at delivery because schema and authentication can change.
 
 **Authentication is required to subscribe** to any collection whose `viewRule` is not
 `"@public"`. A socket may subscribe anonymously *only* to a public (`@public`) collection;

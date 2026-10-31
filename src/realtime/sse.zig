@@ -186,12 +186,9 @@ pub fn handleUplink(sc: *SseConn, a: RequestArena, body: []const u8) !?Reply {
             return .{ .status = 200, .frame = try protocol.authFrame(a.a, ok) };
         },
         .subscribe => |m| {
-            switch (hub.subscribeCheck(sc.app, &sc.conn, a, m.topic)) {
-                .limit => return .{ .status = 200, .frame = try protocol.errorFrame(a.a, "subscription limit reached") },
-                .unknown => return .{ .status = 200, .frame = try protocol.errorFrame(a.a, "unknown collection") },
-                .auth_required => return .{ .status = 200, .frame = try protocol.errorFrame(a.a, "authentication required to subscribe") },
-                .ok => {},
-            }
+            const decision = hub.subscribeFilterCheck(sc.app, &sc.conn, a, m.topic, m.filter);
+            if (decision.errorMessage()) |reason|
+                return .{ .status = 200, .frame = try protocol.errorFrame(a.a, reason) };
             // #3: replace-in-place on a repeat subscribe (mirrors ws.zig) — reuse the single fio
             // subscription instead of stacking a second, which bypassed MAX_SUBS and duplicated
             // every delivered frame.
@@ -560,4 +557,87 @@ test "handleUplink: subscribe/auth run the SHARED hub verbs (pool-backed decisio
     try std.testing.expectEqualStrings("{\"type\":\"auth\",\"status\":\"error\"}", auth_bad.frame);
 
     markClosedAndRelease(sc);
+}
+
+test "subscribe rejects invalid client filters before registering or replacing subscriptions" {
+    const db = @import("../db.zig");
+    const migrations = @import("../migrations.zig");
+    const collections = @import("../collections.zig");
+    const schema = @import("../schema.zig");
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(dir_path);
+    const db_path = try std.fmt.allocPrintSentinel(a, "{s}/test.db", .{dir_path}, 0);
+    defer a.free(db_path);
+    var pool = try db.Pool.init(a, std.testing.io, db_path);
+    defer pool.deinit();
+    {
+        const w = pool.acquireWriter();
+        defer pool.releaseWriter();
+        try migrations.run(w);
+        const target = try collections.create(a, std.testing.io, w, .{ .id = "", .name = "targets", .fields = &.{}, .viewRule = null });
+        defer target.deinit(a);
+        const public = try collections.create(a, std.testing.io, w, .{ .id = "", .name = "public_targets", .fields = &.{}, .viewRule = "@public" });
+        defer public.deinit(a);
+        const source = try collections.create(a, std.testing.io, w, .{ .id = "", .name = "sources", .fields = &[_]schema.Field{
+            .{ .id = "f1", .name = "target", .options = .{ .relation = .{ .targetCollectionId = target.id, .maxSelect = 1 } } },
+            .{ .id = "f2", .name = "public_target", .options = .{ .relation = .{ .targetCollectionId = public.id, .maxSelect = 1 } } },
+            .{ .id = "f3", .name = "secret", .hidden = true, .options = .{ .text = .{} } },
+        }, .viewRule = "@public" });
+        defer source.deinit(a);
+    }
+    var app = App{ .allocator = a, .io = std.testing.io, .pool = &pool };
+    const sc = try create(&app);
+    defer unref(sc);
+    // Request-scoped allocations use a bounded buffer; durable state still runs
+    // on the raw test allocator so conn destruction verifies ownership.
+    var buffer: [128 * 1024]u8 = undefined;
+    var scratch = std.heap.FixedBufferAllocator.init(&buffer);
+    const arena = RequestArena{ .a = scratch.allocator() };
+    const cases = [_]struct { filter: []const u8, message: []const u8 }{
+        .{ .filter = "target.id = 't1'", .message = "Cannot filter through a relation with restricted target visibility." },
+        .{ .filter = "secret = 'value'", .message = "Cannot filter by a hidden field." },
+        .{ .filter = "missing = 'value'", .message = "invalid subscription filter" },
+        .{ .filter = "id = (", .message = "invalid subscription filter" },
+    };
+    for (cases) |case| {
+        scratch.reset();
+        const body = try std.json.Stringify.valueAlloc(a, .{ .action = "subscribe", .topic = "sources", .filter = case.filter }, .{});
+        defer a.free(body);
+        const reply = (try handleUplink(sc, arena, body)).?;
+        try std.testing.expectEqual(@as(u16, 200), reply.status);
+        const expected = try protocol.errorFrame(a, case.message);
+        defer a.free(expected);
+        try std.testing.expectEqualStrings(expected, reply.frame);
+        try std.testing.expect(!sc.conn.hasSub("sources"));
+    }
+    // Record topics pass through the same policy validation.
+    scratch.reset();
+    const record = (try handleUplink(sc, arena, "{\"action\":\"subscribe\",\"topic\":\"sources/s1\",\"filter\":\"target.id = 't1'\"}")).?;
+    try std.testing.expect(std.mem.indexOf(u8, record.frame, "restricted target visibility") != null);
+    try std.testing.expect(!sc.conn.hasSub("sources/s1"));
+
+    // Public targets remain supported and an invalid replacement preserves the
+    // original subscription and its last successfully validated filter.
+    scratch.reset();
+    const good = (try handleUplink(sc, arena, "{\"action\":\"subscribe\",\"topic\":\"sources\",\"filter\":\"public_target.id = 't1'\"}")).?;
+    try std.testing.expect(std.mem.indexOf(u8, good.frame, "\"type\":\"ack\"") != null);
+    try std.testing.expect(sc.conn.hasSub("sources"));
+    scratch.reset();
+    const replacement = (try handleUplink(sc, arena, "{\"action\":\"subscribe\",\"topic\":\"sources\",\"filter\":\"secret = 'value'\"}")).?;
+    try std.testing.expect(std.mem.indexOf(u8, replacement.frame, "hidden field") != null);
+    try std.testing.expectEqualStrings("public_target.id = 't1'", sc.conn.subFilter("sources").?.*.?);
+
+    // The size cap applies before parsing and registration as well.
+    scratch.reset();
+    const oversized = try a.alloc(u8, @import("../records.zig").max_filter_len + 1);
+    defer a.free(oversized);
+    @memset(oversized, ' ');
+    const large_body = try std.json.Stringify.valueAlloc(a, .{ .action = "subscribe", .topic = "sources/large", .filter = oversized }, .{});
+    defer a.free(large_body);
+    const large = (try handleUplink(sc, arena, large_body)).?;
+    try std.testing.expectEqualStrings("{\"type\":\"error\",\"message\":\"invalid subscription filter\"}", large.frame);
+    try std.testing.expect(!sc.conn.hasSub("sources/large"));
 }

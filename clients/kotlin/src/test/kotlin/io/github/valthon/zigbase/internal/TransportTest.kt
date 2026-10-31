@@ -44,6 +44,125 @@ import java.io.IOException
 @OptIn(ExperimentalCoroutinesApi::class)
 class TransportTest {
     @Test
+    fun `old token unauthorized joins a pending newer refresh`() =
+        runTest {
+            val auth = MemoryAuthStore().apply { save("T0", null) }
+            val delayedStarted = CompletableDeferred<Unit>()
+            val releaseDelayed = CompletableDeferred<Unit>()
+            val secondRefreshStarted = CompletableDeferred<Unit>()
+            val releaseSecondRefresh = CompletableDeferred<Unit>()
+            val delayedTokens = mutableListOf<String?>()
+            var refreshes = 0
+            val transport =
+                makeTransport(authStore = auth, authCollection = "users", autoRefresh = true) { req ->
+                    val token = req.headers[HttpHeaders.Authorization]
+                    if (req.url.encodedPath.endsWith("auth-refresh")) {
+                        refreshes += 1
+                        if (refreshes == 2) {
+                            secondRefreshStarted.complete(Unit)
+                            releaseSecondRefresh.await()
+                        }
+                        respond("""{"token":"T$refreshes","record":null}""", HttpStatusCode.OK)
+                    } else {
+                        if (req.url.encodedPath == "/delayed") {
+                            delayedTokens.add(token)
+                            if (token == "Bearer T0") {
+                                delayedStarted.complete(Unit)
+                                releaseDelayed.await()
+                            }
+                        }
+                        if (token == "Bearer T2" || (token == "Bearer T1" && req.url.encodedPath == "/first")) {
+                            respond("""{"ok":true}""", HttpStatusCode.OK)
+                        } else {
+                            respond("{}", HttpStatusCode.Unauthorized)
+                        }
+                    }
+                }
+            val delayed = async { transport.request(RequestSpec(method = HttpMethod.Get, path = "/delayed")) }
+            delayedStarted.await()
+            transport.request(RequestSpec(method = HttpMethod.Get, path = "/first"))
+            val newer = async { transport.request(RequestSpec(method = HttpMethod.Get, path = "/newer")) }
+            secondRefreshStarted.await()
+            releaseDelayed.complete(Unit)
+            advanceUntilIdle()
+            assertEquals(listOf("Bearer T0"), delayedTokens)
+            releaseSecondRefresh.complete(Unit)
+            assertEquals(
+                true,
+                newer
+                    .await()
+                    ?.jsonObject
+                    ?.get("ok")
+                    ?.jsonPrimitive
+                    ?.boolean,
+            )
+            assertEquals(
+                true,
+                delayed
+                    .await()
+                    ?.jsonObject
+                    ?.get("ok")
+                    ?.jsonPrimitive
+                    ?.boolean,
+            )
+            assertEquals(listOf("Bearer T0", "Bearer T2"), delayedTokens)
+            assertEquals(2, refreshes)
+        }
+
+    @Test
+    fun `delayed stale unauthorized reuses completed refresh and later expiry refreshes`() =
+        runTest {
+            val auth = MemoryAuthStore().apply { save("old", null) }
+            val started = CompletableDeferred<Unit>()
+            val release = CompletableDeferred<Unit>()
+            var refreshes = 0
+            var expireNext = false
+            val transport =
+                makeTransport(authStore = auth, authCollection = "users", autoRefresh = true) { req ->
+                    if (req.url.encodedPath.endsWith("auth-refresh")) {
+                        refreshes += 1
+                        respond("""{"token":"fresh-$refreshes","record":null}""", HttpStatusCode.OK)
+                    } else if (req.headers[HttpHeaders.Authorization] == "Bearer old") {
+                        if (req.url.encodedPath == "/delayed") {
+                            started.complete(Unit)
+                            release.await()
+                        }
+                        respond("{}", HttpStatusCode.Unauthorized)
+                    } else if (expireNext) {
+                        expireNext = false
+                        respond("{}", HttpStatusCode.Unauthorized)
+                    } else {
+                        respond("""{"ok":true}""", HttpStatusCode.OK)
+                    }
+                }
+            val second = async { transport.request(RequestSpec(method = HttpMethod.Get, path = "/delayed")) }
+            started.await()
+            assertEquals(
+                true,
+                transport
+                    .request(RequestSpec(method = HttpMethod.Get, path = "/first"))
+                    ?.jsonObject
+                    ?.get("ok")
+                    ?.jsonPrimitive
+                    ?.boolean,
+            )
+            release.complete(Unit)
+            assertEquals(
+                true,
+                second
+                    .await()
+                    ?.jsonObject
+                    ?.get("ok")
+                    ?.jsonPrimitive
+                    ?.boolean,
+            )
+            assertEquals(1, refreshes)
+            expireNext = true
+            transport.request(RequestSpec(method = HttpMethod.Get, path = "/later"))
+            assertEquals(2, refreshes)
+        }
+
+    @Test
     fun `admission overload retries writes without duplicating effects`() =
         runTest {
             for (method in listOf(HttpMethod.Post, HttpMethod.Patch, HttpMethod.Delete)) {

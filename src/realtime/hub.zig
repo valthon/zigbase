@@ -18,6 +18,10 @@ const connection = @import("connection.zig");
 const Conn = connection.Conn;
 const App = @import("../app.zig").App;
 const Ctx = @import("../ctx.zig").Ctx;
+const lexer = @import("../query/lexer.zig");
+const parser = @import("../query/parser.zig");
+const compiler = @import("../query/compiler.zig");
+const joiner = @import("../query/joiner.zig");
 
 pub const DeliverError = policy.PolicyError || @typeInfo(@typeInfo(@TypeOf(matchesSnapshot)).@"fn".return_type.?).error_union.error_set;
 
@@ -38,7 +42,28 @@ pub fn subscribeAuthorized(view_rule: ?[]const u8, authed: bool, is_superuser: b
 /// The result of authorizing a subscribe request. `.limit` (NEW in the extraction) is the
 /// MAX_SUBS rejection — previously an inline check in ws.onMessage; folded in here so BOTH
 /// transports share the complete decision.
-pub const SubscribeOutcome = enum { ok, unknown, auth_required, limit };
+pub const SubscribeOutcome = enum {
+    ok,
+    unknown,
+    auth_required,
+    limit,
+    invalid_filter,
+    hidden_field,
+    restricted_relation,
+
+    /// Both transports use the existing error-frame envelope and messages.
+    pub fn errorMessage(self: SubscribeOutcome) ?[]const u8 {
+        return switch (self) {
+            .ok => null,
+            .unknown => "unknown collection",
+            .auth_required => "authentication required to subscribe",
+            .limit => "subscription limit reached",
+            .invalid_filter => "invalid subscription filter",
+            .hidden_field => "Cannot filter by a hidden field.",
+            .restricted_relation => "Cannot filter through a relation with restricted target visibility.",
+        };
+    }
+};
 
 /// Pure subscribe-authorization decision (#143, F5), factored out so the security PRECEDENCE
 /// is testable in one place: a REAL collection topic (`col != null`) ALWAYS uses per-collection
@@ -175,6 +200,12 @@ pub fn cloneMemberships(alloc: std.mem.Allocator, src: []const request.Membershi
 /// non-collection custom topics). Pure decision — the caller performs the transport-side
 /// subscription + reply. `alloc` is per-call scratch (the collection lookup borrows it).
 pub fn subscribeCheck(app: *App, conn: *const Conn, alloc: RequestArena, topic: []const u8) SubscribeOutcome {
+    return subscribeFilterCheck(app, conn, alloc, topic, null);
+}
+
+/// Reject invalid client filters before either transport installs or replaces a
+/// subscription. Delivery still revalidates against current identity and schema.
+pub fn subscribeFilterCheck(app: *App, conn: *const Conn, alloc: RequestArena, topic: []const u8, filter: ?[]const u8) SubscribeOutcome {
     // #3: a re-subscribe to an already-held topic is a REPLACE (the transports take the
     // `Conn.updateFilter` path) — it reuses the existing subscription slot and never grows
     // `subs.count()`, so it must not trip the cap. Only a genuinely NEW topic counts against
@@ -195,10 +226,35 @@ pub fn subscribeCheck(app: *App, conn: *const Conn, alloc: RequestArena, topic: 
         app.pool.releaseReader(&r);
         return .unknown;
     };
-    // Release the reader now: the canSubscribe predicate is handed a Ctx that may acquire its own.
+    if (lookup) |col| {
+        defer app.pool.releaseReader(&r);
+        const decision = subscribeDecision(col, rctx.auth != null, rctx.is_superuser, false);
+        if (decision != .ok) return decision;
+        if (filter) |f| validateClientFilter(alloc.a, &r, col, f, &rctx) catch |err| return switch (err) {
+            error.HiddenField => .hidden_field,
+            error.RestrictedRelation => .restricted_relation,
+            else => .invalid_filter,
+        };
+        return .ok;
+    }
+    // Release before the custom predicate: its Ctx may acquire another reader.
     app.pool.releaseReader(&r);
-    const custom_allowed = lookup == null and canSubscribeTopic(app, alloc, rctx, topic);
-    return subscribeDecision(lookup, rctx.auth != null, rctx.is_superuser, custom_allowed);
+    return subscribeDecision(null, rctx.auth != null, rctx.is_superuser, canSubscribeTopic(app, alloc, rctx, topic));
+}
+
+const FilterError = lexer.LexError || parser.ParseError || compiler.CompileError;
+
+/// Self-freeing validation shared by subscription and delivery checks.
+fn validateClientFilter(alloc: std.mem.Allocator, reader: *db.Db, col: schema.Collection, filter: []const u8, rctx: *const request.RequestContext) FilterError!void {
+    if (filter.len == 0) return;
+    if (filter.len > records.max_filter_len) return error.BadFilter;
+    var j = joiner.Joiner.init(alloc, reader, col);
+    defer j.deinit();
+    j.client_rctx = rctx;
+    const sa = j.scratch.allocator();
+    const tokens = try lexer.lex(sa, filter);
+    const ast = try parser.parse(sa, tokens);
+    _ = try compiler.compile(sa, &j, ast, rctx, db.dbDialect(reader), &.{});
 }
 
 /// Combine clauses with `&&`, each parenthesized: `(c1) && (c2)`.
@@ -275,7 +331,11 @@ pub fn shouldDeliver(
         .allow => {},
         .check => try clauses.append(alloc, col.viewRule.?),
     }
-    if (sub_filter) |f| if (f.len > 0) try clauses.append(alloc, f);
+    if (sub_filter) |f| if (f.len > 0) {
+        // Defense in depth: identity or schema may have changed since subscribe.
+        try validateClientFilter(alloc, reader, col, f, &rctx);
+        try clauses.append(alloc, f);
+    };
     // Unconstrained ONLY when there is no rule/filter clause AND no per-row predicate (tenant
     // scope OR a view ability). Otherwise run a guarded query: `matchesRule` ANDs the
     // tenant/ability predicate in (and tolerates an empty rule, so an ability/tenant-only
@@ -1560,4 +1620,27 @@ test "frameForDelivery: F4 delete snapshot authorizes, then is STRIPPED to an id
         try w.exec("UPDATE \"_collections\" SET \"options\"='{\"auth\":{\"two_factor\":\"required\"}}' WHERE \"name\"='principals';");
     }
     try std.testing.expect(frameForDelivery(a, &app, &owner, null, "fnotes", ef.frame_collection) == null);
+}
+
+test "subscription filters cannot infer private related fields or hidden base fields" {
+    const a = std.testing.allocator;
+    var tdb = try TestDb.init();
+    defer tdb.deinit();
+    const target = try tdb.mkColl(a, "targets", null);
+    defer target.deinit(a);
+    const col = try collections.create(a, std.testing.io, &tdb.d, .{ .id = "", .name = "sources", .fields = &.{
+        .{ .id = "f1", .name = "target", .options = .{ .relation = .{ .targetCollectionId = target.id, .maxSelect = 1 } } },
+        .{ .id = "f2", .name = "secret", .hidden = true, .options = .{ .text = .{} } },
+    }, .viewRule = "target.owner = 'alice'" });
+    defer col.deinit(a);
+    try tdb.d.exec("INSERT INTO targets (id,created,updated,owner) VALUES ('t1','t','t','alice');");
+    try tdb.d.exec("INSERT INTO sources (id,created,updated,target,secret) VALUES ('s1','t','t','t1','value');");
+    var anon = Conn{};
+    // Trusted viewRule can gate delivery on a private target.
+    try std.testing.expect(try shouldDeliver(a, std.testing.io, &tdb.d, col, &anon, 0, .create, "s1", null, null));
+    try std.testing.expectError(error.RestrictedRelation, shouldDeliver(a, std.testing.io, &tdb.d, col, &anon, 0, .create, "s1", "target.owner = 'alice'", null));
+    try std.testing.expectError(error.HiddenField, shouldDeliver(a, std.testing.io, &tdb.d, col, &anon, 0, .create, "s1", "secret = 'value'", null));
+    var su = try authedConn(a, "root", true);
+    defer freeConn(a, &su);
+    try std.testing.expect(try shouldDeliver(a, std.testing.io, &tdb.d, col, &su, 0, .create, "s1", "target.owner = 'alice'", null));
 }
