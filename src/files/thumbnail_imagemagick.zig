@@ -370,13 +370,31 @@ test "ImageMagick config accepts capability tuning above embedded ceilings" {
     try std.testing.expect(!valid(.{ .executable = "convert" }, .{ .width = 1, .height = 1 }));
 }
 
+// Test installations may provide IM7's magick alongside a convert compatibility
+// command. Keep deployment selection explicit; only tests discover installed tools.
+fn installedTestConfig() !Config {
+    for ([_]Config{
+        .{ .executable = "/usr/bin/magick", .command_style = .magick },
+        .{ .executable = "/usr/bin/convert", .command_style = .convert },
+    }) |cfg| {
+        std.Io.Dir.cwd().access(std.testing.io, cfg.executable, .{}) catch |err| switch (err) {
+            error.FileNotFound => continue,
+            else => return err,
+        };
+        return cfg;
+    }
+    return error.SkipZigTest;
+}
+
 test "installed ImageMagick converts PNG JPEG and WebP" {
-    std.Io.Dir.cwd().access(std.testing.io, "/usr/bin/convert", .{}) catch return error.SkipZigTest;
+    _ = try installedTestConfig();
     const encoded = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABAQMAAAAl21bKAAAAA1BMVEX/AAAZ4gk3AAAACklEQVQI12NgAAAAAgAB4iG8MwAAAABJRU5ErkJggg==";
     var input: [encoded.len]u8 = undefined;
     const size = try std.base64.standard.Decoder.calcSizeForSlice(encoded);
     try std.base64.standard.Decoder.decode(input[0..size], encoded);
-    const cfg: Config = .{ .executable = "/usr/bin/convert", .command_style = .convert, .max_output_bytes = 65536 };
+    var cfg = try installedTestConfig();
+    cfg.max_output_bytes = 65536;
+    try probe(std.testing.allocator, std.testing.io, cfg);
     for ([_]Format{ .png, .jpeg, .webp }) |format| {
         const out = try transform(std.testing.allocator, std.testing.io, input[0..size], cfg, .{ .width = 1024, .height = 1024, .format = format });
         defer out.deinit(std.testing.allocator);
@@ -417,12 +435,14 @@ fn allocationExercise(allocator: std.mem.Allocator) !void {
     var input: [encoded.len]u8 = undefined;
     const size = try std.base64.standard.Decoder.calcSizeForSlice(encoded);
     try std.base64.standard.Decoder.decode(input[0..size], encoded);
-    const result = try transform(allocator, std.testing.io, input[0..size], .{ .executable = "/usr/bin/convert", .command_style = .convert, .max_output_bytes = 1024 }, .{ .width = 1, .height = 1 });
+    var cfg = try installedTestConfig();
+    cfg.max_output_bytes = 1024;
+    const result = try transform(allocator, std.testing.io, input[0..size], cfg, .{ .width = 1, .height = 1 });
     defer result.deinit(allocator);
 }
 
 test "ImageMagick transform frees scratch and result across allocation failures" {
-    std.Io.Dir.cwd().access(std.testing.io, "/usr/bin/convert", .{}) catch return error.SkipZigTest;
+    _ = try installedTestConfig();
     try std.testing.checkAllAllocationFailures(std.testing.allocator, allocationExercise, .{});
     // Force realloc's allocate/copy/free fallback, including failure while
     // shrinking the final output. The original ceiling allocation must be freed.
@@ -460,9 +480,31 @@ test "container preflight rejects animation and truncated chunk arithmetic" {
 
 test "executable probe distinguishes missing and incompatible style" {
     try std.testing.expectError(error.ImageExecutableUnavailable, probe(std.testing.allocator, std.testing.io, .{ .executable = "/nonexistent/zigbase-test-magick" }));
-    std.Io.Dir.cwd().access(std.testing.io, "/usr/bin/convert", .{}) catch return error.SkipZigTest;
-    try probe(std.testing.allocator, std.testing.io, .{ .executable = "/usr/bin/convert", .command_style = .convert });
-    try std.testing.expectError(error.ImageExecutableIncompatible, probe(std.testing.allocator, std.testing.io, .{ .executable = "/usr/bin/convert", .command_style = .magick }));
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(dir);
+    const executable = try std.fs.path.join(a, &.{ dir, "version-probe" });
+    defer a.free(executable);
+    const cases = .{
+        .{ "Version: ImageMagick 6.9.13-1", true, false },
+        .{ "Version: ImageMagick 7.1.2-18", false, true },
+        .{ "Version: ImageMagick 8.0.0", false, false },
+        .{ "GraphicsMagick 1.3.45", false, false },
+    };
+    inline for (cases) |case| {
+        try tmp.dir.writeFile(io, .{
+            .sub_path = "version-probe",
+            .data = "#!/bin/sh\nprintf '%s\\n' '" ++ case[0] ++ "'\n",
+            .flags = .{ .permissions = .fromMode(0o700) },
+        });
+        const convert: Config = .{ .executable = executable, .command_style = .convert };
+        const magick: Config = .{ .executable = executable, .command_style = .magick };
+        if (case[1]) try probe(a, io, convert) else try std.testing.expectError(error.ImageExecutableIncompatible, probe(a, io, convert));
+        if (case[2]) try probe(a, io, magick) else try std.testing.expectError(error.ImageExecutableIncompatible, probe(a, io, magick));
+    }
 }
 
 test "process pump uses only explicit environment and closes input without SIGPIPE" {
@@ -476,12 +518,13 @@ test "process pump uses only explicit environment and closes input without SIGPI
 }
 
 test "real transforms enforce pixel input output limits and recover after rejection" {
-    std.Io.Dir.cwd().access(std.testing.io, "/usr/bin/convert", .{}) catch return error.SkipZigTest;
+    _ = try installedTestConfig();
     const encoded = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABAQMAAAAl21bKAAAAA1BMVEX/AAAZ4gk3AAAACklEQVQI12NgAAAAAgAB4iG8MwAAAABJRU5ErkJggg==";
     var input: [encoded.len]u8 = undefined;
     const size = try std.base64.standard.Decoder.calcSizeForSlice(encoded);
     try std.base64.standard.Decoder.decode(input[0..size], encoded);
-    var cfg: Config = .{ .executable = "/usr/bin/convert", .command_style = .convert, .max_output_bytes = 65536 };
+    var cfg = try installedTestConfig();
+    cfg.max_output_bytes = 65536;
     const expanded = try transform(std.testing.allocator, std.testing.io, input[0..size], cfg, .{ .width = 4, .height = 3, .fit = .cover });
     defer expanded.deinit(std.testing.allocator);
     cfg.max_dimension = 3;

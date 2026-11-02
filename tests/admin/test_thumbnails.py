@@ -311,7 +311,7 @@ def test_source_replacement_while_waiting_is_not_cached(thumbnail_server):
 def test_real_input_and_output_formats_and_cover(thumbnail_server, fmt, magic):
     base, _ = thumbnail_server
     token = setup(base)
-    converted = subprocess.run(["/usr/bin/convert", "png:-", fmt + ":-"], input=PNG, capture_output=True, check=True).stdout
+    converted = subprocess.run(["/usr/bin/magick" if os.path.exists("/usr/bin/magick") else "/usr/bin/convert", "png:-", fmt + ":-"], input=PNG, capture_output=True, check=True).stdout
     _, path, _ = upload(base, token, content=converted, filename="source." + fmt)
     response = call(base, "GET", path.replace("/tiny", "/" + fmt))
     assert response[0] == 200 and response[2].startswith(magic)

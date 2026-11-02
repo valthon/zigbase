@@ -4,6 +4,8 @@ const zb = @import("zigbase");
 var original: ?*const zb.Storage = null;
 var replacement: zb.Storage = undefined;
 var replacement_vtable: zb.Storage.VTable = undefined;
+var converter_path: []const u8 = "/usr/bin/convert";
+var use_magick7 = false;
 var before_count: std.atomic.Value(u32) = .init(0);
 
 fn neverFetch(_: *anyopaque, _: std.Io, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8) !?[]const u8 {
@@ -13,6 +15,23 @@ fn neverPresign(_: *anyopaque, _: std.Io, _: std.mem.Allocator, _: []const u8, _
     @panic("thumbnail must never call custom presign");
 }
 fn bootstrap(ctx: *zb.Ctx, _: *zb.events.LifecycleEvent) !void {
+    // Prefer IM7 in test installations; preserve explicit executable overrides
+    // so the missing/invalid-backend regressions still exercise startup failure.
+    if (std.c.getenv("ZIGBASE_IMAGEMAGICK_EXECUTABLE") == null) {
+        const has_magick = blk: {
+            std.Io.Dir.cwd().access(ctx.app.io, "/usr/bin/magick", .{}) catch |err| switch (err) {
+                error.FileNotFound => break :blk false,
+                else => return err,
+            };
+            break :blk true;
+        };
+        if (has_magick) {
+            ctx.app.files.thumbnails.imagemagick.executable = "/usr/bin/magick";
+            ctx.app.files.thumbnails.imagemagick.command_style = .magick;
+        }
+    }
+    converter_path = ctx.app.files.thumbnails.imagemagick.executable;
+    use_magick7 = ctx.app.files.thumbnails.imagemagick.command_style == .magick;
     original = ctx.app.storage;
     replacement = original.?.*;
     replacement_vtable = replacement.vtable.*;
@@ -50,7 +69,7 @@ fn control(req: *zb.Req(Control)) zb.RouteError!struct { before: u32, active: u3
         return .{ .before = before_count.load(.monotonic), .active = app.thumbnail_admission.active, .waiting = app.thumbnail_admission.waiting };
     }
     app.storage = original;
-    app.files.thumbnails.imagemagick = .{ .executable = "/usr/bin/convert", .command_style = .convert };
+    app.files.thumbnails.imagemagick = .{ .executable = converter_path, .command_style = if (use_magick7) .magick else .convert };
     app.files.thumbnails.max_waiting = 32;
     app.files.thumbnails.wait_timeout_ms = 1000;
     switch (req.input.mode) {
