@@ -4739,6 +4739,12 @@ reproduce the built-in wiring:
   plaintext) when `ZIGBASE_SMTP_HOST` is set, else a `LogMailer` (logs the email).
   Switching is config-driven; no code change is needed to upgrade from logging to a
   local sendmail/msmtp relay or real SMTP.
+- An app that intentionally sends **no** mail selects
+  `.mailer = zigbase.DisabledMailerPlugin`. Every message is dropped, including the
+  built-in password-reset, verification and OTP mail. The log line names only the subject,
+  never the recipient or body, so live tokens never reach the log. SMTP/sendmail config is
+  ignored, and `doctor --production` reports `mailer-configured` as ok, where it would
+  otherwise be an error. It warns if a transport is configured anyway.
 
 A plugin is a type with this uniform contract (built from the runtime
 `zigbase.Config`):

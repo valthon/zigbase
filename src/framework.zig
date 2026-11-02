@@ -259,6 +259,29 @@ pub const DefaultMailerPlugin = struct {
     }
 };
 
+/// Mailer plugin for an app that intentionally sends no mail:
+/// `App(.{ .mailer = zigbase.DisabledMailerPlugin })`. Every message is dropped without
+/// logging its recipient or body (auth mail carries live tokens), SMTP/sendmail config is
+/// ignored, and `doctor --production` reports the choice instead of a missing mailer.
+pub const DisabledMailerPlugin = struct {
+    backend: mail.DisabledMailer = .{},
+
+    pub fn create(gpa: std.mem.Allocator, io: std.Io, cfg: config.Config) !DisabledMailerPlugin {
+        _ = gpa;
+        _ = io;
+        _ = cfg;
+        return .{};
+    }
+
+    pub fn interface(self: *DisabledMailerPlugin) mail.Mailer {
+        return self.backend.mailer();
+    }
+
+    pub fn deinit(self: *DisabledMailerPlugin) void {
+        _ = self;
+    }
+};
+
 /// Default error-reporter plugin (#244), config-driven with no code change to switch backends
 /// (the DefaultMailerPlugin precedent):
 ///   1. `cfg.sentry_dsn` non-empty → `SentryReporter` (POSTs a Sentry envelope).
@@ -2323,7 +2346,7 @@ fn runCliImpl(init: std.process.Init, dispatch: *const events.Dispatch, jobs: []
         // stub ignores it: Task 9's real doctor needs the binary's compiled-in
         // `.migrations` to judge the migrations check, and settling the call
         // shape now means this dispatch line is written once.
-        .doctor => |da| try doctorImpl(allocator, init.io, init.environ_map, da, schema_migrations),
+        .doctor => |da| try doctorImpl(allocator, init.io, init.environ_map, da, schema_migrations, opts.MailerPlugin == DisabledMailerPlugin),
         .file_inventory => |fa| {
             if (comptime build_options.file_inventory) {
                 try fileInventoryImpl(opts, allocator, init.io, init.environ_map, fa);
@@ -4671,13 +4694,14 @@ fn fileReconcileRun(comptime opts: ServeOpts, allocator: std.mem.Allocator, io: 
 
 /// Read-mostly preflight; may create the migration ledger. Its interlinked
 /// findings/render graph lives in one command-scoped arena (contract 4).
-fn doctorImpl(allocator: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map, da: cli.DoctorArgs, schema_migrations: []const provision.Migration) !void {
+fn doctorImpl(allocator: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map, da: cli.DoctorArgs, schema_migrations: []const provision.Migration, mail_disabled: bool) !void {
     const cfg = try loadCfg(environ, .{ .data_dir = da.data_dir });
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const facts = doctor_run.gather(arena, io, cfg, environ, schema_migrations);
+    var facts = doctor_run.gather(arena, io, cfg, environ, schema_migrations);
+    facts.mail_disabled = mail_disabled; // a comptime choice the runtime config can't see
     const findings = try doctor.evaluate(arena, facts, da.production);
     const summary = doctor.summarize(findings, da.production);
     doctor_run.render(io, arena, findings, summary, da.json);
@@ -6119,6 +6143,23 @@ test "App(.{}) resolves the default storage + mailer plugins and reader pool" {
     try std.testing.expectEqual(DefaultStoragePlugin, A.StoragePlugin);
     try std.testing.expectEqual(DefaultMailerPlugin, A.MailerPlugin);
     try std.testing.expectEqual(@as(usize, 16), A.reader_pool_size);
+}
+
+test "DisabledMailerPlugin satisfies the mailer contract and drops every message" {
+    const A = App(.{ .mailer = DisabledMailerPlugin });
+    try std.testing.expectEqual(DisabledMailerPlugin, A.MailerPlugin);
+
+    // SMTP/sendmail config is ignored: the app declared it sends no mail.
+    var p = try DisabledMailerPlugin.create(std.testing.allocator, std.testing.io, .{
+        .smtp_host = "smtp.example.com",
+        .sendmail_command = "sendmail -t -i",
+    });
+    defer p.deinit();
+    try p.interface().send(std.testing.io, std.testing.allocator, .{
+        .to = "user@example.com",
+        .subject = "Reset your password",
+        .text_body = "token=secret",
+    });
 }
 
 test "DefaultMailerPlugin selects Command > SMTP > Log by config" {

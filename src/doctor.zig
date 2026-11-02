@@ -50,6 +50,9 @@ pub const Facts = struct {
     smtp_host: []const u8,
     smtp_username: []const u8,
     smtp_tls_resolved: config.SmtpTls,
+    /// The app selected `DisabledMailerPlugin` (comptime): it intentionally sends no mail.
+    /// Set by framework-mode doctor; the stock binary has no comptime mailer choice.
+    mail_disabled: bool = false,
     data_dir: []const u8,
     data_dir_writable: bool,
     data_dir_error: ?[]const u8, // @errorName when not writable
@@ -233,8 +236,15 @@ fn checkMailerConfigured(arena: std.mem.Allocator, f: Facts, production: bool, o
     const has_sendmail = f.sendmail_command.len != 0;
     const has_smtp = f.smtp_host.len != 0;
 
+    if (f.mail_disabled) {
+        if (has_sendmail or has_smtp) {
+            return append(arena, out, id, .warn, null, "the app uses DisabledMailerPlugin, so the configured {s} is ignored and every message is dropped", .{if (has_sendmail) "sendmail_command" else "smtp_host"});
+        }
+        return append(arena, out, id, .ok, null, "mail intentionally disabled (DisabledMailerPlugin) — outbound mail is dropped", .{});
+    }
+
     if (!has_sendmail and !has_smtp) {
-        return append(arena, out, id, if (production) .err else .warn, null, "no mailer configured (no sendmail_command, no smtp_host) — falls back to the Log mailer", .{});
+        return append(arena, out, id, if (production) .err else .warn, null, "no mailer configured (no sendmail_command, no smtp_host) — falls back to the Log mailer; an app that sends no mail selects DisabledMailerPlugin", .{});
     }
 
     // SMTP AUTH over a connection that resolves to no transport security
@@ -524,6 +534,28 @@ test "doctor: mailer — unconfigured and cleartext-credentialed SMTP both flagg
     f.smtp_tls_resolved = .none;
     try std.testing.expectEqualStrings("warn", findingFor(try evaluate(arena, f, false), "mailer-configured").?.severity);
     try std.testing.expectEqualStrings("error", findingFor(try evaluate(arena, f, true), "mailer-configured").?.severity);
+}
+
+test "doctor: mailer — an app that disabled mail is ok, but configured transports are flagged as ignored" {
+    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var f = okFacts();
+    f.mail_disabled = true;
+    f.smtp_host = "";
+    for ([_]bool{ false, true }) |production| {
+        try std.testing.expectEqualStrings("ok", findingFor(try evaluate(arena, f, production), "mailer-configured").?.severity);
+    }
+
+    // Disabled wins over a transport; say so rather than let the operator think mail flows.
+    f.smtp_host = "smtp.example.com";
+    try std.testing.expectEqualStrings("warn", findingFor(try evaluate(arena, f, true), "mailer-configured").?.severity);
+    f.smtp_host = "";
+    f.sendmail_command = "sendmail -t -i";
+    const w = findingFor(try evaluate(arena, f, true), "mailer-configured").?;
+    try std.testing.expectEqualStrings("warn", w.severity);
+    try std.testing.expect(std.mem.indexOf(u8, w.message, "sendmail_command") != null);
 }
 
 test "doctor: migrations and data dir; an unreachable DB skips its dependent checks" {
