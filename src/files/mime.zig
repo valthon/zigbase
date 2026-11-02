@@ -29,6 +29,8 @@ const extensions = [_]Ext{
     .{ .ext = "css", .mime = "text/css; charset=utf-8" },
     .{ .ext = "js", .mime = "application/javascript" },
     .{ .ext = "mjs", .mime = "application/javascript" },
+    .{ .ext = "webmanifest", .mime = "application/manifest+json" },
+    .{ .ext = "ics", .mime = "text/calendar; charset=utf-8" },
     .{ .ext = "json", .mime = "application/json" },
     .{ .ext = "map", .mime = "application/json" },
     .{ .ext = "svg", .mime = "image/svg+xml" },
@@ -111,6 +113,12 @@ test "fromExtension maps common static-asset extensions" {
     try std.testing.expectEqualStrings("application/pdf", fromExtension("doc.pdf"));
     try std.testing.expectEqualStrings("video/mp4", fromExtension("v.mp4"));
     try std.testing.expectEqualStrings("video/webm", fromExtension("v.webm"));
+}
+
+test "web app MIME types" {
+    try std.testing.expectEqualStrings("application/manifest+json", fromExtension("manifest.webmanifest"));
+    try std.testing.expectEqualStrings("application/manifest+json", fromExtension("MANIFEST.WEBMANIFEST"));
+    try std.testing.expectEqualStrings("text/calendar; charset=utf-8", fromExtension("events.ics"));
 }
 
 test "fromExtension falls back to octet-stream" {

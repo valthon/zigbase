@@ -448,6 +448,8 @@ pub fn build(b: *std.Build) void {
     // the independent children in parallel; CI and Python invoke one aggregate step.
     const route_contracts = b.step("check-route-contracts", "Check consumer route compile-time contracts");
     inline for (&.{
+        .{ .step = "invalid-static-header-value", .file = "fixtures/invalid-routes/static-header-value.zig", .expected = ".static_headers: invalid control character in header value" },
+        .{ .step = "invalid-static-header-framing", .file = "fixtures/invalid-routes/static-header-framing.zig", .expected = ".static_headers: representation/framing headers are managed by ZigBase" },
         .{ .step = "invalid-route-missing-method", .file = "fixtures/invalid-routes/missing-method.zig", .expected = "route spec is missing '.method' (expected .{ .method = .GET, .path = \"/...\", .handler = fn })" },
         .{ .step = "invalid-route-unknown-method", .file = "fixtures/invalid-routes/unknown-method.zig", .expected = "route '/api/unknown': .method cannot be .UNKNOWN" },
         .{ .step = "invalid-route-noncanonical-path", .file = "fixtures/invalid-routes/noncanonical-path.zig", .expected = "route '/api/reports/:bad-name': .path must be a canonical absolute router pattern with optional :name captures" },

@@ -401,6 +401,7 @@ other character is rejected. The bound parameter receives the unescaped value.
 
 | Macro | Value |
 | --- | --- |
+| `@request.auth.collection` | authenticated collection **name**, `""` when anonymous; a pseudo-field, not a stored record field |
 | `@request.auth.<field>` | a field of the authenticated record (e.g. `@request.auth.id`) |
 | `@request.data.<field>` | a field of the incoming request body |
 | `@request.method` | the HTTP method (e.g. `"GET"`) |
@@ -413,6 +414,9 @@ other character is rejected. The bound parameter receives the unescaped value.
 > to `""` / the empty list, so a rule using them is fail-closed and existing rules are
 > unaffected. A typical use is scoping a collection to the caller's accounts:
 > `account in @request.account.ids`.
+
+For a superuser the authenticated collection is `_superusers`; ordinary record rules
+are bypassed by superusers, so a collection predicate does not restrict their access.
 
 Examples:
 

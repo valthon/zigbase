@@ -150,8 +150,8 @@ Three collections use four auth methods, all disambiguated by `onAuth`:
 ```text
 POST /api/collections/authors/auth/webauthn/register/begin     -- start registration
 POST /api/collections/authors/auth/webauthn/register/finish    -- complete registration
-POST /api/collections/authors/auth/webauthn/authenticate/begin   -- start login
-POST /api/collections/authors/auth/webauthn/authenticate/finish  -- complete login, mint session
+POST /api/collections/authors/auth/webauthn/initiate           -- start login
+POST /api/collections/authors/auth/webauthn/complete           -- complete login, mint session
 ```
 
 Building a full passkey UI requires `navigator.credentials.create()` / `.get()`, CBOR

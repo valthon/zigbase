@@ -192,6 +192,7 @@ error.**
 | `static_routes` | Tier-2 comptime static rewrites: a list of `.{ .match = "/…", .serve = "/…" }` entries mapping request paths to fixed served paths/files. | data-only — lowers to an empty list when unset. |
 | `enable_spa_marker` | Tier-1 `.spa` marker enablement for static serving (issue #183). Default: on when `.static_routes` is absent/empty (byte-identical to the shipped binary), off when routes are declared; an explicit bool always wins. | always — a bool feeding core static-serving logic, not an optional subsystem. |
 | `collections_frozen` | Assert that collections do not change after boot + migrations (default `false`, issue #234). When `true`: the collection-metadata cache runs on **all** backends — including Postgres, where it is otherwise skipped because a concurrent instance could `ALTER` collections unseen — and the runtime collection create/update/delete endpoints return **403** (schema then evolves only via `.migrations` + a redeploy). | always — a standalone bool feeding core collection-metadata caching and the collection-DDL endpoints, not an optional subsystem. |
+| `static_headers` | Ordered static response-header rules with `.match` and `.set` pairs; later matches override per header. See [Response headers for static files](#response-headers-for-static-files). | data-only — empty when unset. |
 | `static_cache_control` | Comptime default `Cache-Control` for static responses (embedded + dir). Runtime `--static-cache-control` / `ZIGBASE_STATIC_CACHE_CONTROL` override it; unset → facil.io's stock `max-age=3600`. | data-only — a `?[]const u8` default feeding core static serving, not an optional subsystem. |
 | `admin` | `.admin = .disabled` removes the embedded admin SPA (route dispatch **and** the ~58 KiB of `@embedFile`-d assets) from your binary — useful for headless/embedded consumers. Default: served at `/_/`. | excluded, opt-**out** — the admin SPA ships by default; set `.admin = .disabled` to exclude it (the only key in this table where "unset" means *included*). |
 | `webhooks` | `.webhooks = true` registers the built-in `"webhook"` job kind, compiling in `ctx.webhook()`'s managed outbound delivery (`webhook.zig`, ~689 LOC). Default: off, so a consumer that never sends managed webhooks pays nothing for it. See [`ctx.webhook()`](#ctxwebhook--managed-outbound-webhooks-144). | excluded — off by default; `webhook.zig` is not compiled in unless `.webhooks = true`. |
@@ -3691,8 +3692,8 @@ The declaration is authoritative, including the default empty `.indexes`: indexe
 through REST/admin metadata but omitted from code are removed at the next startup. Every
 DROP/CREATE is logged. Existing ordinary migration-created indexes with matching table,
 columns, uniqueness, direction and collation are adopted into metadata ownership rather
-than recreated. Conflicting names or unsupported definitions (such as partial indexes)
-are preserved and refuse startup; resolve them with an explicit migration. Once adopted,
+than recreated. Conflicting names or existing unmanaged definitions that cannot be safely adopted
+(such as partial indexes) are preserved and refuse startup; resolve them with an explicit migration. Once adopted,
 an index follows the declaration, including later removal.
 Unchanged declarations do not rebuild indexes or bump schema generation:
 
@@ -3707,8 +3708,10 @@ Unchanged declarations do not rebuild indexes or bump schema generation:
 },
 ```
 
-`.collation` (`.binary` default / `.nocase`) is applied to every indexed column;
-`.where` is an optional partial-index predicate emitted verbatim as `WHERE <where>`.
+`.collation` (`.binary` default / `.nocase`) is applied to every indexed column.
+Declared partial indexes are supported: `.where` is an optional predicate emitted
+verbatim as `WHERE <where>`. The adoption restriction above applies only to existing
+unmanaged indexes, not to declared indexes.
 The index `.name` and `.fields` are validated as identifiers; the `.where` predicate
 is raw SQL authored in the schema. Index `.fields` reference fields by their declared name (not an internal id); `.name` and each field are validated as identifiers at compile time.
 
@@ -4109,11 +4112,8 @@ and applies the **minimal safe change set** (running it twice is a clean no-op):
 
 For the changes auto-migration won't do, use the `.migrations` escape hatch.
 
-> **`.indexes` changes on an existing collection are not yet re-applied.** Adding or
-> removing an entry in a live collection's `.indexes` only takes effect if that same
-> startup also adds a field (which rebuilds the table). Use an explicit `.migrations`
-> entry with raw `CREATE INDEX` / `DROP INDEX` to change indexes on a collection that
-> already exists.
+Declared `.indexes` are reconciled on every startup, including when no fields change.
+See [Indexes](#indexes) for ownership, adoption, and failure behavior.
 
 ### Explicit migrations (`.migrations`)
 
@@ -5896,6 +5896,92 @@ mistake that must never reach production silently:
 - The per-miss ancestor walk is capped at 64 levels (far deeper than any real static
   tree); once exhausted it jumps straight to checking the static root as the final
   candidate, bounding the filesystem cost of a crafted, very-deep request path.
+
+### Stream a local file from a custom route
+
+Use `zigbase.files.respondPath` after authorizing the request and choosing a trusted
+absolute path. It streams through the file transport with an explicit byte window:
+
+```zig
+fn media(ctx: *zigbase.Ctx) !zigbase.http.Response {
+    return zigbase.files.respondPath(ctx, "/srv/app/media/demo.mp4", .{
+        .cache_control = "private, max-age=60",
+        // .content_type = "video/mp4", // inferred from the extension when null
+    });
+}
+// In App config:
+// .routes = .{
+//     .{ .method = .GET, .path = "/media", .handler = media, .auth = .authed },
+//     .{ .method = .HEAD, .name = "mediaHead", .path = "/media", .handler = media, .auth = .authed },
+// },
+```
+
+GET and HEAD support closed, open-ended (`bytes=N-`), and suffix ranges (`bytes=-N`),
+206/416, If-Range strong comparison, and If-None-Match revalidation (304).
+Malformed and multiple ranges are ignored, producing a full 200. HEAD sends no body
+and retains the selected representation length. Missing/unreadable paths propagate an
+error; map those to your application's desired response using normal handler error handling.
+
+The default strong ETag hashes the file with SHA-256 using bounded memory. This reads
+the whole file before each response; for large immutable media, provide `.etag` with
+an already computed strong, quoted content tag to avoid that work. The caller must
+keep the path and bytes stable through transmission, including when using an explicit
+ETag. Path validation, authorization, and traversal/symlink confinement belong to the
+caller; see `src/static_files.zig`'s `sanitize` and real-path confinement checks for a
+reference. Do not pass an unchecked request path to this helper.
+
+The pure building blocks are also public: `zigbase.serve_file.plan`, `parseRange`,
+`etagMatches`, `fileEtag`, and `zigbase.mime.fromExtension`. `fileEtag` is specifically
+for immutable stored-record identities, not an arbitrary mutable filesystem path.
+
+### Response headers for static files
+
+Set `.static_headers` to send a CSP or vary caching by path. Later matching entries
+override earlier values for the same header, case-insensitively:
+
+```zig
+.static_headers = &.{
+    .{ .match = "/**", .set = &.{
+        .{ "Content-Security-Policy", "default-src 'self'" },
+        .{ "Cache-Control", "no-cache" },
+    } },
+    .{ .match = "/spa/chunks/**", .set = &.{
+        .{ "Cache-Control", "public, max-age=31536000, immutable" },
+    } },
+},
+```
+
+Use the CSP value emitted by your frontend build (for example,
+`@embedFile("csp.txt")` after removing a trailing newline). Header values cannot
+contain CR/LF or other control characters except horizontal tab. Framing and
+representation headers such as Content-Length, Content-Type, ETag and Content-Range
+are managed by ZigBase and cannot be configured in this table.
+
+Patterns use exactly the [static_routes grammar](#spa-fallback-comptime-static_routes):
+literal segments, `:name` for one segment, terminal `*` for one or more segments,
+and terminal `**` for zero or more. Shell globs like `/**/*.html` are unsupported;
+list stable HTML/entry-point paths explicitly, or use `/**` with later overrides
+for the directory containing hashed assets.
+
+The table matches the sanitized **request URL**, including directory-index and SPA
+fallback requests, and applies to 200/206/304/416 and HEAD responses in embedded,
+comptime directory, and CLI `--serve-static` modes. It does not apply to API responses
+or misses. Table entries override `static_cache_control` and its flag/env overrides;
+unmatched headers keep their usual defaults (SPA fallback defaults to `no-cache`).
+
+When a nonempty table is configured, direct directory hits and `static_routes`
+targets use ZigBase's owned streaming path so the transport preserves per-response
+cache headers. This path uses SHA-256 ETags and serves the original file without
+facil.io's automatic `.gz` sidecar selection. An empty table retains the existing
+directory transport behavior.
+
+Directory `.spa` marker fallbacks retain their existing shell implementation,
+including when a header table is configured: they buffer the HTML shell (up to
+16 MiB) and derive its ETag from file size and modification time rounded to seconds.
+A same-size edit within the same second can therefore retain the previous validator.
+These fallback responses ignore Range/If-Range and return the full 200 or a
+conditional 304; they do not produce 206/416 byte-window responses. The configured
+headers still apply, and HEAD still suppresses the response body.
 
 ### SPA fallback: comptime `static_routes`
 

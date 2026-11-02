@@ -403,9 +403,20 @@ pub fn Harness(comptime AppType: type) type {
             else
                 try AppType.routeForTest(&ctx);
             const resp = try server.normalizeResponse(&ctx, routed);
+            const response_body = if (resp.file != null and method != .HEAD) blk: {
+                const window = resp.file.?;
+                const file = try std.Io.Dir.cwd().openFile(self.io, window.path, .{});
+                defer file.close(self.io);
+                const length = window.len orelse (try file.stat(self.io)).size;
+                const bytes = try a.alloc(u8, std.math.cast(usize, length) orelse return error.FileTooBig);
+                const offset = if (window.len != null) window.offset else 0;
+                const n = try file.readPositionalAll(self.io, bytes, offset);
+                if (n != bytes.len) return error.UnexpectedEndOfFile;
+                break :blk bytes;
+            } else resp.body;
             return .{
                 .status = resp.status,
-                .body = resp.body,
+                .body = response_body,
                 .content_type = resp.content_type,
                 .cookies = resp.cookies,
                 .headers = resp.extra_headers,
@@ -887,5 +898,229 @@ test "harness: boot -> deinit twice is leak-clean and free of double-free (std.t
         defer t.deinit();
         const r = try t.request(.GET, "/api/ping", .{});
         try std.testing.expectEqual(@as(u16, 200), r.status);
+    }
+}
+
+fn localFileHandler(ctx: *Ctx) !http.Response {
+    const path = ctx.request.?.query;
+    return @import("root.zig").files.respondPath(ctx, path, .{});
+}
+
+const LocalFileTestApp = framework.App(.{
+    .routes = .{
+        .{ .method = .GET, .path = "/api/media", .handler = localFileHandler, .auth = .public },
+        .{ .method = .HEAD, .name = "mediaHead", .path = "/api/media", .handler = localFileHandler, .auth = .public },
+        .{ .method = .GET, .path = "/api/owned-options", .handler = ownedOptionsHandler, .auth = .public },
+        .{ .method = .HEAD, .name = "ownedOptionsHead", .path = "/api/owned-options", .handler = ownedOptionsHandler, .auth = .public },
+        .{ .method = .GET, .path = "/api/file-ref-whole", .handler = fileRefHandler, .auth = .public },
+        .{ .method = .GET, .path = "/api/file-ref-window", .handler = fileRefHandler, .auth = .public },
+    },
+});
+
+test "local file public helper: range and conditional matrix through framework route" {
+    var t = try start(LocalFileTestApp, .{});
+    defer t.deinit();
+    const path = try std.fmt.allocPrint(std.testing.allocator, "{s}/media.mp4", .{t.data_dir});
+    defer std.testing.allocator.free(path);
+    const url = try std.fmt.allocPrint(std.testing.allocator, "/api/media?{s}", .{path});
+    defer std.testing.allocator.free(url);
+    try std.Io.Dir.cwd().writeFile(t.io, .{ .sub_path = path, .data = "0123456789" });
+    const full = try t.request(.GET, url, .{});
+    try std.testing.expectEqual(@as(u16, 200), full.status);
+    try std.testing.expectEqualStrings("0123456789", full.body);
+    try std.testing.expectEqualStrings("video/mp4", full.content_type);
+    const etag = full.header("etag").?;
+    const cases = .{
+        .{ "bytes=0-", 206, "0123456789", "bytes 0-9/10" },
+        .{ "bytes=4-", 206, "456789", "bytes 4-9/10" },
+        .{ "bytes=-3", 206, "789", "bytes 7-9/10" },
+        .{ "bytes=2-4", 206, "234", "bytes 2-4/10" },
+        .{ "bytes=8-100", 206, "89", "bytes 8-9/10" },
+        .{ "bytes=10-", 416, "", "bytes */10" },
+        .{ "bytes=-0", 416, "", "bytes */10" },
+        .{ "bytes=0-1,3-4", 200, "0123456789", "" },
+        .{ "bad", 200, "0123456789", "" },
+    };
+    inline for (cases) |case| {
+        const r = try t.request(.GET, url, .{ .headers = &.{.{ "Range", case[0] }} });
+        try std.testing.expectEqual(@as(u16, case[1]), r.status);
+        try std.testing.expectEqualStrings(case[2], r.body);
+        try std.testing.expectEqualStrings(case[3], r.header("Content-Range") orelse "");
+        const head = try t.request(.HEAD, url, .{ .headers = &.{.{ "Range", case[0] }} });
+        try std.testing.expectEqual(r.status, head.status);
+        try std.testing.expectEqualStrings("", head.body);
+        try std.testing.expectEqualStrings(try std.fmt.allocPrint(head.arena, "{d}", .{r.body.len}), head.header("content-length").?);
+    }
+    const unchanged = try t.request(.GET, url, .{ .headers = &.{ .{ "If-None-Match", etag }, .{ "Range", "bytes=0-1" } } });
+    try std.testing.expectEqual(@as(u16, 304), unchanged.status);
+    try std.testing.expectEqualStrings("", unchanged.body);
+    const hit = try t.request(.GET, url, .{ .headers = &.{ .{ "If-Range", etag }, .{ "Range", "bytes=2-3" } } });
+    try std.testing.expectEqual(@as(u16, 206), hit.status);
+    for ([_][]const u8{ "\"old\"", try std.fmt.allocPrint(full.arena, "W/{s}", .{etag}) }) |validator| {
+        const miss = try t.request(.GET, url, .{ .headers = &.{ .{ "If-Range", validator }, .{ "Range", "bytes=2-3" } } });
+        try std.testing.expectEqual(@as(u16, 200), miss.status);
+    }
+    try std.Io.Dir.cwd().writeFile(t.io, .{ .sub_path = path, .data = "" });
+    const empty = try t.request(.GET, url, .{});
+    try std.testing.expectEqual(@as(u16, 200), empty.status);
+    try std.testing.expectEqualStrings("", empty.body);
+    const empty_range = try t.request(.GET, url, .{ .headers = &.{.{ "Range", "bytes=0-" }} });
+    try std.testing.expectEqual(@as(u16, 416), empty_range.status);
+}
+
+fn ownedOptionsHandler(ctx: *Ctx) !http.Response {
+    var etag = "\"caller-etag\"".*;
+    var cache = "private, max-age=42".*;
+    var content_type = "video/custom".*;
+    const response = try @import("root.zig").files.respondPath(ctx, ctx.request.?.query, .{
+        .etag = &etag,
+        .cache_control = &cache,
+        .content_type = &content_type,
+    });
+    // Caller storage is no longer valid after returning the completed response.
+    @memset(&etag, '!');
+    @memset(&cache, '!');
+    @memset(&content_type, '!');
+    return response;
+}
+
+fn fileRefHandler(ctx: *Ctx) !http.Response {
+    return .{
+        .status = 200,
+        .body = "",
+        .file = .{
+            .path = ctx.request.?.query,
+            .offset = 4,
+            .len = if (std.mem.endsWith(u8, ctx.request.?.path, "window")) 3 else null,
+        },
+    };
+}
+
+test "local file responses own supplied options across success and conditional statuses" {
+    var t = try start(LocalFileTestApp, .{});
+    defer t.deinit();
+    const path = try std.fmt.allocPrint(std.testing.allocator, "{s}/owned.mp4", .{t.data_dir});
+    defer std.testing.allocator.free(path);
+    try std.Io.Dir.cwd().writeFile(t.io, .{ .sub_path = path, .data = "0123456789" });
+    const url = try std.fmt.allocPrint(std.testing.allocator, "/api/owned-options?{s}", .{path});
+    defer std.testing.allocator.free(url);
+    const cases = [_]struct { method: http.Method = .GET, range: []const u8 = "", conditional: []const u8 = "", status: u16 }{
+        .{ .status = 200 },
+        .{ .range = "bytes=4-", .status = 206 },
+        .{ .conditional = "\"caller-etag\"", .status = 304 },
+        .{ .range = "bytes=99-", .status = 416 },
+        .{ .method = .HEAD, .status = 200 },
+        .{ .method = .HEAD, .range = "bytes=4-", .status = 206 },
+    };
+    for (cases) |case| {
+        const response = try t.request(case.method, url, .{ .headers = &.{ .{ "Range", case.range }, .{ "If-None-Match", case.conditional } } });
+        try std.testing.expectEqual(case.status, response.status);
+        try std.testing.expectEqualStrings("\"caller-etag\"", response.header("ETag").?);
+        try std.testing.expectEqualStrings("private, max-age=42", response.header("Cache-Control").?);
+        try std.testing.expectEqualStrings("video/custom", response.content_type);
+    }
+}
+
+test "harness ignores offsets for delegated files and honors explicit byte windows" {
+    var t = try start(LocalFileTestApp, .{});
+    defer t.deinit();
+    const path = try std.fmt.allocPrint(std.testing.allocator, "{s}/window.txt", .{t.data_dir});
+    defer std.testing.allocator.free(path);
+    try std.Io.Dir.cwd().writeFile(t.io, .{ .sub_path = path, .data = "0123456789" });
+    for ([_][]const u8{ "whole", "window" }, [_][]const u8{ "0123456789", "456" }) |kind, expected| {
+        const url = try std.fmt.allocPrint(std.testing.allocator, "/api/file-ref-{s}?{s}", .{ kind, path });
+        defer std.testing.allocator.free(url);
+        const response = try t.request(.GET, url, .{});
+        try std.testing.expectEqual(@as(u16, 200), response.status);
+        try std.testing.expectEqualStrings(expected, response.body);
+    }
+}
+
+const AuthCollectionTestApp = framework.App(.{
+    .collections = .{
+        .staff = .{ .type = .auth },
+        .services = .{ .type = .auth },
+        .documents = .{
+            .fields = .{.{ .name = "title", .type = .text }},
+            .rules = .{ .view = "@request.auth.collection = 'staff'", .create = "@request.auth.collection = 'staff'" },
+        },
+    },
+});
+
+test "auth collection rule: staff allow, service and anonymous deny, superuser bypass" {
+    var t = try start(AuthCollectionTestApp, .{});
+    defer t.deinit();
+    const staff = try t.createRecord("staff", .{ .email = "staff@example.com", .password = "password123" });
+    const service = try t.createRecord("services", .{ .email = "service@example.com", .password = "password123" });
+    const staff_token = try t.mintSession("staff", staff.object.get("id").?.string);
+    const service_token = try t.mintSession("services", service.object.get("id").?.string);
+    const document = try t.createRecord("documents", .{ .title = "private" });
+    const url = try std.fmt.allocPrint(std.testing.allocator, "/api/collections/documents/records/{s}", .{document.object.get("id").?.string});
+    defer std.testing.allocator.free(url);
+    _ = try t.createSuperuser("admin@example.com", "password123");
+    const admin = try t.loginSuperuser("admin@example.com", "password123");
+    for ([_]?[]const u8{ null, service_token, staff_token, admin }, [_]u16{ 404, 404, 200, 200 }) |token, expected| {
+        const r = try t.request(.GET, url, .{ .auth = token });
+        try std.testing.expectEqual(expected, r.status);
+        const create = try t.request(.POST, "/api/collections/documents/records", .{ .auth = token, .json = .{ .title = "new" } });
+        try std.testing.expectEqual(@as(u16, if (expected == 200) 201 else 403), create.status);
+    }
+}
+
+const StaticHeadersTestApp = framework.App(.{
+    .static_files = .{ .embedded = &[_]@import("static_files.zig").StaticFile{
+        .{ .path = "index.html", .bytes = "<html>shell</html>", .etag = "\"shell\"" },
+        .{ .path = "chunks/app-hash.js", .bytes = "asset", .etag = "\"asset\"" },
+        .{ .path = ".spa", .bytes = "", .etag = "\"marker\"" },
+        .{ .path = "manifest.webmanifest", .bytes = "{}", .etag = "\"manifest\"" },
+    } },
+    .static_headers = &.{
+        .{ .match = "/**", .set = &.{ .{ "Content-Security-Policy", "default-src 'self'" }, .{ "Cache-Control", "no-cache" } } },
+        .{ .match = "/chunks/**", .set = &.{.{ "cache-control", "public, max-age=31536000, immutable" }} },
+    },
+});
+
+test "static headers: embedded, directory and CLI source share precedence and conditional semantics" {
+    var t = try start(StaticHeadersTestApp, .{});
+    defer t.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(t.io, "chunks", .default_dir);
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "index.html", .data = "<html>shell</html>" });
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "chunks/app-hash.js", .data = "asset" });
+    try tmp.dir.writeFile(t.io, .{ .sub_path = ".spa", .data = "" });
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "manifest.webmanifest", .data = "{}" });
+    const dir = try tmp.dir.realPathFileAlloc(t.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(dir);
+    for ([_]bool{ false, true }) |directory| {
+        // CLI --serve-static and comptime .dir both resolve to this runtime source.
+        if (directory) t.booted.app.static_source = .{ .dir = dir };
+        for ([_][]const u8{ "/", "/index.html", "/deep/link", "/chunks/app-hash.js", "/manifest.webmanifest" }) |url| {
+            const r = try t.request(.GET, url, .{});
+            try std.testing.expectEqual(@as(u16, 200), r.status);
+            try std.testing.expectEqualStrings("default-src 'self'", r.header("Content-Security-Policy").?);
+            const cache = if (std.mem.startsWith(u8, url, "/chunks/")) "public, max-age=31536000, immutable" else "no-cache";
+            try std.testing.expectEqualStrings(cache, r.header("Cache-Control").?);
+            var cache_count: usize = 0;
+            for (r.headers) |h| {
+                if (std.ascii.eqlIgnoreCase(h.name, "cache-control")) cache_count += 1;
+            }
+            try std.testing.expectEqual(@as(usize, 1), cache_count);
+            const not_modified = try t.request(.GET, url, .{ .headers = &.{.{ "If-None-Match", r.header("etag").? }} });
+            try std.testing.expectEqual(@as(u16, 304), not_modified.status);
+            try std.testing.expectEqualStrings(cache, not_modified.header("Cache-Control").?);
+            try std.testing.expectEqualStrings("default-src 'self'", not_modified.header("Content-Security-Policy").?);
+        }
+        const range = try t.request(.GET, "/chunks/app-hash.js", .{ .headers = &.{.{ "Range", "bytes=1-2" }} });
+        try std.testing.expectEqual(@as(u16, 206), range.status);
+        try std.testing.expectEqualStrings("ss", range.body);
+        const unsatisfiable = try t.request(.HEAD, "/chunks/app-hash.js", .{ .headers = &.{.{ "Range", "bytes=99-" }} });
+        try std.testing.expectEqual(@as(u16, 416), unsatisfiable.status);
+        try std.testing.expectEqualStrings("default-src 'self'", unsatisfiable.header("Content-Security-Policy").?);
+        const manifest = try t.request(.GET, "/manifest.webmanifest", .{});
+        try std.testing.expectEqualStrings("application/manifest+json", manifest.content_type);
+        const missing_api = try t.request(.GET, "/api/does-not-exist", .{});
+        try std.testing.expectEqual(@as(u16, 404), missing_api.status);
+        try std.testing.expect(missing_api.header("Content-Security-Policy") == null);
     }
 }

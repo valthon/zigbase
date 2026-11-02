@@ -44,6 +44,9 @@ def test_serve_static_runtime_mode():
     with tempfile.TemporaryDirectory() as static, tempfile.TemporaryDirectory() as data:
         pub = pathlib.Path(static)
         (pub / "index.html").write_text("<h1>hello static</h1>")
+        (pub / "manifest.webmanifest").write_text('{"name":"Test app"}')
+        (pub / "image.avif").write_bytes(b"avif")
+        (pub / "app.wasm").write_bytes(b"wasm")
         (pub / "assets").mkdir()
         (pub / "assets" / "app.js").write_text("console.log('hi')")
         port = _free_port()
@@ -59,6 +62,15 @@ def test_serve_static_runtime_mode():
             # index.html at /
             st, hdr, body = _get(f"{base}/")
             assert st == 200 and b"hello static" in body
+            for name, content_type in (
+                ("manifest.webmanifest", "application/manifest+json"),
+                ("image.avif", "image/avif"),
+                ("app.wasm", "application/wasm"),
+            ):
+                status, headers, _ = _get(f"{base}/{name}")
+                assert status == 200
+                assert _hdr(headers, "Content-Type") == content_type
+                assert _hdr(headers, "X-Content-Type-Options") == "nosniff"
             assert "text/html" in _hdr(hdr, "content-type")
 
             # asset with content type + ETag, then 304

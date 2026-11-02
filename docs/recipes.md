@@ -314,6 +314,7 @@ A rule is one of: **Locked** (`null` or `""` — superuser only; the safe defaul
 **filter expression** evaluated per request (full grammar in
 [api.md → Filter grammar](api.md#filter-grammar)). Relevant pieces:
 
+- `@request.auth.collection` — authenticated collection name (`""` when anonymous).
 - `@request.auth.id` — the authenticated user's record id (`""` when anonymous).
 - A bare field name (e.g. `owner`) refers to the record being checked.
 - **Relation traversal with `.` is supported in rules** (not just flat fields):
@@ -417,7 +418,7 @@ guard escalation with a one-line hook:
 fn guardRole(ctx: *zigbase.Ctx, ev: *zigbase.RecordEvent) anyerror!void {
     _ = ctx;
     if (ev.phase != .before_update) return;
-    if (ev.ctx.is_superuser) return;
+    if (ev.rctx.is_superuser) return;
     if (ev.record.* == .object and ev.record.object.get("role") != null)
         return error.Forbidden;
 }
@@ -428,6 +429,18 @@ field-guarding `updateRule`). For **per-account** roles with an ordered ladder
 (`viewer < editor < admin < owner`), use the built-in tenancy system instead —
 `_memberships.role`, `@request.account.role`, and `.abilities` `.min_role` already ship
 ordered comparisons (see docs/tenancy.md and docs/abilities.md).
+
+### Multiple auth collections
+
+For an app with human `staff` identities and machine `services` identities, protect
+record operations with rules such as `@request.auth.collection = "staff"` or
+`@request.auth.collection = "services" && @request.auth.id = owner`. Collection
+names refer to the authenticated identity, not the collection being queried.
+Anonymous callers resolve the macro to `""`; superusers bypass record rules.
+
+Use `.auth = .{ .authed = "staff" }` on a custom framework route to gate entry to
+that handler. Use the rule macro on collection list/view/create/update/delete rules
+to control built-in record operations. A route guard does not replace record rules.
 
 ---
 

@@ -553,6 +553,7 @@ pub fn Server(comptime gates: Gates) type {
             {
                 const served = static_files.serve(app.io, ctx, app.static_source, .{
                     .routes = app.static_routes,
+                    .headers = app.static_headers,
                     .spa_roots = app.spa_roots,
                     .spa_marker_enabled = app.spa_marker_enabled,
                     .cache_control = app.static_cache_control,
@@ -722,7 +723,10 @@ pub fn Server(comptime gates: Gates) type {
                     };
                 } else {
                     // Wholesale facil.io delegation (dir-mode static): mime, ETag, 304,
-                    // `.gz` sidecar, Range are ALL facil.io's (§A.3) — byte-identical to today.
+                    // `.gz` sidecar and Range are delegated to facil.io. Supply our MIME
+                    // fallback first: its built-in extension registry lacks newer web types.
+                    // Known facil.io types may still replace this during sendFile.
+                    r.setHeader("content-type", resp.content_type) catch {};
                     r.sendFile(f.path) catch {
                         sendRawEnvelope(r, ctx.method, 404, "{\"status\":404,\"code\":\"not_found\",\"message\":\"Not found.\",\"data\":{}}");
                         logged_status = 404;
