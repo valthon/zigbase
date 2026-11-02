@@ -56,6 +56,11 @@ pub const ErrorCode = error_codes.Code;
 // Types an external consumer must be able to NAME to write a custom storage or
 // mailer plugin, an explicit migration, or to reference the built-in plugins.
 
+/// Local-file HTTP helpers and the pure Range/conditional planner.
+pub const files = @import("files/respond_path.zig");
+pub const serve_file = @import("files/serve_file.zig");
+pub const mime = @import("files/mime.zig");
+pub const StaticHeaders = @import("static_files.zig").StaticHeaders;
 // Storage plugin: a custom storage plugin's `interface()` returns this vtable.
 pub const Storage = @import("files/storage.zig").Storage;
 pub const LocalStorage = @import("files/storage.zig").LocalStorage;

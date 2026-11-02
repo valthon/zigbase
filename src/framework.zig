@@ -526,7 +526,7 @@ pub fn App(comptime cfg: anytype) type {
             @setEvalBranchQuota(20_000);
             // Guard top-level cfg keys so a typo (e.g. `.hook`, `.on_error`) fails
             // loudly at comptime instead of silently producing an empty Dispatch.
-            const allowed = .{ "rest_idempotency", "query_workbench", "admission", "resource_profile", "hooks", "onError", "routes", "onAuth", "beforeAuthSuccess", "auth", "onFileServe", "onFileUpload", "onBootstrap", "onBeforeServe", "onBeforeTerminate", "cron", "jobs", "storage", "mailer", "reporter", "reporter_dedup", "pools", "collections", "migrations", "static_files", "pagination", "enable_typegen", "flags", "experiments", "features", "onFeatureExposure", "experiment_assignment_ttl", "queues", "workers", "realtime", "tenancy", "abilities", "mail", "analytics", "static_routes", "enable_spa_marker", "static_cache_control", "admin", "webhooks", "ttl_gc_interval", "files", "push", "sms", "sms_provider", "collections_frozen", "app_context" };
+            const allowed = .{ "rest_idempotency", "query_workbench", "admission", "resource_profile", "hooks", "onError", "routes", "onAuth", "beforeAuthSuccess", "auth", "onFileServe", "onFileUpload", "onBootstrap", "onBeforeServe", "onBeforeTerminate", "cron", "jobs", "storage", "mailer", "reporter", "reporter_dedup", "pools", "collections", "migrations", "static_files", "pagination", "enable_typegen", "flags", "experiments", "features", "onFeatureExposure", "experiment_assignment_ttl", "queues", "workers", "realtime", "tenancy", "abilities", "mail", "analytics", "static_routes", "enable_spa_marker", "static_cache_control", "static_headers", "admin", "webhooks", "ttl_gc_interval", "files", "push", "sms", "sms_provider", "collections_frozen", "app_context" };
             const allowed_list = blk2: {
                 var s: []const u8 = "";
                 for (allowed, 0..) |name, i| s = s ++ (if (i == 0) "" else "/") ++ name;
@@ -1221,6 +1221,56 @@ pub fn App(comptime cfg: anytype) type {
             @compileError("static_files: expected .disabled, .{ .dir = \"<path>\" }, or .{ .embedded = &<manifest>.files }");
         };
 
+        /// Response headers for static files, matched against the sanitized request path.
+        pub const static_headers: []const static_files.StaticHeaders = blk: {
+            if (!@hasField(@TypeOf(cfg), "static_headers")) break :blk &.{};
+            var branch_budget: u32 = 10_000;
+            @setEvalBranchQuota(branch_budget);
+            const raw = cfg.static_headers;
+            const list = switch (@typeInfo(@TypeOf(raw))) {
+                .pointer => |p| if (p.size == .one) raw.* else raw,
+                else => raw,
+            };
+            var out: [list.len]static_files.StaticHeaders = undefined;
+            for (0..list.len) |i| {
+                const entry = list[i];
+                branch_budget += @intCast(entry.match.len * 16 + 1000);
+                @setEvalBranchQuota(branch_budget);
+                validateRoutePattern(entry.match);
+                const pairs = switch (@typeInfo(@TypeOf(entry.set))) {
+                    .pointer => |p| if (p.size == .one) entry.set.* else entry.set,
+                    else => entry.set,
+                };
+                var hs: [pairs.len][2][]const u8 = undefined;
+                for (0..pairs.len) |j| {
+                    const name: []const u8 = pairs[j][0];
+                    const value: []const u8 = pairs[j][1];
+                    // CSP hash lists can span many kilobytes. Budget this initializer's
+                    // scan by its input bytes rather than relying on another scope.
+                    branch_budget += @intCast((name.len + value.len) * 16 + 1000);
+                    @setEvalBranchQuota(branch_budget);
+                    if (name.len == 0) @compileError(".static_headers: empty header name");
+                    for (name) |c| {
+                        if (!std.ascii.isAlphanumeric(c) and std.mem.indexOfScalar(u8, "!#$%&'*+-.^_`|~", c) == null)
+                            @compileError(".static_headers: invalid header name");
+                    }
+                    for (value) |c| {
+                        if ((c < 32 and c != '\t') or c == 127)
+                            @compileError(".static_headers: invalid control character in header value");
+                    }
+                    for (.{ "Content-Length", "Transfer-Encoding", "Trailer", "Connection", "Content-Type", "Content-Range", "Content-Encoding", "ETag", "Accept-Ranges" }) |reserved| {
+                        if (std.ascii.eqlIgnoreCase(name, reserved))
+                            @compileError(".static_headers: representation/framing headers are managed by ZigBase");
+                    }
+                    hs[j] = .{ name, value };
+                }
+                const final_headers = hs;
+                out[i] = .{ .match = entry.match, .set = &final_headers };
+            }
+            const final = out;
+            break :blk &final;
+        };
+
         /// §C.2 comptime DEFAULT for the static Cache-Control knob (null = not configured).
         pub const static_cache_control: ?[]const u8 = blk: {
             if (!@hasField(@TypeOf(cfg), "static_cache_control")) break :blk null;
@@ -1726,6 +1776,7 @@ pub fn App(comptime cfg: anytype) type {
             .cache_kib = cache_kib,
             .static_mode = static_mode,
             .static_routes = static_routes,
+            .static_headers = static_headers,
             .enable_spa_marker = enable_spa_marker,
             .collections_frozen = collections_frozen,
             .pagination = pagination_config,
@@ -1920,6 +1971,7 @@ pub const ServeOpts = struct {
     /// Embedded serve targets were proven at comptime; dir targets are startup-validated
     /// in serveImpl (missing target = fatal, like a missing static dir).
     static_routes: []const static_files.StaticRoute = &.{},
+    static_headers: []const static_files.StaticHeaders = &.{},
     /// Tier-1 `.spa` marker gate (issue #183); false skips the startup scan entirely
     /// (a `.spa` file is then just another never-served dotfile).
     enable_spa_marker: bool = true,
@@ -5203,6 +5255,7 @@ fn bootApp(
         .sentry_dsn = cfg.sentry_dsn,
         .static_source = static_source,
         .static_routes = opts.static_routes,
+        .static_headers = opts.static_headers,
         .static_cache_control = static_cc,
         .spa_roots = holder.spa_roots,
         .spa_marker_enabled = opts.enable_spa_marker,
@@ -6672,4 +6725,27 @@ test "resource envelope reports opt-in coordinated admission separately from HTT
         try std.testing.expect(Bytes.route_gates.admission);
         try std.testing.expect(!Bytes.route_gates.admission_http);
     }
+}
+
+test "static_headers supports tuple and typed slice configuration in all modes" {
+    const typed: []const static_files.StaticHeaders = &.{.{ .match = "/**", .set = &.{.{ "Cache-Control", "no-cache" }} }};
+    try std.testing.expectEqual(@as(usize, 0), App(.{}).static_headers.len);
+    const Default = App(.{ .static_headers = typed });
+    try std.testing.expectEqualStrings("no-cache", Default.static_headers[0].set[0][1]);
+    const Directory = App(.{ .static_files = .{ .dir = "public" }, .static_headers = .{.{ .match = "/**", .set = .{.{ "X-App", "yes" }} }} });
+    try std.testing.expectEqualStrings("yes", Directory.static_headers[0].set[0][1]);
+}
+
+test "static_headers accepts a multi-kilobyte generated hash CSP" {
+    // Generated from 128 distinct inline-script snippets, like a frontend release.
+    const csp = comptime std.mem.trim(u8, @embedFile("testdata/generated-hash-csp.txt"), "\n");
+    const WithCsp = App(.{
+        .static_headers = &.{.{ .match = "/**", .set = &.{
+            .{ "Content-Security-Policy", csp },
+            .{ "Cache-Control", "no-cache" },
+        } }},
+    });
+    try std.testing.expect(csp.len > 4096);
+    try std.testing.expectEqualStrings(csp, WithCsp.static_headers[0].set[0][1]);
+    try std.testing.expectEqualStrings("no-cache", WithCsp.static_headers[0].set[1][1]);
 }

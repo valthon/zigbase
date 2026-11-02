@@ -36,9 +36,13 @@ pub const Source = union(enum) {
     embedded: []const StaticFile,
 };
 
-/// One Tier-2 rewrite (issue #183): a comptime-validated `match` pattern -> a fixed
-/// `serve` target. Both start with '/'; `serve` names a real document in the active
-/// static source (proven at comptime for embedded manifests, at startup for dirs).
+/// Patterns use the static_routes grammar; later matching entries win per header.
+pub const StaticHeaders = struct {
+    match: []const u8,
+    set: []const [2][]const u8,
+};
+
+/// One Tier-2 rewrite: a validated pattern and fixed static document target.
 pub const StaticRoute = struct { match: []const u8, serve: []const u8 };
 
 /// Miss-handler inputs threaded into `serve` by server.zig (issue #183).
@@ -57,6 +61,7 @@ pub const StaticRoute = struct { match: []const u8, serve: []const u8 };
 /// All fields default empty/false: `serve(.., .{})` behaves exactly as before the feature.
 pub const Fallback = struct {
     routes: []const StaticRoute = &.{},
+    headers: []const StaticHeaders = &.{},
     spa_roots: []const []const u8 = &.{},
     spa_marker_enabled: bool = false,
     /// §C.2: the resolved static Cache-Control knob (app.static_cache_control).
@@ -526,7 +531,7 @@ pub fn validateRouteTargetsDir(io: std.Io, alloc: std.mem.Allocator, root: []con
     return null;
 }
 
-fn serveDir(io: std.Io, ctx: *http.RequestCtx, root: []const u8, rel: []const u8) !?http.Response {
+fn serveDir(io: std.Io, ctx: *http.RequestCtx, root: []const u8, rel: []const u8, owned_cache: ?[]const u8) !?http.Response {
     const first = if (rel.len == 0) "index.html" else rel;
     var full = try std.fmt.allocPrint(ctx.allocator.a, "{s}/{s}", .{ root, first });
     var st = std.Io.Dir.cwd().statFile(io, full, .{}) catch return null;
@@ -542,6 +547,13 @@ fn serveDir(io: std.Io, ctx: *http.RequestCtx, root: []const u8, rel: []const u8
     const real_root = std.Io.Dir.cwd().realPathFileAlloc(io, root, ctx.allocator.a) catch return null;
     const real_full = std.Io.Dir.cwd().realPathFileAlloc(io, full, ctx.allocator.a) catch return null;
     if (!withinRoot(real_root, real_full)) return null;
+    if (owned_cache) |cache| return @import("files/respond_path.zig").respond(io, ctx, real_full, .{
+        .cache_control = cache,
+        .content_type = mime.fromExtension(full),
+    }) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return null, // unreadable/disappearing static files remain misses
+    };
     // §A.2 shim: normalize the Range header against the size of the file facil.io
     // WILL serve — mirroring its .gz sidecar probe (http.c:449-470: Accept-Encoding
     // contains "gzip" -> stat "<path>.gz") — then keep delegating. The shim only edits
@@ -647,11 +659,11 @@ fn serveShellOwned(io: std.Io, ctx: *http.RequestCtx, root: []const u8, shell_re
 
 /// Resolve `source` to serve one relative path (shared by the direct lookup and both
 /// fallback tiers, so fallback documents inherit ETag/304/HEAD/nosniff/F10 for free).
-fn serveRel(io: std.Io, ctx: *http.RequestCtx, source: Source, rel: []const u8, cache_control: []const u8) !?http.Response {
+fn serveRel(io: std.Io, ctx: *http.RequestCtx, source: Source, rel: []const u8, cache_control: []const u8, owned: bool) !?http.Response {
     return switch (source) {
         .none => unreachable, // gated in serve()
         .embedded => |files| serveEmbedded(ctx, files, rel, cache_control),
-        .dir => |root| serveDir(io, ctx, root, rel), // dir-mode CC = the facil.io global (§C.1)
+        .dir => |root| serveDir(io, ctx, root, rel, if (owned) cache_control else null), // dir-mode CC = the facil.io global (§C.1)
     };
 }
 
@@ -672,6 +684,30 @@ fn serveRel(io: std.Io, ctx: *http.RequestCtx, source: Source, rel: []const u8, 
 ///      set, so a `.spa` added/removed/edited after boot takes effect immediately;
 ///   6. null (the caller's plain-text 404, unchanged).
 pub fn serve(io: std.Io, ctx: *http.RequestCtx, source: Source, fb: Fallback) !?http.Response {
+    var response = (try serveContent(io, ctx, source, fb)) orelse return null;
+    if (fb.headers.len == 0) return response;
+    const rel = (try sanitize(ctx.allocator.a, ctx.path)) orelse return null;
+    var headers: std.ArrayList(http.Header) = .empty;
+    try headers.appendSlice(ctx.allocator.a, response.extra_headers);
+    for (fb.headers) |entry| {
+        if (!matchRoute(entry.match, rel)) continue;
+        for (entry.set) |pair| {
+            var replaced = false;
+            for (headers.items) |*header| {
+                if (std.ascii.eqlIgnoreCase(header.name, pair[0])) {
+                    header.value = pair[1];
+                    replaced = true;
+                    break;
+                }
+            }
+            if (!replaced) try headers.append(ctx.allocator.a, .{ .name = pair[0], .value = pair[1] });
+        }
+    }
+    response.extra_headers = try headers.toOwnedSlice(ctx.allocator.a);
+    return response;
+}
+
+fn serveContent(io: std.Io, ctx: *http.RequestCtx, source: Source, fb: Fallback) !?http.Response {
     if (ctx.method != .GET and ctx.method != .HEAD) return null;
     if (std.meta.activeTag(source) == .none) return null;
     const rel = (try sanitize(ctx.allocator.a, ctx.path)) orelse return null;
@@ -688,11 +724,11 @@ pub fn serve(io: std.Io, ctx: *http.RequestCtx, source: Source, fb: Fallback) !?
     if (std.mem.eql(u8, rel, "api") or std.mem.startsWith(u8, rel, "api/")) return null;
     const cc_default: []const u8 = fb.cache_control orelse "max-age=3600";
     if (!isSpaMarkerPath(rel)) {
-        if (try serveRel(io, ctx, source, rel, cc_default)) |hit| return hit;
+        if (try serveRel(io, ctx, source, rel, cc_default, fb.headers.len > 0)) |hit| return hit;
     }
     for (fb.routes) |rt| {
         if (matchRoute(rt.match, rel))
-            return serveRel(io, ctx, source, std.mem.trimStart(u8, rt.serve, "/"), cc_default);
+            return serveRel(io, ctx, source, std.mem.trimStart(u8, rt.serve, "/"), cc_default, fb.headers.len > 0);
     }
     if (!fb.spa_marker_enabled) return null;
     switch (source) {
@@ -705,7 +741,7 @@ pub fn serve(io: std.Io, ctx: *http.RequestCtx, source: Source, fb: Fallback) !?
                 // §C.3: a FALLBACK-served shell is always no-cache — a cached stale shell
                 // after a redeploy references hashed assets that no longer exist, breaking
                 // deep links. Direct hits on the same file still get the knob value.
-                return serveRel(io, ctx, source, shell, "no-cache");
+                return serveRel(io, ctx, source, shell, "no-cache", fb.headers.len > 0);
             }
             return null;
         },

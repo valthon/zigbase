@@ -70,6 +70,8 @@ pub const App = struct {
     /// registers the FIO_CALL_PRE_START swap, so facil.io's stock `max-age=3600` stays
     /// byte-identical to today. Never touches record-file downloads (api/files.zig).
     static_cache_control: ?[]const u8 = null,
+    /// Static response-header table, evaluated in declaration order.
+    static_headers: []const @import("static_files.zig").StaticHeaders = &.{},
     /// Tier-2 comptime static rewrites (issue #183), lowered from `App(.{ .static_routes })`
     /// by framework.zig and threaded here by serveImpl. Comptime constant slice
     /// (static lifetime); empty = no routes.
