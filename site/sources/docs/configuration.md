@@ -151,8 +151,9 @@ with a message pointing back at `-Ddev-tools=true` instead of running them.
 | `ZIGBASE_VERIFICATION_TTL` | — | `604800` (7 days) | email-verification token lifetime, seconds |
 | `ZIGBASE_PASSWORD_RESET_TTL` | — | `3600` (1 hour) | password-reset token lifetime, seconds |
 | `ZIGBASE_REALTIME_ORIGINS` | `--realtime-origins` | `""` (deny cross-origin) | CSV of allowed WebSocket `Origin`s. Empty denies cross-origin browser upgrades; same-origin upgrades are always allowed |
+| `ZIGBASE_SSE_HEARTBEAT_SECONDS` | `--sse-heartbeat-seconds` | `0` (inherit 40s listener timeout) | SSE heartbeat (`: ping`) interval, 1–255 seconds |
 | `ZIGBASE_REALTIME_OUTBOUND_HWM` | `--realtime-outbound-hwm` | `1024` (frames) | slow-consumer outbound high-water-mark: max queued outbound frames per realtime (WS/SSE) connection before the server disconnects the peer (bounds memory under a stalled/slow reader). `0` disables the bound |
-| `ZIGBASE_SERVE_BACKGROUND` | `--background` | _auto-detect_ | `1` forces `serve` into the background; any other value (including empty) disables the automatic backgrounding that a detected AI-agent environment (`CLAUDECODE`, `CODEX_THREAD_ID`, `GEMINI_CLI`, ...) would otherwise trigger. See [Running the server → Agent auto-detection](./serve#5-agent-auto-detection) |
+| `ZIGBASE_SERVE_BACKGROUND` | `--background` | _unset_ | `1` forces `serve` into the background; any other value (including empty) disables the automatic backgrounding that a detected AI-agent environment (`CLAUDECODE`, `CODEX_THREAD_ID`, `GEMINI_CLI`, ...) would otherwise trigger. See [Running the server → Agent auto-detection](./serve#5-agent-auto-detection) |
 | `ZIGBASE_LOG_FORMAT` | `--log-format` | `text` | log stream encoding: `text` or `json` (one JSON object per line on stderr). The env var applies to every subcommand; the flag is `serve`-only. See [Observability](./observability) |
 | `ZIGBASE_LOG_LEVEL` | `--log-level` | `info` | minimum log severity: `debug`, `info`, `warn`, `error` |
 | `ZIGBASE_LOG_REQUESTS` | `--no-request-log` (sets `false`) | `true` | per-request access lines (method, path, status, duration); turn off when a reverse proxy already ships access logs |
@@ -164,6 +165,7 @@ with a message pointing back at `-Ddev-tools=true` instead of running them.
 | `ZIGBASE_OAUTH_STATE_SERVER` | — | `true` | server-side OAuth `state` (CSRF) store is **on by default**; set `false` to opt out (client-driven state only — PKCE still required) |
 | `ZIGBASE_OAUTH_STATE_TTL` | — | `600` (10 min) | server-side OAuth `state` lifetime, seconds |
 | `ZIGBASE_PUBLIC_URL` | — | `""` | public base URL used to build user-facing links (magic-link sign-in emails). Unset → magic-link emails contain the raw token instead of a clickable URL |
+| `ZIGBASE_UNSUBSCRIBE_BASE_URL` | — | `""` (off) | Public base URL for RFC 8058 one-click unsubscribe; empty disables its route and headers. Overrides the comptime `.mail` setting |
 | `ZIGBASE_SMTP_HOST` | — | `""` (use LogMailer) | SMTP server host; set to deliver verify/reset email instead of logging |
 | `ZIGBASE_SMTP_PORT` | — | `25` | SMTP server port |
 | `ZIGBASE_SMTP_USERNAME` | — | `""` | SMTP username; non-empty enables `AUTH LOGIN` |
@@ -172,6 +174,12 @@ with a message pointing back at `-Ddev-tools=true` instead of running them.
 | `ZIGBASE_SMTP_TLS` | — | `auto` | transport security: `none` / `starttls` / `implicit` / `auto` (auto: 465→implicit, 587→starttls, else→none) |
 | `ZIGBASE_SMTP_INSECURE` | — | `false` | skip TLS cert verification (self-signed relays only) |
 | `ZIGBASE_SENDMAIL_COMMAND` | — | `""` (off) | local-MTA command to pipe mail to (e.g. `sendmail -t -i` or `msmtp -t`); when set, **overrides** SMTP. App holds no SMTP creds |
+| `ZIGBASE_TWILIO_ACCOUNT_SID` | — | `""` (log SMS) | Twilio Account SID; with auth token and sender, delivers `ctx.sms()` messages through Twilio |
+| `ZIGBASE_TWILIO_AUTH_TOKEN` | — | `""` | Twilio HTTP Basic-auth password |
+| `ZIGBASE_TWILIO_FROM` | — | `""` | Twilio sender number in E.164 |
+| `ZIGBASE_IMAGEMAGICK_EXECUTABLE` | — | Compiled thumbnail executable | Absolute override for configured thumbnails in `-Dimage-thumbnails=true` builds; must match the compiled ImageMagick command style. Ignored when compiled out |
+| `ZIGBASE_VAPID_PUBLIC_KEY` | — | `""` | Base64url Web Push public key for `ctx.push()` and the browser's `applicationServerKey`; generate with `zigbase vapid-keygen` |
+| `ZIGBASE_VAPID_PRIVATE_KEY` | — | `""` | Secret base64url Web Push private key; both keys unset makes push a no-op |
 | `ZIGBASE_FAKE_NOW` | — | _unset_ | **DEV-ONLY test clock.** Freeze "now" to an ISO-8601 UTC instant (e.g. `2029-03-07T16:00:00Z`) for deterministic time-boundary e2e tests. Freezes both the framework's own timestamps and a consumer's raw SQL `datetime('now')` / `unixepoch('now')` / `strftime(…, 'now')` (and `date`/`time`/`julianday`), plus the `CURRENT_TIMESTAMP` / `CURRENT_TIME` / `CURRENT_DATE` keywords and column `DEFAULT CURRENT_TIMESTAMP` (via a wrapping VFS). **Ignored entirely on a production build** (compiled out unless built with `-Ddev-mode=true`; off in any release build). See [Known limitations → Testing](./known-limitations) for scope |
 | `ZIGBASE_FAKE_SEED` | — | _unset_ | **DEV-ONLY seeded entropy.** Set to a decimal `u64` (e.g. `12345`) to make record/field ID and token generation deterministic: two runs with the same seed produce identical IDs and tokens. Useful for snapshot tests. **Ignored entirely on a production build** (compiled out unless built with `-Ddev-mode=true`; off in any release build). See [Framework → Test/dev-mode seams](./framework#14-test--dev-mode-determinism-seams) |
 | `ZIGBASE_S3_BUCKET` | — | `""` (off) | **Opt-in.** Non-empty selects the S3-compatible storage backend instead of local disk. Only honored in a binary built with `-Ds3=true` (see below); ignored otherwise |
@@ -225,13 +233,15 @@ via configuration alone" contract as `ZIGBASE_DB_URL`. A **stock (`-Ds3=false`) 
 handed `ZIGBASE_S3_BUCKET` does **not** silently keep writing to local disk unnoticed — it
 logs a loud warning and falls back to local storage.
 
-Downloads are never proxied straight from S3: the server spools an object to a local
-cache file on first read (`ZIGBASE_S3_CACHE_DIR`) and serves every subsequent read from
-that file, so Range requests, conditional requests, `ETag`, and per-collection
-cacheability behave identically to local storage. Startup runs a fail-fast `HeadObject`
-probe so a bad config is caught at boot, not on first upload. See [Known
-limitations](./known-limitations) for the write-lock, best-effort-delete,
-proxy-only-serving, and buffered-multipart caveats.
+By default, the server spools S3 downloads to a local cache file
+(`ZIGBASE_S3_CACHE_DIR`) and serves them through the normal Range/ETag path.
+Framework apps may instead opt into `.files.s3_presign_redirect = true`: after
+authorization, downloads return a 302 to a presigned GET URL with a bounded TTL.
+That URL is a bearer capability, usable by anyone holding it until expiry; keep
+the TTL short. See [presigned redirects](./framework#presigned-redirect-serving-s3).
+Startup runs a fail-fast `HeadObject` probe so bad configuration is caught at boot.
+See [Known limitations](./known-limitations) for transfer buffering, cleanup,
+cache-disk sizing, and redirect tradeoffs.
 
 ## Email delivery
 
@@ -312,7 +322,9 @@ response. Jobs can consume all capacity, so allow room for handlers that enqueue
 work and handle rejection. Shared diagnostics expose `work_limit`, `jobs`,
 `work_high_water`, and `jobs_rejected`; `resources` reports the compiled ceiling.
 This optional integration compiles out without its build flag. It counts work,
-not bytes, and excludes durable jobs, transport buffers and long-lived realtime.
+not bytes. Each active serial durable poll batch also reserves one work permit;
+retained durable backlog rows do not each consume one. Transport buffers,
+long-lived realtime and durable claim payload bytes are outside this work count.
 
 The same build gate also offers an independent retained-copy byte ceiling:
 `.admission = .{ .max_job_bytes = 64 * 1024 }`. No `max_requests` is required:

@@ -226,9 +226,10 @@ apply — with optional `--upsert-key` idempotency and source-id preservation. S
 model and `schema apply` executes the difference between a document and the live schema
 through the same path the REST collections API uses — refusing the whole document, before
 writing anything, if any access rule in it fails to parse. `schema check-rules` lints access-rule
-expressions — which nothing validates when they are *written*, so a malformed rule otherwise
-ships silently and fails closed (500) on the first request — through the real rule pipeline,
-emitting `doctor`-shaped NDJSON findings and exiting `0`/`2`/`1` clean/warnings-only/error.
+expressions through the real rule pipeline. `schema apply` and REST collection mutations
+already validate syntax and field/relation references against the prospective schema;
+use the standalone check to audit schemas created by trusted low-level writers.
+It emits `doctor`-shaped NDJSON findings and exits `0`/`2`/`1` clean/warnings-only/error.
 Given a document it is a **syntax**-depth check; run against a data dir it is **full** depth
 and also resolves field and relation names. Together with `import --manifest` and
 `import --legacy-hashes` they are the machinery behind
@@ -262,7 +263,7 @@ environment variables, then `serve` command-line flags (where a flag exists).
 | `ZIGBASE_FIELD_CRYPTO` | — | `real` | **dev builds only** (`-Ddev-mode`, on by default in Debug): set `fake` to store `.encrypted` fields as readable `fake:<key>:<value>` instead of AES-GCM — useful for eyeballing values while debugging. Compiled out of release binaries; never read there. See [docs/fields.md](docs/fields.md) |
 | `ZIGBASE_COOKIE_SECURE` | `--insecure-cookies` (sets `false`) | `true` | mark auth cookies `Secure`. On by default; opt out for plain-HTTP local dev |
 | `ZIGBASE_TRUST_PROXY` | `--trust-proxy` (sets `true`) | `false` | trust `X-Forwarded-For`/`X-Real-IP` for client-IP / rate-limit keying (set only behind a trusted reverse proxy) |
-| `ZIGBASE_SERVE_BACKGROUND` | — | _unset_ | `1` forces `serve` to run in the background; any other value disables the automatic backgrounding that a detected AI-agent environment would otherwise trigger. See [docs/serve.md](docs/serve.md) |
+| `ZIGBASE_SERVE_BACKGROUND` | `--background` | _unset_ | `1` forces `serve` to run in the background; any other value disables the automatic backgrounding that a detected AI-agent environment would otherwise trigger. See [docs/serve.md](docs/serve.md) |
 | `ZIGBASE_AUTH_TOKEN_TTL` | — | `1209600` (14 days) | auth token lifetime, seconds |
 | `ZIGBASE_VERIFICATION_TTL` | — | `604800` (7 days) | email-verification token lifetime, seconds |
 | `ZIGBASE_PASSWORD_RESET_TTL` | — | `3600` (1 hour) | password-reset token lifetime, seconds |

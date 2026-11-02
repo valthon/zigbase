@@ -113,15 +113,19 @@ const off = zb.authStore.onChange((token, record) => {
 ### OAuth2 (Authorization-Code + PKCE)
 
 ```ts
-import { createPkceChallenge, randomState } from "@zigbase/client";
+import { createPkceChallenge } from "@zigbase/client";
 
 // Discover configured providers (name, authURL, clientId, scopes):
 const { items: providers } = await zb.collection("users").listAuthProviders();
+const oauth = await zb.collection("users").oauth2Init("github");
 
 const { verifier, challenge } = await createPkceChallenge();
-const state = randomState();
-// 1. redirect the user to the provider authorize URL with `challenge` + `state`
-// 2. on callback, exchange the code:
+const state = oauth.state;
+if (!state) throw new Error("This example requires server-issued OAuth state");
+// Save verifier/state privately across the redirect. Build the provider URL from
+// oauth.authURL/clientId/scopes, adding challenge, state, and your redirect URL.
+// On the callback, read code and returnedState from the provider response:
+if (returnedState !== state) throw new Error("OAuth state mismatch");
 await zb.collection("users").authWithOAuth2({
   provider: "github",
   code,

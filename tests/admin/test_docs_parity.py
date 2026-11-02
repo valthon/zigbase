@@ -66,6 +66,26 @@ def test_env_vars_documented_in_readme():
     missing = sorted(n for n in _code_env_vars() if n not in readme)
     assert not missing, f"env vars referenced in src/ but missing from the README env table: {missing}"
 
+def test_site_configuration_matches_readme():
+    """Both entry points must expose the same public knobs, flags and defaults."""
+    def table(path):
+        rows = {}
+        for line in path.read_text().splitlines():
+            if not re.match(r"\| `ZIGBASE_", line):
+                continue
+            cells = [cell.strip() for cell in line.strip("|").split("|")]
+            name = cells[0].strip("`")
+            # Parenthetical explanations may differ; the literal default/flag may not.
+            rows[name] = tuple(re.sub(r"\s+\(.*", "", cell).strip('`"') for cell in cells[1:3])
+        return rows
+
+    readme = table(REPO / "README.md")
+    site = table(REPO / "site/sources/docs/configuration.md")
+    # These two development-build knobs are explicitly listed only on the site.
+    for name in ("ZIGBASE_FAKE_NOW", "ZIGBASE_FAKE_SEED"):
+        site.pop(name)
+    assert site == readme
+
 def test_env_vars_are_registered_in_config_known_vars():
     """Every ZIGBASE_* knob in the code must be registered as known — either read
     directly by Config.loadDiag (config.known_vars) or consumed outside Config, e.g.

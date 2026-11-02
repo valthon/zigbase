@@ -37,7 +37,7 @@ The example apps are also built in CI (the `examples/plugins` frontend must be `
 
 ## Architecture (the parts that span multiple files)
 
-**Library/binary split.** `build.zig` compiles `src/root.zig` into the `zigbase` module (links libc, compiles the vendored SQLite, imports `zap`); `src/main.zig` is a ~3-line consumer that calls `zigbase.App(.{}).runCli(init)`. Everything real lives in the library module.
+**Library/binary split.** `build.zig` compiles `src/root.zig` into the `zigbase` module (links libc, compiles the vendored SQLite, imports `zap`). `src/main.zig` is the stock consumer: it enables `.enable_typegen`, `.mail = .{}`, and `.auth.two_factor` with TOTP and WebAuthn before calling `runCli(init)`. An embedded `zigbase.App(.{})` uses the library defaults and does not reproduce those stock-server opt-ins. The implementation lives in the library module.
 
 **`src/root.zig` is both the public API surface AND the unit-test root.** Its `test { _ = @import("…"); }` block references every internal file so their `test {}` blocks are discovered. **A new `src/*.zig` file's tests will not run until it is added to that block.** `root.zig` also re-exports every type a framework consumer must be able to name (e.g. `App`, `RecordEvent`, `Storage`, `Mailer`, `Migration`, `Db`).
 
@@ -61,11 +61,11 @@ migration itself owns and for non-additive DDL the provisioner won't perform.
 
 **Embedded admin UI.** `src/admin.zig` serves the SPA whose source is `src/admin/app.js` (Preact via htm, `@embedFile`-d into the binary — there is no build step for it; edit `app.js` directly and rebuild the binary). Elements carry `data-test=…` hooks the Playwright suite drives. A consumer's own frontend is embedded separately via `build.zig`'s `embedStaticDir` (a generated static-site `dist` tree → a `static_assets.zig` manifest with CRC32 ETags).
 
-**Pluggable backends.** `files/storage.zig` (`Storage` vtable; only local-disk ships) and `mail/mailer.zig` (`Mailer` vtable; Log + SMTP with STARTTLS/implicit-TLS). Consumers swap them via `App(.{ .storage = T, .mailer = T })`.
+**Pluggable backends.** `files/storage.zig` supplies a `Storage` vtable with local disk by default and opt-in S3-compatible storage (`-Ds3=true`, selected by `ZIGBASE_S3_*`). `mail/mailer.zig` supplies the `Mailer` vtable; built-in backends include Log, SMTP, command delivery, SES, Postmark, and capture. Consumers wrap concrete backends in `create`/`interface`/`deinit` plugin types and select them via `App(.{ .storage = T, .mailer = T })`.
 
 ## The three examples are a deliberate complexity ladder
 
-`examples/blog` (bare packaging proof — one hook), `examples/golfsim` (a realistic app — computed/validating hooks, business routes, cron, file fields, realtime), `examples/plugins` (the advanced comptime surface — custom storage+mailer plugins, comptime schema, explicit migrations, embedded frontend). Each is a standalone consumer package with a path dependency on the repo root and its own vendored `zig-pkg/zap` (do not edit vendored deps). Keep blog the simplest and plugins the most advanced when changing them.
+`examples/blog` (basic schema, hooks, route, cron, and frontend), `examples/golfsim` (a realistic app — computed/validating hooks, business routes, cron, file fields, realtime), `examples/plugins` (the advanced comptime surface — custom storage+mailer plugins, comptime schema, explicit migrations, embedded frontend). Each is a standalone consumer package with a path dependency on the repo root and its own vendored `zig-pkg/zap` (do not edit vendored deps). Keep blog the simplest and plugins the most advanced when changing them.
 
 ## Conventions that bite
 

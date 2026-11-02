@@ -110,7 +110,7 @@ features a consumer configures in code.
    `[onAuth] collection=authors method=webauthn`, `method=custom` (api_token),
    and `collection=commenters method=magic_link`.
 
-10. **Custom `AuthMethod` plugin** (`ApiTokenMethod`) via `.auth_methods`,
+10. **Custom `AuthMethod` plugin** (`ApiTokenMethod`) via `.auth = .{ .methods = .{ApiTokenMethod} }`,
     demonstrating the auth-method plugin contract alongside storage + mailer.
     Enabled on `authors` via `.auth.methods.custom = .{"api_token"}`.
 

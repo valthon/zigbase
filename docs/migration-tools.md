@@ -793,8 +793,11 @@ zigbase schema dump --out schema.json --data-dir ./zb_data
   validate syntax and references, not the values a future request will supply. Run
   `schema check-rules` against the live data dir and exercise access rules via replay before
   cutover; compiling a rule is not proof it decides what you intended.
-- **Collection rename is not supported by the engine** (`collections.update` preserves
-  the stored name), so a renamed collection in a document reads as create + untracked.
+- **Schema documents do not infer collection renames.** `collections.update` preserves
+  the stored name, so a renamed collection in a document reads as create + untracked.
+  Use an explicit offline `m.renameCollection(from, to, .{ .offline = true })`
+  migration when identity and immutable storage namespaces must be preserved; stop
+  all writers and update compiled name references. See [offline collection rename](framework.md#offline-collection-rename).
 - **A live server sees another process's schema change within about five seconds, not
   instantly** — it polls the `_schema_state` generation marker and then drops its
   collection cache (see §2's apply semantics for the mechanism). Requests in that window

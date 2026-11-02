@@ -25,10 +25,11 @@ const App = zigbase.App(.{
     .tenancy = .{ .enabled = true, .auth_collection = "users",
                   .roles = .{ "viewer", "editor", "admin", "owner" } },
     .collections = .{
+        .users = .{ .type = .auth, .fields = .{} },
         .projects = .{
             .fields = .{
                 .{ .name = "title",   .type = .text },
-                .{ .name = "account", .type = .relation, .target = "accounts" }, // owning account
+                .{ .name = "account", .type = .relation, .target = "_accounts" }, // owning account
             },
             .rules = .{ .list = "@public", .view = "@public" },
         },

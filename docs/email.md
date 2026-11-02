@@ -142,9 +142,12 @@ a production binary is unaffected.
 > **`testcapture.mail` vs `CaptureMailer`.** These are two different things. `testcapture.mail` is
 > the **framework-internal** outbox above — it captures the framework's own auth mail (and anything
 > else sent through the wired mailer) for e2e tests, gated on a `dev_mode` build. `CaptureMailer`
-> is a **consumer-owned** `Mailer` backend you plug in yourself via `App(.{ .mailer =
-> CaptureMailer })` (or call its `mailer()` directly) to capture and assert your own application's
-> mail with no network, independent of the `dev_mode` gate.
+> is a **consumer-owned** concrete backend with `init(allocator)` and `mailer()`.
+> It does not implement the `App(.{ .mailer = PluginType })` plugin contract:
+> wrap it in a type exposing `create` / `interface` / `deinit` to use it there.
+> For in-process application tests, prefer `const mail = try t.captureMail()` on
+> the [test harness](testing.md). Both capture options work independently of the
+> `dev_mode` gate.
 
 ## Reference
 

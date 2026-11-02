@@ -98,12 +98,18 @@ from zigbase.pkce import code_challenge_s256, generate_code_verifier
 
 users = zb.collection("users")
 providers = users.list_auth_providers()
+oauth = users.oauth2_init("github")
 
 verifier = generate_code_verifier()
 challenge = code_challenge_s256(verifier)
-state = generate_code_verifier(32)  # any random string works for state too
-# 1. redirect to the provider's authorize URL with `challenge` + `state`
-# 2. on the callback, exchange the code:
+state = oauth.get("state")
+if not state:
+    raise ValueError("This example requires server-issued OAuth state")
+# Save verifier/state privately across the redirect. Build the provider URL from
+# oauth["authURL"], clientId and scopes, adding challenge/state and the redirect URL.
+# On the callback, read code and returned_state from the provider response:
+if returned_state != state:
+    raise ValueError("OAuth state mismatch")
 auth = users.auth_with_oauth2(
     provider="github",
     code=code,

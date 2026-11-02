@@ -3,7 +3,7 @@
 Every recorded change adds a small **fragment** file in this directory instead of editing
 `CHANGELOG.md`. At release time `scripts/assemble-changelog.sh` collects the fragments into
 a new version section in `CHANGELOG.md` and deletes them. (The published mirror
-`site/src/content/docs/changelog.md` is a generated artifact — see [At release](#at-release).)
+`site/content/docs/changelog.smd` is a generated artifact — see [At release](#at-release).)
 
 > ⚠️ **`scripts/assemble-changelog.sh` is NOT a validator — it is DESTRUCTIVE.** Running it
 > rewrites `CHANGELOG.md` (inserting a new version block) **and `git rm`s every fragment in
@@ -95,8 +95,8 @@ The release PR runs `scripts/assemble-changelog.sh [<version> [<date>]]` (versio
 3. inserts that block into `CHANGELOG.md`, and
 4. `git rm`s the consumed fragment files.
 
-It does **not** write `site/src/content/docs/changelog.md` — that mirror is a generated build
-artifact, regenerated from `CHANGELOG.md` by `site/scripts/gen-docs-mirror.mjs` on
+It does **not** write `site/content/docs/changelog.smd` — that mirror is a generated build
+artifact, regenerated from `CHANGELOG.md` by `site/scripts/gen-content.ts` on
 `npm run dev`/`build`. Never hand-edit it.
 
 The assembled block matters beyond the repo: the `v*` release workflow extracts it with

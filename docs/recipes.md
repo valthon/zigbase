@@ -258,7 +258,7 @@ A bad row (malformed JSON, validation failure, duplicate id) **fails fast**, rol
 in-flight batch, and names the offending line; batches committed before it persist (fix the
 file and re-run, ideally with `--upsert-key`). Id preservation is **import-only** — the HTTP
 create path always generates the id and never honors a client-supplied one. See
-[docs/framework.md](docs/framework.md) → "Offline bulk import" and `examples/golfsim/seed/`.
+[framework.md](framework.md) → "Offline bulk import" and `examples/golfsim/seed/`.
 
 ---
 
@@ -446,8 +446,10 @@ to control built-in record operations. A route guard does not replace record rul
 
 ## Recipe: a computed-field / validation `beforeCreate` hook
 
-A `beforeCreate` hook runs **after** access rules pass and **before** the write. It
-may mutate `ev.record` and may **return an error to reject** the write (the request
+A `beforeCreate` hook runs after early locked-rule/tenant gates and **before** the
+write. A conditional create rule is checked afterward, inside the same transaction;
+a denial rolls back the hook's database side-writes. Put external side effects in
+after-hooks. The hook may mutate `ev.record` and may **return an error to reject** the write (the request
 fails with `400`). This example, on `bookings`, (a) rejects a booking that overlaps
 an existing confirmed booking for the same listing, and (b) computes a derived
 `duration_minutes` field.
@@ -531,35 +533,38 @@ authenticated identity via `ctx.user()`, and the raw request (path params, body)
 const std = @import("std");
 const zigbase = @import("zigbase");
 
-/// POST /api/bookings/:id/confirm — host confirms a pending booking.
-fn confirmBooking(ctx: *zigbase.Ctx) anyerror!zigbase.http.Response {
-    const a = ctx.arena.a; // the request arena's allocator
-    const id = ctx.request.?.param("id") orelse
-        return ctx.jsonError(404, "not_found", "Not found.");
+const ConfirmBooking = struct { id: []const u8, user_id: []const u8 };
 
-    // DB access via the capability object — ctx.records() manages the pooled
-    // connection itself (no manual acquireWriter / Data wiring).
-    const records = ctx.records();
+fn confirmBookingTxn(t: *zigbase.Tx, p: *const ConfirmBooking) anyerror!std.json.Value {
+    const records = t.records();
+    const booking = (try records.getAs(struct { listing: []const u8, status: []const u8 }, "bookings", p.id))
+        orelse return error.BookingNotFound;
+    const listing = (try records.getAs(struct { simulator: []const u8 }, "listings", booking.listing))
+        orelse return error.BookingNotFound;
+    const simulator = (try records.getAs(struct { owner: []const u8 }, "simulators", listing.simulator))
+        orelse return error.BookingNotFound;
+    // Trusted record access bypasses REST rules: authorize the complete owner path.
+    if (!std.mem.eql(u8, simulator.owner, p.user_id)) return error.BookingNotFound;
+    if (!std.mem.eql(u8, booking.status, "pending")) return error.BookingNotPending;
 
-    // Load the booking (null = unknown collection OR missing record).
-    const booking = (try records.get("bookings", id, .{})) orelse
-        return ctx.jsonError(404, "not_found", "Not found.");
-
-    // Authorize: only the host who owns the booked listing's simulator may confirm.
-    // (ctx.user() is the authenticated identity; .auth = .authed on the route spec
-    // already guarantees a logged-in user.)
-    const uid = if (ctx.user()) |u| u.id else "";
-    _ = booking; // (look up listing.simulator.owner via records.get and compare to uid)
-    if (uid.len == 0)
-        return ctx.jsonError(403, "forbidden", "Forbidden.");
-
-    // Mutate: set status = "confirmed".
     var patch: std.json.ObjectMap = .empty;
-    try patch.put(a, "status", .{ .string = "confirmed" });
-    const updated = (try records.update("bookings", id, .{ .object = patch })) orelse
-        return ctx.jsonError(404, "not_found", "Not found.");
+    try patch.put(t.arena(), "status", .{ .string = "confirmed" });
+    return (try records.update("bookings", p.id, .{ .object = patch }))
+        orelse error.BookingNotFound;
+}
 
-    return .{ .status = 200, .body = try std.json.Stringify.valueAlloc(a, updated, .{}) };
+fn confirmBooking(ctx: *zigbase.Ctx) anyerror!zigbase.http.Response {
+    const user = ctx.user() orelse return ctx.jsonError(401, "unauthorized", "Sign in first.");
+    if (!std.mem.eql(u8, user.collection, "users"))
+        return ctx.jsonError(403, "forbidden", "A users session is required.");
+    const id = ctx.request.?.param("id") orelse return ctx.notFound();
+    const params = ConfirmBooking{ .id = id, .user_id = user.id };
+    const updated = ctx.txWith(std.json.Value, &params, confirmBookingTxn) catch |err| switch (err) {
+        error.BookingNotFound => return ctx.notFound(),
+        error.BookingNotPending => return ctx.jsonError(409, "conflict", "Only pending bookings can be confirmed."),
+        else => return err,
+    };
+    return ctx.json(200, updated);
 }
 ```
 
@@ -575,8 +580,12 @@ default if omitted is `.superuser`):
 Key points:
 
 - **Path params:** `ctx.request.?.param("id")` returns the captured `:id` (or `null`).
-- **The auth level is enforced by the framework before your handler runs**; inside,
-  use `ctx.user()` for finer authorization (e.g. owner checks).
+- **The auth level is enforced before your handler runs.** `ctx.records()` is
+  trusted server access and bypasses REST rules; explicitly verify the auth
+  collection, resource ownership, and permitted transition. This single-process
+  SQLite example checks and updates within one writer transaction. PostgreSQL
+  replicas require row locking or a conditional SQL mutation for an equivalent
+  read-check-write guarantee.
 - **Built-in routes win** over custom routes matching the same method+path, so namespace
   your routes (`/api/bookings/:id/confirm`, not a path that shadows a built-in).
 - Return any `zigbase.http.Response`; the body is a JSON string you allocate from
@@ -680,13 +689,16 @@ The full `zigbase.auth` surface used here:
   binds a small opaque, signed, tamper-proof string into the token (e.g. a post-login
   redirect path), returned by `verifyLinkToken` as `claims.pl` — carry bound state in the
   one token instead of an unsigned `&next=` URL param.
-- `zigbase.auth.deliverAuthMail(ctx.app, alloc, to, subject, body)` — sends the link
-  via the configured mailer (SMTP or log in dev).
+- `zigbase.auth.deliverAuthMail(ctx.app, to, subject, body)` — queues best-effort
+  delivery via the configured mailer (SMTP or log in dev). Returns `void`.
 - `zigbase.auth.verifyLinkToken(ctx.request.?, conn, collection, token)` — validates the JWT
   and returns `?jwt.Claims` (`null` → expired / wrong collection / bad signature).
   `claims.id` is the record id.
 - `zigbase.auth.consumeLinkToken(conn, claims)` — marks the token consumed; returns
   `error.AlreadyConsumed` on replay.
+- `zigbase.auth.beginAuthentication(ctx.request.?, conn, collection, record_id)` —
+  after verifying the primary proof, returns a pending two-factor response when
+  enrollment or another factor is required. Return it without issuing a session.
 - `ctx.issueSession(collection, record_id)` — issues a session from a route handler's
   `*Ctx`, sets the auth cookies, fires `onAuth(.custom)`, and returns `Issued{ .token, .cookies }`.
   This is the seam that guarantees **every login fires your `onAuth` handler**,
@@ -703,95 +715,62 @@ The full `zigbase.auth` surface used here:
 const std = @import("std");
 const zigbase = @import("zigbase");
 
-// Body shapes for the two endpoints.
 const MagicRequestBody = struct { email: []const u8 };
 const MagicConfirmBody = struct { token: []const u8 };
 
-/// POST /api/members/magic/request  { "email": "..." }
-///
-/// Always returns 204 — enumeration-safe. If the email matches a record, mints a
-/// single-use link token (TTL 900 s) and mails it. Rate-limited per IP/email.
 fn magicRequest(ctx: *zigbase.Ctx) anyerror!zigbase.http.Response {
     const a = ctx.arena.a;
-
-    // 1) Parse the request body first so we can key the rate limit on the parsed
-    //    email rather than the raw body (whitespace/key-order variants of the same
-    //    email would otherwise dodge the per-identity cap).
     const parsed = std.json.parseFromSlice(MagicRequestBody, a, ctx.request.?.body, .{}) catch
-        return .{ .status = 204, .body = "" }; // malformed body → silent 204
+        return .{ .status = 204, .body = "" };
     defer parsed.deinit();
     const email = parsed.value.email;
-
-    // 2) Rate-limit on the scope "magic-request" keyed on the parsed email.
-    //    rateLimit returns a ready-to-return 429 Response when limited.
     if (try zigbase.auth.rateLimit(ctx.request.?, "magic-request", email)) |resp| return resp;
 
-    // 3) Acquire a DB writer connection for the auth-helper calls that need a raw conn.
+    // One writer owns lookup + proof issuance. Runtime input is a bound value.
     const w = ctx.app.pool.acquireWriter();
     defer ctx.app.pool.releaseWriter();
-
-    // 4) Resolve the member record by email (DB lookup after rate-limit gate).
-    //    ctx.records().list returns an empty items slice when nothing matches — we treat
-    //    both "not found" and "found" paths the same way externally (always 204).
-    const results = try ctx.records().list("members", .{
-        .filter = try std.fmt.allocPrint(a, "email = \"{s}\"", .{email}),
-        .perPage = 1,
+    const data = zigbase.data.Data{ .app = ctx.app, .conn = w, .io = ctx.app.io, .alloc = a };
+    const results = try data.list("members", .{
+        .filter = "email = ?", .filter_args = &.{.{ .string = email }}, .perPage = 1,
     });
-    if ((results.totalItems orelse 0) > 0) {
-        const record = results.items[0];
-        const rid = record.object.get("id").?.string;
-
-        // Mint a single-use link token valid for 15 minutes. Pass `.{}` for no bound
-        // payload, or `.{ .payload = "/dashboard" }` to carry a signed post-login target.
-        const lt = try zigbase.auth.mintLinkToken(ctx.request.?, w, "members", rid, 900, .{});
-
-        // Build the magic-link URL (adapt the base URL to your deployment).
-        const link = try std.fmt.allocPrint(a,
-            "https://app.example.com/auth/confirm?token={s}", .{lt.token});
-        const body = try std.fmt.allocPrint(a,
-            "Click to sign in (link expires in 15 minutes):\n\n{s}", .{link});
-
-        // Deliver the email. Uses SMTP when configured, logs the token in dev.
-        try zigbase.auth.deliverAuthMail(
-            ctx.app, a, email, "Your sign-in link", body);
+    if (results.items.len > 0) {
+        const member = results.items[0];
+        const lt = try zigbase.auth.mintLinkToken(
+            ctx.request.?, w, "members", member.object.get("id").?.string, 900, .{},
+        );
+        const link = try std.fmt.allocPrint(a, "https://app.example.com/auth/confirm?token={s}", .{lt.token});
+        const body = try std.fmt.allocPrint(a, "Click to sign in (expires in 15 minutes):\n\n{s}", .{link});
+        // Best-effort queued delivery: no allocator argument and no error union.
+        zigbase.auth.deliverAuthMail(ctx.app, email, "Your sign-in link", body);
     }
-
-    // Always 204 — callers learn nothing about whether the email is registered.
     return .{ .status = 204, .body = "" };
 }
 
-/// POST /api/members/magic/confirm  { "token": "..." }
-///
-/// Verifies the single-use link token, consumes it (replay → 400), issues a
-/// real session, and returns 200 with the auth cookies set. onAuth fires here.
 fn magicConfirm(ctx: *zigbase.Ctx) anyerror!zigbase.http.Response {
     const a = ctx.arena.a;
-
     const parsed = std.json.parseFromSlice(MagicConfirmBody, a, ctx.request.?.body, .{}) catch
-        return .{ .status = 400, .body = "{\"message\":\"Invalid request body.\"}" };
+        return ctx.jsonError(400, "bad_request", "A token is required.");
     defer parsed.deinit();
-    const token = parsed.value.token;
+    if (try zigbase.auth.rateLimit(ctx.request.?, "magic-confirm", parsed.value.token)) |resp| return resp;
 
     const w = ctx.app.pool.acquireWriter();
     defer ctx.app.pool.releaseWriter();
-
-    // Verify: null = expired / wrong collection / bad signature.
-    const claims = (try zigbase.auth.verifyLinkToken(ctx.request.?, w, "members", token))
-        orelse return .{ .status = 400, .body = "{\"message\":\"Invalid or expired link.\"}" };
-
-    // Consume: error.AlreadyConsumed on replay — the link is single-use.
+    const claims = (try zigbase.auth.verifyLinkToken(ctx.request.?, w, "members", parsed.value.token))
+        orelse return ctx.jsonError(400, "bad_request", "Invalid or expired link.");
     zigbase.auth.consumeLinkToken(w, claims) catch |err| switch (err) {
-        error.AlreadyConsumed =>
-            return .{ .status = 400, .body = "{\"message\":\"Link already used.\"}" },
+        error.AlreadyConsumed => return ctx.jsonError(400, "bad_request", "Link already used."),
         else => return err,
     };
-
-    // Issue the session reusing the writer connection already held — do NOT call
-    // ctx.issueSession here; it acquires the writer a second time and would deadlock.
-    // zigbase.auth.issueSession takes an explicit conn and fires onAuth(.custom).
+    // A verified primary proof may still need enrollment or a second factor.
+    if (try zigbase.auth.beginAuthentication(ctx.request.?, w, "members", claims.id)) |pending|
+        return pending;
+    // Reuse the held writer; ctx.issueSession would acquire it again and deadlock.
     const issued = try zigbase.auth.issueSession(ctx.request.?, w, "members", claims.id);
-    // We mint with `zigbase.auth.issueSession(ctx.request.?, w, …)`, reusing the writer we already hold — do **not** call `ctx.issueSession(…)` while holding the writer, as it would acquire the single non-reentrant writer a second time and deadlock.
-    return .{ .status = 200, .body = "{\"ok\":true}", .cookies = &issued.cookies };
+    return .{
+        .status = 200,
+        .body = try std.json.Stringify.valueAlloc(a, .{ .token = issued.token }, .{}),
+        .cookies = try a.dupe(zigbase.http.Cookie, &issued.cookies),
+    };
 }
 ```
 
@@ -817,10 +796,10 @@ Key behaviours to note:
   token receives `400 "Link already used."`. The link also carries a TTL (900 s above) —
   an expired token returns `400 "Invalid or expired link."` before `consumeLinkToken` is
   reached.
-- **`onAuth` fires on confirm.** `zigbase.auth.issueSession` routes through the same seam as
-  password and OAuth2 logins, so your `onAuth` handler (if registered) is called on
-  every magic-link sign-in. There is no way to mint a session via this path — or any
-  custom path — that bypasses it. See [framework.md → Tier 3: escape hatch for exotic flows](framework.md#tier-3-escape-hatch-for-exotic-flows).
+- **Two-factor policy runs before session issuance.** `beginAuthentication` can return
+  a pending challenge or enrollment response. Only after that policy allows a full
+  session does this route call `issueSession`, which invokes `onAuth` through the same
+  seam as password and OAuth2 logins. See [framework.md → Tier 3: escape hatch for exotic flows](framework.md#tier-3-escape-hatch-for-exotic-flows).
 - **Rate limiting.** The request route calls `zigbase.auth.rateLimit` keyed on the
   parsed email (not the raw body). The built-in scope key `"magic-request"` is app-defined;
   use a descriptive scope per endpoint. Adjust the window and cap via the standard
@@ -875,76 +854,64 @@ Note: the existing custom-route magic-link recipe (above) remains the "low-level
 
 ## Recipe: custom `AuthMethod` plugin sketch
 
-A minimal custom plugin implementing the `AuthMethod` contract:
+A custom plugin implementing the `AuthMethod` contract with the existing signed,
+single-use link-token helpers. A trusted server issues its token; completion
+resolves the principal from the verified claims. Use the built-in magic-link
+method for ordinary email login; this example shows a custom delivery workflow.
 
 ```zig
 const std = @import("std");
 const zigbase = @import("zigbase");
 
-/// A minimal custom auth method that validates a pre-shared API key.
-/// In production, key lookup would hit a database or external service.
-const ApiKeyMethod = struct {
-    gpa: std.mem.Allocator,
-
-    pub fn create(gpa: std.mem.Allocator, io: std.Io, cfg: zigbase.Config) !ApiKeyMethod {
-        _ = io; _ = cfg;
-        return .{ .gpa = gpa };
+// A trusted server issues the link token (see the magic-link recipe above).
+// This plugin verifies and consumes that proof; clients cannot choose its owner.
+const SignedLinkMethod = struct {
+    pub fn create(_: std.mem.Allocator, _: std.Io, _: zigbase.Config) !SignedLinkMethod {
+        return .{};
     }
 
-    pub fn method(self: *ApiKeyMethod) zigbase.AuthMethod {
-        return .{
-            .slug = "api-key",
-            .ctx = self,
-            .vtable = &vtable,
-        };
+    pub fn method(self: *SignedLinkMethod) zigbase.AuthMethod {
+        return .{ .slug = "signed-link", .ctx = self, .vtable = &vtable };
     }
 
-    pub fn deinit(self: *ApiKeyMethod) void { _ = self; }
+    pub fn deinit(_: *SignedLinkMethod) void {}
 
-    const vtable = zigbase.AuthMethod.VTable{
-        .initiate = initiate,
-        .complete = complete,
-    };
+    const vtable = zigbase.AuthMethod.VTable{ .initiate = initiate, .complete = complete };
 
-    /// Phase 1: nothing to do for API-key auth (no challenge).
-    fn initiate(ctx: *anyopaque, ac: *zigbase.AuthCtx) anyerror!zigbase.AuthCtx.InitiateResult {
-        _ = ctx; _ = ac;
-        return .{ .status = 204, .body = null };
+    fn initiate(_: *anyopaque, _: *zigbase.AuthCtx) anyerror!zigbase.InitiateResult {
+        return .{ .status = 204 };
     }
 
-    /// Phase 2: validate the key, resolve to a record.
-    fn complete(ctx: *anyopaque, ac: *zigbase.AuthCtx) anyerror!zigbase.auth.Resolution {
-        _ = ctx;
-        const body = ac.ctx.body;
-
-        // Parse {"apiKey":"..."} from the request body.
+    fn complete(_: *anyopaque, ac: *zigbase.AuthCtx) anyerror!zigbase.Resolution {
         const parsed = std.json.parseFromSlice(
-            struct { apiKey: []const u8 }, ac.ctx.allocator.a, body, .{},
-        ) catch return .{ .fail = .{ .status = 400, .message = "Missing apiKey." } };
+            struct { token: []const u8 }, ac.ctx.allocator.a, ac.ctx.body, .{},
+        ) catch return .{ .fail = .{ .status = 400, .message = "A token is required." } };
         defer parsed.deinit();
 
-        // Look up the record by identity (here: by api key field).
-        // findByIdentity matches the collection's configured identity fields.
-        const record_id = (try ac.findByIdentity(parsed.value.apiKey))
-            orelse return .{ .fail = .{ .status = 401, .message = "Invalid API key." } };
-
-        // Return the record id — the framework mints the session + fires onAuth.
-        return .{ .record = record_id };
+        var w = ac.writer();
+        defer w.deinit();
+        const claims = (try ac.verifyLinkToken(w.conn, parsed.value.token))
+            orelse return .{ .fail = .{ .status = 400, .message = "Invalid or expired link." } };
+        ac.consumeLinkToken(w.conn, claims) catch |err| switch (err) {
+            error.AlreadyConsumed => return .{ .fail = .{ .status = 400, .message = "Link already used." } },
+            else => return err,
+        };
+        // The framework applies verification/two-factor policy and issues the session.
+        return .{ .record = claims.id };
     }
 };
 
-// Register at the app level and enable per collection:
+pub const RecipeApp = zigbase.App(.{
+    .auth = .{ .methods = .{SignedLinkMethod} },
+    .collections = .{
+        .members = .{ .type = .auth, .fields = .{}, .auth = .{
+            .methods = .{ .custom = &.{"signed-link"} },
+        } },
+    },
+});
+
 pub fn main(init: std.process.Init) !void {
-    return zigbase.App(.{
-        .auth = .{ .methods = .{ApiKeyMethod} },
-        .collections = .{
-            .services = .{ .type = .auth, .auth = .{
-                .methods = .{
-                    .custom = &.{"api-key"},  // enable by slug
-                },
-            } },
-        },
-    }).runCli(init);
+    return RecipeApp.runCli(init);
 }
 ```
 
@@ -953,7 +920,8 @@ Key points:
 - `complete` NEVER mints a session — it returns a `Resolution`. The framework mints via the seam (`issueSession`+`emitAuth`).
 - Rate-limiting is applied by the framework around both phases; `ac.rateLimit` is available for finer-grained control within the handler.
 - `initiate` may be a no-op (`.{ .status = 204 }`) for methods that need no challenge phase.
-- Custom plugins appear in the generated TypeScript client's `auth` surface as untyped stubs (currently).
+- Custom plugins appear in the generated TypeScript client's `auth` surface;
+  declare comptime I/O types when you need schema-specific method types.
 
 ---
 

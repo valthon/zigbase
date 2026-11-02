@@ -371,31 +371,57 @@ record, and flips its status:
 const std = @import("std");
 const zigbase = @import("zigbase");
 
-fn confirmBooking(ctx: *zigbase.Ctx) anyerror!zigbase.http.Response {
-    const a = ctx.arena.a; // the request arena's allocator
-    const id = ctx.request.?.param("id") orelse
-        return ctx.jsonError(404, "not_found", "Not found.");
+const ConfirmBooking = struct { id: []const u8, user_id: []const u8 };
+
+fn confirmBookingTxn(t: *zigbase.Tx, p: *const ConfirmBooking) anyerror!std.json.Value {
+    const records = t.records();
+    const booking = (try records.getAs(struct { listing: []const u8, status: []const u8 }, "bookings", p.id))
+        orelse return error.BookingNotFound;
+    const listing = (try records.getAs(struct { simulator: []const u8 }, "listings", booking.listing))
+        orelse return error.BookingNotFound;
+    const simulator = (try records.getAs(struct { owner: []const u8 }, "simulators", listing.simulator))
+        orelse return error.BookingNotFound;
+    // Trusted record access bypasses REST rules: authorize the complete owner path.
+    if (!std.mem.eql(u8, simulator.owner, p.user_id)) return error.BookingNotFound;
+    if (!std.mem.eql(u8, booking.status, "pending")) return error.BookingNotPending;
 
     var patch: std.json.ObjectMap = .empty;
-    try patch.put(a, "status", .{ .string = "confirmed" });
-    const updated = (try ctx.records().update("bookings", id, .{ .object = patch })) orelse
-        return ctx.jsonError(404, "not_found", "Not found.");
+    try patch.put(t.arena(), "status", .{ .string = "confirmed" });
+    return (try records.update("bookings", p.id, .{ .object = patch }))
+        orelse error.BookingNotFound;
+}
 
-    return .{ .status = 200, .body = try std.json.Stringify.valueAlloc(a, updated, .{}) };
+fn confirmBooking(ctx: *zigbase.Ctx) anyerror!zigbase.http.Response {
+    const user = ctx.user() orelse return ctx.jsonError(401, "unauthorized", "Sign in first.");
+    if (!std.mem.eql(u8, user.collection, "users"))
+        return ctx.jsonError(403, "forbidden", "A users session is required.");
+    const id = ctx.request.?.param("id") orelse return ctx.notFound();
+    const params = ConfirmBooking{ .id = id, .user_id = user.id };
+    const updated = ctx.txWith(std.json.Value, &params, confirmBookingTxn) catch |err| switch (err) {
+        error.BookingNotFound => return ctx.notFound(),
+        error.BookingNotPending => return ctx.jsonError(409, "conflict", "Only pending bookings can be confirmed."),
+        else => return err,
+    };
+    return ctx.json(200, updated);
 }
 ```
 
-`ctx` (`*zigbase.Ctx`) is the per-request capability object: the raw request via
-`ctx.request.?` (path params with `ctx.request.?.param`), the authenticated identity via
-`ctx.user()`, and DB access via `ctx.records()` — which checks out and releases a pooled
-connection for you, so there is no manual `acquireWriter` / `Data` wiring. The full
-version (with owner authorization) is in
+`ctx` (`*zigbase.Ctx`) supplies the raw request (`ctx.request.?`) and authenticated
+identity (`ctx.user()`). For independent operations, `ctx.records()` manages pooled
+connections for you. This example instead uses `ctx.txWith` to hold one writer
+transaction: the callback's `t.records()` runs the ownership reads and status
+update on that same connection, and the framework commits or rolls back the unit.
+Record operations are trusted server access and do not run REST access rules. The example
+verifies the caller's auth collection, walks the ownership relation, and accepts
+only a pending-to-confirmed transition in one SQLite writer transaction. This
+tutorial runs one SQLite process; PostgreSQL replicas also need row locking or a
+conditional SQL mutation for that read-check-write sequence. More route guidance is in
 [Recipes → a custom business route](./recipes#recipe-a-custom-business-route-with-a-path-param--db-write).
 
 ## 7. Add a scheduled job
 
 A nightly job cancels stale pending bookings. A `JobEvent` still carries `app` and `name`,
-but the scheduler now hands the job a `*zigbase.Ctx` first — so, like the route above, you
+but the scheduler now hands the job a `*zigbase.Ctx` first — you can
 read and write through `ctx.records()` (which manages the pooled connection for you, no
 manual wiring):
 

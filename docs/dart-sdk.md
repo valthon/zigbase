@@ -137,11 +137,15 @@ zb.authStore.onChange.listen((event) {
 ```dart
 // Discover configured providers (name, authUrl, clientId, scopes):
 final providers = await zb.collection('users').listAuthProviders();
+final oauth = await zb.collection('users').oauth2Init('github');
 
 final pkce = createPkceChallenge(); // { verifier, challenge }
-final state = randomState();
-// 1. redirect the user to the provider authorize URL with pkce.challenge + state
-// 2. on callback, exchange the code:
+final state = oauth.state;
+if (state == null) throw StateError('This example requires server-issued OAuth state');
+// Save pkce.verifier/state privately across the redirect. Build the provider URL
+// from oauth.authUrl/clientId/scopes, adding pkce.challenge, state and redirectUrl.
+// On the callback, read code and returnedState from the provider response:
+if (returnedState != state) throw StateError('OAuth state mismatch');
 final token = await zb.collection('users').authWithOAuth2(
   provider: 'github',
   code: code,

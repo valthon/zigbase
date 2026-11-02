@@ -183,17 +183,22 @@ with the new token.
 ```kotlin
 import io.github.valthon.zigbase.auth.codeChallengeS256
 import io.github.valthon.zigbase.auth.generateCodeVerifier
+import kotlinx.serialization.json.jsonPrimitive
 
 val users = zb.collection("users")
 
 // Discover configured providers (name, authURL, clientId, scopes):
 val providers = users.listAuthProviders()
+val oauth = users.oauth2Init("github")
 
 val verifier = generateCodeVerifier()
 val challenge = codeChallengeS256(verifier)
-val state = generateCodeVerifier(32)   // any random string works for state too
-// 1. redirect the user to the provider authorize URL with `challenge` + `state`
-// 2. on the callback, exchange the code:
+val state = oauth["state"]?.jsonPrimitive?.content
+    ?: error("This example requires server-issued OAuth state")
+// Save verifier/state privately across the redirect. Build the provider URL from
+// oauth's authURL/clientId/scopes, adding challenge, state and your redirect URL.
+// On the callback, read code and returnedState from the provider response:
+require(returnedState == state) { "OAuth state mismatch" }
 val auth =
     users.authWithOAuth2(
         provider = "github",
@@ -317,8 +322,8 @@ Every read/write returns a `ZbRecord` — a thin wrapper over the raw `JsonObjec
 null-safe typed accessors: `record.id`, `record.getString("title")`, `record.getInt("views")`,
 `record.getDouble(...)`, `record.getBoolean(...)`, `record.getStringList(...)`, `record.expand`
 — plus `record["key"]` for the raw `JsonElement` and `record.raw` for the whole object. Nothing
-validates a record's shape against its collection's schema (that's the [typed
-tier](#divergences-and-whats-next)'s job in a future release) — every accessor is best-effort
+validates a record's shape against its collection's schema (use the generated
+[typed tier](#typed-tier) for schema-specific models) — every accessor is best-effort
 and returns `null` rather than throwing on a missing or mistyped field.
 
 ### Safe filters — `zbFilter`

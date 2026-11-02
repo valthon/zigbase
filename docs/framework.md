@@ -20,16 +20,20 @@ for resource profiles, effective settings, and measurement-driven tuning.
 
 ## 1. Overview
 
-The shipped binary is, in its entirety:
+The smallest framework application is:
 
 ```zig
 const std = @import("std");
 const zigbase = @import("zigbase");
 
 pub fn main(init: std.process.Init) !void {
-    return zigbase.App(.{}).runCli(init); // no extensions = the stock server
+    return zigbase.App(.{}).runCli(init);
 }
 ```
+
+The stock server additionally enables `.enable_typegen`, `.mail = .{}`, and
+`.auth.two_factor` with TOTP and WebAuthn. Embedded applications opt into those
+features explicitly; the empty configuration above does not enable them.
 
 `App(cfg)` is a **comptime** application builder. Everything you register is
 assembled and validated when your program compiles:
@@ -315,8 +319,8 @@ Add `_ = ctx;` when a hook doesn't use it.
 - `rctx` — the request context; `ev.rctx.auth` is the authenticated record (if
   any). Named `rctx` (not `ctx`) — `ctx` always means the `*zigbase.Ctx`
   parameter in a hook signature.
-- `arena: std.mem.Allocator` — the **request-scoped** allocator that owns
-  `record`'s JSON storage.
+- `arena: zigbase.RequestArena` — the **request-scoped** arena handle that owns
+  `record`'s JSON storage; use `ev.arena.a` for its allocator.
 - `collection: []const u8` — the collection name.
 - `record: *std.json.Value` — mutable in `before_*`; the persisted record in
   `after_*`.
@@ -328,7 +332,11 @@ Need the app itself (e.g. `app.allocator`, `app.io`)? Use the hook's `ctx.app`
 ### Semantics
 
 - **`before*` hooks** may MUTATE `ev.record` and may return an error to REJECT
-  the write (the request fails with `400`). They run AFTER access rules pass.
+  the write (the request fails with `400`). Early locked-rule and tenant gates
+  run first; conditional create/update predicates are checked in the write
+  transaction after the hook. A later denial rolls back its database side-writes.
+  A before-hook is not proof of final authorization: keep external side effects
+  in after-hooks, where they run only after commit.
 - **`after*` hooks** are post-commit. An error returned from an after-hook is
   swallowed and routed to the error backstop (it does not undo the committed
   write).
@@ -619,6 +627,12 @@ An untyped route handler reaches the database through `ctx.records()` — the sa
 out a pooled reader for reads and acquires the pool writer per write call, releasing
 both when the framework tears the ctx down, so there is no manual `acquireReader` /
 `acquireWriter` + `Data` wiring.
+
+This is trusted server access: `get` and mutation helpers do not enforce REST access
+rules. `list` and expand retain their documented tenant/ability scoping; they do
+not replace a route's authorization check. Custom routes must authorize the caller's
+auth collection, ownership, and allowed operation explicitly. Use `ctx.txWith` when the check and mutation must
+share a writer transaction; see the [booking recipe](recipes.md#recipe-a-custom-business-route-with-a-path-param--db-write).
 
 For custom HTTP routes, authentication and tenant resolution release their lookup
 reader before route guards and the handler run. Identity, session and membership
@@ -2661,7 +2675,7 @@ Each auth collection in `.collections` can declare a `.auth.methods` struct enab
 | Password | `password` | (none beyond `rate_limit`) | Built-in default when no `.methods` specified |
 | Magic link | `magic_link` | `ttl_s: i64` (default 900), `auto_create: bool` (default false) | when `auto_create=true`, provisions an account for unknown identities; initiate emails link; complete verifies+consumes |
 | OTP | `otp` | `length: u8` (default 6), `ttl_s: i64` (default 300), `auto_create: bool` (default false) | when `auto_create=true`, provisions an account for unknown identities; initiate emails code; complete verifies code |
-| WebAuthn | `webauthn` | `rp_id: []const u8`, `rp_name: []const u8`, `origin: []const u8`, `credentials_collection: []const u8`, `require_uv: bool` (default false) | all four string fields required; `require_uv` rejects assertions without user-verification (biometrics/PIN) |
+| WebAuthn | `webauthn` | `rp_id: []const u8`, `rp_name: []const u8`, `origin: []const u8`, `require_uv: bool` (default false), `credentials_collection: []const u8` (ignored compatibility option) | non-empty `rp_id` and `origin` are required; set `rp_name` for browser display. Credentials use the internal `_webauthnCredentials` store; `require_uv` rejects assertions without user-verification (biometrics/PIN) |
 | OAuth2 | (see below) | gated by `.auth.oauth2.enabled` + `.auth.oauth2.providers` | 5th built-in; uses the contract but is NOT listed in `.auth.methods` |
 
 **Per-collection auth options** (set directly on `.auth`, independent of which methods are enabled):
@@ -2687,7 +2701,6 @@ Example — two collections, each with different methods:
             .rp_id = "app.example.com",
             .rp_name = "My App",
             .origin = "https://app.example.com",
-            .credentials_collection = "webauthnCredentials",
         } },
     } },
 },
@@ -2791,10 +2804,10 @@ pub const AuthCtx = struct {
 
     // Blessed helpers (each takes the conn you acquired):
     pub fn rateLimit(ac: *AuthCtx, scope: []const u8, ident: []const u8) !?http.Response;
-    pub fn mintLinkToken(ac: *AuthCtx, conn: *db.Db, record_id: []const u8, ttl_s: i64) ![]const u8;
+    pub fn mintLinkToken(ac: *AuthCtx, conn: *db.Db, record_id: []const u8, ttl_s: i64, opts: zigbase.auth.MintOptions) ![]const u8;
     pub fn verifyLinkToken(ac: *AuthCtx, conn: *db.Db, token: []const u8) !?Claims;
     pub fn consumeLinkToken(ac: *AuthCtx, conn: *db.Db, claims: Claims) !void;
-    pub fn deliverMail(ac: *AuthCtx, to: []const u8, subject: []const u8, body: []const u8) !void;
+    pub fn deliverMail(ac: *AuthCtx, to: []const u8, subject: []const u8, body: []const u8) void;
     pub fn findByIdentity(ac: *AuthCtx, conn: *db.Db, identity: []const u8) !?[]const u8;
 };
 
@@ -2812,29 +2825,43 @@ A plugin type missing `create`/`method`/`deinit` is a **compile error**. Built-i
 
 **Login flow (via the two-phase contract):**
 
-1. `initiate`: POST body `{ "identity": "user@example.com" }` (optional for discoverable credentials). Returns `{ "challenge": "...", "rpId": "...", "ceremonyId": "..." }`.
+1. `initiate`: POST body `{ "identity": "user@example.com" }` (optional for discoverable credentials). Returns `{ "challenge": "...", "rpId": "...", "ceremonyId": "...", "timeout": 300000 }`.
 2. Browser calls `navigator.credentials.get()` with the options.
 3. `complete`: POST body `{ "ceremonyId": "...", "credentialId": "...", "authenticatorData": "...", "clientDataJSON": "...", "signature": "..." }`. On success, the framework mints the session and fires `onAuth(.webauthn)`.
 
 **Passkey registration (requires an existing session):**
 
-1. `POST /api/collections/:col/auth/webauthn/register/begin` → returns `{ "challenge": "...", "rpId": "...", "rpName": "...", "ceremonyId": "..." }`.
+1. `POST /api/collections/:col/auth/webauthn/register/begin` → returns WebAuthn creation options plus a ceremony id: `{ "rp": { "id", "name" }, "user": { "id", "name", "displayName" }, "challenge": "...", "pubKeyCredParams": [...], "timeout": 300000, "ceremonyId": "..." }` (see [api.md](api.md#auth-method-endpoints-pluggable-auth) for the full shape).
 2. Browser calls `navigator.credentials.create()` with those options.
-3. `POST /api/collections/:col/auth/webauthn/register/finish` with `{ "ceremonyId": "...", "id": "...", "rawId": "...", "response": { "clientDataJSON": "...", "attestationObject": "..." } }`. Stores the credential in `_webauthnCredentials` bound to the authenticated user.
+3. `POST /api/collections/:col/auth/webauthn/register/finish` with the flat body `{ "ceremonyId": "...", "clientDataJSON": "...", "attestationObject": "..." }` (base64url). Stores the credential in `_webauthnCredentials` bound to the authenticated user and returns `204` with no body.
 
 Notes:
 - Supports ES256 (P-256, COSE -7) and Ed25519 (COSE -8) public keys; the COSE key curve is validated against the algorithm (ES256→P-256, EdDSA→Ed25519).
 - Attestation format: `fmt:"none"` (v1; other formats are future work).
 - `signCount` is tracked; a count regression (possible credential clone) fails authentication closed.
-- Each credential is bound to the collection it was registered on; presenting it on a different collection returns `401`.
+- Each credential is bound to the collection it was registered on; presenting it on a different collection returns `400` (`Unknown credential.`).
 - `require_uv: true` rejects assertions where the authenticator did not perform user verification (biometrics or PIN). Default `false`.
-- Requires `webauthn.credentials_collection` to name a collection that stores credentials.
+- Credentials are stored in the engine-owned `_webauthnCredentials` table. The
+  retained `credentials_collection` option is a compatibility field: it may be
+  empty and does not select or provision a different store.
+
+The HTTP responses are JSON wire options. Before invoking the browser API, decode
+the base64url `challenge` to bytes; for primary registration, encode the raw record
+ID in `user.id` as UTF-8 bytes. Pass the resulting options as `{ publicKey: options }`
+and keep `ceremonyId` separately. Encode response buffers (`clientDataJSON`,
+`attestationObject`, `authenticatorData`, `signature`, and the credential's raw ID)
+as unpadded base64url before posting the flat proof. The second-factor endpoints
+instead encode their creation-option `user.id` as base64url; follow their
+[wire contract](api.md#two-factor-authentication).
 
 ### ChallengeStore
 
-`ChallengeStore` is a TTL'd, GC'd server-side store backed by `_authChallenges`. It is used internally by `magic_link` (the link token), `otp` (the emailed code), and `webauthn` (ceremony challenges). Custom plugins may access it via `AuthCtx.challengeStore()`, which returns a handle with:
-- `store(id, data, ttl_s)` — store a challenge under `id` with the given TTL.
-- `consume(id) ![]const u8` — retrieve and delete in one atomic step (single-use).
+The internal `ChallengeStore` backs `_authChallenges` and is used by OTP and
+WebAuthn. Its connection-bound `put`/`take` operations are implementation details;
+`AuthCtx` does not expose a `challengeStore()` accessor. Consumer plugins should
+use the public `mintLinkToken` / `verifyLinkToken` / `consumeLinkToken` helpers
+for signed, single-use link proofs, or own an explicit challenge table and its
+expiry/consumption policy. Acquire and release the writer through `ac.writer()`.
 
 ### OAuth2 providers (`.auth.oauth2`)
 
@@ -3029,9 +3056,9 @@ pub fn rotate(ctx: *Ctx) !Issued            // bump epoch + re-mint (kill other 
 
 // Send auth email via the configured mailer (SMTP or log in dev).
 pub fn deliverAuthMail(
-    app: *App, alloc: std.mem.Allocator,
+    app: *Runtime,
     to: []const u8, subject: []const u8, body: []const u8,
-) !void
+) void
 
 // Rate-limit helper — returns a ready-to-return 429 Response when the caller
 // is over the limit, null otherwise. scope identifies the endpoint; ident is the
@@ -6126,7 +6153,7 @@ to `@test@`, or `ZIGBASE_FIELD_KEY` if set). Fake and real envelopes are mutuall
 unreadable, so a fake-encrypted database fails closed on a real binary. The in-process
 test harness (§15) exposes the same behavior via `StartOptions.field_crypto` /
 `field_key` (this is how a `.encrypted`-field app is booted under test). See
-[Fields → Encryption at rest](./fields) for the field-level details.
+[Fields → Encryption at rest](fields.md) for the field-level details.
 
 ```sh
 ZIGBASE_FIELD_CRYPTO=fake ./zigbase serve --insecure-cookies ...
@@ -6432,7 +6459,8 @@ The public surface (from `src/root.zig`):
 - `zigbase.Tx` — the transaction scope passed to a `ctx.tx(T, fn(*Tx) ...)` callback
   (`t.records()`, `t.arena()`).
 - `zigbase.Migration` — the `.migrations` entry type (bare tuple or typed slice);
-  `zigbase.Db` — the writer connection passed to a migration's `.up`.
+  its `up` / `down` / `change` callbacks receive `*zigbase.Migrator`.
+  `zigbase.Db` is the database connection type used by lower-level APIs.
 - `zigbase.StaticFile` — the embedded manifest entry type (path, bytes, etag); used
   by `.static_files = .{ .embedded = ... }`.
 - `zigbase.Storage` / `zigbase.Mailer` / `zigbase.Email` — the storage & mailer
@@ -6449,7 +6477,7 @@ The public surface (from `src/root.zig`):
   `ctx.enqueueByName`.
 - `zigbase.AuthMethod` — the auth plugin vtable type.
 - `zigbase.AuthCtx` — the per-request auth context passed to plugin phases.
-- `zigbase.auth.Resolution` / `zigbase.auth.InitiateResult` — the phase return types.
+- `zigbase.Resolution` / `zigbase.InitiateResult` — the phase return types.
 - `zigbase.testing` — the in-process test harness (`testing.start(App, .{})` →
   `Harness` with `request` / `mintSession` / `loginSuperuser` / `createRecord` /
   `captureMail`). See [§15](#15-testing-your-app-zigbasetesting).
