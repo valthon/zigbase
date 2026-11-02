@@ -115,15 +115,20 @@ once with the new token.
 ```kotlin
 import io.github.valthon.zigbase.auth.codeChallengeS256
 import io.github.valthon.zigbase.auth.generateCodeVerifier
+import kotlinx.serialization.json.jsonPrimitive
 
 val users = zb.collection("users")
 val providers = users.listAuthProviders()
+val oauth = users.oauth2Init("github")
 
 val verifier = generateCodeVerifier()
 val challenge = codeChallengeS256(verifier)
-val state = generateCodeVerifier(32)   // any random string works for state too
-// 1. redirect to the provider's authorize URL with `challenge` + `state`
-// 2. on the callback, exchange the code:
+val state = oauth["state"]?.jsonPrimitive?.content
+    ?: error("This example requires server-issued OAuth state")
+// Save verifier/state privately across the redirect. Build the provider URL from
+// oauth's authURL/clientId/scopes, adding challenge, state and your redirect URL.
+// On the callback, read code and returnedState from the provider response:
+require(returnedState == state) { "OAuth state mismatch" }
 val auth = users.authWithOAuth2(
     provider = "github",
     code = code,

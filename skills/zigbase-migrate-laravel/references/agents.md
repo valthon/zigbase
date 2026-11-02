@@ -452,5 +452,5 @@ Machine-readable indexes: <https://valthon.github.io/zigbase/llms.txt> and
 Different job, different rules — those live in the repository's `CLAUDE.md` and
 `CONTRIBUTING.md`. The short version: changelog entries go in `changelog.d/`
 fragments and never in `CHANGELOG.md`; published docs under
-`site/src/content/docs/` are generated and must never be hand-edited; and a
+`site/content/docs/` are generated and must never be hand-edited; and a
 green `zig build test` does not imply a green browser suite.

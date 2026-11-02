@@ -14,10 +14,11 @@ repoPath: examples/blog
 # Blog
 
 A minimal application built on **ZigBase as a library**. It imports the
-`zigbase` module, then registers a single `before_create` record hook on the
-`posts` collection that derives a URL `slug` from the post `title` when one
-isn't supplied. Everything else — HTTP API, SQLite storage, auth, CLI — comes
-straight from the framework.
+`zigbase` module, declares its users/posts schema, and chains record hooks to
+derive a slug, stamp the author, and calculate reading time. A published-post
+route and an hourly cron job complete the example; HTTP CRUD, SQLite storage,
+auth, realtime, and the CLI come from the framework. The hook below isolates
+slug generation; see the source and README for the complete application.
 
 
   ![The blog example's retro 90s GeoCities-style home page: a 'Latest posts' list of post cards with titles, dates, and excerpts, served by the blog binary itself](../../assets/screenshots/example-blog-home.png)

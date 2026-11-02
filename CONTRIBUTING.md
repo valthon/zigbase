@@ -299,16 +299,16 @@ part of every PR, not an afterthought.
   document, run `python3 tools/sync_skill_references.py`; CI runs the same command with `--check`.
   The generator converts repository-relative Markdown links to stable repository URLs so the
   standalone skill bundle has no dangling local links.
-- **The published site under `site/src/content/docs/` is generated** from those by
-  `site/scripts/gen-docs-mirror.mjs`, which runs automatically on `npm run dev` / `npm run build`.
+- **The published SuperMD under `site/content/docs/` is generated** from those by
+  `site/scripts/gen-content.ts`, which runs automatically on `npm run dev` / `npm run build`.
   **Never hand-edit a mirror** — they are gitignored build artifacts. Edit the canonical file and
   the mirror follows.
-- **The exceptions** are the site-authored pages with no `docs/` canonical: `configuration.md`,
-  `overview.md`, and the `.mdx` pages (`tutorial.mdx`, `quick-start.mdx`). Edit those in `site/`
-  directly. New CLI flags and env vars go in `site/src/content/docs/configuration.md`.
+- **The exceptions** are the site-authored Markdown pages under `site/sources/docs/`:
+  `configuration.md`, `overview.md`, `tutorial.md`, and `quick-start.md`. Edit those sources
+  directly. New CLI flags and env vars go in `site/sources/docs/configuration.md` as well as
+  the README reference; the parity tests require the same supported environment settings.
 - **`docs/superpowers/` is a historical design archive.** Do not rewrite it.
-- **The three examples are a deliberate complexity ladder** — `examples/blog` (bare packaging
-  proof), `examples/golfsim` (a realistic app), `examples/plugins` (the advanced comptime surface).
+- **The three examples are a deliberate complexity ladder** — `examples/blog` (basic hooks, route, cron, and frontend), `examples/golfsim` (a realistic app), `examples/plugins` (the advanced comptime surface).
   Update their code *and* READMEs when behavior, defaults, fields, APIs, or access rules change,
   and keep blog the simplest and plugins the most advanced. Each is a standalone consumer package
   with its own vendored `zig-pkg/zap` — do not edit vendored dependencies.

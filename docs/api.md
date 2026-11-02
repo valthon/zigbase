@@ -409,11 +409,12 @@ other character is rejected. The bound parameter receives the unescaped value.
 | `@request.account.role` | the principal's role in the active account (`""` when none) |
 | `@request.account.ids` | **list macro** — every account the principal belongs to; use with `in` |
 
-> The `@request.account.*` macros are the **foundation** for multi-tenancy and
-> row-level/relationship authorization. Until the tenancy resolver ships they resolve
-> to `""` / the empty list, so a rule using them is fail-closed and existing rules are
-> unaffected. A typical use is scoping a collection to the caller's accounts:
-> `account in @request.account.ids`.
+> With tenancy enabled, the resolver fills `@request.account.id` and `.role`
+> from the caller's active membership selected by `X-Account-Id` or the signed
+> account cookie; `.ids` contains the caller's active account memberships.
+> Disabled tenancy or an anonymous caller yields empty values. An absent or
+> invalid account selection leaves `.id` and `.role` empty even when `.ids`
+> contains memberships. Resolution fails closed. See [Multi-tenancy](tenancy.md).
 
 For a superuser the authenticated collection is `_superusers`; ordinary record rules
 are bypassed by superusers, so a collection predicate does not restrict their access.
@@ -851,7 +852,7 @@ The `redirect` target is validated **server-side** so each app does not re-imple
 // request (identity optional for discoverable credentials)
 { "identity": "user@example.com" }
 // response (200)
-{ "challenge": "<base64url>", "rpId": "app.example.com", "ceremonyId": "<opaque>" }
+{ "challenge": "<base64url>", "rpId": "app.example.com", "ceremonyId": "<opaque>", "timeout": 300000 }
 ```
 
 **webauthn complete:**
@@ -1554,8 +1555,10 @@ REST invalidation recovery, not exactly-once delivery or an audit/event-sourcing
 Database backups must include the journal tables. Restoring or rewinding a database
 requires clients to discard checkpoints and reload snapshots; restored history can
 reuse earlier journal positions. Before serving a restored database, with all
-instances stopped, replace `_replay_state.secret` with a newly generated
-cryptographically random 32-byte secret encoded as 64 hexadecimal characters.
+instances stopped, replace the `secret` column in row `id = 1` of the
+`_replay_state` journal table with a newly generated cryptographically random
+32-byte secret encoded as 64 hexadecimal characters. This is a database value,
+not a file in the data directory. See the [SQLite and PostgreSQL rotation commands](deployment.md#rotate-the-durable-replay-secret).
 This forces old cursors to return `409`, including clients unaware of the restore. Normal database durability settings
 apply. Startup creates `_replay_state` and `_replay_events` in SQLite `main` or the
 PostgreSQL current schema; internal SQL qualifies that schema so temporary tables
@@ -1885,11 +1888,14 @@ do not acquire admission permits, even when the retained-byte budget is full.
 
 With `-Dcoordinated-admission=true` and `.admission.max_work`, `work_limit` is
 the shared ceiling for `active + jobs`; `jobs` counts queued/running memory jobs
-and `app.submit` tasks, including retry backoff. `work_high_water` records peak
+and `app.submit` tasks, including retry backoff, plus one permit for each active
+serial durable poll batch. `work_high_water` records peak
 combined occupancy, and saturating `jobs_rejected` counts shared-budget job
 refusals, not independent ring-full errors. Without shared admission,
 `work_limit` is `null` and the three shared counters are zero. These are
-process-local work counts, not memory measurements; durable jobs are excluded.
+process-local work counts, not memory measurements. Retained durable backlog
+rows do not each consume a permit; database capacity and claimed payload memory
+have separate semantics.
 
 Optional `.admission.max_job_bytes` adds `job_bytes_limit` (nullable), `job_bytes`,
 `job_bytes_high_water`, and saturating `job_bytes_rejected`. These count precisely

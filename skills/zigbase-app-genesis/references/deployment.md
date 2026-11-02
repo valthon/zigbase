@@ -335,12 +335,51 @@ Rehearse restore into a different directory or non-production service:
 
 1. provision the exact ZigBase version that created the backup;
 2. restore the complete data directory with correct ownership;
-3. start on a non-public port/origin;
-4. run health, meta, `migrate status`, and `doctor --production`;
-5. authenticate a test user and read an uploaded file; and
-6. record the measured recovery time and any manual step.
+3. if durable realtime replay was enabled, keep all instances stopped and rotate
+   the `secret` column in row `id = 1` of the `_replay_state` journal table using
+   the [SQL commands below](#rotate-the-durable-replay-secret). Require clients to
+   discard old checkpoints and reload snapshots. A restore can reuse old journal positions;
+   retaining the old secret can make an old checkpoint appear valid against rewound
+   history. Follow the [durable replay restore contract](https://github.com/valthon/zigbase/blob/main/docs/api.md#durable-record-invalidation-replay-sqlite-and-postgresql)
+   before starting any restored instance;
+4. start on a non-public port/origin;
+5. run health, meta, `migrate status`, and `doctor --production`;
+6. authenticate a test user and read an uploaded file; and
+7. record the measured recovery time and any manual step.
 
 Never test restore by overwriting the only production copy.
+
+### Rotate the durable replay secret
+
+Run **one** of these alternatives against the restored database while every
+ZigBase instance remains stopped. `_replay_state` is a database table; its
+`secret` column holds exactly 64 hexadecimal characters, encoding 32 random bytes.
+Generate the replacement with `openssl rand`, independently of the restored value.
+
+For SQLite, set the path to the restored `data.db`:
+
+```sh
+RESTORED_SQLITE=/path/to/restored/data.db
+replay_secret=$(openssl rand -hex 32) || exit 1
+sqlite3 "$RESTORED_SQLITE" "UPDATE main._replay_state SET secret = '$replay_secret' WHERE id = 1; SELECT changes();"
+```
+
+Expect `1` changed row. For PostgreSQL, set the restored database connection URL
+and `replay_schema` to the schema used by the deployment (`public` below):
+
+```sh
+RESTORED_PG_URL='postgres://user:password@host/restored_database'
+replay_secret=$(openssl rand -hex 32) || exit 1
+psql "$RESTORED_PG_URL" -v ON_ERROR_STOP=1 -v replay_schema=public -v replay_secret="$replay_secret" <<'SQL'
+UPDATE :"replay_schema"._replay_state SET secret = :'replay_secret' WHERE id = 1;
+SQL
+```
+
+Expect `UPDATE 1`. If the table is missing or the changed-row count is different,
+keep instances stopped and verify the restored database and schema. Do not create
+a replacement journal table or change its `sequence`/`floor` counters. After rotation,
+old checkpoints return `409 resetRequired`; clients must obtain new checkpoints
+and reload their snapshots.
 
 ## Upgrades and rollback
 

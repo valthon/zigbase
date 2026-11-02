@@ -73,13 +73,17 @@ const off = zb.authStore.onChange((token, record) => {
 ### OAuth2 (Authorization-Code + PKCE)
 
 ```ts
-import { createPkceChallenge, randomState } from "@zigbase/client";
+import { createPkceChallenge } from "@zigbase/client";
 
-const { providers } = await zb.collection("users").listAuthProviders();
+const { items: providers } = await zb.collection("users").listAuthProviders();
+const oauth = await zb.collection("users").oauth2Init("github");
 const { verifier, challenge } = await createPkceChallenge();
-const state = randomState();
-// 1. redirect to the provider authorize URL with `challenge` + `state`
-// 2. on the callback, exchange the code:
+const state = oauth.state;
+if (!state) throw new Error("This example requires server-issued OAuth state");
+// Save verifier/state privately across the redirect. Build the provider URL from
+// oauth.authURL/clientId/scopes, adding challenge, state, and your redirect URL.
+// On the callback, read code and returnedState from the provider response:
+if (returnedState !== state) throw new Error("OAuth state mismatch");
 await zb.collection("users").authWithOAuth2({
   provider: "github",
   code,
@@ -223,9 +227,9 @@ in the TypeScript SDK docs for the full flag reference and CI staleness-gate rec
 ## Typed client — `@zigbase/client/typed`
 
 `@zigbase/client/typed` is the **generic typed core** that a generated `zbase.gen.ts` file
-instantiates into a fully type-safe, schema-aware client. The generator is coming in SP2.1b;
-for now, the hand-authored fixture `test/fixtures/blog.gen.ts` serves as the reference pattern
-for what the generator will emit.
+instantiates into a fully type-safe, schema-aware client. Generate it at comptime with
+`zig build gen-client` or from a live/offline schema with `npx @zigbase/typegen`.
+The fixture `test/fixtures/blog.gen.ts` illustrates the runtime core's generated shape.
 
 The subpath exports runtime factories (`makeRecordService`, `makeTypedRealtime`,
 `makeTypedFiles`) and the `where`-DSL compiler + fluent builder. A generated client imports
@@ -262,8 +266,8 @@ const page = await posts.getList({ where: { status: "published" }, sort: "-creat
 // page.items[0]?.title — typed string
 ```
 
-Until the Zig generator lands (SP2.1b), see `test/fixtures/blog.gen.ts` for the full worked
-example of what a generated client looks like, including expand-narrowed `getOne`, typed `create`/
+See `test/fixtures/blog.gen.ts` for a worked example of the generated client shape,
+including expand-narrowed `getOne`, typed `create`/
 `update` payloads, fluent filter builder, and realtime/files surfaces.
 
 ## Typed RPC — `zb.rpc.*`

@@ -60,7 +60,8 @@ not API-compatible.
   rotate keys live with `zigbase rewrap`. → [Framework](./framework)
 - **TTL / expiry** — declare `.ttl_field` on a collection and the framework GC's expired
   rows automatically every 5 minutes. → [Framework](./framework)
-- **KV store & feature flags** — built-in key-value store (`ctx.kv` / `ctx.flag`)
+- **KV store & feature flags** — built-in key-value store (`ctx.kv()`) and declared
+  flags (`App.flag(ctx, .name)` / `ctx.flagByName("name")`)
   accessible from hooks and routes; managed in the admin Settings UI.
   → [Framework](./framework)
 - **Ctx capability layer** — a single `*Ctx` passed to every hook, route, and job wraps
