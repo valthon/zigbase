@@ -154,6 +154,28 @@ pub const LogMailer = struct {
     }
 };
 
+/// Backend for an app that sends no mail (selected via `DisabledMailerPlugin`). Every
+/// message is dropped; the log line names only the subject, never the recipient or body,
+/// because built-in auth mail (password reset, verification, OTP) carries live tokens.
+pub const DisabledMailer = struct {
+    pub fn init() DisabledMailer {
+        return .{};
+    }
+
+    pub fn mailer(self: *DisabledMailer) Mailer {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable = Mailer.VTable{ .send = send };
+
+    fn send(ptr: *anyopaque, io: std.Io, alloc: std.mem.Allocator, email: Email) anyerror!void {
+        _ = ptr;
+        _ = io;
+        _ = alloc;
+        std.log.warn("[mail] disabled: dropped message (subject={s})", .{email.subject});
+    }
+};
+
 /// Minimal SMTP backend with optional TLS. Supports three transport modes,
 /// driven by `tls` (see `config.SmtpTls`):
 ///   .none     — plaintext SMTP (MailHog / local relays).

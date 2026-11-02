@@ -750,6 +750,10 @@ send failure can be used to enumerate which addresses are registered.
 - **Without either** (the default), the token is **logged to the server** instead — a
   dev/CI convenience. To complete a flow locally, read the token from the log and POST
   it to the matching `confirm-*` endpoint.
+- **With `DisabledMailerPlugin`** (`App(.{ .mailer = zigbase.DisabledMailerPlugin })`, for
+  an app that sends no mail), the message is **dropped** and the token is never logged.
+  The endpoint still answers exactly as above, so a flow that needs mail can't be
+  completed.
 
 Verification and password-reset tokens are **strictly single-use**: each token carries a
 random `jti` that is recorded on first redemption, so a second `confirm-*` with the same

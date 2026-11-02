@@ -73,6 +73,7 @@ pub const S3Storage = if (@import("build_options").s3) @import("files/s3.zig").S
 pub const Mailer = @import("mail/mailer.zig").Mailer;
 pub const Email = @import("mail/mailer.zig").Email;
 pub const LogMailer = @import("mail/mailer.zig").LogMailer;
+pub const DisabledMailer = @import("mail/mailer.zig").DisabledMailer;
 pub const SmtpMailer = @import("mail/mailer.zig").SmtpMailer;
 pub const CommandMailer = @import("mail/mailer.zig").CommandMailer;
 pub const SmtpTls = @import("config.zig").SmtpTls;
@@ -113,6 +114,7 @@ pub const SentryReporter = @import("report/sentry.zig").SentryReporter;
 // Built-in plugins (for composition / overriding only one side of the pair).
 pub const DefaultStoragePlugin = @import("framework.zig").DefaultStoragePlugin;
 pub const DefaultMailerPlugin = @import("framework.zig").DefaultMailerPlugin;
+pub const DisabledMailerPlugin = @import("framework.zig").DisabledMailerPlugin;
 pub const DefaultReporterPlugin = @import("framework.zig").DefaultReporterPlugin;
 
 // Migration: the `up` fn for an explicit migration receives a `*Migrator` carrying the active
