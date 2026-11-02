@@ -1036,6 +1036,37 @@ test "harness ignores offsets for delegated files and honors explicit byte windo
     }
 }
 
+const AuthCollectionTestApp = framework.App(.{
+    .collections = .{
+        .staff = .{ .type = .auth },
+        .services = .{ .type = .auth },
+        .documents = .{
+            .fields = .{.{ .name = "title", .type = .text }},
+            .rules = .{ .view = "@request.auth.collection = 'staff'", .create = "@request.auth.collection = 'staff'" },
+        },
+    },
+});
+
+test "auth collection rule: staff allow, service and anonymous deny, superuser bypass" {
+    var t = try start(AuthCollectionTestApp, .{});
+    defer t.deinit();
+    const staff = try t.createRecord("staff", .{ .email = "staff@example.com", .password = "password123" });
+    const service = try t.createRecord("services", .{ .email = "service@example.com", .password = "password123" });
+    const staff_token = try t.mintSession("staff", staff.object.get("id").?.string);
+    const service_token = try t.mintSession("services", service.object.get("id").?.string);
+    const document = try t.createRecord("documents", .{ .title = "private" });
+    const url = try std.fmt.allocPrint(std.testing.allocator, "/api/collections/documents/records/{s}", .{document.object.get("id").?.string});
+    defer std.testing.allocator.free(url);
+    _ = try t.createSuperuser("admin@example.com", "password123");
+    const admin = try t.loginSuperuser("admin@example.com", "password123");
+    for ([_]?[]const u8{ null, service_token, staff_token, admin }, [_]u16{ 404, 404, 200, 200 }) |token, expected| {
+        const r = try t.request(.GET, url, .{ .auth = token });
+        try std.testing.expectEqual(expected, r.status);
+        const create = try t.request(.POST, "/api/collections/documents/records", .{ .auth = token, .json = .{ .title = "new" } });
+        try std.testing.expectEqual(@as(u16, if (expected == 200) 201 else 403), create.status);
+    }
+}
+
 const StaticHeadersTestApp = framework.App(.{
     .static_files = .{ .embedded = &[_]@import("static_files.zig").StaticFile{
         .{ .path = "index.html", .bytes = "<html>shell</html>", .etag = "\"shell\"" },

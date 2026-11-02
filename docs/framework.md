@@ -3692,8 +3692,8 @@ The declaration is authoritative, including the default empty `.indexes`: indexe
 through REST/admin metadata but omitted from code are removed at the next startup. Every
 DROP/CREATE is logged. Existing ordinary migration-created indexes with matching table,
 columns, uniqueness, direction and collation are adopted into metadata ownership rather
-than recreated. Conflicting names or unsupported definitions (such as partial indexes)
-are preserved and refuse startup; resolve them with an explicit migration. Once adopted,
+than recreated. Conflicting names or existing unmanaged definitions that cannot be safely adopted
+(such as partial indexes) are preserved and refuse startup; resolve them with an explicit migration. Once adopted,
 an index follows the declaration, including later removal.
 Unchanged declarations do not rebuild indexes or bump schema generation:
 
@@ -3708,8 +3708,10 @@ Unchanged declarations do not rebuild indexes or bump schema generation:
 },
 ```
 
-`.collation` (`.binary` default / `.nocase`) is applied to every indexed column;
-`.where` is an optional partial-index predicate emitted verbatim as `WHERE <where>`.
+`.collation` (`.binary` default / `.nocase`) is applied to every indexed column.
+Declared partial indexes are supported: `.where` is an optional predicate emitted
+verbatim as `WHERE <where>`. The adoption restriction above applies only to existing
+unmanaged indexes, not to declared indexes.
 The index `.name` and `.fields` are validated as identifiers; the `.where` predicate
 is raw SQL authored in the schema. Index `.fields` reference fields by their declared name (not an internal id); `.name` and each field are validated as identifiers at compile time.
 
@@ -4110,11 +4112,8 @@ and applies the **minimal safe change set** (running it twice is a clean no-op):
 
 For the changes auto-migration won't do, use the `.migrations` escape hatch.
 
-> **`.indexes` changes on an existing collection are not yet re-applied.** Adding or
-> removing an entry in a live collection's `.indexes` only takes effect if that same
-> startup also adds a field (which rebuilds the table). Use an explicit `.migrations`
-> entry with raw `CREATE INDEX` / `DROP INDEX` to change indexes on a collection that
-> already exists.
+Declared `.indexes` are reconciled on every startup, including when no fields change.
+See [Indexes](#indexes) for ownership, adoption, and failure behavior.
 
 ### Explicit migrations (`.migrations`)
 
