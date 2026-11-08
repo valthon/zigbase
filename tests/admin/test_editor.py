@@ -121,6 +121,7 @@ def test_live_surface_reflects_sanitized_html(page):
     page.wait_for_selector('[data-test=records-view]')
     page.click('[data-test=new-record]')
     page.wait_for_selector('[data-test=record-drawer]')
+    page.locator('[data-test=in-body]').wait_for(state='visible')
 
     page.evaluate("""() => {
       const el = document.querySelector('[data-test=in-body]');

@@ -118,6 +118,19 @@ pub fn scaledIntToDecimal(alloc: std.mem.Allocator, v: i64, scale: u8) ![]u8 {
     return out.toOwnedSlice(alloc);
 }
 
+/// Convert typed JSON numbers to a finite float. JSON preserves integral tokens
+/// outside i64 as number_string; ordinary strings retain their type error.
+pub fn floatValue(v: std.json.Value) error{ TypeMismatch, BadNumber }!f64 {
+    const number: f64 = switch (v) {
+        .float => v.float,
+        .integer => @floatFromInt(v.integer),
+        .number_string => std.fmt.parseFloat(f64, v.number_string) catch return error.BadNumber,
+        else => return error.TypeMismatch,
+    };
+    if (!std.math.isFinite(number)) return error.BadNumber;
+    return number;
+}
+
 /// Bind a `std.json.Value` into a prepared statement parameter according to the field's type.
 pub fn bindValue(alloc: std.mem.Allocator, stmt: *db.Stmt, idx: c_int, field: schema.Field, v: std.json.Value) (ValueError || db.DbError || EncryptError)!void {
     if (v == .null) return stmt.bindNull(idx);
@@ -131,14 +144,7 @@ pub fn bindValue(alloc: std.mem.Allocator, stmt: *db.Stmt, idx: c_int, field: sc
             try stmt.bindInt(idx, if (v.bool) 1 else 0);
         },
         .number => |o| switch (o.mode) {
-            .float => {
-                const f: f64 = switch (v) {
-                    .float => v.float,
-                    .integer => @floatFromInt(v.integer),
-                    else => return error.TypeMismatch,
-                };
-                try stmt.bindDouble(idx, f);
-            },
+            .float => try stmt.bindDouble(idx, try floatValue(v)),
             .int => {
                 // Symmetric with reads (which RETURN `.string`): accept a JSON string
                 // (the canonical form), a JSON integer (bind directly), or a JSON float
@@ -358,6 +364,27 @@ test "float round-trips as a number" {
     const f = schema.Field{ .id = "f", .name = "ratio", .options = .{ .number = .{ .mode = .float } } };
     const out = try roundTrip(a, f, "REAL", .{ .float = 1.5 }); // .float result carries no allocation
     try std.testing.expectApproxEqAbs(@as(f64, 1.5), out.float, 0.0001);
+}
+
+test "float number-string tokens outside i64 round-trip as numbers" {
+    const a = std.testing.allocator;
+    const f = schema.Field{ .id = "f", .name = "ratio", .options = .{ .number = .{ .mode = .float } } };
+    for ([_][]const u8{ "100000000000000000000", "-100000000000000000000", "9223372036854776000" }) |token| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, token, .{});
+        defer parsed.deinit();
+        try std.testing.expect(parsed.value == .number_string);
+        const expected = try std.fmt.parseFloat(f64, token);
+        const out = try roundTrip(a, f, "REAL", parsed.value);
+        try std.testing.expectEqual(expected, out.float);
+    }
+}
+
+test "float conversion rejects ordinary strings and nonfinite numbers" {
+    try std.testing.expectError(error.TypeMismatch, floatValue(.{ .string = "100000000000000000000" }));
+    try std.testing.expectError(error.BadNumber, floatValue(.{ .float = std.math.inf(f64) }));
+    try std.testing.expectError(error.BadNumber, floatValue(.{ .float = std.math.nan(f64) }));
+    try std.testing.expectError(error.BadNumber, floatValue(.{ .number_string = "1e999" }));
+    try std.testing.expectError(error.BadNumber, floatValue(.{ .number_string = "not-a-number" }));
 }
 
 test "int number round-trips as a string" {

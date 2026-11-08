@@ -118,8 +118,15 @@ pub fn create(ctx: *http.RequestCtx) anyerror!http.Response {
     if (try requireSuperuser(ctx)) |resp| return resp;
     const app = ctx.app.?;
     if (try rejectIfFrozen(ctx, app)) |resp| return resp;
-    const def = schema.parseCollectionInput(ctx.allocator.a, ctx.body) catch
-        return ApiError.badRequest("Invalid request body.").toResponse(ctx.allocator.a);
+    const def = schema.parseCollectionInput(ctx.allocator.a, ctx.body) catch |err| switch (err) {
+        error.InvalidMinPasswordLength => return ApiError.validation(&.{.{
+            .field = "options.auth.minPasswordLength",
+            .code = codes.s(.validation_value),
+            .message = "Minimum password length must be an integer from 0 to 255.",
+        }}).toResponse(ctx.allocator.a),
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return ApiError.badRequest("Invalid request body.").toResponse(ctx.allocator.a),
+    };
     // Fail-closed: can't create an encrypted field with no field key configured
     // (the startup guard only inspects comptime collections). Without this, an
     // encrypted field created at runtime would be unwritable / leak intent.
@@ -161,8 +168,15 @@ pub fn update(ctx: *http.RequestCtx) anyerror!http.Response {
     const app = ctx.app.?;
     if (try rejectIfFrozen(ctx, app)) |resp| return resp;
     const key = ctx.param("idOrName") orelse return ApiError.notFound().toResponse(ctx.allocator.a);
-    const def = schema.parseCollectionInput(ctx.allocator.a, ctx.body) catch
-        return ApiError.badRequest("Invalid request body.").toResponse(ctx.allocator.a);
+    const def = schema.parseCollectionInput(ctx.allocator.a, ctx.body) catch |err| switch (err) {
+        error.InvalidMinPasswordLength => return ApiError.validation(&.{.{
+            .field = "options.auth.minPasswordLength",
+            .code = codes.s(.validation_value),
+            .message = "Minimum password length must be an integer from 0 to 255.",
+        }}).toResponse(ctx.allocator.a),
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return ApiError.badRequest("Invalid request body.").toResponse(ctx.allocator.a),
+    };
     if (schema.hasEncryptedField(def) and db.poolFieldCipher(app.pool) == null)
         return ApiError.badRequest("Encrypted fields require ZIGBASE_FIELD_KEY to be configured.").toResponse(ctx.allocator.a);
     const w = app.pool.acquireWriter();

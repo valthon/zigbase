@@ -5,7 +5,7 @@ import { html, useState, useEffect, useLayoutEffect, useRef } from '/_/assets/pr
 // Monospace textarea with live validation, a Format button, and tab-to-indent.
 // Invalid JSON never propagates upward (onChange only fires on valid/empty), and
 // reports validity via onValidity so the record drawer can block Save.
-export function JsonEditor({ value, onChange, onValidity, name }) {
+export function JsonEditor({ value, onChange, onValidity, name, id, labelledBy, required }) {
   const initial = value == null ? '' : JSON.stringify(value, null, 2);
   const [text, setText] = useState(initial);
   const [error, setError] = useState('');
@@ -41,10 +41,10 @@ export function JsonEditor({ value, onChange, onValidity, name }) {
 
   return html`
     <div>
-      <textarea class="code" rows="6" spellcheck="false" data-test=${'in-' + name}
+      <textarea id=${id} aria-labelledby=${labelledBy} aria-required=${!!required} class="code" rows="6" spellcheck="false" data-test=${'in-' + name}
         value=${text} onInput=${e => apply(e.target.value)} onKeyDown=${onKeyDown}></textarea>
       <div class="row" style="margin-top:4px">
-        <button type="button" class="ghost" data-test=${'json-format-' + name} onClick=${format}>Format</button>
+        <button type="button" class="ghost" aria-label=${'Format '+name+' JSON'} data-test=${'json-format-' + name} onClick=${format}>Format</button>
         ${error && html`<span class="error" data-test=${'json-err-' + name}>Invalid JSON: ${error}</span>`}
       </div>
     </div>`;
@@ -132,7 +132,7 @@ export function stripTags(dirty) {
 // ── Rich-text WYSIWYG editor (editor fields) ─────────────────────────────────
 // A contenteditable surface + toolbar. Stores sanitized HTML. execCommand is
 // deprecated but universally supported and the standard lean-editor mechanism.
-export function RichTextEditor({ value, onChange, name }) {
+export function RichTextEditor({ value, onChange, name, id, labelledBy, required }) {
   const ref = useRef(null);
   const last = useRef(''); // last HTML we emitted, to break the parent-echo loop
 
@@ -163,6 +163,9 @@ export function RichTextEditor({ value, onChange, name }) {
     // (no caret churn); when it does fire, park the caret at the end so editing
     // continues sensibly.
     if (clean !== el.innerHTML) { el.innerHTML = clean; placeCaretEnd(el); }
+    // Preserve untouched nulls, but persist cleanup of unsafe API-stored HTML
+    // even when the visible surface already matches its sanitized form.
+    if (clean === last.current && clean === (value ?? '')) return;
     last.current = clean;
     onChange(clean);
   }
@@ -199,12 +202,12 @@ export function RichTextEditor({ value, onChange, name }) {
   }
 
   const btn = (action, label, on, title) => html`
-    <button type="button" class="rte-btn" data-test=${'rte-' + action + '-' + name} title=${title}
+    <button type="button" class="rte-btn" data-test=${'rte-' + action + '-' + name} title=${title} aria-label=${title}
       onMouseDown=${e => e.preventDefault()} onClick=${on}>${label}</button>`;
 
   return html`
     <div class="rte-wrap">
-      <div class="rte-toolbar" data-test=${'rte-toolbar-' + name}>
+      <div class="rte-toolbar" role="group" aria-label=${name+' formatting'} data-test=${'rte-toolbar-' + name}>
         ${btn('bold', html`<b>B</b>`, () => cmd('bold'), 'Bold')}
         ${btn('italic', html`<i>I</i>`, () => cmd('italic'), 'Italic')}
         ${btn('underline', html`<u>U</u>`, () => cmd('underline'), 'Underline')}
@@ -219,7 +222,7 @@ export function RichTextEditor({ value, onChange, name }) {
         ${btn('link', '🔗', link, 'Link')}
         ${btn('clear', '⨯', clear, 'Clear formatting')}
       </div>
-      <div class="rte" contenteditable="true" data-test=${'in-' + name} ref=${ref}
+      <div id=${id} class="rte" role="textbox" aria-labelledby=${labelledBy} aria-multiline="true" aria-required=${!!required} contenteditable="true" data-test=${'in-' + name} ref=${ref}
         data-placeholder="Rich text…" onInput=${emit} onBlur=${emit} onPaste=${onPaste}></div>
     </div>`;
 }
