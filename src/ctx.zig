@@ -59,6 +59,8 @@ pub const Ctx = struct {
     reader: ?events.ReaderData = null,
     /// Stashed error from ctx.fail/ctx.invalid; consumed by errorResponse(error.Handled).
     handled: ?error_mod.ApiError = null,
+    handled_bytes: ?[]u8 = null,
+    handled_fields: ?[]error_mod.FieldError = null,
     /// The raw HTTP request context. Non-null for route handlers; null for job/hook contexts
     /// where there is no HTTP request. Required by `issueSession`.
     request: ?*http_mod.RequestCtx = null,
@@ -143,6 +145,7 @@ pub const Ctx = struct {
 
     /// Release any cached reader. Call once (the accessor/handler frame owns this via defer).
     pub fn deinit(self: *Ctx) void {
+        self.clearHandled();
         if (self.reader) |*r| {
             r.deinit();
             self.reader = null;
@@ -670,17 +673,68 @@ pub const Ctx = struct {
     /// Sentinel error type returned by fail/invalid so callers can propagate.
     pub const FailError = error{Handled};
 
-    /// Stash a custom status+message error and return error.Handled for propagation.
-    /// `code` is derived from `status` (`error_codes.forStatus`) since this call carries no
-    /// code of its own — the same derivation `route_types.zig`'s typed-route path uses.
+    /// Discard a prior failure, including one a handler caught and recovered from.
+    pub fn clearHandled(self: *Ctx) void {
+        if (self.handled_bytes) |bytes| self.arena.a.free(bytes);
+        if (self.handled_fields) |fields| self.arena.a.free(fields);
+        self.handled_bytes = null;
+        self.handled_fields = null;
+        self.handled = null;
+    }
+
+    // Own every borrowed string before the caller's stack frame returns. Two
+    // allocations hold the strings and field descriptors; deinit/clearHandled
+    // release them even with a general-purpose allocator.
+    fn copyHandled(self: *Ctx, ae: error_mod.ApiError) !void {
+        var size = try std.math.add(usize, ae.message.len, ae.code.len);
+        for (ae.fields) |field| {
+            size = try std.math.add(usize, size, field.field.len);
+            size = try std.math.add(usize, size, field.code.len);
+            size = try std.math.add(usize, size, field.message.len);
+        }
+        const bytes = try self.arena.a.alloc(u8, size);
+        errdefer self.arena.a.free(bytes);
+        const fields = try self.arena.a.alloc(error_mod.FieldError, ae.fields.len);
+        errdefer self.arena.a.free(fields);
+        var remaining = bytes;
+        var owned = ae;
+        owned.message = copyString(&remaining, ae.message);
+        owned.code = copyString(&remaining, ae.code);
+        for (ae.fields, fields) |source, *dest| dest.* = .{
+            .field = copyString(&remaining, source.field),
+            .code = copyString(&remaining, source.code),
+            .message = copyString(&remaining, source.message),
+        };
+        owned.fields = fields;
+        self.clearHandled();
+        self.handled_bytes = bytes;
+        self.handled_fields = fields;
+        self.handled = owned;
+    }
+
+    fn copyString(remaining: *[]u8, source: []const u8) []const u8 {
+        const dest = remaining.*[0..source.len];
+        @memcpy(dest, source);
+        remaining.* = remaining.*[source.len..];
+        return dest;
+    }
+
+    /// Copy a custom error now, so message may be a hook-local stack buffer.
+    /// Allocation failure preserves the sentinel API and produces a generic 500.
     pub fn fail(self: *Ctx, status: u16, message: []const u8) FailError {
-        self.handled = .{ .status = status, .code = error_codes.s(error_codes.forStatus(status)), .message = message };
+        self.copyHandled(.{ .status = status, .code = error_codes.s(error_codes.forStatus(status)), .message = message }) catch {
+            self.clearHandled();
+            self.handled = error_mod.ApiError.internal();
+        };
         return error.Handled;
     }
 
-    /// Stash a validation error (400 with field details) and return error.Handled.
+    /// Copy all validation descriptors and strings before returning error.Handled.
     pub fn invalid(self: *Ctx, fields: []const error_mod.FieldError) FailError {
-        self.handled = error_mod.ApiError.validation(fields);
+        self.copyHandled(error_mod.ApiError.validation(fields)) catch {
+            self.clearHandled();
+            self.handled = error_mod.ApiError.internal();
+        };
         return error.Handled;
     }
 
@@ -704,6 +758,13 @@ pub const Ctx = struct {
         // or is UB (ReleaseFast) on the error path of any request under memory pressure. Fall back to
         // a preallocated static 500 body — no allocation, so it cannot fail.
         return ae.toResponse(self.arena.a) catch static_internal_response;
+    }
+
+    /// True when a rendered failure degraded to the generic 500 because copying the
+    /// failure (`fail`/`invalid`) or rendering its envelope ran out of memory.
+    pub fn usedAllocationFallback(self: *const Ctx, response: http_mod.Response) bool {
+        return response.body.ptr == static_internal_response.body.ptr or
+            (self.handled != null and self.handled_bytes == null);
     }
 
     // -----------------------------------------------------------------------
@@ -3076,4 +3137,49 @@ test "job ctx relation queries remain trusted while client opt-in and row scopes
     // The low-level opt-in also fails closed when no principal was provided.
     const data = try job.records().dataRead();
     try std.testing.expectError(error.RestrictedRelation, data.list("sources", .{ .client_query = true, .sort = "author.name" }));
+}
+
+// Mutating all source buffers after fail/invalid proves the payload is owned
+// before the hook returns, independently of stack layout or optimizer behavior.
+test "handled failures own message and every validation field slice" {
+    const a = std.testing.allocator;
+    var ctx = Ctx{ .app = undefined, .arena = RequestArena.forTest(a) };
+    defer ctx.deinit();
+    var message = "stack message".*;
+    try std.testing.expectEqual(error.Handled, ctx.fail(503, &message));
+    @memset(&message, 'x');
+    try std.testing.expectEqual(error.Handled, ctx.fail(503, ctx.handled.?.message));
+    const failure = ctx.errorResponse(error.Handled);
+    defer a.free(failure.body);
+    try std.testing.expectEqual(@as(u16, 503), failure.status);
+    try std.testing.expect(std.mem.indexOf(u8, failure.body, "stack message") != null);
+    var name = "title".*;
+    var code = "validation_required".*;
+    var detail = "Choose a title.".*;
+    var fields = [_]error_mod.FieldError{.{ .field = &name, .code = &code, .message = &detail }};
+    try std.testing.expectEqual(error.Handled, ctx.invalid(&fields));
+    @memset(&name, 'x');
+    @memset(&code, 'x');
+    @memset(&detail, 'x');
+    fields[0] = .{ .field = "wrong", .code = "wrong", .message = "wrong" };
+    try std.testing.expectEqual(error.Handled, ctx.invalid(ctx.handled.?.fields));
+    const response = ctx.errorResponse(error.Handled);
+    defer a.free(response.body);
+    ctx.deinit();
+    try std.testing.expectEqualStrings("{\"status\":400,\"code\":\"validation_failed\",\"message\":\"Failed to validate the request.\",\"data\":{\"title\":{\"code\":\"validation_required\",\"message\":\"Choose a title.\"}}}", response.body);
+}
+
+test "handled payload allocation failures clean up and use an internal error" {
+    for (0..4) |failure_index| {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = failure_index });
+        var ctx = Ctx{ .app = undefined, .arena = RequestArena.forTest(failing.allocator()) };
+        defer ctx.deinit();
+        if (failure_index >= 2) {
+            try std.testing.expectEqual(error.Handled, ctx.invalid(&.{.{ .field = "prior", .code = "validation_required", .message = "Prior failure." }}));
+            try std.testing.expectEqual(error.Handled, ctx.invalid(ctx.handled.?.fields));
+        } else try std.testing.expectEqual(error.Handled, ctx.invalid(&.{.{ .field = "title", .code = "validation_required", .message = "Choose a title." }}));
+        try std.testing.expectEqual(@as(u16, 500), ctx.handled.?.status);
+        try std.testing.expectEqual(@as(?[]u8, null), ctx.handled_bytes);
+        try std.testing.expectEqual(@as(?[]error_mod.FieldError, null), ctx.handled_fields);
+    }
 }

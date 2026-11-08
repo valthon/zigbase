@@ -38,15 +38,30 @@ pub fn emitRecord(
     value: *std.json.Value,
     phase: events.RecordPhase,
 ) !void {
-    const d = app.dispatch orelse return;
-    const handler = d.record orelse return;
+    _ = try emitRecordResponse(app, rctx, arena, conn, col_name, value, phase, false);
+}
+
+/// HTTP callers render via Ctx while it owns the copied failure payload.
+/// Non-HTTP callers retain error propagation through emitRecord.
+fn emitRecordResponse(
+    app: *app_mod.App,
+    rctx: *const request.RequestContext,
+    arena: RequestArena,
+    conn: *db.Db,
+    col_name: []const u8,
+    value: *std.json.Value,
+    phase: events.RecordPhase,
+    render_failure: bool,
+) !?HookRejection {
+    const d = app.dispatch orelse return null;
+    const handler = d.record orelse return null;
     const is_before = switch (phase) {
         .before_create, .before_update, .before_delete => true,
         else => false,
     };
     // before-hooks observe the raw request body; skip non-object bodies so a hook's
     // `ev.record.object` access can't panic. records.* will reject non-objects with NotObject (400).
-    if (is_before and value.* != .object) return;
+    if (is_before and value.* != .object) return null;
     var ev = events.RecordEvent{
         .rctx = rctx,
         .arena = arena,
@@ -61,13 +76,25 @@ pub fn emitRecord(
     var ctx = Ctx{ .app = app, .arena = arena, .rctx = rctx.*, .bound_conn = conn };
     defer ctx.deinit();
     if (is_before) {
-        try handler(&ctx, &ev);
+        handler(&ctx, &ev) catch |err| {
+            if (render_failure) {
+                if (err == error.Handled) if (ctx.handled) |handled| {
+                    if (http.isErrorStatus(handled.status)) {
+                        const response = ctx.errorResponse(err);
+                        return .{ .response = response, .incident = hookIncident(&ctx, arena, col_name, handled, response) };
+                    }
+                };
+                return .{ .response = try ApiError.badRequest("Request rejected by a hook.").toResponse(arena.a) };
+            }
+            return err;
+        };
     } else {
         handler(&ctx, &ev) catch |e| {
             var err_ev = events.ErrorEvent{ .app = app, .ctx = rctx, .err = e, .phase = .after_hook, .message = @errorName(e) };
             events.dispatchError(app, app.dispatch, &err_ev);
         };
     }
+    return null;
 }
 
 /// Fire file.afterUpload once per written file. After-style: never propagates.
@@ -130,9 +157,53 @@ fn forbidden(ctx: *http.RequestCtx) !http.Response {
     return ApiError.forbidden().toResponse(ctx.allocator.a);
 }
 
-fn hookRejected(ctx: *http.RequestCtx) anyerror!http.Response {
-    return ApiError.badRequest("Request rejected by a hook.").toResponse(ctx.allocator.a);
+fn emitBeforeRecord(ctx: *http.RequestCtx, rctx: *const request.RequestContext, conn: *db.Db, col_name: []const u8, value: *std.json.Value, phase: events.RecordPhase) !?HookRejection {
+    return emitRecordResponse(ctx.app.?, rctx, ctx.allocator, conn, col_name, value, phase, true);
 }
+
+/// The rendered response for a rejecting before-hook, plus what to report if it is a 5xx.
+const HookRejection = struct {
+    response: http.Response,
+    incident: ?HookIncident = null,
+};
+
+const HookIncident = struct {
+    err: anyerror,
+    /// Request-arena owned, or `hook_incident_fallback_message`.
+    message: []const u8,
+};
+
+const hook_incident_fallback_message = "record before-hook failed; report allocation failed";
+
+// Built while the hook Ctx still owns `handled`. Reporter dedup keys on this text,
+// so it must tell apart failures from different collections, statuses and messages.
+fn hookIncident(ctx: *const Ctx, arena: RequestArena, col_name: []const u8, handled: ApiError, response: http.Response) ?HookIncident {
+    if (response.status < 500) return null;
+    return .{
+        .err = if (ctx.usedAllocationFallback(response)) error.OutOfMemory else error.Handled,
+        .message = std.fmt.allocPrint(arena.a, "{s}: {d} {s}", .{ col_name, handled.status, handled.message }) catch hook_incident_fallback_message,
+    };
+}
+
+// Register this defer before acquiring the writer. A consumer onError callback
+// may write to the database; it must run after rollback and writer release.
+const HookErrorReport = struct {
+    app: *app_mod.App,
+    pending: ?Pending = null,
+
+    const Pending = struct { rctx: request.RequestContext, incident: HookIncident };
+
+    fn capture(self: *HookErrorReport, rejection: HookRejection, rctx: request.RequestContext) void {
+        if (rejection.incident) |incident| self.pending = .{ .rctx = rctx, .incident = incident };
+    }
+
+    fn dispatch(self: *HookErrorReport) void {
+        if (self.pending) |*pending| {
+            var ev = events.ErrorEvent{ .app = self.app, .ctx = &pending.rctx, .err = pending.incident.err, .phase = .before_hook, .message = pending.incident.message };
+            events.dispatchError(self.app, self.app.dispatch, &ev);
+        }
+    }
+};
 
 /// For auth collections, transform request data through auth.applyCreate/applyUpdate
 /// (hash password, gen/rotate tokenKey, strip plaintext, force verified=false on create).
@@ -390,6 +461,8 @@ pub fn create(ctx: *http.RequestCtx) anyerror!http.Response {
     writeUploads(ctx, col, &upload_id, all.writes) catch
         return ApiError.internal().toResponse(ctx.allocator.a);
 
+    var hook_error = HookErrorReport{ .app = app };
+    defer hook_error.dispatch();
     const w = app.pool.acquireWriter();
     defer app.pool.releaseWriter();
     const rctx = buildContext(ctx, w, data);
@@ -421,10 +494,11 @@ pub fn create(ctx: *http.RequestCtx) anyerror!http.Response {
     // local; downstream MUST read the `_mut` binding (here and for rec_mut/ur_mut/ex_mut
     // below), not the original const — the binding is the grow-capturing reference.
     var data_mut = data2;
-    emitRecord(app, &rctx, ctx.allocator, w, col.name, &data_mut, .before_create) catch {
+    if (try emitBeforeRecord(ctx, &rctx, w, col.name, &data_mut, .before_create)) |rejection| {
+        hook_error.capture(rejection, rctx);
         w.rollback() catch {};
-        return hookRejected(ctx);
-    };
+        return rejection.response;
+    }
     // #98: auth-collection registration hook. Fires INSIDE the create transaction, after the
     // generic before_create hook and before the INSERT. An abort rolls back the whole create
     // (fail closed) and returns the Ctx-mapped response. `data_mut` is the writable record.
@@ -602,6 +676,8 @@ fn updateImpl(ctx: *http.RequestCtx, comptime is_resumable: bool, resumable: if 
     if (upload_plan) |p| writeUploads(ctx, upload_lease.col.?, rid, p.writes) catch
         return ApiError.internal().toResponse(ctx.allocator.a);
 
+    var hook_error = HookErrorReport{ .app = app };
+    defer hook_error.dispatch();
     const w = app.pool.acquireWriter();
     defer app.pool.releaseWriter();
     var txn_open = false;
@@ -696,9 +772,10 @@ fn updateImpl(ctx: *http.RequestCtx, comptime is_resumable: bool, resumable: if 
     const old_files = if (cleanup_files) (try records.getFilesPhysical(ctx.allocator.a, w, col, rid)).? else null;
 
     var data_mut = data2;
-    emitRecord(app, &rctx, ctx.allocator, w, col.name, &data_mut, .before_update) catch {
-        return hookRejected(ctx);
-    };
+    if (try emitBeforeRecord(ctx, &rctx, w, col.name, &data_mut, .before_update)) |rejection| {
+        hook_error.capture(rejection, rctx);
+        return rejection.response;
+    }
 
     // #98 on the PATCH path (spec §F1): `beforePasswordChange` fires ONLY when the prepared
     // data contains a password change, INSIDE the update transaction, with a READ-ONLY
@@ -807,6 +884,8 @@ pub fn delete(ctx: *http.RequestCtx) anyerror!http.Response {
         return ApiError.badRequest("REST idempotency is not configured.").toResponse(ctx.allocator.a);
     }
     const app = ctx.app.?;
+    var hook_error = HookErrorReport{ .app = app };
+    defer hook_error.dispatch();
     const w = app.pool.acquireWriter();
     defer app.pool.releaseWriter();
     var col_lease = try resolveCollection(ctx, w);
@@ -834,9 +913,10 @@ pub fn delete(ctx: *http.RequestCtx) anyerror!http.Response {
         return ApiError.conflict("Record changed before mutation; reload and retry.").toResponse(ctx.allocator.a);
 
     var ex_mut = existing;
-    emitRecord(app, &rctx, ctx.allocator, w, col.name, &ex_mut, .before_delete) catch {
-        return hookRejected(ctx);
-    };
+    if (try emitBeforeRecord(ctx, &rctx, w, col.name, &ex_mut, .before_delete)) |rejection| {
+        hook_error.capture(rejection, rctx);
+        return rejection.response;
+    }
     // Realtime delete prep (#159, PR-6/PR-6b), INSIDE this transaction so a Postgres side-table
     // snapshot commits atomically with the delete. Returns the AT-REST (ciphertext) snapshot used
     // for delete authz — so LOCAL authz matches the cross-instance REMOTE path and the live
@@ -2375,21 +2455,6 @@ test "creating an auth record without a password is a 400" {
 // the `audit` row survived (this test FAILS there) — proof the abort is atomic.
 // ---------------------------------------------------------------------------
 
-fn auditThenRejectHook(ctx: *Ctx, ev: *events.RecordEvent) anyerror!void {
-    if (ev.phase != .before_create) return;
-    if (!std.mem.eql(u8, ev.collection, "posts")) return; // act only on the primary write
-    // Side-write into `audit` on the hook's IN-TRANSACTION connection (ctx.bound_conn).
-    // We call records.create directly with ev.arena rather than ctx.records().create — the
-    // latter would allocate the throwaway record on app.allocator and trip the test's
-    // leak detector; the connection (and thus the shared transaction) is identical.
-    const conn = ctx.bound_conn.?;
-    const acol = (try collections.get(ev.arena.a, conn, "audit")) orelse return error.AuditMissing;
-    var obj: std.json.ObjectMap = .empty;
-    try obj.put(ev.arena.a, "title", .{ .string = "audit-side-write" });
-    _ = try records.create(ev.arena.a, ctx.app.io, conn, acol, .{ .object = obj });
-    return error.HookRejected;
-}
-
 fn countRows(env: *TestEnv, table: []const u8) !i64 {
     var r = try env.pool.acquireReader();
     defer env.pool.releaseReader(&r);
@@ -2403,26 +2468,380 @@ fn countRows(env: *TestEnv, table: []const u8) !i64 {
     return st.columnInt(0);
 }
 
+const RejectionHooks = struct {
+    fn reject(ctx: *Ctx, ev: *events.RecordEvent) anyerror!void {
+        const conn = ctx.bound_conn.?;
+        const audit = (try collections.get(ev.arena.a, conn, "audit")).?;
+        var obj: std.json.ObjectMap = .empty;
+        try obj.put(ev.arena.a, "title", .{ .string = "must roll back" });
+        _ = try records.create(ev.arena.a, ctx.app.io, conn, audit, .{ .object = obj });
+
+        return fail(ctx, ev);
+    }
+
+    fn fail(ctx: *Ctx, ev: *events.RecordEvent) anyerror!void {
+        const mode = ev.record.object.get("title").?.string;
+        if (std.mem.eql(u8, mode, "raw")) return error.PrivateHookFailure;
+        if (std.mem.eql(u8, mode, "stale")) {
+            try std.testing.expectEqual(error.Handled, ctx.fail(409, "Discarded failure."));
+            return error.PrivateHookFailure;
+        }
+        if (std.mem.eql(u8, mode, "unhandled")) return error.Handled;
+        if (std.mem.eql(u8, mode, "invalid")) {
+            var name = "title".*;
+            var code = "validation_required".*;
+            var message = "Choose a title.".*;
+            var fields = [_]FieldError{.{ .field = &name, .code = &code, .message = &message }};
+            return ctx.invalid(&fields);
+        }
+        var buffer: [64]u8 = undefined;
+        const message = try std.fmt.bufPrint(&buffer, "{s}", .{"That item is already queued."});
+        return ctx.fail(try std.fmt.parseInt(u16, mode, 10), message);
+    }
+    const Case = struct { mode: []const u8, status: u16 = 400, code: []const u8 = "bad_request", message: []const u8 = "Request rejected by a hook." };
+    const cases = [_]Case{
+        .{ .mode = "400", .code = "bad_request", .message = "That item is already queued." },
+        .{ .mode = "403", .status = 403, .code = "forbidden", .message = "That item is already queued." },
+        .{ .mode = "409", .status = 409, .code = "conflict", .message = "That item is already queued." },
+        .{ .mode = "418", .status = 418, .code = "bad_request", .message = "That item is already queued." },
+        .{ .mode = "421", .status = 421, .code = "bad_request", .message = "That item is already queued." },
+        .{ .mode = "422", .status = 422, .code = "bad_request", .message = "That item is already queued." },
+        .{ .mode = "431", .status = 431, .code = "bad_request", .message = "That item is already queued." },
+        .{ .mode = "451", .status = 451, .code = "bad_request", .message = "That item is already queued." },
+        .{ .mode = "432" },
+        .{ .mode = "499" },
+        .{ .mode = "200" },
+        .{ .mode = "302" },
+        .{ .mode = "399" },
+        .{ .mode = "500", .status = 500, .code = "internal", .message = "That item is already queued." },
+        .{ .mode = "503", .status = 503, .code = "internal", .message = "That item is already queued." },
+        .{ .mode = "65535" },
+        .{ .mode = "raw" },
+        .{ .mode = "stale" },
+        .{ .mode = "unhandled" },
+        .{ .mode = "invalid", .code = "validation_failed", .message = "Failed to validate the request." },
+    };
+
+    fn caseForMode(comptime mode: []const u8) Case {
+        inline for (cases) |case| {
+            if (comptime std.mem.eql(u8, case.mode, mode)) return case;
+        }
+        @compileError("Unknown rejection mode: " ++ mode);
+    }
+
+    fn expectResponse(response: http.Response, case: Case) !void {
+        try std.testing.expectEqual(case.status, response.status);
+        const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, response.body, .{});
+        defer parsed.deinit();
+        const envelope = parsed.value.object;
+        try std.testing.expectEqual(@as(i64, case.status), envelope.get("status").?.integer);
+        try std.testing.expectEqualStrings(case.code, envelope.get("code").?.string);
+        try std.testing.expectEqualStrings(case.message, envelope.get("message").?.string);
+        const data = envelope.get("data").?.object;
+        if (std.mem.eql(u8, case.mode, "invalid")) {
+            try std.testing.expectEqual(@as(usize, 1), data.count());
+            const title = data.get("title").?.object;
+            try std.testing.expectEqualStrings("validation_required", title.get("code").?.string);
+            try std.testing.expectEqualStrings("Choose a title.", title.get("message").?.string);
+        } else try std.testing.expectEqual(@as(usize, 0), data.count());
+    }
+};
+
+test "record before-hook response ownership is leak-checked without an arena" {
+    const a = std.testing.allocator;
+    const dispatch = events.Dispatch{ .record = RejectionHooks.fail };
+    var app = app_mod.App{ .allocator = a, .io = std.testing.io, .pool = undefined, .dispatch = &dispatch };
+    // This hook only rejects; it never touches the supplied connection.
+    var conn: db.Db = undefined;
+    const rctx = request.RequestContext{ .method = "POST" };
+    inline for (.{ .before_create, .before_update, .before_delete }) |phase| {
+        for (RejectionHooks.cases) |case| {
+            var object: std.json.ObjectMap = .empty;
+            defer object.deinit(a);
+            try object.put(a, "title", .{ .string = case.mode });
+            var value = std.json.Value{ .object = object };
+            var ctx = http.RequestCtx{ .method = .POST, .path = "/", .allocator = RequestArena.forTest(a), .app = &app };
+            const rejection = (try emitBeforeRecord(&ctx, &rctx, &conn, "posts", &value, phase)) orelse return error.ExpectedRejection;
+            const response = rejection.response;
+            defer a.free(response.body);
+            defer if (rejection.incident) |owned| a.free(owned.message);
+            const normalized = try @import("../server.zig").normalizeResponse(&ctx, response);
+            try RejectionHooks.expectResponse(normalized, case);
+        }
+    }
+}
+
+test "before-hook server failures reach onError and the reporter, including allocation fallback" {
+    const reporter = @import("../report/reporter.zig");
+    const Reports = struct {
+        var consumer_calls: usize = 0;
+        var reporter_calls: usize = 0;
+        var context_matches: bool = true;
+        var report_matches: bool = true;
+        var expected_err: anyerror = error.Handled;
+        var expected_message: []const u8 = "";
+        fn reject(ctx: *Ctx, ev: *events.RecordEvent) anyerror!void {
+            return ctx.fail(if (std.mem.eql(u8, ev.collection, "client")) 409 else 503, "Hook rejection.");
+        }
+        fn onError(ev: *events.ErrorEvent) void {
+            consumer_calls += 1;
+            context_matches = context_matches and ev.phase == .before_hook and ev.err == expected_err and
+                std.mem.eql(u8, ev.message, expected_message) and
+                ev.ctx != null and std.mem.eql(u8, ev.ctx.?.method, "POST");
+        }
+        fn report(_: *anyopaque, _: std.Io, _: std.mem.Allocator, value: reporter.Report) anyerror!void {
+            report_matches = report_matches and std.mem.eql(u8, "before_hook", value.phase) and
+                std.mem.eql(u8, @errorName(expected_err), value.err_name) and
+                std.mem.eql(u8, expected_message, value.message);
+            reporter_calls += 1;
+        }
+        const vt = reporter.Reporter.VTable{ .report = report };
+    };
+    Reports.consumer_calls = 0;
+    Reports.reporter_calls = 0;
+    Reports.context_matches = true;
+    Reports.report_matches = true;
+    var dummy: u8 = 0;
+    var report_interface = reporter.Reporter{ .ptr = &dummy, .vtable = &Reports.vt };
+    const dispatch = events.Dispatch{ .record = Reports.reject, .on_error = Reports.onError };
+    const a = std.testing.allocator;
+    var app = app_mod.App{ .allocator = a, .io = std.testing.io, .pool = undefined, .dispatch = &dispatch, .reporter = &report_interface };
+    var conn: db.Db = undefined;
+    var value = std.json.Value{ .object = .empty };
+    const rctx = request.RequestContext{ .method = "POST" };
+    inline for (.{ .before_create, .before_update, .before_delete }) |phase| {
+        for ([_][]const u8{ "client", "server", "allocation_failure" }) |mode| {
+            var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+            const out_of_memory = std.mem.eql(u8, mode, "allocation_failure");
+            var ctx = http.RequestCtx{ .method = .POST, .path = "/", .allocator = RequestArena.forTest(if (out_of_memory) failing.allocator() else a), .app = &app };
+            const before_consumer = Reports.consumer_calls;
+            const before_reporter = Reports.reporter_calls;
+            Reports.expected_err = if (out_of_memory) error.OutOfMemory else error.Handled;
+            Reports.expected_message = if (out_of_memory) hook_incident_fallback_message else "server: 503 Hook rejection.";
+            const rejection = (try emitBeforeRecord(&ctx, &rctx, &conn, mode, &value, phase)).?;
+            const response = rejection.response;
+            var hook_error = HookErrorReport{ .app = &app };
+            hook_error.capture(rejection, rctx);
+            hook_error.dispatch();
+            // OOM uses Ctx's allocation-free static internal envelope and report text.
+            defer if (!out_of_memory) a.free(response.body);
+            defer if (!out_of_memory) if (rejection.incident) |owned| a.free(owned.message);
+            const incident: usize = @intFromBool(!std.mem.eql(u8, mode, "client"));
+            try std.testing.expectEqual(before_consumer + incident, Reports.consumer_calls);
+            try std.testing.expectEqual(before_reporter + incident, Reports.reporter_calls);
+            try std.testing.expectEqual(@as(u16, if (out_of_memory) 500 else if (incident == 1) 503 else 409), response.status);
+        }
+    }
+    try std.testing.expect(Reports.context_matches);
+    try std.testing.expect(Reports.report_matches);
+}
+
+test "before-hook incident reports keep distinct failures apart inside the dedup window" {
+    const reporter = @import("../report/reporter.zig");
+    const Dedup = @import("../report/dedup.zig").Dedup;
+    const Reports = struct {
+        const expected = [_][]const u8{ "posts: 503 payment provider down", "orders: 500 ledger mismatch" };
+        var consumer_calls: usize = 0;
+        var reporter_calls: usize = 0;
+        var messages_match: bool = true;
+        fn reject(ctx: *Ctx, ev: *events.RecordEvent) anyerror!void {
+            if (std.mem.eql(u8, ev.collection, "posts")) return ctx.fail(503, "payment provider down");
+            return ctx.fail(500, "ledger mismatch");
+        }
+        fn onError(_: *events.ErrorEvent) void {
+            consumer_calls += 1;
+        }
+        fn report(_: *anyopaque, _: std.Io, _: std.mem.Allocator, value: reporter.Report) anyerror!void {
+            messages_match = messages_match and reporter_calls < expected.len and
+                std.mem.eql(u8, expected[reporter_calls], value.message);
+            reporter_calls += 1;
+        }
+        const vt = reporter.Reporter.VTable{ .report = report };
+    };
+    Reports.consumer_calls = 0;
+    Reports.reporter_calls = 0;
+    Reports.messages_match = true;
+    var dummy: u8 = 0;
+    var report_interface = reporter.Reporter{ .ptr = &dummy, .vtable = &Reports.vt };
+    const dispatch = events.Dispatch{ .record = Reports.reject, .on_error = Reports.onError };
+    const a = std.testing.allocator;
+    var dedup = Dedup.init(a, 60);
+    defer dedup.deinit();
+    var app = app_mod.App{ .allocator = a, .io = std.testing.io, .pool = undefined, .dispatch = &dispatch, .reporter = &report_interface };
+    app.report_dedup = &dedup;
+    var conn: db.Db = undefined;
+    var value = std.json.Value{ .object = .empty };
+    const rctx = request.RequestContext{ .method = "POST" };
+    // The repeated posts failure is the one the window should suppress.
+    for ([_][]const u8{ "posts", "orders", "posts" }) |collection| {
+        var ctx = http.RequestCtx{ .method = .POST, .path = "/", .allocator = RequestArena.forTest(a), .app = &app };
+        const rejection = (try emitBeforeRecord(&ctx, &rctx, &conn, collection, &value, .before_create)).?;
+        defer a.free(rejection.response.body);
+        defer if (rejection.incident) |owned| a.free(owned.message);
+        var hook_error = HookErrorReport{ .app = &app };
+        hook_error.capture(rejection, rctx);
+        hook_error.dispatch();
+    }
+    try std.testing.expectEqual(@as(usize, 3), Reports.consumer_calls);
+    try std.testing.expectEqual(@as(usize, 2), Reports.reporter_calls);
+    try std.testing.expect(Reports.messages_match);
+}
+
+test "before-hook onError can write after the rejected transaction releases its writer" {
+    const report_log = @import("../report/log.zig");
+    const Observer = struct {
+        var calls: usize = 0;
+        var reports: usize = 0;
+        var writer_available: bool = true;
+        var transaction_closed: bool = true;
+        var wrote: bool = true;
+        fn onError(ev: *events.ErrorEvent) void {
+            calls += 1;
+            const pool = ev.app.pool;
+            // Inspect before acquiring: a regression must fail, never deadlock the suite.
+            const available = if (comptime @import("build_options").postgres)
+                switch (pool.impl) {
+                    inline else => |*backend| backend.writer_mutex.state.load(.acquire) == .unlocked,
+                }
+            else
+                pool.writer_mutex.state.load(.acquire) == .unlocked;
+            writer_available = writer_available and available;
+            if (!available) return;
+            const w = pool.acquireWriter();
+            defer pool.releaseWriter();
+            transaction_closed = transaction_closed and !w.inTransaction();
+            w.exec("INSERT INTO audit(id,created,updated,title) VALUES ('operator','t','t','reported');") catch {
+                wrote = false;
+            };
+        }
+        fn sink(_: []const u8) void {
+            reports += 1;
+        }
+    };
+    report_log.log_sink = Observer.sink;
+    defer report_log.log_sink = null;
+    inline for (.{ .before_create, .before_update, .before_delete }) |phase| {
+        Observer.calls = 0;
+        Observer.reports = 0;
+        Observer.writer_available = true;
+        Observer.transaction_closed = true;
+        Observer.wrote = true;
+        var env = try TestEnv.init();
+        defer env.deinit();
+        try seedRuled(env, "audit", "@public", "@public", "@public");
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const col_params = [_]http.Param{.{ .key = "col", .value = "posts" }};
+        const body = "{\"title\":\"503\"}";
+        var rid: []const u8 = "";
+        if (phase != .before_create) {
+            var ctx = ctxFor(env, RequestArena.from(&arena), .POST, body, &col_params);
+            const created = try create(&ctx);
+            try std.testing.expectEqual(@as(u16, 201), created.status);
+            rid = (try std.json.parseFromSlice(std.json.Value, a, created.body, .{})).value.object.get("id").?.string;
+        }
+        const dispatch = events.Dispatch{ .record = RejectionHooks.reject, .on_error = Observer.onError };
+        env.app.dispatch = &dispatch;
+        const row_params = [_]http.Param{ .{ .key = "col", .value = "posts" }, .{ .key = "id", .value = rid } };
+        var ctx = ctxFor(env, RequestArena.from(&arena), .POST, body, if (phase == .before_create) &col_params else &row_params);
+        const response = try switch (phase) {
+            .before_create => create(&ctx),
+            .before_update => update(&ctx),
+            .before_delete => delete(&ctx),
+            else => unreachable,
+        };
+        try std.testing.expectEqual(@as(u16, 503), response.status);
+        try std.testing.expectEqual(@as(usize, 1), Observer.calls);
+        try std.testing.expectEqual(@as(usize, 1), Observer.reports);
+        try std.testing.expect(Observer.writer_available);
+        try std.testing.expect(Observer.transaction_closed);
+        try std.testing.expect(Observer.wrote);
+        // The rejected hook's audit side-write vanished; only onError's write remains.
+        try std.testing.expectEqual(@as(i64, 1), try countRows(env, "audit"));
+        try std.testing.expectEqual(@as(i64, if (phase == .before_create) 0 else 1), try countRows(env, "posts"));
+    }
+}
+
+test "record dispatcher discards a recovered wildcard failure before the next handler" {
+    const H = struct {
+        fn recover(ctx: *Ctx, _: *events.RecordEvent) anyerror!void {
+            const result: anyerror!void = ctx.fail(409, "Recovered conflict.");
+            result catch |err| {
+                try std.testing.expectEqual(error.Handled, err);
+            };
+        }
+        fn reject(_: *Ctx, _: *events.RecordEvent) anyerror!void {
+            return error.Handled;
+        }
+    };
+    const a = std.testing.allocator;
+    const dispatch = events.Dispatch{ .record = events.buildRecordDispatcher(.{
+        .any = .{ .beforeCreate = H.recover },
+        .posts = .{ .beforeCreate = H.reject },
+    }) };
+    var app = app_mod.App{ .allocator = a, .io = std.testing.io, .pool = undefined, .dispatch = &dispatch };
+    var conn: db.Db = undefined;
+    var value = std.json.Value{ .object = .empty };
+    var ctx = http.RequestCtx{ .method = .POST, .path = "/", .allocator = RequestArena.forTest(a), .app = &app };
+    const rejection = (try emitBeforeRecord(&ctx, &.{}, &conn, "posts", &value, .before_create)).?;
+    defer a.free(rejection.response.body);
+    try RejectionHooks.expectResponse(rejection.response, .{ .mode = "unhandled" });
+}
+
 test "before-hook side-write rolls back with the triggering write on hook error" {
-    var env = try TestEnv.init();
-    defer env.deinit();
-    // A second collection the hook writes into.
-    try seedRuled(env, "audit", "@public", "@public", "@public");
-
-    const disp = events.Dispatch{ .record = auditThenRejectHook };
-    env.app.dispatch = &disp;
-    defer env.app.dispatch = null;
-
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const col_param = [_]http.Param{.{ .key = "col", .value = "posts" }};
-    var cctx = ctxFor(env, RequestArena.from(&arena), .POST, "{\"title\":\"hi\"}", &col_param);
-    const res = try create(&cctx);
-
-    // The hook rejected the write -> 400, and BOTH writes rolled back atomically.
-    try std.testing.expectEqual(@as(u16, 400), res.status);
-    try std.testing.expectEqual(@as(i64, 0), try countRows(env, "posts"));
-    try std.testing.expectEqual(@as(i64, 0), try countRows(env, "audit"));
+    inline for (.{ .before_create, .before_update, .before_delete }) |phase| {
+        for ([_]RejectionHooks.Case{ RejectionHooks.caseForMode("409"), RejectionHooks.caseForMode("raw"), RejectionHooks.caseForMode("invalid") }) |case| {
+            var env = try TestEnv.init();
+            defer env.deinit();
+            try seedRuled(env, "audit", "@public", "@public", "@public");
+            var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer arena.deinit();
+            const a = arena.allocator();
+            const body = try std.fmt.allocPrint(a, "{{\"title\":\"{s}\"}}", .{case.mode});
+            const col_param = [_]http.Param{.{ .key = "col", .value = "posts" }};
+            var rid: []const u8 = "";
+            if (phase != .before_create) {
+                var seed = ctxFor(env, RequestArena.from(&arena), .POST, body, &col_param);
+                const res = try create(&seed);
+                try std.testing.expectEqual(@as(u16, 201), res.status);
+                rid = (try std.json.parseFromSlice(std.json.Value, a, res.body, .{})).value.object.get("id").?.string;
+            }
+            const dispatch = events.Dispatch{ .record = events.buildRecordDispatcher(.{
+                .posts = .{ .beforeCreate = RejectionHooks.reject, .beforeUpdate = RejectionHooks.reject, .beforeDelete = RejectionHooks.reject },
+            }) };
+            env.app.dispatch = &dispatch;
+            const row_params = [_]http.Param{ .{ .key = "col", .value = "posts" }, .{ .key = "id", .value = rid } };
+            var ctx = ctxFor(env, RequestArena.from(&arena), switch (phase) {
+                .before_create => .POST,
+                .before_update => .PATCH,
+                .before_delete => .DELETE,
+                else => unreachable,
+            }, body, if (phase == .before_create) &col_param else &row_params);
+            // Updates use the rejection mode in their request, while the stored
+            // title differs so a mistakenly committed update is observable.
+            if (phase == .before_update) {
+                const w = env.pool.acquireWriter();
+                defer env.pool.releaseWriter();
+                try w.exec("UPDATE posts SET title = 'original';");
+            }
+            const response = try switch (phase) {
+                .before_create => create(&ctx),
+                .before_update => update(&ctx),
+                .before_delete => delete(&ctx),
+                else => unreachable,
+            };
+            const normalized = try @import("../server.zig").normalizeResponse(&ctx, response);
+            try RejectionHooks.expectResponse(normalized, case);
+            try std.testing.expectEqual(@as(i64, 0), try countRows(env, "audit"));
+            try std.testing.expectEqual(@as(i64, if (phase == .before_create) 0 else 1), try countRows(env, "posts"));
+            if (phase == .before_update) {
+                var view_ctx = ctxFor(env, RequestArena.from(&arena), .GET, "", &row_params);
+                const persisted = (try std.json.parseFromSlice(std.json.Value, a, (try view(&view_ctx)).body, .{})).value.object;
+                try std.testing.expectEqualStrings("original", persisted.get("title").?.string);
+            }
+        }
+    }
 }
 
 // ---- Tenancy: update pre-authorization (reviewer MINOR 1, #156) -------------

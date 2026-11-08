@@ -449,8 +449,11 @@ to control built-in record operations. A route guard does not replace record rul
 A `beforeCreate` hook runs after early locked-rule/tenant gates and **before** the
 write. A conditional create rule is checked afterward, inside the same transaction;
 a denial rolls back the hook's database side-writes. Put external side effects in
-after-hooks. The hook may mutate `ev.record` and may **return an error to reject** the write (the request
-fails with `400`). This example, on `bookings`, (a) rejects a booking that overlaps
+after-hooks. The hook may mutate `ev.record` and may **return an error to reject** the write.
+Use `ctx.fail(status, message)` with a [supported error status](framework.md#4-record-hooks-hooks)
+(for example, 409) for a specific status and explanation, or
+`ctx.invalid(fields)` for field validation details; other errors return a generic
+`400`. This example, on `bookings`, (a) rejects a booking that overlaps
 an existing confirmed booking for the same listing, and (b) computes a derived
 `duration_minutes` field.
 
