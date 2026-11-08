@@ -177,9 +177,11 @@ const framework_traps =
     \\## Trap 8 — schema provisioning is ADDITIVE ONLY
     \\
     \\The comptime `.collections` literal is provisioned at startup: missing
-    \\collections are created and new fields are added. **Renames, drops, and type
-    \\changes are detected, logged, and then skipped** — the server starts happily
-    \\and your change did not happen. Those need an explicit `.migrations` entry.
+    \\collections are created, new fields are added, and select options may widen
+    \\without changing single/multi-value storage. **Renames, drops, type changes,
+    \\and other existing field option/flag changes are logged and skipped** — the
+    \\server starts happily and your change did not happen. Those need an explicit
+    \\`.migrations` entry.
     \\Read the startup log after any schema edit.
     \\
     \\## Trap 9 — hook allocations belong to the request arena

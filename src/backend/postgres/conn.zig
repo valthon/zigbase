@@ -16,14 +16,7 @@ const scram = @import("scram.zig");
 const connstr = @import("connstr.zig");
 const tls_trust = @import("tls_trust.zig");
 
-/// A TLS/auth misconfiguration is a hard `.err` in production, but Zig's test runner
-/// counts every `std.log.err` as a test failure — so the tests that deliberately
-/// exercise these refuse-to-connect paths would fail on the log alone even though
-/// their assertions (the returned error) are correct. Under the test runner we emit
-/// the identical message at `.warn`; production still logs `.err`.
-fn logMisconfig(comptime fmt: []const u8, args: anytype) void {
-    if (builtin.is_test) std.log.warn(fmt, args) else std.log.err(fmt, args);
-}
+const logMisconfig = @import("../../startup_log.zig").refusal;
 
 pub const ConnError = error{
     ConnectFailed,

@@ -5,6 +5,7 @@ const migrations = @import("migrations.zig");
 const ddl = @import("ddl.zig");
 const id = @import("id.zig");
 const schema_gen = @import("schema_gen.zig");
+const fts = @import("search/fts.zig");
 
 /// The JSON parse helpers in schema.zig return the inferred error set of
 /// std.json.parseFromSlice, which is wider than schema.ParseError. Capture it so
@@ -12,7 +13,7 @@ const schema_gen = @import("schema_gen.zig");
 const SchemaJsonError = @typeInfo(@typeInfo(@TypeOf(schema.fieldsFromJson)).@"fn".return_type.?).error_union.error_set ||
     @typeInfo(@typeInfo(@TypeOf(schema.indexesFromJson)).@"fn".return_type.?).error_union.error_set;
 
-pub const EngineError = error{ Validation, NotFound, Conflict, StorageNamespaceMissing } || @import("files/namespace.zig").Error || db.DbError || std.mem.Allocator.Error || schema.ParseError || SchemaJsonError;
+pub const EngineError = error{ Validation, NotFound, Conflict, StorageNamespaceMissing } || @import("files/namespace.zig").Error || db.DbError || std.mem.Allocator.Error || schema.ParseError || SchemaJsonError || fts.EnsureIndexError;
 
 /// Validation details for the most recent failed create/update (2b surfaces these).
 pub threadlocal var last_errors: ?[]const schema.ValidationError = null;
@@ -225,30 +226,32 @@ fn dupOptText(alloc: std.mem.Allocator, st: *db.Stmt, idx: c_int) !?[]const u8 {
 /// Must be called before the next step()/finalize() (columnText pointers are transient).
 fn rowToCollection(alloc: std.mem.Allocator, st: *db.Stmt) EngineError!schema.Collection {
     if (st.isNull(15)) return error.StorageNamespaceMissing;
-    const col_id = try alloc.dupe(u8, st.columnText(0));
-    const name = try alloc.dupe(u8, st.columnText(1));
-    const ctype = std.meta.stringToEnum(schema.CollectionType, st.columnText(2)) orelse .base;
-    const system = st.columnInt(3) != 0;
-    const fields = try schema.fieldsFromJson(alloc, st.columnText(4));
-    const indexes = try schema.indexesFromJson(alloc, st.columnText(5));
-    return .{
-        .id = col_id,
-        .name = name,
-        .type = ctype,
-        .system = system,
-        .fields = fields,
-        .indexes = indexes,
-        .listRule = try dupOptText(alloc, st, 6),
-        .viewRule = try dupOptText(alloc, st, 7),
-        .createRule = try dupOptText(alloc, st, 8),
-        .updateRule = try dupOptText(alloc, st, 9),
-        .deleteRule = try dupOptText(alloc, st, 10),
-        .created = try alloc.dupe(u8, st.columnText(11)),
-        .updated = try alloc.dupe(u8, st.columnText(12)),
-        .options = try schema.optionsFromJson(alloc, st.columnText(13)),
-        .rename_epoch = st.columnInt(14),
-        .storage_namespace = try alloc.dupe(u8, st.columnText(15)),
+    // Start with an empty owned graph; the auth identity default normally points
+    // at static "email", so override it until optionsFromJson installs ownership.
+    var result: schema.Collection = .{
+        .id = "",
+        .name = "",
+        .fields = &.{},
+        .options = .{ .auth = .{ .identityFields = &.{} } },
     };
+    errdefer result.deinit(alloc);
+    result.id = try alloc.dupe(u8, st.columnText(0));
+    result.name = try alloc.dupe(u8, st.columnText(1));
+    result.type = std.meta.stringToEnum(schema.CollectionType, st.columnText(2)) orelse .base;
+    result.system = st.columnInt(3) != 0;
+    result.fields = try schema.fieldsFromJson(alloc, st.columnText(4));
+    result.indexes = try schema.indexesFromJson(alloc, st.columnText(5));
+    result.listRule = try dupOptText(alloc, st, 6);
+    result.viewRule = try dupOptText(alloc, st, 7);
+    result.createRule = try dupOptText(alloc, st, 8);
+    result.updateRule = try dupOptText(alloc, st, 9);
+    result.deleteRule = try dupOptText(alloc, st, 10);
+    result.created = try alloc.dupe(u8, st.columnText(11));
+    result.updated = try alloc.dupe(u8, st.columnText(12));
+    result.options = try schema.optionsFromJson(alloc, st.columnText(13));
+    result.rename_epoch = st.columnInt(14);
+    result.storage_namespace = try alloc.dupe(u8, st.columnText(15));
+    return result;
 }
 
 /// Load one FULLY-OWNED collection from the current row of `st`: `rowToCollection` plus auth
@@ -312,6 +315,18 @@ pub fn list(alloc: std.mem.Allocator, w: *db.Db) EngineError![]schema.Collection
 }
 
 pub fn update(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, id_or_name: []const u8, newdef: schema.Collection) EngineError!schema.Collection {
+    return updateImpl(alloc, io, w, id_or_name, newdef, null);
+}
+
+/// Provisioning may plan an additive rebuild before another process changes the
+/// schema. Recheck preflight's full stored definition under the same metadata lock as
+/// the rebuild, before issuing DDL. Keep update()'s FK and savepoint ownership:
+/// wrapping it in a new outer transaction would defeat SQLite's FK pause.
+pub fn updateWithExpectedDefinition(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, id_or_name: []const u8, newdef: schema.Collection, expected: schema.Collection) EngineError!schema.Collection {
+    return updateImpl(alloc, io, w, id_or_name, newdef, expected);
+}
+
+fn updateImpl(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, id_or_name: []const u8, newdef: schema.Collection, expected: ?schema.Collection) EngineError!schema.Collection {
     last_errors = null;
 
     // Like create(): everything except the validation errors (via `last_errors`) and the final
@@ -321,8 +336,6 @@ pub fn update(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, id_or_name: []con
     var scratch = std.heap.ArenaAllocator.init(alloc);
     defer scratch.deinit();
     const sa = scratch.allocator();
-
-    const old = (try get(sa, w, id_or_name)) orelse return error.NotFound;
 
     // assign ids to new fields lacking one; preserve existing ids (all on the scratch arena)
     const fields = try sa.alloc(schema.Field, newdef.fields.len);
@@ -335,26 +348,17 @@ pub fn update(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, id_or_name: []con
     }
     var newc = newdef;
     newc.fields = fields;
-    // Rename is not supported in SP2, so the id/name are preserved from `old`.
-    newc.id = try sa.dupe(u8, old.id);
-    newc.name = try sa.dupe(u8, old.name);
+    // An update ignores an incoming rename. Validate its fields/options now;
+    // the canonical stored name is checked after loading metadata under lock.
 
     // validate (see create(): last_errors is handed back as an OWNED, freeable slice on `alloc`)
     var errs: std.ArrayList(schema.ValidationError) = .empty;
     errdefer errs.deinit(alloc);
-    try schema.validate(alloc, newc, &errs);
+    try schema.validateFieldsAndOptions(alloc, newc, &errs);
     if (errs.items.len > 0) {
         last_errors = try errs.toOwnedSlice(alloc);
         return error.Validation;
     }
-
-    // Inject auth system fields (after validation, which only sees user fields) so the rebuild
-    // preserves the auth columns: `old` is auth-injected (from get), so both sides carry the
-    // auth field ids and rebuildPlan keeps them. Without this an auth-collection update would
-    // drop email/passwordHash/tokenKey/etc and destroy all credentials. On `sa`.
-    const newc_full = try schema.injectAuthFields(sa, newc);
-    // relation-resolved view for the rebuild's FK generation
-    const ddl_new = try resolveRelations(sa, w, newc_full);
 
     const d = db.dbDialect(w);
     // SQLite rebuilds via __new+copy+drop+rename, so FK enforcement must be paused around it;
@@ -369,28 +373,54 @@ pub fn update(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, id_or_name: []con
     if (sqlite_rebuild) {
         try w.exec("PRAGMA foreign_keys=OFF;");
     }
-    errdefer if (sqlite_rebuild) {
-        w.exec("PRAGMA foreign_keys=ON;") catch {};
+    defer if (sqlite_rebuild) {
+        w.exec("PRAGMA foreign_keys=ON;") catch |err| {
+            std.log.warn("collection update: could not restore foreign keys ({s}); connection quarantined", .{@errorName(err)});
+            const inner = if (comptime @import("build_options").postgres) &w.sqlite else w;
+            inner.quarantined = true;
+        };
     };
     const tx = try Tx.begin(w);
     errdefer tx.rollback();
-    const plan = try ddl.rebuildPlan(sa, old, ddl_new, d);
-    for (plan) |stmt| try w.exec(try sa.dupeZ(u8, stmt));
-    if (newc.type == .auth) {
-        for (newc.options.auth.identityFields) |idf| {
-            try w.exec(try sa.dupeZ(u8, try ddl.authIdentityIndexSql(sa, newc.name, idf)));
-        }
-    }
-    try updateRow(sa, w, newc.id, newc); // persist user fields only
-    try schema_gen.bump(w); // inside the tx: a rolled-back rebuild must not advertise a change
-    try tx.commit();
-    if (sqlite_rebuild) {
-        try w.exec("PRAGMA foreign_keys=ON;");
-    }
+    // Every input to the rebuild plan, including relation target names, must
+    // come from this locked snapshot. A pre-lock read could observe an interim
+    // definition even when another writer restores the expected one (ABA).
+    const old = (try get(sa, w, id_or_name)) orelse return error.NotFound;
+    try validateStoredName(alloc, old.name);
+    newc.id = try sa.dupe(u8, old.id);
+    newc.name = try sa.dupe(u8, old.name);
+    const unchanged = expected != null and try definitionEql(sa, old, newc);
+    if (!unchanged) {
+        if (expected) |snapshot| try checkDefinitionSnapshot(sa, snapshot, old);
 
-    // Return a fully-owned reload on `alloc` (name changes require Migrator.renameCollection), matching
-    // the former hand-assembled `newc_full` but with every string/slice owned.
-    return (try get(alloc, w, old.id)).?;
+        // Inject auth system fields (after validation, which only sees user fields) so the rebuild
+        // preserves the auth columns: `old` is auth-injected (from get), so both sides carry the
+        // auth field ids and rebuildPlan keeps them. Without this an auth-collection update would
+        // drop email/passwordHash/tokenKey/etc and destroy all credentials. On `sa`.
+        const newc_full = try schema.injectAuthFields(sa, newc);
+        // relation-resolved view for the rebuild's FK generation
+        const ddl_new = try resolveRelations(sa, w, newc_full);
+
+        const plan = try ddl.rebuildPlan(sa, old, ddl_new, d);
+        for (plan) |stmt| try w.exec(try sa.dupeZ(u8, stmt));
+        if (newc.type == .auth) {
+            for (newc.options.auth.identityFields) |idf| {
+                try w.exec(try sa.dupeZ(u8, try ddl.authIdentityIndexSql(sa, newc.name, idf)));
+            }
+        }
+        if (expected != null) {
+            try ensureTenantIndex(sa, w, newc);
+            try fts.ensureIndex(sa, w, newc);
+        }
+        try updateRow(sa, w, newc.id, newc); // persist user fields only
+        try schema_gen.bump(w); // inside the tx: a rolled-back rebuild must not advertise a change
+    }
+    // Materialize the owned result before committing. An allocator failure in
+    // get() must roll back the rebuild rather than report failure after a write.
+    const result = (try get(alloc, w, old.id)).?;
+    errdefer result.deinit(alloc);
+    try tx.commit();
+    return result;
 }
 
 fn updateRow(alloc: std.mem.Allocator, w: *db.Db, col_id: []const u8, col: schema.Collection) EngineError!void {
@@ -510,34 +540,110 @@ pub fn updateRules(alloc: std.mem.Allocator, w: *db.Db, col_id: []const u8, rule
     try tx.commit();
 }
 
-/// Reconcile only declared indexes. Migration-owned indexes and table data are untouched.
-/// A failed CREATE (e.g. duplicate values for a new UNIQUE constraint) rolls back both the
-/// index changes and metadata. No-op declarations do not bump the schema generation.
-pub fn updateIndexes(alloc: std.mem.Allocator, w: *db.Db, col_id: []const u8, indexes: []const schema.Index) EngineError!void {
+/// Apply a provisioning plan without rebuilding records. All physical index/search
+/// changes and metadata share one lock, transaction, and generation bump.
+pub fn provisionMetadata(alloc: std.mem.Allocator, w: *db.Db, expected: schema.Collection, desired: schema.Collection) EngineError!void {
+    last_errors = null;
+    var scratch = std.heap.ArenaAllocator.init(alloc);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const tx = try Tx.begin(w);
+    errdefer tx.rollback();
+    const current = (try get(a, w, expected.id)) orelse return error.NotFound;
+    const unchanged = try definitionEql(a, current, desired);
+    if (!unchanged) {
+        try validateStoredName(alloc, current.name);
+        try checkDefinitionSnapshot(a, expected, current);
+    }
+    try reconcileIndexes(alloc, w, current, desired);
+    try ensureTenantIndex(a, w, desired);
+    try fts.ensureIndex(a, w, desired);
+    if (!unchanged) {
+        try updateRow(a, w, desired.id, desired);
+        try schema_gen.bump(w);
+    }
+    try tx.commit();
+}
+
+/// Only a caller that will write checks this: a legacy reserved name that needs no
+/// change must keep starting. On failure, `last_errors` is an owned slice on `alloc`.
+fn validateStoredName(alloc: std.mem.Allocator, name: []const u8) EngineError!void {
+    var errs: std.ArrayList(schema.ValidationError) = .empty;
+    errdefer errs.deinit(alloc);
+    try schema.validateCollectionName(alloc, name, &errs);
+    if (errs.items.len == 0) return;
+    last_errors = try errs.toOwnedSlice(alloc);
+    return error.Validation;
+}
+
+fn definitionEql(alloc: std.mem.Allocator, a: schema.Collection, b: schema.Collection) EngineError!bool {
+    if (!std.mem.eql(u8, a.id, b.id) or !std.mem.eql(u8, a.name, b.name) or
+        a.system != b.system or a.rename_epoch != b.rename_epoch or
+        !std.mem.eql(u8, a.storage_namespace, b.storage_namespace)) return false;
+    if (!Rules.from(a).eql(Rules.from(b))) return false;
+    checkFieldSnapshot(alloc, a, b) catch |err| switch (err) {
+        error.Conflict => return false,
+        else => return err,
+    };
+    const ai = try schema.indexesToJson(alloc, a.indexes);
+    defer alloc.free(ai);
+    const bi = try schema.indexesToJson(alloc, b.indexes);
+    defer alloc.free(bi);
+    const ao = try schema.optionsToJson(alloc, a, false);
+    defer alloc.free(ao);
+    const bo = try schema.optionsToJson(alloc, b, false);
+    defer alloc.free(bo);
+    return a.type == b.type and std.mem.eql(u8, ai, bi) and std.mem.eql(u8, ao, bo);
+}
+
+fn checkDefinitionSnapshot(alloc: std.mem.Allocator, expected: schema.Collection, current: schema.Collection) EngineError!void {
+    if (!try definitionEql(alloc, expected, current)) return error.Conflict;
+}
+
+fn checkFieldSnapshot(alloc: std.mem.Allocator, expected: schema.Collection, current: schema.Collection) EngineError!void {
+    const expected_json = try userFieldsJson(alloc, expected);
+    defer alloc.free(expected_json);
+    const current_json = try userFieldsJson(alloc, current);
+    defer alloc.free(current_json);
+    if (!std.mem.eql(u8, expected_json, current_json)) return error.Conflict;
+}
+
+/// get() injects auth system fields, which have reserved names. User field ids are
+/// opaque: an underscore prefix does not identify a system-owned field.
+fn userFieldsJson(alloc: std.mem.Allocator, col: schema.Collection) ![]u8 {
+    var user_fields: std.ArrayList(schema.Field) = .empty;
+    defer user_fields.deinit(alloc);
+    for (col.fields) |field| {
+        if (schema.isInjectedField(col.type, field.name)) continue;
+        try user_fields.append(alloc, field);
+    }
+    return schema.fieldsToJson(alloc, user_fields.items);
+}
+
+/// Caller owns the metadata transaction and generation bump. Reconcile declared
+/// indexes without rebuilding records or touching migration-owned objects.
+fn reconcileIndexes(alloc: std.mem.Allocator, w: *db.Db, old: schema.Collection, desired: schema.Collection) EngineError!void {
+    const indexes = desired.indexes;
     var scratch = std.heap.ArenaAllocator.init(alloc);
     defer scratch.deinit();
     const sa = scratch.allocator();
-    const tx = try Tx.begin(w);
-    errdefer tx.rollback();
-    const old = (try get(sa, w, col_id)) orelse return error.NotFound;
     const old_json = try schema.indexesToJson(sa, old.indexes);
     const new_json = try schema.indexesToJson(sa, indexes);
-    if (std.mem.eql(u8, old_json, new_json)) {
-        try tx.commit();
-        return;
-    }
-    var newc = old;
-    newc.indexes = indexes;
+    if (std.mem.eql(u8, old_json, new_json)) return;
+    var newc = desired;
     var user_fields: std.ArrayList(schema.Field) = .empty;
-    for (old.fields) |field| {
-        if (field.id.len > 0 and field.id[0] == '_') continue;
+    for (desired.fields) |field| {
         if (schema.isSystemFieldName(field.name)) continue;
         try user_fields.append(sa, field);
     }
     newc.fields = user_fields.items;
+    // Reserved names are hidden from field validation, which would refuse a stored
+    // legacy field. Index rules still apply to it, so those see every desired field.
+    newc.indexes = &.{};
     var errs: std.ArrayList(schema.ValidationError) = .empty;
     errdefer errs.deinit(alloc);
     try schema.validate(alloc, newc, &errs);
+    try schema.validateIndexes(alloc, desired, &errs);
     if (errs.items.len > 0) {
         last_errors = try errs.toOwnedSlice(alloc);
         return error.Validation;
@@ -588,8 +694,6 @@ pub fn updateIndexes(alloc: std.mem.Allocator, w: *db.Db, col_id: []const u8, in
         try st.bindText(2, new_json);
         _ = try st.step();
     }
-    try schema_gen.bump(w);
-    try tx.commit();
 }
 
 /// Conservative adoption of ordinary migration-created indexes. Compare catalog properties,
@@ -1211,4 +1315,341 @@ test "a failed create inside a caller's transaction leaves the caller's transact
     try conn.commit();
     const still = (try get(a, &conn, "keep")).?;
     still.deinit(a);
+}
+
+/// Auto-create the index backing the `tenant_field` column so the per-request tenant scope
+/// predicate (`"<col>"."<tenant_field>" = ?`) is served from an index, not a scan. Idempotent
+/// (`IF NOT EXISTS`); identifiers are gated through `schema.isValidIdentifier` before interpolation.
+pub fn ensureTenantIndex(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection) EngineError!void {
+    const tf = col.options.tenant_field orelse return;
+    if (!schema.isValidIdentifier(col.name) or !schema.isValidIdentifier(tf)) return;
+    // Bound + freed rather than nested inside the allocPrint: `alloc` here is the caller's
+    // allocator, not an arena (the `sql` free below says so), so a nested temporary would leak.
+    const qidx = try ddl.quoteComposite(alloc, "idx_{s}_{s}_tenant", .{ col.name, tf });
+    defer alloc.free(qidx);
+    const qtbl = try ddl.quoteIdent(alloc, col.name);
+    defer alloc.free(qtbl);
+    const qtf = try ddl.quoteIdent(alloc, tf);
+    defer alloc.free(qtf);
+    const sql = try std.fmt.allocPrintSentinel(
+        alloc,
+        "CREATE INDEX IF NOT EXISTS {s} ON {s} ({s});",
+        .{ qidx, qtbl, qtf },
+        0,
+    );
+    defer alloc.free(sql);
+    try w.exec(sql);
+    std.log.info("provision: ensured tenant index on '{s}'.'{s}'", .{ col.name, tf });
+}
+
+test "owned update result allocation failure rolls back rebuild and generation" {
+    const a = std.testing.allocator;
+    var allocations: usize = 0;
+    for ([_]bool{ false, true }) |fail_last| {
+        var conn = try db.Db.openMemory();
+        defer conn.close();
+        try migrations.run(&conn);
+        const original = try create(a, std.testing.io, &conn, .{
+            .id = "",
+            .name = "items",
+            .fields = &.{.{ .id = "title_id", .name = "title", .options = .{ .text = .{} } }},
+        });
+        defer original.deinit(a);
+        try conn.exec("INSERT INTO items(id,title) VALUES ('old','preserve me');");
+        try conn.exec("CREATE INDEX migration_index ON items(title);");
+        const generation = try schema_gen.read(&conn);
+        var desired = original;
+        desired.fields = &.{ original.fields[0], .{ .id = "extra_id", .name = "extra", .options = .{ .text = .{} } } };
+        // Measure the successful path, then fail its last allocation: the owned
+        // reload after the DDL and metadata writes, rather than an early preflight.
+        var failing = std.testing.FailingAllocator.init(a, .{
+            .fail_index = if (fail_last) allocations - 1 else std.math.maxInt(usize),
+        });
+        const fa = failing.allocator();
+        if (fail_last) {
+            try std.testing.expectError(error.OutOfMemory, updateWithExpectedDefinition(fa, std.testing.io, &conn, original.id, desired, original));
+            try std.testing.expectEqual(generation, try schema_gen.read(&conn));
+            const preserved = (try get(a, &conn, original.id)).?;
+            defer preserved.deinit(a);
+            try std.testing.expect(schema.fieldByName(preserved, "extra") == null);
+            var st = try conn.prepare("SELECT (SELECT title FROM items WHERE id='old'), (SELECT count(*) FROM pragma_table_info('items') WHERE name='extra'), (SELECT count(*) FROM sqlite_master WHERE name='migration_index');");
+            defer st.finalize();
+            try std.testing.expect(try st.step());
+            try std.testing.expectEqualStrings("preserve me", st.columnText(0));
+            try std.testing.expectEqual(@as(i64, 0), st.columnInt(1));
+            try std.testing.expectEqual(@as(i64, 1), st.columnInt(2));
+        } else {
+            const updated = try updateWithExpectedDefinition(fa, std.testing.io, &conn, original.id, desired, original);
+            updated.deinit(fa);
+            allocations = failing.alloc_index;
+            try std.testing.expect(allocations > 0);
+            try std.testing.expectEqual(generation + 1, try schema_gen.read(&conn));
+        }
+        try std.testing.expect(!conn.inTransaction());
+        var fk = try conn.prepare("PRAGMA foreign_keys;");
+        defer fk.finalize();
+        try std.testing.expect(try fk.step());
+        try std.testing.expectEqual(@as(i64, 1), fk.columnInt(0));
+    }
+}
+
+test "rebuild reads collection and relation metadata only after locking" {
+    const c = @import("c.zig").c;
+    const Reads = struct {
+        handle: ?*c.sqlite3,
+        locked: bool = false,
+        reads: usize = 0,
+        denied: bool = false,
+
+        fn authorize(context: ?*anyopaque, action: c_int, first: [*c]const u8, _: [*c]const u8, _: [*c]const u8, _: [*c]const u8) callconv(.c) c_int {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            if (first == null) return c.SQLITE_OK;
+            const table = std.mem.span(first);
+            if (action == c.SQLITE_UPDATE and std.mem.eql(u8, table, "_schema_state")) self.locked = true;
+            if (action == c.SQLITE_READ and std.mem.eql(u8, table, "_collections")) {
+                self.reads += 1;
+                // The SQLite authorizer rejects pre-lock reads rather than
+                // coordinating threads with timing-sensitive sleeps.
+                if (!self.locked or c.sqlite3_get_autocommit(self.handle) != 0) {
+                    self.denied = true;
+                    return c.SQLITE_DENY;
+                }
+            }
+            return c.SQLITE_OK;
+        }
+    };
+    const a = std.testing.allocator;
+    var conn = try db.Db.openMemory();
+    defer conn.close();
+    try migrations.run(&conn);
+    const target = try create(a, std.testing.io, &conn, .{ .id = "", .name = "targets", .fields = &.{} });
+    defer target.deinit(a);
+    const original = try create(a, std.testing.io, &conn, .{
+        .id = "",
+        .name = "items",
+        .fields = &.{.{ .id = "title_id", .name = "title", .options = .{ .text = .{} } }},
+    });
+    defer original.deinit(a);
+    var desired = original;
+    desired.fields = &.{ original.fields[0], .{ .id = "target_id", .name = "target", .options = .{ .relation = .{ .targetCollectionId = target.id } } } };
+    const inner = if (comptime @import("build_options").postgres) &conn.sqlite else &conn;
+    var reads: Reads = .{ .handle = inner.handle };
+    try std.testing.expectEqual(c.SQLITE_OK, c.sqlite3_set_authorizer(inner.handle, Reads.authorize, &reads));
+    defer _ = c.sqlite3_set_authorizer(inner.handle, null, null);
+    const updated = try updateWithExpectedDefinition(a, std.testing.io, &conn, original.id, desired, original);
+    defer updated.deinit(a);
+    try std.testing.expect(reads.locked);
+    try std.testing.expect(reads.reads > 1);
+    try std.testing.expect(!reads.denied);
+    try std.testing.expect(schema.fieldByName(updated, "target") != null);
+}
+
+test "committed rebuild survives FK restoration failure and quarantines its connection" {
+    const c = @import("c.zig").c;
+    const DenyRestore = struct {
+        fn authorize(_: ?*anyopaque, action: c_int, first: [*c]const u8, second: [*c]const u8, _: [*c]const u8, _: [*c]const u8) callconv(.c) c_int {
+            if (action == c.SQLITE_PRAGMA and first != null and second != null and
+                std.mem.eql(u8, std.mem.span(first), "foreign_keys") and
+                std.ascii.eqlIgnoreCase(std.mem.span(second), "ON")) return c.SQLITE_DENY;
+            return c.SQLITE_OK;
+        }
+    };
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(dir);
+    const path = try std.fmt.allocPrintSentinel(a, "{s}/data.db", .{dir}, 0);
+    defer a.free(path);
+    var conn = try db.Db.open(path);
+    defer conn.close();
+    try migrations.run(&conn);
+    const original = try create(a, std.testing.io, &conn, .{
+        .id = "",
+        .name = "items",
+        .fields = &.{.{ .id = "title_id", .name = "title", .options = .{ .text = .{} } }},
+    });
+    defer original.deinit(a);
+    const generation = try schema_gen.read(&conn);
+    var desired = original;
+    desired.fields = &.{ original.fields[0], .{ .id = "extra_id", .name = "extra", .options = .{ .text = .{} } } };
+    const inner = if (comptime @import("build_options").postgres) &conn.sqlite else &conn;
+    try std.testing.expectEqual(c.SQLITE_OK, c.sqlite3_set_authorizer(inner.handle, DenyRestore.authorize, null));
+    const result = try updateWithExpectedDefinition(a, std.testing.io, &conn, original.id, desired, original);
+    defer result.deinit(a);
+    try std.testing.expect(schema.fieldByName(result, "extra") != null);
+    try std.testing.expect(!conn.isHealthy());
+    try std.testing.expectError(error.WriterUnavailable, conn.exec("SELECT 1;"));
+    var observer = try db.Db.open(path);
+    defer observer.close();
+    try std.testing.expectEqual(generation + 1, try schema_gen.read(&observer));
+    const saved = (try get(a, &observer, original.id)).?;
+    defer saved.deinit(a);
+    try std.testing.expect(schema.fieldByName(saved, "extra") != null);
+}
+
+test "invalid update inputs are rejected before foreign key changes or metadata locks" {
+    const c = @import("c.zig").c;
+    const RejectMutation = struct {
+        attempts: usize = 0,
+        fn authorize(context: ?*anyopaque, action: c_int, _: [*c]const u8, _: [*c]const u8, _: [*c]const u8, _: [*c]const u8) callconv(.c) c_int {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            if (action == c.SQLITE_UPDATE or action == c.SQLITE_TRANSACTION or action == c.SQLITE_PRAGMA) {
+                self.attempts += 1;
+                return c.SQLITE_DENY;
+            }
+            return c.SQLITE_OK;
+        }
+    };
+    const a = std.testing.allocator;
+    var conn = try db.Db.openMemory();
+    defer conn.close();
+    try migrations.run(&conn);
+    const original = try create(a, std.testing.io, &conn, .{ .id = "", .name = "items", .fields = &.{} });
+    defer original.deinit(a);
+    var invalid = original;
+    invalid.fields = &.{.{ .id = "bad_id", .name = "bad-name", .options = .{ .text = .{} } }};
+    var rejected: RejectMutation = .{};
+    const inner = if (comptime @import("build_options").postgres) &conn.sqlite else &conn;
+    try std.testing.expectEqual(c.SQLITE_OK, c.sqlite3_set_authorizer(inner.handle, RejectMutation.authorize, &rejected));
+    defer _ = c.sqlite3_set_authorizer(inner.handle, null, null);
+    try std.testing.expectError(error.Validation, update(a, std.testing.io, &conn, original.id, invalid));
+    const errors = last_errors.?;
+    defer a.free(errors);
+    defer last_errors = null;
+    try std.testing.expectEqual(@as(usize, 0), rejected.attempts);
+    try std.testing.expect(!conn.inTransaction());
+}
+
+fn expectStoredNameRejected(a: std.mem.Allocator, reserved_name: []const u8, by_id: bool) !void {
+    const c = @import("c.zig").c;
+    const DdlAttempts = struct {
+        count: usize = 0,
+        fn authorize(context: ?*anyopaque, action: c_int, _: [*c]const u8, _: [*c]const u8, _: [*c]const u8, _: [*c]const u8) callconv(.c) c_int {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            if (action == c.SQLITE_CREATE_TABLE or action == c.SQLITE_DROP_TABLE or
+                action == c.SQLITE_ALTER_TABLE or action == c.SQLITE_CREATE_INDEX or
+                action == c.SQLITE_DROP_INDEX) self.count += 1;
+            return c.SQLITE_OK;
+        }
+    };
+    var conn = try db.Db.openMemory();
+    defer conn.close();
+    try migrations.run(&conn);
+    if (!std.mem.eql(u8, reserved_name, "_superusers")) {
+        const created = try create(a, std.testing.io, &conn, .{
+            .id = "",
+            .name = "legacy",
+            .fields = &.{.{ .id = "title_id", .name = "title", .options = .{ .text = .{} } }},
+        });
+        created.deinit(a);
+        // Simulate a legacy table created before the FTS suffix reservation.
+        try conn.exec("ALTER TABLE legacy RENAME TO legacy_fts;");
+        try conn.exec("UPDATE _collections SET name='legacy_fts' WHERE name='legacy';");
+    }
+    const original = (try get(a, &conn, reserved_name)).?;
+    defer original.deinit(a);
+    const quoted = try ddl.quoteIdent(a, original.name);
+    defer a.free(quoted);
+    const index_sql = try std.fmt.allocPrintSentinel(a, "CREATE INDEX name_guard_marker ON {s}(created);", .{quoted}, 0);
+    defer a.free(index_sql);
+    try conn.exec(index_sql);
+    const generation = try schema_gen.read(&conn);
+    var desired = original;
+    var fields: std.ArrayList(schema.Field) = .empty;
+    defer fields.deinit(a);
+    for (original.fields) |field| {
+        if (!schema.isSystemFieldName(field.name)) try fields.append(a, field);
+    }
+    try fields.append(a, .{ .id = "extra_id", .name = "extra", .options = .{ .text = .{} } });
+    desired.fields = fields.items;
+    var attempts: DdlAttempts = .{};
+    const inner = if (comptime @import("build_options").postgres) &conn.sqlite else &conn;
+    try std.testing.expectEqual(c.SQLITE_OK, c.sqlite3_set_authorizer(inner.handle, DdlAttempts.authorize, &attempts));
+    defer _ = c.sqlite3_set_authorizer(inner.handle, null, null);
+    const key = if (by_id) original.id else original.name;
+    if (update(a, std.testing.io, &conn, key, desired)) |saved| {
+        saved.deinit(a);
+        return error.TestExpectedStoredNameValidation;
+    } else |err| try std.testing.expectEqual(error.Validation, err);
+    const errors = last_errors.?;
+    defer a.free(errors);
+    defer last_errors = null;
+    try std.testing.expectEqualStrings("name", errors[0].field);
+    try std.testing.expectEqual(@as(usize, 0), attempts.count);
+    try std.testing.expectEqual(generation, try schema_gen.read(&conn));
+    try std.testing.expect(!conn.inTransaction());
+    const preserved = (try get(a, &conn, original.id)).?;
+    defer preserved.deinit(a);
+    try std.testing.expect(schema.fieldByName(preserved, "extra") == null);
+    var state = try conn.prepare("SELECT (SELECT count(*) FROM sqlite_master WHERE name='name_guard_marker'), (SELECT foreign_keys FROM pragma_foreign_keys);");
+    defer state.finalize();
+    try std.testing.expect(try state.step());
+    try std.testing.expectEqual(@as(i64, 1), state.columnInt(0));
+    try std.testing.expectEqual(@as(i64, 1), state.columnInt(1));
+}
+
+test "updates reject stored superuser name for name and id lookups" {
+    for ([_]bool{ false, true }) |by_id| try expectStoredNameRejected(std.testing.allocator, "_superusers", by_id);
+}
+
+test "updates reject stored legacy FTS suffix for name and id lookups" {
+    for ([_]bool{ false, true }) |by_id| try expectStoredNameRejected(std.testing.allocator, "legacy_fts", by_id);
+}
+
+test "metadata-only provisioning rejects a stored reserved name only when it would write" {
+    const a = std.testing.allocator;
+    var conn = try db.Db.openMemory();
+    defer conn.close();
+    try migrations.run(&conn);
+    const created = try create(a, std.testing.io, &conn, .{
+        .id = "",
+        .name = "legacy",
+        .fields = &.{.{ .id = "title_id", .name = "title", .options = .{ .text = .{} } }},
+    });
+    created.deinit(a);
+    // Simulate a legacy table created before the FTS suffix reservation.
+    try conn.exec("ALTER TABLE legacy RENAME TO legacy_fts;");
+    try conn.exec("UPDATE _collections SET name='legacy_fts' WHERE name='legacy';");
+    const original = (try get(a, &conn, "legacy_fts")).?;
+    defer original.deinit(a);
+    const generation = try schema_gen.read(&conn);
+
+    // An unchanged boot writes nothing, so an existing deployment keeps starting.
+    try provisionMetadata(a, &conn, original, original);
+    try std.testing.expectEqual(generation, try schema_gen.read(&conn));
+
+    var desired = original;
+    desired.listRule = "@public";
+    try std.testing.expectError(error.Validation, provisionMetadata(a, &conn, original, desired));
+    const errors = last_errors.?;
+    defer a.free(errors);
+    defer last_errors = null;
+    try std.testing.expectEqualStrings("name", errors[0].field);
+    try std.testing.expectEqual(generation, try schema_gen.read(&conn));
+    try std.testing.expect(!conn.inTransaction());
+    const preserved = (try get(a, &conn, original.id)).?;
+    defer preserved.deinit(a);
+    try std.testing.expectEqual(@as(?[]const u8, null), preserved.listRule);
+}
+
+test "updates validate stored name while ignoring incoming rename" {
+    const a = std.testing.allocator;
+    var conn = try db.Db.openMemory();
+    defer conn.close();
+    try migrations.run(&conn);
+    const original = try create(a, std.testing.io, &conn, .{
+        .id = "",
+        .name = "items",
+        .fields = &.{.{ .id = "title_id", .name = "title", .options = .{ .text = .{} } }},
+    });
+    defer original.deinit(a);
+    for ([_][]const u8{ "_ignored", "ignored_fts" }) |incoming_name| {
+        var desired = original;
+        desired.name = incoming_name;
+        const updated = try update(a, std.testing.io, &conn, original.id, desired);
+        defer updated.deinit(a);
+        try std.testing.expectEqualStrings("items", updated.name);
+        try std.testing.expectEqualStrings(original.id, updated.id);
+    }
 }

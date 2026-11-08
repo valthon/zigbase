@@ -4163,6 +4163,21 @@ and applies the **minimal safe change set** (running it twice is a clean no-op):
 - A field present in the spec but missing from the live collection is **added**,
   rebuilding the table while **preserving existing data** (the new column is null
   for old rows).
+- An existing **select** field's options are updated when the declared `.values`
+  contain every live value and `.maxSelect` does not decrease. This is a
+  metadata-only write, preserving records, indexes, and triggers. The field's
+  other flags must be unchanged, and it must keep the same single/multi-value
+  representation: increasing `.maxSelect` from 1 to 2 or more needs an explicit
+  data migration from scalar strings to JSON arrays. A value of 0 is a zero limit,
+  not an unlimited sentinel. If another process changes any stored collection definition (including rules or options) between
+  the startup comparison and schema write, provisioning fails with `Conflict`
+  rather than overwriting that change, including when widening accompanies a
+  new field or TTL change; restart against the current schema. Concurrent boots
+  requesting the same resulting definition succeed without another rewrite.
+  Reordering the same select values keeps the stored order and does not count as
+  widening or invalidate caches. Accepted fields, rules,
+  declared indexes, search objects and one cache-generation bump commit together;
+  any failure rolls the whole collection update back.
 - A changed **access rule** (`.list_rule` / `.view_rule` / `.create_rule` /
   `.update_rule` / `.delete_rule`) is **re-applied to the live collection**. This is a
   metadata-only write — no table rebuild, no data copy — so tightening a rule in code
@@ -4170,12 +4185,20 @@ and applies the **minimal safe change set** (running it twice is a clean no-op):
   (`null`) in the literal means "unspecified: leave whatever is live alone"; to lock a
   rule explicitly, spell it `""` (blank and unset are the same rule at evaluation time
   — superusers only — so switching between them is not treated as a change).
-- A **non-additive** change — a field rename, drop, or type/storage-class change —
+- A **non-additive** change — a field rename, drop, type/storage-class change,
+  select narrowing, or any other existing field option or flag change —
   is **detected, logged, and SKIPPED** (never applied, so no data loss). Relation
   targets must reference a known collection (a comptime collection or a pre-existing
   live one such as `_superusers`); an unknown target is a startup error.
 
 For the changes auto-migration won't do, use the `.migrations` escape hatch.
+Changing a text length/pattern, number scale/bounds, relation target, or required
+flag in the declaration alone does not update an existing database; startup logs
+a warning. Test schema upgrades against an existing database as well as a fresh
+one: a fresh `zigbase.testing.start` harness already has the new options.
+Search indexes follow the effective persisted flags: a skipped `.searchable`
+change neither enables nor disables an existing field's search index. A newly
+added searchable field is indexed after its column is created.
 
 Declared `.indexes` are reconciled on every startup, including when no fields change.
 See [Indexes](#indexes) for ownership, adoption, and failure behavior.
