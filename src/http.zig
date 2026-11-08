@@ -4,6 +4,34 @@ const App = @import("app.zig").App;
 
 pub const Method = enum { GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD, UNKNOWN };
 
+/// Map only the transport's named statuses. Its non-exhaustive enum also accepts
+/// unnamed integers, which the socket adapter cannot preserve as API responses.
+pub fn transportStatus(status: u16) ?@import("zap").http.StatusCode {
+    const StatusCode = @import("zap").http.StatusCode;
+    inline for (std.meta.fields(StatusCode)) |field| {
+        if (field.value == status) return @field(StatusCode, field.name);
+    }
+    return null;
+}
+
+/// Whether the transport can send this completed application response.
+/// Conditional 304 method restrictions are enforced by response normalization.
+pub fn isFinalStatus(status: u16) bool {
+    return status >= 200 and transportStatus(status) != null;
+}
+
+/// Explicit failures must be final, transport-supported 4xx or 5xx responses.
+pub fn isErrorStatus(status: u16) bool {
+    return status >= 400 and status < 600 and isFinalStatus(status);
+}
+
+test "transportStatus accepts named client errors and rejects unnamed statuses" {
+    for ([_]u16{ 400, 409, 418, 421, 422, 431, 451, 500 }) |status|
+        try std.testing.expect(transportStatus(status) != null);
+    for ([_]u16{ 419, 420, 427, 430, 432, 499, 799 }) |status|
+        try std.testing.expectEqual(null, transportStatus(status));
+}
+
 pub const Param = struct { key: []const u8, value: []const u8 };
 
 pub const RequestCtx = struct {

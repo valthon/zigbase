@@ -2648,6 +2648,14 @@ ZigBase ships with a **pluggable auth-method system** that lets every auth colle
 1. **Initiate** — challenge delivery (email a link/code, return WebAuthn options, or a no-op for API-key flows).
 2. **Complete** — proof verification. On success the method returns a `Resolution.record(record_id)` and the framework mints the session via the one seam (`issueSession`+`emitAuth`), firing `onAuth`. The method never mints sessions itself.
 
+Auth-method `Resolution.fail` messages for the transport's named 4xx statuses
+(`http.isErrorStatus`) are intentionally public and returned to the anonymous
+caller. A status without a dedicated machine code (such as 422) uses
+`bad_request`. Write these as client explanations, without operator secrets.
+Server-error and unnamed-status (such as 432) failure messages remain
+operator-only: they are logged and replaced with the generic 500 `internal`
+response.
+
 There are three tiers:
 
 | Tier | How | When |

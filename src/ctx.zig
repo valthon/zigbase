@@ -2189,7 +2189,7 @@ test "errorResponse maps known errors to status codes, unknown to 500" {
     try std.testing.expectEqual(@as(u16, 500), ctx.errorResponse(error.SomethingWeird).status);
 
     // ctx.fail stashes a custom message that errorResponse(error.Handled) renders. The code is
-    // derived from status (422 has no specific mapping, so it falls back to "internal" — see
+    // derived from status (422 has no specific mapping, so it falls back to "bad_request" — see
     // the next case for a status that DOES have a specific code).
     const e = ctx.fail(422, "nope");
     try std.testing.expectError(error.Handled, @as(error{Handled}!void, e));

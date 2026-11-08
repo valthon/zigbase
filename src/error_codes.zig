@@ -96,11 +96,16 @@ pub fn info(c: Code) Info {
             .explanation =
             \\A catch-all for requests that fail validation ZigBase doesn't attach to a
             \\specific field — malformed query parameters, an unparseable filter/sort
-            \\expression, a bad cursor, or another request-shape problem the handler
-            \\rejected before doing any work.
+            \\expression, a bad cursor, or another request-shape problem.
             \\
-            \\Read `message` for the specific cause and fix the request; this code is
-            \\not retried automatically.
+            \\Also the generic code for any 4xx status without a dedicated code (see
+            \\`forStatus`), e.g. a `ctx.fail(422, …)` from a route or hook, which may
+            \\reject the request after work was done and rolled back. There the HTTP
+            \\`status` carries the specific meaning.
+            \\
+            \\Read `message` for the specific cause. ZigBase does not retry this code
+            \\automatically; whether a retry can succeed follows the HTTP `status`
+            \\(e.g. 408, 423 and 425 are retryable, 400 and 422 need a changed request).
             ,
         },
         .collections_frozen => .{
@@ -173,8 +178,9 @@ pub fn info(c: Code) Info {
             \\a bug. `message` is deliberately generic so internals never leak into
             \\the response.
             \\
-            \\Also the default for any HTTP status this registry doesn't otherwise
-            \\map (see `forStatus`) — receiving `internal` for a request that "should"
+            \\Also the default for any 5xx or non-error HTTP status this registry
+            \\doesn't otherwise map (see `forStatus`; unmapped 4xx statuses use
+            \\`bad_request`) — receiving `internal` for a request that "should"
             \\have a specific code is itself a signal to check the server logs.
             ,
         },
@@ -500,7 +506,7 @@ pub fn info(c: Code) Info {
 
 /// The envelope code for a bare HTTP status, used where an error reaches the
 /// renderer without one (e.g. `ctx.fail(status, message)`). Deliberately
-/// conservative: anything unmapped is `internal`, never an invented code.
+/// conservative: unmapped 4xx use `bad_request`; other unmapped statuses use `internal`.
 pub fn forStatus(status: u16) Code {
     return switch (status) {
         400 => .bad_request,
@@ -511,7 +517,7 @@ pub fn forStatus(status: u16) Code {
         410 => .gone,
         413 => .payload_too_large,
         429 => .too_many_requests,
-        else => .internal,
+        else => if (status >= 400 and status < 500) .bad_request else .internal,
     };
 }
 
@@ -628,7 +634,7 @@ test "error_codes: forStatus maps every constructor's status" {
     // agent into a pointless retry loop. Regression guard for that exact conflation.
     try std.testing.expectEqual(Code.payload_too_large, forStatus(413));
     try std.testing.expectEqual(Code.too_many_requests, forStatus(429));
-    // Anything unmapped — including every 5xx — is `internal`, never a guess.
+    // Unmapped server errors stay internal; unmapped client errors stay client errors.
     try std.testing.expectEqual(Code.internal, forStatus(500));
-    try std.testing.expectEqual(Code.internal, forStatus(418));
+    try std.testing.expectEqual(Code.bad_request, forStatus(418));
 }
