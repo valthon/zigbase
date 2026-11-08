@@ -5,6 +5,10 @@ pub const InitiateResult = struct { status: u16 = 200, body: ?[]const u8 = null 
 
 pub const Resolution = union(enum) {
     record: []const u8, // resolved record id → framework mints session + onAuth
+    /// Messages for the transport's named 4xx statuses are public explanations for
+    /// the anonymous caller, including statuses without a dedicated error code.
+    /// Server-error and unnamed-status messages are logged for operators and
+    /// replaced with the generic internal error response.
     fail: struct { status: u16, message: []const u8 },
 };
 

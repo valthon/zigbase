@@ -1,0 +1,2 @@
+### Fixes
+- Unmapped 4xx statuses use the generic `bad_request` code consistently in typed routes, route `ctx.fail`, and auth-method failures. Auth-method failure messages with a named 4xx status are deliberately client-facing, including 422; these previously became a generic 500 for statuses without dedicated codes. Auth-method 5xx and unnamed-status (such as 432) messages remain operator-only: logged and redacted from client responses.

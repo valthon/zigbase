@@ -154,12 +154,18 @@ fn dispatch(ctx: *http.RequestCtx, phase: DispatchPhase) anyerror!http.Response 
                     // code of its own — derive one from the status, same as route_types.zig's
                     // jsonError does for typed routes.
                     const derived = codes.forStatus(f.status);
-                    // `internal` promises in the frozen registry that no detail is
-                    // leaked, so a 5xx must NOT forward the method's own message —
-                    // that text is written for operators, not for an anonymous caller.
-                    // Log it (the operator still needs it) and answer generically.
-                    if (derived == .internal) {
-                        std.log.err("auth method failed with {d}: {s}", .{ f.status, f.message });
+                    // A failure message with a named 4xx status is intentionally
+                    // client-facing, including statuses without a dedicated code
+                    // (422 -> bad_request). `internal` promises no detail is leaked:
+                    // messages attached to 5xx, non-error, or transport-unnamed statuses
+                    // (e.g. 432, which response normalization would replace with a 500)
+                    // are operator-only. Log and redact them.
+                    if (derived == .internal or !http.isErrorStatus(f.status)) {
+                        // warn under test: the test runner fails the build on any logged error.
+                        if (@import("builtin").is_test)
+                            std.log.warn("auth method failed with {d}: {s}", .{ f.status, f.message })
+                        else
+                            std.log.err("auth method failed with {d}: {s}", .{ f.status, f.message });
                         return ApiError.internal().toResponse(ctx.allocator.a);
                     }
                     return (ApiError{ .status = f.status, .code = codes.s(derived), .message = f.message }).toResponse(ctx.allocator.a);
@@ -287,6 +293,52 @@ test "every primary method resolution enters the second-factor gate" {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+test "auth-method client failures preserve their public message without a dedicated status code" {
+    const env = try auth.TestEnv.initAuth("users");
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const Failure = struct {
+        status: u16,
+        fn initiate(_: *anyopaque, _: *method_mod.AuthCtx) anyerror!method_mod.InitiateResult {
+            return .{};
+        }
+        fn complete(ptr: *anyopaque, _: *method_mod.AuthCtx) anyerror!method_mod.Resolution {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{ .fail = .{ .status = self.status, .message = "Choose an allowed account option." } };
+        }
+        const vt = method_mod.AuthMethod.VTable{ .initiate = @This().initiate, .complete = @This().complete };
+    };
+    var failure = Failure{ .status = 422 };
+    const methods = [_]method_mod.AuthMethod{.{ .slug = "password", .ctx = &failure, .vtable = &Failure.vt }};
+    var registry = registry_mod.Registry{ .methods = &methods };
+    env.app.auth_methods = @ptrCast(&registry);
+    const params = [_]http.Param{ .{ .key = "col", .value = "users" }, .{ .key = "method", .value = "password" } };
+    for ([_]u16{ 401, 422, 451 }) |status| {
+        failure.status = status;
+        var ctx = env.ctx(RequestArena.from(&arena), .POST, "{}", &params);
+        const response = try complete(&ctx);
+        const normalized = try @import("../server.zig").normalizeResponse(&ctx, response);
+        try std.testing.expectEqual(status, normalized.status);
+        const envelope = (try std.json.parseFromSlice(std.json.Value, arena.allocator(), normalized.body, .{})).value.object;
+        try std.testing.expectEqualStrings(if (status == 401) "unauthorized" else "bad_request", envelope.get("code").?.string);
+        try std.testing.expectEqualStrings("Choose an allowed account option.", envelope.get("message").?.string);
+        try std.testing.expectEqual(@as(i64, status), envelope.get("status").?.integer);
+        try std.testing.expectEqual(@as(usize, 0), response.cookies.len);
+    }
+    // 432 has no transport name; its message must be redacted like a 5xx, not lost to normalization.
+    for ([_]u16{ 432, 500, 503, 200 }) |status| {
+        failure.status = status;
+        var ctx = env.ctx(RequestArena.from(&arena), .POST, "{}", &params);
+        const response = try complete(&ctx);
+        const normalized = try @import("../server.zig").normalizeResponse(&ctx, response);
+        try std.testing.expectEqual(@as(u16, 500), normalized.status);
+        const envelope = (try std.json.parseFromSlice(std.json.Value, arena.allocator(), normalized.body, .{})).value.object;
+        try std.testing.expectEqualStrings("internal", envelope.get("code").?.string);
+        try std.testing.expect(std.mem.indexOf(u8, normalized.body, "Choose an allowed") == null);
+    }
+}
 
 test "auth-method dispatch: password complete succeeds + 2 cookies + onAuth fires" {
     const api_auth = @import("auth.zig");
