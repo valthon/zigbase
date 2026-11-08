@@ -1030,6 +1030,7 @@ pub fn buildRecordDispatcher(comptime hooks: anytype) RecordHandler {
                                 inline else => |p| {
                                     const fname = comptime phaseFieldName(p);
                                     if (@hasField(@TypeOf(g), fname)) {
+                                        ctx.clearHandled();
                                         try @field(g, fname)(ctx, ev);
                                     }
                                 },
