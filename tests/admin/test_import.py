@@ -10,6 +10,7 @@ e2e in the suite; it needs no browser, so it uses subprocess + sqlite3 + urllib 
 The `import-fixture` binary (fixtures/import/main.zig) declares an auth collection `members`
 (password) and a base collection `vault` with an `.encrypted` field `secret`.
 """
+from conftest import _reserve_port
 import json
 import os
 import pathlib
@@ -27,12 +28,6 @@ ZIG = ["mise", "exec", "zig@0.16.0", "--", "zig"]
 FIELD_KEY = "an-operator-supplied-field-key-32b"  # >= 32 bytes
 
 
-def _free_port():
-    s = socket.socket()
-    s.bind(("127.0.0.1", 0))
-    p = s.getsockname()[1]
-    s.close()
-    return p
 
 
 @pytest.fixture(scope="session")
@@ -82,30 +77,30 @@ def _serve(binary, data):
     or never binds within the deadline, terminate/kill it and pytest.fail with its captured
     stderr, so a boot failure surfaces here instead of as opaque connection-refused later.
     """
-    port = _free_port()
-    log_path = os.path.join(data, "serve.log")
-    with open(log_path, "wb") as log:
-        proc = subprocess.Popen(
-            [binary, "serve", "--insecure-cookies", "--http-port", str(port)],
-            env=_env(data), stdout=log, stderr=subprocess.STDOUT,
-        )
-    for _ in range(50):
-        if proc.poll() is not None:
-            break  # process already exited; stop polling and fail below
+    with _reserve_port() as port:
+        log_path = os.path.join(data, "serve.log")
+        with open(log_path, "wb") as log:
+            proc = subprocess.Popen(
+                [binary, "serve", "--insecure-cookies", "--http-port", str(port)],
+                env=_env(data), stdout=log, stderr=subprocess.STDOUT,
+            )
+        for _ in range(50):
+            if proc.poll() is not None:
+                break  # process already exited; stop polling and fail below
+            try:
+                with socket.create_connection(("127.0.0.1", port), timeout=0.2):
+                    return proc, f"http://127.0.0.1:{port}"
+            except OSError:
+                time.sleep(0.1)
+        # Never became reachable — clean up the subprocess and fail loudly with its output.
+        proc.terminate()
         try:
-            with socket.create_connection(("127.0.0.1", port), timeout=0.2):
-                return proc, f"http://127.0.0.1:{port}"
-        except OSError:
-            time.sleep(0.1)
-    # Never became reachable — clean up the subprocess and fail loudly with its output.
-    proc.terminate()
-    try:
-        proc.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait(timeout=5)
-    output = pathlib.Path(log_path).read_text(errors="replace") if pathlib.Path(log_path).exists() else "<no output captured>"
-    pytest.fail(f"serve on port {port} never became reachable (exit={proc.returncode}):\n{output}")
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)
+        output = pathlib.Path(log_path).read_text(errors="replace") if pathlib.Path(log_path).exists() else "<no output captured>"
+        pytest.fail(f"serve on port {port} never became reachable (exit={proc.returncode}):\n{output}")
 
 
 def _get_json(url):

@@ -14,6 +14,7 @@ as Locked system collections (superuser-only) — what the Zig integration tests
 3/6/7, which cover the full sendBulk -> pollOnce -> CaptureMailer + suppression path)
 cannot prove: live HTTP semantics and superuser-vs-anonymous authz through the records API.
 """
+from conftest import _reserve_port, _stop_server, _wait_reachable_or_fail
 
 import base64
 import hashlib
@@ -21,11 +22,8 @@ import hmac
 import json
 import os
 import pathlib
-import shutil
-import socket
 import subprocess
 import tempfile
-import time
 
 import pytest
 import urllib.error
@@ -37,12 +35,6 @@ REPO = pathlib.Path(__file__).resolve().parents[2]
 JWT_SECRET = "e2e-unsub-secret-0123456789abcdef"
 
 
-def _free_port():
-    s = socket.socket()
-    s.bind(("127.0.0.1", 0))
-    p = s.getsockname()[1]
-    s.close()
-    return p
 
 
 def _http(method, url, body=None, token=None):
@@ -72,27 +64,22 @@ def mint_token(secret: str, account: str, list_name: str, recipient: str) -> str
 @pytest.fixture(scope="module")
 def unsub_server():
     binary = resolve_binary("ZIGBASE_TEST_BINARY", REPO, "zigbase")
-    data = tempfile.mkdtemp(prefix="zb_unsub_")
-    env = {**os.environ, "ZIGBASE_DATA_DIR": data, "ZIGBASE_JWT_SECRET": JWT_SECRET}
-    subprocess.run([binary, "superuser", "create", "--email", "admin@x.io",
-                    "--password", "adminpassword", "--data-dir", data], check=True, env=env)
-    port = _free_port()
-    env["ZIGBASE_HTTP_PORT"] = str(port)
-    env["ZIGBASE_UNSUBSCRIBE_BASE_URL"] = f"http://127.0.0.1:{port}"
-    proc = subprocess.Popen([binary, "serve", "--insecure-cookies"], env=env,
-                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    for _ in range(100):
+    with tempfile.TemporaryDirectory(prefix="zb_unsub_") as data, _reserve_port() as port:
+        env = {**os.environ, "ZIGBASE_DATA_DIR": data, "ZIGBASE_JWT_SECRET": JWT_SECRET}
+        subprocess.run([binary, "superuser", "create", "--email", "admin@x.io",
+                        "--password", "adminpassword", "--data-dir", data], check=True, env=env)
+        env["ZIGBASE_HTTP_PORT"] = str(port)
+        env["ZIGBASE_SERVE_BACKGROUND"] = "0"
+        env["ZIGBASE_UNSUBSCRIBE_BASE_URL"] = f"http://127.0.0.1:{port}"
+        log_path = pathlib.Path(data) / "server.log"
+        with log_path.open("wb") as log:
+            proc = subprocess.Popen([binary, "serve", "--insecure-cookies"], env=env,
+                                    stdout=log, stderr=subprocess.STDOUT)
         try:
-            with socket.create_connection(("127.0.0.1", port), timeout=0.2):
-                break
-        except OSError:
-            time.sleep(0.1)
-    try:
-        yield f"http://127.0.0.1:{port}"
-    finally:
-        proc.terminate()
-        proc.wait(timeout=5)
-        shutil.rmtree(data, ignore_errors=True)
+            _wait_reachable_or_fail(proc, port, log_path, timeout_s=10.0)
+            yield f"http://127.0.0.1:{port}"
+        finally:
+            _stop_server(proc)
 
 
 def _su_token(base):

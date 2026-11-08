@@ -78,7 +78,7 @@ def test_current_identity_rules_schema_and_bounds(server):
 @pytest.mark.parametrize("backend", ["sqlite", "postgres"])
 def test_receipt_survives_restart_and_second_process(binary, tmp_path, backend):
     import subprocess
-    from conftest import _free_port, _stop_server, _wait_reachable_or_fail
+    from conftest import _reserve_port, _stop_server, _wait_reachable_or_fail
     url = os.environ.get("ZIGBASE_REST_PG_TEST_URL") if backend == "postgres" else None
     if backend == "postgres" and not url:
         pytest.skip("requires dedicated disposable ZIGBASE_REST_PG_TEST_URL")
@@ -89,13 +89,13 @@ def test_receipt_survives_restart_and_second_process(binary, tmp_path, backend):
     processes = []
 
     def start():
-        port = _free_port()
-        log_path = tmp_path / f"server-{port}.log"
-        with log_path.open("wb") as log:
-            proc = subprocess.Popen([binary, "serve", "--insecure-cookies", "--ignore-lock"], env={**env, "ZIGBASE_HTTP_PORT": str(port)}, stdout=log, stderr=subprocess.STDOUT)
-        processes.append(proc)
-        _wait_reachable_or_fail(proc, port, str(log_path))
-        return f"http://127.0.0.1:{port}"
+        with _reserve_port() as port:
+            log_path = tmp_path / f"server-{port}.log"
+            with log_path.open("wb") as log:
+                proc = subprocess.Popen([binary, "serve", "--insecure-cookies", "--ignore-lock"], env={**env, "ZIGBASE_HTTP_PORT": str(port)}, stdout=log, stderr=subprocess.STDOUT)
+            processes.append(proc)
+            _wait_reachable_or_fail(proc, port, str(log_path))
+            return f"http://127.0.0.1:{port}"
 
     try:
         first = start()
@@ -145,26 +145,26 @@ def test_unsupported_collections_and_failed_mutation_do_not_consume_key(server):
 
 def test_unavailable_feature_refuses_key_without_writing(tmp_path):
     import subprocess
-    from conftest import _free_port, _stop_server, _wait_reachable_or_fail
+    from conftest import _reserve_port, _stop_server, _wait_reachable_or_fail
     binary = os.environ.get("ZIGBASE_TEST_REST_IDEMPOTENCY_OFF_BINARY")
     if not binary:
         pytest.skip("requires default-off server binary")
-    port = _free_port()
-    env = {**os.environ, "ZIGBASE_DATA_DIR": str(tmp_path), "ZIGBASE_HTTP_PORT": str(port), "ZIGBASE_SERVE_BACKGROUND": "0"}
-    subprocess.run([binary, "superuser", "create", "--email", "admin@x.io", "--password", "adminpassword"], env=env, check=True, capture_output=True, timeout=30)
-    log_path = tmp_path / "server.log"
-    with log_path.open("wb") as log:
-        proc = subprocess.Popen([binary, "serve", "--insecure-cookies"], env=env, stdout=log, stderr=subprocess.STDOUT)
-    try:
-        _wait_reachable_or_fail(proc, port, str(log_path))
-        base = f"http://127.0.0.1:{port}"
-        admin, token, _, _ = setup(base)
-        path = "/api/collections/posts/records"
-        result = call(base, "POST", path, {"title": "refuse"}, token, "off")
-        assert result[0] == 400, result
-        assert call(base, "GET", path, token=admin)[1]["items"] == []
-    finally:
-        _stop_server(proc)
+    with _reserve_port() as port:
+        env = {**os.environ, "ZIGBASE_DATA_DIR": str(tmp_path), "ZIGBASE_HTTP_PORT": str(port), "ZIGBASE_SERVE_BACKGROUND": "0"}
+        subprocess.run([binary, "superuser", "create", "--email", "admin@x.io", "--password", "adminpassword"], env=env, check=True, capture_output=True, timeout=30)
+        log_path = tmp_path / "server.log"
+        with log_path.open("wb") as log:
+            proc = subprocess.Popen([binary, "serve", "--insecure-cookies"], env=env, stdout=log, stderr=subprocess.STDOUT)
+        try:
+            _wait_reachable_or_fail(proc, port, str(log_path))
+            base = f"http://127.0.0.1:{port}"
+            admin, token, _, _ = setup(base)
+            path = "/api/collections/posts/records"
+            result = call(base, "POST", path, {"title": "refuse"}, token, "off")
+            assert result[0] == 400, result
+            assert call(base, "GET", path, token=admin)[1]["items"] == []
+        finally:
+            _stop_server(proc)
 
 
 @pytest.mark.parametrize("replay", [False, True], ids=["fresh", "replay"])
@@ -173,108 +173,108 @@ def test_postgres_rule_writer_blocks_receipt_authorization(binary, tmp_path, rep
     """A concurrent rule change commits before fresh receipt authorization runs."""
     import subprocess
     import time
-    from conftest import _free_port, _stop_server, _wait_reachable_or_fail
+    from conftest import _reserve_port, _stop_server, _wait_reachable_or_fail
 
     url = os.environ.get("ZIGBASE_REST_PG_TEST_URL")
     if not url:
         pytest.skip("requires dedicated disposable ZIGBASE_REST_PG_TEST_URL")
     import psycopg
 
-    port = _free_port()
-    env = {**os.environ, "ZIGBASE_DB_URL": url, "ZIGBASE_DATA_DIR": str(tmp_path),
-           "ZIGBASE_HTTP_PORT": str(port), "ZIGBASE_SERVE_BACKGROUND": "0"}
-    # The preceding PostgreSQL restart test may already have bootstrapped this user.
-    subprocess.run([binary, "superuser", "create", "--email", "admin@x.io",
-                    "--password", "adminpassword"], env=env, capture_output=True, timeout=30)
-    log_path = tmp_path / "schema-coordination.log"
-    with log_path.open("wb") as log:
-        proc = subprocess.Popen([binary, "serve", "--insecure-cookies"], env=env,
-                                stdout=log, stderr=subprocess.STDOUT)
-    base = f"http://127.0.0.1:{port}"
-    original_rule = None
-    original_auth_id = None
-    replacement_auth_id = None
-    restore_rule = False
-    try:
-        _wait_reachable_or_fail(proc, port, str(log_path))
-        admin, token, _, collection = setup(base, reuse=True)
-        original_rule = collection["createRule"]
-        status, auth_collection, _ = call(base, "GET", "/api/collections/users", token=admin)
-        assert status == 200, auth_collection
-        original_auth_id = auth_collection["id"]
-        import uuid
-        replacement_auth_id = uuid.uuid4().hex[:15]
-        restore_rule = True
-        key = "schema-race-replay" if replay else "schema-race-fresh"
-        if replay:
-            result = call(base, "POST", "/api/collections/posts/records",
-                          {"title": "must-not-commit"}, token, key)
-            assert result[0] == 201, result
-        with psycopg.connect(url, autocommit=True) as writer, psycopg.connect(url, autocommit=True) as observer:
-            def receipt_count():
-                if observer.execute("SELECT to_regclass('_idempotency_receipts')").fetchone()[0] is None:
-                    return 0
-                return observer.execute("SELECT count(*) FROM _idempotency_receipts").fetchone()[0]
-
-            before_receipts = receipt_count()
-            before_records = observer.execute("SELECT count(*) FROM posts").fetchone()[0]
-            writer.execute("BEGIN")
-            writer.execute('UPDATE "_schema_state" SET generation=generation WHERE id=1')
-            if change == "rule":
-                writer.execute('UPDATE "_collections" SET "createRule"=NULL WHERE name=%s', ("posts",))
-            else:
-                # Model a replacement/import retaining auth table name and token
-                # bytes while changing the collection identity used by receipts.
-                writer.execute('UPDATE "_collections" SET id=%s WHERE name=%s', (replacement_auth_id, "users"))
-                writer.execute('UPDATE "_storage_namespaces" SET collection_id=%s WHERE collection_id=%s',
-                               (replacement_auth_id, original_auth_id))
-            writer.execute('UPDATE "_schema_state" SET generation=generation+1 WHERE id=1')
-            writer_pid = writer.info.backend_pid
-            try:
-                with ThreadPoolExecutor(max_workers=1) as executor:
-                    pending = executor.submit(call, base, "POST", "/api/collections/posts/records",
-                                              {"title": "must-not-commit"}, token, key)
-                    try:
-                        deadline = time.monotonic() + 5
-                        blocked = False
-                        while time.monotonic() < deadline:
-                            blocked = observer.execute(
-                                "SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=current_database() "
-                                "AND %s=ANY(pg_blocking_pids(pid)) AND query LIKE %s)",
-                                (writer_pid, 'UPDATE "_schema_state"%'),
-                            ).fetchone()[0]
-                            if blocked or pending.done():
-                                break
-                            time.sleep(0.02)
-                        assert blocked, "REST mutation did not wait for the concurrent metadata writer"
-                        assert not pending.done()
-                    finally:
-                        # Always release the request, including on a failed assertion.
-                        writer.execute("COMMIT")
-                    status, body, _ = pending.result(timeout=10)
-                    assert status == (409 if change == "rule" else 401), body
-            finally:
-                writer.execute("ROLLBACK")
-            assert observer.execute('SELECT count(*) FROM posts').fetchone()[0] == before_records
-            assert receipt_count() == before_receipts
-            # authorize runs before receipt lookup/fingerprint comparison. The now
-            # locked rule returns 403 for both fresh and replay attempts, not 409.
-            if change == "rule":
-                assert call(base, "POST", "/api/collections/posts/records",
-                            {"title": "must-not-commit"}, token, key)[0] == 403
-    finally:
+    with _reserve_port() as port:
+        env = {**os.environ, "ZIGBASE_DB_URL": url, "ZIGBASE_DATA_DIR": str(tmp_path),
+               "ZIGBASE_HTTP_PORT": str(port), "ZIGBASE_SERVE_BACKGROUND": "0"}
+        # The preceding PostgreSQL restart test may already have bootstrapped this user.
+        subprocess.run([binary, "superuser", "create", "--email", "admin@x.io",
+                        "--password", "adminpassword"], env=env, capture_output=True, timeout=30)
+        log_path = tmp_path / "schema-coordination.log"
+        with log_path.open("wb") as log:
+            proc = subprocess.Popen([binary, "serve", "--insecure-cookies"], env=env,
+                                    stdout=log, stderr=subprocess.STDOUT)
+        base = f"http://127.0.0.1:{port}"
+        original_rule = None
+        original_auth_id = None
+        replacement_auth_id = None
+        restore_rule = False
         try:
-            if restore_rule:
-                with psycopg.connect(url) as cleanup:
-                    cleanup.execute('UPDATE "_schema_state" SET generation=generation WHERE id=1')
-                    cleanup.execute('UPDATE "_collections" SET "createRule"=%s WHERE name=%s', (original_rule, "posts"))
-                    if change == "auth_collection_id":
-                        cleanup.execute('UPDATE "_collections" SET id=%s WHERE name=%s', (original_auth_id, "users"))
-                        cleanup.execute('UPDATE "_storage_namespaces" SET collection_id=%s WHERE collection_id=%s',
-                                        (original_auth_id, replacement_auth_id))
-                    cleanup.execute('UPDATE "_schema_state" SET generation=generation+1 WHERE id=1')
+            _wait_reachable_or_fail(proc, port, str(log_path))
+            admin, token, _, collection = setup(base, reuse=True)
+            original_rule = collection["createRule"]
+            status, auth_collection, _ = call(base, "GET", "/api/collections/users", token=admin)
+            assert status == 200, auth_collection
+            original_auth_id = auth_collection["id"]
+            import uuid
+            replacement_auth_id = uuid.uuid4().hex[:15]
+            restore_rule = True
+            key = "schema-race-replay" if replay else "schema-race-fresh"
+            if replay:
+                result = call(base, "POST", "/api/collections/posts/records",
+                              {"title": "must-not-commit"}, token, key)
+                assert result[0] == 201, result
+            with psycopg.connect(url, autocommit=True) as writer, psycopg.connect(url, autocommit=True) as observer:
+                def receipt_count():
+                    if observer.execute("SELECT to_regclass('_idempotency_receipts')").fetchone()[0] is None:
+                        return 0
+                    return observer.execute("SELECT count(*) FROM _idempotency_receipts").fetchone()[0]
+
+                before_receipts = receipt_count()
+                before_records = observer.execute("SELECT count(*) FROM posts").fetchone()[0]
+                writer.execute("BEGIN")
+                writer.execute('UPDATE "_schema_state" SET generation=generation WHERE id=1')
+                if change == "rule":
+                    writer.execute('UPDATE "_collections" SET "createRule"=NULL WHERE name=%s', ("posts",))
+                else:
+                    # Model a replacement/import retaining auth table name and token
+                    # bytes while changing the collection identity used by receipts.
+                    writer.execute('UPDATE "_collections" SET id=%s WHERE name=%s', (replacement_auth_id, "users"))
+                    writer.execute('UPDATE "_storage_namespaces" SET collection_id=%s WHERE collection_id=%s',
+                                   (replacement_auth_id, original_auth_id))
+                writer.execute('UPDATE "_schema_state" SET generation=generation+1 WHERE id=1')
+                writer_pid = writer.info.backend_pid
+                try:
+                    with ThreadPoolExecutor(max_workers=1) as executor:
+                        pending = executor.submit(call, base, "POST", "/api/collections/posts/records",
+                                                  {"title": "must-not-commit"}, token, key)
+                        try:
+                            deadline = time.monotonic() + 5
+                            blocked = False
+                            while time.monotonic() < deadline:
+                                blocked = observer.execute(
+                                    "SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=current_database() "
+                                    "AND %s=ANY(pg_blocking_pids(pid)) AND query LIKE %s)",
+                                    (writer_pid, 'UPDATE "_schema_state"%'),
+                                ).fetchone()[0]
+                                if blocked or pending.done():
+                                    break
+                                time.sleep(0.02)
+                            assert blocked, "REST mutation did not wait for the concurrent metadata writer"
+                            assert not pending.done()
+                        finally:
+                            # Always release the request, including on a failed assertion.
+                            writer.execute("COMMIT")
+                        status, body, _ = pending.result(timeout=10)
+                        assert status == (409 if change == "rule" else 401), body
+                finally:
+                    writer.execute("ROLLBACK")
+                assert observer.execute('SELECT count(*) FROM posts').fetchone()[0] == before_records
+                assert receipt_count() == before_receipts
+                # authorize runs before receipt lookup/fingerprint comparison. The now
+                # locked rule returns 403 for both fresh and replay attempts, not 409.
+                if change == "rule":
+                    assert call(base, "POST", "/api/collections/posts/records",
+                                {"title": "must-not-commit"}, token, key)[0] == 403
         finally:
-            _stop_server(proc)
+            try:
+                if restore_rule:
+                    with psycopg.connect(url) as cleanup:
+                        cleanup.execute('UPDATE "_schema_state" SET generation=generation WHERE id=1')
+                        cleanup.execute('UPDATE "_collections" SET "createRule"=%s WHERE name=%s', (original_rule, "posts"))
+                        if change == "auth_collection_id":
+                            cleanup.execute('UPDATE "_collections" SET id=%s WHERE name=%s', (original_auth_id, "users"))
+                            cleanup.execute('UPDATE "_storage_namespaces" SET collection_id=%s WHERE collection_id=%s',
+                                            (original_auth_id, replacement_auth_id))
+                        cleanup.execute('UPDATE "_schema_state" SET generation=generation+1 WHERE id=1')
+            finally:
+                _stop_server(proc)
 
 
 @pytest.mark.parametrize("operation", ["create", "update"])
@@ -282,69 +282,69 @@ def test_postgres_replay_waits_for_concurrent_record_writer(binary, tmp_path, op
     """A replay may not return its old body while a row mutation is in flight."""
     import subprocess
     import time
-    from conftest import _free_port, _stop_server, _wait_reachable_or_fail
+    from conftest import _reserve_port, _stop_server, _wait_reachable_or_fail
 
     url = os.environ.get("ZIGBASE_REST_PG_TEST_URL")
     if not url:
         pytest.skip("requires dedicated disposable ZIGBASE_REST_PG_TEST_URL")
     import psycopg
 
-    port = _free_port()
-    env = {**os.environ, "ZIGBASE_DB_URL": url, "ZIGBASE_DATA_DIR": str(tmp_path),
-           "ZIGBASE_HTTP_PORT": str(port), "ZIGBASE_SERVE_BACKGROUND": "0"}
-    subprocess.run([binary, "superuser", "create", "--email", "admin@x.io",
-                    "--password", "adminpassword"], env=env, capture_output=True, timeout=30)
-    log_path = tmp_path / "row-coordination.log"
-    with log_path.open("wb") as log:
-        proc = subprocess.Popen([binary, "serve", "--insecure-cookies"], env=env,
-                                stdout=log, stderr=subprocess.STDOUT)
-    base = f"http://127.0.0.1:{port}"
-    try:
-        _wait_reachable_or_fail(proc, port, str(log_path))
-        admin, token, _, _ = setup(base, reuse=True)
-        path = "/api/collections/posts/records"
-        method = "POST"
-        if operation == "update":
-            status, original, _ = call(base, "POST", path, {"title": "initial"}, admin)
-            assert status == 201, original
-            path += "/" + original["id"]
-            method = "PATCH"
-        key = "row-lock-" + operation
-        status, receipt, _ = call(base, method, path, {"title": "receipt-body"}, token, key)
-        assert status == (201 if operation == "create" else 200), receipt
-        with psycopg.connect(url, autocommit=True) as writer, psycopg.connect(url, autocommit=True) as observer:
-            before_receipts = observer.execute("SELECT count(*) FROM _idempotency_receipts").fetchone()[0]
-            writer.execute("BEGIN")
-            writer.execute('UPDATE posts SET title=%s WHERE id=%s', ("concurrent-body", receipt["id"]))
-            writer_pid = writer.info.backend_pid
-            try:
-                with ThreadPoolExecutor(max_workers=1) as executor:
-                    pending = executor.submit(call, base, method, path,
-                                              {"title": "receipt-body"}, token, key)
-                    try:
-                        deadline = time.monotonic() + 5
-                        blocked = False
-                        while time.monotonic() < deadline:
-                            blocked = observer.execute(
-                                "SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=current_database() "
-                                "AND %s=ANY(pg_blocking_pids(pid)) AND query LIKE %s)",
-                                (writer_pid, '%FOR UPDATE%'),
-                            ).fetchone()[0]
-                            if blocked or pending.done():
-                                break
-                            time.sleep(0.02)
-                        assert blocked, "REST replay did not wait for the concurrent record writer"
-                        assert not pending.done()
-                    finally:
-                        writer.execute("COMMIT")
-                    status, body, _ = pending.result(timeout=10)
-                    assert status == 409, body
-            finally:
-                writer.execute("ROLLBACK")
-            assert observer.execute("SELECT title FROM posts WHERE id=%s", (receipt["id"],)).fetchone()[0] == "concurrent-body"
-            assert observer.execute("SELECT count(*) FROM _idempotency_receipts").fetchone()[0] == before_receipts
-    finally:
-        _stop_server(proc)
+    with _reserve_port() as port:
+        env = {**os.environ, "ZIGBASE_DB_URL": url, "ZIGBASE_DATA_DIR": str(tmp_path),
+               "ZIGBASE_HTTP_PORT": str(port), "ZIGBASE_SERVE_BACKGROUND": "0"}
+        subprocess.run([binary, "superuser", "create", "--email", "admin@x.io",
+                        "--password", "adminpassword"], env=env, capture_output=True, timeout=30)
+        log_path = tmp_path / "row-coordination.log"
+        with log_path.open("wb") as log:
+            proc = subprocess.Popen([binary, "serve", "--insecure-cookies"], env=env,
+                                    stdout=log, stderr=subprocess.STDOUT)
+        base = f"http://127.0.0.1:{port}"
+        try:
+            _wait_reachable_or_fail(proc, port, str(log_path))
+            admin, token, _, _ = setup(base, reuse=True)
+            path = "/api/collections/posts/records"
+            method = "POST"
+            if operation == "update":
+                status, original, _ = call(base, "POST", path, {"title": "initial"}, admin)
+                assert status == 201, original
+                path += "/" + original["id"]
+                method = "PATCH"
+            key = "row-lock-" + operation
+            status, receipt, _ = call(base, method, path, {"title": "receipt-body"}, token, key)
+            assert status == (201 if operation == "create" else 200), receipt
+            with psycopg.connect(url, autocommit=True) as writer, psycopg.connect(url, autocommit=True) as observer:
+                before_receipts = observer.execute("SELECT count(*) FROM _idempotency_receipts").fetchone()[0]
+                writer.execute("BEGIN")
+                writer.execute('UPDATE posts SET title=%s WHERE id=%s', ("concurrent-body", receipt["id"]))
+                writer_pid = writer.info.backend_pid
+                try:
+                    with ThreadPoolExecutor(max_workers=1) as executor:
+                        pending = executor.submit(call, base, method, path,
+                                                  {"title": "receipt-body"}, token, key)
+                        try:
+                            deadline = time.monotonic() + 5
+                            blocked = False
+                            while time.monotonic() < deadline:
+                                blocked = observer.execute(
+                                    "SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=current_database() "
+                                    "AND %s=ANY(pg_blocking_pids(pid)) AND query LIKE %s)",
+                                    (writer_pid, '%FOR UPDATE%'),
+                                ).fetchone()[0]
+                                if blocked or pending.done():
+                                    break
+                                time.sleep(0.02)
+                            assert blocked, "REST replay did not wait for the concurrent record writer"
+                            assert not pending.done()
+                        finally:
+                            writer.execute("COMMIT")
+                        status, body, _ = pending.result(timeout=10)
+                        assert status == 409, body
+                finally:
+                    writer.execute("ROLLBACK")
+                assert observer.execute("SELECT title FROM posts WHERE id=%s", (receipt["id"],)).fetchone()[0] == "concurrent-body"
+                assert observer.execute("SELECT count(*) FROM _idempotency_receipts").fetchone()[0] == before_receipts
+        finally:
+            _stop_server(proc)
 
 
 @pytest.mark.parametrize("operation", ["create", "update"])

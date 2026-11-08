@@ -7,7 +7,7 @@ import subprocess
 
 import pytest
 
-from conftest import _free_port, _stop_server, _su_template_for, _wait_reachable_or_fail
+from conftest import _reserve_port, _stop_server, _su_template_for, _wait_reachable_or_fail
 from test_query_workbench import call
 from test_rest_idempotency import setup
 from test_realtime_backfill import backfill
@@ -20,17 +20,17 @@ def app(tmp_path):
         pytest.skip("requires REST idempotency fixture with durable realtime and tenancy")
     assert Path(binary).is_file()
     shutil.copytree(_su_template_for(binary), tmp_path, dirs_exist_ok=True)
-    port = _free_port()
-    env = {k: v for k, v in os.environ.items() if not k.startswith("ZIGBASE_")}
-    env.update(ZIGBASE_DATA_DIR=str(tmp_path), ZIGBASE_HTTP_PORT=str(port), ZIGBASE_SERVE_BACKGROUND="0")
-    log_path = tmp_path / "server.log"
-    with log_path.open("wb") as log:
-        proc = subprocess.Popen([binary, "serve", "--insecure-cookies"], env=env, stdout=log, stderr=subprocess.STDOUT)
-    try:
-        _wait_reachable_or_fail(proc, port, str(log_path))
-        yield f"http://127.0.0.1:{port}", tmp_path / "data.db"
-    finally:
-        _stop_server(proc)
+    with _reserve_port() as port:
+        env = {k: v for k, v in os.environ.items() if not k.startswith("ZIGBASE_")}
+        env.update(ZIGBASE_DATA_DIR=str(tmp_path), ZIGBASE_HTTP_PORT=str(port), ZIGBASE_SERVE_BACKGROUND="0")
+        log_path = tmp_path / "server.log"
+        with log_path.open("wb") as log:
+            proc = subprocess.Popen([binary, "serve", "--insecure-cookies"], env=env, stdout=log, stderr=subprocess.STDOUT)
+        try:
+            _wait_reachable_or_fail(proc, port, str(log_path))
+            yield f"http://127.0.0.1:{port}", tmp_path / "data.db"
+        finally:
+            _stop_server(proc)
 
 
 def test_retries_do_not_duplicate_journal_entries_and_capture_failure_rolls_back_receipt(app):

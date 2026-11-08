@@ -1,5 +1,6 @@
 import os, re, socket, subprocess, tempfile, time, shutil, pathlib, pytest
 import json, urllib.request, urllib.error
+from contextlib import ExitStack, contextmanager
 from _bin import resolve_binary
 
 REPO = pathlib.Path(__file__).resolve().parents[2]
@@ -29,8 +30,41 @@ ZIG = ["mise", "exec", "zig@0.16.0", "--", "zig"]
 # so an inherited ZIGBASE_SERVE_BACKGROUND=1 would be a mistake to honor.
 os.environ["ZIGBASE_SERVE_BACKGROUND"] = "0"
 
-def _free_port():
-    s = socket.socket(); s.bind(("127.0.0.1", 0)); p = s.getsockname()[1]; s.close(); return p
+@contextmanager
+def _reserve_port():
+    """Hold a non-listening loopback reservation while a REUSEADDR HTTP child binds.
+
+    An explicit context owns the socket through successful startup; fixtures
+    may retain it until server cleanup. Other workers' port-zero allocations
+    cannot select it during the spawn/bind gap.
+    facil.io sets SO_REUSEADDR too, so its listener can bind while this socket
+    remains open. This helper is for ZigBase HTTP servers, not SMTP/mock servers.
+    """
+    with socket.socket() as reservation:
+        reservation.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        reservation.bind(("127.0.0.1", 0))
+        yield reservation.getsockname()[1]
+
+def _server_diagnostics(node, proc, log_path):
+    try:
+        output = pathlib.Path(log_path).read_text(errors="replace")
+    except OSError as error:
+        output = f"<server log unavailable: {error}>"
+    return f"\nServer diagnostics for {node.nodeid}: pid={proc.pid}, exit_before_cleanup={proc.poll()!r}\n{log_path}:\n{output}"
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item, call):
+    outcome = yield
+    report = outcome.get_result()
+    setattr(item, "rep_" + report.when, report)
+    if report.when == "setup" and report.failed:
+        context = getattr(item, "_server_diagnostic_context", None)
+        if context is not None:
+            # A passing teardown's captured output is hidden after setup errors,
+            # including under xdist. Attach live evidence before report delivery.
+            report.sections.append(("Server diagnostics", _server_diagnostics(item, *context)))
+
 
 @pytest.fixture(scope="session")
 def binary():
@@ -66,33 +100,45 @@ def _cleanup_su_templates():
 
 @pytest.fixture()
 def server(binary, request):
-    data = tempfile.mkdtemp(prefix="zb_admin_")
-    shutil.copytree(_su_template_for(binary), data, dirs_exist_ok=True)
-    port = _free_port()
-    extra_env = getattr(request, "param", None) or {}
-    env = {**os.environ, "ZIGBASE_DATA_DIR": data, "ZIGBASE_HTTP_PORT": str(port),
-           # The harness owns this process as a FOREGROUND child (terminate() in the
-           # finally). Without the pin, running the suite from inside an AI-agent
-           # session (CLAUDECODE etc.) would trigger serve's auto-backgrounding: the
-           # parent exits after readiness, terminate() hits the dead parent, and the
-           # detached child leaks past the test.
-           "ZIGBASE_SERVE_BACKGROUND": "0", **extra_env}
-    # Plain-HTTP local test server: opt out of Secure cookies (default-on) so the
-    # browser stores the auth/CSRF cookies over http://; the default loopback bind
-    # and auto-generated JWT secret are exactly what we want.
-    log_path = os.path.join(data, "server.log")
-    with open(log_path, "wb") as log:
-        proc = subprocess.Popen([binary, "serve", "--insecure-cookies"], env=env,
-                                stdout=log, stderr=subprocess.STDOUT)
-    base = f"http://127.0.0.1:{port}"
-    try:
-        _wait_reachable_or_fail(proc, port, log_path)
-        yield base
-    finally:
+    with tempfile.TemporaryDirectory(prefix="zb_admin_") as data, _reserve_port() as port:
+        shutil.copytree(_su_template_for(binary), data, dirs_exist_ok=True)
+        extra_env = getattr(request, "param", None) or {}
+        env = {**os.environ, "ZIGBASE_DATA_DIR": data, "ZIGBASE_HTTP_PORT": str(port),
+               # The harness owns this process as a FOREGROUND child (terminate() in the
+               # finally). Without the pin, running the suite from inside an AI-agent
+               # session (CLAUDECODE etc.) would trigger serve's auto-backgrounding: the
+               # parent exits after readiness, terminate() hits the dead parent, and the
+               # detached child leaks past the test.
+               "ZIGBASE_SERVE_BACKGROUND": "0", **extra_env}
+        # Plain-HTTP local test server: opt out of Secure cookies (default-on) so the
+        # browser stores the auth/CSRF cookies over http://; the default loopback bind
+        # and auto-generated JWT secret are exactly what we want.
+        log_path = os.path.join(data, "server.log")
+        with open(log_path, "wb") as log:
+            proc = subprocess.Popen([binary, "serve", "--insecure-cookies"], env=env,
+                                    stdout=log, stderr=subprocess.STDOUT)
+        base = f"http://127.0.0.1:{port}"
+        ready = False
         try:
-            _stop_server(proc)
+            _wait_reachable_or_fail(proc, port, log_path)
+            ready = True
+            request.node._server_diagnostic_context = (proc, log_path)
+            yield base
         finally:
-            shutil.rmtree(data, ignore_errors=True)
+            try:
+                exited = proc.poll()
+                failed = any(
+                    getattr(getattr(request.node, "rep_" + phase, None), "failed", False)
+                    for phase in ("setup", "call")
+                )
+                if exited is not None or failed:
+                    diagnostics = _server_diagnostics(request.node, proc, log_path)
+                    if ready and exited is not None and not failed:
+                        pytest.fail("Server exited unexpectedly before fixture cleanup." + diagnostics, pytrace=False)
+                    print(diagnostics)
+            finally:
+                request.node.__dict__.pop("_server_diagnostic_context", None)
+                _stop_server(proc)
 
 # Launching Chromium (~0.5s) once per test dominated the wall time of the (now
 # parallel) suite. Reuse ONE browser process per test session — under pytest-xdist
@@ -148,24 +194,43 @@ def _stop_server(proc):
         proc.wait(timeout=5)
 
 
-def _wait_reachable_or_fail(proc, port, log_path, timeout_s=5.0):
+def _wait_reachable_or_fail(proc, port, log_path, timeout_s=5.0, *, log_start=0):
     """Require HTTP health readiness, not merely an open socket; raise instead of returning
     silently if the server dies early or never comes up. A fixture that raises here
     fails cleanly at setup, instead of yielding a base URL nothing is listening on and
     leaving every test in the fixture to fail later with a generic connection error."""
     deadline = time.monotonic() + timeout_s
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-    while time.monotonic() < deadline:
-        if proc.poll() is not None:
-            break  # process already exited; no point polling further
-        try:
-            with opener.open(f"http://127.0.0.1:{port}/api/health", timeout=0.2) as response:
-                body = json.load(response)
-                if response.status == 200 and isinstance(body, dict) and body.get("status") == "ok":
-                    return
-        except (OSError, ValueError, urllib.error.URLError):
-            pass
-        time.sleep(0.1)
+    output = ""
+    reader = None
+    with ExitStack() as logs:
+        while time.monotonic() < deadline:
+            if proc.poll() is not None:
+                break  # process already exited; no point polling further
+            if reader is None:
+                try:
+                    reader = logs.enter_context(pathlib.Path(log_path).open("rb"))
+                    reader.seek(log_start)
+                except FileNotFoundError:
+                    pass
+            if reader is not None:
+                output += reader.read().decode(errors="replace")
+            if re.search(r"cannot bind [^\n]*:" + str(port) + r": ListenError", output):
+                break  # This child lost the bind; a foreign healthy listener is irrelevant.
+            # Bind success belongs to the spawned PID, not merely this port. The PID
+            # also distinguishes restarts whose logs append to an earlier launch.
+            listening = (re.search(r'zigbase listening on http://[^"\\\s]+:' + str(port) + r'\b', output) or
+                         re.search(r"Listening on port " + str(port) + r"\b", output))
+            own_process = re.search(r"\* Root pid: " + str(proc.pid) + r"(?:\s|$)", output)
+            if listening and own_process:
+                try:
+                    with opener.open(f"http://127.0.0.1:{port}/api/health", timeout=0.2) as response:
+                        body = json.load(response)
+                        if response.status == 200 and isinstance(body, dict) and body.get("status") == "ok" and proc.poll() is None:
+                            return
+                except (OSError, ValueError, urllib.error.URLError):
+                    pass
+            time.sleep(0.1)
     _stop_server(proc)
     output = pathlib.Path(log_path).read_text(errors="replace") if pathlib.Path(log_path).exists() else "<no output captured>"
     raise AssertionError(f"server on port {port} never became reachable (exit={proc.returncode}):\n{output}")
@@ -173,28 +238,20 @@ def _wait_reachable_or_fail(proc, port, log_path, timeout_s=5.0):
 @pytest.fixture()
 def auth2_server(auth2_binary):
     """A live table-mode server with the beforeAuthSuccess fixture hook registered."""
-    data = tempfile.mkdtemp(prefix="zb_auth2_")
-    shutil.copytree(_su_template_for(auth2_binary), data, dirs_exist_ok=True)
-    port = _free_port()
-    # Foreground pin: see the server fixture's comment on ZIGBASE_SERVE_BACKGROUND.
-    env = {**os.environ, "ZIGBASE_DATA_DIR": data, "ZIGBASE_HTTP_PORT": str(port),
-           "ZIGBASE_SERVE_BACKGROUND": "0"}
-    log_path = os.path.join(data, "server.log")
-    with open(log_path, "wb") as log:
-        proc = subprocess.Popen([auth2_binary, "serve", "--insecure-cookies"], env=env,
-                                stdout=log, stderr=subprocess.STDOUT)
-    try:
-        _wait_reachable_or_fail(proc, port, log_path)
-    except AssertionError:
-        shutil.rmtree(data, ignore_errors=True)
-        raise
-    try:
-        yield f"http://127.0.0.1:{port}"
-    finally:
+    with tempfile.TemporaryDirectory(prefix="zb_auth2_") as data, _reserve_port() as port:
+        shutil.copytree(_su_template_for(auth2_binary), data, dirs_exist_ok=True)
+        # Foreground pin: see the server fixture's comment on ZIGBASE_SERVE_BACKGROUND.
+        env = {**os.environ, "ZIGBASE_DATA_DIR": data, "ZIGBASE_HTTP_PORT": str(port),
+               "ZIGBASE_SERVE_BACKGROUND": "0"}
+        log_path = os.path.join(data, "server.log")
+        with open(log_path, "wb") as log:
+            proc = subprocess.Popen([auth2_binary, "serve", "--insecure-cookies"], env=env,
+                                    stdout=log, stderr=subprocess.STDOUT)
         try:
-            _stop_server(proc)
+            _wait_reachable_or_fail(proc, port, log_path)
+            yield f"http://127.0.0.1:{port}"
         finally:
-            shutil.rmtree(data, ignore_errors=True)
+            _stop_server(proc)
 
 @pytest.fixture()
 def auth2_page(_browser, auth2_server):

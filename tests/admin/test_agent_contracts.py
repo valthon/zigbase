@@ -7,14 +7,13 @@ that every response path in `server.zig` actually calls it. Uses its own launche
 fixture sends stdout/stderr to `DEVNULL` (conftest.py:52) and this test needs to read
 the log stream.
 """
+from conftest import _reserve_port
 import json, os, pathlib, shutil, socket, sqlite3, subprocess, tempfile, time, urllib.request, urllib.error
 import pytest
 
 REPO = pathlib.Path(__file__).resolve().parents[2]
 
 
-def _free_port():
-    s = socket.socket(); s.bind(("127.0.0.1", 0)); p = s.getsockname()[1]; s.close(); return p
 
 
 class LoggedServer:
@@ -40,33 +39,33 @@ class LoggedServer:
 def logged_server(binary, request):
     flags = list(getattr(request, "param", []) or [])
     data = tempfile.mkdtemp(prefix="zb_logged_")
-    port = _free_port()
-    log_path = pathlib.Path(data) / "server.log"
-    # Foreground pin: this fixture asserts on the log file its own redirect
-    # captures, so serve must NOT auto-background itself when the suite runs
-    # inside an AI-agent session (CLAUDECODE etc.) — backgrounding would route
-    # the request log to <data-dir>/serve.log and leak the detached child past
-    # terminate(). See tests/admin/conftest.py's server fixture for the same pin.
-    env = {**os.environ, "ZIGBASE_DATA_DIR": data, "ZIGBASE_HTTP_PORT": str(port),
-           "ZIGBASE_SERVE_BACKGROUND": "0"}
-    with open(log_path, "w") as log:
-        proc = subprocess.Popen(
-            [binary, "serve", "--insecure-cookies", *flags],
-            env=env, stdout=log, stderr=subprocess.STDOUT,
-        )
-        for _ in range(50):
+    with _reserve_port() as port:
+        log_path = pathlib.Path(data) / "server.log"
+        # Foreground pin: this fixture asserts on the log file its own redirect
+        # captures, so serve must NOT auto-background itself when the suite runs
+        # inside an AI-agent session (CLAUDECODE etc.) — backgrounding would route
+        # the request log to <data-dir>/serve.log and leak the detached child past
+        # terminate(). See tests/admin/conftest.py's server fixture for the same pin.
+        env = {**os.environ, "ZIGBASE_DATA_DIR": data, "ZIGBASE_HTTP_PORT": str(port),
+               "ZIGBASE_SERVE_BACKGROUND": "0"}
+        with open(log_path, "w") as log:
+            proc = subprocess.Popen(
+                [binary, "serve", "--insecure-cookies", *flags],
+                env=env, stdout=log, stderr=subprocess.STDOUT,
+            )
+            for _ in range(50):
+                try:
+                    with socket.create_connection(("127.0.0.1", port), timeout=0.2):
+                        break
+                except OSError:
+                    time.sleep(0.1)
+            else:
+                proc.terminate()
+                pytest.fail(f"server never became reachable; log:\n{log_path.read_text()}")
             try:
-                with socket.create_connection(("127.0.0.1", port), timeout=0.2):
-                    break
-            except OSError:
-                time.sleep(0.1)
-        else:
-            proc.terminate()
-            pytest.fail(f"server never became reachable; log:\n{log_path.read_text()}")
-        try:
-            yield LoggedServer(f"http://127.0.0.1:{port}", proc, log_path, data)
-        finally:
-            proc.terminate(); proc.wait(timeout=5); shutil.rmtree(data, ignore_errors=True)
+                yield LoggedServer(f"http://127.0.0.1:{port}", proc, log_path, data)
+            finally:
+                proc.terminate(); proc.wait(timeout=5); shutil.rmtree(data, ignore_errors=True)
 
 
 @pytest.mark.parametrize("logged_server", [["--log-format", "json"]], indirect=True)

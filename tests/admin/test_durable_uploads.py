@@ -8,7 +8,7 @@ import subprocess
 import urllib.error
 
 import pytest
-from conftest import _free_port, _su_template_for, _wait_reachable_or_fail
+from conftest import _reserve_port, _su_template_for, _wait_reachable_or_fail
 import test_resumable_uploads as network
 
 
@@ -25,34 +25,35 @@ def binary():
 def running(binary, tmp_path):
     data = tmp_path / "data"
     shutil.copytree(_su_template_for(binary), data)
-    port = _free_port()
-    base = f"http://127.0.0.1:{port}"
-    env = {**os.environ, "ZIGBASE_DATA_DIR": str(data), "ZIGBASE_HTTP_PORT": str(port),
-           "ZIGBASE_SERVE_BACKGROUND": "0"}
-    log_path = tmp_path / "server.log"
-    processes = []
+    with _reserve_port() as port:
+        base = f"http://127.0.0.1:{port}"
+        env = {**os.environ, "ZIGBASE_DATA_DIR": str(data), "ZIGBASE_HTTP_PORT": str(port),
+               "ZIGBASE_SERVE_BACKGROUND": "0"}
+        log_path = tmp_path / "server.log"
+        processes = []
 
-    def start(*, ready=True, other_port=None):
-        launch_env = {**env, "ZIGBASE_HTTP_PORT": str(other_port or port)}
-        args = [binary, "serve", "--insecure-cookies"]
-        if other_port:
-            args.append("--ignore-lock")  # Exercise upload ownership, not CLI tracking.
-        with log_path.open("ab") as log:
-            proc = subprocess.Popen(args, env=launch_env,
-                                    stdout=log, stderr=subprocess.STDOUT)
-        processes.append(proc)
-        if ready:
-            _wait_reachable_or_fail(proc, other_port or port, str(log_path))
-        return proc
+        def start(*, ready=True, other_port=None):
+            launch_env = {**env, "ZIGBASE_HTTP_PORT": str(other_port or port)}
+            args = [binary, "serve", "--insecure-cookies"]
+            if other_port:
+                args.append("--ignore-lock")  # Exercise upload ownership, not CLI tracking.
+            log_start = log_path.stat().st_size if log_path.exists() else 0
+            with log_path.open("ab") as log:
+                proc = subprocess.Popen(args, env=launch_env,
+                                        stdout=log, stderr=subprocess.STDOUT)
+            processes.append(proc)
+            if ready:
+                _wait_reachable_or_fail(proc, other_port or port, str(log_path), log_start=log_start)
+            return proc
 
-    proc = start()
-    try:
-        yield base, data, proc, start, log_path
-    finally:
-        for child in processes:
-            if child.poll() is None:
-                child.kill()
-            child.wait(timeout=10)
+        proc = start()
+        try:
+            yield base, data, proc, start, log_path
+        finally:
+            for child in processes:
+                if child.poll() is None:
+                    child.kill()
+                child.wait(timeout=10)
 
 
 def kill(proc):
@@ -275,13 +276,14 @@ def test_owner_lock_and_persisted_principal_quota(running):
     _, tokens, _, record = network.setup(base)
     assert network.begin(base, tokens[0], record, 64)[0] == 201
     assert network.begin(base, tokens[0], record, 64)[0] == 201
-    competing = start(ready=False, other_port=_free_port())
-    assert competing.wait(timeout=10) != 0
-    assert "WouldBlock" in log_path.read_text()
-    kill(proc)
-    start()
-    assert network.begin(base, tokens[0], record)[0] == 429
-    assert network.begin(base, tokens[1], record)[0] == 429
+    with _reserve_port() as other_port:
+        competing = start(ready=False, other_port=other_port)
+        assert competing.wait(timeout=10) != 0
+        assert "WouldBlock" in log_path.read_text()
+        kill(proc)
+        start()
+        assert network.begin(base, tokens[0], record)[0] == 429
+        assert network.begin(base, tokens[1], record)[0] == 429
 
 
 def test_competing_owner_cannot_run_startup_cleanup(running):
@@ -289,15 +291,16 @@ def test_competing_owner_cannot_run_startup_cleanup(running):
     with sqlite3.connect(data / "data.db") as conn:
         conn.execute("INSERT INTO _authChallenges VALUES(?,?,?,?,?,?,?,?)",
                      ("startup-marker", "users", "probe", "marker", "{}", 0, 0, "2000-01-01"))
-    competing = start(ready=False, other_port=_free_port())
-    assert competing.wait(timeout=10) != 0
-    assert "WouldBlock" in log_path.read_text()
-    with sqlite3.connect(data / "data.db") as conn:
-        assert conn.execute("SELECT id FROM _authChallenges WHERE id='startup-marker'").fetchone() == ("startup-marker",)
-    kill(proc)
-    start()
-    with sqlite3.connect(data / "data.db") as conn:
-        assert conn.execute("SELECT id FROM _authChallenges WHERE id='startup-marker'").fetchone() is None
+    with _reserve_port() as other_port:
+        competing = start(ready=False, other_port=other_port)
+        assert competing.wait(timeout=10) != 0
+        assert "WouldBlock" in log_path.read_text()
+        with sqlite3.connect(data / "data.db") as conn:
+            assert conn.execute("SELECT id FROM _authChallenges WHERE id='startup-marker'").fetchone() == ("startup-marker",)
+        kill(proc)
+        start()
+        with sqlite3.connect(data / "data.db") as conn:
+            assert conn.execute("SELECT id FROM _authChallenges WHERE id='startup-marker'").fetchone() is None
 
 
 @pytest.mark.parametrize("mutation,expected", [

@@ -10,6 +10,7 @@ Two server flavors are exercised:
   - the `dating-server` fixture binary (declares two flags + one experiment) — named
     flags/experiment resolve, deterministically, and reflect a superuser override.
 """
+from conftest import _reserve_port
 
 import json
 import os
@@ -30,12 +31,6 @@ REPO = pathlib.Path(__file__).resolve().parents[2]
 ZIG = ["mise", "exec", "zig@0.16.0", "--", "zig"]
 
 
-def _free_port():
-    s = socket.socket()
-    s.bind(("127.0.0.1", 0))
-    p = s.getsockname()[1]
-    s.close()
-    return p
 
 
 def _wait_port(port):
@@ -172,231 +167,231 @@ def test_feature_head_is_bodyless_for_default_remapped_and_disabled(
         ("disabled", "/api/state?subject=head", 200),
     ):
         with tempfile.TemporaryDirectory(prefix=f"zb_feature_{mode}_") as data:
-            port = _free_port()
-            proc = subprocess.Popen(
-                [
-                    str(feature_route_binaries[mode]),
-                    "serve",
-                    "--http-port",
-                    str(port),
-                    "--data-dir",
-                    data,
-                ],
-                env={
-                    **os.environ,
-                    "ZIGBASE_SERVE_BACKGROUND": "0",
-                    "ZIGBASE_JWT_SECRET": "test-secret-not-default-0123456789abcdef",
-                },
-            )
-            try:
-                _wait_port(port)
-                content_type = (
-                    "text/plain"
-                    if path.startswith("/api/state")
-                    else "application/json"
+            with _reserve_port() as port:
+                proc = subprocess.Popen(
+                    [
+                        str(feature_route_binaries[mode]),
+                        "serve",
+                        "--http-port",
+                        str(port),
+                        "--data-dir",
+                        data,
+                    ],
+                    env={
+                        **os.environ,
+                        "ZIGBASE_SERVE_BACKGROUND": "0",
+                        "ZIGBASE_JWT_SECRET": "test-secret-not-default-0123456789abcdef",
+                    },
                 )
-                _assert_head_parity(
-                    f"http://127.0.0.1:{port}{path}", expected_status, content_type
-                )
+                try:
+                    _wait_port(port)
+                    content_type = (
+                        "text/plain"
+                        if path.startswith("/api/state")
+                        else "application/json"
+                    )
+                    _assert_head_parity(
+                        f"http://127.0.0.1:{port}{path}", expected_status, content_type
+                    )
 
-                if path.startswith("/api/state"):
-                    status, body = _http("GET", f"http://127.0.0.1:{port}{path}")
-                    assert status == 200
-                    assert body == "consumer-state"
+                    if path.startswith("/api/state"):
+                        status, body = _http("GET", f"http://127.0.0.1:{port}{path}")
+                        assert status == 200
+                        assert body == "consumer-state"
 
-                if mode == "remapped":
-                    for custom_path, custom_status, representation_length in (
-                        (
-                            "/custom/head-success",
-                            200,
-                            len(b"custom-head-representation"),
-                        ),
-                        ("/custom/head-error", 500, None),
-                    ):
-                        status, headers, wire_body = _raw_head(
-                            f"http://127.0.0.1:{port}{custom_path}"
-                        )
-                        assert status == custom_status
-                        assert wire_body == b""
-                        assert int(headers["content-length"]) > 0
-                        if representation_length is not None:
-                            assert (
-                                int(headers["content-length"]) == representation_length
+                    if mode == "remapped":
+                        for custom_path, custom_status, representation_length in (
+                            (
+                                "/custom/head-success",
+                                200,
+                                len(b"custom-head-representation"),
+                            ),
+                            ("/custom/head-error", 500, None),
+                        ):
+                            status, headers, wire_body = _raw_head(
+                                f"http://127.0.0.1:{port}{custom_path}"
                             )
+                            assert status == custom_status
+                            assert wire_body == b""
+                            assert int(headers["content-length"]) > 0
+                            if representation_length is not None:
+                                assert (
+                                    int(headers["content-length"]) == representation_length
+                                )
 
-                    status, headers, wire_body = _raw_head(
-                        f"http://127.0.0.1:{port}/custom/no-content"
-                    )
-                    assert status == 204
-                    assert "content-length" not in headers
-                    assert "transfer-encoding" not in headers
-                    assert wire_body == b""
-
-                    for method in ("HEAD", "POST"):
-                        _, header_items, _ = _raw_response(
-                            method,
-                            f"http://127.0.0.1:{port}/custom/no-content",
+                        status, headers, wire_body = _raw_head(
+                            f"http://127.0.0.1:{port}/custom/no-content"
                         )
-                        dates = [
-                            value for name, value in header_items if name == "date"
-                        ]
-                        assert dates == ["Thu, 01 Jan 1970 00:00:00 GMT"]
-
-                    status, headers, wire_body = _raw_head(
-                        f"http://127.0.0.1:{port}/custom/not-modified"
-                    )
-                    assert status == 304
-                    assert headers.get("content-length") == "9"
-                    assert "transfer-encoding" not in headers
-                    assert wire_body == b""
-
-                    status, headers, wire_body = _raw_request(
-                        "POST", f"http://127.0.0.1:{port}/custom/no-content"
-                    )
-                    assert status == 204
-                    assert "content-length" not in headers
-                    assert "transfer-encoding" not in headers
-                    assert wire_body == b""
-
-                    for method in ("HEAD", "POST"):
-                        status, headers, wire_body = _raw_request(
-                            method,
-                            f"http://127.0.0.1:{port}/custom/reset-content",
-                        )
-                        assert status == 205
-                        assert headers.get("content-length") == "0"
+                        assert status == 204
+                        assert "content-length" not in headers
                         assert "transfer-encoding" not in headers
                         assert wire_body == b""
 
-                    for method in ("GET", "POST"):
+                        for method in ("HEAD", "POST"):
+                            _, header_items, _ = _raw_response(
+                                method,
+                                f"http://127.0.0.1:{port}/custom/no-content",
+                            )
+                            dates = [
+                                value for name, value in header_items if name == "date"
+                            ]
+                            assert dates == ["Thu, 01 Jan 1970 00:00:00 GMT"]
+
+                        status, headers, wire_body = _raw_head(
+                            f"http://127.0.0.1:{port}/custom/not-modified"
+                        )
+                        assert status == 304
+                        assert headers.get("content-length") == "9"
+                        assert "transfer-encoding" not in headers
+                        assert wire_body == b""
+
                         status, headers, wire_body = _raw_request(
-                            method,
-                            f"http://127.0.0.1:{port}/custom/wrong-framing",
+                            "POST", f"http://127.0.0.1:{port}/custom/no-content"
+                        )
+                        assert status == 204
+                        assert "content-length" not in headers
+                        assert "transfer-encoding" not in headers
+                        assert wire_body == b""
+
+                        for method in ("HEAD", "POST"):
+                            status, headers, wire_body = _raw_request(
+                                method,
+                                f"http://127.0.0.1:{port}/custom/reset-content",
+                            )
+                            assert status == 205
+                            assert headers.get("content-length") == "0"
+                            assert "transfer-encoding" not in headers
+                            assert wire_body == b""
+
+                        for method in ("GET", "POST"):
+                            status, headers, wire_body = _raw_request(
+                                method,
+                                f"http://127.0.0.1:{port}/custom/wrong-framing",
+                            )
+                            assert status == 200
+                            assert headers.get("content-length") == "6"
+                            assert "transfer-encoding" not in headers
+                            assert "trailer" not in headers
+                            assert wire_body == b"framed"
+
+                        status, headers, wire_body = _raw_head(
+                            f"http://127.0.0.1:{port}/custom/owned-file"
                         )
                         assert status == 200
-                        assert headers.get("content-length") == "6"
-                        assert "transfer-encoding" not in headers
-                        assert "trailer" not in headers
-                        assert wire_body == b"framed"
+                        assert headers.get("content-length") == "7"
+                        assert wire_body == b""
 
-                    status, headers, wire_body = _raw_head(
-                        f"http://127.0.0.1:{port}/custom/owned-file"
-                    )
-                    assert status == 200
-                    assert headers.get("content-length") == "7"
-                    assert wire_body == b""
-
-                    missing_body_length = None
-                    for method in ("GET", "HEAD"):
-                        status, header_items, wire_body = _raw_response(
-                            method,
-                            f"http://127.0.0.1:{port}/custom/missing-owned-file",
-                        )
-                        headers = dict(header_items)
-                        assert status == 404
-                        if method == "GET":
-                            missing_body_length = len(wire_body)
-                            assert json.loads(wire_body)["code"] == "not_found"
-                        else:
-                            assert wire_body == b""
-                        assert int(headers["content-length"]) == missing_body_length
-                        header_names = [name for name, _ in header_items]
-                        assert header_names.count("content-length") == 1
-                        assert header_names.count("content-type") == 1
-                        assert not {
-                            "accept-ranges",
-                            "content-range",
-                            "etag",
-                        }.intersection(header_names)
-
-                    for method, path in (
-                        ("GET", "/custom/early-hints"),
-                        ("HEAD", "/custom/early-hints"),
-                        ("GET", "/custom/informational-unnamed"),
-                        ("GET", "/custom/status-unsupported"),
-                        ("POST", "/custom/not-modified"),
-                    ):
-                        status, header_items, wire_body = _raw_response(
-                            method, f"http://127.0.0.1:{port}{path}"
-                        )
-                        headers = dict(header_items)
-                        assert status == 500
-                        assert headers["content-type"].startswith("application/json")
-                        assert int(headers["content-length"]) > 0
-                        assert "transfer-encoding" not in headers
-                        if method == "HEAD":
-                            assert wire_body == b""
-                        else:
-                            assert json.loads(wire_body)["code"] == "internal"
-                        if path == "/custom/status-unsupported":
-                            assert any(
-                                value.startswith("invalid-status=kept")
-                                for name, value in header_items
-                                if name == "set-cookie"
+                        missing_body_length = None
+                        for method in ("GET", "HEAD"):
+                            status, header_items, wire_body = _raw_response(
+                                method,
+                                f"http://127.0.0.1:{port}/custom/missing-owned-file",
                             )
-            finally:
-                proc.terminate()
-                proc.wait(timeout=10)
+                            headers = dict(header_items)
+                            assert status == 404
+                            if method == "GET":
+                                missing_body_length = len(wire_body)
+                                assert json.loads(wire_body)["code"] == "not_found"
+                            else:
+                                assert wire_body == b""
+                            assert int(headers["content-length"]) == missing_body_length
+                            header_names = [name for name, _ in header_items]
+                            assert header_names.count("content-length") == 1
+                            assert header_names.count("content-type") == 1
+                            assert not {
+                                "accept-ranges",
+                                "content-range",
+                                "etag",
+                            }.intersection(header_names)
+
+                        for method, path in (
+                            ("GET", "/custom/early-hints"),
+                            ("HEAD", "/custom/early-hints"),
+                            ("GET", "/custom/informational-unnamed"),
+                            ("GET", "/custom/status-unsupported"),
+                            ("POST", "/custom/not-modified"),
+                        ):
+                            status, header_items, wire_body = _raw_response(
+                                method, f"http://127.0.0.1:{port}{path}"
+                            )
+                            headers = dict(header_items)
+                            assert status == 500
+                            assert headers["content-type"].startswith("application/json")
+                            assert int(headers["content-length"]) > 0
+                            assert "transfer-encoding" not in headers
+                            if method == "HEAD":
+                                assert wire_body == b""
+                            else:
+                                assert json.loads(wire_body)["code"] == "internal"
+                            if path == "/custom/status-unsupported":
+                                assert any(
+                                    value.startswith("invalid-status=kept")
+                                    for name, value in header_items
+                                    if name == "set-cookie"
+                                )
+                finally:
+                    proc.terminate()
+                    proc.wait(timeout=10)
 
 
 def test_invalid_handler_status_logs_the_normalized_wire_status(feature_route_binaries):
     with tempfile.TemporaryDirectory(prefix="zb_invalid_status_") as data:
-        port = _free_port()
-        log_path = pathlib.Path(data) / "server.log"
-        with log_path.open("w") as log:
-            proc = subprocess.Popen(
-                [
-                    str(feature_route_binaries["remapped"]),
-                    "serve",
-                    "--http-port",
-                    str(port),
-                    "--data-dir",
-                    data,
-                    "--log-format",
-                    "json",
-                ],
-                env={
-                    **os.environ,
-                    "ZIGBASE_SERVE_BACKGROUND": "0",
-                    "ZIGBASE_JWT_SECRET": "test-secret-not-default-0123456789abcdef",
-                },
-                stdout=log,
-                stderr=subprocess.STDOUT,
-            )
-            try:
-                _wait_port(port)
-                long_path = "/custom/status-unsupported/" + "x" * 256
-                for path in ("/custom/status-unsupported", long_path):
-                    status, body = _http(
-                        "GET", f"http://127.0.0.1:{port}{path}"
-                    )
-                    assert status == 500
-                    assert json.loads(body)["code"] == "internal"
-                time.sleep(0.2)
-            finally:
-                proc.terminate()
-                proc.wait(timeout=10)
+        with _reserve_port() as port:
+            log_path = pathlib.Path(data) / "server.log"
+            with log_path.open("w") as log:
+                proc = subprocess.Popen(
+                    [
+                        str(feature_route_binaries["remapped"]),
+                        "serve",
+                        "--http-port",
+                        str(port),
+                        "--data-dir",
+                        data,
+                        "--log-format",
+                        "json",
+                    ],
+                    env={
+                        **os.environ,
+                        "ZIGBASE_SERVE_BACKGROUND": "0",
+                        "ZIGBASE_JWT_SECRET": "test-secret-not-default-0123456789abcdef",
+                    },
+                    stdout=log,
+                    stderr=subprocess.STDOUT,
+                )
+                try:
+                    _wait_port(port)
+                    long_path = "/custom/status-unsupported/" + "x" * 256
+                    for path in ("/custom/status-unsupported", long_path):
+                        status, body = _http(
+                            "GET", f"http://127.0.0.1:{port}{path}"
+                        )
+                        assert status == 500
+                        assert json.loads(body)["code"] == "internal"
+                    time.sleep(0.2)
+                finally:
+                    proc.terminate()
+                    proc.wait(timeout=10)
 
-        log_text = log_path.read_text()
-        records = [
-            json.loads(line)
-            for line in log_text.splitlines()
-            if line.strip().startswith("{")
-        ]
-        request = next(
-            record
-            for record in records
-            if record.get("msg") == "request"
-            and record.get("path") == "/custom/status-unsupported"
-        )
-        assert request["status"] == 500
-        assert (
-            "route returned invalid final status 799 for GET "
-            "/custom/status-unsupported" in log_text
-        )
-        long_message = f"route returned invalid final status 799 for GET {long_path}"
-        assert long_message in log_text
-        assert f"fixture observed InvalidResponseStatus: {long_message}" in log_text
+            log_text = log_path.read_text()
+            records = [
+                json.loads(line)
+                for line in log_text.splitlines()
+                if line.strip().startswith("{")
+            ]
+            request = next(
+                record
+                for record in records
+                if record.get("msg") == "request"
+                and record.get("path") == "/custom/status-unsupported"
+            )
+            assert request["status"] == 500
+            assert (
+                "route returned invalid final status 799 for GET "
+                "/custom/status-unsupported" in log_text
+            )
+            long_message = f"route returned invalid final status 799 for GET {long_path}"
+            assert long_message in log_text
+            assert f"fixture observed InvalidResponseStatus: {long_message}" in log_text
 
 
 # ---------------------------------------------------------------------------
@@ -426,21 +421,21 @@ def dating_server(dating_binary):
         ],
         check=True,
     )
-    port = _free_port()
-    env = {**os.environ, "ZIGBASE_DATA_DIR": data, "ZIGBASE_HTTP_PORT": str(port)}
-    proc = subprocess.Popen(
-        [dating_binary, "serve", "--insecure-cookies"],
-        env=env,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    _wait_port(port)
-    try:
-        yield f"http://127.0.0.1:{port}"
-    finally:
-        proc.terminate()
-        proc.wait(timeout=5)
-        shutil.rmtree(data, ignore_errors=True)
+    with _reserve_port() as port:
+        env = {**os.environ, "ZIGBASE_DATA_DIR": data, "ZIGBASE_HTTP_PORT": str(port)}
+        proc = subprocess.Popen(
+            [dating_binary, "serve", "--insecure-cookies"],
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        _wait_port(port)
+        try:
+            yield f"http://127.0.0.1:{port}"
+        finally:
+            proc.terminate()
+            proc.wait(timeout=5)
+            shutil.rmtree(data, ignore_errors=True)
 
 
 def _su_token(base):

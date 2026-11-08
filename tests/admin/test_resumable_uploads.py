@@ -10,7 +10,7 @@ import urllib.error
 import urllib.request
 
 import pytest
-from conftest import _free_port, _su_template_for, _wait_reachable_or_fail
+from conftest import _reserve_port, _su_template_for, _wait_reachable_or_fail
 
 
 @pytest.fixture(scope="session")
@@ -72,37 +72,37 @@ def begin(server, token, record, length=4, filename="a.txt"):
 def test_automatic_rollback_does_not_retry_rollback(binary, tmp_path):
     data = tmp_path / "data"
     shutil.copytree(_su_template_for(binary), data)
-    port = _free_port()
-    base = f"http://127.0.0.1:{port}"
-    log_path = tmp_path / "server.log"
-    env = {**os.environ, "ZIGBASE_DATA_DIR": str(data),
-           "ZIGBASE_HTTP_PORT": str(port), "ZIGBASE_SERVE_BACKGROUND": "0"}
-    with log_path.open("wb") as log:
-        proc = subprocess.Popen([binary, "serve", "--insecure-cookies"], env=env,
-                                stdout=log, stderr=subprocess.STDOUT)
-    try:
-        _wait_reachable_or_fail(proc, port, str(log_path))
-        admin, tokens, _, record = setup(base)
-        code, upload = begin(base, tokens[0], record)
-        assert code == 201, upload
-        path = "/api/uploads/" + upload["id"]
-        assert call(base, "PATCH", path, b"abcd", tokens[0], 0)[0] == 204
-        with sqlite3.connect(data / "data.db") as conn:
-            conn.execute("CREATE TRIGGER automatic_rollback BEFORE UPDATE ON uploads "
-                         "BEGIN SELECT RAISE(ROLLBACK, 'injected automatic rollback'); END")
-        assert call(base, "POST", path + "/commit", token=tokens[0])[0] >= 400
-        with sqlite3.connect(data / "data.db") as conn:
-            conn.execute("DROP TRIGGER automatic_rollback")
-            assert conn.execute("SELECT file FROM uploads WHERE id=?",
-                                (record["id"],)).fetchone() == (None,)
-        assert call(base, "PATCH", "/api/collections/uploads/records/" + record["id"],
-                    {"title": "writer-still-usable"}, admin)[0] == 200
-        assert "record update rollback failed" not in log_path.read_text()
-        assert proc.poll() is None
-    finally:
-        if proc.poll() is None:
-            proc.terminate()
-        proc.wait(timeout=10)
+    with _reserve_port() as port:
+        base = f"http://127.0.0.1:{port}"
+        log_path = tmp_path / "server.log"
+        env = {**os.environ, "ZIGBASE_DATA_DIR": str(data),
+               "ZIGBASE_HTTP_PORT": str(port), "ZIGBASE_SERVE_BACKGROUND": "0"}
+        with log_path.open("wb") as log:
+            proc = subprocess.Popen([binary, "serve", "--insecure-cookies"], env=env,
+                                    stdout=log, stderr=subprocess.STDOUT)
+        try:
+            _wait_reachable_or_fail(proc, port, str(log_path))
+            admin, tokens, _, record = setup(base)
+            code, upload = begin(base, tokens[0], record)
+            assert code == 201, upload
+            path = "/api/uploads/" + upload["id"]
+            assert call(base, "PATCH", path, b"abcd", tokens[0], 0)[0] == 204
+            with sqlite3.connect(data / "data.db") as conn:
+                conn.execute("CREATE TRIGGER automatic_rollback BEFORE UPDATE ON uploads "
+                             "BEGIN SELECT RAISE(ROLLBACK, 'injected automatic rollback'); END")
+            assert call(base, "POST", path + "/commit", token=tokens[0])[0] >= 400
+            with sqlite3.connect(data / "data.db") as conn:
+                conn.execute("DROP TRIGGER automatic_rollback")
+                assert conn.execute("SELECT file FROM uploads WHERE id=?",
+                                    (record["id"],)).fetchone() == (None,)
+            assert call(base, "PATCH", "/api/collections/uploads/records/" + record["id"],
+                        {"title": "writer-still-usable"}, admin)[0] == 200
+            assert "record update rollback failed" not in log_path.read_text()
+            assert proc.poll() is None
+        finally:
+            if proc.poll() is None:
+                proc.terminate()
+            proc.wait(timeout=10)
 
 
 def wait_for_expiry(expires_at):
@@ -334,46 +334,47 @@ def test_disabled_http_routes(tmp_path):
     off = os.environ.get("ZIGBASE_TEST_UPLOADS_OFF_BINARY")
     if not off:
         pytest.skip("requires a default-build negative control")
-    port = _free_port()
-    env = {**os.environ, "ZIGBASE_DATA_DIR": str(tmp_path / "off"), "ZIGBASE_HTTP_PORT": str(port), "ZIGBASE_SERVE_BACKGROUND": "0"}
-    log_path = tmp_path / "off.log"
-    with log_path.open("wb") as log:
-        proc = subprocess.Popen([off, "serve", "--insecure-cookies"], env=env, stdout=log, stderr=subprocess.STDOUT)
-    try:
-        _wait_reachable_or_fail(proc, port, str(log_path))
-        server = f"http://127.0.0.1:{port}"
-        for method, path in [("POST", "/api/collections/x/records/y/uploads"), ("GET", "/api/uploads/x"), ("PATCH", "/api/uploads/x"), ("DELETE", "/api/uploads/x"), ("POST", "/api/uploads/x/commit")]:
-            assert call(server, method, path)[0] == 404
-    finally:
-        proc.terminate()
-        proc.wait(timeout=10)
+    with _reserve_port() as port:
+        env = {**os.environ, "ZIGBASE_DATA_DIR": str(tmp_path / "off"), "ZIGBASE_HTTP_PORT": str(port), "ZIGBASE_SERVE_BACKGROUND": "0"}
+        log_path = tmp_path / "off.log"
+        with log_path.open("wb") as log:
+            proc = subprocess.Popen([off, "serve", "--insecure-cookies"], env=env, stdout=log, stderr=subprocess.STDOUT)
+        try:
+            _wait_reachable_or_fail(proc, port, str(log_path))
+            server = f"http://127.0.0.1:{port}"
+            for method, path in [("POST", "/api/collections/x/records/y/uploads"), ("GET", "/api/uploads/x"), ("PATCH", "/api/uploads/x"), ("DELETE", "/api/uploads/x"), ("POST", "/api/uploads/x/commit")]:
+                assert call(server, method, path)[0] == 404
+        finally:
+            proc.terminate()
+            proc.wait(timeout=10)
 
 
 def test_restart_invalidates_sessions_without_staging_files(binary, tmp_path):
     data = tmp_path / "data"
     shutil.copytree(_su_template_for(binary), data)
-    port = _free_port()
-    server = f"http://127.0.0.1:{port}"
-    env = {**os.environ, "ZIGBASE_DATA_DIR": str(data), "ZIGBASE_HTTP_PORT": str(port), "ZIGBASE_SERVE_BACKGROUND": "0"}
-    log_path = tmp_path / "server.log"
-    def start():
-        with log_path.open("ab") as log:
-            proc = subprocess.Popen([binary, "serve", "--insecure-cookies"], env=env, stdout=log, stderr=subprocess.STDOUT)
-        _wait_reachable_or_fail(proc, port, str(log_path))
-        return proc
-    proc = start()
-    try:
-        _, tokens, _, record = setup(server)
-        _, upload = begin(server, tokens[0], record)
-        path = "/api/uploads/" + upload["id"]
-        assert call(server, "PATCH", path, b"ab", tokens[0], 0)[0] == 204
-    finally:
-        proc.terminate()
-        proc.wait(timeout=10)
-    proc = start()
-    try:
-        assert call(server, "GET", path, token=tokens[0])[0] == 404
-        assert not list((data / "storage").rglob("a.txt"))
-    finally:
-        proc.terminate()
-        proc.wait(timeout=10)
+    with _reserve_port() as port:
+        server = f"http://127.0.0.1:{port}"
+        env = {**os.environ, "ZIGBASE_DATA_DIR": str(data), "ZIGBASE_HTTP_PORT": str(port), "ZIGBASE_SERVE_BACKGROUND": "0"}
+        log_path = tmp_path / "server.log"
+        def start():
+            log_start = log_path.stat().st_size if log_path.exists() else 0
+            with log_path.open("ab") as log:
+                proc = subprocess.Popen([binary, "serve", "--insecure-cookies"], env=env, stdout=log, stderr=subprocess.STDOUT)
+            _wait_reachable_or_fail(proc, port, str(log_path), log_start=log_start)
+            return proc
+        proc = start()
+        try:
+            _, tokens, _, record = setup(server)
+            _, upload = begin(server, tokens[0], record)
+            path = "/api/uploads/" + upload["id"]
+            assert call(server, "PATCH", path, b"ab", tokens[0], 0)[0] == 204
+        finally:
+            proc.terminate()
+            proc.wait(timeout=10)
+        proc = start()
+        try:
+            assert call(server, "GET", path, token=tokens[0])[0] == 404
+            assert not list((data / "storage").rglob("a.txt"))
+        finally:
+            proc.terminate()
+            proc.wait(timeout=10)

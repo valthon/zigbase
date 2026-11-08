@@ -9,7 +9,7 @@ import uuid
 
 import pytest
 
-from conftest import _free_port, _stop_server, _wait_reachable_or_fail
+from conftest import _reserve_port, _stop_server, _wait_reachable_or_fail
 
 
 @pytest.mark.parametrize("backend", ["sqlite", "postgres"])
@@ -39,32 +39,32 @@ def test_cli_superuser_create_login_and_duplicate_failure(binary, backend, tmp_p
     for secret in (password, "replacement-password"):
         assert secret not in first.stdout + first.stderr + duplicate.stdout + duplicate.stderr
 
-    port = _free_port()
-    env["ZIGBASE_HTTP_PORT"] = str(port)
-    log_path = tmp_path / "server.log"
-    with log_path.open("wb") as log:
-        proc = subprocess.Popen([binary, "serve", "--insecure-cookies"], env=env,
-                                stdout=log, stderr=subprocess.STDOUT)
-    try:
-        _wait_reachable_or_fail(proc, port, str(log_path))
+    with _reserve_port() as port:
+        env["ZIGBASE_HTTP_PORT"] = str(port)
+        log_path = tmp_path / "server.log"
+        with log_path.open("wb") as log:
+            proc = subprocess.Popen([binary, "serve", "--insecure-cookies"], env=env,
+                                    stdout=log, stderr=subprocess.STDOUT)
+        try:
+            _wait_reachable_or_fail(proc, port, str(log_path))
 
-        def login(value):
-            request = urllib.request.Request(
-                f"http://127.0.0.1:{port}/api/collections/_superusers/auth-with-password",
-                data=json.dumps({"identity": email, "password": value}).encode(),
-                headers={"Content-Type": "application/json"}, method="POST")
-            try:
-                response = urllib.request.urlopen(request, timeout=10)
-            except urllib.error.HTTPError as error:
-                response = error
-            with response:
-                return response.status, json.load(response)
+            def login(value):
+                request = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/api/collections/_superusers/auth-with-password",
+                    data=json.dumps({"identity": email, "password": value}).encode(),
+                    headers={"Content-Type": "application/json"}, method="POST")
+                try:
+                    response = urllib.request.urlopen(request, timeout=10)
+                except urllib.error.HTTPError as error:
+                    response = error
+                with response:
+                    return response.status, json.load(response)
 
-        code, result = login(password)
-        assert code == 200, result
-        assert result["token"] and result["record"]["email"] == email
-        for name in ("created", "updated"):
-            assert datetime.datetime.fromisoformat(result["record"][name])
-        assert login("replacement-password")[0] == 400
-    finally:
-        _stop_server(proc)
+            code, result = login(password)
+            assert code == 200, result
+            assert result["token"] and result["record"]["email"] == email
+            for name in ("created", "updated"):
+                assert datetime.datetime.fromisoformat(result["record"][name])
+            assert login("replacement-password")[0] == 400
+        finally:
+            _stop_server(proc)
