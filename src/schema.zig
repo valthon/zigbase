@@ -1323,12 +1323,15 @@ fn getU64(v: Value, key: []const u8) !?u64 {
 
 fn getF64(v: Value, key: []const u8) !?f64 {
     const x = objGet(v, key) orelse return null;
-    return switch (x) {
-        .null => null,
+    const number: f64 = switch (x) {
+        .null => return null,
         .float => |f| f,
         .integer => |i| @floatFromInt(i),
-        else => error.InvalidSchema,
+        .number_string => |s| std.fmt.parseFloat(f64, s) catch return error.InvalidSchema,
+        else => return error.InvalidSchema,
     };
+    if (!std.math.isFinite(number)) return error.InvalidSchema;
+    return number;
 }
 
 fn getStrArray(alloc: std.mem.Allocator, v: Value, key: []const u8) !?[]const []const u8 {
@@ -1475,6 +1478,12 @@ pub fn parseCollectionInput(alloc: std.mem.Allocator, s: []const u8) !Collection
     defer parsed.deinit(); // everything retained is duped into `alloc` before return
     const obj = parsed.value;
     if (obj != .object) return error.InvalidSchema;
+    if (objGet(obj, "options")) |options| if (objGet(options, "auth")) |auth_options| {
+        if (objGet(auth_options, "minPasswordLength")) |minimum| {
+            if (minimum != .integer or minimum.integer < 0 or minimum.integer > 255)
+                return error.InvalidMinPasswordLength;
+        }
+    };
 
     // The `fv`/`iv`/`ov` re-stringify-then-reparse round trips below are pure scratch (each is
     // immediately consumed by fieldsFromJson/indexesFromJson/optionsFromJson, which dupe every
@@ -1638,6 +1647,44 @@ test "parseCollectionInput then collectionToJson round-trips the essentials" {
     try std.testing.expect(std.mem.indexOf(u8, out, "\"name\":\"posts\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"schema\":[") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"title\"") != null);
+}
+
+test "large finite number bounds parse and round-trip through schema JSON" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{
+        \\[{"id":"rating1","name":"rating","type":"number","options":{"mode":"float","min":-100000000000000000000,"max":100000000000000000000}}]
+        ,
+        \\[{"id":"rating1","name":"rating","type":"number","options":{"mode":"float","min":-1e20,"max":1e20}}]
+        ,
+    }) |input| {
+        const fields = try fieldsFromJson(a, input);
+        defer freeFieldsOwned(a, fields);
+        try std.testing.expectEqual(@as(f64, -1e20), fields[0].options.number.min.?);
+        try std.testing.expectEqual(@as(f64, 1e20), fields[0].options.number.max.?);
+        const encoded = try fieldsToJson(a, fields);
+        defer a.free(encoded);
+        const decoded = try fieldsFromJson(a, encoded);
+        defer freeFieldsOwned(a, decoded);
+        try std.testing.expectEqual(@as(f64, -1e20), decoded[0].options.number.min.?);
+        try std.testing.expectEqual(@as(f64, 1e20), decoded[0].options.number.max.?);
+    }
+}
+
+test "number bounds reject strings and nonfinite values" {
+    const a = std.testing.allocator;
+    var options: std.json.ObjectMap = .empty;
+    defer options.deinit(a);
+    for ([_]Value{
+        .{ .string = "1e20" },
+        .{ .number_string = "1e999" },
+        .{ .float = std.math.inf(f64) },
+        .{ .float = std.math.nan(f64) },
+    }) |value| {
+        try options.put(a, "min", value);
+        try std.testing.expectError(error.InvalidSchema, getF64(.{ .object = options }, "min"));
+        try options.put(a, "max", value);
+        try std.testing.expectError(error.InvalidSchema, getF64(.{ .object = options }, "max"));
+    }
 }
 
 fn collectErrors(c: Collection) !std.ArrayList(ValidationError) {
@@ -2328,4 +2375,20 @@ test "authInjectionPrefix answers identity, not equality" {
     truncated[0].name = sys[0].name[0..1];
     try std.testing.expectEqual(@as(usize, 0), authInjectionPrefix(.auth, truncated));
     try std.testing.expectEqual(@as(usize, 0), authInjectionPrefix(.base, injected.fields));
+}
+
+test "collection input rejects invalid password minima and preserves boundaries" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "-1", "256", "9.5", "null", "\"8\"" }) |value| {
+        const input = try std.fmt.allocPrint(a, "{{\"name\":\"members\",\"type\":\"auth\",\"fields\":[],\"options\":{{\"auth\":{{\"minPasswordLength\":{s}}}}}}}", .{value});
+        defer a.free(input);
+        try std.testing.expectError(error.InvalidMinPasswordLength, parseCollectionInput(a, input));
+    }
+    for ([_]u8{ 0, 255 }) |minimum| {
+        const input = try std.fmt.allocPrint(a, "{{\"name\":\"members\",\"type\":\"auth\",\"fields\":[],\"options\":{{\"auth\":{{\"minPasswordLength\":{d}}}}}}}", .{minimum});
+        defer a.free(input);
+        const col = try parseCollectionInput(a, input);
+        defer col.deinit(a);
+        try std.testing.expectEqual(minimum, col.options.auth.minPasswordLength);
+    }
 }

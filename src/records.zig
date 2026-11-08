@@ -486,10 +486,10 @@ fn validateFieldValue(alloc: std.mem.Allocator, conn: *db.Db, f: schema.Field, v
             }
         },
         .number => |o| if (o.mode == .float) {
-            const x: f64 = switch (v) {
-                .float => |fl| fl,
-                .integer => |i| @floatFromInt(i),
-                else => return,
+            if (v == .null) return;
+            const x = values.floatValue(v) catch |e| {
+                try errs.append(alloc, .{ .field = f.name, .code = convCode(e), .message = "Invalid number." });
+                return;
             };
             try appendMinMax(alloc, errs, f.name, x, o.min, o.max);
         } else if (v == .string) {
@@ -572,15 +572,18 @@ fn validateFieldValue(alloc: std.mem.Allocator, conn: *db.Db, f: schema.Field, v
 ///   number (all)  "" -> null; float mode: parseable, finite -> JSON float
 ///                 (else left as a string); int/fixed: kept as a string
 ///                 (the accepted form)
-///   select/relation (multi)  "" -> null; JSON-array string -> array (the admin
+///   select/relation (all)  "" -> null; multi-valued JSON-array string -> array (the admin
 ///                 UI sends JSON.stringify(array)); any other string wraps as a
 ///                 one-element array of the ORIGINAL string ("123" -> ["123"])
 ///   json          "" -> null; any parseable JSON -> the parsed value; else the
 ///                 raw string
-///   everything else (text/email/url/editor/date/single select/relation/file)
-///                 kept verbatim — including "", which is their JSON clear form
-/// So an empty multipart value clears every field type: text-likes store "",
-/// bool/number/json/multi-value fields store null. Keys that match no schema
+///   select/relation (single)  nonempty option/target ids kept verbatim; "" stays a
+///                 value when a single select declares it as an option, and "null"
+///                 then clears the field unless it is declared too
+///   everything else (text/email/url/editor/date/file)
+///                 kept verbatim — including ""
+/// Empty multipart bool/number/json/select/relation/multi-value fields store null;
+/// text-likes store "". Keys that match no schema
 /// field ("<field>-" removal keys, auth password/passwordConfirm) and
 /// non-string values keep their value unchanged (deep-cloned as-is, never aliased).
 ///
@@ -601,6 +604,14 @@ pub fn coerceFormFields(alloc: std.mem.Allocator, col: schema.Collection, data: 
         out.putAssumeCapacity(k, cv);
     }
     return .{ .object = out };
+}
+
+fn singleSelectDeclares(f: schema.Field, value: []const u8) bool {
+    if (f.options != .select or f.isMultiValue()) return false;
+    for (f.options.select.values) |option| {
+        if (std.mem.eql(u8, option, value)) return true;
+    }
+    return false;
 }
 
 /// Coerce one multipart field value to its schema-shaped JSON, returning an OWNED value on `alloc`
@@ -634,8 +645,13 @@ fn coerceFieldValue(alloc: std.mem.Allocator, col: schema.Collection, key: []con
             return values.cloneValue(alloc, parsed.value);
         },
         .select, .relation => {
+            // Empty selects and relations represent a clear in multipart, including
+            // single-valued fields, unless a single select declares "" as an option.
+            // That select takes the JSON spelling instead, unless "null" is an option too.
+            const declares_empty = singleSelectDeclares(f, "");
+            if (s.len == 0 and !declares_empty) return .null;
+            if (declares_empty and std.mem.eql(u8, s, "null") and !singleSelectDeclares(f, "null")) return .null;
             if (!f.isMultiValue()) return values.cloneValue(alloc, v);
-            if (s.len == 0) return .null; // multipart "" = clear
             if (std.json.parseFromSlice(std.json.Value, alloc, s, .{})) |parsed| {
                 defer parsed.deinit();
                 if (parsed.value == .array) return values.cloneValue(alloc, parsed.value);
@@ -670,6 +686,9 @@ fn coerceCol() schema.Collection {
             .{ .id = "f7", .name = "status", .options = .{ .select = .{ .values = &.{ "a", "b" }, .maxSelect = 1 } } },
             .{ .id = "f8", .name = "meta", .options = .{ .json = .{} } },
             .{ .id = "f9", .name = "photos", .options = .{ .file = .{ .maxSelect = 3 } } },
+            .{ .id = "f10", .name = "owner", .options = .{ .relation = .{ .targetCollectionId = "groups", .maxSelect = 1 } } },
+            .{ .id = "f11", .name = "mode", .options = .{ .select = .{ .values = &.{ "", "active" }, .maxSelect = 1 } } },
+            .{ .id = "f12", .name = "literal", .options = .{ .select = .{ .values = &.{ "", "null" }, .maxSelect = 1 } } },
         };
     };
     return .{ .id = "c", .name = "things", .fields = &S.fields };
@@ -780,16 +799,21 @@ test "coerce: an empty multipart value clears optional non-text fields to null" 
     try std.testing.expect((try coerceOneField(a, "ratio", "")) == .null);
     try std.testing.expect((try coerceOneField(a, "meta", "")) == .null);
     try std.testing.expect((try coerceOneField(a, "tags", "")) == .null);
-    // text-like and single select keep "" (their JSON form accepts it)
+    try std.testing.expect((try coerceOneField(a, "owner", "")) == .null);
+    try expectCoerceString(a, "owner", "some-record-id", "some-record-id");
+    try std.testing.expect((try coerceOneField(a, "status", "")) == .null);
+    // A single select that declares "" as an option keeps it as a value.
+    try expectCoerceString(a, "mode", "", "");
+    // That select cannot use "" for a clear, so the JSON spelling clears it.
+    try std.testing.expect((try coerceOneField(a, "mode", "null")) == .null);
+    // Unless "null" is an option too, and other selects keep the literal text.
+    try expectCoerceString(a, "literal", "null", "null");
+    try expectCoerceString(a, "status", "null", "null");
+    // Text-like fields keep their literal empty string.
     {
         const tv = try coerceOneField(a, "title", "");
         defer values.freeValue(a, tv);
         try std.testing.expect(tv == .string and tv.string.len == 0);
-    }
-    {
-        const sv = try coerceOneField(a, "status", "");
-        defer values.freeValue(a, sv);
-        try std.testing.expect(sv == .string and sv.string.len == 0);
     }
 }
 
@@ -1401,6 +1425,33 @@ test "create rejects an over-precise fixed value with a field error" {
     try std.testing.expectError(error.Validation, create(a, std.testing.io, &d, col, .{ .object = data }));
     try std.testing.expect(last_errors != null and last_errors.?.len >= 1);
     freeLastErrors(a);
+}
+
+test "float number-string validation enforces bounds and finite values" {
+    const a = std.testing.allocator;
+    var d = try db.Db.openMemory();
+    defer d.close();
+    const f = schema.Field{ .id = "f", .name = "rating", .options = .{ .number = .{ .mode = .float, .min = -1e20, .max = 1e20 } } };
+    var errs: std.ArrayList(schema.ValidationError) = .empty;
+    defer errs.deinit(a);
+    try validateFieldValue(a, &d, f, .{ .number_string = "100000000000000000000" }, &errs);
+    try validateFieldValue(a, &d, f, .null, &errs);
+    try std.testing.expectEqual(@as(usize, 0), errs.items.len);
+    try validateFieldValue(a, &d, f, .{ .number_string = "200000000000000000000" }, &errs);
+    try std.testing.expectEqual(@as(usize, 1), errs.items.len);
+    try std.testing.expectEqualStrings(codes.s(.validation_max), errs.items[0].code);
+    errs.clearRetainingCapacity();
+    try validateFieldValue(a, &d, f, .{ .number_string = "-200000000000000000000" }, &errs);
+    try std.testing.expectEqual(@as(usize, 1), errs.items.len);
+    try std.testing.expectEqualStrings(codes.s(.validation_min), errs.items[0].code);
+    errs.clearRetainingCapacity();
+    try validateFieldValue(a, &d, f, .{ .number_string = "1e999" }, &errs);
+    try std.testing.expectEqual(@as(usize, 1), errs.items.len);
+    try std.testing.expectEqualStrings(codes.s(.validation_number), errs.items[0].code);
+    errs.clearRetainingCapacity();
+    try validateFieldValue(a, &d, f, .{ .string = "100000000000000000000" }, &errs);
+    try std.testing.expectEqual(@as(usize, 1), errs.items.len);
+    try std.testing.expectEqualStrings(codes.s(.validation_type), errs.items[0].code);
 }
 
 test "create rejects a missing required field" {
