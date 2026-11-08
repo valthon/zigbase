@@ -846,10 +846,7 @@ fn zapHeaderSet(ctx: *anyopaque, name: []const u8, value: []const u8) void {
 /// turns omitted-but-valid codes (e.g. 401 auth rejections, 307 magic-link redirects,
 /// 405, 415) into 500s. Anything zap doesn't name falls back to 500.
 fn statusToCode(status: u16) zap.http.StatusCode {
-    inline for (std.meta.fields(zap.http.StatusCode)) |field| {
-        if (field.value == status) return @field(zap.http.StatusCode, field.name);
-    }
-    return .internal_server_error;
+    return http.transportStatus(status) orelse .internal_server_error;
 }
 
 test "statusToCode maps named codes and falls back to 500 for unknown" {
@@ -1955,9 +1952,8 @@ pub fn normalizeResponse(ctx: *http.RequestCtx, response: http.Response) !http.R
     // reach here. Likewise, 304 is only meaningful for GET/HEAD, and zap cannot put an
     // unnamed status on the wire. Turn every invalid application status into one coherent
     // final response so the wire, body, and access log all agree.
-    const invalid_status = (response.status >= 100 and response.status < 200) or
-        (response.status == 304 and ctx.method != .GET and ctx.method != .HEAD) or
-        (response.status != 500 and statusToCode(response.status) == .internal_server_error);
+    const invalid_status = !http.isFinalStatus(response.status) or
+        (response.status == 304 and ctx.method != .GET and ctx.method != .HEAD);
     var normalized = response;
     if (invalid_status) {
         reportInvalidResponseStatus(ctx, response.status);
@@ -2252,7 +2248,7 @@ test "normalizeResponse maps invalid final statuses to one framed 500" {
         .allocator = RequestArena.from(&arena),
         .app = null,
     };
-    for ([_]u16{ 100, 103, 199, 799 }) |status| {
+    for ([_]u16{ 100, 103, 199, 432, 499, 799 }) |status| {
         const normalized = try normalizeResponse(&ctx, .{ .status = status, .body = "wrong" });
         try std.testing.expectEqual(@as(u16, 500), normalized.status);
         try std.testing.expectEqualStrings("application/json", normalized.content_type);

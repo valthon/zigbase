@@ -184,14 +184,15 @@ fn parseLiteralStatus(span: []const u8) ?u16 {
 // Regression guard (SP-1 Task 2 follow-up): walks every `src/**/*.zig` file at test
 // time and flags a bare `ApiError{ .status = N, .message = … }` struct-literal
 // construction that omits `.code` while `N` is a status `error_codes.forStatus` maps
-// to something OTHER than `.internal` (400/401/403/404/409/410/429 today, read live
-// off `forStatus` so this guard tracks it automatically). Such a literal silently
+// to something OTHER than `.internal` (every 4xx today: the dedicated codes for
+// 400/401/403/404/409/410/413/429 and `bad_request` for the rest, read live off
+// `forStatus` so this guard tracks it automatically). Such a literal silently
 // falls back to `ApiError`'s default `code: []const u8 = codes.s(.internal)` even
 // though a specific registered code exists for its status — the exact defect this
 // task fixed at ~30 call sites (see task-2-report.md, "Concern 2").
 //
-// Literals at 500, or any other status `forStatus` does not specifically map, are
-// NOT flagged: `internal` is the documented, correct default there.
+// Literals at 5xx or other non-4xx statuses, which `forStatus` maps to `internal`,
+// are NOT flagged: `internal` is the documented, correct default there.
 //
 // Limits (stated, not hidden): this is a textual brace-balancing scan, not a Zig
 // parser. It only understands a single `ApiError{ ... }` literal per match (nested

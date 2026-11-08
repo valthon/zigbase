@@ -304,6 +304,32 @@ The six valid phase fields are `beforeCreate`, `afterCreate`, `beforeUpdate`,
 `any` group runs first, then the collection-specific group; only the field
 matching the current phase runs.
 
+On HTTP record create, update, and delete, a before-hook can return
+`ctx.fail(status, message)` to reject the write with a **supported error**
+status and message in the standard error envelope. Supported statuses are
+the transport’s named 4xx and 5xx statuses (`http.isErrorStatus`). The machine `code` follows the same
+status mapping as other `ctx.fail` callers (`409` → `conflict`; a supported status
+without a specific code uses `bad_request` for 4xx and `internal` for 5xx). `ctx.invalid(fields)` returns a 400 validation envelope
+with the supplied field details. The primary write and the hook's database
+side-writes roll back together. After rollback and writer release, rendered 5xx
+failures invoke `onError` and its reporter backstop with phase `before_hook`;
+deliberate 4xx failures do not. The event's `message` is
+`<collection>: <status> <hook message>`, so reporter dedup keeps distinct failures
+apart. Its `err` is `error.Handled`, or `error.OutOfMemory` when the response is the
+allocation-failure fallback.
+For example:
+
+```zig
+return ctx.fail(409, "That item is already queued.");
+```
+
+Any other returned error, `error.Handled` without a stashed error, or an
+unsupported `ctx.fail` status (including unnamed 4xx values such as 432 or 499)
+retains the generic 400 response
+(`bad_request`, `Request rejected by a hook.`). Internal error names are never
+returned to the client. After-hook errors keep their existing error-reporting
+behavior and do not change the committed write's response.
+
 Every hook has the signature:
 
 ```zig
@@ -332,7 +358,8 @@ Need the app itself (e.g. `app.allocator`, `app.io`)? Use the hook's `ctx.app`
 ### Semantics
 
 - **`before*` hooks** may MUTATE `ev.record` and may return an error to REJECT
-  the write (the request fails with `400`). Early locked-rule and tenant gates
+  the write (explicit supported `ctx.fail` statuses and `ctx.invalid` details
+  are preserved; other errors return generic `400`). Early locked-rule and tenant gates
   run first; conditional create/update predicates are checked in the write
   transaction after the hook. A later denial rolls back its database side-writes.
   A before-hook is not proof of final authorization: keep external side effects
@@ -1732,7 +1759,10 @@ fn confirmBooking(ctx: *zigbase.Ctx) anyerror!zigbase.http.Response {
 }
 ```
 
-`ctx.fail(status, message)` stashes the error and returns `error.Handled`.
+`ctx.fail(status, message)` copies the error and returns `error.Handled`.
+`ctx.fail` and `ctx.invalid` copy all supplied strings and field descriptors
+before returning, so stack buffers are safe. The `Ctx` owns these copies until
+`deinit` or the next handler invocation; a rendered response owns its separate body.
 `ctx.errorResponse(err)` maps any error to a `{code, message, data}` JSON response:
 
 | `anyerror` | HTTP status |
@@ -2647,6 +2677,14 @@ ZigBase ships with a **pluggable auth-method system** that lets every auth colle
 
 1. **Initiate** — challenge delivery (email a link/code, return WebAuthn options, or a no-op for API-key flows).
 2. **Complete** — proof verification. On success the method returns a `Resolution.record(record_id)` and the framework mints the session via the one seam (`issueSession`+`emitAuth`), firing `onAuth`. The method never mints sessions itself.
+
+Auth-method `Resolution.fail` messages for the transport's named 4xx statuses
+(`http.isErrorStatus`) are intentionally public and returned to the anonymous
+caller. A status without a dedicated machine code (such as 422) uses
+`bad_request`. Write these as client explanations, without operator secrets.
+Server-error and unnamed-status (such as 432) failure messages remain
+operator-only: they are logged and replaced with the generic 500 `internal`
+response.
 
 There are three tiers:
 
