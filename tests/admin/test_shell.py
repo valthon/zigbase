@@ -27,9 +27,9 @@ def test_unauthenticated_deeplink_bounces_to_login(page):
     page.goto("/_/#/collections/_superusers/records")
     page.wait_for_selector('[data-test=email]', timeout=5000)
 
-def test_browse_records_table_renders(page):
+def test_browse_builtin_accounts_renders(page):
     login(page)
     page.click('[data-test=nav-_superusers]')
-    page.wait_for_selector('[data-test=records-view]', timeout=5000)
-    page.wait_for_selector('[data-test=row]', timeout=5000)
-    assert page.locator('[data-test=row]').count() >= 1
+    page.wait_for_selector('[data-test=users-view]', timeout=5000)
+    page.wait_for_selector('[data-test=user-row]', timeout=5000)
+    assert page.locator('[data-test=user-row]').count() >= 1

@@ -2408,11 +2408,33 @@ realtime health, below), **Features** (flags & experiments, below), and
 **Settings** (raw KV, above). It ships as browser-native ES modules — no build
 step — and every asset is served with a CRC32 `ETag`.
 
-**Users** (`/_/#/users`) manages both superusers and auth-collection users: list
-and search (filter-based) either, create/edit/delete records, an admin password
-reset (superuser `PATCH`), and a read-only OAuth-providers panel per auth
-collection. It composes the existing collections/records/auth REST API — no new
-endpoints ship for it. Per-device sessions are not yet exposed here.
+The sidebar groups ordinary collections under **Data collections** and auth
+collections under **Users**, using each collection's type rather than its name.
+**Collection settings** lists every collection definition and offers collection
+creation, fields, API rules, and authentication settings.
+
+**Users** (`/_/#/users/<collection>`) manages both superusers and auth-collection
+accounts. Selecting an auth collection opens its account list, and the collection
+stays selected across reloads and browser history. Existing
+`/_/#/collections/<collection>/records` links for auth collections redirect to
+the same collection's Users page. The unscoped `/_/#/users` link chooses the
+`users` auth collection when present, otherwise the first auth collection.
+
+Create/edit forms include email, username, password, and custom schema fields,
+including required profile fields, JSON, rich text, relations, multiple
+selections, and file uploads. Creation requires a password meeting the
+collection's minimum length, as required by the records REST API; leaving the
+password blank during editing preserves it. An entered password performs an
+admin reset (superuser `PATCH`). Editing submits only changed profile fields
+and credentials, plus file uploads/removals, preserving unrelated concurrent
+updates. A blank username on creation is omitted, matching API-created accounts.
+Server-managed credential and system fields remain protected. Unchecked boolean profile fields save as false, and relation
+editors retain existing selections beyond the initially loaded target list.
+Users links to its collection's settings, and auth collection
+settings links back with **Manage users →**. Search matches email or username,
+and a read-only OAuth-providers panel shows the collection's providers.
+It composes the existing collections/records/auth REST API — no new endpoints
+ship for it. Per-device sessions are not yet exposed here.
 
 **Files** (`/_/#/files`) covers per-collection file-field browsing: a read-only
 storage-backend strip (local disk vs S3, from the new superuser `GET

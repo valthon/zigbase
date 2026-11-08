@@ -3,15 +3,14 @@ import { api, API } from '/_/assets/lib/api.js';
 import { useLiveCollection } from '/_/assets/lib/ui.js';
 import { RichTextEditor, JsonEditor, stripTags } from '/_/assets/lib/editor.js';
 
-export function RecordsTable({ col }) {
+export function RecordsTable({ col, collection, metadataError }) {
   const [data, setData] = useState(null);
   const [err, setErr] = useState('');
   const [page, setPage] = useState(1);
   const [filter, setFilter] = useState('');
   const [sort, setSort] = useState('');
   const [editing, setEditing] = useState(undefined); // undefined=closed, null=new, record=edit
-  const [schema, setSchema] = useState([]);
-  useEffect(() => { API.collections().then(cs => { const c = cs.find(x => x.name === col); setSchema(c ? c.schema : []); }); }, [col]);
+  const schema = collection?.schema || [];
   const perPage = 30;
   function load() {
     setErr('');
@@ -44,13 +43,13 @@ export function RecordsTable({ col }) {
         <div class="grow"></div>
         <input class="grow" data-test="filter" placeholder="filter e.g. status='published'" value=${filter} onInput=${e => setFilter(e.target.value)} onKeyDown=${e => { if (e.key === 'Enter') { setPage(1); load(); } }}/>
         <button class="ghost" data-test="apply-filter" onClick=${() => { setPage(1); load(); }}>Apply</button>
-        <button data-test="new-record" onClick=${() => setEditing(null)}>+ New record</button>
+        <button data-test="new-record" disabled=${!collection} onClick=${() => setEditing(null)}>+ New record</button>
       </div>
-      ${err && html`<div class="error" data-test="records-error">${err}</div>`}
+      ${(err || metadataError) && html`<div class="error" data-test="records-error">${err || metadataError}</div>`}
       <table>
         <thead><tr>${columns.map(c => html`<th key=${c} onClick=${() => setSort(sort === c ? '-' + c : c)} style="cursor:pointer">${c}${sort === c ? ' ▲' : sort === '-' + c ? ' ▼' : ''}</th>`)}</tr></thead>
         <tbody data-test="rows">
-          ${items.map(r => html`<tr key=${r.id} data-test="row" style="cursor:pointer" onClick=${() => setEditing(r)}>${columns.map(c => html`<td key=${c}>${fmt(r[c], typeOf[c])}</td>`)}</tr>`)}
+          ${items.map(r => html`<tr key=${r.id} data-test="row" style="cursor:pointer" onClick=${() => setEditing(r)}>${columns.map(c => html`<td key=${c}>${fmt(ownValue(r, c), ownValue(typeOf, c))}</td>`)}</tr>`)}
         </tbody>
       </table>
       ${data && data.totalItems === 0 && html`<p class="muted" data-test="empty">No records.</p>`}
@@ -59,7 +58,7 @@ export function RecordsTable({ col }) {
         <span data-test="pageinfo">Page ${data ? data.page : page} / ${data ? data.totalPages || 1 : 1}</span>
         <button class="ghost" disabled=${data && page >= (data.totalPages || 1)} onClick=${() => setPage(page + 1)}>Next ›</button>
       </div>
-      ${editing !== undefined && html`<${RecordDrawer} col=${col} record=${editing} schema=${schema} onClose=${() => setEditing(undefined)} onSaved=${() => { setEditing(undefined); load(); }}/>`}
+      ${editing !== undefined && html`<${RecordDrawer} col=${col} record=${editing} onClose=${() => setEditing(undefined)} onSaved=${() => { setEditing(undefined); load(); }}/>`}
     </div>`;
 }
 
@@ -106,6 +105,10 @@ export function SchemaEditor({ name }) {
 
   async function save() {
     setErr(''); setFieldErrs({});
+    if (col.type === 'auth' && !validPasswordMinimum(col.options?.auth?.minPasswordLength ?? 8)) {
+      setErr('Minimum password length must be an integer from 0 to 255.');
+      return;
+    }
     const payload = { name: col.name, type: col.type, fields: col.name === '_superusers' ? [] : col.schema, options: col.options };
     if (col.name !== '_superusers') for (const r of RULES) payload[r] = col[r];
     try {
@@ -113,7 +116,7 @@ export function SchemaEditor({ name }) {
       // Do a full page load of the saved collection's records view so the sidebar list refreshes.
       // location.assign() to a URL with a *new path query* forces a document reload (not just a
       // hashchange), avoiding the race between setting the hash and a separate location.reload().
-      location.assign('/_/?saved=' + Date.now() + '#/collections/' + encodeURIComponent(saved.name) + '/records');
+      location.assign('/_/?saved=' + Date.now() + (saved.type === 'auth' ? '#/users/' + encodeURIComponent(saved.name) : '#/collections/' + encodeURIComponent(saved.name) + '/records'));
     } catch (x) {
       setErr((x.data && x.data.message) || 'Save failed');
       if (x.data && x.data.data) setFieldErrs(x.data.data);
@@ -126,13 +129,18 @@ export function SchemaEditor({ name }) {
   }
 
   const isAuth = col.type === 'auth';
+  // Draft names can temporarily equal a reserved name while the user types.
+  // Protect only fields whose persisted identity belonged to the original schema.
+  const originalSchema = (allCols.find(c => c.name === name) || {}).schema || [];
+  const protectedFieldIds = new Set(originalSchema.filter(f => f.id && isSystemField(f.name, isAuth)).map(f => f.id));
   return html`
     <div data-test="schema-editor">
       <div class="toolbar">
         <h2 style="margin:0">${isNew ? 'New collection' : 'Edit ' + col.name}</h2>
         <div class="grow"></div>
+        ${!isNew && isAuth && html`<a data-test="manage-users" href=${'#/users/' + encodeURIComponent(name)}>Manage users →</a>`}
         ${!isNew && !col.system && html`<button class="ghost" data-test="delete-collection" onClick=${del}>Delete</button>`}
-        <button data-test="save-collection" onClick=${save}>Save</button>
+        <button data-test="save-collection" disabled=${isAuth && !validPasswordMinimum(col.options?.auth?.minPasswordLength ?? 8)} onClick=${save}>Save</button>
       </div>
       ${err && html`<div class="error" data-test="schema-error">${err}</div>`}
       <div class="row" style="border-bottom:1px solid var(--line); margin-bottom:12px">
@@ -144,13 +152,13 @@ export function SchemaEditor({ name }) {
         ${isNew && html`<div class="field"><label>Type</label><select data-test="col-type" value=${col.type} onChange=${e => setCol({ ...col, type: e.target.value })}>${['base','auth'].map(t => html`<option key=${t} value=${t}>${t}</option>`)}</select></div>`}
         <label class="muted">Fields</label>
         ${col.schema.map((f, i) => html`<div class="row" data-test="field-row" style="margin:6px 0; align-items:flex-start; flex-wrap:wrap" key=${i}>
-          <input style="width:150px" data-test="field-name" placeholder="name" value=${f.name} onInput=${e => setF(i, { name: e.target.value })} disabled=${isSystemField(f.name)}/>
-          <select style="width:120px" data-test="field-type" value=${f.type} onChange=${e => setF(i, { type: e.target.value, options: {} })} disabled=${isSystemField(f.name)}>${FIELD_TYPES.map(t => html`<option key=${t} value=${t}>${t}</option>`)}</select>
+          <input style="width:150px" data-test="field-name" placeholder="name" value=${f.name} onInput=${e => setF(i, { name: e.target.value })} disabled=${protectedFieldIds.has(f.id)}/>
+          <select style="width:120px" data-test="field-type" value=${f.type} onChange=${e => setF(i, { type: e.target.value, options: {} })} disabled=${protectedFieldIds.has(f.id)}>${FIELD_TYPES.map(t => html`<option key=${t} value=${t}>${t}</option>`)}</select>
           <label class="muted"><input type="checkbox" style="width:auto" checked=${f.required} onChange=${e => setF(i, { required: e.target.checked })}/> req</label>
           <label class="muted"><input type="checkbox" style="width:auto" checked=${f.unique} onChange=${e => setF(i, { unique: e.target.checked })}/> uniq</label>
           ${fieldOptions(f, i, setOpt, allCols)}
-          ${!isSystemField(f.name) && html`<button class="ghost" data-test="del-field" onClick=${() => delField(i)}>✕</button>`}
-          ${fieldErrs[f.name] && html`<div class="error" style="flex-basis:100%">${fieldErrs[f.name].message}</div>`}
+          ${!protectedFieldIds.has(f.id) && html`<button class="ghost" data-test="del-field" onClick=${() => delField(i)}>✕</button>`}
+          ${ownValue(fieldErrs, f.name) && html`<div class="error" style="flex-basis:100%">${ownValue(fieldErrs, f.name).message}</div>`}
         </div>`)}
         <button class="ghost" data-test="add-field" onClick=${addField}>+ Add field</button>
       </div>`}
@@ -204,7 +212,16 @@ export function SchemaEditor({ name }) {
     </div>`;
 }
 
-function isSystemField(n) { return ['id','created','updated','email','username','passwordHash','tokenKey','verified'].includes(n); }
+// Keep the auth entries aligned with schema.authSystemFields; request-only
+// credentials and legacy externalAuths must never become profile controls either.
+export const AUTH_SYSTEM_FIELDS = ['email', 'username', 'passwordHash', 'tokenKey', 'verified', 'token_epoch'];
+const SYSTEM_FIELDS = new Set(['id', 'created', 'updated', 'passwordHash', 'tokenKey'].map(n => n.toLowerCase()));
+const AUTH_FIELD_NAMES = new Set(AUTH_SYSTEM_FIELDS.map(n => n.toLowerCase()));
+const ACCOUNT_INPUT_FIELDS = new Set(['password', 'passwordConfirm', 'oldPassword', 'externalAuths']);
+export function isSystemField(name, account = false) {
+  return SYSTEM_FIELDS.has(name.toLowerCase()) ||
+    (account === true && (AUTH_FIELD_NAMES.has(name.toLowerCase()) || ACCOUNT_INPUT_FIELDS.has(name)));
+}
 
 function fieldOptions(f, i, setOpt, allCols) {
   const o = f.options || {};
@@ -213,6 +230,10 @@ function fieldOptions(f, i, setOpt, allCols) {
   if (f.type === 'number') return html`<select style="width:110px" data-test="opt-mode" value=${o.mode||'float'} onChange=${e => setOpt(i, { mode: e.target.value, scale: e.target.value === 'fixed' ? o.scale : undefined })}>${['float','int','fixed'].map(m => html`<option key=${m} value=${m}>${m}</option>`)}</select>${o.mode === 'fixed' ? html`<input style="width:90px" type="number" min="1" max="8" step="1" data-test="opt-scale" placeholder="scale 1..8" value=${o.scale||''} onInput=${e => setOpt(i, { scale: /^[0-9]+$/.test(e.target.value) ? parseInt(e.target.value, 10) : undefined })}/>` : ''}`;
   if (f.type === 'file') return html`<input style="width:90px" type="number" data-test="opt-maxselect" placeholder="maxSel" value=${o.maxSelect||1} onInput=${e => setOpt(i, { maxSelect: +e.target.value || 1 })}/>`;
   return '';
+}
+
+function validPasswordMinimum(value) {
+  return typeof value === 'number' && Number.isInteger(value) && value >= 0 && value <= 255;
 }
 
 const OAUTH_PRESETS = ['google','github','microsoft','discord','generic'];
@@ -228,7 +249,9 @@ function AuthTab({ col, setCol }) {
 
   return html`<div data-test="tab-auth-body">
     <div class="field"><label>identityFields (comma)</label><input data-test="identity-fields" value=${(auth.identityFields||[]).join(',')} onInput=${e => setAuth({ identityFields: e.target.value.split(',').map(s=>s.trim()).filter(Boolean) })}/></div>
-    <div class="field"><label>minPasswordLength</label><input type="number" data-test="min-pw" value=${auth.minPasswordLength||8} onInput=${e => setAuth({ minPasswordLength: +e.target.value || 8 })}/></div>
+    <div class="field"><label for="min-pw">minPasswordLength</label><input id="min-pw" type="number" data-test="min-pw" min="0" max="255" step="1" aria-invalid=${!validPasswordMinimum(auth.minPasswordLength ?? 8)} value=${auth.minPasswordLength ?? 8} onInput=${e => setAuth({ minPasswordLength: e.target.value === '' ? '' : Number(e.target.value) })}/>
+      ${!validPasswordMinimum(auth.minPasswordLength ?? 8) && html`<span class="error" data-test="min-pw-error">Minimum password length must be an integer from 0 to 255.</span>`}
+    </div>
     <div class="field"><label>Two-factor authentication</label><select data-test="two-factor-policy" value=${auth.two_factor || 'disabled'} onChange=${e => setAuth({ two_factor: e.target.value })}>
       <option value="disabled">Disabled</option><option value="optional">Optional — enforced after enrollment</option><option value="required">Required for everyone</option>
     </select><small class="muted">Requires a binary built with two-factor support. Application policy can additionally require enrollment for selected users or groups.</small></div>
@@ -245,7 +268,7 @@ function AuthTab({ col, setCol }) {
   </div>`;
 }
 
-function RecordDrawer({ col, record, schema, onClose, onSaved }) {
+function RecordDrawer({ col, record, onClose, onSaved }) {
   const isNew = !record;
   const [vals, setVals] = useState(() => ({ ...(record || {}) }));
   const [files, setFiles] = useState({}); // field -> FileList
@@ -255,27 +278,19 @@ function RecordDrawer({ col, record, schema, onClose, onSaved }) {
   const [invalid, setInvalid] = useState({}); // field name -> true when unparseable
   const anyInvalid = Object.values(invalid).some(Boolean);
   const onValidity = (n, ok) => setInvalid(m => ({ ...m, [n]: !ok }));
-  const editable = schema.filter(f => !['id','created','updated','passwordHash','tokenKey'].includes(f.name) && f.type !== 'autodate');
+  const [collection, setCollection] = useState(null);
+  useEffect(() => {
+    let active = true;
+    api('GET', `/collections/${encodeURIComponent(col)}`).then(c => { if (active) setCollection(c); })
+      .catch(x => { if (active) setErr(x.data?.message || 'Failed to load collection fields'); });
+    return () => { active = false; };
+  }, [col]);
+  const editable = (collection?.schema || []).filter(f => !isSystemField(f.name, collection.type === 'auth') && f.type !== 'autodate');
 
   function set(name, v) { setVals({ ...vals, [name]: v }); }
   async function save() {
     setErr(''); setFieldErrs({});
-    const hasFiles = Object.values(files).some(fl => fl && fl.length);
-    let body, isForm = false;
-    if (hasFiles || Object.keys(removals).length) {
-      const fd = new FormData(); isForm = true;
-      for (const f of editable) {
-        if (f.type === 'file') continue;
-        const v = vals[f.name];
-        if (v != null) fd.append(f.name, typeof v === 'object' ? JSON.stringify(v) : String(v));
-      }
-      for (const [name, fl] of Object.entries(files)) for (const file of fl) fd.append(name, file);
-      for (const [name, names] of Object.entries(removals)) if (names.length) fd.append(name + '-', JSON.stringify(names));
-      body = fd;
-    } else {
-      body = {};
-      for (const f of editable) if (vals[f.name] !== undefined) body[f.name] = vals[f.name];
-    }
+    const { body, isForm } = recordBody(editable, vals, files, removals);
     try {
       const saved = isNew
         ? await api('POST', `/collections/${encodeURIComponent(col)}/records`, body, isForm)
@@ -294,40 +309,144 @@ function RecordDrawer({ col, record, schema, onClose, onSaved }) {
       <div class="row"><b style="flex:1">${isNew ? 'New record' : 'Edit record'}</b><button class="ghost" data-test="drawer-close" onClick=${onClose}>✕</button></div>
       ${err && html`<div class="error" data-test="record-error">${err}</div>`}
       ${editable.map(f => html`<div class="field" key=${f.name}>
-        <label>${f.name} <span class="muted">(${f.type})</span></label>
-        ${control(f, vals[f.name], v => set(f.name, v), files, setFiles, removals, setRemovals, onValidity)}
-        ${fieldErrs[f.name] && html`<div class="error" data-test=${'err-'+f.name}>${fieldErrs[f.name].message}</div>`}
+        <label for=${f.type === 'editor' ? undefined : 'record-field-'+f.name}><span id=${'record-field-'+f.name+'-label'}>${f.name}</span> <span class="muted" aria-hidden="true">(${f.type})</span></label>
+        ${control(f, ownValue(vals, f.name), v => set(f.name, v), files, setFiles, removals, setRemovals, onValidity, 'record-field-'+f.name)}
+        ${ownValue(fieldErrs, f.name) && html`<div class="error" data-test=${'err-'+f.name}>${ownValue(fieldErrs, f.name).message}</div>`}
       </div>`)}
       <div class="row" style="margin-top:14px">
-        <button data-test="record-save" onClick=${save} disabled=${anyInvalid}>Save</button>
+        <button data-test="record-save" onClick=${save} disabled=${!collection || anyInvalid}>Save</button>
         ${anyInvalid && html`<span class="error" data-test="save-blocked">Fix invalid JSON to save</span>`}
         ${!isNew && html`<button class="ghost" data-test="record-delete" onClick=${del}>Delete</button>`}
       </div>
     </div>`;
 }
 
-function control(f, value, set, files, setFiles, removals, setRemovals, onValidity) {
-  const t = f.type, o = f.options || {};
-  if (t === 'bool') return html`<input type="checkbox" style="width:auto" data-test=${'in-'+f.name} checked=${!!value} onChange=${e => set(e.target.checked)}/>`;
-  if (t === 'number') return html`<input type="text" data-test=${'in-'+f.name} value=${value ?? ''} onInput=${e => set(e.target.value)}/>`;
-  if (t === 'json') return html`<${JsonEditor} value=${value} onChange=${set} onValidity=${onValidity} name=${f.name}/>`;
-  if (t === 'editor') return html`<${RichTextEditor} value=${value} onChange=${set} name=${f.name}/>`;
-  if (t === 'date') return html`<input type="text" placeholder="YYYY-MM-DD" data-test=${'in-'+f.name} value=${value ?? ''} onInput=${e => set(e.target.value)}/>`;
-  if (t === 'select') return html`<select data-test=${'in-'+f.name} value=${value ?? ''} onChange=${e => set(e.target.value)}><option value="">—</option>${(o.values||[]).map(v => html`<option key=${v} value=${v}>${v}</option>`)}</select>`;
-  if (t === 'relation') return html`<${RelationPicker} target=${o.targetCollectionId} value=${value} onChange=${set} name=${f.name}/>`;
-  if (t === 'file') {
-    const existing = value == null ? [] : (Array.isArray(value) ? value : [value]).filter(Boolean);
-    return html`<div>
-      ${existing.map(fn => html`<label class="muted" key=${fn} style="display:block"><input type="checkbox" style="width:auto" data-test=${'rm-'+f.name} onChange=${e => setRemovals({ ...removals, [f.name]: e.target.checked ? [...(removals[f.name]||[]), fn] : (removals[f.name]||[]).filter(x=>x!==fn) })}/> ${fn} (remove)</label>`)}
-      <input type="file" multiple=${(o.maxSelect||1) > 1} data-test=${'in-'+f.name} onChange=${e => setFiles({ ...files, [f.name]: e.target.files })}/>
-    </div>`;
-  }
-  return html`<input type="text" data-test=${'in-'+f.name} value=${value ?? ''} onInput=${e => set(e.target.value)}/>`;
+export function ownValue(values, name) {
+  return Object.prototype.hasOwnProperty.call(values, name) ? values[name] : undefined;
 }
 
-function RelationPicker({ target, value, onChange, name }) {
+function recordValue(field, value) {
+  if (field.type !== 'number') return value;
+  if (value === '') return null;
+  if (typeof value === 'number' && !Number.isFinite(value)) return String(value);
+  if ((field.options?.mode || 'float') !== 'float') return value;
+  if (typeof value === 'string' && value.trim() !== '') {
+    const number = Number(value);
+    if (Number.isFinite(number)) return number;
+  }
+  return value;
+}
+
+function equalRecordValue(left, right) {
+  if (left === right) return true;
+  if (left === null || right === null || typeof left !== 'object' || typeof right !== 'object') return false;
+  if (Array.isArray(left) || Array.isArray(right)) {
+    return Array.isArray(left) && Array.isArray(right) && left.length === right.length &&
+      left.every((value, index) => equalRecordValue(value, right[index]));
+  }
+  const keys = Object.keys(left);
+  return keys.length === Object.keys(right).length && keys.every(key =>
+    Object.prototype.hasOwnProperty.call(right, key) && equalRecordValue(left[key], right[key]));
+}
+
+export function changedRecordFields(fields, values, original) {
+  return fields.filter(f => !equalRecordValue(recordValue(f, ownValue(values, f.name)),
+    recordValue(f, ownValue(original, f.name))));
+}
+
+function noSelectionValue(values) {
+  let value = '__zigbase_no_selection__';
+  while (values.includes(value)) value += '_';
+  return value;
+}
+
+function selectDeclares(field, value) {
+  return field.type === 'select' && (field.options?.maxSelect || 1) <= 1 && (field.options?.values || []).includes(value);
+}
+
+export function recordBody(editable, vals, files, removals) {
+  const hasFiles = Object.values(files).some(fl => fl && fl.length);
+  let body, isForm = false;
+  if (hasFiles || Object.keys(removals).length) {
+    const fd = new FormData(); isForm = true;
+    for (const f of editable) {
+      if (f.type === 'file') continue;
+      const v = recordValue(f, ownValue(vals, f.name));
+      if (v === undefined) continue;
+      // A select declaring "" cannot use an empty part for a clear. The server
+      // reads "null" as one, unless that is an option too and cannot be encoded.
+      if (v === null && selectDeclares(f, '')) {
+        if (!selectDeclares(f, 'null')) fd.append(f.name, 'null');
+        continue;
+      }
+      // Text-like controls emit '' only for an intentional clear. Multipart
+      // cannot encode their SQL null, so preserve untouched nulls by omission.
+      if (v === null && ['text', 'date', 'editor', 'url', 'email'].includes(f.type)) continue;
+      // Empty form fields clear nullable values; JSON scalars need their JSON
+      // spelling too, so a string such as "true" never turns into a boolean.
+      // Quote unnormalized float strings so multipart's broader parser cannot
+      // accept a spelling that the JSON request would reject.
+      const invalidFloat = f.type === 'number' && (f.options?.mode || 'float') === 'float' && typeof v === 'string';
+      const encoded = v === null ? '' : f.type === 'json' || typeof v === 'object' || invalidFloat ? JSON.stringify(v) : String(v);
+      fd.append(f.name, encoded);
+    }
+    for (const [name, fl] of Object.entries(files)) for (const file of fl) fd.append(name, file);
+    for (const [name, names] of Object.entries(removals)) if (names.length) fd.append(name + '-', JSON.stringify(names));
+    body = fd;
+  } else {
+    body = Object.create(null);
+    for (const f of editable) {
+      const v = recordValue(f, ownValue(vals, f.name));
+      if (v !== undefined) body[f.name] = v;
+    }
+  }
+  return { body, isForm };
+}
+
+export function control(f, value, set, files, setFiles, removals, setRemovals, onValidity, id) {
+  const t = f.type, o = f.options || {};
+  const labelledBy = id && id+'-label';
+  if (t === 'bool') return html`<input id=${id} aria-labelledby=${labelledBy} aria-required=${!!f.required} type="checkbox" style="width:auto" data-test=${'in-'+f.name} checked=${!!value} onChange=${e => set(e.target.checked)}/>`;
+  if (t === 'number') return html`<input id=${id} aria-labelledby=${labelledBy} aria-required=${!!f.required} type="text" data-test=${'in-'+f.name} value=${value ?? ''} onInput=${e => set(e.target.value)}/>`;
+  if (t === 'json') return html`<${JsonEditor} id=${id} labelledBy=${labelledBy} required=${f.required} value=${value} onChange=${set} onValidity=${onValidity} name=${f.name}/>`;
+  if (t === 'editor') return html`<${RichTextEditor} id=${id} labelledBy=${labelledBy} required=${f.required} value=${value} onChange=${set} name=${f.name}/>`;
+  if (t === 'date') return html`<input id=${id} aria-labelledby=${labelledBy} aria-required=${!!f.required} type="text" placeholder="YYYY-MM-DD" data-test=${'in-'+f.name} value=${value ?? ''} onInput=${e => set(e.target.value)}/>`;
+  if (t === 'select') {
+    const multiple = (o.maxSelect || 1) > 1;
+    // A declared "" option needs its own value, distinct from "no selection".
+    const none = selectDeclares(f, '') ? noSelectionValue(o.values) : '';
+    // Preact core needs per-option selection for array-valued controls.
+    return html`<select id=${id} aria-labelledby=${labelledBy} aria-required=${!!f.required} data-test=${'in-'+f.name} multiple=${multiple} value=${multiple ? undefined : value ?? none}
+      onChange=${e => set(multiple ? [...e.target.selectedOptions].map(o => o.value) : e.target.value === none ? null : e.target.value)}>
+      ${!multiple && html`<option value=${none}>—</option>`}
+      ${(o.values||[]).map(v => html`<option key=${v} value=${v} selected=${multiple ? Array.isArray(value) && value.includes(v) : undefined}>${v === '' ? '(empty)' : v}</option>`)}
+    </select>`;
+  }
+  if (t === 'relation') return html`<${RelationPicker} id=${id} labelledBy=${labelledBy} required=${f.required} target=${o.targetCollectionId} multiple=${(o.maxSelect || 1) > 1} value=${value} onChange=${set} name=${f.name}/>`;
+  if (t === 'file') {
+    const existing = value == null ? [] : (Array.isArray(value) ? value : [value]).filter(Boolean);
+    const removed = ownValue(removals, f.name) || [];
+    return html`<div>
+      ${existing.map(fn => html`<label class="muted" key=${fn} style="display:block"><input aria-label=${'Remove '+f.name+' file '+fn} type="checkbox" style="width:auto" data-test=${'rm-'+f.name} onChange=${e => setRemovals({ ...removals, [f.name]: e.target.checked ? [...removed, fn] : removed.filter(x=>x!==fn) })}/> ${fn} (remove)</label>`)}
+      <input id=${id} aria-labelledby=${labelledBy} aria-required=${!!f.required} type="file" multiple=${(o.maxSelect||1) > 1} data-test=${'in-'+f.name} onChange=${e => setFiles({ ...files, [f.name]: e.target.files })}/>
+    </div>`;
+  }
+  return html`<input id=${id} aria-labelledby=${labelledBy} aria-required=${!!f.required} type="text" data-test=${'in-'+f.name} value=${value ?? ''} onInput=${e => set(e.target.value)}/>`;
+}
+
+function RelationPicker({ target, multiple, value, onChange, name, id, labelledBy, required }) {
   const [opts, setOpts] = useState([]);
-  useEffect(() => { if (target) API.records(target, 'perPage=50').then(d => setOpts(d.items)).catch(() => {}); }, [target]);
-  return html`<select data-test=${'in-'+name} value=${value ?? ''} onChange=${e => onChange(e.target.value || null)}>
-    <option value="">—</option>${opts.map(r => html`<option key=${r.id} value=${r.id}>${r.id}</option>`)}</select>`;
+  useEffect(() => {
+    let active = true;
+    setOpts([]);
+    if (target) API.records(target, 'perPage=50').then(d => { if (active) setOpts(d.items); }).catch(() => {});
+    return () => { active = false; };
+  }, [target]);
+  // The fetched page is a convenience list, not the complete relation value.
+  // Keep references outside that page visible so adding an option preserves
+  // them and removing one always requires an explicit selection change.
+  const selectedIds = multiple ? (Array.isArray(value) ? value : []) : value ? [value] : [];
+  const options = [...opts, ...selectedIds.filter(id => !opts.some(r => r.id === id)).map(id => ({ id }))];
+  return html`<select id=${id} aria-labelledby=${labelledBy} aria-required=${!!required} data-test=${'in-'+name} multiple=${multiple} value=${multiple ? undefined : value ?? ''} onChange=${e => onChange(multiple ? [...e.target.selectedOptions].map(o => o.value) : e.target.value || null)}>
+    ${!multiple && html`<option value="">—</option>`}${options.map(r => html`<option key=${r.id} value=${r.id} selected=${multiple ? selectedIds.includes(r.id) : undefined}>${r.id}</option>`)}</select>`;
 }
