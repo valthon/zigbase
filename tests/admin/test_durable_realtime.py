@@ -10,7 +10,7 @@ import uuid
 
 import pytest
 
-from conftest import _free_port, _stop_server, _su_template_for, _wait_reachable_or_fail
+from conftest import _reserve_port, _stop_server, _su_template_for, _wait_reachable_or_fail
 from test_realtime_backfill import backfill, call, setup
 from test_realtime_backfill import (
     test_checkpoint_before_snapshot_and_id_only_updates_and_delete,
@@ -29,18 +29,18 @@ def binary():
 
 @contextlib.contextmanager
 def running(binary, data, extra_env=None):
-    port = _free_port()
-    env = {**os.environ, "ZIGBASE_DATA_DIR": str(data), "ZIGBASE_HTTP_PORT": str(port),
-           "ZIGBASE_SERVE_BACKGROUND": "0", **(extra_env or {})}
-    log_path = data / "server.log"
-    with log_path.open("wb") as log:
-        proc = subprocess.Popen([binary, "serve", "--insecure-cookies"], env=env,
-                                stdout=log, stderr=subprocess.STDOUT)
-    try:
-        _wait_reachable_or_fail(proc, port, str(log_path))
-        yield f"http://127.0.0.1:{port}"
-    finally:
-        _stop_server(proc)
+    with _reserve_port() as port:
+        env = {**os.environ, "ZIGBASE_DATA_DIR": str(data), "ZIGBASE_HTTP_PORT": str(port),
+               "ZIGBASE_SERVE_BACKGROUND": "0", **(extra_env or {})}
+        log_path = data / "server.log"
+        with log_path.open("wb") as log:
+            proc = subprocess.Popen([binary, "serve", "--insecure-cookies"], env=env,
+                                    stdout=log, stderr=subprocess.STDOUT)
+        try:
+            _wait_reachable_or_fail(proc, port, str(log_path))
+            yield f"http://127.0.0.1:{port}"
+        finally:
+            _stop_server(proc)
 
 
 def test_restart_retains_cursor_and_authorization(binary, tmp_path):

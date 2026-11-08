@@ -12,7 +12,7 @@ import urllib.request
 import zlib
 
 import pytest
-from conftest import _free_port, _su_template_for, _wait_reachable_or_fail
+from conftest import _reserve_port, _su_template_for, _wait_reachable_or_fail
 from test_file_range import _multipart
 
 
@@ -45,18 +45,18 @@ def thumbnail_server(tmp_path):
         pytest.skip("requires thumbnails-fixture built with -Dimage-thumbnails=true")
     data = tmp_path / "data"
     shutil.copytree(_su_template_for(binary), data)
-    port = _free_port()
-    env = {**os.environ, "ZIGBASE_SERVE_BACKGROUND": "false"}
-    log = (tmp_path / "server.log").open("w+")
-    process = subprocess.Popen([binary, "serve", "--insecure-cookies", "--http-port", str(port), "--data-dir", str(data)], env=env, stdout=log, stderr=log)
-    base = f"http://127.0.0.1:{port}"
-    try:
-        _wait_reachable_or_fail(process, port, tmp_path / "server.log")
-        yield base, data
-    finally:
-        process.terminate()
-        process.wait(timeout=10)
-        log.close()
+    with _reserve_port() as port:
+        env = {**os.environ, "ZIGBASE_SERVE_BACKGROUND": "false"}
+        log = (tmp_path / "server.log").open("w+")
+        process = subprocess.Popen([binary, "serve", "--insecure-cookies", "--http-port", str(port), "--data-dir", str(data)], env=env, stdout=log, stderr=log)
+        base = f"http://127.0.0.1:{port}"
+        try:
+            _wait_reachable_or_fail(process, port, tmp_path / "server.log")
+            yield base, data
+        finally:
+            process.terminate()
+            process.wait(timeout=10)
+            log.close()
 
 
 def admin(base):
@@ -331,8 +331,9 @@ def test_missing_backend_only_blocks_serving_not_offline_schema_apply(tmp_path):
     applied = subprocess.run([binary, "schema", "apply", str(schema), "--data-dir", str(data)], env=env, capture_output=True, text=True, timeout=20)
     assert applied.returncode == 0, applied.stdout + applied.stderr
     assert (data / "data.db").exists()
-    served = subprocess.run([binary, "serve", "--http-port", str(_free_port()), "--data-dir", str(data)], env=env, capture_output=True, text=True, timeout=20)
-    assert served.returncode != 0 and "ImageExecutableUnavailable" in served.stderr
-    env["ZIGBASE_IMAGEMAGICK_EXECUTABLE"] = "convert"
-    invalid = subprocess.run([binary, "serve", "--data-dir", str(data)], env=env, capture_output=True, text=True, timeout=20)
-    assert invalid.returncode != 0 and "ZIGBASE_IMAGEMAGICK_EXECUTABLE" in invalid.stderr
+    with _reserve_port() as port:
+        served = subprocess.run([binary, "serve", "--http-port", str(port), "--data-dir", str(data)], env=env, capture_output=True, text=True, timeout=20)
+        assert served.returncode != 0 and "ImageExecutableUnavailable" in served.stderr
+        env["ZIGBASE_IMAGEMAGICK_EXECUTABLE"] = "convert"
+        invalid = subprocess.run([binary, "serve", "--data-dir", str(data)], env=env, capture_output=True, text=True, timeout=20)
+        assert invalid.returncode != 0 and "ZIGBASE_IMAGEMAGICK_EXECUTABLE" in invalid.stderr

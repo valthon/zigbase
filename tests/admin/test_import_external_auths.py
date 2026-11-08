@@ -34,6 +34,7 @@ What this module proves instead, out-of-process and end-to-end:
   pinned on its own by `src/auth.zig`'s "strip a client-supplied externalAuths" test — this
   one stays green if only that strip regresses.)
 """
+from conftest import _reserve_port
 import json
 import os
 import pathlib
@@ -58,12 +59,6 @@ PROVIDER_ID = "g-legacy-1"
 SU = {"identity": "admin@x.io", "password": "adminpassword"}
 
 
-def _free_port():
-    s = socket.socket()
-    s.bind(("127.0.0.1", 0))
-    p = s.getsockname()[1]
-    s.close()
-    return p
 
 
 def _http(method, url, token=None, body=None):
@@ -88,27 +83,27 @@ class _Server:
         self.binary, self.data = binary, data
 
     def __enter__(self):
-        port = _free_port()
-        self.log = os.path.join(self.data, "serve.log")
-        with open(self.log, "ab") as log:
-            self.proc = subprocess.Popen(
-                [self.binary, "serve", "--insecure-cookies", "--http-port", str(port)],
-                # Foreground pin: see conftest's note on ZIGBASE_SERVE_BACKGROUND.
-                env={**os.environ, "ZIGBASE_DATA_DIR": self.data,
-                     "ZIGBASE_SERVE_BACKGROUND": "0"},
-                stdout=log, stderr=subprocess.STDOUT,
-            )
-        for _ in range(50):
-            if self.proc.poll() is not None:
-                break
-            try:
-                with socket.create_connection(("127.0.0.1", port), timeout=0.2):
-                    return f"http://127.0.0.1:{port}"
-            except OSError:
-                time.sleep(0.1)
-        self.__exit__(None, None, None)
-        output = pathlib.Path(self.log).read_text(errors="replace")
-        pytest.fail(f"serve on port {port} never became reachable:\n{output}")
+        with _reserve_port() as port:
+            self.log = os.path.join(self.data, "serve.log")
+            with open(self.log, "ab") as log:
+                self.proc = subprocess.Popen(
+                    [self.binary, "serve", "--insecure-cookies", "--http-port", str(port)],
+                    # Foreground pin: see conftest's note on ZIGBASE_SERVE_BACKGROUND.
+                    env={**os.environ, "ZIGBASE_DATA_DIR": self.data,
+                         "ZIGBASE_SERVE_BACKGROUND": "0"},
+                    stdout=log, stderr=subprocess.STDOUT,
+                )
+            for _ in range(50):
+                if self.proc.poll() is not None:
+                    break
+                try:
+                    with socket.create_connection(("127.0.0.1", port), timeout=0.2):
+                        return f"http://127.0.0.1:{port}"
+                except OSError:
+                    time.sleep(0.1)
+            self.__exit__(None, None, None)
+            output = pathlib.Path(self.log).read_text(errors="replace")
+            pytest.fail(f"serve on port {port} never became reachable:\n{output}")
 
     def __exit__(self, *_exc):
         self.proc.terminate()

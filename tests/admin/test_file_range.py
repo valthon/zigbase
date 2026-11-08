@@ -1,3 +1,4 @@
+from conftest import _reserve_port
 import io, json, socket, subprocess, tempfile, time, os, pathlib, shutil, urllib.request, urllib.error, uuid
 
 import pytest
@@ -6,8 +7,6 @@ from _bin import resolve_binary
 REPO = pathlib.Path(__file__).resolve().parents[2]
 
 
-def _free_port():
-    s = socket.socket(); s.bind(("127.0.0.1", 0)); p = s.getsockname()[1]; s.close(); return p
 
 
 def _wait_up(url, deadline_s=20):
@@ -65,16 +64,16 @@ def file_server():
     data = tempfile.mkdtemp(prefix="zb_files_")
     subprocess.run([str(binary), "superuser", "create", "--email", "admin@x.io",
                     "--password", "adminpassword", "--data-dir", data], check=True)
-    port = _free_port()
-    proc = subprocess.Popen(
-        [str(binary), "serve", "--insecure-cookies", "--http-port", str(port), "--data-dir", data],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    base = f"http://127.0.0.1:{port}"
-    _wait_up(f"{base}/api/health")
-    try:
-        yield base
-    finally:
-        proc.terminate(); proc.wait(timeout=5); shutil.rmtree(data, ignore_errors=True)
+    with _reserve_port() as port:
+        proc = subprocess.Popen(
+            [str(binary), "serve", "--insecure-cookies", "--http-port", str(port), "--data-dir", data],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        base = f"http://127.0.0.1:{port}"
+        _wait_up(f"{base}/api/health")
+        try:
+            yield base
+        finally:
+            proc.terminate(); proc.wait(timeout=5); shutil.rmtree(data, ignore_errors=True)
 
 
 def _setup_record(base, blob, view_rule="@public"):
