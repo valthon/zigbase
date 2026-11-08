@@ -3,7 +3,7 @@
 //! Developers describe their schema IN ZIG at comptime via `Schema(.{ ... })`,
 //! and ZigBase provisions it at startup: creating not-yet-existing collections,
 //! resolving relation targets BY NAME, and applying safe ADDITIVE auto-migration
-//! (new columns). Destructive changes (type change / column drop) are detected,
+//! (new columns and select-option widening). Other field changes are detected,
 //! logged, and SKIPPED — never silently applied. An explicit-migration escape
 //! hatch (`.migrations`) covers the rest.
 //!
@@ -62,31 +62,6 @@ fn warnTenantOwned(col: schema.Collection) void {
     }
 }
 
-/// Auto-create the index backing the `tenant_field` column so the per-request tenant scope
-/// predicate (`"<col>"."<tenant_field>" = ?`) is served from an index, not a scan. Idempotent
-/// (`IF NOT EXISTS`); identifiers are gated through `schema.isValidIdentifier` before interpolation.
-fn ensureTenantIndex(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection) ProvisionError!void {
-    const tf = col.options.tenant_field orelse return;
-    if (!schema.isValidIdentifier(col.name) or !schema.isValidIdentifier(tf)) return;
-    // Bound + freed rather than nested inside the allocPrint: `alloc` here is the caller's
-    // allocator, not an arena (the `sql` free below says so), so a nested temporary would leak.
-    const qidx = try ddl.quoteComposite(alloc, "idx_{s}_{s}_tenant", .{ col.name, tf });
-    defer alloc.free(qidx);
-    const qtbl = try ddl.quoteIdent(alloc, col.name);
-    defer alloc.free(qtbl);
-    const qtf = try ddl.quoteIdent(alloc, tf);
-    defer alloc.free(qtf);
-    const sql = try std.fmt.allocPrintSentinel(
-        alloc,
-        "CREATE INDEX IF NOT EXISTS {s} ON {s} ({s});",
-        .{ qidx, qtbl, qtf },
-        0,
-    );
-    defer alloc.free(sql);
-    try w.exec(sql);
-    std.log.info("provision: ensured tenant index on '{s}'.'{s}'", .{ col.name, tf });
-}
-
 /// Wrap search validation/reconciliation: a SQLite build with `-Dfts5=false` cannot serve a
 /// `.searchable` schema. Rather than let that surface as a silent no-op (and a later `?search=`
 /// 500), fail LOUDLY at startup with an actionable message — the fail-fast-at-boot principle
@@ -96,10 +71,8 @@ fn inspectSearchIndex(alloc: std.mem.Allocator, w: *db.Db, spec: schema.Collecti
     const result = if (reconcile) fts.ensureIndex(alloc, w, spec) else fts.validateIndex(alloc, w, spec);
     result catch |err| switch (err) {
         error.SearchDisabled => {
-            std.log.err(
-                "refusing to start: collection '{s}' declares .searchable fields but this binary was built with -Dfts5=false — rebuild with -Dfts5 (or its default) to enable full-text search",
-                .{spec.name},
-            );
+            const message = "refusing to start: collection '{s}' declares .searchable fields but this binary was built with -Dfts5=false — rebuild with -Dfts5 (or its default) to enable full-text search";
+            @import("startup_log.zig").refusal(message, .{spec.name});
             return error.FtsDisabled;
         },
         // `err`'s static type is fts.EnsureIndexError (includes SearchDisabled, handled above);
@@ -965,6 +938,9 @@ pub fn applySpecs(
 ) ProvisionError!void {
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
+    // Provisioning's caller receives ProvisionError, not an owned validation list.
+    // Low-level diagnostics allocated on this arena must not escape through TLS.
+    defer collections.last_errors = null;
     const a = arena.allocator();
 
     // Opt-in vector search (#157/#159): on Postgres the `?vector=` KNN lowering needs the pgvector
@@ -1013,7 +989,8 @@ pub fn ensureCollection(
     w: *db.Db,
     spec_in: schema.Collection,
 ) ProvisionError!void {
-    const spec = try resolveTargets(alloc, w, spec_in);
+    var target_ids: std.StringHashMapUnmanaged([]const u8) = .empty;
+    const spec = try resolveTargets(alloc, w, spec_in, &target_ids);
 
     // F3 lint: surface any allow-all (@public) rule prominently at startup.
     warnPublicRules(spec);
@@ -1027,21 +1004,27 @@ pub fn ensureCollection(
     if (existing == null) {
         _ = try collections.create(alloc, io, w, spec);
         std.log.info("provision: created collection '{s}'", .{spec.name});
-        try ensureTenantIndex(alloc, w, spec);
+        try collections.ensureTenantIndex(alloc, w, spec);
         try inspectSearchIndex(alloc, w, spec, true);
         return;
     }
     const live = existing.?;
-    // The physical table exists now; ensure the tenant_field is indexed (idempotent).
-    try ensureTenantIndex(alloc, w, spec);
     // Diff user fields. `live.fields` from get() includes injected auth system
     // fields for auth collections; compare only against non-system field names.
     // (additions/merged below skip .deinit(): this fn runs under applySpecs'
     // arena, which reclaims them wholesale.)
     var additions: std.ArrayList(schema.Field) = .empty;
+    var merged: std.ArrayList(schema.Field) = .empty;
+    for (live.fields) |lf| {
+        if (!schema.isInjectedField(live.type, lf.name)) try merged.append(alloc, lf);
+    }
+    var widened_count: usize = 0;
     var changed = false;
     for (spec.fields) |sf| {
-        const lf = schema.fieldByName(live, sf.name);
+        const field_index = for (merged.items, 0..) |field, i| {
+            if (std.mem.eql(u8, field.name, sf.name)) break i;
+        } else null;
+        const lf = if (field_index) |i| merged.items[i] else null;
         if (lf == null) {
             try additions.append(alloc, sf);
             changed = true;
@@ -1055,14 +1038,27 @@ pub fn ensureCollection(
                 "provision: collection '{s}' field '{s}' type changed ({s} -> {s}); SKIPPED — write an explicit migration (auto-migration is additive-only)",
                 .{ spec.name, sf.name, @tagName(lf.?.fieldType()), @tagName(sf.fieldType()) },
             );
+            continue;
+        }
+        switch (try fieldChangeWithRelations(alloc, lf.?, sf, target_ids)) {
+            .unchanged => {},
+            .widen_select => {
+                var next = lf.?; // preserve the live field's id and other metadata
+                next.options = sf.options;
+                merged.items[field_index.?] = next;
+                widened_count += 1;
+            },
+            .migration => std.log.warn(
+                "provision: collection '{s}' field '{s}' options or flags changed; SKIPPED — write an explicit migration (auto-migration only widens selects without changing single/multi-value storage)",
+                .{ spec.name, sf.name },
+            ),
         }
     }
 
     // Detect drops: a live user field absent from the comptime spec. We do NOT
     // drop it (data loss); just warn so the developer knows the schemas diverge.
     for (live.fields) |lf| {
-        if (lf.id.len > 0 and lf.id[0] == '_') continue; // injected auth system field
-        if (schema.isSystemFieldName(lf.name)) continue;
+        if (schema.isInjectedField(live.type, lf.name)) continue;
         if (specFieldByName(spec, lf.name) == null) {
             std.log.warn(
                 "provision: collection '{s}' has live field '{s}' not in the comptime schema; left in place (auto-migration never drops columns)",
@@ -1070,6 +1066,13 @@ pub fn ensureCollection(
             );
         }
     }
+
+    for (additions.items) |sf| try merged.append(alloc, sf);
+    // Every downstream schema consumer must see the changes actually accepted
+    // above. In particular, rejected searchable flags must not remove/create FTS
+    // objects while _collections continues to expose the old flags.
+    var effective = live;
+    effective.fields = merged.items;
 
     // TTL: a `.ttl_field` newly added to (or changed on) an EXISTING collection must
     // be persisted, else the GC never sees it. Compare the spec's ttl_field against
@@ -1085,54 +1088,74 @@ pub fn ensureCollection(
     };
     if (ttl_differs) changed = true;
 
-    // Access rules: a rule-only comptime change carries NO physical-schema consequence, so it
-    // must not be gated behind `changed` (which only tracks field additions and the ttl_field) —
-    // and it must not go through collections.update either, whose unconditional table rebuild
-    // would copy every row and drop unknown indexes just to tighten a rule. Persist it with the
-    // metadata-only writer instead. This matters for security: policy.zig enforces the rules on
-    // the collection loaded out of _collections, so a developer who TIGHTENS a rule in code and
-    // redeploys would otherwise keep enforcing the old, looser rule indefinitely.
     const merged_rules = mergeRules(spec, live);
-    if (!changed and !merged_rules.eql(collections.Rules.from(live))) {
-        try collections.updateRules(alloc, w, live.id, merged_rules);
+    merged_rules.applyTo(&effective);
+    effective.indexes = spec.indexes;
+    effective.options.ttl_field = spec.options.ttl_field;
+    // Validate accepted additions even when their columns do not exist yet.
+    try inspectSearchIndex(alloc, w, effective, false);
+    if (changed) {
+        const updated = try collections.updateWithExpectedDefinition(alloc, io, w, live.id, effective, live);
+        updated.deinit(alloc);
+        std.log.info("provision: collection '{s}' added {d} field(s)", .{ spec.name, additions.items.len });
+    } else {
+        try collections.provisionMetadata(alloc, w, live, effective);
+    }
+    if (!merged_rules.eql(collections.Rules.from(live)))
         std.log.info("provision: collection '{s}' access rules updated", .{spec.name});
+    if (widened_count > 0)
+        std.log.info("provision: collection '{s}' widened {d} select field(s)", .{ spec.name, widened_count });
+}
+
+/// Relation names and ids identify the same target. Resolve only for comparison;
+/// retain the live representation in the metadata that provisioning persists.
+fn fieldChangeWithRelations(alloc: std.mem.Allocator, live: schema.Field, resolved: schema.Field, target_ids: std.StringHashMapUnmanaged([]const u8)) ProvisionError!FieldChange {
+    var normalized = live;
+    if (live.options == .relation) {
+        if (target_ids.get(live.options.relation.targetCollectionId)) |target_id|
+            normalized.options.relation.targetCollectionId = target_id;
     }
+    return fieldChange(alloc, normalized, resolved);
+}
 
-    if (!changed) {
-        try inspectSearchIndex(alloc, w, spec, true);
-        try collections.updateIndexes(alloc, w, live.id, spec.indexes);
-        return;
+const FieldChange = enum { unchanged, widen_select, migration };
+
+/// Compare persisted field values, not slice addresses. A declaration's stable id
+/// can differ from a runtime-created field's id; provisioning matches by name.
+fn fieldChange(alloc: std.mem.Allocator, live: schema.Field, spec: schema.Field) ProvisionError!FieldChange {
+    var normalized = spec;
+    normalized.id = live.id;
+    const old = try schema.fieldsToJson(alloc, &.{live});
+    defer alloc.free(old);
+    const next = try schema.fieldsToJson(alloc, &.{normalized});
+    defer alloc.free(next);
+    if (std.mem.eql(u8, old, next)) return .unchanged;
+
+    if (live.options != .select or spec.options != .select) return .migration;
+    if (live.required != spec.required or live.unique != spec.unique or
+        live.hidden != spec.hidden or live.encrypted != spec.encrypted or
+        live.searchable != spec.searchable) return .migration;
+    const before = live.options.select;
+    const after = spec.options.select;
+    if (after.maxSelect < before.maxSelect) return .migration;
+    // Crossing 1 -> many changes how existing TEXT values are decoded (scalar
+    // versus JSON array), so it needs a data migration even though the limit grows.
+    // maxSelect=0 is a zero limit in records.validate, not an unlimited sentinel.
+    if (live.isMultiValue() != spec.isMultiValue()) return .migration;
+    for (before.values) |value| {
+        for (after.values) |candidate| {
+            if (std.mem.eql(u8, value, candidate)) break;
+        } else return .migration;
     }
-
-    // Validate the old physical search objects before an additive rebuild can
-    // remove their triggers. Desired searchable fields may not exist yet.
-    // The unchanged path above needs only its single reconciliation pass.
-    try inspectSearchIndex(alloc, w, spec, false);
-
-    // Additive auto-migration: rebuild the table with the union of live + new
-    // fields, matching existing columns by id (rebuildPlan preserves their data),
-    // and persist the merged user-field schema.
-    var merged: std.ArrayList(schema.Field) = .empty;
-    // keep the live user fields (preserves their ids/order), then append additions
-    for (live.fields) |lf| {
-        if (lf.id.len > 0 and lf.id[0] == '_') continue; // skip injected auth fields
-        if (schema.isSystemFieldName(lf.name)) continue;
-        try merged.append(alloc, lf);
+    if (after.maxSelect == before.maxSelect) {
+        for (after.values) |value| {
+            for (before.values) |candidate| {
+                if (std.mem.eql(u8, value, candidate)) break;
+            } else return .widen_select;
+        }
+        return .unchanged;
     }
-    for (additions.items) |sf| try merged.append(alloc, sf);
-
-    var newdef = live;
-    newdef.fields = merged.items;
-    newdef.indexes = spec.indexes;
-    merged_rules.applyTo(&newdef);
-    // Carry the (possibly newly-set) ttl_field; keep the rest of live.options
-    // (e.g. persisted OAuth secrets) untouched by NOT copying spec.options wholesale.
-    newdef.options.ttl_field = spec.options.ttl_field;
-    _ = try collections.update(alloc, io, w, live.id, newdef);
-    std.log.info("provision: collection '{s}' added {d} field(s)", .{ spec.name, additions.items.len });
-    // The additive rebuild drops triggers tied to the old table; re-ensure the FTS index so its
-    // sync triggers (and any newly-searchable column) are restored.
-    try inspectSearchIndex(alloc, w, spec, true);
+    return .widen_select;
 }
 
 /// `spec`'s access rules overlaid on `live`'s: a `null` spec rule means "unspecified —
@@ -1161,7 +1184,7 @@ fn mergeRules(spec: schema.Collection, live: schema.Collection) collections.Rule
 /// `WHERE id = ?1 OR name = ?1` treats a name exactly like an id, so this is functionally
 /// identical to the resolved-id form once the collection exists (and is exactly why the
 /// manifest importer's `manifestCollections` already normalizes id-or-name — see import_manifest.zig).
-fn resolveTargets(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection) ProvisionError!schema.Collection {
+fn resolveTargets(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection, target_ids: *std.StringHashMapUnmanaged([]const u8)) ProvisionError!schema.Collection {
     var any = false;
     for (col.fields) |f| if (f.options == .relation) {
         any = true;
@@ -1173,7 +1196,11 @@ fn resolveTargets(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection) P
         fields[i] = f;
         switch (f.options) {
             .relation => |r| {
-                if (try collections.get(alloc, w, r.targetCollectionId)) |target| {
+                if (target_ids.get(r.targetCollectionId)) |target_id| {
+                    fields[i].options.relation.targetCollectionId = target_id;
+                } else if (try collections.get(alloc, w, r.targetCollectionId)) |target| {
+                    try target_ids.put(alloc, target.name, target.id);
+                    try target_ids.put(alloc, target.id, target.id);
                     var nr = r;
                     nr.targetCollectionId = target.id;
                     fields[i].options = .{ .relation = nr };
@@ -2373,6 +2400,473 @@ test "applySpecs additively adds a new field (auto-migration), preserving data" 
     try std.testing.expect(st.isNull(1)); // new column, null for old row
 }
 
+test "applySpecs widens persisted selects after reopening without rebuilding or losing data" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(dir);
+    const path = try std.fmt.allocPrintSentinel(a, "{s}/data.db", .{dir}, 0);
+    defer a.free(path);
+    // Runtime schemas accept opaque field ids, including an underscore prefix.
+    // These ids must never be mistaken for ownership of injected system fields.
+    const runtime_fields = [_]schema.Field{
+        .{ .id = "_runtime_kind", .name = "kind", .options = .{ .select = .{ .values = &.{ "a", "b" } } } },
+        .{ .id = "_runtime_tags", .name = "tags", .options = .{ .select = .{ .values = &.{ "a", "b" }, .maxSelect = 2 } } },
+        .{ .id = "_runtime_note", .name = "note", .options = .{ .text = .{} } },
+    };
+    {
+        var first = try db.Db.open(path);
+        defer first.close();
+        try migrations.run(&first);
+        const created = try collections.create(a, io, &first, .{ .id = "", .name = "items", .fields = &runtime_fields });
+        defer created.deinit(a);
+        try first.exec("INSERT INTO items(id,kind,tags,note) VALUES ('old','a','[\"a\",\"b\"]','keep me');");
+        try first.exec("CREATE INDEX migration_index ON items(kind);");
+        try first.exec("CREATE TRIGGER migration_trigger AFTER INSERT ON items BEGIN SELECT 1; END;");
+    }
+    // A fresh test harness would already have these values and hide the stale-schema bug.
+    var d = try db.Db.open(path);
+    defer d.close();
+    const after = comptime buildCollections(.{ .items = .{ .fields = .{
+        .{ .name = "kind", .type = .select, .values = .{ "b", "c", "a" } },
+        .{ .name = "tags", .type = .select, .values = .{ "a", "b", "c" }, .maxSelect = 3 },
+    } } });
+    const generation = try schema_gen.read(&d);
+    // The metadata and cache-generation marker must commit together.
+    try d.exec("CREATE TRIGGER block_generation BEFORE UPDATE ON _schema_state WHEN NEW.generation != OLD.generation BEGIN SELECT RAISE(ABORT,'blocked'); END;");
+    try std.testing.expectError(error.ExecFailed, applySpecs(a, io, &d, after));
+    {
+        const unchanged = (try collections.get(a, &d, "items")).?;
+        defer unchanged.deinit(a);
+        try std.testing.expectEqual(@as(usize, 2), schema.fieldByName(unchanged, "kind").?.options.select.values.len);
+        try std.testing.expectEqual(generation, try schema_gen.read(&d));
+    }
+    try d.exec("DROP TRIGGER block_generation;");
+    try applySpecs(a, io, &d, after);
+    try std.testing.expectEqual(generation + 1, try schema_gen.read(&d));
+    try applySpecs(a, io, &d, after);
+    try std.testing.expectEqual(generation + 1, try schema_gen.read(&d));
+
+    const live = (try collections.get(a, &d, "items")).?;
+    defer live.deinit(a);
+    try std.testing.expectEqual(@as(usize, 3), live.fields.len);
+    for (runtime_fields) |original|
+        try std.testing.expectEqualStrings(original.id, schema.fieldByName(live, original.name).?.id);
+    try std.testing.expectEqual(@as(u32, 3), schema.fieldByName(live, "tags").?.options.select.maxSelect);
+    // Exercise the actual write validator loaded from _collections, not just the JSON.
+    const input = try std.json.parseFromSlice(std.json.Value, a, "{\"kind\":\"c\",\"tags\":[\"a\",\"b\",\"c\"]}", .{});
+    defer input.deinit();
+    const records = @import("records.zig");
+    const created = try records.create(a, io, &d, live, input.value);
+    defer records.freeRecord(a, created);
+    const old = (try records.get(a, &d, live, "old")).?;
+    defer records.freeRecord(a, old);
+    try std.testing.expectEqualStrings("a", old.object.get("kind").?.string);
+    try std.testing.expectEqual(@as(usize, 2), old.object.get("tags").?.array.items.len);
+    try std.testing.expectEqualStrings("keep me", old.object.get("note").?.string);
+    var st = try d.prepare("SELECT count(*) FROM sqlite_master WHERE name IN ('migration_index','migration_trigger');");
+    defer st.finalize();
+    try std.testing.expect(try st.step());
+    try std.testing.expectEqual(@as(i64, 2), st.columnInt(0));
+}
+
+test "applySpecs keeps a stored reserved-named field on a base collection while widening" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try migrations.run(&d);
+    const created = try collections.create(a, io, &d, .{ .id = "", .name = "contacts", .fields = &.{
+        .{ .id = "kind_id", .name = "kind", .options = .{ .select = .{ .values = &.{ "a", "b" } } } },
+        .{ .id = "contact_id", .name = "contact", .options = .{ .text = .{} } },
+    } });
+    defer created.deinit(a);
+    // Creation refuses reserved names, so stage what a migration can leave behind.
+    try d.exec("ALTER TABLE contacts RENAME COLUMN contact TO email;");
+    try d.exec("UPDATE _collections SET \"schema\"=replace(\"schema\",'\"contact\"','\"email\"') WHERE name='contacts';");
+    const after = comptime buildCollections(.{ .contacts = .{ .fields = .{
+        .{ .name = "kind", .type = .select, .values = .{ "a", "b", "c" } },
+    } } });
+    const generation = try schema_gen.read(&d);
+    try applySpecs(a, io, &d, after);
+    try applySpecs(a, io, &d, after);
+    try std.testing.expectEqual(generation + 1, try schema_gen.read(&d));
+
+    const live = (try collections.get(a, &d, "contacts")).?;
+    defer live.deinit(a);
+    try std.testing.expectEqual(@as(usize, 3), schema.fieldByName(live, "kind").?.options.select.values.len);
+    try std.testing.expectEqualStrings("contact_id", schema.fieldByName(live, "email").?.id);
+
+    // The snapshot guard must see that field too: a stale plan differing only in it conflicts.
+    var stale = live;
+    stale.fields = live.fields[0..1];
+    var desired = live;
+    desired.listRule = "@public";
+    try std.testing.expectError(error.Conflict, collections.provisionMetadata(a, &d, stale, desired));
+}
+
+test "provisioning refuses an index on a stored reserved-named encrypted field" {
+    const a = std.testing.allocator;
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try migrations.run(&d);
+    const created = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "contacts", .fields = &.{
+        .{ .id = "contact_id", .name = "contact", .encrypted = true, .options = .{ .text = .{} } },
+    } });
+    defer created.deinit(a);
+    // Creation refuses reserved names, so stage what a migration can leave behind.
+    try d.exec("ALTER TABLE contacts RENAME COLUMN contact TO email;");
+    try d.exec("UPDATE _collections SET \"schema\"=replace(\"schema\",'\"contact\"','\"email\"') WHERE name='contacts';");
+    const live = (try collections.get(a, &d, "contacts")).?;
+    defer live.deinit(a);
+    var desired = live;
+    desired.indexes = &.{.{ .name = "idx_email", .fields = &.{"email"} }};
+    try std.testing.expectError(error.Validation, collections.provisionMetadata(a, &d, live, desired));
+    const errors = collections.last_errors.?;
+    defer a.free(errors);
+    defer collections.last_errors = null;
+    try std.testing.expectEqual(@as(usize, 1), errors.len);
+    try std.testing.expectEqualStrings("email", errors[0].field);
+}
+
+test "applySpecs preserves skipped option changes while adding fields and widening selects" {
+    const a = std.testing.allocator;
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try migrations.run(&d);
+    const before = comptime buildCollections(.{ .items = .{ .fields = .{
+        .{ .name = "kind", .type = .select, .values = .{ "a", "b" } },
+        .{ .name = "tags", .type = .select, .values = .{ "a", "b", "c" }, .maxSelect = 3 },
+        .{ .name = "title", .type = .text, .min = 2 },
+        .{ .name = "state", .type = .select, .values = .{ "a", "b" } },
+    } } });
+    try applySpecs(a, std.testing.io, &d, before);
+    try d.exec("INSERT INTO items(id,kind,tags,title,state) VALUES ('old','b','[\"a\",\"b\",\"c\"]','ok','a');");
+    const after = comptime buildCollections(.{ .items = .{ .fields = .{
+        .{ .name = "kind", .type = .select, .values = .{ "a", "b", "c" } },
+        .{ .name = "tags", .type = .select, .values = .{ "a", "b" }, .maxSelect = 2 },
+        .{ .name = "title", .type = .text, .min = 3 },
+        .{ .name = "state", .type = .select, .values = .{ "a", "b", "c" }, .required = true },
+        .{ .name = "views", .type = .number },
+    } } });
+    try applySpecs(a, std.testing.io, &d, after);
+    const live = (try collections.get(a, &d, "items")).?;
+    defer live.deinit(a);
+    try std.testing.expectEqual(@as(usize, 3), schema.fieldByName(live, "kind").?.options.select.values.len);
+    try std.testing.expectEqual(@as(u32, 3), schema.fieldByName(live, "tags").?.options.select.maxSelect);
+    try std.testing.expectEqual(@as(usize, 3), schema.fieldByName(live, "tags").?.options.select.values.len);
+    try std.testing.expectEqual(@as(?u32, 2), schema.fieldByName(live, "title").?.options.text.min);
+    try std.testing.expect(!schema.fieldByName(live, "state").?.required);
+    try std.testing.expectEqual(@as(usize, 2), schema.fieldByName(live, "state").?.options.select.values.len);
+    try std.testing.expect(schema.fieldByName(live, "views") != null);
+    var st = try d.prepare("SELECT kind,tags,title,views FROM items WHERE id='old';");
+    defer st.finalize();
+    try std.testing.expect(try st.step());
+    try std.testing.expectEqualStrings("b", st.columnText(0));
+    try std.testing.expectEqualStrings("[\"a\",\"b\",\"c\"]", st.columnText(1));
+    try std.testing.expectEqualStrings("ok", st.columnText(2));
+    try std.testing.expect(st.isNull(3));
+}
+
+test "select widening rejects stale field snapshots without overwriting values or flags" {
+    const a = std.testing.allocator;
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try migrations.run(&d);
+    const initial = comptime buildCollections(.{ .items = .{ .type = .auth, .fields = .{
+        .{ .name = "kind", .type = .select, .values = .{ "a", "b" } },
+    } } });
+    var runtime_kind = initial[0].fields[0];
+    runtime_kind.id = "_runtime_kind";
+    var runtime_initial = initial[0];
+    runtime_initial.fields = &.{runtime_kind};
+    const runtime_created = try collections.create(a, std.testing.io, &d, runtime_initial);
+    defer runtime_created.deinit(a);
+    const stale = (try collections.get(a, &d, "items")).?;
+    defer stale.deinit(a);
+    const first = comptime buildCollections(.{ .items = .{ .type = .auth, .fields = .{
+        .{ .name = "kind", .type = .select, .values = .{ "a", "b", "c" } },
+    } } });
+    // Two boots can both preflight against {a,b}. The first writer adds c.
+    try applySpecs(a, std.testing.io, &d, first);
+    const generation = try schema_gen.read(&d);
+    const other = comptime buildCollections(.{ .items = .{ .type = .auth, .fields = .{
+        .{ .name = "kind", .type = .select, .values = .{ "a", "b", "d" } },
+    } } });
+    var desired_other = stale;
+    var other_field = schema.fieldByName(stale, "kind").?;
+    other_field.options = other[0].fields[0].options;
+    desired_other.fields = &.{other_field};
+    try std.testing.expectError(error.Conflict, collections.provisionMetadata(a, &d, stale, desired_other));
+    try std.testing.expect(!d.inTransaction());
+    try std.testing.expectEqual(generation, try schema_gen.read(&d));
+    const current = (try collections.get(a, &d, "items")).?;
+    defer current.deinit(a);
+    try std.testing.expectEqualStrings("_runtime_kind", schema.fieldByName(current, "kind").?.id);
+    try std.testing.expectEqualStrings("c", schema.fieldByName(current, "kind").?.options.select.values[2]);
+
+    // An admin changes a flag after another widening preflight. Preserve that
+    // change too, even when the selection values themselves have not changed.
+    var field = schema.fieldByName(current, "kind").?;
+    field.hidden = true;
+    var edited = current;
+    edited.fields = &.{field};
+    const saved = try collections.update(a, std.testing.io, &d, current.id, edited);
+    defer saved.deinit(a);
+    const flagged_generation = try schema_gen.read(&d);
+    const wider = comptime buildCollections(.{ .items = .{ .type = .auth, .fields = .{
+        .{ .name = "kind", .type = .select, .values = .{ "a", "b", "c", "d" } },
+    } } });
+    var desired_wider = current;
+    var wider_field = schema.fieldByName(current, "kind").?;
+    wider_field.options = wider[0].fields[0].options;
+    desired_wider.fields = &.{wider_field};
+    try std.testing.expectError(error.Conflict, collections.provisionMetadata(a, &d, current, desired_wider));
+    try std.testing.expectEqual(flagged_generation, try schema_gen.read(&d));
+    const unchanged = (try collections.get(a, &d, "items")).?;
+    defer unchanged.deinit(a);
+    try std.testing.expect(schema.fieldByName(unchanged, "kind").?.hidden);
+    try std.testing.expectEqual(@as(usize, 3), schema.fieldByName(unchanged, "kind").?.options.select.values.len);
+    // The auth path compared only custom fields and never persisted injected
+    // credential fields in _collections.schema.
+    try std.testing.expect(schema.fieldByName(unchanged, "passwordHash") != null);
+    {
+        var st = try d.prepare("SELECT schema FROM _collections WHERE name='items';");
+        defer st.finalize();
+        try std.testing.expect(try st.step());
+        try std.testing.expect(std.mem.indexOf(u8, st.columnText(0), "passwordHash") == null);
+    }
+
+    try collections.delete(a, &d, unchanged.id);
+    const deleted_generation = try schema_gen.read(&d);
+    try std.testing.expectError(error.NotFound, collections.provisionMetadata(a, &d, unchanged, desired_wider));
+    try std.testing.expect(!d.inTransaction());
+    try std.testing.expectEqual(deleted_generation, try schema_gen.read(&d));
+}
+
+test "field option diff requires migration for narrowing flags and representation changes" {
+    const a = std.testing.allocator;
+    const single: schema.Field = .{ .id = "live_id", .name = "kind", .options = .{ .select = .{ .values = &.{ "a", "b" } } } };
+    var same = single;
+    same.id = "comptime_id";
+    same.options = .{ .select = .{ .values = &.{ "a", "b" } } };
+    try std.testing.expectEqual(FieldChange.unchanged, try fieldChange(a, single, same));
+    var multi = single;
+    multi.options.select.maxSelect = 2;
+    try std.testing.expectEqual(FieldChange.migration, try fieldChange(a, single, multi));
+    try std.testing.expectEqual(FieldChange.migration, try fieldChange(a, multi, single));
+    var zero = single;
+    zero.options.select.maxSelect = 0;
+    try std.testing.expectEqual(FieldChange.migration, try fieldChange(a, single, zero));
+    try std.testing.expectEqual(FieldChange.widen_select, try fieldChange(a, zero, single));
+    var narrow = single;
+    narrow.options.select.values = &.{"a"};
+    try std.testing.expectEqual(FieldChange.migration, try fieldChange(a, single, narrow));
+    inline for (.{ "required", "unique", "hidden", "encrypted", "searchable" }) |flag| {
+        var flagged = single;
+        @field(flagged, flag) = true;
+        try std.testing.expectEqual(FieldChange.migration, try fieldChange(a, single, flagged));
+    }
+    // Numeric options can alter interpretation even when storageClass is unchanged.
+    const fixed: schema.Field = .{ .id = "fixed", .name = "price", .options = .{ .number = .{ .mode = .fixed, .scale = 2 } } };
+    var rescaled = fixed;
+    rescaled.options.number.scale = 3;
+    try std.testing.expectEqual(FieldChange.migration, try fieldChange(a, fixed, rescaled));
+}
+
+test "provisioning preserves effective searchable flags while widening selects" {
+    if (comptime !fts.enabled) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const records = @import("records.zig");
+    for ([_]bool{ false, true }) |was_searchable| {
+        for ([_]bool{ false, true }) |add_field| {
+            var d = try db.Db.openMemory();
+            defer d.close();
+            try migrations.run(&d);
+            const fields = [_]schema.Field{
+                .{ .id = "_kind", .name = "kind", .options = .{ .select = .{ .values = &.{ "a", "b" } } } },
+                .{ .id = "_title", .name = "title", .searchable = was_searchable, .options = .{ .text = .{} } },
+            };
+            const original = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "items", .fields = &fields });
+            defer original.deinit(a);
+            try fts.ensureIndex(a, &d, original);
+            try d.exec("INSERT INTO items(id,kind,title) VALUES ('old','a','needle');");
+            var desired_fields = [_]schema.Field{
+                fields[0], fields[1], .{ .id = "_body", .name = "body", .searchable = true, .options = .{ .text = .{} } },
+            };
+            desired_fields[0].options.select.values = &.{ "a", "b", "c" };
+            desired_fields[1].searchable = !was_searchable; // rejected in either direction
+            var desired = original;
+            desired.fields = desired_fields[0..if (add_field) 3 else 2];
+            try applySpecs(a, std.testing.io, &d, &.{desired});
+            try applySpecs(a, std.testing.io, &d, &.{desired}); // repeat boot must preserve the same FTS
+            const live = (try collections.get(a, &d, "items")).?;
+            defer live.deinit(a);
+            try std.testing.expectEqual(was_searchable, schema.fieldByName(live, "title").?.searchable);
+            try std.testing.expectEqualStrings("_kind", schema.fieldByName(live, "kind").?.id);
+            if (!was_searchable and !add_field) {
+                try std.testing.expectError(error.NotSearchable, records.list(a, &d, live, .{ .search = "needle" }));
+                var st = try d.prepare("SELECT count(*) FROM sqlite_master WHERE name='items_fts';");
+                defer st.finalize();
+                try std.testing.expect(try st.step());
+                try std.testing.expectEqual(@as(i64, 0), st.columnInt(0));
+            } else {
+                // The actual records search must agree with persisted flags: a rejected
+                // enable never indexes title, and a rejected disable never loses it.
+                var found = try records.list(a, &d, live, .{ .search = "needle" });
+                defer found.deinit(a);
+                try std.testing.expectEqual(@as(usize, if (was_searchable) 1 else 0), found.items.len);
+                if (add_field) {
+                    try d.exec("UPDATE items SET body='freshmarker' WHERE id='old';");
+                    var fresh = try records.list(a, &d, live, .{ .search = "freshmarker" });
+                    defer fresh.deinit(a);
+                    try std.testing.expectEqual(@as(usize, 1), fresh.items.len);
+                }
+                if (was_searchable) {
+                    try d.exec("UPDATE items SET title='updatedneedle' WHERE id='old';");
+                    var updated = try records.list(a, &d, live, .{ .search = "updatedneedle" });
+                    defer updated.deinit(a);
+                    try std.testing.expectEqual(@as(usize, 1), updated.items.len);
+                }
+            }
+        }
+    }
+}
+
+test "disabled FTS rejects accepted searchable additions before rebuilding" {
+    if (comptime fts.enabled) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try migrations.run(&d);
+    const fields = [_]schema.Field{
+        .{ .id = "_title", .name = "title", .options = .{ .text = .{} } },
+        .{ .id = "_kind", .name = "kind", .options = .{ .select = .{ .values = &.{ "a", "b" } } } },
+    };
+    const original = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "items", .fields = &fields });
+    defer original.deinit(a);
+    try d.exec("INSERT INTO items(id,title,kind) VALUES ('old','keep me','a');");
+    try d.exec("CREATE INDEX migration_index ON items(kind);");
+    try d.exec("CREATE TRIGGER migration_trigger AFTER INSERT ON items BEGIN SELECT 1; END;");
+    const generation = try schema_gen.read(&d);
+    var desired_fields = [_]schema.Field{
+        fields[0], fields[1], .{ .id = "_body", .name = "body", .searchable = true, .options = .{ .text = .{} } },
+    };
+    desired_fields[1].options.select.values = &.{ "a", "b", "c" };
+    var desired = original;
+    desired.fields = &desired_fields;
+    try std.testing.expectError(error.FtsDisabled, applySpecs(a, std.testing.io, &d, &.{desired}));
+    try std.testing.expectEqual(generation, try schema_gen.read(&d));
+    try std.testing.expect(!d.inTransaction());
+    const unchanged = (try collections.get(a, &d, "items")).?;
+    defer unchanged.deinit(a);
+    try std.testing.expect(schema.fieldByName(unchanged, "body") == null);
+    try std.testing.expectEqual(@as(usize, 2), schema.fieldByName(unchanged, "kind").?.options.select.values.len);
+    try std.testing.expectEqualStrings("_title", schema.fieldByName(unchanged, "title").?.id);
+    {
+        var st = try d.prepare("SELECT (SELECT title FROM items WHERE id='old'), (SELECT kind FROM items WHERE id='old'), (SELECT count(*) FROM pragma_table_info('items') WHERE name='body'), (SELECT count(*) FROM sqlite_master WHERE name IN ('migration_index','migration_trigger'));");
+        defer st.finalize();
+        try std.testing.expect(try st.step());
+        try std.testing.expectEqualStrings("keep me", st.columnText(0));
+        try std.testing.expectEqualStrings("a", st.columnText(1));
+        try std.testing.expectEqual(@as(i64, 0), st.columnInt(2));
+        try std.testing.expectEqual(@as(i64, 2), st.columnInt(3));
+    }
+    // A rejected change on an existing field is not an accepted search feature:
+    // disabling search on the addition makes this retry valid even though the
+    // desired title flag is now true. Preflight must use effective, not raw spec.
+    desired_fields[0].searchable = true;
+    desired_fields[2].searchable = false;
+    try applySpecs(a, std.testing.io, &d, &.{desired});
+    const upgraded = (try collections.get(a, &d, "items")).?;
+    defer upgraded.deinit(a);
+    try std.testing.expect(!schema.fieldByName(upgraded, "title").?.searchable);
+    try std.testing.expect(!schema.fieldByName(upgraded, "body").?.searchable);
+    try std.testing.expectEqual(@as(usize, 3), schema.fieldByName(upgraded, "kind").?.options.select.values.len);
+}
+
+test "additive rebuild rejects stale select snapshots before changing storage" {
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |ttl_only| {
+        var d = try db.Db.openMemory();
+        defer d.close();
+        try migrations.run(&d);
+        const fields = [_]schema.Field{
+            .{ .id = "_kind", .name = "kind", .options = .{ .select = .{ .values = &.{ "a", "b" } } } },
+            .{ .id = "_expiry", .name = "expiry", .options = .{ .date = .{} } },
+        };
+        const original = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "items", .fields = &fields });
+        defer original.deinit(a);
+        try d.exec("INSERT INTO items(id,kind) VALUES ('old','a');");
+        try d.exec("CREATE INDEX migration_index ON items(kind);");
+        try d.exec("CREATE TRIGGER migration_trigger AFTER INSERT ON items BEGIN SELECT 1; END;");
+        try d.exec("CREATE TABLE child (id TEXT PRIMARY KEY, parent TEXT REFERENCES items(id) ON DELETE CASCADE);");
+        try d.exec("INSERT INTO child VALUES ('child','old');");
+        const stale = (try collections.get(a, &d, "items")).?;
+        defer stale.deinit(a);
+        var desired_fields = [_]schema.Field{
+            fields[0], fields[1], .{ .id = "_views", .name = "views", .options = .{ .number = .{} } },
+        };
+        desired_fields[0].options.select.values = &.{ "a", "b", "c" };
+        var desired = stale;
+        desired.fields = desired_fields[0..if (ttl_only) 2 else 3];
+        if (ttl_only) desired.options.ttl_field = "expiry";
+
+        // A second writer commits d after this boot planned c plus an unrelated
+        // field/TTL change. Its new row must not become invalid under a stale plan.
+        var intervening_fields = fields;
+        intervening_fields[0].options.select.values = &.{ "a", "b", "d" };
+        var intervening = original;
+        intervening.fields = &intervening_fields;
+        try applySpecs(a, std.testing.io, &d, &.{intervening});
+        try d.exec("INSERT INTO items(id,kind) VALUES ('other','d');");
+        const generation = try schema_gen.read(&d);
+        for ([_]bool{ false, true }) |nested| {
+            if (nested) try d.begin();
+            try std.testing.expectError(error.Conflict, collections.updateWithExpectedDefinition(a, std.testing.io, &d, stale.id, desired, stale));
+            try std.testing.expectEqual(nested, d.inTransaction());
+            try std.testing.expectEqual(generation, try schema_gen.read(&d));
+            if (nested) try d.rollback();
+        }
+        const preserved = (try collections.get(a, &d, "items")).?;
+        defer preserved.deinit(a);
+        try std.testing.expectEqualStrings("_kind", schema.fieldByName(preserved, "kind").?.id);
+        try std.testing.expectEqualStrings("d", schema.fieldByName(preserved, "kind").?.options.select.values[2]);
+        try std.testing.expect(schema.fieldByName(preserved, "views") == null);
+        try std.testing.expect(preserved.options.ttl_field == null);
+        {
+            var st = try d.prepare("SELECT (SELECT kind FROM items WHERE id='other'), (SELECT count(*) FROM items), (SELECT count(*) FROM child), (SELECT count(*) FROM sqlite_master WHERE name IN ('migration_index','migration_trigger'));");
+            defer st.finalize();
+            try std.testing.expect(try st.step());
+            try std.testing.expectEqualStrings("d", st.columnText(0));
+            try std.testing.expectEqual(@as(i64, 2), st.columnInt(1));
+            try std.testing.expectEqual(@as(i64, 1), st.columnInt(2));
+            try std.testing.expectEqual(@as(i64, 2), st.columnInt(3));
+        }
+        {
+            var st = try d.prepare("PRAGMA foreign_keys;");
+            defer st.finalize();
+            try std.testing.expect(try st.step());
+            try std.testing.expectEqual(@as(i64, 1), st.columnInt(0));
+        }
+        // Re-plan from the current schema, then exercise the real provisioning
+        // rebuild. Its FK pause must happen outside BEGIN so child rows survive.
+        desired_fields[0].options.select.values = &.{ "a", "b", "c", "d" };
+        try applySpecs(a, std.testing.io, &d, &.{desired});
+        const upgraded = (try collections.get(a, &d, "items")).?;
+        defer upgraded.deinit(a);
+        try std.testing.expectEqual(@as(usize, 4), schema.fieldByName(upgraded, "kind").?.options.select.values.len);
+        try std.testing.expectEqual(ttl_only, upgraded.options.ttl_field != null);
+        try std.testing.expectEqual(!ttl_only, schema.fieldByName(upgraded, "views") != null);
+        var child = try d.prepare("SELECT count(*) FROM child;");
+        defer child.finalize();
+        try std.testing.expect(try child.step());
+        try std.testing.expectEqual(@as(i64, 1), child.columnInt(0));
+    }
+}
+
 test "index-only provisioning reconciles definitions without rebuilding tables" {
     const a = std.testing.allocator;
     var d = try db.Db.openMemory();
@@ -2638,8 +3132,24 @@ test "applySpecs provisions a self-relation; idempotent re-provision is a no-op"
     try d.exec("INSERT INTO \"authors\" (\"id\",\"created\",\"updated\",\"name\") VALUES ('a1','','','Ada');");
     try d.exec("INSERT INTO \"authors\" (\"id\",\"created\",\"updated\",\"name\",\"mentor\") VALUES ('a2','','','Grace','a1');");
 
+    var declared_mentor = af[1];
+    declared_mentor.options.relation.targetCollectionId = authors.id;
+    // The actual classifier used at boot must avoid the migration-warning branch.
+    var target_ids: std.StringHashMapUnmanaged([]const u8) = .empty;
+    defer target_ids.deinit(a);
+    try target_ids.put(a, authors.name, authors.id);
+    try target_ids.put(a, authors.id, authors.id);
+    try std.testing.expectEqual(FieldChange.unchanged, try fieldChangeWithRelations(a, mentor, declared_mentor, target_ids));
+    const generation = try schema_gen.read(&d);
     // Re-provision: clean no-op (no error, no duplicate collection).
     try applySpecs(a, std.testing.io, &d, &specs);
+    try std.testing.expectEqual(generation, try schema_gen.read(&d));
+    var by_id = af;
+    by_id[1].options.relation.targetCollectionId = authors.id;
+    var id_spec = specs[0];
+    id_spec.fields = &by_id;
+    try applySpecs(a, std.testing.io, &d, &.{id_spec});
+    try std.testing.expectEqual(generation, try schema_gen.read(&d));
     const all = try collections.list(a, &d);
     defer {
         for (all) |c| c.deinit(a);
@@ -3537,4 +4047,199 @@ test "resolveDiscoveryProviders returns the same slice when no provider uses dis
     }};
     const out = try resolveDiscoveryProviders(a, stub.transport(), &cols);
     try std.testing.expectEqual(@as(usize, @intFromPtr(&cols)), @as(usize, @intFromPtr(out.ptr)));
+}
+
+test "provisioning commits widening rules and indexes atomically once" {
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |fts_failure| {
+        if (fts_failure and !fts.enabled) continue;
+        var d = try db.Db.openMemory();
+        defer d.close();
+        try migrations.run(&d);
+        const initial = comptime buildCollections(.{ .items = .{ .fields = .{
+            .{ .name = "kind", .type = .select, .values = .{ "a", "b" } },
+            .{ .name = "title", .type = .text, .searchable = true },
+        } } });
+        var original = initial[0];
+        // Keep this regression runnable in the disabled-FTS configuration.
+        var fields = [_]schema.Field{ original.fields[0], original.fields[1] };
+        fields[1].searchable = fts.enabled;
+        original.fields = &fields;
+        try applySpecs(a, std.testing.io, &d, &.{original});
+        try d.exec("INSERT INTO items(id,kind,title) VALUES ('one','a','same'),('two','b','same');");
+        try d.exec("CREATE INDEX migration_index ON items(kind);");
+        try d.exec("CREATE TRIGGER migration_trigger AFTER INSERT ON items BEGIN SELECT 1; END;");
+        const before = (try collections.get(a, &d, "items")).?;
+        defer before.deinit(a);
+        const generation = try schema_gen.read(&d);
+        fields[0].options.select.values = &.{ "a", "b", "c" };
+        var desired = original;
+        desired.viewRule = "id != ''";
+        desired.indexes = &.{.{ .name = "unique_title", .fields = &.{"title"}, .unique = true }};
+        if (fts_failure) {
+            // Physical ownership conflict must fail before any metadata can commit.
+            try d.exec("DROP TABLE items_fts;");
+            try d.exec("CREATE TABLE items_fts (id TEXT);");
+            desired.indexes = &.{.{ .name = "title_index", .fields = &.{"title"} }};
+        }
+        try std.testing.expectError(error.ExecFailed, applySpecs(a, std.testing.io, &d, &.{desired}));
+        try std.testing.expect(!d.inTransaction());
+        try std.testing.expectEqual(generation, try schema_gen.read(&d));
+        const after = (try collections.get(a, &d, "items")).?;
+        defer after.deinit(a);
+        try std.testing.expect(collections.Rules.from(before).eql(collections.Rules.from(after)));
+        try std.testing.expectEqual(@as(usize, 2), schema.fieldByName(after, "kind").?.options.select.values.len);
+        try std.testing.expectEqual(@as(usize, 0), after.indexes.len);
+        {
+            var st = try d.prepare("SELECT count(*) FROM sqlite_master WHERE name IN ('migration_index','migration_trigger');");
+            defer st.finalize();
+            try std.testing.expect(try st.step());
+            try std.testing.expectEqual(@as(i64, 2), st.columnInt(0));
+        }
+        if (fts_failure) continue;
+        desired.indexes = &.{.{ .name = "title_index", .fields = &.{"title"} }};
+        try applySpecs(a, std.testing.io, &d, &.{desired});
+        try std.testing.expectEqual(generation + 1, try schema_gen.read(&d));
+        try applySpecs(a, std.testing.io, &d, &.{desired});
+        try std.testing.expectEqual(generation + 1, try schema_gen.read(&d));
+    }
+}
+
+test "whole definition guards reject concurrent rules options and TTL before any write" {
+    const a = std.testing.allocator;
+    const edits = [_][:0]const u8{
+        "UPDATE _collections SET viewRule='id != 0' WHERE name='items';",
+        "UPDATE _collections SET options=json_set(options,'$.ttl.field','expiry') WHERE name='items';",
+        "UPDATE _collections SET options=json_set(options,'$.auth.oauth2.enabled',json('true')) WHERE name='items';",
+        "UPDATE _collections SET options=json_set(options,'$.auth.oauth2.providers',json('[{\"name\":\"custom\",\"clientId\":\"id\",\"clientSecret\":\"new-secret\",\"enabled\":false}]')) WHERE name='items';",
+    };
+    for (edits) |edit| {
+        var d = try db.Db.openMemory();
+        defer d.close();
+        try migrations.run(&d);
+        const initial = comptime buildCollections(.{ .items = .{ .fields = .{
+            .{ .name = "kind", .type = .select, .values = .{ "a", "b" } },
+            .{ .name = "expiry", .type = .date },
+        } } });
+        try applySpecs(a, std.testing.io, &d, initial);
+        const stale = (try collections.get(a, &d, "items")).?;
+        defer stale.deinit(a);
+        var fields = [_]schema.Field{ stale.fields[0], stale.fields[1], .{ .id = "newfield", .name = "extra", .options = .{ .text = .{} } } };
+        fields[0].options.select.values = &.{ "a", "b", "c" };
+        var desired = stale;
+        desired.fields = &fields;
+        try d.exec(edit);
+        const generation = try schema_gen.read(&d);
+        try std.testing.expectError(error.Conflict, collections.updateWithExpectedDefinition(a, std.testing.io, &d, stale.id, desired, stale));
+        desired.fields = fields[0..2];
+        try std.testing.expectError(error.Conflict, collections.provisionMetadata(a, &d, stale, desired));
+        try std.testing.expectEqual(generation, try schema_gen.read(&d));
+        const after = (try collections.get(a, &d, "items")).?;
+        defer after.deinit(a);
+        try std.testing.expectEqual(@as(usize, 2), schema.fieldByName(after, "kind").?.options.select.values.len);
+        try std.testing.expect(schema.fieldByName(after, "extra") == null);
+    }
+}
+
+test "index reconciliation accepts opaque underscore field ids and keeps validation errors owned" {
+    const a = std.testing.allocator;
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try migrations.run(&d);
+    const original = try collections.create(a, std.testing.io, &d, .{
+        .id = "",
+        .name = "items",
+        .fields = &.{
+            .{ .id = "_runtime_kind", .name = "kind", .options = .{ .text = .{} } },
+            .{ .id = "_runtime_secret", .name = "secret", .encrypted = true, .options = .{ .text = .{} } },
+        },
+    });
+    defer original.deinit(a);
+    var desired = original;
+    desired.indexes = &.{.{ .name = "idx_kind", .fields = &.{"kind"} }};
+    try collections.provisionMetadata(a, &d, original, desired);
+    const indexed = (try collections.get(a, &d, original.id)).?;
+    defer indexed.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), indexed.indexes.len);
+    try std.testing.expectEqualStrings("_runtime_kind", schema.fieldByName(indexed, "kind").?.id);
+    const generation = try schema_gen.read(&d);
+    desired = indexed;
+    // Opaque ids must not hide encrypted fields from index validation either.
+    desired.indexes = &.{.{ .name = "idx_secret", .fields = &.{"secret"} }};
+    try std.testing.expectError(error.Validation, collections.provisionMetadata(a, &d, indexed, desired));
+    const encrypted_errors = collections.last_errors.?;
+    try std.testing.expectEqualStrings("secret", encrypted_errors[0].field);
+    a.free(encrypted_errors);
+    collections.last_errors = null;
+    desired.indexes = &.{.{ .name = "bad-index-name", .fields = &.{"kind"} }};
+    try std.testing.expectError(error.Validation, collections.provisionMetadata(a, &d, indexed, desired));
+    // The helper's scratch arena is gone. This caller-owned diagnostic must still
+    // be readable and freeable, rather than a dangling threadlocal arena slice.
+    const errors = collections.last_errors.?;
+    defer a.free(errors);
+    defer collections.last_errors = null;
+    try std.testing.expect(errors.len > 0);
+    try std.testing.expectEqualStrings("bad-index-name", errors[0].field);
+    try std.testing.expectEqual(generation, try schema_gen.read(&d));
+    try std.testing.expectError(error.Validation, applySpecs(a, std.testing.io, &d, &.{desired}));
+    try std.testing.expect(collections.last_errors == null);
+}
+
+test "identical provisioning plans from two boots converge without conflict or another rebuild" {
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |rebuild| {
+        var d = try db.Db.openMemory();
+        defer d.close();
+        try migrations.run(&d);
+        const original = try collections.create(a, std.testing.io, &d, .{
+            .id = "",
+            .name = "items",
+            .fields = &.{.{ .id = "kind_id", .name = "kind", .options = .{ .select = .{ .values = &.{ "a", "b" } } } }},
+        });
+        defer original.deinit(a);
+        try d.exec("INSERT INTO items(id,kind) VALUES ('old','a');");
+        var fields = [_]schema.Field{ original.fields[0], .{ .id = "extra_id", .name = "extra", .options = .{ .text = .{} } } };
+        fields[0].options.select.values = &.{ "a", "b", "c" };
+        var desired = original;
+        desired.fields = fields[0..if (rebuild) 2 else 1];
+        desired.viewRule = "id != ''";
+        const generation = try schema_gen.read(&d);
+        for (0..2) |boot| {
+            if (rebuild) {
+                const result = try collections.updateWithExpectedDefinition(a, std.testing.io, &d, original.id, desired, original);
+                result.deinit(a);
+            } else try collections.provisionMetadata(a, &d, original, desired);
+            try std.testing.expectEqual(generation + 1, try schema_gen.read(&d));
+            if (boot == 0) {
+                try d.exec("CREATE INDEX after_first_boot ON items(kind);");
+                try d.exec("CREATE TRIGGER after_first_boot_trigger AFTER INSERT ON items BEGIN SELECT 1; END;");
+            }
+        }
+        var st = try d.prepare("SELECT (SELECT kind FROM items WHERE id='old'), (SELECT count(*) FROM sqlite_master WHERE name IN ('after_first_boot','after_first_boot_trigger'));");
+        defer st.finalize();
+        try std.testing.expect(try st.step());
+        try std.testing.expectEqualStrings("a", st.columnText(0));
+        try std.testing.expectEqual(@as(i64, 2), st.columnInt(1));
+    }
+}
+
+test "reordered select values leave persisted order and generation unchanged" {
+    const a = std.testing.allocator;
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try migrations.run(&d);
+    const initial = comptime buildCollections(.{ .items = .{ .fields = .{
+        .{ .name = "kind", .type = .select, .values = .{ "b", "a" } },
+    } } });
+    try applySpecs(a, std.testing.io, &d, initial);
+    const generation = try schema_gen.read(&d);
+    const reorder = comptime buildCollections(.{ .items = .{ .fields = .{
+        .{ .name = "kind", .type = .select, .values = .{ "a", "b" } },
+    } } });
+    try std.testing.expectEqual(FieldChange.unchanged, try fieldChange(a, initial[0].fields[0], reorder[0].fields[0]));
+    try applySpecs(a, std.testing.io, &d, reorder);
+    try std.testing.expectEqual(generation, try schema_gen.read(&d));
+    const live = (try collections.get(a, &d, "items")).?;
+    defer live.deinit(a);
+    try std.testing.expectEqualStrings("b", schema.fieldByName(live, "kind").?.options.select.values[0]);
 }

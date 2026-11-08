@@ -882,6 +882,12 @@ pub fn isSystemFieldName(name: []const u8) bool {
     return false;
 }
 
+/// Only auth collections carry engine-injected fields. A stored field with a reserved
+/// name on any other collection type is user data, left behind by a migration.
+pub fn isInjectedField(collection_type: CollectionType, name: []const u8) bool {
+    return collection_type == .auth and isSystemFieldName(name);
+}
+
 /// The implicit system fields of an auth collection (beyond id/created/updated).
 /// passwordHash/tokenKey are hidden (never serialized). Stable ids (leading '_').
 pub fn authSystemFields() []const Field {
@@ -1000,14 +1006,40 @@ pub fn hasSearchableField(c: Collection) bool {
 
 /// Appends any validation problems to `errors`. Self-sizing; messages/codes are static or borrowed from `c`.
 pub fn validate(alloc: std.mem.Allocator, c: Collection, errors: *std.ArrayList(ValidationError)) std.mem.Allocator.Error!void {
-    if (!isValidIdentifier(c.name))
+    try validateCollectionName(alloc, c.name, errors);
+    try validateFieldsAndOptions(alloc, c, errors);
+}
+
+/// Check a canonical stored name independently of an update's ignored rename.
+pub fn validateCollectionName(alloc: std.mem.Allocator, name: []const u8, errors: *std.ArrayList(ValidationError)) std.mem.Allocator.Error!void {
+    if (!isValidIdentifier(name))
         try errors.append(alloc, .{ .field = "name", .code = codes.s(.validation_invalid_name), .message = "Name must start with a letter and contain only letters, digits, and underscores." });
     // `_fts` is reserved: a searchable collection `posts` provisions an FTS5 shadow table named
     // `posts_fts`, so a user collection literally named `<x>_fts` could collide with `<x>`'s index
     // (CREATE VIRTUAL TABLE over an existing base table errors). Reserve the suffix outright (#157).
-    if (std.mem.endsWith(u8, c.name, fts_suffix))
+    if (std.mem.endsWith(u8, name, fts_suffix))
         try errors.append(alloc, .{ .field = "name", .code = codes.s(.validation_reserved_suffix), .message = "Collection name may not end with '_fts' (reserved for full-text search index tables)." });
+}
 
+/// Check index names and that no index covers an encrypted field of `c`.
+pub fn validateIndexes(alloc: std.mem.Allocator, c: Collection, errors: *std.ArrayList(ValidationError)) std.mem.Allocator.Error!void {
+    for (c.indexes) |idx| {
+        if (!isValidIdentifier(idx.name))
+            try errors.append(alloc, .{ .field = idx.name, .code = codes.s(.validation_invalid_name), .message = "Invalid index name." });
+        for (idx.fields) |fname| {
+            if (!isValidIdentifier(fname))
+                try errors.append(alloc, .{ .field = fname, .code = codes.s(.validation_invalid_name), .message = "Invalid index field name." });
+            // An encrypted column holds per-row-nonce ciphertext, so an index over it
+            // is useless (every row's stored bytes differ). Reject rather than build a
+            // dead index. (Comptime path enforces this with @compileError.)
+            if (fieldByName(c, fname)) |fl| if (fl.encrypted)
+                try errors.append(alloc, .{ .field = fname, .code = codes.s(.validation_encrypted_index), .message = "Cannot index an encrypted field." });
+        }
+    }
+}
+
+/// Check caller-controlled fields, indexes and options without loading metadata.
+pub fn validateFieldsAndOptions(alloc: std.mem.Allocator, c: Collection, errors: *std.ArrayList(ValidationError)) std.mem.Allocator.Error!void {
     for (c.fields, 0..) |f, i| {
         if (!isValidIdentifier(f.name)) {
             try errors.append(alloc, .{ .field = f.name, .code = codes.s(.validation_invalid_name), .message = "Invalid field name." });
@@ -1073,19 +1105,7 @@ pub fn validate(alloc: std.mem.Allocator, c: Collection, errors: *std.ArrayList(
         }
     }
 
-    for (c.indexes) |idx| {
-        if (!isValidIdentifier(idx.name))
-            try errors.append(alloc, .{ .field = idx.name, .code = codes.s(.validation_invalid_name), .message = "Invalid index name." });
-        for (idx.fields) |fname| {
-            if (!isValidIdentifier(fname))
-                try errors.append(alloc, .{ .field = fname, .code = codes.s(.validation_invalid_name), .message = "Invalid index field name." });
-            // An encrypted column holds per-row-nonce ciphertext, so an index over it
-            // is useless (every row's stored bytes differ). Reject rather than build a
-            // dead index. (Comptime path enforces this with @compileError.)
-            if (fieldByName(c, fname)) |fl| if (fl.encrypted)
-                try errors.append(alloc, .{ .field = fname, .code = codes.s(.validation_encrypted_index), .message = "Cannot index an encrypted field." });
-        }
-    }
+    try validateIndexes(alloc, c, errors);
 
     // Auth identity fields are interpolated into SQL/DDL, so they must be valid identifiers.
     if (c.type == .auth) {
