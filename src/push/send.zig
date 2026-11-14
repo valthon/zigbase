@@ -24,6 +24,7 @@ pub const PushError = error{PushDeliveryFailed};
 
 pub const Subscription = sender.PushSubscription;
 pub const Message = sender.PushMessage;
+pub const Urgency = sender.PushUrgency;
 pub const Result = sender.PushResult;
 
 /// Options for `ctx.push().enqueue`. `queue` routes the "push" job to a declared queue
@@ -44,6 +45,7 @@ pub const PushApi = struct {
 
     pub const Subscription = sender.PushSubscription;
     pub const Message = sender.PushMessage;
+    pub const Urgency = sender.PushUrgency;
     pub const Result = sender.PushResult;
     /// Re-export of the module-level `EnqueueOpts` so callers can name `ctx.push().EnqueueOpts`.
     pub const Opts = EnqueueOpts;
@@ -197,6 +199,50 @@ test "jobHandler: unconfigured push is a network-free no-op" {
     const payload = try jobPayload(testing.allocator);
     defer testing.allocator.free(payload);
     try jobHandler(&cx, payload); // completes, no network
+    try testing.expectEqual(@as(usize, 0), testcapture.http.requestCount());
+}
+
+test "jobHandler: a queued urgency survives the job round-trip onto the wire" {
+    if (!testcapture.enabled) return error.SkipZigTest;
+    testcapture.http.reset();
+    defer testcapture.http.reset();
+    testcapture.http.enable(true);
+    testcapture.http.mock("push.example.com", .{ .status = 201 });
+
+    var env = JobEnv.init(try configuredCfg(testing.allocator));
+    var cx = env.ctx();
+    const job = PushJob{
+        .subscription = .{ .endpoint = test_endpoint, .p256dh = test_p256dh, .auth = test_auth },
+        .message = .{ .title = "Hi", .urgency = .high },
+    };
+    const payload = try std.json.Stringify.valueAlloc(testing.allocator, job, .{});
+    defer testing.allocator.free(payload);
+    try jobHandler(&cx, payload);
+
+    try testing.expectEqual(@as(usize, 1), testcapture.http.requestCount());
+    var urgency: ?[]const u8 = null;
+    for (testcapture.http.requestAt(0).?.headers) |h| {
+        if (std.ascii.eqlIgnoreCase(h.name, "Urgency")) urgency = h.value;
+    }
+    try testing.expectEqualStrings("high", urgency orelse return error.TestExpectedUrgencyHeader);
+}
+
+const invalid_urgency = "urgent";
+
+test "jobHandler: an invalid urgency is rejected (dropped, no network)" {
+    if (!testcapture.enabled) return error.SkipZigTest;
+    testcapture.http.reset();
+    defer testcapture.http.reset();
+    testcapture.http.enable(true); // block unmocked — a network attempt would error
+
+    var env = JobEnv.init(try configuredCfg(testing.allocator));
+    var cx = env.ctx();
+    // Valid keys, so the ONLY reason nothing is sent is the unknown urgency value.
+    const payload = try std.fmt.allocPrint(testing.allocator,
+        \\{{"subscription":{{"endpoint":"{s}","p256dh":"{s}","auth":"{s}"}},"message":{{"title":"Hi","urgency":"{s}"}}}}
+    , .{ test_endpoint, test_p256dh, test_auth, invalid_urgency });
+    defer testing.allocator.free(payload);
+    try jobHandler(&cx, payload);
     try testing.expectEqual(@as(usize, 0), testcapture.http.requestCount());
 }
 

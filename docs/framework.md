@@ -1457,6 +1457,7 @@ const result = try ctx.push().send(sub, .{
     .body  = "Tee time 09:20 is locked in.",
     .data  = "{\"url\":\"/bookings/42\"}",  // opaque JSON passed to the service worker
     .ttl_s = 120,                            // push-service TTL header
+    .urgency = .high,                        // RFC 8030 Urgency header (optional)
 });
 switch (result) {
     .delivered => {},
@@ -1464,6 +1465,15 @@ switch (result) {
     .failed => {}, // transient; try again later
 }
 ```
+
+**Urgency.** `.urgency` (a `zigbase.PushUrgency`: `.very_low`, `.low`, `.normal`, `.high`)
+sets the [RFC 8030 §5.3](https://www.rfc-editor.org/rfc/rfc8030#section-5.3) `Urgency`
+header (`very-low` / `low` / `normal` / `high` on the wire), which push services and browsers
+use to decide how promptly to wake the device. Use `.high` for time-sensitive messages (chat,
+security alerts) and `.low` / `.very_low` for routine digests to save battery. Leave it unset
+(the default, `null`) to omit the header, which push services treat as `normal`. It is
+carried through `enqueue` too; a queued job whose stored urgency is not one of those values
+is rejected as malformed and dropped.
 
 **Tri-state result — prune on `.gone`.** `send` returns `.delivered` (2xx), `.gone`
 (**404/410** — the subscription is dead: delete your stored row and never retry), or

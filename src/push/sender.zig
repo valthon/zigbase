@@ -40,14 +40,36 @@ pub const PushSubscription = struct {
     auth: []const u8,
 };
 
+/// RFC 8030 §5.3 message urgency — a hint to the push service/user agent about how promptly
+/// to wake the device. Lower urgency lets a battery-constrained device defer delivery.
+pub const PushUrgency = enum {
+    very_low,
+    low,
+    normal,
+    high,
+
+    /// The `Urgency` header value (RFC 8030 spells the levels with a hyphen).
+    pub fn wireValue(self: PushUrgency) []const u8 {
+        return switch (self) {
+            .very_low => "very-low",
+            .low => "low",
+            .normal => "normal",
+            .high => "high",
+        };
+    }
+};
+
 /// The notification payload. The service worker receives the JSON `{title, body, data}`;
 /// `data` is opaque raw JSON passed through verbatim (default `null`). `ttl_s` is the push
 /// service `TTL` header — how long it should hold the message for an offline device.
+/// `urgency` sets the RFC 8030 `Urgency` header; `null` (the default) omits it, which push
+/// services treat as `normal`.
 pub const PushMessage = struct {
     title: []const u8,
     body: []const u8 = "",
     data: []const u8 = "",
     ttl_s: u32 = 60,
+    urgency: ?PushUrgency = null,
 };
 
 /// Tri-state delivery outcome (issue #223). `.gone` is the prune signal.
@@ -128,6 +150,7 @@ pub fn deliver(ctx: *Ctx, cfg: config.Runtime, sub: PushSubscription, msg: PushM
     const ttl_str = try std.fmt.allocPrint(a.a, "{d}", .{msg.ttl_s});
     defer a.a.free(ttl_str);
     try headers.append(a.a, .{ .name = "TTL", .value = ttl_str });
+    if (msg.urgency) |u| try headers.append(a.a, .{ .name = "Urgency", .value = u.wireValue() });
     try headers.append(a.a, .{ .name = "Content-Encoding", .value = "aes128gcm" });
     try headers.append(a.a, .{ .name = "Content-Type", .value = "application/octet-stream" });
     try headers.append(a.a, .{ .name = "Authorization", .value = auth_header });
@@ -244,6 +267,7 @@ test "deliver: composes a well-formed POST and maps 201 → delivered" {
 
     var have_ce = false;
     var have_ttl = false;
+    var have_urgency = false;
     var have_ct = false;
     var vapid_ok = false;
     for (rq.headers) |h| {
@@ -253,6 +277,8 @@ test "deliver: composes a well-formed POST and maps 201 → delivered" {
         } else if (std.ascii.eqlIgnoreCase(h.name, "TTL")) {
             have_ttl = true;
             try testing.expectEqualStrings("120", h.value);
+        } else if (std.ascii.eqlIgnoreCase(h.name, "Urgency")) {
+            have_urgency = true;
         } else if (std.ascii.eqlIgnoreCase(h.name, "Content-Type")) {
             have_ct = true;
             try testing.expectEqualStrings("application/octet-stream", h.value);
@@ -262,6 +288,42 @@ test "deliver: composes a well-formed POST and maps 201 → delivered" {
         }
     }
     try testing.expect(have_ce and have_ttl and have_ct and vapid_ok);
+    // Urgency unset → no `Urgency` header (push services default to `normal`).
+    try testing.expect(!have_urgency);
+}
+
+/// The value of the recorded request's `Urgency` header, or null when absent.
+fn recordedUrgency(rq: anytype) ?[]const u8 {
+    for (rq.headers) |h| {
+        if (std.ascii.eqlIgnoreCase(h.name, "Urgency")) return h.value;
+    }
+    return null;
+}
+
+test "PushUrgency.wireValue uses the RFC 8030 spellings" {
+    try testing.expectEqualStrings("very-low", PushUrgency.very_low.wireValue());
+    try testing.expectEqualStrings("low", PushUrgency.low.wireValue());
+    try testing.expectEqualStrings("normal", PushUrgency.normal.wireValue());
+    try testing.expectEqualStrings("high", PushUrgency.high.wireValue());
+}
+
+test "deliver: sends the Urgency header when set" {
+    if (!testcapture.enabled) return error.SkipZigTest;
+
+    inline for (.{ .{ PushUrgency.very_low, "very-low" }, .{ PushUrgency.low, "low" }, .{ PushUrgency.normal, "normal" }, .{ PushUrgency.high, "high" } }) |case| {
+        testcapture.http.reset();
+        testcapture.http.enable(true);
+        testcapture.http.mock("push.example.com", .{ .status = 201 });
+
+        var env = TestEnv.init();
+        var cx = env.ctx();
+        const cfg = try testCfg(testing.allocator);
+        const res = try deliver(&cx, cfg, .{ .endpoint = test_endpoint, .p256dh = test_p256dh, .auth = test_auth }, .{ .title = "x", .urgency = case[0] });
+        try testing.expectEqual(PushResult.delivered, res);
+        try testing.expectEqual(@as(usize, 1), testcapture.http.requestCount());
+        try testing.expectEqualStrings(case[1], recordedUrgency(testcapture.http.requestAt(0).?) orelse return error.TestExpectedUrgencyHeader);
+    }
+    testcapture.http.reset();
 }
 
 test "deliver: 410 → gone (prune), 500 → failed (retry)" {
