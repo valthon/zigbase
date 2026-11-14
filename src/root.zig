@@ -170,6 +170,7 @@ pub const WebhookOpts = @import("webhook.zig").WebhookOpts;
 // shapes and the tri-state result via these re-exports.
 pub const PushSubscription = @import("push/sender.zig").PushSubscription;
 pub const PushMessage = @import("push/sender.zig").PushMessage;
+pub const PushUrgency = @import("push/sender.zig").PushUrgency;
 pub const PushResult = @import("push/sender.zig").PushResult;
 pub const WebhookHmac = @import("webhook.zig").Hmac;
 
