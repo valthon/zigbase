@@ -205,6 +205,24 @@ pub fn summaryTable(alloc: std.mem.Allocator, name: []const u8) ![:0]u8 {
     return std.fmt.allocPrintSentinel(alloc, "_rollup_{s}", .{name}, 0);
 }
 
+/// Whether `table` (a `summaryTable` name) exists yet. A summary table is created by the first
+/// `runRollup` pass, so a read before that must answer "no rows", not an error. Checked against
+/// the catalog because the backends fail differently on a missing table: SQLite at `prepare`,
+/// PostgreSQL (which prepares lazily) only at the first `step` (#487). The PostgreSQL arm resolves
+/// the name with `to_regclass` (`quote_ident` keeps its case), the same `search_path` lookup the
+/// unqualified `SELECT … FROM "_rollup_<name>"` then performs, so the check and the read cannot
+/// disagree about which schema holds the table.
+pub fn summaryExists(conn: *db.Db, table: []const u8) !bool {
+    const sql: [:0]const u8 = switch (db.dbDialect(conn).kind) {
+        .sqlite => "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1 COLLATE NOCASE;",
+        .postgres => "SELECT 1 FROM pg_class WHERE oid=to_regclass(quote_ident(?1)) AND relkind IN ('r','p');",
+    };
+    var st = try prep(conn, sql);
+    defer st.finalize();
+    try st.bindText(1, table);
+    return st.step();
+}
+
 /// The SQL expression for a rollup's `bucket` value (a constant fragment, never user input).
 /// `occurred_at` is stored as an ISO-8601 `YYYY-MM-DDTHH:MM:SSZ` TEXT instant on both backends, so
 /// the day/hour bucket is a fixed-width prefix of that text: SQLite normalizes it via `strftime`;
@@ -231,19 +249,26 @@ fn bucketExpr(conn: *db.Db, tb: TimeBucket) []const u8 {
 /// grouping are stored as `''` so the key is uniform across all `group_by` shapes.
 pub fn provisionSummary(conn: *db.Db, alloc: std.mem.Allocator, name: []const u8) !void {
     const table = try summaryTable(alloc, name);
+    defer alloc.free(table);
     // `value` accumulates COUNT(*) sums across passes; bind values are i64, so use the dialect's
     // integer type (BIGINT on Postgres, where INTEGER is only 32-bit; INTEGER on SQLite).
     const int_ty = db.dbDialect(conn).sqlType(.integer);
+    // Text columns are byte-ordered on both backends (`textCollate`: "" on SQLite, `COLLATE "C"`
+    // on PostgreSQL), so the rollup read's `ORDER BY "bucket" DESC, "account", "actor"` and its
+    // `from`/`to` range match SQLite and the primary-key index serves them (#487; tables created
+    // before migration 0030 are pinned by it).
+    const tc = db.dbDialect(conn).textCollate();
     const create = try std.fmt.allocPrintSentinel(alloc,
-        \\CREATE TABLE IF NOT EXISTS "{s}" (
-        \\  "bucket" TEXT NOT NULL DEFAULT '',
-        \\  "account" TEXT NOT NULL DEFAULT '',
-        \\  "actor" TEXT NOT NULL DEFAULT '',
-        \\  "value" {s} NOT NULL DEFAULT 0,
-        \\  "computed_at" TEXT NOT NULL DEFAULT '',
+        \\CREATE TABLE IF NOT EXISTS "{[table]s}" (
+        \\  "bucket" TEXT{[tc]s} NOT NULL DEFAULT '',
+        \\  "account" TEXT{[tc]s} NOT NULL DEFAULT '',
+        \\  "actor" TEXT{[tc]s} NOT NULL DEFAULT '',
+        \\  "value" {[int_ty]s} NOT NULL DEFAULT 0,
+        \\  "computed_at" TEXT{[tc]s} NOT NULL DEFAULT '',
         \\  PRIMARY KEY ("bucket","account","actor")
         \\);
-    , .{ table, int_ty }, 0);
+    , .{ .table = table, .tc = tc, .int_ty = int_ty }, 0);
+    defer alloc.free(create);
     try conn.exec(create);
 }
 
@@ -511,6 +536,29 @@ test "runRollup aggregates incrementally and is idempotent" {
     defer v.finalize();
     _ = try v.step();
     try std.testing.expectEqual(@as(i64, 2), v.columnInt(0));
+}
+
+test "summaryExists is false before the first rollup pass and true after" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try migrations.run(&d);
+    try std.testing.expect(!try summaryExists(&d, "_rollup_signups"));
+    try provisionSummary(&d, std.testing.allocator, "signups");
+    try std.testing.expect(try summaryExists(&d, "_rollup_signups"));
+    try std.testing.expect(!try summaryExists(&d, "_rollup_other"));
+}
+
+test "summaryExists follows SQLite identifier case when reusing populated summaries" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try provisionSummary(&d, std.testing.allocator, "Signups");
+    try d.exec("INSERT INTO \"_rollup_Signups\" (bucket,account,actor,value,computed_at) VALUES ('all','','',7,'t');");
+    try provisionSummary(&d, std.testing.allocator, "signups");
+    try std.testing.expect(try summaryExists(&d, "_rollup_signups"));
+    var st = try d.prepare("SELECT value FROM \"_rollup_signups\";");
+    defer st.finalize();
+    try std.testing.expect(try st.step());
+    try std.testing.expectEqual(@as(i64, 7), st.columnInt(0));
 }
 
 test "runRollup accepts a long valid rollup name on SQLite" {

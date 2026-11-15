@@ -33,6 +33,7 @@ const auth = @import("../auth.zig");
 const tenancy = @import("../tenancy/tenancy.zig");
 const params_mod = @import("../query/params.zig");
 const analytics = @import("analytics.zig");
+const param_sink = @import("../sql/param_sink.zig");
 const ApiError = @import("../api/error.zig").ApiError;
 
 /// Hard cap on rows returned by the feed (defends against an unbounded scan); the default is 50.
@@ -70,7 +71,8 @@ fn resolveScope(ctx: *http.RequestCtx, app: *app_mod.App, conn: *db.Db) !?Scope 
 }
 
 /// A bound-parameter SQL builder: accumulates `WHERE` conditions and their text params so the
-/// account id / filters are always bound (`?N`), never interpolated.
+/// account id / filters are always bound (`?N`), never interpolated. The finished statement goes
+/// through `lowerFor` before `prepare`, which renumbers `?N` to `$n` on PostgreSQL (#487).
 const Bound = struct {
     alloc: std.mem.Allocator,
     conds: std.ArrayListUnmanaged([]const u8) = .empty,
@@ -110,6 +112,12 @@ const Bound = struct {
     }
 };
 
+/// Lower a statement built with `Bound` for `conn`'s backend: verbatim on SQLite, `$n`
+/// placeholders on PostgreSQL. The lowered copy lives in the request arena.
+fn lowerFor(ctx: *http.RequestCtx, conn: *db.Db, sql: [:0]const u8) ![:0]const u8 {
+    return param_sink.lowerStmtZ(ctx.allocator.a, db.dbDialect(conn), sql);
+}
+
 fn emptyItems(ctx: *http.RequestCtx) !http.Response {
     _ = ctx;
     return .{ .status = 200, .body = "{\"items\":[]}" };
@@ -146,6 +154,9 @@ pub fn events(ctx: *http.RequestCtx) anyerror!http.Response {
     const scope = (try resolveScope(ctx, app, &reader)) orelse
         return ApiError.withCode(401, .unauthorized, "Authentication required.").toResponse(ctx.allocator.a);
 
+    // Text order and ranges are bytewise on both backends: SQLite's BINARY default, and on
+    // PostgreSQL the `COLLATE "C"` that migration 0030 puts on `_events`' columns, so the
+    // (account[,name],occurred_at) indexes serve the ORDER BY and the range bounds below (#487).
     var b = Bound{ .alloc = ctx.allocator.a };
 
     // Base authorization scope (fail closed).
@@ -168,13 +179,14 @@ pub fn events(ctx: *http.RequestCtx) anyerror!http.Response {
 
     // Keyset pagination: `?cursor=` is the opaque "<occurred_at>|<id>" boundary of the last row
     // of the previous page. Matches the ORDER BY below (occurred_at DESC, id DESC) — expanded to
-    // an OR rather than a SQLite row-value comparison for portability.
+    // an OR rather than a SQLite row-value comparison for portability. The leading
+    // `occurred_at <= c` is implied by the OR but gives the index a start key, so a later page
+    // begins at the cursor instead of filtering every newer row of the account (#487).
     if (qp.get("cursor")) |raw| if (raw.len > 0) {
         const cur = parseCursor(raw) orelse
             return ApiError.badRequest("Invalid cursor.").toResponse(ctx.allocator.a);
         const n1 = b.params.items.len + 1;
-        try b.conds.append(ctx.allocator.a, try std.fmt.allocPrint(ctx.allocator.a, "(\"occurred_at\" < ?{d} OR (\"occurred_at\" = ?{d} AND \"id\" < ?{d}))", .{ n1, n1 + 1, n1 + 2 }));
-        try b.params.append(ctx.allocator.a, cur.occurred_at);
+        try b.conds.append(ctx.allocator.a, try std.fmt.allocPrint(ctx.allocator.a, "(\"occurred_at\" <= ?{d} AND (\"occurred_at\" < ?{d} OR \"id\" < ?{d}))", .{ n1, n1, n1 + 1 }));
         try b.params.append(ctx.allocator.a, cur.occurred_at);
         try b.params.append(ctx.allocator.a, cur.id);
     };
@@ -185,7 +197,7 @@ pub fn events(ctx: *http.RequestCtx) anyerror!http.Response {
     const sql = try std.fmt.allocPrintSentinel(ctx.allocator.a, "SELECT \"id\",\"created\",\"name\",\"payload\",\"actor_collection\",\"actor\",\"account\",\"occurred_at\" " ++
         "FROM \"_events\"{s} ORDER BY \"occurred_at\" DESC, \"id\" DESC LIMIT {d};", .{ where, limit + 1 }, 0);
 
-    var st = reader.prepare(sql) catch return emptyEventsPage(ctx);
+    var st = try reader.prepare(try lowerFor(ctx, &reader, sql));
     defer st.finalize();
     try b.bindAll(&st);
 
@@ -237,6 +249,8 @@ pub fn rollups(ctx: *http.RequestCtx) anyerror!http.Response {
     const reg = analytics.registryFromApp(app) orelse return ApiError.notFound().toResponse(ctx.allocator.a);
     const spec = reg.byName(name) orelse return ApiError.notFound().toResponse(ctx.allocator.a);
 
+    // Bytewise order and ranges as in `events`: the summary table's text columns are `COLLATE "C"`
+    // on PostgreSQL (`provisionSummary`, or migration 0030 for older tables).
     var b = Bound{ .alloc = ctx.allocator.a };
     if (scope.is_superuser) {
         // superuser sees all buckets
@@ -255,12 +269,13 @@ pub fn rollups(ctx: *http.RequestCtx) anyerror!http.Response {
 
     const table = analytics.summaryTable(ctx.allocator.a, name) catch
         return ApiError.notFound().toResponse(ctx.allocator.a);
+    // The summary table is created by the first rollup run; until then the rollup has no rows.
+    if (!try analytics.summaryExists(&reader, table)) return emptyItems(ctx);
     const where = try b.whereClause();
     const sql = try std.fmt.allocPrintSentinel(ctx.allocator.a, "SELECT \"bucket\",\"account\",\"actor\",\"value\",\"computed_at\" FROM {s}{s} " ++
         "ORDER BY \"bucket\" DESC, \"account\", \"actor\";", .{ try ddl.quoteIdent(ctx.allocator.a, table), where }, 0);
 
-    // The summary table is created lazily on the first rollup run; until then, return an empty set.
-    var st = reader.prepare(sql) catch return emptyItems(ctx);
+    var st = try reader.prepare(try lowerFor(ctx, &reader, sql));
     defer st.finalize();
     try b.bindAll(&st);
 

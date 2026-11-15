@@ -684,7 +684,59 @@ pub const all = [_]Migration{
     .{ .name = "0027_collection_rename_epoch", .up = init_0027_collection_rename_epoch },
     .{ .name = "0028_storage_namespaces", .up = @import("files/namespace.zig").migrate },
     .{ .name = "0029_queue_capacity_index", .up = init_0029_queue_capacity_index },
+    .{ .name = "0030_analytics_text_collation", .up = init_0030_analytics_text_collation },
 };
+
+/// PostgreSQL only: pin every TEXT column of `_events` and of each existing `_rollup_<name>`
+/// summary table to `COLLATE "C"` (#487), the byte order `ddl.zig` already gives user tables
+/// (`Dialect.textCollate`) and SQLite's BINARY default. The analytics feed pages by
+/// `(occurred_at DESC, id DESC)` and the rollup read orders by `bucket`; under the database's
+/// default (locale) collation those orders differ from SQLite's, and pinning the order in the
+/// query instead leaves the `_events` indexes unusable for it (a bitmap scan of the whole account
+/// plus a top-N sort on every page). With the columns in "C" the existing indexes serve the order
+/// and the range filters. Summary tables created later get "C" from `analytics.provisionSummary`.
+///
+/// Cost: each table is altered under an ACCESS EXCLUSIVE lock held until this migration commits,
+/// so `ctx.track` inserts and analytics reads wait for it. The heap is not rewritten (TEXT to
+/// TEXT is binary-coercible), but every index on an altered column is rebuilt: 1.1 s measured for
+/// a 400k-row `_events` with its primary key and two indexes.
+///
+/// The statements come from the catalog (`format('%I')` quotes each name), so only columns that
+/// exist, are TEXT and are not yet "C" are touched, and a table already pinned is left alone.
+/// Resolve tables through search_path just like analytics reads: legacy tables may live in a
+/// later schema. Qualify each ALTER with its catalog schema so it targets that exact relation.
+/// Shadowed and off-path tables are left alone. User collections cannot take the `_rollup_`
+/// prefix (`schema.isValidIdentifier` rejects a leading `_`).
+fn init_0030_analytics_text_collation(m: *Migrator) db.DbError!void {
+    if (m.dialect.kind != .postgres) return;
+    var stmts: std.ArrayList([:0]const u8) = .empty; // on the migration arena, freed with it
+    {
+        var st = try m.prepare(analytics_collation_plan_sql);
+        defer st.finalize();
+        while (try st.step()) {
+            const sql = m.arena.dupeZ(u8, st.columnText(0)) catch return error.ExecFailed;
+            stmts.append(m.arena, sql) catch return error.ExecFailed;
+        }
+    }
+    for (stmts.items) |sql| try m.exec(sql);
+}
+
+/// One schema-qualified `ALTER TABLE … ALTER COLUMN … TYPE TEXT COLLATE "C", …;` per visible table
+/// named `_events` or `_rollup_*` that has a TEXT column not yet in "C" (see 0030).
+const analytics_collation_plan_sql =
+    \\SELECT format('ALTER TABLE %I.%I %s;', n.nspname, c.relname,
+    \\         string_agg(format('ALTER COLUMN %I TYPE TEXT COLLATE "C"', a.attname), ', ' ORDER BY a.attnum))
+    \\  FROM pg_class c
+    \\  JOIN pg_namespace n ON n.oid = c.relnamespace
+    \\  JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
+    \\ WHERE pg_catalog.pg_table_is_visible(c.oid)
+    \\   AND c.relkind IN ('r', 'p')
+    \\   AND (c.relname = '_events' OR c.relname LIKE '\_rollup\_%')
+    \\   AND a.atttypid = 'text'::regtype
+    \\   AND a.attcollation <> 'pg_catalog."C"'::regcollation
+    \\ GROUP BY n.nspname, c.relname
+    \\ ORDER BY n.nspname, c.relname;
+;
 
 fn init_0027_collection_rename_epoch(m: *Migrator) db.DbError!void {
     try m.exec(collections_rename_epoch_column_sql);

@@ -629,6 +629,10 @@ test {
     _ = @import("scaffold/agents_md.zig");
     _ = @import("scaffold/templates.zig");
     _ = @import("scaffold.zig");
+    // #487: route-level parity for /api/senders and /api/analytics/*. Registered outside the
+    // postgres gate so its SQLite reference arm runs in every build; the PostgreSQL arms skip
+    // themselves unless -Dpostgres is on and a server is reachable.
+    _ = @import("backend/postgres/senders_analytics_pg_test.zig");
     // Opt-in pure-Zig PostgreSQL backend (#159). The `build_options.postgres` condition is
     // comptime-known, so when it is false (the default) these `@import`s are never analyzed —
     // the driver compiles to nothing and the default build stays byte-identical.
