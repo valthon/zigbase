@@ -27,10 +27,14 @@ fn prepare(a: std.mem.Allocator, w: *db.Db, sql: [:0]const u8) !db.Stmt {
     return w.prepare(try @import("sql/param_sink.zig").lowerStmtZ(scratch.allocator(), db.dbDialect(w), sql));
 }
 
-/// Ownership decisions call this AFTER taking the schedule row lock; readiness
-/// probes need no lock. PostgreSQL's transaction-start now() is unsuitable after
-/// lock waits, and application clocks can differ by instance.
-fn databaseNow(w: *db.Db) !i64 {
+/// The shared database clock in unix seconds: the PostgreSQL server's
+/// `clock_timestamp()`, or SQLite's `unixepoch('now')` (the host clock, since
+/// SQLite is in-process). Application clocks can differ by instance; this one is
+/// common to every instance of a database. Ownership decisions call this AFTER
+/// taking the schedule row lock; readiness probes need no lock. PostgreSQL's
+/// transaction-start now() is unsuitable after lock waits. Durable queues on
+/// PostgreSQL stamp, sweep and schedule claims with it (`queue/durable.zig`).
+pub fn databaseNow(w: *db.Db) !i64 {
     if (clock.frozenUnix()) |now| return now;
     var st = try w.prepare(if (db.dbDialect(w).kind == .postgres)
         "SELECT floor(extract(epoch FROM clock_timestamp()))::bigint;"

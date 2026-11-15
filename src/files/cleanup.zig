@@ -42,7 +42,7 @@ pub fn enqueueRemoved(alloc: std.mem.Allocator, w: *db.Db, io: std.Io, def: queu
     if (new == null) {
         const payload = try std.json.Stringify.valueAlloc(alloc, Payload{ .collection = col.name, .collection_id = col.id, .record = rid }, .{});
         defer alloc.free(payload);
-        _ = try durable.enqueue(w, io, def, "file_cleanup", payload, @import("../clock.zig").nowUnix(io));
+        _ = try durable.enqueue(w, io, def, "file_cleanup", payload, .now);
         return;
     }
     if (old != .object) return;
@@ -62,7 +62,7 @@ fn enqueueName(alloc: std.mem.Allocator, w: *db.Db, io: std.Io, def: queue.Queue
     if (name.len == 0 or referenced(col, new, name)) return;
     const payload = try std.json.Stringify.valueAlloc(alloc, Payload{ .collection = col.name, .collection_id = col.id, .record = rid, .filename = name }, .{});
     defer alloc.free(payload);
-    _ = try durable.enqueue(w, io, def, "file_cleanup", payload, @import("../clock.zig").nowUnix(io));
+    _ = try durable.enqueue(w, io, def, "file_cleanup", payload, .now);
 }
 
 pub fn jobHandler(ctx: *Ctx, payload: []const u8) !void {

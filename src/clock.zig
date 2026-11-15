@@ -18,7 +18,8 @@
 //! to `null` at compile time. It is impossible to freeze time on a prod build.
 //!
 //! ## Scope of what honors the override
-//! - The framework clock: `scheduler.unixNow` (job scheduling cadence / next-fire math).
+//! - The framework clock: `scheduler.unixNow` (cron next-fire math; scheduler delays run on
+//!   the monotonic boot clock and are not frozen).
 //! - The auth rate-limiter wall clock (`api/auth.wallNowUnix`).
 //! - SQL `now` the framework issues for its OWN logic: token `iat`/`exp` (`api/auth`,
 //!   `auth`), the auth-challenge TTL/expiry checks, the records keyset-cursor `now`.
@@ -107,13 +108,33 @@ pub fn resetForTest() void {
     Cache.value.store(unset_sentinel, .release);
 }
 
+/// TEST-ONLY simulated wall-clock step: seconds added to every `nowUnix` read, so a unit
+/// test can step the host wall clock forward or back mid-run (the frozen override still
+/// wins). Only the test binary carries it: outside `builtin.is_test`, `stepOffset` is
+/// `comptime 0` and the atomic is never touched.
+const Step = struct {
+    var offset: std.atomic.Value(i64) = std.atomic.Value(i64).init(0);
+};
+
+/// TEST-ONLY: step the simulated host wall clock to `seconds` away from the real one
+/// (0 restores it). Reset it with `defer clock.stepForTest(0)`.
+pub fn stepForTest(seconds: i64) void {
+    if (!builtin.is_test) @compileError("clock.stepForTest is test-only");
+    Step.offset.store(seconds, .release);
+}
+
+fn stepOffset() i64 {
+    if (!builtin.is_test) return 0;
+    return Step.offset.load(.acquire);
+}
+
 /// Wall-clock seconds, honoring the override. The framework clock (`scheduler.unixNow`)
 /// and the auth rate-limiter route through here. On a prod build / no override it is
 /// exactly `std.Io.Timestamp.now(io, .real)` truncated to seconds.
 pub fn nowUnix(io: std.Io) i64 {
     if (frozenUnix()) |v| return v;
     const ts = std.Io.Timestamp.now(io, .real);
-    return @intCast(@divTrunc(ts.nanoseconds, std.time.ns_per_s));
+    return @as(i64, @intCast(@divTrunc(ts.nanoseconds, std.time.ns_per_s))) + stepOffset();
 }
 
 /// Wall-clock seconds without a `std.Io`. `std.Options.logFn` receives no `io`, and a

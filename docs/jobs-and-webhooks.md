@@ -74,7 +74,8 @@ and the job is routed to the named queue's backend.
   per-worker poller. **At-least-once** — a crash after a side effect but before the row is marked
   done replays the job, so durable consumers must tolerate replays (idempotency keys are the
   antidote). A **reclaim sweep** resets jobs stranded by a crashed worker (claimed longer than
-  that queue's `visibility_timeout_s`), and a GC sweep reaps done/failed rows older than its
+  that queue's `visibility_timeout_s` on the queue clock: the database server's clock on
+  PostgreSQL, the host clock on SQLite), and a GC sweep reaps done/failed rows older than its
   `done_ttl_s` — **both are per-queue** (set `visibility_timeout_s` above the entire serial batch's
   runtime, or a long job gets reclaimed mid-flight and re-dispatched). The poller and GC jobs are
   installed **only when a durable queue is declared** — pure-memory and no-queue apps install

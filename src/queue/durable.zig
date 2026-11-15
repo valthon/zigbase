@@ -13,6 +13,7 @@ const clock = @import("../clock.zig");
 const id = @import("../id.zig");
 const events = @import("../events.zig");
 const queue = @import("queue.zig");
+const coordination = @import("../scheduler_coordination.zig");
 const App = @import("../app.zig").App;
 const Ctx = @import("../ctx.zig").Ctx;
 
@@ -31,15 +32,38 @@ fn prepareStatic(w: *db.Db, sql: [:0]const u8) !db.Stmt {
     return w.prepare(try @import("../sql/param_sink.zig").lowerStmtZ(scratch.allocator(), db.dbDialect(w), sql));
 }
 
+/// The clock durable claims are stamped, swept and scheduled against (unix seconds).
+/// On PostgreSQL it is the database server's clock (`databaseNow`), so instances on
+/// different hosts agree on claim age and readiness however far their own clocks
+/// drift or step. On SQLite (one local file, so one host) it is the host clock.
+pub fn queueNow(w: *db.Db, io: std.Io) !i64 {
+    if (db.dbDialect(w).kind == .postgres) return coordination.databaseNow(w);
+    return clock.nowUnix(io);
+}
+
 /// Bound on a single GC / reclaim batch so a large backlog never holds the writer
 /// for one long statement (mirrors `features_resolver.assignment_gc_batch`).
 pub const gc_batch: usize = 1000;
 
-/// Insert a `pending` durable job and return its generated id. `run_at` is the earliest
-/// unix-second the job may be claimed (pass `clock.nowUnix(io)` for immediate; a future
-/// value is the SCHEDULING primitive — `claimBatch` only claims `run_at <= now`, indexed).
-/// The writer must be held by the caller.
-pub fn enqueue(w: *db.Db, io: std.Io, def: QueueDef, kind: []const u8, payload: []const u8, run_at: i64) ![15]u8 {
+/// When an enqueued job first becomes claimable. A delay and an instant are kept apart
+/// because on PostgreSQL they land differently on the queue clock (`queueNow`): a delay
+/// is added to the database server's clock inside the INSERT, while an instant is stored
+/// as given and compared with that clock later. Neither depends on this host's clock
+/// agreeing with the server's. On SQLite both are host-clock seconds.
+pub const RunAt = union(enum) {
+    /// Seconds after the queue clock's current second (`0` = immediately).
+    delay_s: i64,
+    /// An absolute unix second.
+    at: i64,
+
+    /// Claimable immediately.
+    pub const now: RunAt = .{ .delay_s = 0 };
+};
+
+/// Insert a `pending` durable job and return its generated id. `run_at` is when it first
+/// becomes claimable (`.now` for immediate; a later time is the SCHEDULING primitive —
+/// `claimBatch` only claims `run_at <= now`, indexed). The writer must be held by the caller.
+pub fn enqueue(w: *db.Db, io: std.Io, def: QueueDef, kind: []const u8, payload: []const u8, run_at: RunAt) ![15]u8 {
     const limits = def.capacity orelse return enqueueUnchecked(w, io, def, kind, payload, run_at);
     try validateCapacity(limits);
     if (limits.max_payload_bytes) |bytes| if (payload.len > bytes) return error.QueueFull;
@@ -119,13 +143,26 @@ pub fn capacitySnapshot(w: *db.Db, def: QueueDef) !queue.CapacitySnapshot {
     return .{ .limits = limits, .retained_jobs = count, .exact = exact, .retained_payload_bytes = bytes, .full = count >= limits.max_jobs or (if (limits.max_payload_bytes) |limit| bytes == null or bytes.? >= limit else false) };
 }
 
-fn enqueueUnchecked(w: *db.Db, io: std.Io, def: QueueDef, kind: []const u8, payload: []const u8, run_at: i64) ![15]u8 {
-    const jid = id.collectionId(io);
-    var st = try prepareStatic(w,
+fn enqueueUnchecked(w: *db.Db, io: std.Io, def: QueueDef, kind: []const u8, payload: []const u8, run_at: RunAt) ![15]u8 {
+    const head =
         \\INSERT INTO "_queue_jobs"
         \\  ("id","queue","kind","payload","priority","max_attempts","run_at","status","created")
-        \\ VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', datetime('now'));
-    );
+        \\ VALUES (?1, ?2, ?3, ?4, ?5, ?6,
+    ;
+    const tail = ", 'pending', datetime('now'));";
+    // Claims compare `run_at` with `queueNow`. On PostgreSQL (unless the dev clock is
+    // frozen, which `queueNow` then returns) that is the server clock, so a delay is
+    // added to it in the INSERT itself: no extra round-trip, and no app-host clock.
+    const server_delay = run_at == .delay_s and db.dbDialect(w).kind == .postgres and clock.frozenUnix() == null;
+    const value: i64 = switch (run_at) {
+        .at => |t| t,
+        .delay_s => |d| if (server_delay) d else clock.nowUnix(io) +| d,
+    };
+    const jid = id.collectionId(io);
+    var st = try prepareStatic(w, if (server_delay)
+        head ++ " ?7 + floor(extract(epoch FROM clock_timestamp()))::bigint" ++ tail
+    else
+        head ++ " ?7" ++ tail);
     defer st.finalize();
     try st.bindText(1, &jid);
     try st.bindText(2, def.name);
@@ -133,7 +170,7 @@ fn enqueueUnchecked(w: *db.Db, io: std.Io, def: QueueDef, kind: []const u8, payl
     try st.bindText(4, payload);
     try st.bindInt(5, @intFromEnum(def.priority));
     try st.bindInt(6, @intCast(def.retry.max_attempts));
-    try st.bindInt(7, run_at);
+    try st.bindInt(7, value);
     _ = try st.step();
     return jid;
 }
@@ -428,7 +465,6 @@ pub fn pollOnce(app: *App, reg: *const Registry, worker: WorkerDef) !usize {
     if (admission) |state| if (!state.acquireJobBytes(0)) return 0;
     defer if (admission) |state| state.releaseJobBytes(0);
     const io = app.io;
-    const now = clock.nowUnix(io);
 
     // Restrict to this worker's DURABLE queues (memory queues are not polled).
     var poll_arena = std.heap.ArenaAllocator.init(app.allocator);
@@ -446,9 +482,13 @@ pub fn pollOnce(app: *App, reg: *const Registry, worker: WorkerDef) !usize {
     if (durable_qs.items.len == 0 and rated_qs.items.len == 0) return 0;
 
     var claimed_list: std.ArrayList(Claimed) = .empty;
+    // One reading of the queue clock stamps this batch's claims, ages other workers'
+    // claims for the sweep, and schedules any retry (see `queueNow`).
+    var now: i64 = undefined;
     {
         const w = app.pool.acquireWriter();
         defer app.pool.releaseWriter();
+        now = try queueNow(w, io);
         // Reclaim each durable queue with ITS OWN visibility timeout before claiming.
         for (durable_qs.items) |qn| {
             const vt = if (reg.queueByName(qn)) |q| q.visibility_timeout_s else 300;
@@ -521,6 +561,25 @@ pub fn pollOnce(app: *App, reg: *const Registry, worker: WorkerDef) !usize {
     return claimed.len;
 }
 
+/// The body of the framework's hourly `_queue_gc` job: for every durable queue, reclaim
+/// claims older than that queue's `visibility_timeout_s` and reap done/failed/canceled
+/// rows older than its `done_ttl_s`. Claim age is read on the queue clock (`queueNow`),
+/// the same clock `pollOnce` stamps claims with, so on PostgreSQL an instance whose own
+/// clock runs ahead cannot reset other instances' claims early (#491). A failing queue
+/// is logged and the sweep moves on to the next.
+pub fn gcSweep(app: *App, reg: *const Registry) !void {
+    const w = app.pool.acquireWriter();
+    defer app.pool.releaseWriter();
+    const now = try queueNow(w, app.io);
+    for (reg.queues) |q| {
+        if (q.backend != .durable) continue;
+        _ = reclaimStale(w, q.name, now, q.visibility_timeout_s) catch |e|
+            std.log.warn("_queue_gc: reclaim for '{s}' failed: {s}", .{ q.name, @errorName(e) });
+        _ = gcDoneJobs(w, q.name, q.done_ttl_s) catch |e|
+            std.log.warn("_queue_gc: GC for '{s}' failed: {s}", .{ q.name, @errorName(e) });
+    }
+}
+
 fn randomU64(io: std.Io) u64 {
     var b: [8]u8 = undefined;
     @import("../entropy.zig").fill(io, &b);
@@ -554,10 +613,10 @@ test "durable enqueue + claimBatch claims ready pending rows and marks them clai
     const io = testing.io;
 
     const def = QueueDef{ .name = "default", .backend = .durable };
-    _ = try enqueue(&d, io, def, "mail", "{\"a\":1}", clock.nowUnix(io));
-    _ = try enqueue(&d, io, def, "mail", "{\"a\":2}", clock.nowUnix(io));
+    _ = try enqueue(&d, io, def, "mail", "{\"a\":1}", .now);
+    _ = try enqueue(&d, io, def, "mail", "{\"a\":2}", .now);
     // A future row must NOT be claimed yet.
-    _ = try enqueue(&d, io, def, "mail", "{\"a\":3}", clock.nowUnix(io) + 3600);
+    _ = try enqueue(&d, io, def, "mail", "{\"a\":3}", .{ .delay_s = 3600 });
 
     // claimBatch returns an owned graph (contract-2), freed via freeClaimed — so it runs under the
     // raw leak-detecting allocator.
@@ -577,9 +636,9 @@ test "durable claimBatch drains queues in strict priority order" {
     const io = testing.io;
     const now = clock.nowUnix(io);
 
-    _ = try enqueue(&d, io, .{ .name = "low", .backend = .durable, .priority = .low }, "k", "lo", now);
-    _ = try enqueue(&d, io, .{ .name = "norm", .backend = .durable, .priority = .normal }, "k", "no", now);
-    _ = try enqueue(&d, io, .{ .name = "high", .backend = .durable, .priority = .high }, "k", "hi", now);
+    _ = try enqueue(&d, io, .{ .name = "low", .backend = .durable, .priority = .low }, "k", "lo", .{ .at = now });
+    _ = try enqueue(&d, io, .{ .name = "norm", .backend = .durable, .priority = .normal }, "k", "no", .{ .at = now });
+    _ = try enqueue(&d, io, .{ .name = "high", .backend = .durable, .priority = .high }, "k", "hi", .{ .at = now });
 
     const a = testing.allocator;
     const qs: []const []const u8 = &.{ "low", "norm", "high" };
@@ -603,7 +662,7 @@ test "shared rate window charges actual claims, respects changed limits and back
     const empty = try claimRateLimited(a, &d, "rated", "a", 3, 10, 100);
     defer freeClaimed(a, empty);
     try testing.expectEqual(@as(usize, 0), empty.len);
-    for (0..6) |_| _ = try enqueue(&d, testing.io, .{ .name = "rated", .backend = .durable }, "k", "{}", 0);
+    for (0..6) |_| _ = try enqueue(&d, testing.io, .{ .name = "rated", .backend = .durable }, "k", "{}", .{ .at = 0 });
     const first = try claimRateLimited(a, &d, "rated", "a", 3, 2, 100);
     defer freeClaimed(a, first);
     try testing.expectEqual(@as(usize, 2), first.len);
@@ -627,7 +686,7 @@ test "shared rate claim rolls back job mutations and budget on allocation failur
             var d = try db.Db.openMemory();
             defer d.close();
             try migrations.run(&d);
-            _ = try enqueue(&d, testing.io, .{ .name = "rated", .backend = .durable }, "k", "{}", 0);
+            _ = try enqueue(&d, testing.io, .{ .name = "rated", .backend = .durable }, "k", "{}", .{ .at = 0 });
             const claimed = claimRateLimited(a, &d, "rated", "a", 1, 10, 100) catch |e| {
                 try testing.expectEqual(@as(i64, 1), try countStatus(&d, "pending"));
                 // A fresh allocator must still be able to claim the entire budget
@@ -656,7 +715,7 @@ test "idle and exhausted rated polls never update the rate row" {
     defer freeClaimed(a, rollover);
     try testing.expectEqual(@as(usize, 0), rollover.len);
     try d.exec("DROP TRIGGER reject_idle_rate_write;");
-    _ = try enqueue(&d, testing.io, .{ .name = "rated", .backend = .durable }, "k", "{}", 0);
+    _ = try enqueue(&d, testing.io, .{ .name = "rated", .backend = .durable }, "k", "{}", .{ .at = 0 });
     const claimed = try claimRateLimited(a, &d, "rated", "a", 1, 1, 101);
     defer freeClaimed(a, claimed);
     try testing.expectEqual(@as(usize, 1), claimed.len);
@@ -671,13 +730,13 @@ test "reclaimed attempts may finish before re-claim but never override cancellat
     defer d.close();
     try migrations.run(&d);
     inline for (.{ Outcome.done, Outcome.retry, Outcome.failed }) |outcome| {
-        _ = try enqueue(&d, testing.io, .{ .name = "q", .backend = .durable }, "k", "{}", 0);
+        _ = try enqueue(&d, testing.io, .{ .name = "q", .backend = .durable }, "k", "{}", .{ .at = 0 });
         const jobs = try claimBatch(testing.allocator, &d, &.{"q"}, "worker", 1, 100);
         defer freeClaimed(testing.allocator, jobs);
         try testing.expectEqual(@as(usize, 1), try reclaimStale(&d, "q", 101, 1));
         try testing.expect(try finishClaim(&d, jobs[0], outcome, 1, 200, "late"));
         try d.exec("DELETE FROM _queue_jobs;");
-        const id_cancel = try enqueue(&d, testing.io, .{ .name = "q", .backend = .durable }, "k", "{}", 0);
+        const id_cancel = try enqueue(&d, testing.io, .{ .name = "q", .backend = .durable }, "k", "{}", .{ .at = 0 });
         const canceled = try claimBatch(testing.allocator, &d, &.{"q"}, "worker", 1, 100);
         defer freeClaimed(testing.allocator, canceled);
         _ = try reclaimStale(&d, "q", 101, 1);
@@ -692,7 +751,7 @@ test "expired queue attempts cannot overwrite a newer claim with any outcome" {
     var d = try db.Db.openMemory();
     defer d.close();
     try migrations.run(&d);
-    _ = try enqueue(&d, testing.io, .{ .name = "q", .backend = .durable }, "k", "{}", 0);
+    _ = try enqueue(&d, testing.io, .{ .name = "q", .backend = .durable }, "k", "{}", .{ .at = 0 });
     const first = try claimBatch(testing.allocator, &d, &.{"q"}, "same-worker", 1, 100);
     defer freeClaimed(testing.allocator, first);
     try testing.expectEqual(@as(usize, 1), try reclaimStale(&d, "q", 101, 1));
@@ -750,7 +809,7 @@ test "pg durable claims skip another connection's uncommitted claims" {
     if (!@import("build_options").postgres) return error.SkipZigTest;
     var env = try PgQueueTest.init();
     defer env.deinit();
-    for (0..2) |_| _ = try enqueue(&env.first, testing.io, .{ .name = "q", .backend = .durable }, "k", "{}", 0);
+    for (0..2) |_| _ = try enqueue(&env.first, testing.io, .{ .name = "q", .backend = .durable }, "k", "{}", .{ .at = 0 });
     try env.first.beginImmediate();
     defer env.first.rollback() catch |e| std.log.err("test rollback failed: {s}", .{@errorName(e)});
     const first = try claimBatch(testing.allocator, &env.first, &.{"q"}, "a", 1, 100);
@@ -768,7 +827,7 @@ test "pg concurrent rated claimers share one database rate ceiling" {
     if (!@import("build_options").postgres) return error.SkipZigTest;
     var env = try PgQueueTest.init();
     defer env.deinit();
-    for (0..10) |_| _ = try enqueue(&env.first, testing.io, .{ .name = "q", .backend = .durable }, "k", "{}", 0);
+    for (0..10) |_| _ = try enqueue(&env.first, testing.io, .{ .name = "q", .backend = .durable }, "k", "{}", .{ .at = 0 });
     const Runner = struct {
         conn: *db.Db,
         start: *std.atomic.Value(bool),
@@ -803,7 +862,7 @@ test "pg durable reclaim, fenced completion, cancellation and GC use backend-cor
     var env = try PgQueueTest.init();
     defer env.deinit();
     const q = QueueDef{ .name = "q", .backend = .durable };
-    _ = try enqueue(&env.first, testing.io, q, "k", "{}", 0);
+    _ = try enqueue(&env.first, testing.io, q, "k", "{}", .{ .at = 0 });
     const first = try claimBatch(testing.allocator, &env.first, &.{"q"}, "a", 1, 100);
     defer freeClaimed(testing.allocator, first);
     try testing.expectEqual(@as(usize, 1), try reclaimStale(&env.second, "q", 101, 1));
@@ -814,21 +873,164 @@ test "pg durable reclaim, fenced completion, cancellation and GC use backend-cor
     const third = try claimBatch(testing.allocator, &env.first, &.{"q"}, "a", 1, 102);
     defer freeClaimed(testing.allocator, third);
     try testing.expect(try finishClaim(&env.first, third[0], .failed, 2, 102, "failed"));
-    const canceled = try enqueue(&env.second, testing.io, q, "k", "{}", 0);
+    const canceled = try enqueue(&env.second, testing.io, q, "k", "{}", .{ .at = 0 });
     try testing.expect(try cancelJob(&env.second, &canceled));
     try testing.expect(!try cancelJob(&env.second, &canceled));
-    _ = try enqueue(&env.first, testing.io, q, "k", "{}", 0);
+    _ = try enqueue(&env.first, testing.io, q, "k", "{}", .{ .at = 0 });
     const late = try claimBatch(testing.allocator, &env.first, &.{"q"}, "a", 1, 103);
     defer freeClaimed(testing.allocator, late);
     _ = try reclaimStale(&env.second, "q", 104, 1);
     try testing.expect(try finishClaim(&env.first, late[0], .done, 0, 104, ""));
-    const cancel_late = try enqueue(&env.first, testing.io, q, "k", "{}", 0);
+    const cancel_late = try enqueue(&env.first, testing.io, q, "k", "{}", .{ .at = 0 });
     const interrupted = try claimBatch(testing.allocator, &env.first, &.{"q"}, "a", 1, 105);
     defer freeClaimed(testing.allocator, interrupted);
     _ = try reclaimStale(&env.second, "q", 106, 1);
     try testing.expect(try cancelJob(&env.second, &cancel_late));
     try testing.expect(!try finishClaim(&env.first, interrupted[0], .retry, 1, 107, ""));
     try testing.expectEqual(@as(usize, 4), try gcDoneJobs(&env.first, "q", 0));
+}
+
+/// `run_at` of the one `kind` job minus the PostgreSQL server clock right now.
+fn pgRunAtOffset(d: *db.Db, kind: []const u8) !i64 {
+    var st = try prepareStatic(d, "SELECT \"run_at\" - floor(extract(epoch FROM clock_timestamp()))::bigint FROM \"_queue_jobs\" WHERE \"kind\"=?1;");
+    defer st.finalize();
+    try st.bindText(1, kind);
+    if (!try st.step()) return error.MissingJob;
+    return st.columnInt(0);
+}
+
+test "pg durable enqueue keeps delays on the server clock and stores instants as given (#491)" {
+    if (!@import("build_options").postgres) return error.SkipZigTest;
+    // The frozen dev clock pins both clocks to one instant; this test needs them apart.
+    if (clock.frozenUnix() != null) return error.SkipZigTest;
+    var env = try PgQueueTest.init();
+    defer env.deinit();
+    defer clock.stepForTest(0);
+    const q = QueueDef{ .name = "q", .backend = .durable };
+
+    // The enqueuing host's clock runs an hour AHEAD of the database server.
+    clock.stepForTest(3600);
+    // "Now" and "in 90 s" are measured from the server clock, not the host's.
+    _ = try enqueue(&env.first, testing.io, q, "now", "{}", .now);
+    _ = try enqueue(&env.first, testing.io, q, "later", "{}", .{ .delay_s = 90 });
+    try testing.expect(@abs(try pgRunAtOffset(&env.first, "now")) <= 2);
+    try testing.expect(@abs(try pgRunAtOffset(&env.first, "later") - 90) <= 2);
+    // An absolute instant is stored unmodified (the host's offset is not applied to it).
+    const server_now = try coordination.databaseNow(&env.first);
+    _ = try enqueue(&env.first, testing.io, q, "at", "{}", .{ .at = server_now + 600 });
+    var st = try prepareStatic(&env.first, "SELECT \"run_at\" FROM \"_queue_jobs\" WHERE \"kind\"='at';");
+    defer st.finalize();
+    try testing.expect(try st.step());
+    try testing.expectEqual(server_now + 600, st.columnInt(0));
+}
+
+/// `pollOnce` / `gcSweep` against PostgreSQL: an `App` whose pool writer works in a
+/// private schema (`queues.first` and `queues.second` stand in for other instances).
+const PgPollEnv = struct {
+    queues: PgQueueTest,
+    url: [:0]u8,
+    pool: db.Pool,
+    app: App,
+
+    fn init() !*PgPollEnv {
+        const ga = testing.allocator;
+        const env = try ga.create(PgPollEnv);
+        errdefer ga.destroy(env);
+        env.queues = try PgQueueTest.init();
+        errdefer env.queues.deinit();
+        env.url = try ga.dupeZ(u8, @import("../backend/postgres/tests.zig").testUrl());
+        errdefer ga.free(env.url);
+        env.pool = try db.Pool.init(ga, testing.io, env.url);
+        errdefer env.pool.deinit();
+        {
+            const w = env.pool.acquireWriter();
+            defer env.pool.releaseWriter();
+            var buf: [128]u8 = undefined;
+            try w.exec(try std.fmt.bufPrintZ(&buf, "SET search_path TO \"zbq_{s}\";", .{env.queues.name}));
+        }
+        env.app = App{ .allocator = ga, .io = testing.io, .pool = &env.pool };
+        return env;
+    }
+
+    fn deinit(env: *PgPollEnv) void {
+        const ga = testing.allocator;
+        env.pool.deinit();
+        ga.free(env.url);
+        env.queues.deinit();
+        ga.destroy(env);
+    }
+};
+
+test "pg pollOnce ages, stamps and schedules claims on the server clock across host clock steps (#491)" {
+    if (!@import("build_options").postgres) return error.SkipZigTest;
+    if (clock.frozenUnix() != null) return error.SkipZigTest;
+    const env = try PgPollEnv.init();
+    defer env.deinit();
+    defer clock.stepForTest(0);
+    th_runs = 0;
+    th_fail_until = 100; // "flaky" always fails, so each poll schedules a retry
+    const reg = Registry{
+        .queues = &.{.{ .name = "q", .backend = .durable, .visibility_timeout_s = 300, .retry = .{ .max_attempts = 10, .base_ms = 0, .jitter = false } }},
+        .jobs = &.{ .{ .kind = "held", .handler = okHandler }, .{ .kind = "flaky", .handler = flakyHandler } },
+    };
+    const worker = WorkerDef{ .name = "b", .queues = &.{"q"}, .concurrency = 5 };
+    const other = &env.queues.first;
+
+    // Another instance claimed "held" 100 s ago on the server clock: inside the 300 s timeout.
+    _ = try enqueue(other, testing.io, reg.queues[0], "held", "{}", .{ .at = 0 });
+    const held = try claimBatch(testing.allocator, other, &.{"q"}, "a", 1, try coordination.databaseNow(other) - 100);
+    defer freeClaimed(testing.allocator, held);
+    try testing.expectEqual(@as(usize, 1), held.len);
+    _ = try enqueue(other, testing.io, reg.queues[0], "flaky", "{}", .now);
+
+    // This instance's host clock is stepped ten minutes AHEAD. Its poll must not reset
+    // the held claim (that would run "held" a second time while it is still running),
+    // and the retry it schedules for "flaky" (base_ms 0: due immediately) is stamped on
+    // the server clock, not ten minutes into the future.
+    clock.stepForTest(600);
+    try testing.expectEqual(@as(usize, 1), try pollOnce(&env.app, &reg, worker));
+    try testing.expectEqual(@as(usize, 1), th_runs);
+    try testing.expectEqual(@as(i64, 1), try countStatus(other, "claimed"));
+    try testing.expect(@abs(try pgRunAtOffset(other, "flaky")) <= 2);
+
+    // Now stepped ten minutes BEHIND, and the held claim really is 400 s old on the server
+    // clock. The poll reclaims and runs it, and the due retry is claimed too: a backward
+    // host step neither strands a crashed claim nor holds back due work.
+    try other.exec("UPDATE \"_queue_jobs\" SET \"claimed_at\" = \"claimed_at\" - 300 WHERE \"kind\"='held';");
+    clock.stepForTest(-600);
+    try testing.expectEqual(@as(usize, 2), try pollOnce(&env.app, &reg, worker));
+    try testing.expectEqual(@as(usize, 3), th_runs);
+    try testing.expectEqual(@as(i64, 0), try countStatus(other, "claimed"));
+    try testing.expect(@abs(try pgRunAtOffset(other, "flaky")) <= 2);
+}
+
+test "pg _queue_gc sweep ages claims on the server clock across host clock steps (#491)" {
+    if (!@import("build_options").postgres) return error.SkipZigTest;
+    if (clock.frozenUnix() != null) return error.SkipZigTest;
+    const env = try PgPollEnv.init();
+    defer env.deinit();
+    defer clock.stepForTest(0);
+    const reg = Registry{
+        .queues = &.{.{ .name = "q", .backend = .durable, .visibility_timeout_s = 300 }},
+        .jobs = &.{.{ .kind = "held", .handler = okHandler }},
+    };
+    const other = &env.queues.first;
+    _ = try enqueue(other, testing.io, reg.queues[0], "held", "{}", .{ .at = 0 });
+    const held = try claimBatch(testing.allocator, other, &.{"q"}, "a", 1, try coordination.databaseNow(other) - 100);
+    defer freeClaimed(testing.allocator, held);
+    try testing.expectEqual(@as(usize, 1), held.len);
+
+    // A sweep on a host stepped ten minutes ahead leaves the 100 s old claim alone.
+    clock.stepForTest(600);
+    try gcSweep(&env.app, &reg);
+    try testing.expectEqual(@as(i64, 1), try countStatus(other, "claimed"));
+    // A sweep on a host stepped ten minutes behind still resets a claim that is 400 s
+    // old on the server clock.
+    try other.exec("UPDATE \"_queue_jobs\" SET \"claimed_at\" = \"claimed_at\" - 300 WHERE \"kind\"='held';");
+    clock.stepForTest(-600);
+    try gcSweep(&env.app, &reg);
+    try testing.expectEqual(@as(i64, 0), try countStatus(other, "claimed"));
+    try testing.expectEqual(@as(i64, 1), try countStatus(other, "pending"));
 }
 
 test "durable reclaimStale honors the per-queue timeout and queue scope" {
@@ -859,7 +1061,7 @@ test "durable fenced retry and failure update attempts and state" {
     defer d.close();
     try migrations.run(&d);
     const io = testing.io;
-    _ = try enqueue(&d, io, .{ .name = "default", .backend = .durable }, "k", "p", clock.nowUnix(io));
+    _ = try enqueue(&d, io, .{ .name = "default", .backend = .durable }, "k", "p", .now);
     var idst = try d.prepare("SELECT id FROM \"_queue_jobs\" LIMIT 1;");
     _ = try idst.step();
     const jid = try testing.allocator.dupe(u8, idst.columnText(0));
@@ -911,7 +1113,7 @@ test "enqueue returns the persisted job id; a future run_at is not claimed until
     try migrations.run(&d);
     const io = testing.io;
     const def = QueueDef{ .name = "default", .backend = .durable };
-    const jid = try enqueue(&d, io, def, "k", "{}", 2_000_000); // due at t=2M
+    const jid = try enqueue(&d, io, def, "k", "{}", .{ .at = 2_000_000 }); // due at t=2M
     {
         var st = try d.prepare("SELECT \"status\" FROM \"_queue_jobs\" WHERE \"id\"=?1;");
         defer st.finalize();
@@ -935,7 +1137,7 @@ test "cancelJob: pending -> true; claimed/done/second-cancel -> false (changes()
     try migrations.run(&d);
     const io = testing.io;
     const def = QueueDef{ .name = "default", .backend = .durable };
-    const jid = try enqueue(&d, io, def, "k", "{}", clock.nowUnix(io) + 3600);
+    const jid = try enqueue(&d, io, def, "k", "{}", .{ .delay_s = 3600 });
     try testing.expect(try cancelJob(&d, &jid)); // pending -> canceled
     try testing.expect(!try cancelJob(&d, &jid)); // already canceled -> no match
     try testing.expect(!try cancelJob(&d, "nonexistent-id!")); // unknown -> no match
@@ -1028,7 +1230,7 @@ test "pollOnce: claim -> dispatch -> done (success)" {
     {
         const w = env.pool.acquireWriter();
         defer env.pool.releaseWriter();
-        _ = try enqueue(w, env.app.io, reg.queues[0], "ok", "{}", clock.nowUnix(env.app.io));
+        _ = try enqueue(w, env.app.io, reg.queues[0], "ok", "{}", .now);
     }
     const worker = WorkerDef{ .name = "w1", .queues = &.{"default"}, .concurrency = 5 };
     const n = try pollOnce(&env.app, &reg, worker);
@@ -1093,7 +1295,7 @@ test "pollOnce: retry then terminal failure fires .onError" {
     {
         const w = env.pool.acquireWriter();
         defer env.pool.releaseWriter();
-        _ = try enqueue(w, env.app.io, reg.queues[0], "flaky", "{}", clock.nowUnix(env.app.io));
+        _ = try enqueue(w, env.app.io, reg.queues[0], "flaky", "{}", .now);
     }
     const worker = WorkerDef{ .name = "w1", .queues = &.{"default"}, .concurrency = 5 };
 
@@ -1137,9 +1339,9 @@ test "pollOnce claims <= tokens on a rated queue while an unrated queue drains u
         const w = env.pool.acquireWriter();
         defer env.pool.releaseWriter();
         var i: usize = 0;
-        while (i < 3) : (i += 1) _ = try enqueue(w, env.app.io, reg.queues[0], "ok", "{}", clock.nowUnix(env.app.io));
+        while (i < 3) : (i += 1) _ = try enqueue(w, env.app.io, reg.queues[0], "ok", "{}", .now);
         i = 0;
-        while (i < 5) : (i += 1) _ = try enqueue(w, env.app.io, reg.queues[1], "ok", "{}", clock.nowUnix(env.app.io));
+        while (i < 5) : (i += 1) _ = try enqueue(w, env.app.io, reg.queues[1], "ok", "{}", .now);
     }
     const worker = WorkerDef{ .name = "w1", .queues = &.{ "fast", "slow" }, .concurrency = 10 };
     // Tick 1: all 3 unrated + only 2 rated (the 1s burst).
@@ -1159,31 +1361,31 @@ test "durable capacity retains retries cancellations and terminal history until 
     defer d.close();
     try migrations.run(&d);
     const def = QueueDef{ .name = "bounded", .backend = .durable, .capacity = .{ .max_jobs = 2, .max_payload_bytes = 5 } };
-    const first = try enqueue(&d, testing.io, def, "k", "é", 0); // two UTF-8 bytes
-    _ = try enqueue(&d, testing.io, def, "k", "abc", 0);
+    const first = try enqueue(&d, testing.io, def, "k", "é", .{ .at = 0 }); // two UTF-8 bytes
+    _ = try enqueue(&d, testing.io, def, "k", "abc", .{ .at = 0 });
     const snap = try capacitySnapshot(&d, def);
     try testing.expectEqual(@as(u64, 2), snap.retained_jobs);
     try testing.expectEqual(@as(?u64, 5), snap.retained_payload_bytes);
     try testing.expect(snap.full and snap.exact);
-    try testing.expectError(error.QueueFull, enqueue(&d, testing.io, def, "k", "x", 0));
+    try testing.expectError(error.QueueFull, enqueue(&d, testing.io, def, "k", "x", .{ .at = 0 }));
     try testing.expect(!d.inTransaction());
     try testing.expect(try cancelJob(&d, &first));
     const claims = try claimBatch(testing.allocator, &d, &.{def.name}, "worker", 1, 0);
     defer freeClaimed(testing.allocator, claims);
     try testing.expect(try finishClaim(&d, claims[0], .retry, 1, 0, "retry"));
-    try testing.expectError(error.QueueFull, enqueue(&d, testing.io, def, "k", "x", 0));
+    try testing.expectError(error.QueueFull, enqueue(&d, testing.io, def, "k", "x", .{ .at = 0 }));
     const retry = try claimBatch(testing.allocator, &d, &.{def.name}, "worker", 1, 0);
     defer freeClaimed(testing.allocator, retry);
     try testing.expect(try finishClaim(&d, retry[0], .failed, 2, 0, "failed"));
     try testing.expectEqual(@as(?u64, 5), (try capacitySnapshot(&d, def)).retained_payload_bytes);
     try d.exec("UPDATE _queue_jobs SET created='2000-01-01';");
     try testing.expectEqual(@as(usize, 2), try gcDoneJobs(&d, def.name, 1));
-    _ = try enqueue(&d, testing.io, def, "k", "fresh", 0);
+    _ = try enqueue(&d, testing.io, def, "k", "fresh", .{ .at = 0 });
     // Bytes alone reject before the independent count ceiling is reached.
-    try testing.expectError(error.QueueFull, enqueue(&d, testing.io, def, "k", "x", 0));
+    try testing.expectError(error.QueueFull, enqueue(&d, testing.io, def, "k", "x", .{ .at = 0 }));
     try testing.expectEqual(@as(u64, 1), (try capacitySnapshot(&d, def)).retained_jobs);
     // Empty payloads spend a row but no bytes, even at the exact byte ceiling.
-    _ = try enqueue(&d, testing.io, def, "k", "", 0);
+    _ = try enqueue(&d, testing.io, def, "k", "", .{ .at = 0 });
     try testing.expectEqual(@as(u64, 2), (try capacitySnapshot(&d, def)).retained_jobs);
 }
 
@@ -1193,20 +1395,20 @@ test "durable capacity composes with rollback and bounds shrunken legacy snapsho
     try migrations.run(&d);
     const def = QueueDef{ .name = "bound", .backend = .durable, .capacity = .{ .max_jobs = 1 } };
     try d.beginImmediate();
-    _ = try enqueue(&d, testing.io, def, "k", "x", 0);
-    try testing.expectError(error.QueueFull, enqueue(&d, testing.io, def, "k", "y", 0));
+    _ = try enqueue(&d, testing.io, def, "k", "x", .{ .at = 0 });
+    try testing.expectError(error.QueueFull, enqueue(&d, testing.io, def, "k", "y", .{ .at = 0 }));
     try testing.expect(d.inTransaction());
     try d.rollback();
     try testing.expectEqual(@as(u64, 0), (try capacitySnapshot(&d, def)).retained_jobs);
     const unlimited = QueueDef{ .name = def.name, .backend = .durable };
-    for (0..4) |_| _ = try enqueue(&d, testing.io, unlimited, "k", "legacy", 0);
+    for (0..4) |_| _ = try enqueue(&d, testing.io, unlimited, "k", "legacy", .{ .at = 0 });
     const over = try capacitySnapshot(&d, def);
     try testing.expectEqual(@as(u64, 2), over.retained_jobs);
     try testing.expect(!over.exact and over.full);
     try testing.expectEqual(null, over.retained_payload_bytes);
-    try testing.expectError(error.QueueFull, enqueue(&d, testing.io, def, "k", "", 0));
+    try testing.expectError(error.QueueFull, enqueue(&d, testing.io, def, "k", "", .{ .at = 0 }));
     const separate = QueueDef{ .name = "other", .backend = .durable, .capacity = def.capacity };
-    _ = try enqueue(&d, testing.io, separate, "k", "other", 0);
+    _ = try enqueue(&d, testing.io, separate, "k", "other", .{ .at = 0 });
 }
 
 test "durable shared process permit prevents claims then recovers without spending attempts" {
@@ -1220,7 +1422,7 @@ test "durable shared process permit prevents claims then recovers without spendi
     {
         const w = env.pool.acquireWriter();
         defer env.pool.releaseWriter();
-        _ = try enqueue(w, testing.io, reg.queues[0], "ok", "{}", 0);
+        _ = try enqueue(w, testing.io, reg.queues[0], "ok", "{}", .{ .at = 0 });
     }
     try testing.expect(state.acquire());
     try testing.expectEqual(@as(usize, 0), try pollOnce(&env.app, &reg, worker));
@@ -1244,34 +1446,34 @@ test "pg durable capacity coordinates replicas and rejects stale caller snapshot
     defer env.deinit();
     const def = QueueDef{ .name = "bounded", .backend = .durable, .capacity = .{ .max_jobs = 1, .max_payload_bytes = 4 } };
     try env.first.beginImmediate();
-    _ = try enqueue(&env.first, testing.io, def, "k", "éé", 0);
+    _ = try enqueue(&env.first, testing.io, def, "k", "éé", .{ .at = 0 });
     // The first enqueue returned but its caller transaction still owns the lock.
-    try testing.expectError(error.QueueAdmissionBusy, enqueue(&env.second, testing.io, def, "k", "x", 0));
+    try testing.expectError(error.QueueAdmissionBusy, enqueue(&env.second, testing.io, def, "k", "x", .{ .at = 0 }));
     try testing.expect(!env.second.inTransaction());
     try env.first.commit();
-    try testing.expectError(error.QueueFull, enqueue(&env.second, testing.io, def, "k", "x", 0));
+    try testing.expectError(error.QueueFull, enqueue(&env.second, testing.io, def, "k", "x", .{ .at = 0 }));
     try testing.expectEqual(@as(?u64, 4), (try capacitySnapshot(&env.second, def)).retained_payload_bytes);
     try env.first.exec("DELETE FROM _queue_jobs;");
     try env.second.exec("BEGIN ISOLATION LEVEL REPEATABLE READ;");
-    try testing.expectError(error.QueueCapacityIsolation, enqueue(&env.second, testing.io, def, "k", "x", 0));
+    try testing.expectError(error.QueueCapacityIsolation, enqueue(&env.second, testing.io, def, "k", "x", .{ .at = 0 }));
     try testing.expect(env.second.inTransaction());
     try env.second.rollback();
     // Standalone admission uses fresh READ COMMITTED even when the connection default differs.
     try env.second.exec("SET default_transaction_isolation='repeatable read';");
-    _ = try enqueue(&env.second, testing.io, def, "k", "x", 0);
+    _ = try enqueue(&env.second, testing.io, def, "k", "x", .{ .at = 0 });
     try env.first.exec("DELETE FROM _queue_jobs;");
     try env.first.beginImmediate();
-    _ = try enqueue(&env.first, testing.io, def, "k", "x", 0);
+    _ = try enqueue(&env.first, testing.io, def, "k", "x", .{ .at = 0 });
     try env.first.rollback();
-    _ = try enqueue(&env.second, testing.io, def, "k", "free", 0);
+    _ = try enqueue(&env.second, testing.io, def, "k", "free", .{ .at = 0 });
     const claims = try claimBatch(testing.allocator, &env.second, &.{def.name}, "dead-worker", 1, 1);
     defer freeClaimed(testing.allocator, claims);
     try testing.expectEqual(@as(usize, 1), try reclaimStale(&env.first, def.name, 3, 1));
-    try testing.expectError(error.QueueFull, enqueue(&env.first, testing.io, def, "k", "x", 0));
+    try testing.expectError(error.QueueFull, enqueue(&env.first, testing.io, def, "k", "x", .{ .at = 0 }));
     try testing.expect(try cancelJob(&env.first, claims[0].id));
     try env.first.exec("UPDATE _queue_jobs SET created='2000-01-01';");
     try testing.expectEqual(@as(usize, 1), try gcDoneJobs(&env.first, def.name, 1));
-    _ = try enqueue(&env.second, testing.io, def, "k", "free", 0);
+    _ = try enqueue(&env.second, testing.io, def, "k", "free", .{ .at = 0 });
 }
 
 test "durable capacity serializes independent SQLite producers and survives reopen" {
@@ -1290,7 +1492,7 @@ test "durable capacity serializes independent SQLite producers and survives reop
                 _ = failures.fetchAdd(1, .monotonic);
                 return;
             };
-            _ = enqueue(&conn, testing.io, def, "k", "xx", 0) catch |err| {
+            _ = enqueue(&conn, testing.io, def, "k", "xx", .{ .at = 0 }) catch |err| {
                 if (err != error.QueueFull) _ = failures.fetchAdd(1, .monotonic);
                 return;
             };
@@ -1315,7 +1517,7 @@ test "durable capacity serializes independent SQLite producers and survives reop
     const snapshot = try capacitySnapshot(&reopened, S.def);
     try testing.expectEqual(@as(u64, 3), snapshot.retained_jobs);
     try testing.expectEqual(@as(?u64, 6), snapshot.retained_payload_bytes);
-    try testing.expectError(error.QueueFull, enqueue(&reopened, testing.io, S.def, "k", "x", 0));
+    try testing.expectError(error.QueueFull, enqueue(&reopened, testing.io, S.def, "k", "x", .{ .at = 0 }));
 }
 
 test "workbench isolates consecutive durable attempts from claim and acknowledgement SQL" {
@@ -1343,8 +1545,8 @@ test "workbench isolates consecutive durable attempts from claim and acknowledge
     {
         const writer = env.pool.acquireWriter();
         defer env.pool.releaseWriter();
-        _ = try enqueue(writer, env.app.io, reg.queues[0], "fails", "fail", clock.nowUnix(env.app.io));
-        _ = try enqueue(writer, env.app.io, reg.queues[0], "succeeds", "private payload", clock.nowUnix(env.app.io));
+        _ = try enqueue(writer, env.app.io, reg.queues[0], "fails", "fail", .now);
+        _ = try enqueue(writer, env.app.io, reg.queues[0], "succeeds", "private payload", .now);
     }
     try testing.expectEqual(@as(usize, 2), try pollOnce(&env.app, &reg, .{ .name = "w", .queues = &.{"default"}, .concurrency = 2 }));
     try testing.expectEqual(@as(usize, 2), store.route_count);
