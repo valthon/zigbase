@@ -124,3 +124,31 @@ def test_tenant_stamp_preserves_original_request_data_on_first_attempt_and_repla
     assert created[0] == 201 and created[1]["account"] == "accountA", created
     assert call(base, "POST", path, body, token, headers) == created
     assert len(call(base, "GET", path, token=admin)[1]["items"]) == 1
+
+
+def test_idempotent_delete_journals_fk_cascade_once(app):
+    """#489: a parent delete sent with an Idempotency-Key journals each FK-cascaded delete and SET
+    NULL update in the same transaction as its receipt; a retry replays the receipt and journals
+    nothing more."""
+    base, _ = app
+    admin, token, _, posts = setup(base)
+    public = {"listRule": "@public", "viewRule": "@public"}
+    for name, cascade in (("comments", True), ("drafts", False)):
+        code, col = call(base, "POST", "/api/collections", {"name": name, "type": "base", **public, "fields": [
+            {"id": "", "name": "post", "type": "relation",
+             "options": {"targetCollectionId": posts["id"], "cascadeDelete": cascade, "maxSelect": 1}}]}, admin)
+        assert code == 201, col
+    code, post = call(base, "POST", "/api/collections/posts/records", {"title": "parent"}, admin)
+    assert code == 201, post
+    comment = call(base, "POST", "/api/collections/comments/records", {"post": post["id"]}, admin)[1]["id"]
+    draft = call(base, "POST", "/api/collections/drafts/records", {"post": post["id"]}, admin)[1]["id"]
+    checkpoints = {topic: backfill(base, topic=topic)[1]["nextCursor"] for topic in ("comments", "drafts")}
+    headers = {"Idempotency-Key": "cascade-delete"}
+    first = call(base, "DELETE", "/api/collections/posts/records/" + post["id"], None, token, headers)
+    assert first[0] == 204, first
+    assert call(base, "DELETE", "/api/collections/posts/records/" + post["id"], None, token, headers) == first
+    for topic, action, rid in (("comments", "delete", comment), ("drafts", "update", draft)):
+        code, events = backfill(base, checkpoints[topic], topic=topic)
+        assert code == 200 and events["items"] == [{"type": "event", "topic": topic, "action": action, "record": {"id": rid}}], events
+    assert call(base, "GET", "/api/collections/comments/records/" + comment, token=admin)[0] == 404
+    assert call(base, "GET", "/api/collections/drafts/records/" + draft, token=admin)[1]["post"] is None

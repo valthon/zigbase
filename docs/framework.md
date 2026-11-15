@@ -302,7 +302,10 @@ by collection name, plus an optional `any` wildcard group:
 The six valid phase fields are `beforeCreate`, `afterCreate`, `beforeUpdate`,
 `afterUpdate`, `beforeDelete`, `afterDelete`. Within a triggered write, the
 `any` group runs first, then the collection-specific group; only the field
-matching the current phase runs.
+matching the current phase runs. Hooks run only for the record a write names: records the
+database deletes or clears through a relation's foreign key when their parent is deleted
+run no hooks (realtime still announces them; see
+[deleting a referenced record](fields.md#deleting-a-referenced-record)).
 
 On HTTP record create, update, and delete, a before-hook can return
 `ctx.fail(status, message)` to reject the write with a **supported error**

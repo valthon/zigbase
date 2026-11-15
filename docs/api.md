@@ -1524,9 +1524,16 @@ and fresh random nonces; they bind collection identity and rename generation
 without exposing other collections' aggregate write positions.
 
 Built-in REST record create, update and delete operations append invalidations
-**inside the record transaction**, including resumable record updates. A journal
-failure rolls back the mutation; an oversized delete snapshot also rejects the
-mutation. Response serialization, after-hooks and live transport run after commit,
+**inside the record transaction**, including resumable record updates. A REST
+delete, with or without an `Idempotency-Key`, also appends a `delete` invalidation for
+every record its foreign keys cascade-deleted and an `update` invalidation for every record
+whose relation they set to `null`
+([deleting a referenced record](fields.md#deleting-a-referenced-record)). A journal
+failure rolls back the mutation; an oversized delete snapshot of the record the request
+names also rejects the mutation. A cascaded record never fails the delete: when the journal
+cannot hold the cascade entry by entry (more than 1000 affected rows, a cascaded row that
+cannot be decoded, or a cascaded snapshot over the frame budget), the journal is reset in the
+same transaction and every earlier checkpoint answers `resetRequired`. Response serialization, after-hooks and live transport run after commit,
 so failure there does not remove the committed invalidation. Create/update entries
 retain only record IDs. Deletes retain private at-rest authorization snapshots;
 replay never returns these snapshots or historical field values.
@@ -1571,7 +1578,9 @@ invalidations are still required; WS/SSE messages do not carry journal cursors.
 
 Enable this option on **every writer** in the deployment. Writes from older or
 non-enabled binaries, raw SQL, migrations, the `Data` facade, hook side-writes,
-authentication helpers and custom channels are outside this journal's REST scope.
+authentication helpers and custom channels are outside this journal's REST scope, as are
+the foreign-key cascades and `SET NULL` updates of deletes made outside the REST delete
+(the `Data` facade, raw SQL, migrations, TTL expiry).
 Changing capture coverage requires clients to discard checkpoints and reload;
 the journal cannot detect writes performed by code that bypasses it. This is durable
 REST invalidation recovery, not exactly-once delivery or an audit/event-sourcing log.
@@ -1778,6 +1787,14 @@ SQLite semantics (for example,
 both. A `viewRule` that traverses a relation (`owner.team = …`) cannot be evaluated against the
 snapshot, because the related records are not part of it; such a delete is not delivered to that
 subscriber.
+A REST delete also publishes the rows the database changed through foreign keys: a `delete`
+event for each record removed by a relation's `cascadeDelete`, authorized per subscriber against
+that record's snapshot like any delete, and an `update` event with the record as stored for each
+record whose relation was set to `null`. No record hooks run for those rows, so the `update`
+record is not shaped by `afterUpdate` hooks. A delete discovering more than 1000 distinct
+collection/record candidates, or encountering a composite or alternate-key foreign key,
+publishes no per-row events and invalidates backfill (and resets the durable journal when
+enabled); see [deleting a referenced record](fields.md#deleting-a-referenced-record).
 Existing WebSocket and SSE sessions are reverified before subscriptions and delivery.
 New two-factor requirements and session revocation therefore stop private delivery
 without waiting for the original token to expire; send a fresh `auth` frame after

@@ -70,30 +70,59 @@ pub fn initialize(a: std.mem.Allocator, io: std.Io, conn: *db.Db) !void {
 }
 
 pub fn capture(a: std.mem.Allocator, io: std.Io, conn: *db.Db, col: schema.Collection, action: protocol.Action, id: []const u8, snapshot: ?std.json.Value) !void {
-    var record: std.json.ObjectMap = .empty;
-    defer record.deinit(a);
-    try record.put(a, "id", .{ .string = id });
-    if (action == .delete) try record.put(a, @import("hub.zig").delete_snapshot_key, snapshot orelse return error.MissingDeleteSnapshot);
-    const frame = try protocol.serializeEvent(a, col.name, action, .{ .object = record });
+    const frame = try eventFrame(a, col, action, id, snapshot);
     defer a.free(frame);
     try append(a, conn, col.id, frame, @import("../clock.zig").nowUnix(io));
 }
 
+/// The retained frame for one invalidation: `{id}` (create/update) or `{id, <private delete
+/// snapshot>}` (delete, which requires `snapshot`). Owned by the caller (`a`).
+pub fn eventFrame(a: std.mem.Allocator, col: schema.Collection, action: protocol.Action, id: []const u8, snapshot: ?std.json.Value) ![]u8 {
+    var record: std.json.ObjectMap = .empty;
+    defer record.deinit(a);
+    try record.put(a, "id", .{ .string = id });
+    if (action == .delete) try record.put(a, @import("hub.zig").delete_snapshot_key, snapshot orelse return error.MissingDeleteSnapshot);
+    return protocol.serializeEvent(a, col.name, action, .{ .object = record });
+}
+
+/// One entry of `appendMany`: the collection id it is retained under and its frame.
+pub const Pending = struct { collection: []const u8, frame: []const u8 };
+
 /// Caller owns transaction. The metadata row lock is held through its commit,
 /// so another process cannot allocate a visible position ahead of this write.
 pub fn append(a: std.mem.Allocator, conn: *db.Db, collection: []const u8, frame: []const u8, now: i64) !void {
+    return appendMany(a, conn, &.{.{ .collection = collection, .frame = frame }}, now);
+}
+
+/// `append` for several entries, retained in order at consecutive positions. The sequence
+/// allocation, expiry and budget passes run ONCE for the batch instead of once per entry (#489:
+/// a delete's foreign-key cascade journals one entry per affected row). Every frame is checked
+/// against `max_frame_bytes` before anything is written.
+pub fn appendMany(a: std.mem.Allocator, conn: *db.Db, entries: []const Pending, now: i64) !void {
     if (!conn.inTransaction()) return error.TransactionRequired;
-    if (frame.len > max_frame_bytes) return error.ReplayFrameTooLarge;
+    if (entries.len == 0) return;
+    for (entries) |e| if (e.frame.len > max_frame_bytes) return error.ReplayFrameTooLarge;
     if (now < 0 or now > @as(i64, std.math.maxInt(i64)) - retention_seconds) return error.InvalidTime;
-    try execute(a, conn, "UPDATE journal._replay_state SET sequence=sequence+1 WHERE id=1 AND sequence<9223372036854775807;");
+    const n: i64 = @intCast(entries.len);
+    {
+        var bump = try prep(a, conn, "UPDATE journal._replay_state SET sequence=sequence+?1 WHERE id=1 AND sequence<=9223372036854775807-?1;");
+        defer bump.finalize();
+        try bump.bindInt(1, n);
+        _ = try bump.step();
+    }
     if (conn.changesCount() != 1) return error.ReplaySequenceExhausted;
-    var insert = try prep(a, conn, "INSERT INTO journal._replay_events SELECT sequence,?1,?2,?3,?4 FROM journal._replay_state WHERE id=1;");
+    // `sequence` is now the LAST allocated position; entry i takes sequence-(n-1-i).
+    var insert = try prep(a, conn, "INSERT INTO journal._replay_events SELECT sequence-?5,?1,?2,?3,?4 FROM journal._replay_state WHERE id=1;");
     defer insert.finalize();
-    try insert.bindText(1, collection);
-    try insert.bindText(2, frame);
-    try insert.bindInt(3, @intCast(frame.len));
-    try insert.bindInt(4, now + retention_seconds);
-    _ = try insert.step();
+    for (entries, 0..) |e, i| {
+        try insert.bindText(1, e.collection);
+        try insert.bindText(2, e.frame);
+        try insert.bindInt(3, @intCast(e.frame.len));
+        try insert.bindInt(4, now + retention_seconds);
+        try insert.bindInt(5, n - 1 - @as(i64, @intCast(i)));
+        _ = try insert.step();
+        insert.reset();
+    }
     // Bound work by the fixed journal ceiling, independent of application size.
     // Expiry follows the sequence prefix even if server clocks move backwards.
     var expired = try prep(a, conn, "UPDATE journal._replay_state SET floor=COALESCE((SELECT MAX(sequence) FROM journal._replay_events WHERE expires<=?1),floor) WHERE id=1;");
@@ -108,6 +137,19 @@ pub fn append(a: std.mem.Allocator, conn: *db.Db, collection: []const u8, frame:
     try budget.bindInt(1, max_entries);
     try budget.bindInt(2, max_bytes);
     _ = try budget.step();
+    try execute(a, conn, "DELETE FROM journal._replay_events WHERE sequence<=(SELECT floor FROM journal._replay_state WHERE id=1);");
+}
+
+/// Caller owns transaction. Discard the whole journal and move the floor past every position
+/// issued so far, so EVERY existing cursor (all collections) answers `409 resetRequired` while
+/// a checkpoint taken after this commit stays usable. This is the journal's degraded form for a
+/// write it cannot record entry by entry (#489: a cascade above the announcement cap, or a
+/// cascaded row whose snapshot is unreadable or larger than `max_frame_bytes`).
+pub fn requireReset(a: std.mem.Allocator, conn: *db.Db) !void {
+    if (!conn.inTransaction()) return error.TransactionRequired;
+    // The right-hand sides read the row's old values: both columns become old sequence + 1.
+    try execute(a, conn, "UPDATE journal._replay_state SET sequence=sequence+1, floor=sequence+1 WHERE id=1 AND sequence<9223372036854775807;");
+    if (conn.changesCount() != 1) return error.ReplaySequenceExhausted;
     try execute(a, conn, "DELETE FROM journal._replay_events WHERE sequence<=(SELECT floor FROM journal._replay_state WHERE id=1);");
 }
 
@@ -250,6 +292,40 @@ fn exercise(conn: *db.Db) !void {
     _ = try size.step();
     try std.testing.expect(size.columnInt(0) <= max_entries);
     try std.testing.expect(size.columnInt(1) <= max_bytes);
+
+    // #489: a batch is retained in order at consecutive positions; one frame over the budget
+    // rejects the whole batch before anything is written.
+    const head = try page(arena, conn, "batch", null, 1, 100);
+    try conn.beginImmediate();
+    try std.testing.expectError(error.ReplayFrameTooLarge, appendMany(a, conn, &.{ .{ .collection = "batch", .frame = "b0" }, .{ .collection = "batch", .frame = oversized } }, 100));
+    try conn.rollback();
+    try conn.beginImmediate();
+    try appendMany(a, conn, &.{ .{ .collection = "batch", .frame = "b1" }, .{ .collection = "other", .frame = "o1" }, .{ .collection = "batch", .frame = "b2" } }, 100);
+    try conn.commit();
+    const batch = try page(arena, conn, "batch", head.position, 4, 100);
+    try std.testing.expectEqual(@as(usize, 2), batch.items.len);
+    try std.testing.expectEqualStrings("b1", batch.items[0].frame);
+    try std.testing.expectEqualStrings("b2", batch.items[1].frame);
+    const other_head = try page(arena, conn, "other", null, 1, 100);
+    // requireReset: every existing cursor of every collection — including caught-up ones —
+    // must reset, while a checkpoint taken afterwards keeps working.
+    try conn.beginImmediate();
+    try requireReset(a, conn);
+    try conn.commit();
+    try std.testing.expectError(error.ResetRequired, page(arena, conn, "batch", head.position, 4, 100));
+    try std.testing.expectError(error.ResetRequired, page(arena, conn, "batch", batch.position, 4, 100));
+    try std.testing.expectError(error.ResetRequired, page(arena, conn, "other", other_head.position, 4, 100));
+    const after = try page(arena, conn, "batch", null, 1, 100);
+    try conn.beginImmediate();
+    try append(a, conn, "batch", "b3", 100);
+    try conn.commit();
+    const resumed = try page(arena, conn, "batch", after.position, 4, 100);
+    try std.testing.expectEqual(@as(usize, 1), resumed.items.len);
+    try std.testing.expectEqualStrings("b3", resumed.items[0].frame);
+    var remaining = try prep(a, conn, "SELECT COUNT(*) FROM journal._replay_events;");
+    defer remaining.finalize();
+    _ = try remaining.step();
+    try std.testing.expectEqual(@as(i64, 1), remaining.columnInt(0));
 }
 
 test "pg journal isolates schema and serializes visibility across connections" {

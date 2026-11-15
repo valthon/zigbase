@@ -307,3 +307,68 @@ def test_retained_delete_on_relation_collection_is_authorized_per_item(server):
     authorized per item: hidden from callers who could not view the row, delivered to its owner."""
     token, _ = setup(server)
     relation_delete_scenario(server, token)
+
+
+def cascade_owner_scenario(server, token, suffix=""):
+    """#489 scenario, shared with the durable-journal suite (SQLite and PostgreSQL). Alice and Bob
+    each own a row that cascades from one project and a row whose project relation the database
+    sets to null. A superuser deletes the project; each user's replay holds the delete and the
+    update for their own rows only, id-only. `suffix` keeps names unique on a shared database."""
+    users_name, projects_name = "users" + suffix, "projects" + suffix
+    owned_name, assigned_name = "owned" + suffix, "assigned" + suffix
+    status, users = call(server, "POST", "/api/collections", {"name": users_name, "type": "auth", "fields": []}, token)
+    assert status == 201, users
+    status, projects = call(server, "POST", "/api/collections", {"name": projects_name, "type": "base", "fields": []}, token)
+    assert status == 201, projects
+    rule = "owner = @request.auth.id"
+    for name, cascade in ((owned_name, True), (assigned_name, False)):
+        status, col = call(server, "POST", "/api/collections", {
+            "name": name, "type": "base", "listRule": rule, "viewRule": rule,
+            "fields": [{"id": "", "name": "label", "type": "text", "options": {}},
+                       {"id": "", "name": "owner", "type": "relation", "options": {"targetCollectionId": users["id"], "maxSelect": 1}},
+                       {"id": "", "name": "project", "type": "relation",
+                        "options": {"targetCollectionId": projects["id"], "cascadeDelete": cascade, "maxSelect": 1}}],
+        }, token)
+        assert status == 201, col
+    status, project = call(server, "POST", f"/api/collections/{projects_name}/records", {}, token)
+    assert status == 201, project
+    sessions, rows = {}, {}
+    for name in ("alice", "bob"):
+        email = f"cascade-{name}{suffix}@x.io"
+        status, user = call(server, "POST", f"/api/collections/{users_name}/records", {"email": email, "password": name + "password"}, token)
+        assert status == 201, user
+        status, auth = call(server, "POST", f"/api/collections/{users_name}/auth-with-password", {"identity": email, "password": name + "password"})
+        assert status == 200, auth
+        sessions[name] = auth["token"]
+        for topic in (owned_name, assigned_name):
+            status, row = call(server, "POST", f"/api/collections/{topic}/records",
+                               {"label": name + "-secret", "owner": user["id"], "project": project["id"]}, token)
+            assert status == 201, row
+            rows[(name, topic)] = row["id"]
+    checkpoints = {}
+    for name in ("alice", "bob"):
+        for topic in (owned_name, assigned_name):
+            status, checkpoint = backfill(server, token=sessions[name], topic=topic)
+            assert status == 200, checkpoint
+            checkpoints[(name, topic)] = checkpoint["nextCursor"]
+
+    assert call(server, "DELETE", f"/api/collections/{projects_name}/records/{project['id']}", token=token)[0] == 204
+
+    for name in ("alice", "bob"):
+        for topic, action in ((owned_name, "delete"), (assigned_name, "update")):
+            for _ in range(2):  # a retry of the same checkpoint answers the same
+                status, page = backfill(server, checkpoints[(name, topic)], token=sessions[name], topic=topic)
+                assert status == 200, page
+                assert page["items"] == [{"type": "event", "topic": topic, "action": action, "record": {"id": rows[(name, topic)]}}], (name, page)
+                assert "secret" not in json.dumps(page)
+    # The database did both actions; the nulled relation reads back as null.
+    assert call(server, "GET", f"/api/collections/{owned_name}/records/{rows[('alice', owned_name)]}", token=token)[0] == 404
+    status, kept = call(server, "GET", f"/api/collections/{assigned_name}/records/{rows[('alice', assigned_name)]}", token=token)
+    assert status == 200 and kept["project"] is None and kept["label"] == "alice-secret", kept
+
+
+def test_fk_cascade_replay_is_authorized_per_item(server):
+    """#489: rows the database deleted or nulled through a foreign key are retained as delete and
+    update events, each replayed only to callers whose rule admits that row."""
+    token, _ = setup(server)
+    cascade_owner_scenario(server, token)

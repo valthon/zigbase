@@ -11,10 +11,11 @@ import uuid
 import pytest
 
 from conftest import _reserve_port, _stop_server, _su_template_for, _wait_reachable_or_fail
-from test_realtime_backfill import backfill, call, hidden_rule_delete_scenario, relation_delete_scenario, setup
+from test_realtime_backfill import backfill, call, cascade_owner_scenario, hidden_rule_delete_scenario, relation_delete_scenario, setup
 from test_realtime_backfill import (
     test_checkpoint_before_snapshot_and_id_only_updates_and_delete,
     test_current_rules_hide_retained_delete_and_empty_page_advances,
+    test_fk_cascade_replay_is_authorized_per_item,
     test_retained_delete_on_relation_collection_is_authorized_per_item,
     test_retained_delete_with_hidden_rule_field_is_authorized_from_its_stored_value,
 )
@@ -162,6 +163,100 @@ def test_postgres_retained_delete_on_relation_collection(binary, tmp_path):
         code, auth = call(server, "POST", "/api/collections/_superusers/auth-with-password", {"identity": identity, "password": "adminpassword"})
         assert code == 200, auth
         relation_delete_scenario(server, auth["token"], suffix)
+
+
+def test_postgres_fk_cascade_replay_is_authorized_per_item(binary, tmp_path):
+    """#489 on the PostgreSQL durable journal: row-constrained replay of FK-cascaded deletes and
+    SET NULL updates (the snapshot travels through the PostgreSQL snapshot store)."""
+    url = os.environ.get("ZIGBASE_PG_TEST_URL")
+    if not url:
+        pytest.skip("requires disposable PostgreSQL database and -Dpostgres=true binary")
+    suffix = "_" + uuid.uuid4().hex[:10]
+    identity = "cas" + suffix + "@x.io"
+    extra = {"ZIGBASE_DB_URL": url, "ZIGBASE_JWT_SECRET": "durable-replay-test-shared-secret-32bytes"}
+    subprocess.run([binary, "superuser", "create", "--email", identity, "--password", "adminpassword"],
+                   env={**os.environ, **extra, "ZIGBASE_DATA_DIR": str(tmp_path)},
+                   check=True, capture_output=True, timeout=30)
+    with running(binary, tmp_path, extra) as server:
+        code, auth = call(server, "POST", "/api/collections/_superusers/auth-with-password", {"identity": identity, "password": "adminpassword"})
+        assert code == 200, auth
+        cascade_owner_scenario(server, auth["token"], suffix)
+
+
+def test_fk_cascade_and_set_null_are_journaled_with_the_delete(binary, tmp_path):
+    """#489: deleting a parent journals a delete for each FK-cascaded row and an update for each
+    row the database set to null, in the delete's transaction. Controls: a REST delete and a
+    REST update on the same collections."""
+    shutil.copytree(_su_template_for(binary), tmp_path, dirs_exist_ok=True)
+    with running(binary, tmp_path) as server:
+        token, notes = setup(server)
+        public = {"listRule": "@public", "viewRule": "@public"}
+        for name, cascade in (("items", True), ("tasks", False)):
+            code, col = call(server, "POST", "/api/collections", {"name": name, "type": "base", "fields": [
+                {"id": "", "name": "note", "type": "relation",
+                 "options": {"targetCollectionId": notes["id"], "cascadeDelete": cascade, "maxSelect": 1}},
+                {"id": "", "name": "label", "type": "text", "options": {}}], **public}, token)
+            assert code == 201, col
+        note = call(server, "POST", "/api/collections/notes/records", {"title": "N"}, token)[1]["id"]
+        item, item2 = (call(server, "POST", "/api/collections/items/records", {"note": note}, token)[1]["id"] for _ in range(2))
+        task = call(server, "POST", "/api/collections/tasks/records", {"note": note}, token)[1]["id"]
+        task2 = call(server, "POST", "/api/collections/tasks/records", {"label": "unrelated"}, token)[1]["id"]
+        checkpoints = {topic: backfill(server, topic=topic)[1]["nextCursor"] for topic in ("items", "tasks")}
+        assert call(server, "DELETE", "/api/collections/items/records/" + item2, token=token)[0] == 204
+        assert call(server, "PATCH", "/api/collections/tasks/records/" + task2, {"label": "control"}, token)[0] == 200
+        assert call(server, "DELETE", "/api/collections/notes/records/" + note, token=token)[0] == 204
+        code, replay = backfill(server, checkpoints["items"], topic="items")
+        assert code == 200, replay
+        assert [(i["action"], i["record"]["id"]) for i in replay["items"]] == [("delete", item2), ("delete", item)]
+        code, replay = backfill(server, checkpoints["tasks"], topic="tasks")
+        assert code == 200, replay
+        assert [(i["action"], i["record"]["id"]) for i in replay["items"]] == [("update", task2), ("update", task)]
+        assert call(server, "GET", "/api/collections/items/records/" + item, token=token)[0] == 404
+        assert call(server, "GET", "/api/collections/tasks/records/" + task, token=token)[1]["note"] is None
+
+
+def test_postgres_fk_cascade_replay_across_instances(binary, tmp_path):
+    """#489 on PostgreSQL: a parent delete on one instance journals the FK-cascaded delete and
+    the SET NULL update; another instance replays both."""
+    url = os.environ.get("ZIGBASE_PG_TEST_URL")
+    if not url:
+        pytest.skip("requires disposable PostgreSQL database and -Dpostgres=true binary")
+    identity = "cascade-" + uuid.uuid4().hex + "@x.io"
+    prefix = "fk" + uuid.uuid4().hex[:10]
+    notes, items, tasks = (f"{prefix}_{n}" for n in ("notes", "items", "tasks"))
+    first_dir, second_dir = tmp_path / "first", tmp_path / "second"
+    first_dir.mkdir()
+    second_dir.mkdir()
+    extra = {"ZIGBASE_DB_URL": url, "ZIGBASE_JWT_SECRET": "durable-replay-test-shared-secret-32bytes"}
+    subprocess.run([binary, "superuser", "create", "--email", identity, "--password", "adminpassword"],
+                   env={**os.environ, **extra, "ZIGBASE_DATA_DIR": str(first_dir)},
+                   check=True, capture_output=True, timeout=30)
+    with running(binary, first_dir, extra) as first, running(binary, second_dir, extra) as second:
+        code, auth = call(first, "POST", "/api/collections/_superusers/auth-with-password", {"identity": identity, "password": "adminpassword"})
+        assert code == 200, auth
+        token = auth["token"]
+        public = {"listRule": "@public", "viewRule": "@public"}
+        code, notes_col = call(first, "POST", "/api/collections", {"name": notes, "type": "base", "fields": [], **public}, token)
+        assert code == 201, notes_col
+        created = []
+        for name, cascade in ((items, True), (tasks, False)):
+            code, col = call(first, "POST", "/api/collections", {"name": name, "type": "base", "fields": [
+                {"id": "", "name": "note", "type": "relation",
+                 "options": {"targetCollectionId": notes_col["id"], "cascadeDelete": cascade, "maxSelect": 1}}], **public}, token)
+            assert code == 201, col
+            created.append(col)
+        note = call(first, "POST", f"/api/collections/{notes}/records", {}, token)[1]["id"]
+        item = call(first, "POST", f"/api/collections/{items}/records", {"note": note}, token)[1]["id"]
+        task = call(first, "POST", f"/api/collections/{tasks}/records", {"note": note}, token)[1]["id"]
+        checkpoints = {topic: backfill(second, topic=topic)[1]["nextCursor"] for topic in (items, tasks)}
+        assert call(first, "DELETE", f"/api/collections/{notes}/records/{note}", token=token)[0] == 204
+        code, replay = backfill(second, checkpoints[items], topic=items)
+        assert code == 200 and [(i["action"], i["record"]["id"]) for i in replay["items"]] == [("delete", item)], replay
+        code, replay = backfill(second, checkpoints[tasks], topic=tasks)
+        assert code == 200 and [(i["action"], i["record"]["id"]) for i in replay["items"]] == [("update", task)], replay
+        assert call(second, "GET", f"/api/collections/{tasks}/records/{task}", token=token)[1]["note"] is None
+        for col in created + [notes_col]:
+            assert call(first, "DELETE", "/api/collections/" + col["id"], token=token)[0] == 204
 
 
 def test_retained_frame_over_current_budget_returns_reset_without_partial_page(binary, tmp_path):
