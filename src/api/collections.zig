@@ -146,6 +146,7 @@ pub fn create(ctx: *http.RequestCtx) anyerror!http.Response {
         // duplicate that races in between the pre-check and the write — still a 409, never a 500.
         error.StorageNamespaceConflict => return ApiError.conflict("Storage namespace remains reserved by an existing or deleted collection.").toResponse(ctx.allocator.a),
         error.Conflict, error.Constraint => return ApiError.conflict("Collection already exists.").toResponse(ctx.allocator.a),
+        error.SearchDisabled => return ApiError.badRequest("Full-text search is not enabled in this build; remove `searchable` from the fields.").toResponse(ctx.allocator.a),
         else => return e,
     };
     try w.commit();
@@ -218,6 +219,7 @@ pub fn update(ctx: *http.RequestCtx) anyerror!http.Response {
         error.NotFound => return ApiError.notFound().toResponse(ctx.allocator.a),
         error.Validation => return validationResponse(ctx),
         error.Conflict, error.Constraint => return ApiError.conflict("Conflict.").toResponse(ctx.allocator.a),
+        error.SearchDisabled => return ApiError.badRequest("Full-text search is not enabled in this build; remove `searchable` from the fields.").toResponse(ctx.allocator.a),
         else => return e,
     };
     try w.commit();
@@ -247,6 +249,7 @@ pub fn delete(ctx: *http.RequestCtx) anyerror!http.Response {
     collections.delete(ctx.allocator.a, w, key) catch |e| switch (e) {
         error.NotFound => return ApiError.notFound().toResponse(ctx.allocator.a),
         error.Conflict => return ApiError.conflict("Collection is referenced by a relation.").toResponse(ctx.allocator.a),
+        error.SearchDisabled => return ApiError.badRequest("Full-text search is not enabled in this build, so its search index cannot be dropped.").toResponse(ctx.allocator.a),
         else => return e,
     };
     if (app.col_cache) |cc| cc.invalidate(); // R1-4: collection DDL invalidates the metadata cache

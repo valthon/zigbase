@@ -128,6 +128,10 @@ pub fn create(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, def: schema.Colle
             try w.exec(try sa.dupeZ(u8, try ddl.authIdentityIndexSql(sa, col.name, idf)));
         }
     }
+    // The search index (FTS5 shadow table + triggers, or the Postgres tsvector) is part of the
+    // collection's physical shape, so it commits or rolls back with the table (#507). A no-op for
+    // a collection with no searchable field.
+    try fts.ensureIndex(sa, w, col);
     try insertRow(sa, w, col);
     try schema_gen.bump(w); // inside the tx: a rolled-back create must not advertise a change
     try tx.commit();
@@ -401,6 +405,10 @@ fn updateImpl(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, id_or_name: []con
         // relation-resolved view for the rebuild's FK generation
         const ddl_new = try resolveRelations(sa, w, newc_full);
 
+        // A change to the indexed columns (one added, removed, replaced, renamed, retyped or reordered) drops
+        // the old search index BEFORE the DDL that would break it; `ensureIndex` below rebuilds it
+        // from the new shape (#507).
+        if (!fts.sameSearchColumns(old, newc)) try fts.dropIndexFor(sa, w, old);
         const plan = try ddl.rebuildPlan(sa, old, ddl_new, d);
         for (plan) |stmt| try w.exec(try sa.dupeZ(u8, stmt));
         if (newc.type == .auth) {
@@ -408,10 +416,10 @@ fn updateImpl(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, id_or_name: []con
                 try w.exec(try sa.dupeZ(u8, try ddl.authIdentityIndexSql(sa, newc.name, idf)));
             }
         }
-        if (expected != null) {
-            try ensureTenantIndex(sa, w, newc);
-            try fts.ensureIndex(sa, w, newc);
-        }
+        if (expected != null) try ensureTenantIndex(sa, w, newc);
+        // Create, backfill, re-sync after the SQLite rebuild (which drops the sync triggers), or
+        // drop the search index, inside this transaction.
+        try fts.ensureIndex(sa, w, newc);
         try updateRow(sa, w, newc.id, newc); // persist user fields only
         try schema_gen.bump(w); // inside the tx: a rolled-back rebuild must not advertise a change
     }
@@ -780,6 +788,10 @@ pub fn delete(alloc: std.mem.Allocator, w: *db.Db, id_or_name: []const u8) Engin
     }
     const tx = try Tx.begin(w);
     errdefer tx.rollback();
+    // SQLite's FTS5 shadow table is a separate table that `DROP TABLE` on the base would orphan;
+    // drop it (and its triggers) first, in the same transaction (#507). The Postgres tsvector
+    // column and its GIN index go with the table.
+    if (db.dbDialect(w).kind == .sqlite) try fts.dropIndexFor(sa, w, target);
     try w.exec(try std.fmt.allocPrintSentinel(sa, "DROP TABLE {s};", .{try ddl.quoteIdent(sa, target.name)}, 0));
     var st = try w.prepare(try db.dbDialect(w).renumberPlaceholders(sa, "DELETE FROM \"_collections\" WHERE \"id\" = ?1;"));
     defer st.finalize();
@@ -1652,4 +1664,199 @@ test "updates validate stored name while ignoring incoming rename" {
         try std.testing.expectEqualStrings("items", updated.name);
         try std.testing.expectEqualStrings(original.id, updated.id);
     }
+}
+
+// ---- Search index follows runtime schema changes (#507) ----------------------
+
+/// Count the SQLite catalog objects (shadow tables, triggers) whose name starts with `prefix`.
+fn ftsObjectCount(d: *db.Db, prefix: []const u8) !i64 {
+    var st = try d.prepare("SELECT COUNT(*) FROM sqlite_master WHERE substr(name,1,length(?1))=?1;");
+    defer st.finalize();
+    try st.bindText(1, prefix);
+    _ = try st.step();
+    return st.columnInt(0);
+}
+
+/// The ids of `name` rows its FTS index matches for `term`, as one `id|id|…|` string (by id).
+fn ftsMatches(a: std.mem.Allocator, d: *db.Db, name: []const u8, term: []const u8) ![]u8 {
+    const sql = try std.fmt.allocPrintSentinel(a, "SELECT n.id FROM \"{s}\" n JOIN \"{s}_fts\" f ON f.rowid = n.rowid WHERE \"{s}_fts\" MATCH ?1 ORDER BY n.id;", .{ name, name, name }, 0);
+    defer a.free(sql);
+    var st = try d.prepare(sql);
+    defer st.finalize();
+    try st.bindText(1, term);
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(a);
+    while (try st.step()) {
+        try out.appendSlice(a, st.columnText(0));
+        try out.append(a, '|');
+    }
+    return out.toOwnedSlice(a);
+}
+
+fn expectMatches(d: *db.Db, term: []const u8, want: []const u8) !void {
+    return expectMatchesIn(d, "notes", term, want);
+}
+
+fn expectMatchesIn(d: *db.Db, name: []const u8, term: []const u8, want: []const u8) !void {
+    const a = std.testing.allocator;
+    const got = try ftsMatches(a, d, name, term);
+    defer a.free(got);
+    try std.testing.expectEqualStrings(want, got);
+}
+
+/// Replace the stored definition of `col` with `fields` through `update`, returning the reload.
+fn updateFields(a: std.mem.Allocator, d: *db.Db, col: schema.Collection, fields: []const schema.Field) !schema.Collection {
+    var def = col;
+    def.fields = fields;
+    return update(a, std.testing.io, d, col.id, def);
+}
+
+test "create and update provision, backfill, re-sync and drop the FTS index (#507)" {
+    if (comptime !fts.enabled) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try migrations.run(&d);
+
+    // Created searchable: the index exists at once and its triggers index new rows.
+    {
+        const fields = [_]schema.Field{.{ .id = "t1", .name = "title", .searchable = true, .options = .{ .text = .{} } }};
+        // (A deleted collection's storage namespace stays reserved, hence another name.)
+        const memos = try create(a, std.testing.io, &d, .{ .id = "", .name = "memos", .fields = &fields });
+        defer memos.deinit(a);
+        try d.exec("INSERT INTO memos(id,title) VALUES ('r1','alpha one');");
+        try expectMatchesIn(&d, "memos", "alpha", "r1|");
+        try delete(a, &d, memos.id);
+        try std.testing.expectEqual(@as(i64, 0), try ftsObjectCount(&d, "memos_fts"));
+    }
+
+    // Created NOT searchable, with rows: no index until a field becomes searchable.
+    var fields = [_]schema.Field{
+        .{ .id = "t1", .name = "title", .options = .{ .text = .{} } },
+        .{ .id = "b1", .name = "body", .options = .{ .text = .{} } },
+    };
+    var col = try create(a, std.testing.io, &d, .{ .id = "", .name = "notes", .fields = &fields });
+    defer col.deinit(a);
+    try std.testing.expectEqual(@as(i64, 0), try ftsObjectCount(&d, "notes_fts"));
+    try d.exec("INSERT INTO notes(id,title,body) VALUES ('r1','alpha one','bravo one');");
+
+    // A field becomes searchable: the index is created and BACKFILLED with the existing row.
+    fields[0].searchable = true;
+    var next = try updateFields(a, &d, col, &fields);
+    col.deinit(a);
+    col = next;
+    try expectMatches(&d, "alpha", "r1|");
+    try d.exec("INSERT INTO notes(id,title,body) VALUES ('r2','alpha two','x');");
+    try expectMatches(&d, "alpha", "r1|r2|");
+
+    // A second searchable field joins the index.
+    fields[1].searchable = true;
+    next = try updateFields(a, &d, col, &fields);
+    col.deinit(a);
+    col = next;
+    try expectMatches(&d, "bravo", "r1|");
+
+    // A searchable field is renamed (same id): the index follows the new column name.
+    fields[0].name = "headline";
+    next = try updateFields(a, &d, col, &fields);
+    col.deinit(a);
+    col = next;
+    try expectMatches(&d, "alpha", "r1|r2|");
+    try d.exec("UPDATE notes SET headline='charlie' WHERE id='r2';");
+    try expectMatches(&d, "alpha", "r1|");
+    try expectMatches(&d, "charlie", "r2|");
+
+    // A searchable field is removed: the index rebuilds over the remaining one.
+    next = try updateFields(a, &d, col, fields[0..1]);
+    col.deinit(a);
+    col = next;
+    try expectMatches(&d, "bravo", "");
+    try expectMatches(&d, "charlie", "r2|");
+
+    // Search turned off: the shadow table and its triggers are dropped.
+    fields[0].searchable = false;
+    next = try updateFields(a, &d, col, fields[0..1]);
+    col.deinit(a);
+    col = next;
+    try std.testing.expectEqual(@as(i64, 0), try ftsObjectCount(&d, "notes_fts"));
+
+    // Back on, then the collection is deleted: nothing named notes_fts* survives.
+    fields[0].searchable = true;
+    next = try updateFields(a, &d, col, fields[0..1]);
+    col.deinit(a);
+    col = next;
+    try expectMatches(&d, "charlie", "r2|");
+    try delete(a, &d, col.id);
+    try std.testing.expectEqual(@as(i64, 0), try ftsObjectCount(&d, "notes_fts"));
+}
+
+test "a search-index failure rolls back the whole collection create or update (#507)" {
+    if (comptime !fts.enabled) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try migrations.run(&d);
+
+    // An application table already holds the shadow name: create fails and leaves nothing.
+    try d.exec("CREATE TABLE notes_fts(x TEXT);");
+    const fields = [_]schema.Field{.{ .id = "t1", .name = "title", .searchable = true, .options = .{ .text = .{} } }};
+    try std.testing.expectError(error.Conflict, create(a, std.testing.io, &d, .{ .id = "", .name = "notes", .fields = &fields }));
+    try std.testing.expect((try get(a, &d, "notes")) == null);
+    {
+        var st = try d.prepare("SELECT COUNT(*) FROM sqlite_master WHERE name='notes';");
+        defer st.finalize();
+        _ = try st.step();
+        try std.testing.expectEqual(@as(i64, 0), st.columnInt(0));
+    }
+    try d.exec("DROP TABLE notes_fts;");
+
+    // A view depends on the index: turning search off fails and changes nothing.
+    const col = try create(a, std.testing.io, &d, .{ .id = "", .name = "notes", .fields = &fields });
+    defer col.deinit(a);
+    try d.exec("INSERT INTO notes(id,title) VALUES ('r1','alpha');");
+    try d.exec("CREATE VIEW notes_view AS SELECT * FROM notes_fts;");
+    var off = fields;
+    off[0].searchable = false;
+    try std.testing.expectError(error.Conflict, updateFields(a, &d, col, &off));
+    const still = (try get(a, &d, col.id)).?;
+    defer still.deinit(a);
+    try std.testing.expect(still.fields[0].searchable);
+    try expectMatches(&d, "alpha", "r1|");
+}
+
+test "without FTS5 a searchable create or update fails cleanly and changes nothing (#507)" {
+    if (comptime fts.enabled) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try migrations.run(&d);
+    var fields = [_]schema.Field{.{ .id = "t1", .name = "title", .searchable = true, .options = .{ .text = .{} } }};
+    try std.testing.expectError(error.SearchDisabled, create(a, std.testing.io, &d, .{ .id = "", .name = "notes", .fields = &fields }));
+    try std.testing.expect((try get(a, &d, "notes")) == null);
+
+    fields[0].searchable = false;
+    const col = try create(a, std.testing.io, &d, .{ .id = "", .name = "notes", .fields = &fields });
+    defer col.deinit(a);
+    fields[0].searchable = true;
+    try std.testing.expectError(error.SearchDisabled, updateFields(a, &d, col, &fields));
+    const still = (try get(a, &d, col.id)).?;
+    defer still.deinit(a);
+    try std.testing.expect(!still.fields[0].searchable);
+}
+
+test "sameSearchColumns compares the indexed columns in order" {
+    const t = schema.Field{ .id = "t", .name = "title", .searchable = true, .options = .{ .text = .{} } };
+    const b = schema.Field{ .id = "b", .name = "body", .searchable = true, .options = .{ .text = .{} } };
+    const n = schema.Field{ .id = "n", .name = "note", .options = .{ .text = .{} } };
+    const base = schema.Collection{ .id = "c", .name = "notes", .fields = &.{ t, n, b } };
+    var other = base;
+    other.fields = &.{ t, b }; // a non-indexed field removed: same index
+    try std.testing.expect(fts.sameSearchColumns(base, other));
+    other.fields = &.{ b, t }; // reordered
+    try std.testing.expect(!fts.sameSearchColumns(base, other));
+    other.fields = &.{t}; // one dropped
+    try std.testing.expect(!fts.sameSearchColumns(base, other));
+    other = base;
+    other.name = "posts"; // another table
+    try std.testing.expect(!fts.sameSearchColumns(base, other));
 }

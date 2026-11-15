@@ -830,11 +830,18 @@ test "offline rename preserves unproven stale search objects after search was di
     const old = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "posts", .fields = &fields });
     defer old.deinit(a);
     try fts.ensureIndex(a, &d, old);
+    // `collections.update` now drops the index when search is turned off (#507), so stale objects
+    // come from metadata changed behind the engine's back (e.g. an older version's update).
     fields[0].searchable = false;
-    var definition = old;
-    definition.fields = &fields;
-    const updated = try collections.update(a, std.testing.io, &d, old.id, definition);
-    defer updated.deinit(a);
+    {
+        const stale = try schema.fieldsToJson(a, &fields);
+        defer a.free(stale);
+        var st = try d.prepare("UPDATE \"_collections\" SET \"schema\"=?1 WHERE \"id\"=?2;");
+        defer st.finalize();
+        try st.bindText(1, stale);
+        try st.bindText(2, old.id);
+        _ = try st.step();
+    }
     const before = try generation.read(&d);
     try std.testing.expectError(error.Conflict, rename(a, std.testing.io, &d, "posts", "articles"));
     try std.testing.expectEqual(before, try generation.read(&d));

@@ -823,10 +823,20 @@ test "SQLite without FTS rejects search while ordinary lists retain tenant and a
     const a = std.testing.allocator;
     var d = try db.Db.openMemory();
     defer d.close();
+    // This build refuses to create a searchable collection (#507) and leaves nothing behind...
     try std.testing.expectError(error.SearchDisabled, searchableBase(a, &d));
-    const base = (try collections.getByName(a, &d, "posts")).?;
+    try std.testing.expect((try collections.getByName(a, &d, "posts")) == null);
+    // ...so a searchable definition can only reach the read path from stale metadata. Model that:
+    // create `posts` unsearchable, then hand `records.list` a definition marking `title` searchable.
+    const base = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "posts", .fields = &[_]schema.Field{
+        .{ .id = "f1", .name = "title", .options = .{ .text = .{} } },
+        .{ .id = "f2", .name = "owner", .options = .{ .text = .{} } },
+    } });
     defer base.deinit(a);
+    var stale_fields = [_]schema.Field{ base.fields[0], base.fields[1] };
+    stale_fields[0].searchable = true;
     var col = withRule(withAbility(base, "editor"), "@public");
+    col.fields = &stale_fields;
     col.options.tenant_field = "owner";
     try d.exec("INSERT INTO posts(id,title,owner) VALUES ('r1','budget','acc1'),('r2','budget','acc2');");
     var index = try d.prepare("SELECT 1 FROM sqlite_schema WHERE name='posts_fts';");

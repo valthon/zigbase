@@ -107,8 +107,14 @@ comptime {
 /// with "the engine will serve it" is what let the provisioner skip a collection in complete
 /// silence. `ensureIndex` needs the first question to decide whether a skip is worth reporting.
 fn hasSearchableField(col: schema.Collection) bool {
-    for (col.fields) |f| if (f.searchable and schema.isSearchableType(f.fieldType()) and schema.isValidIdentifier(f.name) and !f.encrypted) return true;
+    for (col.fields) |f| if (isIndexedField(f)) return true;
     return false;
+}
+
+/// A field the search index covers: flagged searchable, a text/editor type, a valid identifier,
+/// and not encrypted.
+fn isIndexedField(f: schema.Field) bool {
+    return f.searchable and schema.isSearchableType(f.fieldType()) and schema.isValidIdentifier(f.name) and !f.encrypted;
 }
 
 /// True iff `col` has at least one valid, searchable column AND a valid table identifier — i.e.
@@ -126,10 +132,7 @@ pub fn isSearchable(col: schema.Collection) bool {
 /// `alloc`. Empty when the collection is not searchable.
 fn searchableColumns(alloc: std.mem.Allocator, col: schema.Collection) ![]const []const u8 {
     var out: std.ArrayList([]const u8) = .empty;
-    for (col.fields) |f| {
-        if (f.searchable and schema.isSearchableType(f.fieldType()) and schema.isValidIdentifier(f.name) and !f.encrypted)
-            try out.append(alloc, f.name);
-    }
+    for (col.fields) |f| if (isIndexedField(f)) try out.append(alloc, f.name);
     return out.toOwnedSlice(alloc);
 }
 
@@ -414,6 +417,52 @@ pub const EnsureIndexError = error{SearchDisabled} || @import("ownership.zig").E
 /// at startup — NOT a numbered migration. Identifiers are gated through `schema.isValidIdentifier`.
 pub fn ensureIndex(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection) EnsureIndexError!void {
     return inspectIndex(alloc, w, col, true);
+}
+
+/// Self-freeing. Remove `col`'s engine-owned search objects (the SQLite FTS5 shadow table and its
+/// sync triggers, or the Postgres tsvector column and GIN index), if any, after the same ownership
+/// checks `ensureIndex` applies. `col.name`'s base table must still exist. Used by the runtime
+/// schema paths (`collections.update`/`delete`) before DDL that would orphan or break the objects;
+/// a no-op when there are none.
+///
+/// A SQLite build with `-Dfts5=false` cannot drop an FTS5 table (the module is absent), so when
+/// one exists this returns `error.SearchDisabled` rather than leave it orphaned.
+pub fn dropIndexFor(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection) EnsureIndexError!void {
+    if (comptime !enabled) {
+        if (db.dbDialect(w).kind == .sqlite) {
+            if (!schema.isValidIdentifier(col.name)) return;
+            var scratch = std.heap.ArenaAllocator.init(alloc);
+            defer scratch.deinit();
+            const sa = scratch.allocator();
+            if (try tableExists(sa, w, try tableName(sa, col.name))) return error.SearchDisabled;
+            return;
+        }
+    }
+    var without_search = col;
+    without_search.fields = &.{};
+    return ensureIndex(alloc, w, without_search);
+}
+
+/// True iff `a` and `b` produce the same search index: the same table name and the same indexed
+/// columns with the same stable field ids in the same order (the FTS5 column order and the
+/// Postgres tsvector expression order). A new id replaces the column even if its name is unchanged.
+/// When true, DDL that leaves those columns' names and storage alone keeps the index valid. When
+/// false, the index must be dropped BEFORE the DDL: Postgres refuses to drop or retype a column
+/// its generated tsvector reads, and the SQLite ownership check refuses a shadow table naming a
+/// column the base table no longer has.
+pub fn sameSearchColumns(a: schema.Collection, b: schema.Collection) bool {
+    if (!std.mem.eql(u8, a.name, b.name)) return false;
+    var i: usize = 0;
+    var j: usize = 0;
+    while (true) {
+        while (i < a.fields.len and !isIndexedField(a.fields[i])) i += 1;
+        while (j < b.fields.len and !isIndexedField(b.fields[j])) j += 1;
+        if (i == a.fields.len or j == b.fields.len) return i == a.fields.len and j == b.fields.len;
+        if (!std.mem.eql(u8, a.fields[i].name, b.fields[j].name)) return false;
+        if (!std.mem.eql(u8, a.fields[i].id, b.fields[j].id)) return false;
+        i += 1;
+        j += 1;
+    }
 }
 
 /// Self-freeing. Validate the current physical search objects without reconciling

@@ -70,15 +70,17 @@ fn warnTenantOwned(col: schema.Collection) void {
 fn inspectSearchIndex(alloc: std.mem.Allocator, w: *db.Db, spec: schema.Collection, reconcile: bool) ProvisionError!void {
     const result = if (reconcile) fts.ensureIndex(alloc, w, spec) else fts.validateIndex(alloc, w, spec);
     result catch |err| switch (err) {
-        error.SearchDisabled => {
-            const message = "refusing to start: collection '{s}' declares .searchable fields but this binary was built with -Dfts5=false — rebuild with -Dfts5 (or its default) to enable full-text search";
-            @import("startup_log.zig").refusal(message, .{spec.name});
-            return error.FtsDisabled;
-        },
+        error.SearchDisabled => return refuseFtsDisabled(spec.name),
         // `err`'s static type is fts.EnsureIndexError (includes SearchDisabled, handled above);
         // every OTHER member is genuinely a ProvisionError member, so this narrowing cast is safe.
         else => return @errorCast(err),
     };
+}
+
+fn refuseFtsDisabled(name: []const u8) ProvisionError {
+    const message = "refusing to start: collection '{s}' declares .searchable fields but this binary was built with -Dfts5=false — rebuild with -Dfts5 (or its default) to enable full-text search";
+    @import("startup_log.zig").refusal(message, .{name});
+    return error.FtsDisabled;
 }
 
 // ---------------------------------------------------------------------------
@@ -1002,10 +1004,13 @@ pub fn ensureCollection(
 
     const existing = try collections.get(alloc, w, spec.name);
     if (existing == null) {
-        _ = try collections.create(alloc, io, w, spec);
+        // `create` provisions the search index in its own transaction (#507).
+        _ = collections.create(alloc, io, w, spec) catch |err| switch (err) {
+            error.SearchDisabled => return refuseFtsDisabled(spec.name),
+            else => return err,
+        };
         std.log.info("provision: created collection '{s}'", .{spec.name});
         try collections.ensureTenantIndex(alloc, w, spec);
-        try inspectSearchIndex(alloc, w, spec, true);
         return;
     }
     const live = existing.?;
