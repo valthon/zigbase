@@ -545,6 +545,7 @@ test {
     _ = @import("mail/config.zig");
     _ = @import("mail/senders.zig");
     _ = @import("mail/suppression.zig");
+    _ = @import("mail/sql.zig");
     _ = @import("mail/inbound.zig");
     _ = @import("mail/unsubscribe.zig");
     _ = @import("sms/sender.zig");

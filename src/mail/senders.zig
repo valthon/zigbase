@@ -18,7 +18,6 @@ const db = @import("../db.zig");
 const id_gen = @import("../id.zig");
 const crypto = @import("../crypto.zig");
 const addr = @import("addr.zig");
-const param_sink = @import("../sql/param_sink.zig");
 
 pub const status_pending = "pending";
 pub const status_verified = "verified";
@@ -28,25 +27,11 @@ pub const status_verified = "verified";
 /// 429 — so an authenticated member cannot amplify mail at an arbitrary recipient.
 pub const resend_interval_s: i64 = 60;
 
-/// Lower + prepare one of this module's engine-owned statements for `conn`'s backend (#487).
-/// SQLite gets the verbatim `?N`/`datetime('now')` SQL; PostgreSQL gets `$n` placeholders and the
-/// dialect's ISO-8601 `now` text (`param_sink.lowerStmtZ`, the auth/analytics precedent). Every
-/// statement here is a short constant, so the lowered text lives in bounded stack scratch
-/// (`Db.prepare` copies it) and an over-long one fails as `PrepareFailed`, never silently.
-fn prep(conn: *db.Db, sql: [:0]const u8) db.DbError!db.Stmt {
-    var buffer: [prep_scratch_len]u8 = undefined;
-    const lowered = lowerInto(&buffer, db.dbDialect(conn), sql) catch return db.DbError.PrepareFailed;
-    return conn.prepare(lowered);
-}
-
-/// `prep`'s stack scratch. `lowerStmtZ` keeps intermediate copies, so this is several times the
-/// longest statement (the PostgreSQL resend-age query); a test pins that it fits.
-const prep_scratch_len = 8192;
-
-fn lowerInto(buffer: *[prep_scratch_len]u8, d: db.Dialect, sql: [:0]const u8) ![:0]const u8 {
-    var scratch = std.heap.FixedBufferAllocator.init(buffer);
-    return param_sink.lowerStmtZ(scratch.allocator(), d, sql);
-}
+/// Lower + prepare one of this module's engine-owned statements for `conn`'s backend (#487):
+/// the mail subsystem's shared `prep` (SQLite verbatim; PostgreSQL `$n` placeholders and the
+/// dialect's ISO-8601 `now`, in bounded stack scratch, an over-long statement `PrepareFailed`).
+const mail_sql = @import("sql.zig");
+const prep = mail_sql.prep;
 
 /// This module's fixed statements, in the SQLite flavor `prep` lowers. Named so the test below
 /// can lower every one of them for PostgreSQL.
@@ -308,8 +293,8 @@ test "every statement prep lowers for PostgreSQL fits its stack scratch and is f
         Sql.confirm,                           Sql.is_verified, Sql.list,
     };
     for (all) |sql| {
-        var buffer: [prep_scratch_len]u8 = undefined;
-        const pg = try lowerInto(&buffer, db.Dialect.postgres, sql);
+        var buffer: [mail_sql.scratch_len]u8 = undefined;
+        const pg = try mail_sql.lower(&buffer, db.Dialect.postgres, sql);
         try std.testing.expect(std.mem.indexOf(u8, pg, "$1") != null);
         // No `?N` placeholder survives (the age arm's regex has bare `?` quantifiers).
         for (pg, 0..) |ch, i| if (ch == '?' and i + 1 < pg.len) try std.testing.expect(!std.ascii.isDigit(pg[i + 1]));
