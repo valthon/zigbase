@@ -95,4 +95,5 @@ test {
     // Migrations Piece C: live `migrate dump` catalog reconstruction (CREATE TABLE / ADD CONSTRAINT
     // / CREATE INDEX, deterministic, no pg_dump). Skips if no PG.
     _ = @import("schema_dump_pg_test.zig");
+    _ = @import("mail_pg_test.zig"); // live mail suppression + bulk-send parity. Skips if no PG.
 }

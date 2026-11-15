@@ -17,10 +17,24 @@ const std = @import("std");
 const db = @import("../db.zig");
 const id_gen = @import("../id.zig");
 const addr = @import("addr.zig");
+const mail_sql = @import("sql.zig");
 
 pub const reason_hard_bounce = "hard_bounce";
 pub const reason_complaint = "complaint";
 pub const reason_unsubscribe = "unsubscribe";
+
+/// Every engine-owned statement this module prepares, in SQLite form (`?N`, `datetime('now')`);
+/// `mail_sql.prep` lowers them for PostgreSQL. Kept together so `mail/sql.zig`'s backend-free
+/// test can lower each one into `prep`'s fixed scratch.
+pub const stmts = struct {
+    pub const upsert =
+        \\INSERT INTO "_suppressions" ("id","created","account","email","reason","source") VALUES (?1,datetime('now'),?2,?3,?4,?5)
+        \\ ON CONFLICT("account","email") DO UPDATE SET "reason"=excluded."reason", "source"=excluded."source";
+    ;
+    pub const is_suppressed =
+        \\SELECT 1 FROM "_suppressions" WHERE "email"=?1 AND ("account"='' OR "account"=?2) AND (?3=1 OR "reason"<>'unsubscribe') LIMIT 1;
+    ;
+};
 
 /// Inbound providers whose bounce/complaint payloads we can normalize.
 pub const Provider = enum { ses, postmark };
@@ -44,10 +58,7 @@ pub fn upsert(io: std.Io, alloc: std.mem.Allocator, w: *db.Db, account: []const 
     defer alloc.free(email);
     var idbuf: [15]u8 = undefined;
     id_gen.generate(io, &idbuf);
-    var st = try w.prepare(
-        "INSERT INTO \"_suppressions\" (\"id\",\"created\",\"account\",\"email\",\"reason\",\"source\") VALUES (?1,datetime('now'),?2,?3,?4,?5) " ++
-            "ON CONFLICT(\"account\",\"email\") DO UPDATE SET \"reason\"=excluded.\"reason\", \"source\"=excluded.\"source\";",
-    );
+    var st = try mail_sql.prep(w, stmts.upsert);
     defer st.finalize();
     try st.bindText(1, &idbuf);
     try st.bindText(2, account);
@@ -71,9 +82,7 @@ pub const Kind = enum { transactional, list };
 pub fn isSuppressed(alloc: std.mem.Allocator, reader: *db.Db, account: []const u8, email_in: []const u8, kind: Kind) (db.DbError || std.mem.Allocator.Error)!bool {
     const email = try addr.normalize(alloc, email_in);
     defer alloc.free(email);
-    var st = try reader.prepare(
-        "SELECT 1 FROM \"_suppressions\" WHERE \"email\"=?1 AND (\"account\"='' OR \"account\"=?2) AND (?3=1 OR \"reason\"<>'unsubscribe') LIMIT 1;",
-    );
+    var st = try mail_sql.prep(reader, stmts.is_suppressed);
     defer st.finalize();
     try st.bindText(1, email);
     try st.bindText(2, account);
@@ -109,9 +118,39 @@ fn strField(v: std.json.Value, key: []const u8) ?[]const u8 {
     };
 }
 
+/// Append one event whose email is duped onto `alloc` (the source string is borrowed from a
+/// parse tree the caller frees). The dupe is freed if the append fails, so `out` only ever
+/// holds events it owns.
+fn appendEvent(alloc: std.mem.Allocator, out: *std.ArrayList(Event), email: []const u8, reason: []const u8) std.mem.Allocator.Error!void {
+    const owned = try alloc.dupe(u8, email);
+    errdefer alloc.free(owned);
+    try out.append(alloc, .{ .email = owned, .reason = reason });
+}
+
+/// Free a partially built event list on an error path (each `.email` is owned; `.reason` is a
+/// static literal).
+fn discardEvents(alloc: std.mem.Allocator, out: *std.ArrayList(Event)) void {
+    for (out.items) |ev| alloc.free(ev.email);
+    out.deinit(alloc);
+}
+
+/// Append an `emailAddress` event for every entry of `holder[key]` (a JSON array of objects).
+/// A non-object holder or a non-array list yields nothing: a malformed signed payload is
+/// ignored, never a crash.
+fn appendRecipients(alloc: std.mem.Allocator, out: *std.ArrayList(Event), holder: std.json.Value, key: []const u8, reason: []const u8) std.mem.Allocator.Error!void {
+    if (holder != .object) return;
+    const recips = holder.object.get(key) orelse return;
+    if (recips != .array) return;
+    for (recips.array.items) |r| {
+        if (strField(r, "emailAddress")) |e| try appendEvent(alloc, out, e, reason);
+    }
+}
+
 /// Map an SES event (direct, or SNS-wrapped with the SES message stringified in `Message`).
 fn mapSes(alloc: std.mem.Allocator, root_in: std.json.Value) ![]Event {
     // SNS delivers the SES notification JSON as a STRING in the `Message` field; unwrap it.
+    // A `Message` that is not JSON leaves the envelope as the root (it carries no SES type and
+    // so maps to no events); OOM propagates — swallowing it would silently drop a complaint.
     var root = root_in;
     var inner_parsed: ?std.json.Parsed(std.json.Value) = null;
     defer if (inner_parsed) |p| p.deinit();
@@ -119,32 +158,27 @@ fn mapSes(alloc: std.mem.Allocator, root_in: std.json.Value) ![]Event {
         if (std.json.parseFromSlice(std.json.Value, alloc, msg, .{})) |p| {
             inner_parsed = p;
             root = p.value;
-        } else |_| {}
+        } else |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => {},
+        }
     }
 
     var out: std.ArrayList(Event) = .empty;
-    errdefer out.deinit(alloc);
+    errdefer discardEvents(alloc, &out);
 
-    // `e` (below) is a string borrowed from the (about-to-be-freed) parse tree — dupe it
-    // onto `alloc` so the returned Event owns its bytes independently of that tree.
+    // `bounce`/`complaint` are checked for `.object` (in `strField`/`appendRecipients`) before
+    // any field access: the body is provider-signed but its shape is still untrusted input.
     const kind = strField(root, "notificationType") orelse strField(root, "eventType") orelse "";
     if (std.mem.eql(u8, kind, "Bounce")) {
         const bounce = root.object.get("bounce") orelse return out.toOwnedSlice(alloc);
-        // Only PERMANENT bounces suppress.
+        // Only PERMANENT bounces suppress (`strField` is null for a non-object `bounce`).
         const btype = strField(bounce, "bounceType") orelse "";
         if (!std.mem.eql(u8, btype, "Permanent")) return out.toOwnedSlice(alloc);
-        if (bounce.object.get("bouncedRecipients")) |recips| {
-            if (recips == .array) for (recips.array.items) |r| {
-                if (strField(r, "emailAddress")) |e| try out.append(alloc, .{ .email = try alloc.dupe(u8, e), .reason = reason_hard_bounce });
-            };
-        }
+        try appendRecipients(alloc, &out, bounce, "bouncedRecipients", reason_hard_bounce);
     } else if (std.mem.eql(u8, kind, "Complaint")) {
         const complaint = root.object.get("complaint") orelse return out.toOwnedSlice(alloc);
-        if (complaint.object.get("complainedRecipients")) |recips| {
-            if (recips == .array) for (recips.array.items) |r| {
-                if (strField(r, "emailAddress")) |e| try out.append(alloc, .{ .email = try alloc.dupe(u8, e), .reason = reason_complaint });
-            };
-        }
+        try appendRecipients(alloc, &out, complaint, "complainedRecipients", reason_complaint);
     }
     return out.toOwnedSlice(alloc);
 }
@@ -152,22 +186,20 @@ fn mapSes(alloc: std.mem.Allocator, root_in: std.json.Value) ![]Event {
 /// Map a Postmark webhook. `RecordType` "Bounce" with a hard `Type`, or "SpamComplaint", suppress.
 fn mapPostmark(alloc: std.mem.Allocator, root: std.json.Value) ![]Event {
     var out: std.ArrayList(Event) = .empty;
-    errdefer out.deinit(alloc);
+    errdefer discardEvents(alloc, &out);
     const record_type = strField(root, "RecordType") orelse "";
     const email = strField(root, "Email") orelse "";
     if (email.len == 0) return out.toOwnedSlice(alloc);
 
-    // `email` is borrowed from the (about-to-be-freed) parse tree — dupe it so the
-    // returned Event owns its bytes independently of that tree.
     if (std.mem.eql(u8, record_type, "SpamComplaint")) {
-        try out.append(alloc, .{ .email = try alloc.dupe(u8, email), .reason = reason_complaint });
+        try appendEvent(alloc, &out, email, reason_complaint);
     } else if (std.mem.eql(u8, record_type, "Bounce")) {
         // Postmark `Type`: HardBounce / SpamNotification suppress; transient types don't.
         const ptype = strField(root, "Type") orelse "";
         if (std.mem.eql(u8, ptype, "HardBounce") or std.mem.eql(u8, ptype, "BadEmailAddress")) {
-            try out.append(alloc, .{ .email = try alloc.dupe(u8, email), .reason = reason_hard_bounce });
+            try appendEvent(alloc, &out, email, reason_hard_bounce);
         } else if (std.mem.eql(u8, ptype, "SpamNotification") or std.mem.eql(u8, ptype, "SpamComplaint")) {
-            try out.append(alloc, .{ .email = try alloc.dupe(u8, email), .reason = reason_complaint });
+            try appendEvent(alloc, &out, email, reason_complaint);
         }
     }
     return out.toOwnedSlice(alloc);
@@ -310,4 +342,56 @@ test "parseProvider Postmark: hard bounce + spam complaint; soft ignored" {
 
 test "parseProvider rejects malformed JSON" {
     try testing.expectError(error.SyntaxError, parseProvider(testing.allocator, .ses, "{ not json"));
+}
+
+/// `checkAllAllocationFailures` body: parse, assert the event count, free.
+fn parseExpectingCount(alloc: std.mem.Allocator, provider: Provider, body: []const u8, want: usize) !void {
+    const evs = try parseProvider(alloc, provider, body);
+    defer freeEvents(alloc, evs);
+    try testing.expectEqual(want, evs.len);
+}
+
+test "parseProvider frees every partial event and propagates OOM at each allocation" {
+    // Two recipients: a failure on the second dupe/append must free the first email.
+    try testing.checkAllAllocationFailures(testing.allocator, parseExpectingCount, .{
+        Provider.ses,
+        \\{"notificationType":"Bounce","bounce":{"bounceType":"Permanent","bouncedRecipients":[{"emailAddress":"a@x.io"},{"emailAddress":"b@x.io"}]}}
+        ,
+        @as(usize, 2),
+    });
+    // SNS-wrapped: an OOM in the inner `Message` parse must surface, not be swallowed into
+    // "no events" (that would silently drop a complaint).
+    try testing.checkAllAllocationFailures(testing.allocator, parseExpectingCount, .{
+        Provider.ses,
+        \\{"Type":"Notification","Message":"{\"notificationType\":\"Complaint\",\"complaint\":{\"complainedRecipients\":[{\"emailAddress\":\"spam@x.io\"},{\"emailAddress\":\"spam2@x.io\"}]}}"}
+        ,
+        @as(usize, 2),
+    });
+    try testing.checkAllAllocationFailures(testing.allocator, parseExpectingCount, .{
+        Provider.postmark,
+        \\{"RecordType":"Bounce","Type":"HardBounce","Email":"hb@x.io"}
+        ,
+        @as(usize, 1),
+    });
+}
+
+test "parseProvider SES: a non-object bounce/complaint yields no events (no crash)" {
+    const a = testing.allocator;
+    const bodies = [_][]const u8{
+        \\{"notificationType":"Complaint","complaint":1}
+        ,
+        \\{"notificationType":"Complaint","complaint":"x"}
+        ,
+        \\{"notificationType":"Bounce","bounce":[1,2]}
+        ,
+        \\{"notificationType":"Bounce","bounce":null}
+        ,
+        \\{"Type":"Notification","Message":"{\"notificationType\":\"Complaint\",\"complaint\":[]}"}
+        ,
+    };
+    for (bodies) |body| {
+        const evs = try parseProvider(a, .ses, body);
+        defer freeEvents(a, evs);
+        try testing.expectEqual(@as(usize, 0), evs.len);
+    }
 }

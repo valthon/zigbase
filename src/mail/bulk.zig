@@ -31,8 +31,51 @@ const template = @import("template.zig");
 const senders = @import("senders.zig");
 const suppression = @import("suppression.zig");
 const unsubscribe = @import("unsubscribe.zig");
+const mail_sql = @import("sql.zig");
 const App = @import("../app.zig").App;
 const Ctx = @import("../ctx.zig").Ctx;
+
+/// Every engine-owned statement this module prepares, in SQLite form (`?N`, `datetime('now')`);
+/// `mail_sql.prep` lowers them for PostgreSQL. Kept together so `mail/sql.zig`'s backend-free
+/// test can lower each one into `prep`'s fixed scratch.
+pub const stmts = struct {
+    pub const insert_batch =
+        \\INSERT INTO "_mail_batches"
+        \\ ("id","created","updated","account","list","queue","from_addr","reply_to","subject_tpl","text_tpl","html_tpl","total","status")
+        \\ VALUES (?1,datetime('now'),datetime('now'),?2,?3,?4,?5,?6,?7,?8,?9,0,'active');
+    ;
+    pub const insert_recipient =
+        \\INSERT INTO "_mail_batch_recipients" ("id","created","updated","batch","email","vars_json")
+        \\ VALUES (?1,datetime('now'),datetime('now'),?2,?3,?4)
+        \\ ON CONFLICT("batch","email") DO NOTHING
+        \\ RETURNING "id";
+    ;
+    pub const set_batch_total = "UPDATE \"_mail_batches\" SET \"total\"=?2, \"updated\"=datetime('now') WHERE \"id\"=?1;";
+    pub const cancel_batch = "UPDATE \"_mail_batches\" SET \"status\"='canceled', \"updated\"=datetime('now') WHERE \"id\"=?1 AND \"status\"='active';";
+    pub const cancel_recipients =
+        \\UPDATE "_mail_batch_recipients" SET "status"='canceled', "updated"=datetime('now')
+        \\ WHERE "batch"=?1 AND "status"='pending';
+    ;
+    pub const batch_total = "SELECT \"total\" FROM \"_mail_batches\" WHERE \"id\"=?1;";
+    pub const status_counts = "SELECT \"status\", COUNT(*) FROM \"_mail_batch_recipients\" WHERE \"batch\"=?1 GROUP BY \"status\";";
+    pub const mark_recipient =
+        \\UPDATE "_mail_batch_recipients"
+        \\ SET "status"=?2, "last_error"=?3, "updated"=datetime('now'),
+        \\     "sent_at"=CASE WHEN ?2='sent' THEN datetime('now') ELSE "sent_at" END
+        \\ WHERE "id"=?1;
+    ;
+    pub const recipient_by_email = "SELECT \"id\",\"status\",\"vars_json\",\"attempts\" FROM \"_mail_batch_recipients\" WHERE \"batch\"=?1 AND \"email\"=?2;";
+    pub const batch_by_id =
+        \\SELECT "account","list","queue","from_addr","reply_to","subject_tpl","text_tpl","html_tpl","status"
+        \\ FROM "_mail_batches" WHERE "id"=?1;
+    ;
+    pub const record_attempt =
+        \\UPDATE "_mail_batch_recipients"
+        \\ SET "attempts"=?2, "last_error"=?3, "updated"=datetime('now'),
+        \\     "status"=CASE WHEN ?4=1 THEN 'failed' ELSE "status" END
+        \\ WHERE "id"=?1;
+    ;
+};
 
 /// The built-in durable job kind backing bulk delivery (registered in framework.zig).
 pub const job_kind = "mail_batch_item";
@@ -150,6 +193,9 @@ pub fn sendBulk(
     const run_at = b.at orelse clock.nowUnix(io);
     const batch_id_buf = id_gen.collectionId(io);
     const batch_id = try arena.dupe(u8, &batch_id_buf);
+    // The id reaches the caller only on success; a failed submit must not strand it when the
+    // caller passed a non-arena allocator.
+    errdefer arena.free(batch_id);
 
     // 3. One writer transaction: batch row + all recipient rows (duplicates collapse
     //    via ON CONFLICT DO NOTHING on the UNIQUE (batch,email)) + one durable job
@@ -157,11 +203,7 @@ pub fn sendBulk(
     if (own_txn) try w.begin();
     errdefer if (own_txn) w.rollback() catch {};
     {
-        var st = try w.prepare(
-            \\INSERT INTO "_mail_batches"
-            \\ ("id","created","updated","account","list","queue","from_addr","reply_to","subject_tpl","text_tpl","html_tpl","total","status")
-            \\ VALUES (?1,datetime('now'),datetime('now'),?2,?3,?4,?5,?6,?7,?8,?9,0,'active');
-        );
+        var st = try mail_sql.prep(w, stmts.insert_batch);
         defer st.finalize();
         try st.bindText(1, batch_id);
         try st.bindText(2, account);
@@ -176,22 +218,22 @@ pub fn sendBulk(
     }
     var total: i64 = 0;
     {
-        var st = try w.prepare(
-            \\INSERT INTO "_mail_batch_recipients" ("id","created","updated","batch","email","vars_json")
-            \\ VALUES (?1,datetime('now'),datetime('now'),?2,?3,?4)
-            \\ ON CONFLICT("batch","email") DO NOTHING
-            \\ RETURNING "id";
-        );
+        var st = try mail_sql.prep(w, stmts.insert_recipient);
         defer st.finalize();
         for (b.recipients) |r| {
             const rid = id_gen.collectionId(io);
+            // `reset` alone keeps the previous row's bound values: PostgreSQL's
+            // `bindText` copies each value into the statement's parameter arena, which
+            // only `clearBindings` releases — without it a 100k-recipient batch would
+            // retain every copy until `finalize`.
             st.reset();
+            try st.clearBindings();
             try st.bindText(1, &rid);
             try st.bindText(2, batch_id);
             try st.bindText(3, r.to);
-            // bindText copies (SQLITE_TRANSIENT), so vars_json is pure scratch once
-            // `step()` returns — free it every iteration rather than letting it ride
-            // on the caller's arena for the whole batch.
+            // bindText copies (SQLite: SQLITE_TRANSIENT; PostgreSQL: the parameter
+            // arena), so vars_json is pure scratch once bound — free it every iteration
+            // rather than letting it ride on the caller's arena for the whole batch.
             const vars_json = try varsToJson(arena, r.vars);
             defer arena.free(vars_json);
             try st.bindText(4, vars_json);
@@ -207,7 +249,7 @@ pub fn sendBulk(
         }
     }
     {
-        var st = try w.prepare("UPDATE \"_mail_batches\" SET \"total\"=?2, \"updated\"=datetime('now') WHERE \"id\"=?1;");
+        var st = try mail_sql.prep(w, stmts.set_batch_total);
         defer st.finalize();
         try st.bindText(1, batch_id);
         try st.bindInt(2, total);
@@ -228,15 +270,12 @@ pub fn cancelBatch(app: *App, w: *db.Db, own_txn: bool, batch_id: []const u8) !u
     if (own_txn) try w.begin();
     errdefer if (own_txn) w.rollback() catch {};
     {
-        var st = try w.prepare("UPDATE \"_mail_batches\" SET \"status\"='canceled', \"updated\"=datetime('now') WHERE \"id\"=?1 AND \"status\"='active';");
+        var st = try mail_sql.prep(w, stmts.cancel_batch);
         defer st.finalize();
         try st.bindText(1, batch_id);
         _ = try st.step();
     }
-    var st = try w.prepare(
-        \\UPDATE "_mail_batch_recipients" SET "status"='canceled', "updated"=datetime('now')
-        \\ WHERE "batch"=?1 AND "status"='pending';
-    );
+    var st = try mail_sql.prep(w, stmts.cancel_recipients);
     defer st.finalize();
     try st.bindText(1, batch_id);
     _ = try st.step();
@@ -255,13 +294,13 @@ pub fn batchStatus(app: *App, alloc: std.mem.Allocator, batch_id: []const u8) !B
     defer app.pool.releaseReader(&rd);
     var rep = BatchReport{};
     {
-        var st = try rd.prepare("SELECT \"total\" FROM \"_mail_batches\" WHERE \"id\"=?1;");
+        var st = try mail_sql.prep(&rd, stmts.batch_total);
         defer st.finalize();
         try st.bindText(1, batch_id);
         if (!try st.step()) return error.BatchNotFound;
         rep.total = @intCast(@max(st.columnInt(0), 0));
     }
-    var st = try rd.prepare("SELECT \"status\", COUNT(*) FROM \"_mail_batch_recipients\" WHERE \"batch\"=?1 GROUP BY \"status\";");
+    var st = try mail_sql.prep(&rd, stmts.status_counts);
     defer st.finalize();
     try st.bindText(1, batch_id);
     while (try st.step()) {
@@ -288,12 +327,7 @@ const BatchRow = struct {
 fn markStatus(app: *App, rcpt_id: []const u8, status: []const u8, last_error: []const u8) !void {
     const w = app.pool.acquireWriter();
     defer app.pool.releaseWriter();
-    var st = try w.prepare(
-        \\UPDATE "_mail_batch_recipients"
-        \\ SET "status"=?2, "last_error"=?3, "updated"=datetime('now'),
-        \\     "sent_at"=CASE WHEN ?2='sent' THEN datetime('now') ELSE "sent_at" END
-        \\ WHERE "id"=?1;
-    );
+    var st = try mail_sql.prep(w, stmts.mark_recipient);
     defer st.finalize();
     try st.bindText(1, rcpt_id);
     try st.bindText(2, status);
@@ -329,7 +363,7 @@ pub fn jobHandler(ctx: *Ctx, payload: []const u8) anyerror!void {
     {
         var rd = try app.pool.acquireReader();
         defer app.pool.releaseReader(&rd);
-        var st = try rd.prepare("SELECT \"id\",\"status\",\"vars_json\",\"attempts\" FROM \"_mail_batch_recipients\" WHERE \"batch\"=?1 AND \"email\"=?2;");
+        var st = try mail_sql.prep(&rd, stmts.recipient_by_email);
         defer st.finalize();
         try st.bindText(1, p.batch);
         try st.bindText(2, p.to);
@@ -339,10 +373,7 @@ pub fn jobHandler(ctx: *Ctx, payload: []const u8) anyerror!void {
         vars_json = try sa.dupe(u8, st.columnText(2));
         rcpt_attempts = st.columnInt(3);
 
-        var bst = try rd.prepare(
-            \\SELECT "account","list","queue","from_addr","reply_to","subject_tpl","text_tpl","html_tpl","status"
-            \\ FROM "_mail_batches" WHERE "id"=?1;
-        );
+        var bst = try mail_sql.prep(&rd, stmts.batch_by_id);
         defer bst.finalize();
         try bst.bindText(1, p.batch);
         if (!try bst.step()) return; // orphaned job — no-op
@@ -431,12 +462,7 @@ pub fn jobHandler(ctx: *Ctx, payload: []const u8) anyerror!void {
             const terminal = new_attempts >= policy.max_attempts;
             const w = app.pool.acquireWriter();
             defer app.pool.releaseWriter();
-            var st = try w.prepare(
-                \\UPDATE "_mail_batch_recipients"
-                \\ SET "attempts"=?2, "last_error"=?3, "updated"=datetime('now'),
-                \\     "status"=CASE WHEN ?4=1 THEN 'failed' ELSE "status" END
-                \\ WHERE "id"=?1;
-            );
+            var st = try mail_sql.prep(w, stmts.record_attempt);
             defer st.finalize();
             try st.bindText(1, rcpt_id);
             try st.bindInt(2, new_attempts);
@@ -654,6 +680,31 @@ test "sendBulk dedups byte-identical recipients (UNIQUE batch,email): total==2, 
     const rep = try batchStatus(&env.app, arena, batch_id);
     try testing.expectEqual(@as(u32, 2), rep.total);
     try testing.expectEqual(@as(u32, 2), rep.pending);
+}
+
+/// `checkAllAllocationFailures` body: one successful submit frees the returned id; a failed
+/// one must leave nothing allocated (the batch-id errdefer) and roll the writer txn back.
+fn submitAndFree(alloc: std.mem.Allocator, env: *BulkEnv) !void {
+    const batch_id = try BulkEnv.submit(env, alloc, &test_registry, .{
+        .subject = "Hi {{name}}",
+        .text = "body",
+        .recipients = &.{
+            .{ .to = "a@x.io", .vars = &.{.{ .key = "name", .value = "A" }} },
+            .{ .to = "b@x.io", .vars = &.{.{ .key = "name", .value = "B" }} },
+        },
+        .queue = "emails",
+    }, "");
+    alloc.free(batch_id);
+}
+
+test "sendBulk frees the batch id and rolls back on OOM at every allocation" {
+    const env = try BulkEnv.init(.{});
+    defer env.deinit();
+    env.app.queues = @ptrCast(&test_registry);
+    try testing.checkAllAllocationFailures(testing.allocator, submitAndFree, .{env});
+    // Only the final, fully-successful run committed: every failed run rolled back.
+    try testing.expectEqual(@as(i64, 1), try BulkEnv.countTable(env, "_mail_batches"));
+    try testing.expectEqual(@as(i64, 2), try BulkEnv.countTable(env, "_mail_batch_recipients"));
 }
 
 test "fan-out + personalization: pollOnce drains, per-recipient render, html-escape, sent rows, batchStatus" {
