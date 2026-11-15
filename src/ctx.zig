@@ -568,13 +568,12 @@ pub const Ctx = struct {
         switch (q.backend) {
             .memory => try queue_memory.enqueue(self.app, q, j.handler, payload_json),
             .durable => {
-                const now = clock.nowUnix(self.app.io);
                 if (self.bound_conn) |c| {
-                    _ = try queue_durable.enqueue(c, self.app.io, q, kind, payload_json, now);
+                    _ = try queue_durable.enqueue(c, self.app.io, q, kind, payload_json, .now);
                 } else {
                     const w = self.app.pool.acquireWriter();
                     defer self.app.pool.releaseWriter();
-                    _ = try queue_durable.enqueue(w, self.app.io, q, kind, payload_json, now);
+                    _ = try queue_durable.enqueue(w, self.app.io, q, kind, payload_json, .now);
                 }
             },
         }
@@ -1430,8 +1429,7 @@ pub const MailApi = struct {
         const q = reg.queueByName(opts.queue) orelse return error.UnknownQueue;
         if (q.backend != .durable) return error.ScheduleRequiresDurable;
         const io = self.ctx.app.io;
-        const now = clock.nowUnix(io);
-        const run_at: i64 = opts.at orelse (now + @as(i64, opts.delay_s orelse 0));
+        const run_at: queue_durable.RunAt = if (opts.at) |t| .{ .at = t } else .{ .delay_s = opts.delay_s orelse 0 };
         const payload = try self.ctx.serializePayload(scoped);
         const jid = blk: {
             if (self.ctx.bound_conn) |c| break :blk try queue_durable.enqueue(c, io, q, "mail", payload, run_at);

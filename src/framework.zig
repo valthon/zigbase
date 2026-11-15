@@ -1932,20 +1932,12 @@ fn queueWorkerRun(ctx: *ctx_mod.Ctx, ev: *events.JobEvent) anyerror!?schedule.Re
 /// The framework-internal `_queue_gc` job (#137 PR2): per durable queue, reclaims stale
 /// claims (using that queue's `visibility_timeout_s`) and reaps done/failed rows older than
 /// that queue's `done_ttl_s`, in bounded batches. Registered only when a durable queue is
-/// declared (see `App.queue_gc_jobs`).
+/// declared (see `App.queue_gc_jobs`). Claim age is read on the queue clock (the database
+/// server's on PostgreSQL); see `queue_durable.gcSweep`.
 fn queueGcJob(ctx: *ctx_mod.Ctx, ev: *events.JobEvent) anyerror!void {
     _ = ev;
     const reg = queue.registryFromApp(ctx.app) orelse return;
-    const now = clock.nowUnix(ctx.app.io);
-    const w = ctx.app.pool.acquireWriter();
-    defer ctx.app.pool.releaseWriter();
-    for (reg.queues) |q| {
-        if (q.backend != .durable) continue;
-        _ = queue_durable.reclaimStale(w, q.name, now, q.visibility_timeout_s) catch |e|
-            std.log.warn("_queue_gc: reclaim for '{s}' failed: {s}", .{ q.name, @errorName(e) });
-        _ = queue_durable.gcDoneJobs(w, q.name, q.done_ttl_s) catch |e|
-            std.log.warn("_queue_gc: GC for '{s}' failed: {s}", .{ q.name, @errorName(e) });
-    }
+    try queue_durable.gcSweep(ctx.app, reg);
 }
 
 /// The per-rollup analytics aggregation job (`_rollup:<name>`, #158). Resolves the spec by

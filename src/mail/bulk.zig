@@ -147,7 +147,7 @@ pub fn sendBulk(
     }
 
     const io = app.io;
-    const run_at = b.at orelse clock.nowUnix(io);
+    const run_at: durable.RunAt = if (b.at) |t| .{ .at = t } else .now;
     const batch_id_buf = id_gen.collectionId(io);
     const batch_id = try arena.dupe(u8, &batch_id_buf);
 

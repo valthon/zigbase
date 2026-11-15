@@ -3366,7 +3366,9 @@ The typed configuration is `zigbase.DistributedJobConfig`.
 All replicas sharing a database and job name observe one persisted cadence. A
 short transaction claims due work with an owner token, generation and expiry;
 handlers run **outside** that transaction. PostgreSQL uses row locks and its server
-clock after lock acquisition, while SQLite uses its immediate writer transaction.
+clock after lock acquisition, while SQLite uses its immediate writer transaction (and
+the host clock). Leases therefore expire early if that clock is stepped forward; see
+[Wall-clock steps](#wall-clock-steps).
 SQLite coordination applies to processes sharing the same local database file,
 not independent database copies or unsupported network filesystems.
 
@@ -3453,6 +3455,19 @@ restore, a manual `date -s`) affects jobs as follows.
   (`scheduler_coordination.finish`), so a backward step of that clock during a
   handler can schedule the same minute again, so a distributed handler must
   tolerate running a minute twice.
+- **Database-clock deadlines.** Durable claim age (`visibility_timeout_s`), durable
+  `run_at` readiness, and `.distributed` leases and next-fire times are read on the
+  database clock: the PostgreSQL server's clock, or the host clock on SQLite (whose
+  coordination is one local file, hence one host). A *forward* step of S seconds of
+  that clock while work is in flight can reset a durable claim up to S seconds
+  before its visibility timeout has really elapsed, and can let another replica
+  claim a `.distributed` occurrence up to S seconds before its lease has really
+  expired, so two handlers overlap. Either way the completion of the replaced
+  attempt is fenced by its generation and cannot overwrite the newer attempt's
+  state, and the duplicate run is the at-least-once kind handlers must already
+  tolerate. A *backward* step of S postpones those deadlines by up to S instead. On
+  PostgreSQL, app hosts' clocks (their skew or their steps) do not move these
+  deadlines; only the server's clock does.
 
 ### Ad-hoc background work: `app.submit`
 
@@ -3626,7 +3641,8 @@ HTTP endpoint; the fixture demonstrates an operator-authenticated route.
   per-worker poller. **At-least-once** — a crash after a side effect but before the row is
   marked done replays the job, so durable consumers must tolerate replays (idempotency keys
   are the antidote). A **reclaim sweep** resets jobs stranded by a crashed worker (claimed
-  longer than that queue's `visibility_timeout_s`), and a GC sweep reaps done/failed rows
+  longer than that queue's `visibility_timeout_s` on the queue clock: the database
+  server's clock on PostgreSQL, the host clock on SQLite), and a GC sweep reaps done/failed rows
   older than its `done_ttl_s` — **both are per-queue** (set `visibility_timeout_s` above the
   queue's longest job runtime, or a long job gets reclaimed mid-flight and re-dispatched).
   The poller and GC jobs are installed **only when a durable queue is declared** —
@@ -3646,8 +3662,8 @@ HTTP endpoint; the fixture demonstrates an operator-authenticated route.
 - **Rate throttling** (`.rate = .{ .per_second = N }`, durable only): a per-second window per
   rated queue, capacity = `per_second` (max burst = one second), enforced at **claim
   time** — a job without remaining capacity this tick simply waits for the next ~500ms
-  scheduler tick rather than sleeping in the worker. Integer-second windows are
-  stored in the database: all instances sharing that database and queue name share
+  scheduler tick rather than sleeping in the worker. Integer-second windows of the
+  queue clock (the server's on PostgreSQL) are stored in the database: all instances sharing that database and queue name share
   the ceiling. Claims and their rate charge commit atomically; empty claims spend
   no capacity, and restarts do not reset the current window. Deploy the same rate
   configuration on each instance (mixed configurations apply each claimant's own
@@ -3667,13 +3683,28 @@ HTTP endpoint; the fixture demonstrates an operator-authenticated route.
   **entire batch's worst-case processing time**, not just one handler, or reduce
   `.concurrency` (the batch size). No lease heartbeat extends that timeout. The scheduler itself is
   per-process (see §7 caveats); ordinary scheduled handlers are not coordinated.
+- On PostgreSQL, claims are stamped, swept (by the poller and by `_queue_gc`) and
+  compared with `run_at` on the database server's clock, so instances whose own clocks
+  disagree still agree on claim age and retry times. A job enqueued for now, or with a
+  delay (mail `deliverAt`'s `.delay_s`), is due that many seconds after the server's
+  current second; an absolute time (mail `deliverAt`'s `.at`, `sendBulk`'s `.at`) is
+  stored as given and is due when the server's clock reaches it. Neither depends on the
+  enqueuing host's clock. A forward step of the queue clock (the server's on
+  PostgreSQL, the host's on SQLite) can still reset an in-flight claim early; see
+  [Wall-clock steps](#wall-clock-steps).
 - **Upgrade coordinated workers together:** drain and stop older worker binaries
   before applying migration `0025_queue_rates` from one process, then start the
   upgraded instances. Older binaries neither enforce shared rate windows nor fence
   completion, so mixed-version workers do not provide these guarantees. Older
   binaries still need a single migration leader; current PostgreSQL consumer and
   system migrations, and SQLite consumer batches, are serialized automatically
-  (see §8).
+  (see §8). On PostgreSQL the same holds for the queue clock: binaries before the
+  database-clock change stamp claims, retries and `.rate` windows with their own host
+  clock, while current ones use the server's, so a mixed fleet compares two clocks.
+  An older instance whose clock runs ahead can still reset current instances' claims
+  early, and its windows can stall a rated queue (a window from the future is not
+  refilled until the server's clock passes it). Upgrade every coordinated instance
+  together.
 - Memory jobs run on a bounded worker pool that is drained and joined at shutdown (like `app.submit`); jobs still queued at a hard crash are lost (at-most-once), and a full ring rejects with `error.QueueFull`.
 
 ## 8. Define your schema in code (`.collections` + `.migrations`)
