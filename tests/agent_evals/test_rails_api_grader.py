@@ -1098,3 +1098,44 @@ def test_the_secret_values_are_the_snapshots(root):
     )
     assert rails_api_grader.API_TOKEN_MESSAGE.format(1) == "bookclub-token:1"
 
+
+def _tree(root: Path) -> dict[str, bytes]:
+    return {
+        str(path.relative_to(root)): path.read_bytes()
+        for path in sorted(root.rglob("*"))
+        if path.is_file()
+    }
+
+
+class BoundarySnapshotCommands(FakeCommands):
+    """Captures `source/` at the moment the agent's own boundary test would run."""
+
+    def __init__(self, source: Path) -> None:
+        super().__init__()
+        self.source = source
+        self.at_boundary: dict[str, bytes] | None = None
+
+    def run(self, argv, *, cwd, env=None, timeout=300):  # noqa: ANN001, ARG002
+        if "unittest" in [str(part) for part in argv]:
+            self.at_boundary = _tree(self.source)
+        return super().run(argv, cwd=cwd, env=env, timeout=timeout)
+
+
+def test_grading_leaves_source_byte_for_byte_unchanged(tmp_path):
+    """Re-extraction opened the WAL-mode snapshot in place and left -wal/-shm sidecars.
+
+    The prompt tells the agent to leave `source/` byte-for-byte unchanged, so an agent
+    test asserting exactly that failed on the grader's own residue (#494).
+    """
+    target = workspace(tmp_path)
+    source = target / "source"
+    before = _tree(source)
+    commands = BoundarySnapshotCommands(source)
+
+    report = grade_fixture(target, tmp_path / "artifacts", commands)
+
+    assert report.failures == ()
+    assert commands.at_boundary is not None, "the agent boundary never ran"
+    assert sorted(commands.at_boundary) == sorted(before)
+    assert commands.at_boundary == before
+    assert _tree(source) == before

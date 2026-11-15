@@ -690,10 +690,17 @@ def _verify_determinism(workspace: Path, source: Path) -> None:
     report must list a `determinism` check — but a check nobody performs is a claim, and
     this grader was accepting the word for the deed. Extraction is offline and cheap, so
     the honest thing is to do it again.
+
+    It extracts from a scratch copy: reading the WAL-mode snapshot in place leaves
+    `-wal`/`-shm` sidecars in `source/`, which the prompt says to leave byte-for-byte
+    unchanged and which the agent's own boundary test, run last, may check (#494). The
+    checks that guard `source/` itself have already run against the original.
     """
     decisions = rails2zb.load_decisions(workspace / "decisions.json")
-    loaded = rails2zb.load_source(source)
     with tempfile.TemporaryDirectory(dir=workspace) as scratch:
+        copy = Path(scratch) / "source"
+        shutil.copytree(source, copy, symlinks=True)
+        loaded = rails2zb.load_source(copy)
         second = Path(scratch) / "bundle"
         try:
             rails2zb.extract(loaded, decisions, second)
