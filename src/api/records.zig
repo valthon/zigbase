@@ -25,6 +25,7 @@ const file_plan = @import("../files/plan.zig");
 const events = @import("../events.zig");
 const crypto = @import("../crypto.zig");
 const jwt = @import("../jwt.zig");
+const param_sink = @import("../sql/param_sink.zig");
 const ratelimit = @import("../ratelimit.zig");
 
 /// Fire a record lifecycle event. `before_*` errors propagate (caller rolls back via the
@@ -931,7 +932,7 @@ pub fn delete(ctx: *http.RequestCtx) anyerror!http.Response {
         return ApiError.notFound().toResponse(ctx.allocator.a);
     }
     if (col.type == .auth) {
-        var st = try w.prepare("DELETE FROM \"_externalAuths\" WHERE \"collectionRef\"=?1 AND \"recordRef\"=?2;");
+        var st = try w.prepare(try param_sink.lowerStmtZ(ctx.allocator.a, db.dbDialect(w), "DELETE FROM \"_externalAuths\" WHERE \"collectionRef\"=?1 AND \"recordRef\"=?2;"));
         defer st.finalize();
         try st.bindText(1, col.name);
         try st.bindText(2, rid);

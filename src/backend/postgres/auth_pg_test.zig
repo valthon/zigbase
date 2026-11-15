@@ -434,3 +434,55 @@ test "pg: token mint + VERIFY round-trip (epoch, table-session, superuser) on Po
     try std.testing.expect(v3.is_superuser);
     try std.testing.expectEqualStrings("root@example.com", v3.record.object.get("email").?.string);
 }
+
+test "pg: REST auth record delete removes external auth links (#519)" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const url = testUrlZ() orelse return error.SkipZigTest;
+    var ctx = (try Ctx.open(a, io, "rest_delete")) orelse return error.SkipZigTest;
+    defer ctx.deinit();
+    var pool = try db.Pool.init(a, io, url);
+    defer pool.deinit();
+    {
+        const writer = pool.acquireWriter();
+        defer pool.releaseWriter();
+        try writer.exec("SET search_path TO zb_authpg_rest_delete;");
+    }
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const al = arena.allocator();
+    const w = ctx.w();
+    try migrations.run(w);
+    if (comptime @import("build_options").durable_realtime)
+        try @import("../../realtime/durable.zig").initialize(a, io, w);
+    const col = try collections.create(al, io, w, .{
+        .id = "",
+        .name = "members",
+        .type = .auth,
+        .fields = &.{},
+    });
+    try w.exec("INSERT INTO members (id,email,\"tokenKey\") VALUES ('member1','member@example.com','member-key');");
+    try w.exec("INSERT INTO \"_superusers\" (id,email,\"tokenKey\",verified) VALUES ('su1','root@example.com','super-key',1);");
+    try oauth_api.insertLink(io, al, w, col.name, "member1", "google", "target-google");
+    try oauth_api.insertLink(io, al, w, col.name, "member1", "github", "target-github");
+    try oauth_api.insertLink(io, al, w, col.name, "member2", "google", "other-record");
+    try oauth_api.insertLink(io, al, w, "other_members", "member1", "google", "other-collection");
+    try std.testing.expectEqual(@as(i64, 4), try scalarCount(w, "SELECT count(*) FROM \"_externalAuths\";"));
+
+    const secret = "pg-rest-delete-test-secret";
+    var app = app_mod.App{ .allocator = a, .io = io, .pool = &pool, .jwt_secret = secret };
+    const token = try mintAuth(al, secret, "_superusers", "su1", "super-key", null, 0);
+    var req = @import("../../http.zig").RequestCtx{
+        .method = .DELETE,
+        .path = "/api/collections/members/records/member1",
+        .allocator = @import("../../request_arena.zig").RequestArena.from(&arena),
+        .app = &app,
+        .authorization = try std.fmt.allocPrint(al, "Bearer {s}", .{token}),
+        .params = &.{ .{ .key = "col", .value = "members" }, .{ .key = "id", .value = "member1" } },
+    };
+    const response = try @import("../../api/records.zig").delete(&req);
+    try std.testing.expectEqual(@as(u16, 204), response.status);
+    try std.testing.expect((try records.get(al, w, col, "member1")) == null);
+    try std.testing.expectEqual(@as(i64, 0), try scalarCount(w, "SELECT count(*) FROM \"_externalAuths\" WHERE \"collectionRef\"='members' AND \"recordRef\"='member1';"));
+    try std.testing.expectEqual(@as(i64, 2), try scalarCount(w, "SELECT count(*) FROM \"_externalAuths\";"));
+}
