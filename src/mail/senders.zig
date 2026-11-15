@@ -18,6 +18,7 @@ const db = @import("../db.zig");
 const id_gen = @import("../id.zig");
 const crypto = @import("../crypto.zig");
 const addr = @import("addr.zig");
+const param_sink = @import("../sql/param_sink.zig");
 
 pub const status_pending = "pending";
 pub const status_verified = "verified";
@@ -26,6 +27,78 @@ pub const status_verified = "verified";
 /// (#154 review I3). A re-request inside this window does not re-issue/resend — the API returns
 /// 429 — so an authenticated member cannot amplify mail at an arbitrary recipient.
 pub const resend_interval_s: i64 = 60;
+
+/// Lower + prepare one of this module's engine-owned statements for `conn`'s backend (#487).
+/// SQLite gets the verbatim `?N`/`datetime('now')` SQL; PostgreSQL gets `$n` placeholders and the
+/// dialect's ISO-8601 `now` text (`param_sink.lowerStmtZ`, the auth/analytics precedent). Every
+/// statement here is a short constant, so the lowered text lives in bounded stack scratch
+/// (`Db.prepare` copies it) and an over-long one fails as `PrepareFailed`, never silently.
+fn prep(conn: *db.Db, sql: [:0]const u8) db.DbError!db.Stmt {
+    var buffer: [prep_scratch_len]u8 = undefined;
+    const lowered = lowerInto(&buffer, db.dbDialect(conn), sql) catch return db.DbError.PrepareFailed;
+    return conn.prepare(lowered);
+}
+
+/// `prep`'s stack scratch. `lowerStmtZ` keeps intermediate copies, so this is several times the
+/// longest statement (the PostgreSQL resend-age query); a test pins that it fits.
+const prep_scratch_len = 8192;
+
+fn lowerInto(buffer: *[prep_scratch_len]u8, d: db.Dialect, sql: [:0]const u8) ![:0]const u8 {
+    var scratch = std.heap.FixedBufferAllocator.init(buffer);
+    return param_sink.lowerStmtZ(scratch.allocator(), d, sql);
+}
+
+/// This module's fixed statements, in the SQLite flavor `prep` lowers. Named so the test below
+/// can lower every one of them for PostgreSQL.
+const Sql = struct {
+    const reissue = "UPDATE \"_sender_identities\" SET \"verification_token\"=?1, \"updated\"=datetime('now') WHERE \"id\"=?2;";
+    const insert = "INSERT INTO \"_sender_identities\" (\"id\",\"created\",\"updated\",\"account\",\"email\",\"verification_token\",\"status\") VALUES (?1,datetime('now'),datetime('now'),?2,?3,?4,?5);";
+    const pending_token = "SELECT \"verification_token\" FROM \"_sender_identities\" WHERE \"id\"=?1 AND \"account\"=?2 AND \"status\"=?3;";
+    const confirm = "UPDATE \"_sender_identities\" SET \"status\"=?1, \"verified_at\"=datetime('now'), \"verification_token\"='', \"updated\"=datetime('now') " ++
+        "WHERE \"id\"=?2 AND \"account\"=?3 AND \"status\"=?4;";
+    const is_verified = "SELECT 1 FROM \"_sender_identities\" WHERE \"account\"=?1 AND \"email\"=?2 AND \"status\"=?3 LIMIT 1;";
+    const list = "SELECT \"id\",\"email\",\"status\",\"verified_at\",\"created\" FROM \"_sender_identities\" WHERE \"account\"=?1 ORDER BY \"created\" DESC;";
+};
+
+/// Whole seconds since the row's `updated` stamp, truncated toward zero like SQLite's
+/// `CAST(... AS INTEGER)`. `updated` is UTC TEXT: `datetime('now')` on SQLite, ISO-8601 `Z` on
+/// PostgreSQL, or SQLite's form after `migrate-db` copied the rows. PostgreSQL reads it as a
+/// zone-less timestamp pinned to UTC, so neither form depends on the session `TimeZone`.
+///
+/// A stamp that is not a date-time (`''`, or garbage from a raw write or import) must not fail the
+/// request: SQLite's `julianday` yields NULL, which reads as age 0, so the resend stays throttled.
+/// The PostgreSQL arm matches that: it only casts text that matches `age_stamp_pattern` and yields
+/// NULL otherwise. The day and the time are added as intervals to the first of the month, so a
+/// day past the month's end (`2026-02-30`) or hour 24 rolls over the way `julianday` normalizes
+/// it instead of raising.
+fn ageSecondsSql(conn: *db.Db) [:0]const u8 {
+    return ageSecondsSqlFor(db.dbDialect(conn));
+}
+
+fn ageSecondsSqlFor(d: db.Dialect) [:0]const u8 {
+    return switch (d.kind) {
+        .sqlite => "SELECT \"id\",\"status\",CAST((julianday('now')-julianday(\"updated\"))*86400 AS INTEGER) FROM \"_sender_identities\" WHERE \"account\"=?1 AND \"email\"=?2;",
+        .postgres => "SELECT \"id\",\"status\",CASE WHEN \"updated\" ~ '" ++ age_stamp_pattern ++ "' THEN " ++
+            "CAST(TRUNC(EXTRACT(EPOCH FROM (now() - ((CAST(substr(\"updated\",1,8) || '01' AS timestamp) " ++
+            "+ (CAST(substr(\"updated\",9,2) AS INTEGER) - 1) * INTERVAL '1 day' " ++
+            "+ CAST(substr(\"updated\",12,2) AS INTEGER) * INTERVAL '1 hour' " ++
+            "+ CAST(substr(\"updated\",15,2) AS INTEGER) * INTERVAL '1 minute' " ++
+            "+ CAST(rtrim(substr(\"updated\",18,9),'Z') AS DOUBLE PRECISION) * INTERVAL '1 second') AT TIME ZONE 'UTC')))) AS BIGINT) END " ++
+            "FROM \"_sender_identities\" WHERE \"account\"=?1 AND \"email\"=?2;",
+    };
+}
+
+/// The `updated` shapes the PostgreSQL age arm will cast: `YYYY-MM-DD` + `T` or space +
+/// `HH:MM:SS`, then an optional fraction and an optional `Z`, and nothing else. Year 0001-9999,
+/// month 01-12, day 01-31, hour 00-24 and minute/second 00-59, so no cast in `ageSecondsSql` can
+/// raise. Seconds are parsed from at most nine characters (SS plus six fractional digits),
+/// preserving PostgreSQL microsecond precision without an unbounded numeric cast.
+/// PostgreSQL has no year 0: `0000-06-01` is out of range. The end anchor makes trailing
+/// text NULL, as `julianday` does, instead of an age read from the prefix. Two shapes `julianday`
+/// does accept read as age 0 here (throttled), which neither writer emits: year 0000 and a
+/// `+HH:MM` offset.
+const age_stamp_pattern = "^([1-9][0-9]{3}|0[1-9][0-9]{2}|00[1-9][0-9]|000[1-9])-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])" ++
+    "[T ]([01][0-9]|2[0-4]):[0-5][0-9]:[0-5][0-9](\\.[0-9]+)?Z?$";
 
 pub const SenderError = error{
     /// A send's From is not a verified identity for the sending account (fail closed).
@@ -81,7 +154,7 @@ pub fn requestVerification(io: std.Io, alloc: std.mem.Allocator, w: *db.Db, acco
     var existing_verified = false;
     var age_s: i64 = 0;
     {
-        var st = try w.prepare("SELECT \"id\",\"status\",CAST((julianday('now')-julianday(\"updated\"))*86400 AS INTEGER) FROM \"_sender_identities\" WHERE \"account\"=?1 AND \"email\"=?2;");
+        var st = try prep(w, ageSecondsSql(w));
         defer st.finalize();
         try st.bindText(1, account);
         try st.bindText(2, email);
@@ -102,7 +175,7 @@ pub fn requestVerification(io: std.Io, alloc: std.mem.Allocator, w: *db.Db, acco
         // Re-issue a token on the pending row.
         const token = try crypto.genToken(io, alloc, 40);
         errdefer alloc.free(token);
-        var up = try w.prepare("UPDATE \"_sender_identities\" SET \"verification_token\"=?1, \"updated\"=datetime('now') WHERE \"id\"=?2;");
+        var up = try prep(w, Sql.reissue);
         defer up.finalize();
         try up.bindText(1, token);
         try up.bindText(2, eid);
@@ -117,9 +190,7 @@ pub fn requestVerification(io: std.Io, alloc: std.mem.Allocator, w: *db.Db, acco
     errdefer alloc.free(rid);
     const token = try crypto.genToken(io, alloc, 40);
     errdefer alloc.free(token);
-    var ins = try w.prepare(
-        "INSERT INTO \"_sender_identities\" (\"id\",\"created\",\"updated\",\"account\",\"email\",\"verification_token\",\"status\") VALUES (?1,datetime('now'),datetime('now'),?2,?3,?4,?5);",
-    );
+    var ins = try prep(w, Sql.insert);
     defer ins.finalize();
     try ins.bindText(1, rid);
     try ins.bindText(2, account);
@@ -143,7 +214,7 @@ pub fn confirm(alloc: std.mem.Allocator, w: *db.Db, account: []const u8, identit
     var stored: ?[]u8 = null;
     defer if (stored) |s| alloc.free(s);
     {
-        var st = try w.prepare("SELECT \"verification_token\" FROM \"_sender_identities\" WHERE \"id\"=?1 AND \"account\"=?2 AND \"status\"=?3;");
+        var st = try prep(w, Sql.pending_token);
         defer st.finalize();
         try st.bindText(1, identity_id);
         try st.bindText(2, account);
@@ -153,10 +224,7 @@ pub fn confirm(alloc: std.mem.Allocator, w: *db.Db, account: []const u8, identit
     const s = stored orelse return false;
     if (s.len == 0 or !crypto.timingSafeEql(s, token)) return false;
 
-    var up = try w.prepare(
-        "UPDATE \"_sender_identities\" SET \"status\"=?1, \"verified_at\"=datetime('now'), \"verification_token\"='', \"updated\"=datetime('now') " ++
-            "WHERE \"id\"=?2 AND \"account\"=?3 AND \"status\"=?4;",
-    );
+    var up = try prep(w, Sql.confirm);
     defer up.finalize();
     try up.bindText(1, status_verified);
     try up.bindText(2, identity_id);
@@ -171,7 +239,7 @@ pub fn confirm(alloc: std.mem.Allocator, w: *db.Db, account: []const u8, identit
 pub fn isVerified(alloc: std.mem.Allocator, reader: *db.Db, account: []const u8, email_in: []const u8) SenderError!bool {
     const email = try addr.normalize(alloc, email_in);
     defer alloc.free(email);
-    var st = try reader.prepare("SELECT 1 FROM \"_sender_identities\" WHERE \"account\"=?1 AND \"email\"=?2 AND \"status\"=?3 LIMIT 1;");
+    var st = try prep(reader, Sql.is_verified);
     defer st.finalize();
     try st.bindText(1, account);
     try st.bindText(2, email);
@@ -188,20 +256,36 @@ pub fn assertVerified(alloc: std.mem.Allocator, reader: *db.Db, account: []const
 /// List `account`'s sender identities (newest first), allocated on `alloc`.
 pub fn listForAccount(alloc: std.mem.Allocator, reader: *db.Db, account: []const u8) SenderError![]Identity {
     var out: std.ArrayList(Identity) = .empty;
-    errdefer out.deinit(alloc);
-    var st = try reader.prepare("SELECT \"id\",\"email\",\"status\",\"verified_at\",\"created\" FROM \"_sender_identities\" WHERE \"account\"=?1 ORDER BY \"created\" DESC;");
+    errdefer {
+        for (out.items) |it| freeIdentity(alloc, it);
+        out.deinit(alloc);
+    }
+    var st = try prep(reader, Sql.list);
     defer st.finalize();
     try st.bindText(1, account);
     while (try st.step()) {
-        try out.append(alloc, .{
-            .id = try alloc.dupe(u8, st.columnText(0)),
-            .email = try alloc.dupe(u8, st.columnText(1)),
-            .status = try alloc.dupe(u8, st.columnText(2)),
-            .verified_at = try alloc.dupe(u8, st.columnText(3)),
-            .created = try alloc.dupe(u8, st.columnText(4)),
-        });
+        try out.ensureUnusedCapacity(alloc, 1);
+        const id = try alloc.dupe(u8, st.columnText(0));
+        errdefer alloc.free(id);
+        const email = try alloc.dupe(u8, st.columnText(1));
+        errdefer alloc.free(email);
+        const status = try alloc.dupe(u8, st.columnText(2));
+        errdefer alloc.free(status);
+        const verified_at = try alloc.dupe(u8, st.columnText(3));
+        errdefer alloc.free(verified_at);
+        const created = try alloc.dupe(u8, st.columnText(4));
+        out.appendAssumeCapacity(.{ .id = id, .email = email, .status = status, .verified_at = verified_at, .created = created });
     }
     return out.toOwnedSlice(alloc);
+}
+
+/// Free one `Identity` returned by `listForAccount` (each field is its own allocation on `alloc`).
+pub fn freeIdentity(alloc: std.mem.Allocator, it: Identity) void {
+    alloc.free(it.id);
+    alloc.free(it.email);
+    alloc.free(it.status);
+    alloc.free(it.verified_at);
+    alloc.free(it.created);
 }
 
 // ---------------------------------------------------------------------------
@@ -216,6 +300,22 @@ fn testDb() !db.Db {
     errdefer d.close();
     try migrations.run(&d);
     return d;
+}
+
+test "every statement prep lowers for PostgreSQL fits its stack scratch and is fully lowered" {
+    const all = [_][:0]const u8{
+        ageSecondsSqlFor(db.Dialect.postgres), Sql.reissue,     Sql.insert, Sql.pending_token,
+        Sql.confirm,                           Sql.is_verified, Sql.list,
+    };
+    for (all) |sql| {
+        var buffer: [prep_scratch_len]u8 = undefined;
+        const pg = try lowerInto(&buffer, db.Dialect.postgres, sql);
+        try std.testing.expect(std.mem.indexOf(u8, pg, "$1") != null);
+        // No `?N` placeholder survives (the age arm's regex has bare `?` quantifiers).
+        for (pg, 0..) |ch, i| if (ch == '?' and i + 1 < pg.len) try std.testing.expect(!std.ascii.isDigit(pg[i + 1]));
+        try std.testing.expect(std.mem.indexOf(u8, pg, "datetime(") == null);
+        try std.testing.expect(std.mem.indexOf(u8, pg, "julianday") == null);
+    }
 }
 
 test "validateEmail accepts plain addresses, rejects malformed" {
@@ -363,4 +463,44 @@ test "requestVerification throttles a re-send within the window (I3)" {
     }
     try testing.expectEqual(@as(usize, 1), list.len);
     try testing.expectEqualStrings("pending", list[0].status);
+}
+
+// Pin the clock in the production age query so fractional boundaries cannot race wall time.
+fn expectFractionalResendAge(d: *db.Db) !void {
+    try d.exec("CREATE TEMP TABLE \"_sender_identities\" (id TEXT, status TEXT, updated TEXT, account TEXT, email TEXT);");
+    try d.exec("INSERT INTO \"_sender_identities\" VALUES ('fractional','pending','2026-11-15T12:00:00.900Z','acc1','from@app.com');");
+    const pg = db.dbDialect(d).kind == .postgres;
+    for ([_]struct { now: []const u8, age: i64 }{
+        .{ .now = "2026-11-15T12:01:00.100Z", .age = 59 },
+        .{ .now = "2026-11-15T12:01:01.100Z", .age = 60 },
+    }) |case| {
+        const literal = try std.fmt.allocPrint(testing.allocator, "'{s}'{s}", .{ case.now, if (pg) "::timestamptz" else "" });
+        defer testing.allocator.free(literal);
+        const sql = try std.mem.replaceOwned(u8, testing.allocator, ageSecondsSql(d), if (pg) "now()" else "'now'", literal);
+        defer testing.allocator.free(sql);
+        const sql_z = try testing.allocator.dupeZ(u8, sql);
+        defer testing.allocator.free(sql_z);
+        var st = try prep(d, sql_z);
+        defer st.finalize();
+        try st.bindText(1, "acc1");
+        try st.bindText(2, "from@app.com");
+        try testing.expect(try st.step());
+        const age = st.columnInt(2);
+        try testing.expectEqual(case.age, age);
+        try testing.expectEqual(case.age >= resend_interval_s, age >= resend_interval_s);
+    }
+}
+
+test "SQLite resend age preserves fractional seconds across the throttle boundary" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try expectFractionalResendAge(&d);
+}
+
+test "PostgreSQL resend age preserves fractional seconds across the throttle boundary" {
+    if (!@import("build_options").postgres) return error.SkipZigTest;
+    const url = testing.environ.getPosix("ZIGBASE_PG_TEST_URL") orelse return error.SkipZigTest;
+    var d = try db.Db.openPostgres(testing.allocator, testing.io, url);
+    defer d.close();
+    try expectFractionalResendAge(&d);
 }

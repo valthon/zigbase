@@ -115,6 +115,18 @@ lookup, so 401-vs-404 never leaks which rollup names exist).
 > is deliberately no intra-account role gating. Treat event payloads as readable by every member
 > of the account.
 
+## PostgreSQL upgrades
+
+Analytics text ordering uses byte order on both backends, independent of the database locale.
+Migration `0030_analytics_text_collation` sets PostgreSQL `_events` and existing `_rollup_*`
+text columns to `COLLATE "C"`. It follows `search_path`, including legacy tables in later
+schemas, and alters each resolved table with its schema-qualified name. Shadowed tables and
+tables outside the path are left alone. New summary tables use the same collation.
+
+The migration holds `ACCESS EXCLUSIVE` locks until its transaction commits, blocking event
+inserts and analytics reads while it rebuilds indexes on changed columns. Allow for that
+startup pause when upgrading a large event store. SQLite needs no collation migration.
+
 ## Using it standalone
 
 No `.analytics` config is needed for capture. With no `.analytics` config the `_events` table is
