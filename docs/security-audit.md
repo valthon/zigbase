@@ -67,6 +67,7 @@ collection (with a prominent startup warning for every one).
 | F16 | OTP/magic-link initiate leaks account existence via send timing + status | Info-leak / Auth | Med | A | Moderate (unauthenticated enumeration of the user table) | **Fixed** |
 | F17 | File `?token=` accepted full `.auth` session tokens (session tokens in URLs) | Info-leak / hardening | Low | A | Low (session token exposed via logs/Referer if used in a URL) | **Fixed** |
 | F18 | Runtime API accepted an invalid/dangling `tenant_field`, scoping then fails open | Authz / Tenancy | Med | A | Low (superuser misconfig → cross-tenant leak to non-superusers) | **Fixed** |
+| F19 | Relation validation ignored the target's tenant scope: id-existence oracle + cross-tenant cascade on delete | Authz / Tenancy | Med | A | Low (needs an already-leaked id; ids are 15 CSPRNG base36 chars) | **Fixed** |
 
 Items deliberately re-assessed as **not exploitable**: rule **parse errors fail *closed*** (a
 malformed rule yields a 500, the write never runs — see F3 notes); `expand` **does** re-apply the
@@ -852,3 +853,73 @@ collection with `error.NotSearchable` — loud — instead of dropping the MATCH
 returning unfiltered rows. The FTS provisioner's matching skip now also **reports itself** when a
 collection actually declared searchable fields, so it can no longer be silent about work it
 declined to do.
+
+### F19 — Relation validation ignored the target's tenant scope (FIXED, #497)
+
+**Where.** `src/records.zig` (`validateFieldValue`, the `.relation` arm); the effect on delete is the
+plain FK clause in `src/ddl.zig` (`ON DELETE CASCADE` / `SET NULL`).
+
+**Description.** A relation value was validated with `SELECT 1 FROM <target> WHERE "id" = ?` and no
+tenant predicate. Two consequences for a tenant-owned target:
+
+1. **Existence oracle.** A create or update naming another account's record id succeeded (and stored
+   the id), while a never-minted id answered `400 validation_not_found` — so the relation check
+   confirmed that a foreign id exists, and the stored relation later reading `null` revealed its
+   deletion. View-by-id answered `404` for both, so this was the only place the two disagreed.
+2. **Cross-tenant effect on delete.** Because account B could store a link to account A's record,
+   A's delete of **its own** record then deleted B's linking row (`cascadeDelete`) or set B's
+   relation to `null` — a write into B's data that no request of A's could otherwise make.
+
+Content never leaked (`expand` re-applies the target's view rule), and ids are 15 random base36
+characters from the OS CSPRNG, so the oracle needs an id that has already leaked rather than
+enumeration — the same class as F4's id-only leak.
+
+**Fix.** The existence probe on a tenant-owned target now carries the request's tenant-scope
+predicate (`tenancy.scopePredicate`, the same bound `"<target>"."<tenant_field>" = ?` reads use), via
+`records.CreateOpts.relation_scope` / `UpdateOpts.relation_scope`, which the HTTP create and update
+handlers and the REST idempotency path pass. An id outside the caller's active account is now
+indistinguishable from a missing one: same status, code, message and body, and the same single
+indexed lookup. Single and multi relations are covered. On an update, ids the row already stores
+in the field are accepted without the narrowing (the writer can already read them, so a re-send
+confirms nothing, and a whole-record save does not fail on a legacy link); only ids the request
+adds are scoped. The check runs on the post-hook values, so a `before_create`/`before_update` hook
+that sets a relation to another account's record is refused too (hooks that must link across
+accounts use `ctx.records()`). The target's view rule and abilities are deliberately **not**
+applied, so a non-tenant target (e.g. `users`) stays referenceable by id. Superusers,
+`crossTenant` contexts and request-less server writes (`ctx.records()`, migrations, imports) keep
+the plain existence check.
+
+**Residual.**
+
+- **Stored links.** Links stored before the fix, or by one of those bypasses, stay in place and
+  still follow the FK on the other account's delete; nothing rewrites them. `zigbase doctor`
+  reports them as `cross-tenant-relations` (one `warn` per relation field, with a count, plus any
+  multi-relation values it could not parse), so an operator can find and resolve them.
+- **No-tenancy view-rule oracle.** On a target that is *not* tenant-owned, existence is still
+  checked without the target's `viewRule`: a record hidden from the caller only by its view rule
+  answers `201` on a link while a never-minted id answers `400`, so its id is confirmed (and a
+  stored link that later reads `null` reveals its deletion). Applying the view rule would make a
+  shared `users` target unlinkable for most rules, so this is accepted; the precondition is still
+  an already-leaked 15-character CSPRNG id.
+- **`account=<foreign account>` on ability-guarded collections.** `_accounts` is not itself
+  tenant-owned, so a relation into it is not narrowed: a write naming an *existing* account the
+  caller does not belong to passes the relation check and is then refused by the collection's
+  ability guard with `403`, while a never-minted account id gets `400 validation_not_found`. This
+  confirms account ids (not records) and is out of #497's scope.
+- The delete-side gaps tracked in #489 (a cascade or `SET NULL` emits no realtime frame, runs no
+  hooks and writes no journal entry) are separate.
+
+Regression tests: "relation to a tenant-owned target: another tenant's id answers like a missing one
+(#497)", "relation tenant scope is bypassed by superuser, crossTenant, tenancy off and the engine
+path (#497)", "relation update keeps the ids the row already stores; only NEW ids are
+tenant-scoped (#497)", "relation to a NON-tenant target is not narrowed by the writer's tenant
+(#497)" (`src/records.zig`); "a before-hook that sets a relation to another account's record is
+refused like a client (#497)" (`src/api/records.zig`); "findCrossTenantLinks + scoped relation
+check on SQLite/PostgreSQL (#497)" (`src/tenancy/tenancy.zig`); the doctor check's unit test
+(`src/doctor.zig`); `tests/admin/test_relation_tenant_scope.py`, which reproduces the issue's
+existence and cascade repros over HTTP (byte-identical bodies for a foreign and a never-minted id;
+the other tenant's delete leaves B's rows alone), covers a non-tenant source, a request with no
+active account, a member switching accounts, re-sending a stored link, the superuser link with its
+doctor finding, and a failed doctor scan that skips only its own check; and
+`test_keyed_relation_to_another_account_answers_like_a_missing_id` in
+`tests/admin/test_rest_idempotency.py` for the `Idempotency-Key` write path.

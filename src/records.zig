@@ -142,7 +142,25 @@ pub const RecordError = error{ Validation, NotFound, NotObject, Forbidden, Inval
 /// hook create path leaves it false — the public `create`/`createInTxn` wrappers pass
 /// `.{}` — so a client can NEVER supply a record id; the server always generates one.
 /// Do not thread this flag to any request-facing caller.
-pub const CreateOpts = struct { allow_provided_id: bool = false };
+///
+/// `relation_scope` is the writing request's context (#497). When set, every relation id that
+/// names a record of a TENANT-OWNED target collection must belong to that request's active
+/// account (`tenancy.scopePredicate`); one outside it fails validation exactly like a missing id
+/// (`validation_not_found`). It is a no-op for a superuser, a `crossTenant` context, an app
+/// without tenancy, and a target with no `tenant_field`. Null — the engine/trusted path (imports,
+/// migrations, `ctx.records()`) — keeps the plain existence check.
+pub const CreateOpts = struct {
+    allow_provided_id: bool = false,
+    relation_scope: ?*const request.RequestContext = null,
+};
+
+/// Options for the low-level update path; `relation_scope` as in `CreateOpts`.
+pub const UpdateOpts = struct {
+    relation_scope: ?*const request.RequestContext = null,
+    /// Enable only after GET-style view authorization of the source row. Hidden fields
+    /// remain fully scope-checked even when the row is readable.
+    allow_stored_relations: bool = false,
+};
 
 /// Sanity gate for an import-preserved record id: non-empty, at most 255 bytes, and
 /// every byte a printable, non-space ASCII character (URL/JSON-safe). This is NOT the
@@ -388,6 +406,11 @@ fn isEmpty(v: std.json.Value) bool {
     };
 }
 
+fn containsId(ids: []const []const u8, id: []const u8) bool {
+    for (ids) |x| if (std.mem.eql(u8, x, id)) return true;
+    return false;
+}
+
 fn countValues(v: std.json.Value) usize {
     return switch (v) {
         .array => |arr| arr.items.len,
@@ -413,12 +436,67 @@ fn appendMinMax(alloc: std.mem.Allocator, errs: *std.ArrayList(schema.Validation
         try errs.append(alloc, .{ .field = field, .code = codes.s(.validation_max), .message = "Value is above the maximum." });
 }
 
+/// How `validateFieldValue` checks relation ids (#497).
+const RelationCheck = struct {
+    /// The writing request's context; see `CreateOpts.relation_scope`.
+    scope: ?*const request.RequestContext = null,
+    /// Update only: a row the caller has been authorized to read. For non-hidden fields, ids in its STORED value
+    /// are accepted as they are, without the tenant narrowing — the writer can already read them,
+    /// so re-sending them confirms nothing (an SDK that PUTs the whole record, or a full-array
+    /// PATCH of a multi relation, must not 400 on a link it did not add). Only NEW ids are
+    /// scope-checked.
+    row: ?StoredRow = null,
+
+    const StoredRow = struct { table: []const u8, id: []const u8 };
+};
+
+/// The ids `row` currently stores in relation field `f` (one for a single relation, the JSON
+/// array's string items for a multi relation; none for a missing row, NULL, or a value that is
+/// not an id array). Contract 2: the result owns its graph and all SQL/parse scratch.
+/// Call `deinit` on success; errors reclaim every allocation.
+const StoredRelationIds = struct {
+    arena: std.heap.ArenaAllocator,
+    ids: []const []const u8 = &.{},
+
+    fn deinit(self: *StoredRelationIds) void {
+        self.arena.deinit();
+    }
+};
+
+fn storedRelationIds(alloc: std.mem.Allocator, conn: *db.Db, row: RelationCheck.StoredRow, f: schema.Field) !StoredRelationIds {
+    var result: StoredRelationIds = .{ .arena = std.heap.ArenaAllocator.init(alloc) };
+    errdefer result.deinit();
+    const sa = result.arena.allocator();
+    const sql = try std.fmt.allocPrintSentinel(sa, "SELECT {s} FROM {s} WHERE \"id\" = ?1;", .{ try ddl.quoteIdent(sa, f.name), try ddl.quoteIdent(sa, row.table) }, 0);
+    var st = try prep(sa, conn, sql);
+    defer st.finalize();
+    try st.bindText(1, row.id);
+    if (!try st.step() or st.isNull(0)) return result;
+    const txt = try sa.dupe(u8, st.columnText(0));
+    if (!f.isMultiValue()) {
+        const one = try sa.alloc([]const u8, 1);
+        one[0] = txt;
+        result.ids = one;
+        return result;
+    }
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, sa, txt, .{}) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        return result; // malformed stored JSON has no ids to preserve
+    };
+    if (parsed != .array) return result;
+    var ids: std.ArrayList([]const u8) = .empty;
+    for (parsed.array.items) |it| if (it == .string) try ids.append(sa, it.string);
+    result.ids = ids.items;
+    return result;
+}
+
 /// Validate text/number min/max constraints, select membership/count, relation
 /// existence/count, and number string parsing. Appends field errors to `errs`.
-/// `conn` is used for relation existence lookups. Null and empty values skip the
-/// min/max constraint checks (required-ness is enforced separately by the caller,
-/// and an optional field must stay clearable).
-fn validateFieldValue(alloc: std.mem.Allocator, conn: *db.Db, f: schema.Field, v: std.json.Value, errs: *std.ArrayList(schema.ValidationError)) !void {
+/// `conn` is used for relation existence lookups; `rel` (see `RelationCheck`) narrows a
+/// tenant-owned relation target to the writer's active account. Null and empty
+/// values skip the min/max constraint checks (required-ness is enforced separately by the
+/// caller, and an optional field must stay clearable).
+fn validateFieldValue(alloc: std.mem.Allocator, conn: *db.Db, f: schema.Field, v: std.json.Value, rel: RelationCheck, errs: *std.ArrayList(schema.ValidationError)) !void {
     switch (f.options) {
         .text => |o| if (v == .string and v.string.len > 0) {
             // min/max are documented as length in unicode codepoints (docs/fields.md).
@@ -549,13 +627,34 @@ fn validateFieldValue(alloc: std.mem.Allocator, conn: *db.Db, f: schema.Field, v
                 .string => &.{v},
                 else => &.{},
             };
+            // #497: on a TENANT-OWNED target, the existence probe is narrowed to the writer's
+            // active account with the same bound predicate reads use. A foreign tenant's id then
+            // answers exactly like a never-minted one (same code, message and one indexed
+            // lookup), so the check is no existence oracle and no client can store a link that
+            // another tenant's delete would cascade into (FK ON DELETE CASCADE / SET NULL).
+            // The target's view rule and abilities are deliberately NOT applied: a non-tenant
+            // target (e.g. `users`) stays referenceable by id.
+            const qtarget = try ddl.quoteIdent(sa, tcol.name);
+            const tscope = if (rel.scope) |rctx| try tenancy.scopePredicate(sa, tcol, rctx) else null;
+            // Only public fields expose their stored ids to the caller. Exempting a hidden
+            // stored id would let a guessed value confirm an otherwise unreadable link.
+            var stored: ?StoredRelationIds = if (tscope != null and !f.hidden) if (rel.row) |row| try storedRelationIds(sa, conn, row, f) else null else null;
+            defer if (stored) |*owned| owned.deinit();
+            const kept: []const []const u8 = if (stored) |owned| owned.ids else &.{};
+            const q = if (tscope) |sp|
+                try std.fmt.allocPrintSentinel(sa, "SELECT 1 FROM {s} WHERE {s}.\"id\" = ? AND {s} AND ? <> '';", .{ qtarget, qtarget, sp.sql }, 0)
+            else
+                try std.fmt.allocPrintSentinel(sa, "SELECT 1 FROM {s} WHERE \"id\" = ?1;", .{qtarget}, 0);
             for (items) |it| if (it == .string) {
-                const qtarget = try ddl.quoteIdent(sa, tcol.name);
-                defer sa.free(qtarget);
-                const q = try std.fmt.allocPrintSentinel(sa, "SELECT 1 FROM {s} WHERE \"id\" = ?1;", .{qtarget}, 0);
+                if (tscope != null and containsId(kept, it.string)) continue; // already stored: kept as is
                 var st = try prep(sa, conn, q);
                 defer st.finalize();
                 try st.bindText(1, it.string);
+                if (tscope) |sp| {
+                    try st.bindText(2, sp.param.text);
+                    // An unresolved account binds ""; it must not match an empty-owner target.
+                    try st.bindText(3, sp.param.text);
+                }
                 if (!try st.step())
                     try errs.append(alloc, .{ .field = f.name, .code = codes.s(.validation_not_found), .message = "Referenced record not found." });
             };
@@ -918,7 +1017,7 @@ pub fn createInTxnOpts(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, col: sch
             continue;
         }
         if (provided) |pv| {
-            try validateFieldValue(alloc, w, f, pv, &errs);
+            try validateFieldValue(alloc, w, f, pv, .{ .scope = opts.relation_scope }, &errs);
             try cols.append(sa, ',');
             try cols.appendSlice(sa, try ddl.quoteIdent(sa, f.name));
             try vals.append(sa, ',');
@@ -1434,22 +1533,22 @@ test "float number-string validation enforces bounds and finite values" {
     const f = schema.Field{ .id = "f", .name = "rating", .options = .{ .number = .{ .mode = .float, .min = -1e20, .max = 1e20 } } };
     var errs: std.ArrayList(schema.ValidationError) = .empty;
     defer errs.deinit(a);
-    try validateFieldValue(a, &d, f, .{ .number_string = "100000000000000000000" }, &errs);
-    try validateFieldValue(a, &d, f, .null, &errs);
+    try validateFieldValue(a, &d, f, .{ .number_string = "100000000000000000000" }, .{}, &errs);
+    try validateFieldValue(a, &d, f, .null, .{}, &errs);
     try std.testing.expectEqual(@as(usize, 0), errs.items.len);
-    try validateFieldValue(a, &d, f, .{ .number_string = "200000000000000000000" }, &errs);
+    try validateFieldValue(a, &d, f, .{ .number_string = "200000000000000000000" }, .{}, &errs);
     try std.testing.expectEqual(@as(usize, 1), errs.items.len);
     try std.testing.expectEqualStrings(codes.s(.validation_max), errs.items[0].code);
     errs.clearRetainingCapacity();
-    try validateFieldValue(a, &d, f, .{ .number_string = "-200000000000000000000" }, &errs);
+    try validateFieldValue(a, &d, f, .{ .number_string = "-200000000000000000000" }, .{}, &errs);
     try std.testing.expectEqual(@as(usize, 1), errs.items.len);
     try std.testing.expectEqualStrings(codes.s(.validation_min), errs.items[0].code);
     errs.clearRetainingCapacity();
-    try validateFieldValue(a, &d, f, .{ .number_string = "1e999" }, &errs);
+    try validateFieldValue(a, &d, f, .{ .number_string = "1e999" }, .{}, &errs);
     try std.testing.expectEqual(@as(usize, 1), errs.items.len);
     try std.testing.expectEqualStrings(codes.s(.validation_number), errs.items[0].code);
     errs.clearRetainingCapacity();
-    try validateFieldValue(a, &d, f, .{ .string = "100000000000000000000" }, &errs);
+    try validateFieldValue(a, &d, f, .{ .string = "100000000000000000000" }, .{}, &errs);
     try std.testing.expectEqual(@as(usize, 1), errs.items.len);
     try std.testing.expectEqualStrings(codes.s(.validation_type), errs.items[0].code);
 }
@@ -1512,6 +1611,235 @@ test "over-maxSelect relation short-circuits before the per-element existence ch
         if (std.mem.eql(u8, e.code, codes.s(.validation_not_found))) return error.TestUnexpectedResult;
     }
     freeLastErrors(a);
+}
+
+/// #497 fixture: a tenant-owned `notes` target (rows `mine` in acc1, `theirs` in acc2) and an
+/// un-owned `tasks` collection holding a single (`note`) and a multi (`notes`) relation to it.
+const RelTenantFixture = struct {
+    notes: schema.Collection,
+    tasks: schema.Collection,
+
+    fn init(a: std.mem.Allocator, d: *db.Db) !RelTenantFixture {
+        try migrations.run(d);
+        const note_fields = [_]schema.Field{
+            .{ .id = "n1", .name = "title", .options = .{ .text = .{} } },
+            .{ .id = "n2", .name = "account", .options = .{ .text = .{} } },
+        };
+        const notes = try collections.create(a, std.testing.io, d, .{ .id = "", .name = "notes", .fields = &note_fields, .options = .{ .tenant_field = "account" } });
+        errdefer notes.deinit(a);
+        const task_fields = [_]schema.Field{
+            .{ .id = "t1", .name = "note", .options = .{ .relation = .{ .targetCollectionId = notes.id, .maxSelect = 1 } } },
+            .{ .id = "t2", .name = "notes", .options = .{ .relation = .{ .targetCollectionId = notes.id, .maxSelect = 5 } } },
+        };
+        const tasks = try collections.create(a, std.testing.io, d, .{ .id = "", .name = "tasks", .fields = &task_fields });
+        errdefer tasks.deinit(a);
+        try d.exec("INSERT INTO notes (id,created,updated,title,account) VALUES " ++
+            "('mine','t','t','a','acc1'),('theirs','t','t','b','acc2');");
+        return .{ .notes = notes, .tasks = tasks };
+    }
+
+    fn deinit(self: RelTenantFixture, a: std.mem.Allocator) void {
+        self.tasks.deinit(a);
+        self.notes.deinit(a);
+    }
+
+    fn create1(self: RelTenantFixture, a: std.mem.Allocator, d: *db.Db, key: []const u8, v: std.json.Value, scope: ?*const request.RequestContext) RecordError!std.json.Value {
+        var data: std.json.ObjectMap = .empty;
+        defer data.deinit(a);
+        try data.put(a, key, v);
+        return createInTxnOpts(a, std.testing.io, d, self.tasks, .{ .object = data }, .{ .relation_scope = scope });
+    }
+
+    fn update1(self: RelTenantFixture, a: std.mem.Allocator, d: *db.Db, id: []const u8, key: []const u8, v: std.json.Value, scope: ?*const request.RequestContext) RecordError!?std.json.Value {
+        var data: std.json.ObjectMap = .empty;
+        defer data.deinit(a);
+        try data.put(a, key, v);
+        return updateInTxnOpts(a, d, self.tasks, id, .{ .object = data }, .{ .relation_scope = scope, .allow_stored_relations = true });
+    }
+};
+
+/// Assert `foreign` and `missing` (both already-evaluated create/update results) failed with the
+/// SAME validation errors — field, code and message — and that the one error is
+/// `validation_not_found` on `field`. Frees each OWNED `last_errors` slice as it goes.
+fn expectForeignLikeMissing(a: std.mem.Allocator, foreign_errs: ?[]const schema.ValidationError, missing_errs: ?[]const schema.ValidationError, field: []const u8) !void {
+    const fe = foreign_errs orelse return error.TestExpectedEqual;
+    defer a.free(fe);
+    const me = missing_errs orelse return error.TestExpectedEqual;
+    defer a.free(me);
+    try std.testing.expectEqual(@as(usize, 1), fe.len);
+    try std.testing.expectEqual(me.len, fe.len);
+    try std.testing.expectEqualStrings(field, fe[0].field);
+    try std.testing.expectEqualStrings(codes.s(.validation_not_found), fe[0].code);
+    try std.testing.expectEqualStrings(me[0].field, fe[0].field);
+    try std.testing.expectEqualStrings(me[0].code, fe[0].code);
+    try std.testing.expectEqualStrings(me[0].message, fe[0].message);
+}
+
+/// Take ownership of the `last_errors` a failed write left (so a following write cannot clobber it).
+fn takeLastErrors() ?[]const schema.ValidationError {
+    defer last_errors = null;
+    return last_errors;
+}
+
+test "relation to a tenant-owned target: another tenant's id answers like a missing one (#497)" {
+    const a = std.testing.allocator;
+    var d = try db.Db.openMemory();
+    defer d.close();
+    const fx = try RelTenantFixture.init(a, &d);
+    defer fx.deinit(a);
+    const member = request.RequestContext{ .tenancy_enabled = true, .account_id = "acc1" };
+
+    // Single relation, create: own note accepted; foreign == never-minted.
+    freeRecord(a, try fx.create1(a, &d, "note", .{ .string = "mine" }, &member));
+    try std.testing.expectError(error.Validation, fx.create1(a, &d, "note", .{ .string = "theirs" }, &member));
+    const f1 = takeLastErrors();
+    try std.testing.expectError(error.Validation, fx.create1(a, &d, "note", .{ .string = "nevermintedid01" }, &member));
+    try expectForeignLikeMissing(a, f1, takeLastErrors(), "note");
+
+    // Multi relation, create: one foreign id among own ones fails the same way.
+    var mixed = std.json.Array.init(a);
+    defer mixed.deinit();
+    try mixed.append(.{ .string = "mine" });
+    try mixed.append(.{ .string = "theirs" });
+    var unknown = std.json.Array.init(a);
+    defer unknown.deinit();
+    try unknown.append(.{ .string = "mine" });
+    try unknown.append(.{ .string = "nevermintedid01" });
+    var own = std.json.Array.init(a);
+    defer own.deinit();
+    try own.append(.{ .string = "mine" });
+    freeRecord(a, try fx.create1(a, &d, "notes", .{ .array = own }, &member));
+    try std.testing.expectError(error.Validation, fx.create1(a, &d, "notes", .{ .array = mixed }, &member));
+    const f2 = takeLastErrors();
+    try std.testing.expectError(error.Validation, fx.create1(a, &d, "notes", .{ .array = unknown }, &member));
+    try expectForeignLikeMissing(a, f2, takeLastErrors(), "notes");
+
+    // Update: re-pointing an own task at the foreign note fails like a missing id, single + multi.
+    const task = try fx.create1(a, &d, "note", .{ .string = "mine" }, &member);
+    defer freeRecord(a, task);
+    const tid = task.object.get("id").?.string;
+    try std.testing.expectError(error.Validation, fx.update1(a, &d, tid, "note", .{ .string = "theirs" }, &member));
+    const f3 = takeLastErrors();
+    try std.testing.expectError(error.Validation, fx.update1(a, &d, tid, "note", .{ .string = "nevermintedid01" }, &member));
+    try expectForeignLikeMissing(a, f3, takeLastErrors(), "note");
+    try std.testing.expectError(error.Validation, fx.update1(a, &d, tid, "notes", .{ .array = mixed }, &member));
+    const f4 = takeLastErrors();
+    try std.testing.expectError(error.Validation, fx.update1(a, &d, tid, "notes", .{ .array = unknown }, &member));
+    try expectForeignLikeMissing(a, f4, takeLastErrors(), "notes");
+    freeRecord(a, (try fx.update1(a, &d, tid, "note", .{ .string = "mine" }, &member)).?);
+
+    // No resolved account: even an own-looking id is outside scope (fail closed).
+    const noacct = request.RequestContext{ .tenancy_enabled = true, .account_id = "" };
+    try expectRejected(a, fx.create1(a, &d, "note", .{ .string = "mine" }, &noacct), "note", codes.s(.validation_not_found));
+}
+
+test "relation tenant scope is bypassed by superuser, crossTenant, tenancy off and the engine path (#497)" {
+    const a = std.testing.allocator;
+    var d = try db.Db.openMemory();
+    defer d.close();
+    const fx = try RelTenantFixture.init(a, &d);
+    defer fx.deinit(a);
+    const su = request.RequestContext{ .tenancy_enabled = true, .is_superuser = true, .account_id = "acc1" };
+    const xt = tenancy.crossTenant(.{ .tenancy_enabled = true, .account_id = "acc1" });
+    const off = request.RequestContext{ .tenancy_enabled = false, .account_id = "acc1" };
+    for ([_]?*const request.RequestContext{ &su, &xt, &off, null }) |scope| {
+        freeRecord(a, try fx.create1(a, &d, "note", .{ .string = "theirs" }, scope));
+    }
+    // The plain existence check still applies on every bypass: a never-minted id is rejected.
+    try expectRejected(a, fx.create1(a, &d, "note", .{ .string = "nevermintedid01" }, &su), "note", codes.s(.validation_not_found));
+    try expectRejected(a, fx.create1(a, &d, "note", .{ .string = "nevermintedid01" }, null), "note", codes.s(.validation_not_found));
+}
+
+test "relation update keeps the ids the row already stores; only NEW ids are tenant-scoped (#497)" {
+    const a = std.testing.allocator;
+    var d = try db.Db.openMemory();
+    defer d.close();
+    const fx = try RelTenantFixture.init(a, &d);
+    defer fx.deinit(a);
+    try d.exec("INSERT INTO notes (id,created,updated,title,account) VALUES ('theirs2','t','t','c','acc2');");
+    const member = request.RequestContext{ .tenancy_enabled = true, .account_id = "acc1" };
+
+    // A legacy cross-tenant link, stored by the engine path (no scope): single + multi.
+    var legacy = std.json.Array.init(a);
+    defer legacy.deinit();
+    try legacy.append(.{ .string = "mine" });
+    try legacy.append(.{ .string = "theirs" });
+    var data: std.json.ObjectMap = .empty;
+    defer data.deinit(a);
+    try data.put(a, "note", .{ .string = "theirs" });
+    try data.put(a, "notes", .{ .array = legacy });
+    const task = try createInTxnOpts(a, std.testing.io, &d, fx.tasks, .{ .object = data }, .{});
+    defer freeRecord(a, task);
+    const tid = task.object.get("id").?.string;
+
+    // Re-sending the stored value (whole record, or the full multi array, or a subset) is accepted.
+    freeRecord(a, (try updateInTxnOpts(a, &d, fx.tasks, tid, .{ .object = data }, .{ .relation_scope = &member, .allow_stored_relations = true })).?);
+    var subset = std.json.Array.init(a);
+    defer subset.deinit();
+    try subset.append(.{ .string = "theirs" });
+    freeRecord(a, (try fx.update1(a, &d, tid, "notes", .{ .array = subset }, &member)).?);
+    freeRecord(a, (try fx.update1(a, &d, tid, "notes", .{ .array = legacy }, &member)).?);
+
+    // A NEW foreign id is still refused like a missing one, single and multi, even next to kept ones.
+    var added = std.json.Array.init(a);
+    defer added.deinit();
+    try added.append(.{ .string = "mine" });
+    try added.append(.{ .string = "theirs" });
+    try added.append(.{ .string = "theirs2" });
+    try expectRejected(a, fx.update1(a, &d, tid, "notes", .{ .array = added }, &member), "notes", codes.s(.validation_not_found));
+    try expectRejected(a, fx.update1(a, &d, tid, "note", .{ .string = "theirs2" }, &member), "note", codes.s(.validation_not_found));
+
+    // The kept set is the UPDATED row's own value: another row that never stored `theirs` is refused.
+    const other = try fx.create1(a, &d, "note", .{ .string = "mine" }, &member);
+    defer freeRecord(a, other);
+    try expectRejected(a, fx.update1(a, &d, other.object.get("id").?.string, "note", .{ .string = "theirs" }, &member), "note", codes.s(.validation_not_found));
+}
+
+// Sweep the owned result with a raw allocator: leaks on success and OOM are failures.
+fn checkStoredRelationAllocations(a: std.mem.Allocator, d: *db.Db, field: schema.Field) !void {
+    var owned = try storedRelationIds(a, d, .{ .table = "tasks", .id = "legacy" }, field);
+    defer owned.deinit();
+    const ids = owned.ids;
+    try std.testing.expectEqual(@as(usize, 513), ids.len);
+    try std.testing.expectEqualStrings("theirs", ids[0]);
+    try std.testing.expectEqualStrings("mine", ids[1]);
+}
+
+test "stored multi relation propagates allocation failures and tolerates malformed JSON" {
+    const a = std.testing.allocator;
+    var d = try db.Db.openMemory();
+    defer d.close();
+    const fx = try RelTenantFixture.init(a, &d);
+    defer fx.deinit(a);
+    try d.exec("INSERT INTO tasks (id,created,updated,notes) VALUES ('legacy','t','t','[\"theirs\"" ++ ",\"mine\"" ** 512 ++ "]');");
+    const field = fx.tasks.fields[1];
+    try std.testing.checkAllAllocationFailures(a, checkStoredRelationAllocations, .{ &d, field });
+
+    try d.exec("UPDATE tasks SET notes='[broken' WHERE id='legacy';");
+    var owned = try storedRelationIds(a, &d, .{ .table = "tasks", .id = "legacy" }, field);
+    defer owned.deinit();
+    const ids = owned.ids;
+    try std.testing.expectEqual(@as(usize, 0), ids.len);
+}
+
+test "relation to a NON-tenant target is not narrowed by the writer's tenant (#497)" {
+    // DECIDED: only a tenant-owned target is scoped; a shared target (e.g. `users`) stays
+    // referenceable by id from any tenant, and its view rule is not applied.
+    const a = std.testing.allocator;
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try migrations.run(&d);
+    const shared = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "shared", .fields = &[_]schema.Field{.{ .id = "s1", .name = "name", .options = .{ .text = .{} } }} });
+    defer shared.deinit(a);
+    const fields = [_]schema.Field{.{ .id = "f1", .name = "ref", .options = .{ .relation = .{ .targetCollectionId = shared.id, .maxSelect = 1 } } }};
+    const holders = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "holders", .fields = &fields });
+    defer holders.deinit(a);
+    try d.exec("INSERT INTO shared (id,created,updated,name) VALUES ('s1','t','t','x');");
+    const member = request.RequestContext{ .tenancy_enabled = true, .account_id = "acc1" };
+    var data: std.json.ObjectMap = .empty;
+    defer data.deinit(a);
+    try data.put(a, "ref", .{ .string = "s1" });
+    freeRecord(a, try createInTxnOpts(a, std.testing.io, &d, holders, .{ .object = data }, .{ .relation_scope = &member }));
 }
 
 test "over-maxSelect select short-circuits before the per-value allowed-set scan" {
@@ -1780,6 +2108,12 @@ pub fn update(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection, id: [
 /// Update a record on `w` WITHOUT opening a transaction. The caller must already
 /// be inside one (or accept autocommit). Returns null if the row does not exist.
 pub fn updateInTxn(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection, id: []const u8, data: std.json.Value) RecordError!?std.json.Value {
+    return updateInTxnOpts(alloc, w, col, id, data, .{});
+}
+
+/// The single update implementation behind `update`/`updateInTxn`; `opts.relation_scope` is the
+/// request-facing tenant narrowing of relation targets (see `CreateOpts`).
+pub fn updateInTxnOpts(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection, id: []const u8, data: std.json.Value, opts: UpdateOpts) RecordError!?std.json.Value {
     last_errors = null;
     if (data != .object) return error.NotObject;
     // Same ownership split as createInTxnOpts: `errs` escapes via last_errors (OWNED slice) on the
@@ -1807,7 +2141,7 @@ pub fn updateInTxn(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection, 
             continue;
         }
         const provided = data.object.get(f.name) orelse continue; // partial: only provided fields
-        try validateFieldValue(alloc, w, f, provided, &errs);
+        try validateFieldValue(alloc, w, f, provided, .{ .scope = opts.relation_scope, .row = if (opts.allow_stored_relations) .{ .table = col.name, .id = id } else null }, &errs);
         try sets.appendSlice(sa, try std.fmt.allocPrint(sa, ",{s}=?{d}", .{ try ddl.quoteIdent(sa, f.name), next }));
         try binds.append(sa, .{ .idx = @intCast(next), .field = f, .value = provided });
         next += 1;

@@ -81,7 +81,7 @@ Running `zigbase` with no recognised command prints usage.
 - **`serve stop | status | logs`** — manage a background `serve` session via its
   `serve.lock`/`serve.json` session files. `status --json`/`logs --follow` for scripting.
   See [Running the server → Control verbs](./serve#2-control-verbs).
-- **`doctor`** — run the nine frozen preflight checks over this deployment's config,
+- **`doctor`** — run the ten frozen preflight checks over this deployment's config,
   data dir, and schema; `--production` escalates the checks that matter more in a real
   deployment; `--json` emits NDJSON findings plus a summary object. Exits `0` fully
   clean, `1` on any error, `2` on warnings only. See

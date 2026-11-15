@@ -36,6 +36,16 @@ pub const RuleFact = struct {
     auth_signup: bool = false,
 };
 
+/// Stored links from a tenant-owned row to another account's record through one relation
+/// field (`tenancy.findCrossTenantLinks`, #497).
+pub const CrossTenantLinkFact = struct {
+    collection: []const u8,
+    field: []const u8,
+    target: []const u8,
+    count: usize,
+    unparseable: usize = 0, // multi relation values that are not a JSON id array
+};
+
 /// Everything the checks read. Gathered by doctor_run.zig; a plain struct here
 /// so every severity rule is testable without a server, a DB, or an env.
 pub const Facts = struct {
@@ -62,6 +72,10 @@ pub const Facts = struct {
     migrations_pending: usize,
     migrations_orphaned: usize,
     legacy_password_hashes: usize, // auth records still on a `$zblegacy$` hash
+    cross_tenant_links: []const CrossTenantLinkFact = &.{}, // only fields with >= 1 link or unparseable value
+    /// Set when the cross-tenant scan itself failed on an otherwise reachable database: that one
+    /// check reports `skipped` with this reason; every other DB-backed check is unaffected.
+    cross_tenant_error: ?[]const u8 = null,
 };
 
 pub const Summary = struct {
@@ -88,6 +102,7 @@ pub const check_ids: []const []const u8 = &[_][]const u8{
     "migrations-applied",
     "data-dir-writable",
     "legacy-password-hashes",
+    "cross-tenant-relations",
 };
 
 /// Map the internal enum to its FROZEN wire spelling. `err` -> `"error"` is
@@ -298,6 +313,36 @@ fn checkLegacyPasswordHashes(arena: std.mem.Allocator, f: Facts, production: boo
     return append(arena, out, id, .warn, null, "{d} auth record(s) still carry a legacy password hash; each re-hashes automatically on its next successful login, so this count falls as users sign in", .{f.legacy_password_hashes});
 }
 
+/// Links that cross accounts were writable before #497 (and still are for a superuser,
+/// `crossTenant` tooling, imports and `ctx.records()`); they are left in place, not rewritten.
+/// One finding per relation field that holds any, because each is a judgment call — a superuser
+/// may have linked across accounts on purpose — and never an error: on a single relation the
+/// other account's delete of the target cascades into (`cascadeDelete`) or nulls the row, which
+/// the operator decides about. Same severity in both modes.
+fn checkCrossTenantRelations(arena: std.mem.Allocator, f: Facts, production: bool, out: *std.ArrayListUnmanaged(Finding)) !void {
+    _ = production;
+    const id = "cross-tenant-relations";
+    if (!f.db_reachable) {
+        return append(arena, out, id, .skipped, null, "database unreachable: {s}", .{f.db_error orelse "unknown"});
+    }
+    if (f.cross_tenant_error) |reason| {
+        return append(arena, out, id, .skipped, null, "could not scan relation links: {s}", .{reason});
+    }
+    if (f.cross_tenant_links.len == 0) {
+        return append(arena, out, id, .ok, null, "no relation links another account's record", .{});
+    }
+    for (f.cross_tenant_links) |l| {
+        const subject = try std.fmt.allocPrint(arena, "{s}.{s}", .{ l.collection, l.field });
+        if (l.count > 0 and l.unparseable > 0) {
+            try append(arena, out, id, .warn, subject, "{d} stored link(s) from '{s}.{s}' point at a '{s}' record owned by another account; a delete there cascades into or clears a single-relation link, and leaves a multi-relation id stale. {d} stored value(s) are not a JSON id array and were not examined", .{ l.count, l.collection, l.field, l.target, l.unparseable });
+        } else if (l.count > 0) {
+            try append(arena, out, id, .warn, subject, "{d} stored link(s) from '{s}.{s}' point at a '{s}' record owned by another account; a delete there cascades into or clears a single-relation link, and leaves a multi-relation id stale", .{ l.count, l.collection, l.field, l.target });
+        } else {
+            try append(arena, out, id, .warn, subject, "{d} stored value(s) of '{s}.{s}' are not a JSON id array and were not examined for links to another account's '{s}' records", .{ l.unparseable, l.collection, l.field, l.target });
+        }
+    }
+}
+
 /// Contract 4 (arena-scoped): findings and their messages are allocated on
 /// `arena` and never freed. Emission order is ledger order.
 pub fn evaluate(arena: std.mem.Allocator, f: Facts, production: bool) error{OutOfMemory}![]const Finding {
@@ -311,6 +356,7 @@ pub fn evaluate(arena: std.mem.Allocator, f: Facts, production: bool) error{OutO
     try checkMigrationsApplied(arena, f, production, &out);
     try checkDataDirWritable(arena, f, production, &out);
     try checkLegacyPasswordHashes(arena, f, production, &out);
+    try checkCrossTenantRelations(arena, f, production, &out);
     return out.toOwnedSlice(arena);
 }
 
@@ -575,7 +621,7 @@ test "doctor: migrations and data dir; an unreachable DB skips its dependent che
     f.data_dir_error = "AccessDenied";
     try std.testing.expectEqualStrings("error", findingFor(try evaluate(arena, f, false), "data-dir-writable").?.severity);
 
-    // A DB we could not open makes the three DB-backed checks SKIPPED, not ok
+    // A DB we could not open makes the four DB-backed checks SKIPPED, not ok
     // and not error — claiming "no @public rules" when we could not look would
     // be the worst possible answer for a ship gate.
     f = okFacts();
@@ -585,8 +631,9 @@ test "doctor: migrations and data dir; an unreachable DB skips its dependent che
     try std.testing.expectEqualStrings("skipped", findingFor(skipped, "public-rules-enumerated").?.severity);
     try std.testing.expectEqualStrings("skipped", findingFor(skipped, "migrations-applied").?.severity);
     try std.testing.expectEqualStrings("skipped", findingFor(skipped, "legacy-password-hashes").?.severity);
+    try std.testing.expectEqualStrings("skipped", findingFor(skipped, "cross-tenant-relations").?.severity);
     const s = summarize(skipped, true);
-    try std.testing.expectEqual(@as(usize, 3), s.skipped);
+    try std.testing.expectEqual(@as(usize, 4), s.skipped);
     try std.testing.expectEqual(@as(usize, 0), s.errors);
 }
 
@@ -613,4 +660,59 @@ test "doctor: legacy password hashes warn in both modes (never escalate), unreac
     f.db_reachable = false;
     f.db_error = "FileNotFound";
     try std.testing.expectEqualStrings("skipped", findingFor(try evaluate(arena, f, false), "legacy-password-hashes").?.severity);
+}
+
+test "doctor: cross-tenant relation links warn once per field in both modes, unreachable db skips" {
+    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var f = okFacts();
+    try std.testing.expectEqualStrings("ok", findingFor(try evaluate(arena, f, true), "cross-tenant-relations").?.severity);
+
+    const links = [_]CrossTenantLinkFact{
+        .{ .collection = "tasks", .field = "note", .target = "notes", .count = 2 },
+        .{ .collection = "items", .field = "note", .target = "notes", .count = 1 },
+    };
+    f.cross_tenant_links = &links;
+    for ([_]bool{ false, true }) |production| {
+        const found = try evaluate(arena, f, production);
+        const subjects = try severitiesFor(arena, found, "cross-tenant-relations");
+        try std.testing.expectEqual(@as(usize, 2), subjects.len);
+        for (subjects) |sev| try std.testing.expectEqualStrings("warn", sev);
+        const first = findingFor(found, "cross-tenant-relations").?;
+        try std.testing.expectEqualStrings("tasks.note", first.subject.?);
+        try std.testing.expect(std.mem.indexOf(u8, first.message, "2 stored link(s)") != null);
+    }
+
+    // Unparseable multi values are reported on the field, with or without links.
+    const odd = [_]CrossTenantLinkFact{
+        .{ .collection = "tasks", .field = "notes", .target = "notes", .count = 0, .unparseable = 3 },
+        .{ .collection = "items", .field = "notes", .target = "notes", .count = 1, .unparseable = 2 },
+    };
+    f.cross_tenant_links = &odd;
+    const odd_found = try evaluate(arena, f, false);
+    const odd_first = findingFor(odd_found, "cross-tenant-relations").?;
+    try std.testing.expectEqualStrings("warn", odd_first.severity);
+    try std.testing.expect(std.mem.indexOf(u8, odd_first.message, "3 stored value(s)") != null);
+    var saw_both = false;
+    for (odd_found) |fd| if (std.mem.eql(u8, fd.check, "cross-tenant-relations") and std.mem.eql(u8, fd.subject.?, "items.notes")) {
+        saw_both = std.mem.indexOf(u8, fd.message, "1 stored link(s)") != null and std.mem.indexOf(u8, fd.message, "2 stored value(s)") != null;
+    };
+    try std.testing.expect(saw_both);
+
+    f = okFacts();
+    f.db_reachable = false;
+    f.db_error = "FileNotFound";
+    try std.testing.expectEqualStrings("skipped", findingFor(try evaluate(arena, f, false), "cross-tenant-relations").?.severity);
+
+    // A failed scan on a reachable DB degrades THIS check alone; the other DB checks still answer.
+    f = okFacts();
+    f.cross_tenant_error = "SqliteError";
+    const degraded = try evaluate(arena, f, false);
+    const ct = findingFor(degraded, "cross-tenant-relations").?;
+    try std.testing.expectEqualStrings("skipped", ct.severity);
+    try std.testing.expect(std.mem.indexOf(u8, ct.message, "SqliteError") != null);
+    try std.testing.expectEqualStrings("ok", findingFor(degraded, "migrations-applied").?.severity);
+    try std.testing.expectEqualStrings("ok", findingFor(degraded, "legacy-password-hashes").?.severity);
 }

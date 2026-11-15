@@ -67,6 +67,39 @@ zigbase.App(.{
 `.tenant_field` names the column on `projects` that holds the owning account id — that's what makes
 `projects` tenant-owned. Collections without `.tenant_field` are untouched by tenancy.
 
+## Relations into a tenant-owned collection
+
+A relation field whose **target** is tenant-owned only accepts ids of records in the request's
+active account. On a create or update over HTTP, an id that belongs to another account is rejected
+exactly like an id that was never minted: `400` with `validation_not_found` on that field, the same
+body and the same single indexed lookup. This holds for single and multi relations, and whether or
+not the collection holding the relation is itself tenant-owned. So a client cannot use the relation
+check to confirm another tenant's record ids, and it cannot store a link that the other tenant's own
+delete would then follow into its rows (`cascadeDelete` deletes the linking row; otherwise the link
+is set to `null`).
+
+On an **update**, only ids the request adds are checked against the active account. Ids the row
+already stores in that field are accepted as they are, so a client that sends the whole record
+back (an SDK save, a full-array `PATCH` of a multi relation) does not fail on a link it did not
+add — it can already read those ids, so re-sending them confirms nothing. Adding a new
+other-account id next to them, or switching a single relation to one, is still rejected.
+
+The check runs on the values the write will store, **after** `before_create` / `before_update`
+hooks. A hook that sets a relation to another account's record therefore gets the same `400` as a
+client would. A hook that must link across accounts writes through `ctx.records()`, which carries
+no request scope.
+
+Only the target's tenant scope is applied — not its `viewRule` or abilities — so a target that is
+not tenant-owned (a shared `users` collection, say) stays referenceable by id from any account.
+Superusers and `crossTenant` contexts bypass the check, as do server-side writes that carry no
+request scope: `ctx.records()` in hooks, routes and jobs, migrations, and imports. Links already
+stored across accounts (before this check existed, or written by one of those bypasses) are left in
+place; `zigbase doctor` reports them under `cross-tenant-relations`, one finding per relation field
+([serve.md §8](./serve.md#8-zigbase-doctor)). A row whose tenant value is NULL or empty belongs to
+no account and is not counted on either side of a link. On both SQLite and PostgreSQL, each
+multi-relation field uses one aggregate statement over the source rows to count cross-tenant
+links and non-empty values that cannot be examined as JSON arrays together.
+
 ## Accounts, memberships, invitations
 
 Enabling tenancy provisions three built-in system collections (visible in `_collections`,

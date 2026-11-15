@@ -54,8 +54,8 @@ case $? in 0|2) deploy ;; *) exit 1 ;; esac
 ```
 
 Review every current check: persisted JWT secret, public-rule inventory, secure cookies, host
-binding, trusted-proxy coherence, mail delivery, applied migrations, writable data directory, and
-remaining legacy password hashes. Check ids are frozen; prose is not.
+binding, trusted-proxy coherence, mail delivery, applied migrations, writable data directory,
+remaining legacy password hashes, and relation links that cross accounts. Check ids are frozen; prose is not.
 
 ## Secrets and environment
 

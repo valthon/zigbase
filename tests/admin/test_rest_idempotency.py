@@ -420,3 +420,99 @@ def test_keyed_delete_refuses_nonempty_body_without_consuming_key(server, body):
     assert call(server, "GET", target, token=admin)[0] == 200
     assert call(server, "DELETE", target, token=token, key="delete-body")[0] == 204
     assert call(server, "DELETE", target, token=token, key="delete-body")[0] == 204
+
+
+def _keyed_raw(base, method, path, data, token, key, account):
+    """A keyed write in an active account, returning (status, raw body bytes)."""
+    import json
+    import urllib.error
+    import urllib.request
+    headers = {"Authorization": f"Bearer {token}", "Idempotency-Key": key, "X-Account-Id": account,
+               "Content-Type": "application/json"}
+    req = urllib.request.Request(base + path, data=json.dumps(data).encode(), headers=headers, method=method)
+    try:
+        response = urllib.request.urlopen(req, timeout=15)
+    except urllib.error.HTTPError as error:
+        response = error
+    with response:
+        return response.status, response.read()
+
+
+def test_keyed_relation_to_another_account_answers_like_a_missing_id(binary, tmp_path):
+    """#497 on the receipt path: a keyed create/PATCH naming another account's record in a relation
+    to a tenant-owned collection gets the same 400 bytes as a never-minted id."""
+    import json
+    import sqlite3
+    import subprocess
+    from conftest import _reserve_port, _stop_server, _wait_reachable_or_fail
+    env = {k: v for k, v in os.environ.items() if not k.startswith("ZIGBASE_")}
+    env.update(ZIGBASE_DATA_DIR=str(tmp_path), ZIGBASE_SERVE_BACKGROUND="0")
+    subprocess.run([binary, "superuser", "create", "--email", "admin@x.io", "--password", "adminpassword"],
+                   env=env, check=True, capture_output=True, timeout=30)
+    with _reserve_port() as port:
+        log_path = tmp_path / "server.log"
+        with log_path.open("wb") as log:
+            proc = subprocess.Popen([binary, "serve", "--insecure-cookies"], env={**env, "ZIGBASE_HTTP_PORT": str(port)},
+                                    stdout=log, stderr=subprocess.STDOUT)
+        try:
+            _wait_reachable_or_fail(proc, port, str(log_path))
+            base = f"http://127.0.0.1:{port}"
+            admin, token, user, _ = setup(base)
+            rules = {k: '@request.auth.id != ""' for k in ("listRule", "viewRule", "createRule", "updateRule", "deleteRule")}
+            text = lambda n: {"id": "", "name": n, "type": "text", "options": {}}
+            tenant = {"type": "base", **rules, "options": {"tenant": {"field": "account"}}}
+            status, notes, _ = call(base, "POST", "/api/collections", {"name": "notes", "fields": [text("account")], **tenant}, admin)
+            assert status == 201, notes
+            rel = lambda n, m: {"id": "", "name": n, "type": "relation", "options": {"targetCollectionId": notes["id"], "maxSelect": m}}
+            status, tasks, _ = call(base, "POST", "/api/collections",
+                                    {"name": "tasks", "fields": [text("account"), text("title"), rel("note", 1), rel("notes", 5)], **tenant}, admin)
+            assert status == 201, tasks
+            with sqlite3.connect(tmp_path / "data.db") as db:
+                for account in ("acct-a", "acct-b"):
+                    db.execute("INSERT INTO _accounts(id,created,updated,slug) VALUES(?,?,?,?)", (account, "t", "t", account))
+                db.execute("INSERT INTO _memberships(id,created,updated,account,user_collection,user,role,status) VALUES(?,?,?,?,?,?,?,?)",
+                           ("member-a", "t", "t", "acct-a", "users", user["id"], "owner", "active"))
+                db.execute("INSERT INTO notes(id,created,updated,account) VALUES('ownnote00000001','t','t','acct-a'),('foreignnote0001','t','t','acct-b')")
+            own, foreign, missing = "ownnote00000001", "foreignnote0001", "zzzzzzzzzzzzzz9"
+            path = "/api/collections/tasks/records"
+            created = _keyed_raw(base, "POST", path, {"note": own, "notes": [own]}, token, "rel-own", "acct-a")
+            assert created[0] == 201, created
+            target = path + "/" + json.loads(created[1])["id"]
+            for field, bad, absent in (("note", foreign, missing), ("notes", [own, foreign], [own, missing])):
+                for method, where in (("POST", path), ("PATCH", target)):
+                    as_foreign = _keyed_raw(base, method, where, {field: bad}, token, f"rel-{method}-{field}-f", "acct-a")
+                    as_missing = _keyed_raw(base, method, where, {field: absent}, token, f"rel-{method}-{field}-m", "acct-a")
+                    assert as_foreign[0] == 400, as_foreign
+                    assert json.loads(as_foreign[1])["data"][field]["code"] == "validation_not_found", as_foreign
+                    assert as_foreign == as_missing, (method, field, as_foreign, as_missing)
+
+            # A superuser can seed legacy cross-tenant links. Readers may resend
+            # those ids with a key just as on ordinary PATCH; non-readers may not.
+            status, legacy, _ = call(base, "POST", path,
+                                     {"account": "acct-a", "note": foreign, "notes": [own, foreign]}, admin)
+            assert status == 201, legacy
+            legacy_target = path + "/" + legacy["id"]
+            for rule_index, (view_rule, readable) in enumerate((
+                ('@request.method = "GET" && @request.data.title = ""', True),
+                (None, False),
+                ('@request.method = "GET" && @request.data.title = "grant"', False),
+            )):
+                status, body, _ = call(base, "PATCH", "/api/collections/tasks",
+                                       {**tasks, "fields": tasks["schema"], "viewRule": view_rule}, admin)
+                assert status == 200, body
+                for field, stored, absent in (("note", foreign, missing),
+                                               ("notes", [own, foreign], [own, missing])):
+                    key = f"legacy-{rule_index}-{field}"
+                    payload = {field: stored, "title": "grant"}
+                    result = _keyed_raw(base, "PATCH", legacy_target, payload, token, key, "acct-a")
+                    if readable:
+                        assert result[0] == 200, result
+                        assert json.loads(result[1])[field] == stored
+                        assert _keyed_raw(base, "PATCH", legacy_target, payload, token, key, "acct-a") == result
+                    else:
+                        assert result[0] == 400, result
+                        assert json.loads(result[1])["data"][field]["code"] == "validation_not_found", result
+                        assert result == _keyed_raw(base, "PATCH", legacy_target,
+                                                    {field: absent, "title": "grant"}, token, key + "-missing", "acct-a")
+        finally:
+            _stop_server(proc)

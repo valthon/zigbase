@@ -321,6 +321,13 @@ A foreign-key reference to records in another collection.
 - `maxSelect: 1` → a single relation (one referenced id).
 - `maxSelect > 1` → a multi-relation.
 
+On create and update every referenced id must exist in the target collection, or the field
+fails with `400` `validation_not_found`. When the target is **tenant-owned**
+([tenancy.md](tenancy.md#relations-into-a-tenant-owned-collection)), the id must also belong to
+the request's active account: another account's id gets the same `validation_not_found` as a
+missing one. On an update, ids the row already stores are accepted as they are; only added ids
+are checked. Superusers are not narrowed, and the target's `viewRule` is not applied.
+
 > ### CRITICAL: `targetCollectionId` is an **id**, not a name
 >
 > `targetCollectionId` must be the **id** that the target collection's create

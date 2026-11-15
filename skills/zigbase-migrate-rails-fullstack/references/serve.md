@@ -340,7 +340,7 @@ parent exits the moment the JSON line is available.
 
 ## 8. `zigbase doctor`
 
-`zigbase doctor [--production] [--json] [--data-dir PATH]` runs nine fixed, ordered checks
+`zigbase doctor [--production] [--json] [--data-dir PATH]` runs ten fixed, ordered checks
 over a deployment and reports one finding per check (or per `@public` rule, for the rules
 check) plus a summary.
 
@@ -355,9 +355,13 @@ check) plus a summary.
 | 7 | `migrations-applied` | the `_migrations` ledger vs. the binary's compiled `.migrations` | pending → **error** (both modes); orphaned (applied, no longer declared) → **warn** (both modes) | same as default |
 | 8 | `data-dir-writable` | a throwaway probe file written then deleted under the data dir | not writable → **error** (both modes) | same as default |
 | 9 | `legacy-password-hashes` | count of auth-collection records whose `passwordHash` still matches `$zblegacy$%`, summed across every auth collection (including `_superusers`) | any count > 0 → **warn** (both modes) | same as default — legacy hashes are a normal, self-healing transitional state (each one re-hashes on its account's next successful login), never a misconfiguration, so this never escalates |
+| 10 | `cross-tenant-relations` | for each relation field from a tenant-owned collection to a tenant-owned collection (target given by id or name), the count of stored links whose target row belongs to a different account than the linking row (rows whose tenant value is NULL or empty on either side, and multi-relation ids with no target row, are not counted), plus the count of stored multi-relation values that are not a JSON id array (not examined, reported); one finding per field, named `<collection>.<field>` | any link or unexaminable value → **warn** (both modes) | same as default — such links can only come from a superuser, `crossTenant` tooling, a server-side write or data stored before relations were tenant-scoped, and may be deliberate; on a single relation the other account's delete of the target deletes (`cascadeDelete`) or clears the linking row ([tenancy.md](https://github.com/valthon/zigbase/blob/main/docs/tenancy.md#relations-into-a-tenant-owned-collection)) |
 
-A DB-backed check (2, 7, or 9) that cannot open the database reports **`skipped`** instead of
-a false `ok` or `error` — a check that could not run is reported, not scored either way.
+A DB-backed check (2, 7, 9, or 10) that cannot open the database reports **`skipped`** instead of
+a false `ok` or `error` — a check that could not run is reported, not scored either way. If the
+database opens but the cross-tenant scan itself fails (a collection's table is missing, or on
+PostgreSQL a stored multi-relation value that starts like a JSON array but is not valid JSON),
+only check 10 reports `skipped`, with the error; the other checks keep their answers.
 
 Open signup is intentionally narrow: exact `@public` on `createRule` for a non-system auth
 collection is the documented registration mechanism, so production doctor warns and enumerates it
@@ -383,7 +387,8 @@ ok       mailer-configured: mailer configured
 ok       migrations-applied: all declared migrations applied
 ok       data-dir-writable: data dir './zb_data' is writable
 ok       legacy-password-hashes: no legacy password hashes
-9 checks, 0 errors, 1 warning, 0 skipped
+ok       cross-tenant-relations: no relation links another account's record
+10 checks, 0 errors, 1 warning, 0 skipped
 ```
 
 `--json` instead: one compact object per finding, then exactly one summary object carrying
@@ -403,17 +408,18 @@ $ ZIGBASE_JWT_SECRET=a-strong-development-only-secret-key-value \
 {"check":"migrations-applied","severity":"ok","subject":null,"message":"all declared migrations applied"}
 {"check":"data-dir-writable","severity":"ok","subject":null,"message":"data dir './zb_data' is writable"}
 {"check":"legacy-password-hashes","severity":"ok","subject":null,"message":"no legacy password hashes"}
-{"summary":true,"production":false,"checks":9,"errors":0,"warnings":1,"skipped":0}
+{"check":"cross-tenant-relations","severity":"ok","subject":null,"message":"no relation links another account's record"}
+{"summary":true,"production":false,"checks":10,"errors":0,"warnings":1,"skipped":0}
 ```
 
 **Check ids never change. Match on the id, never on the message text — messages are free to
 improve.**
 
 **Database mutation:** `doctor` opens the database read-mostly to check public rules,
-migration status, and legacy password hashes; the *one* write it performs is creating the
+migration status, legacy password hashes, and cross-tenant relation links; the *one* write it performs is creating the
 `_migrations` ledger table if it is missing — the same write `migrate status` already makes
 on a fresh database. It changes nothing else, and it never fails outright: an unopenable
-database or an unwritable data dir is reported as a finding (`skipped` on the three
+database or an unwritable data dir is reported as a finding (`skipped` on the four
 DB-backed checks, `error` on `data-dir-writable`), not a crash.
 
 ### Exit codes

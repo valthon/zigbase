@@ -210,9 +210,9 @@ rotates field-encryption keys (`--dry-run` reports without rewriting), and `vapi
 prints a fresh Web Push VAPID keypair. `explain-code` looks up a frozen API error code
 (the `code` field in every `{status,code,message,data}` error response) with no args to
 list them all, or `zigbase explain-code <CODE>` (`--json` for machine-readable output) for
-one. See [docs/api.md → Conventions](docs/api.md#conventions). `doctor` runs nine preflight
+one. See [docs/api.md → Conventions](docs/api.md#conventions). `doctor` runs ten preflight
 checks over a deployment (JWT-secret persistence, `@public` rules, cookie/host/proxy/mailer
-config, migrations, data-dir writability, legacy password hashes) and exits `0`/`2`/`1`
+config, migrations, data-dir writability, legacy password hashes, cross-tenant relation links) and exits `0`/`2`/`1`
 clean/warnings-only/error so
 it can gate a deploy (`--production` escalates the checks that are only risky, not always
 wrong, in dev); `--json` emits NDJSON findings. See [docs/serve.md](docs/serve.md).
