@@ -62,6 +62,8 @@ test {
     // SP3-A item 2: live SASLprep/SCRAM coverage (NFC pass-through + needs-NFKC hard
     // error). Skips without PG.
     _ = @import("scram_pg_test.zig");
+    // #490: live synchronous_commit floor (off -> local; stronger levels untouched). Skips without PG.
+    _ = @import("durability_pg_test.zig");
     _ = @import("protocol.zig");
     _ = @import("connstr.zig");
     _ = @import("tls_trust.zig");

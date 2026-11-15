@@ -102,6 +102,43 @@ misconfigured deployment is visible rather than quietly misdirecting data.
 See the full environment-variable reference at
 <https://valthon.github.io/zigbase/docs/configuration#database-backend-experimental>.
 
+## Commit durability
+
+ZigBase acknowledges a write only after its transaction commits, and its contracts assume that
+acknowledgement survives a crash: a session revoke that answered `204` stays revoked, a "log out
+everywhere" stays logged out, a mail enqueue that answered `200` is sent. On PostgreSQL that
+requires the commit record to be **flushed to the local WAL** before `COMMIT` returns.
+
+PostgreSQL's `synchronous_commit = off` breaks that: `COMMIT` returns before the WAL flush, and a
+crash of the PostgreSQL server (or a power cut) within the next few hundred milliseconds
+(up to 3 × `wal_writer_delay`) undoes writes the client was already told succeeded — a revoked
+token verifies again after recovery.
+
+So on **every connection it opens**, after authentication, ZigBase reads the effective
+`synchronous_commit` (whatever the cluster, database or role sets) and:
+
+| Effective setting | What ZigBase does |
+|---|---|
+| `off` | sets `synchronous_commit = local` for its own session, and logs one startup warning naming the override, the pooler caveat below and the durable fix (a server, database or role default of `local` or stronger) |
+| `local`, `on`, `remote_write`, `remote_apply` | nothing — a stronger level, including your synchronous-replication choice, is never lowered |
+
+`local` is the weakest level that waits for the local WAL flush. If you run synchronous standbys
+and want acknowledged writes to survive losing the primary, set `synchronous_commit` to `on` or
+stronger yourself; ZigBase leaves it alone.
+
+ZigBase does **not** override, and cannot compensate for, server settings that remove the flush
+itself: with `fsync = off` or `full_page_writes = off` an operating-system crash or power cut can
+lose or corrupt committed data whatever `synchronous_commit` says. Run those only on disposable
+databases.
+
+> **Connection poolers.** The override is a session setting on ZigBase's own connection. Behind a
+> pooler in **transaction** (or statement) pooling mode, such as PgBouncer's
+> `pool_mode = transaction`, the server session that runs a later transaction is not necessarily
+> the one that received the setting, so the override does not reliably apply. If you put such a
+> pooler in front of ZigBase, set `synchronous_commit` to `local` or stronger on the server, the
+> database or ZigBase's role instead (`ALTER ROLE <role> SET synchronous_commit = local`).
+> Session pooling mode is unaffected.
+
 ## Move a ZigBase instance from SQLite to PostgreSQL
 
 Once you have a `-Dpostgres` binary, the `migrate-db` subcommand copies an existing SQLite-backed
