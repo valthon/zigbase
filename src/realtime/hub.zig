@@ -144,7 +144,11 @@ pub fn authVerb(app: *App, conn: *Conn, identity_arena: *std.heap.ArenaAllocator
             conn.clearAuth();
             return false;
         };
-        conn.setAuth(.{ .record = record, .is_superuser = v.is_superuser, .exp = v.exp, .token = saved_token });
+        const saved_collection = ia.dupe(u8, v.collection) catch {
+            conn.clearAuth();
+            return false;
+        };
+        conn.setAuth(.{ .collection = saved_collection, .record = record, .is_superuser = v.is_superuser, .exp = v.exp, .token = saved_token });
         // Reset the account scope to static empties on EVERY re-auth: the `identity_arena.reset`
         // above reclaimed the bytes backing the prior `account_id`/`memberships`, and the tenancy
         // branch below refreshes them onto the fresh arena ONLY for a non-superuser tenant. Without
@@ -610,7 +614,7 @@ test "event frame construction releases partial allocations" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
 }
 
-/// Two-factor policy is dynamic even for an already-open transport. Use the
+/// Authentication and account membership are dynamic even for an already-open transport. Use the
 /// same verifier as HTTP, including epoch/session revocation and current record
 /// data. The fresh record graph is used only during this subscription/delivery
 /// decision; its interlinked JSON lives on that scratch arena, not the connection.
@@ -619,9 +623,20 @@ fn currentIdentity(arena: RequestArena, app: *App, reader: *db.Db, conn: *const 
     var current = conn.*;
     const previous = conn.auth orelse return current;
     const verified = auth.verifyToken(a, app, reader, previous.token) orelse return null;
-    defer a.free(verified.collection);
+    // The refreshed collection, like the record graph, lives until the decision arena drops.
     defer a.free(verified.sid);
-    current.auth = .{ .record = verified.record, .is_superuser = verified.is_superuser, .exp = verified.exp, .token = previous.token };
+    current.auth = .{ .collection = verified.collection, .record = verified.record, .is_superuser = verified.is_superuser, .exp = verified.exp, .token = previous.token };
+    if (current.tenancy_enabled and !verified.is_superuser) {
+        // One bounded membership query on the delivery reader, just as REST resolves per
+        // request. Never authorize against the scope cached when this connection authed.
+        // The returned membership graph belongs to the decision arena, not the connection;
+        // account_id and the role derived by requestContext alias that graph until it drops.
+        const scope = tenancy.resolve(a, reader, verified.collection, recordIdOf(verified.record), conn.account_id) catch |err| {
+            std.log.warn("realtime: dropped delivery after tenant resolution failed: {s}", .{@errorName(err)});
+            return null;
+        };
+        current.setTenancyScope(scope.account_id, scope.memberships);
+    }
     return current;
 }
 
@@ -1501,7 +1516,7 @@ test "frameForDelivery: committed mid-fanout policy and revocation affect later 
         const posts = try collections.create(a, app.io, w, .{
             .id = "",
             .name = "fanout_posts",
-            .viewRule = "owner = @request.auth.id",
+            .viewRule = "@request.auth.collection != \"_superusers\" && owner = @request.auth.id",
             .fields = &.{.{ .id = "owner", .name = "owner", .options = .{ .text = .{} } }},
         });
         defer posts.deinit(a);

@@ -314,8 +314,13 @@ A rule is one of: **Locked** (`null` or `""` — superuser only; the safe defaul
 **filter expression** evaluated per request (full grammar in
 [api.md → Filter grammar](api.md#filter-grammar)). Relevant pieces:
 
-- `@request.auth.collection` — authenticated collection name (`""` when anonymous).
-- `@request.auth.id` — the authenticated user's record id (`""` when anonymous).
+- `@request.auth.collection` — authenticated collection name (absent when anonymous).
+- `@request.auth.id` — the authenticated user's record id (absent when anonymous).
+- An **absent** auth value (anonymous caller, expired session, unset field) matches
+  nothing: `owner = @request.auth.id`, `owner ~ @request.auth.id` and
+  `owner != @request.auth.id` all deny an anonymous caller. Test for a signed-in
+  caller with `@request.auth.id != ""` (or for an anonymous one with `= ""`). See
+  [api.md → Filter grammar](api.md#filter-grammar).
 - A bare field name (e.g. `owner`) refers to the record being checked.
 - **Relation traversal with `.` is supported in rules** (not just flat fields):
   `simulator.owner` follows the single-value `simulator` relation to the simulators
@@ -387,7 +392,8 @@ Two patterns:
    "createRule": "@request.data.owner = @request.auth.id"
    ```
    The client must include `"owner": "<their id>"` in the body; a mismatched or
-   missing value fails the rule with `403`.
+   missing value fails the rule with `403`, and so does an anonymous caller (an
+   absent `@request.auth.id` equals nothing, not even a missing `owner`).
 
 Pattern 1 is sturdier (the client cannot get it wrong); pattern 2 needs no Zig code.
 

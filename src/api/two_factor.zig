@@ -5,6 +5,7 @@ const schema = @import("../schema.zig");
 const collections = @import("../collections.zig");
 const records = @import("../records.zig");
 const auth = @import("auth.zig");
+const Authed = @import("../auth.zig").Authed;
 const core = @import("../auth/two_factor.zig");
 const attempts = @import("../auth/two_factor_attempt.zig");
 const store = @import("../auth/two_factor_store.zig");
@@ -302,7 +303,7 @@ pub fn Subsystem(comptime selected: selection.Selection, comptime hook: ?core.Po
                 try w.rollback();
                 return ApiError.withCode(403, .email_not_verified, "Email not verified.").toResponse(a);
             }
-            if (try auth.fireBeforeAuthSuccess(ctx, w, col.name, pending.principal, pending.primary, rec)) |response| {
+            if (try auth.fireBeforeAuthSuccess(ctx, w, col.name, pending.principal, pending.primary, Authed.borrowed(rec, col.name, false))) |response| {
                 try w.rollback();
                 return response;
             }
@@ -316,7 +317,7 @@ pub fn Subsystem(comptime selected: selection.Selection, comptime hook: ?core.Po
             const management = try createPending(ctx, w, col, pending.principal, pending.primary, .management);
             const issued = try auth.issueSessionNoEmit(ctx, w, col.name, pending.principal);
             try w.commit();
-            auth.emitAuth(ctx, col.name, rec, pending.primary);
+            auth.emitAuth(ctx, w, col.name, Authed.borrowed(rec, col.name, false), pending.primary);
             return .{ .status = 200, .body = try std.json.Stringify.valueAlloc(a, .{ .status = "authenticated", .token = issued.token, .record = rec, .managementToken = management, .recoveryCodes = recovery_codes }, .{ .emit_null_optional_fields = false }), .cookies = try a.dupe(http.Cookie, &issued.cookies) };
         }
     };

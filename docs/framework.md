@@ -2549,7 +2549,14 @@ Guarantees:
   chosen status, `error.Forbidden`/`error.Unauthorized` for 403/401; any other error → 500.
 - **Bound connection.** Do **not** call `ctx.tx` inside the hook (you are already in a
   transaction → `error.NestedTransaction`); use `ctx.records()` directly. `ctx.user()`
-  reflects the just-authenticated principal.
+  reflects the just-authenticated principal. Auth lifecycle hooks and `onAuth` also
+  carry the principal's collection and the same resolved account scope as REST:
+  `account_id`, `account_role`, and active memberships. With tenancy enabled,
+  resolution uses the existing connection and verifies the requested account's
+  membership. Collection and superuser status come from the verified principal,
+  never the URL collection. A verified superuser bypasses resolution; auth flows
+  without a verified superuser flag keep it false. Hook `ctx.can()` checks therefore
+  evaluate `@request.account.*` using that scope.
 
 Where it fires: the unified `POST /api/collections/:col/auth/:method/complete` endpoint
 (password / otp / webauthn / oauth2 / custom), the magic-link `GET …/auth/magic-link/consume`

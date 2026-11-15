@@ -207,8 +207,63 @@ fn operandToParam(alloc: std.mem.Allocator, field: ?schema.Field, op: parser.Ope
     }
 }
 
+/// An identity macro names a property of the CALLER: `@request.auth.<field>` (including the
+/// `.collection` pseudo-field) and the active account scope `@request.account.id`/`.role`.
+/// `@request.method` and `@request.data.*` are not identity: the method is always set, and the
+/// request body is chosen by the caller, so an empty body value grants nothing the caller could not
+/// already send explicitly.
+fn isIdentityMacro(path: []const u8) bool {
+    return std.mem.startsWith(u8, path, "@request.auth.") or
+        std.mem.eql(u8, path, "@request.account.id") or
+        std.mem.eql(u8, path, "@request.account.role");
+}
+
+/// True when `op` is an identity macro whose value is ABSENT for this caller (#505): anonymous,
+/// an expired session, no active account, or the auth record leaves the field unset/non-string.
+/// `RequestContext.resolveMacro` reports all of those as `""`, which used to bind as an ordinary
+/// value — so `owner ~ @request.auth.id` became `LIKE '%%'` and matched every row. The compiler
+/// treats an absent identity value like SQL NULL instead: see `emitCmp`. A missing context or an
+/// unknown macro is NOT absent here; the binding path reports those as `error.BadFilter`.
+fn isAbsentIdentity(op: parser.Operand, rctx: ?*const request.RequestContext) bool {
+    if (op != .path) return false;
+    const p = op.path;
+    if (!isIdentityMacro(p)) return false;
+    const rc = rctx orelse return false;
+    const v = rc.resolveMacro(p) orelse return false;
+    return v.len == 0;
+}
+
+/// The literal empty string, written inline (`""`/`''`) or bound through a `?` placeholder.
+fn isEmptyStringValue(op: parser.Operand, filter_args: []const FilterArg) bool {
+    return switch (op) {
+        .str => |s| s.len == 0,
+        .placeholder => |idx| filter_args[idx] == .string and filter_args[idx].string.len == 0,
+        else => false,
+    };
+}
+
+/// `@request.auth.id = ""` / `@request.auth.id != ""` (either operand order) is the documented
+/// "is the caller anonymous / signed in" test. It compares the macro with the empty string on
+/// purpose, so it keeps its literal meaning when the value is absent (anonymous `= ""` is true,
+/// `!= ""` is false). No column is involved, so it cannot widen a row match.
+fn isPresenceTest(c: Cmp, rctx: ?*const request.RequestContext, filter_args: []const FilterArg) bool {
+    if (c.op != .eq and c.op != .ne) return false;
+    return (isAbsentIdentity(c.lhs, rctx) and isEmptyStringValue(c.rhs, filter_args)) or
+        (isAbsentIdentity(c.rhs, rctx) and isEmptyStringValue(c.lhs, filter_args));
+}
+
 fn emitCmp(alloc: std.mem.Allocator, j: *joiner.Joiner, c: Cmp, params: *std.ArrayList(Param), rctx: ?*const request.RequestContext, dialect: Dialect, filter_args: []const FilterArg) CompileError![]u8 {
     if (c.op == .in) return emitIn(alloc, j, c, params, rctx, dialect, filter_args);
+
+    // #505: a comparison with an ABSENT identity value is unknown, as with SQL NULL, and an
+    // unknown comparison never grants: it compiles to constant false for EVERY operator. That
+    // includes `!=`/`!~`/`<`/`>` — "not the owner" must not hold for a caller who has no identity,
+    // and `owner > ""` would otherwise match every owned row. The only exception is the explicit
+    // presence test against the empty-string literal (`isPresenceTest`). The constant is emitted
+    // only after the column side is resolved and validated, so a rule that references an unknown,
+    // hidden, encrypted or LIKE-incompatible field fails identically for every caller.
+    const absent_false = (isAbsentIdentity(c.lhs, rctx) or isAbsentIdentity(c.rhs, rctx)) and
+        !isPresenceTest(c, rctx, filter_args);
 
     const l_col = isColPath(c.lhs);
     const r_col = isColPath(c.rhs);
@@ -229,10 +284,12 @@ fn emitCmp(alloc: std.mem.Allocator, j: *joiner.Joiner, c: Cmp, params: *std.Arr
         const val_op = if (l_col) c.rhs else c.lhs;
         if (c.op == .like or c.op == .nlike) {
             if (!likeAllowed(col.field)) return error.BadValue;
+            if (absent_false) return alloc.dupe(u8, dialect.constFalse());
             const term = try operandToText(val_op, rctx, filter_args);
             try params.append(alloc, .{ .text = try std.fmt.allocPrint(alloc, "%{s}%", .{term}) });
             return std.fmt.allocPrint(alloc, "{s} {s} ?", .{ col.sql, opSql(c.op, dialect) });
         }
+        if (absent_false) return alloc.dupe(u8, dialect.constFalse());
         try params.append(alloc, try operandToParam(alloc, col.field, val_op, rctx, filter_args));
         // Case-insensitive equality against a `.nocase` column: lower the column AND the placeholder
         // so it uses the `lower()` functional index and agrees with uniqueness (PG only; SQLite
@@ -245,6 +302,13 @@ fn emitCmp(alloc: std.mem.Allocator, j: *joiner.Joiner, c: Cmp, params: *std.Arr
     }
 
     // neither side is a column: both are macros/literals -> bind both as text
+    if (absent_false) {
+        // Still resolve both operands so a bad operand (a null literal, a non-string
+        // placeholder, an unknown macro) is the same error for every caller.
+        _ = try operandToText(c.lhs, rctx, filter_args);
+        _ = try operandToText(c.rhs, rctx, filter_args);
+        return alloc.dupe(u8, dialect.constFalse());
+    }
     if (c.op == .like or c.op == .nlike) {
         const lt = try operandToText(c.lhs, rctx, filter_args);
         const rt = try operandToText(c.rhs, rctx, filter_args);
@@ -268,6 +332,9 @@ fn emitIn(alloc: std.mem.Allocator, j: *joiner.Joiner, c: Cmp, params: *std.Arra
     var n: usize = 0;
     switch (c.rhs) {
         .list => |items| for (items) |it| {
+            // #505: an absent identity value is SQL NULL, which no IN element can equal; leave it
+            // out of the set. A list of only absent values is the empty set (constant false).
+            if (isAbsentIdentity(it, rctx)) continue;
             try params.append(alloc, try operandToParam(alloc, col.field, it, rctx, filter_args));
             n += 1;
         },
@@ -1046,4 +1113,163 @@ test "LIKE with a null operand is rejected (fail closed), never a match-everythi
     var j2 = joiner.Joiner.init(a, &d, posts);
     defer j2.deinit();
     try std.testing.expectError(error.BadValue, compileFilterArgs(a, "title ~ ?", &j2, &.{.null}));
+}
+
+/// Compile `src` against `posts` with `rctx` (helper for the #505 compile-shape tests).
+fn compileWith(a: std.mem.Allocator, d: *db.Db, posts: schema.Collection, src: []const u8, rctx: *const request.RequestContext, dia: Dialect, filter_args: []const FilterArg) !Compiled {
+    const toks = try lexer.lex(a, src);
+    defer lexer.freeTokens(a, src, toks);
+    const ast = try parser.parse(a, toks);
+    defer parser.freeNode(a, ast);
+    var j = joiner.Joiner.init(a, d, posts);
+    defer j.deinit();
+    return compile(a, &j, ast, rctx, dia, filter_args);
+}
+
+test "#505: an absent identity macro compiles to constant false, never a '%%' or '' bind" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    const a = std.testing.allocator;
+    const posts = try setup(&d, a);
+    defer posts.deinit(a);
+    const anon = request.RequestContext{};
+    const Case = struct { src: []const u8, dia: Dialect, want: []const u8 };
+    const cases = [_]Case{
+        .{ .src = "title ~ @request.auth.id", .dia = Dialect.sqlite, .want = "0" },
+        .{ .src = "title ~ @request.auth.id", .dia = Dialect.postgres, .want = "false" },
+        .{ .src = "title !~ @request.auth.id", .dia = Dialect.sqlite, .want = "0" },
+        .{ .src = "title = @request.auth.id", .dia = Dialect.sqlite, .want = "0" },
+        .{ .src = "title != @request.auth.id", .dia = Dialect.postgres, .want = "false" },
+        .{ .src = "@request.auth.id < title", .dia = Dialect.sqlite, .want = "0" },
+        .{ .src = "title = @request.account.id", .dia = Dialect.sqlite, .want = "0" },
+        .{ .src = "\"x\" ~ @request.auth.email", .dia = Dialect.sqlite, .want = "0" },
+        .{ .src = "@request.data.owner = @request.auth.id", .dia = Dialect.sqlite, .want = "0" },
+        // An absent element drops out of an IN list; nothing left is the empty set.
+        .{ .src = "title in (@request.auth.id)", .dia = Dialect.sqlite, .want = "0" },
+        .{ .src = "title in (@request.auth.id, \"x\")", .dia = Dialect.sqlite, .want = "\"posts\".\"title\" IN (?)" },
+        // The documented presence tests keep their literal meaning.
+        .{ .src = "@request.auth.id = \"\"", .dia = Dialect.sqlite, .want = "? = ?" },
+        .{ .src = "'' != @request.auth.id", .dia = Dialect.sqlite, .want = "? != ?" },
+        // A rule author's own empty LIKE term is not an identity value: unchanged.
+        .{ .src = "title ~ \"\"", .dia = Dialect.sqlite, .want = "\"posts\".\"title\" LIKE ?" },
+        // Composition: the false leg leaves the other leg in charge.
+        .{ .src = "title ~ @request.auth.id || title = \"pub\"", .dia = Dialect.sqlite, .want = "(0 OR \"posts\".\"title\" = ?)" },
+    };
+    for (cases) |cs| {
+        const c = try compileWith(a, &d, posts, cs.src, &anon, cs.dia, &.{});
+        defer freeCompiled(a, c);
+        std.testing.expectEqualStrings(cs.want, c.where_sql) catch |err| {
+            std.debug.print("rule: {s}\n", .{cs.src});
+            return err;
+        };
+    }
+    // A placeholder bound to "" is the same presence test as the inline literal.
+    const p = try compileWith(a, &d, posts, "@request.auth.id = ?", &anon, Dialect.sqlite, &.{.{ .string = "" }});
+    defer freeCompiled(a, p);
+    try std.testing.expectEqualStrings("? = ?", p.where_sql);
+}
+
+test "#505: an absent identity macro does not mask a rule's own errors" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    const a = std.testing.allocator;
+    const posts = try setup(&d, a);
+    defer posts.deinit(a);
+    const anon = request.RequestContext{};
+    // LIKE on a number column is a BadValue for an authenticated caller; it must stay one for
+    // an anonymous caller instead of collapsing to a quiet constant false.
+    try std.testing.expectError(error.BadValue, compileWith(a, &d, posts, "price ~ @request.auth.id", &anon, Dialect.sqlite, &.{}));
+    try std.testing.expectError(error.UnknownField, compileWith(a, &d, posts, "nosuch = @request.auth.id", &anon, Dialect.sqlite, &.{}));
+    try std.testing.expectError(error.BadValue, compileWith(a, &d, posts, "null ~ @request.auth.id", &anon, Dialect.sqlite, &.{}));
+    try std.testing.expectError(error.BadFilter, compileWith(a, &d, posts, "title = @request.bogus", &anon, Dialect.sqlite, &.{}));
+}
+
+test "#505: rule matrix - every operator x {anonymous, expired, owner, other} on live rows" {
+    const migrations = @import("../migrations.zig");
+    const collections = @import("../collections.zig");
+    const rules = @import("../rules.zig");
+    const connection = @import("../realtime/connection.zig");
+    var d = try db.Db.openMemory();
+    defer d.close();
+    const a = std.testing.allocator;
+    try migrations.run(&d);
+    const notes = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "notes", .fields = &[_]schema.Field{
+        .{ .id = "o1", .name = "owner", .options = .{ .text = .{} } },
+        .{ .id = "c1", .name = "contact", .options = .{ .text = .{} } },
+    } });
+    defer notes.deinit(a);
+    // Rows, in result-string order: owned by u1, owned by u2, empty owner, NULL owner.
+    try d.exec("INSERT INTO notes (id,created,updated,owner,contact) VALUES " ++
+        "('r1','t','t','u1','u1@x.io'),('r2','t','t','u2','u2@x.io'),('r3','t','t','',''),('r4','t','t',NULL,NULL);");
+    const ids = [_][]const u8{ "r1", "r2", "r3", "r4" };
+
+    var rec1: std.json.ObjectMap = .empty;
+    defer rec1.deinit(a);
+    try rec1.put(a, "id", .{ .string = "u1" });
+    try rec1.put(a, "email", .{ .string = "u1@x.io" });
+    var rec2: std.json.ObjectMap = .empty;
+    defer rec2.deinit(a);
+    try rec2.put(a, "id", .{ .string = "u2" });
+    try rec2.put(a, "email", .{ .string = "u2@x.io" });
+
+    const anon = request.RequestContext{};
+    // An expired session, exactly as realtime builds it: u1's identity with a token past `exp`.
+    var conn = connection.Conn{};
+    defer conn.deinit(a);
+    conn.setAuth(.{ .record = .{ .object = rec1 }, .is_superuser = false, .exp = 100 });
+    const expired = conn.requestContext(200);
+    try std.testing.expect(expired.auth == null);
+    const owner = request.RequestContext{ .auth = .{ .object = rec1 }, .collection = "users" };
+    const other = request.RequestContext{ .auth = .{ .object = rec2 }, .collection = "users" };
+    const ctxs = [_]*const request.RequestContext{ &anon, &expired, &owner, &other };
+
+    // `want` per context (anonymous, expired, owner u1, other u2): one char per row r1..r4.
+    const Row = struct { rule: []const u8, want: [4][]const u8 };
+    const matrix = [_]Row{
+        .{ .rule = "owner = @request.auth.id", .want = .{ "0000", "0000", "1000", "0100" } },
+        .{ .rule = "@request.auth.id = owner", .want = .{ "0000", "0000", "1000", "0100" } },
+        .{ .rule = "owner != @request.auth.id", .want = .{ "0000", "0000", "0110", "1010" } },
+        .{ .rule = "owner ~ @request.auth.id", .want = .{ "0000", "0000", "1000", "0100" } },
+        .{ .rule = "@request.auth.id ~ owner", .want = .{ "0000", "0000", "1000", "0100" } },
+        .{ .rule = "owner !~ @request.auth.id", .want = .{ "0000", "0000", "0110", "1010" } },
+        .{ .rule = "owner > @request.auth.id", .want = .{ "0000", "0000", "0100", "0000" } },
+        .{ .rule = "owner >= @request.auth.id", .want = .{ "0000", "0000", "1100", "0100" } },
+        .{ .rule = "owner < @request.auth.id", .want = .{ "0000", "0000", "0010", "1010" } },
+        .{ .rule = "owner <= @request.auth.id", .want = .{ "0000", "0000", "1010", "1110" } },
+        .{ .rule = "owner in (@request.auth.id)", .want = .{ "0000", "0000", "1000", "0100" } },
+        .{ .rule = "owner in (@request.auth.id, \"u2\")", .want = .{ "0100", "0100", "1100", "0100" } },
+        .{ .rule = "contact ~ @request.auth.email", .want = .{ "0000", "0000", "1000", "0100" } },
+        .{ .rule = "owner ~ @request.auth.collection", .want = .{ "0000", "0000", "0000", "0000" } },
+        .{ .rule = "owner = @request.account.id", .want = .{ "0000", "0000", "0000", "0000" } },
+        .{ .rule = "owner ~ @request.auth.id || owner = \"u2\"", .want = .{ "0100", "0100", "1100", "0100" } },
+        .{ .rule = "@request.auth.id != \"\"", .want = .{ "0000", "0000", "1111", "1111" } },
+        .{ .rule = "@request.auth.id = \"\"", .want = .{ "1111", "1111", "0000", "0000" } },
+        .{ .rule = "@request.auth.id != \"\" && owner = @request.auth.id", .want = .{ "0000", "0000", "1000", "0100" } },
+    };
+    // A live member's active-account role reaches realtime rules (#505 review): an editor of the
+    // active account sees their own row under a role-gated owner rule; once expired, nothing.
+    {
+        const ms = [_]request.Membership{.{ .account = "acc1", .role = "editor" }};
+        var member = connection.Conn{};
+        defer member.deinit(a);
+        member.setAuth(.{ .record = .{ .object = rec1 }, .collection = "users", .is_superuser = false, .exp = 100 });
+        member.setTenancyScope("acc1", &ms);
+        const rule = "@request.account.role != \"viewer\" && owner = @request.auth.id";
+        const live_ctx = member.requestContext(50);
+        try std.testing.expect(try rules.matches(a, &d, notes, "r1", rule, &live_ctx));
+        try std.testing.expect(!try rules.matches(a, &d, notes, "r2", rule, &live_ctx));
+        const expired_ctx = member.requestContext(200);
+        try std.testing.expect(!try rules.matches(a, &d, notes, "r1", rule, &expired_ctx));
+    }
+
+    for (matrix) |row| {
+        for (ctxs, row.want, 0..) |rc, want, ci| {
+            var got: [4]u8 = undefined;
+            for (ids, 0..) |id, i| got[i] = if (try rules.matches(a, &d, notes, id, row.rule, rc)) '1' else '0';
+            std.testing.expectEqualStrings(want, &got) catch |err| {
+                std.debug.print("rule: {s}  context #{d} (0=anonymous 1=expired 2=owner 3=other)\n", .{ row.rule, ci });
+                return err;
+            };
+        }
+    }
 }

@@ -416,6 +416,21 @@ other character is rejected. The bound parameter receives the unescaped value.
 > invalid account selection leaves `.id` and `.role` empty even when `.ids`
 > contains memberships. Resolution fails closed. See [Multi-tenancy](tenancy.md).
 
+**Absent identity values never match.** For an anonymous caller, a session whose
+token has expired, or an auth record that leaves the field unset, `@request.auth.<field>`
+(including `.collection`) has no value; so does `@request.account.id`/`.role` with no
+active account. An absent value behaves like SQL `NULL`: every comparison that uses
+it is false. This holds for every operator, the negative ones included (`=`, `!=`, `~`,
+`!~`, `<`, `<=`, `>`, `>=`), and in either operand position. So for an anonymous
+caller `owner ~ @request.auth.id`, `owner != @request.auth.id` and
+`@request.data.owner = @request.auth.id` all deny. Inside an `in (…)` list an absent
+value matches nothing, so the other elements still apply. The one exception is the
+explicit presence test against the empty string: `@request.auth.id != ""` (signed
+in) and `@request.auth.id = ""` (anonymous) keep their literal meaning. A rule
+author's own literal, such as `title ~ ""`, is not an identity value and is
+unaffected. `@request.data.*` and `@request.method` are not identity macros: an
+omitted body field is still the empty string.
+
 For a superuser the authenticated collection is `_superusers`; ordinary record rules
 are bypassed by superusers, so a collection predicate does not restrict their access.
 
@@ -1668,6 +1683,12 @@ from this same binary — the Origin authority equals the request `Host`) are **
 so the common single-binary deployment needs no configuration. A request with **no** `Origin`
 header (a non-browser client) is allowed regardless; delivery is still gated per-record by each
 collection's `viewRule`.
+
+Authenticated WebSocket and SSE rule contexts carry the verified auth collection
+name in `@request.auth.collection`, including after reauthentication. For example,
+`@request.auth.collection != "_superusers" && owner = @request.auth.id` delivers
+only the subscriber's own records. Expired tokens receive no protected events;
+send a fresh `auth` message to restore authenticated delivery.
 
 ### Authenticating
 

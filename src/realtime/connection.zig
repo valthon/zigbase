@@ -99,6 +99,8 @@ fn filtersEqual(a: ?[]const u8, b: ?[]const u8) bool {
 /// treated as anonymous until a fresh `auth` message.
 pub const AuthIdentity = struct {
     record: std.json.Value,
+    /// Verified auth collection name, owned by the identity arena.
+    collection: []const u8 = "",
     is_superuser: bool,
     exp: i64,
     /// Owned by the identity arena; retained for current-policy verification.
@@ -195,13 +197,20 @@ pub const Conn = struct {
     pub fn requestContext(self: *const Conn, now: i64) request.RequestContext {
         const live = if (self.auth) |ident| ident.exp > now else false;
         var ctx: request.RequestContext = if (live)
-            .{ .auth = self.auth.?.record, .is_superuser = self.auth.?.is_superuser, .method = "" }
+            .{ .auth = self.auth.?.record, .collection = self.auth.?.collection, .is_superuser = self.auth.?.is_superuser, .method = "" }
         else
             .{ .auth = null, .is_superuser = false, .method = "" };
         ctx.tenancy_enabled = self.tenancy_enabled;
         if (live) {
             ctx.account_id = self.account_id;
             ctx.memberships = self.memberships;
+            // The active account's role, chosen as REST does (`tenancy.resolve`): the verified
+            // membership whose account is the active one. Left empty, `@request.account.role`
+            // would read as absent and deny a live member (#505).
+            for (self.memberships) |m| if (std.mem.eql(u8, m.account, self.account_id)) {
+                ctx.account_role = m.role;
+                break;
+            };
         }
         return ctx;
     }
@@ -252,17 +261,42 @@ test "requestContext: anonymous, authed, expired" {
     var conn = Conn{};
     defer conn.deinit(a);
     try std.testing.expect(conn.requestContext(1000).auth == null);
+    try std.testing.expectEqualStrings("", conn.requestContext(1000).collection);
     var rec: std.json.ObjectMap = .empty;
     defer rec.deinit(a);
     try rec.put(a, "id", .{ .string = "u1" });
-    conn.setAuth(.{ .record = .{ .object = rec }, .is_superuser = false, .exp = 2000 });
+    conn.setAuth(.{ .record = .{ .object = rec }, .collection = "users", .is_superuser = false, .exp = 2000 });
     const c1 = conn.requestContext(1500);
     try std.testing.expect(c1.auth != null);
+    try std.testing.expectEqualStrings("users", c1.collection);
     try std.testing.expectEqualStrings("u1", c1.auth.?.object.get("id").?.string);
     try std.testing.expect(conn.requestContext(2000).auth == null);
+    try std.testing.expectEqualStrings("", conn.requestContext(2000).collection);
     try std.testing.expect(conn.requestContext(2001).auth == null);
-    conn.setAuth(.{ .record = .{ .object = rec }, .is_superuser = true, .exp = 2000 });
+    conn.setAuth(.{ .record = .{ .object = rec }, .collection = "_superusers", .is_superuser = true, .exp = 2000 });
     try std.testing.expect(conn.requestContext(1500).is_superuser);
+    try std.testing.expectEqualStrings("_superusers", conn.requestContext(1500).collection);
+    conn.clearAuth();
+    try std.testing.expectEqualStrings("", conn.requestContext(1500).collection);
+}
+
+test "requestContext: the live active account carries its membership role (#505)" {
+    const a = std.testing.allocator;
+    var conn = Conn{};
+    defer conn.deinit(a);
+    var rec: std.json.ObjectMap = .empty;
+    defer rec.deinit(a);
+    try rec.put(a, "id", .{ .string = "u1" });
+    conn.setAuth(.{ .record = .{ .object = rec }, .collection = "users", .is_superuser = false, .exp = 2000 });
+    const ms = [_]request.Membership{ .{ .account = "acc0", .role = "viewer" }, .{ .account = "acc1", .role = "editor" } };
+    conn.setTenancyScope("acc1", &ms);
+    try std.testing.expectEqualStrings("acc1", conn.requestContext(1500).account_id);
+    try std.testing.expectEqualStrings("editor", conn.requestContext(1500).account_role);
+    // Expired: no account scope at all.
+    try std.testing.expectEqualStrings("", conn.requestContext(2000).account_role);
+    // No active account: no role, even with memberships.
+    conn.setTenancyScope("", &ms);
+    try std.testing.expectEqualStrings("", conn.requestContext(1500).account_role);
 }
 
 test "outboundOverHwm: disconnect decision boundary (issue #203)" {

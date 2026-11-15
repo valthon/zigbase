@@ -185,8 +185,8 @@ pub const Ctx = struct {
     /// Uses the bound (in-transaction) connection when present, else a pooled reader.
     pub fn can(self: *Ctx, action: policy.Action, collection: []const u8, id: []const u8) !bool {
         const conn = try self.connForRead();
-        const col = (try collections.get(self.arena, conn, collection)) orelse return false;
-        return policy.authorizes(self.arena, conn, col, action, id, &self.rctx);
+        const col = (try collections.get(self.arena.a, conn, collection)) orelse return false;
+        return policy.authorizes(self.arena.a, conn, col, action, id, &self.rctx);
     }
 
     /// Returns the session-management namespace (`ctx.auth()`): `clearSession` (#86),

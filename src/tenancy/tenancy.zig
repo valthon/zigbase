@@ -114,8 +114,8 @@ pub fn crossTenant(rctx: request.RequestContext) request.RequestContext {
 // ---- Tenant resolution ------------------------------------------------------
 
 /// The resolved account scope for a request: the active account + role, and every account the
-/// principal belongs to (the source for `@request.account.ids`). All slices are allocated on the
-/// caller's (request) arena.
+/// principal belongs to (the source for `@request.account.ids`). Owned-result contract:
+/// call `deinit` with the allocator passed to `resolve`.
 pub const Resolution = struct {
     account_id: []const u8 = "",
     account_role: []const u8 = "",
@@ -157,6 +157,10 @@ pub fn resolve(
 
     var list: std.ArrayList(request.Membership) = .empty;
     defer list.deinit(alloc); // no-op after toOwnedSlice (success); frees on an OOM error path
+    errdefer for (list.items) |m| {
+        alloc.free(m.account);
+        alloc.free(m.role);
+    };
     var st = try conn.prepare(
         if (db.dbDialect(conn).kind == .postgres)
             "SELECT \"account\",\"role\" FROM \"_memberships\" WHERE \"user_collection\"=$1 AND \"user\"=$2 AND \"status\"=$3;"
@@ -175,7 +179,9 @@ pub fn resolve(
             break;
         }
         const account = try alloc.dupe(u8, st.columnText(0));
+        errdefer alloc.free(account);
         const role = try alloc.dupe(u8, st.columnText(1));
+        errdefer alloc.free(role);
         try list.append(alloc, .{ .account = account, .role = role });
     }
     const memberships = try list.toOwnedSlice(alloc);
@@ -599,4 +605,19 @@ test "PostgreSQL membership resolution uses bound parameters inside a transactio
     const restored = try resolve(a, &conn, "users", "user-a", "account-a");
     defer restored.deinit(a);
     try std.testing.expectEqualStrings("account-a", restored.account_id);
+}
+
+fn resolveAllocationProbe(alloc: std.mem.Allocator, conn: *db.Db) !void {
+    const res = try resolve(alloc, conn, "users", "u1", "acc1");
+    defer res.deinit(alloc);
+    try std.testing.expectEqualStrings("editor", res.account_role);
+    try std.testing.expectEqual(@as(usize, 2), res.memberships.len);
+}
+
+test "resolve frees partial memberships on every allocation failure" {
+    var conn = try db.Db.openMemory();
+    defer conn.close();
+    try conn.exec("CREATE TABLE _memberships (account TEXT, role TEXT, user_collection TEXT, user TEXT, status TEXT);");
+    try conn.exec("INSERT INTO _memberships VALUES ('acc1','editor','users','u1','active'),('acc2','viewer','users','u1','active');");
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, resolveAllocationProbe, .{&conn});
 }

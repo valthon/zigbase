@@ -12,6 +12,7 @@ const auth = @import("../auth.zig");
 const clock = @import("../clock.zig");
 const events = @import("../events.zig");
 const request = @import("../request.zig");
+const tenancy = @import("../tenancy/tenancy.zig");
 const session = @import("../session.zig");
 const id_gen = @import("../id.zig");
 const Ctx = @import("../ctx.zig").Ctx;
@@ -571,13 +572,44 @@ pub fn issue(ctx: *http.RequestCtx, conn: *db.Db, collection: []const u8, rid: [
     };
 }
 
+const HookContext = struct {
+    rctx: request.RequestContext,
+
+    fn deinit(self: HookContext, alloc: std.mem.Allocator) void {
+        (tenancy.Resolution{ .memberships = self.rctx.memberships }).deinit(alloc);
+    }
+};
+
+/// Owned-result context: the caller must deinit it after the hook returns.
+/// Use the verified principal supplied by the auth flow, never re-authenticate the
+/// incoming token (login may have none, and refresh may already have rotated it).
+/// Collection and superuser status come only from this explicit principal, never
+/// route/event metadata. Record-based auth flows without a verified superuser flag
+/// pass false, preserving the conservative pre-account-scope hook behavior.
+fn hookContext(req: *http.RequestCtx, conn: *db.Db, principal: ?auth.Authed) HookContext {
+    var rctx = request.RequestContext{ .method = @tagName(req.method) };
+    const app = req.app orelse return .{ .rctx = rctx };
+    rctx.tenancy_enabled = app.tenancy.enabled;
+    rctx.role_ranking = app.role_ranking;
+    if (principal) |verified| {
+        rctx.auth = verified.record;
+        rctx.collection = verified.collection;
+        rctx.is_superuser = verified.is_superuser;
+        tenancy.resolveRequest(req, conn, app, verified, &rctx);
+    }
+    return .{ .rctx = rctx };
+}
+
 /// Fire auth.afterAuthSuccess. After-style: never propagates (auth already succeeded).
-pub fn emitAuth(ctx: *http.RequestCtx, collection: []const u8, record: ?std.json.Value, method: events.AuthMethod) void {
+/// `principal` must describe the identity the auth flow verified, never a URL collection.
+pub fn emitAuth(ctx: *http.RequestCtx, conn: *db.Db, collection: []const u8, principal: ?auth.Authed, method: events.AuthMethod) void {
     const app = ctx.app orelse return;
     const d = app.dispatch orelse return;
     const h = d.on_auth orelse return;
-    var rctx = request.RequestContext{ .method = @tagName(ctx.method) };
-    var ev = events.AuthEvent{ .app = app, .ctx = &rctx, .collection = collection, .record = record, .method = method };
+    const scope = hookContext(ctx, conn, principal);
+    defer scope.deinit(ctx.allocator.a);
+    var rctx = scope.rctx;
+    var ev = events.AuthEvent{ .app = app, .ctx = &rctx, .collection = collection, .record = if (principal) |verified| verified.record else null, .method = method };
     h(&ev);
 }
 
@@ -613,7 +645,7 @@ pub fn issueSessionExt(
     const ke = (try tokenKeyAndEpochFor(ctx.allocator.a, conn, col.name, record_id)) orelse return error.NotFound;
     const issued = try issue(ctx, conn, col.name, record_id, ke.token_key, ke.epoch);
     const rec: ?std.json.Value = if (opt_record) |r| r else try records.get(ctx.allocator.a, conn, col, record_id);
-    emitAuth(ctx, col.name, rec, method);
+    emitAuth(ctx, conn, col.name, if (rec) |record| auth.Authed.borrowed(record, col.name, false) else null, method);
     return issued;
 }
 
@@ -648,18 +680,15 @@ pub fn fireBeforeAuthSuccess(
     col_name: []const u8,
     rid: []const u8,
     method: events.AuthMethod,
-    rec: std.json.Value,
+    principal: auth.Authed,
 ) !?http.Response {
     const app = req.app orelse return null;
     const d = app.dispatch orelse return null;
     const h = d.before_auth_success orelse return null;
     // Identity context: the hook's ctx.user() reflects the just-authenticated principal.
-    const rctx = request.RequestContext{
-        .auth = rec,
-        .is_superuser = false,
-        .collection = col_name,
-        .method = @tagName(req.method),
-    };
+    const scope = hookContext(req, conn, principal);
+    defer scope.deinit(req.allocator.a);
+    const rctx = scope.rctx;
     var cx = Ctx{ .app = app, .arena = req.allocator, .rctx = rctx, .request = req, .bound_conn = conn };
     defer cx.deinit(); // no-op when bound (reads reuse bound_conn), kept for hygiene
     var ev = events.AuthSuccessEvent{
@@ -667,7 +696,7 @@ pub fn fireBeforeAuthSuccess(
         .collection = col_name,
         .record_id = rid,
         .method = method,
-        .record = rec,
+        .record = principal.record,
     };
     h(&cx, &ev) catch |e| return cx.errorResponse(e);
     return null;
@@ -698,7 +727,8 @@ pub fn hasBeforeAuthSuccess(app: *@import("../app.zig").App) bool {
 /// (the hook returns any error) returns a ready-to-send `http.Response` mapped via the `Ctx`
 /// error model — the CALLER must roll back (where a txn exists) before returning it, so the
 /// action is blocked (fail closed). `rec` is the writable record pointer where applicable
-/// (`before_register` data); `identity` populates `ctx.user()` for the principal.
+/// (`before_register` data); `principal` is the verified identity, including its auth collection and superuser flag.
+/// The event collection is metadata only and must never supply authorization scope.
 pub fn fireAuthLifecycleBefore(
     req: *http.RequestCtx,
     conn: *db.Db,
@@ -706,17 +736,14 @@ pub fn fireAuthLifecycleBefore(
     rid: []const u8,
     phase: events.AuthLifecyclePhase,
     rec: ?*std.json.Value,
-    identity: ?std.json.Value,
+    principal: ?auth.Authed,
 ) !?http.Response {
     const app = req.app orelse return null;
     const d = app.dispatch orelse return null;
     const h = d.auth_lifecycle orelse return null;
-    const rctx = request.RequestContext{
-        .auth = identity,
-        .is_superuser = false,
-        .collection = col_name,
-        .method = @tagName(req.method),
-    };
+    const scope = hookContext(req, conn, principal);
+    defer scope.deinit(req.allocator.a);
+    const rctx = scope.rctx;
     var cx = Ctx{ .app = app, .arena = req.allocator, .rctx = rctx, .request = req, .bound_conn = conn };
     defer cx.deinit();
     var ev = events.AuthLifecycleEvent{
@@ -740,17 +767,14 @@ pub fn emitAuthLifecycle(
     rid: []const u8,
     phase: events.AuthLifecyclePhase,
     rec: ?*std.json.Value,
-    identity: ?std.json.Value,
+    principal: ?auth.Authed,
 ) void {
     const app = req.app orelse return;
     const d = app.dispatch orelse return;
     const h = d.auth_lifecycle orelse return;
-    const rctx = request.RequestContext{
-        .auth = identity,
-        .is_superuser = false,
-        .collection = col_name,
-        .method = @tagName(req.method),
-    };
+    const scope = hookContext(req, conn, principal);
+    defer scope.deinit(req.allocator.a);
+    const rctx = scope.rctx;
     var cx = Ctx{ .app = app, .arena = req.allocator, .rctx = rctx, .request = req, .bound_conn = conn };
     defer cx.deinit();
     var ev = events.AuthLifecycleEvent{
@@ -828,7 +852,7 @@ pub fn authWithPassword(ctx: *http.RequestCtx) anyerror!http.Response {
             // issueSessionNoEmit, commit); value-returns roll back explicitly — a later
             // double-rollback is a harmless no-op.
             errdefer w.rollback() catch {};
-            if (try fireBeforeAuthSuccess(ctx, w, col.name, rid, .password, rec)) |resp| {
+            if (try fireBeforeAuthSuccess(ctx, w, col.name, rid, .password, auth.Authed.borrowed(rec, col.name, false))) |resp| {
                 w.rollback() catch {};
                 return resp;
             }
@@ -843,7 +867,7 @@ pub fn authWithPassword(ctx: *http.RequestCtx) anyerror!http.Response {
                 w.rollback() catch {};
                 return e;
             };
-            emitAuth(ctx, col.name, rec, .password);
+            emitAuth(ctx, w, col.name, auth.Authed.borrowed(rec, col.name, false), .password);
             break :blk iss;
         }
         if (app.session_store == .table) {
@@ -890,14 +914,14 @@ pub fn authRefresh(ctx: *http.RequestCtx) anyerror!http.Response {
     // Safety net for every error-return after begin (the hook, issueSessionNoEmit, commit):
     // value-returns below roll back explicitly; a later double-rollback is a harmless no-op.
     errdefer w.rollback() catch {};
-    if (try fireAuthLifecycleBefore(ctx, w, col_name, rid, .before_refresh, &rec_mut, authed.record)) |resp| {
+    if (try fireAuthLifecycleBefore(ctx, w, col_name, rid, .before_refresh, &rec_mut, authed)) |resp| {
         w.rollback() catch {};
         return resp;
     }
     // #80 on the legacy refresh (0.10.0): `beforeAuthSuccess` slots into the SAME
     // transaction, AFTER `before_refresh` (surrounding phase first, then the seam).
     // Either abort rolls back the whole refresh — old session/row intact, fail closed.
-    if (try fireBeforeAuthSuccess(ctx, w, col_name, rid, .refresh, rec_mut)) |resp| {
+    if (try fireBeforeAuthSuccess(ctx, w, col_name, rid, .refresh, auth.Authed.borrowed(rec_mut, authed.collection, authed.is_superuser))) |resp| {
         w.rollback() catch {};
         return resp;
     }
@@ -924,8 +948,8 @@ pub fn authRefresh(ctx: *http.RequestCtx) anyerror!http.Response {
         w.rollback() catch {};
         return e;
     };
-    emitAuth(ctx, col_name, rec_mut, .refresh);
-    emitAuthLifecycle(ctx, w, col_name, rid, .after_refresh, &rec_mut, rec_mut);
+    emitAuth(ctx, w, col_name, auth.Authed.borrowed(rec_mut, authed.collection, authed.is_superuser), .refresh);
+    emitAuthLifecycle(ctx, w, col_name, rid, .after_refresh, &rec_mut, auth.Authed.borrowed(rec_mut, authed.collection, authed.is_superuser));
 
     var root: std.json.ObjectMap = .empty;
     try root.put(ctx.allocator.a, "token", .{ .string = issued.token });
@@ -953,26 +977,27 @@ pub fn authLogout(ctx: *http.RequestCtx) anyerror!http.Response {
     if (hasAuthLifecycle(app) or app.session_store == .table) {
         const w = app.pool.acquireWriter();
         defer app.pool.releaseWriter();
-        var lc_col = ctx.param("col") orelse "";
+        // The URL collection is not evidence about this token's identity.
+        var lc_col: []const u8 = "";
         // Best-effort identity: an invalid/expired/absent token logs out anonymously (rid="").
         var rid: []const u8 = "";
-        var identity: ?std.json.Value = null;
+        var principal: ?auth.Authed = null;
         var sid: []const u8 = "";
         if (auth.authenticate(app.io, ctx.allocator.a, app, ctx, w) catch null) |a| {
             rid = recordId(a.record);
-            identity = a.record;
+            principal = a;
             sid = a.sid;
-            if (lc_col.len == 0) lc_col = a.collection;
+            lc_col = a.collection;
         }
         // Logout performs no transactional write, so a `beforeLogout` hook is writable +
         // abortable but NOT transactional — an abort returns the mapped response and the
         // cookies are NOT cleared (and the session row is left intact).
-        if (try fireAuthLifecycleBefore(ctx, w, lc_col, rid, .before_logout, null, identity)) |resp| return resp;
+        if (try fireAuthLifecycleBefore(ctx, w, lc_col, rid, .before_logout, null, principal)) |resp| return resp;
         // Table mode: drop this token's server-side session row (per-device logout).
         if (app.session_store == .table and sid.len > 0) _ = try deleteSession(w, sid);
         const cleared = session.clearedCookies(app.cookie_secure);
         const cookies = try ctx.allocator.a.dupe(http.Cookie, &cleared);
-        emitAuthLifecycle(ctx, w, lc_col, rid, .after_logout, null, identity);
+        emitAuthLifecycle(ctx, w, lc_col, rid, .after_logout, null, principal);
         return .{ .status = 204, .body = "", .cookies = cookies };
     }
 
@@ -1242,7 +1267,7 @@ pub fn confirmPasswordReset(ctx: *http.RequestCtx) anyerror!http.Response {
     // returns null only for genuine not-found, so that path is preserved below.
     var rec_opt = try records.get(ctx.allocator.a, w, col, claims.id);
     const rec_ptr: ?*std.json.Value = if (rec_opt) |*r| r else null;
-    if (try fireAuthLifecycleBefore(ctx, w, col.name, claims.id, .before_password_change, rec_ptr, rec_opt)) |resp| {
+    if (try fireAuthLifecycleBefore(ctx, w, col.name, claims.id, .before_password_change, rec_ptr, if (rec_opt) |record| auth.Authed.borrowed(record, claims.collection, false) else null)) |resp| {
         w.rollback() catch {};
         return resp;
     }
@@ -1260,7 +1285,7 @@ pub fn confirmPasswordReset(ctx: *http.RequestCtx) anyerror!http.Response {
         w.rollback() catch {};
         return e;
     };
-    emitAuthLifecycle(ctx, w, col.name, claims.id, .after_password_change, rec_ptr, rec_opt);
+    emitAuthLifecycle(ctx, w, col.name, claims.id, .after_password_change, rec_ptr, if (rec_opt) |record| auth.Authed.borrowed(record, claims.collection, false) else null);
     return .{ .status = 204, .body = "" };
 }
 
@@ -2450,49 +2475,91 @@ test "verifyPasswordUpgrading leaves an argon2 hash untouched" {
     try std.testing.expectEqualStrings(phc, after); // byte-identical: no pointless rehash
 }
 
-test "#98 refresh: before/after refresh hooks fire on a valid refresh" {
+test "#98 refresh: all authenticated hook contexts authorize role-gated owners" {
     var env = try TestEnv.initAuth("refreshu");
     defer env.deinit();
+    // Handler request/response graphs are request-arena scoped.
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
     try env.createUser(a, "refreshu", "rf@x.io", "longenough");
     const token = try loginToken(env, RequestArena.from(&arena), "refreshu", "rf@x.io", "longenough");
-
+    {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        const rid = (try findByIdentity(a, w, (try collections.get(a, w, "refreshu")).?, "rf@x.io")).?;
+        _ = try collections.create(a, env.app.io, w, .{
+            .id = "",
+            .name = "hookdocs",
+            .type = .base,
+            .fields = &.{
+                .{ .id = "owner", .name = "owner", .options = .{ .text = .{} } },
+                .{ .id = "account", .name = "account", .options = .{ .text = .{} } },
+            },
+            .viewRule = "@request.account.role != \"viewer\" && owner = @request.auth.id",
+            .options = .{ .tenant_field = "account" },
+        });
+        var st = try w.prepare("INSERT INTO hookdocs (id,created,updated,owner,account) VALUES ('doc','','',?1,'acc1');");
+        defer st.finalize();
+        try st.bindText(1, rid);
+        _ = try st.step();
+        var ms = try w.prepare("INSERT INTO _memberships (id,created,updated,account,user_collection,user,role,status) VALUES ('m1','','','acc1','refreshu',?1,'editor','active'),('m2','','','acc2','refreshu',?1,'viewer','active');");
+        defer ms.finalize();
+        try ms.bindText(1, rid);
+        _ = try ms.step();
+    }
+    env.app.tenancy = .{ .enabled = true, .auth_collection = "refreshu" };
     const Hook = struct {
-        var before_seen: usize = 0;
-        var after_seen: usize = 0;
-        var phase_ok = false;
-        var rid_seen: []const u8 = "";
-        fn before(ctx: *Ctx, ev: *events.AuthLifecycleEvent) anyerror!void {
-            _ = ctx;
-            before_seen += 1;
-            if (ev.phase == .before_refresh) phase_ok = true;
-            rid_seen = ev.record_id;
+        var seen: usize = 0;
+        var allowed = true;
+        var role: []const u8 = "editor";
+        fn check(ctx: *Ctx) !void {
+            try std.testing.expectEqualStrings("refreshu", ctx.rctx.collection);
+            try std.testing.expectEqualStrings(role, ctx.rctx.account_role);
+            try std.testing.expectEqual(@as(usize, 2), ctx.rctx.memberships.len);
+            try std.testing.expectEqual(allowed, try ctx.can(.view, "hookdocs", "doc"));
+            seen += 1;
         }
-        fn after(ctx: *Ctx, ev: *events.AuthLifecycleEvent) anyerror!void {
-            _ = ctx;
-            _ = ev;
-            after_seen += 1;
+        fn lifecycle(ctx: *Ctx, _: *events.AuthLifecycleEvent) anyerror!void {
+            try check(ctx);
+        }
+        fn success(ctx: *Ctx, _: *events.AuthSuccessEvent) anyerror!void {
+            try check(ctx);
+        }
+        fn notification(ev: *events.AuthEvent) void {
+            std.testing.expectEqualStrings("refreshu", ev.ctx.collection) catch @panic("onAuth lost collection");
+            std.testing.expect(ev.ctx.auth != null) catch @panic("onAuth lost principal");
+            std.testing.expectEqualStrings(role, ev.ctx.account_role) catch @panic("onAuth lost role");
+            std.testing.expectEqual(@as(usize, 2), ev.ctx.memberships.len) catch @panic("onAuth lost memberships");
+            seen += 1;
         }
     };
-    Hook.before_seen = 0;
-    Hook.after_seen = 0;
-    var disp = events.Dispatch{ .auth_lifecycle = events.buildAuthLifecycleDispatcher(.{
-        .beforeRefresh = Hook.before,
-        .afterRefresh = Hook.after,
-    }) };
+    Hook.seen = 0;
+    var disp = events.Dispatch{
+        .auth_lifecycle = events.buildAuthLifecycleDispatcher(.{ .beforeRefresh = Hook.lifecycle, .afterRefresh = Hook.lifecycle }),
+        .before_auth_success = Hook.success,
+        .on_auth = Hook.notification,
+    };
     env.app.dispatch = &disp;
-
     const p = [_]http.Param{.{ .key = "col", .value = "refreshu" }};
-    var refresh = env.ctx(RequestArena.from(&arena), .POST, "", &p);
-    refresh.authorization = try std.fmt.allocPrint(a, "Bearer {s}", .{token});
-    const res = try authRefresh(&refresh);
-    try std.testing.expectEqual(@as(u16, 200), res.status);
-    try std.testing.expectEqual(@as(usize, 1), Hook.before_seen);
-    try std.testing.expectEqual(@as(usize, 1), Hook.after_seen);
-    try std.testing.expect(Hook.phase_ok);
-    try std.testing.expect(Hook.rid_seen.len > 0);
+    for ([_][]const u8{ "editor", "viewer", "" }) |role| {
+        Hook.role = role;
+        Hook.allowed = std.mem.eql(u8, role, "editor");
+        if (role.len > 0) {
+            const w = env.pool.acquireWriter();
+            defer env.pool.releaseWriter();
+            var st = try w.prepare("UPDATE _memberships SET role=?1 WHERE id='m1';");
+            defer st.finalize();
+            try st.bindText(1, role);
+            _ = try st.step();
+        }
+        var refresh = env.ctx(RequestArena.from(&arena), .POST, "", &p);
+        refresh.headers = &.{.{ .key = "x-account-id", .value = if (role.len > 0) "acc1" else "not-a-membership" }};
+        refresh.authorization = try std.fmt.allocPrint(a, "Bearer {s}", .{token});
+        const res = try authRefresh(&refresh);
+        try std.testing.expectEqual(@as(u16, 200), res.status);
+    }
+    try std.testing.expectEqual(@as(usize, 12), Hook.seen);
 }
 
 test "#98 refresh: aborting beforeRefresh blocks the session AND rolls back side-writes" {
@@ -2526,7 +2593,7 @@ test "#98 refresh: aborting beforeRefresh blocks the session AND rolls back side
     try std.testing.expectEqual(@as(i64, 0), try countTable(env, "posts")); // side-write rolled back
 }
 
-test "#98 logout: before/after logout hooks fire; session cookies still cleared" {
+test "#98 logout: a regular token cannot gain superuser hook scope from the URL" {
     var env = try TestEnv.initAuth("logoutu");
     defer env.deinit();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -2539,14 +2606,20 @@ test "#98 logout: before/after logout hooks fire; session cookies still cleared"
         var before_seen: usize = 0;
         var after_seen: usize = 0;
         var rid_seen: []const u8 = "";
+        fn check(ctx: *Ctx, ev: *events.AuthLifecycleEvent) !void {
+            // The user's own auth record is locked; a forged superuser scope bypasses it.
+            try std.testing.expect(!try ctx.can(.view, "logoutu", ev.record_id));
+            try std.testing.expect(!ctx.rctx.is_superuser);
+            try std.testing.expectEqualStrings("logoutu", ctx.rctx.collection);
+            try std.testing.expectEqualStrings("logoutu", ev.collection);
+        }
         fn before(ctx: *Ctx, ev: *events.AuthLifecycleEvent) anyerror!void {
-            _ = ctx;
+            try check(ctx, ev);
             before_seen += 1;
             rid_seen = ev.record_id;
         }
         fn after(ctx: *Ctx, ev: *events.AuthLifecycleEvent) anyerror!void {
-            _ = ctx;
-            _ = ev;
+            try check(ctx, ev);
             after_seen += 1;
         }
     };
@@ -2558,18 +2631,21 @@ test "#98 logout: before/after logout hooks fire; session cookies still cleared"
     }) };
     env.app.dispatch = &disp;
 
-    const p = [_]http.Param{.{ .key = "col", .value = "logoutu" }};
-    var logout = env.ctx(RequestArena.from(&arena), .POST, "", &p);
-    logout.authorization = try std.fmt.allocPrint(a, "Bearer {s}", .{token});
-    const res = try authLogout(&logout);
-    try std.testing.expectEqual(@as(u16, 204), res.status);
-    var cleared: usize = 0;
-    for (res.cookies) |c| if (c.max_age_s < 0) {
-        cleared += 1;
-    };
-    try std.testing.expectEqual(@as(usize, 2), cleared);
-    try std.testing.expectEqual(@as(usize, 1), Hook.before_seen);
-    try std.testing.expectEqual(@as(usize, 1), Hook.after_seen);
+    for ([_][]const u8{ "logoutu", "_superusers" }) |url_collection| {
+        const p = [_]http.Param{.{ .key = "col", .value = url_collection }};
+        var logout = env.ctx(RequestArena.from(&arena), .POST, "", &p);
+        logout.authorization = try std.fmt.allocPrint(a, "Bearer {s}", .{token});
+        logout.path = if (std.mem.eql(u8, url_collection, "_superusers")) "/api/collections/_superusers/auth-logout" else "/api/collections/logoutu/auth-logout";
+        const res = try authLogout(&logout);
+        try std.testing.expectEqual(@as(u16, 204), res.status);
+        var cleared: usize = 0;
+        for (res.cookies) |c| if (c.max_age_s < 0) {
+            cleared += 1;
+        };
+        try std.testing.expectEqual(@as(usize, 2), cleared);
+    }
+    try std.testing.expectEqual(@as(usize, 2), Hook.before_seen);
+    try std.testing.expectEqual(@as(usize, 2), Hook.after_seen);
     try std.testing.expect(Hook.rid_seen.len > 0); // identity resolved from the bearer
 }
 

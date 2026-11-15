@@ -561,7 +561,7 @@ pub fn create(ctx: *http.RequestCtx) anyerror!http.Response {
     // #98: auth-collection registration after-hook (post-commit, notify-only). `rec_mut` is
     // the persisted account (id populated); it also seeds the hook's `ctx.user()` identity.
     if (col.type == .auth)
-        api_auth.emitAuthLifecycle(ctx, w, col.name, rid, .after_register, &rec_mut, rec_mut);
+        api_auth.emitAuthLifecycle(ctx, w, col.name, rid, .after_register, &rec_mut, auth.Authed.borrowed(rec_mut, col.name, false));
     realtime_ws.broadcast(app, col, .create, rid, rec_mut, null);
     return jsonResponse(ctx, 201, rec_mut);
 }
@@ -783,7 +783,7 @@ fn updateImpl(ctx: *http.RequestCtx, comptime is_resumable: bool, resumable: if 
     // the Ctx error model — identical contract to confirm-password-reset.
     if (col.type == .auth and pw_change) {
         var snap = existing;
-        if (try api_auth.fireAuthLifecycleBefore(ctx, w, col.name, rid, .before_password_change, &snap, existing)) |resp| {
+        if (try api_auth.fireAuthLifecycleBefore(ctx, w, col.name, rid, .before_password_change, &snap, auth.Authed.borrowed(existing, col.name, false))) |resp| {
             return resp;
         }
     }
@@ -868,7 +868,7 @@ fn updateImpl(ctx: *http.RequestCtx, comptime is_resumable: bool, resumable: if 
     // #98: afterPasswordChange AFTER the record after-hooks (notify-only, post-commit).
     if (col.type == .auth and pw_change) {
         var snap2 = ur_mut;
-        api_auth.emitAuthLifecycle(ctx, w, col.name, rid, .after_password_change, &snap2, ur_mut);
+        api_auth.emitAuthLifecycle(ctx, w, col.name, rid, .after_password_change, &snap2, auth.Authed.borrowed(ur_mut, col.name, false));
     }
     realtime_ws.broadcast(app, col, .update, broadcast_id, ur_mut, null);
     if (pw_cookies.len > 0) {

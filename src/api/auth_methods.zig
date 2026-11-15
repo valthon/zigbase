@@ -20,6 +20,7 @@ const method_mod = @import("../auth/method.zig");
 const ApiError = @import("error.zig").ApiError;
 const codes = @import("../error_codes.zig");
 const auth = @import("auth.zig");
+const Authed = @import("../auth.zig").Authed;
 const records = @import("../records.zig");
 const ratelimit = @import("../ratelimit.zig");
 const Ctx = @import("../ctx.zig").Ctx;
@@ -210,7 +211,7 @@ fn dispatch(ctx: *http.RequestCtx, phase: DispatchPhase) anyerror!http.Response 
                     // all subsequent writes). Value-returns below roll back explicitly; the
                     // double-rollback a later error would cause is a harmless no-op (no active txn).
                     errdefer w.rollback() catch {};
-                    if (try auth.fireBeforeAuthSuccess(ctx, w, col.name, rid, auth_tag, rec)) |resp| {
+                    if (try auth.fireBeforeAuthSuccess(ctx, w, col.name, rid, auth_tag, Authed.borrowed(rec, col.name, false))) |resp| {
                         w.rollback() catch {};
                         return resp;
                     }
@@ -223,7 +224,7 @@ fn dispatch(ctx: *http.RequestCtx, phase: DispatchPhase) anyerror!http.Response 
                         return e;
                     };
                     // onAuth fires only AFTER a durable commit (session truly issued).
-                    auth.emitAuth(ctx, col.name, rec, auth_tag);
+                    auth.emitAuth(ctx, w, col.name, Authed.borrowed(rec, col.name, false), auth_tag);
                     var root: std.json.ObjectMap = .empty;
                     try root.put(ctx.allocator.a, "token", .{ .string = issued.token });
                     const cookies = try ctx.allocator.a.dupe(http.Cookie, &issued.cookies);
