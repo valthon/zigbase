@@ -12,9 +12,11 @@ const build_options = @import("build_options");
 const workbench = @import("../../query_workbench.zig");
 
 /// sqlite-vec's static entry point (#157). Declared unconditionally but only REFERENCED inside the
-/// `build_options.vector` comptime branch in `open`, so the default build neither links the symbol
-/// nor compiles the amalgamation. With `-DSQLITE_CORE` the init fn calls SQLite directly (no api
-/// routines pointer needed), so we pass null for pzErrMsg/pApi.
+/// `build_options.vector` comptime branch in `Db.openConnection`, so the default build neither links
+/// the symbol nor compiles the amalgamation. With `-DSQLITE_CORE` the init fn calls SQLite directly
+/// (no api routines pointer needed), so pApi is null. pzErrMsg must be a real out-pointer: on a
+/// failed function/module registration sqlite-vec writes `*pzErrMsg = sqlite3_mprintf(...)` without
+/// a null check, and the caller owns that string (sqlite3_free).
 extern fn sqlite3_vec_init(db: ?*c.sqlite3, pzErrMsg: ?*?[*:0]u8, pApi: ?*const anyopaque) callconv(.c) c_int;
 
 /// Returns the linked SQLite library version string, e.g. "3.53.2".
@@ -78,38 +80,46 @@ pub const Db = struct {
     }
 
     pub fn open(path: [:0]const u8) DbError!Db {
-        var handle: ?*c.sqlite3 = null;
-        const flags = c.SQLITE_OPEN_READWRITE | c.SQLITE_OPEN_CREATE | c.SQLITE_OPEN_FULLMUTEX;
-        // Dev-only: open against the freezing VFS so CURRENT_TIMESTAMP / column DEFAULTs honor
-        // ZIGBASE_FAKE_NOW (#97). comptime-null on a prod build -> the OS default VFS, unchanged.
-        if (c.sqlite3_open_v2(path.ptr, &handle, flags, clock_vfs.vfsName()) != c.SQLITE_OK) {
-            if (handle) |h| _ = c.sqlite3_close(h);
-            return DbError.OpenFailed;
-        }
-        const conn = Db{ .handle = handle.? };
-        // Dev-only: shadow SQLite's date/time builtins so a consumer's raw `datetime('now')`
-        // honors the frozen test clock (#84). comptime no-op on a prod build, so the writer/
-        // any Db.open caller (incl. openMemory) is unchanged in production.
-        clock_sql.register(conn.handle);
-        // Opt-in vector search (#157): register sqlite-vec on every connection so vec_distance_*
-        // is available to the reader pool + writer. comptime-folded away in the default build.
-        if (build_options.vector) _ = sqlite3_vec_init(conn.handle, null, null);
-        return conn;
+        return openConnection(path, c.SQLITE_OPEN_READWRITE | c.SQLITE_OPEN_CREATE | c.SQLITE_OPEN_FULLMUTEX);
     }
 
     /// Open an existing database without write/create capability. Inspection commands use
     /// this constructor so reading schema metadata cannot create a missing database, change
     /// journal mode, or write application rows.
     pub fn openReadOnly(path: [:0]const u8) DbError!Db {
+        return openConnection(path, c.SQLITE_OPEN_READONLY | c.SQLITE_OPEN_FULLMUTEX);
+    }
+
+    /// The ONE place a query-serving connection is opened: `open` (writer, openMemory),
+    /// `openReadOnly` (inspection commands) and `Pool.openReader` (every pooled/overflow
+    /// reader) all go through here, so the per-connection SQL functions cannot drift
+    /// between them again (#488: the reader path skipped sqlite-vec, so every `?vector=`
+    /// list answered 500 "no such function: vec_distance_cosine").
+    fn openConnection(path: [:0]const u8, flags: c_int) DbError!Db {
         var handle: ?*c.sqlite3 = null;
-        const flags = c.SQLITE_OPEN_READONLY | c.SQLITE_OPEN_FULLMUTEX;
+        // Dev-only: open against the freezing VFS so CURRENT_TIMESTAMP / column DEFAULTs honor
+        // ZIGBASE_FAKE_NOW (#97). comptime-null on a prod build -> the OS default VFS, unchanged.
         if (c.sqlite3_open_v2(path.ptr, &handle, flags, clock_vfs.vfsName()) != c.SQLITE_OK) {
             if (handle) |h| _ = c.sqlite3_close(h);
             return DbError.OpenFailed;
         }
-        const conn = Db{ .handle = handle.? };
+        var conn = Db{ .handle = handle.? };
+        errdefer conn.close();
+        // Dev-only: shadow SQLite's date/time builtins so a consumer's raw `datetime('now')`
+        // honors the frozen test clock (#84). comptime no-op on a prod build.
         clock_sql.register(conn.handle);
-        if (build_options.vector) _ = sqlite3_vec_init(conn.handle, null, null);
+        // Opt-in vector search (#157): register sqlite-vec so vec_distance_* is available on
+        // this connection. comptime-folded away in the default build. A failed registration
+        // fails the open rather than handing out a connection whose vector queries all fail.
+        if (build_options.vector) {
+            var err_msg: ?[*:0]u8 = null;
+            const rc = sqlite3_vec_init(conn.handle, &err_msg, null);
+            if (err_msg) |m| {
+                std.log.err("sqlite-vec registration failed: {s}", .{std.mem.span(m)});
+                c.sqlite3_free(m);
+            }
+            if (rc != c.SQLITE_OK) return DbError.OpenFailed;
+        }
         return conn;
     }
 
@@ -708,23 +718,14 @@ pub const Pool = struct {
 
     /// Opens a fresh read-only connection. Caller owns it and must call close().
     pub fn openReader(self: *Pool) DbError!Db {
-        var handle: ?*c.sqlite3 = null;
-        const flags = c.SQLITE_OPEN_READONLY | c.SQLITE_OPEN_FULLMUTEX;
-        // Dev-only freezing VFS (#97); comptime-null on a prod build (default VFS, unchanged).
-        if (c.sqlite3_open_v2(self.path.ptr, &handle, flags, clock_vfs.vfsName()) != c.SQLITE_OK) {
-            if (handle) |h| _ = c.sqlite3_close(h);
-            return DbError.OpenFailed;
-        }
-        var db = Db{ .handle = handle.? };
+        // Same constructor as the writer, so the reader gets the same per-connection SQL
+        // functions (clock shadowing #84, sqlite-vec #157/#488).
+        var db = try Db.openConnection(self.path, c.SQLITE_OPEN_READONLY | c.SQLITE_OPEN_FULLMUTEX);
         errdefer db.close();
         try db.exec("PRAGMA busy_timeout=5000;");
         // Match the writer's soft cache target on every reader, including overflow
         // connections. reader_cap bounds idle retention, not total live caches.
         try setCacheSize(&db, self.cache_kib);
-        // Dev-only: same date/time-builtin shadowing as the writer (#84). The reader path
-        // opens via raw sqlite3_open_v2 (not Db.open), so register here too. comptime no-op
-        // on a prod build.
-        clock_sql.register(db.handle);
         return db;
     }
 
@@ -823,6 +824,77 @@ test "pool: a reader sees writes committed by the writer (WAL)" {
     defer sel.finalize();
     try std.testing.expect((try sel.step()) == true);
     try std.testing.expectEqual(@as(i64, 7), sel.columnInt(0));
+}
+
+/// Runs a nearest-neighbour ORDER BY through `conn` and asserts the closest row comes first.
+/// Fails with PrepareFailed ("no such function: vec_distance_cosine") when sqlite-vec was not
+/// registered on that connection (#488).
+fn expectVectorOrdering(conn: *Db) !void {
+    var sel = try conn.prepare("SELECT id FROM emb ORDER BY vec_distance_cosine(v, '[1,0]'), id;");
+    defer sel.finalize();
+    try std.testing.expect(try sel.step());
+    try std.testing.expectEqualStrings("near", sel.columnText(0));
+    try std.testing.expect(try sel.step());
+    try std.testing.expectEqualStrings("mid", sel.columnText(0));
+    try std.testing.expect(try sel.step());
+    try std.testing.expectEqualStrings("far", sel.columnText(0));
+}
+
+test "pool: every query-serving connection registers sqlite-vec (#488)" {
+    if (comptime !build_options.vector) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(dir_path);
+    const db_path = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/test.db", .{dir_path}, 0);
+    defer std.testing.allocator.free(db_path);
+
+    var pool = try Pool.init(std.testing.allocator, std.testing.io, db_path);
+    defer pool.deinit();
+
+    {
+        const w = pool.acquireWriter();
+        defer pool.releaseWriter();
+        try w.exec("CREATE TABLE emb (id TEXT, v TEXT);");
+        try w.exec("INSERT INTO emb VALUES ('far','[0,1]'),('near','[1,0]'),('mid','[1,1]');");
+        try expectVectorOrdering(w);
+    }
+
+    // A fresh reader (the cold-pool / overflow path that served `?vector=` lists with a 500).
+    {
+        var reader = try pool.openReader();
+        defer reader.close();
+        try expectVectorOrdering(&reader);
+    }
+    // The pooled path the HTTP list handler uses: a cold open on the empty pool, then (after
+    // release parks it) a warm reuse of that same connection.
+    try std.testing.expectEqual(@as(usize, 0), pool.reader_count);
+    const cold_handle = blk: {
+        var reader = try pool.acquireReader();
+        defer pool.releaseReader(&reader);
+        try expectVectorOrdering(&reader);
+        break :blk reader.handle;
+    };
+    try std.testing.expectEqual(@as(usize, 1), pool.reader_count);
+    {
+        var reader = try pool.acquireReader();
+        defer pool.releaseReader(&reader);
+        try std.testing.expectEqual(cold_handle, reader.handle);
+        try expectVectorOrdering(&reader);
+        // A query embedding of the wrong dimension fails at step time with sqlite-vec's
+        // dimension error on the connection — the backend message the list handler reads
+        // (`conn.errMsg()`) when it maps a `?vector=` StepFailed to its 400.
+        var bad = try reader.prepare("SELECT id FROM emb ORDER BY vec_distance_cosine(v, '[1,0,0]');");
+        defer bad.finalize();
+        try std.testing.expectError(DbError.StepFailed, bad.step());
+        try std.testing.expect(std.mem.indexOf(u8, reader.errMsg(), "dimension mistmatch") != null);
+    }
+    // The inspection-command constructor.
+    {
+        var ro = try Db.openReadOnly(db_path);
+        defer ro.close();
+        try expectVectorOrdering(&ro);
+    }
 }
 
 test "pool: acquireReader reuses a warm connection and sees committed writes" {
