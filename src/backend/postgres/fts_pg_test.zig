@@ -337,9 +337,9 @@ test "pg-fts: provisions a tsvector index and ranks `?search=` matches (parity w
     try std.testing.expectEqual(@as(?i64, 2), pg_res.totalItems);
 
     // Parity: SQLite (FTS5) surfaces the SAME matched SET, never "miss". (Exact rank ORDER is
-    // algorithm-specific — FTS5 bm25 length-normalizes, so it favors the shorter "low" doc, while
-    // Postgres ts_rank (no length normalization) favors the 3-occurrence "high" doc — so we assert
-    // set parity, not identical ordering across backends.)
+    // algorithm-specific — SQLite's row-local `zb_rank` divides by row length while Postgres
+    // ts_rank (default normalization) does not, so the two can order rows differently — so we
+    // assert set parity, not identical ordering across backends.)
     const sl_res = try records.list(al, &sl, scol, .{ .search = "zig", .perPage = 50 });
     try std.testing.expectEqual(pg_res.items.len, sl_res.items.len);
     var pg_slugs = try valueSet(al, pg_res.items, "slug");

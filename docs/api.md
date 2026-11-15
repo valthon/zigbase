@@ -536,7 +536,9 @@ GET /api/collections/posts/records?search=zig%20database
 GET /api/collections/posts/records?q=alpha%20OR%20beta&filter=published=true
 ```
 
-Results are ranked by relevance (`bm25`) in offset mode. The terms support the basic FTS5
+Results are ranked by a row-local relevance score in offset mode, ties broken by `id` (see
+[docs/search.md](./search.md#ranking); the score never reads other rows, so another tenant's text
+cannot change a tenant's order). The terms support the basic FTS5
 operators (`AND`, `OR`, `NOT`, and a trailing `*` for prefix search); the whole term is passed
 as a **bound parameter** (never interpolated) and lowered to a guaranteed-valid query, so a
 malformed input is harmless — it can never become a SQL error or injection. `search` AND-s with
@@ -558,9 +560,11 @@ over the searchable columns) plus a **GIN index**, queried with `@@ plainto_tsqu
 and ranked by `ts_rank(…) DESC`. The query surface, the bound-parameter safety, and — critically —
 the *same composed-`WHERE` scoping* (filter + list rule + abilities + tenant) are identical to the
 SQLite path, so a tenant-/ability-scoped search returns only the rows the caller may view on either
-backend. The exact relevance ORDER can differ between the two ranking functions (FTS5 `bm25`
-length-normalizes; `ts_rank` does not), but the matched set is equivalent. `plainto_tsquery` parses
-the plain term (it does not honor the `AND`/`OR`/`NOT`/`*` operators).
+backend. The exact relevance ORDER can differ between the two ranking functions (SQLite's
+`zb_rank` length-normalizes; `ts_rank` does not); both are row-local. `plainto_tsquery` parses
+the plain term (it does not honor the `AND`/`OR`/`NOT`/`*` operators), and SQLite's tokenizer folds
+diacritics where PostgreSQL's `simple` configuration does not, so the matched rows can differ
+between the backends.
 
 **Vector / nearest-neighbor — opt-in `-Dvector` build.** Vector search is **not** compiled into the
 default binary. The single `-Dvector=true` flag enables KNN on **both** backends — on SQLite it

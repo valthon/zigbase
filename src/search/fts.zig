@@ -8,8 +8,9 @@
 //!
 //!   * **SQLite (FTS5):** an **external-content** shadow table (`"<col>_fts"`, `content='<col>'`)
 //!     plus AFTER INSERT/UPDATE/DELETE triggers that keep it in lock-step with the base table, read
-//!     via a JOIN + `"<fts>" MATCH ?` + bm25 `"<fts>"."rank"` ordering. The index is (re)populated
-//!     with the FTS5 `'rebuild'` command on first provision.
+//!     via a JOIN + `"<fts>" MATCH ?` + row-local `zb_rank("<fts>") DESC` ordering (NOT bm25, whose
+//!     corpus statistics span every tenant's rows — see `rank_fn`, #495). The index is
+//!     (re)populated with the FTS5 `'rebuild'` command on first provision.
 //!   * **Postgres (tsvector):** a STORED **generated column** `"<col>_fts"` of type `tsvector`
 //!     (`to_tsvector('simple', coalesce("c1",'')||' '||…)`) plus a **GIN index**, read via
 //!     `"<col>"."<col>_fts" @@ plainto_tsquery('simple', ?)` + `ORDER BY ts_rank(…) DESC`. No JOIN
@@ -30,6 +31,7 @@ const build_options = @import("build_options");
 const schema = @import("../schema.zig");
 const db = @import("../db.zig");
 const compiler = @import("../query/compiler.zig");
+const sqlite_c = @import("../c.zig").c;
 
 /// Comptime gate: SQLite FTS5 is compiled in (`-Dfts5`, default ON). When false, the SQLite
 /// MATCH/`ensureIndex` paths are comptime-dead and `?search=` fails closed with a clean 400.
@@ -135,11 +137,12 @@ fn searchableColumns(alloc: std.mem.Allocator, col: schema.Collection) ![]const 
 /// `records.list`. `join_sql` brings the FTS shadow table into the query (no params; **empty on
 /// Postgres**, where the tsvector lives on the base table); `where_sql` is the bound search
 /// predicate (one trailing `?` — `MATCH` on SQLite, `@@ plainto_tsquery(…)` on Postgres);
-/// `order_sql` is the relevance ordering (bm25 `"<fts>"."rank"` on SQLite, `ts_rank(…) DESC` on
-/// Postgres). `param` is the bound WHERE term (the SANITIZED FTS5 query on SQLite, the raw term for
-/// `plainto_tsquery` on Postgres). `order_param`, when non-null, is the SECOND bound term consumed
-/// by `order_sql` (Postgres `ts_rank` re-runs `plainto_tsquery`); it is null on SQLite (bm25 `rank`
-/// takes no param), and `records.list` binds it in the ORDER BY position when present.
+/// `order_sql` is the relevance ordering (row-local `zb_rank("<fts>") DESC` on SQLite,
+/// `ts_rank(…) DESC` on Postgres). `param` is the bound WHERE term (the SANITIZED FTS5 query on
+/// SQLite, the raw term for `plainto_tsquery` on Postgres). `order_param`, when non-null, is the
+/// SECOND bound term consumed by `order_sql` (Postgres `ts_rank` re-runs `plainto_tsquery`); it is
+/// null on SQLite (`zb_rank` takes no param), and `records.list` binds it in the ORDER BY position
+/// when present.
 pub const Search = struct {
     join_sql: []const u8,
     where_sql: []const u8,
@@ -153,27 +156,147 @@ pub const Search = struct {
 /// comptime-prunes the guard away, an inferred `!?Search` would silently DROP `SearchDisabled`
 /// from the type, breaking every well-typed `error.SearchDisabled => …` handler in a default
 /// build. Mirrors `vector.zig`'s `VectorError` for the same reason (opposite default).
-pub const SearchError = error{SearchDisabled} ||
+pub const SearchError = error{ SearchDisabled, SearchRankUnavailable } ||
     @typeInfo(@typeInfo(@TypeOf(buildSqliteImpl)).@"fn".return_type.?).error_union.error_set ||
     @typeInfo(@typeInfo(@TypeOf(buildPostgres)).@"fn".return_type.?).error_union.error_set;
 
-/// Build the full-text search clause for `raw_term` on `col` under `dialect`, or null when the
-/// collection is not searchable OR the term carries no searchable token. Allocations are on
-/// `alloc`. The bound `param`/`order_param` are never interpolated.
-pub fn build(alloc: std.mem.Allocator, dialect: db.Dialect, col: schema.Collection, raw_term: []const u8) SearchError!?Search {
+/// Build the full-text search clause for `raw_term` on `col` for the connection `conn` that will
+/// run it, or null when the collection is not searchable OR the term carries no searchable token.
+/// Allocations are on `alloc`. The bound `param`/`order_param` are never interpolated.
+///
+/// Takes the CONNECTION, not just its dialect, because the SQLite ordering calls the row-local
+/// rank function (`rank_fn`), which FTS5 keeps per connection: `build` registers it on `conn`
+/// (once per connection) before returning SQL that names it. Every SQLite connection that runs a
+/// search — the writer, a pooled reader, a fresh overflow reader — therefore has it, with no
+/// separate registration step a new connection path could forget.
+pub fn build(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, raw_term: []const u8) SearchError!?Search {
     if (!isSearchable(col)) return null;
-    return switch (dialect.kind) {
-        .sqlite => buildSqlite(alloc, col, raw_term),
+    return switch (db.dbDialect(conn).kind) {
+        .sqlite => buildSqlite(alloc, conn, col, raw_term),
         .postgres => buildPostgres(alloc, col, raw_term),
     };
 }
 
 /// SQLite lowering: `error.SearchDisabled` when `-Dfts5=false` (this branch folds to comptime-dead
 /// there — see `enabled`); otherwise a JOIN onto the FTS5 shadow table + a bound `MATCH` predicate
-/// + bm25 `rank` ordering. `param.text` is the SANITIZED, guaranteed-valid FTS5 query (`sanitize`).
-fn buildSqlite(alloc: std.mem.Allocator, col: schema.Collection, raw_term: []const u8) SearchError!?Search {
+/// + row-local `rank_fn` ordering. `param.text` is the SANITIZED, guaranteed-valid FTS5 query
+/// (`sanitize`).
+fn buildSqlite(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, raw_term: []const u8) SearchError!?Search {
     if (comptime !enabled) return error.SearchDisabled;
+    try ensureRankFunction(conn);
     return buildSqliteImpl(alloc, col, raw_term);
+}
+
+// ---- Row-local ranking (SQLite) --------------------------------------------
+//
+// Why not FTS5's built-in bm25 `rank` (#495): the shadow table indexes EVERY row of the
+// collection, across tenants, and bm25 weighs each term by corpus statistics — IDF from the
+// table's row count and per-term document counts, length normalisation against the table's
+// average row length. So the ORDER of one tenant's (correctly scoped) results moved with text
+// other tenants had stored: a member of one tenant could rank two of their own records and learn,
+// one bit per query, whether another tenant's searchable text contained a word.
+//
+// `rank_fn` scores a row from that row ALONE. It reads only:
+//   * per-phrase hit counts in this row (`xPhraseFirst`/`xPhraseNext` over the row's instances),
+//   * this row's token count across the searchable columns (`xColumnSize(-1)`).
+// It never calls `xRowCount`, `xColumnTotalSize` or `xQueryPhrase` (the corpus-wide APIs).
+//
+//   score = ( Σ_p tf_p / (tf_p + 1) ) / log2(1 + L)
+//
+// where p ranges over the query's phrases (each search token is one phrase), tf_p is the number
+// of times phrase p occurs in the row (0 for an OR branch the row does not match) and L is the
+// row's total token count. The per-phrase term saturates (1 hit → 0.5, 2 → 0.67, 3 → 0.75), so a
+// row matching MORE DISTINCT terms outranks one repeating a single term at comparable length,
+// more hits outrank fewer at equal length, and the length divisor prefers a DENSER (shorter) row
+// at equal hits. Every searchable field weighs the same (the schema has no per-field weights
+// today). Higher is better (`ORDER BY … DESC`); `records.list` breaks equal scores by record id,
+// which is itself row-local.
+
+/// The SQL name of the row-local FTS5 rank auxiliary function.
+pub const rank_fn = "zb_rank";
+
+/// `sqlite3_get_clientdata` key marking a connection on which `rank_fn` is registered. FTS5's
+/// `xCreateFunction` does not deduplicate (each call prepends another entry that lives until the
+/// connection closes), so registration must happen at most once per connection.
+const rank_clientdata_key = "zigbase.fts.rank";
+var rank_marker: u8 = 1; // any non-null pointer marks "registered"; never dereferenced
+
+/// Register `rank_fn` on `conn` unless already registered there. Idempotent and cheap after the
+/// first call (one client-data lookup). SQLite-only; `conn` must be a SQLite connection.
+pub fn ensureRankFunction(conn: *db.Db) error{SearchRankUnavailable}!void {
+    if (comptime !enabled) return;
+    const handle = db.sqliteHandle(conn);
+    if (sqlite_c.sqlite3_get_clientdata(handle, rank_clientdata_key) != null) return;
+    registerRankFunction(handle) catch |err| {
+        // The one place this failure is logged; the caller maps it to a clean 500.
+        std.log.err("search: cannot register FTS5 rank function '{s}': {s}", .{ rank_fn, std.mem.span(sqlite_c.sqlite3_errmsg(handle)) });
+        return err;
+    };
+}
+
+/// Register `rank_fn` on `handle` and mark the connection. The marker is set FIRST and cleared
+/// again if `xCreateFunction` fails, so after a return the marker is set iff the function is
+/// registered: a marker failure (OOM) registers nothing, and a registration failure leaves no
+/// marker that would skip the next attempt.
+fn registerRankFunction(handle: *sqlite_c.sqlite3) error{SearchRankUnavailable}!void {
+    const c = sqlite_c;
+    // The documented way to reach the FTS5 C API: `SELECT fts5(?1)` with a pointer bound under
+    // the "fts5_api_ptr" type tag; FTS5 writes its `fts5_api*` through it.
+    var stmt: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(handle, "SELECT fts5(?1);", -1, &stmt, null) != c.SQLITE_OK or stmt == null)
+        return error.SearchRankUnavailable;
+    defer _ = c.sqlite3_finalize(stmt);
+    var api: ?*c.fts5_api = null;
+    if (c.sqlite3_bind_pointer(stmt, 1, @ptrCast(&api), "fts5_api_ptr", null) != c.SQLITE_OK)
+        return error.SearchRankUnavailable;
+    if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return error.SearchRankUnavailable;
+    const fts5 = api orelse return error.SearchRankUnavailable;
+    const create = fts5.xCreateFunction orelse return error.SearchRankUnavailable;
+    if (c.sqlite3_set_clientdata(handle, rank_clientdata_key, @ptrCast(&rank_marker), null) != c.SQLITE_OK)
+        return error.SearchRankUnavailable;
+    if (create(fts5, rank_fn, null, rowLocalRank, null) != c.SQLITE_OK) {
+        // Clearing an entry (a NULL value) frees it and cannot fail.
+        _ = c.sqlite3_set_clientdata(handle, rank_clientdata_key, null, null);
+        return error.SearchRankUnavailable;
+    }
+}
+
+/// The FTS5 auxiliary function behind `rank_fn` — see the formula above. Row-local by
+/// construction: it touches only the current row's phrase instances and token count.
+fn rowLocalRank(
+    api_ptr: [*c]const sqlite_c.Fts5ExtensionApi,
+    fts: ?*sqlite_c.Fts5Context,
+    ctx: ?*sqlite_c.sqlite3_context,
+    n_val: c_int,
+    vals: [*c]?*sqlite_c.sqlite3_value,
+) callconv(.c) void {
+    const c = sqlite_c;
+    _ = vals;
+    if (n_val != 0) return c.sqlite3_result_error(ctx, rank_fn ++ "() takes no arguments beyond the table", -1);
+    const api: *const c.Fts5ExtensionApi = api_ptr; // borrow FTS5's table; no copy
+    var tokens: c_int = 0;
+    var rc = api.xColumnSize.?(fts, -1, &tokens);
+    if (rc != c.SQLITE_OK) return c.sqlite3_result_error_code(ctx, rc);
+    const n_phrase = api.xPhraseCount.?(fts);
+    var coverage: f64 = 0; // allocation-free: one running sum, one phrase at a time
+    var p: c_int = 0;
+    while (p < n_phrase) : (p += 1) {
+        var it: c.Fts5PhraseIter = undefined;
+        var icol: c_int = 0;
+        var ioff: c_int = 0;
+        rc = api.xPhraseFirst.?(fts, p, &it, &icol, &ioff);
+        if (rc != c.SQLITE_OK) return c.sqlite3_result_error_code(ctx, rc);
+        var tf: f64 = 0;
+        while (icol >= 0) : (api.xPhraseNext.?(fts, &it, &icol, &ioff)) tf += 1;
+        coverage += tf / (tf + 1);
+    }
+    c.sqlite3_result_double(ctx, rowLocalScore(coverage, tokens));
+}
+
+/// The pure half of `rowLocalRank`: `coverage` = Σ_p tf_p/(tf_p+1), `tokens` = the row's length.
+fn rowLocalScore(coverage: f64, tokens: c_int) f64 {
+    const len: f64 = @floatFromInt(@max(tokens, 1));
+    return coverage / std.math.log2(1 + len);
 }
 
 fn buildSqliteImpl(alloc: std.mem.Allocator, col: schema.Collection, raw_term: []const u8) !?Search {
@@ -188,7 +311,7 @@ fn buildSqliteImpl(alloc: std.mem.Allocator, col: schema.Collection, raw_term: [
     errdefer alloc.free(join_sql);
     const where_sql = try std.fmt.allocPrint(alloc, "\"{s}\" MATCH ?", .{ft});
     errdefer alloc.free(where_sql);
-    const order_sql = try std.fmt.allocPrint(alloc, "\"{s}\".\"rank\"", .{ft});
+    const order_sql = try std.fmt.allocPrint(alloc, rank_fn ++ "(\"{s}\") DESC", .{ft});
     errdefer alloc.free(order_sql); // last today, but errdefer'd too so a future line before the return can't leak it
     return .{ .join_sql = join_sql, .where_sql = where_sql, .order_sql = order_sql, .param = .{ .text = q } };
 }
@@ -948,7 +1071,7 @@ test "ensureIndex provisions FTS5, triggers keep it in sync, MATCH search return
         records.freeRecord(a, rec);
     }
 
-    const s = (try build(a, db.dbDialect(&d), col, "zig")).?;
+    const s = (try build(a, &d, col, "zig")).?;
     // SQLite `build` returns an owned Search (join/where/order SQL + the sanitized param text), no
     // aliasing (order_param is null on SQLite) — free the four heap slices after use.
     defer {
@@ -1004,4 +1127,196 @@ test "Postgres lowering emits the exact tsquery SQL, with the ts config as a fix
 
     // A term that trims to nothing yields no search clause at all (rather than an empty MATCH).
     try std.testing.expect((try buildPostgres(a, col, "   \t\n ")) == null);
+}
+
+// ---- Row-local ranking tests (#495) ------------------------------------------
+
+/// Insert one `notes` row through the records layer (so the FTS sync trigger indexes it).
+fn addNote(a: std.mem.Allocator, conn: *db.Db, col: schema.Collection, account: []const u8, title: []const u8) !void {
+    var obj: std.json.ObjectMap = .empty;
+    defer obj.deinit(a);
+    try obj.put(a, "account", .{ .string = account });
+    try obj.put(a, "title", .{ .string = title });
+    const rec = try records.create(a, std.testing.io, conn, col, .{ .object = obj });
+    records.freeRecord(a, rec);
+}
+
+/// Run `?search=term` (offset mode) scoped by `filter`, returning the titles in result order as
+/// one owned `title|title|…|` string (so two orders compare with one `expectEqualStrings`).
+fn searchOrder(a: std.mem.Allocator, conn: *db.Db, col: schema.Collection, filter: ?[]const u8, term: []const u8) ![]u8 {
+    var res = try records.list(a, conn, col, .{ .filter = filter, .search = term });
+    defer res.deinit(a);
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(a);
+    for (res.items) |item| {
+        try out.appendSlice(a, item.object.get("title").?.string);
+        try out.append(a, '|');
+    }
+    return out.toOwnedSlice(a);
+}
+
+/// A `notes(account, title searchable)` collection with its FTS index provisioned on `conn`.
+fn notesCollection(a: std.mem.Allocator, conn: *db.Db) !schema.Collection {
+    try migrations.run(conn);
+    const fields = [_]schema.Field{
+        .{ .id = "f1", .name = "account", .options = .{ .text = .{} } },
+        .{ .id = "f2", .name = "title", .searchable = true, .options = .{ .text = .{} } },
+    };
+    const col = try collections.create(a, std.testing.io, conn, .{ .id = "", .name = "notes", .fields = &fields });
+    errdefer col.deinit(a);
+    try ensureIndex(a, conn, col);
+    return col;
+}
+
+test "search order is row-local: another tenant's text cannot reorder a tenant's results (#495)" {
+    if (comptime !enabled) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var d = try db.Db.openMemory();
+    defer d.close();
+    const col = try notesCollection(a, &d);
+    defer col.deinit(a);
+    // Tenant scoping is a WHERE predicate like this filter; the shadow index (the leak's source)
+    // holds both accounts' rows either way.
+    const scope_a = "account = \"a\"";
+
+    // The issue's first repro: A's two symmetric rows, B's five rows all containing ONE of the
+    // two query words. Under bm25 the other word's IDF rises, flipping A's order.
+    try addNote(a, &d, col, "a", "alpha alpha bravo");
+    try addNote(a, &d, col, "a", "alpha bravo bravo");
+    for (0..5) |i| {
+        var buf: [32]u8 = undefined;
+        try addNote(a, &d, col, "b", try std.fmt.bufPrint(&buf, "alpha filler{d}", .{i}));
+    }
+    const case1 = try searchOrder(a, &d, col, scope_a, "alpha bravo");
+    defer a.free(case1);
+    try d.exec("UPDATE notes SET title = replace(title, 'alpha', 'bravo') WHERE account = 'b';");
+    const case2 = try searchOrder(a, &d, col, scope_a, "alpha bravo");
+    defer a.free(case2);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, case1, "|"));
+    try std.testing.expectEqualStrings(case1, case2);
+}
+
+test "search order is not a word-presence oracle for another tenant's text (#495)" {
+    if (comptime !enabled) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var d = try db.Db.openMemory();
+    defer d.close();
+    const col = try notesCollection(a, &d);
+    defer col.deinit(a);
+    const scope_a = "account = \"a\"";
+    // The issue's 7-row variant: whether B stores `zebrasecret` must not decide which of A's two
+    // otherwise-identical rows comes first.
+    for (0..4) |i| {
+        var buf: [32]u8 = undefined;
+        try addNote(a, &d, col, "b", try std.fmt.bufPrint(&buf, "filler note {d}", .{i}));
+    }
+    try addNote(a, &d, col, "a", "zebrasecret pad");
+    try addNote(a, &d, col, "a", "qqcontrolqq pad");
+    try addNote(a, &d, col, "b", "zebrasecret merger plan");
+    const with_word = try searchOrder(a, &d, col, scope_a, "zebrasecret OR qqcontrolqq");
+    defer a.free(with_word);
+    try d.exec("UPDATE notes SET title = 'ordinary merger plan' WHERE account = 'b' AND title = 'zebrasecret merger plan';");
+    const without_word = try searchOrder(a, &d, col, scope_a, "zebrasecret OR qqcontrolqq");
+    defer a.free(without_word);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, with_word, "|"));
+    try std.testing.expectEqualStrings(with_word, without_word);
+}
+
+test "row-local rank prefers more distinct terms, more hits, and denser rows" {
+    if (comptime !enabled) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var d = try db.Db.openMemory();
+    defer d.close();
+    const col = try notesCollection(a, &d);
+    defer col.deinit(a);
+    // Inserted worst-first, so neither insertion order nor rowid can produce the expected order.
+    try addNote(a, &d, col, "a", "alpha x y z w v"); // 1 hit, 6 tokens
+    try addNote(a, &d, col, "a", "alpha x y"); // 1 hit, 3 tokens: denser
+    try addNote(a, &d, col, "a", "alpha alpha x"); // 2 hits of one term, 3 tokens
+    try addNote(a, &d, col, "a", "alpha bravo x"); // both terms, 3 tokens
+    const got = try searchOrder(a, &d, col, null, "alpha OR bravo");
+    defer a.free(got);
+    try std.testing.expectEqualStrings("alpha bravo x|alpha alpha x|alpha x y|alpha x y z w v|", got);
+
+    // Prefix: `alp*` is one phrase whose hits are every token it expands to in the row.
+    try addNote(a, &d, col, "p", "beta x"); // no match
+    try addNote(a, &d, col, "p", "alpaca x y z w v"); // 1 hit, 6 tokens
+    try addNote(a, &d, col, "p", "alpha x y"); // 1 hit, 3 tokens
+    try addNote(a, &d, col, "p", "alpha alpine x"); // 2 hits (alpha, alpine), 3 tokens
+    const prefix = try searchOrder(a, &d, col, "account = \"p\"", "alp*");
+    defer a.free(prefix);
+    try std.testing.expectEqualStrings("alpha alpine x|alpha x y|alpaca x y z w v|", prefix);
+
+    // NOT: the excluded term's phrase counts 0 hits in every surviving row, so the order is the
+    // positive term's alone, and a row containing the excluded term is absent.
+    try addNote(a, &d, col, "n", "alpha x y z w v");
+    try addNote(a, &d, col, "n", "alpha bravo x"); // excluded by NOT
+    try addNote(a, &d, col, "n", "alpha x y");
+    try addNote(a, &d, col, "n", "alpha alpha x");
+    const not_q = try searchOrder(a, &d, col, "account = \"n\"", "alpha NOT bravo");
+    defer a.free(not_q);
+    try std.testing.expectEqualStrings("alpha alpha x|alpha x y|alpha x y z w v|", not_q);
+
+    // OR across those rows: the row with BOTH terms now ranks first.
+    const or_q = try searchOrder(a, &d, col, "account = \"n\"", "bravo OR alpha");
+    defer a.free(or_q);
+    try std.testing.expectEqualStrings("alpha bravo x|alpha alpha x|alpha x y|alpha x y z w v|", or_q);
+
+    // Hyphenated term: `well-known` is ONE phrase (the tokenizer splits it into adjacent tokens), so
+    // a hit is the adjacent pair, and the reversed / split orders do not match at all.
+    try addNote(a, &d, col, "h", "known well x"); // not the phrase
+    try addNote(a, &d, col, "h", "well x known"); // not adjacent
+    try addNote(a, &d, col, "h", "well known x y"); // 1 phrase hit, 4 tokens
+    try addNote(a, &d, col, "h", "well known well known x"); // 2 phrase hits, 5 tokens
+    const hyphen = try searchOrder(a, &d, col, "account = \"h\"", "well-known");
+    defer a.free(hyphen);
+    try std.testing.expectEqualStrings("well known well known x|well known x y|", hyphen);
+
+    // The formula itself (documented in docs/search.md): coverage / log2(1 + tokens).
+    try std.testing.expectApproxEqAbs(@as(f64, 0.5), rowLocalScore(1.0, 3), 1e-12);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.5 / std.math.log2(7.0)), rowLocalScore(0.5, 6), 1e-12);
+}
+
+test "row-local rank is registered on pooled and fresh reader connections" {
+    if (comptime !enabled) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(dir_path);
+    const db_path = try std.fmt.allocPrintSentinel(a, "{s}/rank.db", .{dir_path}, 0);
+    defer a.free(db_path);
+
+    var pool = try db.Pool.init(a, std.testing.io, db_path);
+    defer pool.deinit();
+    const col = blk: {
+        const w = pool.acquireWriter();
+        defer pool.releaseWriter();
+        const col = try notesCollection(a, w);
+        errdefer col.deinit(a);
+        try addNote(a, w, col, "a", "alpha x y");
+        try addNote(a, w, col, "a", "alpha alpha x");
+        break :blk col;
+    };
+    defer col.deinit(a);
+    const want = "alpha alpha x|alpha x y|";
+
+    {
+        var r = try pool.acquireReader(); // a warm pooled reader the search never opened itself
+        defer pool.releaseReader(&r);
+        const got = try searchOrder(a, &r, col, null, "alpha");
+        defer a.free(got);
+        try std.testing.expectEqualStrings(want, got);
+        // Registration is once per connection: a second search reuses it.
+        const again = try searchOrder(a, &r, col, null, "alpha");
+        defer a.free(again);
+        try std.testing.expectEqualStrings(want, again);
+    }
+    {
+        var r = try pool.openReader(); // a fresh overflow-style reader
+        defer r.close();
+        const got = try searchOrder(a, &r, col, null, "alpha");
+        defer a.free(got);
+        try std.testing.expectEqualStrings(want, got);
+    }
 }
