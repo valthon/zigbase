@@ -849,7 +849,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        lane: [workbench, thumbnails, resumable, durable, coordination, admission]
+        lane: [workbench, thumbnails, resumable, durable, coordination, admission, vector]
     env:
       ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-global
       ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/.zig-local
@@ -971,6 +971,12 @@ jobs:
         run: |
           mise exec zig@0.16.0 -- zig build -Drealtime-backfill=true --prefix zig-out/backfill
           ZIGBASE_TEST_BACKFILL_BINARY="$GITHUB_WORKSPACE/zig-out/backfill/bin/zigbase" mise exec python@3.13 -- python -m pytest tests/admin/test_realtime_backfill.py -q
+      - name: Opt-in SQLite vector search regressions
+        if: matrix.lane == 'vector'
+        run: |
+          mise exec zig@0.16.0 -- zig build test -Dvector=true --summary all
+          mise exec zig@0.16.0 -- zig build -Dvector=true --prefix zig-out/vector
+          ZIGBASE_TEST_VECTOR_BINARY="$GITHUB_WORKSPACE/zig-out/vector/bin/zigbase" mise exec python@3.13 -- python -m pytest tests/admin/test_vector_search.py -q
       - name: SQLite consumer migration process coordination
         if: matrix.lane == 'coordination'
         run: |
