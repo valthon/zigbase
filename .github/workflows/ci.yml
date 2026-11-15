@@ -778,6 +778,7 @@ jobs:
           chmod +x artifacts/zig-out/bin/full-fixture
           chmod +x artifacts/zig-out/bin/admission-fixture
           echo "ZIGBASE_TEST_ADMISSION_BINARY=$GITHUB_WORKSPACE/artifacts/zig-out/bin/admission-fixture" >> "$GITHUB_ENV"
+          echo "ZIGBASE_TEST_CAPACITY_BINARY=$GITHUB_WORKSPACE/artifacts/zig-out/bin/application-capacity" >> "$GITHUB_ENV"
           echo "ZIGBASE_TEST_FULL_BINARY=$GITHUB_WORKSPACE/artifacts/zig-out/bin/full-fixture" >> "$GITHUB_ENV"
       - name: Install Python test deps + resolve Playwright version
         id: pw

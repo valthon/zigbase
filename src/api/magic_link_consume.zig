@@ -20,6 +20,7 @@ const schema = @import("../schema.zig");
 const collections = @import("../collections.zig");
 const params_mod = @import("../query/params.zig");
 const auth = @import("auth.zig");
+const Authed = @import("../auth.zig").Authed;
 const records = @import("../records.zig");
 const auth_helpers = @import("../auth_helpers.zig");
 const ApiError = @import("error.zig").ApiError;
@@ -178,7 +179,7 @@ pub fn consume(ctx: *http.RequestCtx) anyerror!http.Response {
         return pending;
     }
 
-    if (try auth.fireBeforeAuthSuccess(ctx, w, col.name, claims.id, .magic_link, rec)) |resp| {
+    if (try auth.fireBeforeAuthSuccess(ctx, w, col.name, claims.id, .magic_link, Authed.borrowed(rec, claims.collection, false))) |resp| {
         w.rollback() catch {};
         return resp;
     }
@@ -186,7 +187,7 @@ pub fn consume(ctx: *http.RequestCtx) anyerror!http.Response {
     const issued = try auth.issueSessionNoEmit(ctx, w, col.name, claims.id);
     try w.commit();
     // onAuth fires only AFTER a durable commit (session truly issued).
-    auth.emitAuth(ctx, col.name, rec, .magic_link);
+    auth.emitAuth(ctx, w, col.name, Authed.borrowed(rec, col.name, false), .magic_link);
 
     const cookies = try ctx.allocator.a.dupe(http.Cookie, &issued.cookies);
     const headers = try ctx.allocator.a.dupe(http.Header, &[_]http.Header{

@@ -259,6 +259,7 @@ pub fn snapshotForDelivery(sc: *SseConn, a: std.mem.Allocator, channel: []const 
     // identity arena, which a concurrent re-auth may reset out from under the lock-free delivery.
     const auth_copy: ?connection.AuthIdentity = if (sc.conn.auth) |ident| .{
         .record = hub.cloneJson(a, ident.record) catch return null,
+        .collection = a.dupe(u8, ident.collection) catch return null,
         .is_superuser = ident.is_superuser,
         .exp = ident.exp,
         .token = a.dupe(u8, ident.token) catch return null,

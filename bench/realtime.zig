@@ -30,6 +30,9 @@ pub fn run(alloc: std.mem.Allocator, io: std.Io, results: *std.ArrayList(harness
         const users = try i.collections.create(alloc, io, writer, .{ .id = "", .name = "principals", .type = .auth, .fields = &.{} });
         defer users.deinit(alloc);
         try writer.exec("INSERT INTO principals (id,created,updated,email,passwordHash,tokenKey,verified) VALUES ('u1','','','bench@example.test','','bench-key',1);");
+        // Delivery re-resolves the account scope from `_memberships` (as REST does per request),
+        // so the tenant case needs a real active membership, not only a retained scope.
+        try writer.exec("INSERT INTO _memberships (id,created,updated,account,user_collection,user,role,status) VALUES ('m1','','','accA','principals','u1','owner','active');");
         const fields = [_]i.schema.Field{
             .{ .id = "owner", .name = "owner", .options = .{ .text = .{} } },
             .{ .id = "account", .name = "account", .options = .{ .text = .{} } },
@@ -68,7 +71,7 @@ pub fn run(alloc: std.mem.Allocator, io: std.Io, results: *std.ArrayList(harness
         .{ .name = "private_topic", .conn = authenticated },
     };
     // Prove the tenant fixture actually constrains delivery before timing it.
-    // This is a retained account scope, not a benchmark of membership resolution.
+    // accB has no membership for u1, so the re-resolved scope cannot reach accA's rows.
     var wrong_tenant = authenticated;
     wrong_tenant.tenancy_enabled = true;
     wrong_tenant.account_id = "accB";
