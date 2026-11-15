@@ -264,10 +264,28 @@ fn rowToObject(alloc: std.mem.Allocator, stmt: *db.Stmt, col: schema.Collection,
     return .{ .object = obj };
 }
 
+/// Which hidden fields an at-rest read keeps. `strip` drops every hidden field, like `rowToObject`.
+/// `rule_inputs` keeps the hidden fields a delete-authorization snapshot needs (see
+/// `deleteSnapshotKeeps`) — that snapshot is PRIVATE to the server and never serialized to a client.
+const HiddenFields = enum { strip, rule_inputs };
+
+/// Whether a hidden field of `col` belongs in a realtime delete-authorization snapshot (#486). An
+/// operator-authored `viewRule` may reference a hidden field (`rules.compileGuard` sets
+/// `allow_hidden`), so the snapshot the delete is authorized against must hold it, or the rule
+/// compares NULL and never matches. Two hidden kinds stay out: an encrypted field (rules cannot
+/// reference one — `error.EncryptedField` — so its value is never needed) and the auth credentials
+/// the engine injects (`passwordHash`, `tokenKey`, `token_epoch`), which no snapshot may carry into
+/// the backfill store, the durable journal or the cross-instance side table.
+pub fn deleteSnapshotKeeps(col: schema.Collection, f: schema.Field) bool {
+    if (!f.hidden) return true;
+    return !f.encrypted and !schema.isInjectedField(col.type, f.name);
+}
+
 /// Like `rowToObject`, but encrypted fields are returned as their AT-REST ciphertext envelope
-/// (NEVER decrypted) instead of plaintext. Every other field reads identically. Backs `getAtRest`.
+/// (NEVER decrypted) instead of plaintext, and `hidden` selects which hidden fields are kept.
+/// Every other field reads identically. Backs `getAtRest` and `getDeleteSnapshot`.
 /// `keys` follows the same interned/self-contained contract as `rowToObject`.
-fn rowToObjectAtRest(alloc: std.mem.Allocator, stmt: *db.Stmt, col: schema.Collection, keys: ?[]const []const u8) !std.json.Value {
+fn rowToObjectAtRest(alloc: std.mem.Allocator, stmt: *db.Stmt, col: schema.Collection, keys: ?[]const []const u8, hidden: HiddenFields) !std.json.Value {
     var obj: std.json.ObjectMap = .empty;
     // Symmetric with rowToObject: a mid-row read can fail after earlier entries are in place, so
     // free the partial record on error rather than relying on a caller arena.
@@ -288,7 +306,7 @@ fn rowToObjectAtRest(alloc: std.mem.Allocator, stmt: *db.Stmt, col: schema.Colle
             (if (stmt.isNull(idx)) std.json.Value{ .null = {} } else std.json.Value{ .string = try alloc.dupe(u8, stmt.columnText(idx)) })
         else
             try values.readValue(alloc, stmt, idx, f);
-        if (f.hidden) {
+        if (f.hidden and (hidden == .strip or !deleteSnapshotKeeps(col, f))) {
             values.freeValue(alloc, v);
             continue;
         }
@@ -298,12 +316,25 @@ fn rowToObjectAtRest(alloc: std.mem.Allocator, stmt: *db.Stmt, col: schema.Colle
 }
 
 /// Read a row WITHOUT decrypting its encrypted fields (they come back as the at-rest ciphertext
-/// envelope). Used by the cross-instance realtime DELETE path (#159, PR-6b) to capture a snapshot
-/// that holds NO decrypted plaintext: the snapshot transits a side table (not the NOTIFY wire) and
-/// is used only for the receiving instance's delete authz — which, like the live create/update
-/// path, compares the at-rest (ciphertext) column. No TTL filter (the row is live, captured
-/// pre-delete inside the delete transaction).
+/// envelope); hidden fields are stripped as `get` strips them. No TTL filter. The realtime delete
+/// path reads through `getDeleteSnapshot` instead, which also keeps the hidden fields a rule needs.
 pub fn getAtRest(alloc: std.mem.Allocator, r: *db.Db, col: schema.Collection, id: []const u8) !?std.json.Value {
+    return readAtRest(alloc, r, col, id, .strip);
+}
+
+/// The realtime DELETE-authorization snapshot of a live row (#486): `getAtRest`'s at-rest form
+/// plus the hidden fields a `viewRule` may reference (`deleteSnapshotKeeps`). PRIVATE to the
+/// server: it rides the published delete frame, the backfill store, the durable journal and the
+/// cross-instance side table only under `hub.delete_snapshot_key`, which every delivery path
+/// strips before a client sees the id-only frame (`hub.frameForCollectionDelivery`). It holds NO
+/// decrypted plaintext (#159, PR-6b), so it may transit a side table, and like the live
+/// create/update path it carries the at-rest (ciphertext) column. No TTL filter (the row is live,
+/// captured pre-delete inside the delete transaction).
+pub fn getDeleteSnapshot(alloc: std.mem.Allocator, r: *db.Db, col: schema.Collection, id: []const u8) !?std.json.Value {
+    return readAtRest(alloc, r, col, id, .rule_inputs);
+}
+
+fn readAtRest(alloc: std.mem.Allocator, r: *db.Db, col: schema.Collection, id: []const u8, hidden: HiddenFields) !?std.json.Value {
     const cols = try columnList(alloc, col);
     defer alloc.free(cols);
     // The table name is ESCAPED (`ddl.quoteIdent`, as `columnList` already does for the columns),
@@ -321,7 +352,7 @@ pub fn getAtRest(alloc: std.mem.Allocator, r: *db.Db, col: schema.Collection, id
     defer st.finalize();
     try st.bindText(1, id);
     if (!try st.step()) return null;
-    return try rowToObjectAtRest(alloc, &st, col, null);
+    return try rowToObjectAtRest(alloc, &st, col, null, hidden);
 }
 
 /// Internal blob ownership snapshot, not a user-visible read. Includes hidden
@@ -2434,6 +2465,40 @@ test "getAtRest reads a system ('_'-prefixed) collection instead of reporting a 
     try std.testing.expect(snap.object.get("passwordHash") == null);
     // A genuinely absent id still reads as not-found.
     try std.testing.expect((try getAtRest(a, &d, col, "nope")) == null);
+}
+
+test "getDeleteSnapshot keeps rule-visible hidden fields but never auth credentials" {
+    // The realtime delete-authorization snapshot (#486) must hold a hidden field an operator rule
+    // may reference, but never the injected auth credentials, and never a hidden encrypted field.
+    const a = std.testing.allocator;
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try migrations.run(&d);
+    const col = try collections.create(a, std.testing.io, &d, .{
+        .id = "",
+        .name = "members",
+        .type = .auth,
+        .fields = &[_]schema.Field{
+            .{ .id = "m1", .name = "tier", .hidden = true, .options = .{ .text = .{} } },
+            .{ .id = "m2", .name = "bio", .options = .{ .text = .{} } },
+        },
+    });
+    defer col.deinit(a);
+    try d.exec(
+        \\INSERT INTO "members" ("id","created","updated","email","username","passwordHash","tokenKey","verified","token_epoch","tier","bio")
+        \\  VALUES ('m1','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','m@example.com','','hash','tk',1,3,'gold','hi');
+    );
+    const snap = (try getDeleteSnapshot(a, &d, col, "m1")).?;
+    defer freeRecord(a, snap);
+    try std.testing.expectEqualStrings("gold", snap.object.get("tier").?.string);
+    try std.testing.expectEqualStrings("hi", snap.object.get("bio").?.string);
+    for ([_][]const u8{ "passwordHash", "tokenKey", "token_epoch" }) |name| try std.testing.expect(snap.object.get(name) == null);
+    // `getAtRest` still strips every hidden field.
+    const plain = (try getAtRest(a, &d, col, "m1")).?;
+    defer freeRecord(a, plain);
+    try std.testing.expect(plain.object.get("tier") == null);
+    // A hidden ENCRYPTED field is never kept (rules cannot reference one).
+    try std.testing.expect(!deleteSnapshotKeeps(col, .{ .id = "x", .name = "x", .hidden = true, .encrypted = true, .options = .{ .text = .{} } }));
 }
 
 test "ttl read-exclusion: list excludes expired, includes future+null, non-ttl unaffected" {

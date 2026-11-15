@@ -1580,7 +1580,16 @@ The `501` uses the standard error envelope with code `not_implemented`. If an
 identity becomes invalid while a page is being authorized, the entire page is
 discarded and the endpoint returns `401` (`unauthorized`), without items or a
 new cursor. Reauthenticate and retry the previous checkpoint. Operational
-failures similarly return an error without advancing the checkpoint.
+failures (for example the server running out of memory or database connections)
+return `500` without advancing the checkpoint; retry the previous checkpoint
+later. If the same checkpoint keeps failing, discard it and start again from
+step 1 below (a cursorless request returns a fresh checkpoint). A retained
+deletion snapshot that can never be authorized (a stored value that no longer
+fits its field after a schema change, or a current rule that cannot be evaluated
+against it) does not fail the page: it is skipped for that caller and logged by
+the server, like any other item the caller may not see. A server-side failure
+while authorizing it (memory, or the database the check runs in) is an
+operational failure: `500`, and the retry can still deliver the item.
 It is not a durable log or a historical record-payload replay API.
 
 The endpoint accepts one collection name (`topic`), an optional opaque `cursor`,
@@ -1591,7 +1600,9 @@ not supported. The response is
 `{items, nextCursor, hasNext, resetRequired}`. Items use the normal event envelope
 but contain **only `{id}`** in `record`; refetch current record data through REST.
 Current token/session/two-factor policy, view rules, abilities and tenant scope
-are checked for each item, including for retained deletion snapshots. Identity
+are checked for each item, including for retained deletion snapshots, which are
+authorized exactly like live `delete` events (a `viewRule` that traverses a
+relation does not match a deletion snapshot). Identity
 verification and reader acquisition are intentionally repeated per item so a
 revocation committed mid-page aborts the entire response, not merely the next
 request. Collection metadata is also reacquired to observe schema changes. Deletion
@@ -1727,6 +1738,21 @@ When a subscribed record changes, the server pushes:
 Delete events are authorized per subscriber against a snapshot of the just-deleted record,
 so an owner-scoped (or otherwise gated) `viewRule` only notifies subscribers who were allowed
 to view that record — a delete on someone else's record is not leaked to other subscribers.
+Column comparisons (`owner = @request.auth.id`, a tenant field, an ability's `.via` relation,
+`created`, a number or json field, or a hidden field) are evaluated against the deleted record's
+stored values, including relation ids, so they decide the delete as they decided a view of the
+record just before it was deleted. Hidden fields are part of that server-side snapshot only; they
+never appear in a delivered frame or a backfill item, and auth credentials (`passwordHash`,
+`tokenKey`, `token_epoch`) are never captured. If a required snapshot read fails, the delete
+transaction fails before commit; it never substitutes a stripped hook record. Idempotent deletes
+also use their prepared snapshot for local delivery and replay (the REST idempotency collection
+restrictions still apply). A queued record event whose collection has been removed is dropped
+and logged, never forwarded as a custom-topic message. On PostgreSQL the snapshot comparison uses
+SQLite semantics (for example,
+`~` is case-insensitive for ASCII letters only); equality on ids and tenant fields is the same on
+both. A `viewRule` that traverses a relation (`owner.team = …`) cannot be evaluated against the
+snapshot, because the related records are not part of it; such a delete is not delivered to that
+subscriber.
 Existing WebSocket and SSE sessions are reverified before subscriptions and delivery.
 New two-factor requirements and session revocation therefore stop private delivery
 without waiting for the original token to expire; send a fresh `auth` frame after

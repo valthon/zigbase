@@ -319,6 +319,11 @@ fn onClose(context: ?*LiveConn, uuid: isize) anyerror!void {
     connection.releaseConnectionSlot(); // F9: free the global connection slot
 }
 
+pub const TestCapture = if (@import("builtin").is_test) struct {
+    // Borrowed only for the duration of the handler's request arena.
+    pub var delete_snapshot: ?*?std.json.Value = null;
+} else struct {};
+
 /// Publish a record event to its collection + record channels. Called from the record-writer path
 /// (any thread); `fio_publish` is a non-blocking enqueue. `record` is the full record for
 /// create/update (hidden fields already stripped) and the deletion snapshot for delete.
@@ -329,6 +334,9 @@ fn onClose(context: ?*LiveConn, uuid: isize) anyerror!void {
 /// at-rest snapshot in the side table — see `prepareDelete`; null for create/update and on
 /// SQLite. The NOTIFY carries only the token, never the (possibly encrypted) row data.
 pub fn broadcast(app: *App, col: schema.Collection, action: protocol.Action, record_id: []const u8, record: ?std.json.Value, notify_token: ?[]const u8) void {
+    if (comptime @import("builtin").is_test) if (action == .delete) {
+        if (TestCapture.delete_snapshot) |out| out.* = record;
+    };
     if (!active) return; // reactor not running (tests/CLI): no-op to avoid "cluster inactive" + UB
     if (comptime @import("build_options").realtime_backfill) {
         if (app.backfill) |store| captureInvalidation(app.allocator, store, db.poolBackend(app.pool), col, action, record_id, record);
@@ -407,7 +415,8 @@ pub const DeleteRealtime = struct {
     /// The snapshot fed to per-subscriber delete AUTHZ (`hub.matchesSnapshot`). It is the AT-REST
     /// representation (`.encrypted` fields are CIPHERTEXT, not decrypted) so the LOCAL delete authz
     /// compares the SAME representation as the cross-instance REMOTE path AND the live create/update
-    /// path (which both compare the ciphertext column) — all three agree. The delivered delete frame
+    /// path (which both compare the ciphertext column) — all three agree. It also holds the hidden
+    /// fields a `viewRule` may reference (`records.getDeleteSnapshot`). The delivered delete frame
     /// is id-only regardless (the snapshot is stripped before any client sees it), so the
     /// representation choice never changes what subscribers receive.
     snapshot: ?std.json.Value,
@@ -420,20 +429,33 @@ pub const DeleteRealtime = struct {
 /// the snapshot the caller already read for its hooks (hidden fields stripped, `.encrypted` fields
 /// DECRYPTED).
 ///
-/// Delete authz must use the AT-REST (ciphertext) snapshot so local == remote == live. We only
-/// re-read it when it could DIFFER from `decrypted` (the collection has an `.encrypted` field) or
-/// when the cross-instance side table needs it (Postgres). Otherwise — the common case: SQLite (or
-/// any collection with no encrypted fields) — `decrypted` IS the at-rest representation, so we reuse
-/// it with NO extra read and SQLite stays byte-identical.
-pub fn prepareDelete(alloc: std.mem.Allocator, app: *App, w: *db.Db, col: schema.Collection, record_id: []const u8, decrypted: ?std.json.Value) DeleteRealtime {
+/// Delete authz must use the AT-REST (ciphertext) snapshot so local == remote == live, and it must
+/// hold the hidden fields a `viewRule` may reference (`records.getDeleteSnapshot`, #486). We only
+/// re-read it when it could DIFFER from `decrypted` (the collection has an `.encrypted` field or a
+/// hidden field the snapshot keeps, or record hooks are installed) or when the cross-instance
+/// side table needs it (Postgres). Hooks can mutate the public record without persisting it;
+/// authorization must always reflect the stored row. The type-erased record dispatcher is
+/// conservatively treated as potentially mutating any collection's before-delete record.
+/// Otherwise — SQLite with none of these — `decrypted` IS that
+/// snapshot, so we reuse it with NO extra read and SQLite stays byte-identical.
+/// A required capture failure (including a missing row) aborts the caller's delete transaction;
+/// a stripped hook record is never a substitute for missing authorization inputs.
+pub fn prepareDelete(alloc: std.mem.Allocator, app: *App, w: *db.Db, col: schema.Collection, record_id: []const u8, decrypted: ?std.json.Value) !DeleteRealtime {
     const cross = pg_bridge.crossInstanceEnabled(app);
-    if (!cross and !schema.hasEncryptedField(col)) return .{ .snapshot = decrypted, .token = null };
-    const at_rest = (records.getAtRest(alloc, w, col, record_id) catch |e| {
+    const has_record_hooks = if (app.dispatch) |dispatch| dispatch.record != null else false;
+    if (!cross and !schema.hasEncryptedField(col) and !hasSnapshotOnlyField(col) and !has_record_hooks) return .{ .snapshot = decrypted, .token = null };
+    const at_rest = (records.getDeleteSnapshot(alloc, w, col, record_id) catch |e| {
         std.log.warn("realtime: delete-snapshot capture failed for {s}/{s}: {s}", .{ col.name, record_id, @errorName(e) });
-        return .{ .snapshot = decrypted, .token = null };
-    }) orelse return .{ .snapshot = decrypted, .token = null };
+        return e;
+    }) orelse return error.NotFound;
     const token = if (cross) pg_bridge.storeDeleteSnapshot(alloc, app.io, w, at_rest) else null;
     return .{ .snapshot = at_rest, .token = token };
+}
+
+/// Whether `col` has a hidden field the delete snapshot keeps but a hook's `get` read strips.
+fn hasSnapshotOnlyField(col: schema.Collection) bool {
+    for (col.fields) |f| if (f.hidden and records.deleteSnapshotKeeps(col, f)) return true;
+    return false;
 }
 
 /// Build + publish the two event frames into the LOCAL in-process hub (no NOTIFY). Shared by the

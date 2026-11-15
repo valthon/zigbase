@@ -56,6 +56,7 @@ pub fn pow10(scale: u8) error{Overflow}!i64 {
 
 pub fn decimalToScaledInt(s: []const u8, scale: u8) ValueError!i64 {
     if (s.len == 0) return error.BadNumber;
+    const pow = try pow10(scale);
     var i: usize = 0;
     var neg = false;
     if (s[0] == '-') {
@@ -70,7 +71,8 @@ pub fn decimalToScaledInt(s: []const u8, scale: u8) ValueError!i64 {
         if (s[i] < '0' or s[i] > '9') return error.BadNumber;
         seen = true;
         int_part = std.math.mul(i64, int_part, 10) catch return error.Overflow;
-        int_part = std.math.add(i64, int_part, s[i] - '0') catch return error.Overflow;
+        // Accumulate negatively: abs(minInt(i64)) cannot fit in an i64.
+        int_part = std.math.sub(i64, int_part, s[i] - '0') catch return error.Overflow;
     }
     var frac: i64 = 0;
     var fdigits: u8 = 0;
@@ -85,21 +87,17 @@ pub fn decimalToScaledInt(s: []const u8, scale: u8) ValueError!i64 {
         }
     }
     if (!seen) return error.BadNumber;
-    const pow = try pow10(scale);
     while (fdigits < scale) : (fdigits += 1) frac *= 10;
     var result = std.math.mul(i64, int_part, pow) catch return error.Overflow;
-    result = std.math.add(i64, result, frac) catch return error.Overflow;
-    return if (neg) -result else result;
+    result = std.math.sub(i64, result, frac) catch return error.Overflow;
+    return if (neg) result else std.math.sub(i64, 0, result) catch return error.Overflow;
 }
 
 pub fn scaledIntToDecimal(alloc: std.mem.Allocator, v: i64, scale: u8) ![]u8 {
     if (scale == 0) return std.fmt.allocPrint(alloc, "{d}", .{v});
-    // -minInt(i64) overflows; only reachable via direct DB tampering since
-    // decimalToScaledInt is overflow-checked. Reject rather than panic.
-    if (v == std.math.minInt(i64)) return error.Overflow;
-    const pow = try pow10(scale);
+    const pow: u64 = @intCast(try pow10(scale));
     const neg = v < 0;
-    const av: i64 = if (neg) -v else v;
+    const av = @abs(v);
     const int_part = @divTrunc(av, pow);
     const frac_part = @rem(av, pow);
     var fbuf: [24]u8 = undefined;
@@ -532,4 +530,36 @@ test "scaledIntToDecimal round-trips" {
     const s5 = try scaledIntToDecimal(a, 9007199254740993, 0);
     defer a.free(s5);
     try std.testing.expectEqualStrings("9007199254740993", s5);
+}
+
+test "signed i64 boundaries round-trip as integers and scaled fixed point" {
+    const a = std.testing.allocator;
+    inline for (.{ @as(u8, 0), @as(u8, 2), @as(u8, 18) }) |scale| {
+        const minimum = switch (scale) {
+            0 => "-9223372036854775808",
+            2 => "-92233720368547758.08",
+            18 => "-9.223372036854775808",
+            else => unreachable,
+        };
+        const maximum = switch (scale) {
+            0 => "9223372036854775807",
+            2 => "92233720368547758.07",
+            18 => "9.223372036854775807",
+            else => unreachable,
+        };
+        try std.testing.expectEqual(std.math.minInt(i64), try decimalToScaledInt(minimum, scale));
+        try std.testing.expectEqual(std.math.maxInt(i64), try decimalToScaledInt(maximum, scale));
+        const min_read = try scaledIntToDecimal(a, std.math.minInt(i64), scale);
+        defer a.free(min_read);
+        const max_read = try scaledIntToDecimal(a, std.math.maxInt(i64), scale);
+        defer a.free(max_read);
+        try std.testing.expectEqualStrings(minimum, min_read);
+        try std.testing.expectEqualStrings(maximum, max_read);
+    }
+    try std.testing.expectError(error.Overflow, decimalToScaledInt("9223372036854775808", 0));
+    try std.testing.expectError(error.Overflow, decimalToScaledInt("-9223372036854775809", 0));
+    try std.testing.expectError(error.Overflow, decimalToScaledInt("92233720368547758.08", 2));
+    try std.testing.expectError(error.Overflow, decimalToScaledInt("-92233720368547758.09", 2));
+    try std.testing.expectError(error.Overflow, decimalToScaledInt("9.223372036854775808", 18));
+    try std.testing.expectError(error.Overflow, decimalToScaledInt("-9.223372036854775809", 18));
 }
