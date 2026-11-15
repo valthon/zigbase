@@ -38,6 +38,22 @@ collection's rows, full stop. You do not write `account = @request.account.id` o
 hand; the tenant scope is composed into the guard stack automatically. A client can never read or
 write across tenants, even through a `@public` rule, an `expand`, or a realtime subscription.
 
+Tenants still share **capacity**, and two documented side channels follow from it. Neither reveals
+content, record ids or which tenant wrote:
+
+- **Realtime backfill retention** (opt-in, `-Drealtime-backfill=true` or `-Ddurable-realtime=true`).
+  Retained invalidations are bounded per collection (local store) or globally (durable journal), not
+  per tenant. One tenant's write volume can evict the entries another tenant's checkpoint depends on,
+  and that tenant's next `GET /api/realtime/backfill` answers `409 resetRequired`; the `409` tells it
+  the collection (local) or the journal (durable) received more than its retention budget since its
+  checkpoint (or, durable only, that retention expired). A tenant can force these resets at will by writing past the budget.
+- **Response time.** A backfill request authorizes every retained entry it scans, including other
+  tenants', so its latency grows with their write volume.
+
+Backfill items, `hasNext`, page count and cursors do not depend on other tenants' writes (cursors are
+encrypted; `limit` counts authorized items). See [API → Realtime](api.md#durable-record-invalidation-replay-sqlite-and-postgresql)
+for the budgets and the one build-time exception (`-Dreplay-max-entries` above 4096).
+
 ## Enable it
 
 Turn tenancy on at the top level of `App(.{ ... })`, then mark each owned collection's

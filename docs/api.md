@@ -1581,8 +1581,15 @@ or not the caller may see it, so response time grows with them; a request author
 most 4096 entries and uses temporary database and JSON storage. Admission/concurrency
 budgets remain application responsibilities.
 
-Unlike the local store, retention is shared across collections: a busy collection
-can cause another collection's checkpoint to require reset. Invalid, expired,
+Unlike the local store, retention is shared across collections **and across tenants**:
+a busy collection can cause another collection's checkpoint to require reset, and one
+tenant's write volume can evict the entries other tenants' checkpoints depend on, so
+their next request answers `409 resetRequired` and the client reloads its snapshot.
+A tenant can cause this at will by writing past the budget. The `409` itself tells
+the caller that, since its checkpoint, the journal received more than its entry or byte
+budget across all collections and tenants, or that retention expired; it reveals no
+content, ids or tenant attribution. Deployments that cannot accept this should size
+the budgets for their write volume. Invalid, expired,
 evicted, collection-renamed or wrong-collection checkpoints return the same `409 resetRequired`
 envelope below. Obtain a new checkpoint before reloading a snapshot. A cursorless
 request does not reserve retention. Snapshot reload and idempotent application of
@@ -1695,6 +1702,13 @@ eviction, invalid cursors and failed capture return `409` with
 `{resetRequired:true, items:[], nextCursor:null, hasNext:false}`. Discard the old
 checkpoint and repeat the initial snapshot sequence. Capture positions and
 pagination are collection-local; slot replacement is still a shared capacity limit.
+A collection's ring is also shared by every tenant and user writing to it: writes
+the caller may not see can evict its checkpoint, and the resulting `409` tells it
+that the collection received more than 256 events (or more than 64 KiB of frames)
+since that checkpoint, or that the slot was replaced or invalidated. Apart from that `409` and response time
+(a request authorizes every retained entry it scans, visible or not), a page's
+items, `hasNext`, page count and cursor do not depend on entries the caller may
+not see.
 
 **Maximum event size is 64 KiB, including the JSON envelope.** This is also the
 per-collection retention budget, deliberately kept small for bounded memory use.
