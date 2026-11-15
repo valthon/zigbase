@@ -18,7 +18,15 @@ Mark one or more `text`/`editor` fields `.searchable` in the schema:
 } },
 ```
 
-At startup ZigBase provisions the index automatically — no migration needed. On **SQLite** (the
+ZigBase provisions the index automatically — no migration needed — at startup for comptime
+collections, and in the same transaction as the schema change when a collection is created,
+updated or deleted through the collections API or the admin UI. Making a field searchable
+backfills the index from the existing rows; adding, removing or renaming a searchable field
+rebuilds it. Replacing a searchable field with a new field ID also rebuilds the index, even
+when its name stays the same; the replacement discards that field's old values. Turning
+search off or deleting the collection drops the index. If the index cannot be
+built (for example a conflicting object named `<col>_fts`), the whole schema change fails
+and nothing is applied. On **SQLite** (the
 default backend) that's an [FTS5](https://www.sqlite.org/fts5.html) **external-content** index
 per searchable collection (`"<col>_fts"`, `content='<col>'`) plus `INSERT`/`UPDATE`/`DELETE`
 triggers that keep it in lock-step with the base table — no doubled storage. On **Postgres**
@@ -60,7 +68,9 @@ smaller binary); every FTS5 code path in `src/search/fts.zig` folds to comptime-
 `-Dfts5=false`, a `?search=` request answers a clean **400** (`"Full-text search is not enabled
 in this build."`), and — more importantly — **the server refuses to start** if the comptime
 schema declares any `.searchable` field on the SQLite backend, with an actionable startup error,
-rather than silently skipping the index and surfacing a 500 on the first search. Postgres
+rather than silently skipping the index and surfacing a 500 on the first search. For the same
+reason the collections API answers **400** to a create or update that would make a field
+searchable in such a build, and changes nothing. Postgres
 full-text search (the `tsvector`/GIN path above) is a server-native feature and is **not** gated
 by this flag.
 

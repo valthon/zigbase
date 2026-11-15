@@ -533,16 +533,17 @@ test "rewrapColumn succeeds on a searchable+encrypted collection (FTS triggers i
         .id = "",
         .name = "docs",
         .fields = &.{
-            .{ .id = "", .name = "title", .searchable = true, .options = .{ .text = .{} } },
+            // `create` provisions the FTS5 shadow table + AFTER UPDATE trigger (#507). A build
+            // without FTS5 refuses a searchable create, and must still rotate encrypted fields.
+            .{ .id = "", .name = "title", .searchable = fts.enabled, .options = .{ .text = .{} } },
             .{ .id = "", .name = "secret", .encrypted = true, .options = .{ .text = .{} } },
         },
     };
-    const col = try collections.create(a, io, &d, def);
+    _ = try collections.create(a, io, &d, def);
     if (fts.enabled) {
-        try fts.ensureIndex(a, &d, col); // provision the FTS5 shadow table + AFTER UPDATE trigger
-    } else {
-        // Disabling search must not disable encrypted-field key rotation.
-        try std.testing.expectError(error.SearchDisabled, fts.ensureIndex(a, &d, col));
+        var index = try d.prepare("SELECT 1 FROM sqlite_schema WHERE name='docs_fts_au';");
+        defer index.finalize();
+        try std.testing.expect(try index.step());
     }
 
     // Seed a v1 envelope in the encrypted column (with a searchable title present).

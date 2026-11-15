@@ -105,31 +105,8 @@ def two_tenants(base, database):
             {"id": "", "name": "title", "type": "text", "searchable": True, "options": {}},
         ],
     }, admin)
-    assert status == 201, col
-    provision_search_index(database)
+    assert status == 201, col  # the engine provisions the search index with the collection (#507)
     return tokens
-
-
-def provision_search_index(database):
-    """Create the engine's FTS5 objects for `memos` (same DDL as `fts.ensureIndexSqliteImpl`).
-
-    A collection created over HTTP is not search-provisioned today (only startup provisioning
-    of comptime collections and `provisionMetadata` call `fts.ensureIndex`), and the only
-    tenancy-enabled fixture with no extra build flags (dating-server) has no tenant-owned
-    searchable collection. Under test here is the READ path — ranking over a shared index with
-    real HTTP tenancy — so the index is built directly, before any row exists.
-    """
-    with sqlite3.connect(database) as db:
-        db.executescript("""
-            CREATE VIRTUAL TABLE "memos_fts" USING fts5("title", content="memos");
-            CREATE TRIGGER "memos_fts_ai" AFTER INSERT ON "memos" BEGIN
-              INSERT INTO "memos_fts"(rowid, "title") VALUES (new.rowid, new."title"); END;
-            CREATE TRIGGER "memos_fts_ad" AFTER DELETE ON "memos" BEGIN
-              INSERT INTO "memos_fts"("memos_fts", rowid, "title") VALUES ('delete', old.rowid, old."title"); END;
-            CREATE TRIGGER "memos_fts_au" AFTER UPDATE ON "memos" BEGIN
-              INSERT INTO "memos_fts"("memos_fts", rowid, "title") VALUES ('delete', old.rowid, old."title");
-              INSERT INTO "memos_fts"(rowid, "title") VALUES (new.rowid, new."title"); END;
-        """)
 
 
 def create(base, tokens, tenant, title):

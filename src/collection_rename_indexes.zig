@@ -359,6 +359,8 @@ test "pg: rename provenance preserves identity index OID and refuses owned-data 
 
     const posts = try collections.create(a, std.testing.io, &w, .{ .id = "", .name = "posts", .fields = &.{.{ .id = "titleid", .name = "title", .searchable = true, .options = .{ .text = .{} } }} });
     defer posts.deinit(a);
+    // `create` provisions the engine's tsvector (#507); remove it so the name holds user data.
+    try fts.dropIndexFor(a, &w, posts);
     try w.exec("ALTER TABLE posts ADD COLUMN posts_fts TEXT; INSERT INTO posts(id,posts_fts) VALUES('r1','keep');");
     try std.testing.expectError(error.Conflict, preflight(a, &w, posts, "articles"));
     var saved = try w.prepare("SELECT posts_fts FROM posts;");
