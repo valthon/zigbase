@@ -2069,8 +2069,9 @@ pub const ListQuery = struct {
     rctx: ?*const request.RequestContext = null,
     /// Full-text search terms (#157, the `?search=`/`?q=` param). When non-null/non-empty on a
     /// SEARCHABLE collection, a bound FTS5 `MATCH` predicate is AND-ed into the same WHERE
-    /// composition as filter/rule/ability/tenant/ttl, and results are ranked by bm25 relevance
-    /// (offset mode). A search on a non-searchable collection returns `error.NotSearchable`.
+    /// composition as filter/rule/ability/tenant/ttl, and results are ranked by a row-local
+    /// relevance score, ties broken by id (offset mode; see `fts.rank_fn`). A search on a
+    /// non-searchable collection returns `error.NotSearchable`.
     /// On SQLite, honored only in an `-Dfts5` build (default ON; else `error.SearchDisabled`) —
     /// Postgres full-text search is unaffected by the flag.
     search: ?[]const u8 = null,
@@ -2940,7 +2941,8 @@ pub fn list(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, q: L
 
     // Full-text search (#157): compose a BOUND FTS5 `MATCH` predicate as the FIRST WHERE clause —
     // so its `?` is params[0] — then let filter/rule/ability/tenant/ttl below narrow it further. The
-    // FTS shadow table is brought in via a join; relevance (bm25 `rank`) drives the OFFSET ordering.
+    // FTS shadow table is brought in via a join; relevance (row-local `zb_rank`, #495) drives the
+    // OFFSET ordering.
     // CRITICAL: search NEVER bypasses scoping — it AND-s INTO the same composition, so a search on a
     // tenant-/ability-guarded collection still returns only rows the caller may view. A search on a
     // collection with no searchable field is `error.NotSearchable` (handler -> 400).
@@ -2951,7 +2953,7 @@ pub fn list(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, q: L
         const trimmed = std.mem.trim(u8, sterm, " \t\r\n");
         if (trimmed.len > 0) {
             if (!fts.isSearchable(col)) return error.NotSearchable;
-            if (try fts.build(sa, dialect, col, sterm)) |s| {
+            if (try fts.build(sa, conn, col, sterm)) |s| {
                 // Postgres' tsvector lives on the base table → no JOIN (empty join_sql); SQLite's
                 // FTS5 shadow table needs one. Only append a non-empty join.
                 if (s.join_sql.len > 0) try j.joins.append(sa, s.join_sql);
@@ -3111,11 +3113,19 @@ pub fn list(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, q: L
         defer sa.free(qcol);
         break :blk try std.fmt.allocPrint(sa, "{s}.\"created\" DESC{s}", .{ qcol, dialect.nullsOrder(.desc) });
     };
-    // Search/vector relevance leads the OFFSET ordering: bm25 `rank` (FTS) and/or nearest-neighbor
-    // distance (vector), with any client sort kept as the tiebreaker. Cursor mode keeps the keyset
-    // order (the MATCH/where predicate still scopes the page; vector cursors are rejected above).
-    if (search_order) |so|
-        offset_order_sql = if (base_terms.len > 0) try std.fmt.allocPrint(sa, "{s}, {s}", .{ so, offset_order_sql }) else so;
+    // Search/vector relevance leads the OFFSET ordering: the row-local text score (FTS) and/or
+    // nearest-neighbor distance (vector), with any client sort kept as the tiebreaker. Cursor mode
+    // keeps the keyset order (the MATCH/where predicate still scopes the page; vector cursors are
+    // rejected above). A search always ends in the record id so equal scores have one total,
+    // row-local order: left to the plan, ties would follow scan/insertion order, which other
+    // tenants' writes can shift (#495).
+    if (search_order) |so| {
+        const qcol = try ddl.quoteIdent(sa, col.name);
+        offset_order_sql = if (base_terms.len > 0)
+            try std.fmt.allocPrint(sa, "{s}, {s}, {s}.\"id\" ASC", .{ so, offset_order_sql, qcol })
+        else
+            try std.fmt.allocPrint(sa, "{s}, {s}.\"id\" ASC", .{ so, qcol });
+    }
     if (vector_order) |vo|
         offset_order_sql = if (base_terms.len > 0 or search_order != null) try std.fmt.allocPrint(sa, "{s}, {s}", .{ vo, offset_order_sql }) else vo;
     const eff_terms = try effectiveSortTerms(sa, col, base_terms);
@@ -3295,7 +3305,7 @@ pub fn list(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, q: L
     // The relevance ORDER BY carries up to two `?`s, in the SAME textual order they were prepended
     // to `offset_order_sql`: vector distance FIRST (`vector_order` is prepended last → leads), then
     // the Postgres `ts_rank` term (`search_order`), then LIMIT/OFFSET. Bind them in that exact order
-    // so the placeholder indices line up. On SQLite both are null (bm25 `rank` takes no param; the
+    // so the placeholder indices line up. On SQLite both are null (`zb_rank` takes no param; the
     // vector arm needs `-Dvector`), so this is byte-identical to the prior single-vector binding.
     if (vector_param) |vp| after = try bindParams(&pst, &.{vp}, after);
     if (search_order_param) |sp| after = try bindParams(&pst, &.{sp}, after);

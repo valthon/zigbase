@@ -724,7 +724,7 @@ test "records.list full-text search respects the view ability (denied rows absen
     try std.testing.expect(!hasOwner(owners, "acc3"));
 }
 
-test "records.list full-text search ranks by bm25 and binds a basic-operator query safely" {
+test "records.list full-text search ranks by row-local relevance and binds a basic-operator query safely" {
     if (comptime !fts.enabled) return error.SkipZigTest;
     var d = try db.Db.openMemory();
     defer d.close();
@@ -740,7 +740,7 @@ test "records.list full-text search ranks by bm25 and binds a basic-operator que
         "('r3','t','t','gamma delta','acc1');");
     const anon = request.RequestContext{};
 
-    // Ranked ordering: the row with the densest "alpha" match comes first (bm25 via FTS `rank`).
+    // Ranked ordering: the row with the densest "alpha" match comes first (row-local `zb_rank`).
     var ranked = try records.list(a, &d, col, .{ .search = "alpha", .rule = listRuleFilter(col, &anon), .rctx = &anon });
     defer ranked.deinit(a);
     try std.testing.expectEqual(@as(usize, 2), ranked.items.len);
