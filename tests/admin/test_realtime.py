@@ -2,6 +2,7 @@ import json as _json
 import re
 import socket
 import time
+import urllib.request
 import pytest
 from _ws import _recv_until
 from urllib.parse import urlparse
@@ -423,6 +424,90 @@ def test_rt_delete_is_id_only_and_gated(page, transport):
     assert deletes and all("topsecretvalue" not in f and "_deleteSnapshot" not in f for f in deletes), deletes
     anon = page.evaluate("() => window.__anonFrames")
     assert not any('"action":"delete"' in f for f in anon), anon
+
+@pytest.mark.parametrize("hidden", [False, True], ids=["owner", "hidden_field"])
+@pytest.mark.parametrize("transport", ["ws", "sse"])
+def test_rt_owner_receives_delete_on_relation_collection(page, transport, hidden):
+    """#486: on a collection WITH a relation field and an owner-scoped viewRule, a NON-superuser
+    owner receives the delete frame (the delete-snapshot sandbox used to fail building the
+    collection's table because the relation target was not in it, dropping every such delete),
+    while another authenticated user still receives nothing for the same delete. With `hidden`,
+    the rule also compares a HIDDEN field: the private authorization snapshot must carry its value
+    (the hook-facing record strips it), and the value must never reach a delivered frame."""
+    login(page)
+    tag = transport + ("_h" if hidden else "")
+    users, notes = f"u486_{tag}", f"n486_{tag}"
+    rule = "owner = @request.auth.id" + (" && tier = 'gold-hidden-marker'" if hidden else "")
+    r = api_request(page, "POST", "/api/collections", {"name": users, "type": "auth", "fields": [],
+        "listRule": "", "viewRule": "", "createRule": "", "updateRule": "", "deleteRule": ""})
+    assert r.status == 201, r.text()
+    r = api_request(page, "POST", "/api/collections", {"name": notes, "type": "base",
+        "fields": [{"id": "", "name": "title", "type": "text", "options": {}},
+                   {"id": "", "name": "owner", "type": "relation",
+                    "options": {"targetCollectionId": users, "maxSelect": 1}}]
+                  + ([{"id": "", "name": "tier", "type": "text", "hidden": True, "options": {}}] if hidden else []),
+        "listRule": rule, "viewRule": rule,
+        "createRule": "", "updateRule": "", "deleteRule": ""})
+    assert r.status == 201, r.text()
+    su = {"Authorization": "Bearer " + superuser_token(page), "Content-Type": "application/json"}
+    ids, tokens = {}, {}
+    for who in ("alice", "bob"):
+        email = f"{who}-{transport}@x.io"
+        r = page.request.post(f"/api/collections/{users}/records", headers=su,
+                              data=_json.dumps({"email": email, "password": "password12345"}))
+        assert r.status == 201, r.text()
+        ids[who] = r.json()["id"]
+        # Log in OUTSIDE the page's cookie jar: page.request would replace the superuser
+        # session cookie the rest of this test writes with.
+        u = urlparse(page.url)
+        req = urllib.request.Request(f"{u.scheme}://{u.netloc}/api/collections/{users}/auth-with-password",
+                                     data=_json.dumps({"identity": email, "password": "password12345"}).encode(),
+                                     headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            tokens[who] = _json.loads(resp.read())["token"]
+    body = {"title": "mine", "owner": ids["alice"]}
+    if hidden:
+        body["tier"] = "gold-hidden-marker"
+    r = api_request(page, "POST", f"/api/collections/{notes}/records", body)
+    assert r.status == 201, r.text()
+    rec = r.json()
+    assert "tier" not in rec  # hidden: never serialized
+
+    # Stream 1: alice (the owner) on the transport under test.
+    rt_open(page, transport)
+    rt_send(page, {"action": "auth", "token": tokens["alice"]})
+    rt_wait_frame(page, "f.includes('\"type\":\"auth\"') && f.includes('\"status\":\"ok\"')")
+    rt_send(page, {"action": "subscribe", "topic": notes})
+    rt_wait_frame(page, "f.includes('\"type\":\"ack\"')")
+    # Stream 2: bob (authenticated, not the owner) over SSE under separate globals.
+    page.evaluate("""([topic, token]) => {
+        window.__bobFrames = []; window.__bobReady = false;
+        const es = new EventSource('/api/realtime/sse');
+        es.onmessage = async (e) => {
+            window.__bobFrames.push(e.data);
+            const m = JSON.parse(e.data);
+            if (m.type === 'connect') {
+                const up = (f) => fetch('/api/realtime/sse/' + m.clientId, { method: 'POST', body: JSON.stringify(f) });
+                await up({action: 'auth', token});
+                const r = await up({action: 'subscribe', topic});
+                window.__bobFrames.push(await r.text());
+                window.__bobReady = true;
+            }
+        };
+    }""", [notes, tokens["bob"]])
+    page.wait_for_function("window.__bobReady === true", timeout=8000)
+    assert any('"type":"ack"' in f for f in page.evaluate("() => window.__bobFrames"))
+
+    r = api_request(page, "DELETE", f"/api/collections/{notes}/records/{rec['id']}")
+    assert r.status == 204, r.text()
+    rt_wait_frame(page, "f.includes('\"action\":\"delete\"') && f.includes('%s')" % rec["id"])
+    deletes = [f for f in page.evaluate("() => window.__rt.frames") if '"action":"delete"' in f]
+    assert deletes and all("_deleteSnapshot" not in f and "mine" not in f for f in deletes), deletes
+    page.wait_for_timeout(500)  # alice's frame has arrived; give bob's stream the same chance
+    bob = page.evaluate("() => window.__bobFrames")
+    assert not any('"action":"delete"' in f for f in bob), bob
+    frames = page.evaluate("() => window.__rt.frames") + bob
+    assert not any("hidden-marker" in f for f in frames), frames
 
 @pytest.mark.parametrize("transport", ["ws", "sse"])
 def test_rt_features_signal(page, transport):

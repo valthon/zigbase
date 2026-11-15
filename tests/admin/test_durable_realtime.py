@@ -11,10 +11,12 @@ import uuid
 import pytest
 
 from conftest import _reserve_port, _stop_server, _su_template_for, _wait_reachable_or_fail
-from test_realtime_backfill import backfill, call, setup
+from test_realtime_backfill import backfill, call, hidden_rule_delete_scenario, relation_delete_scenario, setup
 from test_realtime_backfill import (
     test_checkpoint_before_snapshot_and_id_only_updates_and_delete,
     test_current_rules_hide_retained_delete_and_empty_page_advances,
+    test_retained_delete_on_relation_collection_is_authorized_per_item,
+    test_retained_delete_with_hidden_rule_field_is_authorized_from_its_stored_value,
 )
 
 
@@ -126,6 +128,40 @@ def test_postgres_cross_instance_replay(binary, tmp_path):
         assert code == 200 and deleted["items"][0]["action"] == "delete", deleted
         assert call(first, "DELETE", "/api/collections/" + col["id"], token=token)[0] == 204
         assert backfill(second, initial["nextCursor"], topic=topic)[0] == 404
+
+
+def test_postgres_retained_delete_with_hidden_rule_field(binary, tmp_path):
+    """#486 on the PostgreSQL durable journal: a hidden rule field rides the private snapshot."""
+    url = os.environ.get("ZIGBASE_PG_TEST_URL")
+    if not url:
+        pytest.skip("requires disposable PostgreSQL database and -Dpostgres=true binary")
+    suffix = "_" + uuid.uuid4().hex[:10]
+    identity = "hid" + suffix + "@x.io"
+    extra = {"ZIGBASE_DB_URL": url, "ZIGBASE_JWT_SECRET": "durable-replay-test-shared-secret-32bytes"}
+    subprocess.run([binary, "superuser", "create", "--email", identity, "--password", "adminpassword"],
+                   env={**os.environ, **extra, "ZIGBASE_DATA_DIR": str(tmp_path)},
+                   check=True, capture_output=True, timeout=30)
+    with running(binary, tmp_path, extra) as server:
+        code, auth = call(server, "POST", "/api/collections/_superusers/auth-with-password", {"identity": identity, "password": "adminpassword"})
+        assert code == 200, auth
+        hidden_rule_delete_scenario(server, auth["token"], suffix)
+
+
+def test_postgres_retained_delete_on_relation_collection(binary, tmp_path):
+    """#499 on the PostgreSQL durable journal (the only PostgreSQL backfill)."""
+    url = os.environ.get("ZIGBASE_PG_TEST_URL")
+    if not url:
+        pytest.skip("requires disposable PostgreSQL database and -Dpostgres=true binary")
+    suffix = "_" + uuid.uuid4().hex[:10]
+    identity = "rel" + suffix + "@x.io"
+    extra = {"ZIGBASE_DB_URL": url, "ZIGBASE_JWT_SECRET": "durable-replay-test-shared-secret-32bytes"}
+    subprocess.run([binary, "superuser", "create", "--email", identity, "--password", "adminpassword"],
+                   env={**os.environ, **extra, "ZIGBASE_DATA_DIR": str(tmp_path)},
+                   check=True, capture_output=True, timeout=30)
+    with running(binary, tmp_path, extra) as server:
+        code, auth = call(server, "POST", "/api/collections/_superusers/auth-with-password", {"identity": identity, "password": "adminpassword"})
+        assert code == 200, auth
+        relation_delete_scenario(server, auth["token"], suffix)
 
 
 def test_retained_frame_over_current_budget_returns_reset_without_partial_page(binary, tmp_path):

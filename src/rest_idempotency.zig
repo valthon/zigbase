@@ -47,6 +47,11 @@ fn Implementation(comptime config: anytype) type {
             data: std.json.Value,
             result: std.json.Value = .null,
             delete_token: ?[]const u8 = null,
+            delete_snapshot: ?std.json.Value = null,
+
+            fn eventRecord(s: *const State) ?std.json.Value {
+                return if (s.action == .delete) s.delete_snapshot else s.result;
+            }
         };
         fn state(raw: *anyopaque) *State {
             return @ptrCast(@alignCast(raw));
@@ -129,10 +134,11 @@ fn Implementation(comptime config: anytype) type {
             if (s.action == .delete) {
                 const previous = (try records.get(a, conn, s.col, s.rid)) orelse return error.NotFound;
                 // Preserve existing transactional delete transport preparation.
-                const prepared = realtime.prepareDelete(a, app, conn, s.col, s.rid, previous);
+                const prepared = try realtime.prepareDelete(a, app, conn, s.col, s.rid, previous);
                 s.delete_token = prepared.token;
+                s.delete_snapshot = prepared.snapshot;
                 if (comptime @import("build_options").durable_realtime) {
-                    const snapshot = (try records.getAtRest(a, conn, s.col, s.rid)) orelse return error.NotFound;
+                    const snapshot = (try records.getDeleteSnapshot(a, conn, s.col, s.rid)) orelse return error.NotFound;
                     try @import("realtime/durable.zig").capture(a, app.io, conn, s.col, .delete, s.rid, snapshot);
                 }
                 if (!try records.deleteInTxn(a, conn, s.col, s.rid)) return error.NotFound;
@@ -236,7 +242,7 @@ fn Implementation(comptime config: anytype) type {
                 switch (action) {
                     .create => realtime.broadcast(app, col, .create, event_id, s.result, null),
                     .update => realtime.broadcast(app, col, .update, event_id, s.result, null),
-                    .delete => realtime.broadcast(app, col, .delete, event_id, s.result, s.delete_token),
+                    .delete => realtime.broadcast(app, col, .delete, event_id, s.eventRecord(), s.delete_token),
                     else => unreachable,
                 }
             }
@@ -254,6 +260,76 @@ fn validationResponse(allocator: std.mem.Allocator) !http.Response {
     defer allocator.free(fields);
     for (details, 0..) |detail, i| fields[i] = .{ .field = detail.field, .code = detail.code, .message = detail.message };
     return ApiError.validation(fields).toResponse(allocator);
+}
+
+test "idempotent delete broadcasts its prepared private snapshot and retains it for replay" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(dir);
+    const path = try std.fmt.allocPrintSentinel(a, "{s}/test.db", .{dir}, 0);
+    defer a.free(path);
+    var pool = try db.Pool.init(a, std.testing.io, path);
+    defer pool.deinit();
+    const w = pool.acquireWriter();
+    defer pool.releaseWriter();
+    try @import("migrations.zig").run(w);
+    if (comptime @import("build_options").durable_realtime)
+        try @import("realtime/durable.zig").initialize(a, std.testing.io, w);
+    const col = try collections.create(a, std.testing.io, w, .{
+        .id = "",
+        .name = "idem_notes",
+        .fields = &.{
+            .{ .id = "owner", .name = "owner", .options = .{ .text = .{} } },
+            .{ .id = "tier", .name = "tier", .hidden = true, .options = .{ .text = .{} } },
+        },
+        .viewRule = "owner = @request.auth.id && tier = 'gold'",
+    });
+    defer col.deinit(a);
+    try w.exec("INSERT INTO idem_notes (id,created,updated,owner,tier) VALUES ('n1','','','u1','gold');");
+    var app = @import("app.zig").App{ .allocator = a, .io = std.testing.io, .pool = &pool };
+    // Exercise the transactional mutation directly: HTTP intentionally rejects
+    // hidden-field collections. Request-owned results live in this bounded arena.
+    var buffer: [65536]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buffer);
+    const arena = @import("request_arena.zig").RequestArena{ .a = fba.allocator() };
+    var ctx = http.RequestCtx{ .method = .DELETE, .path = "/", .allocator = arena, .app = &app };
+    const Impl = Implementation(.{ .limits = .{ .namespace = "snapshot-test" } });
+    var s = Impl.State{ .ctx = &ctx, .col = col, .rctx = .{}, .auth_collection_id = "", .action = .delete, .rid = "n1", .data = .null };
+    {
+        try w.beginImmediate();
+        errdefer w.rollback() catch |err| std.log.err("test rollback failed: {s}", .{@errorName(err)});
+        var output: [1]u8 = undefined;
+        try std.testing.expectEqual(@as(usize, 0), try Impl.mutate(w, &s, &output));
+        try w.commit();
+    }
+    try std.testing.expect(s.result.object.get("tier") == null);
+    const snapshot = s.eventRecord() orelse return error.TestExpectedSnapshot;
+    const tier = snapshot.object.get("tier") orelse return error.TestExpectedHiddenFieldInSnapshot;
+    try std.testing.expectEqualStrings("gold", tier.string);
+    const hub = @import("realtime/hub.zig");
+    const frames = try hub.buildEventFrames(a, col.name, .delete, s.rid, snapshot);
+    defer frames.deinit(a);
+    var store = @import("realtime/backfill.zig").Store.init(a, std.testing.io);
+    defer store.deinit();
+    const checkpoint = try store.cursor(a, try store.page(arena, col.id, null, 128));
+    defer a.free(checkpoint);
+    try store.append(col.id, frames.frame_collection);
+    const page = try store.page(arena, col.id, checkpoint, 128);
+    try std.testing.expectEqual(@as(usize, 1), page.items.len);
+    const retained = try std.json.parseFromSlice(std.json.Value, a, page.items[0].frame, .{});
+    defer retained.deinit();
+    var identity: std.json.ObjectMap = .empty;
+    defer identity.deinit(a);
+    try identity.put(a, "id", .{ .string = "u1" });
+    var owner = @import("realtime/connection.zig").Conn{};
+    owner.setAuth(.{ .record = .{ .object = identity }, .is_superuser = false, .exp = 9999999999 });
+    const retained_snapshot = retained.value.object.get("record").?.object.get(hub.delete_snapshot_key).?;
+    try std.testing.expect(try hub.shouldDeliver(a, w, col, &owner, 0, .delete, s.rid, null, retained_snapshot));
+    try identity.put(a, "id", .{ .string = "u2" });
+    owner.auth.?.record = .{ .object = identity };
+    try std.testing.expect(!try hub.shouldDeliver(a, w, col, &owner, 0, .delete, s.rid, null, retained_snapshot));
 }
 
 test "REST validation details are consumed before the request arena expires" {

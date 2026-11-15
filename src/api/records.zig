@@ -921,10 +921,12 @@ pub fn delete(ctx: *http.RequestCtx) anyerror!http.Response {
     // snapshot commits atomically with the delete. Returns the AT-REST (ciphertext) snapshot used
     // for delete authz — so LOCAL authz matches the cross-instance REMOTE path and the live
     // create/update path (all compare ciphertext) — plus the cross-instance NOTIFY token (Postgres
-    // only; the wire carries only the token, never the row data). On SQLite with no encrypted
-    // fields this reuses `ex_mut` with no extra read (byte-identical).
-    const durable_snapshot = if (comptime @import("build_options").durable_realtime) try records.getAtRest(ctx.allocator.a, w, col, rid) else null;
-    const rt = realtime_ws.prepareDelete(ctx.allocator.a, app, w, col, rid, ex_mut);
+    // only; the wire carries only the token, never the row data). The snapshot also keeps the
+    // hidden fields a viewRule may reference (`records.getDeleteSnapshot`). On SQLite with no
+    // encrypted or kept hidden fields and no record hooks, this reuses `ex_mut` with no extra
+    // read (byte-identical). Installed hooks require a re-read of the stored row.
+    const durable_snapshot = if (comptime @import("build_options").durable_realtime) try records.getDeleteSnapshot(ctx.allocator.a, w, col, rid) else null;
+    const rt = try realtime_ws.prepareDelete(ctx.allocator.a, app, w, col, rid, ex_mut);
     if (!try records.deleteInTxn(ctx.allocator.a, w, col, rid)) {
         return ApiError.notFound().toResponse(ctx.allocator.a);
     }
@@ -1175,6 +1177,113 @@ const TestEnv = struct {
 
 fn ctxFor(env: *TestEnv, a: RequestArena, m: http.Method, body: []const u8, params: []const http.Param) http.RequestCtx {
     return .{ .method = m, .path = "/", .body = body, .allocator = a, .app = &env.app, .params = params };
+}
+
+test "REST delete snapshot ignores an owner-rewriting beforeDelete hook on a relation collection" {
+    var env = try TestEnv.init();
+    defer env.deinit();
+    const a = std.testing.allocator;
+    const col = blk: {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        const owners = try collections.create(a, std.testing.io, w, .{ .id = "", .name = "owners", .fields = &.{} });
+        defer owners.deinit(a);
+        try w.exec("INSERT INTO owners (id,created,updated) VALUES ('u1','',''),('u2','','');");
+        const col = try collections.create(a, std.testing.io, w, .{
+            .id = "",
+            .name = "hook_notes",
+            .fields = &.{.{ .id = "owner", .name = "owner", .options = .{ .relation = .{ .targetCollectionId = owners.id, .maxSelect = 1 } } }},
+            .viewRule = "owner = @request.auth.id",
+            .deleteRule = "@public",
+        });
+        errdefer col.deinit(a);
+        try w.exec("INSERT INTO hook_notes (id,created,updated,owner) VALUES ('n1','','','u1');");
+        break :blk col;
+    };
+    defer col.deinit(a);
+    const Hooks = struct {
+        fn rewrite(_: *Ctx, ev: *events.RecordEvent) !void {
+            try ev.record.object.put(ev.arena.a, "owner", .{ .string = "u2" });
+        }
+    };
+    const dispatch = events.Dispatch{ .record = events.buildRecordDispatcher(.{ .hook_notes = .{ .beforeDelete = Hooks.rewrite } }) };
+    env.app.dispatch = &dispatch;
+    var buffer: [65536]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buffer);
+    var ctx = ctxFor(env, .{ .a = fba.allocator() }, .DELETE, "", &.{
+        .{ .key = "col", .value = "hook_notes" }, .{ .key = "id", .value = "n1" },
+    });
+    var snapshot: ?std.json.Value = null;
+    realtime_ws.TestCapture.delete_snapshot = &snapshot;
+    defer realtime_ws.TestCapture.delete_snapshot = null;
+    const hub = @import("../realtime/hub.zig");
+    const Conn = @import("../realtime/connection.zig").Conn;
+    var identity: std.json.ObjectMap = .empty;
+    defer identity.deinit(a);
+    try identity.put(a, "id", .{ .string = "u1" });
+    var viewer = Conn{};
+    viewer.setAuth(.{ .record = .{ .object = identity }, .is_superuser = false, .exp = 9999999999 });
+    {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        try std.testing.expect(try hub.shouldDeliver(a, w, col, &viewer, 0, .update, "n1", null, null));
+        try identity.put(a, "id", .{ .string = "u2" });
+        viewer.auth.?.record = .{ .object = identity };
+        try std.testing.expect(!try hub.shouldDeliver(a, w, col, &viewer, 0, .update, "n1", null, null));
+    }
+    try std.testing.expectEqual(@as(u16, 204), (try delete(&ctx)).status);
+    try std.testing.expectEqualStrings("u1", snapshot.?.object.get("owner").?.string);
+    const w = env.pool.acquireWriter();
+    defer env.pool.releaseWriter();
+    try std.testing.expect((try records.get(a, w, col, "n1")) == null);
+    try std.testing.expect(!try hub.shouldDeliver(a, w, col, &viewer, 0, .delete, "n1", null, snapshot));
+    try identity.put(a, "id", .{ .string = "u1" });
+    viewer.auth.?.record = .{ .object = identity };
+    try std.testing.expect(try hub.shouldDeliver(a, w, col, &viewer, 0, .delete, "n1", null, snapshot));
+}
+
+test "delete rolls back when required private snapshot capture fails after the hook read" {
+    var env = try TestEnv.init();
+    defer env.deinit();
+    const a = std.testing.allocator;
+    const col = blk: {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        const col = try collections.create(a, std.testing.io, w, .{
+            .id = "",
+            .name = "capture_notes",
+            .fields = &.{.{ .id = "tier", .name = "tier", .hidden = true, .options = .{ .text = .{} } }},
+            .viewRule = "tier = 'gold'",
+            .deleteRule = "@public",
+        });
+        errdefer col.deinit(a);
+        try w.exec("INSERT INTO capture_notes (id,created,updated,tier) VALUES ('n1','','','gold');");
+        break :blk col;
+    };
+    defer col.deinit(a);
+    const Fault = struct {
+        fn before(ctx: *Ctx, ev: *events.RecordEvent) !void {
+            if (ev.phase == .before_delete) {
+                // The initial public read succeeded, but the required snapshot
+                // SELECT can no longer be prepared. This DDL must roll back too.
+                try std.testing.expect(ev.record.object.get("tier") == null);
+                try ctx.bound_conn.?.exec("ALTER TABLE capture_notes RENAME COLUMN tier TO lost_tier;");
+            }
+        }
+    };
+    const dispatch = events.Dispatch{ .record = Fault.before };
+    env.app.dispatch = &dispatch;
+    var buffer: [65536]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buffer);
+    var ctx = ctxFor(env, .{ .a = fba.allocator() }, .DELETE, "", &.{
+        .{ .key = "col", .value = "capture_notes" }, .{ .key = "id", .value = "n1" },
+    });
+    try std.testing.expectError(error.PrepareFailed, delete(&ctx));
+    const w = env.pool.acquireWriter();
+    defer env.pool.releaseWriter();
+    const surviving = (try records.getDeleteSnapshot(a, w, col, "n1")).?;
+    defer records.freeRecord(a, surviving);
+    try std.testing.expectEqualStrings("gold", surviving.object.get("tier").?.string);
 }
 
 test "create then view a record over handlers" {

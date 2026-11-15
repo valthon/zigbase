@@ -108,6 +108,68 @@ def test_current_rules_hide_retained_delete_and_empty_page_advances(server):
     assert backfill(server, "stale:1", token=token)[0] == 409
 
 
+def hidden_rule_delete_scenario(server, token, suffix=""):
+    """#486 scenario, shared with the durable-journal suite (SQLite and PostgreSQL): a `viewRule`
+    that compares a HIDDEN field decides a retained delete from the field's stored value. The
+    record a delete hook reads strips hidden fields, so the private authorization snapshot must
+    carry it; the value must never reach a backfill item. `suffix` keeps names unique on a shared
+    PostgreSQL database."""
+    users_name, notes_name = "husers" + suffix, "hnotes" + suffix
+    status, users = call(server, "POST", "/api/collections", {"name": users_name, "type": "auth", "fields": []}, token)
+    assert status == 201, users
+    rule = "owner = @request.auth.id && tier = 'gold-hidden-marker'"
+    status, notes = call(server, "POST", "/api/collections", {
+        "name": notes_name, "type": "base",
+        "fields": [{"id": "", "name": "owner", "type": "text", "options": {}},
+                   {"id": "", "name": "tier", "type": "text", "hidden": True, "options": {}}],
+        "listRule": rule, "viewRule": rule,
+    }, token)
+    assert status == 201, notes
+    sessions = {}
+    for name in ("alice", "bob"):
+        email = f"h{name}{suffix}@x.io"
+        status, user = call(server, "POST", f"/api/collections/{users_name}/records", {"email": email, "password": name + "password"}, token)
+        assert status == 201, user
+        status, auth = call(server, "POST", f"/api/collections/{users_name}/auth-with-password", {"identity": email, "password": name + "password"})
+        assert status == 200, auth
+        sessions[name] = (auth["token"], user["id"])
+    (alice, alice_id), (bob, _) = sessions["alice"], sessions["bob"]
+    records = f"/api/collections/{notes_name}/records"
+    status, alice_checkpoint = backfill(server, token=alice, topic=notes_name)
+    assert status == 200, alice_checkpoint
+    status, bob_checkpoint = backfill(server, token=bob, topic=notes_name)
+    assert status == 200, bob_checkpoint
+    status, su_checkpoint = backfill(server, token=token, topic=notes_name)
+    assert status == 200, su_checkpoint
+    deleted = {}
+    for tier in ("gold-hidden-marker", "bronze-hidden-marker"):
+        status, row = call(server, "POST", records, {"owner": alice_id, "tier": tier}, token)
+        assert status == 201, row
+        assert "tier" not in row
+        assert call(server, "DELETE", f"{records}/{row['id']}", token=token)[0] == 204
+        deleted[tier] = row["id"]
+
+    # Alice owns both rows; only the gold row's delete matches the rule on its hidden value. (The
+    # creates are authorized against the current rows, which are gone.)
+    status, page = backfill(server, alice_checkpoint["nextCursor"], token=alice, topic=notes_name)
+    assert status == 200, page
+    assert page["items"] == [{"type": "event", "topic": notes_name, "action": "delete", "record": {"id": deleted["gold-hidden-marker"]}}]
+    assert "hidden-marker" not in json.dumps(page)
+    status, page = backfill(server, bob_checkpoint["nextCursor"], token=bob, topic=notes_name)
+    assert status == 200 and page["items"] == [], page
+    # Superusers bypass the rule and still receive only id-only items.
+    status, page = backfill(server, su_checkpoint["nextCursor"], token=token, topic=notes_name)
+    assert status == 200, page
+    assert [item["action"] for item in page["items"]] == ["create", "delete", "create", "delete"]
+    assert "hidden-marker" not in json.dumps(page)
+
+
+def test_retained_delete_with_hidden_rule_field_is_authorized_from_its_stored_value(server):
+    """#486: a viewRule on a hidden field decides retained deletes for their owner."""
+    token, _ = setup(server)
+    hidden_rule_delete_scenario(server, token)
+
+
 def test_collection_deletion_replacement_and_eviction_require_reset(server):
     token, col = setup(server)
     _, initial = backfill(server)
@@ -186,3 +248,62 @@ def test_large_delete_snapshot_resets_only_its_collection(server):
             assert status == 409 and reset["resetRequired"]
         status, quiet = backfill(server, unaffected["nextCursor"], topic="quiet")
         assert status == 200 and quiet["items"] == [] and not quiet["hasNext"]
+
+
+def relation_delete_scenario(server, token, suffix=""):
+    """#499 scenario, shared with the durable-journal suite (SQLite and PostgreSQL). Creates an auth
+    collection, two signed-in users, and a collection whose `owner` is a RELATION to the users under
+    `owner = @request.auth.id`. Bob creates and deletes a row between both users' checkpoints;
+    Alice then creates her own. `suffix` keeps names unique on a shared PostgreSQL database."""
+    users_name, owned_name = "users" + suffix, "owned" + suffix
+    status, users = call(server, "POST", "/api/collections", {"name": users_name, "type": "auth", "fields": []}, token)
+    assert status == 201, users
+    rule = "owner = @request.auth.id"
+    status, owned = call(server, "POST", "/api/collections", {
+        "name": owned_name, "type": "base",
+        "fields": [{"id": "", "name": "title", "type": "text", "options": {}},
+                   {"id": "", "name": "owner", "type": "relation", "options": {"targetCollectionId": users["id"], "maxSelect": 1}}],
+        "listRule": rule, "viewRule": rule, "createRule": rule, "deleteRule": rule,
+    }, token)
+    assert status == 201, owned
+    sessions = {}
+    for name in ("alice", "bob"):
+        email = f"{name}{suffix}@x.io"
+        status, user = call(server, "POST", f"/api/collections/{users_name}/records", {"email": email, "password": name + "password"}, token)
+        assert status == 201, user
+        status, auth = call(server, "POST", f"/api/collections/{users_name}/auth-with-password", {"identity": email, "password": name + "password"})
+        assert status == 200, auth
+        sessions[name] = (auth["token"], user["id"])
+    (alice, alice_id), (bob, bob_id) = sessions["alice"], sessions["bob"]
+    records = f"/api/collections/{owned_name}/records"
+
+    status, alice_checkpoint = backfill(server, token=alice, topic=owned_name)
+    assert status == 200, alice_checkpoint
+    status, bob_checkpoint = backfill(server, token=bob, topic=owned_name)
+    assert status == 200, bob_checkpoint
+    status, row = call(server, "POST", records, {"title": "b-row", "owner": bob_id}, bob)
+    assert status == 201, row
+    assert call(server, "DELETE", f"{records}/{row['id']}", token=bob)[0] == 204
+    status, own = call(server, "POST", records, {"title": "a-row", "owner": alice_id}, alice)
+    assert status == 201, own
+
+    # Alice: 200, Bob's create and delete are invisible, and her own later create arrives.
+    for _ in range(2):  # a retry of the same checkpoint answers the same
+        status, page = backfill(server, alice_checkpoint["nextCursor"], token=alice, topic=owned_name)
+        assert status == 200, page
+        assert page["items"] == [{"type": "event", "topic": owned_name, "action": "create", "record": {"id": own["id"]}}]
+        assert not page["hasNext"]
+    # Bob (the owner): his own delete, id-only. (His earlier create is authorized against the current
+    # row, which is gone, so only the delete — authorized against its snapshot — is replayed.)
+    status, page = backfill(server, bob_checkpoint["nextCursor"], token=bob, topic=owned_name)
+    assert status == 200, page
+    assert page["items"] == [{"type": "event", "topic": owned_name, "action": "delete", "record": {"id": row["id"]}}]
+    assert "b-row" not in json.dumps(page)
+
+
+def test_retained_delete_on_relation_collection_is_authorized_per_item(server):
+    """#499: a retained delete snapshot on a collection with a relation field used to make every
+    row-constrained replay of a checkpoint spanning it answer 500, on every retry. Now the delete is
+    authorized per item: hidden from callers who could not view the row, delivered to its owner."""
+    token, _ = setup(server)
+    relation_delete_scenario(server, token)

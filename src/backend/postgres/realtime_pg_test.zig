@@ -114,10 +114,10 @@ test "pg realtime: owner-scoped create/update delivery — only the owner is aut
     var anon = Conn{};
 
     // create/update authorize against the LIVE row via the dialect-correct guarded SELECT on PG.
-    try std.testing.expect(try hub.shouldDeliver(al, io, &d, col, &owner, 0, .create, rid, null, null));
-    try std.testing.expect(!try hub.shouldDeliver(al, io, &d, col, &other, 0, .create, rid, null, null));
-    try std.testing.expect(!try hub.shouldDeliver(al, io, &d, col, &anon, 0, .update, rid, null, null));
-    try std.testing.expect(try hub.shouldDeliver(al, io, &d, col, &owner, 0, .update, rid, null, null));
+    try std.testing.expect(try hub.shouldDeliver(al, &d, col, &owner, 0, .create, rid, null, null));
+    try std.testing.expect(!try hub.shouldDeliver(al, &d, col, &other, 0, .create, rid, null, null));
+    try std.testing.expect(!try hub.shouldDeliver(al, &d, col, &anon, 0, .update, rid, null, null));
+    try std.testing.expect(try hub.shouldDeliver(al, &d, col, &owner, 0, .update, rid, null, null));
 }
 
 test "pg realtime: @public delivers to anyone; locked only to superusers" {
@@ -154,10 +154,10 @@ test "pg realtime: @public delivers to anyone; locked only to superusers" {
 
     var anon = Conn{};
     var su = try authedConn(al, "admin", true);
-    try std.testing.expect(try hub.shouldDeliver(al, io, &d, pub_col, &anon, 0, .create, prid, null, null));
+    try std.testing.expect(try hub.shouldDeliver(al, &d, pub_col, &anon, 0, .create, prid, null, null));
     // locked: anon denied, superuser allowed (id-only delete path, no row needed).
-    try std.testing.expect(!try hub.shouldDeliver(al, io, &d, locked_col, &anon, 0, .delete, "GONE", null, null));
-    try std.testing.expect(try hub.shouldDeliver(al, io, &d, locked_col, &su, 0, .delete, "GONE", null, null));
+    try std.testing.expect(!try hub.shouldDeliver(al, &d, locked_col, &anon, 0, .delete, "GONE", null, null));
+    try std.testing.expect(try hub.shouldDeliver(al, &d, locked_col, &su, 0, .delete, "GONE", null, null));
 }
 
 test "pg realtime: owner-scoped DELETE authz uses the snapshot (no :memory: PG analog needed)" {
@@ -190,10 +190,10 @@ test "pg realtime: owner-scoped DELETE authz uses the snapshot (no :memory: PG a
 
     var owner = try authedConn(al, "u1", false);
     var other = try authedConn(al, "u2", false);
-    try std.testing.expect(try hub.shouldDeliver(al, io, &d, col, &owner, 0, .delete, "GONE", null, snapshot));
-    try std.testing.expect(!try hub.shouldDeliver(al, io, &d, col, &other, 0, .delete, "GONE", null, snapshot));
+    try std.testing.expect(try hub.shouldDeliver(al, &d, col, &owner, 0, .delete, "GONE", null, snapshot));
+    try std.testing.expect(!try hub.shouldDeliver(al, &d, col, &other, 0, .delete, "GONE", null, snapshot));
     // No snapshot -> conservative deny even for the would-be owner.
-    try std.testing.expect(!try hub.shouldDeliver(al, io, &d, col, &owner, 0, .delete, "GONE", null, null));
+    try std.testing.expect(!try hub.shouldDeliver(al, &d, col, &owner, 0, .delete, "GONE", null, null));
 }
 
 // ---- PR-6b: cross-instance LISTEN/NOTIFY (token + side-table snapshot) -------
@@ -311,8 +311,8 @@ test "pg cross-instance: a DELETE token is stored on A, NOTIFY'd, read back + au
     };
     var owner = try authedConn(al, "u9", false);
     var other = try authedConn(al, "u8", false);
-    try std.testing.expect(try hub.shouldDeliver(al, io, &conn_b, col, &owner, 0, .delete, ev.id, null, back));
-    try std.testing.expect(!try hub.shouldDeliver(al, io, &conn_b, col, &other, 0, .delete, ev.id, null, back));
+    try std.testing.expect(try hub.shouldDeliver(al, &conn_b, col, &owner, 0, .delete, ev.id, null, back));
+    try std.testing.expect(!try hub.shouldDeliver(al, &conn_b, col, &other, 0, .delete, ev.id, null, back));
 
     // A FORGED NOTIFY with a fabricated token finds no side-table row → no snapshot → no delivery.
     try std.testing.expect(pg_bridge.readDeleteSnapshot(al, &conn_b, "forged-token-does-not-exist") == null);
@@ -386,8 +386,8 @@ test "pg cross-instance: delete NOTIFY leaks no encrypted plaintext (token-only 
     // The remote subscriber still gets correct delete authz from the read-back snapshot.
     var owner = try authedConn(al, "u1", false);
     var other = try authedConn(al, "u2", false);
-    try std.testing.expect(try hub.shouldDeliver(al, io, &d, col, &owner, 0, .delete, rid, null, back));
-    try std.testing.expect(!try hub.shouldDeliver(al, io, &d, col, &other, 0, .delete, rid, null, back));
+    try std.testing.expect(try hub.shouldDeliver(al, &d, col, &owner, 0, .delete, rid, null, back));
+    try std.testing.expect(!try hub.shouldDeliver(al, &d, col, &other, 0, .delete, rid, null, back));
 }
 
 test "pg delete authz: local snapshot == remote snapshot (at-rest ciphertext basis; identical authz)" {
@@ -445,10 +445,10 @@ test "pg delete authz: local snapshot == remote snapshot (at-rest ciphertext bas
     // local == remote: identical authz on both snapshots, for owner (allow) and non-owner (deny).
     var owner = try authedConn(al, "u1", false);
     var other = try authedConn(al, "u2", false);
-    const local_owner = try hub.shouldDeliver(al, io, &d, col, &owner, 0, .delete, rid, null, local_snapshot);
-    const remote_owner = try hub.shouldDeliver(al, io, &d, col, &owner, 0, .delete, rid, null, remote_snapshot);
-    const local_other = try hub.shouldDeliver(al, io, &d, col, &other, 0, .delete, rid, null, local_snapshot);
-    const remote_other = try hub.shouldDeliver(al, io, &d, col, &other, 0, .delete, rid, null, remote_snapshot);
+    const local_owner = try hub.shouldDeliver(al, &d, col, &owner, 0, .delete, rid, null, local_snapshot);
+    const remote_owner = try hub.shouldDeliver(al, &d, col, &owner, 0, .delete, rid, null, remote_snapshot);
+    const local_other = try hub.shouldDeliver(al, &d, col, &other, 0, .delete, rid, null, local_snapshot);
+    const remote_other = try hub.shouldDeliver(al, &d, col, &other, 0, .delete, rid, null, remote_snapshot);
     try std.testing.expectEqual(local_owner, remote_owner);
     try std.testing.expectEqual(local_other, remote_other);
     try std.testing.expect(local_owner); // owner authorized on both
@@ -456,8 +456,8 @@ test "pg delete authz: local snapshot == remote snapshot (at-rest ciphertext bas
 
     // And the live create/update path (ciphertext column) agrees with the delete basis: owner
     // allowed, non-owner denied — the same decisions, proving all three paths use one basis.
-    try std.testing.expect(try hub.shouldDeliver(al, io, &d, col, &owner, 0, .create, rid, null, null));
-    try std.testing.expect(!try hub.shouldDeliver(al, io, &d, col, &other, 0, .create, rid, null, null));
+    try std.testing.expect(try hub.shouldDeliver(al, &d, col, &owner, 0, .create, rid, null, null));
+    try std.testing.expect(!try hub.shouldDeliver(al, &d, col, &other, 0, .create, rid, null, null));
 }
 
 // ---- PR-4a: cross-instance custom topics (signal + message side-table) -------

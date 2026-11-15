@@ -244,17 +244,42 @@ deleted even if it was never theirs to view.
 no record contents.
 
 **Fix.** The delete event is now authorized per subscriber against a **snapshot** of the deleted
-row. The writer (`src/api/records.zig` `delete`) passes the row it already holds in `existing` into
-`realtime_ws.broadcast`; `buildEventFrames` embeds it in the *published* delete frame under a
-private key (`_deleteSnapshot`). `hub.shouldDeliver` for `delete` evaluates the collection's
+row. The writer (`src/api/records.zig` `delete`) passes the private snapshot prepared inside the
+delete transaction into `realtime_ws.broadcast`; `buildEventFrames` embeds it in the *published*
+delete frame under a private key (`_deleteSnapshot`). `hub.shouldDeliver` for `delete` evaluates the collection's
 `viewRule` against that snapshot in a throwaway in-memory DB (reusing the standard guarded-SELECT
 machinery), so an owner-scoped collection only notifies subscribers who were allowed to view the
 record. `onChannelMessage` strips the private snapshot and re-serializes an **id-only** frame
-before delivery, so the snapshot never reaches a client. A `@public` viewRule still notifies anyone
-(no snapshot needed); a `null`/locked one still notifies only superusers; with no snapshot the
-delete is conservatively *not* delivered to `check`-state subscribers. Relation-traversing delete
-rules deny (the temp DB has empty target tables) — a safe direction. Regression test:
-`F4: owner-scoped delete only notifies the owner (snapshot authz)`.
+before delivery, so the snapshot never reaches a client. Missing collection metadata causes a
+record event to be dropped and logged; its `event` envelope cannot enter custom-topic verbatim
+forwarding. Required snapshot capture failures abort the delete transaction before commit, and
+idempotent deletes retain the prepared authorization snapshot separately from the public record.
+A `@public` viewRule still notifies anyone (no snapshot needed); a `null`/locked one still notifies
+only superusers; with no snapshot the
+delete is conservatively *not* delivered to `check`-state subscribers. The temp DB holds only the
+deleted row's own table (relation fields keep their stored ids, without FK clauses) and an empty
+collection registry, so a relation-traversing delete rule denies (its target is unknown) — a safe
+direction. The snapshot row is written back in its **stored** form: `created`/`updated` as
+captured, and every field through the write path's `values.bindValue` (a fixed-point number as its
+scaled integer, a json value as JSON text). Encrypted fields bind NULL: rules cannot reference them
+(`error.EncryptedField`). Hidden fields can be referenced by operator rules, so the snapshot
+(`records.getDeleteSnapshot`) carries them, except the injected auth credentials (`passwordHash`,
+`tokenKey`, `token_epoch`) and hidden encrypted fields; it stays server-side (the published frame,
+the backfill store, the durable journal and the PostgreSQL side table hold it only under the
+private key that every delivery path strips).
+Binding the API (read) form instead would let a sandbox column differ from the live one, and a
+differing column can allow where the live row denies (`created < "…"` against an empty
+`created`, `price < 100` against an unscaled `250`). Regression tests:
+`F4: owner-scoped delete only notifies the owner (snapshot authz)`, the `#486:` tests in
+`src/realtime/hub.zig` (collections with relation fields: tenant, ability, owner-rule and
+relation-traversing cases), and the `delete sandbox stores …` live-vs-delete parity tests. A
+snapshot value the sandbox cannot store by its field's type, or a rule that cannot be compiled
+against the snapshot (`hub.SnapshotItemError`), is a logged **deny** for that subscriber, never an
+error: as an error it repeated on every attempt and turned one retained delete into a `500` for
+every retry of a realtime backfill page (#499). `OutOfMemory` and every sandbox SQLite failure
+(`db.DbError`, which is also how SQLite reports its own allocation failures) still propagate: they
+are transient, the page answers `500` without advancing the checkpoint, and a retry can deliver a
+delete that denying would have skipped for good. Tests: `#499:` in `src/realtime/hub.zig`.
 
 ---
 

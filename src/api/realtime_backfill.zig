@@ -95,7 +95,12 @@ pub fn get(ctx: *http.RequestCtx) !http.Response {
 
 /// The shared delivery path can fail after earlier items were authorized. Return
 /// only an error envelope, never a partial page/checkpoint. Operational failures
-/// still propagate to the server's 500 handler; identity changes require reauth.
+/// (out of memory, the reader pool, the live database or the delete-authorization
+/// sandbox failing) still propagate to the server's 500 handler so a retry of the
+/// same checkpoint can succeed; identity changes require reauth. A failure tied to
+/// ONE retained item would instead repeat on every retry, so it never reaches here:
+/// a deletion snapshot that no longer fits its fields, or a rule that cannot be
+/// compiled against it, is a logged per-item deny in `hub.matchesSnapshot` (#499).
 fn deliveryError(allocator: std.mem.Allocator, err: DeliveryError) DeliveryError!http.Response {
     if (err == error.AuthenticationChanged) return ApiError.unauthorized().toResponse(allocator);
     return err;

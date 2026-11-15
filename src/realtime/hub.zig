@@ -10,8 +10,8 @@ const request = @import("../request.zig");
 const collections = @import("../collections.zig");
 const colcache = @import("../colcache.zig");
 const records = @import("../records.zig");
+const values = @import("../values.zig");
 const migrations = @import("../migrations.zig");
-const schema_gen = @import("../schema_gen.zig");
 const auth = @import("../auth.zig");
 const protocol = @import("protocol.zig");
 const connection = @import("connection.zig");
@@ -283,7 +283,6 @@ fn combineClauses(alloc: std.mem.Allocator, clauses: []const []const u8) ![]u8 {
 /// to the coarse "deliver unless locked" behavior (e.g. no snapshot available).
 pub fn shouldDeliver(
     alloc: std.mem.Allocator,
-    io: std.Io,
     reader: *db.Db,
     col: schema.Collection,
     conn: *const Conn,
@@ -316,14 +315,14 @@ pub fn shouldDeliver(
                 // rule clause). No snapshot -> deny.
                 if (!row_constrained) return true;
                 const snap = delete_snapshot orelse return false;
-                return matchesSnapshot(alloc, io, col, record_id, "", snap, &rctx);
+                return matchesSnapshot(alloc, col, record_id, "", snap, &rctx);
             },
             .check => {
                 // Owner/expression-scoped viewRule: authorize the deleted row against its
                 // snapshot (the live row is gone). The tenant predicate, when applicable, is
                 // composed in by `matchesSnapshot`->`policy.matchesRule`. No snapshot -> deny.
                 const snap = delete_snapshot orelse return false;
-                return matchesSnapshot(alloc, io, col, record_id, col.viewRule.?, snap, &rctx);
+                return matchesSnapshot(alloc, col, record_id, col.viewRule.?, snap, &rctx);
             },
         }
     }
@@ -351,18 +350,17 @@ pub fn shouldDeliver(
     return policy.matchesRule(alloc, reader, col, record_id, combined, &rctx);
 }
 
-/// A built delete-authz sandbox: a `:memory:` DB carrying the minimal `_collections` registry, a
-/// recreation of the deleted row's collection, and the single snapshot row. It depends ONLY on
-/// (collection, snapshot) — NOT on any subscriber — so it is reusable across every subscriber of one
-/// delete event. `key` is the exact `<collection>\x00<canonical snapshot JSON>` bytes it was built
+/// A built delete-authz sandbox: a `:memory:` DB carrying an EMPTY collection registry, the deleted
+/// row's collection table, and the single snapshot row. It depends ONLY on (collection, snapshot) —
+/// NOT on any subscriber — so it is reusable across every subscriber of one delete event. `key` is
+/// the exact `<id>\x00<name>\x00<CREATE TABLE DDL>\x00<canonical snapshot JSON>` bytes it was built
 /// for; a reuse is gated on an EXACT `mem.eql` match (never a hash) so a cached sandbox can only
-/// ever authorize the SAME (collection, snapshot) it was built from — no collision could authorize a
-/// delete against the wrong row. Everything (key, schema, row) lives on `arena`; `db` is the live
-/// SQLite handle. `deinit` closes both.
+/// ever authorize the SAME (collection schema, snapshot) it was built from — no collision could
+/// authorize a delete against the wrong row or a stale table shape. The key lives on `arena`; `db`
+/// is the SQLite handle. `deinit` closes both.
 const SnapshotSandbox = struct {
     arena: std.heap.ArenaAllocator,
     db: db.Db,
-    live_col: schema.Collection,
     key: []const u8,
     fn deinit(self: *SnapshotSandbox) void {
         self.db.close();
@@ -386,13 +384,45 @@ const SnapshotSandbox = struct {
 /// scope for a realtime-only change.
 threadlocal var snapshot_sandbox: ?SnapshotSandbox = null;
 
+/// The registry tables the sandbox carries, all EMPTY: `_collections` (+ its later columns) and
+/// `_storage_namespaces` (which `collections.get`'s SELECT joins). They exist only so the query
+/// joiner's relation-target lookup (`collections.get`) runs and finds NOTHING — which is what makes
+/// every relation-traversing rule a conservative deny (`error.UnknownField`) rather than an error.
+fn sandboxRegistry(tmp: *db.Db) db.DbError!void {
+    try tmp.exec(migrations.collections_table_sql);
+    try tmp.exec(migrations.collections_options_column_sql);
+    try tmp.exec(migrations.collections_rename_epoch_column_sql);
+    try tmp.exec(@import("../files/namespace.zig").table_sql);
+}
+
+/// The sandbox's CREATE TABLE for `col`: its physical columns exactly as the live table declares
+/// them (relation fields stay RELATION-typed, so multi-relation operators compile as they do live),
+/// but with NO foreign-key clauses. The sandbox holds no target tables, and a delete's authz only
+/// reads the one snapshot row, so an FK has nothing to enforce. This deliberately bypasses
+/// `collections.create`: its relation-target resolution rejects (`error.Validation`) any collection
+/// whose targets are absent, which in the sandbox is every collection with a relation field
+/// (#486). `col` is a registry-loaded collection, so an auth collection's system fields are
+/// already in `col.fields`.
+fn sandboxTableSql(alloc: std.mem.Allocator, col: schema.Collection) ![]u8 {
+    var rel_names: std.ArrayList([]const u8) = .empty;
+    defer rel_names.deinit(alloc);
+    for (col.fields) |f| if (f.options == .relation) try rel_names.append(alloc, f.name);
+    return ddl.createTableSql(alloc, col, null, @import("../sql/dialect.zig").Dialect.sqlite, rel_names.items);
+}
+
 /// Evaluate `rule` against a single deleted-record `snapshot` (F4), reusing a thread-local sandbox
-/// across a delete event's subscribers (#18). The sandbox is a throwaway in-memory DB (a MINIMAL
-/// schema: just the _collections registry — R1-3) with `col`'s table recreated and ONLY the snapshot
-/// row inserted (id + its stored columns preserved verbatim); the standard guarded SELECT then runs
-/// per subscriber. Reuses the exact rule machinery without touching the (now row-less) live DB.
-/// Relation-traversing rules resolve against empty target tables in the temp DB and therefore won't
-/// match — a conservative (deny) failure for delete events, which is the safe direction.
+/// across a delete event's subscribers (#18). The sandbox is a throwaway in-memory DB holding an
+/// EMPTY collection registry and `col`'s table with ONLY the snapshot row inserted (its real id,
+/// `created`/`updated`, and every field converted back to its live storage form by the write path's
+/// `values.bindValue`); the standard guarded SELECT then runs per subscriber against `col`. Reuses
+/// the exact rule machinery without touching the (now row-less) live DB.
+///
+/// Column, macro, tenant-scope and ability predicates (all of which compile to columns of `col`'s
+/// own table plus bound params) therefore see the same stored values the live row held (subject to
+/// the SQLite-dialect caveat below). A relation-TRAVERSING rule
+/// (`owner.name = …`) cannot: the registry is empty, so the joiner's target lookup fails with
+/// `error.UnknownField`, mapped below to a deny — a conservative failure for delete events, which
+/// is the safe direction.
 ///
 /// BACKEND-AGNOSTIC (#159, PR-6): the sandbox is `db.Db.openMemory()`, which is ALWAYS the SQLite
 /// union arm (SQLite is compiled into every build; Postgres has no `:memory:` analog). So this
@@ -407,12 +437,11 @@ threadlocal var snapshot_sandbox: ?SnapshotSandbox = null;
 /// Postgres dialect against the live row. A rule relying on dialect-divergent SCALAR semantics
 /// (date/time functions, `LIKE` case-sensitivity, boolean coercion) could authorize a delete event
 /// marginally differently than Postgres would authorize a live view. Blast radius is narrow — a
-/// single-row sandbox, relation rules deny against empty target tables, and the typical authz
-/// fields (owner id, tenant key) are plain string equality that is identical across dialects — and
-/// this is pre-existing F4 behavior, not new in PR-6. Owner/tenant-scoped deletes are unaffected.
+/// single-row sandbox, relation-traversing rules deny, and the typical authz fields (owner id,
+/// tenant key, ability `.via` account id) are plain string equality that is identical across
+/// dialects.
 fn matchesSnapshot(
     alloc: std.mem.Allocator,
-    io: std.Io,
     col: schema.Collection,
     record_id: []const u8,
     rule: []const u8,
@@ -423,32 +452,106 @@ fn matchesSnapshot(
     if (snapshot.object.get("id")) |rid| {
         if (rid != .string) return false;
     } else return false;
-    const sandbox = try snapshotSandbox(io, col, snapshot);
+    // FAIL CLOSED, per item (#499): a failure that is a property of THIS retained event — a
+    // snapshot value that no longer fits its field, or a rule that cannot be evaluated against the
+    // snapshot (`SnapshotItemError`) — is a logged DENY for this subscriber, never an error. As an
+    // error it would repeat on every attempt: backfill turned it into a 500 for the whole page on
+    // every retry of the checkpoint until the event left retention, and the live fan-out logged a
+    // dropped delivery per subscriber. Every OTHER failure propagates: OutOfMemory and a sandbox
+    // SQLite failure (`db.DbError`, which is also how SQLite reports its own allocation failures)
+    // say the server cannot answer NOW, so backfill answers 500 without advancing the checkpoint
+    // and a retry can deliver the item. Denying those would skip the delete for good.
+    const sandbox = snapshotSandbox(col, snapshot) catch |err| {
+        if (!isSnapshotItemError(err)) return err;
+        std.log.warn("realtime: delete on {s}/{s} not delivered: its snapshot could not be prepared for authorization: {s}", .{ col.name, record_id, @errorName(err) });
+        return false;
+    };
     // ONLY the guarded SELECT is per-subscriber; the sandbox build above is shared across the
     // event's fan-out on this reactor thread (#18). `rctx` is this subscriber's identity, so the
-    // decision stays per-subscriber even though the single-row input is shared.
-    return policy.matchesRule(alloc, &sandbox.db, sandbox.live_col, record_id, rule, rctx) catch |err| switch (err) {
-        // Related collections are deliberately absent from the isolated delete
-        // sandbox. This is a known conservative denial, not an operational fault.
-        error.UnknownField => false,
-        else => return err,
+    // decision stays per-subscriber even though the single-row input is shared. The sandbox table
+    // was built from `col`'s exact DDL (it is part of the cache key), so `col` describes it.
+    return policy.matchesRule(alloc, &sandbox.db, col, record_id, rule, rctx) catch |err| {
+        if (!isSnapshotItemError(err)) return err;
+        if (err == error.UnknownField) {
+            // Related collections are deliberately absent from the isolated delete sandbox, so a
+            // relation-traversing rule is a known conservative denial, not an operational fault.
+            // The same error also covers a rule naming a column `col` does not have (which the
+            // live create/update path rejects too); the info line makes either visible when
+            // diagnosing a missing delete frame.
+            std.log.info("realtime: delete on {s}/{s} not delivered: its rule references a field outside the deleted record (relation traversal or unknown field)", .{ col.name, record_id });
+        } else {
+            std.log.warn("realtime: delete on {s}/{s} not delivered: its rule could not be evaluated against the snapshot: {s}", .{ col.name, record_id, @errorName(err) });
+        }
+        return false;
     };
+}
+
+/// The delete-authorization failures that belong to ONE retained item and repeat on every attempt
+/// (#499), so `matchesSnapshot` denies the item instead of failing: a snapshot value the sandbox
+/// cannot store by its field's type (`values.ValueError`, `values.EncryptError`), and a rule that
+/// cannot be compiled against the snapshot's collection (lexer/parser/compiler/joiner errors —
+/// `UnknownField` is how every relation traversal ends in the registry-less sandbox). Deliberately
+/// absent: `OutOfMemory` and every `db.DbError`, which propagate (see `matchesSnapshot`).
+const SnapshotItemError = error{
+    // values.ValueError (its OutOfMemory excluded) and values.EncryptError
+    TypeMismatch,
+    TooPrecise,
+    Overflow,
+    BadNumber,
+    BadSelect,
+    NotObject,
+    FieldKeyMissing,
+    // rules.RuleError's rule-shape members: rules, lexer, parser, compiler, joiner
+    BadRule,
+    UnexpectedChar,
+    UnterminatedString,
+    InvalidEscape,
+    UnexpectedToken,
+    BadOperand,
+    Empty,
+    TooDeep,
+    BadFilter,
+    BadValue,
+    UnknownField,
+    NotARelation,
+    MultiRelationTraversal,
+    EncryptedField,
+    HiddenField,
+    RestrictedRelation,
+};
+
+comptime {
+    // Every name above must still be an error those layers can return: a rename there fails the
+    // build here instead of silently turning an item failure into a repeating 500.
+    const Sources = values.ValueError || values.EncryptError || policy.PolicyError;
+    for (@typeInfo(SnapshotItemError).error_set.?) |e| _ = @errorName(@field(Sources, e.name));
+}
+
+fn isSnapshotItemError(err: anyerror) bool {
+    inline for (@typeInfo(SnapshotItemError).error_set.?) |e| {
+        if (err == @field(SnapshotItemError, e.name)) return true;
+    }
+    return false;
 }
 
 /// Build — or reuse from the thread-local slot — the delete sandbox for (col, snapshot). The
 /// caller has already validated `snapshot` is an object with a string `id`.
-fn snapshotSandbox(io: std.Io, col: schema.Collection, snapshot: std.json.Value) !*SnapshotSandbox {
-    // Compute the exact cache key on a throwaway arena first: "<id>\x00<name>\x00<canonical JSON>".
-    // The stable collection id keys the SCHEMA (so two collections that share a name + snapshot can
-    // never reuse each other's sandbox — the schema build depends on the id's fields), the name
-    // keys the INSERT target, and the canonical snapshot JSON keys the row. Canonical JSON of the
-    // deleted row is far cheaper than the schema build it guards, so forming the key per delivery
-    // still leaves the reuse a net win.
+fn snapshotSandbox(col: schema.Collection, snapshot: std.json.Value) !*SnapshotSandbox {
+    // Compute the exact cache key on a throwaway arena first:
+    // "<id>\x00<name>\x00<table DDL>\x00<fields JSON>\x00<canonical JSON>". The stable collection
+    // id, the DDL and the serialized field definitions key the SCHEMA: a schema change on the same
+    // collection rebuilds rather than reusing a table of the old shape, and the field options that
+    // drive the INSERT's storage conversion (a fixed number's scale, multi-value-ness) are part of
+    // the key even when they leave the DDL unchanged. The name keys the INSERT target, and the
+    // canonical snapshot JSON keys the row. All are far cheaper than the build they guard, so
+    // forming the key per delivery still leaves the reuse a net win.
     var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer scratch.deinit();
     const sa = scratch.allocator();
     const snap_json = try std.json.Stringify.valueAlloc(sa, snapshot, .{});
-    const key = try std.fmt.allocPrint(sa, "{s}\x00{s}\x00{s}", .{ col.id, col.name, snap_json });
+    const table_sql = try sandboxTableSql(sa, col);
+    const fields_json = try schema.fieldsToJson(sa, col.fields);
+    const key = try std.fmt.allocPrint(sa, "{s}\x00{s}\x00{s}\x00{s}\x00{s}", .{ col.id, col.name, table_sql, fields_json, snap_json });
 
     if (snapshot_sandbox) |*cached| {
         if (std.mem.eql(u8, cached.key, key)) return cached; // hit: same (collection, snapshot)
@@ -456,87 +559,67 @@ fn snapshotSandbox(io: std.Io, col: schema.Collection, snapshot: std.json.Value)
         snapshot_sandbox = null;
     }
 
-    // Build a fresh sandbox that OWNS its key + schema + row on its own arena (page-allocator
-    // backed, so it outlives the per-delivery arena and never touches a tracked test allocator).
+    // Build a fresh sandbox that OWNS its key on its own arena (page-allocator backed, so it
+    // outlives the per-delivery arena and never touches a tracked test allocator). The build's
+    // statement scratch goes on `sa`.
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     errdefer arena.deinit();
-    const aa = arena.allocator();
-    const owned_key = try aa.dupe(u8, key);
+    const owned_key = try arena.allocator().dupe(u8, key);
 
     var tmp = try db.Db.openMemory();
     errdefer tmp.close();
-    // R1-3: the sandbox needs ONLY the `_collections` registry (+ its `options` column) —
-    // collections.create below reads and writes it — plus the one collection table that
-    // create() builds. Semantics are unchanged: tenancy/ability predicates compile to columns
-    // on the target table + bound params, and relation-traversing rules resolve against an EMPTY
-    // `_collections` (conservative deny) because user collections were never present in the sandbox.
-    try tmp.exec(migrations.collections_table_sql);
-    try tmp.exec(migrations.collections_options_column_sql);
-    try tmp.exec(migrations.collections_rename_epoch_column_sql);
-    // `collections.create` below bumps the schema-generation marker inside its transaction, so
-    // the sandbox needs that table too. The bump is deliberately STRICT — it propagates rather
-    // than tolerating a missing table — because a "table missing -> skip" fallback would mask a
-    // real misconfiguration on the production path, where an unbumped marker means every serving
-    // process runs blind to schema changes. So seed it here rather than weakening the bump.
-    // (This sandbox is built in the LIVE SERVING PROCESS, once per delete-event delivery: if the
-    // marker table were absent, every delete-event authorization would fail.)
-    try tmp.exec(migrations.schema_state_table_sql);
-    try tmp.exec(migrations.schema_state_seed_sql);
-    try tmp.exec(@import("../files/namespace.zig").table_sql);
-    // Recreate the collection table (fresh id; we never persist relation FKs, so an isolated
-    // schema is enough to evaluate column/macro comparisons).
-    var spec = col;
-    spec.id = "";
-    spec.indexes = &.{}; // unique indexes are irrelevant for a single-row authz probe
-    const live_col = try collections.create(aa, io, &tmp, spec);
+    try sandboxRegistry(&tmp);
+    try tmp.exec(try sa.dupeZ(u8, table_sql));
 
-    // Direct INSERT preserving the snapshot's real id + stored scalar columns, binding each value
-    // by its JSON type. (We bypass records.create on purpose: it regenerates the id and re-runs
+    // Direct INSERT of the snapshot's real id + every column, each converted back to the form the
+    // LIVE table stores. (We bypass records.create on purpose: it regenerates the id and re-runs
     // validation, neither of which we want for an authz snapshot of an already-validated row.)
+    // The snapshot is a record READ (`values.readValue` API form), so binding it by its JSON type
+    // would diverge from the live column for any field whose API form is not its storage form —
+    // and a divergent column can make the sandbox ALLOW where the live row denies:
+    //   - `created`/`updated`: the stored text (rules compare them like any column);
+    //   - a fixed-scale number reads as "250.00" but is stored as the scaled integer 25000;
+    //   - a json field stores every value as JSON text (`true`, `"admin"`), scalars included.
+    // So every field binds through `values.bindValue` — the exact write-path conversion — by its
+    // SCHEMA type. An `.encrypted` field is the exception and binds NULL: no rule can reference one
+    // (the joiner rejects it, `error.EncryptedField`), so its value is never read, and binding its
+    // at-rest envelope could only fail. A hidden field CAN be referenced (operator rules set
+    // `allow_hidden`), so the snapshot carries it (`records.getDeleteSnapshot`); only the auth
+    // credentials and hidden encrypted fields are left out of it. A field absent from the snapshot
+    // binds NULL.
     var cols_sql: std.ArrayList(u8) = .empty;
     var ph_sql: std.ArrayList(u8) = .empty;
-    const Bind = struct { v: std.json.Value };
-    var binds: std.ArrayList(Bind) = .empty;
-    try cols_sql.appendSlice(aa, "\"id\",\"created\",\"updated\"");
-    try ph_sql.appendSlice(aa, "?1,'',''");
-    var n: c_int = 2;
-    var it = snapshot.object.iterator();
-    while (it.next()) |e| {
-        const name = e.key_ptr.*;
-        if (std.mem.eql(u8, name, "id") or std.mem.eql(u8, name, "created") or std.mem.eql(u8, name, "updated")) continue;
-        if (schema.fieldByName(live_col, name) == null) continue; // skip non-column keys (e.g. expand)
-        switch (e.value_ptr.*) {
-            .string, .integer, .float, .bool, .number_string => {},
-            else => continue, // null/object/array: leave column NULL
-        }
-        try cols_sql.append(aa, ',');
-        try cols_sql.appendSlice(aa, try ddl.quoteIdent(aa, name));
-        try ph_sql.append(aa, ',');
-        try ph_sql.appendSlice(aa, try std.fmt.allocPrint(aa, "?{d}", .{n}));
-        try binds.append(aa, .{ .v = e.value_ptr.* });
-        n += 1;
+    try cols_sql.appendSlice(sa, "\"id\",\"created\",\"updated\"");
+    try ph_sql.appendSlice(sa, "?1,?2,?3");
+    for (col.fields, 0..) |f, i| {
+        try cols_sql.append(sa, ',');
+        try cols_sql.appendSlice(sa, try ddl.quoteIdent(sa, f.name));
+        try ph_sql.appendSlice(sa, try std.fmt.allocPrint(sa, ",?{d}", .{i + 4}));
     }
-    const sql = try std.fmt.allocPrintSentinel(aa, "INSERT INTO {s} ({s}) VALUES ({s});", .{ try ddl.quoteIdent(aa, col.name), cols_sql.items, ph_sql.items }, 0);
+    const sql = try std.fmt.allocPrintSentinel(sa, "INSERT INTO {s} ({s}) VALUES ({s});", .{ try ddl.quoteIdent(sa, col.name), cols_sql.items, ph_sql.items }, 0);
     var st = try tmp.prepare(sql);
     defer st.finalize();
     try st.bindText(1, snapshot.object.get("id").?.string);
-    var bi: c_int = 2;
-    for (binds.items) |b| {
-        switch (b.v) {
-            .string => |s| try st.bindText(bi, s),
-            .number_string => |s| try st.bindText(bi, s),
-            .integer => |x| try st.bindInt(bi, x),
-            .float => |x| try st.bindDouble(bi, x),
-            .bool => |x| try st.bindInt(bi, if (x) 1 else 0),
-            else => try st.bindNull(bi),
+    inline for (.{ "created", "updated" }, 2..) |name, idx| {
+        switch (snapshot.object.get(name) orelse .null) {
+            .string => |s| try st.bindText(idx, s),
+            .null => try st.bindNull(idx),
+            else => return error.TypeMismatch,
         }
-        bi += 1;
+    }
+    for (col.fields, 0..) |f, i| {
+        const idx: c_int = @intCast(i + 4);
+        if (f.encrypted) {
+            try st.bindNull(idx);
+            continue;
+        }
+        try values.bindValue(sa, &st, idx, f, snapshot.object.get(f.name) orelse .null);
     }
     _ = try st.step();
 
     // Publish into the thread-local slot and return a pointer to it. No errdefer fires past this
     // point, so the moved-in `arena`/`tmp` are owned solely by the slot (no double-free).
-    snapshot_sandbox = .{ .arena = arena, .db = tmp, .live_col = live_col, .key = owned_key };
+    snapshot_sandbox = .{ .arena = arena, .db = tmp, .key = owned_key };
     return &snapshot_sandbox.?;
 }
 
@@ -697,7 +780,13 @@ pub fn frameForCollectionDelivery(
     var col_lease = try colcache.lease(app.col_cache, &r, a, t.collection);
     defer col_lease.release();
     const col = col_lease.col orelse {
-        if (expected_collection_id != null) return null;
+        // Record events retain their type even after their collection is dropped.
+        // Never reinterpret their private envelope as a verbatim custom message.
+        const header = try std.json.parseFromSliceLeaky(struct { type: []const u8 = "" }, sa, message, .{ .ignore_unknown_fields = true });
+        if (expected_collection_id != null or std.mem.eql(u8, header.type, "event")) {
+            std.log.info("realtime: dropped record event for missing collection {s}", .{t.collection});
+            return null;
+        }
         const now = try auth.nowUnixPub(&r);
         // A consumer predicate may acquire its own reader. Match subscribeCheck's
         // lock order rather than holding a pool reader across application code.
@@ -736,7 +825,7 @@ pub fn frameForCollectionDelivery(
     const delete_snapshot: ?std.json.Value = if (action == .delete) env.record._deleteSnapshot else null;
 
     const now = try auth.nowUnixPub(&r);
-    const deliver = try shouldDeliver(a, app.io, &r, col, &current, now, action, record_id, sub_filter, delete_snapshot);
+    const deliver = try shouldDeliver(a, &r, col, &current, now, action, record_id, sub_filter, delete_snapshot);
     if (!deliver) return null;
 
     if (action == .delete and delete_snapshot != null) {
@@ -838,7 +927,7 @@ test "public viewRule (@public): create delivered to anyone, no filter" {
     const rid = try tdb.mkRec(a, col, "u1");
     defer a.free(rid);
     var anon = Conn{};
-    try std.testing.expect(try shouldDeliver(a, std.testing.io, &tdb.d, col, &anon, 0, .create, rid, null, null));
+    try std.testing.expect(try shouldDeliver(a, &tdb.d, col, &anon, 0, .create, rid, null, null));
 }
 
 test "@public viewRule + view ability: create is NOT delivered to a non-member" {
@@ -862,11 +951,11 @@ test "@public viewRule + view ability: create is NOT delivered to a non-member" 
     // empty qualifying set compiles to constant-false, so the guarded query matches no row.
     var outsider = try authedConn(a, "outsider", false);
     defer freeConn(a, &outsider);
-    try std.testing.expect(!(try shouldDeliver(a, std.testing.io, &tdb.d, col, &outsider, 0, .create, rid, null, null)));
+    try std.testing.expect(!(try shouldDeliver(a, &tdb.d, col, &outsider, 0, .create, rid, null, null)));
     // A superuser bypasses abilities (consistent with rules.decide) and still receives it.
     var su = try authedConn(a, "root", true);
     defer freeConn(a, &su);
-    try std.testing.expect(try shouldDeliver(a, std.testing.io, &tdb.d, col, &su, 0, .create, rid, null, null));
+    try std.testing.expect(try shouldDeliver(a, &tdb.d, col, &su, 0, .create, rid, null, null));
 }
 
 test "empty viewRule (\"\") is now LOCKED: anon receives nothing, superuser does" {
@@ -878,10 +967,10 @@ test "empty viewRule (\"\") is now LOCKED: anon receives nothing, superuser does
     const rid = try tdb.mkRec(a, col, "u1");
     defer a.free(rid);
     var anon = Conn{};
-    try std.testing.expect(!try shouldDeliver(a, std.testing.io, &tdb.d, col, &anon, 0, .create, rid, null, null));
+    try std.testing.expect(!try shouldDeliver(a, &tdb.d, col, &anon, 0, .create, rid, null, null));
     var su = try authedConn(a, "admin", true);
     defer freeConn(a, &su);
-    try std.testing.expect(try shouldDeliver(a, std.testing.io, &tdb.d, col, &su, 0, .create, rid, null, null));
+    try std.testing.expect(try shouldDeliver(a, &tdb.d, col, &su, 0, .create, rid, null, null));
 }
 
 test "null viewRule: superuser-only" {
@@ -893,10 +982,10 @@ test "null viewRule: superuser-only" {
     const rid = try tdb.mkRec(a, col, "u1");
     defer a.free(rid);
     var anon = Conn{};
-    try std.testing.expect(!try shouldDeliver(a, std.testing.io, &tdb.d, col, &anon, 0, .create, rid, null, null));
+    try std.testing.expect(!try shouldDeliver(a, &tdb.d, col, &anon, 0, .create, rid, null, null));
     var su = try authedConn(a, "admin", true);
     defer freeConn(a, &su);
-    try std.testing.expect(try shouldDeliver(a, std.testing.io, &tdb.d, col, &su, 0, .create, rid, null, null));
+    try std.testing.expect(try shouldDeliver(a, &tdb.d, col, &su, 0, .create, rid, null, null));
 }
 
 test "macro viewRule: only the owner receives the record" {
@@ -912,9 +1001,9 @@ test "macro viewRule: only the owner receives the record" {
     var other = try authedConn(a, "u2", false);
     defer freeConn(a, &other);
     var anon = Conn{};
-    try std.testing.expect(try shouldDeliver(a, std.testing.io, &tdb.d, col, &owner, 0, .update, rid, null, null));
-    try std.testing.expect(!try shouldDeliver(a, std.testing.io, &tdb.d, col, &other, 0, .update, rid, null, null));
-    try std.testing.expect(!try shouldDeliver(a, std.testing.io, &tdb.d, col, &anon, 0, .update, rid, null, null));
+    try std.testing.expect(try shouldDeliver(a, &tdb.d, col, &owner, 0, .update, rid, null, null));
+    try std.testing.expect(!try shouldDeliver(a, &tdb.d, col, &other, 0, .update, rid, null, null));
+    try std.testing.expect(!try shouldDeliver(a, &tdb.d, col, &anon, 0, .update, rid, null, null));
 }
 
 test "subscription filter narrows within an authorized viewRule" {
@@ -926,8 +1015,8 @@ test "subscription filter narrows within an authorized viewRule" {
     const rid = try tdb.mkRec(a, col, "alice");
     defer a.free(rid);
     var anon = Conn{};
-    try std.testing.expect(try shouldDeliver(a, std.testing.io, &tdb.d, col, &anon, 0, .create, rid, "owner = \"alice\"", null));
-    try std.testing.expect(!try shouldDeliver(a, std.testing.io, &tdb.d, col, &anon, 0, .create, rid, "owner = \"bob\"", null));
+    try std.testing.expect(try shouldDeliver(a, &tdb.d, col, &anon, 0, .create, rid, "owner = \"alice\"", null));
+    try std.testing.expect(!try shouldDeliver(a, &tdb.d, col, &anon, 0, .create, rid, "owner = \"bob\"", null));
 }
 
 test "delete is id-only: locked -> only superuser; @public -> anyone" {
@@ -940,12 +1029,12 @@ test "delete is id-only: locked -> only superuser; @public -> anyone" {
     defer locked.deinit(a);
     var anon = Conn{};
     // @public: anyone learns of the delete (no snapshot needed).
-    try std.testing.expect(try shouldDeliver(a, std.testing.io, &tdb.d, pub_col, &anon, 0, .delete, "GONE", null, null));
+    try std.testing.expect(try shouldDeliver(a, &tdb.d, pub_col, &anon, 0, .delete, "GONE", null, null));
     // null/locked: only a superuser.
-    try std.testing.expect(!try shouldDeliver(a, std.testing.io, &tdb.d, locked, &anon, 0, .delete, "GONE", null, null));
+    try std.testing.expect(!try shouldDeliver(a, &tdb.d, locked, &anon, 0, .delete, "GONE", null, null));
     var su = try authedConn(a, "admin", true);
     defer freeConn(a, &su);
-    try std.testing.expect(try shouldDeliver(a, std.testing.io, &tdb.d, locked, &su, 0, .delete, "GONE", null, null));
+    try std.testing.expect(try shouldDeliver(a, &tdb.d, locked, &su, 0, .delete, "GONE", null, null));
 }
 
 test "F4: owner-scoped delete only notifies the owner (snapshot authz)" {
@@ -968,11 +1057,11 @@ test "F4: owner-scoped delete only notifies the owner (snapshot authz)" {
     defer freeConn(a, &other);
     var anon = Conn{};
     // Owner: receives the delete. Non-owner and anonymous: do NOT (no id leak).
-    try std.testing.expect(try shouldDeliver(a, std.testing.io, &tdb.d, col, &owner, 0, .delete, "GONE", null, snapshot));
-    try std.testing.expect(!try shouldDeliver(a, std.testing.io, &tdb.d, col, &other, 0, .delete, "GONE", null, snapshot));
-    try std.testing.expect(!try shouldDeliver(a, std.testing.io, &tdb.d, col, &anon, 0, .delete, "GONE", null, snapshot));
+    try std.testing.expect(try shouldDeliver(a, &tdb.d, col, &owner, 0, .delete, "GONE", null, snapshot));
+    try std.testing.expect(!try shouldDeliver(a, &tdb.d, col, &other, 0, .delete, "GONE", null, snapshot));
+    try std.testing.expect(!try shouldDeliver(a, &tdb.d, col, &anon, 0, .delete, "GONE", null, snapshot));
     // No snapshot at all -> conservative deny, even for the would-be owner.
-    try std.testing.expect(!try shouldDeliver(a, std.testing.io, &tdb.d, col, &owner, 0, .delete, "GONE", null, null));
+    try std.testing.expect(!try shouldDeliver(a, &tdb.d, col, &owner, 0, .delete, "GONE", null, null));
 }
 
 test "#18 hoist: the thread-local delete sandbox is reused per-subscriber AND rebuilt per event, with no cross-subscriber/cross-event leak" {
@@ -1007,19 +1096,19 @@ test "#18 hoist: the thread-local delete sandbox is reused per-subscriber AND re
     // Event 1 (snapshot owned by u1): first call BUILDS the sandbox, the next two REUSE it. Each
     // subscriber's decision comes from its own identity — a reused sandbox must not carry u1's
     // "allow" over to u2/anon.
-    try std.testing.expect(try shouldDeliver(a, std.testing.io, &tdb.d, col, &owner1, 0, .delete, "R1", null, s1));
-    try std.testing.expect(!try shouldDeliver(a, std.testing.io, &tdb.d, col, &owner2, 0, .delete, "R1", null, s1));
-    try std.testing.expect(!try shouldDeliver(a, std.testing.io, &tdb.d, col, &anon, 0, .delete, "R1", null, s1));
+    try std.testing.expect(try shouldDeliver(a, &tdb.d, col, &owner1, 0, .delete, "R1", null, s1));
+    try std.testing.expect(!try shouldDeliver(a, &tdb.d, col, &owner2, 0, .delete, "R1", null, s1));
+    try std.testing.expect(!try shouldDeliver(a, &tdb.d, col, &anon, 0, .delete, "R1", null, s1));
 
     // Event 2 (different snapshot owned by u2): the key changes -> REBUILD. Now u2 is the owner and
     // u1 is denied — proving the rebuild swapped in the new row and did not reuse event 1's row.
-    try std.testing.expect(try shouldDeliver(a, std.testing.io, &tdb.d, col, &owner2, 0, .delete, "R2", null, s2));
-    try std.testing.expect(!try shouldDeliver(a, std.testing.io, &tdb.d, col, &owner1, 0, .delete, "R2", null, s2));
+    try std.testing.expect(try shouldDeliver(a, &tdb.d, col, &owner2, 0, .delete, "R2", null, s2));
+    try std.testing.expect(!try shouldDeliver(a, &tdb.d, col, &owner1, 0, .delete, "R2", null, s2));
 
     // Back to event 1's snapshot: another rebuild; u1 allowed, u2 denied again. Interleaving proves
     // the cache never stalely authorizes against the wrong event's row.
-    try std.testing.expect(try shouldDeliver(a, std.testing.io, &tdb.d, col, &owner1, 0, .delete, "R1", null, s1));
-    try std.testing.expect(!try shouldDeliver(a, std.testing.io, &tdb.d, col, &owner2, 0, .delete, "R1", null, s1));
+    try std.testing.expect(try shouldDeliver(a, &tdb.d, col, &owner1, 0, .delete, "R1", null, s1));
+    try std.testing.expect(!try shouldDeliver(a, &tdb.d, col, &owner2, 0, .delete, "R1", null, s1));
 }
 
 test "tenant scoping: a subscriber receives ONLY its account's frames; unresolved account gets nothing" {
@@ -1059,10 +1148,10 @@ test "tenant scoping: a subscriber receives ONLY its account's frames; unresolve
     connA.setAuth(.{ .record = .{ .object = rec }, .is_superuser = false, .exp = 9999999999 });
 
     // create/update of accA's row -> delivered; accB's row -> NOT delivered (cross-tenant denied).
-    try std.testing.expect(try shouldDeliver(a, std.testing.io, &tdb.d, col, &connA, 0, .create, "rA", null, null));
-    try std.testing.expect(!try shouldDeliver(a, std.testing.io, &tdb.d, col, &connA, 0, .create, "rB", null, null));
-    try std.testing.expect(try shouldDeliver(a, std.testing.io, &tdb.d, col, &connA, 0, .update, "rA", null, null));
-    try std.testing.expect(!try shouldDeliver(a, std.testing.io, &tdb.d, col, &connA, 0, .update, "rB", null, null));
+    try std.testing.expect(try shouldDeliver(a, &tdb.d, col, &connA, 0, .create, "rA", null, null));
+    try std.testing.expect(!try shouldDeliver(a, &tdb.d, col, &connA, 0, .create, "rB", null, null));
+    try std.testing.expect(try shouldDeliver(a, &tdb.d, col, &connA, 0, .update, "rA", null, null));
+    try std.testing.expect(!try shouldDeliver(a, &tdb.d, col, &connA, 0, .update, "rB", null, null));
 
     // delete uses the pre-delete snapshot: accA's snapshot delivered, accB's not.
     var snapA: std.json.ObjectMap = .empty;
@@ -1073,25 +1162,552 @@ test "tenant scoping: a subscriber receives ONLY its account's frames; unresolve
     defer snapB.deinit(a);
     try snapB.put(a, "id", .{ .string = "rB" });
     try snapB.put(a, "account", .{ .string = "accB" });
-    try std.testing.expect(try shouldDeliver(a, std.testing.io, &tdb.d, col, &connA, 0, .delete, "rA", null, .{ .object = snapA }));
-    try std.testing.expect(!try shouldDeliver(a, std.testing.io, &tdb.d, col, &connA, 0, .delete, "rB", null, .{ .object = snapB }));
+    try std.testing.expect(try shouldDeliver(a, &tdb.d, col, &connA, 0, .delete, "rA", null, .{ .object = snapA }));
+    try std.testing.expect(!try shouldDeliver(a, &tdb.d, col, &connA, 0, .delete, "rB", null, .{ .object = snapB }));
 
     // A subscriber with tenancy enabled but NO resolved account receives NOTHING on a tenant-owned
     // collection (fail closed) — even though the viewRule is @public.
     var connNone = Conn{ .tenancy_enabled = true, .account_id = "" };
     connNone.setAuth(.{ .record = .{ .object = rec }, .is_superuser = false, .exp = 9999999999 });
-    try std.testing.expect(!try shouldDeliver(a, std.testing.io, &tdb.d, col, &connNone, 0, .create, "rA", null, null));
-    try std.testing.expect(!try shouldDeliver(a, std.testing.io, &tdb.d, col, &connNone, 0, .create, "rB", null, null));
+    try std.testing.expect(!try shouldDeliver(a, &tdb.d, col, &connNone, 0, .create, "rA", null, null));
+    try std.testing.expect(!try shouldDeliver(a, &tdb.d, col, &connNone, 0, .create, "rB", null, null));
 
     // A superuser bypasses tenancy (receives both); tenancy OFF on the conn = byte-identical legacy
     // (@public delivers all), proving the gate is the per-connection tenancy flag.
     var su = try authedConn(a, "admin", true);
     defer freeConn(a, &su);
     su.tenancy_enabled = true;
-    try std.testing.expect(try shouldDeliver(a, std.testing.io, &tdb.d, col, &su, 0, .create, "rB", null, null));
+    try std.testing.expect(try shouldDeliver(a, &tdb.d, col, &su, 0, .create, "rB", null, null));
     var legacy = Conn{ .tenancy_enabled = false };
     legacy.setAuth(.{ .record = .{ .object = rec }, .is_superuser = false, .exp = 9999999999 });
-    try std.testing.expect(try shouldDeliver(a, std.testing.io, &tdb.d, col, &legacy, 0, .create, "rB", null, null));
+    try std.testing.expect(try shouldDeliver(a, &tdb.d, col, &legacy, 0, .create, "rB", null, null));
+}
+
+/// #486 fixture: an `owners` target collection plus a `posts` collection carrying a TEXT
+/// `account`, a RELATION `owner` (-> owners), a RELATION `org` (-> owners, used as a relation-typed
+/// tenant field / ability `.via`), and a multi-RELATION `members` (-> owners). The delete sandbox
+/// never holds `owners`, which is what used to make every snapshot authz on `posts` fail with
+/// `error.Validation` (dropped delivery). Returns both owned collections; free with `deinit`.
+const RelFixture = struct {
+    owners: schema.Collection,
+    posts: schema.Collection,
+    fn init(a: std.mem.Allocator, tdb: *TestDb, view_rule: ?[]const u8) !RelFixture {
+        const owners = try collections.create(a, std.testing.io, &tdb.d, .{
+            .id = "",
+            .name = "owners",
+            .fields = &[_]schema.Field{.{ .id = "o1", .name = "name", .options = .{ .text = .{} } }},
+        });
+        errdefer owners.deinit(a);
+        const posts = try collections.create(a, std.testing.io, &tdb.d, .{
+            .id = "",
+            .name = "posts",
+            .fields = &[_]schema.Field{
+                .{ .id = "p1", .name = "account", .options = .{ .text = .{} } },
+                .{ .id = "p2", .name = "owner", .options = .{ .relation = .{ .targetCollectionId = owners.id, .maxSelect = 1 } } },
+                .{ .id = "p3", .name = "org", .options = .{ .relation = .{ .targetCollectionId = owners.id, .maxSelect = 1 } } },
+                .{ .id = "p4", .name = "members", .options = .{ .relation = .{ .targetCollectionId = owners.id, .maxSelect = 9 } } },
+                .{ .id = "p5", .name = "expires", .options = .{ .date = .{} } },
+            },
+            .viewRule = view_rule,
+        });
+        return .{ .owners = owners, .posts = posts };
+    }
+    fn deinit(self: RelFixture, a: std.mem.Allocator) void {
+        self.posts.deinit(a);
+        self.owners.deinit(a);
+    }
+};
+
+/// The deleted `posts` row: account accA, owner u1, org accA, members ["u1"].
+fn relSnapshot(a: std.mem.Allocator, map: *std.json.ObjectMap, members: *std.json.Array) !std.json.Value {
+    try members.append(.{ .string = "u1" });
+    try map.put(a, "id", .{ .string = "GONE" });
+    try map.put(a, "account", .{ .string = "accA" });
+    try map.put(a, "owner", .{ .string = "u1" });
+    try map.put(a, "org", .{ .string = "accA" });
+    try map.put(a, "members", .{ .array = members.* });
+    return .{ .object = map.* };
+}
+
+test "#486: tenant-owned (TEXT tenant field) collection WITH a relation delivers deletes to its tenant only" {
+    var tdb = try TestDb.init();
+    defer tdb.deinit();
+    const a = std.testing.allocator;
+    const fx = try RelFixture.init(a, &tdb, rules.public_sentinel);
+    defer fx.deinit(a);
+    var col = fx.posts;
+    col.options.tenant_field = "account";
+    var map: std.json.ObjectMap = .empty;
+    defer map.deinit(a);
+    var members = std.json.Array.init(a);
+    defer members.deinit();
+    const snap = try relSnapshot(a, &map, &members);
+
+    var rec: std.json.ObjectMap = .empty;
+    defer rec.deinit(a);
+    try rec.put(a, "id", .{ .string = "u1" });
+    var member = Conn{ .tenancy_enabled = true, .account_id = "accA" };
+    member.setAuth(.{ .record = .{ .object = rec }, .is_superuser = false, .exp = 9999999999 });
+    var outsider = Conn{ .tenancy_enabled = true, .account_id = "accB" };
+    outsider.setAuth(.{ .record = .{ .object = rec }, .is_superuser = false, .exp = 9999999999 });
+    try std.testing.expect(try shouldDeliver(a, &tdb.d, col, &member, 0, .delete, "GONE", null, snap));
+    try std.testing.expect(!try shouldDeliver(a, &tdb.d, col, &outsider, 0, .delete, "GONE", null, snap));
+}
+
+test "#486: relation-typed tenant field delivers deletes to its tenant only" {
+    var tdb = try TestDb.init();
+    defer tdb.deinit();
+    const a = std.testing.allocator;
+    const fx = try RelFixture.init(a, &tdb, rules.public_sentinel);
+    defer fx.deinit(a);
+    var col = fx.posts;
+    col.options.tenant_field = "org";
+    var map: std.json.ObjectMap = .empty;
+    defer map.deinit(a);
+    var members = std.json.Array.init(a);
+    defer members.deinit();
+    const snap = try relSnapshot(a, &map, &members);
+
+    var rec: std.json.ObjectMap = .empty;
+    defer rec.deinit(a);
+    try rec.put(a, "id", .{ .string = "u1" });
+    var member = Conn{ .tenancy_enabled = true, .account_id = "accA" };
+    member.setAuth(.{ .record = .{ .object = rec }, .is_superuser = false, .exp = 9999999999 });
+    var outsider = Conn{ .tenancy_enabled = true, .account_id = "accB" };
+    outsider.setAuth(.{ .record = .{ .object = rec }, .is_superuser = false, .exp = 9999999999 });
+    try std.testing.expect(try shouldDeliver(a, &tdb.d, col, &member, 0, .delete, "GONE", null, snap));
+    try std.testing.expect(!try shouldDeliver(a, &tdb.d, col, &outsider, 0, .delete, "GONE", null, snap));
+}
+
+test "#486: relation-via ability delivers deletes to members only" {
+    var tdb = try TestDb.init();
+    defer tdb.deinit();
+    const a = std.testing.allocator;
+    const fx = try RelFixture.init(a, &tdb, rules.public_sentinel);
+    defer fx.deinit(a);
+    var col = fx.posts;
+    col.options.abilities = .{ .view = .{ .relationship = .{ .via = "org" } } };
+    var map: std.json.ObjectMap = .empty;
+    defer map.deinit(a);
+    var members = std.json.Array.init(a);
+    defer members.deinit();
+    const snap = try relSnapshot(a, &map, &members);
+
+    var member = try authedConn(a, "u1", false);
+    defer freeConn(a, &member);
+    member.memberships = &.{.{ .account = "accA", .role = "member" }};
+    var outsider = try authedConn(a, "u2", false);
+    defer freeConn(a, &outsider);
+    outsider.memberships = &.{.{ .account = "accB", .role = "member" }};
+    try std.testing.expect(try shouldDeliver(a, &tdb.d, col, &member, 0, .delete, "GONE", null, snap));
+    try std.testing.expect(!try shouldDeliver(a, &tdb.d, col, &outsider, 0, .delete, "GONE", null, snap));
+}
+
+test "#486: owner rule on a relation field delivers deletes to the owner only" {
+    var tdb = try TestDb.init();
+    defer tdb.deinit();
+    const a = std.testing.allocator;
+    const fx = try RelFixture.init(a, &tdb, "owner = @request.auth.id");
+    defer fx.deinit(a);
+    var map: std.json.ObjectMap = .empty;
+    defer map.deinit(a);
+    var members = std.json.Array.init(a);
+    defer members.deinit();
+    const snap = try relSnapshot(a, &map, &members);
+
+    var owner = try authedConn(a, "u1", false);
+    defer freeConn(a, &owner);
+    var other = try authedConn(a, "u2", false);
+    defer freeConn(a, &other);
+    var anon = Conn{};
+    try std.testing.expect(try shouldDeliver(a, &tdb.d, fx.posts, &owner, 0, .delete, "GONE", null, snap));
+    try std.testing.expect(!try shouldDeliver(a, &tdb.d, fx.posts, &other, 0, .delete, "GONE", null, snap));
+    try std.testing.expect(!try shouldDeliver(a, &tdb.d, fx.posts, &anon, 0, .delete, "GONE", null, snap));
+}
+
+test "#486: an already-EXPIRED TTL row's delete still reaches its owner (and only its owner)" {
+    // The snapshot sandbox applies no TTL filter, exactly like live create/update delivery
+    // (`policy.matchesRule` never reads `ttl_field`): the owner of a row whose `expires` has passed
+    // still learns it was deleted (e.g. by the TTL sweeper), so a client holding it can drop it. The
+    // rule, not the TTL, decides who.
+    var tdb = try TestDb.init();
+    defer tdb.deinit();
+    const a = std.testing.allocator;
+    const fx = try RelFixture.init(a, &tdb, "owner = @request.auth.id");
+    defer fx.deinit(a);
+    var col = fx.posts;
+    col.options.ttl_field = "expires";
+    var map: std.json.ObjectMap = .empty;
+    defer map.deinit(a);
+    var members = std.json.Array.init(a);
+    defer members.deinit();
+    _ = try relSnapshot(a, &map, &members);
+    try map.put(a, "expires", .{ .string = "2000-01-01 00:00:00.000Z" });
+    const snap: std.json.Value = .{ .object = map }; // taken AFTER the last put (the map may grow)
+
+    var owner = try authedConn(a, "u1", false);
+    defer freeConn(a, &owner);
+    var other = try authedConn(a, "u2", false);
+    defer freeConn(a, &other);
+    try std.testing.expect(try shouldDeliver(a, &tdb.d, col, &owner, 0, .delete, "GONE", null, snap));
+    try std.testing.expect(!try shouldDeliver(a, &tdb.d, col, &other, 0, .delete, "GONE", null, snap));
+}
+
+test "#486: a multi-relation rule sees the snapshot's array value in the delete sandbox" {
+    // A multi-value field is stored live as its JSON array text; the sandbox must bind the
+    // snapshot's array the same way (it used to leave array/object columns NULL), so a
+    // `members ~ @request.auth.id` rule decides a delete exactly as it decides a live view.
+    var tdb = try TestDb.init();
+    defer tdb.deinit();
+    const a = std.testing.allocator;
+    const fx = try RelFixture.init(a, &tdb, "members ~ @request.auth.id");
+    defer fx.deinit(a);
+    var map: std.json.ObjectMap = .empty;
+    defer map.deinit(a);
+    var members = std.json.Array.init(a);
+    defer members.deinit();
+    const snap = try relSnapshot(a, &map, &members);
+
+    var member = try authedConn(a, "u1", false);
+    defer freeConn(a, &member);
+    var other = try authedConn(a, "u2", false);
+    defer freeConn(a, &other);
+    try std.testing.expect(try shouldDeliver(a, &tdb.d, fx.posts, &member, 0, .delete, "GONE", null, snap));
+    try std.testing.expect(!try shouldDeliver(a, &tdb.d, fx.posts, &other, 0, .delete, "GONE", null, snap));
+}
+
+test "#486: a relation-TRAVERSING rule still conservatively denies a delete (no widening)" {
+    // The related `owners` row is not in the sandbox, so `owner.name`/`owner.id` cannot be
+    // evaluated: the decision is a deny for everyone (superuser aside), never an error and never
+    // an allow — not even for the subscriber whose id the live traversal would have matched.
+    var tdb = try TestDb.init();
+    defer tdb.deinit();
+    const a = std.testing.allocator;
+    inline for (.{ "owner.name = \"alice\"", "owner.id = @request.auth.id", "owner.id != \"\"" }) |rule| {
+        const fx = try RelFixture.init(a, &tdb, rule);
+        defer {
+            fx.deinit(a);
+            tdb.d.exec("DROP TABLE posts; DROP TABLE owners; DELETE FROM _storage_namespaces; DELETE FROM _collections;") catch unreachable;
+        }
+        var map: std.json.ObjectMap = .empty;
+        defer map.deinit(a);
+        var members = std.json.Array.init(a);
+        defer members.deinit();
+        const snap = try relSnapshot(a, &map, &members);
+        var owner = try authedConn(a, "u1", false);
+        defer freeConn(a, &owner);
+        try std.testing.expect(!try shouldDeliver(a, &tdb.d, fx.posts, &owner, 0, .delete, "GONE", null, snap));
+        var su = try authedConn(a, "root", true);
+        defer freeConn(a, &su);
+        try std.testing.expect(try shouldDeliver(a, &tdb.d, fx.posts, &su, 0, .delete, "GONE", null, snap));
+    }
+}
+
+test "#486: an auth collection's owner-scoped delete reaches its owner" {
+    // Registry-loaded auth collections already carry the injected system fields; the sandbox must
+    // build their table from those fields as-is.
+    var tdb = try TestDb.init();
+    defer tdb.deinit();
+    const a = std.testing.allocator;
+    const users = try collections.create(a, std.testing.io, &tdb.d, .{
+        .id = "",
+        .name = "people",
+        .type = .auth,
+        .fields = &[_]schema.Field{.{ .id = "b1", .name = "bio", .options = .{ .text = .{} } }},
+        .viewRule = "id = @request.auth.id",
+    });
+    defer users.deinit(a);
+    var map: std.json.ObjectMap = .empty;
+    defer map.deinit(a);
+    try map.put(a, "id", .{ .string = "u1" });
+    try map.put(a, "email", .{ .string = "u1@example.com" });
+    try map.put(a, "bio", .{ .string = "hi" });
+    var self_conn = try authedConn(a, "u1", false);
+    defer freeConn(a, &self_conn);
+    var other = try authedConn(a, "u2", false);
+    defer freeConn(a, &other);
+    try std.testing.expect(try shouldDeliver(a, &tdb.d, users, &self_conn, 0, .delete, "u1", null, .{ .object = map }));
+    try std.testing.expect(!try shouldDeliver(a, &tdb.d, users, &other, 0, .delete, "u1", null, .{ .object = map }));
+}
+
+test "#486: an auth collection's `verified` rule decides deletes from the snapshot's bool" {
+    // `verified` is an injected auth system field (a bool column). It is the only such flag a rule
+    // can name: `emailVisibility` is not a column here (the joiner rejects it as an unknown field).
+    var tdb = try TestDb.init();
+    defer tdb.deinit();
+    const a = std.testing.allocator;
+    inline for (.{ .{ "verified = true", true }, .{ "verified != true", false } }) |c| {
+        const people = try collections.create(a, std.testing.io, &tdb.d, .{
+            .id = "",
+            .name = "people",
+            .type = .auth,
+            .fields = &[_]schema.Field{.{ .id = "b1", .name = "bio", .options = .{ .text = .{} } }},
+            .viewRule = c[0],
+        });
+        defer {
+            people.deinit(a);
+            tdb.d.exec("DROP TABLE people; DELETE FROM _storage_namespaces; DELETE FROM _collections;") catch unreachable;
+        }
+        var viewer = try authedConn(a, "u2", false);
+        defer freeConn(a, &viewer);
+        for ([_]bool{ true, false }) |on| {
+            var map: std.json.ObjectMap = .empty;
+            defer map.deinit(a);
+            try map.put(a, "id", .{ .string = "u1" });
+            try map.put(a, "email", .{ .string = "u1@example.com" });
+            try map.put(a, "verified", .{ .bool = on });
+            try std.testing.expectEqual(on == c[1], try shouldDeliver(a, &tdb.d, people, &viewer, 0, .delete, "u1", null, .{ .object = map }));
+        }
+    }
+}
+
+test "#486: a viewRule on a hidden field decides deletes from the private snapshot, which never reaches a frame" {
+    // Operator rules may reference hidden fields (`allow_hidden`), but the hook-facing record a
+    // delete starts from strips them. The authorization snapshot (`ws.prepareDelete` ->
+    // `records.getDeleteSnapshot`) must carry the hidden value, or the rule compares NULL and the
+    // owner never receives the delete. The value must still never reach a delivered frame.
+    var env = try PoolEnv.init();
+    defer env.deinit();
+    const a = std.testing.allocator;
+    var app = App{ .allocator = a, .io = std.testing.io, .pool = &env.pool };
+    var hnotes: schema.Collection = undefined;
+    {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        const principals = try collections.create(a, std.testing.io, w, .{ .id = "", .name = "principals", .type = .auth, .fields = &.{} });
+        defer principals.deinit(a);
+        try w.exec("INSERT INTO principals (id,created,updated,email,passwordHash,tokenKey,verified) VALUES ('u1','','','u1@example.test','','test-key',1),('u2','','','u2@example.test','','test-key',1);");
+        hnotes = try collections.create(a, std.testing.io, w, .{
+            .id = "",
+            .name = "hnotes",
+            .fields = &[_]schema.Field{
+                .{ .id = "f1", .name = "owner", .options = .{ .relation = .{ .targetCollectionId = principals.id, .maxSelect = 1 } } },
+                .{ .id = "f2", .name = "tier", .hidden = true, .options = .{ .text = .{} } },
+            },
+            .viewRule = "owner = @request.auth.id && tier = 'gold-hidden-marker'",
+        });
+        try w.exec("INSERT INTO hnotes (id,created,updated,owner,tier) VALUES ('n1','','','u1','gold-hidden-marker'),('n2','','','u1','bronze-hidden-marker');");
+    }
+    defer hnotes.deinit(a);
+
+    const jwt = @import("../jwt.zig");
+    const key = @import("../crypto.zig").deriveKey(app.jwt_secret, "test-key");
+    var owner = try authedConn(a, "u1", false);
+    defer freeConn(a, &owner);
+    var other = try authedConn(a, "u2", false);
+    defer freeConn(a, &other);
+    const owner_token = try jwt.sign(a, .{ .id = "u1", .collection = "principals", .type = .auth, .iat = 0, .exp = 9999999999 }, &key);
+    defer a.free(owner_token);
+    const other_token = try jwt.sign(a, .{ .id = "u2", .collection = "principals", .type = .auth, .iat = 0, .exp = 9999999999 }, &key);
+    defer a.free(other_token);
+    owner.auth.?.token = owner_token;
+    other.auth.?.token = other_token;
+
+    inline for (.{ .{ "n1", true }, .{ "n2", false } }) |c| {
+        const snapshot = blk: {
+            const w = env.pool.acquireWriter();
+            defer env.pool.releaseWriter();
+            // What the delete handler hands `prepareDelete`: the hook read, hidden fields stripped.
+            const hook_read = (try records.get(a, w, hnotes, c[0])).?;
+            defer records.freeRecord(a, hook_read);
+            try std.testing.expect(hook_read.object.get("tier") == null);
+            const rt = try @import("ws.zig").prepareDelete(a, &app, w, hnotes, c[0], hook_read);
+            // Only a re-read carries `tier`; the reused hook read must not be freed twice.
+            const tier = rt.snapshot.?.object.get("tier") orelse return error.TestExpectedHiddenFieldInSnapshot;
+            try std.testing.expect(std.mem.endsWith(u8, tier.string, "-hidden-marker"));
+            break :blk rt.snapshot.?;
+        };
+        defer records.freeRecord(a, snapshot);
+        const ef = try buildEventFrames(a, "hnotes", .delete, c[0], snapshot);
+        defer ef.deinit(a);
+        const out = try frameForCollectionDelivery(a, &app, &owner, null, "hnotes", ef.frame_collection, hnotes.id);
+        defer if (out) |o| a.free(o);
+        try std.testing.expectEqual(c[1], out != null);
+        if (out) |o| {
+            try std.testing.expect(std.mem.indexOf(u8, o, "hidden-marker") == null);
+            try std.testing.expect(std.mem.indexOf(u8, o, "tier") == null);
+            try std.testing.expect(std.mem.indexOf(u8, o, delete_snapshot_key) == null);
+        }
+        try std.testing.expect((try frameForCollectionDelivery(a, &app, &other, null, "hnotes", ef.frame_collection, hnotes.id)) == null);
+    }
+}
+
+test "#486: an encrypted field binds NULL in the delete sandbox, whatever the snapshot holds" {
+    // Rules cannot reference an encrypted field (`error.EncryptedField`), so its snapshot value is
+    // never needed. A value that is not an at-rest string envelope used to fail the sandbox build.
+    var tdb = try TestDb.init();
+    defer tdb.deinit();
+    const a = std.testing.allocator;
+    const col = try collections.create(a, std.testing.io, &tdb.d, .{
+        .id = "",
+        .name = "sealed",
+        .fields = &[_]schema.Field{
+            .{ .id = "s1", .name = "owner", .options = .{ .text = .{} } },
+            .{ .id = "s2", .name = "secret", .encrypted = true, .options = .{ .text = .{} } },
+        },
+        .viewRule = "owner = @request.auth.id",
+    });
+    defer col.deinit(a);
+    var owner = try authedConn(a, "u1", false);
+    defer freeConn(a, &owner);
+    var other = try authedConn(a, "u2", false);
+    defer freeConn(a, &other);
+    for ([_]std.json.Value{ .{ .string = "v1.envelope" }, .{ .integer = 7 }, .null }) |secret| {
+        var map: std.json.ObjectMap = .empty;
+        defer map.deinit(a);
+        try map.put(a, "id", .{ .string = "GONE" });
+        try map.put(a, "owner", .{ .string = "u1" });
+        try map.put(a, "secret", secret);
+        try std.testing.expect(try shouldDeliver(a, &tdb.d, col, &owner, 0, .delete, "GONE", null, .{ .object = map }));
+        try std.testing.expect(!try shouldDeliver(a, &tdb.d, col, &other, 0, .delete, "GONE", null, .{ .object = map }));
+    }
+}
+
+/// Live-vs-delete PARITY: create `data` in `col` for real, read it back the way the delete path
+/// captures its snapshot (`records.get`), then assert that the LIVE view decision for `conn` (an
+/// `.update` delivery, evaluated against the stored row) and the DELETE decision (evaluated against
+/// the snapshot in the sandbox) are BOTH `expect`. A sandbox column that diverged from the stored
+/// form would make the two disagree — in the fail-open direction when the sandbox allows.
+fn expectDeleteParity(a: std.mem.Allocator, tdb: *TestDb, col: schema.Collection, data: std.json.Value, conn: *const Conn, expect: bool) !void {
+    const rec = try records.create(a, std.testing.io, &tdb.d, col, data);
+    defer records.freeRecord(a, rec);
+    const rid = rec.object.get("id").?.string;
+    const snap = (try records.get(a, &tdb.d, col, rid)).?;
+    defer records.freeRecord(a, snap);
+    try std.testing.expectEqual(expect, try shouldDeliver(a, &tdb.d, col, conn, 0, .update, rid, null, null));
+    try std.testing.expectEqual(expect, try shouldDeliver(a, &tdb.d, col, conn, 0, .delete, rid, null, snap));
+}
+
+/// One `typed` collection per rule: a text `owner`, a fixed-scale-2 `price`, and a json `meta`.
+fn typedCollection(a: std.mem.Allocator, tdb: *TestDb, view_rule: []const u8) !schema.Collection {
+    return collections.create(a, std.testing.io, &tdb.d, .{
+        .id = "",
+        .name = "typed",
+        .fields = &[_]schema.Field{
+            .{ .id = "t1", .name = "owner", .options = .{ .text = .{} } },
+            .{ .id = "t2", .name = "price", .options = .{ .number = .{ .mode = .fixed, .scale = 2 } } },
+            .{ .id = "t3", .name = "meta", .options = .{ .json = .{} } },
+        },
+        .viewRule = view_rule,
+    });
+}
+
+fn dropTyped(tdb: *TestDb) void {
+    tdb.d.exec("DROP TABLE typed; DELETE FROM _storage_namespaces; DELETE FROM _collections;") catch unreachable;
+}
+
+test "delete sandbox stores the snapshot's created/updated: a timestamp rule decides as it does live" {
+    // Regression (review F1): the sandbox used to insert `created`/`updated` as '' — so
+    // `created < "<future>"`-style rules ALLOWED every delete that live denies.
+    var tdb = try TestDb.init();
+    defer tdb.deinit();
+    const a = std.testing.allocator;
+    var viewer = try authedConn(a, "u2", false);
+    defer freeConn(a, &viewer);
+    const cases = .{
+        .{ "created < \"2000-01-01 00:00:00\"", false },
+        .{ "created > \"2000-01-01 00:00:00\"", true },
+        .{ "updated < \"2000-01-01 00:00:00\"", false },
+        .{ "updated != \"\"", true },
+    };
+    inline for (cases) |c| {
+        const col = try typedCollection(a, &tdb, c[0]);
+        defer {
+            col.deinit(a);
+            dropTyped(&tdb);
+        }
+        var data: std.json.ObjectMap = .empty;
+        defer data.deinit(a);
+        try data.put(a, "owner", .{ .string = "u1" });
+        try expectDeleteParity(a, &tdb, col, .{ .object = data }, &viewer, c[1]);
+    }
+}
+
+test "delete sandbox stores a fixed-scale number scaled, as live does" {
+    // Regression (review F2): "250.00" (the API form) used to be bound as text into the INTEGER
+    // column (-> 250), while live stores 25000 — so `price < 100` allowed a delete live denies,
+    // and `price = 250` denied one live allows.
+    var tdb = try TestDb.init();
+    defer tdb.deinit();
+    const a = std.testing.allocator;
+    var viewer = try authedConn(a, "u2", false);
+    defer freeConn(a, &viewer);
+    const cases = .{
+        .{ "price < 100", false },
+        .{ "price = 250", true },
+        .{ "price > 249.99", true },
+    };
+    inline for (cases) |c| {
+        const col = try typedCollection(a, &tdb, c[0]);
+        defer {
+            col.deinit(a);
+            dropTyped(&tdb);
+        }
+        var data: std.json.ObjectMap = .empty;
+        defer data.deinit(a);
+        try data.put(a, "price", .{ .string = "250.00" });
+        try expectDeleteParity(a, &tdb, col, .{ .object = data }, &viewer, c[1]);
+    }
+}
+
+test "delete sandbox stores a json field's scalar as JSON text, as live does" {
+    // Regression (review F3): a json scalar used to be bound raw (true -> 1, "admin" -> admin),
+    // while live stores JSON text (`true`, `"admin"`). Live compares a json column's JSON TEXT
+    // against the literal's text, so a json string `"admin"` does NOT equal the literal "admin"
+    // live — the old sandbox said it did (`meta = "admin"` allowed a delete live denies), and
+    // `meta != true` on a stored `true` was allowed by the old sandbox ('1' != 'true') too.
+    var tdb = try TestDb.init();
+    defer tdb.deinit();
+    const a = std.testing.allocator;
+    var viewer = try authedConn(a, "u2", false);
+    defer freeConn(a, &viewer);
+    const Case = struct { rule: []const u8, meta: std.json.Value, expect: bool };
+    const cases = [_]Case{
+        .{ .rule = "meta != true", .meta = .{ .bool = true }, .expect = false },
+        .{ .rule = "meta = true", .meta = .{ .bool = true }, .expect = true },
+        .{ .rule = "meta != \"admin\"", .meta = .{ .string = "admin" }, .expect = true },
+        .{ .rule = "meta = \"admin\"", .meta = .{ .string = "admin" }, .expect = false },
+    };
+    for (cases) |c| {
+        const col = try typedCollection(a, &tdb, c.rule);
+        defer {
+            col.deinit(a);
+            dropTyped(&tdb);
+        }
+        var data: std.json.ObjectMap = .empty;
+        defer data.deinit(a);
+        try data.put(a, "meta", c.meta);
+        try expectDeleteParity(a, &tdb, col, .{ .object = data }, &viewer, c.expect);
+    }
+}
+
+test "delete sandbox cache: a schema change with the same id, name and snapshot rebuilds" {
+    // The thread-local sandbox is reused only for an EXACT key match. The key carries the table DDL
+    // AND the field definitions: a scale change leaves the DDL identical (INTEGER either way) but
+    // changes the stored form of the same snapshot value, so it must rebuild too.
+    var map: std.json.ObjectMap = .empty;
+    defer map.deinit(std.testing.allocator);
+    try map.put(std.testing.allocator, "id", .{ .string = "r1" });
+    try map.put(std.testing.allocator, "price", .{ .string = "250.0" });
+    const snap: std.json.Value = .{ .object = map };
+    var fields = [_]schema.Field{.{ .id = "p1", .name = "price", .options = .{ .number = .{ .mode = .fixed, .scale = 1 } } }};
+    const col = schema.Collection{ .id = "same-id", .name = "cached", .fields = &fields };
+    const expectStored = struct {
+        fn f(c: schema.Collection, s: std.json.Value, sql: [:0]const u8, want: i64) !void {
+            const sb = try snapshotSandbox(c, s);
+            var st = try sb.db.prepare(sql);
+            defer st.finalize();
+            try std.testing.expect(try st.step());
+            try std.testing.expectEqual(want, st.columnInt(0));
+        }
+    }.f;
+    try expectStored(col, snap, "SELECT \"price\" FROM \"cached\";", 2500);
+    fields[0].options.number.scale = 2; // same id/name/snapshot, same DDL — different stored form
+    try expectStored(col, snap, "SELECT \"price\" FROM \"cached\";", 25000);
+    // A new column (DDL change) is present after the rebuild.
+    var wider = [_]schema.Field{ fields[0], .{ .id = "p2", .name = "extra", .options = .{ .text = .{} } } };
+    const col2 = schema.Collection{ .id = "same-id", .name = "cached", .fields = &wider };
+    try expectStored(col2, snap, "SELECT COUNT(\"extra\") FROM \"cached\";", 0);
 }
 
 test "expired identity is treated as anonymous" {
@@ -1107,8 +1723,8 @@ test "expired identity is treated as anonymous" {
     var c = Conn{};
     defer freeConn(a, &c);
     c.setAuth(.{ .record = .{ .object = rec }, .is_superuser = false, .exp = 100 });
-    try std.testing.expect(try shouldDeliver(a, std.testing.io, &tdb.d, col, &c, 50, .update, rid, null, null));
-    try std.testing.expect(!try shouldDeliver(a, std.testing.io, &tdb.d, col, &c, 200, .update, rid, null, null));
+    try std.testing.expect(try shouldDeliver(a, &tdb.d, col, &c, 50, .update, rid, null, null));
+    try std.testing.expect(!try shouldDeliver(a, &tdb.d, col, &c, 200, .update, rid, null, null));
 }
 
 test "buildEventFrames: create carries the full record on both channels" {
@@ -1151,49 +1767,28 @@ test "F4: delete frame carries the private authz snapshot (stripped before clien
     // WS.write, so the client never sees the snapshot — covered by the hub authz tests above.)
 }
 
-test "R1-3: delete sandbox schema is minimal — 6 statements, not the migration suite" {
+test "R1-3: delete sandbox registry is minimal — two empty tables, not the migration suite" {
     var tmp = try db.Db.openMemory();
     defer tmp.close();
-    try tmp.exec(migrations.collections_table_sql);
-    try tmp.exec(migrations.collections_options_column_sql);
-    try tmp.exec(migrations.collections_rename_epoch_column_sql);
-    try tmp.exec(migrations.schema_state_table_sql);
-    try tmp.exec(migrations.schema_state_seed_sql);
-    try tmp.exec(@import("../files/namespace.zig").table_sql);
+    try sandboxRegistry(&tmp);
     var st = try tmp.prepare("SELECT COUNT(*) FROM sqlite_master WHERE type='table';");
     defer st.finalize();
     try std.testing.expect(try st.step());
-    // The _collections registry plus the schema-generation marker that collections.create bumps.
-    // This pins the per-subscriber-per-delete cost: the full suite (migrations.run) creates
-    // dozens of tables; the sandbox needs three, including namespace reservations.
-    try std.testing.expectEqual(@as(i64, 3), st.columnInt(0));
+    // `_collections` and `_storage_namespaces` only. This pins the per-delete-event cost: the full
+    // suite (migrations.run) creates dozens of tables.
+    try std.testing.expectEqual(@as(i64, 2), st.columnInt(0));
 }
 
-test "R1-3: the delete sandbox can actually run collections.create (marker table seeded)" {
-    // THE REGRESSION THIS EXISTS FOR: the sandbox is hand-seeded with a minimal schema and is
-    // built in the LIVE SERVING PROCESS on every delete-event delivery. `collections.create`
-    // bumps `_schema_state` inside its transaction, so if the sandbox ever stops seeding that
-    // table, EVERY delete-event authorization breaks — while `zig build test` stays green,
-    // because nothing else exercises this hand-rolled schema. Assert the real call succeeds.
-    const a = std.testing.allocator;
+test "R1-3: a relation-target lookup in the sandbox registry finds nothing (and does not error)" {
+    // THE REGRESSION THIS EXISTS FOR: the sandbox is hand-seeded and built in the LIVE SERVING
+    // PROCESS on every delete-event delivery. The query joiner resolves a traversed relation's
+    // target with `collections.get`; if the registry ever stops carrying a table that SELECT reads,
+    // every relation-traversing delete authz turns from a conservative deny into a dropped
+    // delivery — while `zig build test` stays green unless this path is exercised.
     var tmp = try db.Db.openMemory();
     defer tmp.close();
-    try tmp.exec(migrations.collections_table_sql);
-    try tmp.exec(migrations.collections_options_column_sql);
-    try tmp.exec(migrations.collections_rename_epoch_column_sql);
-    try tmp.exec(migrations.schema_state_table_sql);
-    try tmp.exec(migrations.schema_state_seed_sql);
-    try tmp.exec(@import("../files/namespace.zig").table_sql);
-
-    const created = try collections.create(a, std.testing.io, &tmp, .{
-        .id = "",
-        .name = "notes",
-        .fields = &[_]schema.Field{.{ .id = "f_owner", .name = "owner", .options = .{ .text = .{} } }},
-    });
-    created.deinit(a);
-
-    // ...and the bump really landed in the sandbox (proving the marker is wired, not merely present).
-    try std.testing.expectEqual(@as(i64, 1), try schema_gen.read(&tmp));
+    try sandboxRegistry(&tmp);
+    try std.testing.expect((try collections.get(std.testing.allocator, &tmp, "anything")) == null);
 }
 
 test "F5: anonymous subscribe allowed only on @public; gated collections require auth" {
@@ -1652,10 +2247,246 @@ test "subscription filters cannot infer private related fields or hidden base fi
     try tdb.d.exec("INSERT INTO sources (id,created,updated,target,secret) VALUES ('s1','t','t','t1','value');");
     var anon = Conn{};
     // Trusted viewRule can gate delivery on a private target.
-    try std.testing.expect(try shouldDeliver(a, std.testing.io, &tdb.d, col, &anon, 0, .create, "s1", null, null));
-    try std.testing.expectError(error.RestrictedRelation, shouldDeliver(a, std.testing.io, &tdb.d, col, &anon, 0, .create, "s1", "target.owner = 'alice'", null));
-    try std.testing.expectError(error.HiddenField, shouldDeliver(a, std.testing.io, &tdb.d, col, &anon, 0, .create, "s1", "secret = 'value'", null));
+    try std.testing.expect(try shouldDeliver(a, &tdb.d, col, &anon, 0, .create, "s1", null, null));
+    try std.testing.expectError(error.RestrictedRelation, shouldDeliver(a, &tdb.d, col, &anon, 0, .create, "s1", "target.owner = 'alice'", null));
+    try std.testing.expectError(error.HiddenField, shouldDeliver(a, &tdb.d, col, &anon, 0, .create, "s1", "secret = 'value'", null));
     var su = try authedConn(a, "root", true);
     defer freeConn(a, &su);
-    try std.testing.expect(try shouldDeliver(a, std.testing.io, &tdb.d, col, &su, 0, .create, "s1", "target.owner = 'alice'", null));
+    try std.testing.expect(try shouldDeliver(a, &tdb.d, col, &su, 0, .create, "s1", "target.owner = 'alice'", null));
+}
+
+test "#499: a delete snapshot that cannot be authorized is a per-item deny, never an error" {
+    // `frameForCollectionDelivery` is the backfill chokepoint: an error there 500s the whole page,
+    // and the retained event repeats it on every retry of the checkpoint. A snapshot that no longer
+    // fits its field (here a string in a bool column) must deny that one item for every caller,
+    // while well-formed deletes on the same relation-bearing collection still reach their owner.
+    var env = try PoolEnv.init();
+    defer env.deinit();
+    const a = std.testing.allocator;
+    var app = App{ .allocator = a, .io = std.testing.io, .pool = &env.pool };
+    var rnotes: schema.Collection = undefined;
+    {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        const principals = try collections.create(a, std.testing.io, w, .{ .id = "", .name = "principals", .type = .auth, .fields = &.{} });
+        defer principals.deinit(a);
+        try w.exec("INSERT INTO principals (id,created,updated,email,passwordHash,tokenKey,verified) VALUES ('u1','','','u1@example.test','','test-key',1),('u2','','','u2@example.test','','test-key',1);");
+        rnotes = try collections.create(a, std.testing.io, w, .{
+            .id = "",
+            .name = "rnotes",
+            .fields = &[_]schema.Field{
+                .{ .id = "f1", .name = "owner", .options = .{ .relation = .{ .targetCollectionId = principals.id, .maxSelect = 1 } } },
+                .{ .id = "f2", .name = "flag", .options = .{ .bool = .{} } },
+            },
+            .viewRule = "owner = @request.auth.id",
+        });
+    }
+    defer rnotes.deinit(a);
+
+    const jwt = @import("../jwt.zig");
+    const key = @import("../crypto.zig").deriveKey(app.jwt_secret, "test-key");
+    var owner = try authedConn(a, "u1", false);
+    defer freeConn(a, &owner);
+    var other = try authedConn(a, "u2", false);
+    defer freeConn(a, &other);
+    const owner_token = try jwt.sign(a, .{ .id = "u1", .collection = "principals", .type = .auth, .iat = 0, .exp = 9999999999 }, &key);
+    defer a.free(owner_token);
+    const other_token = try jwt.sign(a, .{ .id = "u2", .collection = "principals", .type = .auth, .iat = 0, .exp = 9999999999 }, &key);
+    defer a.free(other_token);
+    owner.auth.?.token = owner_token;
+    other.auth.?.token = other_token;
+
+    inline for (.{ .{ std.json.Value{ .bool = true }, true }, .{ std.json.Value{ .string = "not-a-bool" }, false } }) |c| {
+        const ef = try snapshotFramesForTest(a, c[0]);
+        defer ef.deinit(a);
+        const out = try frameForCollectionDelivery(a, &app, &owner, null, "rnotes", ef.frame_collection, rnotes.id);
+        defer if (out) |o| a.free(o);
+        try std.testing.expectEqual(c[1], out != null);
+        try std.testing.expect((try frameForCollectionDelivery(a, &app, &other, null, "rnotes", ef.frame_collection, rnotes.id)) == null);
+    }
+}
+
+fn snapshotFramesForTest(a: std.mem.Allocator, flag: std.json.Value) !EventFrames {
+    var snap: std.json.ObjectMap = .empty;
+    defer snap.deinit(a);
+    try snap.put(a, "id", .{ .string = "GONE" });
+    try snap.put(a, "owner", .{ .string = "u1" });
+    try snap.put(a, "flag", flag);
+    return buildEventFrames(a, "rnotes", .delete, "GONE", .{ .object = snap });
+}
+
+test "delete delivery fixture releases snapshot on every allocation failure" {
+    const Check = struct {
+        fn run(a: std.mem.Allocator) !void {
+            const frames = try snapshotFramesForTest(a, .{ .bool = true });
+            defer frames.deinit(a);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+}
+
+test "live delivery drops queued record deletes after collection removal" {
+    var env = try PoolEnv.init();
+    defer env.deinit();
+    const a = std.testing.allocator;
+    var app = App{ .allocator = a, .io = std.testing.io, .pool = &env.pool };
+    const col = blk: {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        break :blk try collections.create(a, std.testing.io, w, .{
+            .id = "",
+            .name = "rnotes",
+            .fields = &.{
+                .{ .id = "owner", .name = "owner", .options = .{ .text = .{} } },
+                .{ .id = "flag", .name = "flag", .hidden = true, .options = .{ .text = .{} } },
+            },
+            .viewRule = "owner = @request.auth.id",
+        });
+    };
+    defer col.deinit(a);
+    // Queue a private record envelope while metadata still exists. An anonymous
+    // subscriber must never receive it via the default-allow custom topic guard.
+    const frames = try snapshotFramesForTest(a, .{ .string = "gold-hidden-marker" });
+    defer frames.deinit(a);
+    {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        try w.exec("DROP TABLE rnotes; DELETE FROM _collections WHERE name='rnotes';");
+    }
+    const anon = Conn{};
+    try std.testing.expect(frameForDelivery(a, &app, &anon, null, frames.collection_channel, frames.frame_collection) == null);
+    try std.testing.expect(frameForDelivery(a, &app, &anon, null, frames.record_channel, frames.frame_record) == null);
+    // Public custom messages still retain their intended behavior.
+    const message = "{\"type\":\"message\",\"data\":1}";
+    try std.testing.expectEqualStrings(message, frameForDelivery(a, &app, &anon, null, "rnotes", message).?);
+}
+
+test "delete preparation propagates snapshot OOM and database failures before removal" {
+    var env = try PoolEnv.init();
+    defer env.deinit();
+    const a = std.testing.allocator;
+    var app = App{ .allocator = a, .io = std.testing.io, .pool = &env.pool };
+    const w = env.pool.acquireWriter();
+    defer env.pool.releaseWriter();
+    const col = try collections.create(a, std.testing.io, w, .{
+        .id = "",
+        .name = "capture_notes",
+        .fields = &.{.{ .id = "tier", .name = "tier", .hidden = true, .options = .{ .text = .{} } }},
+    });
+    defer col.deinit(a);
+    try w.exec("INSERT INTO capture_notes (id,created,updated,tier) VALUES ('n1','','','gold');");
+    const hook_read = (try records.get(a, w, col, "n1")).?;
+    defer records.freeRecord(a, hook_read);
+    try std.testing.expect(hook_read.object.get("tier") == null);
+    try w.beginImmediate();
+    var txn_open = true;
+    defer if (txn_open) w.rollback() catch |err| std.log.err("test rollback failed: {s}", .{@errorName(err)});
+    const ws = @import("ws.zig");
+    try std.testing.expectError(error.OutOfMemory, ws.prepareDelete(std.testing.failing_allocator, &app, w, col, "n1", hook_read));
+    // Transactional DDL makes the required capture SELECT fail without losing the
+    // initial hook record. The caller must roll back, never broadcast that record.
+    try w.exec("ALTER TABLE capture_notes RENAME COLUMN tier TO lost_tier;");
+    try std.testing.expectError(error.PrepareFailed, ws.prepareDelete(a, &app, w, col, "n1", hook_read));
+    try w.rollback();
+    txn_open = false;
+    const surviving = (try records.getDeleteSnapshot(a, w, col, "n1")).?;
+    defer records.freeRecord(a, surviving);
+    try std.testing.expectEqualStrings("gold", surviving.object.get("tier").?.string);
+}
+
+test "#499: a sandbox database failure or OutOfMemory propagates instead of denying the delete" {
+    // These say the server cannot answer NOW, not that the item is unauthorizable: denying them
+    // would let backfill answer 200 and advance the checkpoint past a delete the owner may see.
+    // An error lets the page answer 500 and a retry of the same checkpoint deliver it.
+    var tdb = try TestDb.init();
+    defer tdb.deinit();
+    const a = std.testing.allocator;
+    const col = try typedCollection(a, &tdb, "owner = @request.auth.id");
+    defer col.deinit(a);
+    var map: std.json.ObjectMap = .empty;
+    defer map.deinit(a);
+    try map.put(a, "id", .{ .string = "GONE" });
+    try map.put(a, "owner", .{ .string = "u1" });
+    var owner = try authedConn(a, "u1", false);
+    defer freeConn(a, &owner);
+    // Evict whatever an earlier test cached, and leave the slot empty for later tests.
+    if (snapshot_sandbox) |*c| c.deinit();
+    snapshot_sandbox = null;
+    defer {
+        if (snapshot_sandbox) |*c| c.deinit();
+        snapshot_sandbox = null;
+    }
+    try std.testing.expect(try shouldDeliver(a, &tdb.d, col, &owner, 0, .delete, "GONE", null, .{ .object = map }));
+
+    // A SQLite failure inside the (cached) sandbox: its table is gone, so the guarded SELECT
+    // cannot be prepared. Same snapshot, same key: the next delivery reuses this sandbox.
+    try snapshot_sandbox.?.db.exec("DROP TABLE typed;");
+    try std.testing.expectError(error.PrepareFailed, shouldDeliver(a, &tdb.d, col, &owner, 0, .delete, "GONE", null, .{ .object = map }));
+
+    // OutOfMemory in the rule evaluation's allocator.
+    var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, shouldDeliver(failing.allocator(), &tdb.d, col, &owner, 0, .delete, "GONE", null, .{ .object = map }));
+}
+
+test "#499: an unauthorizable delete snapshot denies at shouldDeliver for every non-superuser" {
+    var tdb = try TestDb.init();
+    defer tdb.deinit();
+    const a = std.testing.allocator;
+    const col = try typedCollection(a, &tdb, "owner = @request.auth.id");
+    defer col.deinit(a);
+    var map: std.json.ObjectMap = .empty;
+    defer map.deinit(a);
+    try map.put(a, "id", .{ .string = "GONE" });
+    try map.put(a, "owner", .{ .string = "u1" });
+    try map.put(a, "price", .{ .string = "not-a-number" }); // cannot be stored in the fixed column
+    var owner = try authedConn(a, "u1", false);
+    defer freeConn(a, &owner);
+    try std.testing.expect(!try shouldDeliver(a, &tdb.d, col, &owner, 0, .delete, "GONE", null, .{ .object = map }));
+    // The superuser short-circuits before any snapshot evaluation, as for every delete.
+    var su = try authedConn(a, "root", true);
+    defer freeConn(a, &su);
+    try std.testing.expect(try shouldDeliver(a, &tdb.d, col, &su, 0, .delete, "GONE", null, .{ .object = map }));
+}
+
+test "relation delete authorization matches live delivery at signed integer boundaries" {
+    var tdb = try TestDb.init();
+    defer tdb.deinit();
+    const a = std.testing.allocator;
+    const owners = try collections.create(a, std.testing.io, &tdb.d, .{ .id = "", .name = "owners", .fields = &.{} });
+    defer owners.deinit(a);
+    try tdb.d.exec("INSERT INTO owners (id,created,updated) VALUES ('u1','',''),('u2','','');");
+    const col = try collections.create(a, std.testing.io, &tdb.d, .{
+        .id = "",
+        .name = "boundary_notes",
+        .fields = &.{
+            .{ .id = "o1", .name = "owner", .options = .{ .relation = .{ .targetCollectionId = owners.id, .maxSelect = 1 } } },
+            .{ .id = "n1", .name = "amount", .options = .{ .number = .{ .mode = .int } } },
+        },
+        .viewRule = "owner = @request.auth.id",
+    });
+    defer col.deinit(a);
+    var owner = try authedConn(a, "u1", false);
+    defer freeConn(a, &owner);
+    var other = try authedConn(a, "u2", false);
+    defer freeConn(a, &other);
+    for ([_]i64{ std.math.minInt(i64), std.math.maxInt(i64) }) |amount| {
+        var input: std.json.ObjectMap = .empty;
+        defer input.deinit(a);
+        try input.put(a, "owner", .{ .string = "u1" });
+        // JSON integers bind directly on the write path; reads return decimal strings.
+        try input.put(a, "amount", .{ .integer = amount });
+        const created = try records.create(a, std.testing.io, &tdb.d, col, .{ .object = input });
+        defer records.freeRecord(a, created);
+        const rid = created.object.get("id").?.string;
+        const snapshot = (try records.getDeleteSnapshot(a, &tdb.d, col, rid)).?;
+        defer records.freeRecord(a, snapshot);
+        try std.testing.expect(snapshot.object.get("amount").? == .string);
+        const live_owner = try shouldDeliver(a, &tdb.d, col, &owner, 0, .update, rid, null, null);
+        const live_other = try shouldDeliver(a, &tdb.d, col, &other, 0, .update, rid, null, null);
+        try std.testing.expect(live_owner);
+        try std.testing.expect(!live_other);
+        try std.testing.expect(try records.deleteInTxn(a, &tdb.d, col, rid));
+        try std.testing.expectEqual(live_owner, try shouldDeliver(a, &tdb.d, col, &owner, 0, .delete, rid, null, snapshot));
+        try std.testing.expectEqual(live_other, try shouldDeliver(a, &tdb.d, col, &other, 0, .delete, rid, null, snapshot));
+    }
 }
