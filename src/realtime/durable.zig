@@ -9,8 +9,7 @@ pub const max_entries = options.replay_max_entries;
 pub const max_bytes = options.replay_max_bytes;
 pub const max_frame_bytes = options.replay_max_frame_bytes;
 pub const retention_seconds = options.replay_retention_seconds;
-pub const Entry = struct { frame: []const u8 };
-pub const Page = struct { items: []const Entry, position: []const u8, has_next: bool };
+const backfill = @import("backfill.zig");
 
 fn prep(a: std.mem.Allocator, conn: *db.Db, sql: []const u8) !db.Stmt {
     const pg = db.dbDialect(conn).kind == .postgres;
@@ -153,87 +152,157 @@ pub fn requireReset(a: std.mem.Allocator, conn: *db.Db) !void {
     try execute(a, conn, "DELETE FROM journal._replay_events WHERE sequence<=(SELECT floor FROM journal._replay_state WHERE id=1);");
 }
 
-/// A consistent read transaction protects metadata/rows against concurrent prune.
-/// Current authorization is applied by the HTTP layer AFTER releasing this reader.
-pub fn readPage(arena: Arena, io: std.Io, conn: *db.Db, collection: []const u8, binding: []const u8, cursor: ?[]const u8, limit: usize, now: i64) !Page {
-    if (limit == 0 or limit > 128) return error.BadLimit;
+/// Per-request ceiling on examined journal entries (`backfill.fill`). At or above the
+/// retention ceiling a page always reaches the head it started from, so neither its
+/// items, `hasNext` nor page count depend on entries the caller may not see (#501).
+/// Builds with `-Dreplay-max-entries` above 4096 can end a page early (see docs/api.md).
+pub const scan_budget: usize = @min(max_entries, 4096);
+/// Rows per read transaction while scanning. Bounds a chunk's transient frame copies.
+pub const scan_chunk: usize = 128;
+
+/// A checkpoint resolved against the journal: the position to scan after, the head
+/// the scan stops at, and the key that seals the next cursor.
+pub const Resolved = struct { after: i64, head: i64, key: [32]u8 };
+
+fn begin(conn: *db.Db) !void {
     if (conn.inTransaction()) return error.NestedTransaction;
     if (db.dbDialect(conn).kind == .postgres) try conn.exec("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY;") else try conn.exec("BEGIN;");
-    errdefer conn.rollback() catch |err| std.log.warn("replay read rollback: {s}", .{@errorName(err)});
-    const a = arena.a;
+}
+
+/// Journal head and effective floor (discarded or expired prefix) in the open transaction.
+fn bounds(a: std.mem.Allocator, conn: *db.Db, now: i64, key: ?*[32]u8) !struct { head: i64, floor: i64 } {
     var state = try prep(a, conn, "SELECT secret,sequence,floor,COALESCE((SELECT MAX(sequence) FROM journal._replay_events WHERE expires<=?1),0) FROM journal._replay_state WHERE id=1;");
     defer state.finalize();
     try state.bindInt(1, now);
     if (!try state.step()) return error.ReplayUnavailable;
+    if (key) |out| {
+        if (state.columnText(0).len != 64) return error.InvalidReplaySecret;
+        _ = std.fmt.hexToBytes(out, state.columnText(0)) catch return error.InvalidReplaySecret;
+    }
+    return .{ .head = state.columnInt(1), .floor = @max(state.columnInt(2), state.columnInt(3)) };
+}
+
+/// Opens `cursor` (null: a fresh checkpoint at the head). Cursors mean "after this
+/// sequence". Equality with the floor has missed no event; rejecting it would also
+/// invalidate a fresh checkpoint on an idle journal.
+pub fn resolve(a: std.mem.Allocator, conn: *db.Db, binding: []const u8, cursor: ?[]const u8, now: i64) !Resolved {
+    try begin(conn);
+    errdefer conn.rollback() catch |err| std.log.warn("replay read rollback: {s}", .{@errorName(err)});
     var key: [32]u8 = undefined;
-    if (state.columnText(0).len != 64) return error.InvalidReplaySecret;
-    _ = std.fmt.hexToBytes(&key, state.columnText(0)) catch return error.InvalidReplaySecret;
-    const head = state.columnInt(1);
-    const floor = @max(state.columnInt(2), state.columnInt(3));
-    state.reset();
-    var after = head;
+    const b = try bounds(a, conn, now, &key);
+    var after = b.head;
     if (cursor) |c| {
         after = try openCursor(key, binding, c);
-        // Cursors mean "after this sequence". Equality has missed no event;
-        // rejecting it would also invalidate a fresh checkpoint on an idle journal.
-        if (after < floor or after > head) return error.ResetRequired;
+        if (after < b.floor or after > b.head) return error.ResetRequired;
     }
+    try conn.commit();
+    return .{ .after = after, .head = b.head, .key = key };
+}
+
+/// One chunk of raw (unauthorized) entries of `collection` in `(after, upto]`, at most
+/// `max`. `next` is the last returned sequence when more remain, else `upto`. A
+/// consistent read transaction protects metadata/rows against concurrent prune; current
+/// authorization is applied by the caller AFTER releasing this reader. A floor that
+/// passed `after` since the previous chunk requires reset, like a stale cursor.
+pub fn readPage(arena: Arena, conn: *db.Db, collection: []const u8, after: i64, upto: i64, max: usize, now: i64) !backfill.Page {
+    if (max == 0 or max > scan_chunk) return error.BadLimit;
+    try begin(conn);
+    errdefer conn.rollback() catch |err| std.log.warn("replay read rollback: {s}", .{@errorName(err)});
+    const a = arena.a;
+    const b = try bounds(a, conn, now, null);
+    if (after < b.floor or after > upto or upto > b.head) return error.ResetRequired;
     var rows = try prep(a, conn, if (db.dbDialect(conn).kind == .postgres)
-        "SELECT sequence,CASE WHEN octet_length(frame)<=?4 THEN frame ELSE NULL END FROM journal._replay_events WHERE sequence>?1 AND collection=?2 ORDER BY sequence LIMIT ?3;"
+        "SELECT sequence,CASE WHEN octet_length(frame)<=?4 THEN frame ELSE NULL END FROM journal._replay_events WHERE sequence>?1 AND sequence<=?5 AND collection=?2 ORDER BY sequence LIMIT ?3;"
     else
-        "SELECT sequence,CASE WHEN length(CAST(frame AS BLOB))<=?4 THEN frame ELSE NULL END FROM journal._replay_events WHERE sequence>?1 AND collection=?2 ORDER BY sequence LIMIT ?3;");
+        "SELECT sequence,CASE WHEN length(CAST(frame AS BLOB))<=?4 THEN frame ELSE NULL END FROM journal._replay_events WHERE sequence>?1 AND sequence<=?5 AND collection=?2 ORDER BY sequence LIMIT ?3;");
     defer rows.finalize();
     try rows.bindInt(1, after);
     try rows.bindText(2, collection);
-    try rows.bindInt(3, @intCast(limit + 1));
+    try rows.bindInt(3, @intCast(max + 1));
     try rows.bindInt(4, max_frame_bytes);
-    var items: std.ArrayList(Entry) = .empty;
-    var next = head;
+    try rows.bindInt(5, upto);
+    var items: std.ArrayList(backfill.Entry) = .empty;
     var more = false;
-    var last = after;
     while (try rows.step()) {
-        if (items.items.len == limit) {
-            next = last;
+        if (items.items.len == max) {
             more = true;
             break;
         }
         if (rows.isNull(1)) return error.ReplayFrameTooLarge;
         const frame = rows.columnText(1);
         if (frame.len > max_frame_bytes) return error.ReplayFrameTooLarge;
-        try items.append(a, .{ .frame = try a.dupe(u8, frame) });
-        last = rows.columnInt(0);
+        try items.append(a, .{ .sequence = @intCast(rows.columnInt(0)), .frame = try a.dupe(u8, frame) });
     }
     rows.reset();
-    const position = try sealCursor(a, io, key, binding, next);
     try conn.commit();
-    return .{ .items = items.items, .position = position, .has_next = more };
+    const next: u64 = if (more) items.items[items.items.len - 1].sequence else @intCast(upto);
+    return .{ .items = items.items, .topic = collection, .generation = 0, .next = next, .has_next = more };
 }
 
 const Cipher = std.crypto.aead.chacha_poly.XChaCha20Poly1305;
-const cursor_bytes = Cipher.nonce_length + 8 + Cipher.tag_length;
 
-fn sealCursor(a: std.mem.Allocator, io: std.Io, key: [32]u8, binding: []const u8, sequence: i64) ![]u8 {
-    var token: [cursor_bytes]u8 = undefined;
+/// Seals `words` under `key` with a fresh random nonce, authenticating `binding` as
+/// associated data: the hex token reveals neither the words nor whether two tokens
+/// carry equal ones. Shared by the durable journal and the process-local store (#496).
+pub fn seal(comptime n: usize, a: std.mem.Allocator, io: std.Io, key: [32]u8, binding: []const u8, words: [n]u64) ![]u8 {
+    var token: [Cipher.nonce_length + 8 * n + Cipher.tag_length]u8 = undefined;
     const nonce = token[0..Cipher.nonce_length];
     io.random(nonce);
-    var plaintext: [8]u8 = undefined;
-    std.mem.writeInt(i64, &plaintext, sequence, .big);
-    Cipher.encrypt(token[Cipher.nonce_length..][0..8], token[Cipher.nonce_length + 8 ..][0..Cipher.tag_length], &plaintext, binding, nonce.*, key);
+    var plaintext: [8 * n]u8 = undefined;
+    for (words, 0..) |word, i| std.mem.writeInt(u64, plaintext[8 * i ..][0..8], word, .big);
+    Cipher.encrypt(token[Cipher.nonce_length..][0 .. 8 * n], token[Cipher.nonce_length + 8 * n ..][0..Cipher.tag_length], &plaintext, binding, nonce.*, key);
     const encoded = std.fmt.bytesToHex(token, .lower);
     return a.dupe(u8, &encoded);
 }
 
-fn openCursor(key: [32]u8, binding: []const u8, cursor: []const u8) !i64 {
-    if (cursor.len != cursor_bytes * 2) return error.ResetRequired;
-    var token: [cursor_bytes]u8 = undefined;
+/// Opens a `seal` token. Any malformed, forged, re-bound or foreign-key token is
+/// `ResetRequired`, indistinguishable from a stale cursor.
+pub fn open(comptime n: usize, key: [32]u8, binding: []const u8, cursor: []const u8) ![n]u64 {
+    var token: [Cipher.nonce_length + 8 * n + Cipher.tag_length]u8 = undefined;
+    if (cursor.len != token.len * 2) return error.ResetRequired;
     _ = std.fmt.hexToBytes(&token, cursor) catch return error.ResetRequired;
-    var plaintext: [8]u8 = undefined;
-    Cipher.decrypt(&plaintext, token[Cipher.nonce_length..][0..8], token[Cipher.nonce_length + 8 ..][0..Cipher.tag_length].*, binding, token[0..Cipher.nonce_length].*, key) catch return error.ResetRequired;
-    return std.mem.readInt(i64, &plaintext, .big);
+    var plaintext: [8 * n]u8 = undefined;
+    Cipher.decrypt(&plaintext, token[Cipher.nonce_length..][0 .. 8 * n], token[Cipher.nonce_length + 8 * n ..][0..Cipher.tag_length].*, binding, token[0..Cipher.nonce_length].*, key) catch return error.ResetRequired;
+    var words: [n]u64 = undefined;
+    for (&words, 0..) |*word, i| word.* = std.mem.readInt(u64, plaintext[8 * i ..][0..8], .big);
+    return words;
 }
 
-fn page(arena: Arena, conn: *db.Db, collection: []const u8, cursor: ?[]const u8, limit: usize, now: i64) !Page {
-    return readPage(arena, std.testing.io, conn, collection, collection, cursor, limit, now);
+/// The journal's cursor token: one sealed sequence, the same bytes as before #496
+/// generalized the sealing, so existing checkpoints stay valid across the upgrade.
+pub fn sealCursor(a: std.mem.Allocator, io: std.Io, key: [32]u8, binding: []const u8, sequence: i64) ![]u8 {
+    return seal(1, a, io, key, binding, .{@bitCast(sequence)});
+}
+
+fn openCursor(key: [32]u8, binding: []const u8, cursor: []const u8) !i64 {
+    return @bitCast((try open(1, key, binding, cursor))[0]);
+}
+
+/// Test helper: one unauthorized page through the same resolve/scan/seal path the
+/// HTTP layer uses, with every entry delivered.
+const TestPage = struct { items: []const backfill.Entry, position: []const u8, has_next: bool };
+fn page(arena: Arena, conn: *db.Db, collection: []const u8, cursor: ?[]const u8, limit: usize, now: i64) !TestPage {
+    const resolved = try resolve(arena.a, conn, collection, cursor, now);
+    const Source = struct {
+        conn: *db.Db,
+        collection: []const u8,
+        upto: i64,
+        now: i64,
+        pub fn fetch(self: @This(), chunk_arena: Arena, after: u64, max: usize) !backfill.Page {
+            return readPage(chunk_arena, self.conn, self.collection, @intCast(after), self.upto, max, self.now);
+        }
+    };
+    const All = struct {
+        a: std.mem.Allocator,
+        pub fn deliver(self: @This(), _: std.mem.Allocator, entry: backfill.Entry) !?backfill.Entry {
+            return .{ .sequence = entry.sequence, .frame = try self.a.dupe(u8, entry.frame) };
+        }
+    };
+    const filled = if (cursor == null)
+        backfill.Filled(backfill.Entry){ .items = &.{}, .next = @intCast(resolved.head), .has_next = false }
+    else
+        try backfill.fill(backfill.Entry, arena, Source{ .conn = conn, .collection = collection, .upto = resolved.head, .now = now }, All{ .a = arena.a }, @intCast(resolved.after), limit, scan_budget, scan_chunk);
+    return .{ .items = filled.items, .position = try sealCursor(arena.a, std.testing.io, resolved.key, collection, @intCast(filled.next)), .has_next = filled.has_next };
 }
 
 test "journal transaction rollback pagination expiry and hard budgets" {
@@ -405,6 +474,82 @@ test "journal count budget evicts oldest entry and preserves newest prefix" {
     try std.testing.expectEqual(@as(i64, max_entries), size.columnInt(0));
     try std.testing.expectEqual(@as(i64, 2), size.columnInt(1));
     try std.testing.expectEqual(@as(i64, max_entries) + 1, size.columnInt(2));
+}
+
+test "journal pages fill with authorized entries, whatever hidden writes they skip (#501)" {
+    const a = std.testing.allocator;
+    var conn = try db.Db.openMemory();
+    defer conn.close();
+    try initialize(a, std.testing.io, &conn);
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    const arena = Arena{ .a = scratch.allocator() };
+    const Mine = struct {
+        pub fn deliver(_: @This(), _: std.mem.Allocator, e: backfill.Entry) !?backfill.Entry {
+            return if (std.mem.eql(u8, e.frame, "mine")) e else null;
+        }
+    };
+    const Source = struct {
+        conn: *db.Db,
+        upto: i64,
+        pub fn fetch(self: @This(), chunk_arena: Arena, after: u64, max: usize) !backfill.Page {
+            return readPage(chunk_arena, self.conn, "one", @intCast(after), self.upto, max, 100);
+        }
+    };
+    var outcomes: [2][8]struct { items: usize, has_next: bool } = undefined;
+    var counts: [2]usize = .{ 0, 0 };
+    for ([_]usize{ 1, 3 }, 0..) |hidden, case| {
+        const checkpoint = try resolve(a, &conn, "one", null, 100);
+        try conn.beginImmediate();
+        for (0..2) |_| {
+            for (0..hidden) |_| try append(a, &conn, "one", "hidden", 100);
+            try append(a, &conn, "other", "mine", 100); // another collection never counts
+            try append(a, &conn, "one", "mine", 100);
+        }
+        for (0..hidden) |_| try append(a, &conn, "one", "hidden", 100);
+        try conn.commit();
+        var cursor = try sealCursor(a, std.testing.io, checkpoint.key, "one", checkpoint.after);
+        defer a.free(cursor);
+        while (true) {
+            const resolved = try resolve(a, &conn, "one", cursor, 100);
+            // Chunks of one row: the scan crosses several read transactions.
+            const filled = try backfill.fill(backfill.Entry, arena, Source{ .conn = &conn, .upto = resolved.head }, Mine{}, @intCast(resolved.after), 1, scan_budget, 1);
+            outcomes[case][counts[case]] = .{ .items = filled.items.len, .has_next = filled.has_next };
+            counts[case] += 1;
+            const next = try sealCursor(a, std.testing.io, resolved.key, "one", @intCast(filled.next));
+            a.free(cursor);
+            cursor = next;
+            if (!filled.has_next) break;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 2), counts[0]);
+    try std.testing.expectEqual(counts[0], counts[1]);
+    for (outcomes[0][0..counts[0]], outcomes[1][0..counts[1]], [_]bool{ true, false }) |one, three, has_next| {
+        try std.testing.expectEqual(@as(usize, 1), one.items);
+        try std.testing.expectEqual(has_next, one.has_next);
+        try std.testing.expectEqual(one, three);
+    }
+}
+
+test "a chunk whose floor passed its position requires reset" {
+    const a = std.testing.allocator;
+    var conn = try db.Db.openMemory();
+    defer conn.close();
+    try initialize(a, std.testing.io, &conn);
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    const arena = Arena{ .a = scratch.allocator() };
+    try conn.beginImmediate();
+    try append(a, &conn, "one", "first", 100);
+    try conn.commit();
+    // Expired by the read's clock: the scan cannot continue from before the floor,
+    // and cannot read past the head the request resolved.
+    try std.testing.expectError(error.ResetRequired, readPage(arena, &conn, "one", 0, 1, 1, 100 + retention_seconds));
+    try std.testing.expectError(error.ResetRequired, readPage(arena, &conn, "one", 0, 2, 1, 100));
+    const ok = try readPage(arena, &conn, "one", 0, 1, 1, 100);
+    try std.testing.expectEqual(@as(usize, 1), ok.items.len);
+    try std.testing.expect(!ok.has_next);
+    try std.testing.expectEqual(@as(u64, 1), ok.next);
 }
 
 test "opaque cursor authenticates scope and ciphertext without exposing positions" {

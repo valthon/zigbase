@@ -1,6 +1,7 @@
 """Live opt-in checks: ZIGBASE_TEST_BACKFILL_BINARY must use -Drealtime-backfill=true."""
 import json
 import os
+import re
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -250,11 +251,11 @@ def test_large_delete_snapshot_resets_only_its_collection(server):
         assert status == 200 and quiet["items"] == [] and not quiet["hasNext"]
 
 
-def relation_delete_scenario(server, token, suffix=""):
-    """#499 scenario, shared with the durable-journal suite (SQLite and PostgreSQL). Creates an auth
-    collection, two signed-in users, and a collection whose `owner` is a RELATION to the users under
-    `owner = @request.auth.id`. Bob creates and deletes a row between both users' checkpoints;
-    Alice then creates her own. `suffix` keeps names unique on a shared PostgreSQL database."""
+def owner_scoped(server, token, suffix=""):
+    """An auth collection, two signed-in users (alice, bob), and a collection whose `owner` is a
+    RELATION to the users under `owner = @request.auth.id`: each user sees only their own rows.
+    `suffix` keeps names unique on a shared PostgreSQL database. Returns
+    `(owned_name, owned_collection, {name: (token, user_id)})`."""
     users_name, owned_name = "users" + suffix, "owned" + suffix
     status, users = call(server, "POST", "/api/collections", {"name": users_name, "type": "auth", "fields": []}, token)
     assert status == 201, users
@@ -274,6 +275,14 @@ def relation_delete_scenario(server, token, suffix=""):
         status, auth = call(server, "POST", f"/api/collections/{users_name}/auth-with-password", {"identity": email, "password": name + "password"})
         assert status == 200, auth
         sessions[name] = (auth["token"], user["id"])
+    return owned_name, owned, sessions
+
+
+def relation_delete_scenario(server, token, suffix=""):
+    """#499 scenario, shared with the durable-journal suite (SQLite and PostgreSQL). Bob creates and
+    deletes a row of an owner-scoped relation collection between both users' checkpoints; Alice then
+    creates her own."""
+    owned_name, _, sessions = owner_scoped(server, token, suffix)
     (alice, alice_id), (bob, bob_id) = sessions["alice"], sessions["bob"]
     records = f"/api/collections/{owned_name}/records"
 
@@ -372,3 +381,94 @@ def test_fk_cascade_replay_is_authorized_per_item(server):
     update events, each replayed only to callers whose rule admits that row."""
     token, _ = setup(server)
     cascade_owner_scenario(server, token)
+
+
+def assert_opaque(cursor, collection_id):
+    """A cursor is `<collection id>[:<rename epoch>]:<sealed token>`: the token is hex ciphertext,
+    so no part of it reads as a position (#496)."""
+    prefix, token = cursor.rsplit(":", 1)
+    assert prefix == collection_id or re.fullmatch(re.escape(collection_id) + r":\d+", prefix), cursor
+    assert re.fullmatch(r"[0-9a-f]{96,}", token), cursor
+
+
+def hidden_cursor(server, token, hidden, suffix):
+    """Alice's cursor after Bob wrote `hidden` rows she may not see. Returns the collection id and
+    two cursors issued for the same position."""
+    owned_name, owned, sessions = owner_scoped(server, token, suffix)
+    (alice, _), (bob, bob_id) = sessions["alice"], sessions["bob"]
+    status, checkpoint = backfill(server, token=alice, topic=owned_name)
+    assert status == 200, checkpoint
+    for i in range(hidden):
+        status, row = call(server, "POST", f"/api/collections/{owned_name}/records", {"title": f"b{i}", "owner": bob_id}, bob)
+        assert status == 201, row
+    cursors = []
+    for _ in range(2):
+        status, page = backfill(server, checkpoint["nextCursor"], token=alice, topic=owned_name)
+        assert status == 200 and page["items"] == [] and not page["hasNext"], page
+        cursors.append(page["nextCursor"])
+    # The sealed cursor still resumes: nothing new for Alice.
+    status, page = backfill(server, cursors[0], token=alice, topic=owned_name)
+    assert status == 200 and page["items"] == [] and not page["hasNext"], page
+    return owned["id"], cursors
+
+
+def hidden_cursor_scenario(server, token, suffix=""):
+    """#496: a caller's cursor bytes must not count writes it may not see. Bob writes once vs twice;
+    Alice's cursors have the same opaque shape and length, and a fresh nonce per response."""
+    lengths = []
+    for hidden in (1, 2):
+        collection_id, (first, second) = hidden_cursor(server, token, hidden, f"{suffix}_c{hidden}")
+        assert_opaque(first, collection_id)
+        assert_opaque(second, collection_id)
+        assert first != second  # sealed per response: equal positions do not compare equal
+        lengths.append(len(first))
+    assert lengths[0] == lengths[1], lengths
+
+
+def hidden_paging(server, token, hidden, suffix):
+    """Alice pages at limit=1 over `hidden` rows by Bob, one row of her own, then `hidden` more by
+    Bob. Returns every page Alice gets, with her row's id normalized away."""
+    owned_name, owned, sessions = owner_scoped(server, token, suffix)
+    (alice, alice_id), (bob, bob_id) = sessions["alice"], sessions["bob"]
+    records = f"/api/collections/{owned_name}/records"
+    status, checkpoint = backfill(server, limit=1, token=alice, topic=owned_name)
+    assert status == 200, checkpoint
+
+    def bob_writes():
+        for i in range(hidden):
+            status, row = call(server, "POST", records, {"title": f"b{i}", "owner": bob_id}, bob)
+            assert status == 201, row
+
+    bob_writes()
+    status, own = call(server, "POST", records, {"title": "a-row", "owner": alice_id}, alice)
+    assert status == 201, own
+    bob_writes()
+    pages, cursor = [], checkpoint["nextCursor"]
+    while True:
+        status, page = backfill(server, cursor, limit=1, token=alice, topic=owned_name)
+        assert status == 200, page
+        assert_opaque(page["nextCursor"], owned["id"])
+        pages.append((json.dumps(page["items"]).replace(own["id"], "OWN"), page["hasNext"]))
+        cursor = page["nextCursor"]
+        if not page["hasNext"]:
+            return pages
+        assert len(pages) < 16, pages
+
+
+def hidden_paging_scenario(server, token, suffix=""):
+    """#501: `limit` counts authorized items, so Alice's page count and `hasNext` do not depend on
+    how many of Bob's writes she skipped: one page holding her own create, then nothing."""
+    expected = [(json.dumps([{"type": "event", "topic": "owned" + f"{suffix}_p1", "action": "create", "record": {"id": "OWN"}}]), False)]
+    assert hidden_paging(server, token, 1, f"{suffix}_p1") == expected
+    expected = [(expected[0][0].replace(f"{suffix}_p1", f"{suffix}_p3"), False)]
+    assert hidden_paging(server, token, 3, f"{suffix}_p3") == expected
+
+
+def test_cursor_does_not_count_hidden_writes(server):
+    token, _ = setup(server)
+    hidden_cursor_scenario(server, token)
+
+
+def test_page_count_and_has_next_do_not_count_hidden_writes(server):
+    token, _ = setup(server)
+    hidden_paging_scenario(server, token)

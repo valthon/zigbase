@@ -1,11 +1,16 @@
 //! Bounded, process-local invalidations. Never a durable event log.
+//! Also the paging primitive (`fill`) shared with the durable journal.
 const std = @import("std");
 const RequestArena = @import("../request_arena.zig").RequestArena;
+const durable = @import("durable.zig");
 pub const max_topics = 16;
 pub const max_entries = 256; // per topic
 pub const max_bytes = 64 * 1024; // encoded frames per topic; 1 MiB total
 pub const Entry = struct { sequence: u64, frame: []const u8 };
-pub const Page = struct { items: []const Entry, generation: u64, next: u64, has_next: bool };
+/// Raw (unauthorized) entries after a position. `next` is the last returned sequence
+/// when `has_next`, else the head; `topic` and `generation` bind its sealed cursor.
+pub const Page = struct { items: []const Entry, topic: []const u8, generation: u64, next: u64, has_next: bool };
+pub const Position = struct { generation: u64, sequence: u64 };
 
 const Topic = struct {
     id: []const u8,
@@ -44,7 +49,10 @@ const Topic = struct {
 
 pub const Store = struct {
     allocator: std.mem.Allocator,
-    epoch: [32]u8,
+    io: std.Io,
+    /// Per-process cursor key. A cursor from another process (or before a restart)
+    /// fails authentication and requires reset, as the plaintext epoch did before #496.
+    key: [32]u8,
     mutex: std.atomic.Mutex = .unlocked,
     // Lazy rings: idle enabled servers pay only for these pointers.
     topics: [max_topics]?*Topic = @splat(null),
@@ -65,9 +73,9 @@ pub const Store = struct {
         allocator.destroy(self);
     }
     pub fn init(allocator: std.mem.Allocator, io: std.Io) Store {
-        var entropy: [16]u8 = undefined;
-        io.random(&entropy);
-        return .{ .allocator = allocator, .epoch = std.fmt.bytesToHex(entropy, .lower) };
+        var key: [32]u8 = undefined;
+        io.random(&key);
+        return .{ .allocator = allocator, .io = io, .key = key };
     }
     fn lock(self: *Store) void {
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
@@ -146,39 +154,111 @@ pub const Store = struct {
         self.touch(topic);
         topic.appendOwned(self.allocator, owned);
     }
-    /// Arena-scoped graph: independent frame copies survive concurrent eviction.
-    /// Limit counts this topic's entries before authorization, so denied pages progress.
-    pub fn page(self: *Store, arena: RequestArena, id: []const u8, checkpoint: ?[]const u8, limit: usize) !Page {
+    /// The position a checkpoint names, or (null) a fresh checkpoint at the head,
+    /// which may claim a free slot but never displaces an occupied one. A sealed
+    /// cursor that does not authenticate for `id` under this process's key is reset.
+    pub fn start(self: *Store, id: []const u8, checkpoint: ?[]const u8) !Position {
+        if (checkpoint) |c| {
+            const words = try durable.open(2, self.key, id, c);
+            return .{ .generation = words[0], .sequence = words[1] };
+        }
         self.lock();
         defer self.mutex.unlock();
-        if (limit == 0 or limit > 128) return error.BadLimit;
-        const c = checkpoint orelse {
-            const topic = try self.getOrCreate(id, .free_slot_only);
-            self.touch(topic);
-            return .{ .items = &.{}, .generation = topic.generation, .next = topic.sequence, .has_next = false };
-        };
-        if (c.len < 36 or c[32] != ':' or !std.mem.eql(u8, c[0..32], &self.epoch)) return error.ResetRequired;
-        const separator = std.mem.indexOfScalarPos(u8, c, 33, ':') orelse return error.ResetRequired;
-        const generation = std.fmt.parseInt(u64, c[33..separator], 10) catch return error.ResetRequired;
-        const after = std.fmt.parseInt(u64, c[separator + 1 ..], 10) catch return error.ResetRequired;
+        const topic = try self.getOrCreate(id, .free_slot_only);
+        self.touch(topic);
+        return .{ .generation = topic.generation, .sequence = topic.sequence };
+    }
+    /// Arena-scoped graph: independent frame copies survive concurrent eviction.
+    /// Up to `max` of this topic's raw entries after `from`, before authorization.
+    pub fn read(self: *Store, arena: RequestArena, id: []const u8, from: Position, max: usize) !Page {
+        if (max == 0) return error.BadLimit;
+        self.lock();
+        defer self.mutex.unlock();
         const topic = self.find(id) orelse return error.ResetRequired;
-        if (generation != topic.generation or after < topic.floor or after > topic.sequence) return error.ResetRequired;
+        if (from.generation != topic.generation or from.sequence < topic.floor or from.sequence > topic.sequence) return error.ResetRequired;
         self.touch(topic);
         var out: std.ArrayList(Entry) = .empty;
-        var next = after;
+        var more = false;
         for (0..topic.count) |offset| {
             const e = topic.entries[(topic.first + offset) % max_entries];
-            if (e.sequence <= after) continue;
-            if (out.items.len == limit) break;
+            if (e.sequence <= from.sequence) continue;
+            if (out.items.len == max) {
+                more = true;
+                break;
+            }
             try out.append(arena.a, .{ .sequence = e.sequence, .frame = try arena.a.dupe(u8, e.frame) });
-            next = e.sequence;
         }
-        return .{ .items = out.items, .generation = topic.generation, .next = next, .has_next = next < topic.sequence };
+        const next = if (more) out.items[out.items.len - 1].sequence else topic.sequence;
+        return .{ .items = out.items, .topic = id, .generation = topic.generation, .next = next, .has_next = more };
+    }
+    /// One raw page from a checkpoint (`start` then `read`); a cursorless call is an
+    /// empty page at the head.
+    pub fn page(self: *Store, arena: RequestArena, id: []const u8, checkpoint: ?[]const u8, limit: usize) !Page {
+        if (limit == 0 or limit > 128) return error.BadLimit;
+        const position = try self.start(id, checkpoint);
+        if (checkpoint == null) return .{ .items = &.{}, .topic = id, .generation = position.generation, .next = position.sequence, .has_next = false };
+        return self.read(arena, id, position, limit);
+    }
+    /// A sealed cursor: generation and sequence encrypted under this process's key,
+    /// bound to the topic id. Its bytes reveal neither position, so they cannot count
+    /// writes to the collection the caller may not see (#496).
+    pub fn seal(self: *const Store, allocator: std.mem.Allocator, id: []const u8, position: Position) ![]u8 {
+        return durable.seal(2, allocator, self.io, self.key, id, .{ position.generation, position.sequence });
     }
     pub fn cursor(self: *const Store, allocator: std.mem.Allocator, page_result: Page) ![]u8 {
-        return std.fmt.allocPrint(allocator, "{s}:{d}:{d}", .{ self.epoch, page_result.generation, page_result.next });
+        return self.seal(allocator, page_result.topic, .{ .generation = page_result.generation, .sequence = page_result.next });
     }
 };
+
+/// The result of `fill`: authorized items and where the scan ended.
+pub fn Filled(comptime Item: type) type {
+    return struct { items: []const Item, next: u64, has_next: bool };
+}
+
+/// Fills a page with up to `limit` AUTHORIZED items, scanning raw entries after
+/// `after` in chunks of at most `chunk`, and examining at most `budget` entries.
+///
+/// `source.fetch(arena, after, max) !Page`-shaped: raw entries after `after`, at
+/// most `max`, with `next` (the head when `!has_next`). `authorizer.deliver(scratch,
+/// entry) !?Item`: the caller's item, allocated on its own request arena, or null
+/// when the caller may not see the entry. `scratch` dies with the chunk.
+///
+/// Observable output depends only on authorized entries (#501): `items` are the first
+/// `limit` the caller may see; `has_next` is whether one more exists (it is looked
+/// up, never inferred from hidden entries), and `next` resumes after the last item or,
+/// when none follow, at the source's head. Only exhausting `budget` ends a page on
+/// hidden entries: then `has_next` is true and `next` resumes after the examined ones.
+/// A source that bounds its head (`durable.scan_budget` at or above the retained
+/// entries; the local store's ring) cannot exhaust it.
+///
+/// Contract 4: the items graph (each item and the list) is request-scoped, allocated
+/// on `arena` and freed with it; per-chunk raw copies use a child arena reset per chunk.
+pub fn fill(comptime Item: type, arena: RequestArena, source: anytype, authorizer: anytype, after: u64, limit: usize, budget: usize, chunk: usize) !Filled(Item) {
+    std.debug.assert(limit > 0 and budget > 0 and chunk > 0);
+    var items: std.ArrayList(Item) = .empty;
+    errdefer items.deinit(arena.a);
+    var scratch = std.heap.ArenaAllocator.init(arena.a);
+    defer scratch.deinit();
+    var position = after; // every entry at or before this has been examined
+    var last_item = after;
+    var examined: usize = 0;
+    while (true) {
+        _ = scratch.reset(.retain_capacity);
+        const got = try source.fetch(RequestArena.from(&scratch), position, @min(chunk, budget - examined));
+        std.debug.assert(got.items.len > 0 or !got.has_next);
+        for (got.items) |entry| {
+            examined += 1;
+            if (try authorizer.deliver(scratch.allocator(), entry)) |item| {
+                if (items.items.len == limit) return .{ .items = try items.toOwnedSlice(arena.a), .next = last_item, .has_next = true };
+                try items.append(arena.a, item);
+                last_item = entry.sequence;
+            }
+            position = entry.sequence;
+        }
+        if (!got.has_next) return .{ .items = try items.toOwnedSlice(arena.a), .next = got.next, .has_next = false };
+        if (examined == budget) return .{ .items = try items.toOwnedSlice(arena.a), .next = position, .has_next = true };
+    }
+}
 
 test "quiet topic history and pagination survive hot topic eviction" {
     var store = Store.init(std.testing.allocator, std.testing.io);
@@ -361,4 +441,108 @@ test "PostgreSQL never allocates a backfill store" {
     defer store.destroy();
     try store.append("notes", "{}");
     try std.testing.expectEqual(@as(usize, 1), store.find("notes").?.count);
+}
+
+/// Test source over a fixed entry list; `head` is the position after the last entry.
+const FakeSource = struct {
+    entries: []const Entry,
+    head: u64,
+    pub fn fetch(self: FakeSource, arena: RequestArena, after: u64, max: usize) !Page {
+        var out: std.ArrayList(Entry) = .empty;
+        var more = false;
+        for (self.entries) |e| {
+            if (e.sequence <= after) continue;
+            if (out.items.len == max) {
+                more = true;
+                break;
+            }
+            try out.append(arena.a, e);
+        }
+        return .{ .items = out.items, .topic = "t", .generation = 1, .next = if (more) out.items[out.items.len - 1].sequence else self.head, .has_next = more };
+    }
+};
+
+/// Test authorizer: the caller sees only frames reading "mine".
+const MineOnly = struct {
+    pub fn deliver(_: MineOnly, _: std.mem.Allocator, e: Entry) !?u64 {
+        return if (std.mem.eql(u8, e.frame, "mine")) e.sequence else null;
+    }
+};
+
+const Outcome = struct { items: usize, has_next: bool };
+
+/// Every page a caller gets paging `frames` from the start at `limit`.
+fn pagesOver(frames: []const []const u8, limit: usize, budget: usize, chunk: usize, out: []Outcome) ![]Outcome {
+    var entries: [32]Entry = undefined;
+    for (frames, 0..) |frame, i| entries[i] = .{ .sequence = i + 1, .frame = frame };
+    const source = FakeSource{ .entries = entries[0..frames.len], .head = frames.len };
+    var after: u64 = 0;
+    var n: usize = 0;
+    while (true) : (n += 1) {
+        const filled = try fill(u64, RequestArena.forTest(std.testing.allocator), source, MineOnly{}, after, limit, budget, chunk);
+        defer std.testing.allocator.free(filled.items);
+        for (filled.items) |sequence| try std.testing.expect(sequence > after);
+        out[n] = .{ .items = filled.items.len, .has_next = filled.has_next };
+        after = filled.next;
+        if (!filled.has_next) return out[0 .. n + 1];
+    }
+}
+
+test "fill: items, hasNext and page count do not depend on hidden entries (#501)" {
+    var one_buf: [32]Outcome = undefined;
+    var three_buf: [32]Outcome = undefined;
+    // Hidden entries before, between and after the caller's own two entries.
+    const one = try pagesOver(&.{ "h", "mine", "h", "mine", "h" }, 1, 64, 2, &one_buf);
+    const three = try pagesOver(&.{ "h", "h", "h", "mine", "h", "h", "h", "mine", "h", "h", "h" }, 1, 64, 2, &three_buf);
+    try std.testing.expectEqualSlices(Outcome, &.{ .{ .items = 1, .has_next = true }, .{ .items = 1, .has_next = false } }, one);
+    try std.testing.expectEqualSlices(Outcome, one, three);
+    // Only hidden entries: one empty page, however many there are.
+    const none = try pagesOver(&.{ "h", "h", "h", "h", "h" }, 1, 64, 1, &one_buf);
+    try std.testing.expectEqualSlices(Outcome, &.{.{ .items = 0, .has_next = false }}, none);
+    // A full page whose remaining entries are hidden ends the stream.
+    const full = try pagesOver(&.{ "mine", "h", "h" }, 1, 64, 1, &one_buf);
+    try std.testing.expectEqualSlices(Outcome, &.{.{ .items = 1, .has_next = false }}, full);
+}
+
+test "fill: an exhausted scan budget resumes after the examined entries" {
+    var buf: [32]Outcome = undefined;
+    // The residual the budget allows: 5 hidden entries over a budget of 2 end two pages early.
+    const pages = try pagesOver(&.{ "h", "h", "h", "h", "h", "mine" }, 1, 2, 1, &buf);
+    try std.testing.expectEqualSlices(Outcome, &.{ .{ .items = 0, .has_next = true }, .{ .items = 0, .has_next = true }, .{ .items = 1, .has_next = false } }, pages);
+    // A budget that covers the source never ends a page on hidden entries.
+    const complete = try pagesOver(&.{ "h", "h", "h", "h", "h", "mine" }, 1, 6, 1, &buf);
+    try std.testing.expectEqualSlices(Outcome, &.{.{ .items = 1, .has_next = false }}, complete);
+}
+
+test "fill: allocation failure leaks nothing" {
+    const Check = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            const entries = [_]Entry{ .{ .sequence = 1, .frame = "mine" }, .{ .sequence = 2, .frame = "h" }, .{ .sequence = 3, .frame = "mine" } };
+            const filled = try fill(u64, RequestArena.forTest(allocator), FakeSource{ .entries = &entries, .head = 3 }, MineOnly{}, 0, 2, 8, 1);
+            allocator.free(filled.items);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+}
+
+test "local cursors are sealed: same shape at any position, bound to topic and process (#496)" {
+    const a = std.testing.allocator;
+    var store = Store.init(a, std.testing.io);
+    defer store.deinit();
+    var other = Store.init(a, std.testing.io);
+    defer other.deinit();
+    const once = try store.seal(a, "notes", .{ .generation = 2, .sequence = 1 });
+    defer a.free(once);
+    const twice = try store.seal(a, "notes", .{ .generation = 2, .sequence = 2 });
+    defer a.free(twice);
+    const again = try store.seal(a, "notes", .{ .generation = 2, .sequence = 1 });
+    defer a.free(again);
+    try std.testing.expectEqual(once.len, twice.len);
+    for (once) |c| try std.testing.expect(std.ascii.isHex(c) and !std.ascii.isUpper(c));
+    try std.testing.expect(!std.mem.eql(u8, once, again)); // fresh nonce per cursor
+    try std.testing.expectEqual(Position{ .generation = 2, .sequence = 1 }, try store.start("notes", once));
+    try std.testing.expectEqual(Position{ .generation = 2, .sequence = 2 }, try store.start("notes", twice));
+    try std.testing.expectError(error.ResetRequired, store.start("other", once));
+    try std.testing.expectError(error.ResetRequired, other.start("notes", once));
+    try std.testing.expectError(error.ResetRequired, store.start("notes", "stale:1"));
 }
