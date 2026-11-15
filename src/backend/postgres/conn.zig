@@ -71,6 +71,35 @@ pub const QueryResult = struct {
     rows_affected: i64 = 0,
 };
 
+/// Raises the session to `synchronous_commit = local` only when the effective setting is `off`
+/// (#490). Returns one row when it overrode, none otherwise — the row drives the warning.
+/// `set_config(..., false)` is session-scoped, the same as a plain `SET`.
+/// `current_setting(name, true)` (missing_ok) yields NULL instead of raising when a
+/// wire-compatible server has no such parameter; `NULL = 'off'` selects no row, so such a
+/// server is left alone rather than failing every connect.
+pub const pin_local_durability_sql =
+    "SELECT set_config('synchronous_commit', 'local', false) WHERE current_setting('synchronous_commit', true) = 'off'";
+
+/// Once-per-process latch for the #490 override warning: every pooled/lazy connection runs
+/// the pin, but the operator needs to read it once, at startup (the pool's writer connects first).
+var sync_commit_override_warned: std.atomic.Value(bool) = .init(false);
+
+/// Test builds only: how many times the #490 warning was emitted (the latch must keep it <= 1
+/// per process). Never touched in a non-test build.
+var sync_commit_override_warnings: std.atomic.Value(u32) = .init(0);
+
+/// Test-only view of the #490 warn-once latch; a compile error to reference outside `zig build test`.
+pub const sync_commit_warning_for_test = if (builtin.is_test) struct {
+    /// Clear the latch and the counter so a test observes only its own connects.
+    pub fn reset() void {
+        sync_commit_override_warned.store(false, .monotonic);
+        sync_commit_override_warnings.store(0, .monotonic);
+    }
+    pub fn count() u32 {
+        return sync_commit_override_warnings.load(.monotonic);
+    }
+} else @compileError("sync_commit_warning_for_test is test-only");
+
 const sock_buf_len = tls.Client.min_buffer_len; // >= max TLS record; ample for plaintext
 
 pub const Conn = struct {
@@ -170,7 +199,31 @@ pub const Conn = struct {
         try self.startup(cfg);
         try self.authenticate(cfg);
         try self.readUntilReady();
+        try self.pinLocalDurability();
         return self;
+    }
+
+    /// The commit-durability floor every zigbase connection runs at (#490). zigbase acknowledges
+    /// a write (a session revoke's 204, a revoke-all, a mail enqueue's 200) only after COMMIT
+    /// returns, and its contracts assume that acknowledgement survives a PostgreSQL crash or a
+    /// power cut. Under `synchronous_commit = off` COMMIT returns before the commit record is
+    /// flushed to the local WAL, so an acknowledged write can be undone by crash recovery.
+    ///
+    /// One round trip, decided server-side: when the effective setting (cluster, database or
+    /// role default) is `off`, raise this SESSION to `local` — the weakest level that waits for
+    /// the local WAL flush. `local`, `on`, `remote_write` and `remote_apply` are all at least as
+    /// durable and are never touched, so a deployment's synchronous-replication choice stands.
+    /// A server without the parameter at all is left alone (see `pin_local_durability_sql`); any
+    /// other failure here fails the connect (the caller frees the half-open connection): handing
+    /// out a connection whose durability is unknown would silently reopen the hole.
+    fn pinLocalDurability(self: *Conn) ConnError!void {
+        var arena_state = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena_state.deinit();
+        const result = try self.execExtended(arena_state.allocator(), pin_local_durability_sql, &.{});
+        if (result.rows.len != 0 and !sync_commit_override_warned.swap(true, .monotonic)) {
+            if (builtin.is_test) _ = sync_commit_override_warnings.fetchAdd(1, .monotonic);
+            std.log.warn("postgres: the server/database/role default for synchronous_commit is 'off', so a crash can undo writes zigbase already acknowledged; zigbase overrides it to 'local' on each session it opens, but that per-session override does not survive a transaction-mode pooler (e.g. PgBouncer pool_mode=transaction). Durable fix: set synchronous_commit to 'local' or stronger on the server, database or zigbase's role (ALTER ROLE <role> SET synchronous_commit = local). See docs/postgres.md#commit-durability", .{});
+        }
     }
 
     /// Flush BOTH buffer layers. `self.out.flush()` flushes the active app-data writer

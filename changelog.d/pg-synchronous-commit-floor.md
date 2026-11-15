@@ -1,0 +1,2 @@
+### Fixes
+- PostgreSQL: a connection whose effective `synchronous_commit` is `off` (set on the cluster, database or role) is raised to `local` for ZigBase's session, with one startup warning, so an acknowledged session revoke, "log out everywhere" or mail enqueue is no longer undone by a PostgreSQL crash or power cut. Stronger settings (`local`, `on`, `remote_write`, `remote_apply`) are left alone. `docs/postgres.md` now documents the durability requirement, that `fsync = off` / `full_page_writes = off` are not overridden, and the transaction-pooler caveat (#490).
