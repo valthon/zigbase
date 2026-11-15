@@ -117,22 +117,67 @@ pub fn concatJobs(comptime a: []const RuntimeJob, comptime b: []const RuntimeJob
     return &Holder.table;
 }
 
-pub const JobState = struct {
-    status: enum { idle, running, stopped },
-    next_fire: i64, // unix seconds; meaningful when status == .idle
-    failures: u32 = 0, // consecutive handler failures; drives exponential backoff
+/// One reading of both scheduler clocks: `wall` is unix seconds (it can step when the
+/// host clock is set), `mono_ms` is milliseconds on the boot clock (it never steps).
+pub const Now = struct { wall: i64, mono_ms: i64 };
+
+/// When an idle job is next due. A cron occurrence names a wall-clock minute, so it is a
+/// `.wall` instant (unix seconds). Every other wait is a duration from a local event: an
+/// interval or reactive `.after` from the last completion, a failure backoff, the
+/// `.distributed` poll. Those are `.mono` deadlines (boot-clock milliseconds), so a wall
+/// clock step neither stalls nor bunches them (#493).
+pub const Due = union(enum) {
+    wall: i64,
+    mono: i64,
+
+    fn reached(self: Due, now: Now) bool {
+        return switch (self) {
+            .wall => |t| t <= now.wall,
+            .mono => |t| t <= now.mono_ms,
+        };
+    }
 };
 
-/// Pure decision: append the indices of jobs that are `.idle` AND due (`next_fire <= now`)
-/// to `out`, marking each `.running` (single-flight). Returns the filled slice of `out`.
+pub const JobState = struct {
+    status: enum { idle, running, stopped },
+    due: Due, // meaningful when status == .idle
+    failures: u32 = 0, // consecutive handler failures; drives exponential backoff
+    /// The wall-clock minute (unix seconds) of the cron occurrence that last fired. The
+    /// next occurrence is always after it, so no minute runs twice whatever the wall
+    /// clock does while the handler runs (see `completeJob`).
+    last_cron: ?i64 = null,
+};
+
+/// A boot-clock deadline `seconds` after `now`, saturating rather than overflowing for an
+/// absurd interval.
+fn monoAfter(now: Now, seconds: i64) Due {
+    return .{ .mono = now.mono_ms +| (seconds *| std.time.ms_per_s) };
+}
+
+/// The next due time a schedule itself implies after `now`: the next matching wall minute
+/// for cron, one period on the boot clock for an interval, none for reactive.
+fn scheduleDue(sched: schedule.Schedule, now: Now) ?Due {
+    return switch (sched) {
+        .cron => if (schedule.nextFire(sched, now.wall)) |t| .{ .wall = t } else null,
+        .interval => |iv| monoAfter(now, schedule.periodSeconds(iv)),
+        .reactive => null,
+    };
+}
+
+/// Pure decision: append the indices of jobs that are `.idle` AND due to `out`, marking
+/// each `.running` (single-flight). Returns the filled slice of `out`.
 /// `out` may be shorter than `state`; due jobs beyond its capacity remain idle
 /// and are eligible for the next tick.
-pub fn tick(state: []JobState, now: i64, out: []usize) []usize {
+pub fn tick(state: []JobState, now: Now, out: []usize) []usize {
     var n: usize = 0;
     for (state, 0..) |*s, i| {
-        if (s.status == .idle and s.next_fire <= now) {
+        if (s.status == .idle and s.due.reached(now)) {
             if (n < out.len) {
                 s.status = .running;
+                switch (s.due) {
+                    .wall => |minute| s.last_cron = minute,
+                    .mono => {},
+                }
                 out[n] = i;
                 n += 1;
             }
@@ -143,22 +188,27 @@ pub fn tick(state: []JobState, now: i64, out: []usize) []usize {
 
 test "tick leaves due jobs beyond the output capacity idle for the next tick" {
     var state = [_]JobState{
-        .{ .status = .idle, .next_fire = 10 },
-        .{ .status = .idle, .next_fire = 10 },
-        .{ .status = .idle, .next_fire = 10 },
+        .{ .status = .idle, .due = .{ .wall = 10 } },
+        .{ .status = .idle, .due = .{ .mono = 10 } },
+        .{ .status = .idle, .due = .{ .wall = 10 } },
     };
     var out: [1]usize = undefined;
-    try std.testing.expectEqualSlices(usize, &.{0}, tick(&state, 10, &out));
+    const now: Now = .{ .wall = 10, .mono_ms = 10 };
+    try std.testing.expectEqualSlices(usize, &.{0}, tick(&state, now, &out));
     try std.testing.expect(state[1].status == .idle);
-    try std.testing.expectEqualSlices(usize, &.{1}, tick(&state, 10, &out));
-    try std.testing.expectEqualSlices(usize, &.{2}, tick(&state, 10, &out));
+    try std.testing.expectEqualSlices(usize, &.{1}, tick(&state, now, &out));
+    try std.testing.expectEqualSlices(usize, &.{2}, tick(&state, now, &out));
 }
 
 /// Apply a job's completion to its local state. `reactive_result` is non-null for
 /// reactive jobs or distributed wrappers polling a database-owned schedule.
-/// For ordinary cron/interval jobs, next_fire is recomputed from `sched`;
+/// For ordinary cron/interval jobs, the due time is recomputed from `sched`;
 /// if there is no future fire (e.g. an impossible cron), the job is retired (`.stopped`).
-pub fn completeJob(s: *JobState, sched: schedule.Schedule, reactive_result: ?schedule.Reactive, now: i64) void {
+/// A cron job's next occurrence is the first matching minute after both the wall time it
+/// completed at and the minute that last fired (`last_cron`): after a forward step it
+/// does not replay the skipped minutes, and after a backward step, even one taken while
+/// the handler ran, it does not repeat a minute it already ran.
+pub fn completeJob(s: *JobState, sched: schedule.Schedule, reactive_result: ?schedule.Reactive, now: Now) void {
     s.failures = 0; // a successful completion resets the backoff counter
     if (reactive_result) |rr| {
         switch (rr) {
@@ -167,23 +217,40 @@ pub fn completeJob(s: *JobState, sched: schedule.Schedule, reactive_result: ?sch
                 return;
             },
             .after => |iv| {
-                s.next_fire = now + schedule.periodSeconds(iv);
+                s.due = monoAfter(now, schedule.periodSeconds(iv));
                 s.status = .idle;
                 return;
             },
         }
     }
-    s.next_fire = schedule.nextFire(sched, now) orelse {
+    const from: Now = if (s.last_cron) |minute| .{ .wall = @max(now.wall, minute), .mono_ms = now.mono_ms } else now;
+    s.due = scheduleDue(sched, from) orelse {
         s.status = .stopped;
         return;
     };
     s.status = .idle;
 }
 
-fn completeRuntimeJob(s: *JobState, job: RuntimeJob, result: ?schedule.Reactive, now: i64) void {
-    completeJob(s, job.schedule, result, now);
-    // No public seconds-granularity schedule is needed for this internal poll.
-    if (job.distributed and s.status == .idle) s.next_fire = @max(s.next_fire, now + 15);
+/// How often an idle `.distributed` job re-reads its database-owned schedule.
+const distributed_poll_s: i64 = 15;
+
+fn completeRuntimeJob(s: *JobState, job: RuntimeJob, result: ?schedule.Reactive, now: Now) void {
+    if (!job.distributed) return completeJob(s, job.schedule, result, now);
+    // A `.distributed` job's cadence lives in the database, so `job.schedule` is never
+    // read here and no wall-clock due time is produced: the wrapper answers `.stop`
+    // (retire) or asks to be polled again (`.after`; a null answer means the same), and
+    // the next poll is on the boot clock, never sooner than `distributed_poll_s`. No
+    // public seconds-granularity schedule is needed for this internal poll.
+    s.failures = 0;
+    const delay_s: i64 = switch (result orelse schedule.Reactive{ .after = .{ .minutes = 0 } }) {
+        .stop => {
+            s.status = .stopped;
+            return;
+        },
+        .after => |iv| schedule.periodSeconds(iv),
+    };
+    s.due = monoAfter(now, @max(delay_s, distributed_poll_s));
+    s.status = .idle;
 }
 
 test "distributed idle polling is bounded and stopped jobs retire locally" {
@@ -191,13 +258,24 @@ test "distributed idle polling is bounded and stopped jobs retire locally" {
         fn handler(_: *Ctx, _: *events.JobEvent) anyerror!void {}
     };
     const jobs = buildJobs(.{.{ .name = "poll", .schedule = schedule.Schedule{ .interval = .hourly }, .distributed = .{}, .handler = H.handler }});
-    var state = JobState{ .status = .running, .next_fire = 0 };
-    completeRuntimeJob(&state, jobs[0], .{ .after = .{ .minutes = 0 } }, 100);
-    try std.testing.expectEqual(@as(i64, 115), state.next_fire);
+    var state = JobState{ .status = .running, .due = .{ .mono = 0 } };
+    completeRuntimeJob(&state, jobs[0], .{ .after = .{ .minutes = 0 } }, .{ .wall = 100, .mono_ms = 7_000 });
+    try std.testing.expectEqual(Due{ .mono = 22_000 }, state.due);
     var out: [1]usize = undefined;
-    try std.testing.expectEqual(@as(usize, 0), tick((&state)[0..1], 114, &out).len);
-    completeRuntimeJob(&state, jobs[0], .stop, 115);
+    try std.testing.expectEqual(@as(usize, 0), tick((&state)[0..1], .{ .wall = 114, .mono_ms = 21_999 }, &out).len);
+    // The poll re-arm is on the boot clock: a backward wall step does not delay it.
+    try std.testing.expectEqual(@as(usize, 1), tick((&state)[0..1], .{ .wall = 50, .mono_ms = 22_000 }, &out).len);
+    completeRuntimeJob(&state, jobs[0], .stop, .{ .wall = 115, .mono_ms = 22_000 });
     try std.testing.expect(state.status == .stopped);
+
+    // A distributed cron job never gets a local wall-clock due time: its next poll is
+    // on the boot clock whatever the wrapper answers, never the next cron minute.
+    const cron_jobs = buildJobs(.{.{ .name = "cron-poll", .schedule = schedule.Schedule{ .cron = "0 * * * *" }, .distributed = .{}, .handler = H.handler }});
+    var cron_state = JobState{ .status = .running, .due = .{ .mono = 0 } };
+    completeRuntimeJob(&cron_state, cron_jobs[0], null, .{ .wall = 3_590, .mono_ms = 1_000 });
+    try std.testing.expectEqual(Due{ .mono = 16_000 }, cron_state.due);
+    completeRuntimeJob(&cron_state, cron_jobs[0], .{ .after = .{ .minutes = 2 } }, .{ .wall = 3_600, .mono_ms = 16_000 });
+    try std.testing.expectEqual(Due{ .mono = 136_000 }, cron_state.due);
 }
 
 /// Exponential backoff delay (seconds) for the Nth consecutive failure: 1, 2, 4, 8, ...
@@ -217,9 +295,9 @@ pub fn retryDelay(failures: u32) i64 {
 /// Apply a job-handler FAILURE to its state: report-count++, retry after exponential
 /// backoff. The job is NOT retired (it keeps retrying with growing, capped delay); each
 /// failure is reported separately by the worker via dispatchError.
-pub fn completeJobError(s: *JobState, now: i64) void {
-    s.failures += 1;
-    s.next_fire = now + retryDelay(s.failures);
+pub fn completeJobError(s: *JobState, now: Now) void {
+    s.failures +|= 1;
+    s.due = monoAfter(now, retryDelay(s.failures));
     s.status = .idle;
 }
 
@@ -243,10 +321,21 @@ pub const default_job_stack_size: usize = 1 << 20; // 1 MiB
 /// is clamped up to it rather than allowed to crash the process at startup.
 pub const min_job_stack_size: usize = 1 << 20; // 1 MiB
 
-/// The framework's scheduling clock — wall-clock seconds, honoring the dev-only
-/// `ZIGBASE_FAKE_NOW` override (see `clock.zig`) so e2e suites can freeze next-fire math.
+/// The framework's scheduling wall clock — wall-clock seconds, honoring the dev-only
+/// `ZIGBASE_FAKE_NOW` override (see `clock.zig`) so e2e suites can freeze cron math.
 fn unixNow(io: std.Io) i64 {
     return clock.nowUnix(io);
+}
+
+/// Both scheduling clocks. `mono_ms` is the boot clock (`CLOCK_BOOTTIME` on Linux):
+/// monotonic, counting suspended time where the OS can, never stepped and never frozen.
+/// It measures the delays; `unixNow` places cron occurrences.
+fn readNow(io: std.Io) Now {
+    const boot = std.Io.Timestamp.now(io, .boot);
+    return .{
+        .wall = unixNow(io),
+        .mono_ms = @intCast(@divTrunc(boot.nanoseconds, std.time.ns_per_ms)),
+    };
 }
 
 /// Threaded scheduler runtime: a scheduler thread ticks the `JobState` table on a fixed
@@ -283,26 +372,27 @@ pub const Scheduler = struct {
     pub fn initSized(allocator: std.mem.Allocator, app: *App, jobs: []const RuntimeJob, pool_size: usize, stack_size: usize) !Scheduler {
         const state = try allocator.alloc(JobState, jobs.len);
         errdefer allocator.free(state);
-        const now = unixNow(app.io);
+        const now = readNow(app.io);
+        const at_boot: Due = .{ .mono = now.mono_ms };
         for (state, 0..) |*s, i| {
             if (jobs[i].distributed) {
-                s.* = .{ .status = .idle, .next_fire = now };
+                s.* = .{ .status = .idle, .due = at_boot };
                 continue;
             }
             const sched = jobs[i].schedule;
-            if (schedule.nextFire(sched, now)) |nf| {
-                s.* = .{ .status = .idle, .next_fire = nf };
+            if (scheduleDue(sched, now)) |due| {
+                s.* = .{ .status = .idle, .due = due };
             } else switch (sched) {
                 // Reactive jobs have no schedule-derived fire; they intentionally run once at
                 // boot (their handler's returned `Reactive` drives every subsequent fire).
-                .reactive => s.* = .{ .status = .idle, .next_fire = now },
+                .reactive => s.* = .{ .status = .idle, .due = at_boot },
                 // A cron/interval with no future fire (e.g. an impossible cron like Feb 30)
                 // must NOT be aliased onto the reactive boot-fire path — that would run the
                 // handler at an arbitrary boot time and never on schedule. Retire it and log
                 // why, so it isn't a silent no-op.
                 else => {
                     std.log.warn("scheduler: job '{s}' has no future fire time (impossible schedule); retiring it without running", .{jobs[i].name});
-                    s.* = .{ .status = .stopped, .next_fire = now };
+                    s.* = .{ .status = .stopped, .due = at_boot };
                 },
             }
         }
@@ -363,7 +453,7 @@ pub const Scheduler = struct {
     fn schedulerLoop(self: *Scheduler) void {
         var fire_buf: [256]usize = undefined;
         while (!self.shutdown.load(.acquire)) {
-            const now = unixNow(self.app.io);
+            const now = readNow(self.app.io);
             self.lock();
             const cap = @min(fire_buf.len, self.state.len);
             const fired = tick(self.state, now, fire_buf[0..cap]);
@@ -409,7 +499,7 @@ pub const Scheduler = struct {
             };
             if (outcome) |result| {
                 // SUCCESS: resume the normal schedule (resets the backoff counter).
-                const now = unixNow(self.app.io);
+                const now = readNow(self.app.io);
                 self.lock();
                 completeRuntimeJob(&self.state[idx], job, result, now);
                 const retired_no_fire = result == null and self.state[idx].status == .stopped;
@@ -423,7 +513,7 @@ pub const Scheduler = struct {
                 // FAILURE: report this failure, then retry with exponential backoff.
                 var err_ev = events.ErrorEvent{ .app = self.app, .ctx = null, .err = e, .phase = .cron, .message = @errorName(e) };
                 events.dispatchError(self.app, self.app.dispatch, &err_ev);
-                const now = unixNow(self.app.io);
+                const now = readNow(self.app.io);
                 self.lock();
                 completeJobError(&self.state[idx], now);
                 self.unlock();
@@ -490,50 +580,129 @@ test "buildJobs assembles cron/interval/reactive into a uniform table" {
     try std.testing.expect(r0 == null);
 }
 
+fn at(wall: i64, mono_ms: i64) Now {
+    return .{ .wall = wall, .mono_ms = mono_ms };
+}
+
 test "tick fires due idle jobs and marks them running (single-flight)" {
     var st = [_]JobState{
-        .{ .status = .idle, .next_fire = 1000 },
-        .{ .status = .idle, .next_fire = 2000 },
+        .{ .status = .idle, .due = .{ .wall = 1000 } },
+        .{ .status = .idle, .due = .{ .wall = 2000 } },
+        .{ .status = .idle, .due = .{ .mono = 500 } },
+        .{ .status = .idle, .due = .{ .mono = 501 } },
     };
     var fire_buf: [8]usize = undefined;
-    const fired = tick(&st, 1000, &fire_buf);
-    try std.testing.expectEqual(@as(usize, 1), fired.len); // only job 0 is due (next_fire <= now)
-    try std.testing.expectEqual(@as(usize, 0), fired[0]);
-    try std.testing.expect(st[0].status == .running);
-    try std.testing.expect(st[1].status == .idle);
+    const fired = tick(&st, at(1000, 500), &fire_buf);
+    // Job 0's wall instant and job 2's boot-clock deadline are reached; 1 and 3 are not.
+    try std.testing.expectEqualSlices(usize, &.{ 0, 2 }, fired);
+    try std.testing.expect(st[0].status == .running and st[2].status == .running);
+    try std.testing.expect(st[1].status == .idle and st[3].status == .idle);
 }
 
 test "tick does not refire a job that is already running" {
-    var st = [_]JobState{.{ .status = .running, .next_fire = 1000 }};
+    var st = [_]JobState{.{ .status = .running, .due = .{ .wall = 1000 } }};
     var fire_buf: [8]usize = undefined;
-    const fired = tick(&st, 5000, &fire_buf);
+    const fired = tick(&st, at(5000, 5000), &fire_buf);
     try std.testing.expectEqual(@as(usize, 0), fired.len);
 }
 
 test "tick skips stopped jobs" {
-    var st = [_]JobState{.{ .status = .stopped, .next_fire = 0 }};
+    var st = [_]JobState{.{ .status = .stopped, .due = .{ .wall = 0 } }};
     var fire_buf: [8]usize = undefined;
-    const fired = tick(&st, 9999, &fire_buf);
+    const fired = tick(&st, at(9999, 9999), &fire_buf);
     try std.testing.expectEqual(@as(usize, 0), fired.len);
 }
 
 test "completeJob: interval reschedules; reactive uses returned delay; stop retires; invalid cron retires" {
-    var s = JobState{ .status = .running, .next_fire = 1000 };
-    completeJob(&s, .{ .interval = .hourly }, null, 1000);
-    try std.testing.expect(s.status == .idle and s.next_fire == 1000 + 3600);
+    var s = JobState{ .status = .running, .due = .{ .wall = 1000 } };
+    completeJob(&s, .{ .interval = .hourly }, null, at(1000, 40_000));
+    try std.testing.expect(s.status == .idle);
+    try std.testing.expectEqual(Due{ .mono = 40_000 + 3_600_000 }, s.due);
 
-    var s2 = JobState{ .status = .running, .next_fire = 0 };
-    completeJob(&s2, .reactive, .{ .after = .{ .minutes = 5 } }, 2000);
-    try std.testing.expect(s2.status == .idle and s2.next_fire == 2000 + 300);
+    var s2 = JobState{ .status = .running, .due = .{ .wall = 0 } };
+    completeJob(&s2, .reactive, .{ .after = .{ .minutes = 5 } }, at(2000, 70_000));
+    try std.testing.expect(s2.status == .idle);
+    try std.testing.expectEqual(Due{ .mono = 70_000 + 300_000 }, s2.due);
 
-    var s3 = JobState{ .status = .running, .next_fire = 0 };
-    completeJob(&s3, .reactive, .stop, 2000);
+    var s3 = JobState{ .status = .running, .due = .{ .wall = 0 } };
+    completeJob(&s3, .reactive, .stop, at(2000, 0));
     try std.testing.expect(s3.status == .stopped);
 
+    // A cron occurrence is a wall-clock minute.
+    var s5 = JobState{ .status = .running, .due = .{ .wall = 0 } };
+    completeJob(&s5, .{ .cron = "* * * * *" }, null, at(1_000_030, 0));
+    try std.testing.expectEqual(Due{ .wall = 1_000_080 }, s5.due);
+
     // An impossible cron has no next fire -> retire the job rather than spin.
-    var s4 = JobState{ .status = .running, .next_fire = 0 };
-    completeJob(&s4, .{ .cron = "0 0 30 2 *" }, null, 1609470000); // Feb 30 never occurs
+    var s4 = JobState{ .status = .running, .due = .{ .wall = 0 } };
+    completeJob(&s4, .{ .cron = "0 0 30 2 *" }, null, at(1609470000, 0)); // Feb 30 never occurs
     try std.testing.expect(s4.status == .stopped);
+}
+
+test "a backward wall-clock step does not stall interval, reactive or backoff jobs (#493)" {
+    // Each job completes at wall 10_000 / boot 50_000 ms; the wall clock is then stepped
+    // back 10 s while 500 ms of real time pass.
+    const before = at(10_000, 50_000);
+    const after_step = at(10_000 - 10, 50_500);
+    var worker = JobState{ .status = .running, .due = .{ .wall = 0 } };
+    completeJob(&worker, .reactive, .{ .after = .{ .minutes = 0 } }, before); // a durable worker's re-arm
+    var interval = JobState{ .status = .running, .due = .{ .wall = 0 } };
+    completeJob(&interval, .{ .interval = .{ .minutes = 1 } }, null, before);
+    var backoff = JobState{ .status = .running, .due = .{ .wall = 0 } };
+    completeJobError(&backoff, before);
+    var st = [_]JobState{ worker, interval, backoff };
+    var fire_buf: [8]usize = undefined;
+    // The re-armed worker fires on the next tick despite the wall clock going back.
+    try std.testing.expectEqualSlices(usize, &.{0}, tick(&st, after_step, &fire_buf));
+    // The 1 s backoff and the 60 s interval fire after 1 s and 60 s of real time, not 10 s later.
+    try std.testing.expectEqualSlices(usize, &.{2}, tick(&st, at(10_000 - 9, 51_000), &fire_buf));
+    try std.testing.expectEqualSlices(usize, &.{}, tick(&st, at(10_000 + 49, 109_999), &fire_buf));
+    try std.testing.expectEqualSlices(usize, &.{1}, tick(&st, at(10_000 + 50, 110_000), &fire_buf));
+}
+
+test "a forward wall-clock step neither fires interval jobs early nor bunches them (#493)" {
+    var st = [_]JobState{
+        .{ .status = .running, .due = .{ .wall = 0 } },
+        .{ .status = .running, .due = .{ .wall = 0 } },
+    };
+    completeJob(&st[0], .{ .interval = .hourly }, null, at(10_000, 50_000));
+    completeJob(&st[1], .reactive, .{ .after = .{ .minutes = 5 } }, at(10_000, 50_000));
+    var fire_buf: [8]usize = undefined;
+    // The wall clock jumps two hours ahead after one real second: nothing is due.
+    try std.testing.expectEqual(@as(usize, 0), tick(&st, at(10_000 + 7_200, 51_000), &fire_buf).len);
+    // Each fires once its own delay has really elapsed, once, and re-arms one period on.
+    try std.testing.expectEqualSlices(usize, &.{1}, tick(&st, at(17_500, 350_000), &fire_buf));
+    try std.testing.expectEqualSlices(usize, &.{0}, tick(&st, at(20_800, 3_650_000), &fire_buf));
+    completeJob(&st[0], .{ .interval = .hourly }, null, at(20_800, 3_650_000));
+    try std.testing.expectEqual(@as(usize, 0), tick(&st, at(20_800 + 86_400, 3_651_000), &fire_buf).len);
+    try std.testing.expectEqual(Due{ .mono = 3_650_000 + 3_600_000 }, st[0].due);
+}
+
+test "cron across wall-clock steps: missed minutes fire once, a ran minute never repeats (#493)" {
+    const every_minute = schedule.Schedule{ .cron = "* * * * *" };
+    var st = [_]JobState{.{ .status = .idle, .due = .{ .wall = 60_060 } }};
+    var fire_buf: [8]usize = undefined;
+    // Forward step of ten minutes past the due minute: one late fire, not ten.
+    try std.testing.expectEqualSlices(usize, &.{0}, tick(&st, at(60_660, 1_000), &fire_buf));
+    completeJob(&st[0], every_minute, null, at(60_660, 1_100));
+    // The next occurrence is the first minute after the stepped wall time.
+    try std.testing.expectEqual(Due{ .wall = 60_720 }, st[0].due);
+    try std.testing.expectEqual(@as(usize, 0), tick(&st, at(60_661, 1_500), &fire_buf).len);
+    // It runs the 60_720 minute, then the wall clock steps back 10 s: that minute is
+    // not run a second time; the job waits for the wall clock to reach 60_780.
+    try std.testing.expectEqualSlices(usize, &.{0}, tick(&st, at(60_720, 60_000), &fire_buf));
+    completeJob(&st[0], every_minute, null, at(60_720, 60_100));
+    try std.testing.expectEqual(@as(usize, 0), tick(&st, at(60_710, 61_000), &fire_buf).len);
+    try std.testing.expectEqual(@as(usize, 0), tick(&st, at(60_779, 130_000), &fire_buf).len);
+    try std.testing.expectEqualSlices(usize, &.{0}, tick(&st, at(60_780, 131_000), &fire_buf));
+    // The step can also land while the handler runs: the 60_780 minute fires, the clock
+    // goes back 10 s, and the handler completes at 60_773. The next occurrence is still
+    // 60_840, not 60_780 again.
+    completeJob(&st[0], every_minute, null, at(60_773, 131_500));
+    try std.testing.expectEqual(Due{ .wall = 60_840 }, st[0].due);
+    try std.testing.expectEqual(@as(usize, 0), tick(&st, at(60_780, 138_000), &fire_buf).len);
+    try std.testing.expectEqual(@as(usize, 0), tick(&st, at(60_839, 197_000), &fire_buf).len);
+    try std.testing.expectEqualSlices(usize, &.{0}, tick(&st, at(60_840, 198_000), &fire_buf));
 }
 
 test "retryDelay is exponential, capped at 1h" {
@@ -546,22 +715,27 @@ test "retryDelay is exponential, capped at 1h" {
 }
 
 test "completeJobError backs off and increments failures; success resets" {
-    var s = JobState{ .status = .running, .next_fire = 0, .failures = 0 };
-    completeJobError(&s, 1000);
-    try std.testing.expect(s.status == .idle and s.failures == 1 and s.next_fire == 1000 + 1);
-    completeJobError(&s, 1000);
-    try std.testing.expect(s.failures == 2 and s.next_fire == 1000 + 2);
-    completeJobError(&s, 1000);
-    try std.testing.expect(s.failures == 3 and s.next_fire == 1000 + 4);
+    var s = JobState{ .status = .running, .due = .{ .wall = 0 }, .failures = 0 };
+    completeJobError(&s, at(1000, 0));
+    try std.testing.expect(s.status == .idle and s.failures == 1);
+    try std.testing.expectEqual(Due{ .mono = 1_000 }, s.due);
+    completeJobError(&s, at(1000, 0));
+    try std.testing.expect(s.failures == 2);
+    try std.testing.expectEqual(Due{ .mono = 2_000 }, s.due);
+    completeJobError(&s, at(1000, 0));
+    try std.testing.expect(s.failures == 3);
+    try std.testing.expectEqual(Due{ .mono = 4_000 }, s.due);
     // a subsequent SUCCESS resets failures and schedules normally
-    completeJob(&s, .{ .interval = .hourly }, null, 2000);
-    try std.testing.expect(s.status == .idle and s.failures == 0 and s.next_fire == 2000 + 3600);
+    completeJob(&s, .{ .interval = .hourly }, null, at(2000, 9_000));
+    try std.testing.expect(s.status == .idle and s.failures == 0);
+    try std.testing.expectEqual(Due{ .mono = 9_000 + 3_600_000 }, s.due);
 }
 
 test "reactive job that errors retries with backoff (not retired)" {
-    var s = JobState{ .status = .running, .next_fire = 0, .failures = 0 };
-    completeJobError(&s, 5000); // an errored reactive job is NOT stopped; it backs off
-    try std.testing.expect(s.status == .idle and s.failures == 1 and s.next_fire == 5001);
+    var s = JobState{ .status = .running, .due = .{ .wall = 0 }, .failures = 0 };
+    completeJobError(&s, at(5000, 8_000)); // an errored reactive job is NOT stopped; it backs off
+    try std.testing.expect(s.status == .idle and s.failures == 1);
+    try std.testing.expectEqual(Due{ .mono = 9_000 }, s.due);
 }
 
 test "initSized: valid cron schedules a future fire, reactive fires at boot, impossible cron is retired" {
@@ -582,16 +756,84 @@ test "initSized: valid cron schedules a future fire, reactive fires at boot, imp
         // Grammatically valid but impossible (Feb 30) — nextFire yields null; it must NOT be
         // aliased onto the reactive boot-fire path, it must be retired.
         .{ .name = "feb30", .schedule = schedule.Schedule{ .cron = "0 0 30 2 *" }, .handler = H.noop },
+        .{ .name = "hourly", .schedule = schedule.Schedule{ .interval = .hourly }, .handler = H.noop },
     });
     var app: App = undefined;
     app.io = std.testing.io;
     app.allocator = std.testing.allocator;
+    const before = readNow(app.io);
     var sched = try Scheduler.initSized(std.testing.allocator, &app, jobs, 1, min_job_stack_size);
     defer sched.deinit();
-    const now = clock.nowUnix(app.io);
-    try std.testing.expect(sched.state[0].status == .idle and sched.state[0].next_fire > now);
-    try std.testing.expect(sched.state[1].status == .idle and sched.state[1].next_fire <= now);
+    const now = readNow(app.io);
+    try std.testing.expect(sched.state[0].status == .idle and sched.state[0].due.wall > now.wall);
+    try std.testing.expect(sched.state[1].status == .idle and sched.state[1].due.reached(now));
     try std.testing.expect(sched.state[2].status == .stopped);
+    // An interval's first fire is one period on the boot clock.
+    const first = sched.state[3].due.mono;
+    try std.testing.expect(first >= before.mono_ms + 3_600_000 and first <= now.mono_ms + 3_600_000);
+}
+
+test "Scheduler keeps re-arming a reactive job across a backward wall-clock step (#493)" {
+    // The durable-worker shape: re-arm immediately, forever. Before #493 its due time was
+    // a wall second, so stepping the clock back 10 s silenced it for 10 s.
+    const Counter = struct {
+        var n: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
+        fn run(ctx: *Ctx, ev: *events.JobEvent) anyerror!schedule.Reactive {
+            _ = ctx;
+            _ = ev;
+            _ = n.fetchAdd(1, .monotonic);
+            return .{ .after = .{ .minutes = 0 } };
+        }
+    };
+    Counter.n.store(0, .monotonic);
+    if (clock.frozenUnix() != null) return error.SkipZigTest; // a frozen wall clock cannot step
+    defer clock.stepForTest(0);
+    const jobs = buildJobs(.{
+        .{ .name = "worker", .schedule = schedule.Schedule.reactive, .handler = Counter.run },
+    });
+    var app: App = undefined;
+    app.io = std.testing.io;
+    app.allocator = std.testing.allocator;
+    app.pool = undefined;
+    app.dispatch = null;
+    app.scheduler = null;
+    app.submit_fn = null;
+    if (comptime @import("build_options").query_workbench) app.query_workbench = null;
+
+    var sched = try Scheduler.init(std.testing.allocator, &app, jobs, 1);
+    defer sched.deinit();
+    try sched.start();
+    defer sched.stop();
+    var waited: usize = 0;
+    while (Counter.n.load(.monotonic) == 0 and waited < 300) : (waited += 1) {
+        app.io.sleep(std.Io.Duration.fromMilliseconds(10), .awake) catch {};
+    }
+    try std.testing.expect(Counter.n.load(.monotonic) > 0);
+    // Step the clock while holding the scheduler lock with the job idle, i.e. after its
+    // completion read the clock and set its due time, and before the loop's next tick.
+    // Before #493 that due time was the pre-step wall second, which the stepped clock
+    // does not reach for 10 s.
+    var at_step: u32 = 0;
+    waited = 0;
+    while (waited < 300) : (waited += 1) {
+        sched.lock();
+        const idle = sched.state[0].status == .idle;
+        if (idle) {
+            clock.stepForTest(-10);
+            at_step = Counter.n.load(.monotonic);
+        }
+        sched.unlock();
+        if (idle) break;
+        app.io.sleep(std.Io.Duration.fromMilliseconds(1), .awake) catch {};
+    }
+    try std.testing.expect(at_step > 0);
+    // The loop ticks every 500 ms; allow three seconds (well under the 10 s step) for two
+    // more runs.
+    waited = 0;
+    while (Counter.n.load(.monotonic) < at_step + 2 and waited < 300) : (waited += 1) {
+        app.io.sleep(std.Io.Duration.fromMilliseconds(10), .awake) catch {};
+    }
+    try std.testing.expect(Counter.n.load(.monotonic) >= at_step + 2);
 }
 
 test "Scheduler runs a due reactive job then stops cleanly" {

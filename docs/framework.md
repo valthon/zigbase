@@ -3422,6 +3422,7 @@ The scheduler is intentionally simple (see
 - **Minute granularity** — the smallest schedule resolution is one minute.
 - **Interval drift** — interval schedules measure the next fire from the
   previous run's *completion*, not a fixed wall clock, so long-running jobs drift.
+  The delay runs on the monotonic boot clock (see [Wall-clock steps](#wall-clock-steps)).
 - **Single-flight** — a job never overlaps itself.
 
 The framework may also register **internal jobs** of its own alongside your
@@ -3429,6 +3430,29 @@ The framework may also register **internal jobs** of its own alongside your
 interval job named `_ttl_gc` that reaps expired rows on the `.ttl_gc_interval`
 cadence (default every 5 minutes); it runs on the same worker pool and starts the
 scheduler even when you have no `.cron` configured.
+
+#### Wall-clock steps
+
+A wall clock that NTP *slews* (speeds up or slows down slightly) affects nothing
+below. A *step* (the clock jumps: a large correction at boot, a VM snapshot
+restore, a manual `date -s`) affects jobs as follows.
+
+- **Delays are monotonic.** Each process keeps its interval, reactive `.after`,
+  retry-backoff, durable-worker poll and `.distributed` poll deadlines on the boot
+  clock (`CLOCK_BOOTTIME` on Linux). A wall-clock step in either direction neither
+  stalls these jobs nor makes them fire early or in a burst.
+- **Cron is wall-clock.** A cron occurrence is a wall-clock minute. After a forward
+  step past one or more occurrences the job runs once, late, and its next
+  occurrence is the first matching minute after the new time; the skipped minutes
+  are not replayed. For a per-process cron job, a minute that already ran is never
+  run again while the process runs, even when the clock steps back while its
+  handler is running: after a backward step the next occurrence is the first
+  matching minute after the last one run, and it fires when the wall clock reaches
+  it, so the job waits out the step. A `.distributed` cron job takes its next
+  occurrence from the database clock at completion
+  (`scheduler_coordination.finish`), so a backward step of that clock during a
+  handler can schedule the same minute again, so a distributed handler must
+  tolerate running a minute twice.
 
 ### Ad-hoc background work: `app.submit`
 
@@ -6195,7 +6219,9 @@ freeze the framework's clock for the lifetime of the process. Every framework-co
 timestamp routes through the seam:
 
 - Token `iat` / `exp` (JWT auth tokens).
-- The scheduler's next-fire math (cron / interval jobs).
+- The scheduler's cron next-fire math. Interval, reactive and retry delays are
+  durations on the monotonic boot clock, so they keep elapsing while the wall clock is
+  frozen.
 - Auth rate-limiter wall clock.
 - Auth-challenge and keyset-cursor TTL/expiry checks.
 - A consumer's own `datetime('now')` / `unixepoch('now')` / `strftime(…, 'now')` /
