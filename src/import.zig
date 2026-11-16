@@ -123,6 +123,7 @@ pub const ImportError = error{
     UnknownUpsertKey,
     EncryptedUpsertKey,
     UnsupportedUpsertKeyValue,
+    MissingUpsertTenant,
     MalformedJson,
     RowNotObject,
     DuplicateId,
@@ -190,11 +191,17 @@ fn bindScalar(st: *db.Stmt, idx: c_int, v: std.json.Value) !void {
 /// matches. The statement is reset before binding and again after reading, so it never holds a
 /// row cursor across the batch's commit boundary. The returned id is duped into `a` (the per-row
 /// arena) BEFORE the reset, since `columnText` borrows statement-owned memory that reset frees.
-fn findExistingId(a: std.mem.Allocator, st: *db.Stmt, key: []const u8, data: std.json.Value) !?[]const u8 {
+fn findExistingId(a: std.mem.Allocator, st: *db.Stmt, key: []const u8, tenant_field: ?[]const u8, data: std.json.Value) !?[]const u8 {
+    const tenant = if (tenant_field) |tf| blk: {
+        const v = data.object.get(tf) orelse return ImportError.MissingUpsertTenant;
+        if (v != .string or v.string.len == 0) return ImportError.MissingUpsertTenant;
+        break :blk v.string;
+    } else null;
     const key_val = data.object.get(key) orelse return null;
     if (key_val == .null) return null;
     st.reset();
     try bindScalar(st, 1, key_val);
+    if (tenant) |value| try st.bindText(2, value);
     if (!try st.step()) {
         st.reset();
         return null;
@@ -452,6 +459,7 @@ test "TimestampRestorer init releases SQL scratch under a general allocator" {
 /// source timestamps are preserved. All are connection-scoped and reset before batch boundaries.
 const Lookups = struct {
     upsert: ?db.Stmt = null,
+    tenant_field: ?[]const u8 = null,
     dup_check: ?db.Stmt = null,
     timestamp_update: ?db.Stmt = null,
 
@@ -466,7 +474,7 @@ const Lookups = struct {
 fn importRow(app: *App, w: *db.Db, io: std.Io, a: std.mem.Allocator, col: schema.Collection, data: std.json.Value, opts: Options, lookups: *Lookups) !RowOutcome {
     const timestamps = if (opts.preserve_timestamps) try sourceTimestamps(data) else null;
     if (opts.upsert_key) |key| {
-        if (try findExistingId(a, &lookups.upsert.?, key, data)) |existing_id| {
+        if (try findExistingId(a, &lookups.upsert.?, key, lookups.tenant_field, data)) |existing_id| {
             // Update the matched row's provided fields. Note: an auth `password` on UPDATE is
             // not re-hashed (there is no `password` column) — same as the Data.update path;
             // credential rotation is not an import-update concern.
@@ -577,8 +585,9 @@ fn importOneRow(
 
 /// Capture the failing field detail while `records.last_errors` is still valid — it points
 /// into the row arena, which this row's scope is about to reset. Empty for anything but
-/// `error.Validation`.
+/// `error.Validation` and a missing tenant value.
 fn captureDetail(e: anyerror) []const u8 {
+    if (e == error.MissingUpsertTenant) return "tenant-scoped --upsert-key requires a non-empty tenant field value on every row";
     if (e != error.Validation) return "";
     const errs = records.last_errors orelse return "";
     if (errs.len == 0) return "";
@@ -689,7 +698,12 @@ pub fn run(app: *App, w: *db.Db, io: std.Io, reader: *std.Io.Reader, opts: Optio
             // Operational heads-up (warn is not counted as a test-failing error log).
             std.log.warn("import: --upsert-key '{s}' is not backed by a unique constraint; a non-unique key may update the wrong row", .{key});
         }
-        const sql = try std.fmt.allocPrintSentinel(ca, "SELECT \"id\" FROM {s} WHERE {s}=?1 LIMIT 1;", .{ try ddl.quoteIdent(ca, col.name), try ddl.quoteIdent(ca, key) }, 0);
+        lookups.tenant_field = if (schema.uniqueScope(col, f) == .tenant) col.options.tenant_field else null;
+        const tenant_predicate = if (lookups.tenant_field) |tf|
+            try std.fmt.allocPrint(ca, " AND {s}=?2", .{try ddl.quoteIdent(ca, tf)})
+        else
+            "";
+        const sql = try std.fmt.allocPrintSentinel(ca, "SELECT \"id\" FROM {s} WHERE {s}=?1{s} LIMIT 1;", .{ try ddl.quoteIdent(ca, col.name), try ddl.quoteIdent(ca, key), tenant_predicate }, 0);
         lookups.upsert = try prep(ca, w, sql);
     } else if (opts.preserve_ids) {
         const sql = try std.fmt.allocPrintSentinel(ca, "SELECT 1 FROM {s} WHERE \"id\"=?1 LIMIT 1;", .{try ddl.quoteIdent(ca, col.name)}, 0);
@@ -1915,4 +1929,52 @@ test "import: a refused link rolls back the record it belonged to" {
     defer st.finalize();
     _ = try st.step();
     try std.testing.expectEqual(@as(i64, 0), st.columnInt(0));
+}
+
+test "import: tenant unique upsert requires tenant and never selects another tenant" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try migrations.run(&d);
+    const col = try collections.create(a, io, &d, .{
+        .id = "",
+        .name = "tenant_slugs",
+        .fields = &.{
+            .{ .id = "account", .name = "account", .options = .{ .text = .{} } },
+            .{ .id = "slug", .name = "slug", .unique = true, .options = .{ .text = .{} } },
+            .{ .id = "title", .name = "title", .options = .{ .text = .{} } },
+        },
+        .options = .{ .tenant_field = "account" },
+    });
+    defer col.deinit(a);
+    var app = testApp(a, io);
+    const opts = Options{ .collection = "tenant_slugs", .upsert_key = "slug" };
+    _ = try runNdjson(&app, &d, io,
+        \\{"account":"acct-b","slug":"acme-corp","title":"B"}
+    , opts);
+    const first = try runNdjson(&app, &d, io,
+        \\{"account":"acct-a","slug":"acme-corp","title":"A"}
+    , opts);
+    try std.testing.expectEqual(@as(usize, 1), first.created);
+    const again = try runNdjson(&app, &d, io,
+        \\{"account":"acct-a","slug":"acme-corp","title":"replacement"}
+    , opts);
+    try std.testing.expectEqual(@as(usize, 1), again.updated);
+    for ([_][]const u8{
+        \\{"slug":"acme-corp","title":"bad"}
+        ,
+        \\{"account":null,"slug":"acme-corp"}
+        ,
+        \\{"account":"","slug":"acme-corp"}
+        ,
+        \\{"account":42,"slug":"acme-corp"}
+    }) |row| try std.testing.expectError(error.MissingUpsertTenant, runNdjson(&app, &d, io, row, opts));
+    var st = try d.prepare("SELECT title FROM tenant_slugs ORDER BY account;");
+    defer st.finalize();
+    try std.testing.expect(try st.step());
+    try std.testing.expectEqualStrings("replacement", st.columnText(0));
+    try std.testing.expect(try st.step());
+    try std.testing.expectEqualStrings("B", st.columnText(0));
+    try std.testing.expect(!try st.step());
 }

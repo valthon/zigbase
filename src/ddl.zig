@@ -85,6 +85,10 @@ fn nameIn(names: []const []const u8, name: []const u8) bool {
 }
 
 pub fn createTableSql(alloc: std.mem.Allocator, c: schema.Collection, single_rel_target: ?[]const u8, d: dialect.Dialect, skip_fk_fields: []const []const u8) ![]u8 {
+    return createTableSqlMain(alloc, c, single_rel_target, d, skip_fk_fields, false);
+}
+
+fn createTableSqlMain(alloc: std.mem.Allocator, c: schema.Collection, single_rel_target: ?[]const u8, d: dialect.Dialect, skip_fk_fields: []const []const u8, main: bool) ![]u8 {
     // Self-freeing (contract 1): every intermediate fragment (quoted idents, column defs,
     // allocPrint'd clauses) is scratch, built on a function-local arena and copied into `out`
     // via `appendSlice`; only `out`'s final `toOwnedSlice` escapes on `alloc`.
@@ -93,7 +97,7 @@ pub fn createTableSql(alloc: std.mem.Allocator, c: schema.Collection, single_rel
     const sa = scratch.allocator();
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(alloc);
-    try out.appendSlice(alloc, "CREATE TABLE ");
+    try out.appendSlice(alloc, if (main) "CREATE TABLE \"main\"." else "CREATE TABLE ");
     const tbl = try quoteIdent(sa, c.name);
     try out.appendSlice(alloc, tbl);
     // The base text columns (incl. the `id` keyset tiebreaker) get the byte-order collation pin so
@@ -102,8 +106,16 @@ pub fn createTableSql(alloc: std.mem.Allocator, c: schema.Collection, single_rel
     try out.appendSlice(alloc, try std.fmt.allocPrint(sa, " (\"id\" TEXT{s} PRIMARY KEY, \"created\" TEXT{s}, \"updated\" TEXT{s}", .{ tc, tc, tc }));
     for (c.fields) |f| {
         try out.appendSlice(alloc, ", ");
-        try out.appendSlice(alloc, try columnDef(sa, f, d, fieldCollate(c, f, d)));
+        // Only a table-wide unique field carries the inline column UNIQUE; a tenant-scoped one
+        // (#498) is the composite table constraint emitted below.
+        var col_f = f;
+        col_f.unique = schema.uniqueScope(c, f) == .global;
+        try out.appendSlice(alloc, try columnDef(sa, col_f, d, fieldCollate(c, f, d)));
     }
+    if (c.options.tenant_field) |tf| for (c.fields) |f| {
+        if (schema.uniqueScope(c, f) != .tenant) continue;
+        try out.appendSlice(alloc, try std.fmt.allocPrint(sa, ", UNIQUE ({s}, {s})", .{ try quoteIdent(sa, tf), try quoteIdent(sa, f.name) }));
+    };
     for (c.fields) |f| {
         switch (f.options) {
             // skip_fk_fields (migrate-db cycle edges, Postgres target): the COLUMN was
@@ -122,6 +134,10 @@ pub fn createTableSql(alloc: std.mem.Allocator, c: schema.Collection, single_rel
 }
 
 pub fn createIndexSql(alloc: std.mem.Allocator, table: []const u8, idx: schema.Index, d: dialect.Dialect) ![]u8 {
+    return createIndexSqlMain(alloc, table, idx, d, false);
+}
+
+fn createIndexSqlMain(alloc: std.mem.Allocator, table: []const u8, idx: schema.Index, d: dialect.Dialect, main: bool) ![]u8 {
     // Self-freeing (contract 1): see `createTableSql`.
     var scratch = std.heap.ArenaAllocator.init(alloc);
     defer scratch.deinit();
@@ -134,6 +150,7 @@ pub fn createIndexSql(alloc: std.mem.Allocator, table: []const u8, idx: schema.I
     // and a UNIQUE one over `lower("col")` rejects case-variant duplicates just like SQLite's. A
     // `.binary` index is the plain quoted column on both backends.
     try out.appendSlice(alloc, if (idx.unique) "CREATE UNIQUE INDEX " else "CREATE INDEX ");
+    if (main) try out.appendSlice(alloc, "\"main\".");
     try out.appendSlice(alloc, try quoteIdent(sa, idx.name));
     try out.appendSlice(alloc, " ON ");
     try out.appendSlice(alloc, try quoteIdent(sa, table));
@@ -159,17 +176,53 @@ pub fn createIndexSql(alloc: std.mem.Allocator, table: []const u8, idx: schema.I
     return out.toOwnedSlice(alloc);
 }
 
+/// `ALTER TABLE "<table>" ADD UNIQUE ("<col>", ...);` - an unnamed unique table constraint, the
+/// same shape `createTableSql` emits inline, so PostgreSQL names it `<table>_<cols>_key` either
+/// way. Used to converge a live Postgres table on its field-level unique flags (#498).
+pub fn addUniqueConstraintSql(alloc: std.mem.Allocator, table: []const u8, cols: []const []const u8) ![]u8 {
+    var scratch = std.heap.ArenaAllocator.init(alloc);
+    defer scratch.deinit();
+    const sa = scratch.allocator();
+    var list: std.ArrayList(u8) = .empty;
+    for (cols, 0..) |col, i| {
+        if (i > 0) try list.appendSlice(sa, ", ");
+        try list.appendSlice(sa, try quoteIdent(sa, col));
+    }
+    return std.fmt.allocPrint(alloc, "ALTER TABLE {s} ADD UNIQUE ({s});", .{ try quoteIdent(sa, table), list.items });
+}
+
+/// `ALTER TABLE "<table>" DROP CONSTRAINT IF EXISTS "<name>";` (Postgres).
+pub fn dropConstraintSql(alloc: std.mem.Allocator, table: []const u8, name: []const u8) ![]u8 {
+    var scratch = std.heap.ArenaAllocator.init(alloc);
+    defer scratch.deinit();
+    const sa = scratch.allocator();
+    return std.fmt.allocPrint(alloc, "ALTER TABLE {s} DROP CONSTRAINT IF EXISTS {s};", .{ try quoteIdent(sa, table), try quoteIdent(sa, name) });
+}
+
+/// Engine-owned identity index name. Caller owns the returned allocation.
+pub fn authIdentityIndexName(alloc: std.mem.Allocator, table: []const u8, field: []const u8) ![]u8 {
+    return std.fmt.allocPrint(alloc, "idx_auth_{s}_{s}", .{ table, field });
+}
+
 /// A partial UNIQUE index enforcing identity uniqueness only over non-empty values:
 ///   CREATE UNIQUE INDEX IF NOT EXISTS "idx_auth_<table>_<field>" ON "<table>" ("<field>") WHERE "<field>" != '';
 /// Every identifier is escaped — the comment here used to claim quoting the code did not do.
 pub fn authIdentityIndexSql(alloc: std.mem.Allocator, table: []const u8, field: []const u8) ![]u8 {
+    const name = try authIdentityIndexName(alloc, table, field);
+    defer alloc.free(name);
+    return authIdentityIndexSqlNamed(alloc, table, field, name);
+}
+
+/// Use the same generated definition for a private catalog probe with a reserved index name.
+/// Caller owns the returned allocation.
+pub fn authIdentityIndexSqlNamed(alloc: std.mem.Allocator, table: []const u8, field: []const u8, name: []const u8) ![]u8 {
     var scratch = std.heap.ArenaAllocator.init(alloc);
     defer scratch.deinit();
     const sa = scratch.allocator();
     return std.fmt.allocPrint(
         alloc,
         "CREATE UNIQUE INDEX IF NOT EXISTS {s} ON {s} ({s}) WHERE {s} != '';",
-        .{ try quoteComposite(sa, "idx_auth_{s}_{s}", .{ table, field }), try quoteIdent(sa, table), try quoteIdent(sa, field), try quoteIdent(sa, field) },
+        .{ try quoteIdent(sa, name), try quoteIdent(sa, table), try quoteIdent(sa, field), try quoteIdent(sa, field) },
     );
 }
 
@@ -220,7 +273,7 @@ pub fn rebuildPlan(alloc: std.mem.Allocator, old: schema.Collection, new: schema
     const tmp = try std.fmt.allocPrint(sa, "{s}__new", .{new.name});
     var tmp_col = new;
     tmp_col.name = tmp;
-    try stmts.append(alloc, try createTableSql(alloc, tmp_col, null, d, &.{}));
+    try stmts.append(alloc, try createTableSqlMain(alloc, tmp_col, null, d, &.{}, true));
 
     var new_cols: std.ArrayList(u8) = .empty;
     var src_cols: std.ArrayList(u8) = .empty;
@@ -246,10 +299,13 @@ pub fn rebuildPlan(alloc: std.mem.Allocator, old: schema.Collection, new: schema
             try src_cols.appendSlice(sa, "NULL");
         }
     }
-    try stmts.append(alloc, try std.fmt.allocPrint(alloc, "INSERT INTO {s} ({s}) SELECT {s} FROM {s};", .{ try quoteIdent(sa, tmp), new_cols.items, src_cols.items, try quoteIdent(sa, old.name) }));
-    try stmts.append(alloc, try std.fmt.allocPrint(alloc, "DROP TABLE {s};", .{try quoteIdent(sa, old.name)}));
-    try stmts.append(alloc, try std.fmt.allocPrint(alloc, "ALTER TABLE {s} RENAME TO {s};", .{ try quoteIdent(sa, tmp), try quoteIdent(sa, new.name) }));
-    for (new.indexes) |idx| try stmts.append(alloc, try createIndexSql(alloc, new.name, idx, d));
+    // Copy the hidden rowid too: restored migration triggers (and anything else keyed on it)
+    // must see the same rowid for the same row after the rebuild. `_rowid_`, not `rowid`:
+    // `rowid` may be a user field name, and field names cannot start with '_'.
+    try stmts.append(alloc, try std.fmt.allocPrint(alloc, "INSERT INTO \"main\".{s} (\"_rowid_\",{s}) SELECT \"_rowid_\",{s} FROM \"main\".{s};", .{ try quoteIdent(sa, tmp), new_cols.items, src_cols.items, try quoteIdent(sa, old.name) }));
+    try stmts.append(alloc, try std.fmt.allocPrint(alloc, "DROP TABLE \"main\".{s};", .{try quoteIdent(sa, old.name)}));
+    try stmts.append(alloc, try std.fmt.allocPrint(alloc, "ALTER TABLE \"main\".{s} RENAME TO {s};", .{ try quoteIdent(sa, tmp), try quoteIdent(sa, new.name) }));
+    for (new.indexes) |idx| try stmts.append(alloc, try createIndexSqlMain(alloc, new.name, idx, d, true));
     return stmts.toOwnedSlice(alloc);
 }
 
@@ -312,7 +368,9 @@ fn rebuildPlanPg(alloc: std.mem.Allocator, old: schema.Collection, new: schema.C
             if (of.storageClass() != nf.storageClass())
                 try stmts.append(alloc, try std.fmt.allocPrint(alloc, "ALTER TABLE {s} ALTER COLUMN {s} TYPE {s} USING ({s}::{s});", .{ qtbl, try quoteIdent(sa, nf.name), ty, try quoteIdent(sa, nf.name), ty }));
         } else {
-            const uniq = if (nf.unique) " UNIQUE" else "";
+            // A tenant-scoped unique field (#498) gets its composite constraint from the
+            // caller's catalog reconcile (`collections.reconcileUniqueConstraintsPg`), not inline.
+            const uniq = if (schema.uniqueScope(new, nf) == .global) " UNIQUE" else "";
             try stmts.append(alloc, try std.fmt.allocPrint(alloc, "ALTER TABLE {s} ADD COLUMN IF NOT EXISTS {s} {s}{s}{s};", .{ qtbl, try quoteIdent(sa, nf.name), ty, fieldCollate(new, nf, d), uniq }));
         }
     }
@@ -470,9 +528,9 @@ test "every generated statement ESCAPES its identifiers (embedded-quote probe)" 
     var saw_drop = false;
     var saw_rename = false;
     for (plan) |stmt| {
-        if (std.mem.startsWith(u8, stmt, "INSERT INTO \"po\"\"sts__new\"")) saw_insert = true;
-        if (std.mem.eql(u8, stmt, "DROP TABLE \"po\"\"sts\";")) saw_drop = true;
-        if (std.mem.eql(u8, stmt, "ALTER TABLE \"po\"\"sts__new\" RENAME TO \"po\"\"sts\";")) saw_rename = true;
+        if (std.mem.startsWith(u8, stmt, "INSERT INTO \"main\".\"po\"\"sts__new\"")) saw_insert = true;
+        if (std.mem.eql(u8, stmt, "DROP TABLE \"main\".\"po\"\"sts\";")) saw_drop = true;
+        if (std.mem.eql(u8, stmt, "ALTER TABLE \"main\".\"po\"\"sts__new\" RENAME TO \"po\"\"sts\";")) saw_rename = true;
     }
     try std.testing.expect(saw_insert);
     try std.testing.expect(saw_drop);
@@ -541,10 +599,10 @@ test "rebuildPlan copies retained columns by field id, adds new, drops removed" 
     try std.testing.expectEqual(@as(usize, 4), plan.len);
     try std.testing.expect(std.mem.indexOf(u8, plan[0], "\"posts__new\"") != null);
     const insert = plan[1];
-    try std.testing.expect(std.mem.indexOf(u8, insert, "INSERT INTO \"posts__new\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, insert, "INSERT INTO \"main\".\"posts__new\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, insert, "\"headline\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, insert, "\"title\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, plan[2], "DROP TABLE \"posts\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, plan[2], "DROP TABLE \"main\".\"posts\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, plan[3], "RENAME TO \"posts\"") != null);
 }
 

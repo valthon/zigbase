@@ -83,6 +83,7 @@ const Tok = struct {
 const Lexer = struct {
     src: []const u8,
     i: usize = 0,
+    include_strings: bool = false,
 
     fn isIdentStart(c: u8) bool {
         return std.ascii.isAlphabetic(c) or c == '_';
@@ -96,8 +97,14 @@ const Lexer = struct {
         while (self.i < s.len) {
             const c = s[self.i];
             // whitespace
-            if (c == ' ' or c == '\t' or c == '\r' or c == '\n') {
+            // SQLite's whitespace set includes form feed.
+            if (c == ' ' or c == '\t' or c == '\r' or c == '\n' or c == '\x0c') {
                 self.i += 1;
+                continue;
+            }
+            // SQLite also treats a UTF-8 byte-order mark as whitespace between tokens.
+            if (std.mem.startsWith(u8, s[self.i..], "\xef\xbb\xbf")) {
+                self.i += 3;
                 continue;
             }
             // -- line comment
@@ -116,6 +123,7 @@ const Lexer = struct {
             // '...' string literal ('' is an escaped quote). Skipped entirely.
             if (c == '\'') {
                 self.i += 1;
+                const start = self.i;
                 while (self.i < s.len) {
                     if (s[self.i] == '\'') {
                         if (self.i + 1 < s.len and s[self.i + 1] == '\'') {
@@ -127,6 +135,7 @@ const Lexer = struct {
                     }
                     self.i += 1;
                 }
+                if (self.include_strings) return .{ .kind = .ident, .text = s[start..@max(start, self.i - 1)], .quoted = true };
                 continue;
             }
             // "..." or `...` quoted identifier
@@ -171,6 +180,165 @@ const Lexer = struct {
         return copy.next();
     }
 };
+
+/// Compare catalog SQL after collapsing whitespace outside quoted identifiers/literals.
+/// Quoted/comment whitespace and escaped quote characters remain significant. No allocations.
+pub fn whitespaceEql(left: []const u8, right: []const u8) bool {
+    var a = SqlWhitespace{ .text = left };
+    var b = SqlWhitespace{ .text = right };
+    while (true) {
+        const ac = a.next();
+        const bc = b.next();
+        if (ac != bc) return false;
+        if (ac == null) return true;
+    }
+}
+
+const SqlWhitespace = struct {
+    text: []const u8,
+    pos: usize = 0,
+    quote: u8 = 0,
+    escaped: bool = false,
+    line_comment: bool = false,
+    block_comment: bool = false,
+    /// Index of the opening `*` of the current block comment; `/*/` must not close it.
+    block_open: usize = 0,
+
+    fn next(self: *SqlWhitespace) ?u8 {
+        if (self.pos == self.text.len) return null;
+        if (self.line_comment or self.block_comment) {
+            const ch = self.text[self.pos];
+            if (self.line_comment and ch == '\n') self.line_comment = false;
+            if (self.block_comment and ch == '/' and self.pos > self.block_open + 1 and self.text[self.pos - 1] == '*') self.block_comment = false;
+            self.pos += 1;
+            return ch;
+        }
+        if (self.quote == 0 and std.ascii.isWhitespace(self.text[self.pos])) {
+            const leading = self.pos == 0;
+            while (self.pos < self.text.len and std.ascii.isWhitespace(self.text[self.pos])) self.pos += 1;
+            if (self.pos == self.text.len) return null;
+            if (!leading) return ' ';
+        }
+        const ch = self.text[self.pos];
+        self.pos += 1;
+        if (self.escaped) {
+            self.escaped = false;
+        } else if (self.quote != 0) {
+            if (ch == self.quote) {
+                if (self.pos < self.text.len and self.text[self.pos] == ch) self.escaped = true else self.quote = 0;
+            }
+        } else switch (ch) {
+            '-' => self.line_comment = self.pos < self.text.len and self.text[self.pos] == '-',
+            '/' => if (self.pos < self.text.len and self.text[self.pos] == '*') {
+                self.block_comment = true;
+                self.block_open = self.pos;
+            },
+            '\'', '"', '`' => self.quote = ch,
+            '[' => self.quote = ']',
+            else => {},
+        }
+        return ch;
+    }
+};
+
+/// Match an INDEXED BY operand, ignoring comments and accepting quoted index names.
+pub fn referencesIndex(sql: []const u8, name: []const u8) bool {
+    var lexer = Lexer{ .src = sql, .include_strings = true };
+    while (true) {
+        const token = lexer.next();
+        if (token.kind == .eof) return false;
+        if (!kwEq(token, "indexed") or !kwEq(lexer.peek(), "by")) continue;
+        _ = lexer.next();
+        const index = lexer.next();
+        if (index.kind == .ident and eqIC(index.text, name)) return true;
+    }
+}
+
+/// True when an `INDEXED BY` clause names an index starting with `prefix` (case-insensitive).
+/// Used for SQLite's constraint autoindexes (`sqlite_autoindex_<table>_N`), which have no stored
+/// SQL and whose numbering a table rebuild does not preserve.
+pub fn referencesIndexPrefix(sql: []const u8, prefix: []const u8) bool {
+    var lexer = Lexer{ .src = sql, .include_strings = true };
+    while (true) {
+        const token = lexer.next();
+        if (token.kind == .eof) return false;
+        if (!kwEq(token, "indexed") or !kwEq(lexer.peek(), "by")) continue;
+        _ = lexer.next();
+        const index = lexer.next();
+        if (index.kind == .ident and index.text.len >= prefix.len and eqIC(index.text[0..prefix.len], prefix)) return true;
+    }
+}
+
+/// Conservative SQL dependency check: identifiers match case-insensitively; comments are
+/// ignored. Matching strings also count: SQLite accepts single-quoted identifiers in some
+/// grammar positions (notably UPDATE OF), so these candidates cannot safely be skipped.
+pub fn mentionsIdentifier(sql: []const u8, name: []const u8) bool {
+    var lexer = Lexer{ .src = sql, .include_strings = true };
+    while (true) {
+        const token = lexer.next();
+        if (token.kind == .eof) return false;
+        if (token.kind == .ident and eqIC(token.text, name)) return true;
+    }
+}
+
+/// Conservative layout preflight, not a trigger parser. Any wildcard in an object that
+/// names this table is suspect. INSERT INTO this table without a column list is positional.
+/// Comments and literals cannot manufacture wildcard tokens.
+pub fn hasLayoutDependency(sql: []const u8, table: []const u8) bool {
+    if (!mentionsIdentifier(sql, table)) return false;
+    var lexer = Lexer{ .src = sql, .include_strings = true };
+    var prev = Tok{ .kind = .other };
+    var before_prev = prev;
+    while (true) {
+        const token = lexer.next();
+        defer {
+            before_prev = prev;
+            prev = token;
+        }
+        if (token.kind == .eof) return false;
+        // COUNT(*) counts rows; unlike SELECT *, its result shape is independent
+        // of the table's columns (including in triggers attached to that table).
+        if (token.kind == .star and !(prev.kind == .lparen and kwEq(before_prev, "count") and lexer.peek().kind == .rparen)) return true;
+        if (kwEq(token, "into")) {
+            var target = lexer.next();
+            if (lexer.peek().kind == .dot) {
+                _ = lexer.next();
+                target = lexer.next();
+            }
+            if (target.kind == .ident and eqIC(target.text, table) and lexer.peek().kind != .lparen) return true;
+        }
+    }
+}
+
+test "catalog whitespace comparison preserves literal and identifier contents" {
+    try std.testing.expect(whitespaceEql(" CREATE  INDEX x ON t(a) ", "CREATE INDEX x ON t(a)"));
+    try std.testing.expect(!whitespaceEql("WHERE a='two  words'", "WHERE a='two words'"));
+    try std.testing.expect(!whitespaceEql("SELECT \"two  words\"", "SELECT \"two words\""));
+    try std.testing.expect(whitespaceEql("SELECT 'it''s  here'  FROM t", "SELECT 'it''s  here' FROM t"));
+    try std.testing.expect(!mentionsIdentifier("CREATE INDEX x ON t(a) WHERE a='other' /* account */", "account"));
+    try std.testing.expect(mentionsIdentifier("CREATE TRIGGER t AFTER UPDATE OF 'account' ON x BEGIN SELECT 1; END", "account"));
+    try std.testing.expect(!whitespaceEql("WHERE a IS NOT NULL -- guard\n AND b=1", "WHERE a IS NOT NULL -- guard AND b=1"));
+    try std.testing.expect(!whitespaceEql("WHERE a IS NOT NULL -- guard\r\n AND b=1", "WHERE a IS NOT NULL -- guard\r AND b=1"));
+    try std.testing.expect(!whitespaceEql("SELECT a /* two  words */ FROM t", "SELECT a /* two words */ FROM t"));
+    // `/*/` opens a comment that its own `*` cannot close; the string after the real `*/` keeps its spacing.
+    try std.testing.expect(!whitespaceEql("WHERE /*/ ' */ slug='two  words'", "WHERE /*/ ' */ slug='two words'"));
+    try std.testing.expect(whitespaceEql("WHERE /*/ x */  slug = 1", "WHERE /*/ x */ slug = 1"));
+    try std.testing.expect(referencesIndexPrefix("SELECT 1 FROM slugs INDEXED BY \"SQLITE_AUTOINDEX_slugs_2\" WHERE 1", "sqlite_autoindex_slugs_"));
+    try std.testing.expect(referencesIndex("SELECT account FROM slugs INDEXED\x0cBY idx_slugs_account WHERE 1", "idx_slugs_account"));
+    try std.testing.expect(!referencesIndexPrefix("SELECT 1 FROM slugs INDEXED BY idx_slugs WHERE 1 /* sqlite_autoindex_slugs_2 */", "sqlite_autoindex_slugs_"));
+    try std.testing.expect(mentionsIdentifier("CREATE INDEX x ON t(\"Account\")", "account"));
+}
+
+/// First unquoted SQL keyword from `keywords`, borrowing its spelling from `src`.
+/// Used by schema introspection to refuse clauses a metadata rebuild cannot reproduce.
+pub fn firstKeyword(src: []const u8, keywords: []const []const u8) ?[]const u8 {
+    var lexer = Lexer{ .src = src };
+    while (true) {
+        const token = lexer.next();
+        if (token.kind == .eof) return null;
+        for (keywords) |keyword| if (kwEq(token, keyword)) return token.text;
+    }
+}
 
 /// True if `t` is the (unquoted) keyword `kw`.
 fn kwEq(t: Tok, kw: []const u8) bool {
@@ -726,4 +894,12 @@ test "negative: qualified column via table name (no alias)" {
 
 test "negative: auth collection rejects a non-existent qualified column" {
     try expectUnknownColumn("SELECT u.emial FROM users u", "users", "emial");
+}
+
+test "layout dependency preflight distinguishes row counts and ignores comment stars" {
+    try std.testing.expect(!hasLayoutDependency("CREATE TRIGGER t AFTER INSERT ON slugs BEGIN SELECT count(*) FROM slugs; END", "slugs"));
+    try std.testing.expect(!hasLayoutDependency("SELECT 'a*b' FROM slugs /* * */ -- *\n", "slugs"));
+    try std.testing.expect(hasLayoutDependency("SELECT s.* FROM slugs s", "slugs"));
+    try std.testing.expect(hasLayoutDependency("INSERT INTO main.slugs VALUES(1,2)", "slugs"));
+    try std.testing.expect(!hasLayoutDependency("INSERT INTO slugs(id) VALUES(1)", "slugs"));
 }

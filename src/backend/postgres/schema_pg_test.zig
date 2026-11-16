@@ -54,6 +54,83 @@ fn scalarCount(w: *db.Db, sql: [:0]const u8) !i64 {
     return st.columnInt(0);
 }
 
+test "pg: auth convergence and updates retain main uniqueness" {
+    const a = std.testing.allocator;
+    var ctx = (try Ctx.open(a, std.testing.io, "auth_unique_main")) orelse return error.SkipZigTest;
+    defer ctx.deinit();
+    const w = ctx.w();
+    try migrations.run(w);
+    const collections = @import("../../collections.zig");
+    const fields: []const schema.Field = &.{
+        .{ .id = "accountid", .name = "account", .options = .{ .text = .{} } },
+        .{ .id = "slugid", .name = "slug", .unique = true, .options = .{ .text = .{} } },
+        .{ .id = "tagid", .name = "tag", .options = .{ .text = .{} } },
+    };
+    const old = try collections.create(a, std.testing.io, w, .{
+        .id = "",
+        .name = "members",
+        .type = .auth,
+        .fields = fields,
+        .options = .{ .tenant_field = "account" },
+    });
+    defer old.deinit(a);
+    try w.exec("INSERT INTO members(id,email,username,account,slug,tag) VALUES('a','a@example.com','same','one','first','same'),('b','b@example.com','same','two','second','same');");
+    try collections.ensureUniqueScopes(a, std.testing.io, w, old.id);
+    try collections.ensureAllUniqueScopes(a, std.testing.io, w);
+    try std.testing.expectEqual(@as(i64, 3), try scalarCount(w, "SELECT count(*) FROM pg_indexes WHERE schemaname=current_schema() AND tablename='members';"));
+    var changed = [_]schema.Field{ fields[0], fields[1], fields[2] };
+    changed[1].unique = false;
+    changed[2].unique = true;
+    const updated = try collections.update(a, std.testing.io, w, old.id, .{
+        .id = old.id,
+        .name = old.name,
+        .type = .auth,
+        .fields = &changed,
+        .options = .{ .tenant_field = "account", .auth = .{ .identityFields = &.{"slug"} } },
+    });
+    defer updated.deinit(a);
+    // main's in-place PG update leaves existing field constraints and identity indexes
+    // alone, and creates the newly configured identity index. Flag changes are metadata only.
+    try std.testing.expectEqual(@as(i64, 1), try scalarCount(w, "SELECT count(*) FROM pg_indexes WHERE schemaname=current_schema() AND indexname='idx_auth_members_email';"));
+    try std.testing.expectEqual(@as(i64, 4), try scalarCount(w, "SELECT count(*) FROM pg_indexes WHERE schemaname=current_schema() AND tablename='members';"));
+    try w.exec("INSERT INTO members(id,email,username,account,slug,tag) VALUES('c','c@example.com','same','three','third','same');");
+    try std.testing.expectError(error.ExecFailed, w.exec("INSERT INTO members(id,email,slug) VALUES('d','a@example.com','fourth');"));
+}
+
+test "pg: changing identity preserves a newly declared matching unique index" {
+    const a = std.testing.allocator;
+    var ctx = (try Ctx.open(a, std.testing.io, "declared_identity")) orelse return error.SkipZigTest;
+    defer ctx.deinit();
+    const w = ctx.w();
+    try migrations.run(w);
+    const collections = @import("../../collections.zig");
+    const fields: []const schema.Field = &.{.{ .id = "slugid", .name = "slug", .options = .{ .text = .{} } }};
+    const old = try collections.create(a, std.testing.io, w, .{
+        .id = "",
+        .name = "slugs",
+        .type = .auth,
+        .fields = fields,
+        .options = .{ .auth = .{ .identityFields = &.{"slug"} } },
+    });
+    defer old.deinit(a);
+    const updated = try collections.update(a, std.testing.io, w, old.id, .{
+        .id = old.id,
+        .name = old.name,
+        .type = .auth,
+        .fields = fields,
+        .options = .{ .auth = .{ .identityFields = &.{"email"} } },
+        .indexes = &.{.{ .name = "idx_auth_slugs_slug", .fields = &.{"slug"}, .unique = true, .where = "\"slug\" != ''" }},
+    });
+    defer updated.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), updated.options.auth.identityFields.len);
+    try std.testing.expectEqualStrings("email", updated.options.auth.identityFields[0]);
+    try std.testing.expectEqual(@as(usize, 1), updated.indexes.len);
+    try std.testing.expectEqual(@as(i64, 1), try scalarCount(w, "SELECT count(*) FROM pg_indexes WHERE schemaname=current_schema() AND indexname='idx_auth_slugs_slug';"));
+    try w.exec("INSERT INTO slugs(id,slug) VALUES('a','shared');");
+    try std.testing.expectError(error.ExecFailed, w.exec("INSERT INTO slugs(id,slug) VALUES('b','shared');"));
+    try w.exec("INSERT INTO slugs(id,slug) VALUES('c',''),('d','');");
+}
+
 test "pg: auth rename rotates all principal tokens with bounded bindings" {
     const a = std.testing.allocator;
     var ctx = (try Ctx.open(a, std.testing.io, "rename_auth_tokens")) orelse return error.SkipZigTest;
@@ -369,4 +446,54 @@ test "pg: a consumer .nocase UNIQUE index provisions case-INSENSITIVELY via lowe
     // The exact-duplicate is likewise rejected.
     try std.testing.expectError(error.ExecFailed, w.exec("INSERT INTO \"contacts\" (\"id\",\"created\",\"updated\",\"addr\") VALUES ('c3','','','Bob@x.com');"));
     try std.testing.expectEqual(@as(i64, 1), try scalarCount(w, "SELECT count(*) FROM \"contacts\";"));
+}
+
+test "pg: enabling unique over duplicates returns Constraint and rolls back" {
+    try expectUniqueConflict(false);
+}
+
+test "pg: removing tenancy over cross-tenant duplicates returns Constraint and rolls back" {
+    try expectUniqueConflict(true);
+}
+
+fn expectUniqueConflict(remove_tenancy: bool) !void {
+    const a = std.testing.allocator;
+    var ctx = (try Ctx.open(a, std.testing.io, "unique_conflict")) orelse return error.SkipZigTest;
+    defer ctx.deinit();
+    const w = ctx.w();
+    try migrations.run(w);
+    const collections = @import("../../collections.zig");
+    var fields = [_]schema.Field{
+        .{ .id = "accountid", .name = "account", .options = .{ .text = .{} } },
+        .{ .id = "slugid", .name = "slug", .unique = remove_tenancy, .options = .{ .text = .{} } },
+    };
+    const old = try collections.create(a, std.testing.io, w, .{
+        .id = "",
+        .name = "conflict_slugs",
+        .fields = &fields,
+        .options = .{ .tenant_field = if (remove_tenancy) "account" else null },
+    });
+    defer old.deinit(a);
+    try w.exec("INSERT INTO conflict_slugs(id,account,slug) VALUES('a','one','shared'),('b','two','shared');");
+    const generation = try @import("../../schema_gen.zig").read(w);
+    const constraints = try scalarCount(w, "SELECT count(*) FROM pg_constraint WHERE conrelid='conflict_slugs'::regclass AND contype='u';");
+    fields[1].unique = true;
+    // A preceding ADD COLUMN must also roll back on the later uniqueness violation.
+    const changed = [_]schema.Field{ fields[0], fields[1], .{ .id = "extraid", .name = "extra", .options = .{ .text = .{} } } };
+    try std.testing.expectError(error.Constraint, collections.update(a, std.testing.io, w, old.id, .{
+        .id = old.id,
+        .name = old.name,
+        .fields = &changed,
+    }));
+    try std.testing.expect(!w.inTransaction());
+    try std.testing.expectEqual(generation, try @import("../../schema_gen.zig").read(w));
+    const unchanged = (try collections.get(a, w, old.id)).?;
+    defer unchanged.deinit(a);
+    try std.testing.expectEqual(remove_tenancy, schema.fieldByName(unchanged, "slug").?.unique);
+    try std.testing.expectEqual(remove_tenancy, unchanged.options.tenant_field != null);
+    try std.testing.expectEqual(constraints, try scalarCount(w, "SELECT count(*) FROM pg_constraint WHERE conrelid='conflict_slugs'::regclass AND contype='u';"));
+    try std.testing.expectEqual(@as(i64, 0), try scalarCount(w, "SELECT count(*) FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='conflict_slugs' AND column_name='extra';"));
+    try std.testing.expectEqual(@as(i64, 2), try scalarCount(w, "SELECT count(*) FROM conflict_slugs WHERE slug='shared';"));
+    // The connection remains usable and the original tenant scope still applies.
+    try w.exec("INSERT INTO conflict_slugs(id,account,slug) VALUES('c','three','shared');");
 }

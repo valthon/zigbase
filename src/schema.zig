@@ -664,6 +664,7 @@ pub fn optionsFromJson(alloc: std.mem.Allocator, s: []const u8) !CollectionOptio
     // collection, or a system collection) would leave the static `&.{"email"}` default in place,
     // which deinit would then try (and fail) to free. Start owned; a parsed value replaces it below.
     var opts = try defaultOwnedOptions(alloc);
+    errdefer deinitOptions(alloc, opts);
     opts.auth.two_factor = two_factor;
     // `ttl` lives at the options root (sibling of `auth`); parse it regardless of
     // whether the `auth` block is present.
@@ -688,10 +689,18 @@ pub fn optionsFromJson(alloc: std.mem.Allocator, s: []const u8) !CollectionOptio
     if (av != .object) return opts;
     if (av.object.get("identityFields")) |idv| if (idv == .array) {
         var list: std.ArrayList([]const u8) = .empty;
-        for (idv.array.items) |it| if (it == .string) try list.append(alloc, try alloc.dupe(u8, it.string));
+        errdefer {
+            for (list.items) |item| alloc.free(item);
+            list.deinit(alloc);
+        }
+        for (idv.array.items) |it| if (it == .string) {
+            const item = try alloc.dupe(u8, it.string);
+            errdefer alloc.free(item);
+            try list.append(alloc, item);
+        };
+        // Empty arrays retain the default ["email"]. Acquire the replacement before
+        // freeing the owned default.
         if (list.items.len > 0) {
-            // Acquire the replacement BEFORE freeing the owned default, so an OOM in
-            // toOwnedSlice leaves `identityFields` pointing at valid memory (never a dangle).
             const owned = try list.toOwnedSlice(alloc);
             freeStrArrayOwned(alloc, opts.auth.identityFields);
             opts.auth.identityFields = owned;
@@ -865,6 +874,43 @@ pub fn fieldByName(c: Collection, name: []const u8) ?Field {
         if (std.mem.eql(u8, f.name, name)) return f;
     }
     return null;
+}
+
+/// How a field's `.unique` flag is enforced in storage (#498).
+///   - `.none`: the field is not unique.
+///   - `.global`: one value per table, enforced by an inline column `UNIQUE` constraint.
+///   - `.tenant`: one value per owning account, enforced by a composite
+///     `UNIQUE (<tenant_field>, <field>)` table constraint. This applies to every unique field of
+///     a tenant-owned base collection except the tenant field itself. Auth collections stay
+///     global. With a table-wide constraint,
+///     a 409 told a tenant whether ANY other tenant held a value, one request per guess, and
+///     let a tenant squat values. Global uniqueness on a tenant-owned base collection is declared
+///     with an explicit unique `.indexes` entry instead.
+pub const UniqueScope = enum { none, global, tenant };
+
+pub fn uniqueScope(c: Collection, f: Field) UniqueScope {
+    if (!f.unique) return .none;
+    // Auth lookups (including email-token flows) have no tenant context.
+    if (c.type == .auth) return .global;
+    const tf = c.options.tenant_field orelse return .global;
+    // The tenant field has nothing to be scoped by: unique on it stays table-wide.
+    if (std.mem.eql(u8, tf, f.name)) return .global;
+    return .tenant;
+}
+
+test "uniqueScope scopes unique fields of tenant-owned collections to the tenant" {
+    const fields = [_]Field{
+        .{ .id = "f1", .name = "account", .unique = true, .options = .{ .text = .{} } },
+        .{ .id = "f2", .name = "slug", .unique = true, .options = .{ .text = .{} } },
+        .{ .id = "f3", .name = "title", .options = .{ .text = .{} } },
+    };
+    const plain = Collection{ .id = "c", .name = "posts", .fields = &fields };
+    try std.testing.expectEqual(UniqueScope.global, uniqueScope(plain, fields[1]));
+    try std.testing.expectEqual(UniqueScope.none, uniqueScope(plain, fields[2]));
+    const owned = Collection{ .id = "c", .name = "posts", .fields = &fields, .options = .{ .tenant_field = "account" } };
+    try std.testing.expectEqual(UniqueScope.tenant, uniqueScope(owned, fields[1]));
+    try std.testing.expectEqual(UniqueScope.none, uniqueScope(owned, fields[2]));
+    try std.testing.expectEqual(UniqueScope.global, uniqueScope(owned, fields[0]));
 }
 
 test "fieldByName finds and misses" {
@@ -2391,4 +2437,18 @@ test "collection input rejects invalid password minima and preserves boundaries"
         defer col.deinit(a);
         try std.testing.expectEqual(minimum, col.options.auth.minPasswordLength);
     }
+}
+
+test "empty identityFields round-trips to the email default" {
+    const a = std.testing.allocator;
+    const col = Collection{ .id = "c", .name = "members", .type = .auth, .fields = &.{}, .options = .{ .auth = .{ .identityFields = &.{} } } };
+    const json = try optionsToJson(a, col, false);
+    defer a.free(json);
+    const back = try optionsFromJson(a, json);
+    defer deinitOptions(a, back);
+    try std.testing.expectEqual(@as(usize, 1), back.auth.identityFields.len);
+    try std.testing.expectEqualStrings("email", back.auth.identityFields[0]);
+    const omitted = try optionsFromJson(a, "{\"auth\":{}}");
+    defer deinitOptions(a, omitted);
+    try std.testing.expectEqualStrings("email", omitted.auth.identityFields[0]);
 }

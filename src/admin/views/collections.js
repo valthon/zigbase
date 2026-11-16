@@ -155,7 +155,7 @@ export function SchemaEditor({ name }) {
           <input style="width:150px" data-test="field-name" placeholder="name" value=${f.name} onInput=${e => setF(i, { name: e.target.value })} disabled=${protectedFieldIds.has(f.id)}/>
           <select style="width:120px" data-test="field-type" value=${f.type} onChange=${e => setF(i, { type: e.target.value, options: {} })} disabled=${protectedFieldIds.has(f.id)}>${FIELD_TYPES.map(t => html`<option key=${t} value=${t}>${t}</option>`)}</select>
           <label class="muted"><input type="checkbox" style="width:auto" checked=${f.required} onChange=${e => setF(i, { required: e.target.checked })}/> req</label>
-          <label class="muted"><input type="checkbox" style="width:auto" checked=${f.unique} onChange=${e => setF(i, { unique: e.target.checked })}/> uniq</label>
+          <label class="muted"><input type="checkbox" style="width:auto" checked=${f.unique} onChange=${e => setF(i, { unique: e.target.checked })}/> uniq <span data-test="unique-scope">${col.type !== 'auth' && col.options?.tenant?.field && col.options.tenant.field !== f.name ? 'per tenant (' + col.options.tenant.field + ')' : 'global'}</span></label>
           ${fieldOptions(f, i, setOpt, allCols)}
           ${!protectedFieldIds.has(f.id) && html`<button class="ghost" data-test="del-field" onClick=${() => delField(i)}>✕</button>`}
           ${ownValue(fieldErrs, f.name) && html`<div class="error" style="flex-basis:100%">${ownValue(fieldErrs, f.name).message}</div>`}

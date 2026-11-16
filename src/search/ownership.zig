@@ -121,7 +121,12 @@ fn sqliteSearch(scratch: *std.heap.ArenaAllocator, w: *db.Db, old: schema.Collec
         }
         for (0..4) |i| {
             const n: c_int = @intCast(i);
-            if (actual.isNull(n) != expected.isNull(n) or !std.mem.eql(u8, actual.columnText(n), expected.columnText(n))) return error.Conflict;
+            if (actual.isNull(n) != expected.isNull(n)) return error.Conflict;
+            const matches = if (i == 3)
+                @import("../sql/schema_check.zig").whitespaceEql(actual.columnText(n), expected.columnText(n))
+            else
+                std.mem.eql(u8, actual.columnText(n), expected.columnText(n));
+            if (!matches) return error.Conflict;
         }
         has_actual = try actual.step();
     }

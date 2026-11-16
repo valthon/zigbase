@@ -113,7 +113,7 @@ fn hasSearchableField(col: schema.Collection) bool {
 
 /// A field the search index covers: flagged searchable, a text/editor type, a valid identifier,
 /// and not encrypted.
-fn isIndexedField(f: schema.Field) bool {
+pub fn isIndexedField(f: schema.Field) bool {
     return f.searchable and schema.isSearchableType(f.fieldType()) and schema.isValidIdentifier(f.name) and !f.encrypted;
 }
 
@@ -463,6 +463,12 @@ pub fn sameSearchColumns(a: schema.Collection, b: schema.Collection) bool {
         i += 1;
         j += 1;
     }
+}
+
+/// Remove proven engine search state before a base-table rebuild, while old operands exist.
+/// Validation must run before any DROP; a conflicting migration object is never adopted.
+pub fn removeForRebuild(alloc: std.mem.Allocator, w: *db.Db, old: schema.Collection) EnsureIndexError!void {
+    return dropIndexFor(alloc, w, old);
 }
 
 /// Self-freeing. Validate the current physical search objects without reconciling

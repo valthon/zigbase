@@ -30,6 +30,13 @@ object is identical in both directions:
 `required` and `unique` are common to every type and both default to `false`. A create or
 update that would duplicate a `unique` value is rejected with **`409 Conflict`** (not `500`),
 so a client can tell the conflict apart from a server fault — see [api.md → Records](api.md#records).
+On a tenant-owned base collection (one with a `tenant_field`), `unique` means unique **within each
+tenant**: it is enforced as a composite `UNIQUE (<tenant_field>, <field>)`, so two tenants can
+hold the same value and one tenant's rows never decide another tenant's status codes. The tenant
+field itself, if marked `unique`, stays unique across the table. Auth collections keep all
+unique fields global so identity and email-token lookups remain unambiguous. For a value that must be unique
+across every tenant, declare a unique index on the field instead (see
+[tenancy.md → Unique fields are per tenant](tenancy.md#unique-fields-are-per-tenant)).
 A third
 common boolean, `encrypted` (default `false`), stores the value encrypted at rest and is
 valid only on `text`/`editor`/`json` fields — see [Encryption at rest](#encryption-at-rest-encrypted).
