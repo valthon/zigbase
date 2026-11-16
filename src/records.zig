@@ -2220,6 +2220,985 @@ pub fn deleteInTxn(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection, 
     return try st.step();
 }
 
+/// What a record delete changed in OTHER rows through the database's own foreign-key actions
+/// (#489). A single relation (`maxSelect: 1`) is a foreign key: `ON DELETE CASCADE` with
+/// `cascadeDelete: true`, `ON DELETE SET NULL` otherwise (`ddl.createTableSql`). The database
+/// performs those mutations; this only DISCOVERS and REPORTS them so the caller can journal and
+/// publish them like the parent delete. Multi-relations carry no FK and are never reported.
+///
+/// Ownership (NO_SLOP §2.2a contract 2, owned result): every slice, collection and JSON value in
+/// the result lives in `arena`, which `deinit` frees in one shot.
+pub const CascadeEffects = struct {
+    arena: std.heap.ArenaAllocator,
+    /// Rows the database deleted through `ON DELETE CASCADE`, transitively, in discovery order
+    /// (breadth-first from the parent). `snapshot` is the AT-REST row read BEFORE the delete
+    /// (encrypted fields stay ciphertext, hidden fields omitted) — the representation realtime
+    /// delete authorization and the durable journal compare — or null when that row could not
+    /// be decoded (it is then announced id-only; see `deleteCascadingInTxn`). Rows whose TTL had
+    /// already expired are not records and are not listed.
+    deleted: []const Deleted = &.{},
+    /// Rows whose relation the database set to NULL, re-read AFTER the delete inside the same
+    /// transaction, so `record` is exactly what the database now holds (the shape `get`
+    /// returns), or null when the row could not be decoded. A row that was also
+    /// cascade-deleted is reported only in `deleted`.
+    nulled: []const Nulled = &.{},
+    /// More than `cascade_announce_cap` distinct rows, or an unsupported FK, were encountered.
+    /// Discovery stopped:
+    /// `deleted` and `nulled` are empty, and `reach` lists every collection the delete's
+    /// foreign keys can change, so the caller invalidates those instead of announcing rows.
+    overflow: bool = false,
+    reach: []const schema.Collection = &.{},
+
+    pub const Deleted = struct { col: schema.Collection, id: []const u8, snapshot: ?std.json.Value };
+    pub const Nulled = struct { col: schema.Collection, id: []const u8, record: ?std.json.Value };
+
+    pub fn deinit(self: *CascadeEffects) void {
+        self.arena.deinit();
+    }
+};
+
+/// Most rows one delete announces individually (cascade-deleted plus nulled candidates, counted
+/// during discovery). Above it the delete still succeeds; see `CascadeEffects.overflow`.
+pub const cascade_announce_cap = 1000;
+
+/// Ids bound per discovery/verification statement. Far below SQLite's 32766 and PostgreSQL's
+/// 65535 bind-parameter limits.
+pub const cascade_chunk = 256;
+
+/// Delete a record inside the caller's transaction (like `deleteInTxn`) and report the rows the
+/// database's foreign-key actions changed as a consequence. Returns null (and deletes nothing)
+/// when the record does not exist.
+///
+/// The referencing columns and their `ON DELETE` actions come from the DATABASE's own foreign-key
+/// catalog (SQLite `pragma_foreign_key_list`, PostgreSQL `pg_constraint`), not from the stored
+/// collection schema, so a schema whose `cascadeDelete` disagrees with the table's actual
+/// constraint is reported as the database behaves. Discovery runs BEFORE the delete: one set
+/// query per bounded ID page (referencing column, chunk of up to `cascade_chunk` parent ids)
+/// per cascade level, then batched snapshots. It is cycle-safe (each deleted row expands once). On
+/// PostgreSQL the parent and every discovered row are locked `FOR UPDATE`, so another instance
+/// can neither attach a new child to a row being deleted nor remove a discovered row before this
+/// transaction commits. After the delete, one set query per (collection or column, chunk)
+/// re-reads the candidates and classifies them by what the database did: gone → deleted, the
+/// column now NULL → nulled, otherwise unchanged (e.g. foreign keys disabled).
+///
+/// Announcing never fails the delete: a row that cannot be decoded (malformed stored JSON, an
+/// encrypted value that does not open) is logged and reported without its body. Database and
+/// allocation errors still propagate (the caller's transaction rolls back).
+pub fn deleteCascadingInTxn(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection, id: []const u8) RecordError!?CascadeEffects {
+    var effects: CascadeEffects = .{ .arena = std.heap.ArenaAllocator.init(alloc) };
+    errdefer effects.arena.deinit();
+    var planner: CascadePlanner = .{ .a = effects.arena.allocator(), .w = w, .pg = db.dbDialect(w).kind == .postgres };
+    try planner.plan(col, id);
+    if (!try deleteInTxn(planner.a, w, col, id)) {
+        effects.arena.deinit();
+        return null;
+    }
+    if (planner.overflow) {
+        effects.overflow = true;
+        effects.reach = try planner.reachable(col);
+        return effects;
+    }
+    var deleted: std.ArrayList(CascadeEffects.Deleted) = .empty;
+    try planner.settleDeleted(&deleted);
+    effects.nulled = try planner.settleNulled(&deleted);
+    effects.deleted = deleted.items;
+    return effects;
+}
+
+/// Helper of `deleteCascadingInTxn`. `a` is the result's own arena, so nothing allocated here is
+/// freed individually (the whole graph is reclaimed by `CascadeEffects.deinit`).
+const CascadePlanner = struct {
+    a: std.mem.Allocator,
+    w: *db.Db,
+    pg: bool,
+    /// Referencing foreign keys per target table name (memoized for one delete).
+    refs_by_target: std.StringHashMapUnmanaged([]const FkRef) = .empty,
+    /// Collections loaded by table name (memoized for one delete).
+    cols_by_table: std.StringHashMapUnmanaged(?schema.Collection) = .empty,
+    /// `collection id ++ 0 ++ record id` of every row the delete removes, root included.
+    doomed: std.StringHashMapUnmanaged(void) = .empty,
+    candidates: std.ArrayList(Candidate) = .empty,
+    null_groups: std.ArrayList(NullGroup) = .empty,
+    seen: std.StringHashMapUnmanaged(void) = .empty,
+    /// Distinct candidate rows (cascade and SET NULL), against `cascade_announce_cap`.
+    count: usize = 0,
+    overflow: bool = false,
+
+    const FkRef = struct { table: []const u8, col: ?schema.Collection, column: []const u8, cascade: bool, supported: bool };
+    const Candidate = struct { col: schema.Collection, id: []const u8, snapshot: ?std.json.Value, visible: bool };
+    const NullGroup = struct { col: schema.Collection, column: []const u8, ids: std.ArrayList([]const u8) = .empty };
+    const Level = struct { col: schema.Collection, ids: []const []const u8 };
+
+    fn rowKey(self: *CascadePlanner, col_id: []const u8, id: []const u8) ![]const u8 {
+        return std.mem.concat(self.a, u8, &.{ col_id, "\x00", id });
+    }
+
+    fn plan(self: *CascadePlanner, root: schema.Collection, id: []const u8) !void {
+        if (self.pg) try self.lockRoot(root, id);
+        try self.doomed.put(self.a, try self.rowKey(root.id, id), {});
+        var queue: std.ArrayList(Level) = .empty;
+        try queue.append(self.a, .{ .col = root, .ids = try self.a.dupe([]const u8, &.{id}) });
+        var next: usize = 0;
+        while (next < queue.items.len) : (next += 1) {
+            const level = queue.items[next];
+            for (try self.referencing(level.col.name)) |ref| {
+                if (!ref.supported or ref.col == null) {
+                    self.overflow = true;
+                    return;
+                }
+                var fresh: std.ArrayList([]const u8) = .empty;
+                var start: usize = 0;
+                while (start < level.ids.len) : (start += cascade_chunk) {
+                    const chunk = level.ids[start..@min(start + cascade_chunk, level.ids.len)];
+                    try self.discover(ref, chunk, &fresh);
+                    if (self.overflow) return;
+                }
+                if (fresh.items.len > 0) try queue.append(self.a, .{ .col = ref.col.?, .ids = fresh.items });
+            }
+        }
+        // No bodies are fetched until ALL bounded ID discovery has passed the cap check.
+        // Group by traversal level, keeping snapshot reads batched rather than per row.
+        for (queue.items[1..]) |level| {
+            var start: usize = 0;
+            while (start < level.ids.len) : (start += cascade_chunk) {
+                var st = try self.selectBodies(level.col, level.ids[start..@min(start + cascade_chunk, level.ids.len)]);
+                defer st.finalize();
+                while (try st.step()) {
+                    for (self.candidates.items) |*candidate| {
+                        if (!std.mem.eql(u8, candidate.col.id, level.col.id) or !std.mem.eql(u8, candidate.id, st.columnText(0))) continue;
+                        candidate.visible = st.columnInt(@intCast(3 + level.col.fields.len)) != 0;
+                        // The private delete-authorization form (#486): hidden rule inputs kept, auth secrets never.
+                        candidate.snapshot = rowToObjectAtRest(self.a, &st, level.col, null, .rule_inputs) catch |err| switch (err) {
+                            error.OutOfMemory => return error.OutOfMemory,
+                            else => blk: {
+                                std.log.warn("realtime: cascade-deleted {s}/{s} is announced without its snapshot (row could not be decoded: {s})", .{ level.col.name, candidate.id, @errorName(err) });
+                                break :blk null;
+                            },
+                        };
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    fn discover(self: *CascadePlanner, ref: FkRef, ids: []const []const u8, fresh: *std.ArrayList([]const u8)) !void {
+        const col = ref.col.?;
+        var after: ?[]const u8 = null;
+        while (true) {
+            var st = try self.selectWhereIn(col, ref.column, ids, after);
+            defer st.finalize();
+            var n: usize = 0;
+            while (try st.step()) {
+                n += 1;
+                const id = try self.a.dupe(u8, st.columnText(0));
+                after = id;
+                const key = try self.rowKey(col.id, id);
+                // The root is announced by the caller, and must not count again in a cycle.
+                if (self.doomed.contains(key) and !self.seen.contains(key)) continue;
+                if (!(try self.seen.getOrPut(self.a, key)).found_existing) {
+                    self.count += 1;
+                    if (self.count > cascade_announce_cap) {
+                        self.overflow = true;
+                        return;
+                    }
+                }
+                if (ref.cascade) {
+                    if ((try self.doomed.getOrPut(self.a, key)).found_existing) continue;
+                    try self.candidates.append(self.a, .{ .col = col, .id = id, .snapshot = null, .visible = false });
+                    try fresh.append(self.a, id);
+                } else {
+                    const group = try self.nullGroup(ref);
+                    try group.ids.append(self.a, id);
+                }
+            }
+            if (n == 0) return;
+            // Keyset paging also handles duplicate candidates from earlier FK edges without
+            // charging them twice or letting them hide new rows beyond a bounded page.
+        }
+    }
+
+    /// PostgreSQL: lock the parent first. A concurrent insert or re-point of a child takes a
+    /// key-share lock on the row it references, so it waits for this transaction (and then
+    /// fails its FK check) instead of slipping in between discovery and the delete.
+    fn lockRoot(self: *CascadePlanner, root: schema.Collection, id: []const u8) !void {
+        const sql = try std.fmt.allocPrintSentinel(self.a, "SELECT \"id\" FROM {s} WHERE \"id\"=?1 FOR UPDATE;", .{try ddl.quoteIdent(self.a, root.name)}, 0);
+        var st = try prep(self.a, self.w, sql);
+        defer st.finalize();
+        try st.bindText(1, id);
+        while (try st.step()) {}
+    }
+
+    fn nullGroup(self: *CascadePlanner, ref: FkRef) !*NullGroup {
+        const col = ref.col.?;
+        for (self.null_groups.items) |*g| {
+            if (std.mem.eql(u8, g.col.id, col.id) and std.mem.eql(u8, g.column, ref.column)) return g;
+        }
+        try self.null_groups.append(self.a, .{ .col = col, .column = ref.column });
+        return &self.null_groups.items[self.null_groups.items.len - 1];
+    }
+
+    /// Every foreign key that references table `target` with `ON DELETE CASCADE`
+    /// or `ON DELETE SET NULL`, read from the database's own catalog. Other actions (RESTRICT,
+    /// NO ACTION) either refuse the delete or change nothing. A referencing table that is not a
+    /// collection is retained so reachability can traverse migration-owned intermediary tables.
+    fn referencing(self: *CascadePlanner, target: []const u8) ![]const FkRef {
+        if (self.refs_by_target.get(target)) |hit| return hit;
+        const Row = struct { table: []const u8, column: []const u8, cascade: bool, supported: bool };
+        var rows: std.ArrayList(Row) = .empty;
+        {
+            // Drained and finalized before `collections.get` prepares its own statements.
+            var st = try prep(self.a, self.w, if (self.pg)
+                \\SELECT cl.relname::text, a.attname::text, c.confdeltype::text,
+                \\  CASE WHEN cardinality(c.conkey) = 1 AND ra.attname = 'id' THEN 1 ELSE 0 END
+                \\FROM pg_catalog.pg_constraint c
+                \\JOIN pg_catalog.pg_class cl ON cl.oid = c.conrelid
+                \\JOIN pg_catalog.pg_class t ON t.oid = c.confrelid
+                \\JOIN pg_catalog.pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = c.conkey[1]
+                \\JOIN pg_catalog.pg_attribute ra ON ra.attrelid = c.confrelid AND ra.attnum = c.confkey[1]
+                \\WHERE c.contype = 'f' AND t.relname = ?1
+                \\  AND t.relnamespace = (SELECT oid FROM pg_catalog.pg_namespace WHERE nspname = current_schema())
+                \\  AND cl.relnamespace = t.relnamespace;
+            else
+                \\SELECT m."name", f."from", f."on_delete",
+                \\  CASE WHEN f."to" = 'id' COLLATE NOCASE AND
+                \\    (SELECT count(*) FROM pragma_foreign_key_list(m."name") g WHERE g.id = f.id) = 1
+                \\    THEN 1 ELSE 0 END FROM "sqlite_master" AS m
+                \\JOIN pragma_foreign_key_list(m."name") AS f
+                \\WHERE m."type" = 'table' AND f."table" = ?1 COLLATE NOCASE;
+            );
+            defer st.finalize();
+            try st.bindText(1, target);
+            while (try st.step()) {
+                const action = st.columnText(2);
+                const cascade = if (self.pg) std.mem.eql(u8, action, "c") else std.ascii.eqlIgnoreCase(action, "CASCADE");
+                const set_null = if (self.pg) std.mem.eql(u8, action, "n") else std.ascii.eqlIgnoreCase(action, "SET NULL");
+                if (!cascade and !set_null) continue;
+                try rows.append(self.a, .{ .table = try self.a.dupe(u8, st.columnText(0)), .column = try self.a.dupe(u8, st.columnText(1)), .cascade = cascade, .supported = st.columnInt(3) != 0 });
+            }
+        }
+        var refs: std.ArrayList(FkRef) = .empty;
+        for (rows.items) |row| {
+            const gop = try self.cols_by_table.getOrPut(self.a, row.table);
+            if (!gop.found_existing) gop.value_ptr.* = try collections.get(self.a, self.w, row.table);
+            try refs.append(self.a, .{ .table = row.table, .col = gop.value_ptr.*, .column = row.column, .cascade = row.cascade, .supported = row.supported });
+        }
+        try self.refs_by_target.put(self.a, try self.a.dupe(u8, target), refs.items);
+        return refs.items;
+    }
+
+    /// Every collection the root's foreign keys can change, transitively through cascades.
+    fn reachable(self: *CascadePlanner, root: schema.Collection) ![]const schema.Collection {
+        // List collections and expand tables separately: SET NULL does not recurse, and
+        // migration-owned intermediary tables may cascade into registered collections.
+        var listed: std.StringHashMapUnmanaged(void) = .empty;
+        var expanded: std.StringHashMapUnmanaged(void) = .empty;
+        var out: std.ArrayList(schema.Collection) = .empty;
+        var queue: std.ArrayList([]const u8) = .empty;
+        try queue.append(self.a, root.name);
+        try expanded.put(self.a, root.name, {});
+        var next: usize = 0;
+        while (next < queue.items.len) : (next += 1) {
+            for (try self.referencing(queue.items[next])) |ref| {
+                if (ref.col) |col| {
+                    if (!(try listed.getOrPut(self.a, col.id)).found_existing) try out.append(self.a, col);
+                }
+                if (ref.cascade and !(try expanded.getOrPut(self.a, ref.table)).found_existing) try queue.append(self.a, ref.table);
+            }
+        }
+        return out.items;
+    }
+
+    /// `ttlVisiblePredicate` as a 0/1 column (1 for a collection without TTL).
+    fn visibleColumn(self: *CascadePlanner, col: schema.Collection) ![]const u8 {
+        const tf = col.options.ttl_field orelse return "1";
+        const pred = try db.dbDialect(self.w).ttlVisiblePredicate(self.a, try ddl.quoteIdent(self.a, tf));
+        return std.fmt.allocPrint(self.a, "CASE WHEN ({s}) THEN 1 ELSE 0 END", .{pred});
+    }
+
+    /// ID-only discovery, bounded before PostgreSQL buffers the result. Each page is
+    /// limited to the remaining distinct-row budget plus one overflow sentinel.
+    fn selectWhereIn(self: *CascadePlanner, col: schema.Collection, column: []const u8, ids: []const []const u8, after: ?[]const u8) !db.Stmt {
+        var sql: std.ArrayList(u8) = .empty;
+        try sql.print(self.a, "SELECT \"id\" FROM {s} WHERE {s} IN (", .{ try ddl.quoteIdent(self.a, col.name), try ddl.quoteIdent(self.a, column) });
+        try self.appendPlaceholders(&sql, ids.len);
+        try sql.appendSlice(self.a, ")");
+        if (after != null) try sql.print(self.a, " AND \"id\">?{d}", .{ids.len + 1});
+        try sql.print(self.a, " ORDER BY \"id\" LIMIT {d}{s};", .{ cascade_announce_cap - self.count + 1, if (self.pg) " FOR UPDATE" else "" });
+        var st = try self.bindIds(&sql, ids);
+        errdefer st.finalize();
+        if (after) |id| try st.bindText(@intCast(ids.len + 1), id);
+        return st;
+    }
+
+    fn selectBodies(self: *CascadePlanner, col: schema.Collection, ids: []const []const u8) !db.Stmt {
+        var sql: std.ArrayList(u8) = .empty;
+        try sql.print(self.a, "SELECT {s},{s} FROM {s} WHERE \"id\" IN (", .{ try columnList(self.a, col), try self.visibleColumn(col), try ddl.quoteIdent(self.a, col.name) });
+        try self.appendPlaceholders(&sql, ids.len);
+        try sql.appendSlice(self.a, ");");
+        return self.bindIds(&sql, ids);
+    }
+
+    /// Verification: `SELECT "id" FROM <col> WHERE "id" IN (<ids>)`.
+    fn selectSurvivors(self: *CascadePlanner, col: schema.Collection, ids: []const []const u8) !db.Stmt {
+        var sql: std.ArrayList(u8) = .empty;
+        try sql.print(self.a, "SELECT \"id\" FROM {s} WHERE \"id\" IN (", .{try ddl.quoteIdent(self.a, col.name)});
+        try self.appendPlaceholders(&sql, ids.len);
+        try sql.appendSlice(self.a, ");");
+        return self.bindIds(&sql, ids);
+    }
+
+    /// Verification: `SELECT <cols>, <visible>, <column> IS NULL FROM <col> WHERE "id" IN (<ids>)`.
+    fn selectAfterNull(self: *CascadePlanner, col: schema.Collection, column: []const u8, ids: []const []const u8) !db.Stmt {
+        var sql: std.ArrayList(u8) = .empty;
+        try sql.print(self.a, "SELECT {s},{s},CASE WHEN {s} IS NULL THEN 1 ELSE 0 END FROM {s} WHERE \"id\" IN (", .{
+            try columnList(self.a, col), try self.visibleColumn(col), try ddl.quoteIdent(self.a, column), try ddl.quoteIdent(self.a, col.name),
+        });
+        try self.appendPlaceholders(&sql, ids.len);
+        try sql.appendSlice(self.a, ");");
+        return self.bindIds(&sql, ids);
+    }
+
+    fn appendPlaceholders(self: *CascadePlanner, sql: *std.ArrayList(u8), n: usize) !void {
+        for (0..n) |i| try sql.print(self.a, "{s}?{d}", .{ if (i == 0) "" else ",", i + 1 });
+    }
+
+    fn bindIds(self: *CascadePlanner, sql: *std.ArrayList(u8), ids: []const []const u8) !db.Stmt {
+        var st = try prep(self.a, self.w, try sql.toOwnedSliceSentinel(self.a, 0));
+        errdefer st.finalize();
+        for (ids, 0..) |v, i| try st.bindText(@intCast(i + 1), v);
+        return st;
+    }
+
+    /// Keep the cascade candidates the database actually deleted (gone after the delete) and
+    /// that were records (not TTL-expired). A survivor is no longer doomed.
+    fn settleDeleted(self: *CascadePlanner, out: *std.ArrayList(CascadeEffects.Deleted)) !void {
+        // Candidates are appended level by level, so one collection's rows are not contiguous:
+        // group ids by collection to keep one statement per (collection, chunk).
+        const Group = struct { col: schema.Collection, ids: std.ArrayList([]const u8) };
+        var by_col: std.StringArrayHashMapUnmanaged(Group) = .empty;
+        for (self.candidates.items) |d| {
+            const gop = try by_col.getOrPut(self.a, d.col.id);
+            if (!gop.found_existing) gop.value_ptr.* = .{ .col = d.col, .ids = .empty };
+            try gop.value_ptr.ids.append(self.a, d.id);
+        }
+        var survivors: std.StringHashMapUnmanaged(void) = .empty;
+        for (by_col.values()) |group| {
+            const ids = group.ids.items;
+            var start: usize = 0;
+            while (start < ids.len) : (start += cascade_chunk) {
+                var st = try self.selectSurvivors(group.col, ids[start..@min(start + cascade_chunk, ids.len)]);
+                defer st.finalize();
+                while (try st.step()) try survivors.put(self.a, try self.rowKey(group.col.id, st.columnText(0)), {});
+            }
+        }
+        for (self.candidates.items) |d| {
+            const key = try self.rowKey(d.col.id, d.id);
+            if (survivors.contains(key)) {
+                _ = self.doomed.remove(key);
+                continue;
+            }
+            if (!d.visible) continue; // expired: physically present until now, never a record
+            try out.append(self.a, .{ .col = d.col, .id = d.id, .snapshot = d.snapshot });
+        }
+    }
+
+    /// Re-read every SET NULL candidate and classify it by what the database did: column now
+    /// NULL → nulled; gone (removed by an action not modeled here) → deleted, without a snapshot;
+    /// unchanged → not reported. A row the delete removed anyway (it also cascaded from
+    /// elsewhere) or one already reported through another column is skipped.
+    fn settleNulled(self: *CascadePlanner, deleted: *std.ArrayList(CascadeEffects.Deleted)) ![]const CascadeEffects.Nulled {
+        var out: std.ArrayList(CascadeEffects.Nulled) = .empty;
+        var seen: std.StringHashMapUnmanaged(void) = .empty;
+        for (self.null_groups.items) |g| {
+            var live: std.ArrayList([]const u8) = .empty;
+            for (g.ids.items) |cid| {
+                const key = try self.rowKey(g.col.id, cid);
+                if (self.doomed.contains(key) or seen.contains(key)) continue;
+                try live.append(self.a, cid);
+            }
+            const visible_idx: c_int = @intCast(3 + g.col.fields.len);
+            var start: usize = 0;
+            while (start < live.items.len) : (start += cascade_chunk) {
+                const chunk = live.items[start..@min(start + cascade_chunk, live.items.len)];
+                var found: std.StringHashMapUnmanaged(void) = .empty;
+                {
+                    var st = try self.selectAfterNull(g.col, g.column, chunk);
+                    defer st.finalize();
+                    while (try st.step()) {
+                        const rid = try self.a.dupe(u8, st.columnText(0));
+                        try found.put(self.a, rid, {});
+                        if (st.columnInt(visible_idx) == 0 or st.columnInt(visible_idx + 1) == 0) continue;
+                        const gop = try seen.getOrPut(self.a, try self.rowKey(g.col.id, rid));
+                        if (gop.found_existing) continue;
+                        const record = rowToObject(self.a, &st, g.col, null) catch |err| switch (err) {
+                            error.OutOfMemory => return error.OutOfMemory,
+                            else => blk: {
+                                std.log.warn("realtime: nulled {s}/{s} is announced id-only (row could not be decoded: {s})", .{ g.col.name, rid, @errorName(err) });
+                                break :blk null;
+                            },
+                        };
+                        try out.append(self.a, .{ .col = g.col, .id = rid, .record = record });
+                    }
+                }
+                for (chunk) |cid| {
+                    if (found.contains(cid)) continue;
+                    const gop = try seen.getOrPut(self.a, try self.rowKey(g.col.id, cid));
+                    if (gop.found_existing) continue;
+                    std.log.warn("realtime: {s}/{s} was expected to be set to null but the delete removed it; announced id-only", .{ g.col.name, cid });
+                    try deleted.append(self.a, .{ .col = g.col, .id = cid, .snapshot = null });
+                }
+            }
+        }
+        return out.items;
+    }
+};
+
+/// #489 fixture: `notes`; `items.note` → notes (cascade) plus a self-relation `items.parent`
+/// (cascade); `subitems.item` → items (cascade); `tasks.note` → notes and `tasks.item` → items
+/// (both SET NULL); `links.note` → notes (SET NULL) and `links.item` → items (cascade).
+const CascadeFixture = struct {
+    notes: schema.Collection,
+    items: schema.Collection,
+    subitems: schema.Collection,
+    tasks: schema.Collection,
+    links: schema.Collection,
+
+    fn init(d: *db.Db, a: std.mem.Allocator) !CascadeFixture {
+        try migrations.run(d);
+        if (db.dbDialect(d).kind == .sqlite) try d.exec("PRAGMA foreign_keys=ON;");
+        const notes = try collections.create(a, std.testing.io, d, .{ .id = "", .name = "notes", .fields = &.{.{ .id = "n1", .name = "title", .options = .{ .text = .{} } }} });
+        errdefer notes.deinit(a);
+        const items = try collections.create(a, std.testing.io, d, .{ .id = "", .name = "items", .fields = &.{
+            .{ .id = "i1", .name = "note", .options = .{ .relation = .{ .targetCollectionId = notes.id, .cascadeDelete = true } } },
+            .{ .id = "i2", .name = "parent", .options = .{ .relation = .{ .targetCollectionId = "items", .cascadeDelete = true } } },
+            .{ .id = "i3", .name = "meta", .options = .{ .json = .{} } },
+        } });
+        errdefer items.deinit(a);
+        const subitems = try collections.create(a, std.testing.io, d, .{ .id = "", .name = "subitems", .fields = &.{
+            .{ .id = "s1", .name = "item", .options = .{ .relation = .{ .targetCollectionId = items.id, .cascadeDelete = true } } },
+        } });
+        errdefer subitems.deinit(a);
+        const tasks = try collections.create(a, std.testing.io, d, .{ .id = "", .name = "tasks", .fields = &.{
+            .{ .id = "t1", .name = "note", .options = .{ .relation = .{ .targetCollectionId = notes.id } } },
+            .{ .id = "t2", .name = "item", .options = .{ .relation = .{ .targetCollectionId = items.id } } },
+            .{ .id = "t3", .name = "label", .options = .{ .text = .{} } },
+            .{ .id = "t4", .name = "meta", .options = .{ .json = .{} } },
+        } });
+        errdefer tasks.deinit(a);
+        const links = try collections.create(a, std.testing.io, d, .{ .id = "", .name = "links", .fields = &.{
+            .{ .id = "l1", .name = "note", .options = .{ .relation = .{ .targetCollectionId = notes.id } } },
+            .{ .id = "l2", .name = "item", .options = .{ .relation = .{ .targetCollectionId = items.id, .cascadeDelete = true } } },
+        } });
+        return .{ .notes = notes, .items = items, .subitems = subitems, .tasks = tasks, .links = links };
+    }
+
+    fn deinit(self: CascadeFixture, a: std.mem.Allocator) void {
+        inline for (.{ self.notes, self.items, self.subitems, self.tasks, self.links }) |c| c.deinit(a);
+    }
+};
+
+fn countWhere(d: *db.Db, sql: [:0]const u8) !i64 {
+    var st = try d.prepare(sql);
+    defer st.finalize();
+    _ = try st.step();
+    return st.columnInt(0);
+}
+
+fn expectIds(rows: anytype, want: []const []const u8) !void {
+    try std.testing.expectEqual(want.len, rows.len);
+    for (want) |id| {
+        var found = false;
+        for (rows) |r| found = found or std.mem.eql(u8, r.id, id);
+        if (!found) {
+            std.debug.print("missing cascade row {s}\n", .{id});
+            return error.TestExpectedEqual;
+        }
+    }
+}
+
+fn cascadeScenarioBasic(d: *db.Db) !void {
+    const a = std.testing.allocator;
+    const fx = try CascadeFixture.init(d, a);
+    defer fx.deinit(a);
+    try d.exec(
+        \\INSERT INTO notes (id,created,updated,title) VALUES ('N','t','t','n'),('N2','t','t','other');
+        \\INSERT INTO items (id,created,updated,note) VALUES ('I1','t','t','N'),('I2','t','t','N'),('I3','t','t','N2');
+        \\INSERT INTO tasks (id,created,updated,note,label) VALUES ('T1','t','t','N','keep'),('T2','t','t','N2','x');
+    );
+    try d.beginImmediate();
+    var effects = (try deleteCascadingInTxn(a, d, fx.notes, "N")).?;
+    defer effects.deinit();
+    try d.commit();
+
+    try expectIds(effects.deleted, &.{ "I1", "I2" });
+    for (effects.deleted) |row| {
+        try std.testing.expectEqualStrings("items", row.col.name);
+        // Pre-delete snapshot: still carries the relation that caused the cascade.
+        try std.testing.expectEqualStrings("N", row.snapshot.?.object.get("note").?.string);
+    }
+    try expectIds(effects.nulled, &.{"T1"});
+    try std.testing.expectEqualStrings("tasks", effects.nulled[0].col.name);
+    // Post-delete record: the DB's SET NULL is what is reported, other fields intact.
+    try std.testing.expect(effects.nulled[0].record.?.object.get("note").? == .null);
+    try std.testing.expectEqualStrings("keep", effects.nulled[0].record.?.object.get("label").?.string);
+    try std.testing.expect(!effects.overflow);
+
+    try std.testing.expectEqual(@as(i64, 1), try countWhere(d, "SELECT COUNT(*) FROM items;"));
+    try std.testing.expectEqual(@as(i64, 1), try countWhere(d, "SELECT COUNT(*) FROM tasks WHERE id='T1' AND note IS NULL;"));
+    try std.testing.expectEqual(@as(i64, 1), try countWhere(d, "SELECT COUNT(*) FROM tasks WHERE id='T2' AND note='N2';"));
+}
+
+fn cascadeScenarioChained(d: *db.Db) !void {
+    const a = std.testing.allocator;
+    const fx = try CascadeFixture.init(d, a);
+    defer fx.deinit(a);
+    // N <- I1 (note) <- I2 (parent, self-relation) <- I3 (parent) ; I1 <- S1, I3 <- S2 (subitems);
+    // T1 -> I3 (SET NULL); L1 -> note N (SET NULL) AND item I2 (cascade): only reported deleted.
+    // I3 also has note N, so it is reachable twice (diamond) and must be reported once.
+    try d.exec(
+        \\INSERT INTO notes (id,created,updated) VALUES ('N','t','t');
+        \\INSERT INTO items (id,created,updated,note,parent) VALUES ('I1','t','t','N',NULL);
+        \\INSERT INTO items (id,created,updated,note,parent) VALUES ('I2','t','t',NULL,'I1');
+        \\INSERT INTO items (id,created,updated,note,parent) VALUES ('I3','t','t','N','I2');
+        \\INSERT INTO subitems (id,created,updated,item) VALUES ('S1','t','t','I1'),('S2','t','t','I3');
+        \\INSERT INTO tasks (id,created,updated,item) VALUES ('T1','t','t','I3');
+        \\INSERT INTO links (id,created,updated,note,item) VALUES ('L1','t','t','N','I2');
+    );
+    try d.beginImmediate();
+    var effects = (try deleteCascadingInTxn(a, d, fx.notes, "N")).?;
+    defer effects.deinit();
+    try d.commit();
+
+    try expectIds(effects.deleted, &.{ "I1", "I2", "I3", "S1", "S2", "L1" });
+    try expectIds(effects.nulled, &.{"T1"});
+    try std.testing.expectEqual(@as(i64, 0), try countWhere(d, "SELECT (SELECT COUNT(*) FROM items)+(SELECT COUNT(*) FROM subitems)+(SELECT COUNT(*) FROM links);"));
+}
+
+fn cascadeScenarioWide(d: *db.Db) !void {
+    const a = std.testing.allocator;
+    const fx = try CascadeFixture.init(d, a);
+    defer fx.deinit(a);
+    const n = cascade_chunk + 44;
+    try d.exec("INSERT INTO notes (id,created,updated) VALUES ('N','t','t');");
+    const seed = try std.fmt.allocPrintSentinel(a,
+        \\WITH RECURSIVE k(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM k WHERE i<{d})
+        \\INSERT INTO items (id,created,updated,note) SELECT 'i'||i,'t','t','N' FROM k;
+        \\WITH RECURSIVE k(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM k WHERE i<{d})
+        \\INSERT INTO subitems (id,created,updated,item) SELECT 's'||i,'t','t','i'||i FROM k;
+        \\WITH RECURSIVE k(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM k WHERE i<{d})
+        \\INSERT INTO tasks (id,created,updated,item) SELECT 't'||i,'t','t','i'||i FROM k;
+    , .{ n, n, n }, 0);
+    defer a.free(seed);
+    try d.exec(seed);
+    try d.beginImmediate();
+    var effects = (try deleteCascadingInTxn(a, d, fx.notes, "N")).?;
+    defer effects.deinit();
+    try d.commit();
+    try std.testing.expectEqual(@as(usize, 2 * n), effects.deleted.len);
+    try std.testing.expectEqual(@as(usize, n), effects.nulled.len);
+}
+
+fn cascadeScenarioBounded(d: *db.Db) !void {
+    const a = std.testing.allocator;
+    const fx = try CascadeFixture.init(d, a);
+    defer fx.deinit(a);
+    try d.exec(
+        \\INSERT INTO notes (id,created,updated) VALUES ('N','t','t');
+        \\WITH RECURSIVE k(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM k WHERE i<1200)
+        \\INSERT INTO items (id,created,updated,note) SELECT 'i'||i,'t','t','N' FROM k;
+    );
+    var effects: CascadeEffects = .{ .arena = std.heap.ArenaAllocator.init(a) };
+    defer effects.deinit();
+    var planner: CascadePlanner = .{ .a = effects.arena.allocator(), .w = d, .pg = db.dbDialect(d).kind == .postgres };
+    try d.beginImmediate();
+    defer d.rollback() catch |err| std.log.err("bounded discovery rollback failed: {s}", .{@errorName(err)});
+    // With only two slots remaining, even the buffered PG statement returns three IDs,
+    // never 1200 record bodies. The last ID is the overflow sentinel.
+    planner.count = cascade_announce_cap - 2;
+    {
+        var st = try planner.selectWhereIn(fx.items, "note", &.{"N"}, null);
+        defer st.finalize();
+        var n: usize = 0;
+        while (try st.step()) {
+            try std.testing.expectEqual(@as(c_int, 1), st.columnCount());
+            n += 1;
+        }
+        try std.testing.expectEqual(@as(usize, 3), n);
+    }
+    planner.count = 0;
+    try planner.plan(fx.notes, "N");
+    try std.testing.expect(planner.overflow);
+    for (planner.candidates.items) |candidate| try std.testing.expect(candidate.snapshot == null);
+}
+
+fn cascadeScenarioDistinct(d: *db.Db) !void {
+    const a = std.testing.allocator;
+    const fx = try CascadeFixture.init(d, a);
+    defer fx.deinit(a);
+    // 501 items match both note N and parent I cascade paths; 498 links match
+    // both a SET NULL path and a cascade path. With I, exactly 1000 records change.
+    try d.exec(
+        \\INSERT INTO notes (id,created,updated) VALUES ('N','t','t');
+        \\INSERT INTO items (id,created,updated,note) VALUES ('I','t','t','N');
+        \\WITH RECURSIVE k(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM k WHERE i<501)
+        \\INSERT INTO items (id,created,updated,note,parent) SELECT 'i'||i,'t','t','N','I' FROM k;
+        \\WITH RECURSIVE k(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM k WHERE i<498)
+        \\INSERT INTO links (id,created,updated,note,item) SELECT 'l'||i,'t','t','N','I' FROM k;
+    );
+    try d.beginImmediate();
+    var effects = (try deleteCascadingInTxn(a, d, fx.notes, "N")).?;
+    defer effects.deinit();
+    try d.commit();
+    try std.testing.expect(!effects.overflow);
+    try std.testing.expectEqual(@as(usize, 1000), effects.deleted.len);
+    try std.testing.expectEqual(@as(usize, 0), effects.nulled.len);
+    try std.testing.expectEqual(@as(i64, 0), try countWhere(d, "SELECT (SELECT count(*) FROM items)+(SELECT count(*) FROM links);"));
+}
+
+fn cascadeScenarioUnsupported(d: *db.Db) !void {
+    const a = std.testing.allocator;
+    const fx = try CascadeFixture.init(d, a);
+    defer fx.deinit(a);
+    const children = try collections.create(a, std.testing.io, d, .{ .id = "", .name = "children", .fields = &.{} });
+    defer children.deinit(a);
+    // Migration-defined composite and alternate-key constraints, not generated relations.
+    try d.exec(
+        \\ALTER TABLE notes ADD COLUMN code TEXT;
+        \\ALTER TABLE notes ADD COLUMN region TEXT;
+        \\CREATE UNIQUE INDEX notes_code_region ON notes(code,region);
+        \\CREATE UNIQUE INDEX notes_code ON notes(code);
+        \\DROP TABLE children;
+        \\CREATE TABLE children (id TEXT PRIMARY KEY, created TEXT, updated TEXT, parent_code TEXT, parent_region TEXT,
+        \\ FOREIGN KEY(parent_code,parent_region) REFERENCES notes(code,region) ON DELETE CASCADE);
+    );
+    const descendants = try collections.create(a, std.testing.io, d, .{ .id = "", .name = "descendants", .fields = &.{
+        .{ .id = "d1", .name = "child", .options = .{ .relation = .{ .targetCollectionId = children.id, .cascadeDelete = true } } },
+    } });
+    defer descendants.deinit(a);
+    try d.exec(
+        \\INSERT INTO notes (id,created,updated,code,region) VALUES ('P','t','t','K','R');
+        \\INSERT INTO children VALUES ('C','t','t','K','R');
+        \\INSERT INTO descendants (id,created,updated,child) VALUES ('D','t','t','C');
+    );
+    try d.beginImmediate();
+    var effects = (try deleteCascadingInTxn(a, d, fx.notes, "P")).?;
+    defer effects.deinit();
+    try d.commit();
+    try std.testing.expect(effects.overflow);
+    try std.testing.expectEqual(@as(usize, 0), effects.deleted.len + effects.nulled.len);
+    var child_reached = false;
+    var descendant_reached = false;
+    for (effects.reach) |col| {
+        child_reached = child_reached or std.mem.eql(u8, col.name, "children");
+        descendant_reached = descendant_reached or std.mem.eql(u8, col.name, "descendants");
+    }
+    try std.testing.expect(child_reached and descendant_reached);
+    try std.testing.expectEqual(@as(i64, 0), try countWhere(d, "SELECT (SELECT count(*) FROM children)+(SELECT count(*) FROM descendants);"));
+
+    // An unregistered migration-owned table must not hide its registered descendants.
+    try d.exec(
+        \\DELETE FROM _collections WHERE name='children';
+        \\INSERT INTO notes (id,created,updated,code,region) VALUES ('P3','t','t','K3','R3');
+        \\INSERT INTO children VALUES ('C3','t','t','K3','R3');
+        \\INSERT INTO descendants (id,created,updated,child) VALUES ('D3','t','t','C3');
+    );
+    try d.beginImmediate();
+    var unregistered = (try deleteCascadingInTxn(a, d, fx.notes, "P3")).?;
+    defer unregistered.deinit();
+    try d.commit();
+    try std.testing.expect(unregistered.overflow);
+    descendant_reached = false;
+    for (unregistered.reach) |col| descendant_reached = descendant_reached or std.mem.eql(u8, col.name, "descendants");
+    try std.testing.expect(descendant_reached);
+    try std.testing.expectEqual(@as(i64, 0), try countWhere(d, "SELECT count(*) FROM descendants;"));
+}
+
+fn cascadeScenarioAlternateKey(d: *db.Db) !void {
+    const a = std.testing.allocator;
+    const fx = try CascadeFixture.init(d, a);
+    defer fx.deinit(a);
+    try d.exec(
+        \\ALTER TABLE notes ADD COLUMN code TEXT;
+        \\CREATE UNIQUE INDEX notes_code ON notes(code);
+    );
+    const altchildren = try collections.create(a, std.testing.io, d, .{ .id = "", .name = "altchildren", .fields = &.{} });
+    defer altchildren.deinit(a);
+    try d.exec(
+        \\DROP TABLE altchildren;
+        \\CREATE TABLE altchildren (id TEXT PRIMARY KEY, created TEXT, updated TEXT, parent_code TEXT REFERENCES notes(code) ON DELETE SET NULL);
+        \\INSERT INTO notes (id,created,updated,code) VALUES ('P2','t','t','K2');
+        \\INSERT INTO altchildren VALUES ('A','t','t','K2');
+    );
+    try d.beginImmediate();
+    var alt = (try deleteCascadingInTxn(a, d, fx.notes, "P2")).?;
+    defer alt.deinit();
+    try d.commit();
+    try std.testing.expect(alt.overflow);
+    var alt_reached = false;
+    for (alt.reach) |col| alt_reached = alt_reached or std.mem.eql(u8, col.name, "altchildren");
+    try std.testing.expect(alt_reached);
+    try std.testing.expectEqual(@as(i64, 1), try countWhere(d, "SELECT count(*) FROM altchildren WHERE parent_code IS NULL;"));
+
+    try std.testing.expectEqual(@as(usize, 0), alt.deleted.len + alt.nulled.len);
+}
+
+test "#489 discovery bounds IDs before fetching any bodies" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try cascadeScenarioBounded(&d);
+}
+
+test "#489 the cap counts distinct candidates across cascade and SET NULL edges" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try cascadeScenarioDistinct(&d);
+}
+
+test "#489 composite FKs reset every reachable collection" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try cascadeScenarioUnsupported(&d);
+}
+
+test "#489 alternate-key SET NULL resets instead of silently missing the row" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try cascadeScenarioAlternateKey(&d);
+}
+
+test "#489 a cascade-deleted row's snapshot keeps the hidden fields a viewRule may reference" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    const a = std.testing.allocator;
+    try migrations.run(&d);
+    const owners = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "owners", .fields = &.{} });
+    defer owners.deinit(a);
+    const kids = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "kids", .fields = &.{
+        .{ .id = "k1", .name = "owner", .options = .{ .relation = .{ .targetCollectionId = owners.id, .cascadeDelete = true } } },
+        .{ .id = "k2", .name = "tier", .hidden = true, .options = .{ .text = .{} } },
+    } });
+    defer kids.deinit(a);
+    try d.exec(
+        \\INSERT INTO owners (id,created,updated) VALUES ('O','t','t');
+        \\INSERT INTO kids (id,created,updated,owner,tier) VALUES ('K','t','t','O','gold');
+    );
+    try d.beginImmediate();
+    var effects = (try deleteCascadingInTxn(a, &d, owners, "O")).?;
+    defer effects.deinit();
+    try d.commit();
+    try std.testing.expectEqual(@as(usize, 1), effects.deleted.len);
+    const snap = effects.deleted[0].snapshot orelse return error.TestExpectedSnapshot;
+    try std.testing.expectEqualStrings("gold", snap.object.get("tier").?.string);
+}
+
+test "#489 delete reports each cascade-deleted row and each nulled row, and the DB did both" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try cascadeScenarioBasic(&d);
+}
+
+test "#489 chained and self-referencing cascades are expanded transitively, each row once" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try cascadeScenarioChained(&d);
+}
+
+test "#489 cascades wider than one statement chunk are all reported" {
+    var d = try db.Db.openMemory();
+    defer d.close();
+    try cascadeScenarioWide(&d);
+}
+
+test "#489 PostgreSQL: cascade and SET NULL reporting matches SQLite" {
+    if (comptime !@import("build_options").postgres) return error.SkipZigTest;
+    const url = std.testing.environ.getPosix("ZIGBASE_PG_TEST_URL") orelse return error.SkipZigTest;
+    const a = std.testing.allocator;
+    inline for (.{ cascadeScenarioBasic, cascadeScenarioChained, cascadeScenarioWide, cascadeScenarioBounded, cascadeScenarioDistinct, cascadeScenarioUnsupported, cascadeScenarioAlternateKey }) |scenario| {
+        var conn = try db.Db.openPostgres(a, std.testing.io, url);
+        defer conn.close();
+        const token = try @import("crypto.zig").genHex(std.testing.io, a, 12);
+        defer a.free(token);
+        const enter = try std.fmt.allocPrintSentinel(a, "CREATE SCHEMA cascade_{s}; SET search_path TO cascade_{s};", .{ token, token }, 0);
+        defer a.free(enter);
+        const drop = try std.fmt.allocPrintSentinel(a, "DROP SCHEMA cascade_{s} CASCADE;", .{token}, 0);
+        defer a.free(drop);
+        try conn.exec(enter);
+        defer conn.exec(drop) catch |err| std.log.err("cascade test schema cleanup failed: {s}", .{@errorName(err)});
+        try scenario(&conn);
+    }
+}
+
+test "#489 the report follows what the database did, not what the schema implies" {
+    const a = std.testing.allocator;
+    var d = try db.Db.openMemory();
+    defer d.close();
+    const fx = try CascadeFixture.init(&d, a);
+    defer fx.deinit(a);
+    try d.exec(
+        \\INSERT INTO notes (id,created,updated) VALUES ('N','t','t');
+        \\INSERT INTO items (id,created,updated,note) VALUES ('I1','t','t','N');
+        \\INSERT INTO tasks (id,created,updated,note) VALUES ('T1','t','t','N');
+    );
+    // With FK enforcement off the database performs no action: nothing may be announced.
+    try d.exec("PRAGMA foreign_keys=OFF;");
+    try d.beginImmediate();
+    var effects = (try deleteCascadingInTxn(a, &d, fx.notes, "N")).?;
+    defer effects.deinit();
+    try d.commit();
+    try std.testing.expectEqual(@as(usize, 0), effects.deleted.len);
+    try std.testing.expectEqual(@as(usize, 0), effects.nulled.len);
+    try std.testing.expectEqual(@as(i64, 1), try countWhere(&d, "SELECT COUNT(*) FROM items WHERE note='N';"));
+
+    // A missing record deletes nothing and reports null.
+    try d.beginImmediate();
+    try std.testing.expect((try deleteCascadingInTxn(a, &d, fx.notes, "absent")) == null);
+    try d.commit();
+}
+
+test "#489 rows are classified by the database's foreign keys when the stored schema disagrees" {
+    const a = std.testing.allocator;
+    var d = try db.Db.openMemory();
+    defer d.close();
+    const fx = try CascadeFixture.init(&d, a);
+    defer fx.deinit(a);
+    try d.exec(
+        \\INSERT INTO notes (id,created,updated) VALUES ('N','t','t');
+        \\INSERT INTO items (id,created,updated,note) VALUES ('I1','t','t','N');
+        \\INSERT INTO subitems (id,created,updated,item) VALUES ('S1','t','t','I1');
+        \\INSERT INTO tasks (id,created,updated,note,label) VALUES ('T1','t','t','N','keep');
+    );
+    // The stored schema now claims the opposite of each table's constraint: items' relations
+    // "SET NULL" (the table still cascades), tasks' relations "cascade" (the table still nulls).
+    try d.exec(
+        \\UPDATE _collections SET schema=replace(schema,'"cascadeDelete":true','"cascadeDelete":false') WHERE name='items';
+        \\UPDATE _collections SET schema=replace(schema,'"cascadeDelete":false','"cascadeDelete":true') WHERE name='tasks';
+    );
+    try d.beginImmediate();
+    var effects = (try deleteCascadingInTxn(a, &d, fx.notes, "N")).?;
+    defer effects.deinit();
+    try d.commit();
+    // What the database did: I1 and (through it) S1 deleted, T1 nulled.
+    try expectIds(effects.deleted, &.{ "I1", "S1" });
+    for (effects.deleted) |row| try std.testing.expect(row.snapshot != null);
+    try expectIds(effects.nulled, &.{"T1"});
+    try std.testing.expectEqualStrings("keep", effects.nulled[0].record.?.object.get("label").?.string);
+    try std.testing.expectEqual(@as(i64, 0), try countWhere(&d, "SELECT (SELECT COUNT(*) FROM items)+(SELECT COUNT(*) FROM subitems);"));
+    try std.testing.expectEqual(@as(i64, 1), try countWhere(&d, "SELECT COUNT(*) FROM tasks WHERE id='T1' AND note IS NULL;"));
+}
+
+test "#489 an undecodable cascaded or nulled row is reported without its body and the delete succeeds" {
+    const a = std.testing.allocator;
+    var d = try db.Db.openMemory();
+    defer d.close();
+    const fx = try CascadeFixture.init(&d, a);
+    defer fx.deinit(a);
+    // `meta` is a json field; the stored text is not JSON, so decoding the row fails.
+    try d.exec(
+        \\INSERT INTO notes (id,created,updated) VALUES ('N','t','t');
+        \\INSERT INTO items (id,created,updated,note,meta) VALUES ('I1','t','t','N','not json'),('I2','t','t','N','{"ok":1}');
+        \\INSERT INTO tasks (id,created,updated,note,meta) VALUES ('T1','t','t','N','not json'),('T2','t','t','N','[1]');
+    );
+    try d.beginImmediate();
+    var effects = (try deleteCascadingInTxn(a, &d, fx.notes, "N")).?;
+    defer effects.deinit();
+    try d.commit();
+    try expectIds(effects.deleted, &.{ "I1", "I2" });
+    for (effects.deleted) |row| {
+        if (std.mem.eql(u8, row.id, "I1")) try std.testing.expect(row.snapshot == null) else try std.testing.expectEqualStrings("N", row.snapshot.?.object.get("note").?.string);
+    }
+    try expectIds(effects.nulled, &.{ "T1", "T2" });
+    for (effects.nulled) |row| {
+        if (std.mem.eql(u8, row.id, "T1")) try std.testing.expect(row.record == null) else try std.testing.expect(row.record.?.object.get("note").? == .null);
+    }
+    try std.testing.expectEqual(@as(i64, 0), try countWhere(&d, "SELECT COUNT(*) FROM items;"));
+    try std.testing.expectEqual(@as(i64, 2), try countWhere(&d, "SELECT COUNT(*) FROM tasks WHERE note IS NULL;"));
+}
+
+test "#489 TTL-expired rows are not announced, but their cascade still is" {
+    const a = std.testing.allocator;
+    var d = try db.Db.openMemory();
+    defer d.close();
+    const fx = try CascadeFixture.init(&d, a);
+    defer fx.deinit(a);
+    const leases = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "leases", .options = .{ .ttl_field = "expires_at" }, .fields = &.{
+        .{ .id = "e1", .name = "note", .options = .{ .relation = .{ .targetCollectionId = fx.notes.id, .cascadeDelete = true } } },
+        .{ .id = "e2", .name = "expires_at", .options = .{ .date = .{} } },
+    } });
+    defer leases.deinit(a);
+    const subleases = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "subleases", .fields = &.{
+        .{ .id = "u1", .name = "lease", .options = .{ .relation = .{ .targetCollectionId = leases.id, .cascadeDelete = true } } },
+    } });
+    defer subleases.deinit(a);
+    const holds = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = "holds", .options = .{ .ttl_field = "expires_at" }, .fields = &.{
+        .{ .id = "h1", .name = "note", .options = .{ .relation = .{ .targetCollectionId = fx.notes.id } } },
+        .{ .id = "h2", .name = "expires_at", .options = .{ .date = .{} } },
+    } });
+    defer holds.deinit(a);
+    try d.exec(
+        \\INSERT INTO notes (id,created,updated) VALUES ('N','t','t');
+        \\INSERT INTO leases (id,created,updated,note,expires_at) VALUES ('Lold','t','t','N','2000-01-01T00:00:00Z'),('Lnew','t','t','N','2999-01-01T00:00:00Z');
+        \\INSERT INTO subleases (id,created,updated,lease) VALUES ('S1','t','t','Lold');
+        \\INSERT INTO holds (id,created,updated,note,expires_at) VALUES ('Hold','t','t','N','2000-01-01T00:00:00Z'),('Hnew','t','t','N',NULL);
+    );
+    try d.beginImmediate();
+    var effects = (try deleteCascadingInTxn(a, &d, fx.notes, "N")).?;
+    defer effects.deinit();
+    try d.commit();
+    // Lold was already expired (not a record); S1, which hung off it, was a live record.
+    try expectIds(effects.deleted, &.{ "Lnew", "S1" });
+    try expectIds(effects.nulled, &.{"Hnew"});
+    try std.testing.expectEqual(@as(i64, 0), try countWhere(&d, "SELECT (SELECT COUNT(*) FROM leases)+(SELECT COUNT(*) FROM subleases);"));
+    try std.testing.expectEqual(@as(i64, 2), try countWhere(&d, "SELECT COUNT(*) FROM holds WHERE note IS NULL;"));
+}
+
+test "#489 a delete affecting more rows than the cap reports overflow and every reachable collection" {
+    const a = std.testing.allocator;
+    var d = try db.Db.openMemory();
+    defer d.close();
+    const fx = try CascadeFixture.init(&d, a);
+    defer fx.deinit(a);
+    try d.exec("INSERT INTO notes (id,created,updated) VALUES ('N','t','t');");
+    const seed = try std.fmt.allocPrintSentinel(a,
+        \\WITH RECURSIVE k(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM k WHERE i<{d})
+        \\INSERT INTO items (id,created,updated,note) SELECT 'i'||i,'t','t','N' FROM k;
+    , .{cascade_announce_cap + 1}, 0);
+    defer a.free(seed);
+    try d.exec(seed);
+    try d.beginImmediate();
+    var effects = (try deleteCascadingInTxn(a, &d, fx.notes, "N")).?;
+    defer effects.deinit();
+    try d.commit();
+    try std.testing.expect(effects.overflow);
+    try std.testing.expectEqual(@as(usize, 0), effects.deleted.len + effects.nulled.len);
+    // notes -> items (cascade), tasks, links (SET NULL); items -> items, subitems, links (cascade), tasks.
+    var names: [4][]const u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 4), effects.reach.len);
+    for (effects.reach, &names) |c, *n| n.* = c.name;
+    std.mem.sort([]const u8, &names, {}, struct {
+        fn lt(_: void, l: []const u8, r: []const u8) bool {
+            return std.mem.lessThan(u8, l, r);
+        }
+    }.lt);
+    for ([_][]const u8{ "items", "links", "subitems", "tasks" }, names) |want, got| try std.testing.expectEqualStrings(want, got);
+    try std.testing.expectEqual(@as(i64, 0), try countWhere(&d, "SELECT COUNT(*) FROM items;"));
+
+    // At exactly the cap every row is still announced.
+    try d.exec("INSERT INTO notes (id,created,updated) VALUES ('M','t','t');");
+    const at_cap = try std.fmt.allocPrintSentinel(a,
+        \\WITH RECURSIVE k(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM k WHERE i<{d})
+        \\INSERT INTO items (id,created,updated,note) SELECT 'm'||i,'t','t','M' FROM k;
+    , .{cascade_announce_cap}, 0);
+    defer a.free(at_cap);
+    try d.exec(at_cap);
+    try d.beginImmediate();
+    var full = (try deleteCascadingInTxn(a, &d, fx.notes, "M")).?;
+    defer full.deinit();
+    try d.commit();
+    try std.testing.expect(!full.overflow);
+    try std.testing.expectEqual(@as(usize, cascade_announce_cap), full.deleted.len);
+}
+
 test "update merges provided fields, bumps updated, 404 on missing" {
     var d = try db.Db.openMemory();
     defer d.close();

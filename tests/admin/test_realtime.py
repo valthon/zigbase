@@ -562,6 +562,164 @@ def test_sse_uplink_404_is_non_oracle(page):
     assert closed["status"] == 404
     assert closed["body"] == bogus["body"]  # NON-ORACLE: byte-identical
 
+def _rt_events(page):
+    out = []
+    for f in page.evaluate("() => window.__rt.frames"):
+        try:
+            m = _json.loads(f)
+        except ValueError:
+            continue
+        if m.get("type") == "event":
+            out.append((m["topic"], m["action"], m["record"]["id"]))
+    return out
+
+@pytest.mark.parametrize("transport", ["ws", "sse"])
+def test_rt_fk_cascade_and_set_null_are_published(page, transport):
+    """#489: deleting a parent publishes a delete for each row the FK cascade removed and an
+    update for each row whose relation the database set to null. Controls: an ordinary REST
+    delete and update on the same collections. Superuser subscriber (no row predicate)."""
+    login(page)
+    tok = superuser_token(page)
+    open_rules = {"listRule": "@public", "viewRule": "@public", "createRule": "@public",
+                  "updateRule": "@public", "deleteRule": "@public"}
+    notes, items, tasks = (f"fk_{transport}_{n}" for n in ("notes", "items", "tasks"))
+    notes_col = api_request(page, "POST", "/api/collections", {"name": notes, "type": "base",
+        "fields": [{"id": "", "name": "title", "type": "text", "options": {}}], **open_rules}).json()
+    for name, cascade in ((items, True), (tasks, False)):
+        r = api_request(page, "POST", "/api/collections", {"name": name, "type": "base", "fields": [
+            {"id": "", "name": "note", "type": "relation",
+             "options": {"targetCollectionId": notes_col["id"], "cascadeDelete": cascade, "maxSelect": 1}},
+            {"id": "", "name": "label", "type": "text", "options": {}}], **open_rules})
+        assert r.status == 201, r.text()
+    note = api_request(page, "POST", f"/api/collections/{notes}/records", {"title": "N"}).json()["id"]
+    item, item2 = (api_request(page, "POST", f"/api/collections/{items}/records", {"note": note}).json()["id"] for _ in range(2))
+    task = api_request(page, "POST", f"/api/collections/{tasks}/records", {"note": note, "label": "keep"}).json()["id"]
+    task2 = api_request(page, "POST", f"/api/collections/{tasks}/records", {"label": "unrelated"}).json()["id"]
+
+    rt_open(page, transport)
+    rt_send(page, {"action": "auth", "token": tok})
+    rt_wait_frame(page, "f.includes('\"status\":\"ok\"')")
+    for topic in (items, tasks):
+        rt_send(page, {"action": "subscribe", "topic": topic})
+        rt_wait_frame(page, "f.includes('\"type\":\"ack\"') && f.includes('%s')" % topic)
+
+    assert api_request(page, "DELETE", f"/api/collections/{items}/records/{item2}").status == 204
+    assert api_request(page, "PATCH", f"/api/collections/{tasks}/records/{task2}", {"label": "control"}).status == 200
+    assert api_request(page, "DELETE", f"/api/collections/{notes}/records/{note}").status == 204
+    rt_wait_frame(page, "f.includes('\"action\":\"update\"') && f.includes('%s')" % task)
+    rt_wait_frame(page, "f.includes('\"action\":\"delete\"') && f.includes('%s')" % item)
+
+    events = _rt_events(page)
+    assert (items, "delete", item2) in events and (tasks, "update", task2) in events, events
+    assert events.count((items, "delete", item)) == 1, events
+    assert events.count((tasks, "update", task)) == 1, events
+    # The update frame carries the row as the database now holds it: relation cleared.
+    updates = [_json.loads(f) for f in page.evaluate("() => window.__rt.frames")
+               if '"action":"update"' in f and task in f and task2 not in f]
+    assert updates and "note" in updates[0]["record"] and updates[0]["record"]["note"] is None, updates
+    assert updates[0]["record"].get("label") == "keep", updates
+    # The database did both actions.
+    assert api_request(page, "GET", f"/api/collections/{items}/records/{item}").status == 404
+    assert api_request(page, "GET", f"/api/collections/{tasks}/records/{task}").json()["note"] is None
+
+def _rt_auth_users(page, users, names):
+    """Creates one auth record per name in `users` and logs each in OUTSIDE the page's cookie
+    jar (page.request would replace the superuser session the test writes with)."""
+    su = {"Authorization": "Bearer " + superuser_token(page), "Content-Type": "application/json"}
+    ids, tokens = {}, {}
+    u = urlparse(page.url)
+    for who in names:
+        email = f"{who}-{users}@x.io"
+        r = page.request.post(f"/api/collections/{users}/records", headers=su,
+                              data=_json.dumps({"email": email, "password": "password12345"}))
+        assert r.status == 201, r.text()
+        ids[who] = r.json()["id"]
+        req = urllib.request.Request(f"{u.scheme}://{u.netloc}/api/collections/{users}/auth-with-password",
+                                     data=_json.dumps({"identity": email, "password": "password12345"}).encode(),
+                                     headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            tokens[who] = _json.loads(resp.read())["token"]
+    return ids, tokens
+
+@pytest.mark.parametrize("transport", ["ws", "sse"])
+def test_rt_fk_cascade_respects_row_rules(page, transport):
+    """#489: cascade frames are authorized per subscriber against the row's own viewRule. Each
+    of alice and bob owns one cascaded row and one SET NULL row under the same parent; each
+    receives the delete and the update for their own rows and nothing for the other's."""
+    login(page)
+    users, projects, owned, assigned = (f"fkr_{transport}_{n}" for n in ("users", "projects", "owned", "assigned"))
+    locked = {"listRule": "", "viewRule": "", "createRule": "", "updateRule": "", "deleteRule": ""}
+    r = api_request(page, "POST", "/api/collections", {"name": users, "type": "auth", "fields": [], **locked})
+    assert r.status == 201, r.text()
+    r = api_request(page, "POST", "/api/collections", {"name": projects, "type": "base",
+        "fields": [{"id": "", "name": "title", "type": "text", "options": {}}], **locked})
+    assert r.status == 201, r.text()
+    owner_rules = {**locked, "listRule": "owner = @request.auth.id", "viewRule": "owner = @request.auth.id"}
+    for name, cascade in ((owned, True), (assigned, False)):
+        r = api_request(page, "POST", "/api/collections", {"name": name, "type": "base", "fields": [
+            {"id": "", "name": "owner", "type": "relation", "options": {"targetCollectionId": users, "maxSelect": 1}},
+            {"id": "", "name": "project", "type": "relation",
+             "options": {"targetCollectionId": projects, "cascadeDelete": cascade, "maxSelect": 1}},
+            {"id": "", "name": "label", "type": "text", "options": {}}], **owner_rules})
+        assert r.status == 201, r.text()
+    ids, tokens = _rt_auth_users(page, users, ("alice", "bob"))
+    project = api_request(page, "POST", f"/api/collections/{projects}/records", {"title": "P"}).json()["id"]
+    rows = {}
+    for who in ("alice", "bob"):
+        for col in (owned, assigned):
+            r = api_request(page, "POST", f"/api/collections/{col}/records",
+                            {"owner": ids[who], "project": project, "label": f"{who}-secret"})
+            assert r.status == 201, r.text()
+            rows[(who, col)] = r.json()["id"]
+
+    # alice on the transport under test; bob over SSE under separate globals.
+    rt_open(page, transport)
+    rt_send(page, {"action": "auth", "token": tokens["alice"]})
+    rt_wait_frame(page, "f.includes('\"type\":\"auth\"') && f.includes('\"status\":\"ok\"')")
+    for topic in (owned, assigned):
+        rt_send(page, {"action": "subscribe", "topic": topic})
+        rt_wait_frame(page, "f.includes('\"type\":\"ack\"') && f.includes('%s')" % topic)
+    page.evaluate("""([topics, token]) => {
+        window.__bobFrames = []; window.__bobReady = false;
+        const es = new EventSource('/api/realtime/sse');
+        es.onmessage = async (e) => {
+            window.__bobFrames.push(e.data);
+            const m = JSON.parse(e.data);
+            if (m.type === 'connect') {
+                const up = (f) => fetch('/api/realtime/sse/' + m.clientId, { method: 'POST', body: JSON.stringify(f) });
+                await up({action: 'auth', token});
+                for (const topic of topics) window.__bobFrames.push(await (await up({action: 'subscribe', topic})).text());
+                window.__bobReady = true;
+            }
+        };
+    }""", [[owned, assigned], tokens["bob"]])
+    page.wait_for_function("window.__bobReady === true", timeout=8000)
+    assert sum('"type":"ack"' in f for f in page.evaluate("() => window.__bobFrames")) == 2
+
+    r = api_request(page, "DELETE", f"/api/collections/{projects}/records/{project}")
+    assert r.status == 204, r.text()
+    rt_wait_frame(page, "f.includes('\"action\":\"delete\"') && f.includes('%s')" % rows[("alice", owned)])
+    rt_wait_frame(page, "f.includes('\"action\":\"update\"') && f.includes('%s')" % rows[("alice", assigned)])
+    page.wait_for_function("window.__bobFrames.filter(f => f.includes('\"type\":\"event\"')).length >= 2", timeout=8000)
+    page.wait_for_timeout(500)  # both owners' frames arrived; give a leak the same chance
+
+    def events(frames):
+        out = []
+        for f in frames:
+            try:
+                m = _json.loads(f)
+            except ValueError:
+                continue
+            if m.get("type") == "event":
+                out.append((m["topic"], m["action"], m["record"]["id"]))
+        return sorted(out)
+    alice = events(page.evaluate("() => window.__rt.frames"))
+    bob = events(page.evaluate("() => window.__bobFrames"))
+    assert alice == sorted([(owned, "delete", rows[("alice", owned)]), (assigned, "update", rows[("alice", assigned)])]), alice
+    assert bob == sorted([(owned, "delete", rows[("bob", owned)]), (assigned, "update", rows[("bob", assigned)])]), bob
+    assert not any("bob-secret" in f for f in page.evaluate("() => window.__rt.frames"))
+    assert not any("alice-secret" in f for f in page.evaluate("() => window.__bobFrames"))
+
 @pytest.mark.parametrize("server", [{"ZIGBASE_SSE_HEARTBEAT_SECONDS": "2"}], indirect=True)
 def test_sse_heartbeat_ping_comment(page):
     """SSE-only: with a 2s heartbeat the raw stream carries the facil.io `: ping` comment on

@@ -314,7 +314,7 @@ A foreign-key reference to records in another collection.
 | Option | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `targetCollectionId` | string | **required** | **the target collection's `id`** (see gotcha) |
-| `cascadeDelete` | bool | `false` | delete this record when its referenced record is deleted |
+| `cascadeDelete` | bool | `false` | delete this record when its referenced record is deleted (single relations; see [deleting a referenced record](#deleting-a-referenced-record)) |
 | `minSelect` | integer | unset | minimum number of references |
 | `maxSelect` | integer | `1` | maximum number of references (1 = single relation) |
 
@@ -327,6 +327,71 @@ fails with `400` `validation_not_found`. When the target is **tenant-owned**
 the request's active account: another account's id gets the same `validation_not_found` as a
 missing one. On an update, ids the row already stores are accepted as they are; only added ids
 are checked. Superusers are not narrowed, and the target's `viewRule` is not applied.
+
+#### Deleting a referenced record
+
+A single relation is a database foreign key. When the referenced record is deleted, the
+database deletes the referencing record if `cascadeDelete` is `true`, and otherwise sets the
+relation field to `null`. Cascades chain: a record removed by a cascade removes or clears the
+records that reference it in turn. A multi-relation has no foreign key; deleting a referenced
+record leaves its id in the array.
+
+A REST delete (`DELETE /api/collections/{collection}/records/{id}`, with or without an
+`Idempotency-Key`) finds these rows inside its own transaction and announces them like its own
+delete:
+
+- realtime publishes a `delete` event for every cascaded record, authorized per subscriber
+  against that record's state before the delete (an owner-scoped `viewRule` delivers each row's
+  delete to its owner only), and an `update` event carrying the record as stored for every
+  record whose relation became `null`;
+- with `-Ddurable-realtime`, the matching invalidations are journaled in the delete's
+  transaction ([durable replay](api.md#durable-record-invalidation-replay-sqlite-and-postgresql)).
+
+The rows are found from the database's own foreign keys, so a stored schema that disagrees with
+the table (for example a `cascadeDelete` flag changed without the table being rebuilt) still
+announces what the database actually did. A record whose TTL has expired is not announced
+(clients never saw it), but the records it cascades to still are. On PostgreSQL the parent and
+every discovered row are locked (`FOR UPDATE`) until the delete commits, so a concurrent write
+cannot add a referencing row between discovery and the delete.
+
+**Record hooks do not run for these rows.** `beforeDelete`/`afterDelete` and
+`beforeUpdate`/`afterUpdate` fire only for the record the request names; a hook on the
+referencing collection cannot see or veto a cascade. Guard the parent's `beforeDelete`
+instead. The database changes the rows directly, so a nulled record's `updated` timestamp
+does not change, and the `update` event's record is not shaped by `afterUpdate` hooks.
+
+The cost grows with the number of affected rows: discovery uses batched set queries per
+referencing relation and level (in chunks of 256 parent ids). Discovery reads only IDs, with
+each query limited to the remaining distinct-record budget plus one; duplicate paths are paged
+in ID order and count only once. Snapshots are fetched only after discovery passes the cap.
+Then each row costs one realtime event and, when enabled, one journal entry, written as one batch. A cascade larger than the journal
+budget evicts older entries, so earlier checkpoints need a reset.
+
+Announcing a cascaded row never fails the delete. The degraded forms are:
+
+- **More than 1000 distinct candidate records** (cascaded and nulled together, counting each
+  collection/record pair once across all FK paths): discovery stops, no per-row
+  events are published, every collection the delete can reach has its local backfill history
+  invalidated, and with `-Ddurable-realtime` the journal is reset in the delete's transaction,
+  so every earlier checkpoint answers `resetRequired` and clients reload.
+- **Composite or alternate-key foreign keys** defined by migrations cannot be mapped to a
+  single child column referencing the parent's `id`. Encountering one uses the same conservative
+  invalidation and journal reset as overflow, even when no rows match; it never silently skips
+  the edge. Cascade descendants are included in the reachable collections, including through
+  unregistered migration-owned tables.
+- **A cascaded row that cannot be decoded** is published as an id-only `delete`, which reaches
+  only subscribers with no row-level restriction, and its collection's local backfill history
+  is invalidated; with `-Ddurable-realtime` the journal is reset.
+- **A cascaded snapshot over the journal's frame budget** resets the journal the same way.
+- **A nulled row that cannot be decoded** is published as an id-only `update`.
+
+Each degraded form is logged as a warning. The record the request names is unchanged: its own
+oversized delete snapshot still rejects the delete under `-Ddurable-realtime`.
+
+Only the REST delete announces these rows. Deletes through the `Data` facade
+(`ctx.records()`), raw SQL, migrations and TTL expiry still cascade in the database without
+events or journal entries. Files of cascaded records are not removed
+([known limitations](../KNOWN_LIMITATIONS.md)).
 
 > ### CRITICAL: `targetCollectionId` is an **id**, not a name
 >

@@ -958,9 +958,11 @@ pub fn delete(ctx: *http.RequestCtx) anyerror!http.Response {
     // read (byte-identical). Installed hooks require a re-read of the stored row.
     const durable_snapshot = if (comptime @import("build_options").durable_realtime) try records.getDeleteSnapshot(ctx.allocator.a, w, col, rid) else null;
     const rt = try realtime_ws.prepareDelete(ctx.allocator.a, app, w, col, rid, ex_mut);
-    if (!try records.deleteInTxn(ctx.allocator.a, w, col, rid)) {
+    // #489: the database's FK actions (ON DELETE CASCADE / SET NULL) change other rows with this
+    // delete; discover them in the same transaction so they are journaled and published too.
+    var cascade = (try records.deleteCascadingInTxn(ctx.allocator.a, w, col, rid)) orelse
         return ApiError.notFound().toResponse(ctx.allocator.a);
-    }
+    defer cascade.deinit();
     if (col.type == .auth) {
         var st = try w.prepare(try param_sink.lowerStmtZ(ctx.allocator.a, db.dbDialect(w), "DELETE FROM \"_externalAuths\" WHERE \"collectionRef\"=?1 AND \"recordRef\"=?2;"));
         defer st.finalize();
@@ -970,6 +972,7 @@ pub fn delete(ctx: *http.RequestCtx) anyerror!http.Response {
     }
     if (app.files.cleanup) |enqueue| try enqueue(ctx.allocator.a, w, app.io, app.files.cleanup_queue.?, col, rid, existing, null);
     if (comptime @import("build_options").durable_realtime) try @import("../realtime/durable.zig").capture(ctx.allocator.a, app.io, w, col, .delete, rid, durable_snapshot);
+    const cascade_tokens = try captureCascadeInTxn(ctx.allocator, app, w, cascade);
     try w.commit();
     txn_open = false;
 
@@ -983,7 +986,98 @@ pub fn delete(ctx: *http.RequestCtx) anyerror!http.Response {
     // can re-authorize the delete event (the live row is gone). The snapshot rides in the published
     // frame under a private key and is stripped before any client receives the id-only delete frame.
     realtime_ws.broadcast(app, col, .delete, rid, rt.snapshot, rt.token);
+    broadcastCascade(ctx.allocator, app, cascade, cascade_tokens);
     return .{ .status = 204, .body = "" };
+}
+
+/// #489: inside the delete transaction (after the parent's own journal entry), journal every row
+/// the delete's FK actions changed — a `delete` invalidation with its private at-rest snapshot per
+/// cascaded row, an `update` invalidation per nulled row, appended as ONE batch — and, on
+/// cross-instance PostgreSQL, store each cascaded row's delete-authorization snapshot (one orphan
+/// GC per delete) the way `prepareDelete` does for the parent. No record hooks run for these
+/// rows: the database changed them, not a record operation.
+///
+/// Announcing never fails the delete. When the journal cannot hold the cascade entry by entry —
+/// more distinct candidates than `records.cascade_announce_cap`, an unsupported FK, a row without a snapshot (it could not
+/// be decoded), or a snapshot frame over the journal's frame budget — it is reset instead
+/// (`durable.requireReset`: every older checkpoint answers `409 resetRequired`). A journal
+/// DATABASE failure still rolls the delete back, like the parent's own capture.
+///
+/// Contract 4 (arena-scoped): the token slice and each token string live exactly as long as the
+/// request and are consumed by `broadcastCascade` within it.
+pub fn captureCascadeInTxn(arena: RequestArena, app: *app_mod.App, w: *db.Db, cascade: records.CascadeEffects) ![]const ?[]const u8 {
+    const pg_bridge = @import("../realtime/pg_bridge.zig");
+    const tokens = try arena.a.alloc(?[]const u8, cascade.deleted.len);
+    @memset(tokens, null);
+    if (pg_bridge.crossInstanceEnabled(app) and cascade.deleted.len > 0) {
+        const snapshots = try arena.a.alloc(?std.json.Value, cascade.deleted.len);
+        for (cascade.deleted, snapshots) |d, *s| s.* = d.snapshot;
+        pg_bridge.storeDeleteSnapshots(arena.a, app.io, w, snapshots, tokens);
+    }
+    if (comptime @import("build_options").durable_realtime) {
+        const durable = @import("../realtime/durable.zig");
+        if (cascade.overflow) {
+            std.log.warn("realtime: FK discovery exceeded {d} distinct candidates or encountered an unsupported FK; the replay journal is reset instead of recording each", .{records.cascade_announce_cap});
+            try durable.requireReset(arena.a, w);
+            return tokens;
+        }
+        const entries = try arena.a.alloc(durable.Pending, cascade.deleted.len + cascade.nulled.len);
+        for (cascade.deleted, entries[0..cascade.deleted.len]) |d, *e| {
+            const snapshot = d.snapshot orelse {
+                std.log.warn("realtime: cascade-deleted {s}/{s} has no snapshot; the replay journal is reset instead", .{ d.col.name, d.id });
+                try durable.requireReset(arena.a, w);
+                return tokens;
+            };
+            const frame = try durable.eventFrame(arena.a, d.col, .delete, d.id, snapshot);
+            if (frame.len > durable.max_frame_bytes) {
+                std.log.warn("realtime: cascade-deleted {s}/{s} snapshot is {d} bytes (over {d}); the replay journal is reset instead", .{ d.col.name, d.id, frame.len, durable.max_frame_bytes });
+                try durable.requireReset(arena.a, w);
+                return tokens;
+            }
+            e.* = .{ .collection = d.col.id, .frame = frame };
+        }
+        for (cascade.nulled, entries[cascade.deleted.len..]) |n, *e| {
+            e.* = .{ .collection = n.col.id, .frame = try durable.eventFrame(arena.a, n.col, .update, n.id, null) };
+        }
+        try durable.appendMany(arena.a, w, entries, @import("../clock.zig").nowUnix(app.io));
+    }
+    return tokens;
+}
+
+/// #489: after commit, publish a `delete` frame per cascaded row (authorized against its
+/// pre-delete snapshot) and an `update` frame carrying the current row per nulled row. Degraded
+/// forms: a row that could not be decoded is published id-only (a delete without a snapshot
+/// reaches only subscribers with no row-level restriction; an update is authorized against the
+/// live row as usual) and its local backfill history is invalidated; above the announcement cap
+/// nothing is published per row and every reachable collection's local backfill history is
+/// invalidated.
+///
+/// These publishes run while the caller still holds the writer, like every other record write's:
+/// a nulled row's `update` frame carries its state, and publishing it after releasing the writer
+/// would let a later write's frame for the same row overtake it.
+pub fn broadcastCascade(arena: RequestArena, app: *app_mod.App, cascade: records.CascadeEffects, tokens: []const ?[]const u8) void {
+    if (cascade.overflow) {
+        std.log.warn("realtime: FK discovery exceeded {d} distinct candidates or encountered an unsupported FK; no per-row events are published", .{records.cascade_announce_cap});
+        for (cascade.reach) |c| realtime_ws.invalidateBackfill(app, c);
+        return;
+    }
+    for (cascade.deleted, tokens) |d, token| {
+        realtime_ws.broadcast(app, d.col, .delete, d.id, d.snapshot, token);
+        if (d.snapshot == null) realtime_ws.invalidateBackfill(app, d.col);
+    }
+    for (cascade.nulled) |n| {
+        const record = if (n.record) |r| r else idOnly(arena, n.id) catch |err| {
+            std.log.err("realtime: dropped cascade update for {s}/{s}: {s}", .{ n.col.name, n.id, @errorName(err) });
+            continue;
+        };
+        realtime_ws.broadcast(app, n.col, .update, n.id, record, null);
+    }
+}
+
+fn idOnly(arena: RequestArena, id: []const u8) !std.json.Value {
+    var obj: std.json.ObjectMap = .empty;
+    try obj.put(arena.a, "id", .{ .string = id });
+    return .{ .object = obj };
 }
 
 pub fn list(ctx: *http.RequestCtx) anyerror!http.Response {
@@ -1733,6 +1827,148 @@ test "delete handler: rule denial -> 403, missing id -> 404" {
     const p_missing = [_]http.Param{ .{ .key = "col", .value = "ud_del" }, .{ .key = "id", .value = "nope" } };
     var mctx = ctxFor(env, RequestArena.from(&arena), .DELETE, "", &p_missing);
     try std.testing.expectEqual(@as(u16, 404), (try delete(&mctx)).status);
+}
+
+const CascadeHooks = struct {
+    var calls: usize = 0;
+    fn count(ctx: *Ctx, ev: *events.RecordEvent) anyerror!void {
+        _ = ctx;
+        _ = ev;
+        calls += 1;
+    }
+};
+
+test "#489 REST delete journals FK cascade/SET NULL rows in its transaction and runs no hooks for them" {
+    var env = try TestEnv.init();
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        const open: schema.Collection = .{ .id = "", .name = "", .fields = &.{}, .listRule = "@public", .viewRule = "@public", .createRule = "@public", .updateRule = "@public", .deleteRule = "@public" };
+        var notes = open;
+        notes.name = "notes";
+        notes.fields = &.{.{ .id = "n1", .name = "title", .options = .{ .text = .{} } }};
+        const notes_col = try collections.create(a, std.testing.io, w, notes);
+        var items = open;
+        items.name = "items";
+        items.fields = &.{.{ .id = "i1", .name = "note", .options = .{ .relation = .{ .targetCollectionId = notes_col.id, .cascadeDelete = true } } }};
+        _ = try collections.create(a, std.testing.io, w, items);
+        var tasks = open;
+        tasks.name = "tasks";
+        tasks.fields = &.{.{ .id = "t1", .name = "note", .options = .{ .relation = .{ .targetCollectionId = notes_col.id } } }};
+        _ = try collections.create(a, std.testing.io, w, tasks);
+        try w.exec(
+            \\INSERT INTO notes (id,created,updated) VALUES ('N','t','t');
+            \\INSERT INTO items (id,created,updated,note) VALUES ('I','t','t','N');
+            \\INSERT INTO tasks (id,created,updated,note) VALUES ('T','t','t','N');
+        );
+    }
+    const dispatch = events.Dispatch{ .record = events.buildRecordDispatcher(.{
+        .items = .{ .beforeDelete = CascadeHooks.count, .afterDelete = CascadeHooks.count, .beforeUpdate = CascadeHooks.count, .afterUpdate = CascadeHooks.count },
+        .tasks = .{ .beforeDelete = CascadeHooks.count, .afterDelete = CascadeHooks.count, .beforeUpdate = CascadeHooks.count, .afterUpdate = CascadeHooks.count },
+    }) };
+    env.app.dispatch = &dispatch;
+    CascadeHooks.calls = 0;
+
+    const params = [_]http.Param{ .{ .key = "col", .value = "notes" }, .{ .key = "id", .value = "N" } };
+    var dctx = ctxFor(env, RequestArena.from(&arena), .DELETE, "", &params);
+    try std.testing.expectEqual(@as(u16, 204), (try delete(&dctx)).status);
+
+    // The database performed both FK actions; record hooks on the affected rows did not run.
+    try std.testing.expectEqual(@as(i64, 0), try countRows(env, "items"));
+    try std.testing.expectEqual(@as(i64, 1), try countRows(env, "tasks"));
+    try std.testing.expectEqual(@as(usize, 0), CascadeHooks.calls);
+
+    if (comptime !@import("build_options").durable_realtime) return;
+    // Journal: the parent delete, then a delete for I (with its private pre-delete snapshot) and
+    // an update for T, all committed with the delete.
+    const w = env.pool.acquireWriter();
+    defer env.pool.releaseWriter();
+    var st = try w.prepare("SELECT \"frame\" FROM main._replay_events ORDER BY \"sequence\";");
+    defer st.finalize();
+    var frames: std.ArrayList([]const u8) = .empty;
+    while (try st.step()) try frames.append(a, try a.dupe(u8, st.columnText(0)));
+    try std.testing.expectEqual(@as(usize, 3), frames.items.len);
+    const want = [_]struct { col: []const u8, action: []const u8, id: []const u8 }{
+        .{ .col = "notes", .action = "delete", .id = "N" },
+        .{ .col = "items", .action = "delete", .id = "I" },
+        .{ .col = "tasks", .action = "update", .id = "T" },
+    };
+    for (want, frames.items) |exp, frame| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, frame, .{});
+        const obj = parsed.value.object;
+        try std.testing.expectEqualStrings(exp.action, obj.get("action").?.string);
+        try std.testing.expectEqualStrings(exp.id, obj.get("record").?.object.get("id").?.string);
+        try std.testing.expectEqualStrings(exp.col, obj.get("topic").?.string);
+    }
+}
+
+test "#489 an undecodable or oversized cascaded row never fails the REST delete" {
+    var env = try TestEnv.init();
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const durable = @import("../realtime/durable.zig");
+    {
+        const w = env.pool.acquireWriter();
+        defer env.pool.releaseWriter();
+        const open: schema.Collection = .{ .id = "", .name = "", .fields = &.{}, .listRule = "@public", .viewRule = "@public", .createRule = "@public", .updateRule = "@public", .deleteRule = "@public" };
+        var notes = open;
+        notes.name = "notes";
+        const notes_col = try collections.create(a, std.testing.io, w, notes);
+        var items = open;
+        items.name = "items";
+        items.fields = &.{
+            .{ .id = "i1", .name = "note", .options = .{ .relation = .{ .targetCollectionId = notes_col.id, .cascadeDelete = true } } },
+            .{ .id = "i2", .name = "meta", .options = .{ .json = .{} } },
+            .{ .id = "i3", .name = "body", .options = .{ .text = .{} } },
+        };
+        _ = try collections.create(a, std.testing.io, w, items);
+        var tasks = open;
+        tasks.name = "tasks";
+        tasks.fields = &.{
+            .{ .id = "t1", .name = "note", .options = .{ .relation = .{ .targetCollectionId = notes_col.id } } },
+            .{ .id = "t2", .name = "meta", .options = .{ .json = .{} } },
+        };
+        _ = try collections.create(a, std.testing.io, w, tasks);
+        // N: a cascaded row and a nulled row whose stored JSON does not parse.
+        // M: a cascaded row whose at-rest snapshot is larger than one journal frame.
+        const seed = try std.fmt.allocPrintSentinel(a,
+            \\INSERT INTO notes (id,created,updated) VALUES ('N','t','t'),('M','t','t');
+            \\INSERT INTO items (id,created,updated,note,meta) VALUES ('I1','t','t','N','not json');
+            \\INSERT INTO tasks (id,created,updated,note,meta) VALUES ('T1','t','t','N','not json');
+            \\INSERT INTO items (id,created,updated,note,body) VALUES ('I2','t','t','M',replace(hex(zeroblob({d})),'0','x'));
+        , .{durable.max_frame_bytes}, 0);
+        try w.exec(seed);
+    }
+    for ([_][]const u8{ "N", "M" }) |parent| {
+        const params = [_]http.Param{ .{ .key = "col", .value = "notes" }, .{ .key = "id", .value = parent } };
+        var dctx = ctxFor(env, RequestArena.from(&arena), .DELETE, "", &params);
+        try std.testing.expectEqual(@as(u16, 204), (try delete(&dctx)).status);
+        if (comptime @import("build_options").durable_realtime) {
+            // Degraded form: the journal was reset (every older cursor must reload) instead of
+            // the delete failing — no entries remain and the floor is at the head.
+            const w = env.pool.acquireWriter();
+            defer env.pool.releaseWriter();
+            var st = try w.prepare("SELECT (SELECT COUNT(*) FROM main._replay_events), floor = sequence FROM main._replay_state WHERE id=1;");
+            defer st.finalize();
+            try std.testing.expect(try st.step());
+            try std.testing.expectEqual(@as(i64, 0), st.columnInt(0));
+            try std.testing.expectEqual(@as(i64, 1), st.columnInt(1));
+        }
+    }
+    try std.testing.expectEqual(@as(i64, 0), try countRows(env, "items"));
+    try std.testing.expectEqual(@as(i64, 0), try countRows(env, "notes"));
+    var r = try env.pool.acquireReader();
+    defer env.pool.releaseReader(&r);
+    var st = try r.prepare("SELECT COUNT(*) FROM tasks WHERE id='T1' AND note IS NULL;");
+    defer st.finalize();
+    _ = try st.step();
+    try std.testing.expectEqual(@as(i64, 1), st.columnInt(0));
 }
 
 fn seedAuth(env: *TestEnv, name: []const u8, createR: ?[]const u8) !void {

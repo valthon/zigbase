@@ -345,6 +345,17 @@ pub fn broadcast(app: *App, col: schema.Collection, action: protocol.Action, rec
     pg_bridge.emit(app, col.name, action, record_id, notify_token);
 }
 
+/// Invalidate `col`'s retained local backfill history (`-Drealtime-backfill`, SQLite): its older
+/// checkpoints answer `409 resetRequired`. The degraded form for a change the store cannot retain
+/// event by event (#489: a cascaded delete without an authorization snapshot, or a cascade above
+/// the announcement cap). A no-op without the store or off SQLite.
+pub fn invalidateBackfill(app: *App, col: schema.Collection) void {
+    if (!active) return;
+    if (comptime @import("build_options").realtime_backfill) {
+        if (app.backfill) |store| if (db.poolBackend(app.pool) == .sqlite) store.invalidate(col.id);
+    }
+}
+
 fn captureInvalidation(allocator: std.mem.Allocator, store: *@import("backfill.zig").Store, backend: db.Backend, col: schema.Collection, action: protocol.Action, record_id: []const u8, record: ?std.json.Value) void {
     if (backend != .sqlite) return;
     var scratch = std.heap.ArenaAllocator.init(allocator);

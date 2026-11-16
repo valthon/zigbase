@@ -301,20 +301,39 @@ pub fn storeDeleteSnapshot(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, snap
     // #39: keep the degrade-to-no-remote-delivery `?`-return, but do NOT collapse every failure to
     // a silent null — a persistent store failure (table dropped, permission change, degraded
     // connection) would otherwise stop ALL cross-instance deletes with zero operator-visible signal.
-    return storeDeleteSnapshotInner(alloc, io, w, snapshot) catch |e| {
+    return storeDeleteSnapshotInner(alloc, io, w, snapshot, true) catch |e| {
         std.log.warn("realtime: cross-instance delete-snapshot store failed (remote subscribers will miss this delete): {s}", .{@errorName(e)});
         return null;
     };
 }
 
-fn storeDeleteSnapshotInner(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, snapshot: std.json.Value) ![]const u8 {
+/// `storeDeleteSnapshot` for several deleted rows (#489: a delete's foreign-key cascade), with
+/// the orphan GC run ONCE for the batch. `tokens[i]` receives the token for `snapshots[i]`, or
+/// null when that snapshot is null (an undecodable row) or its store failed (logged).
+pub fn storeDeleteSnapshots(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, snapshots: []const ?std.json.Value, tokens: []?[]const u8) void {
+    std.debug.assert(snapshots.len == tokens.len);
+    var gc = true;
+    for (snapshots, tokens) |snapshot, *token| {
+        const snap = snapshot orelse {
+            token.* = null;
+            continue;
+        };
+        token.* = storeDeleteSnapshotInner(alloc, io, w, snap, gc) catch |e| blk: {
+            std.log.warn("realtime: cross-instance delete-snapshot store failed (remote subscribers will miss this delete): {s}", .{@errorName(e)});
+            break :blk null;
+        };
+        gc = false;
+    }
+}
+
+fn storeDeleteSnapshotInner(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, snapshot: std.json.Value, gc: bool) ![]const u8 {
     const token = try crypto.genToken(io, alloc, 32);
     const snap_json = try std.json.Stringify.valueAlloc(alloc, snapshot, .{});
     defer alloc.free(snap_json); // scratch: bound into the INSERT below, not retained after
     // GC orphaned tokens first (writers whose listeners never consumed them). Bounds the table to
     // ~the TTL window of deletes; native PG interval compare on the indexed `created` column.
     // Best-effort: a GC failure must not fail the store itself.
-    w.exec("DELETE FROM \"_rt_delete_snapshots\" WHERE \"created\" < now() - interval '" ++
+    if (gc) w.exec("DELETE FROM \"_rt_delete_snapshots\" WHERE \"created\" < now() - interval '" ++
         std.fmt.comptimePrint("{d}", .{snapshot_ttl_seconds}) ++ " seconds';") catch {};
     var st = try w.prepare("INSERT INTO \"_rt_delete_snapshots\" (\"token\",\"snapshot\") VALUES ($1,$2);");
     defer st.finalize();

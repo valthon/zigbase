@@ -49,6 +49,10 @@ fn Implementation(comptime config: anytype) type {
             delete_token: ?[]const u8 = null,
             delete_snapshot: ?std.json.Value = null,
 
+            /// #489: rows the delete's foreign keys changed (owned; freed by `attempt`).
+            cascade: ?records.CascadeEffects = null,
+            cascade_tokens: []const ?[]const u8 = &.{},
+
             fn eventRecord(s: *const State) ?std.json.Value {
                 return if (s.action == .delete) s.delete_snapshot else s.result;
             }
@@ -141,7 +145,12 @@ fn Implementation(comptime config: anytype) type {
                     const snapshot = (try records.getDeleteSnapshot(a, conn, s.col, s.rid)) orelse return error.NotFound;
                     try @import("realtime/durable.zig").capture(a, app.io, conn, s.col, .delete, s.rid, snapshot);
                 }
-                if (!try records.deleteInTxn(a, conn, s.col, s.rid)) return error.NotFound;
+                // #489: discover and journal the rows the database's FK actions change, inside
+                // this receipt's transaction, exactly as the plain REST delete does.
+                if (s.cascade) |*stale| stale.deinit();
+                s.cascade = null;
+                s.cascade = (try records.deleteCascadingInTxn(a, conn, s.col, s.rid)) orelse return error.NotFound;
+                s.cascade_tokens = try api.captureCascadeInTxn(s.ctx.allocator, app, conn, s.cascade.?);
                 s.result = previous;
                 return 0;
             }
@@ -223,6 +232,7 @@ fn Implementation(comptime config: anytype) type {
             const rid = ctx.param("id") orelse "";
             const payload = try std.json.Stringify.valueAlloc(a, .{ .collection = col, .target = rid, .account = rctx.account_id, .body = ctx.body }, .{});
             var s: State = .{ .ctx = ctx, .col = col, .rctx = rctx, .auth_collection_id = auth_col.id, .action = action, .rid = rid, .data = data };
+            defer if (s.cascade) |*c| c.deinit();
             const result = Ledger.execute(a, conn, .{
                 .principal = .{ .collection = auth_col.id, .record = identity.object.get("id").?.string },
                 .operation = try std.fmt.allocPrint(a, "{s}:{s}:{s}", .{ @tagName(action), col.id, rid }),
@@ -246,7 +256,10 @@ fn Implementation(comptime config: anytype) type {
                 switch (action) {
                     .create => realtime.broadcast(app, col, .create, event_id, s.result, null),
                     .update => realtime.broadcast(app, col, .update, event_id, s.result, null),
-                    .delete => realtime.broadcast(app, col, .delete, event_id, s.eventRecord(), s.delete_token),
+                    .delete => {
+                        realtime.broadcast(app, col, .delete, event_id, s.eventRecord(), s.delete_token);
+                        if (s.cascade) |c| api.broadcastCascade(ctx.allocator, app, c, s.cascade_tokens);
+                    },
                     else => unreachable,
                 }
             }

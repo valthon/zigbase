@@ -317,7 +317,7 @@ jobs:
       - name: Durable realtime PostgreSQL cross-instance recovery
         run: |
           mise exec zig@0.16.0 -- zig build -Dpostgres=true -Ddurable-realtime=true --prefix zig-out/replay-pg
-          ZIGBASE_TEST_DURABLE_REALTIME_BINARY="$GITHUB_WORKSPACE/zig-out/replay-pg/bin/zigbase" mise exec python@3.13 -- python -m pytest tests/admin/test_durable_realtime.py::test_postgres_cross_instance_replay -q
+          ZIGBASE_TEST_DURABLE_REALTIME_BINARY="$GITHUB_WORKSPACE/zig-out/replay-pg/bin/zigbase" mise exec python@3.13 -- python -m pytest tests/admin/test_durable_realtime.py::test_postgres_cross_instance_replay tests/admin/test_durable_realtime.py::test_postgres_fk_cascade_replay_across_instances tests/admin/test_durable_realtime.py::test_postgres_fk_cascade_replay_is_authorized_per_item -q
       - name: PostgreSQL REST retry recovery and concurrent rule changes
         env:
           ZIGBASE_REST_PG_TEST_URL: postgres://zbpg:zbpg_secret_pw@127.0.0.1:5432/zbresttest?sslmode=prefer
