@@ -12,8 +12,14 @@ not ZigBase's.
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
 import json
+import os
+import re
 import shutil
+import sqlite3
 import sys
 from pathlib import Path
 
@@ -548,7 +554,7 @@ def test_a_forged_or_dishonest_report_is_rejected(tmp_path, mutation):
     elif mutation == "inferred":
         value["sourceMode"] = "inferred"
     elif mutation == "secret":
-        value["rollback"] += " digest $2a$04$abcdefghijklmnopqrstuv"
+        value["rollback"] += " digest " + FOREIGN_BCRYPT
     elif mutation == "frontend_claimed":
         value["frontend"] = "The Rails views were migrated to the new target."
     elif mutation == "frontend_silent":
@@ -645,3 +651,491 @@ def test_a_thin_rationale_is_not_a_decision(tmp_path):
     path.write_text(json.dumps(value))
     _, failures = inspect_completion(target)
     assert any(f.code == "completion.rationales" for f in failures)
+
+
+#: User 1's API-token signature, computed outside the grader with Ruby's OpenSSL —
+#: `OpenSSL::HMAC.hexdigest("SHA256", "0" * 64, "bookclub-token:1")`, as
+#: `auth_token.rb` signs it — so the grader's own derivation is not checking itself.
+USER_1_TOKEN_SIGNATURE = (
+    "b44dc56040e191a5728dc729103abc85ad64572a1b20d77079c002ae488f33b4"
+)
+
+
+def _signature(user_id: int) -> bytes:
+    return hmac.new(
+        b"0" * 64, f"bookclub-token:{user_id}".encode(), hashlib.sha256
+    ).digest()
+
+
+ZEROS = "0" * 64
+
+#: Whole credential hashes from nowhere in the snapshot, in the shapes the report check
+#: refuses wherever they came from. The argon2id one is `crypto.zig`'s fixed dummy hash.
+FOREIGN_BCRYPT = "$2b$10$" + "abcdefghijklmnopqrstuv" + "ABCDEFGHIJKLMNOPQRSTUVWXYZ01234"
+FOREIGN_ARGON2ID = (
+    "$argon2id$v=19$m=65536,t=2,p=1$X6nNL1XIBemv6GtMawOzIiupjeI6RhVcq4OM6oHc2Ds"
+    "$7q5akLEU/XJR2q91NLbc9ARqZfPFtOSdtSIQZBP4I2o"
+)
+
+
+@pytest.mark.parametrize(
+    ("text", "label"),
+    [
+        ("digest " + FOREIGN_BCRYPT, "a bcrypt password hash"),
+        ("digest " + FOREIGN_BCRYPT.replace("$2b$", "$2y$"), "a bcrypt password hash"),
+        ("stored $zblegacy$bcrypt$" + FOREIGN_BCRYPT, "a $zblegacy$ password hash"),
+        ("rehashed to " + FOREIGN_ARGON2ID, "an argon2 password hash"),
+        ("rehashed to " + FOREIGN_ARGON2ID.replace("argon2id", "argon2i"),
+         "an argon2 password hash"),
+        ("-----BEGIN PRIVATE KEY-----\nMIIEvQ==\n-----END PRIVATE KEY-----",
+         "a PEM block"),
+        ("-----BEGIN RSA PRIVATE KEY-----", "a PEM block"),
+        # Round 5, finding 1: a digest cut short after its salt is still a digest.
+        ("stored digest $2a$04$fixturesaltfixtures00uU9RJtmTs6Ml/RaXi...",
+         "a bcrypt password hash"),
+        ("foreign $2b$10$abcdefghijklmnopqrstuvABCDEFGHIJKLMNOPQRSTU...",
+         "a bcrypt password hash"),
+        ("foreign $2b$10$abcdefghijklmnopqrstuvA", "a bcrypt password hash"),
+        # Round 5, finding 3: argon2 PHC strings without a version, with their
+        # parameters reordered, or with more of them.
+        ("rehashed to " + FOREIGN_ARGON2ID.replace("$v=19", ""),
+         "an argon2 password hash"),
+        ("rehashed to " + FOREIGN_ARGON2ID.replace("m=65536,t=2", "t=2,m=65536"),
+         "an argon2 password hash"),
+        ("rehashed to " + FOREIGN_ARGON2ID.replace("p=1", "p=1,keyid=AA"),
+         "an argon2 password hash"),
+        # Round 5, finding 2's bounds: the shortest salt and hash that still fail.
+        ("rehashed to $argon2id$v=19$m=65536,t=2,p=1$" + "A" * 11 + "$" + "B" * 16,
+         "an argon2 password hash"),
+    ],
+)
+def test_the_report_refuses_whole_credential_hashes(tmp_path, text, label):
+    """A real-shaped hash fails by its shape; its format's name alone does not (#494)."""
+    target = workspace(tmp_path)
+    path = target / "migration" / "report.json"
+    value = json.loads(path.read_text())
+    value["rollback"] += " " + text
+    path.write_text(json.dumps(value))
+    _, failures = inspect_completion(target)
+    assert [(f.code, f.message) for f in failures] == [
+        ("completion.report_secret", f"the report carries {label}")
+    ], text
+
+@pytest.mark.parametrize("salt", ["fixturesaltfixtures00u", "abcdefghijklmnopqrstuv"])
+@pytest.mark.parametrize("prefix", ["$2a$04$", "$zblegacy$bcrypt$$2b$10$"])
+@pytest.mark.parametrize(
+    ("suffix", "accepted"),
+    [(".", True), ("...", True), ("A", False), ("A...", False),
+     (".A", False), ("...A", False), ("/", False), (".../", False)],
+)
+def test_report_distinguishes_bcrypt_salt_punctuation_from_hash(
+    tmp_path, salt, prefix, suffix, accepted
+):
+    """Round 6: periods alone after a salt are prose; hash content still fails."""
+    target = workspace(tmp_path)
+    path = target / "migration" / "report.json"
+    value = json.loads(path.read_text())
+    value["rollback"] += f" The shared salt is {prefix}{salt}{suffix}"
+    path.write_text(json.dumps(value))
+    _, failures = inspect_completion(target)
+    assert [f.code for f in failures] == ([] if accepted else ["completion.report_secret"])
+
+
+#: Review rounds 1 to 3's inputs for #494, verbatim, plus the old test's. The check
+#: looks for the snapshot's secret VALUES, so wording about `secret_key_base` or
+#: `password_digest` — denial, claim or neutral — never decides the verdict; carrying a
+#: value always does. A field of "checks+" appends each `|`-separated piece as its own
+#: string; "rollback{}" makes the rollback an object whose only KEY is the text, and
+#: "rollback{:}" one whose only key and value are the two `|`-separated pieces.
+SECRET_REPORT_CASES = [
+    # The run that exposed #494.
+    ("rollback", "Rails sessions, secret_key_base-derived tokens and API tokens did "
+     "not migrate, so clients re-authenticate on either side.", True),
+    ("rollback", "No `secret_key_base`-derived material survives the cutover.", True),
+    # Finding 1: honest denials the negation heuristic failed.
+    ("rollback", "Rails sessions and secret_key_base-derived material didn't survive.",
+     True),
+    ("rollback", "Rails sessions and secret_key_base-derived material didn’t "
+     "survive.", True),
+    ("rollback", "secret_key_base-derived material don't survive.", True),
+    ("rollback", "secret_key_base-derived material isn't migrated.", True),
+    ("rollback", "secret_key_base-derived material won't survive.", True),
+    ("rollback", "secret_key_base-derived material cannot be carried over.", True),
+    ("rollback", "Sessions signed with secret_key_base are lost at cutover.", True),
+    ("rollback", "secret_key_base-derived cookies are invalidated; users must log in "
+     "again.", True),
+    ("rollback", "Without secret_key_base, Rails sessions are invalid on the target.",
+     True),
+    ("rollback", "secret_key_base-derived material is dropped.", True),
+    ("rollback", "secret_key_base-derived material is non-portable.", True),
+    ("rollback", "Not migrated: Rails sessions, secret_key_base-derived material, API "
+     "tokens.", True),
+    ("rollback", "The following do not survive: Rails sessions, "
+     "secret_key_base-derived material, API tokens.", True),
+    ("rollback", "secret_key_base-derived material: not migrated.", True),
+    ("rollback", "secret_key_base-derived material (e.g. signed cookies) did not "
+     "survive.", True),
+    ("rollback", "No, secret_key_base-derived material is gone.", True),
+    ("rollback", "Rails sessions (not secret_key_base-derived material) ...", True),
+    ("rollback", "**Not** carried: secret_key_base-derived material", True),
+    ("rollback", "Did secret_key_base-derived material survive? No.", True),
+    # Findings 2, 3 and the old test's claims: survival CLAIMS. No check of this report
+    # reads claims about sessions or tokens — the prompt's sentence never had a grader
+    # counterpart beyond a ban on the name — so without a value they are accepted.
+    ("rollback", "secret_key_base-derived sessions survive, so users need not log in "
+     "again.", True),
+    ("rollback", "secret_key_base-derived sessions survive and no re-login is needed.",
+     True),
+    ("rollback", "secret_key_base-derived sessions survive with no downtime.", True),
+    ("rollback", "Sessions signed with secret_key_base survive, not just API tokens.",
+     True),
+    ("rollback", "secret_key_base sessions survive - nothing to do.", True),
+    ("rollback", "secret_key_base sessions never expire and survive the cutover.",
+     True),
+    ("rollback", "secret_key_base-derived sessions survive, none are lost.", True),
+    ("rollback", "There is no reason secret_key_base sessions would break, they keep "
+     "working.", True),
+    ("rollback", "- secret_key_base sessions survive\n- API tokens were not migrated",
+     True),
+    ("rollback", "Sessions signed with secret_key_base survive the cutover.", True),
+    ("rollback", "Nothing else changed; secret_key_base tokens keep working.", True),
+    # Finding 4: a digest beside a denial is not the secret.
+    ("rollback", "The bundle's sha256 is "
+     "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08; "
+     "secret_key_base-derived material did not migrate.", True),
+    # Finding 5: the name in any case.
+    ("rollback", "SECRET_KEY_BASE is unset on the target host.", True),
+    # Round 2, finding 1: a run of zeros is not the key unless the report ties it to
+    # the key. A null digest, a longer run, zero counts and an all-zero uuid all pass.
+    ("rollback", "The empty file's digest is sha256:" + ZEROS + ".", True),
+    ("checks", "0" * 128, True),
+    ("rollback", "counts: " + " ".join(ZEROS), True),
+    ("rollback", "id 00000000-0000-0000-0000-000000000000", True),
+    ("rollback", "The fixture key was " + ZEROS + ".", True),
+    ("rollback", "secret_key_base did not migrate. Null digest: " + "0" * 128, True),
+    # ... nor is a run beside the name that is part of a longer hex value, or one
+    # further from the name than a phrase.
+    ("rollback", "secret_key_base was not copied; checksum f" + ZEROS + ".", True),
+    ("rollback", "secret_key_base was not copied; checksum " + ZEROS + "a.", True),
+    ("rollback", "secret_key_base did not migrate. " + "Nothing else did either. " * 5
+     + "The empty file's digest is sha256:" + ZEROS + ".", True),
+    # Round 2, finding 2: a description of the value is not its bytes, however spelled.
+    ("rollback", 'application.rb sets config.secret_key_base = "0" * 64; it did not '
+     "migrate.", True),
+    ("rollback", "secret_key_base is padded with '0' * 64 bytes.", True),
+    ("rollback", "secret_key_base was a run of 64 zeros.", True),
+    # Round 2, finding 6: the column's name is not a digest.
+    ("rollback", "password_digest hashes were imported as legacy bcrypt and rehash on "
+     "login.", True),
+    ("rollback", "The login for ada was re-tested with a wrong password.", True),
+    # Round 3, finding 2: a password is matched whole, never with its separators
+    # folded out of the report around it.
+    ("rollback", "Logins verified for ada: password 1 of 4 accounts rehashed.", True),
+    ("rollback", "Checked eve password 5 times.", True),
+    ("checks+", "login as ada|password-1 style seeds rehash", True),
+    # Round 3, (b): naming a hash format is not carrying a hash.
+    ("rollback", "bcrypt digests rehash to $argon2id on first login.", True),
+    ("rollback", "Imported hashes are tagged $zblegacy$bcrypt$ until login; $2a$, $2b$ "
+     "and $2y$ are accepted.", True),
+    ("rollback", "No file in the bundle starts with -----BEGIN.", True),
+    ("rollback", "Seed digests use cost 4 ($2a$04$...) and rehash on login.", True),
+    # Round 5: a salt is not a credential, with or without its prefix, nor is an
+    # argon2 string whose salt and hash are placeholders.
+    ("rollback", "Seeds share the salt $2a$04$fixturesaltfixtures00u…",
+     True),
+    ("rollback", "Seeds share the salt fixturesaltfixtures00u.", True),
+    ("rollback", "Hashes look like $argon2id$v=19$m=65536,t=2,p=1$salt$hash after "
+     "first login.", True),
+    ("rollback", "$argon2id$v=19$m=65536,t=2,p=1$" + "A" * 10 + "$" + "B" * 43, True),
+    ("rollback", "$argon2id$v=19$m=65536,t=2,p=1$" + "A" * 22 + "$" + "B" * 15, True),
+    # Round 5, an accepted residual: the last 26 characters of a stored hash, with
+    # neither its salt nor its start, match no needle.
+    ("rollback", "tail " + "$2a$04$fixturesaltfixtures00uU9RJtmTs6Ml/RaXilZAdMIc8h2dgkl2"[-26:],
+     True),
+    # Leaks: the value fails whatever the wording, wherever it is.
+    ("rollback", "secret_key_base is " + ZEROS + " and was not migrated.", False),
+    ("frontend", "SECRET_KEY_BASE=" + ZEROS, False),
+    ("rollback", "secret key base: " + ":".join(["00"] * 32), False),
+    ("rollback", "secret_key_base split: " + " ".join(["0" * 16] * 4) + ".", False),
+    ("rollback", "Its bytes in hex: " + ("30" * 64).upper() + ".", False),
+    ("rollback", "Base64: " + "MDAw" * 21 + "MA==.", False),
+    ("rollback", "Base64 unpadded: " + "MDAw" * 21 + "MA, done.", False),
+    ("rollback", "Wrapped base64:\n" + "\n".join(
+        base64.b64encode(_signature(1)).decode()[i:i + 16] for i in range(0, 44, 16)
+    ), False),
+    ("rollback", base64.b64encode(b"secret_key_base=" + b"0" * 64).decode(), False),
+    ("rollback", "Primary key fixture_primary_key_0000000000000000 stayed behind.",
+     False),
+    ("rollback", "FIXTURE_DETERMINISTIC_KEY_00000000000", False),
+    ("rollback", "ada's API token was 1." + USER_1_TOKEN_SIGNATURE + " and did not "
+     "survive.", False),
+    ("checks", "1." + USER_1_TOKEN_SIGNATURE.upper(), False),
+    ("checks+", "1." + USER_1_TOKEN_SIGNATURE[:30] + "|" + USER_1_TOKEN_SIGNATURE[30:],
+     False),
+    ("rollback{}", "1." + USER_1_TOKEN_SIGNATURE, False),
+    ("rollback", "-".join(_signature(4).hex()[i:i + 2] for i in range(0, 64, 2)),
+     False),
+    ("rollback", base64.urlsafe_b64encode(_signature(2)).decode().rstrip("="), False),
+    ("rollback", base64.b64encode(("1." + USER_1_TOKEN_SIGNATURE).encode()).decode(),
+     False),
+    ("rollback", base64.b64encode(_signature(3).hex().encode()).decode(), False),
+    # Eve is signed up by the recorded HTTP cases, not the seed: user 5.
+    ("rollback", "eve's token 5." + _signature(5).hex(), False),
+    ("rollback", "ada logs in with ada-password-1", False),
+    ("rollback", "eve-password-5", False),
+    ("rollback", "U9RJtmTs6Ml/RaXilZAdMIc8h2dgkl2", False),
+    ("rollback", "ADA-PASSWORD-1 was the seed login.", False),
+    # Round 5, finding 1: user 1's digest cut short, without its "$2a$04$".
+    ("rollback", "stored digest fixturesaltfixtures00uU9RJtmTs6Ml", False),
+    # Round 3, finding 1: the key beside its name in a key/value shape, or followed by
+    # a separated zero or a hex letter.
+    ("rollback{:}", "secret_key_base|" + ZEROS, False),
+    ("checks+", "secret_key_base|" + ZEROS, False),
+    ("rollback", "secret_key_base" + ZEROS, False),
+    ("rollback", "secret_key_base=" + ZEROS + "\n0 errors", False),
+    ("rollback", "secret_key_base is " + ZEROS + " - 0 sessions survived", False),
+    ("rollback", "secret_key_base=" + ZEROS + "d", False),
+    ("rollback", "secret_key_base was " + ZEROS + "d", False),
+    # Round 5, finding 5: other connectors between the name and the key.
+    ("rollback", "secret_key_base => " + ZEROS + "d", False),
+    ("rollback", 'ENV["SECRET_KEY_BASE"]=' + ZEROS + "f", False),
+    ("rollback", "secret_key_base equals " + ZEROS + "abc", False),
+    ("rollback", "secret_key_base (value " + ZEROS + "0)", False),
+    ("rollback", "secret_key_base(" + ZEROS + "0)", False),
+    ("rollback", "secret_key_base value is " + ZEROS + "d", False),
+    # Two strings of a field are joined with a separator, not glued: "...: 0" + the key
+    # is a count and then the key, not one 65-zero value.
+    ("checks+", "secret_key_base copies: 0|" + ZEROS, False),
+    ("rollback", "secret_key_base: " + "0" * 128, False),
+    # ... and a 64-zero window of a longer run near the name, though not assigned.
+    ("rollback", "secret_key_base, for the record: " + ZEROS + "\n0 errors", False),
+    ("rollback", "secret_key_base, for the record: " + ZEROS + " - 0 left", False),
+    # Round 3, finding 3, an accepted residual: a 64-zero run within a phrase of the
+    # name is taken as the key whatever it really is.
+    ("rollback", "secret_key_base not migrated. Empty file sha256:" + ZEROS, False),
+    # Round 5, finding 4, the same accepted residual: a 64-zero window inside a longer
+    # separated run near the name.
+    ("rollback", "secret_key_base not migrated. counts: " + " ".join("0" * 70), False),
+    ("rollback", "secret_key_base not migrated. bytes: " + " ".join(["00"] * 40), False),
+]
+
+
+@pytest.mark.parametrize(("field", "text", "accepted"), SECRET_REPORT_CASES)
+def test_the_report_secret_check_reads_values_not_wording(
+    tmp_path, field, text, accepted
+):
+    """`completion.report_secret` fails on the snapshot's secret values, not names (#494).
+
+    The prompt asks the report not to claim `secret_key_base`-derived material
+    survives, so a correct report names it. A substring test on the name failed that
+    report, and a negation parser in its place failed honest denials and passed claims.
+    """
+    target = workspace(tmp_path)
+    path = target / "migration" / "report.json"
+    value = json.loads(path.read_text())
+    if field == "checks":
+        value["checks"].append(text)
+    elif field == "checks+":
+        value["checks"] += text.split("|")
+    elif field == "rollback{}":
+        value["rollback"] = {text: "did not survive"}
+    elif field == "rollback{:}":
+        key, item = text.split("|")
+        value["rollback"] = {key: item}
+    else:
+        value[field] += " " + text
+    path.write_text(json.dumps(value))
+    _, failures = inspect_completion(target)
+    codes = [failure.code for failure in failures]
+    if accepted:
+        assert codes == [], text
+    else:
+        assert codes == ["completion.report_secret"], text
+
+
+def _base64_runs(raw: bytes) -> set[str]:
+    """Base64 of `raw` at each alignment, from its bit string — not the grader's way."""
+    alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+    bits = "".join(f"{byte:08b}" for byte in raw)
+    runs = set()
+    for prefix_bytes in range(3):
+        start = (-8 * prefix_bytes) % 6
+        usable = bits[start:]
+        usable = usable[: len(usable) - len(usable) % 6]
+        run = "".join(
+            alphabet[int(usable[i:i + 6], 2)] for i in range(0, len(usable), 6)
+        )
+        runs |= {run, run.replace("+", "-").replace("/", "_")}
+    return runs
+
+
+def _expected_needles(root: Path) -> set[tuple[str, str]]:
+    """The needle set, computed from the snapshot's own files without the grader."""
+    app = (root / "app_source" / "config" / "application.rb").read_text()
+    char, count = re.search(
+        r'config\.secret_key_base = "(.)" \* (\d+)\n', app
+    ).groups()
+    secret_key_base = char * int(count)
+    keys = re.findall(
+        r'config\.active_record\.encryption\.'
+        r'(?:primary_key|deterministic_key|key_derivation_salt) = "([^"]+)"\n',
+        app,
+    )
+    assert len(keys) == 3
+
+    connection = sqlite3.connect(
+        f"{(root / 'db' / 'development.sqlite3').resolve().as_uri()}?immutable=1",
+        uri=True,
+    )
+    try:
+        digests = dict(connection.execute("SELECT id, password_digest FROM users"))
+    finally:
+        connection.close()
+    cases = json.loads((root / "http" / "cases.json").read_text())["cases"]
+    signups = [
+        case for case in cases
+        if case["method"] == "POST" and case["path"] == "/api/v1/users"
+        and case["expect"]["status"] == 201
+    ]
+    user_ids = sorted(digests) + [max(digests) + n for n in range(1, len(signups) + 1)]
+
+    seeds = (root / "app_source" / "db" / "seeds.rb").read_text()
+    passwords = re.findall(r"^#\s+\d+ \| \S+\s+\| (\S+)\s+\|", seeds, re.MULTILINE)
+    passwords += [case["body"]["user"]["password"] for case in signups]
+
+    signatures = [
+        hmac.new(
+            secret_key_base.encode(),
+            f"bookclub-token:{user_id}".encode(),
+            hashlib.sha256,
+        ).hexdigest()
+        for user_id in user_ids
+    ]
+    text_values = keys + signatures
+    for digest in digests.values():
+        # the whole digest, its hash part, and its salt with the hash's first 8
+        text_values += [digest, digest[29:], digest[7:37]]
+    binary_values = [secret_key_base.encode()]
+    binary_values += [bytes.fromhex(signature) for signature in signatures]
+    expected: set[tuple[str, str]] = set()
+    for value in text_values:
+        expected.add((re.sub(r"[\s:-]", "", value.lower()), "folded"))
+        binary_values.append(value.encode())
+    for password in passwords:
+        expected.add((password.lower(), "lower"))
+        binary_values.append(password.encode())
+    for raw in binary_values:
+        expected.add((raw.hex(), "folded"))
+        expected |= {(run, "exact") for run in _base64_runs(raw)}
+    return expected
+
+
+@pytest.mark.parametrize("root", [SCENARIO / "fixture" / "source", FIXTURE / "source"])
+def test_the_secret_needles_are_exactly_the_snapshots(root):
+    """Every needle the grader searches, against a set derived from the fixture's text.
+
+    Pinned both ways: a value, a user or an encoding the grader drops fails here, and so
+    does one it invents. The secret values are read from `application.rb`, the users and
+    their digests from the frozen database, the signed-up users from the recorded HTTP
+    cases, and the passwords from `seeds.rb`'s table and the signup's body.
+    """
+    needles = rails_api_grader._source_secret_needles(root)
+    got = {(needle, folded) for _, needle, folded in needles}
+    assert len(got) == len(needles), "a needle is listed twice"
+    expected = _expected_needles(root)
+    assert got == expected, (sorted(got - expected), sorted(expected - got))
+
+    # The anchors the derivation above must reproduce, spelled out.
+    assert (USER_1_TOKEN_SIGNATURE, "folded") in got
+    assert (_signature(5).hex(), "folded") in got  # eve, signed up by the HTTP cases
+    for password in ("ada-password-1", "dane-password-4", "eve-password-5"):
+        assert (password, "lower") in got
+        assert (password.replace("-", ""), "folded") not in got
+    for key in rails_api_grader.SOURCE_ENCRYPTION_KEYS:
+        assert (key, "folded") in got
+        assert (key.encode().hex(), "folded") in got
+    assert not any(needle.endswith("=") for needle, _ in got), "base64 kept its padding"
+    assert all(len(needle) >= 12 for needle, _ in got)
+    # secret_key_base's raw zeros are matched only beside its name, never as a needle.
+    assert not any(set(needle) == {"0"} for needle, _ in got)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root writes through directory modes")
+def test_the_secret_scan_writes_nothing_beside_the_snapshot(tmp_path):
+    """The users are read with `immutable=1`, so not even a `-shm` is created.
+
+    The snapshot is in WAL mode: an ordinary connection creates `-wal`/`-shm` beside it,
+    and deletes them on close, so the leftover tree alone cannot show the difference.
+    A directory nothing may be created in does — the read must still succeed there.
+    """
+    source = tmp_path / "source"
+    shutil.copytree(FIXTURE / "source", source)
+    database = source / "db"
+    database.chmod(0o555)
+    try:
+        needles = rails_api_grader._source_secret_needles(source)
+    finally:
+        database.chmod(0o755)
+    assert (USER_1_TOKEN_SIGNATURE, "folded") in {(n, m) for _, n, m in needles}
+    assert sorted(path.name for path in database.iterdir()) == sorted(
+        path.name for path in (FIXTURE / "source" / "db").iterdir()
+    )
+
+
+@pytest.mark.parametrize("root", [SCENARIO / "fixture" / "source", FIXTURE / "source"])
+def test_the_secret_values_are_the_snapshots(root):
+    """The grader's secret values are the ones `application.rb` sets, verbatim."""
+    text = (root / "app_source" / "config" / "application.rb").read_text()
+    assert rails_api_grader.SOURCE_SECRET_KEY_BASE == "0" * 64
+    assert 'config.secret_key_base = "0" * 64\n' in text
+    assert rails_api_grader.SOURCE_ENCRYPTION_KEYS == tuple(
+        re.findall(r'config\.active_record\.encryption\.\w+ = "([^"]+)"\n', text)
+    )
+    token = (root / "app_source" / "app" / "services" / "auth_token.rb").read_text()
+    assert (
+        'OpenSSL::HMAC.hexdigest("SHA256", Rails.application.secret_key_base, '
+        '"bookclub-token:#{user_id}")' in token
+    )
+    assert rails_api_grader.API_TOKEN_MESSAGE.format(1) == "bookclub-token:1"
+
+
+def _tree(root: Path) -> dict[str, bytes]:
+    return {
+        str(path.relative_to(root)): path.read_bytes()
+        for path in sorted(root.rglob("*"))
+        if path.is_file()
+    }
+
+
+class BoundarySnapshotCommands(FakeCommands):
+    """Captures `source/` at the moment the agent's own boundary test would run."""
+
+    def __init__(self, source: Path) -> None:
+        super().__init__()
+        self.source = source
+        self.at_boundary: dict[str, bytes] | None = None
+
+    def run(self, argv, *, cwd, env=None, timeout=300):  # noqa: ANN001, ARG002
+        if "unittest" in [str(part) for part in argv]:
+            self.at_boundary = _tree(self.source)
+        return super().run(argv, cwd=cwd, env=env, timeout=timeout)
+
+
+def test_grading_leaves_source_byte_for_byte_unchanged(tmp_path):
+    """Re-extraction opened the WAL-mode snapshot in place and left -wal/-shm sidecars.
+
+    The prompt tells the agent to leave `source/` byte-for-byte unchanged, so an agent
+    test asserting exactly that failed on the grader's own residue (#494).
+    """
+    target = workspace(tmp_path)
+    source = target / "source"
+    before = _tree(source)
+    commands = BoundarySnapshotCommands(source)
+
+    report = grade_fixture(target, tmp_path / "artifacts", commands)
+
+    assert report.failures == ()
+    assert commands.at_boundary is not None, "the agent boundary never ran"
+    assert sorted(commands.at_boundary) == sorted(before)
+    assert commands.at_boundary == before
+    assert _tree(source) == before

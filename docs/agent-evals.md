@@ -194,7 +194,10 @@ For `rails-api` they mean:
 - `completion`: the snapshot is untouched and still observed, the bundle is bound to that
   snapshot's inventory digest and attests every output, every blocker carries a decision with a
   usable rationale, row counts match including the row `default_scope` hides, and the report answers
-  the scope gate without claiming the frontend moved;
+  the scope gate without claiming the frontend moved. Credential values and hash shapes
+  are forbidden in the report. A bcrypt salt of 22 characters followed only by sentence
+  periods (`.` or `...`) is allowed; a suffix containing any other bcrypt character
+  still counts as a hash, including a truncated hash and a `$zblegacy$bcrypt$` value;
 - `rules_locked`: the emitted schema, `security/public-rules.json`, the report and production doctor
   all agree that the public surface is exactly `users.create` — anonymous signup — as a reconciled
   warning rather than a suppressed one;

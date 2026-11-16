@@ -17,12 +17,16 @@ on its own:
 
 from __future__ import annotations
 
+import base64
 import hashlib
+import hmac
 import json
 import os
+import re
 import shutil
 import sqlite3
 import stat
+import string
 import tempfile
 from pathlib import Path
 from typing import Any, Callable
@@ -109,16 +113,98 @@ REQUIRED_CHECKS = {
 }
 
 #: Nothing that could carry a credential belongs in a report that gets pasted around.
-FORBIDDEN_REPORT_MARKERS = (
-    "$2a$",
-    "$2b$",
-    "$2y$",
-    "$argon2",
-    "$zblegacy$",
-    "secret_key_base",
-    "password_digest",
-    "-----BEGIN",
+#: These are the SHAPES of credential material — a whole hash, a PEM block's header —
+#: never a name or a bare prefix: "bcrypt digests rehash to $argon2id on first login"
+#: describes the migration and carries nothing, and the first versions of this check
+#: failed it on "$argon2" (#494). The snapshot's actual digests and seed passwords are
+#: matched by value below; these catch a credential of the same kind from anywhere.
+#: `$zblegacy$` is `crypto.zig`'s tag, `$zblegacy$<alg>$<hash>`, and its only
+#: algorithm is bcrypt, so it is listed ahead of the bcrypt shape it contains.
+#:
+#: A bcrypt hash is a 22-character salt and a 31-character hash. The shape takes the
+#: salt and at least one hash character, so a digest cut short after its salt still
+#: fails, while the format named ("$2a$04$...") or a salt alone passes. Periods alone
+#: after the salt count as sentence punctuation; a suffix must contain at least one
+#: other bcrypt character to count as hash content. An argon2 PHC
+#: string is matched with its version optional and its parameters in any order and
+#: number (`t=2,m=65536,p=1`, `p=1,keyid=AA`), but only with a salt of at least 11 and a
+#: hash of at least 16 characters, so a placeholder such as "...$salt$hash" passes.
+BCRYPT_HASH = r"\$2[aby]\$\d\d\$[./A-Za-z0-9]{22}\.*[/A-Za-z0-9][./A-Za-z0-9]*"
+FORBIDDEN_REPORT_SHAPES = (
+    ("a $zblegacy$ password hash", re.compile(r"\$zblegacy\$bcrypt\$" + BCRYPT_HASH)),
+    ("a bcrypt password hash", re.compile(BCRYPT_HASH)),
+    (
+        "an argon2 password hash",
+        re.compile(
+            r"\$argon2(?:id|i|d)(?:\$v=\d+)?\$[a-z]+=[^$,]+(?:,[a-z]+=[^$,]+)*"
+            r"\$[A-Za-z0-9+/]{11,}\$[A-Za-z0-9+/]{16,}"
+        ),
+    ),
+    ("a PEM block", re.compile(r"-----BEGIN [A-Z0-9 ]+-----")),
 )
+
+#: The secret material the snapshot hands the agent, as `config/application.rb` sets it.
+#: `verify_source` has already proved `source/` is the shipped snapshot, so these are
+#: its values exactly; a test pins them to the fixture's text.
+#:
+#: The report is checked for these VALUES, never for their names. The prompt tells the
+#: agent not to claim `secret_key_base`-derived material survives, so a correct report
+#: names it to deny it, and the first version of this check — a substring test on the
+#: name — failed exactly that report (#494). A name says nothing a reader can use; the
+#: value is the leak, and it leaks whatever the wording around it.
+SOURCE_SECRET_KEY_BASE = "0" * 64
+SOURCE_ENCRYPTION_KEYS = (
+    "fixture_primary_key_0000000000000000",
+    "fixture_deterministic_key_00000000000",
+    "fixture_key_derivation_salt_000000000",
+)
+
+#: `app/services/auth_token.rb`: a user's API token is `<id>.<hex HMAC-SHA256 of
+#: "bookclub-token:<id>" keyed by secret_key_base>`.
+API_TOKEN_MESSAGE = "bookclub-token:{}"
+
+#: The recorded HTTP cases that create an account or log one in. Their passwords are the
+#: plaintext credentials of the snapshot's users, and each signup takes the next id.
+SIGNUP_PATH = "/api/v1/users"
+LOGIN_PATH = "/api/v1/sessions"
+
+#: secret_key_base is sixty-four "0"s, the same run as a null SHA-256 digest, an all-zero
+#: 32-byte value in hex, or 64 whitespace-separated zero counts. Its bytes alone cannot
+#: tell those apart, so its raw form is the leak only where the report ties it to the
+#: key, in one of two ways (see `_leaked_secret_key_base`):
+#:
+#: - assigned: the name, then only assignment or bracket punctuation and the words
+#:   "is", "was", "equals" or "value", then a run of 64 or more zeros —
+#:   `secret_key_base=000…`, `"secret_key_base": "000…"`, `secret_key_base => 000…`,
+#:   `ENV["SECRET_KEY_BASE"]=000…`, `secret_key_base (value 000…)`,
+#:   `secret_key_base is 000…`. Whatever follows the run, a reader can paste the key.
+#: - nearby: within one phrase of the name, a WINDOW of 64 zeros inside a run — whole
+#:   groups of zeros between separators adding up to exactly 64, with no hex digit
+#:   just outside it. "000…\n0 errors" holds the key followed by a count; "0" * 128,
+#:   one unbroken group, is a longer value that does not, and neither does a run that
+#:   is part of a longer hex value (`f000…`, `000…a`).
+#:
+#: Its hex and base64 forms are long and distinctive, and are matched unconditionally.
+#: A description of the value ("sixty-four zeros", Ruby's `"0" * 64`) is not its bytes
+#: and is not checked: the check is for material a reader can paste, not for prose.
+SECRET_KEY_BASE_NAME = re.compile(r"secret[\s_-]*key[\s_-]*base", re.IGNORECASE)
+SECRET_KEY_BASE_ASSIGNED = re.compile(
+    r"""[\s"'`=:>()\[\]]*(?:(?:is|was|equals|value)\b[\s"'`=:>()\[\]]*)*(?=0)""",
+    re.IGNORECASE,
+)
+ZERO_RUN = re.compile(r"0(?:[\s:_-]*0)*")
+ZERO_GROUP = re.compile(r"0+")
+SECRET_KEY_BASE_NAME_WINDOW = 100
+
+#: Separators a hex value survives being spelled with: `de:ad`, `de-ad`, `de ad`.
+#: Folded needles are compared after these are removed and case is dropped.
+FOLDED_SEPARATORS = re.compile(r"[\s:-]")
+
+#: A field's strings are scanned run together as well as one by one, joined with this:
+#: not a hex digit, a base64 character or a zero, so the join itself never completes a
+#: value — "secret_key_base" + "000…" must not read as the hex run "e000…" — and it is
+#: a folded separator, so a hex value split across two strings is still one value.
+FIELD_JOIN = "\n"
 
 #: A claim that the frontend moved, and the negations that contain one verbatim.
 #: Substring matching alone inverts meaning: "no frontend is migrated" is an honest
@@ -352,13 +438,249 @@ def _validate_report(workspace: Path) -> dict[str, Any]:
             "the report must say plainly that the Rails frontend did not migrate",
         )
 
-    serialized = json.dumps(report)
-    for marker in FORBIDDEN_REPORT_MARKERS:
-        if marker in serialized:
-            raise GradeFailure(
-                "completion.report_secret", f"the report carries {marker!r}"
-            )
+    texts = _report_texts(report)
+    for text in texts:
+        for label, shape in FORBIDDEN_REPORT_SHAPES:
+            if shape.search(text):
+                raise GradeFailure(
+                    "completion.report_secret", f"the report carries {label}"
+                )
+    needles = _source_secret_needles(workspace / "source")
+    for text in texts:
+        leaked = _leaked_secret(text, needles)
+        if leaked is not None:
+            raise GradeFailure("completion.report_secret", f"the report carries {leaked}")
     return report
+
+
+def _fold(text: str) -> str:
+    return FOLDED_SEPARATORS.sub("", text.lower())
+
+
+def _leaked_secret(text: str, needles: list[tuple[str, str, str]]) -> str | None:
+    """The label of the first secret value `text` carries, or None."""
+    candidates = {
+        "folded": (_fold(text),),
+        # A password is a phrase: matched whole, in any case, but never with its
+        # separators folded away — "ada: password 1 of 4" is not "ada-password-1".
+        "lower": (text.lower(),),
+        # Base64 is case-sensitive and may be wrapped across lines.
+        "exact": (text, "".join(text.split())),
+    }
+    for label, needle, mode in needles:
+        if any(needle in candidate for candidate in candidates[mode]):
+            return label
+    if _leaked_secret_key_base(text):
+        return "secret_key_base"
+    return None
+
+
+def _leaked_secret_key_base(text: str) -> bool:
+    """Whether `text` ties a run of zeros to secret_key_base's name (see `ZERO_RUN`)."""
+    length = len(SOURCE_SECRET_KEY_BASE)
+    names = [match.span() for match in SECRET_KEY_BASE_NAME.finditer(text)]
+    for _, name_end in names:
+        assigned = SECRET_KEY_BASE_ASSIGNED.match(text, name_end)
+        if assigned is not None:
+            run = ZERO_RUN.match(text, assigned.end())
+            if run is not None and run.group().count("0") >= length:
+                return True
+    if not names:
+        return False
+    for run in ZERO_RUN.finditer(text):
+        groups = [group.span() for group in ZERO_GROUP.finditer(text, *run.span())]
+        for first in range(len(groups)):
+            zeros = 0
+            for last in range(first, len(groups)):
+                zeros += groups[last][1] - groups[last][0]
+                if zeros >= length:
+                    break
+            if zeros != length:
+                continue
+            start, end = groups[first][0], groups[last][1]
+            if (start > 0 and text[start - 1] in string.hexdigits) or (
+                end < len(text) and text[end] in string.hexdigits
+            ):
+                continue
+            if any(
+                max(start - name_end, name_start - end) <= SECRET_KEY_BASE_NAME_WINDOW
+                for name_start, name_end in names
+            ):
+                return True
+    return False
+
+
+def _base64_needles(raw: bytes) -> set[str]:
+    """Every base64 run that encodes `raw` wherever it sits in a longer byte string.
+
+    A value base64'd inside something bigger (`secret_key_base=…`, `1.<hex>`) lands at
+    one of three alignments. At each, the characters whose six bits all come from `raw`
+    are the same whatever surrounds it; those, in the standard and URL-safe alphabets,
+    are the needles. Unpadded by construction: padding is not part of the value.
+    """
+    found = set()
+    for offset in range(3):
+        encoded = base64.b64encode(bytes(offset) + raw + bytes(2)).decode()
+        first = -(-offset * 8 // 6)  # the first character starting at or after raw
+        last = (offset + len(raw)) * 8 // 6  # one past the last one ending inside it
+        core = encoded[first:last]
+        found.add(core)
+        found.add(core.translate(str.maketrans("+/", "-_")))
+    return found
+
+
+def _source_secret_needles(source: Path) -> list[tuple[str, str, str]]:
+    """(label, needle, mode) for every secret value the snapshot holds.
+
+    A "folded" needle (a hex value, a key, a digest) is compared case- and
+    separator-insensitively (see `_fold`); a "lower" one (a password) whole and
+    case-insensitively; an "exact" one (base64) exactly. Every value is searched raw,
+    as hex of its bytes and as base64 at every alignment — except secret_key_base's raw
+    form, whose 64 zeros `_leaked_secret_key_base` matches only where the report ties
+    them to its name.
+
+    The values are secret_key_base and the three Active Record encryption keys as
+    `application.rb` sets them; each user's API-token signature, derived as
+    `auth_token.rb` derives it, for every user the snapshot holds AND every user its
+    recorded HTTP cases sign up (their ids continue the users sequence); each stored
+    bcrypt digest, its hash part and its salt with the hash's start; and the
+    plaintext password of every recorded successful signup and login. Only the token's signature is searched, since the id
+    half is not secret; its hex text's base64 also covers base64 of the whole token.
+    """
+    users, signups, passwords = _source_accounts(source)
+    # (label, bytes, how the bytes are matched as text a report could quote, or None)
+    values: list[tuple[str, bytes, str | None]] = [
+        ("secret_key_base", SOURCE_SECRET_KEY_BASE.encode(), None)
+    ]
+    values += [
+        ("an Active Record encryption key", key.encode(), "folded")
+        for key in SOURCE_ENCRYPTION_KEYS
+    ]
+    for user_id in [user_id for user_id, _ in users] + list(
+        range(signups[0] + 1, signups[0] + 1 + signups[1])
+    ):
+        signature = hmac.new(
+            SOURCE_SECRET_KEY_BASE.encode(),
+            API_TOKEN_MESSAGE.format(user_id).encode(),
+            hashlib.sha256,
+        ).digest()
+        label = f"user {user_id}'s secret_key_base-derived API token"
+        values.append((label, signature, None))
+        values.append((f"{label} (hex text)", signature.hex().encode(), "folded"))
+    for user_id, digest in users:
+        label = f"user {user_id}'s password digest"
+        values.append((label, digest.encode(), "folded"))
+        # The 31-character hash after "$2a$04$" and the 22-character salt, and the
+        # salt with the hash's first 8 characters: a digest cut short, without its
+        # "$2a$04$" (with it, `BCRYPT_HASH` already refuses the cut digest).
+        values.append((f"{label} (hash part)", digest[29:].encode(), "folded"))
+        values.append((f"{label} (salt and hash start)", digest[7:37].encode(), "folded"))
+    values += [
+        ("a seed account's plaintext password", password.encode(), "lower")
+        for password in passwords
+    ]
+
+    needles: dict[tuple[str, str], str] = {}
+    for label, raw, text_mode in values:
+        if text_mode == "lower":
+            needles.setdefault((raw.decode().lower(), "lower"), label)
+        elif text_mode == "folded":
+            needles.setdefault((_fold(raw.decode()), "folded"), label)
+        needles.setdefault((raw.hex(), "folded"), f"{label} (hex)")
+        for encoded in sorted(_base64_needles(raw)):
+            needles.setdefault((encoded, "exact"), f"{label} (base64)")
+    return [(label, needle, mode) for (needle, mode), label in needles.items()]
+
+
+def _source_accounts(
+    source: Path,
+) -> tuple[list[tuple[int, str]], tuple[int, int], list[str]]:
+    """The snapshot's credentials: (users, (sequence, signups), passwords).
+
+    `users` is (id, password_digest) for every row of the frozen database, opened
+    `immutable=1` so SQLite creates no `-shm`/`-wal` sidecars: grading must leave
+    `source/` byte-for-byte unchanged, as the prompt asks of the agent. `sequence` is
+    the users table's last assigned id and `signups` the number of accounts the
+    recorded HTTP cases create after it. `passwords` are the plaintext passwords of the
+    recorded signups and logins that succeeded — a failed one's password ("wrong") is
+    nobody's credential.
+    """
+    database = (source / "db" / "development.sqlite3").resolve()
+    try:
+        connection = sqlite3.connect(f"{database.as_uri()}?immutable=1", uri=True)
+        try:
+            users = [
+                (int(user_id), str(digest))
+                for user_id, digest in connection.execute(
+                    "SELECT id, password_digest FROM users ORDER BY id"
+                ).fetchall()
+            ]
+            sequence = connection.execute(
+                "SELECT seq FROM sqlite_sequence WHERE name = 'users'"
+            ).fetchone()
+        finally:
+            connection.close()
+    except sqlite3.Error as exc:
+        raise GradeFailure(
+            "source.unreadable", f"cannot read the snapshot's users: {exc}"
+        ) from exc
+    last = int(sequence[0]) if sequence else max((u for u, _ in users), default=0)
+
+    path = source / "http" / "cases.json"
+    try:
+        cases = strict_json_loads(
+            strict_utf8(read_bounded_regular(path, MAX_JSON_BYTES), str(path))
+        )["cases"]
+    except (OSError, UnicodeError, ValueError, KeyError, TypeError) as exc:
+        raise GradeFailure(
+            "source.unreadable", f"cannot read the snapshot's HTTP cases: {exc}"
+        ) from exc
+    signups = 0
+    passwords: list[str] = []
+    for case in cases:
+        if (
+            not isinstance(case, dict)
+            or case.get("method") != "POST"
+            or case.get("path") not in (SIGNUP_PATH, LOGIN_PATH)
+            or not 200 <= (case.get("expect") or {}).get("status", 0) < 300
+        ):
+            continue
+        signups += case["path"] == SIGNUP_PATH
+        body = case.get("body") or {}
+        password = (body.get("user") or body).get("password")
+        if isinstance(password, str) and password not in passwords:
+            passwords.append(password)
+    return users, (last, signups), passwords
+
+
+def _report_texts(report: dict[str, Any]) -> list[str]:
+    """Every string in the report, plus each field's strings joined by `FIELD_JOIN`.
+
+    Keys are included, so no field escapes the scan; a hex or base64 value split across
+    two strings of one field ("1.b44d", "c560…") is still the value.
+    """
+    texts = []
+    for key, item in report.items():
+        strings = _report_strings(key) + _report_strings(item)
+        texts += strings
+        if len(strings) > 2:
+            texts.append(FIELD_JOIN.join(strings[1:]))
+    return texts
+
+
+def _report_strings(value: Any) -> list[str]:
+    """Every string in `value`, dict keys included."""
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, dict):
+        return [
+            text
+            for key, item in value.items()
+            for text in (*_report_strings(key), *_report_strings(item))
+        ]
+    if isinstance(value, list):
+        return [s for item in value for s in _report_strings(item)]
+    return []
 
 
 def _verify_determinism(workspace: Path, source: Path) -> None:
@@ -368,10 +690,17 @@ def _verify_determinism(workspace: Path, source: Path) -> None:
     report must list a `determinism` check — but a check nobody performs is a claim, and
     this grader was accepting the word for the deed. Extraction is offline and cheap, so
     the honest thing is to do it again.
+
+    It extracts from a scratch copy: reading the WAL-mode snapshot in place leaves
+    `-wal`/`-shm` sidecars in `source/`, which the prompt says to leave byte-for-byte
+    unchanged and which the agent's own boundary test, run last, may check (#494). The
+    checks that guard `source/` itself have already run against the original.
     """
     decisions = rails2zb.load_decisions(workspace / "decisions.json")
-    loaded = rails2zb.load_source(source)
     with tempfile.TemporaryDirectory(dir=workspace) as scratch:
+        copy = Path(scratch) / "source"
+        shutil.copytree(source, copy, symlinks=True)
+        loaded = rails2zb.load_source(copy)
         second = Path(scratch) / "bundle"
         try:
             rails2zb.extract(loaded, decisions, second)

@@ -1,0 +1,5 @@
+### Internal
+
+- The `rails-fullstack` agent-eval grader accepts the production doctor's warnings-only exit 2 when its summary reports no errors; the eval's own environment and the scenario's required public rules always warn, so no run could score 4 (#494).
+- The `rails-api` agent-eval grader's report-secret check looks for the snapshot's actual credential values — `secret_key_base`, the Active Record encryption keys, every migrated and signed-up user's API-token signature, the stored password digests and the seed passwords, raw, hex or base64 — instead of the names `secret_key_base` and `password_digest`, which failed the honest denial the prompt asks for, and refuses other credentials by the shape of a bcrypt (even one cut short after its salt), argon2 or `$zblegacy$` hash or a PEM block rather than by a bare prefix such as `$argon2`, which failed a report naming the hash format (#494).
+- The `rails-api` agent-eval grader re-extracts for its determinism check from a scratch copy of `source/`, so grading no longer leaves SQLite `-wal`/`-shm` sidecars behind for the agent's own unchanged-source test to trip on (#494).

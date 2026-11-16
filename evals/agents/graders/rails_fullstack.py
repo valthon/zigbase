@@ -214,6 +214,35 @@ def _run_ok(result: Any, code: str, what: str) -> None:
     require_command_success(result, code, what, GradeFailure)
 
 
+#: `doctor`'s documented exit for "warnings only" (docs/deployment.md).
+DOCTOR_WARNINGS_ONLY = 2
+
+
+def _production_doctor(result: Any) -> DoctorReport:
+    """Parse doctor, accepting its warnings-only exit when the summary agrees.
+
+    This eval can never see exit 0: EVAL_ENVIRONMENT's https public URL with no
+    explicit host binding warns twice, and the scenario's required public rules warn
+    once each. Exit 2 is believed only when the parsed summary reports no errors; exit
+    1, any other exit, and unparseable output still fail.
+    """
+    if (
+        result.returncode == DOCTOR_WARNINGS_ONLY
+        and not result.timed_out
+        and not result.output_truncated
+    ):
+        doctor = parse_doctor_ndjson(result.stdout)
+        if doctor.errors:
+            raise GradeFailure(
+                "rules.doctor_failed",
+                f"production doctor exited {DOCTOR_WARNINGS_ONLY} (warnings only) but "
+                f"reported {doctor.errors} errors",
+            )
+        return doctor
+    _run_ok(result, "rules.doctor_failed", "running the production doctor")
+    return parse_doctor_ndjson(result.stdout)
+
+
 def _validate_schema_dry_run(result: Any) -> None:
     _run_ok(result, "rehearsal.schema_dry_run", "dry-running the schema")
     try:
@@ -765,8 +794,7 @@ def run_rehearsal(
             cwd=workspace,
             env=dict(EVAL_ENVIRONMENT),
         )
-        _run_ok(result, "rules.doctor_failed", "running the production doctor")
-        doctor = parse_doctor_ndjson(result.stdout)
+        doctor = _production_doctor(result)
         python = _python_with_playwright(commands, workspace, playwright_python)
         handoff = _json(source / "presentation.handoff.json", "tests.handoff")
         with served_target(

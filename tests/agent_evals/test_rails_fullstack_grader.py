@@ -1985,3 +1985,72 @@ def test_live_failure_sinks_tests_grade(tmp_path, monkeypatch):
     )
     assert result.tests_green is False
     assert "rehearsal.error" in {failure.code for failure in result.failures}
+
+
+class WarningDoctorCommands(FakeCommands):
+    """Doctor as it really runs here: the eval environment and public rules warn."""
+
+    def __init__(self, returncode: int, *, errors: int = 0, stdout: str | None = None):
+        super().__init__()
+        self.returncode = returncode
+        self.errors = errors
+        self.stdout = stdout
+
+    def run(self, argv, *, cwd, env=None, timeout=300):  # noqa: ANN001, ARG002
+        result = super().run(argv, cwd=cwd, env=env, timeout=timeout)
+        if "doctor" not in argv:
+            return result
+        if self.stdout is not None:
+            return CommandResult(self.returncode, self.stdout)
+        rows = [json.loads(line) for line in result.stdout.splitlines()]
+        rows[-1].update(errors=self.errors, warnings=5)
+        return CommandResult(
+            self.returncode, "\n".join(json.dumps(row) for row in rows)
+        )
+
+
+def test_doctor_warnings_only_exit_still_scores_four(tmp_path, monkeypatch):
+    """Exit 2 means warnings only (docs/deployment.md), and this eval always warns.
+
+    EVAL_ENVIRONMENT's https public URL with no explicit host binding warns twice, and
+    the scenario's three required public rules warn once each, so demanding exit 0
+    made a perfect migration unable to score four (#494).
+    """
+    result = graded(
+        workspace(tmp_path),
+        tmp_path / "artifacts",
+        monkeypatch,
+        commands=WarningDoctorCommands(2),
+    )
+
+    assert result.failures == ()
+    assert (
+        result.completion,
+        result.rules_locked,
+        result.tests_green,
+        result.deployed,
+    ) == (True, True, True, True)
+
+
+@pytest.mark.parametrize(
+    ("commands", "code"),
+    [
+        (WarningDoctorCommands(1, errors=1), "rules.doctor_failed"),
+        # Exit 2 is trusted only as far as the summary agrees with it.
+        (WarningDoctorCommands(2, errors=1), "rules.doctor_failed"),
+        (WarningDoctorCommands(2, stdout="not doctor output\n"), "rules.doctor_summary"),
+        (WarningDoctorCommands(3), "rules.doctor_failed"),
+    ],
+    ids=["errors-exit", "warn-exit-with-errors", "warn-exit-unparseable", "other-exit"],
+)
+def test_doctor_errors_or_unknown_exits_still_fail(tmp_path, monkeypatch, commands, code):
+    result = graded(
+        workspace(tmp_path),
+        tmp_path / "artifacts",
+        monkeypatch,
+        commands=commands,
+    )
+
+    assert result.rules_locked is False
+    assert result.tests_green is False
+    assert code in {failure.code for failure in result.failures}
