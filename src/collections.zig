@@ -13,10 +13,15 @@ const fts = @import("search/fts.zig");
 const SchemaJsonError = @typeInfo(@typeInfo(@TypeOf(schema.fieldsFromJson)).@"fn".return_type.?).error_union.error_set ||
     @typeInfo(@typeInfo(@TypeOf(schema.indexesFromJson)).@"fn".return_type.?).error_union.error_set;
 
-pub const EngineError = error{ Validation, NotFound, Conflict, StorageNamespaceMissing } || @import("files/namespace.zig").Error || db.DbError || std.mem.Allocator.Error || schema.ParseError || SchemaJsonError || fts.EnsureIndexError;
+pub const EngineError = error{ Validation, NotFound, Conflict, UnsafeSqliteRebuild, MigrationObjectConflict, StorageNamespaceMissing } || @import("files/namespace.zig").Error || db.DbError || std.mem.Allocator.Error || schema.ParseError || SchemaJsonError || fts.EnsureIndexError;
 
 /// Validation details for the most recent failed create/update (2b surfaces these).
 pub threadlocal var last_errors: ?[]const schema.ValidationError = null;
+
+// Bounded diagnostics, independent of updateImpl's scratch lifetime. Long migration names
+// are shown by prefix; no heap allocation or ownership transfer is needed on an error path.
+threadlocal var rebuild_error_buf: [2048]u8 = undefined;
+pub threadlocal var last_rebuild_error: []const u8 = "";
 
 /// A write scope for one collection's DDL that JOINS an already-open transaction instead of
 /// failing inside it.
@@ -29,10 +34,10 @@ pub threadlocal var last_errors: ?[]const schema.ValidationError = null;
 /// the outer transaction decide the final outcome. Standalone callers are unaffected: with no
 /// outer transaction the scope is the plain `BEGIN`/`COMMIT` it always was.
 ///
-/// The savepoint name is fixed. Nothing in this module nests two of these (no create/update/delete
-/// calls another), and both engines scope `ROLLBACK TO` to the most recent savepoint of that name,
-/// so a same-named savepoint opened by an unrelated layer (e.g. `import.zig`'s `zb_row`) cannot be
-/// released by this one.
+/// The savepoint name is fixed. Both engines stack same-named savepoints and scope RELEASE
+/// and ROLLBACK TO to the most recent one. Startup convergence can therefore hold this lock
+/// while joining an outer transaction and invoke update in another nested scope without
+/// releasing the caller's savepoint.
 const Tx = struct {
     const savepoint = "zb_collection";
 
@@ -393,9 +398,20 @@ fn updateImpl(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, id_or_name: []con
     try validateStoredName(alloc, old.name);
     newc.id = try sa.dupe(u8, old.id);
     newc.name = try sa.dupe(u8, old.name);
-    const unchanged = expected != null and try definitionEql(sa, old, newc);
+    const same_definition = expected != null and try definitionEql(sa, old, newc);
+    // A provisioning caller (`expected` set) also rebuilds an unchanged SQLite definition whose
+    // physical unique constraints do not match it: a table created before #498 enforces a
+    // tenant-owned collection's unique fields table-wide, and SQLite can drop an inline column
+    // constraint only by rebuilding the table. Postgres converges in place
+    // (`reconcileUniqueConstraintsPg`), so it never needs this.
+    const scope_drift = same_definition and d.kind == .sqlite and try uniqueScopeDriftSqlite(sa, w, old);
+    const unchanged = same_definition and !scope_drift;
     if (!unchanged) {
         if (expected) |snapshot| try checkDefinitionSnapshot(sa, snapshot, old);
+        // A metadata rebuild must never silently discard migration-owned schema. Check under
+        // the metadata lock before any destructive DDL, including tenant-field changes.
+        if (d.kind == .sqlite) try checkSqliteRebuild(sa, w, old);
+        const foreign = if (d.kind == .sqlite) try tableObjectsSqlite(&scratch, w, old.name) else &[_]TableObject{};
 
         // Inject auth system fields (after validation, which only sees user fields) so the rebuild
         // preserves the auth columns: `old` is auth-injected (from get), so both sides carry the
@@ -405,21 +421,43 @@ fn updateImpl(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, id_or_name: []con
         // relation-resolved view for the rebuild's FK generation
         const ddl_new = try resolveRelations(sa, w, newc_full);
 
-        // A change to the indexed columns (one added, removed, replaced, renamed, retyped or reordered) drops
-        // the old search index BEFORE the DDL that would break it; `ensureIndex` below rebuilds it
-        // from the new shape (#507).
-        if (!fts.sameSearchColumns(old, newc)) try fts.dropIndexFor(sa, w, old);
+        const migration_objects = if (d.kind == .sqlite)
+            try preflightTableObjects(&scratch, w, old, ddl_new, foreign)
+        else
+            &[_]TableObject{};
+        // Validate/drop old search state while all old columns still exist. Sync triggers
+        // are regenerated from the new definition after the base table has been rebuilt.
+        if (d.kind == .sqlite) {
+            // These objects already passed dependency/conflict preflight. Remove them only
+            // within this transaction, then restore their exact SQL after regeneration. This
+            // keeps search's separate catalog validation from adopting migration objects.
+            for (migration_objects) |obj| {
+                const kind = if (obj.kind == .index) "INDEX" else "TRIGGER";
+                try w.exec(try std.fmt.allocPrintSentinel(sa, "DROP {s} \"main\".{s};", .{ kind, try ddl.quoteIdent(sa, obj.name) }, 0));
+            }
+            try fts.dropIndexFor(sa, w, old);
+        }
+        // PostgreSQL alters in place; remove dependent search state only when its operands change.
+        if (d.kind == .postgres and !fts.sameSearchColumns(old, newc)) try fts.dropIndexFor(sa, w, old);
         const plan = try ddl.rebuildPlan(sa, old, ddl_new, d);
         for (plan) |stmt| try w.exec(try sa.dupeZ(u8, stmt));
+        // Postgres alters in place, so its field-level unique constraints converge from the
+        // catalog: scope changes, unique toggles, and a collection made (un)tenant-owned (#498).
+        if (d.kind == .postgres and newc.type != .auth) {
+            try reconcileUniqueConstraintsPg(sa, w, old, newc_full);
+        }
         if (newc.type == .auth) {
             for (newc.options.auth.identityFields) |idf| {
                 try w.exec(try sa.dupeZ(u8, try ddl.authIdentityIndexSql(sa, newc.name, idf)));
             }
         }
-        if (expected != null) try ensureTenantIndex(sa, w, newc);
-        // Create, backfill, re-sync after the SQLite rebuild (which drops the sync triggers), or
-        // drop the search index, inside this transaction.
+        if (d.kind == .sqlite or expected != null) try ensureTenantIndex(sa, w, newc);
+        // Runtime and startup changes provision search inside the schema transaction.
         try fts.ensureIndex(sa, w, newc);
+        for (migration_objects) |obj| {
+            std.log.info("provision: collection '{s}' restoring '{s}' after the unique-scope rebuild", .{ old.name, obj.name });
+            try w.exec(try sa.dupeZ(u8, obj.sql));
+        }
         try updateRow(sa, w, newc.id, newc); // persist user fields only
         try schema_gen.bump(w); // inside the tx: a rolled-back rebuild must not advertise a change
     }
@@ -743,7 +781,7 @@ fn existingIndex(alloc: std.mem.Allocator, w: *db.Db, table: []const u8, idx: sc
             if (!std.mem.eql(u8, cols.columnText(0), bare_expr) and !std.mem.eql(u8, cols.columnText(0), quoted_expr)) return .conflicting;
         }
     } else {
-        var props = try w.prepare("SELECT \"unique\", origin, partial FROM pragma_index_list(?1) WHERE name=?2 COLLATE NOCASE;");
+        var props = try w.prepare("SELECT \"unique\", origin, partial FROM pragma_index_list(?1, 'main') WHERE name=?2 COLLATE NOCASE;");
         defer props.finalize();
         try props.bindText(1, table);
         try props.bindText(2, idx.name);
@@ -1329,6 +1367,491 @@ test "a failed create inside a caller's transaction leaves the caller's transact
     still.deinit(a);
 }
 
+/// One unique constraint of a physical table, as the column names it covers in key order
+/// (SQLite: an `origin='u'` autoindex; Postgres: a `contype='u'` constraint).
+const UniqueConstraint = struct { name: []const u8, cols: []const []const u8 };
+
+/// The unique table/column constraints of `table`, allocated on `alloc` (a scratch arena:
+/// callers never free the result piecemeal). Unique INDEXES (`.indexes`, migrations) are not
+/// constraints and are not listed, so nothing here can touch a declared or migration-owned index.
+fn uniqueConstraints(alloc: std.mem.Allocator, w: *db.Db, table: []const u8) EngineError![]UniqueConstraint {
+    var out: std.ArrayList(UniqueConstraint) = .empty;
+    if (db.dbDialect(w).kind == .postgres) {
+        var st = try w.prepare("SELECT c.conname, a.attname FROM pg_constraint c CROSS JOIN LATERAL unnest(c.conkey) WITH ORDINALITY k(n, o) JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = k.n WHERE c.conrelid = to_regclass($1) AND c.contype = 'u' ORDER BY c.conname, k.o;");
+        defer st.finalize();
+        try st.bindText(1, try ddl.quoteIdent(alloc, table));
+        var cols: std.ArrayList([]const u8) = .empty;
+        while (try st.step()) {
+            const name = st.columnText(0);
+            if (out.items.len == 0 or !std.mem.eql(u8, out.items[out.items.len - 1].name, name)) {
+                cols = .empty;
+                try out.append(alloc, .{ .name = try alloc.dupe(u8, name), .cols = &.{} });
+            }
+            try cols.append(alloc, try alloc.dupe(u8, st.columnText(1)));
+            out.items[out.items.len - 1].cols = cols.items;
+        }
+        return out.items;
+    }
+    var names: std.ArrayList([]const u8) = .empty;
+    {
+        var st = try w.prepare("SELECT name FROM pragma_index_list(?1, 'main') WHERE origin = 'u' ORDER BY name;");
+        defer st.finalize();
+        try st.bindText(1, table);
+        while (try st.step()) try names.append(alloc, try alloc.dupe(u8, st.columnText(0)));
+    }
+    for (names.items) |name| {
+        var cols: std.ArrayList([]const u8) = .empty;
+        var st = try w.prepare("SELECT name FROM pragma_index_info(?1, 'main') ORDER BY seqno;");
+        defer st.finalize();
+        try st.bindText(1, name);
+        while (try st.step()) try cols.append(alloc, try alloc.dupe(u8, st.columnText(0)));
+        try out.append(alloc, .{ .name = name, .cols = cols.items });
+    }
+    return out.items;
+}
+
+fn colsEql(a: []const []const u8, b: []const []const u8) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |x, y| if (!std.mem.eql(u8, x, y)) return false;
+    return true;
+}
+
+/// PostgreSQL stores at most 63 bytes of these ASCII schema identifiers. Compare
+/// catalog columns to their physical names, including both keys of tenant composites.
+fn constraintColsEql(a: []const []const u8, b: []const []const u8, postgres: bool) bool {
+    if (!postgres) return colsEql(a, b);
+    if (a.len != b.len) return false;
+    for (a, b) |physical, metadata| {
+        if (!std.mem.eql(u8, physical, metadata[0..@min(metadata.len, 63)])) return false;
+    }
+    return true;
+}
+
+fn hasConstraint(cons: []const UniqueConstraint, cols: []const []const u8, postgres: bool) bool {
+    for (cons) |con| if (constraintColsEql(con.cols, cols, postgres)) return true;
+    return false;
+}
+
+fn hasTenantScopedUnique(col: schema.Collection) bool {
+    for (col.fields) |f| if (schema.uniqueScope(col, f) == .tenant) return true;
+    return false;
+}
+
+/// True when SQLite `col`'s table does not enforce its tenant-scoped unique fields (#498) as
+/// declared: a table-wide constraint on one of them (a pre-#498 table), or a missing
+/// `UNIQUE (<tenant_field>, <field>)`.
+fn uniqueScopeDriftSqlite(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection) EngineError!bool {
+    if (col.type == .auth) return false;
+    const tf = col.options.tenant_field orelse return false;
+    if (!hasTenantScopedUnique(col)) return false;
+    const cons = try uniqueConstraints(alloc, w, col.name);
+    for (col.fields) |f| {
+        if (schema.uniqueScope(col, f) != .tenant) continue;
+        if (hasConstraint(cons, &.{f.name}, false) or !hasConstraint(cons, &.{ tf, f.name }, false)) return true;
+    }
+    return false;
+}
+
+/// Converge Postgres table `new.name`'s field-level unique constraints on `new`'s flags (#498),
+/// after its columns have been altered to match `new`.
+///   - A tenant-scoped field loses any table-wide constraint on its column and gains
+///     `UNIQUE (<tenant_field>, <field>)`. Dropping a unique constraint only loosens it, and the
+///     composite cannot fail where the table-wide one held, so this is safe on live data.
+///   - With `old` (a definition change), a field that stops being tenant-scoped loses the
+///     composite it had, and a field that becomes table-wide unique gains its column constraint
+///     (which fails, rolling the update back, if existing rows already repeat a value).
+///     Without `old` (startup convergence) only the first rule applies: nothing is added that
+///     live data could refuse.
+fn reconcileUniqueConstraintsPg(alloc: std.mem.Allocator, w: *db.Db, old: ?schema.Collection, new: schema.Collection) EngineError!void {
+    const cons = try uniqueConstraints(alloc, w, new.name);
+    const run = struct {
+        fn exec(a: std.mem.Allocator, conn: *db.Db, sql: []const u8) EngineError!void {
+            const sql_z = try a.dupeZ(u8, sql);
+            defer a.free(sql_z);
+            // step preserves uniqueness violations as Constraint for the API's 409 mapping.
+            var st = try conn.prepare(sql_z);
+            defer st.finalize();
+            _ = try st.step();
+        }
+    }.exec;
+    const dropMatching = struct {
+        fn drop(a: std.mem.Allocator, conn: *db.Db, all: []const UniqueConstraint, table: []const u8, cols: []const []const u8) EngineError!void {
+            for (all) |con| if (constraintColsEql(con.cols, cols, true)) {
+                std.log.info("provision: collection '{s}' DROP unique constraint '{s}'", .{ table, con.name });
+                try run(a, conn, try ddl.dropConstraintSql(a, table, con.name));
+            };
+        }
+    }.drop;
+    for (new.fields) |nf| {
+        const scope = schema.uniqueScope(new, nf);
+        const prev: ?schema.Field = if (old) |o| for (o.fields) |of| {
+            if (std.mem.eql(u8, of.id, nf.id)) break of;
+        } else null else null;
+        const prev_scope: ?schema.UniqueScope = if (prev) |of| schema.uniqueScope(old.?, of) else null;
+
+        if (scope == .tenant or (scope != .global and prev_scope == .global))
+            try dropMatching(alloc, w, cons, new.name, &.{nf.name});
+        if (scope == .global and prev_scope != null and prev_scope.? != .global and !hasConstraint(cons, &.{nf.name}, true))
+            try run(alloc, w, try ddl.addUniqueConstraintSql(alloc, new.name, &.{nf.name}));
+
+        // The composite the old definition implied, under its tenant column's CURRENT name.
+        if (prev_scope == .tenant) old_tf: {
+            const old_tf_name = old.?.options.tenant_field.?;
+            const old_tf = schema.fieldByName(old.?, old_tf_name) orelse break :old_tf;
+            const tf_now = for (new.fields) |f| {
+                if (std.mem.eql(u8, f.id, old_tf.id)) break f.name;
+            } else break :old_tf; // the tenant column was dropped, and its constraints with it
+            if (scope == .tenant and std.mem.eql(u8, tf_now, new.options.tenant_field.?)) break :old_tf;
+            try dropMatching(alloc, w, cons, new.name, &.{ tf_now, nf.name });
+        }
+        if (scope == .tenant) {
+            const cols = [_][]const u8{ new.options.tenant_field.?, nf.name };
+            if (!hasConstraint(cons, &cols, true)) {
+                std.log.info("provision: collection '{s}' scoping unique field '{s}' to '{s}'", .{ new.name, nf.name, cols[0] });
+                try run(alloc, w, try ddl.addUniqueConstraintSql(alloc, new.name, &cols));
+            }
+        }
+    }
+}
+
+/// Converge one collection's physical unique constraints on its tenant-scoped unique fields
+/// (#498) at startup. A deployment whose tenant-owned table predates #498 enforces those fields
+/// table-wide: Postgres swaps the constraints in place, SQLite rebuilds the table (the only way
+/// it can drop an inline column constraint). A no-op for a collection that already matches, so
+/// it is safe on every boot and under concurrent boots (the rebuild re-checks under the lock).
+/// Auth collections are excluded; their physical uniqueness remains as on main.
+pub fn ensureUniqueScopes(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, name: []const u8) EngineError!void {
+    var scratch = std.heap.ArenaAllocator.init(alloc);
+    defer scratch.deinit();
+    const sa = scratch.allocator();
+    // SQLite must pause FK enforcement outside the transaction, including the nested rebuild.
+    const pause_fk = db.dbDialect(w).kind == .sqlite and !w.inTransaction();
+    if (pause_fk) try w.exec("PRAGMA foreign_keys=OFF;");
+    defer if (pause_fk) {
+        w.exec("PRAGMA foreign_keys=ON;") catch |err| {
+            std.log.warn("unique scope convergence: FK restoration failed ({s}); connection quarantined", .{@errorName(err)});
+            const inner = if (comptime @import("build_options").postgres) &w.sqlite else w;
+            inner.quarantined = true;
+        };
+    };
+    const tx = try Tx.begin(w);
+    errdefer tx.rollback();
+    // All decisions and reconciliation use the definition read AFTER acquiring the lock.
+    const live = (try get(sa, w, name)) orelse {
+        try tx.commit();
+        return;
+    };
+    // Auth keeps main's physical uniqueness, including legacy non-identity usernames.
+    if (live.type == .auth) {
+        try tx.commit();
+        return;
+    }
+    if (hasTenantScopedUnique(live)) {
+        if (db.dbDialect(w).kind == .postgres) {
+            try reconcileUniqueConstraintsPg(sa, w, null, live);
+        } else if (try uniqueScopeDriftSqlite(sa, w, live)) {
+            std.log.info("provision: collection '{s}' rebuilding its table to scope unique fields to '{s}'", .{ live.name, live.options.tenant_field.? });
+            var desired = live;
+            var user_fields: std.ArrayList(schema.Field) = .empty;
+            for (live.fields) |f| if (!schema.isInjectedField(live.type, f.name)) try user_fields.append(sa, f);
+            desired.fields = user_fields.items;
+            _ = try updateWithExpectedDefinition(sa, io, w, live.id, desired, live);
+        }
+    }
+    try tx.commit();
+}
+
+/// `ensureUniqueScopes` for every collection, including ones created at runtime through the
+/// collections API (startup provisioning of `.collections` sees only the comptime ones).
+pub fn ensureAllUniqueScopes(alloc: std.mem.Allocator, io: std.Io, w: *db.Db) EngineError!void {
+    var scratch = std.heap.ArenaAllocator.init(alloc);
+    defer scratch.deinit();
+    const sa = scratch.allocator();
+    for (try list(sa, w)) |col| {
+        if (col.type == .auth) continue;
+        try ensureUniqueScopes(alloc, io, w, col.id);
+    }
+}
+
+/// Refuse physical schema that the metadata-only rebuild cannot reproduce. Scratch is
+/// arena-owned by updateImpl. Indexes/triggers with SQL are restored separately.
+fn checkSqliteRebuild(alloc: std.mem.Allocator, w: *db.Db, old: schema.Collection) EngineError!void {
+    // TEMP objects win unqualified name resolution, including catalog PRAGMAs.
+    var shadow = try w.prepare("SELECT name FROM sqlite_temp_schema WHERE type IN ('table','view','index') AND (name=?1 COLLATE NOCASE OR name=?2 COLLATE NOCASE) LIMIT 1;");
+    defer shadow.finalize();
+    try shadow.bindText(1, old.name);
+    try shadow.bindText(2, try std.fmt.allocPrint(alloc, "{s}__new", .{old.name}));
+    if (try shadow.step()) return unsafeSqliteRebuild(old.name, shadow.columnText(0), "shadowing TEMP object");
+    var cols = try w.prepare("SELECT name, type, \"notnull\", pk, hidden FROM pragma_table_xinfo(?1);");
+    defer cols.finalize();
+    try cols.bindText(1, old.name);
+    while (try cols.step()) {
+        const name = cols.columnText(0);
+        const system = std.mem.eql(u8, name, "id") or std.mem.eql(u8, name, "created") or std.mem.eql(u8, name, "updated");
+        const field = schema.fieldByName(old, name);
+        if (!system and field == null) {
+            return unsafeSqliteRebuild(old.name, name, "physical column absent from metadata");
+        }
+        const expected_type = if (field) |f| db.dbDialect(w).sqlType(f.storageClass()) else "TEXT";
+        if (!std.ascii.eqlIgnoreCase(cols.columnText(1), expected_type) or cols.columnInt(2) != 0 or cols.columnInt(4) != 0 or cols.columnInt(3) != @as(i64, if (std.mem.eql(u8, name, "id")) 1 else 0)) {
+            return unsafeSqliteRebuild(old.name, name, "unowned column type, NOT NULL or primary key");
+        }
+    }
+    // Engine DDL never emits these clauses. A conservative refusal also covers defaults,
+    // custom collations, named constraints, generated columns and table storage options.
+    var table = try w.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name=?1;");
+    defer table.finalize();
+    try table.bindText(1, old.name);
+    if (!try table.step()) return error.NotFound;
+    if (@import("sql/schema_check.zig").firstKeyword(table.columnText(0), &.{ "CHECK", "DEFAULT", "COLLATE", "CONSTRAINT", "GENERATED", "STRICT", "WITHOUT", "CONFLICT", "DEFERRABLE", "INITIALLY", "AUTOINCREMENT", "MATCH", "ASC", "DESC" })) |clause| {
+        return unsafeSqliteRebuild(old.name, clause, "unsupported physical clause");
+    }
+    for (try uniqueConstraints(alloc, w, old.name)) |con| {
+        var owned = false;
+        for (old.fields) |f| {
+            if (!f.unique) continue;
+            if (colsEql(con.cols, &.{f.name})) owned = true;
+            if (schema.uniqueScope(old, f) == .tenant and colsEql(con.cols, &.{ old.options.tenant_field.?, f.name })) {
+                owned = true;
+            }
+        }
+        if (!owned) {
+            return unsafeSqliteRebuild(old.name, con.name, "unowned unique constraint");
+        }
+    }
+    // Compare physical foreign keys to the resolved metadata. Composite or customized
+    // referential actions cannot be reproduced by the engine's single-relation DDL.
+    const resolved = try resolveRelations(alloc, w, old);
+    var fk = try w.prepare("SELECT \"from\", \"table\", \"to\", on_update, on_delete, match, seq FROM pragma_foreign_key_list(?1);");
+    defer fk.finalize();
+    try fk.bindText(1, old.name);
+    while (try fk.step()) {
+        const f = schema.fieldByName(resolved, fk.columnText(0));
+        const owned = if (f) |field| switch (field.options) {
+            .relation => |rel| rel.maxSelect == 1 and fk.columnInt(6) == 0 and std.mem.eql(u8, rel.targetCollectionId, fk.columnText(1)) and std.mem.eql(u8, fk.columnText(2), "id") and std.mem.eql(u8, fk.columnText(3), "NO ACTION") and std.mem.eql(u8, fk.columnText(4), if (rel.cascadeDelete) "CASCADE" else "SET NULL") and std.mem.eql(u8, fk.columnText(5), "NONE"),
+            else => false,
+        } else false;
+        if (!owned) {
+            return unsafeSqliteRebuild(old.name, fk.columnText(0), "unowned foreign key");
+        }
+    }
+}
+
+/// Generate the engine's actual catalog SQL in a private empty database. Includes declared
+/// indexes, identity indexes, tenant indexes and FTS triggers; autoindexes have no stored SQL.
+/// Result graph is scratch-owned by updateImpl's arena.
+fn engineTableObjectsSqlite(scratch: *std.heap.ArenaAllocator, col: schema.Collection) EngineError![]TableObject {
+    const alloc = scratch.allocator();
+    var model = try db.Db.openMemory();
+    defer model.close();
+    try model.exec("PRAGMA foreign_keys=OFF;");
+    const d = db.dbDialect(&model);
+    try model.exec(try alloc.dupeZ(u8, try ddl.createTableSql(alloc, col, null, d, &.{})));
+    for (col.indexes) |idx| try model.exec(try alloc.dupeZ(u8, try ddl.createIndexSql(alloc, col.name, idx, d)));
+    if (col.type == .auth) for (col.options.auth.identityFields) |field| {
+        try model.exec(try alloc.dupeZ(u8, try ddl.authIdentityIndexSql(alloc, col.name, field)));
+    };
+    try ensureTenantIndex(alloc, &model, col);
+    try fts.ensureIndex(alloc, &model, col);
+    return tableObjectsSqlite(scratch, &model, null);
+}
+
+fn sameTableObject(a: TableObject, b: TableObject) bool {
+    return a.kind == b.kind and std.ascii.eqlIgnoreCase(a.name, b.name) and
+        @import("sql/schema_check.zig").whitespaceEql(a.sql, b.sql);
+}
+
+fn unsafeSqliteRebuild(table: []const u8, object: []const u8, reason: []const u8) error{UnsafeSqliteRebuild} {
+    last_rebuild_error = std.fmt.bufPrint(&rebuild_error_buf, "Collection '{s}': {s} '{s}'; use an explicit migration before changing the collection.", .{ table[0..@min(table.len, 256)], reason, object[0..@min(object.len, 768)] }) catch unreachable;
+    std.log.warn("{s}", .{last_rebuild_error});
+    return error.UnsafeSqliteRebuild;
+}
+
+fn migrationObjectConflict(object: []const u8, column: []const u8) error{MigrationObjectConflict} {
+    // Prefix lengths prove the message fits even for arbitrarily long raw-SQL object names.
+    last_rebuild_error = std.fmt.bufPrint(&rebuild_error_buf, "Migration-owned object '{s}' conflicts with column or engine object '{s}'; explicitly migrate this object before changing the collection.", .{ object[0..@min(object.len, 768)], column[0..@min(column.len, 768)] }) catch unreachable;
+    std.log.warn("{s}", .{last_rebuild_error});
+    return error.MigrationObjectConflict;
+}
+
+/// Decide every captured object's ownership by OLD generated SQL, never by name alone.
+/// Refuse migration dependencies and NEW engine-name conflicts before destructive DDL.
+/// Returned objects and all model catalogs are on updateImpl's scratch arena.
+fn preflightTableObjects(scratch: *std.heap.ArenaAllocator, w: *db.Db, old: schema.Collection, new: schema.Collection, actual: []const TableObject) EngineError![]TableObject {
+    const alloc = scratch.allocator();
+    // TEMP triggers live on this connection and are deleted by DROP TABLE too.
+    // They are absent from the main catalog capture, so refuse before any DDL.
+    var temp_triggers = try w.prepare("SELECT name FROM sqlite_temp_schema WHERE type='trigger' AND tbl_name=?1 COLLATE NOCASE LIMIT 1;");
+    defer temp_triggers.finalize();
+    try temp_triggers.bindText(1, old.name);
+    if (try temp_triggers.step()) return unsafeSqliteRebuild(old.name, temp_triggers.columnText(0), "attached TEMP trigger");
+    const layout_changed = !columnLayoutEql(old, new) or !try sqliteColumnLayoutEql(w, new);
+    const old_engine = try engineTableObjectsSqlite(scratch, old);
+    const new_engine = try engineTableObjectsSqlite(scratch, new);
+    // Search's virtual and shadow tables may be removed only when they match the OLD
+    // generated catalog too. This also refuses stale search state absent from metadata.
+    const ft = try fts.tableName(alloc, old.name);
+    var search_tables = try w.prepare("SELECT name, sql FROM sqlite_master WHERE type='table' AND (name=?1 COLLATE NOCASE OR substr(name,1,length(?1)+1)=?1||'_' COLLATE NOCASE);");
+    defer search_tables.finalize();
+    try search_tables.bindText(1, ft);
+    search: while (try search_tables.step()) {
+        for (old_engine) |generated| {
+            if (generated.kind == .table and std.ascii.eqlIgnoreCase(generated.name, search_tables.columnText(0)) and @import("sql/schema_check.zig").whitespaceEql(generated.sql, search_tables.columnText(1))) continue :search;
+        }
+        return migrationObjectConflict(search_tables.columnText(0), ft);
+    }
+    // SQLite index names are database-global, not scoped to their attached table. Check
+    // every desired engine name before IF NOT EXISTS could silently suppress enforcement.
+    var occupied = try w.prepare("SELECT name,type,sql FROM sqlite_master WHERE name=?1 COLLATE NOCASE AND ((?2='trigger' AND type='trigger') OR (?2<>'trigger' AND type IN ('table','index','view')));");
+    defer occupied.finalize();
+    for (new_engine) |generated| {
+        // The base table itself is checked by checkSqliteRebuild, which intentionally
+        // accepts the supported legacy unique-constraint shape during startup convergence.
+        if (generated.kind == .table and std.ascii.eqlIgnoreCase(generated.name, old.name)) continue;
+        occupied.reset();
+        try occupied.bindText(1, generated.name);
+        try occupied.bindText(2, if (generated.kind == .trigger) "trigger" else "relation");
+        occupants: while (try occupied.step()) {
+            const kind = occupied.columnText(1);
+            const obj = TableObject{
+                .name = occupied.columnText(0),
+                .sql = occupied.columnText(2),
+                .kind = if (std.mem.eql(u8, kind, "trigger")) .trigger else if (std.mem.eql(u8, kind, "index")) .index else .table,
+            };
+            for (old_engine) |owned| if (sameTableObject(obj, owned)) continue :occupants;
+            return migrationObjectConflict(obj.name, generated.name);
+        }
+    }
+    // Engine relation FKs target id, which a metadata rebuild preserves. Other incoming
+    // keys are migration-owned and may rely on uniqueness that tenant scoping removes.
+    var incoming = try w.prepare("SELECT m.name, fk.\"to\" FROM sqlite_master m JOIN pragma_foreign_key_list(m.name) fk WHERE m.type='table' AND m.name<>?1 COLLATE NOCASE AND fk.\"table\"=?1 COLLATE NOCASE AND fk.\"to\" IS NOT NULL AND fk.\"to\"<>'id' COLLATE NOCASE LIMIT 1;");
+    defer incoming.finalize();
+    try incoming.bindText(1, old.name);
+    if (try incoming.step()) return migrationObjectConflict(incoming.columnText(0), incoming.columnText(1));
+    // External views/triggers cannot be safely rebuilt by this collection's DDL. Refuse
+    // them before any DROP rather than rely on ALTER TABLE validation after the copy.
+    var external = try w.prepare("SELECT name, sql FROM sqlite_master WHERE type IN ('view','trigger') AND tbl_name<>?1 COLLATE NOCASE AND sql IS NOT NULL;");
+    defer external.finalize();
+    try external.bindText(1, old.name);
+    while (try external.step()) {
+        const sql = external.columnText(1);
+        for (old_engine) |generated| {
+            if (generated.kind != .table or !@import("sql/schema_check.zig").mentionsIdentifier(sql, generated.name)) continue;
+            for (old.fields) |field| {
+                if (!fieldRetained(new, field) and @import("sql/schema_check.zig").mentionsIdentifier(sql, field.name))
+                    return migrationObjectConflict(external.columnText(0), field.name);
+            }
+            return migrationObjectConflict(external.columnText(0), generated.name);
+        }
+    }
+    var migrations_owned: std.ArrayList(TableObject) = .empty;
+    objects: for (actual) |obj| {
+        for (old_engine) |generated| if (sameTableObject(obj, generated)) continue :objects;
+        if (layout_changed and obj.kind == .trigger and @import("sql/schema_check.zig").hasLayoutDependency(obj.sql, old.name))
+            return migrationObjectConflict(obj.name, "column layout (wildcard or positional dependency)");
+        // Constraint autoindexes have no stored SQL (absent from old_engine) and a rebuild does
+        // not preserve their numbering, so any INDEXED BY on one of this table's autoindexes
+        // would break after the rebuild: refuse it before DDL.
+        if (obj.kind == .trigger and @import("sql/schema_check.zig").referencesIndexPrefix(obj.sql, try std.fmt.allocPrint(alloc, "sqlite_autoindex_{s}_", .{old.name})))
+            return migrationObjectConflict(obj.name, "a SQLite constraint autoindex (INDEXED BY)");
+        indexes: for (old_engine) |removed| {
+            if (obj.kind != .trigger or removed.kind != .index) continue;
+            // Only an index regenerated with the SAME definition stays valid for INDEXED BY;
+            // a changed one (e.g. made partial) can break the trigger like a removed one.
+            for (new_engine) |retained| if (sameTableObject(removed, retained)) continue :indexes;
+            if (@import("sql/schema_check.zig").referencesIndex(obj.sql, removed.name))
+                return migrationObjectConflict(obj.name, removed.name);
+        }
+        tables: for (old_engine) |removed| {
+            if (removed.kind != .table) continue;
+            for (new_engine) |retained| if (retained.kind == .table and std.ascii.eqlIgnoreCase(removed.name, retained.name)) {
+                // A retained engine table other than the base table whose definition changes
+                // (the FTS shadow table gaining or losing a column) breaks a trigger that reads
+                // it by wildcard/position, or by naming a column it no longer has. A trigger
+                // that only counts its rows keeps working. The base table is covered by
+                // `layout_changed` and the field checks.
+                if (obj.kind == .trigger and !std.ascii.eqlIgnoreCase(removed.name, old.name) and !sameTableObject(removed, retained)) {
+                    const sc = @import("sql/schema_check.zig");
+                    if (sc.hasLayoutDependency(obj.sql, removed.name))
+                        return migrationObjectConflict(obj.name, removed.name);
+                    if (sc.mentionsIdentifier(obj.sql, removed.name)) {
+                        for (old.fields) |of| {
+                            if (!fts.isIndexedField(of)) continue;
+                            const still = for (new.fields) |nf| {
+                                if (fts.isIndexedField(nf) and std.mem.eql(u8, nf.name, of.name)) break true;
+                            } else false;
+                            if (!still and sc.mentionsIdentifier(obj.sql, of.name))
+                                return migrationObjectConflict(obj.name, of.name);
+                        }
+                    }
+                }
+                continue :tables;
+            };
+            if (@import("sql/schema_check.zig").mentionsIdentifier(obj.sql, removed.name))
+                return migrationObjectConflict(obj.name, removed.name);
+        }
+        for (old.fields) |field| {
+            if (!fieldRetained(new, field) and @import("sql/schema_check.zig").mentionsIdentifier(obj.sql, field.name))
+                return migrationObjectConflict(obj.name, field.name);
+        }
+        // A newly added field can change what a restored trigger's names resolve to: one named
+        // like a rowid alias shadows the hidden rowid (`NEW.rowid`/`NEW.oid`), and any other
+        // can make an unqualified column in a join ambiguous. Refuse a trigger that mentions
+        // a field name this update adds.
+        if (obj.kind == .trigger) for (new.fields) |nf| {
+            const existed = for (old.fields) |of| {
+                if (std.ascii.eqlIgnoreCase(of.name, nf.name)) break true;
+            } else false;
+            if (!existed and @import("sql/schema_check.zig").mentionsIdentifier(obj.sql, nf.name))
+                return migrationObjectConflict(obj.name, nf.name);
+        };
+        try migrations_owned.append(alloc, obj);
+    }
+    return migrations_owned.items;
+}
+
+/// A migration can reorder columns without changing metadata. The rebuild emits the
+/// system columns followed by new.fields, so compare that layout to the live catalog.
+fn sqliteColumnLayoutEql(w: *db.Db, new: schema.Collection) EngineError!bool {
+    var cols = try w.prepare("SELECT name FROM pragma_table_info(?1) ORDER BY cid;");
+    defer cols.finalize();
+    try cols.bindText(1, new.name);
+    for ([_][]const u8{ "id", "created", "updated" }) |name| {
+        if (!try cols.step() or !std.mem.eql(u8, cols.columnText(0), name)) return false;
+    }
+    for (new.fields) |field| {
+        if (!try cols.step() or !std.mem.eql(u8, cols.columnText(0), field.name)) return false;
+    }
+    return !try cols.step();
+}
+
+fn columnLayoutEql(old: schema.Collection, new: schema.Collection) bool {
+    if (old.fields.len != new.fields.len) return false;
+    for (old.fields, new.fields) |of, nf| {
+        if (!std.mem.eql(u8, of.id, nf.id) or !std.mem.eql(u8, of.name, nf.name)) return false;
+    }
+    return true;
+}
+
+fn fieldRetained(new: schema.Collection, field: schema.Field) bool {
+    for (new.fields) |nf| if (std.mem.eql(u8, field.id, nf.id) and std.mem.eql(u8, field.name, nf.name)) return true;
+    return false;
+}
+
+const TableObject = struct { name: []const u8, sql: []const u8, kind: enum { index, trigger, table } };
+
+/// The indexes and triggers SQLite holds on `table` that carry their own SQL (autoindexes,
+/// which back table constraints, have none and are rebuilt with the table).
+fn tableObjectsSqlite(scratch: *std.heap.ArenaAllocator, w: *db.Db, table: ?[]const u8) EngineError![]TableObject {
+    const alloc = scratch.allocator();
+    var out: std.ArrayList(TableObject) = .empty;
+    var st = try w.prepare("SELECT name, sql, type FROM sqlite_master WHERE (?1 IS NULL OR (tbl_name=?1 COLLATE NOCASE AND type IN ('index','trigger'))) AND type IN ('index','trigger','table') AND sql IS NOT NULL ORDER BY type, name;");
+    defer st.finalize();
+    if (table) |name| try st.bindText(1, name) else try st.bindNull(1);
+    while (try st.step()) try out.append(alloc, .{ .name = try alloc.dupe(u8, st.columnText(0)), .sql = try alloc.dupe(u8, st.columnText(1)), .kind = if (std.mem.eql(u8, st.columnText(2), "index")) .index else if (std.mem.eql(u8, st.columnText(2), "trigger")) .trigger else .table });
+    return out.items;
+}
+
 /// Auto-create the index backing the `tenant_field` column so the per-request tenant scope
 /// predicate (`"<col>"."<tenant_field>" = ?`) is served from an index, not a scan. Idempotent
 /// (`IF NOT EXISTS`); identifiers are gated through `schema.isValidIdentifier` before interpolation.
@@ -1352,6 +1875,34 @@ pub fn ensureTenantIndex(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collec
     defer alloc.free(sql);
     try w.exec(sql);
     std.log.info("provision: ensured tenant index on '{s}'.'{s}'", .{ col.name, tf });
+}
+
+test "rebuild preserves unrelated TEMP indexes and triggers with migration object names" {
+    const a = std.testing.allocator;
+    var conn = try db.Db.openMemory();
+    defer conn.close();
+    try migrations.run(&conn);
+    const original = try create(a, std.testing.io, &conn, .{
+        .id = "",
+        .name = "items",
+        .fields = &.{.{ .id = "title_id", .name = "title", .options = .{ .text = .{} } }},
+    });
+    defer original.deinit(a);
+    try conn.exec("CREATE INDEX migration_idx ON items(title);");
+    try conn.exec("CREATE TRIGGER migration_trigger AFTER INSERT ON items BEGIN SELECT NEW.title; END;");
+    try conn.exec("CREATE TEMP TABLE unrelated(value TEXT);");
+    try conn.exec("CREATE INDEX temp.migration_idx ON unrelated(value);");
+    try conn.exec("CREATE TEMP TRIGGER migration_trigger AFTER INSERT ON unrelated BEGIN SELECT NEW.value; END;");
+    var desired = original;
+    desired.fields = &.{ original.fields[0], .{ .id = "extra_id", .name = "extra", .options = .{ .text = .{} } } };
+    const updated = try update(a, std.testing.io, &conn, original.id, desired);
+    defer updated.deinit(a);
+    var st = try conn.prepare("SELECT (SELECT count(*) FROM main.sqlite_schema WHERE tbl_name='items' AND name IN ('migration_idx','migration_trigger')), (SELECT count(*) FROM temp.sqlite_schema WHERE tbl_name='unrelated' AND name IN ('migration_idx','migration_trigger'));");
+    defer st.finalize();
+    try std.testing.expect(try st.step());
+    try std.testing.expectEqual(@as(i64, 2), st.columnInt(0));
+    try std.testing.expectEqual(@as(i64, 2), st.columnInt(1));
+    try std.testing.expect(schema.fieldByName(updated, "extra") != null);
 }
 
 test "owned update result allocation failure rolls back rebuild and generation" {
@@ -1817,7 +2368,7 @@ test "a search-index failure rolls back the whole collection create or update (#
     try d.exec("CREATE VIEW notes_view AS SELECT * FROM notes_fts;");
     var off = fields;
     off[0].searchable = false;
-    try std.testing.expectError(error.Conflict, updateFields(a, &d, col, &off));
+    try std.testing.expectError(error.MigrationObjectConflict, updateFields(a, &d, col, &off));
     const still = (try get(a, &d, col.id)).?;
     defer still.deinit(a);
     try std.testing.expect(still.fields[0].searchable);
@@ -1859,4 +2410,96 @@ test "sameSearchColumns compares the indexed columns in order" {
     other = base;
     other.name = "posts"; // another table
     try std.testing.expect(!fts.sameSearchColumns(base, other));
+}
+
+test "startup convergence refuses layout triggers on migration-reordered columns" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{
+        "INSERT INTO audit SELECT * FROM items WHERE id=NEW.id",
+        "INSERT INTO items VALUES('copy','','','acct-b','copy')",
+    }) |body| {
+        var conn = try db.Db.openMemory();
+        defer conn.close();
+        try migrations.run(&conn);
+        const original = try create(a, std.testing.io, &conn, .{
+            .id = "",
+            .name = "items",
+            .fields = &.{
+                .{ .id = "slugid", .name = "slug", .unique = true, .options = .{ .text = .{} } },
+                .{ .id = "tenantid", .name = "account", .options = .{ .text = .{} } },
+            },
+            .options = .{ .tenant_field = "account" },
+        });
+        defer original.deinit(a);
+        // A migration kept the metadata but reordered the physical columns and left
+        // legacy global uniqueness. Startup must rebuild to converge that constraint.
+        try conn.exec("DROP TABLE items;");
+        try conn.exec("CREATE TABLE items(id TEXT PRIMARY KEY,created TEXT,updated TEXT,account TEXT,slug TEXT UNIQUE);");
+        try conn.exec("INSERT INTO items VALUES('kept','','','acct-a','one');");
+        try conn.exec("CREATE TABLE audit AS SELECT * FROM items;");
+        const trigger = try std.fmt.allocPrintSentinel(a, "CREATE TRIGGER migration_layout AFTER INSERT ON items BEGIN {s}; END;", .{body}, 0);
+        defer a.free(trigger);
+        try conn.exec(trigger);
+        const generation = try schema_gen.read(&conn);
+        try std.testing.expectError(error.MigrationObjectConflict, ensureUniqueScopes(a, std.testing.io, &conn, original.id));
+        try std.testing.expectEqual(generation, try schema_gen.read(&conn));
+        var order = try conn.prepare("SELECT name FROM pragma_table_info('items') ORDER BY cid;");
+        defer order.finalize();
+        for ([_][]const u8{ "id", "created", "updated", "account", "slug" }) |name| {
+            try std.testing.expect(try order.step());
+            try std.testing.expectEqualStrings(name, order.columnText(0));
+        }
+        try std.testing.expect(!try order.step());
+        try conn.exec("INSERT INTO items(id,account,slug) VALUES('next','acct-b','two');");
+        var kept = try conn.prepare("SELECT account,slug FROM items WHERE id='kept';");
+        defer kept.finalize();
+        try std.testing.expect(try kept.step());
+        try std.testing.expectEqualStrings("acct-a", kept.columnText(0));
+        try std.testing.expectEqualStrings("one", kept.columnText(1));
+    }
+}
+
+test "startup convergence reads SQLite metadata only after locking" {
+    const c = @import("c.zig").c;
+    const Reads = struct {
+        handle: ?*c.sqlite3,
+        locked: bool = false,
+        reads: usize = 0,
+        denied: bool = false,
+
+        fn authorize(context: ?*anyopaque, action: c_int, first: [*c]const u8, _: [*c]const u8, _: [*c]const u8, _: [*c]const u8) callconv(.c) c_int {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            if (first == null) return c.SQLITE_OK;
+            const table = std.mem.span(first);
+            if (action == c.SQLITE_UPDATE and std.mem.eql(u8, table, "_schema_state")) self.locked = true;
+            if (action == c.SQLITE_READ and std.mem.eql(u8, table, "_collections")) {
+                self.reads += 1;
+                // The SQLite authorizer rejects pre-lock reads rather than
+                // coordinating threads with timing-sensitive sleeps.
+                if (!self.locked or c.sqlite3_get_autocommit(self.handle) != 0) {
+                    self.denied = true;
+                    return c.SQLITE_DENY;
+                }
+            }
+            return c.SQLITE_OK;
+        }
+    };
+    const a = std.testing.allocator;
+    var conn = try db.Db.openMemory();
+    defer conn.close();
+    try migrations.run(&conn);
+    const original = try create(a, std.testing.io, &conn, .{
+        .id = "",
+        .name = "items",
+        .fields = &.{.{ .id = "title_id", .name = "title", .options = .{ .text = .{} } }},
+    });
+    defer original.deinit(a);
+    const inner = if (comptime @import("build_options").postgres) &conn.sqlite else &conn;
+    var reads: Reads = .{ .handle = inner.handle };
+    try std.testing.expectEqual(c.SQLITE_OK, c.sqlite3_set_authorizer(inner.handle, Reads.authorize, &reads));
+    defer _ = c.sqlite3_set_authorizer(inner.handle, null, null);
+    try ensureUniqueScopes(a, std.testing.io, &conn, original.id);
+    try std.testing.expect(reads.locked);
+    try std.testing.expect(reads.reads > 0);
+    try std.testing.expect(!reads.denied);
 }

@@ -144,6 +144,80 @@ viewRule = "@request.account.id != \"\" && account = @request.account.id"
 
 Adapt the shape to your collection; treat this as a starting point, not a fixed template.
 
+## Unique fields are per tenant
+
+On a tenant-owned **base** collection, a field marked `unique` is unique **within each tenant**, not
+across the table. The engine enforces it as a composite `UNIQUE (<tenant_field>, <field>)`
+constraint, so tenant A can create a `slug` of `acme-corp` while tenant B already holds one, and
+A's second `acme-corp` is still refused with `409`. A table-wide constraint would have answered
+`409` whenever *any* tenant held the value: one request per guess would tell a member of one
+tenant what another tenant has stored, and any tenant could claim a value for good.
+
+The tenant field itself, if you mark it `unique`, stays unique across the table (there is nothing
+to scope it by).
+
+When a value really must be unique across every tenant, say so with an explicit unique index:
+
+```zig
+.slugs = .{
+    .fields = .{
+        .{ .name = "slug",    .type = .text, .required = true, .unique = true }, // per tenant
+        .{ .name = "account", .type = .text },
+    },
+    .tenant_field = "account",
+    // Table-wide: a 409 here does reveal that some tenant holds the value. Choose it knowingly.
+    .indexes = .{ .{ .name = "idx_slugs_slug_global", .fields = .{"slug"}, .unique = true } },
+},
+```
+
+Existing deployments are converged at startup. A tenant-owned base table created by an earlier
+release still carries the table-wide constraint; on the next start the server replaces it with the
+per-tenant one, for collections declared in `.collections` and for collections created through
+the collections API alike. Dropping a unique constraint only loosens it and the per-tenant
+constraint holds wherever the table-wide one did. SQLite refuses unsupported physical schema
+drift before rebuilding (see below).
+PostgreSQL swaps the constraints in place. SQLite cannot drop a column constraint, so it rebuilds
+the table once, keeping every row and re-creating any index or trigger a migration had put on it.
+The same rules apply when a collection becomes tenant-owned later, or stops being one: changing
+its `tenant_field` moves its unique fields to the matching enforcement.
+
+Tenant-scoped import upserts (`--upsert-key` on a tenant-scoped unique field) match the
+**tenant field plus the key**, and require a non-empty tenant string on every input row.
+A value held only by another tenant creates a new row; it never updates or moves that row.
+
+SQLite refuses a rebuild if physical columns or table constraints cannot be reproduced from
+collection metadata. The boot error names the column or unsupported clause. For example, a
+migration-added `internal_note` column must be incorporated into collection metadata (or handled
+by an explicit migration) before restarting. This applies when adding or changing `tenant_field`
+too. Migration-owned indexes and triggers are restored transactionally; if restoration fails,
+the rebuild rolls back.
+
+Index and trigger ownership is determined by comparing stored SQL with the SQL generated for
+the old collection definition, collapsing whitespace outside quoted values and comments. Engine objects
+(including tenant and identity indexes and search triggers) are regenerated from the new
+definition; other objects retain their migration SQL, even when they use an engine-style name.
+A migration object that mentions a renamed or dropped column causes a 400 response naming the
+object and column before destructive DDL. A collision with a new engine object, or a migration
+reference to a search table (including FTS shadow tables) being removed, also refuses the update.
+Incoming foreign keys targeting non-`id` columns, and external views or triggers referring to the
+rebuilt table or its search tables, require an explicit migration and are refused before DDL.
+An attached TEMP trigger also refuses a rebuild before DDL; migrate it explicitly on the
+same connection first. SQLite object-name collisions are checked without case sensitivity across the entire database,
+including indexes attached to other tables. Migrate those objects explicitly first; ambiguous SQL identifier references are treated
+conservatively as dependencies.
+
+Auth collections are excluded from unique-scope convergence at startup and on API updates.
+Their uniqueness behavior is unchanged from before this change: configured `identityFields`
+receive global partial unique indexes over non-empty values, and declared unique fields stay
+global. With the default `["email"]` identity, this change adds no username uniqueness;
+existing duplicate non-empty usernames remain accepted. Adding `tenant_field` does not opt
+an auth collection into per-tenant uniqueness.
+
+OpenAPI exposes `x-zigbase-unique-scope` (`tenant` or `global`) beside `x-zigbase-unique`;
+tenant scope also includes `x-zigbase-unique-tenant-field`. The admin schema editor shows
+“per tenant (<field>)” or “global” beside the uniqueness checkbox. Explicit indexes may impose
+additional uniqueness constraints independently of these field hints.
+
 ## Escaping the scope
 
 Superusers bypass tenancy entirely, consistent with the rest of the access-rule engine. For admin

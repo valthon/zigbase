@@ -1092,11 +1092,18 @@ pub fn ensureCollection(
         break :blk !std.mem.eql(u8, a.?, b.?);
     };
     if (ttl_differs) changed = true;
+    // Tenancy: `.tenant_field` added to (or changed on) an existing collection is persisted the
+    // same way, else the collection would stay unscoped while the startup log calls it
+    // tenant-owned. It also changes how the unique fields are enforced (#498), which the update
+    // path converges.
+    const tenant_differs = !optStrEql(spec.options.tenant_field, live.options.tenant_field);
+    if (tenant_differs) changed = true;
 
     const merged_rules = mergeRules(spec, live);
     merged_rules.applyTo(&effective);
     effective.indexes = spec.indexes;
     effective.options.ttl_field = spec.options.ttl_field;
+    effective.options.tenant_field = spec.options.tenant_field;
     // Validate accepted additions even when their columns do not exist yet.
     try inspectSearchIndex(alloc, w, effective, false);
     if (changed) {
@@ -1106,10 +1113,18 @@ pub fn ensureCollection(
     } else {
         try collections.provisionMetadata(alloc, w, live, effective);
     }
+    // A table created before #498 enforces a tenant-owned collection's unique fields
+    // table-wide; converge it on the tenant-scoped constraints.
+    try collections.ensureUniqueScopes(alloc, io, w, spec.name);
     if (!merged_rules.eql(collections.Rules.from(live)))
         std.log.info("provision: collection '{s}' access rules updated", .{spec.name});
     if (widened_count > 0)
         std.log.info("provision: collection '{s}' widened {d} select field(s)", .{ spec.name, widened_count });
+}
+
+fn optStrEql(a: ?[]const u8, b: ?[]const u8) bool {
+    if (a == null or b == null) return a == null and b == null;
+    return std.mem.eql(u8, a.?, b.?);
 }
 
 /// Relation names and ids identify the same target. Resolve only for comparison;

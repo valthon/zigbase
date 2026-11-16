@@ -3814,7 +3814,14 @@ Each value is a struct with:
   `in` set-membership operator, and the `@request.auth.*` / `@request.account.*` macros).
 
 Each field literal needs `.name` and `.type`, plus optional `.required`,
-`.unique`, `.hidden`, and type-specific options:
+`.unique`, `.hidden`, and type-specific options. On a tenant-owned base collection (`.tenant_field`
+set) `.unique` is unique per tenant; declare a unique `.indexes` entry for table-wide uniqueness
+(see [tenancy.md](tenancy.md#unique-fields-are-per-tenant)). SQLite refuses rebuilds that would
+lose migration-owned columns or constraints, or attached TEMP triggers. Tenant-owned auth
+collections keep all unique fields global because identity and email-token lookups have no
+tenant context.
+For tenant-scoped unique import keys, every row must supply the tenant field; upserts match
+tenant plus key. Field literal examples:
 
 ```zig
 .{ .name = "title",  .type = .text, .required = true, .min = 1, .max = 200 }

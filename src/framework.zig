@@ -5050,6 +5050,10 @@ fn bootApp(
             };
             try provision.applySpecs(allocator, io, w, resolved2);
         }
+        // #498: a tenant-owned collection created before field-level unique became per-tenant
+        // still enforces it table-wide. `.collections` provisioning converges the comptime ones;
+        // this converges every collection, including those created through the collections API.
+        try collections_mod.ensureAllUniqueScopes(allocator, io, w);
         // Fail-closed for RUNTIME-created encrypted fields (Theme B1, gap #102). The
         // comptime guard above only sees the `.collections` literal; a collection whose
         // encrypted field was added at runtime (via the superuser collections API while a

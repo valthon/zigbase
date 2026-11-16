@@ -217,6 +217,7 @@ pub fn update(ctx: *http.RequestCtx) anyerror!http.Response {
     if (try validateRules(ctx, w, def_mut)) |resp| return resp;
     const updated = collections.update(ctx.allocator.a, app.io, w, key, def_mut) catch |e| switch (e) {
         error.NotFound => return ApiError.notFound().toResponse(ctx.allocator.a),
+        error.MigrationObjectConflict, error.UnsafeSqliteRebuild => return ApiError.badRequest(collections.last_rebuild_error).toResponse(ctx.allocator.a),
         error.Validation => return validationResponse(ctx),
         error.Conflict, error.Constraint => return ApiError.conflict("Conflict.").toResponse(ctx.allocator.a),
         error.SearchDisabled => return ApiError.badRequest("Full-text search is not enabled in this build; remove `searchable` from the fields.").toResponse(ctx.allocator.a),

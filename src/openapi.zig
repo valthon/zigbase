@@ -121,7 +121,12 @@ fn scalarFieldSchema(alloc: std.mem.Allocator, field: schema.Field, owner: schem
             }
         },
     }
-    if (field.unique) try out.put(alloc, "x-zigbase-unique", .{ .bool = true });
+    if (field.unique) {
+        try out.put(alloc, "x-zigbase-unique", .{ .bool = true });
+        try out.put(alloc, "x-zigbase-unique-scope", .{ .string = @tagName(schema.uniqueScope(owner, field)) });
+        if (schema.uniqueScope(owner, field) == .tenant)
+            try out.put(alloc, "x-zigbase-unique-tenant-field", .{ .string = owner.options.tenant_field.? });
+    }
     if (field.hidden) try out.put(alloc, "writeOnly", .{ .bool = true });
     if (field.encrypted) try out.put(alloc, "x-zigbase-encrypted", .{ .bool = true });
     if (field.searchable) try out.put(alloc, "x-zigbase-searchable", .{ .bool = true });
@@ -1364,4 +1369,18 @@ test "path secret route metadata is useful and contains no configured secret sou
     try std.testing.expect(op.get("x-zigbase-secret-source") == null);
     try std.testing.expect(param_schema.get("default") == null);
     try std.testing.expect(param_schema.get("example") == null);
+}
+
+test "OpenAPI unique metadata distinguishes tenant and global scope" {
+    const a = std.testing.allocator;
+    const fields = [_]schema.Field{
+        .{ .id = "account", .name = "account", .unique = true, .options = .{ .text = .{} } },
+        .{ .id = "slug", .name = "slug", .unique = true, .options = .{ .text = .{} } },
+    };
+    const col = schema.Collection{ .id = "c", .name = "slugs", .fields = &fields, .options = .{ .tenant_field = "account" } };
+    const json = try generateCollections(a, &.{col}, .{ .api_version = "test" });
+    defer a.free(json);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"x-zigbase-unique-scope\": \"tenant\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"x-zigbase-unique-scope\": \"global\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"x-zigbase-unique-tenant-field\": \"account\"") != null);
 }
