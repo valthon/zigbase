@@ -18,6 +18,7 @@ const rules = @import("rules.zig");
 const framework = @import("framework.zig");
 const schema = @import("schema.zig");
 const ddl = @import("ddl.zig");
+const tenancy = @import("tenancy/tenancy.zig");
 
 /// Probe file created (and immediately deleted) under the data dir to test
 /// writability directly, rather than inferring it from whether the database
@@ -159,12 +160,24 @@ fn gatherLegacyPasswordHashes(arena: std.mem.Allocator, w: *db.Db, cols: []const
     return total;
 }
 
+/// Every relation field whose stored links reach another account's record
+/// (`tenancy.findCrossTenantLinks`, #497), mapped onto the I/O-free fact shape.
+fn gatherCrossTenantLinks(arena: std.mem.Allocator, w: *db.Db, cols: []const schema.Collection) ![]const doctor.CrossTenantLinkFact {
+    const found = try tenancy.findCrossTenantLinks(arena, w, cols);
+    defer arena.free(found); // the scan's result is owned; only the mapped facts escape
+    const out = try arena.alloc(doctor.CrossTenantLinkFact, found.len);
+    for (found, out) |l, *o| o.* = .{ .collection = l.collection, .field = l.field, .target = l.target, .count = l.count, .unparseable = l.unparseable };
+    return out;
+}
+
 /// Open the database exactly as `migrateStatusImpl` does and gather the
-/// DB-backed facts (public rules, migration status, legacy password hashes).
+/// DB-backed facts (public rules, migration status, legacy password hashes,
+/// cross-tenant relation links).
 /// Any failure along the way — open, `ensureLedger`, `collections.list`,
 /// `migrationStatus` — leaves `db_reachable = false` and `db_error` set, and
 /// the dependent checks in `doctor.zig` report `skipped` rather than a false
-/// "clean".
+/// "clean". The cross-tenant scan runs after that and only sets
+/// `cross_tenant_error` (its own check skips; the others keep their answers).
 ///
 /// Opens the DB (and creates the `_migrations` ledger — see below) ONLY when
 /// `gatherDataDirWritable` already found the data dir usable. When it did
@@ -209,7 +222,7 @@ fn gatherDb(
     // fine and nothing needs freeing individually — do NOT "fix" this into a
     // deinit loop; the arena already owns every byte and a manual free here
     // would double-free when the arena is torn down. Fetched once and shared
-    // by `gatherPublicRules` and `gatherLegacyPasswordHashes` below.
+    // by `gatherPublicRules`, `gatherLegacyPasswordHashes` and `gatherCrossTenantLinks` below.
     const cols = collections.list(arena, w) catch |err| {
         f.db_error = @errorName(err);
         return;
@@ -238,6 +251,14 @@ fn gatherDb(
     f.migrations_pending = status.pending_count;
     f.migrations_orphaned = status.orphaned.len;
     f.legacy_password_hashes = legacy_hashes;
+
+    // Gathered last, and its failure degrades only `cross-tenant-relations`: a scan that cannot
+    // run (a dropped table, a malformed stored value on PostgreSQL) must not turn the checks above
+    // into "database unreachable" on a database that answered them.
+    f.cross_tenant_links = gatherCrossTenantLinks(arena, w, cols) catch |err| blk: {
+        f.cross_tenant_error = @errorName(err);
+        break :blk &.{};
+    };
 }
 
 /// Open the pool read-mostly, gather every fact, and hand a `Facts` to

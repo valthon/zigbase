@@ -155,7 +155,11 @@ fn Implementation(comptime config: anytype) type {
                 try stamped.put(a, field, .{ .string = s.rctx.account_id });
                 input = .{ .object = stamped };
             };
-            const result = if (s.action == .create) try records.createInTxnOpts(a, app.io, conn, s.col, input, .{}) else (try records.updateInTxn(a, conn, s.col, s.rid, input)) orelse return error.NotFound;
+            var update_opts: records.UpdateOpts = .{ .relation_scope = &s.rctx };
+            if (s.action == .update) {
+                update_opts.allow_stored_relations = try api.storedRelationsReadable(a, conn, s.col, s.rid, input, update_opts.relation_scope);
+            }
+            const result = if (s.action == .create) try records.createInTxnOpts(a, app.io, conn, s.col, input, .{ .relation_scope = &s.rctx }) else (try records.updateInTxnOpts(a, conn, s.col, s.rid, input, update_opts)) orelse return error.NotFound;
             const id = result.object.get("id").?.string;
             if (!try policy.authorizes(a, conn, s.col, s.action, id, &s.rctx)) return error.Forbidden;
             if (comptime @import("build_options").durable_realtime)

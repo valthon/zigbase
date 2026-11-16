@@ -4673,10 +4673,11 @@ generated output, not authoritative configuration.
 
 #### Preflight checks (`zigbase doctor`)
 
-`zigbase doctor [--production] [--json] [--data-dir PATH]` runs nine checks over a deployment —
+`zigbase doctor [--production] [--json] [--data-dir PATH]` runs ten checks over a deployment —
 JWT-secret persistence, every `@public` access rule (enumerated by name), cookie security, bind
 address, reverse-proxy coherence, mailer configuration, pending/orphaned migrations, data-dir
-writability, and legacy password hashes still pending re-hash.
+writability, legacy password hashes still pending re-hash, and relation links that point at
+another account's record.
 
 See [serve.md → `zigbase doctor`](serve.md#8-zigbase-doctor) for the full worked example (prose
 and NDJSON output, captured from a real run), the per-check severity table, exit codes, both

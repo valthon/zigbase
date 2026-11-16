@@ -7,3 +7,4 @@ mailer-configured
 migrations-applied
 data-dir-writable
 legacy-password-hashes
+cross-tenant-relations

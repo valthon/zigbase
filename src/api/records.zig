@@ -304,6 +304,31 @@ fn uploadSchemaUnchanged(alloc: std.mem.Allocator, w: *@import("../db.zig").Db, 
     return std.mem.eql(u8, before, after);
 }
 
+/// Only probe when validation can preserve a visible stored relation id. Both REST
+/// update paths call this inside their writer transaction, after schema coordination.
+/// PostgreSQL locks the source before GET policy evaluation, then retains that lock
+/// through stored-id lookup, validation and mutation. SQLite already holds its writer.
+pub fn storedRelationsReadable(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection, rid: []const u8, data: std.json.Value, scope: ?*const request.RequestContext) !bool {
+    const rctx = scope orelse return false;
+    if (!rctx.tenancy_enabled or rctx.is_superuser or rctx.cross_tenant or data != .object) return false;
+    var relevant = false;
+    for (col.fields) |field| {
+        if (field.hidden or field.options != .relation or !data.object.contains(field.name)) continue;
+        const target = (try collections.get(alloc, w, field.options.relation.targetCollectionId)) orelse continue;
+        defer target.deinit(alloc);
+        if (target.options.tenant_field != null) {
+            relevant = true;
+            break;
+        }
+    }
+    if (!relevant) return false;
+    try lockUploadRecord(alloc, w, col, rid);
+    var read_ctx = rctx.*;
+    read_ctx.method = "GET";
+    read_ctx.data = null;
+    return policy.authorizes(alloc, w, col, .view, rid, &read_ctx);
+}
+
 fn lockUploadRecord(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection, rid: []const u8) !void {
     if (db.dbDialect(w).kind != .postgres) return;
     const table = try @import("../ddl.zig").quoteIdent(alloc, col.name);
@@ -523,6 +548,7 @@ pub fn create(ctx: *http.RequestCtx) anyerror!http.Response {
         try data_mut.object.put(ctx.allocator.a, "id", .{ .string = &upload_id });
     const rec = records.createInTxnOpts(ctx.allocator.a, app.io, w, col, data_mut, .{
         .allow_provided_id = all.writes.len > 0, // overwritten above with the reserved SERVER id
+        .relation_scope = &rctx, // #497: a tenant-owned relation target must be in the active account
     }) catch |e| switch (e) {
         error.Validation => {
             w.rollback() catch {};
@@ -778,6 +804,10 @@ fn updateImpl(ctx: *http.RequestCtx, comptime is_resumable: bool, resumable: if 
         return rejection.response;
     }
 
+    // Include relation fields introduced by before-hooks, while evaluating GET
+    // against the source row before the engine applies the prepared update.
+    const allow_stored_relations = try storedRelationsReadable(ctx.allocator.a, w, col, rid, data_mut, &rctx);
+
     // #98 on the PATCH path (spec §F1): `beforePasswordChange` fires ONLY when the prepared
     // data contains a password change, INSIDE the update transaction, with a READ-ONLY
     // pre-change snapshot. Abort ⇒ rollback ⇒ password unchanged (fail closed), mapped via
@@ -794,7 +824,7 @@ fn updateImpl(ctx: *http.RequestCtx, comptime is_resumable: bool, resumable: if 
 
     // KNOWN LIMITATION: a `.check` guard evaluates `@request.data.*` from rctx.data, which is
     // built pre-hook; a hook mutating a guard-referenced field is not seen by the WHERE clause.
-    const updated = records.updateInTxn(ctx.allocator.a, w, col, rid, data_mut) catch |e| switch (e) {
+    const updated = records.updateInTxnOpts(ctx.allocator.a, w, col, rid, data_mut, .{ .relation_scope = &rctx, .allow_stored_relations = allow_stored_relations }) catch |e| switch (e) {
         // The `committed`-guarded defer above deletes the written files on each of these
         // pre-commit exits, so no branch repeats the storage cleanup.
         error.Validation => {
@@ -1889,6 +1919,104 @@ fn formCtx(env: *TestEnv, a: RequestArena, m: http.Method, fields: std.json.Obje
         .form_fields = .{ .object = fields },
         .files = files,
     };
+}
+
+test "stored relation read eligibility skips policy unless tenant validation needs it" {
+    const a = std.testing.allocator;
+    var conn = try db.Db.openMemory();
+    defer conn.close();
+    try migrations.run(&conn);
+    const target = try collections.create(a, std.testing.io, &conn, .{
+        .id = "",
+        .name = "eligibility_target",
+        .fields = &.{.{ .id = "owner", .name = "owner", .options = .{ .text = .{} } }},
+        .options = .{ .tenant_field = "owner" },
+    });
+    defer target.deinit(a);
+    var col: schema.Collection = .{
+        .id = "source",
+        .name = "source",
+        .fields = &.{.{ .id = "ref", .name = "ref", .options = .{ .relation = .{ .targetCollectionId = target.id } } }},
+        // An invalid expression makes any unwanted compilation observable.
+        .viewRule = "(",
+    };
+    var data: std.json.ObjectMap = .empty;
+    defer data.deinit(a);
+    try data.put(a, "ref", .{ .string = "foreign" });
+    const input: std.json.Value = .{ .object = data };
+    var scope: request.RequestContext = .{};
+    try std.testing.expect(!try storedRelationsReadable(a, &conn, col, "row", input, null));
+    try std.testing.expect(!try storedRelationsReadable(a, &conn, col, "row", input, &scope));
+    scope.tenancy_enabled = true;
+    scope.is_superuser = true;
+    try std.testing.expect(!try storedRelationsReadable(a, &conn, col, "row", input, &scope));
+    scope.is_superuser = false;
+    scope.cross_tenant = true;
+    try std.testing.expect(!try storedRelationsReadable(a, &conn, col, "row", input, &scope));
+    scope.cross_tenant = false;
+    try std.testing.expect(!try storedRelationsReadable(a, &conn, col, "row", .{ .object = .empty }, &scope));
+    var hidden = [_]schema.Field{col.fields[0]};
+    hidden[0].hidden = true;
+    col.fields = &hidden;
+    try std.testing.expect(!try storedRelationsReadable(a, &conn, col, "row", input, &scope));
+    hidden[0].hidden = false;
+    // Now the probe matters: it must evaluate (and reject) the invalid view policy.
+    try std.testing.expectError(error.BadOperand, storedRelationsReadable(a, &conn, col, "row", input, &scope));
+    try conn.exec("UPDATE _collections SET options='{}' WHERE name='eligibility_target';");
+    try std.testing.expect(!try storedRelationsReadable(a, &conn, col, "row", input, &scope));
+}
+
+test "pg: stored relation eligibility locks source through validation and mutation" {
+    if (!@import("build_options").postgres) return error.SkipZigTest;
+    const url = std.testing.environ.getPosix("ZIGBASE_PG_TEST_URL") orelse return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var first = try db.Db.openPostgres(a, std.testing.io, url);
+    defer first.close();
+    try first.exec("CREATE SCHEMA zb_relation_eligibility_lock;");
+    defer first.exec("DROP SCHEMA zb_relation_eligibility_lock CASCADE;") catch |err|
+        std.log.err("relation lock test cleanup failed: {s}", .{@errorName(err)});
+    try first.exec("SET search_path TO zb_relation_eligibility_lock;");
+    try migrations.run(&first);
+    const target = try collections.create(a, std.testing.io, &first, .{
+        .id = "",
+        .name = "targets",
+        .fields = &.{.{ .id = "owner", .name = "owner", .options = .{ .text = .{} } }},
+        .options = .{ .tenant_field = "owner" },
+    });
+    defer target.deinit(a);
+    const col = try collections.create(a, std.testing.io, &first, .{
+        .id = "",
+        .name = "sources",
+        .fields = &.{.{ .id = "ref", .name = "ref", .options = .{ .relation = .{ .targetCollectionId = target.id } } }},
+        .viewRule = "ref != '' && @request.method = 'GET'",
+    });
+    defer col.deinit(a);
+    try first.exec("INSERT INTO targets (id,owner) VALUES ('old','foreign'),('replacement','foreign');");
+    try first.exec("INSERT INTO sources (id,ref) VALUES ('row','old');");
+    var other = try db.Db.openPostgres(a, std.testing.io, url);
+    defer other.close();
+    try other.exec("SET search_path TO zb_relation_eligibility_lock;");
+    try other.exec("SET lock_timeout = '100ms';");
+    var data: std.json.ObjectMap = .empty;
+    defer data.deinit(a);
+    try data.put(a, "ref", .{ .string = "old" });
+    const scope: request.RequestContext = .{ .tenancy_enabled = true, .account_id = "mine", .method = "PATCH" };
+    try first.beginImmediate();
+    errdefer first.rollback() catch |err| std.log.err("relation lock rollback failed: {s}", .{@errorName(err)});
+    try std.testing.expect(try storedRelationsReadable(a, &first, col, "row", .{ .object = data }, &scope));
+    // A second connection cannot replace the stored id or revoke source visibility
+    // after authorization while the first connection validates the exempted id.
+    try std.testing.expectError(error.ExecFailed, other.exec("UPDATE sources SET ref=NULL WHERE id='row';"));
+    const updated = (try records.updateInTxnOpts(a, &first, col, "row", .{ .object = data }, .{
+        .relation_scope = &scope,
+        .allow_stored_relations = true,
+    })).?;
+    defer records.freeRecord(a, updated);
+    try first.commit();
+    try other.exec("UPDATE sources SET ref=NULL WHERE id='row';");
+    try first.beginImmediate();
+    try std.testing.expect(!try storedRelationsReadable(a, &first, col, "row", .{ .object = data }, &scope));
+    try first.rollback();
 }
 
 test "pg: upload schema checks lock metadata until commit" {
@@ -3076,6 +3204,106 @@ test "update pre-authorizes tenant ownership BEFORE the before_update hook fires
         const res = try update(&uctx);
         try std.testing.expectEqual(@as(u16, 200), res.status);
         try std.testing.expectEqual(@as(usize, 1), TenantHooks.before_update_calls);
+    }
+}
+
+// ---- #497: a before-hook's relation value is validated with the request's tenant scope ----
+
+const RelationHooks = struct {
+    var note_id: []const u8 = "";
+    fn setNote(ctx: *Ctx, ev: *events.RecordEvent) anyerror!void {
+        _ = ctx;
+        try ev.record.object.put(ev.arena.a, "note", .{ .string = note_id });
+    }
+};
+
+test "a before-hook that sets a relation to another account's record is refused like a client (#497)" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", gpa);
+    defer gpa.free(dir);
+    const path = try std.fmt.allocPrintSentinel(gpa, "{s}/t.db", .{dir}, 0);
+    defer gpa.free(path);
+    var pool = try db.Pool.init(gpa, std.testing.io, path);
+    defer pool.deinit();
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var u_id: []const u8 = "";
+    var u_tk: []const u8 = "";
+    {
+        const w = pool.acquireWriter();
+        defer pool.releaseWriter();
+        try migrations.run(w);
+        if (comptime @import("build_options").durable_realtime) try @import("../realtime/durable.zig").initialize(std.testing.allocator, std.testing.io, w);
+        _ = try collections.create(a, std.testing.io, w, .{ .id = "", .name = "users", .type = .auth, .fields = &.{} });
+        const users_col = (try collections.get(a, w, "users")).?;
+        var ud: std.json.ObjectMap = .empty;
+        try ud.put(a, "email", .{ .string = "u1@x.io" });
+        try ud.put(a, "password", .{ .string = "longenough" });
+        const user = try records.create(a, std.testing.io, w, users_col, try auth.applyCreate(std.testing.io, a, .{ .object = ud }, users_col.options.auth.minPasswordLength));
+        u_id = user.object.get("id").?.string;
+        var st = try w.prepare("SELECT tokenKey FROM users WHERE email='u1@x.io';");
+        defer st.finalize();
+        _ = try st.step();
+        u_tk = try a.dupe(u8, st.columnText(0));
+        const notes = try collections.create(a, std.testing.io, w, .{ .id = "", .name = "notes", .fields = &[_]schema.Field{
+            .{ .id = "n1", .name = "account", .options = .{ .text = .{} } },
+        }, .options = .{ .tenant_field = "account" } });
+        _ = try collections.create(a, std.testing.io, w, .{
+            .id = "",
+            .name = "tasks",
+            .fields = &[_]schema.Field{
+                .{ .id = "t1", .name = "account", .options = .{ .text = .{} } },
+                .{ .id = "t2", .name = "note", .options = .{ .relation = .{ .targetCollectionId = notes.id, .maxSelect = 1 } } },
+            },
+            .createRule = "@public",
+            .updateRule = "@public",
+            .viewRule = "@public",
+            .options = .{ .tenant_field = "account" },
+        });
+        try w.exec("INSERT INTO notes (id,created,updated,account) VALUES ('nA','t','t','accA'),('nB','t','t','accB');");
+        try w.exec("INSERT INTO tasks (id,created,updated,account,note) VALUES ('tA','t','t','accA','nA');");
+        var ins = try w.prepare("INSERT INTO _memberships (id,created,updated,account,user_collection,user,role,status) VALUES ('m1','','','accA','users',?1,'owner','active');");
+        defer ins.finalize();
+        try ins.bindText(1, u_id);
+        _ = try ins.step();
+    }
+
+    const dispatch = events.Dispatch{ .record = events.buildRecordDispatcher(.{ .tasks = .{ .beforeCreate = RelationHooks.setNote, .beforeUpdate = RelationHooks.setNote } }) };
+    var app = app_mod.App{
+        .allocator = gpa,
+        .io = std.testing.io,
+        .pool = &pool,
+        .dispatch = &dispatch,
+        .tenancy = .{ .enabled = true, .resolver = .header, .auth_collection = "users" },
+    };
+    var mintctx = http.RequestCtx{ .method = .POST, .path = "/", .allocator = RequestArena.from(&arena), .app = &app };
+    const tok = blk: {
+        const w = pool.acquireWriter();
+        defer pool.releaseWriter();
+        break :blk try api_auth.mintToken(&mintctx, w, "users", u_id, u_tk, .auth, 100000, "");
+    };
+    const bearer = try std.fmt.allocPrint(a, "Bearer {s}", .{tok});
+    const hdrs = [_]http.Param{.{ .key = "x-account-id", .value = "accA" }};
+    const col_params = [_]http.Param{.{ .key = "col", .value = "tasks" }};
+    const row_params = [_]http.Param{ .{ .key = "col", .value = "tasks" }, .{ .key = "id", .value = "tA" } };
+
+    // The hook points the relation at accB's note: create and update answer 400 validation_not_found.
+    RelationHooks.note_id = "nB";
+    for ([_]http.Method{ .POST, .PATCH }) |m| {
+        var ctx = http.RequestCtx{ .method = m, .path = "/", .body = "{}", .allocator = RequestArena.from(&arena), .app = &app, .params = if (m == .POST) &col_params else &row_params, .authorization = bearer, .headers = &hdrs };
+        const res = if (m == .POST) try create(&ctx) else try update(&ctx);
+        try std.testing.expectEqual(@as(u16, 400), res.status);
+        try std.testing.expect(std.mem.indexOf(u8, res.body, "\"validation_not_found\"") != null);
+    }
+    // Control: the same hook pointing at the active account's own note succeeds.
+    RelationHooks.note_id = "nA";
+    {
+        var ctx = http.RequestCtx{ .method = .POST, .path = "/", .body = "{}", .allocator = RequestArena.from(&arena), .app = &app, .params = &col_params, .authorization = bearer, .headers = &hdrs };
+        try std.testing.expectEqual(@as(u16, 201), (try create(&ctx)).status);
     }
 }
 

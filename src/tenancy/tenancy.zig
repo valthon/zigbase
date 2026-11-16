@@ -306,6 +306,112 @@ fn macFor(secret: []const u8, account_id: []const u8, out: *[HmacSha256.mac_leng
     h.final(out);
 }
 
+// ---- Cross-tenant relation audit (#497) ---------------------------------------
+
+/// Stored links from a tenant-owned row to a tenant-owned record of ANOTHER account, for one
+/// relation field. Since #497 a scoped request can no longer write such a link (the relation
+/// check answers `validation_not_found`), but links written earlier — before tenancy was enabled,
+/// by a superuser or `crossTenant` tooling, by an import, a migration or `ctx.records()` — stay in
+/// place. `zigbase doctor`'s `cross-tenant-relations` check reports them: on a single relation
+/// (an FK) the other account's delete of the target cascades into (`cascadeDelete`) or nulls the
+/// linking row.
+pub const CrossTenantLinks = struct {
+    collection: []const u8,
+    field: []const u8,
+    target: []const u8,
+    /// Stored links whose source and target rows are owned by two different accounts.
+    count: usize,
+    /// Multi relation only: stored values that are not a JSON array (so hold no examinable id
+    /// list). Such a value can only come from a raw-SQL write; it is reported, not guessed at.
+    unparseable: usize = 0,
+};
+
+/// Count cross-tenant links per relation field across `cols` (one entry per field with at least
+/// one link or unparseable value). Only a tenant-owned source with a relation to a tenant-owned
+/// target is examined; the target is matched by collection id or name, as `collections.get`
+/// resolves it. A link whose source or target tenant value is NULL or `''` has no owning account
+/// to differ from and is not counted (an empty tenant value is never an active account, so no
+/// scoped request can read or write such a row either). Each field is ONE aggregate statement —
+/// a JOIN for a single relation, a JOIN over the expanded JSON id array for a multi relation
+/// (`json_each` on SQLite, `jsonb_array_elements` on PostgreSQL) — so the database does the work
+/// and nothing is buffered here. Read-only.
+///
+/// On PostgreSQL a value that starts like a JSON array but is not valid JSON makes the multi
+/// relation's statement fail; the caller reports the check as not run, with that error.
+///
+/// Contract 1: caller frees the flat result with `alloc.free`; names borrow from `cols`.
+/// Query scratch is freed on every path.
+pub fn findCrossTenantLinks(alloc: std.mem.Allocator, conn: *db.Db, cols: []const schema.Collection) ![]const CrossTenantLinks {
+    var out: std.ArrayList(CrossTenantLinks) = .empty;
+    errdefer out.deinit(alloc);
+    for (cols) |src| {
+        const stf = src.options.tenant_field orelse continue;
+        for (src.fields) |f| {
+            if (f.options != .relation) continue;
+            const target_ref = f.options.relation.targetCollectionId;
+            const tgt = for (cols) |c| {
+                if (std.mem.eql(u8, c.id, target_ref) or std.mem.eql(u8, c.name, target_ref)) break c;
+            } else continue;
+            const ttf = tgt.options.tenant_field orelse continue;
+            var scratch = std.heap.ArenaAllocator.init(alloc);
+            defer scratch.deinit();
+            const arena = scratch.allocator();
+            const q: LinkQuery = .{
+                .src = try ddl.quoteIdent(arena, src.name),
+                .stf = try ddl.quoteIdent(arena, stf),
+                .field = try ddl.quoteIdent(arena, f.name),
+                .tgt = try ddl.quoteIdent(arena, tgt.name),
+                .ttf = try ddl.quoteIdent(arena, ttf),
+            };
+            const multi = f.isMultiValue();
+            var st = try conn.prepare(if (multi) try q.multiSql(arena, db.dbBackend(conn)) else try q.singleSql(arena));
+            defer st.finalize();
+            if (!try st.step()) continue;
+            const n: usize = @intCast(st.columnInt(0));
+            const bad: usize = if (multi) @intCast(st.columnInt(1)) else 0;
+            while (try st.step()) {} // drain to DONE (one aggregate row)
+            if (n > 0 or bad > 0) try out.append(alloc, .{ .collection = src.name, .field = f.name, .target = tgt.name, .count = n, .unparseable = bad });
+        }
+    }
+    return out.toOwnedSlice(alloc);
+}
+
+/// The quoted identifiers of one (source field -> target) pair. `s`/`t` aliases keep a
+/// self-relation (source == target) comparing two distinct rows.
+const LinkQuery = struct {
+    src: []const u8,
+    stf: []const u8,
+    field: []const u8,
+    tgt: []const u8,
+    ttf: []const u8,
+
+    /// Both rows owned (non-NULL, non-empty) and by different accounts.
+    fn owners(self: LinkQuery, arena: std.mem.Allocator) ![]const u8 {
+        return std.fmt.allocPrint(arena, "s.{s} <> '' AND t.{s} <> '' AND s.{s} <> t.{s}", .{ self.stf, self.ttf, self.stf, self.ttf });
+    }
+
+    fn singleSql(self: LinkQuery, arena: std.mem.Allocator) ![:0]const u8 {
+        return std.fmt.allocPrintSentinel(arena, "SELECT COUNT(*) FROM {s} AS s JOIN {s} AS t ON t.\"id\" = s.{s} WHERE {s};", .{
+            self.src, self.tgt, self.field, try self.owners(arena),
+        }, 0);
+    }
+
+    fn multiSql(self: LinkQuery, arena: std.mem.Allocator, backend: db.Backend) ![:0]const u8 {
+        return switch (backend) {
+            // Aggregate each row's links before summing so array length cannot multiply the
+            // unparseable count. CASE is lazy: json_type only sees valid JSON.
+            .sqlite => std.fmt.allocPrintSentinel(arena, "SELECT COALESCE(SUM((SELECT COUNT(*) FROM json_each(CASE WHEN json_valid(s.{s}) THEN CASE json_type(s.{s}) WHEN 'array' THEN s.{s} END END) AS j JOIN {s} AS t ON t.\"id\" = j.value WHERE j.type = 'text' AND {s})), 0), COALESCE(SUM(CASE WHEN s.{s} IS NOT NULL AND s.{s} <> '' AND NOT (CASE WHEN json_valid(s.{s}) THEN json_type(s.{s}) = 'array' ELSE 0 END) THEN 1 ELSE 0 END), 0) FROM {s} AS s;", .{
+                self.field, self.field, self.field, self.tgt, try self.owners(arena), self.field, self.field, self.field, self.field, self.src,
+            }, 0),
+            // No portable "is valid JSON" before PostgreSQL 16: only a value that looks like an
+            // array is cast (see `findCrossTenantLinks` for what a malformed one does).
+            .postgres => std.fmt.allocPrintSentinel(arena, "SELECT COALESCE(SUM((SELECT COUNT(*) FROM jsonb_array_elements(CASE WHEN s.{s} ~ '^\\s*\\[' THEN s.{s}::jsonb ELSE '[]'::jsonb END) AS j(v) JOIN {s} AS t ON t.\"id\" = (j.v #>> '{{}}') WHERE jsonb_typeof(j.v) = 'string' AND {s})), 0), COALESCE(SUM(CASE WHEN s.{s} IS NOT NULL AND s.{s} <> '' AND s.{s} !~ '^\\s*\\[' THEN 1 ELSE 0 END), 0) FROM {s} AS s;", .{
+                self.field, self.field, self.tgt, try self.owners(arena), self.field, self.field, self.field, self.src,
+            }, 0),
+        };
+    }
+};
+
 // ---- Tests ------------------------------------------------------------------
 
 const migrations = @import("../migrations.zig");
@@ -620,4 +726,136 @@ test "resolve frees partial memberships on every allocation failure" {
     try conn.exec("CREATE TABLE _memberships (account TEXT, role TEXT, user_collection TEXT, user TEXT, status TEXT);");
     try conn.exec("INSERT INTO _memberships VALUES ('acc1','editor','users','u1','active'),('acc2','viewer','users','u1','active');");
     try std.testing.checkAllAllocationFailures(std.testing.allocator, resolveAllocationProbe, .{&conn});
+}
+
+const collections_mod = @import("../collections.zig");
+const records_mod = @import("../records.zig");
+const codes_mod = @import("../error_codes.zig");
+
+fn linkFor(found: []const CrossTenantLinks, collection: []const u8, field: []const u8) ?CrossTenantLinks {
+    for (found) |l| if (std.mem.eql(u8, l.collection, collection) and std.mem.eql(u8, l.field, field)) return l;
+    return null;
+}
+
+/// Shared SQLite + PostgreSQL body for #497: `findCrossTenantLinks` counts exactly the stored
+/// cross-tenant links (single + multi, a self-relation, a target named by collection NAME; rows
+/// whose tenant value is NULL or '', dangling multi ids, non-string array items and non-tenant
+/// sources excluded) and counts multi values that are not a JSON array, and a scoped relation
+/// write refuses another account's id as `validation_not_found` on this backend.
+/// The audit result is flat and freed independently of query scratch.
+fn exerciseCrossTenantLinks(gpa: std.mem.Allocator, conn: *db.Db) !void {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try migrations.run(conn);
+    const notes = try collections_mod.create(arena, std.testing.io, conn, .{
+        .id = "",
+        .name = "notes",
+        .fields = &[_]schema.Field{
+            .{ .id = "n1", .name = "title", .options = .{ .text = .{} } },
+            .{ .id = "n2", .name = "account", .options = .{ .text = .{} } },
+            // Self-relation, its target given by collection NAME (as `collections.get` accepts).
+            .{ .id = "n3", .name = "parent", .options = .{ .relation = .{ .targetCollectionId = "notes", .maxSelect = 1 } } },
+        },
+        .options = .{ .tenant_field = "account" },
+    });
+    const tasks = try collections_mod.create(arena, std.testing.io, conn, .{ .id = "", .name = "tasks", .fields = &[_]schema.Field{
+        .{ .id = "t1", .name = "account", .options = .{ .text = .{} } },
+        .{ .id = "t2", .name = "note", .options = .{ .relation = .{ .targetCollectionId = notes.id, .maxSelect = 1 } } },
+        .{ .id = "t3", .name = "notes", .options = .{ .relation = .{ .targetCollectionId = notes.id, .maxSelect = 5 } } },
+    }, .options = .{ .tenant_field = "account" } });
+    _ = try collections_mod.create(arena, std.testing.io, conn, .{ .id = "", .name = "shared", .fields = &[_]schema.Field{
+        .{ .id = "s1", .name = "note", .options = .{ .relation = .{ .targetCollectionId = notes.id, .maxSelect = 1 } } },
+    } });
+    try conn.exec("INSERT INTO notes (id,created,updated,title,account) VALUES ('na','t','t','a','acc1'),('nb','t','t','b','acc2');");
+    try conn.exec("INSERT INTO notes (id,created,updated,title,account,parent) VALUES " ++
+        "('nc','t','t','c','acc1','nb')," ++ // self-relation across accounts: counted
+        "('nd','t','t','d','acc1','na')," ++ // self-relation, same account: not counted
+        "('ne','t','t','e','','nb');"); // '' owner: no account to differ from
+    try conn.exec("INSERT INTO tasks (id,created,updated,account,note,notes) VALUES " ++
+        "('t1','t','t','acc1','na','[\"na\"]')," ++ // same account: not counted
+        "('t2','t','t','acc1','nb','[\"na\",\"nb\"]')," ++ // cross: single + one multi id
+        "('t3','t','t','acc2','na',NULL)," ++ // cross: single
+        "('t4','t','t',NULL,'nb','[\"nb\"]')," ++ // un-owned row: no account to differ from
+        "('t5','t','t','acc1','ne','[\"ghost\",\"nb\"]')," ++ // '' target owner: no; dangling id: no; nb: counted
+        "('t6','t','t','','nb','not-json')," ++ // '' source owner: no; unparseable multi value
+        "('t7','t','t','acc1',NULL,'{\"a\":1}')," ++ // a JSON value that is not an array: unparseable
+        "('t8','t','t','acc1',NULL,'')," ++ // empty: no value, not unparseable
+        "('t9','t','t','acc1',NULL,'[1,\"nb\"]');"); // non-string item ignored; nb: counted
+    try conn.exec("INSERT INTO shared (id,created,updated,note) VALUES ('s1','t','t','nb');"); // not tenant-owned
+
+    const cols = try collections_mod.list(arena, conn);
+    try std.testing.checkAllAllocationFailures(gpa, checkCrossTenantLinkAllocations, .{ conn, cols });
+    const found = try findCrossTenantLinks(gpa, conn, cols);
+    defer gpa.free(found);
+    try std.testing.expectEqual(@as(usize, 3), found.len);
+    const single = linkFor(found, "tasks", "note") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("notes", single.target);
+    try std.testing.expectEqual(@as(usize, 2), single.count);
+    try std.testing.expectEqual(@as(usize, 0), single.unparseable);
+    const multi = linkFor(found, "tasks", "notes") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(usize, 3), multi.count);
+    try std.testing.expectEqual(@as(usize, 2), multi.unparseable);
+    // Both backends must return both counts from the same prepared statement.
+    const q: LinkQuery = .{ .src = "\"tasks\"", .stf = "\"account\"", .field = "\"notes\"", .tgt = "\"notes\"", .ttf = "\"account\"" };
+    var aggregate = try conn.prepare(try q.multiSql(arena, db.dbBackend(conn)));
+    defer aggregate.finalize();
+    try std.testing.expect(try aggregate.step());
+    try std.testing.expectEqual(@as(i64, 3), aggregate.columnInt(0));
+    try std.testing.expectEqual(@as(i64, 2), aggregate.columnInt(1));
+    try std.testing.expect(!try aggregate.step());
+    try conn.exec("DELETE FROM tasks;");
+    var empty = try conn.prepare(try q.multiSql(arena, db.dbBackend(conn)));
+    defer empty.finalize();
+    try std.testing.expect(try empty.step());
+    try std.testing.expectEqual(@as(i64, 0), empty.columnInt(0));
+    try std.testing.expectEqual(@as(i64, 0), empty.columnInt(1));
+    try std.testing.expect(!try empty.step());
+    const self = linkFor(found, "notes", "parent") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("notes", self.target);
+    try std.testing.expectEqual(@as(usize, 1), self.count);
+
+    // The scoped relation check on this backend: another account's id is refused like a missing one.
+    const member = request.RequestContext{ .tenancy_enabled = true, .account_id = "acc1" };
+    var data: std.json.ObjectMap = .empty;
+    try data.put(arena, "note", .{ .string = "nb" });
+    try std.testing.expectError(error.Validation, records_mod.createInTxnOpts(arena, std.testing.io, conn, tasks, .{ .object = data }, .{ .relation_scope = &member }));
+    const errs = records_mod.last_errors orelse return error.TestExpectedEqual;
+    records_mod.last_errors = null; // arena-owned; freed with the arena
+    try std.testing.expectEqual(@as(usize, 1), errs.len);
+    try std.testing.expectEqualStrings(codes_mod.s(.validation_not_found), errs[0].code);
+    try data.put(arena, "note", .{ .string = "na" });
+    _ = try records_mod.createInTxnOpts(arena, std.testing.io, conn, tasks, .{ .object = data }, .{ .relation_scope = &member });
+}
+
+fn checkCrossTenantLinkAllocations(a: std.mem.Allocator, conn: *db.Db, cols: []const schema.Collection) !void {
+    const found = try findCrossTenantLinks(a, conn, cols);
+    defer a.free(found);
+    try std.testing.expectEqual(@as(usize, 3), found.len);
+}
+
+test "findCrossTenantLinks + scoped relation check on SQLite (#497)" {
+    var conn = try db.Db.openMemory();
+    defer conn.close();
+    try exerciseCrossTenantLinks(std.testing.allocator, &conn);
+}
+
+test "findCrossTenantLinks + scoped relation check on PostgreSQL (#497)" {
+    if (comptime !@import("build_options").postgres) return error.SkipZigTest;
+    const url = std.testing.environ.getPosix("ZIGBASE_PG_TEST_URL") orelse return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var conn = try db.Db.openPostgres(a, std.testing.io, url);
+    defer conn.close();
+    const token = try @import("../crypto.zig").genHex(std.testing.io, a, 24);
+    defer a.free(token);
+    const create = try std.fmt.allocPrintSentinel(a, "CREATE SCHEMA tenant_links_{s};", .{token}, 0);
+    defer a.free(create);
+    const drop = try std.fmt.allocPrintSentinel(a, "DROP SCHEMA tenant_links_{s} CASCADE;", .{token}, 0);
+    defer a.free(drop);
+    const path = try std.fmt.allocPrintSentinel(a, "SET search_path TO tenant_links_{s};", .{token}, 0);
+    defer a.free(path);
+    try conn.exec(create);
+    defer conn.exec(drop) catch |err| std.log.err("tenant links test schema cleanup failed: {s}", .{@errorName(err)});
+    try conn.exec(path);
+    try exerciseCrossTenantLinks(a, &conn);
 }
