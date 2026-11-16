@@ -995,3 +995,53 @@ def test_backend_rejects_prototype_setter_field_name(page, kind):
     assert response.status == 400, response.text()
     assert response.json()['data']['__proto__']['message']
     assert not any(c['name'] == 'profiles' for c in api_request(page, 'GET', '/api/collections').json()['items'])
+
+
+@pytest.mark.parametrize('next_request', ['refresh', 'write', 'failed-write'])
+def test_cookie_rotation_does_not_invalidate_queued_requests(page, next_request):
+    login(page)
+    if next_request == 'failed-write':
+        page.route('**/api/collections', lambda route: (
+            route.fulfill(status=503, json={'message': 'Temporary failure'})
+            if route.request.method == 'POST' else route.continue_()
+        ))
+    # Reproduce the browser/network ordering under route interception or load:
+    # the API calls start before the first refresh response, but the second
+    # fetch is dispatched after that response has installed the new cookies.
+    # Only dispatch is controlled; the real server authenticates both requests.
+    result = page.evaluate("""async next => {
+        const { API, cookie } = await import('/_/assets/lib/api.js');
+        const fetch = window.fetch.bind(window);
+        let dispatched = Promise.resolve();
+        const statuses = [];
+        const csrfMatches = [];
+        window.fetch = (url, options) => {
+            if (options?.method !== 'POST') return fetch(url, options);
+            const response = dispatched.then(() => {
+                csrfMatches.push(options.headers['X-CSRF-Token'] === cookie('zb_csrf'));
+                return fetch(url, options);
+            });
+            dispatched = response.then(res => { statuses.push(res.status); });
+            return response;
+        };
+        try {
+            const calls = await Promise.allSettled([
+                API.refresh(),
+                next === 'refresh' ? API.refresh() : API.createCollection({
+                    name: 'after_refresh', type: 'base', fields: [],
+                }),
+                API.refresh(), // Must still run after a rejected write.
+            ]);
+            return { calls: calls.map(c => c.status), statuses, csrfMatches, hash: location.hash };
+        } finally {
+            window.fetch = fetch;
+        }
+    }""", next_request)
+    assert result == {
+        'calls': ['fulfilled', 'rejected' if next_request == 'failed-write' else 'fulfilled', 'fulfilled'],
+        'statuses': [200, {'refresh': 200, 'write': 201, 'failed-write': 503}[next_request], 200],
+        'csrfMatches': [True, True, True],
+        'hash': '#/collections',
+    }
+    if next_request == 'write':
+        assert any(c['name'] == 'after_refresh' for c in api_request(page, 'GET', '/api/collections').json()['items'])
