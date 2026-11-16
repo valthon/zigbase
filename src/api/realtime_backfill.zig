@@ -8,7 +8,6 @@ const hub = @import("../realtime/hub.zig");
 const Conn = @import("../realtime/connection.zig").Conn;
 const ApiError = @import("error.zig").ApiError;
 const unsupported_backend = ApiError.withCode(501, .not_implemented, "Backfill supports single-process SQLite only.");
-const DeliveryError = @typeInfo(@typeInfo(@TypeOf(hub.frameForCollectionDelivery)).@"fn".return_type.?).error_union.error_set;
 
 pub fn get(ctx: *http.RequestCtx) !http.Response {
     if (comptime !@import("build_options").realtime_backfill) return ApiError.notFound().toResponse(ctx.allocator.a);
@@ -53,57 +52,97 @@ pub fn get(ctx: *http.RequestCtx) !http.Response {
         if (cursor.len <= cursor_scope.len or !std.mem.startsWith(u8, cursor, cursor_scope) or cursor[cursor_scope.len] != ':') return resetRequired(a);
         break :blk cursor[cursor_scope.len + 1 ..];
     } else null;
-    const result = blk: {
-        if (comptime @import("build_options").durable_realtime) {
-            var journal_reader = try app.pool.acquireReader();
-            defer app.pool.releaseReader(&journal_reader);
-            const page = @import("../realtime/durable.zig").readPage(ctx.allocator, app.io, &journal_reader, collection.id, cursor_scope, checkpoint, input.limit, @import("../clock.zig").nowUnix(app.io)) catch |err| switch (err) {
-                error.ResetRequired, error.ReplayFrameTooLarge => return resetRequired(a),
-                else => return err,
-            };
-            break :blk page;
-        } else {
-            const store = app.backfill.?;
-            const page = store.page(ctx.allocator, collection.id, checkpoint, input.limit) catch |err| switch (err) {
-                error.ResetRequired => return resetRequired(a),
-                else => return err,
-            };
-            const entries = try a.alloc(@import("../realtime/durable.zig").Entry, page.items.len);
-            for (page.items, entries) |source, *dest| dest.* = .{ .frame = source.frame };
-            break :blk @import("../realtime/durable.zig").Page{ .items = entries, .position = try store.cursor(a, page), .has_next = page.has_next };
-        }
+    const backfill = @import("../realtime/backfill.zig");
+    const durable = @import("../realtime/durable.zig");
+    const delivery = Delivery{ .a = a, .app = app, .conn = &conn, .topic = input.topic, .collection_id = collection.id };
+    const page = if (comptime @import("build_options").durable_realtime) blk: {
+        const now = @import("../clock.zig").nowUnix(app.io);
+        var journal_reader = try app.pool.acquireReader();
+        const resolved = durable.resolve(a, &journal_reader, cursor_scope, checkpoint, now);
+        app.pool.releaseReader(&journal_reader);
+        const start = resolved catch |err| return failure(a, err);
+        const filled = if (checkpoint == null)
+            backfill.Filled(std.json.Value){ .items = &.{}, .next = @intCast(start.head), .has_next = false }
+        else
+            backfill.fill(std.json.Value, ctx.allocator, JournalSource{ .app = app, .collection_id = collection.id, .upto = start.head, .now = now }, delivery, @intCast(start.after), input.limit, durable.scan_budget, durable.scan_chunk) catch |err| return failure(a, err);
+        break :blk .{ filled, try durable.sealCursor(a, app.io, start.key, cursor_scope, @intCast(filled.next)) };
+    } else blk: {
+        const store = app.backfill.?;
+        const start = store.start(collection.id, checkpoint) catch |err| return failure(a, err);
+        // The ring holds at most `max_entries`: one chunk reaches the head.
+        const filled = if (checkpoint == null)
+            backfill.Filled(std.json.Value){ .items = &.{}, .next = start.sequence, .has_next = false }
+        else
+            backfill.fill(std.json.Value, ctx.allocator, LocalSource{ .store = store, .id = collection.id, .generation = start.generation }, delivery, start.sequence, input.limit, backfill.max_entries, backfill.max_entries) catch |err| return failure(a, err);
+        break :blk .{ filled, try store.seal(a, collection.id, .{ .generation = start.generation, .sequence = filled.next }) };
     };
-    var items: std.ArrayList(std.json.Value) = .empty;
-    for (result.items) |e| {
-        // Deliberately revalidate identity and reacquire current collection metadata
-        // per item: a revocation committed mid-page discards the entire response.
-        // A request-wide identity/schema snapshot would weaken that guarantee.
-        const delivered = hub.frameForCollectionDelivery(a, app, &conn, null, input.topic, e.frame, col.?.id) catch |err| return deliveryError(a, err);
-        if (delivered) |frame| {
-            const value = try std.json.parseFromSliceLeaky(std.json.Value, a, frame, .{});
-            try items.append(a, value);
-        }
-    }
-    const position = result.position;
+    const filled, const position = page;
     const next_cursor = try std.fmt.allocPrint(a, "{s}:{s}", .{ cursor_scope, position });
     if (comptime @import("build_options").durable_realtime) {
-        const durable = @import("../realtime/durable.zig");
-        return .{ .status = 200, .body = try std.json.Stringify.valueAlloc(a, .{ .items = items.items, .nextCursor = next_cursor, .hasNext = result.has_next, .resetRequired = false, .retention = .{ .maxEntries = durable.max_entries, .maxBytes = durable.max_bytes, .maxFrameBytes = durable.max_frame_bytes, .seconds = durable.retention_seconds } }, .{}) };
+        return .{ .status = 200, .body = try std.json.Stringify.valueAlloc(a, .{ .items = filled.items, .nextCursor = next_cursor, .hasNext = filled.has_next, .resetRequired = false, .retention = .{ .maxEntries = durable.max_entries, .maxBytes = durable.max_bytes, .maxFrameBytes = durable.max_frame_bytes, .seconds = durable.retention_seconds } }, .{}) };
     }
-    return .{ .status = 200, .body = try std.json.Stringify.valueAlloc(a, .{ .items = items.items, .nextCursor = next_cursor, .hasNext = result.has_next, .resetRequired = false }, .{}) };
+    return .{ .status = 200, .body = try std.json.Stringify.valueAlloc(a, .{ .items = filled.items, .nextCursor = next_cursor, .hasNext = filled.has_next, .resetRequired = false }, .{}) };
 }
 
-/// The shared delivery path can fail after earlier items were authorized. Return
-/// only an error envelope, never a partial page/checkpoint. Operational failures
-/// (out of memory, the reader pool, the live database or the delete-authorization
-/// sandbox failing) still propagate to the server's 500 handler so a retry of the
-/// same checkpoint can succeed; identity changes require reauth. A failure tied to
-/// ONE retained item would instead repeat on every retry, so it never reaches here:
-/// a deletion snapshot that no longer fits its fields, or a rule that cannot be
-/// compiled against it, is a logged per-item deny in `hub.matchesSnapshot` (#499).
-fn deliveryError(allocator: std.mem.Allocator, err: DeliveryError) DeliveryError!http.Response {
-    if (err == error.AuthenticationChanged) return ApiError.unauthorized().toResponse(allocator);
+/// Per-item authorization for `backfill.fill`. Identity is deliberately revalidated and
+/// collection metadata reacquired per item: a revocation committed mid-page discards the
+/// entire response. A request-wide identity/schema snapshot would weaken that guarantee.
+const Delivery = struct {
+    a: std.mem.Allocator,
+    app: *@import("../app.zig").App,
+    conn: *const Conn,
+    topic: []const u8,
+    collection_id: []const u8,
+    pub fn deliver(self: Delivery, scratch: std.mem.Allocator, entry: @import("../realtime/backfill.zig").Entry) !?std.json.Value {
+        const frame = try hub.frameForCollectionDelivery(scratch, self.app, self.conn, null, self.topic, entry.frame, self.collection_id) orelse return null;
+        // `frame` may alias the chunk's scratch copy: own every string on the request arena.
+        return try std.json.parseFromSliceLeaky(std.json.Value, self.a, frame, .{ .allocate = .alloc_always });
+    }
+};
+
+const LocalSource = struct {
+    store: *@import("../realtime/backfill.zig").Store,
+    id: []const u8,
+    generation: u64,
+    pub fn fetch(self: LocalSource, arena: @import("../request_arena.zig").RequestArena, after: u64, max: usize) !@import("../realtime/backfill.zig").Page {
+        return self.store.read(arena, self.id, .{ .generation = self.generation, .sequence = after }, max);
+    }
+};
+
+/// Chunks of the journal up to the head the request resolved, each in its own read
+/// transaction (a reader is held only for the chunk, never across authorization).
+const JournalSource = struct {
+    app: *@import("../app.zig").App,
+    collection_id: []const u8,
+    upto: i64,
+    now: i64,
+    pub fn fetch(self: JournalSource, arena: @import("../request_arena.zig").RequestArena, after: u64, max: usize) !@import("../realtime/backfill.zig").Page {
+        var reader = try self.app.pool.acquireReader();
+        defer self.app.pool.releaseReader(&reader);
+        return @import("../realtime/durable.zig").readPage(arena, &reader, self.collection_id, @intCast(after), self.upto, max, self.now);
+    }
+};
+
+/// A page can fail after earlier items were authorized. Return only an error envelope,
+/// never a partial page/checkpoint. A stale checkpoint, or a retained frame over the
+/// current budget, needs a reset (409); an identity change mid-page needs reauth (401).
+/// Operational failures (out of memory, the reader pool, the live database or the
+/// delete-authorization sandbox failing) propagate to the server's 500 handler so a retry
+/// of the same checkpoint can succeed. A failure tied to ONE retained item would instead
+/// repeat on every retry, so it never reaches here: a deletion snapshot that no longer
+/// fits its fields, or a rule that cannot be compiled against it, is a logged per-item
+/// deny in `hub.matchesSnapshot` (#499).
+fn failure(allocator: std.mem.Allocator, err: anytype) (@TypeOf(err) || error{OutOfMemory})!http.Response {
+    if (try failureResponse(allocator, err)) |response| return response;
     return err;
+}
+
+fn failureResponse(allocator: std.mem.Allocator, err: anyerror) error{OutOfMemory}!?http.Response {
+    return switch (err) {
+        error.ResetRequired, error.ReplayFrameTooLarge => try resetRequired(allocator),
+        error.AuthenticationChanged => try ApiError.unauthorized().toResponse(allocator),
+        else => null,
+    };
 }
 
 test "backfill unsupported backend uses the standard error envelope" {
@@ -113,13 +152,18 @@ test "backfill unsupported backend uses the standard error envelope" {
     try std.testing.expectEqualStrings("{\"status\":501,\"code\":\"not_implemented\",\"message\":\"Backfill supports single-process SQLite only.\",\"data\":{}}", response.body);
 }
 
-test "backfill mid-page identity change returns 401 without partial results or cursor" {
-    const response = try deliveryError(std.testing.allocator, error.AuthenticationChanged);
+test "backfill mid-page identity change returns 401 and stale pages 409, without partial results or cursor" {
+    const response = try failure(std.testing.allocator, @as(anyerror, error.AuthenticationChanged));
     defer std.testing.allocator.free(response.body);
     try std.testing.expectEqual(@as(u16, 401), response.status);
     try std.testing.expectEqualStrings("{\"status\":401,\"code\":\"unauthorized\",\"message\":\"Unauthorized.\",\"data\":{}}", response.body);
-    try std.testing.expectError(error.OutOfMemory, deliveryError(std.testing.allocator, error.OutOfMemory));
-    try std.testing.expectError(error.PrepareFailed, deliveryError(std.testing.allocator, error.PrepareFailed));
+    for ([_]anyerror{ error.ResetRequired, error.ReplayFrameTooLarge }) |err| {
+        const reset = try failure(std.testing.allocator, err);
+        defer std.testing.allocator.free(reset.body);
+        try std.testing.expectEqual(@as(u16, 409), reset.status);
+    }
+    try std.testing.expectError(error.OutOfMemory, failure(std.testing.allocator, @as(anyerror, error.OutOfMemory)));
+    try std.testing.expectError(error.PrepareFailed, failure(std.testing.allocator, @as(anyerror, error.PrepareFailed)));
 }
 
 fn resetRequired(allocator: std.mem.Allocator) !http.Response {

@@ -1521,7 +1521,8 @@ transactional database journal. Checkpoints survive application restarts and wor
 on other instances connected to the same database and PostgreSQL schema.
 Cursor positions are encrypted and authenticated with a persistent journal secret
 and fresh random nonces; they bind collection identity and rename generation
-without exposing other collections' aggregate write positions.
+without exposing any write position: a cursor's bytes do not change with writes
+the caller may not see, in this collection or any other.
 
 Built-in REST record create, update and delete operations append invalidations
 **inside the record transaction**, including resumable record updates. A REST
@@ -1566,11 +1567,29 @@ a cursor equal to its last sequence is still caught up. This also keeps fresh he
 checkpoints usable on an idle journal after every retained entry expires. Reads reject stale checkpoints
 even before physical cleanup. Clock differences can shorten useful retention;
 keep replica clocks synchronized. A backwards clock never revives a pruned cursor.
-Pages copy at most 128 frames (8 MiB encoded with default frame budget), plus temporary database and JSON
-storage. Admission/concurrency budgets remain application responsibilities.
+A request scans the collection's journal entries in read transactions of at most
+128 entries each (8 MiB encoded with the default frame budget), authorizing each entry
+after releasing that reader, until its page holds `limit` authorized items plus one
+more that sets `hasNext`, or it reaches the journal head it started from. It examines
+at most **4096 entries** (or `-Dreplay-max-entries`, if lower): at the default budgets
+every retained entry fits, so a page always reaches that head. Only a build with
+`-Dreplay-max-entries` above 4096 can retain more: a request that examines 4096 entries
+without filling its page stops there and returns the items it found, `hasNext: true`
+and a cursor after the examined entries, so its page count then grows by one per 4096
+entries the caller may not see. Each examined entry costs one authorization, whether
+or not the caller may see it, so response time grows with them; a request authorizes at
+most 4096 entries and uses temporary database and JSON storage. Admission/concurrency
+budgets remain application responsibilities.
 
-Unlike the local store, retention is shared across collections: a busy collection
-can cause another collection's checkpoint to require reset. Invalid, expired,
+Unlike the local store, retention is shared across collections **and across tenants**:
+a busy collection can cause another collection's checkpoint to require reset, and one
+tenant's write volume can evict the entries other tenants' checkpoints depend on, so
+their next request answers `409 resetRequired` and the client reloads its snapshot.
+A tenant can cause this at will by writing past the budget. The `409` itself tells
+the caller that, since its checkpoint, the journal received more than its entry or byte
+budget across all collections and tenants, or that retention expired; it reveals no
+content, ids or tenant attribution. Deployments that cannot accept this should size
+the budgets for their write volume. Invalid, expired,
 evicted, collection-renamed or wrong-collection checkpoints return the same `409 resetRequired`
 envelope below. Obtain a new checkpoint before reloading a snapshot. A cursorless
 request does not reserve retention. Snapshot reload and idempotent application of
@@ -1644,8 +1663,10 @@ current capture position. Clients should:
 2. Load the snapshot, then consume pages from the checkpoint. Apply invalidations
    idempotently: refetch creates/updates, remove deletes. An event may already
    have been reflected in the snapshot.
-3. Save each `nextCursor`, even on empty pages; `limit` bounds this collection's scanned entries,
-   not the number of authorized matches. Continue while `hasNext` is true.
+3. Save each `nextCursor`, even on empty pages. `limit` bounds the number of
+   **authorized** items in a page: the server skips entries the caller may not see
+   and keeps scanning, and `hasNext` is true only when another authorized item
+   follows. Continue while `hasNext` is true.
 4. Repeat periodically and after WS/SSE reconnect. Live transport frames do not
    carry these cursors; keep the backfill checkpoint separately.
 
@@ -1654,9 +1675,11 @@ The store has **16 collection slots**, each independently retaining at most
 all slots). Rings are allocated lazily; on 64-bit targets their metadata is about
 6 KiB per active slot, plus the collection id and small store header. A busy
 collection cannot evict another slot's events or cause it to paginate over
-unrelated traffic. Pages copy only the requested collection's frames, at most
-128 before authorization. Serialization and concurrent requests require
-additional transient memory; these are retained-data limits, not an RSS cap.
+unrelated traffic. A request copies only the requested collection's frames (at
+most its 256 retained events) and authorizes each in turn until the page holds
+`limit` items plus one more that sets `hasNext`. Serialization and concurrent
+requests require additional transient memory; these are retained-data limits, not
+an RSS cap.
 
 Only a **record write** can replace an occupied slot: when it needs a new slot
 and all 16 are occupied, the least recently captured/polled slot is replaced.
@@ -1668,7 +1691,10 @@ to that collection can establish its slot.
 
 A replaced slot's cursors require reset even if that same
 collection later gets another slot: cursors bind the slot generation as well as
-the collection id and process epoch. Workloads actively using more than 16
+the collection id, sealed under a random per-process key (so a cursor from another
+process or before a restart fails authentication). Like the durable journal's,
+these cursors are encrypted with fresh nonces, so their bytes do not change with
+writes the caller may not see. Workloads actively using more than 16
 collections may therefore need frequent snapshot reloads. An oversized event
 or failed capture invalidates only that collection's older checkpoints rather
 than silently skipping a write. Restart, another process, relevant event/slot
@@ -1676,6 +1702,13 @@ eviction, invalid cursors and failed capture return `409` with
 `{resetRequired:true, items:[], nextCursor:null, hasNext:false}`. Discard the old
 checkpoint and repeat the initial snapshot sequence. Capture positions and
 pagination are collection-local; slot replacement is still a shared capacity limit.
+A collection's ring is also shared by every tenant and user writing to it: writes
+the caller may not see can evict its checkpoint, and the resulting `409` tells it
+that the collection received more than 256 events (or more than 64 KiB of frames)
+since that checkpoint, or that the slot was replaced or invalidated. Apart from that `409` and response time
+(a request authorizes every retained entry it scans, visible or not), a page's
+items, `hasNext`, page count and cursor do not depend on entries the caller may
+not see.
 
 **Maximum event size is 64 KiB, including the JSON envelope.** This is also the
 per-collection retention budget, deliberately kept small for bounded memory use.
