@@ -80,7 +80,7 @@ const Bound = struct {
 
     fn add(self: *Bound, comptime col_op: []const u8, value: []const u8) !void {
         const n = self.params.items.len + 1;
-        const cond = try std.fmt.allocPrint(self.alloc, col_op ++ " ?{d}", .{n});
+        const cond = try self.alloc.print(col_op ++ " ?{d}", .{n});
         // If the second append OOMs, the just-built `cond` would leak (a bare `errdefer` would be
         // wrong AFTER the list took ownership, but here ownership only transfers on success).
         self.conds.append(self.alloc, cond) catch |e| {
@@ -94,7 +94,7 @@ const Bound = struct {
         if (self.conds.items.len == 0) return "";
         const joined = try std.mem.join(self.alloc, " AND ", self.conds.items);
         defer self.alloc.free(joined); // scratch: only the wrapped result escapes
-        return std.fmt.allocPrint(self.alloc, " WHERE {s}", .{joined});
+        return self.alloc.print(" WHERE {s}", .{joined});
     }
 
     /// Free everything `Bound` OWNS: the per-condition SQL fragments (built by `add`/the cursor
@@ -186,7 +186,7 @@ pub fn events(ctx: *http.RequestCtx) anyerror!http.Response {
         const cur = parseCursor(raw) orelse
             return ApiError.badRequest("Invalid cursor.").toResponse(ctx.allocator.a);
         const n1 = b.params.items.len + 1;
-        try b.conds.append(ctx.allocator.a, try std.fmt.allocPrint(ctx.allocator.a, "(\"occurred_at\" <= ?{d} AND (\"occurred_at\" < ?{d} OR \"id\" < ?{d}))", .{ n1, n1, n1 + 1 }));
+        try b.conds.append(ctx.allocator.a, try ctx.allocator.a.print("(\"occurred_at\" <= ?{d} AND (\"occurred_at\" < ?{d} OR \"id\" < ?{d}))", .{ n1, n1, n1 + 1 }));
         try b.params.append(ctx.allocator.a, cur.occurred_at);
         try b.params.append(ctx.allocator.a, cur.id);
     };
@@ -194,7 +194,7 @@ pub fn events(ctx: *http.RequestCtx) anyerror!http.Response {
     const limit = parseLimit(qp.get("limit"));
     const where = try b.whereClause();
     // Fetch one extra row as a hasNext lookahead; trimmed back to `limit` below.
-    const sql = try std.fmt.allocPrintSentinel(ctx.allocator.a, "SELECT \"id\",\"created\",\"name\",\"payload\",\"actor_collection\",\"actor\",\"account\",\"occurred_at\" " ++
+    const sql = try ctx.allocator.a.printSentinel("SELECT \"id\",\"created\",\"name\",\"payload\",\"actor_collection\",\"actor\",\"account\",\"occurred_at\" " ++
         "FROM \"_events\"{s} ORDER BY \"occurred_at\" DESC, \"id\" DESC LIMIT {d};", .{ where, limit + 1 }, 0);
 
     var st = try reader.prepare(try lowerFor(ctx, &reader, sql));
@@ -223,7 +223,7 @@ pub fn events(ctx: *http.RequestCtx) anyerror!http.Response {
         const occurred_at = try ctx.allocator.a.dupe(u8, st.columnText(7));
         try o.put(ctx.allocator.a, "occurred_at", .{ .string = occurred_at });
         try items.append(.{ .object = o });
-        if (fetched == limit) pending_cursor = try std.fmt.allocPrint(ctx.allocator.a, "{s}|{s}", .{ occurred_at, id });
+        if (fetched == limit) pending_cursor = try ctx.allocator.a.print("{s}|{s}", .{ occurred_at, id });
     }
     return wrapEventsPage(ctx, items, if (has_next) pending_cursor else null, has_next);
 }
@@ -272,7 +272,7 @@ pub fn rollups(ctx: *http.RequestCtx) anyerror!http.Response {
     // The summary table is created by the first rollup run; until then the rollup has no rows.
     if (!try analytics.summaryExists(&reader, table)) return emptyItems(ctx);
     const where = try b.whereClause();
-    const sql = try std.fmt.allocPrintSentinel(ctx.allocator.a, "SELECT \"bucket\",\"account\",\"actor\",\"value\",\"computed_at\" FROM {s}{s} " ++
+    const sql = try ctx.allocator.a.printSentinel("SELECT \"bucket\",\"account\",\"actor\",\"value\",\"computed_at\" FROM {s}{s} " ++
         "ORDER BY \"bucket\" DESC, \"account\", \"actor\";", .{ try ddl.quoteIdent(ctx.allocator.a, table), where }, 0);
 
     var st = try reader.prepare(try lowerFor(ctx, &reader, sql));
@@ -409,7 +409,7 @@ const TenantTestEnv = struct {
         env.arena = std.heap.ArenaAllocator.init(gpa);
         const a = env.arena.allocator();
         const dir = try env.tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
-        const path = try std.fmt.allocPrintSentinel(a, "{s}/t.db", .{dir}, 0);
+        const path = try a.printSentinel("{s}/t.db", .{dir}, 0);
         env.pool = try db.Pool.init(gpa, std.testing.io, path);
         env.app = .{
             .allocator = gpa,
@@ -450,7 +450,7 @@ const TenantTestEnv = struct {
             defer env.pool.releaseWriter();
             break :blk try api_auth.mintToken(&mintctx, w, "users", u_id, u_tk, .auth, 100000, "");
         };
-        env.bearer = try std.fmt.allocPrint(a, "Bearer {s}", .{tok});
+        env.bearer = try a.print("Bearer {s}", .{tok});
         return env;
     }
 
@@ -562,7 +562,7 @@ test "events read paginates with the house cursor: a two-page walk over 3 events
     const cursor1 = p1.value.object.get("nextCursor").?.string;
 
     // Page 2: fed cursor1 back -> the remaining row (e1), exactly once; no more pages.
-    const q2 = try std.fmt.allocPrint(a, "limit=2&cursor={s}", .{cursor1});
+    const q2 = try a.print("limit=2&cursor={s}", .{cursor1});
     var c2 = http.RequestCtx{ .method = .GET, .path = "/api/analytics/events", .allocator = RequestArena.from(&env.arena), .app = &env.app, .authorization = env.bearer, .headers = &hdrs, .query = q2 };
     const r2 = try events(&c2);
     try std.testing.expectEqual(@as(u16, 200), r2.status);

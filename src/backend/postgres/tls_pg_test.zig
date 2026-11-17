@@ -19,7 +19,7 @@ fn urlWith(a: std.mem.Allocator, host: []const u8, query: []const u8) ![]const u
     const at = std.mem.indexOfScalarPos(u8, base, scheme_end, '@') orelse return error.TestUnexpectedResult;
     const userinfo = base[scheme_end..at]; // verbatim (still percent-encoded if it ever was)
     const bracketed = std.mem.indexOfScalar(u8, host, ':') != null; // IPv6 literal
-    return std.fmt.allocPrint(a, "postgres://{s}@{s}{s}{s}:{d}/{s}{s}", .{
+    return a.print("postgres://{s}@{s}{s}{s}:{d}/{s}{s}", .{
         userinfo,
         if (bracketed) "[" else "",
         host,
@@ -46,7 +46,7 @@ fn connectUrl(a: std.mem.Allocator, io: std.Io, url: []const u8) !*pg.Conn {
 test "pg tls: verify-full + sslrootcert + DNS host succeeds end-to-end" {
     const ca = pgtests.getEnv("ZIGBASE_PG_TLS_CA") orelse return error.SkipZigTest;
     const a = std.testing.allocator;
-    const query = try std.fmt.allocPrint(a, "?sslmode=verify-full&sslrootcert={s}", .{ca});
+    const query = try a.print("?sslmode=verify-full&sslrootcert={s}", .{ca});
     defer a.free(query);
     const url = try urlWith(a, "localhost", query);
     defer a.free(url);
@@ -66,7 +66,7 @@ test "pg tls: verify-full with system roots rejects the self-signed server (Cert
 test "pg tls: verify-full via an IP-literal host fails hostname verification" {
     const ca = pgtests.getEnv("ZIGBASE_PG_TLS_CA") orelse return error.SkipZigTest;
     const a = std.testing.allocator;
-    const query = try std.fmt.allocPrint(a, "?sslmode=verify-full&sslrootcert={s}", .{ca});
+    const query = try a.print("?sslmode=verify-full&sslrootcert={s}", .{ca});
     defer a.free(query);
     const url = try urlWith(a, "127.0.0.1", query);
     defer a.free(url);
@@ -81,7 +81,7 @@ test "pg tls: the DEFAULT mode is verify-full — a bare URL fails vs self-signe
     defer a.free(bare);
     try std.testing.expectError(error.CertUntrusted, connectUrl(a, std.testing.io, bare));
     // Same bare-mode URL + the CA -> the default verifies and connects. Pins the default.
-    const query = try std.fmt.allocPrint(a, "?sslrootcert={s}", .{ca});
+    const query = try a.print("?sslrootcert={s}", .{ca});
     defer a.free(query);
     const with_ca = try urlWith(a, "localhost", query);
     defer a.free(with_ca);

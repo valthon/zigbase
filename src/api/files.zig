@@ -219,7 +219,7 @@ pub fn serve(ctx: *http.RequestCtx) anyerror!http.Response {
         // RFC 9110 §15.4.5: a 304 replays the validator + cache policy only, but the
         // Content-Type still applies to the (unsent) representation — omitting it lets
         // the server fall back to its default application/json, which is wrong here.
-        const representation_length = try std.fmt.allocPrint(ctx.allocator.a, "{d}", .{st.size});
+        const representation_length = try ctx.allocator.a.print("{d}", .{st.size});
         const hs304 = try ctx.allocator.a.dupe(http.Header, &.{
             .{ .name = "ETag", .value = etag },
             .{ .name = "Cache-Control", .value = cache },
@@ -239,7 +239,7 @@ pub fn serve(ctx: *http.RequestCtx) anyerror!http.Response {
     };
     const inline_safe = isInlineSafeExt(ext);
     const disp_kind: []const u8 = if (force_download or !inline_safe) "attachment" else "inline";
-    const disposition = try std.fmt.allocPrint(ctx.allocator.a, "{s}; filename=\"{s}\"", .{ disp_kind, name });
+    const disposition = try ctx.allocator.a.print("{s}; filename=\"{s}\"", .{ disp_kind, name });
 
     var hs: std.ArrayList(http.Header) = .empty;
     try hs.appendSlice(ctx.allocator.a, &.{
@@ -262,7 +262,7 @@ pub fn serve(ctx: *http.RequestCtx) anyerror!http.Response {
         // set-if-missing, so the real length survives while zero bytes are sent.
         try hs.append(ctx.allocator.a, .{
             .name = "content-length",
-            .value = try std.fmt.allocPrint(ctx.allocator.a, "{d}", .{p.len}),
+            .value = try ctx.allocator.a.print("{d}", .{p.len}),
         });
         return .{ .status = p.status, .body = "", .content_type = content_type, .extra_headers = try hs.toOwnedSlice(ctx.allocator.a) };
     }
@@ -332,7 +332,7 @@ test "fileIdentity rejects a full .auth token supplied via ?token= (only .file a
     var app = app_mod.App{ .allocator = std.testing.allocator, .io = std.testing.io, .pool = undefined };
     const key = crypto.deriveKey(app.jwt_secret, "tk");
     const auth_tok = try jwt.sign(a, .{ .id = "rec1", .collection = "users", .type = .auth, .iat = 0, .exp = 9999999999 }, &key);
-    const query = try std.fmt.allocPrint(a, "token={s}", .{auth_tok});
+    const query = try a.print("token={s}", .{auth_tok});
     var ctx = http.RequestCtx{ .method = .GET, .path = "/api/files/users/rec1/x.png", .query = query, .allocator = RequestArena.from(&arena), .app = &app, .params = &[_]http.Param{} };
     // Pre-hardening (accepted set `.{ .auth, .file }`) this returned the .auth record; now null.
     try std.testing.expect(fileIdentity(&ctx, &d) == null);
@@ -441,7 +441,7 @@ test "serve: header emission — exactly one Cache-Control, ETag, Accept-Ranges;
     defer arena.deinit();
     const a = arena.allocator();
     const dir_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
-    const db_path = try std.fmt.allocPrintSentinel(a, "{s}/test.db", .{dir_path}, 0);
+    const db_path = try a.printSentinel("{s}/test.db", .{dir_path}, 0);
     var pool = try db.Pool.init(ga, std.testing.io, db_path);
     defer pool.deinit();
     {
@@ -560,7 +560,7 @@ test "serve: presign_redirect issues a 302 Location; default (off) still proxies
     defer arena.deinit();
     const a = arena.allocator();
     const dir_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
-    const db_path = try std.fmt.allocPrintSentinel(a, "{s}/test.db", .{dir_path}, 0);
+    const db_path = try a.printSentinel("{s}/test.db", .{dir_path}, 0);
     var pool = try db.Pool.init(ga, std.testing.io, db_path);
     defer pool.deinit();
     {

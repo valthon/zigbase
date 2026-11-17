@@ -152,7 +152,7 @@ test "thumbnail source rejects symlink descendants and nonregular files" {
     const Libc = struct {
         extern "c" fn mkfifo(path: [*:0]const u8, mode: std.posix.mode_t) c_int;
     };
-    const fifo = try std.fmt.allocPrintSentinel(a, "{s}/images/r1/fifo", .{root}, 0);
+    const fifo = try a.printSentinel("{s}/images/r1/fifo", .{root}, 0);
     defer a.free(fifo);
     if (Libc.mkfifo(fifo, 0o600) != 0) return error.FifoCreationFailed;
     try std.testing.expectError(error.SourceNotRegular, read(a, io, local.storage(), "images", "r1", "fifo", 3));

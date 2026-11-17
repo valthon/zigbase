@@ -72,10 +72,10 @@ fn sqliteAuthIndexes(scratch: *std.heap.ArenaAllocator, w: *db.Db, old: schema.C
     defer model.close();
     try model.exec(try a.dupeSentinel(u8, try ddl.createTableSql(a, old, null, db.dbDialect(&model), &.{}), 0));
     for (old.options.auth.identityFields) |field| try model.exec(try a.dupeSentinel(u8, try ddl.authIdentityIndexSql(a, old.name, field), 0));
-    if (mutate) try model.exec(try std.fmt.allocPrintSentinel(a, "ALTER TABLE {s} RENAME TO {s};", .{ try ddl.quoteIdent(a, old.name), try ddl.quoteIdent(a, to) }, 0));
+    if (mutate) try model.exec(try a.printSentinel("ALTER TABLE {s} RENAME TO {s};", .{ try ddl.quoteIdent(a, old.name), try ddl.quoteIdent(a, to) }, 0));
     for (old.options.auth.identityFields) |field| {
-        const source_name = try std.fmt.allocPrint(a, "idx_auth_{s}_{s}", .{ old.name, field });
-        const destination_name = try std.fmt.allocPrint(a, "idx_auth_{s}_{s}", .{ to, field });
+        const source_name = try a.print("idx_auth_{s}_{s}", .{ old.name, field });
+        const destination_name = try a.print("idx_auth_{s}_{s}", .{ to, field });
         const exists = check_source: {
             var source = try prepare(a, w, "SELECT type,tbl_name,sql FROM main.sqlite_schema WHERE name=?1 COLLATE NOCASE;");
             defer source.finalize();
@@ -99,7 +99,7 @@ fn sqliteAuthIndexes(scratch: *std.heap.ArenaAllocator, w: *db.Db, old: schema.C
         }
         if (mutate) {
             try w.exec(try a.dupeSentinel(u8, try ddl.authIdentityIndexSql(a, to, field), 0));
-            if (exists) try w.exec(try std.fmt.allocPrintSentinel(a, "DROP INDEX main.{s};", .{try ddl.quoteIdent(a, source_name)}, 0));
+            if (exists) try w.exec(try a.printSentinel("DROP INDEX main.{s};", .{try ddl.quoteIdent(a, source_name)}, 0));
         }
     }
 }
@@ -115,7 +115,7 @@ fn indexOid(a: std.mem.Allocator, w: *db.Db, table: []const u8, name: []const u8
 
 /// Borrowed arena slice, including when PostgreSQL truncates the allocation.
 fn authName(scratch: *std.heap.ArenaAllocator, table: []const u8, field: []const u8) Error![]const u8 {
-    const name = try std.fmt.allocPrint(scratch.allocator(), "idx_auth_{s}_{s}", .{ table, field });
+    const name = try scratch.allocator().print("idx_auth_{s}_{s}", .{ table, field });
     // Collection/field names are ASCII identifiers. PostgreSQL truncates the
     // *whole composite identifier*, not either constituent, to 63 bytes.
     return name[0..@min(name.len, 63)];
@@ -158,7 +158,7 @@ fn authIndexes(scratch: *std.heap.ArenaAllocator, w: *db.Db, old: schema.Collect
             defer ns.finalize();
             try ns.bindInt(1, oid.?);
             if (!try ns.step()) return error.Conflict;
-            try w.exec(try std.fmt.allocPrintSentinel(a, "ALTER INDEX {s}.{s} RENAME TO {s};", .{ try ddl.quoteIdent(a, ns.columnText(0)), try ddl.quoteIdent(a, from_idx), try ddl.quoteIdent(a, to_idx) }, 0));
+            try w.exec(try a.printSentinel("ALTER INDEX {s}.{s} RENAME TO {s};", .{ try ddl.quoteIdent(a, ns.columnText(0)), try ddl.quoteIdent(a, from_idx), try ddl.quoteIdent(a, to_idx) }, 0));
         }
     }
 }

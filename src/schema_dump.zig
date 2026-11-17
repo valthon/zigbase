@@ -122,7 +122,7 @@ fn dumpPostgres(alloc: std.mem.Allocator, a: std.mem.Allocator, conn: *db.Db, di
             const rel = try quoteIdent(a, cons.columnText(0));
             const con = try quoteIdent(a, cons.columnText(1));
             const def = cons.columnText(2);
-            try out.appendSlice(alloc, try std.fmt.allocPrint(a, "ALTER TABLE {s} ADD CONSTRAINT {s} {s};\n", .{ rel, con, def }));
+            try out.appendSlice(alloc, try a.print("ALTER TABLE {s} ADD CONSTRAINT {s} {s};\n", .{ rel, con, def }));
         }
     }
 
@@ -163,7 +163,7 @@ fn emitCreateTable(alloc: std.mem.Allocator, a: std.mem.Allocator, m: *Migrator,
     try st.bindText(1, pg_schema);
     try st.bindText(2, table);
 
-    try out.appendSlice(alloc, try std.fmt.allocPrint(a, "CREATE TABLE {s} (\n", .{try quoteIdent(a, table)}));
+    try out.appendSlice(alloc, try a.print("CREATE TABLE {s} (\n", .{try quoteIdent(a, table)}));
     var first = true;
     while (try st.step()) {
         const name = try quoteIdent(a, st.columnText(0));
@@ -176,10 +176,10 @@ fn emitCreateTable(alloc: std.mem.Allocator, a: std.mem.Allocator, m: *Migrator,
 
         if (!first) try out.appendSlice(alloc, ",\n");
         first = false;
-        try out.appendSlice(alloc, try std.fmt.allocPrint(a, "  {s} {s}", .{ name, type_str }));
+        try out.appendSlice(alloc, try a.print("  {s} {s}", .{ name, type_str }));
         if (!st.isNull(2)) {
             // column_default is a catalog expression (e.g. `nextval(...)`, `now()`); emit verbatim.
-            try out.appendSlice(alloc, try std.fmt.allocPrint(a, " DEFAULT {s}", .{st.columnText(2)}));
+            try out.appendSlice(alloc, try a.print(" DEFAULT {s}", .{st.columnText(2)}));
         }
         if (not_null) try out.appendSlice(alloc, " NOT NULL");
     }
@@ -198,7 +198,7 @@ fn pgColumnType(a: std.mem.Allocator, udt: []const u8, char_max: ?i64, num_prec:
         // Array element modifiers are not available on the array column row; use the bare base type.
         const base = try pgBaseType(a, udt[1..], null, null, null);
         defer a.free(base); // scratch: only the "{s}[]" formatted result escapes
-        return try std.fmt.allocPrint(a, "{s}[]", .{base});
+        return try a.print("{s}[]", .{base});
     }
     return try pgBaseType(a, udt, char_max, num_prec, num_scale);
 }
@@ -224,15 +224,15 @@ fn pgBaseType(a: std.mem.Allocator, udt: []const u8, char_max: ?i64, num_prec: ?
     if (eql(u8, udt, "timestamp")) return a.dupe(u8, "timestamp without time zone");
     if (eql(u8, udt, "text")) return a.dupe(u8, "text");
     if (eql(u8, udt, "varchar")) {
-        if (char_max) |n| return try std.fmt.allocPrint(a, "character varying({d})", .{n});
+        if (char_max) |n| return try a.print("character varying({d})", .{n});
         return a.dupe(u8, "character varying");
     }
     if (eql(u8, udt, "bpchar")) {
-        if (char_max) |n| return try std.fmt.allocPrint(a, "character({d})", .{n});
+        if (char_max) |n| return try a.print("character({d})", .{n});
         return a.dupe(u8, "character");
     }
     if (eql(u8, udt, "numeric")) {
-        if (num_prec) |p| return try std.fmt.allocPrint(a, "numeric({d},{d})", .{ p, num_scale orelse 0 });
+        if (num_prec) |p| return try a.print("numeric({d},{d})", .{ p, num_scale orelse 0 });
         return a.dupe(u8, "numeric");
     }
     return try quoteIdent(a, udt);
@@ -262,7 +262,7 @@ fn appendLedger(alloc: std.mem.Allocator, a: std.mem.Allocator, conn: *db.Db, di
     while (try st.step()) {
         const name = try sqlLiteral(a, st.columnText(0));
         const at = try sqlLiteral(a, st.columnText(1));
-        try rows.append(a, try std.fmt.allocPrint(a, "({s}, {s})", .{ name, at }));
+        try rows.append(a, try a.print("({s}, {s})", .{ name, at }));
     }
     if (rows.items.len == 0) return;
 

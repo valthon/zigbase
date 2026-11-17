@@ -77,7 +77,7 @@ pub fn matches(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, i
         try joins.appendSlice(sa, jn);
     }
     const qcol = try ddl.quoteIdent(sa, col.name);
-    const sql = try std.fmt.allocPrintSentinel(sa, "SELECT 1 FROM {s}{s} WHERE {s}.\"id\"=?1 AND ({s});", .{ qcol, joins.items, qcol, g.where_sql }, 0);
+    const sql = try sa.printSentinel("SELECT 1 FROM {s}{s} WHERE {s}.\"id\"=?1 AND ({s});", .{ qcol, joins.items, qcol, g.where_sql }, 0);
     const param_sink = @import("sql/param_sink.zig");
     var st = try conn.prepare(try param_sink.renumberZ(sa, db.dbDialect(conn), sql));
     defer st.finalize();

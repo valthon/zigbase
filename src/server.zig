@@ -1023,18 +1023,18 @@ fn guardRateLimit(cx: *Ctx, ctx: *http.RequestCtx, rt: events.RuntimeRoute) !?ht
     const limiter = app.rate_limiter orelse return null;
     const key: []const u8 = blk: {
         if (rt.rate_limit_key) |kf| {
-            if (kf(cx)) |subject| break :blk try std.fmt.allocPrint(ctx.allocator.a, "route:{s}:key:{s}", .{ rt.pattern, subject });
+            if (kf(cx)) |subject| break :blk try ctx.allocator.a.print("route:{s}:key:{s}", .{ rt.pattern, subject });
         }
-        if (ctx.remote_ip.len > 0) break :blk try std.fmt.allocPrint(ctx.allocator.a, "route:{s}:ip:{s}", .{ rt.pattern, ctx.remote_ip });
+        if (ctx.remote_ip.len > 0) break :blk try ctx.allocator.a.print("route:{s}:ip:{s}", .{ rt.pattern, ctx.remote_ip });
         if (cx.user()) |u| {
-            if (u.id.len > 0) break :blk try std.fmt.allocPrint(ctx.allocator.a, "route:{s}:auth:{s}/{s}", .{ rt.pattern, u.collection, u.id });
+            if (u.id.len > 0) break :blk try ctx.allocator.a.print("route:{s}:auth:{s}/{s}", .{ rt.pattern, u.collection, u.id });
         }
         // Unidentifiable client — do NOT share a single global bucket (DoS). Skip the limit.
         warnUnkeyedRouteLimitOnce(rt.pattern);
         return null;
     };
     if (limiter.allowCustom(key, clock.nowUnix(app.io), c.max, c.window_s)) return null;
-    const retry = try std.fmt.allocPrint(ctx.allocator.a, "{d}", .{c.window_s});
+    const retry = try ctx.allocator.a.print("{d}", .{c.window_s});
     var resp = try ApiError.withCode(429, .too_many_requests, "Too many requests. Try again later.").toResponse(ctx.allocator.a);
     resp.extra_headers = try ctx.allocator.a.dupe(http.Header, &.{.{ .name = "Retry-After", .value = retry }});
     return resp;
@@ -1206,7 +1206,7 @@ test "dispatchCustom: deliberate 4xx is NOT reported to onError; genuine 5xx is"
     defer tmp.cleanup();
     const dir_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", ga);
     defer ga.free(dir_path);
-    const db_path = try std.fmt.allocPrintSentinel(ga, "{s}/test.db", .{dir_path}, 0);
+    const db_path = try ga.printSentinel("{s}/test.db", .{dir_path}, 0);
     defer ga.free(db_path);
     var pool = try db.Pool.init(ga, std.testing.io, db_path);
     defer pool.deinit();
@@ -1261,7 +1261,7 @@ test "route: a failing BUILT-IN handler is reported to onError, not silently 500
     defer tmp.cleanup();
     const dir_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", ga);
     defer ga.free(dir_path);
-    const db_path = try std.fmt.allocPrintSentinel(ga, "{s}/test.db", .{dir_path}, 0);
+    const db_path = try ga.printSentinel("{s}/test.db", .{dir_path}, 0);
     defer ga.free(db_path);
     var pool = try db.Pool.init(ga, std.testing.io, db_path);
     defer pool.deinit();
@@ -1324,7 +1324,7 @@ test "dispatchCustom: a credential-less public request resolves without acquirin
     defer tmp.cleanup();
     const dir_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", ga);
     defer ga.free(dir_path);
-    const db_path = try std.fmt.allocPrintSentinel(ga, "{s}/t.db", .{dir_path}, 0);
+    const db_path = try ga.printSentinel("{s}/t.db", .{dir_path}, 0);
     defer ga.free(db_path);
     var pool = try db.Pool.init(ga, std.testing.io, db_path);
     defer pool.deinit();
@@ -1368,7 +1368,7 @@ test "route: socketless seam dispatches a custom-route hit and falls back to 404
     defer tmp.cleanup();
     const dir_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", ga);
     defer ga.free(dir_path);
-    const db_path = try std.fmt.allocPrintSentinel(ga, "{s}/t.db", .{dir_path}, 0);
+    const db_path = try ga.printSentinel("{s}/t.db", .{dir_path}, 0);
     defer ga.free(db_path);
     var pool = try db.Pool.init(ga, std.testing.io, db_path);
     defer pool.deinit();
@@ -1452,7 +1452,7 @@ test "custom auth reader is returned before handler reads; identity and tenancy 
     var app = app_mod.App{ .allocator = a, .io = std.testing.io, .pool = &env.pool, .dispatch = &dispatch, .tenancy = .{ .enabled = true, .auth_collection = "customers" } };
     const key = crypto.deriveKey(app.jwt_secret, "key");
     const token = try @import("jwt.zig").sign(a, .{ .id = "c1", .collection = "customers", .type = .auth, .iat = 0, .exp = 9999999999, .sid = "session-marker" }, &key);
-    const bearer = try std.fmt.allocPrint(a, "Bearer {s}", .{token});
+    const bearer = try a.print("Bearer {s}", .{token});
     for ([_][]const u8{ "/scope/ok", "/scope/fail", "/scope/denied", "/scope/ok" }, [_]u16{ 200, 404, 403, 200 }) |path, expected| {
         var ctx = http.RequestCtx{ .method = .GET, .path = path, .allocator = RequestArena.from(&env.arena), .app = &app, .authorization = bearer, .headers = &.{.{ .key = "X-Account-Id", .value = "acc1" }} };
         try std.testing.expectEqual(expected, (try dispatchCustom(&ctx)).?.status);
@@ -1530,7 +1530,7 @@ test "dispatchCustom: .auth = .{ .authed = collection } gate is fail-closed (#24
             const dispatch = events.Dispatch{ .routes = routes };
             app2.dispatch = &dispatch;
             var ctx = http.RequestCtx{ .method = .GET, .path = path, .allocator = RequestArena.from(arena), .app = &app2 };
-            if (token) |t| ctx.authorization = try std.fmt.allocPrint(alloc, "Bearer {s}", .{t});
+            if (token) |t| ctx.authorization = try alloc.print("Bearer {s}", .{t});
             const resp = (try dispatchCustom(&ctx)).?;
             return resp.status;
         }
@@ -1578,7 +1578,7 @@ test "dispatchCustom merges ctx.setCookie/addHeader on success AND error paths (
     defer tmp.cleanup();
     const dir_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", ga);
     defer ga.free(dir_path);
-    const db_path = try std.fmt.allocPrintSentinel(ga, "{s}/test.db", .{dir_path}, 0);
+    const db_path = try ga.printSentinel("{s}/test.db", .{dir_path}, 0);
     defer ga.free(db_path);
     var pool = try db.Pool.init(ga, std.testing.io, db_path);
     defer pool.deinit();
@@ -1703,7 +1703,7 @@ const GuardEnv = struct {
         errdefer tmp.cleanup();
         const dir_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", ga);
         defer ga.free(dir_path);
-        const db_path = try std.fmt.allocPrintSentinel(ga, "{s}/test.db", .{dir_path}, 0);
+        const db_path = try ga.printSentinel("{s}/test.db", .{dir_path}, 0);
         errdefer ga.free(db_path);
         var pool = try db.Pool.init(ga, std.testing.io, db_path);
         errdefer pool.deinit();
@@ -1997,11 +1997,11 @@ pub fn normalizeResponse(ctx: *http.RequestCtx, response: http.Response) !http.R
             selected_length orelse "0"
         else if (normalized.file) |file|
             if (file.len) |file_len|
-                try std.fmt.allocPrint(ctx.allocator.a, "{d}", .{file_len})
+                try ctx.allocator.a.print("{d}", .{file_len})
             else
                 null
         else
-            try std.fmt.allocPrint(ctx.allocator.a, "{d}", .{normalized.body.len}),
+            try ctx.allocator.a.print("{d}", .{normalized.body.len}),
     };
     const header_count = other_count + @intFromBool(length != null);
     if (header_count == 0) {
@@ -2048,11 +2048,10 @@ fn invalidResponseStatusMessage(
     method: http.Method,
     path: []const u8,
 ) []const u8 {
-    return std.fmt.allocPrint(
-        allocator,
+    return allocator.print(
         "route returned invalid final status {d} for {s} {s}",
         .{ status, @tagName(method), path },
-    ) catch std.fmt.bufPrint(
+    ) catch std.mem.print(
         fallback,
         "route returned invalid final status {d} for {s}",
         .{ status, @tagName(method) },
@@ -2254,7 +2253,7 @@ test "normalizeResponse maps invalid final statuses to one framed 500" {
         try std.testing.expectEqualStrings("application/json", normalized.content_type);
         try std.testing.expect(std.mem.indexOf(u8, normalized.body, "\"code\":\"internal\"") != null);
         try std.testing.expectEqualStrings(
-            try std.fmt.allocPrint(ctx.allocator.a, "{d}", .{normalized.body.len}),
+            try ctx.allocator.a.print("{d}", .{normalized.body.len}),
             normalized.extra_headers[0].value,
         );
     }
@@ -2269,7 +2268,7 @@ fn sendRawEnvelope(r: zap.Request, method: http.Method, status: u16, body: []con
     setZapStatus(r, status);
     r.setContentType(.JSON) catch {};
     var length_buf: [32]u8 = undefined;
-    const length = std.fmt.bufPrint(&length_buf, "{d}", .{body.len}) catch "0";
+    const length = std.mem.print(&length_buf, "{d}", .{body.len}) catch "0";
     r.setHeader("content-length", length) catch {};
     if (method == .HEAD) {
         r.sendBody("") catch {};

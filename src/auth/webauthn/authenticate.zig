@@ -165,8 +165,7 @@ fn buildAuthData(rp_id: []const u8, flags_byte: u8, sign_count: u32) [37]u8 {
 fn buildClientDataJson(alloc: std.mem.Allocator, challenge_raw: []const u8, origin: []const u8) ![]u8 {
     const encoded_challenge = try client_data.b64urlNoPad(alloc, challenge_raw);
     defer alloc.free(encoded_challenge);
-    return std.fmt.allocPrint(
-        alloc,
+    return alloc.print(
         "{{\"type\":\"webauthn.get\",\"challenge\":\"{s}\",\"origin\":\"{s}\"}}",
         .{ encoded_challenge, origin },
     );

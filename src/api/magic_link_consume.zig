@@ -292,7 +292,7 @@ fn setupConsumeEnv(name: []const u8, allow: []const []const u8, default_to: []co
     env.tmp = std.testing.tmpDir(.{});
     const dir = try env.tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(dir);
-    const path = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/test.db", .{dir}, 0);
+    const path = try std.testing.allocator.printSentinel("{s}/test.db", .{dir}, 0);
     defer std.testing.allocator.free(path);
     env.pool = try @import("../db.zig").Pool.init(std.testing.allocator, std.testing.io, path);
     {
@@ -345,7 +345,7 @@ test "consume: valid token → 302 with session cookies + allowed redirect; repl
     };
 
     // First consume: 302 + Location=/club/me + both cookies.
-    const q1 = try std.fmt.allocPrint(a, "token={s}&redirect=%2Fclub%2Fme", .{token});
+    const q1 = try a.print("token={s}&redirect=%2Fclub%2Fme", .{token});
     var ctx1 = consumeCtx(env, RequestArena.from(&arena), "mlconsume1", q1);
     const res1 = try consume(&ctx1);
     try std.testing.expectEqual(@as(u16, 302), res1.status);
@@ -359,7 +359,7 @@ test "consume: valid token → 302 with session cookies + allowed redirect; repl
     try std.testing.expect(saw_auth and saw_csrf);
 
     // Replay: same token must be rejected (single-use), 400, no redirect.
-    const q2 = try std.fmt.allocPrint(a, "token={s}&redirect=%2Fclub%2Fme", .{token});
+    const q2 = try a.print("token={s}&redirect=%2Fclub%2Fme", .{token});
     var ctx2 = consumeCtx(env, RequestArena.from(&arena), "mlconsume1", q2);
     const res2 = try consume(&ctx2);
     try std.testing.expectEqual(@as(u16, 400), res2.status);
@@ -400,7 +400,7 @@ test "#80 consume: aborting beforeAuthSuccess blocks session AND leaves the link
     var disp = events.Dispatch{ .before_auth_success = Hook.abort };
     env.app.dispatch = &disp;
 
-    const q1 = try std.fmt.allocPrint(a, "token={s}", .{token});
+    const q1 = try a.print("token={s}", .{token});
     var ctx1 = consumeCtx(env, RequestArena.from(&arena), "mlconsume80", q1);
     const res1 = try consume(&ctx1);
     try std.testing.expectEqual(@as(u16, 403), res1.status); // fail closed
@@ -409,7 +409,7 @@ test "#80 consume: aborting beforeAuthSuccess blocks session AND leaves the link
     // Retry with the SAME token now that the hook permits the login: the token was NOT
     // burned by the aborted attempt, so the consume succeeds (302 + session).
     env.app.dispatch = null;
-    const q2 = try std.fmt.allocPrint(a, "token={s}", .{token});
+    const q2 = try a.print("token={s}", .{token});
     var ctx2 = consumeCtx(env, RequestArena.from(&arena), "mlconsume80", q2);
     const res2 = try consume(&ctx2);
     try std.testing.expectEqual(@as(u16, 302), res2.status);
@@ -420,7 +420,7 @@ test "#80 consume: aborting beforeAuthSuccess blocks session AND leaves the link
     try std.testing.expect(saw_auth);
 
     // And now the single-use guard holds: a third attempt with the same token is rejected.
-    const q3 = try std.fmt.allocPrint(a, "token={s}", .{token});
+    const q3 = try a.print("token={s}", .{token});
     var ctx3 = consumeCtx(env, RequestArena.from(&arena), "mlconsume80", q3);
     const res3 = try consume(&ctx3);
     try std.testing.expectEqual(@as(u16, 400), res3.status);
@@ -458,7 +458,7 @@ test "L1 consume: a DB error after begin rolls back (writer not poisoned)" {
         try w.exec("DROP TABLE \"_consumedTokens\";");
     }
     {
-        const q = try std.fmt.allocPrint(a, "token={s}", .{t1});
+        const q = try a.print("token={s}", .{t1});
         var ctx = consumeCtx(env, RequestArena.from(&arena), "mlconsumeL1", q);
         // The error propagates (it is not a replay); we only care that the writer is left clean.
         if (consume(&ctx)) |_| {} else |_| {}
@@ -471,7 +471,7 @@ test "L1 consume: a DB error after begin rolls back (writer not poisoned)" {
         try w.exec("CREATE TABLE \"_consumedTokens\" (\"jti\" TEXT PRIMARY KEY, \"expires\" INTEGER, \"consumed\" TEXT);");
     }
     const t2 = try mintToken(env, RequestArena.from(&arena));
-    const q2 = try std.fmt.allocPrint(a, "token={s}", .{t2});
+    const q2 = try a.print("token={s}", .{t2});
     var ctx2 = consumeCtx(env, RequestArena.from(&arena), "mlconsumeL1", q2);
     const res = try consume(&ctx2);
     try std.testing.expectEqual(@as(u16, 302), res.status);
@@ -499,7 +499,7 @@ test "consume: non-whitelisted redirect falls back to default (no open redirect)
 
     // redirect points off-list (and a protocol-relative open-redirect attempt):
     // both must degrade to the configured default, never the attacker's target.
-    const q = try std.fmt.allocPrint(a, "token={s}&redirect=%2F%2Fevil.example.com", .{token});
+    const q = try a.print("token={s}&redirect=%2F%2Fevil.example.com", .{token});
     var ctx = consumeCtx(env, RequestArena.from(&arena), "mlconsume2", q);
     const res = try consume(&ctx);
     try std.testing.expectEqual(@as(u16, 302), res.status);
@@ -532,7 +532,7 @@ test "consume: traversal redirect cannot escape an allowed prefix" {
             const rid = (try api_auth.findByIdentity(a, w, col, "u@x.io")).?;
             break :blk (try auth_helpers.mintLinkToken(&mint_ctx, w, "mlconsume5", rid, 900, .{})).token;
         };
-        const q = try std.fmt.allocPrint(a, "token={s}&redirect={s}", .{ token, atk });
+        const q = try a.print("token={s}&redirect={s}", .{ token, atk });
         var ctx = consumeCtx(env, RequestArena.from(&arena), "mlconsume5", q);
         const res = try consume(&ctx);
         // Login still succeeds (302) but the target is forced to the default —

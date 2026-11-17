@@ -204,9 +204,9 @@ pub fn parse(arena: RequestArena, content_type: []const u8, body: []const u8) Pa
     // and whose map/array backings are the escaping owned state). Free them here so
     // a non-arena caller doesn't leak them; the `defer` on `dash_boundary` is armed
     // before the second (fallible) allocPrint so an OOM there still reclaims it.
-    const dash_boundary = try std.fmt.allocPrint(alloc, "--{s}", .{boundary});
+    const dash_boundary = try alloc.print("--{s}", .{boundary});
     defer alloc.free(dash_boundary);
-    const delim = try std.fmt.allocPrint(alloc, "\r\n--{s}", .{boundary});
+    const delim = try alloc.print("\r\n--{s}", .{boundary});
     defer alloc.free(delim);
 
     // First delimiter: "--<boundary>" at the very start of the body, else a full

@@ -294,7 +294,7 @@ test "webauthn_register begin: returns options for the authenticated user" {
 
     const params = [_]http.Param{.{ .key = "col", .value = "wrusers1" }};
     var ctx = env.ctx(RequestArena.from(&arena), .POST, "{}", &params);
-    ctx.authorization = try std.fmt.allocPrint(a, "Bearer {s}", .{token});
+    ctx.authorization = try a.print("Bearer {s}", .{token});
 
     // Writer is released; begin() can now acquire it without deadlocking.
     const res = try begin(&ctx);
@@ -401,8 +401,7 @@ test "webauthn_register finish: wrong account leaves challenge redeemable by rea
     // Build clientDataJSON now that cid is known (challenge bytes are fixed above).
     const challenge_raw = @as([32]u8, @splat(0x33));
     const challenge_b64 = try client_data.b64urlNoPad(a, &challenge_raw);
-    const cdj = try std.fmt.allocPrint(
-        a,
+    const cdj = try a.print(
         "{{\"type\":\"webauthn.create\",\"challenge\":\"{s}\",\"origin\":\"{s}\"}}",
         .{ challenge_b64, origin },
     );
@@ -410,8 +409,7 @@ test "webauthn_register finish: wrong account leaves challenge redeemable by rea
     const att_obj_b64 = try client_data.b64urlNoPad(a, att_obj_buf);
     const cdj_b64 = try client_data.b64urlNoPad(a, cdj);
 
-    const body_str = try std.fmt.allocPrint(
-        a,
+    const body_str = try a.print(
         "{{\"ceremonyId\":\"{s}\",\"attestationObject\":\"{s}\",\"clientDataJSON\":\"{s}\"}}",
         .{ cid, att_obj_b64, cdj_b64 },
     );
@@ -420,7 +418,7 @@ test "webauthn_register finish: wrong account leaves challenge redeemable by rea
     var ctx = env.ctx(RequestArena.from(&arena), .POST, body_str, &params);
 
     // Another authenticated account submits the owner's valid attestation first.
-    ctx.authorization = try std.fmt.allocPrint(a, "Bearer {s}", .{other_token});
+    ctx.authorization = try a.print("Bearer {s}", .{other_token});
     try std.testing.expectEqual(@as(u16, 400), (try finish(&ctx)).status);
     {
         const w = env.pool.acquireWriter();
@@ -432,7 +430,7 @@ test "webauthn_register finish: wrong account leaves challenge redeemable by rea
         try std.testing.expectEqual(@as(i64, 0), st.columnInt(0));
     }
     // The real owner can still finish the same valid ceremony and store the credential.
-    ctx.authorization = try std.fmt.allocPrint(a, "Bearer {s}", .{token});
+    ctx.authorization = try a.print("Bearer {s}", .{token});
     const res = try finish(&ctx);
     try std.testing.expectEqual(@as(u16, 204), res.status);
     try std.testing.expectEqualStrings("", res.body);
@@ -464,7 +462,7 @@ test "webauthn_register begin: webauthn enabled but empty rp_id returns 500" {
     env.tmp = std.testing.tmpDir(.{});
     const dir = try env.tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(dir);
-    const path = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/test.db", .{dir}, 0);
+    const path = try std.testing.allocator.printSentinel("{s}/test.db", .{dir}, 0);
     defer std.testing.allocator.free(path);
     env.pool = try db.Pool.init(std.testing.allocator, std.testing.io, path);
     defer env.deinit();
@@ -516,7 +514,7 @@ test "webauthn_register begin: webauthn enabled but empty rp_id returns 500" {
 
     const params = [_]http.Param{.{ .key = "col", .value = "wrusers_empty_rp" }};
     var ctx = env.ctx(RequestArena.from(&arena), .POST, "{}", &params);
-    ctx.authorization = try std.fmt.allocPrint(a, "Bearer {s}", .{token});
+    ctx.authorization = try a.print("Bearer {s}", .{token});
 
     const res = try begin(&ctx);
     try std.testing.expectEqual(@as(u16, 500), res.status);
@@ -590,23 +588,21 @@ test "webauthn_register finish: duplicate credentialId returns 409" {
 
     const challenge_raw = @as([32]u8, @splat(0x44));
     const challenge_b64 = try client_data.b64urlNoPad(a, &challenge_raw);
-    const cdj = try std.fmt.allocPrint(
-        a,
+    const cdj = try a.print(
         "{{\"type\":\"webauthn.create\",\"challenge\":\"{s}\",\"origin\":\"{s}\"}}",
         .{ challenge_b64, origin },
     );
     const att_obj_b64 = try client_data.b64urlNoPad(a, att_obj_buf);
     const cdj_b64 = try client_data.b64urlNoPad(a, cdj);
 
-    const body_str = try std.fmt.allocPrint(
-        a,
+    const body_str = try a.print(
         "{{\"ceremonyId\":\"{s}\",\"attestationObject\":\"{s}\",\"clientDataJSON\":\"{s}\"}}",
         .{ cid, att_obj_b64, cdj_b64 },
     );
 
     const params = [_]http.Param{.{ .key = "col", .value = "wrusers4" }};
     var ctx = env.ctx(RequestArena.from(&arena), .POST, body_str, &params);
-    ctx.authorization = try std.fmt.allocPrint(a, "Bearer {s}", .{token});
+    ctx.authorization = try a.print("Bearer {s}", .{token});
 
     // Writer is released; finish() can now acquire it without deadlocking.
     const res = try finish(&ctx);
@@ -726,7 +722,7 @@ test "webauthn_register: collection and account isolation preserve ceremonies an
         const t2 = try jwt_mod.sign(a, .{ .id = "sameid", .collection = "scope_foreign", .type = .auth, .iat = 0, .exp = 9999999999 }, &key);
         const t3 = try jwt_mod.sign(a, .{ .id = "otherid", .collection = "scope_foreign", .type = .auth, .iat = 0, .exp = 9999999999 }, &key);
         const cid = try (ChallengeStore{ .conn = w }).put(a, std.testing.io, target.name, "webauthn_reg", "sameid", "challenge", 300);
-        break :blk .{ target, try std.fmt.allocPrint(a, "Bearer {s}", .{t1}), try std.fmt.allocPrint(a, "Bearer {s}", .{t2}), try std.fmt.allocPrint(a, "Bearer {s}", .{t3}), cid };
+        break :blk .{ target, try a.print("Bearer {s}", .{t1}), try a.print("Bearer {s}", .{t2}), try a.print("Bearer {s}", .{t3}), cid };
     };
     const body = try std.json.Stringify.valueAlloc(a, .{ .ceremonyId = ceremony, .attestationObject = "invalid", .clientDataJSON = "invalid" }, .{});
     for ([_][]const u8{ foreign.name, foreign.id }) |alias| {

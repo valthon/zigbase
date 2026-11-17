@@ -127,7 +127,7 @@ test "frozen: Postgres now()/nowIso8601 resolve to the frozen instant (dev build
     // columns must now reflect the frozen instant.
     const iso_expr = dialect_mod.Dialect.postgres.nowIso8601Expr();
     var qbuf: [256]u8 = undefined;
-    const q = try std.fmt.bufPrint(&qbuf, "SELECT {s}", .{iso_expr});
+    const q = try std.mem.print(&qbuf, "SELECT {s}", .{iso_expr});
     const iso = try scalarText(a, conn, q);
     defer a.free(iso);
     try std.testing.expectEqualStrings(frozen_iso, iso);

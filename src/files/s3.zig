@@ -60,7 +60,7 @@ pub const Client = struct {
             }
             host = std.mem.trimEnd(u8, ep, "/");
         } else {
-            host = std.fmt.bufPrint(host_storage, "s3.{s}.amazonaws.com", .{cfg.s3_region}) catch
+            host = std.mem.print(host_storage, "s3.{s}.amazonaws.com", .{cfg.s3_region}) catch
                 unreachable; // region is a short AWS identifier; 256 bytes cannot overflow
         }
         return .{
@@ -81,22 +81,22 @@ pub const Client = struct {
     /// `self` first (like every other `Client` method) so `client.objectKey(alloc, …)`
     /// works via method-call syntax.
     pub fn objectKey(self: Client, alloc: std.mem.Allocator, col: []const u8, rid: []const u8, name: []const u8) ![]const u8 {
-        return std.fmt.allocPrint(alloc, "{s}{s}/{s}/{s}", .{ self.key_prefix, col, rid, name });
+        return alloc.print("{s}{s}/{s}/{s}", .{ self.key_prefix, col, rid, name });
     }
 
     /// Request path for `key`: path-style => "/<bucket>/<key>"; virtual-hosted =>
     /// "/<key>" (the bucket rides the host instead — see effectiveHost).
     fn requestPath(alloc: std.mem.Allocator, self: Client, key: []const u8) ![]const u8 {
         return if (self.path_style)
-            std.fmt.allocPrint(alloc, "/{s}/{s}", .{ self.bucket, key })
+            alloc.print("/{s}/{s}", .{ self.bucket, key })
         else
-            std.fmt.allocPrint(alloc, "/{s}", .{key});
+            alloc.print("/{s}", .{key});
     }
 
     /// Request path for the bucket itself (no key) — used by `listKeys`.
     fn bucketPath(alloc: std.mem.Allocator, self: Client) ![]const u8 {
         return if (self.path_style)
-            std.fmt.allocPrint(alloc, "/{s}", .{self.bucket})
+            alloc.print("/{s}", .{self.bucket})
         else
             alloc.dupe(u8, "/");
     }
@@ -107,7 +107,7 @@ pub const Client = struct {
         return if (self.path_style)
             alloc.dupe(u8, self.host)
         else
-            std.fmt.allocPrint(alloc, "{s}.{s}", .{ self.bucket, self.host });
+            alloc.print("{s}.{s}", .{ self.bucket, self.host });
     }
 
     /// `{scheme}://{effective_host}{UriEncoded path}` (+ `?query` when non-empty). The
@@ -116,9 +116,9 @@ pub const Client = struct {
         const encoded_path = try sigv4.uriEncodePath(alloc, path);
         defer alloc.free(encoded_path);
         return if (query.len == 0)
-            std.fmt.allocPrint(alloc, "{s}://{s}{s}", .{ self.scheme, host, encoded_path })
+            alloc.print("{s}://{s}{s}", .{ self.scheme, host, encoded_path })
         else
-            std.fmt.allocPrint(alloc, "{s}://{s}{s}?{s}", .{ self.scheme, host, encoded_path, query });
+            alloc.print("{s}://{s}{s}?{s}", .{ self.scheme, host, encoded_path, query });
     }
 
     /// Sign one request: `x-amz-content-sha256` is always signed (S3 requires it);
@@ -266,7 +266,7 @@ pub const Client = struct {
         if (upload_id.len == 0 or upload_id.len > 4096) return error.S3InvalidMultipartResponse;
         const encoded_id = try uriEncodeQueryValue(alloc, upload_id);
         defer alloc.free(encoded_id);
-        const query = try std.fmt.allocPrint(alloc, "uploadId={s}", .{encoded_id});
+        const query = try alloc.print("uploadId={s}", .{encoded_id});
         defer alloc.free(query);
         errdefer self.abortMultipart(io, alloc, key, query) catch |err|
             std.log.warn("S3 multipart abort failed ({s}); configure incomplete-upload lifecycle cleanup", .{@errorName(err)});
@@ -277,7 +277,7 @@ pub const Client = struct {
         var offset: usize = 0;
         for (0..plan.count) |part| {
             const end = offset + @min(bytes.len - offset, @as(usize, @intCast(plan.size)));
-            const part_query = try std.fmt.allocPrint(alloc, "partNumber={d}&{s}", .{ part + 1, query });
+            const part_query = try alloc.print("partNumber={d}&{s}", .{ part + 1, query });
             defer alloc.free(part_query);
             const etag = try self.uploadPart(io, alloc, key, part_query, bytes[offset..end]);
             defer alloc.free(etag);
@@ -503,12 +503,12 @@ pub const Client = struct {
         defer alloc.free(encoded_prefix);
         const encoded_token = if (continuation) |token| try uriEncodeQueryValue(alloc, token) else "";
         defer if (continuation != null) alloc.free(encoded_token);
-        const max_keys = if (limit) |n| try std.fmt.allocPrint(alloc, "&max-keys={d}", .{n}) else "";
+        const max_keys = if (limit) |n| try alloc.print("&max-keys={d}", .{n}) else "";
         defer if (limit != null) alloc.free(max_keys);
         const query = if (continuation != null)
-            try std.fmt.allocPrint(alloc, "continuation-token={s}&list-type=2{s}&prefix={s}", .{ encoded_token, max_keys, encoded_prefix })
+            try alloc.print("continuation-token={s}&list-type=2{s}&prefix={s}", .{ encoded_token, max_keys, encoded_prefix })
         else
-            try std.fmt.allocPrint(alloc, "list-type=2{s}&prefix={s}", .{ max_keys, encoded_prefix });
+            try alloc.print("list-type=2{s}&prefix={s}", .{ max_keys, encoded_prefix });
         defer alloc.free(query);
 
         const url = try buildUrl(alloc, self, host, path, query);
@@ -569,7 +569,7 @@ fn amzDate(ts: i64) AmzDateBuf {
     const year_day = epoch_day.calculateYearDay();
     const month_day = year_day.calculateMonthDay();
     var buf: AmzDateBuf = undefined;
-    _ = std.fmt.bufPrint(&buf, "{d:0>4}{d:0>2}{d:0>2}T{d:0>2}{d:0>2}{d:0>2}Z", .{
+    _ = std.mem.print(&buf, "{d:0>4}{d:0>2}{d:0>2}T{d:0>2}{d:0>2}{d:0>2}Z", .{
         year_day.year,
         @backingInt(month_day.month),
         @as(u32, month_day.day_index) + 1,
@@ -757,7 +757,7 @@ pub const S3Storage = struct {
         const cache_dir = if (cfg.s3_cache_dir.len > 0)
             try gpa.dupe(u8, cfg.s3_cache_dir)
         else
-            try std.fmt.allocPrint(gpa, "{s}/storage_cache", .{cfg.data_dir});
+            try gpa.print("{s}/storage_cache", .{cfg.data_dir});
         errdefer gpa.free(cache_dir);
         const host_buf = try gpa.alloc(u8, 256);
         errdefer gpa.free(host_buf);
@@ -800,7 +800,7 @@ pub const S3Storage = struct {
     fn probe(self: S3Storage, io: std.Io) !void {
         var arena = std.heap.ArenaAllocator.init(self.gpa);
         defer arena.deinit();
-        const probe_key = try std.fmt.allocPrint(arena.allocator(), "{s}.zigbase/probe", .{self.client.key_prefix});
+        const probe_key = try arena.allocator().print("{s}.zigbase/probe", .{self.client.key_prefix});
         const status = try self.client.head(io, arena.allocator(), probe_key);
         if (status != 200 and status != 404) return error.S3ProbeFailed;
     }
@@ -893,8 +893,8 @@ pub const S3Storage = struct {
         var rand_hex: [8]u8 = undefined;
         var rand_bytes: [4]u8 = undefined;
         io.random(&rand_bytes); // filename-uniqueness only, not security-critical (entropy.zig scopes to ID/token gen)
-        _ = std.fmt.bufPrint(&rand_hex, "{x:0>8}", .{std.mem.readInt(u32, &rand_bytes, .big)}) catch unreachable;
-        const tmp_path = try std.fmt.allocPrint(a, "{s}.tmp{s}", .{ path, rand_hex });
+        _ = std.mem.print(&rand_hex, "{x:0>8}", .{std.mem.readInt(u32, &rand_bytes, .big)}) catch unreachable;
+        const tmp_path = try a.print("{s}.tmp{s}", .{ path, rand_hex });
         const key = try self.client.objectKey(a, col, record_id, filename);
 
         const f = try std.Io.Dir.cwd().createFile(io, tmp_path, .{});
@@ -945,7 +945,7 @@ pub const S3Storage = struct {
         var arena = std.heap.ArenaAllocator.init(self.gpa);
         defer arena.deinit();
         const a = arena.allocator();
-        const prefix = try std.fmt.allocPrint(a, "{s}{s}/{s}/", .{ self.client.key_prefix, col, record_id });
+        const prefix = try a.print("{s}{s}/{s}/", .{ self.client.key_prefix, col, record_id });
         const keys = try self.client.listKeys(io, a, prefix);
         // Attempt the complete sweep for synchronous callers, while preserving
         // an error for durable retries. Log each key needing operator attention.
@@ -1315,7 +1315,7 @@ test "listKeys reuses response scratch under an outer arena" {
     @memset(padding, ' ');
     var responses: [32]testcapture.MockResponse = undefined;
     for (&responses, 0..) |*response, i| response.* = .{
-        .body = try std.fmt.allocPrint(a, "{s}<ListBucketResult><IsTruncated>{s}</IsTruncated><Key>col/r1/{d}</Key><NextContinuationToken>{d}</NextContinuationToken></ListBucketResult>", .{ padding, if (i + 1 == responses.len) "false" else "true", i, i }),
+        .body = try a.print("{s}<ListBucketResult><IsTruncated>{s}</IsTruncated><Key>col/r1/{d}</Key><NextContinuationToken>{d}</NextContinuationToken></ListBucketResult>", .{ padding, if (i + 1 == responses.len) "false" else "true", i, i }),
     };
     testcapture.http.enable(true);
     defer testcapture.http.reset();
@@ -1894,15 +1894,15 @@ test "LIVE S3: put/head/get/list/delete round-trip (object verifiably GONE)" {
 
     // A real incomplete upload is visible in ListMultipartUploads, then disappears after abort.
     const nonce = @import("../id.zig").collectionId(testing.io);
-    const abort_key = try std.fmt.allocPrint(a, "livetest/abort/{s}", .{nonce});
+    const abort_key = try a.print("livetest/abort/{s}", .{nonce});
     const begun = try client.multipartRequest(testing.io, a, .POST, abort_key, "uploads=", "", "application/octet-stream");
     const raw_id = (try xmlText(begun.body, "UploadId")).?;
     const uid = try decodeXmlText(a, raw_id);
-    const query = try std.fmt.allocPrint(a, "uploadId={s}", .{try uriEncodeQueryValue(a, uid)});
+    const query = try a.print("uploadId={s}", .{try uriEncodeQueryValue(a, uid)});
     errdefer client.abortMultipart(testing.io, a, abort_key, query) catch |err| std.log.warn("live multipart cleanup: {s}", .{@errorName(err)});
-    const part_query = try std.fmt.allocPrint(a, "partNumber=1&{s}", .{query});
+    const part_query = try a.print("partNumber=1&{s}", .{query});
     _ = try client.uploadPart(testing.io, a, abort_key, part_query, "incomplete");
-    const list_query = try std.fmt.allocPrint(a, "prefix={s}&uploads=", .{try uriEncodeQueryValue(a, abort_key)});
+    const list_query = try a.print("prefix={s}&uploads=", .{try uriEncodeQueryValue(a, abort_key)});
     const before = try client.multipartRequest(testing.io, a, .GET, "", list_query, "", "application/xml");
     try testing.expectEqual(@as(u16, 200), before.status);
     try testing.expect(std.mem.indexOf(u8, before.body, "<Upload>") != null);

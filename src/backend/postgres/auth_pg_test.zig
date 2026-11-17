@@ -291,7 +291,7 @@ test "pg: auth identity lookup + login credential check + consumeToken + session
 
     // Server-side session store: insert a row (recordSession INSERT shape) for this record, then
     // list it and delete it.
-    try w.exec(try std.fmt.allocPrintSentinel(al, "INSERT INTO \"_sessions\" (\"id\",\"collectionRef\",\"recordRef\",\"created\",\"lastSeen\",\"expires\",\"userAgent\",\"ip\") VALUES ('sid1','users','{s}','','',9999999999,'ua','ip');", .{rid}, 0));
+    try w.exec(try al.printSentinel("INSERT INTO \"_sessions\" (\"id\",\"collectionRef\",\"recordRef\",\"created\",\"lastSeen\",\"expires\",\"userAgent\",\"ip\") VALUES ('sid1','users','{s}','','',9999999999,'ua','ip');", .{rid}, 0));
     const sessions = try auth_api.listSessions(al, w, "users", rid);
     try std.testing.expectEqual(@as(usize, 1), sessions.len);
     try std.testing.expectEqualStrings("sid1", sessions[0].id);
@@ -419,7 +419,7 @@ test "pg: token mint + VERIFY round-trip (epoch, table-session, superuser) on Po
     // (2) TABLE MODE: a token carrying a `sid` must reference a live `_sessions` row — verify calls
     // sessionActive on PG. Present+unexpired → accept; missing → fail-closed (null).
     const app_table = .{ .jwt_secret = @as([]const u8, secret), .session_store = app_mod.SessionStore.table };
-    try w.exec(try std.fmt.allocPrintSentinel(al, "INSERT INTO \"_sessions\" (\"id\",\"collectionRef\",\"recordRef\",\"created\",\"lastSeen\",\"expires\",\"userAgent\",\"ip\") VALUES ('sidLive','users','{s}','','',9999999999,'ua','ip');", .{rid}, 0));
+    try w.exec(try al.printSentinel("INSERT INTO \"_sessions\" (\"id\",\"collectionRef\",\"recordRef\",\"created\",\"lastSeen\",\"expires\",\"userAgent\",\"ip\") VALUES ('sidLive','users','{s}','','',9999999999,'ua','ip');", .{rid}, 0));
     const tok_live = try mintAuth(al, secret, "users", rid, ke.token_key, "sidLive", 0);
     const v2 = auth_core.verifyToken(al, app_table, w, tok_live) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("sidLive", v2.sid);
@@ -477,7 +477,7 @@ test "pg: REST auth record delete removes external auth links (#519)" {
         .path = "/api/collections/members/records/member1",
         .allocator = @import("../../request_arena.zig").RequestArena.from(&arena),
         .app = &app,
-        .authorization = try std.fmt.allocPrint(al, "Bearer {s}", .{token}),
+        .authorization = try al.print("Bearer {s}", .{token}),
         .params = &.{ .{ .key = "col", .value = "members" }, .{ .key = "id", .value = "member1" } },
     };
     const response = try @import("../../api/records.zig").delete(&req);

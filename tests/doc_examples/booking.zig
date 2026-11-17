@@ -28,9 +28,9 @@ test "documented booking route conceals other owners and enforces the transition
     const bob_auth = try t.mintSession("users", bob.object.get("id").?.string);
     const service_auth = try t.mintSession("services", service.object.get("id").?.string);
     const id = booking.object.get("id").?.string;
-    const path = try std.fmt.allocPrint(t.allocator, "/api/bookings/{s}/confirm", .{id});
+    const path = try t.allocator.print("/api/bookings/{s}/confirm", .{id});
     defer t.allocator.free(path);
-    const rest_path = try std.fmt.allocPrint(t.allocator, "/api/collections/bookings/records/{s}", .{id});
+    const rest_path = try t.allocator.print("/api/collections/bookings/records/{s}", .{id});
     defer t.allocator.free(rest_path);
 
     const denied_rest = try t.request(.PATCH, rest_path, .{ .auth = bob_auth, .json = .{ .status = "confirmed" } });

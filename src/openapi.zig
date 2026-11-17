@@ -34,7 +34,7 @@ fn array(alloc: std.mem.Allocator) std.json.Array {
 
 fn refValue(alloc: std.mem.Allocator, name: []const u8) !Value {
     var out = object();
-    try out.put(alloc, "$ref", .{ .string = try std.fmt.allocPrint(alloc, "#/components/schemas/{s}", .{name}) });
+    try out.put(alloc, "$ref", .{ .string = try alloc.print("#/components/schemas/{s}", .{name}) });
     return .{ .object = out };
 }
 
@@ -423,7 +423,7 @@ const collection_operation_prefixes = [_][]const u8{ "list", "create", "view", "
 
 fn collectionOperationIdsConflict(alloc: std.mem.Allocator, ids: *const std.StringHashMap(void), base: []const u8) !bool {
     for (collection_operation_prefixes) |prefix| {
-        const operation_id = try std.fmt.allocPrint(alloc, "{s}{s}", .{ prefix, base });
+        const operation_id = try alloc.print("{s}{s}", .{ prefix, base });
         if (ids.contains(operation_id)) return true;
     }
     return false;
@@ -431,7 +431,7 @@ fn collectionOperationIdsConflict(alloc: std.mem.Allocator, ids: *const std.Stri
 
 fn reserveCollectionOperationIds(alloc: std.mem.Allocator, ids: *std.StringHashMap(void), base: []const u8) !void {
     for (collection_operation_prefixes) |prefix|
-        try ids.put(try std.fmt.allocPrint(alloc, "{s}{s}", .{ prefix, base }), {});
+        try ids.put(try alloc.print("{s}{s}", .{ prefix, base }), {});
 }
 
 fn collectionSymbolBases(
@@ -457,13 +457,13 @@ fn collectionSymbolBases(
         }
 
         const stem = if (duplicate_friendly or try collectionOperationIdsConflict(alloc, &reserved, friendly[index]))
-            try std.fmt.allocPrint(alloc, "{s}_{s}", .{ friendly[index], col.name })
+            try alloc.print("{s}_{s}", .{ friendly[index], col.name })
         else
             friendly[index];
         var candidate = stem;
         var suffix: usize = 2;
         while (try collectionOperationIdsConflict(alloc, &reserved, candidate)) : (suffix += 1)
-            candidate = try std.fmt.allocPrint(alloc, "{s}_{d}", .{ stem, suffix });
+            candidate = try alloc.print("{s}_{d}", .{ stem, suffix });
         symbols[index] = candidate;
         try reserveCollectionOperationIds(alloc, &reserved, candidate);
     }
@@ -471,29 +471,29 @@ fn collectionSymbolBases(
 }
 
 fn addCollection(alloc: std.mem.Allocator, paths: *Object, schemas: *Object, col: schema.Collection, base: []const u8, all: []const schema.Collection) !void {
-    const record_name = try std.fmt.allocPrint(alloc, "{s}Record", .{base});
-    const create_name = try std.fmt.allocPrint(alloc, "{s}Create", .{base});
-    const update_name = try std.fmt.allocPrint(alloc, "{s}Update", .{base});
-    const list_name = try std.fmt.allocPrint(alloc, "{s}List", .{base});
+    const record_name = try alloc.print("{s}Record", .{base});
+    const create_name = try alloc.print("{s}Create", .{base});
+    const update_name = try alloc.print("{s}Update", .{base});
+    const list_name = try alloc.print("{s}List", .{base});
     try schemas.put(alloc, record_name, try collectionSchema(alloc, col, all, .record));
     try schemas.put(alloc, create_name, try collectionSchema(alloc, col, all, .create));
     try schemas.put(alloc, update_name, try collectionSchema(alloc, col, all, .update));
     try schemas.put(alloc, list_name, try listSchema(alloc, record_name));
 
-    const collection_path = try std.fmt.allocPrint(alloc, "/api/collections/{s}/records", .{col.name});
+    const collection_path = try alloc.print("/api/collections/{s}/records", .{col.name});
     var collection_item = object();
-    try collection_item.put(alloc, "get", try collectionOperation(alloc, col, try std.fmt.allocPrint(alloc, "list{s}", .{base}), col.listRule, list_name, null, try queryParameters(alloc), false));
-    try collection_item.put(alloc, "post", try collectionOperation(alloc, col, try std.fmt.allocPrint(alloc, "create{s}", .{base}), col.createRule, record_name, create_name, null, false));
+    try collection_item.put(alloc, "get", try collectionOperation(alloc, col, try alloc.print("list{s}", .{base}), col.listRule, list_name, null, try queryParameters(alloc), false));
+    try collection_item.put(alloc, "post", try collectionOperation(alloc, col, try alloc.print("create{s}", .{base}), col.createRule, record_name, create_name, null, false));
     try paths.put(alloc, collection_path, .{ .object = collection_item });
 
-    const item_path = try std.fmt.allocPrint(alloc, "{s}/{{id}}", .{collection_path});
+    const item_path = try alloc.print("{s}/{{id}}", .{collection_path});
     var id_params = array(alloc);
     try id_params.append(try idParameter(alloc));
     const params = Value{ .array = id_params };
     var item = object();
-    try item.put(alloc, "get", try collectionOperation(alloc, col, try std.fmt.allocPrint(alloc, "view{s}", .{base}), col.viewRule, record_name, null, try viewParameters(alloc), false));
-    try item.put(alloc, "patch", try collectionOperation(alloc, col, try std.fmt.allocPrint(alloc, "update{s}", .{base}), col.updateRule, record_name, update_name, params, false));
-    try item.put(alloc, "delete", try collectionOperation(alloc, col, try std.fmt.allocPrint(alloc, "delete{s}", .{base}), col.deleteRule, null, null, params, true));
+    try item.put(alloc, "get", try collectionOperation(alloc, col, try alloc.print("view{s}", .{base}), col.viewRule, record_name, null, try viewParameters(alloc), false));
+    try item.put(alloc, "patch", try collectionOperation(alloc, col, try alloc.print("update{s}", .{base}), col.updateRule, record_name, update_name, params, false));
+    try item.put(alloc, "delete", try collectionOperation(alloc, col, try alloc.print("delete{s}", .{base}), col.deleteRule, null, null, params, true));
     try paths.put(alloc, item_path, .{ .object = item });
 }
 

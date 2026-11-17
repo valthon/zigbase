@@ -176,12 +176,12 @@ pub fn explain(ctx: *http.RequestCtx) !http.Response {
     if (input.equalityField) |field| if (!fieldAllowed(col, field)) return invalid(ctx);
     if (input.orderField) |field| if (!fieldAllowed(col, field)) return invalid(ctx);
     const qcol = try ddl.quoteIdent(ctx.allocator.a, col.name);
-    const where = if (input.equalityField) |field| try std.fmt.allocPrint(ctx.allocator.a, " WHERE {s}=?1", .{try ddl.quoteIdent(ctx.allocator.a, field)}) else "";
-    const order = if (input.orderField) |field| try std.fmt.allocPrint(ctx.allocator.a, " ORDER BY {s} {s}", .{ try ddl.quoteIdent(ctx.allocator.a, field), if (input.descending) @as([]const u8, "DESC") else "ASC" }) else "";
+    const where = if (input.equalityField) |field| try ctx.allocator.a.print(" WHERE {s}=?1", .{try ddl.quoteIdent(ctx.allocator.a, field)}) else "";
+    const order = if (input.orderField) |field| try ctx.allocator.a.print(" ORDER BY {s} {s}", .{ try ddl.quoteIdent(ctx.allocator.a, field), if (input.descending) @as([]const u8, "DESC") else "ASC" }) else "";
     // A generated SELECT shape, never EXPLAIN ANALYZE or caller-provided SQL.
     // No input values, functions, joins or expressions. Planning does not read
     // result rows or modify data. The NULL bind is deliberately value-agnostic.
-    const sql = try std.fmt.allocPrintSentinel(ctx.allocator.a, "EXPLAIN QUERY PLAN SELECT \"id\" FROM {s}{s}{s} LIMIT 100;", .{ qcol, where, order }, 0);
+    const sql = try ctx.allocator.a.printSentinel("EXPLAIN QUERY PLAN SELECT \"id\" FROM {s}{s}{s} LIMIT 100;", .{ qcol, where, order }, 0);
     var stmt = try reader.prepare(sql);
     defer stmt.finalize();
     if (input.equalityField != null) try stmt.bindNull(1);

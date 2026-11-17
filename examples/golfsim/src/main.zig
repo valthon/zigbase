@@ -92,8 +92,7 @@ fn prepareBooking(ctx: *zigbase.Ctx, ev: *zigbase.RecordEvent) anyerror!void {
     // for the same listing whose time window overlaps ours.
     //   overlap condition: existing.starts_at < our ends_at AND existing.ends_at > our starts_at
     // Allocate the filter in ev.arena.a (the request-scoped allocator).
-    const overlap_filter = try std.fmt.allocPrint(
-        ev.arena.a,
+    const overlap_filter = try ev.arena.a.print(
         "listing = \"{s}\" && status != \"cancelled\" && starts_at < \"{s}\" && ends_at > \"{s}\"",
         .{ listing_id, ends_at, starts_at },
     );
@@ -225,8 +224,7 @@ fn webhookJob(ctx: *zigbase.Ctx, ev: *zigbase.events.JobEvent) anyerror!void {
     const booking_id = ev.name;
     const url = (ctx.kv().get("booking_webhook_url") catch return) orelse return;
     if (url.len == 0) return;
-    const body = std.fmt.allocPrint(
-        ctx.arena.a,
+    const body = ctx.arena.a.print(
         "{{\"event\":\"booking.confirmed\",\"booking\":\"{s}\"}}",
         .{booking_id},
     ) catch return;
@@ -293,8 +291,7 @@ fn listingAvailability(req: *zigbase.Req(void)) zigbase.RouteError!std.json.Valu
 
     // Read through the per-request capability object — `req.ctx.records()` manages
     // the pooled read connection itself (no manual acquireReader / Data wiring).
-    const filter = std.fmt.allocPrint(
-        req.ctx.arena.a,
+    const filter = req.ctx.arena.a.print(
         "listing = \"{s}\" && status != \"cancelled\"",
         .{id},
     ) catch return error.RouteFailed;
@@ -729,7 +726,7 @@ fn isoFromEpoch(alloc: std.mem.Allocator, secs: i64) ![]u8 {
     // Cast to unsigned before formatting: Zig 0.16's `{d:0>N}` zero-pad emits a `+` sign for
     // SIGNED integers (e.g. "+2030-+6-..."), which datetime validators then reject. All six
     // fields are non-negative for an in-range instant. (Mirrors datetime.formatUtc.)
-    return std.fmt.allocPrint(alloc, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z", .{
+    return alloc.print("{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z", .{
         @as(u64, @intCast(year)), @as(u64, @intCast(month)),  @as(u64, @intCast(day)),
         @as(u64, @intCast(hour)), @as(u64, @intCast(minute)), @as(u64, @intCast(second)),
     });
@@ -1335,7 +1332,7 @@ test "confirmBooking is owner-only and gated by the bookings_frozen feature flag
     });
     const booking_id = (try created.json(struct { id: []const u8 })).id;
     var buf: [128]u8 = undefined;
-    const confirm_path = try std.fmt.bufPrint(&buf, "/api/bookings/{s}/confirm", .{booking_id});
+    const confirm_path = try std.mem.print(&buf, "/api/bookings/{s}/confirm", .{booking_id});
 
     // Neither the guest nor an unrelated caller owns the listing's simulator.
     const forbidden = try t.request(.POST, confirm_path, .{ .auth = stranger.token });
@@ -1369,7 +1366,7 @@ test "confirmBooking is owner-only and gated by the bookings_frozen feature flag
     });
     const booking2_id = (try created2.json(struct { id: []const u8 })).id;
     var buf2: [128]u8 = undefined;
-    const confirm_path2 = try std.fmt.bufPrint(&buf2, "/api/bookings/{s}/confirm", .{booking2_id});
+    const confirm_path2 = try std.mem.print(&buf2, "/api/bookings/{s}/confirm", .{booking2_id});
     const frozen = try t.request(.POST, confirm_path2, .{ .auth = setup.host_token });
     try std.testing.expectEqual(@as(u16, 503), frozen.status);
 }
@@ -1388,7 +1385,7 @@ test "cancelBooking is guest-only" {
     });
     const booking_id = (try created.json(struct { id: []const u8 })).id;
     var buf: [128]u8 = undefined;
-    const cancel_path = try std.fmt.bufPrint(&buf, "/api/bookings/{s}/cancel", .{booking_id});
+    const cancel_path = try std.mem.print(&buf, "/api/bookings/{s}/cancel", .{booking_id});
 
     const forbidden = try t.request(.POST, cancel_path, .{ .auth = stranger.token });
     try std.testing.expectEqual(@as(u16, 403), forbidden.status);
@@ -1421,12 +1418,12 @@ test "listingAvailability lists only non-cancelled bookings for a listing" {
     });
     const dropped_id = (try dropped.json(struct { id: []const u8 })).id;
     var buf: [128]u8 = undefined;
-    const cancel_path = try std.fmt.bufPrint(&buf, "/api/bookings/{s}/cancel", .{dropped_id});
+    const cancel_path = try std.mem.print(&buf, "/api/bookings/{s}/cancel", .{dropped_id});
     const cancelled = try t.request(.POST, cancel_path, .{ .auth = guest.token });
     try std.testing.expectEqual(@as(u16, 200), cancelled.status);
 
     var buf2: [128]u8 = undefined;
-    const avail_path = try std.fmt.bufPrint(&buf2, "/api/listings/{s}/availability", .{setup.listing_id});
+    const avail_path = try std.mem.print(&buf2, "/api/listings/{s}/availability", .{setup.listing_id});
     const avail = try t.request(.GET, avail_path, .{ .auth = guest.token });
     try std.testing.expectEqual(@as(u16, 200), avail.status);
     const page = try avail.json(struct { items: []struct { id: []const u8 } });
@@ -1456,7 +1453,7 @@ test "prepareReview only lets the booking's own guest review it, and only once i
     try std.testing.expectEqual(@as(u16, 400), too_early.status);
 
     var buf: [128]u8 = undefined;
-    const confirm_path = try std.fmt.bufPrint(&buf, "/api/bookings/{s}/confirm", .{booking_id});
+    const confirm_path = try std.mem.print(&buf, "/api/bookings/{s}/confirm", .{booking_id});
     const confirmed = try t.request(.POST, confirm_path, .{ .auth = setup.host_token });
     try std.testing.expectEqual(@as(u16, 200), confirmed.status);
 
@@ -1508,7 +1505,7 @@ test "per-device sessions: two logins register two sessions; revoke one, then lo
     try std.testing.expectEqual(@as(usize, 1), current_count);
 
     var buf: [128]u8 = undefined;
-    const revoke_path = try std.fmt.bufPrint(&buf, "/api/golfsim/sessions/{s}/revoke", .{other_id.?});
+    const revoke_path = try std.mem.print(&buf, "/api/golfsim/sessions/{s}/revoke", .{other_id.?});
     const revoked = try t.request(.POST, revoke_path, .{ .auth = c1 });
     try std.testing.expectEqual(@as(u16, 200), revoked.status);
 
@@ -1540,7 +1537,7 @@ test "ctx.txWith converts a hold into a booking atomically (POST /api/holds/:id/
     const hold_id = (try hold.json(struct { id: []const u8 })).id;
 
     var buf: [128]u8 = undefined;
-    const convert_path = try std.fmt.bufPrint(&buf, "/api/holds/{s}/convert", .{hold_id});
+    const convert_path = try std.mem.print(&buf, "/api/holds/{s}/convert", .{hold_id});
     const converted = try t.request(.POST, convert_path, .{
         .json = .{ .starts_at = "2030-08-01 09:00:00.000Z", .ends_at = "2030-08-01 10:00:00.000Z" },
         .auth = guest.token,
@@ -1552,7 +1549,7 @@ test "ctx.txWith converts a hold into a booking atomically (POST /api/holds/:id/
 
     // Both writes committed together: the hold no longer exists.
     var buf2: [128]u8 = undefined;
-    const hold_get_path = try std.fmt.bufPrint(&buf2, "/api/collections/holds/records/{s}", .{hold_id});
+    const hold_get_path = try std.mem.print(&buf2, "/api/collections/holds/records/{s}", .{hold_id});
     const gone = try t.request(.GET, hold_get_path, .{ .auth = guest.token });
     try std.testing.expectEqual(@as(u16, 404), gone.status);
 }

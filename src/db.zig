@@ -516,7 +516,7 @@ test "seam: a SQLite pool reports the sqlite backend + dialect" {
     defer tmp.cleanup();
     const dir_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(dir_path);
-    const db_path = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/sel.db", .{dir_path}, 0);
+    const db_path = try std.testing.allocator.printSentinel("{s}/sel.db", .{dir_path}, 0);
     defer std.testing.allocator.free(db_path);
 
     var pool = try Pool.init(std.testing.allocator, std.testing.io, db_path);
@@ -591,7 +591,7 @@ test "writer recovery rolls back a failed commit and preserves connection state"
     defer tmp.cleanup();
     const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
     defer a.free(dir);
-    const path = try std.fmt.allocPrintSentinel(a, "{s}/recovery.db", .{dir}, 0);
+    const path = try a.printSentinel("{s}/recovery.db", .{dir}, 0);
     defer a.free(path);
     var pool = try Pool.init(a, std.testing.io, path);
     defer pool.deinit();
@@ -636,7 +636,7 @@ test "writer recovery quarantines a ledger rollback failure across seam views an
     defer tmp.cleanup();
     const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
     defer a.free(dir);
-    const path = try std.fmt.allocPrintSentinel(a, "{s}/poison.db", .{dir}, 0);
+    const path = try a.printSentinel("{s}/poison.db", .{dir}, 0);
     defer a.free(path);
     var pool = try Pool.init(a, std.testing.io, path);
     defer pool.deinit();

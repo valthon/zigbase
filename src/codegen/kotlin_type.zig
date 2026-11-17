@@ -44,7 +44,7 @@ pub fn selectEnumName(alloc: std.mem.Allocator, col_name: []const u8, field_name
     defer alloc.free(rec);
     const fp = try ident.pascal(alloc, field_name);
     defer alloc.free(fp);
-    return std.fmt.allocPrint(alloc, "{s}{s}", .{ rec, fp });
+    return alloc.print("{s}{s}", .{ rec, fp });
 }
 
 /// The scalar (element) Kotlin type of a field — the value domain for a
@@ -77,13 +77,13 @@ pub fn ktRecordTypeOf(alloc: std.mem.Allocator, col_name: []const u8, f: schema.
     const base = try ktBaseTypeOf(alloc, col_name, f);
     if (f.isMultiValue()) {
         defer alloc.free(base);
-        return std.fmt.allocPrint(alloc, "List<{s}>", .{base});
+        return alloc.print("List<{s}>", .{base});
     }
     // Single select and single json are both nullable — `Base?` (json's base is
     // "JsonElement", so this yields the same "JsonElement?" as before).
     if (kindOf(f) == .select_enum or kindOf(f) == .json) {
         defer alloc.free(base);
-        return std.fmt.allocPrint(alloc, "{s}?", .{base});
+        return alloc.print("{s}?", .{base});
     }
     return base;
 }

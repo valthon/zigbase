@@ -97,7 +97,7 @@ pub fn scopePredicate(alloc: std.mem.Allocator, col: schema.Collection, rctx: *c
     defer alloc.free(qcol);
     const qtf = try ddl.quoteIdent(alloc, tf);
     defer alloc.free(qtf);
-    const sql = try std.fmt.allocPrint(alloc, "{s}.{s} = ?", .{ qcol, qtf });
+    const sql = try alloc.print("{s}.{s} = ?", .{ qcol, qtf });
     return .{ .sql = sql, .param = .{ .text = rctx.account_id } };
 }
 
@@ -281,7 +281,7 @@ pub fn signAccount(alloc: std.mem.Allocator, secret: []const u8, account_id: []c
     var mac: [HmacSha256.mac_length]u8 = undefined;
     macFor(secret, account_id, &mac);
     const hex = std.fmt.bytesToHex(mac, .lower);
-    return std.fmt.allocPrint(alloc, "{s}.{s}", .{ account_id, hex });
+    return alloc.print("{s}.{s}", .{ account_id, hex });
 }
 
 /// Verify a `zb_account` cookie value and return the account id it carries, or null if the value
@@ -387,11 +387,11 @@ const LinkQuery = struct {
 
     /// Both rows owned (non-NULL, non-empty) and by different accounts.
     fn owners(self: LinkQuery, arena: std.mem.Allocator) ![]const u8 {
-        return std.fmt.allocPrint(arena, "s.{s} <> '' AND t.{s} <> '' AND s.{s} <> t.{s}", .{ self.stf, self.ttf, self.stf, self.ttf });
+        return arena.print("s.{s} <> '' AND t.{s} <> '' AND s.{s} <> t.{s}", .{ self.stf, self.ttf, self.stf, self.ttf });
     }
 
     fn singleSql(self: LinkQuery, arena: std.mem.Allocator) ![:0]const u8 {
-        return std.fmt.allocPrintSentinel(arena, "SELECT COUNT(*) FROM {s} AS s JOIN {s} AS t ON t.\"id\" = s.{s} WHERE {s};", .{
+        return arena.printSentinel("SELECT COUNT(*) FROM {s} AS s JOIN {s} AS t ON t.\"id\" = s.{s} WHERE {s};", .{
             self.src, self.tgt, self.field, try self.owners(arena),
         }, 0);
     }
@@ -400,12 +400,12 @@ const LinkQuery = struct {
         return switch (backend) {
             // Aggregate each row's links before summing so array length cannot multiply the
             // unparseable count. CASE is lazy: json_type only sees valid JSON.
-            .sqlite => std.fmt.allocPrintSentinel(arena, "SELECT COALESCE(SUM((SELECT COUNT(*) FROM json_each(CASE WHEN json_valid(s.{s}) THEN CASE json_type(s.{s}) WHEN 'array' THEN s.{s} END END) AS j JOIN {s} AS t ON t.\"id\" = j.value WHERE j.type = 'text' AND {s})), 0), COALESCE(SUM(CASE WHEN s.{s} IS NOT NULL AND s.{s} <> '' AND NOT (CASE WHEN json_valid(s.{s}) THEN json_type(s.{s}) = 'array' ELSE 0 END) THEN 1 ELSE 0 END), 0) FROM {s} AS s;", .{
+            .sqlite => arena.printSentinel("SELECT COALESCE(SUM((SELECT COUNT(*) FROM json_each(CASE WHEN json_valid(s.{s}) THEN CASE json_type(s.{s}) WHEN 'array' THEN s.{s} END END) AS j JOIN {s} AS t ON t.\"id\" = j.value WHERE j.type = 'text' AND {s})), 0), COALESCE(SUM(CASE WHEN s.{s} IS NOT NULL AND s.{s} <> '' AND NOT (CASE WHEN json_valid(s.{s}) THEN json_type(s.{s}) = 'array' ELSE 0 END) THEN 1 ELSE 0 END), 0) FROM {s} AS s;", .{
                 self.field, self.field, self.field, self.tgt, try self.owners(arena), self.field, self.field, self.field, self.field, self.src,
             }, 0),
             // No portable "is valid JSON" before PostgreSQL 16: only a value that looks like an
             // array is cast (see `findCrossTenantLinks` for what a malformed one does).
-            .postgres => std.fmt.allocPrintSentinel(arena, "SELECT COALESCE(SUM((SELECT COUNT(*) FROM jsonb_array_elements(CASE WHEN s.{s} ~ '^\\s*\\[' THEN s.{s}::jsonb ELSE '[]'::jsonb END) AS j(v) JOIN {s} AS t ON t.\"id\" = (j.v #>> '{{}}') WHERE jsonb_typeof(j.v) = 'string' AND {s})), 0), COALESCE(SUM(CASE WHEN s.{s} IS NOT NULL AND s.{s} <> '' AND s.{s} !~ '^\\s*\\[' THEN 1 ELSE 0 END), 0) FROM {s} AS s;", .{
+            .postgres => arena.printSentinel("SELECT COALESCE(SUM((SELECT COUNT(*) FROM jsonb_array_elements(CASE WHEN s.{s} ~ '^\\s*\\[' THEN s.{s}::jsonb ELSE '[]'::jsonb END) AS j(v) JOIN {s} AS t ON t.\"id\" = (j.v #>> '{{}}') WHERE jsonb_typeof(j.v) = 'string' AND {s})), 0), COALESCE(SUM(CASE WHEN s.{s} IS NOT NULL AND s.{s} <> '' AND s.{s} !~ '^\\s*\\[' THEN 1 ELSE 0 END), 0) FROM {s} AS s;", .{
                 self.field, self.field, self.tgt, try self.owners(arena), self.field, self.field, self.field, self.src,
             }, 0),
         };
@@ -549,7 +549,7 @@ test "requestedAccount: header wins over the signed cookie; unsigned/bad cookie 
             .headers = &hdrs,
         };
         // cookie name is "zb_account"; wrap it as "zb_account=<signed>" for the cookie parser.
-        const cookie_hdr = try std.fmt.allocPrint(std.testing.allocator, "{s}={s}", .{ account_cookie, signed });
+        const cookie_hdr = try std.testing.allocator.print("{s}={s}", .{ account_cookie, signed });
         defer std.testing.allocator.free(cookie_hdr);
         ctx.cookie_header = cookie_hdr;
         try std.testing.expectEqualStrings("acc-header", requestedAccount(&ctx, &app).?);
@@ -558,7 +558,7 @@ test "requestedAccount: header wins over the signed cookie; unsigned/bad cookie 
     {
         const signed = try signAccount(std.testing.allocator, app.jwt_secret, "acc-cookie");
         defer std.testing.allocator.free(signed);
-        const cookie_hdr = try std.fmt.allocPrint(std.testing.allocator, "{s}={s}", .{ account_cookie, signed });
+        const cookie_hdr = try std.testing.allocator.print("{s}={s}", .{ account_cookie, signed });
         defer std.testing.allocator.free(cookie_hdr);
         var ctx = http.RequestCtx{ .method = .GET, .path = "/", .allocator = RequestArena.forTest(std.testing.allocator), .cookie_header = cookie_hdr };
         try std.testing.expectEqualStrings("acc-cookie", requestedAccount(&ctx, &app).?);
@@ -567,7 +567,7 @@ test "requestedAccount: header wins over the signed cookie; unsigned/bad cookie 
     {
         const forged = try signAccount(std.testing.allocator, "wrong-secret", "acc-evil");
         defer std.testing.allocator.free(forged);
-        const cookie_hdr = try std.fmt.allocPrint(std.testing.allocator, "{s}={s}", .{ account_cookie, forged });
+        const cookie_hdr = try std.testing.allocator.print("{s}={s}", .{ account_cookie, forged });
         defer std.testing.allocator.free(cookie_hdr);
         var ctx = http.RequestCtx{ .method = .GET, .path = "/", .allocator = RequestArena.forTest(std.testing.allocator), .cookie_header = cookie_hdr };
         try std.testing.expect(requestedAccount(&ctx, &app) == null);
@@ -666,7 +666,7 @@ test "signAccount/verifyAccount round-trip; tamper fails closed" {
     // Wrong secret -> null.
     try std.testing.expect(verifyAccount("other", signed) == null);
     // Tampered account id -> null (MAC no longer matches).
-    const tampered = try std.fmt.allocPrint(a, "acc-999.{s}", .{signed[std.mem.lastIndexOfScalar(u8, signed, '.').? + 1 ..]});
+    const tampered = try a.print("acc-999.{s}", .{signed[std.mem.lastIndexOfScalar(u8, signed, '.').? + 1 ..]});
     defer a.free(tampered);
     try std.testing.expect(verifyAccount(secret, tampered) == null);
     // Malformed (no dot) -> null.
@@ -681,11 +681,11 @@ test "PostgreSQL membership resolution uses bound parameters inside a transactio
     defer conn.close();
     const token = try @import("../crypto.zig").genHex(std.testing.io, a, 24);
     defer a.free(token);
-    const create = try std.fmt.allocPrintSentinel(a, "CREATE SCHEMA tenant_retry_{s};", .{token}, 0);
+    const create = try a.printSentinel("CREATE SCHEMA tenant_retry_{s};", .{token}, 0);
     defer a.free(create);
-    const drop = try std.fmt.allocPrintSentinel(a, "DROP SCHEMA tenant_retry_{s} CASCADE;", .{token}, 0);
+    const drop = try a.printSentinel("DROP SCHEMA tenant_retry_{s} CASCADE;", .{token}, 0);
     defer a.free(drop);
-    const path = try std.fmt.allocPrintSentinel(a, "SET search_path TO tenant_retry_{s};", .{token}, 0);
+    const path = try a.printSentinel("SET search_path TO tenant_retry_{s};", .{token}, 0);
     defer a.free(path);
     try conn.exec(create);
     defer conn.exec(drop) catch |err| std.log.err("tenant resolution test schema cleanup failed: {s}", .{@errorName(err)});
@@ -848,11 +848,11 @@ test "findCrossTenantLinks + scoped relation check on PostgreSQL (#497)" {
     defer conn.close();
     const token = try @import("../crypto.zig").genHex(std.testing.io, a, 24);
     defer a.free(token);
-    const create = try std.fmt.allocPrintSentinel(a, "CREATE SCHEMA tenant_links_{s};", .{token}, 0);
+    const create = try a.printSentinel("CREATE SCHEMA tenant_links_{s};", .{token}, 0);
     defer a.free(create);
-    const drop = try std.fmt.allocPrintSentinel(a, "DROP SCHEMA tenant_links_{s} CASCADE;", .{token}, 0);
+    const drop = try a.printSentinel("DROP SCHEMA tenant_links_{s} CASCADE;", .{token}, 0);
     defer a.free(drop);
-    const path = try std.fmt.allocPrintSentinel(a, "SET search_path TO tenant_links_{s};", .{token}, 0);
+    const path = try a.printSentinel("SET search_path TO tenant_links_{s};", .{token}, 0);
     defer a.free(path);
     try conn.exec(create);
     defer conn.exec(drop) catch |err| std.log.err("tenant links test schema cleanup failed: {s}", .{@errorName(err)});

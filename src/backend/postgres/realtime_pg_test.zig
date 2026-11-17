@@ -45,29 +45,29 @@ var schema_counter: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
 
 fn enterTempSchema(a: std.mem.Allocator, d: *dbm.Db) ![:0]const u8 {
     const n = schema_counter.fetchAdd(1, .monotonic);
-    const name = try std.fmt.allocPrint(a, "zb_rt_{d}", .{n});
-    try d.exec(try std.fmt.allocPrintSentinel(a, "DROP SCHEMA IF EXISTS \"{s}\" CASCADE;", .{name}, 0));
-    try d.exec(try std.fmt.allocPrintSentinel(a, "CREATE SCHEMA \"{s}\";", .{name}, 0));
-    try d.exec(try std.fmt.allocPrintSentinel(a, "SET search_path TO \"{s}\";", .{name}, 0));
-    return std.fmt.allocPrintSentinel(a, "{s}", .{name}, 0);
+    const name = try a.print("zb_rt_{d}", .{n});
+    try d.exec(try a.printSentinel("DROP SCHEMA IF EXISTS \"{s}\" CASCADE;", .{name}, 0));
+    try d.exec(try a.printSentinel("CREATE SCHEMA \"{s}\";", .{name}, 0));
+    try d.exec(try a.printSentinel("SET search_path TO \"{s}\";", .{name}, 0));
+    return a.printSentinel("{s}", .{name}, 0);
 }
 
 fn dropTempSchema(a: std.mem.Allocator, d: *dbm.Db, name: []const u8) void {
-    const sql = std.fmt.allocPrintSentinel(a, "DROP SCHEMA IF EXISTS \"{s}\" CASCADE;", .{name}, 0) catch return;
+    const sql = a.printSentinel("DROP SCHEMA IF EXISTS \"{s}\" CASCADE;", .{name}, 0) catch return;
     d.exec(sql) catch {};
 }
 
 fn provisionPg(a: std.mem.Allocator, d: *dbm.Db, col: schema.Collection) !void {
     const tc = Dialect.postgres.textCollate();
     var sql: std.ArrayList(u8) = .empty;
-    try sql.appendSlice(a, try std.fmt.allocPrint(a, "CREATE TABLE \"{s}\" (\"id\" TEXT{s} PRIMARY KEY, \"created\" TEXT{s}, \"updated\" TEXT{s}", .{ col.name, tc, tc, tc }));
+    try sql.appendSlice(a, try a.print("CREATE TABLE \"{s}\" (\"id\" TEXT{s} PRIMARY KEY, \"created\" TEXT{s}, \"updated\" TEXT{s}", .{ col.name, tc, tc, tc }));
     for (col.fields) |f| {
         const ty = Dialect.postgres.sqlType(f.storageClass());
         const collate = if (std.mem.eql(u8, ty, "TEXT")) tc else "";
-        try sql.appendSlice(a, try std.fmt.allocPrint(a, ", \"{s}\" {s}{s}", .{ f.name, ty, collate }));
+        try sql.appendSlice(a, try a.print(", \"{s}\" {s}{s}", .{ f.name, ty, collate }));
     }
     try sql.appendSlice(a, ");");
-    try d.exec(try std.fmt.allocPrintSentinel(a, "{s}", .{sql.items}, 0));
+    try d.exec(try a.printSentinel("{s}", .{sql.items}, 0));
 }
 
 fn authedConn(a: std.mem.Allocator, id: []const u8, is_super: bool) !Conn {

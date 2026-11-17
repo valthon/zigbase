@@ -116,8 +116,7 @@ fn initiateImpl(ctx: *anyopaque, ac: *AuthCtx) anyerror!InitiateResult {
     const challenge_b64 = try client_data.b64urlNoPad(ac.ctx.allocator.a, &challenge_raw);
 
     // Build the PublicKeyCredentialRequestOptions JSON response.
-    const body = try std.fmt.allocPrint(
-        ac.ctx.allocator.a,
+    const body = try ac.ctx.allocator.a.print(
         "{{\"challenge\":\"{s}\",\"rpId\":\"{s}\",\"ceremonyId\":\"{s}\",\"timeout\":300000}}",
         .{ challenge_b64, wa_opts.rp_id, cid },
     );
@@ -310,7 +309,7 @@ const WaEnv = struct {
         env.tmp = std.testing.tmpDir(.{});
         const dir = try env.tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
         defer std.testing.allocator.free(dir);
-        const path = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/wa.db", .{dir}, 0);
+        const path = try std.testing.allocator.printSentinel("{s}/wa.db", .{dir}, 0);
         defer std.testing.allocator.free(path);
         env.pool = try test_db.Pool.init(std.testing.allocator, std.testing.io, path);
         {
@@ -529,8 +528,7 @@ test "WebAuthnMethod: complete succeeds with valid fixture (ES256)" {
     std.mem.writeInt(u32, auth_data_raw[33..37], 1, .big); // signCount=1
 
     // Build clientDataJSON.
-    const cdj = try std.fmt.allocPrint(
-        alloc,
+    const cdj = try alloc.print(
         "{{\"type\":\"webauthn.get\",\"challenge\":\"{s}\",\"origin\":\"{s}\"}}",
         .{ challenge_b64, origin },
     );
@@ -555,8 +553,7 @@ test "WebAuthnMethod: complete succeeds with valid fixture (ES256)" {
     defer alloc.free(sig_b64);
 
     // Build the request body.
-    const body_str = try std.fmt.allocPrint(
-        alloc,
+    const body_str = try alloc.print(
         "{{\"ceremonyId\":\"{s}\",\"credentialId\":\"{s}\",\"authenticatorData\":\"{s}\",\"clientDataJSON\":\"{s}\",\"signature\":\"{s}\"}}",
         .{ cid, cred_id_b64, auth_data_b64, cdj_b64, sig_b64 },
     );
@@ -660,8 +657,7 @@ test "WebAuthnMethod: complete with tampered signature returns 401" {
     auth_data_raw[32] = 0x05;
     std.mem.writeInt(u32, auth_data_raw[33..37], 1, .big);
 
-    const cdj = try std.fmt.allocPrint(
-        alloc,
+    const cdj = try alloc.print(
         "{{\"type\":\"webauthn.get\",\"challenge\":\"{s}\",\"origin\":\"{s}\"}}",
         .{ challenge_b64, origin },
     );
@@ -687,8 +683,7 @@ test "WebAuthnMethod: complete with tampered signature returns 401" {
     const sig_b64 = try client_data.b64urlNoPad(alloc, bad_der[0..der_slice.len]);
     defer alloc.free(sig_b64);
 
-    const body_str = try std.fmt.allocPrint(
-        alloc,
+    const body_str = try alloc.print(
         "{{\"ceremonyId\":\"{s}\",\"credentialId\":\"{s}\",\"authenticatorData\":\"{s}\",\"clientDataJSON\":\"{s}\",\"signature\":\"{s}\"}}",
         .{ cid, cred_id_b64, auth_data_b64, cdj_b64, sig_b64 },
     );
@@ -747,8 +742,7 @@ test "WebAuthnMethod: complete with unknown credentialId returns 400" {
     };
     defer alloc.free(cid);
 
-    const body_str = try std.fmt.allocPrint(
-        alloc,
+    const body_str = try alloc.print(
         "{{\"ceremonyId\":\"{s}\",\"credentialId\":\"nonexistent_cred\",\"authenticatorData\":\"AAAA\",\"clientDataJSON\":\"AAAA\",\"signature\":\"AAAA\"}}",
         .{cid},
     );
@@ -808,8 +802,7 @@ test "WebAuthnMethod: complete with expired ceremonyId returns 400" {
     };
     defer alloc.free(cid);
 
-    const body_str = try std.fmt.allocPrint(
-        alloc,
+    const body_str = try alloc.print(
         "{{\"ceremonyId\":\"{s}\",\"credentialId\":\"somecred\",\"authenticatorData\":\"AAAA\",\"clientDataJSON\":\"AAAA\",\"signature\":\"AAAA\"}}",
         .{cid},
     );
@@ -901,8 +894,7 @@ test "WebAuthnMethod: complete with clone signal (stored count > new count) retu
     auth_data_raw[32] = 0x05;
     std.mem.writeInt(u32, auth_data_raw[33..37], 1, .big); // assertion reports count=1, stored=5 → clone!
 
-    const cdj = try std.fmt.allocPrint(
-        alloc,
+    const cdj = try alloc.print(
         "{{\"type\":\"webauthn.get\",\"challenge\":\"{s}\",\"origin\":\"{s}\"}}",
         .{ challenge_b64, origin },
     );
@@ -923,8 +915,7 @@ test "WebAuthnMethod: complete with clone signal (stored count > new count) retu
     const sig_b64 = try client_data.b64urlNoPad(alloc, der);
     defer alloc.free(sig_b64);
 
-    const body_str = try std.fmt.allocPrint(
-        alloc,
+    const body_str = try alloc.print(
         "{{\"ceremonyId\":\"{s}\",\"credentialId\":\"{s}\",\"authenticatorData\":\"{s}\",\"clientDataJSON\":\"{s}\",\"signature\":\"{s}\"}}",
         .{ cid, cred_id_b64, auth_data_b64, cdj_b64_enc, sig_b64 },
     );
@@ -1039,8 +1030,7 @@ test "WebAuthnMethod: complete rejects a credential bound to a DIFFERENT collect
     auth_data_raw[32] = 0x05;
     std.mem.writeInt(u32, auth_data_raw[33..37], 1, .big);
 
-    const cdj = try std.fmt.allocPrint(
-        alloc,
+    const cdj = try alloc.print(
         "{{\"type\":\"webauthn.get\",\"challenge\":\"{s}\",\"origin\":\"{s}\"}}",
         .{ challenge_b64, origin },
     );
@@ -1060,8 +1050,7 @@ test "WebAuthnMethod: complete rejects a credential bound to a DIFFERENT collect
     const sig_b64 = try client_data.b64urlNoPad(alloc, der);
     defer alloc.free(sig_b64);
 
-    const body_str = try std.fmt.allocPrint(
-        alloc,
+    const body_str = try alloc.print(
         "{{\"ceremonyId\":\"{s}\",\"credentialId\":\"{s}\",\"authenticatorData\":\"{s}\",\"clientDataJSON\":\"{s}\",\"signature\":\"{s}\"}}",
         .{ cid, cred_id_b64, auth_data_b64, cdj_b64_enc, sig_b64 },
     );
@@ -1165,8 +1154,7 @@ test "WebAuthnMethod: complete with require_uv=true rejects an assertion lacking
     auth_data_raw[32] = 0x01;
     std.mem.writeInt(u32, auth_data_raw[33..37], 1, .big);
 
-    const cdj = try std.fmt.allocPrint(
-        alloc,
+    const cdj = try alloc.print(
         "{{\"type\":\"webauthn.get\",\"challenge\":\"{s}\",\"origin\":\"{s}\"}}",
         .{ challenge_b64, origin },
     );
@@ -1186,8 +1174,7 @@ test "WebAuthnMethod: complete with require_uv=true rejects an assertion lacking
     const sig_b64 = try client_data.b64urlNoPad(alloc, der);
     defer alloc.free(sig_b64);
 
-    const body_str = try std.fmt.allocPrint(
-        alloc,
+    const body_str = try alloc.print(
         "{{\"ceremonyId\":\"{s}\",\"credentialId\":\"{s}\",\"authenticatorData\":\"{s}\",\"clientDataJSON\":\"{s}\",\"signature\":\"{s}\"}}",
         .{ cid, cred_id_b64, auth_data_b64, cdj_b64_enc, sig_b64 },
     );

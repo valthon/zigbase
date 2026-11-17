@@ -29,7 +29,7 @@ fn decode(alloc: std.mem.Allocator, value: []const u8) ![]u8 {
 }
 
 fn domain(alloc: std.mem.Allocator, pending: []const u8, enrolling: bool) ![]const u8 {
-    return std.fmt.allocPrint(alloc, "two-factor:webauthn:{s}:{s}", .{ if (enrolling) "register" else "assert", pending });
+    return alloc.print("two-factor:webauthn:{s}:{s}", .{ if (enrolling) "register" else "assert", pending });
 }
 
 pub fn begin(ctx: *http.RequestCtx, conn: *db.Db, col: schema.Collection, principal: []const u8, pending: []const u8, enrolling: bool) !http.Response {

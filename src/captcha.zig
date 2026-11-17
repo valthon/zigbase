@@ -219,7 +219,7 @@ pub fn verify(
     defer alloc.free(enc_secret);
     const enc_token = try url.percentEncode(alloc, token);
     defer alloc.free(enc_token);
-    const body_form = try std.fmt.allocPrint(alloc, "secret={s}&response={s}", .{ enc_secret, enc_token });
+    const body_form = try alloc.print("secret={s}&response={s}", .{ enc_secret, enc_token });
     defer alloc.free(body_form);
 
     const resp = try client.post(provider.verifyUrl(), .{

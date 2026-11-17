@@ -41,7 +41,7 @@ pub fn recordName(alloc: std.mem.Allocator, col_name: []const u8) ![]const u8 {
 fn suffixed(alloc: std.mem.Allocator, col_name: []const u8, suffix: []const u8) ![]const u8 {
     const r = try recordName(alloc, col_name);
     defer alloc.free(r);
-    return std.fmt.allocPrint(alloc, "{s}{s}", .{ r, suffix });
+    return alloc.print("{s}{s}", .{ r, suffix });
 }
 
 pub fn whereName(alloc: std.mem.Allocator, c: []const u8) ![]const u8 {
@@ -66,16 +66,16 @@ pub fn realtimeAliasName(alloc: std.mem.Allocator, c: []const u8) ![]const u8 {
     // Plural collection name + "Realtime" (blog: posts -> PostsRealtime).
     const p = try pascal(alloc, c);
     defer alloc.free(p);
-    return std.fmt.allocPrint(alloc, "{s}Realtime", .{p});
+    return alloc.print("{s}Realtime", .{p});
 }
 pub fn serviceName(alloc: std.mem.Allocator, c: []const u8) ![]const u8 {
     // Plural collection name + "Service" (blog: posts -> PostsService).
     const p = try pascal(alloc, c);
     defer alloc.free(p);
-    return std.fmt.allocPrint(alloc, "{s}Service", .{p});
+    return alloc.print("{s}Service", .{p});
 }
 pub fn metaConst(alloc: std.mem.Allocator, c: []const u8) ![]const u8 {
-    return std.fmt.allocPrint(alloc, "{s}Meta", .{c});
+    return alloc.print("{s}Meta", .{c});
 }
 
 /// Derive a camelCase RPC method name from a route path: strip the api-prefix, drop

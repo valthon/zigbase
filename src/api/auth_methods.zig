@@ -112,7 +112,7 @@ fn dispatch(ctx: *http.RequestCtx, phase: DispatchPhase) anyerror!http.Response 
             // Unconfigured method: keep the prior behavior — the global/default
             // limiter keyed by method slug (collection-agnostic, as before).
             const ident = identityFromBody(ctx);
-            const scope = try std.fmt.allocPrint(ctx.allocator.a, "auth:{s}", .{slug});
+            const scope = try ctx.allocator.a.print("auth:{s}", .{slug});
             if (try auth.rateLimited(ctx, scope, ident)) |resp| return resp;
         },
         .custom => |c| {
@@ -120,7 +120,7 @@ fn dispatch(ctx: *http.RequestCtx, phase: DispatchPhase) anyerror!http.Response 
             // slug (so different methods/collections never share a budget), honoring
             // this method's configured max/window_s instead of the global default.
             const ident = identityFromBody(ctx);
-            const scope = try std.fmt.allocPrint(ctx.allocator.a, "authm:{s}:{s}", .{ col.name, slug });
+            const scope = try ctx.allocator.a.print("authm:{s}:{s}", .{ col.name, slug });
             if (try auth.rateLimitedCustom(ctx, scope, ident, c.max, c.window_s)) |resp| return resp;
         },
     }

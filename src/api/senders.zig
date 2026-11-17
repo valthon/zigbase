@@ -140,7 +140,7 @@ pub fn create(ctx: *http.RequestCtx) anyerror!http.Response {
     // so it bypasses verified-sender enforcement (chicken-and-egg). Best-effort: a mail failure must
     // not lose the already-persisted pending identity, so we swallow it (the operator can re-request).
     if (!req.already_verified and req.token.len > 0) {
-        const text = std.fmt.allocPrint(ctx.allocator.a, "Confirm you can send from {s} by submitting this token to /api/senders/{s}/verify:\n\n{s}\n", .{ req.email, req.id, req.token }) catch "";
+        const text = ctx.allocator.a.print("Confirm you can send from {s} by submitting this token to /api/senders/{s}/verify:\n\n{s}\n", .{ req.email, req.id, req.token }) catch "";
         mail_send.send(app, ctx.allocator.a, .{
             .to = req.email,
             .subject = "Verify your sender address",
@@ -207,7 +207,7 @@ test "verify requires authentication (401 without auth)" {
     const ga = testing.allocator;
     const dir_path = try tmp.dir.realPathFileAlloc(testing.io, ".", ga);
     defer ga.free(dir_path);
-    const db_path = try std.fmt.allocPrintSentinel(ga, "{s}/sapi.db", .{dir_path}, 0);
+    const db_path = try ga.printSentinel("{s}/sapi.db", .{dir_path}, 0);
     defer ga.free(db_path);
     var pool = try db.Pool.init(ga, testing.io, db_path);
     defer pool.deinit();

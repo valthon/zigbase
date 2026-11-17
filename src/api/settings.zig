@@ -143,7 +143,7 @@ const TestEnv = struct {
         env.tmp = std.testing.tmpDir(.{});
         const dir = try env.tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
         defer std.testing.allocator.free(dir);
-        const path = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/test.db", .{dir}, 0);
+        const path = try std.testing.allocator.printSentinel("{s}/test.db", .{dir}, 0);
         defer std.testing.allocator.free(path);
         env.pool = try db.Pool.init(std.testing.allocator, std.testing.io, path);
         {
@@ -200,7 +200,7 @@ test "settings API put/get/list/delete round-trips for a superuser" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const auth_hdr = try std.fmt.allocPrint(a, "Bearer {s}", .{try env.superuserToken(a)});
+    const auth_hdr = try a.print("Bearer {s}", .{try env.superuserToken(a)});
 
     // Absent key -> 404.
     var g0 = ctxFor(env, RequestArena.from(&arena), .GET, "/api/settings/beta", "", &.{.{ .key = "key", .value = "beta" }});

@@ -161,7 +161,7 @@ test "generateKeypair: output round-trips through vapidAuthHeader + verifies" {
     const h = it.next().?;
     const c = it.next().?;
     const s = it.next().?;
-    const signing_input = try std.fmt.allocPrint(a, "{s}.{s}", .{ h, c });
+    const signing_input = try a.print("{s}.{s}", .{ h, c });
     defer a.free(signing_input);
     var sig_bytes: [64]u8 = undefined;
     try b64.Decoder.decode(&sig_bytes, s);

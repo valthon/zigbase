@@ -31,7 +31,7 @@ fn put(alloc: std.mem.Allocator, w: *W, s: []const u8) !void {
     try w.appendSlice(alloc, s);
 }
 fn putf(alloc: std.mem.Allocator, w: *W, comptime fmt: []const u8, args: anytype) !void {
-    const s = try std.fmt.allocPrint(alloc, fmt, args);
+    const s = try alloc.print(fmt, args);
     try w.appendSlice(alloc, s);
 }
 
@@ -107,7 +107,7 @@ const client_reserved: []const []const u8 = &.{ "raw", "owned", "close", "aclose
 fn memberIdent(alloc: std.mem.Allocator, name: []const u8, reserved: []const []const u8) ![]const u8 {
     var out = name;
     while (isPythonKeyword(out) or inSet(out, reserved)) {
-        out = try std.fmt.allocPrint(alloc, "{s}_", .{out});
+        out = try alloc.print("{s}_", .{out});
     }
     return out;
 }
@@ -139,7 +139,7 @@ fn hasSingleFileFields(c: schema.Collection) bool {
 /// snake_case" convention Task 5 already established for record field
 /// members, e.g. `sentAt` stays `sentAt`) and only appends the `_meta` suffix.
 fn pyMetaConst(alloc: std.mem.Allocator, col_name: []const u8) ![]const u8 {
-    return std.fmt.allocPrint(alloc, "{s}_meta", .{col_name});
+    return alloc.print("{s}_meta", .{col_name});
 }
 
 /// True if ANY collection declares a file field (single or multi) — gates the
@@ -178,7 +178,7 @@ fn enumMemberIdent(alloc: std.mem.Allocator, value: []const u8, i: usize) ![]con
     if (schema.isValidIdentifier(value)) {
         return memberIdent(alloc, try toUpperIdent(alloc, value), enum_reserved);
     }
-    return std.fmt.allocPrint(alloc, "V{d}", .{i});
+    return alloc.print("V{d}", .{i});
 }
 
 pub fn emitSelectEnums(alloc: std.mem.Allocator, w: *W, c: schema.Collection) !void {
@@ -195,8 +195,7 @@ pub fn emitSelectEnums(alloc: std.mem.Allocator, w: *W, c: schema.Collection) !v
         // client that silently drops a select value.
         const idents = try alloc.alloc([]const u8, values.len);
         for (values, 0..) |v, i| idents[i] = try enumMemberIdent(alloc, v, i);
-        try checkDuplicateIdents(idents, values, try std.fmt.allocPrint(
-            alloc,
+        try checkDuplicateIdents(idents, values, try alloc.print(
             "select enum {s} (collection '{s}', field '{s}')",
             .{ ename, c.name, f.name },
         ));
@@ -231,25 +230,25 @@ fn coerceExpr(alloc: std.mem.Allocator, col: []const u8, f: schema.Field) ![]con
     const key = f.name;
     return switch (pt.kindOf(f)) {
         .string, .relation_id, .file_name => if (f.isMultiValue())
-            try std.fmt.allocPrint(alloc, "zbt.coerce_str_list(r.get(\"{s}\"))", .{key})
+            try alloc.print("zbt.coerce_str_list(r.get(\"{s}\"))", .{key})
         else
-            try std.fmt.allocPrint(alloc, "zbt.coerce_str(r.get(\"{s}\"))", .{key}),
+            try alloc.print("zbt.coerce_str(r.get(\"{s}\"))", .{key}),
         .integer => if (f.isMultiValue())
-            try std.fmt.allocPrint(alloc, "zbt.coerce_int_list(r.get(\"{s}\"))", .{key})
+            try alloc.print("zbt.coerce_int_list(r.get(\"{s}\"))", .{key})
         else
-            try std.fmt.allocPrint(alloc, "zbt.coerce_int(r.get(\"{s}\"))", .{key}),
+            try alloc.print("zbt.coerce_int(r.get(\"{s}\"))", .{key}),
         .float_ => if (f.isMultiValue())
-            try std.fmt.allocPrint(alloc, "zbt.coerce_float_list(r.get(\"{s}\"))", .{key})
+            try alloc.print("zbt.coerce_float_list(r.get(\"{s}\"))", .{key})
         else
-            try std.fmt.allocPrint(alloc, "zbt.coerce_float(r.get(\"{s}\"))", .{key}),
-        .boolean => try std.fmt.allocPrint(alloc, "zbt.coerce_bool(r.get(\"{s}\"))", .{key}),
-        .json => try std.fmt.allocPrint(alloc, "r.get(\"{s}\")", .{key}),
+            try alloc.print("zbt.coerce_float(r.get(\"{s}\"))", .{key}),
+        .boolean => try alloc.print("zbt.coerce_bool(r.get(\"{s}\"))", .{key}),
+        .json => try alloc.print("r.get(\"{s}\")", .{key}),
         .select_enum => blk: {
             const en = try pt.selectEnumName(alloc, col, f.name);
             break :blk if (f.isMultiValue())
-                try std.fmt.allocPrint(alloc, "[e for v in zbt.coerce_str_list(r.get(\"{s}\")) if (e := {s}.from_wire(v)) is not None]", .{ key, en })
+                try alloc.print("[e for v in zbt.coerce_str_list(r.get(\"{s}\")) if (e := {s}.from_wire(v)) is not None]", .{ key, en })
             else
-                try std.fmt.allocPrint(alloc, "{s}.from_wire(r.get(\"{s}\"))", .{ en, key });
+                try alloc.print("{s}.from_wire(r.get(\"{s}\"))", .{ en, key });
         },
     };
 }
@@ -266,7 +265,7 @@ pub fn emitRecord(alloc: std.mem.Allocator, w: *W, cols: []const schema.Collecti
         idents[i] = try memberIdent(alloc, f.name, record_reserved);
         names[i] = f.name;
     }
-    try checkDuplicateIdents(idents, names, try std.fmt.allocPrint(alloc, "record class {s} (collection '{s}')", .{ rec, c.name }));
+    try checkDuplicateIdents(idents, names, try alloc.print("record class {s} (collection '{s}')", .{ rec, c.name }));
 
     // `<Rec>Expand` is emitted *before* `<Rec>` (not after, as its own
     // from_record cross-reference alone would require) so that `<Rec>`'s
@@ -361,23 +360,23 @@ fn payloadFieldType(alloc: std.mem.Allocator, col: []const u8, f: schema.Field) 
 fn emitToMapEntry(alloc: std.mem.Allocator, w: *W, f: schema.Field, mid: []const u8, optional: bool) !void {
     var val: []const u8 = undefined;
     switch (pt.kindOf(f)) {
-        .integer => val = try std.fmt.allocPrint(alloc, "zbt.encode_int(self.{s})", .{mid}),
+        .integer => val = try alloc.print("zbt.encode_int(self.{s})", .{mid}),
         .float_ => {
             if (f.options == .number and f.options.number.mode == .fixed) {
                 const scale = f.options.number.scale orelse 0;
-                val = try std.fmt.allocPrint(alloc, "zbt.encode_fixed(self.{s}, {d})", .{ mid, scale });
+                val = try alloc.print("zbt.encode_fixed(self.{s}, {d})", .{ mid, scale });
             } else {
-                val = try std.fmt.allocPrint(alloc, "self.{s}", .{mid}); // float: send as-is
+                val = try alloc.print("self.{s}", .{mid}); // float: send as-is
             }
         },
         .select_enum => {
             if (f.isMultiValue()) {
-                val = try std.fmt.allocPrint(alloc, "[e.value for e in self.{s}]", .{mid});
+                val = try alloc.print("[e.value for e in self.{s}]", .{mid});
             } else {
-                val = try std.fmt.allocPrint(alloc, "self.{s}.value", .{mid});
+                val = try alloc.print("self.{s}.value", .{mid});
             }
         },
-        else => val = try std.fmt.allocPrint(alloc, "self.{s}", .{mid}), // string/relation/bool/json/file -> pass through
+        else => val = try alloc.print("self.{s}", .{mid}), // string/relation/bool/json/file -> pass through
     }
     if (optional) {
         try putf(alloc, w, "        if self.{s} is not None:\n            m[\"{s}\"] = {s}\n", .{ mid, f.name, val });
@@ -474,17 +473,17 @@ pub fn anyAuthCollections(cols: []const schema.Collection) bool {
 fn fluentExpr(alloc: std.mem.Allocator, cols: []const schema.Collection, f: schema.Field) !?[]const u8 {
     return switch (pt.kindOf(f)) {
         .file_name, .json => null,
-        .string => try std.fmt.allocPrint(alloc, "zbt.StringFieldExpr(f\"{{self._p}}{s}\")", .{f.name}),
-        .integer, .float_ => try std.fmt.allocPrint(alloc, "zbt.NumFieldExpr(f\"{{self._p}}{s}\")", .{f.name}),
-        .boolean => try std.fmt.allocPrint(alloc, "zbt.BoolFieldExpr(f\"{{self._p}}{s}\")", .{f.name}),
-        .select_enum => try std.fmt.allocPrint(alloc, "zbt.EnumFieldExpr(f\"{{self._p}}{s}\", wire_of=lambda e: e.value)", .{f.name}),
+        .string => try alloc.print("zbt.StringFieldExpr(f\"{{self._p}}{s}\")", .{f.name}),
+        .integer, .float_ => try alloc.print("zbt.NumFieldExpr(f\"{{self._p}}{s}\")", .{f.name}),
+        .boolean => try alloc.print("zbt.BoolFieldExpr(f\"{{self._p}}{s}\")", .{f.name}),
+        .select_enum => try alloc.print("zbt.EnumFieldExpr(f\"{{self._p}}{s}\", wire_of=lambda e: e.value)", .{f.name}),
         .relation_id => blk: {
             const target = f.options.relation.targetCollectionId;
             if (collectionExists(cols, target)) {
                 const tf = try ident.fieldsName(alloc, target);
-                break :blk try std.fmt.allocPrint(alloc, "zbt.RelFieldExpr(f\"{{self._p}}{s}\", lambda p: {s}(p))", .{ f.name, tf });
+                break :blk try alloc.print("zbt.RelFieldExpr(f\"{{self._p}}{s}\", lambda p: {s}(p))", .{ f.name, tf });
             }
-            break :blk try std.fmt.allocPrint(alloc, "zbt.FieldExpr(f\"{{self._p}}{s}\")", .{f.name});
+            break :blk try alloc.print("zbt.FieldExpr(f\"{{self._p}}{s}\")", .{f.name});
         },
     };
 }
@@ -500,13 +499,13 @@ fn fluentReturnType(alloc: std.mem.Allocator, cols: []const schema.Collection, c
         .boolean => "zbt.BoolFieldExpr",
         .select_enum => blk: {
             const en = try pt.selectEnumName(alloc, col, f.name);
-            break :blk try std.fmt.allocPrint(alloc, "zbt.EnumFieldExpr[{s}]", .{en});
+            break :blk try alloc.print("zbt.EnumFieldExpr[{s}]", .{en});
         },
         .relation_id => blk: {
             const target = f.options.relation.targetCollectionId;
             if (collectionExists(cols, target)) {
                 const tf = try ident.fieldsName(alloc, target);
-                break :blk try std.fmt.allocPrint(alloc, "zbt.RelFieldExpr[{s}]", .{tf});
+                break :blk try alloc.print("zbt.RelFieldExpr[{s}]", .{tf});
             }
             break :blk "zbt.FieldExpr[str]";
         },
@@ -614,7 +613,7 @@ pub fn emitMeta(alloc: std.mem.Allocator, w: *W, c: schema.Collection) !void {
 
 fn enumMemberFor(alloc: std.mem.Allocator, name: []const u8) ![]const u8 {
     if (schema.isValidIdentifier(name)) return memberIdent(alloc, try toUpperIdent(alloc, name), enum_reserved);
-    return std.fmt.allocPrint(alloc, "F_{s}", .{name});
+    return alloc.print("F_{s}", .{name});
 }
 
 /// Emit the `<Rec>FileField` enum: one SCREAMING_SNAKE member per SINGLE-
@@ -820,7 +819,7 @@ pub fn emitService(alloc: std.mem.Allocator, w: *W, cols: []const schema.Collect
     }
 
     if (hasSingleFileFields(c)) {
-        const ffenum = try std.fmt.allocPrint(alloc, "{s}FileField", .{rec});
+        const ffenum = try alloc.print("{s}FileField", .{rec});
         try emitFileUrlMethod(alloc, w, c, rec, ffenum);
         try emitFileFieldEnum(alloc, w, c, ffenum);
     } else {
@@ -830,7 +829,7 @@ pub fn emitService(alloc: std.mem.Allocator, w: *W, cols: []const schema.Collect
 
 pub fn emitAsyncService(alloc: std.mem.Allocator, w: *W, cols: []const schema.Collection, c: schema.Collection) !void {
     _ = cols;
-    const svc = try std.fmt.allocPrint(alloc, "Async{s}", .{try ident.serviceName(alloc, c.name)});
+    const svc = try alloc.print("Async{s}", .{try ident.serviceName(alloc, c.name)});
     const rec = try ident.recordName(alloc, c.name);
     const cn = try ident.createName(alloc, c.name);
     const un = try ident.updateName(alloc, c.name);
@@ -990,7 +989,7 @@ pub fn emitAsyncService(alloc: std.mem.Allocator, w: *W, cols: []const schema.Co
     // The `<Rec>FileField` enum is emitted once, by the sync service (above)
     // — re-declaring the same class name here would just shadow it.
     if (hasSingleFileFields(c)) {
-        const ffenum = try std.fmt.allocPrint(alloc, "{s}FileField", .{rec});
+        const ffenum = try alloc.print("{s}FileField", .{rec});
         try emitFileUrlMethod(alloc, w, c, rec, ffenum);
     } else {
         try put(alloc, w, "\n");
@@ -1025,7 +1024,7 @@ pub fn emitClient(alloc: std.mem.Allocator, w: *W, cols: []const schema.Collecti
         svc_idents[i] = try memberIdent(alloc, c.name, client_reserved);
         names[i] = c.name;
     }
-    try checkDuplicateIdents(svc_idents, names, try std.fmt.allocPrint(alloc, "client class {s}", .{client_name}));
+    try checkDuplicateIdents(svc_idents, names, try alloc.print("client class {s}", .{client_name}));
 
     try putf(alloc, w, "class {s}:\n    def __init__(self, raw: ZigBase, *, owned: bool = False) -> None:\n        self.raw = raw\n        self.owned = owned\n", .{client_name});
     for (cols, 0..) |c, i| {
@@ -1057,7 +1056,7 @@ pub fn emitClient(alloc: std.mem.Allocator, w: *W, cols: []const schema.Collecti
     );
 
     const auth_kw = if (auth_collection.len > 0)
-        try std.fmt.allocPrint(alloc, "    kwargs.setdefault(\"auth_collection\", \"{s}\")\n", .{auth_collection})
+        try alloc.print("    kwargs.setdefault(\"auth_collection\", \"{s}\")\n", .{auth_collection})
     else
         "";
     try putf(alloc, w,
@@ -1069,24 +1068,24 @@ pub fn emitClient(alloc: std.mem.Allocator, w: *W, cols: []const schema.Collecti
 }
 
 pub fn emitAsyncClient(alloc: std.mem.Allocator, w: *W, cols: []const schema.Collection, client_name: []const u8, auth_collection: []const u8) !void {
-    const async_name = try std.fmt.allocPrint(alloc, "Async{s}", .{client_name});
+    const async_name = try alloc.print("Async{s}", .{client_name});
     const svc_idents = try alloc.alloc([]const u8, cols.len);
     const rt_idents = try alloc.alloc([]const u8, cols.len);
     const all_idents = try alloc.alloc([]const u8, cols.len * 2);
     const all_names = try alloc.alloc([]const u8, cols.len * 2);
     for (cols, 0..) |c, i| {
         svc_idents[i] = try memberIdent(alloc, c.name, client_reserved);
-        rt_idents[i] = try memberIdent(alloc, try std.fmt.allocPrint(alloc, "{s}Realtime", .{c.name}), client_reserved);
+        rt_idents[i] = try memberIdent(alloc, try alloc.print("{s}Realtime", .{c.name}), client_reserved);
         all_idents[i] = svc_idents[i];
         all_names[i] = c.name;
         all_idents[cols.len + i] = rt_idents[i];
-        all_names[cols.len + i] = try std.fmt.allocPrint(alloc, "{s} (realtime accessor)", .{c.name});
+        all_names[cols.len + i] = try alloc.print("{s} (realtime accessor)", .{c.name});
     }
-    try checkDuplicateIdents(all_idents, all_names, try std.fmt.allocPrint(alloc, "client class {s}", .{async_name}));
+    try checkDuplicateIdents(all_idents, all_names, try alloc.print("client class {s}", .{async_name}));
 
     try putf(alloc, w, "class {s}:\n    def __init__(self, raw: AsyncZigBase, *, owned: bool = False) -> None:\n        self.raw = raw\n        self.owned = owned\n", .{async_name});
     for (cols, 0..) |c, i| {
-        const svc = try std.fmt.allocPrint(alloc, "Async{s}", .{try ident.serviceName(alloc, c.name)});
+        const svc = try alloc.print("Async{s}", .{try ident.serviceName(alloc, c.name)});
         try putf(alloc, w, "        self.{s} = {s}(raw)\n", .{ svc_idents[i], svc });
     }
     for (cols, 0..) |c, i| {
@@ -1119,7 +1118,7 @@ pub fn emitAsyncClient(alloc: std.mem.Allocator, w: *W, cols: []const schema.Col
     );
 
     const auth_kw = if (auth_collection.len > 0)
-        try std.fmt.allocPrint(alloc, "    kwargs.setdefault(\"auth_collection\", \"{s}\")\n", .{auth_collection})
+        try alloc.print("    kwargs.setdefault(\"auth_collection\", \"{s}\")\n", .{auth_collection})
     else
         "";
     try putf(alloc, w,

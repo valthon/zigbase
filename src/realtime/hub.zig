@@ -551,7 +551,7 @@ fn snapshotSandbox(col: schema.Collection, snapshot: std.json.Value) !*SnapshotS
     const snap_json = try std.json.Stringify.valueAlloc(sa, snapshot, .{});
     const table_sql = try sandboxTableSql(sa, col);
     const fields_json = try schema.fieldsToJson(sa, col.fields);
-    const key = try std.fmt.allocPrint(sa, "{s}\x00{s}\x00{s}\x00{s}\x00{s}", .{ col.id, col.name, table_sql, fields_json, snap_json });
+    const key = try sa.print("{s}\x00{s}\x00{s}\x00{s}\x00{s}", .{ col.id, col.name, table_sql, fields_json, snap_json });
 
     if (snapshot_sandbox) |*cached| {
         if (std.mem.eql(u8, cached.key, key)) return cached; // hit: same (collection, snapshot)
@@ -594,9 +594,9 @@ fn snapshotSandbox(col: schema.Collection, snapshot: std.json.Value) !*SnapshotS
     for (col.fields, 0..) |f, i| {
         try cols_sql.append(sa, ',');
         try cols_sql.appendSlice(sa, try ddl.quoteIdent(sa, f.name));
-        try ph_sql.appendSlice(sa, try std.fmt.allocPrint(sa, ",?{d}", .{i + 4}));
+        try ph_sql.appendSlice(sa, try sa.print(",?{d}", .{i + 4}));
     }
-    const sql = try std.fmt.allocPrintSentinel(sa, "INSERT INTO {s} ({s}) VALUES ({s});", .{ try ddl.quoteIdent(sa, col.name), cols_sql.items, ph_sql.items }, 0);
+    const sql = try sa.printSentinel("INSERT INTO {s} ({s}) VALUES ({s});", .{ try ddl.quoteIdent(sa, col.name), cols_sql.items, ph_sql.items }, 0);
     var st = try tmp.prepare(sql);
     defer st.finalize();
     try st.bindText(1, snapshot.object.get("id").?.string);
@@ -658,7 +658,7 @@ pub fn buildEventFrames(
 ) !EventFrames {
     const coll_channel = try alloc.dupe(u8, collection);
     errdefer alloc.free(coll_channel);
-    const rec_channel = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ collection, record_id });
+    const rec_channel = try alloc.print("{s}/{s}", .{ collection, record_id });
     errdefer alloc.free(rec_channel);
 
     // The delete-only wrapper map (`delete_body`) is pure scratch: both serializeEvent calls below
@@ -1873,7 +1873,7 @@ const PoolEnv = struct {
         errdefer tmp.cleanup();
         const dir_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", ga);
         defer ga.free(dir_path);
-        const db_path = try std.fmt.allocPrintSentinel(ga, "{s}/test.db", .{dir_path}, 0);
+        const db_path = try ga.printSentinel("{s}/test.db", .{dir_path}, 0);
         errdefer ga.free(db_path);
         var pool = try db.Pool.init(ga, std.testing.io, db_path);
         errdefer pool.deinit();
@@ -1935,7 +1935,7 @@ test "subscribeCheck decision table: limit / __features / unknown / auth_require
     var full = Conn{};
     var i: usize = 0;
     while (i < connection.MAX_SUBS) : (i += 1) {
-        const topic = try std.fmt.allocPrint(a, "t{d}", .{i});
+        const topic = try a.print("t{d}", .{i});
         try full.addSub(a, topic, null);
     }
     try std.testing.expectEqual(SubscribeOutcome.limit, subscribeCheck(&app, &full, RequestArena.from(&arena), "one_more"));

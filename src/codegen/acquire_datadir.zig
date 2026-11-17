@@ -97,7 +97,7 @@ pub fn acquire(alloc: std.mem.Allocator, io: std.Io, target: []const u8) !acquir
         }
     }
 
-    const path = try std.fmt.allocPrintSentinel(alloc, "{s}/data.db", .{target}, 0);
+    const path = try alloc.printSentinel("{s}/data.db", .{target}, 0);
     defer alloc.free(path);
     // A URL-like target (a malformed `postgres:/user:pass@host/db` that escaped the `postgres://`
     // detection above, etc.) may carry credentials — NEVER echo it in a log. A plain filesystem

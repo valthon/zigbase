@@ -31,24 +31,24 @@ fn urlAs(a: std.mem.Allocator, user: []const u8) ![]const u8 {
     const base = pgtests.testUrl();
     const scheme_end = (std.mem.indexOf(u8, base, "://") orelse return error.TestUnexpectedResult) + 3;
     const at = std.mem.indexOfScalarPos(u8, base, scheme_end, '@') orelse return error.TestUnexpectedResult;
-    return std.fmt.allocPrint(a, "{s}{s}:{s}@{s}", .{ base[0..scheme_end], user, role_password, base[at + 1 ..] });
+    return a.print("{s}{s}:{s}@{s}", .{ base[0..scheme_end], user, role_password, base[at + 1 ..] });
 }
 
 /// (Re)create login role `name` whose server-side default is `synchronous_commit = level`.
 fn createRole(a: std.mem.Allocator, admin: *pg.Db, name: []const u8, level: []const u8) !void {
-    const drop = try std.fmt.allocPrintSentinel(a, "DROP ROLE IF EXISTS {s};", .{name}, 0);
+    const drop = try a.printSentinel("DROP ROLE IF EXISTS {s};", .{name}, 0);
     defer a.free(drop);
     try admin.exec(drop);
-    const create = try std.fmt.allocPrintSentinel(a, "CREATE ROLE {s} LOGIN PASSWORD '{s}';", .{ name, role_password }, 0);
+    const create = try a.printSentinel("CREATE ROLE {s} LOGIN PASSWORD '{s}';", .{ name, role_password }, 0);
     defer a.free(create);
     try admin.exec(create);
-    const alter = try std.fmt.allocPrintSentinel(a, "ALTER ROLE {s} SET synchronous_commit = '{s}';", .{ name, level }, 0);
+    const alter = try a.printSentinel("ALTER ROLE {s} SET synchronous_commit = '{s}';", .{ name, level }, 0);
     defer a.free(alter);
     try admin.exec(alter);
 }
 
 fn dropRole(a: std.mem.Allocator, admin: *pg.Db, name: []const u8) void {
-    const drop = std.fmt.allocPrintSentinel(a, "DROP ROLE IF EXISTS {s};", .{name}, 0) catch return;
+    const drop = a.printSentinel("DROP ROLE IF EXISTS {s};", .{name}, 0) catch return;
     defer a.free(drop);
     admin.exec(drop) catch {};
 }
@@ -62,7 +62,7 @@ fn expectSyncCommit(db: *pg.Db, expected: []const u8) !void {
 
 /// `<base>_<pid>`: a per-run role name (caller frees).
 fn roleName(a: std.mem.Allocator, base: []const u8) ![]u8 {
-    return std.fmt.allocPrint(a, "{s}_{d}", .{ base, std.c.getpid() });
+    return a.print("{s}_{d}", .{ base, std.c.getpid() });
 }
 
 test "pg durability: a role defaulting to synchronous_commit=off is raised to local on connect" {

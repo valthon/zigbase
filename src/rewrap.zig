@@ -102,7 +102,7 @@ pub fn rewrapColumn(
     const tq = try ddl.quoteIdent(arena, table);
     const cq = try ddl.quoteIdent(arena, col);
 
-    const sel = try std.fmt.allocPrintSentinel(arena, "SELECT \"id\", {s} FROM {s};", .{ cq, tq }, 0);
+    const sel = try arena.printSentinel("SELECT \"id\", {s} FROM {s};", .{ cq, tq }, 0);
     var updates: std.ArrayList(Update) = .empty;
 
     var stmt = try w.prepare(sel);
@@ -159,7 +159,7 @@ pub fn rewrapColumn(
 
     // Key the write by the string `id` PK and renumber placeholders for the active
     // backend (`?n` stays `?n` on SQLite, becomes `$n` on Postgres).
-    const upd_tmpl = try std.fmt.allocPrint(arena, "UPDATE {s} SET {s}=?1 WHERE \"id\"=?2;", .{ tq, cq });
+    const upd_tmpl = try arena.print("UPDATE {s} SET {s}=?1 WHERE \"id\"=?2;", .{ tq, cq });
     const upd = try db.dbDialect(w).renumberPlaceholders(arena, upd_tmpl);
     var ustmt = try w.prepare(upd);
     defer ustmt.finalize();
@@ -286,7 +286,7 @@ fn rotatedRing() field_policy.Cipher {
 fn cellText(a: std.mem.Allocator, d: *db.Db, table: [:0]const u8, id: []const u8) ![]u8 {
     // Bind `id` (defense-in-depth; never interpolate even a DB-sourced value) and route the
     // placeholder through the dialect renumber like production rewrap does.
-    const tmpl = try std.fmt.allocPrint(a, "SELECT v FROM {s} WHERE \"id\"=?1;", .{table});
+    const tmpl = try a.print("SELECT v FROM {s} WHERE \"id\"=?1;", .{table});
     const sql = try db.dbDialect(d).renumberPlaceholders(a, tmpl);
     var s = try d.prepare(sql);
     defer s.finalize();

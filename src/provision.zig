@@ -819,9 +819,9 @@ pub fn injectOAuthSecrets(
             defer alloc.free(upper_buf);
             for (p.name, 0..) |ch, ui| upper_buf[ui] = std.ascii.toUpper(ch);
             const upper = upper_buf;
-            const id_key = try std.fmt.allocPrint(alloc, "ZIGBASE_OAUTH_{s}_CLIENT_ID", .{upper});
+            const id_key = try alloc.print("ZIGBASE_OAUTH_{s}_CLIENT_ID", .{upper});
             defer alloc.free(id_key);
-            const sec_key = try std.fmt.allocPrint(alloc, "ZIGBASE_OAUTH_{s}_CLIENT_SECRET", .{upper});
+            const sec_key = try alloc.print("ZIGBASE_OAUTH_{s}_CLIENT_SECRET", .{upper});
             defer alloc.free(sec_key);
             if (getter.get(id_key)) |v| if (v.len > 0) {
                 np[i].clientId = try alloc.dupe(u8, v);
@@ -1307,7 +1307,7 @@ fn lockConsumerMigrations(alloc: std.mem.Allocator, io: std.Io, w: *db.Db) !?std
     if (filename[0] == 0) return null;
     const canonical = try std.Io.Dir.cwd().realPathFileAlloc(io, std.mem.span(filename), alloc);
     defer alloc.free(canonical);
-    const name = try std.fmt.allocPrint(alloc, "{s}.migrations.lock", .{std.fs.path.basename(canonical)});
+    const name = try alloc.print("{s}.migrations.lock", .{std.fs.path.basename(canonical)});
     defer alloc.free(name);
     var dir = try std.Io.Dir.cwd().openDir(io, std.fs.path.dirname(canonical).?, .{});
     defer dir.close(io);
@@ -1341,7 +1341,7 @@ test "SQLite consumer lock refuses nested transactions before creating a sidecar
     defer tmp.cleanup();
     const dir = try tmp.dir.realPathFileAlloc(io, ".", a);
     defer a.free(dir);
-    const path = try std.fmt.allocPrintSentinel(a, "{s}/data.db", .{dir}, 0);
+    const path = try a.printSentinel("{s}/data.db", .{dir}, 0);
     defer a.free(path);
     var w = try db.Db.open(path);
     defer w.close();
@@ -1369,7 +1369,7 @@ test "SQLite setup failure rolls back and releases its consumer lease before ret
     defer tmp.cleanup();
     const dir = try tmp.dir.realPathFileAlloc(io, ".", a);
     defer a.free(dir);
-    const path = try std.fmt.allocPrintSentinel(a, "{s}/data.db", .{dir}, 0);
+    const path = try a.printSentinel("{s}/data.db", .{dir}, 0);
     defer a.free(path);
     var first = try db.Db.open(path);
     defer first.close();
@@ -1397,7 +1397,7 @@ test "SQLite consumer lock releases after rollback preflight and callback failur
     defer tmp.cleanup();
     const dir = try tmp.dir.realPathFileAlloc(io, ".", a);
     defer a.free(dir);
-    const path = try std.fmt.allocPrintSentinel(a, "{s}/data.db", .{dir}, 0);
+    const path = try a.printSentinel("{s}/data.db", .{dir}, 0);
     defer a.free(path);
     var first = try db.Db.open(path);
     defer first.close();
@@ -1684,7 +1684,7 @@ fn runMigrationsLocked(
     var mig = Migrator{ .db = w, .dialect = db.dbDialect(w), .arena = a, .io = io };
 
     for (migs) |m| {
-        const name = try std.fmt.allocPrint(a, "prov:{s}", .{m.id});
+        const name = try a.print("prov:{s}", .{m.id});
         if (try migrationApplied(&mig, name)) continue;
         // Piece A applies migrations FORWARD only (Piece B adds the reverse/rollback pass). Set the
         // direction explicitly per migration so a `change`'s DSL ops emit their forward SQL.
@@ -1736,7 +1736,7 @@ fn migrationApplied(m: *Migrator, name: []const u8) db.DbError!bool {
 }
 
 fn recordMigration(m: *Migrator, name: []const u8) db.DbError!void {
-    const sql = std.fmt.allocPrint(m.arena, "INSERT INTO \"_migrations\" (\"name\", \"applied_at\") VALUES (?1, {s});", .{m.dialect.nowTextExpr()}) catch return error.PrepareFailed;
+    const sql = m.arena.print("INSERT INTO \"_migrations\" (\"name\", \"applied_at\") VALUES (?1, {s});", .{m.dialect.nowTextExpr()}) catch return error.PrepareFailed;
     var st = try m.prepare(sql);
     defer st.finalize();
     try st.bindText(1, name);
@@ -2427,7 +2427,7 @@ test "applySpecs widens persisted selects after reopening without rebuilding or 
     defer tmp.cleanup();
     const dir = try tmp.dir.realPathFileAlloc(io, ".", a);
     defer a.free(dir);
-    const path = try std.fmt.allocPrintSentinel(a, "{s}/data.db", .{dir}, 0);
+    const path = try a.printSentinel("{s}/data.db", .{dir}, 0);
     defer a.free(path);
     // Runtime schemas accept opaque field ids, including an underscore prefix.
     // These ids must never be mistaken for ownership of injected system fields.
@@ -3477,7 +3477,7 @@ test "migrationStatus: empty declared set with no ledger rows is all-zero" {
 fn tableExistsDb(d: *db.Db, alloc: std.mem.Allocator, name: []const u8) !bool {
     const qtbl = try ddl.quoteIdent(alloc, name);
     defer alloc.free(qtbl);
-    const sql = try std.fmt.allocPrintSentinel(alloc, "SELECT 1 FROM {s} LIMIT 0;", .{qtbl}, 0);
+    const sql = try alloc.printSentinel("SELECT 1 FROM {s} LIMIT 0;", .{qtbl}, 0);
     defer alloc.free(sql);
     var st = d.prepare(sql) catch return false;
     st.finalize();
@@ -3485,7 +3485,7 @@ fn tableExistsDb(d: *db.Db, alloc: std.mem.Allocator, name: []const u8) !bool {
 }
 
 fn ledgerHas(d: *db.Db, alloc: std.mem.Allocator, name: []const u8) !bool {
-    const sql = try std.fmt.allocPrintSentinel(alloc, "SELECT 1 FROM \"_migrations\" WHERE \"name\" = '{s}';", .{name}, 0);
+    const sql = try alloc.printSentinel("SELECT 1 FROM \"_migrations\" WHERE \"name\" = '{s}';", .{name}, 0);
     defer alloc.free(sql);
     var st = try d.prepare(sql);
     defer st.finalize();

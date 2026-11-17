@@ -68,7 +68,7 @@ pub const ResolveError = error{
 /// key material is never stored. `gen` must be in 1..MAX_GENERATION.
 pub fn deriveGeneration(secret: []const u8, gen: u16) [32]u8 {
     var buf: [FIELD_KEY_DOMAIN_PREFIX.len + 8]u8 = undefined;
-    const domain = std.fmt.bufPrint(&buf, "{s}{d}", .{ FIELD_KEY_DOMAIN_PREFIX, gen }) catch unreachable;
+    const domain = std.mem.print(&buf, "{s}{d}", .{ FIELD_KEY_DOMAIN_PREFIX, gen }) catch unreachable;
     return aead.deriveKey(secret, domain);
 }
 
@@ -117,7 +117,7 @@ pub const Cipher = struct {
         var g: u16 = 1;
         while (g <= MAX_GENERATION) : (g += 1) {
             var namebuf: [32]u8 = undefined;
-            const name = std.fmt.bufPrint(&namebuf, "ZIGBASE_FIELD_KEY_V{d}", .{g}) catch unreachable;
+            const name = std.mem.print(&namebuf, "ZIGBASE_FIELD_KEY_V{d}", .{g}) catch unreachable;
             const val = getter.get(name) orelse continue;
             if (val.len == 0) continue;
             if (g == primary_gen) return error.GenerationConflict;
@@ -136,7 +136,7 @@ pub const Cipher = struct {
     /// out-of-range generation (it will be ignored).
     fn warnOutOfRange(getter: anytype, gen: u16) void {
         var namebuf: [32]u8 = undefined;
-        const name = std.fmt.bufPrint(&namebuf, "ZIGBASE_FIELD_KEY_V{d}", .{gen}) catch unreachable;
+        const name = std.mem.print(&namebuf, "ZIGBASE_FIELD_KEY_V{d}", .{gen}) catch unreachable;
         const val = getter.get(name) orelse return;
         if (val.len == 0) return;
         std.log.warn("{s} is set but generation {d} is out of range (valid generations are 1..{d}); it is IGNORED — check for a typo", .{ name, gen, MAX_GENERATION });
@@ -150,7 +150,7 @@ pub const Cipher = struct {
                 return aead.seal(self.io, alloc, key, self.primary_gen, plaintext);
             },
             // Readable, self-labeling, deterministic. Dev-only (construction is gated).
-            .fake => return std.fmt.allocPrint(alloc, "fake:{s}:{s}", .{ self.fake_key, plaintext }),
+            .fake => return alloc.print("fake:{s}:{s}", .{ self.fake_key, plaintext }),
         }
     }
 

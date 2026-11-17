@@ -148,7 +148,7 @@ pub fn transform(allocator: std.mem.Allocator, io: std.Io, input: []const u8, cf
     };
     var dir = try std.Io.Dir.cwd().openDir(io, directory, .{});
     defer dir.close(io);
-    const policy = try std.fmt.allocPrint(a, "<policymap>" ++
+    const policy = try a.print("<policymap>" ++
         "<policy domain=\"delegate\" rights=\"none\" pattern=\"*\"/>" ++
         "<policy domain=\"filter\" rights=\"none\" pattern=\"*\"/>" ++
         "<policy domain=\"path\" rights=\"none\" pattern=\"@*\"/>" ++
@@ -169,11 +169,11 @@ pub fn transform(allocator: std.mem.Allocator, io: std.Io, input: []const u8, cf
     try env.put("MAGICK_TEMPORARY_PATH", directory);
     try env.put("TMPDIR", directory);
     try env.put("LC_ALL", "C");
-    try env.put("OMP_NUM_THREADS", try std.fmt.allocPrint(a, "{d}", .{cfg.threads}));
+    try env.put("OMP_NUM_THREADS", try a.print("{d}", .{cfg.threads}));
     var argv: std.ArrayList([]const u8) = .empty;
     try argv.append(a, cfg.executable);
     inline for (.{ .{ "thread", cfg.threads }, .{ "memory", cfg.memory_bytes }, .{ "map", cfg.map_bytes }, .{ "disk", cfg.disk_bytes }, .{ "time", (@as(u64, cfg.timeout_ms) + 999) / 1000 } }) |limit| {
-        try argv.appendSlice(a, &.{ "-limit", limit[0], try std.fmt.allocPrint(a, "{d}", .{limit[1]}) });
+        try argv.appendSlice(a, &.{ "-limit", limit[0], try a.print("{d}", .{limit[1]}) });
     }
     const source = switch (input_format) {
         .png => "PNG:-",
@@ -190,11 +190,11 @@ pub fn transform(allocator: std.mem.Allocator, io: std.Io, input: []const u8, cf
     const metadata_len = try pump(io, argv.items, &env, directory, input, &metadata, cfg.max_stderr_bytes, try remaining(io, deadline));
     _ = try dimensions(metadata[0..metadata_len], cfg);
     argv.shrinkRetainingCapacity(limits_len);
-    const geometry = try std.fmt.allocPrint(a, "{d}x{d}{s}", .{ profile.width, profile.height, if (profile.fit == .cover) "^" else ">" });
+    const geometry = try a.print("{d}x{d}{s}", .{ profile.width, profile.height, if (profile.fit == .cover) "^" else ">" });
     try argv.appendSlice(a, &.{ source, "-auto-orient", "-strip", "-resize", geometry });
-    if (profile.fit == .cover) try argv.appendSlice(a, &.{ "-gravity", "center", "-extent", try std.fmt.allocPrint(a, "{d}x{d}", .{ profile.width, profile.height }) });
+    if (profile.fit == .cover) try argv.appendSlice(a, &.{ "-gravity", "center", "-extent", try a.print("{d}x{d}", .{ profile.width, profile.height }) });
     if (profile.format == .jpeg) try argv.appendSlice(a, &.{ "-background", "white", "-alpha", "remove", "-alpha", "off" });
-    try argv.appendSlice(a, &.{ "-quality", try std.fmt.allocPrint(a, "{d}", .{profile.quality}), switch (profile.format) {
+    try argv.appendSlice(a, &.{ "-quality", try a.print("{d}", .{profile.quality}), switch (profile.format) {
         .png => "PNG:-",
         .jpeg => "JPEG:-",
         .webp => "WEBP:-",
@@ -239,7 +239,7 @@ fn pump(io: std.Io, argv: []const []const u8, env: *const std.process.Environ.Ma
         _ = c.close(sockets[1]);
     };
     for (sockets) |fd| if (c.fcntl(fd, c.F_SETFD, @as(c_int, c.FD_CLOEXEC)) < 0) return error.ImageProcessIo;
-    if (builtin.os.tag == .macos) {
+    if (builtin.target.os.tag == .macos) {
         var enabled: c_int = 1;
         if (c.setsockopt(sockets[0], c.SOL_SOCKET, c.SO_NOSIGPIPE, &enabled, @sizeOf(c_int)) < 0) return error.ImageProcessIo;
     }
@@ -312,7 +312,7 @@ fn pump(io: std.Io, argv: []const []const u8, env: *const std.process.Environ.Ma
             return error.ImageProcessIo;
         }
         if (!input_done and pollers[0].revents != 0) {
-            const n = c.send(sockets[0], input[written..].ptr, @min(input.len - written, 8192), if (builtin.os.tag == .linux) c.MSG_NOSIGNAL else 0);
+            const n = c.send(sockets[0], input[written..].ptr, @min(input.len - written, 8192), if (builtin.target.os.tag == .linux) c.MSG_NOSIGNAL else 0);
             if (n >= 0) written += @intCast(n) else switch (std.posix.errno(n)) {
                 .AGAIN, .INTR => {},
                 .PIPE, .CONNRESET => input_done = true,

@@ -35,7 +35,7 @@ fn urlAs(a: std.mem.Allocator, user: []const u8, pass: []const u8) ![]const u8 {
     const base = pgtests.testUrl();
     const scheme_end = (std.mem.indexOf(u8, base, "://") orelse return error.TestUnexpectedResult) + 3;
     const at = std.mem.indexOfScalarPos(u8, base, scheme_end, '@') orelse return error.TestUnexpectedResult;
-    return std.fmt.allocPrint(a, "{s}{s}:{s}@{s}", .{ base[0..scheme_end], user, pass, base[at + 1 ..] });
+    return a.print("{s}{s}:{s}@{s}", .{ base[0..scheme_end], user, pass, base[at + 1 ..] });
 }
 
 /// Create a NOSUPERUSER login role + a schema it owns; connect as it; pin search_path.
@@ -48,28 +48,28 @@ fn urlAs(a: std.mem.Allocator, user: []const u8, pass: []const u8) ![]const u8 {
 /// superuser and always has this privilege; only a permission-shaped local environment
 /// falls back to skipping, not a hard failure.
 fn openNosuperTarget(al: std.mem.Allocator, admin: *dbm.Db, io: std.Io, schema_name: []const u8, role: []const u8) !?dbm.Db {
-    try admin.exec(try std.fmt.allocPrintSentinel(al, "DROP SCHEMA IF EXISTS \"{s}\" CASCADE;", .{schema_name}, 0));
-    admin.exec(try std.fmt.allocPrintSentinel(al, "DROP ROLE IF EXISTS \"{s}\";", .{role}, 0)) catch |e| switch (e) {
+    try admin.exec(try al.printSentinel("DROP SCHEMA IF EXISTS \"{s}\" CASCADE;", .{schema_name}, 0));
+    admin.exec(try al.printSentinel("DROP ROLE IF EXISTS \"{s}\";", .{role}, 0)) catch |e| switch (e) {
         error.ExecFailed => return null,
         else => return e,
     };
-    admin.exec(try std.fmt.allocPrintSentinel(al, "CREATE ROLE \"{s}\" LOGIN PASSWORD 'zb_dl_pw' NOSUPERUSER;", .{role}, 0)) catch |e| switch (e) {
+    admin.exec(try al.printSentinel("CREATE ROLE \"{s}\" LOGIN PASSWORD 'zb_dl_pw' NOSUPERUSER;", .{role}, 0)) catch |e| switch (e) {
         error.ExecFailed => return null,
         else => return e,
     };
-    try admin.exec(try std.fmt.allocPrintSentinel(al, "CREATE SCHEMA \"{s}\" AUTHORIZATION \"{s}\";", .{ schema_name, role }, 0));
+    try admin.exec(try al.printSentinel("CREATE SCHEMA \"{s}\" AUTHORIZATION \"{s}\";", .{ schema_name, role }, 0));
     const url = try urlAs(al, role, "zb_dl_pw");
     var target = try dbm.Db.openPostgres(std.testing.allocator, io, url);
     errdefer target.close();
-    try target.exec(try std.fmt.allocPrintSentinel(al, "SET search_path TO \"{s}\";", .{schema_name}, 0));
+    try target.exec(try al.printSentinel("SET search_path TO \"{s}\";", .{schema_name}, 0));
     return target;
 }
 
 fn dropNosuper(admin: *dbm.Db, al: std.mem.Allocator, schema_name: []const u8, role: []const u8) void {
     // Schema (owned objects) must go before the role.
-    const s1 = std.fmt.allocPrintSentinel(al, "DROP SCHEMA IF EXISTS \"{s}\" CASCADE;", .{schema_name}, 0) catch return;
+    const s1 = al.printSentinel("DROP SCHEMA IF EXISTS \"{s}\" CASCADE;", .{schema_name}, 0) catch return;
     admin.exec(s1) catch {};
-    const s2 = std.fmt.allocPrintSentinel(al, "DROP ROLE IF EXISTS \"{s}\";", .{role}, 0) catch return;
+    const s2 = al.printSentinel("DROP ROLE IF EXISTS \"{s}\";", .{role}, 0) catch return;
     admin.exec(s2) catch {};
 }
 
@@ -125,20 +125,20 @@ var schema_counter: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
 
 fn enterTempSchema(a: std.mem.Allocator, d: *dbm.Db) ![:0]const u8 {
     const n = schema_counter.fetchAdd(1, .monotonic);
-    const name = try std.fmt.allocPrint(a, "zb_dl_{d}", .{n});
-    try d.exec(try std.fmt.allocPrintSentinel(a, "DROP SCHEMA IF EXISTS \"{s}\" CASCADE;", .{name}, 0));
-    try d.exec(try std.fmt.allocPrintSentinel(a, "CREATE SCHEMA \"{s}\";", .{name}, 0));
-    try d.exec(try std.fmt.allocPrintSentinel(a, "SET search_path TO \"{s}\";", .{name}, 0));
-    return std.fmt.allocPrintSentinel(a, "{s}", .{name}, 0);
+    const name = try a.print("zb_dl_{d}", .{n});
+    try d.exec(try a.printSentinel("DROP SCHEMA IF EXISTS \"{s}\" CASCADE;", .{name}, 0));
+    try d.exec(try a.printSentinel("CREATE SCHEMA \"{s}\";", .{name}, 0));
+    try d.exec(try a.printSentinel("SET search_path TO \"{s}\";", .{name}, 0));
+    return a.printSentinel("{s}", .{name}, 0);
 }
 
 fn dropTempSchema(a: std.mem.Allocator, d: *dbm.Db, name: []const u8) void {
-    const sql = std.fmt.allocPrintSentinel(a, "DROP SCHEMA IF EXISTS \"{s}\" CASCADE;", .{name}, 0) catch return;
+    const sql = a.printSentinel("DROP SCHEMA IF EXISTS \"{s}\" CASCADE;", .{name}, 0) catch return;
     d.exec(sql) catch {};
 }
 
 fn countPg(a: std.mem.Allocator, d: *dbm.Db, table: []const u8) !i64 {
-    const sql = try std.fmt.allocPrintSentinel(a, "SELECT COUNT(*) FROM \"{s}\";", .{table}, 0);
+    const sql = try a.printSentinel("SELECT COUNT(*) FROM \"{s}\";", .{table}, 0);
     var st = try d.prepare(sql);
     defer st.finalize();
     if (!try st.step()) return 0;
@@ -323,7 +323,7 @@ fn eventSeqsById(al: std.mem.Allocator, d: *dbm.Db) ![]const []const u8 {
     defer st.finalize();
     var out: std.ArrayList([]const u8) = .empty;
     while (try st.step())
-        try out.append(al, try std.fmt.allocPrint(al, "{s}={d}", .{ st.columnText(0), st.columnInt(1) }));
+        try out.append(al, try al.print("{s}={d}", .{ st.columnText(0), st.columnInt(1) }));
     return out.toOwnedSlice(al);
 }
 
@@ -447,7 +447,7 @@ test "pg manifest dry run keeps dependency rows visible and rolls everything bac
     var target = (try openTargetOrSkip(a, io)) orelse return error.SkipZigTest;
     defer target.close();
     const schema_name = try enterTempSchema(al, &target);
-    const drop_schema = try std.fmt.allocPrintSentinel(al, "DROP SCHEMA IF EXISTS \"{s}\" CASCADE;", .{schema_name}, 0);
+    const drop_schema = try al.printSentinel("DROP SCHEMA IF EXISTS \"{s}\" CASCADE;", .{schema_name}, 0);
     defer {
         target.exec("SET search_path TO public;") catch {};
         target.exec(drop_schema) catch {};

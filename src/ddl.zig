@@ -38,7 +38,7 @@ pub fn quoteIdent(alloc: std.mem.Allocator, name: []const u8) ![]u8 {
 /// `fk_<table>_<field>`) and escape it as ONE unit. Escaping the assembled name rather than each
 /// part is what keeps the name a `CREATE` emits byte-identical to the one a later `DROP` looks for.
 pub fn quoteComposite(alloc: std.mem.Allocator, comptime fmt: []const u8, args: anytype) ![]u8 {
-    const raw = try std.fmt.allocPrint(alloc, fmt, args);
+    const raw = try alloc.print(fmt, args);
     defer alloc.free(raw);
     return quoteIdent(alloc, raw);
 }
@@ -59,8 +59,8 @@ pub fn columnDef(alloc: std.mem.Allocator, f: schema.Field, d: dialect.Dialect, 
     const ty = d.sqlType(f.storageClass());
     const q = try quoteIdent(alloc, f.name);
     defer alloc.free(q); // copied into the result; freed on both branches and on an alloc failure
-    if (f.unique) return std.fmt.allocPrint(alloc, "{s} {s}{s} UNIQUE", .{ q, ty, collate });
-    return std.fmt.allocPrint(alloc, "{s} {s}{s}", .{ q, ty, collate });
+    if (f.unique) return alloc.print("{s} {s}{s} UNIQUE", .{ q, ty, collate });
+    return alloc.print("{s} {s}{s}", .{ q, ty, collate });
 }
 
 /// The byte-order collation suffix to attach to field `f`'s column DDL: `d.textCollate()` for a
@@ -103,7 +103,7 @@ fn createTableSqlMain(alloc: std.mem.Allocator, c: schema.Collection, single_rel
     // The base text columns (incl. the `id` keyset tiebreaker) get the byte-order collation pin so
     // text ORDER BY / keyset pagination produces the SAME order on Postgres as on SQLite (BINARY).
     const tc = d.textCollate();
-    try out.appendSlice(alloc, try std.fmt.allocPrint(sa, " (\"id\" TEXT{s} PRIMARY KEY, \"created\" TEXT{s}, \"updated\" TEXT{s}", .{ tc, tc, tc }));
+    try out.appendSlice(alloc, try sa.print(" (\"id\" TEXT{s} PRIMARY KEY, \"created\" TEXT{s}, \"updated\" TEXT{s}", .{ tc, tc, tc }));
     for (c.fields) |f| {
         try out.appendSlice(alloc, ", ");
         // Only a table-wide unique field carries the inline column UNIQUE; a tenant-scoped one
@@ -114,7 +114,7 @@ fn createTableSqlMain(alloc: std.mem.Allocator, c: schema.Collection, single_rel
     }
     if (c.options.tenant_field) |tf| for (c.fields) |f| {
         if (schema.uniqueScope(c, f) != .tenant) continue;
-        try out.appendSlice(alloc, try std.fmt.allocPrint(sa, ", UNIQUE ({s}, {s})", .{ try quoteIdent(sa, tf), try quoteIdent(sa, f.name) }));
+        try out.appendSlice(alloc, try sa.print(", UNIQUE ({s}, {s})", .{ try quoteIdent(sa, tf), try quoteIdent(sa, f.name) }));
     };
     for (c.fields) |f| {
         switch (f.options) {
@@ -124,7 +124,7 @@ fn createTableSqlMain(alloc: std.mem.Allocator, c: schema.Collection, single_rel
             .relation => |r| if (r.maxSelect == 1 and !nameIn(skip_fk_fields, f.name)) {
                 const target = single_rel_target orelse r.targetCollectionId;
                 const on_delete = if (r.cascadeDelete) "CASCADE" else "SET NULL";
-                try out.appendSlice(alloc, try std.fmt.allocPrint(sa, ", FOREIGN KEY ({s}) REFERENCES {s} (\"id\") ON DELETE {s}", .{ try quoteIdent(sa, f.name), try quoteIdent(sa, target), on_delete }));
+                try out.appendSlice(alloc, try sa.print(", FOREIGN KEY ({s}) REFERENCES {s} (\"id\") ON DELETE {s}", .{ try quoteIdent(sa, f.name), try quoteIdent(sa, target), on_delete }));
             },
             else => {},
         }
@@ -188,7 +188,7 @@ pub fn addUniqueConstraintSql(alloc: std.mem.Allocator, table: []const u8, cols:
         if (i > 0) try list.appendSlice(sa, ", ");
         try list.appendSlice(sa, try quoteIdent(sa, col));
     }
-    return std.fmt.allocPrint(alloc, "ALTER TABLE {s} ADD UNIQUE ({s});", .{ try quoteIdent(sa, table), list.items });
+    return alloc.print("ALTER TABLE {s} ADD UNIQUE ({s});", .{ try quoteIdent(sa, table), list.items });
 }
 
 /// `ALTER TABLE "<table>" DROP CONSTRAINT IF EXISTS "<name>";` (Postgres).
@@ -196,12 +196,12 @@ pub fn dropConstraintSql(alloc: std.mem.Allocator, table: []const u8, name: []co
     var scratch = std.heap.ArenaAllocator.init(alloc);
     defer scratch.deinit();
     const sa = scratch.allocator();
-    return std.fmt.allocPrint(alloc, "ALTER TABLE {s} DROP CONSTRAINT IF EXISTS {s};", .{ try quoteIdent(sa, table), try quoteIdent(sa, name) });
+    return alloc.print("ALTER TABLE {s} DROP CONSTRAINT IF EXISTS {s};", .{ try quoteIdent(sa, table), try quoteIdent(sa, name) });
 }
 
 /// Engine-owned identity index name. Caller owns the returned allocation.
 pub fn authIdentityIndexName(alloc: std.mem.Allocator, table: []const u8, field: []const u8) ![]u8 {
-    return std.fmt.allocPrint(alloc, "idx_auth_{s}_{s}", .{ table, field });
+    return alloc.print("idx_auth_{s}_{s}", .{ table, field });
 }
 
 /// A partial UNIQUE index enforcing identity uniqueness only over non-empty values:
@@ -219,8 +219,7 @@ pub fn authIdentityIndexSqlNamed(alloc: std.mem.Allocator, table: []const u8, fi
     var scratch = std.heap.ArenaAllocator.init(alloc);
     defer scratch.deinit();
     const sa = scratch.allocator();
-    return std.fmt.allocPrint(
-        alloc,
+    return alloc.print(
         "CREATE UNIQUE INDEX IF NOT EXISTS {s} ON {s} ({s}) WHERE {s} != '';",
         .{ try quoteIdent(sa, name), try quoteIdent(sa, table), try quoteIdent(sa, field), try quoteIdent(sa, field) },
     );
@@ -237,8 +236,7 @@ pub fn addDeferrableFkSql(alloc: std.mem.Allocator, table: []const u8, field: []
     var scratch = std.heap.ArenaAllocator.init(alloc);
     defer scratch.deinit();
     const sa = scratch.allocator();
-    return std.fmt.allocPrint(
-        alloc,
+    return alloc.print(
         "ALTER TABLE {s} ADD CONSTRAINT {s} FOREIGN KEY ({s}) REFERENCES {s} (\"id\") ON DELETE {s} DEFERRABLE INITIALLY IMMEDIATE;",
         .{ try quoteIdent(sa, table), try quoteComposite(sa, "fk_{s}_{s}", .{ table, field }), try quoteIdent(sa, field), try quoteIdent(sa, target), on_delete },
     );
@@ -270,7 +268,7 @@ pub fn rebuildPlan(alloc: std.mem.Allocator, old: schema.Collection, new: schema
         stmts.deinit(alloc);
     }
 
-    const tmp = try std.fmt.allocPrint(sa, "{s}__new", .{new.name});
+    const tmp = try sa.print("{s}__new", .{new.name});
     var tmp_col = new;
     tmp_col.name = tmp;
     try stmts.append(alloc, try createTableSqlMain(alloc, tmp_col, null, d, &.{}, true));
@@ -293,7 +291,7 @@ pub fn rebuildPlan(alloc: std.mem.Allocator, old: schema.Collection, new: schema
             if (of.storageClass() == nf.storageClass()) {
                 try src_cols.appendSlice(sa, try quoteIdent(sa, of.name));
             } else {
-                try src_cols.appendSlice(sa, try std.fmt.allocPrint(sa, "CAST({s} AS {s})", .{ try quoteIdent(sa, of.name), d.sqlType(nf.storageClass()) }));
+                try src_cols.appendSlice(sa, try sa.print("CAST({s} AS {s})", .{ try quoteIdent(sa, of.name), d.sqlType(nf.storageClass()) }));
             }
         } else {
             try src_cols.appendSlice(sa, "NULL");
@@ -302,9 +300,9 @@ pub fn rebuildPlan(alloc: std.mem.Allocator, old: schema.Collection, new: schema
     // Copy the hidden rowid too: restored migration triggers (and anything else keyed on it)
     // must see the same rowid for the same row after the rebuild. `_rowid_`, not `rowid`:
     // `rowid` may be a user field name, and field names cannot start with '_'.
-    try stmts.append(alloc, try std.fmt.allocPrint(alloc, "INSERT INTO \"main\".{s} (\"_rowid_\",{s}) SELECT \"_rowid_\",{s} FROM \"main\".{s};", .{ try quoteIdent(sa, tmp), new_cols.items, src_cols.items, try quoteIdent(sa, old.name) }));
-    try stmts.append(alloc, try std.fmt.allocPrint(alloc, "DROP TABLE \"main\".{s};", .{try quoteIdent(sa, old.name)}));
-    try stmts.append(alloc, try std.fmt.allocPrint(alloc, "ALTER TABLE \"main\".{s} RENAME TO {s};", .{ try quoteIdent(sa, tmp), try quoteIdent(sa, new.name) }));
+    try stmts.append(alloc, try alloc.print("INSERT INTO \"main\".{s} (\"_rowid_\",{s}) SELECT \"_rowid_\",{s} FROM \"main\".{s};", .{ try quoteIdent(sa, tmp), new_cols.items, src_cols.items, try quoteIdent(sa, old.name) }));
+    try stmts.append(alloc, try alloc.print("DROP TABLE \"main\".{s};", .{try quoteIdent(sa, old.name)}));
+    try stmts.append(alloc, try alloc.print("ALTER TABLE \"main\".{s} RENAME TO {s};", .{ try quoteIdent(sa, tmp), try quoteIdent(sa, new.name) }));
     for (new.indexes) |idx| try stmts.append(alloc, try createIndexSqlMain(alloc, new.name, idx, d, true));
     return stmts.toOwnedSlice(alloc);
 }
@@ -341,7 +339,7 @@ fn rebuildPlanPg(alloc: std.mem.Allocator, old: schema.Collection, new: schema.C
     // 1a. Drop the FK of every old single relation field (converges all relation changes; gemini #2).
     for (old.fields) |of| switch (of.options) {
         .relation => |r| if (r.maxSelect == 1) {
-            try stmts.append(alloc, try std.fmt.allocPrint(alloc, "ALTER TABLE {s} DROP CONSTRAINT IF EXISTS {s};", .{ qtbl, try quoteComposite(sa, "fk_{s}_{s}", .{ tbl, of.name }) }));
+            try stmts.append(alloc, try alloc.print("ALTER TABLE {s} DROP CONSTRAINT IF EXISTS {s};", .{ qtbl, try quoteComposite(sa, "fk_{s}_{s}", .{ tbl, of.name }) }));
         },
         else => {},
     };
@@ -352,7 +350,7 @@ fn rebuildPlanPg(alloc: std.mem.Allocator, old: schema.Collection, new: schema.C
             for (new.fields) |nf| if (std.mem.eql(u8, of.id, nf.id)) break :blk true;
             break :blk false;
         };
-        if (!kept) try stmts.append(alloc, try std.fmt.allocPrint(alloc, "ALTER TABLE {s} DROP COLUMN IF EXISTS {s};", .{ qtbl, try quoteIdent(sa, of.name) }));
+        if (!kept) try stmts.append(alloc, try alloc.print("ALTER TABLE {s} DROP COLUMN IF EXISTS {s};", .{ qtbl, try quoteIdent(sa, of.name) }));
     }
 
     // 2. Adds / renames / type changes, keyed by stable field id.
@@ -364,14 +362,14 @@ fn rebuildPlanPg(alloc: std.mem.Allocator, old: schema.Collection, new: schema.C
         };
         if (old_match) |of| {
             if (!std.mem.eql(u8, of.name, nf.name))
-                try stmts.append(alloc, try std.fmt.allocPrint(alloc, "ALTER TABLE {s} RENAME COLUMN {s} TO {s};", .{ qtbl, try quoteIdent(sa, of.name), try quoteIdent(sa, nf.name) }));
+                try stmts.append(alloc, try alloc.print("ALTER TABLE {s} RENAME COLUMN {s} TO {s};", .{ qtbl, try quoteIdent(sa, of.name), try quoteIdent(sa, nf.name) }));
             if (of.storageClass() != nf.storageClass())
-                try stmts.append(alloc, try std.fmt.allocPrint(alloc, "ALTER TABLE {s} ALTER COLUMN {s} TYPE {s} USING ({s}::{s});", .{ qtbl, try quoteIdent(sa, nf.name), ty, try quoteIdent(sa, nf.name), ty }));
+                try stmts.append(alloc, try alloc.print("ALTER TABLE {s} ALTER COLUMN {s} TYPE {s} USING ({s}::{s});", .{ qtbl, try quoteIdent(sa, nf.name), ty, try quoteIdent(sa, nf.name), ty }));
         } else {
             // A tenant-scoped unique field (#498) gets its composite constraint from the
             // caller's catalog reconcile (`collections.reconcileUniqueConstraintsPg`), not inline.
             const uniq = if (schema.uniqueScope(new, nf) == .global) " UNIQUE" else "";
-            try stmts.append(alloc, try std.fmt.allocPrint(alloc, "ALTER TABLE {s} ADD COLUMN IF NOT EXISTS {s} {s}{s}{s};", .{ qtbl, try quoteIdent(sa, nf.name), ty, fieldCollate(new, nf, d), uniq }));
+            try stmts.append(alloc, try alloc.print("ALTER TABLE {s} ADD COLUMN IF NOT EXISTS {s} {s}{s}{s};", .{ qtbl, try quoteIdent(sa, nf.name), ty, fieldCollate(new, nf, d), uniq }));
         }
     }
 
@@ -380,7 +378,7 @@ fn rebuildPlanPg(alloc: std.mem.Allocator, old: schema.Collection, new: schema.C
         .relation => |r| if (r.maxSelect == 1) {
             const on_delete = if (r.cascadeDelete) "CASCADE" else "SET NULL";
             // `new` is relation-resolved by the caller: targetCollectionId is the table name.
-            try stmts.append(alloc, try std.fmt.allocPrint(alloc, "ALTER TABLE {s} ADD CONSTRAINT {s} FOREIGN KEY ({s}) REFERENCES {s} (\"id\") ON DELETE {s};", .{ qtbl, try quoteComposite(sa, "fk_{s}_{s}", .{ tbl, nf.name }), try quoteIdent(sa, nf.name), try quoteIdent(sa, r.targetCollectionId), on_delete }));
+            try stmts.append(alloc, try alloc.print("ALTER TABLE {s} ADD CONSTRAINT {s} FOREIGN KEY ({s}) REFERENCES {s} (\"id\") ON DELETE {s};", .{ qtbl, try quoteComposite(sa, "fk_{s}_{s}", .{ tbl, nf.name }), try quoteIdent(sa, nf.name), try quoteIdent(sa, r.targetCollectionId), on_delete }));
         },
         else => {},
     };
@@ -391,11 +389,11 @@ fn rebuildPlanPg(alloc: std.mem.Allocator, old: schema.Collection, new: schema.C
             for (new.indexes) |nix| if (std.mem.eql(u8, oix.name, nix.name)) break :blk true;
             break :blk false;
         };
-        if (!kept) try stmts.append(alloc, try std.fmt.allocPrint(alloc, "DROP INDEX IF EXISTS {s};", .{try quoteIdent(sa, oix.name)}));
+        if (!kept) try stmts.append(alloc, try alloc.print("DROP INDEX IF EXISTS {s};", .{try quoteIdent(sa, oix.name)}));
     }
     // 4b. Drop-if-exists + recreate every declared index.
     for (new.indexes) |idx| {
-        try stmts.append(alloc, try std.fmt.allocPrint(alloc, "DROP INDEX IF EXISTS {s};", .{try quoteIdent(sa, idx.name)}));
+        try stmts.append(alloc, try alloc.print("DROP INDEX IF EXISTS {s};", .{try quoteIdent(sa, idx.name)}));
         try stmts.append(alloc, try createIndexSql(alloc, tbl, idx, d));
     }
     return stmts.toOwnedSlice(alloc);

@@ -173,7 +173,7 @@ pub fn renumberZ(alloc: std.mem.Allocator, dialect: Dialect, sql: [:0]const u8) 
     var sink = ParamSink.init(dialect);
     const rewritten = sink.rewrite(alloc, sql) catch |e| return toPrepareError(e);
     defer alloc.free(rewritten);
-    return std.fmt.allocPrintSentinel(alloc, "{s}", .{rewritten}, 0);
+    return alloc.printSentinel("{s}", .{rewritten}, 0);
 }
 
 /// Lower a curated auth/oauth/analytics/session DML statement from the SQLite flavor to
@@ -218,7 +218,7 @@ pub fn lowerStmtZ(alloc: std.mem.Allocator, dialect: Dialect, sql: [:0]const u8)
     var sink = ParamSink.init(dialect);
     const renumbered = sink.rewrite(alloc, cur) catch |e| return toPrepareError(e);
     defer alloc.free(renumbered);
-    return std.fmt.allocPrintSentinel(alloc, "{s}", .{renumbered}, 0);
+    return alloc.printSentinel("{s}", .{renumbered}, 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -239,7 +239,7 @@ test "param_sink: lowerStmtZ lowers datetime('now') + renumbers on Postgres" {
     const out = try lowerStmtZ(testing.allocator, Dialect.postgres, sql);
     defer testing.allocator.free(out);
     const now_pg = Dialect.postgres.nowTextExpr();
-    const want = std.fmt.allocPrint(testing.allocator, "INSERT INTO \"_sessions\" (\"id\",\"created\",\"lastSeen\",\"expires\") VALUES ($1,{s},{s},$2);", .{ now_pg, now_pg }) catch unreachable;
+    const want = testing.allocator.print("INSERT INTO \"_sessions\" (\"id\",\"created\",\"lastSeen\",\"expires\") VALUES ($1,{s},{s},$2);", .{ now_pg, now_pg }) catch unreachable;
     defer testing.allocator.free(want);
     try testing.expectEqualStrings(want, out);
     try testing.expectEqual(@as(u8, 0), out.ptr[out.len]); // NUL-terminated

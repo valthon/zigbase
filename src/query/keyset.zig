@@ -255,7 +255,7 @@ pub fn filterHash(filter: ?[]const u8, rule: ?[]const u8, search: ?[]const u8) u
 /// Serialize a `Cursor` to its raw JSON payload bytes (pre-base64). Shared by all encoders.
 fn payloadBytes(alloc: std.mem.Allocator, c: Cursor) ![]u8 {
     var fh_buf: [16]u8 = undefined;
-    const fh_hex = try std.fmt.bufPrint(&fh_buf, "{x:0>16}", .{c.filter_hash});
+    const fh_hex = try std.mem.print(&fh_buf, "{x:0>16}", .{c.filter_hash});
     const w = Wire{
         .v = token_version,
         .d = if (c.forward) "f" else "b",
@@ -306,12 +306,12 @@ pub fn encodeSigned(alloc: std.mem.Allocator, c: Cursor, secret: []const u8) ![]
     const payload = try payloadBytes(alloc, c);
     defer alloc.free(payload); // scratch
     const p_b64 = try b64Encode(alloc, payload);
-    defer alloc.free(p_b64); // scratch: copied into the returned token by allocPrint
+    defer alloc.free(p_b64); // scratch: copied into the returned token by Allocator.print
     var mac: [32]u8 = undefined;
     HmacSha256.create(&mac, p_b64, secret);
     const mac_b64 = try b64Encode(alloc, &mac);
-    defer alloc.free(mac_b64); // scratch: copied into the returned token by allocPrint
-    const token = try std.fmt.allocPrint(alloc, "{s}.{s}", .{ p_b64, mac_b64 });
+    defer alloc.free(mac_b64); // scratch: copied into the returned token by Allocator.print
+    const token = try alloc.print("{s}.{s}", .{ p_b64, mac_b64 });
     errdefer alloc.free(token);
     if (token.len > max_cursor_len) return error.CursorTooLarge;
     return token;

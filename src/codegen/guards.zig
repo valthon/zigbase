@@ -33,7 +33,7 @@ pub fn checkOperatorNames(alloc: std.mem.Allocator, cols: []const schema.Collect
             const target = findByName(cols, f.options.relation.targetCollectionId) orelse continue;
             for (target.fields) |tf| {
                 if (isOperatorKey(tf.name)) {
-                    report.message = try std.fmt.allocPrint(alloc, "codegen: collection '{s}' field '{s}' relates to '{s}', which has a field '{s}' named like a where-operator — this makes the nested-relation where ambiguous. Rename '{s}.{s}'.", .{ c.name, f.name, target.name, tf.name, target.name, tf.name });
+                    report.message = try alloc.print("codegen: collection '{s}' field '{s}' relates to '{s}', which has a field '{s}' named like a where-operator — this makes the nested-relation where ambiguous. Rename '{s}.{s}'.", .{ c.name, f.name, target.name, tf.name, target.name, tf.name });
                     return GuardError.OperatorNameClash;
                 }
             }
@@ -48,15 +48,15 @@ pub fn checkOperatorNames(alloc: std.mem.Allocator, cols: []const schema.Collect
 /// `seen`; the caller frees the whole scratch arena in one shot.
 fn registerName(msg_alloc: std.mem.Allocator, scratch: std.mem.Allocator, seen: *std.ArrayList([]const u8), name: []const u8, owner: []const u8, report: *GuardReport) GuardError!void {
     if (!ident.isValidTsIdent(name)) {
-        report.message = try std.fmt.allocPrint(msg_alloc, "codegen: '{s}' (from collection '{s}') is not a valid TS identifier.", .{ name, owner });
+        report.message = try msg_alloc.print("codegen: '{s}' (from collection '{s}') is not a valid TS identifier.", .{ name, owner });
         return GuardError.InvalidIdentifier;
     }
     if (ident.isReservedName(name)) {
-        report.message = try std.fmt.allocPrint(msg_alloc, "codegen: generated name '{s}' (from collection '{s}') collides with a reserved typed-core name.", .{ name, owner });
+        report.message = try msg_alloc.print("codegen: generated name '{s}' (from collection '{s}') collides with a reserved typed-core name.", .{ name, owner });
         return GuardError.NameCollision;
     }
     for (seen.items) |s| if (std.mem.eql(u8, s, name)) {
-        report.message = try std.fmt.allocPrint(msg_alloc, "codegen: generated name '{s}' (from collection '{s}') collides with another generated name.", .{ name, owner });
+        report.message = try msg_alloc.print("codegen: generated name '{s}' (from collection '{s}') collides with another generated name.", .{ name, owner });
         return GuardError.NameCollision;
     };
     try seen.append(scratch, name);
@@ -75,12 +75,12 @@ pub fn checkIdentifiers(alloc: std.mem.Allocator, cols: []const schema.Collectio
     var seen: std.ArrayList([]const u8) = .empty;
     for (cols) |c| {
         if (!ident.isValidTsIdent(c.name)) {
-            report.message = try std.fmt.allocPrint(alloc, "codegen: collection name '{s}' is not a valid TS identifier.", .{c.name});
+            report.message = try alloc.print("codegen: collection name '{s}' is not a valid TS identifier.", .{c.name});
             return GuardError.InvalidIdentifier;
         }
         for (c.fields) |f| {
             if (!ident.isValidTsIdent(f.name)) {
-                report.message = try std.fmt.allocPrint(alloc, "codegen: field '{s}' in collection '{s}' is not a valid TS identifier.", .{ f.name, c.name });
+                report.message = try alloc.print("codegen: field '{s}' in collection '{s}' is not a valid TS identifier.", .{ f.name, c.name });
                 return GuardError.InvalidIdentifier;
             }
         }
@@ -101,7 +101,7 @@ pub fn checkIdentifiers(alloc: std.mem.Allocator, cols: []const schema.Collectio
         for (c.fields) |f| {
             if (f.fieldType() != .select) continue;
             const union_name = try ts_type.selectUnionName(sa, c.name, f.name);
-            const owner_ctx = try std.fmt.allocPrint(sa, "{s} (field '{s}')", .{ c.name, f.name });
+            const owner_ctx = try sa.print("{s} (field '{s}')", .{ c.name, f.name });
             try registerName(alloc, sa, &seen, union_name, owner_ctx, report);
         }
         // Register the per-collection metadata const (e.g. `postsMeta`), emitted at
@@ -111,7 +111,7 @@ pub fn checkIdentifiers(alloc: std.mem.Allocator, cols: []const schema.Collectio
         // collections with at least one SINGLE-value file field (mirror that gate
         // exactly so we don't register a name that isn't emitted).
         if (hasSingleFileFields(c)) {
-            const file_union = try std.fmt.allocPrint(sa, "{s}FileField", .{try ident.recordName(sa, c.name)});
+            const file_union = try sa.print("{s}FileField", .{try ident.recordName(sa, c.name)});
             try registerName(alloc, sa, &seen, file_union, c.name, report);
         }
     }

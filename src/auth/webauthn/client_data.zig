@@ -382,8 +382,7 @@ test "parseClientData + verifyClientData: full round-trip with b64url challenge"
     defer alloc.free(encoded);
 
     // Build a realistic clientDataJSON as the browser would send it.
-    const json = try std.fmt.allocPrint(
-        alloc,
+    const json = try alloc.print(
         "{{\"type\":\"webauthn.create\",\"challenge\":\"{s}\",\"origin\":\"https://example.test\",\"crossOrigin\":false}}",
         .{encoded},
     );

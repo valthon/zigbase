@@ -86,7 +86,7 @@ pub fn sign(alloc: std.mem.Allocator, claims: Claims, key: []const u8) ![]u8 {
     defer alloc.free(payload_json);
     const p = try b64enc(alloc, payload_json);
     defer alloc.free(p);
-    const signing_input = try std.fmt.allocPrint(alloc, "{s}.{s}", .{ header_b64, p });
+    const signing_input = try alloc.print("{s}.{s}", .{ header_b64, p });
     defer alloc.free(signing_input);
 
     // Bound `sign` by the SAME ceiling `verify` enforces, so this module can never mint a
@@ -101,7 +101,7 @@ pub fn sign(alloc: std.mem.Allocator, claims: Claims, key: []const u8) ![]u8 {
     HmacSha256.create(&sig, signing_input, key);
     const s = try b64enc(alloc, &sig);
     defer alloc.free(s);
-    return std.fmt.allocPrint(alloc, "{s}.{s}", .{ signing_input, s });
+    return alloc.print("{s}.{s}", .{ signing_input, s });
 }
 
 /// Verify signature + expiry (against `now`, unix seconds) and return the claims.
@@ -125,7 +125,7 @@ pub fn verify(alloc: std.mem.Allocator, token: []const u8, key: []const u8, now:
     // Reject any header other than the fixed HS256 header (defense-in-depth vs alg substitution).
     if (!std.mem.eql(u8, h, header_b64)) return error.Malformed;
 
-    const signing_input = try std.fmt.allocPrint(alloc, "{s}.{s}", .{ h, p });
+    const signing_input = try alloc.print("{s}.{s}", .{ h, p });
     var expected: [32]u8 = undefined;
     HmacSha256.create(&expected, signing_input, key);
 
@@ -403,7 +403,7 @@ test "peekClaims and verify agree on token SHAPE (a 4th segment is rejected by b
     defer a.free(token);
 
     // A genuine, signature-valid token with one extra segment appended.
-    const four = try std.fmt.allocPrint(a, "{s}.extra", .{token});
+    const four = try a.print("{s}.extra", .{token});
     defer a.free(four);
 
     var scratch: [scratch_size]u8 = undefined;
@@ -433,13 +433,13 @@ test "#99 token_epoch claim round-trips; a pre-epoch token (no claim) parses as 
     const legacy_json = "{\"id\":\"u1\",\"collection\":\"users\",\"type\":\"auth\",\"csrf\":\"\",\"jti\":\"\",\"pl\":\"\",\"iat\":1000,\"exp\":2000}";
     const p = try b64enc(a, legacy_json);
     defer a.free(p);
-    const signing_input = try std.fmt.allocPrint(a, "{s}.{s}", .{ header_b64, p });
+    const signing_input = try a.print("{s}.{s}", .{ header_b64, p });
     defer a.free(signing_input);
     var sig: [32]u8 = undefined;
     HmacSha256.create(&sig, signing_input, &key);
     const s = try b64enc(a, &sig);
     defer a.free(s);
-    const legacy_token = try std.fmt.allocPrint(a, "{s}.{s}", .{ signing_input, s });
+    const legacy_token = try a.print("{s}.{s}", .{ signing_input, s });
     defer a.free(legacy_token);
     var scratch2: [scratch_size]u8 = undefined;
     const legacy = try verifyInto(&scratch2, legacy_token, &key, 1500);
@@ -455,7 +455,7 @@ test "verify rejects a token with a foreign header" {
     defer a.free(good);
     // replace the header segment with a different (valid base64url) value
     const dot = std.mem.indexOfScalar(u8, good, '.').?;
-    const tampered = try std.fmt.allocPrint(a, "ZXZpbA.{s}", .{good[dot + 1 ..]});
+    const tampered = try a.print("ZXZpbA.{s}", .{good[dot + 1 ..]});
     defer a.free(tampered);
     var scratch: [scratch_size]u8 = undefined;
     try std.testing.expectError(error.Malformed, verifyInto(&scratch, tampered, &key, 1500));
@@ -479,7 +479,7 @@ test "an over-long token is rejected before allocating (pre-auth amplification b
     defer a.free(payload);
     @memset(payload, 'A'); // valid base64url alphabet, so decoding would proceed
 
-    const token = try std.fmt.allocPrint(a, "{s}.{s}.AAAA", .{ header_b64, payload });
+    const token = try a.print("{s}.{s}.AAAA", .{ header_b64, payload });
     defer a.free(token);
     try std.testing.expect(token.len > max_token_len);
 

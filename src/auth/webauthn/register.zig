@@ -281,8 +281,7 @@ fn buildClientDataJson(
 ) ![]u8 {
     const encoded_challenge = try client_data.b64urlNoPad(allocator, challenge_raw);
     defer allocator.free(encoded_challenge);
-    return std.fmt.allocPrint(
-        allocator,
+    return allocator.print(
         "{{\"type\":\"webauthn.create\",\"challenge\":\"{s}\",\"origin\":\"{s}\"}}",
         .{ encoded_challenge, origin },
     );
@@ -554,8 +553,7 @@ test "register: negative — wrong clientData type (webauthn.get) causes TypeMis
     // Use webauthn.get type instead of webauthn.create
     const encoded_challenge = try client_data.b64urlNoPad(alloc, &challenge_raw);
     defer alloc.free(encoded_challenge);
-    const cdj = try std.fmt.allocPrint(
-        alloc,
+    const cdj = try alloc.print(
         "{{\"type\":\"webauthn.get\",\"challenge\":\"{s}\",\"origin\":\"{s}\"}}",
         .{ encoded_challenge, origin },
     );

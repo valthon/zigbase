@@ -203,7 +203,7 @@ pub fn deferralSet(sa: std.mem.Allocator, live: []const schema.Collection, entri
     }
     for (out.items) |d| {
         if (!fieldRequired(cols, d.collection, d.field)) continue;
-        last_error_detail = std.fmt.bufPrint(
+        last_error_detail = std.mem.print(
             &detail_buf,
             "{s}.{s} is required but sits on a relation cycle/self-relation with no legal load order; " ++
                 "make it optional for this import, then restore required and backfill the value afterward",
@@ -269,7 +269,7 @@ fn capturePatchDetail(err: anyerror) []const u8 {
     const errs = records.last_errors orelse return "";
     if (errs.len == 0) return "";
     const ve = errs[0];
-    return std.fmt.bufPrint(&patch_detail_buf, "{s}: {s} ({s})", .{ ve.field, ve.message, ve.code }) catch "";
+    return std.mem.print(&patch_detail_buf, "{s}: {s} ({s})", .{ ve.field, ve.message, ve.code }) catch "";
 }
 
 const PatchOutcome = struct { patched: usize = 0, failed: usize = 0 };
@@ -873,7 +873,7 @@ test "run: dry_run keeps dependency rows visible across files and batches" {
     try std.testing.expect(!d.inTransaction());
 
     for ([_][]const u8{ "authors", "posts" }) |name| {
-        const sql = try std.fmt.allocPrintSentinel(a, "SELECT COUNT(*) FROM \"{s}\";", .{name}, 0);
+        const sql = try a.printSentinel("SELECT COUNT(*) FROM \"{s}\";", .{name}, 0);
         defer a.free(sql);
         var st = try d.prepare(sql);
         defer st.finalize();

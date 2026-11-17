@@ -107,7 +107,7 @@ fn Implementation(comptime config: anytype) type {
             if (db.dbDialect(conn).kind == .postgres) {
                 const table = try @import("ddl.zig").quoteIdent(s.ctx.allocator.a, s.col.name);
                 defer s.ctx.allocator.a.free(table);
-                const sql = try std.fmt.allocPrintSentinel(s.ctx.allocator.a, "SELECT \"id\" FROM {s} WHERE \"id\"=$1 FOR UPDATE;", .{table}, 0);
+                const sql = try s.ctx.allocator.a.printSentinel("SELECT \"id\" FROM {s} WHERE \"id\"=$1 FOR UPDATE;", .{table}, 0);
                 defer s.ctx.allocator.a.free(sql);
                 var locked = try conn.prepare(sql);
                 defer locked.finalize();
@@ -235,7 +235,7 @@ fn Implementation(comptime config: anytype) type {
             defer if (s.cascade) |*c| c.deinit();
             const result = Ledger.execute(a, conn, .{
                 .principal = .{ .collection = auth_col.id, .record = identity.object.get("id").?.string },
-                .operation = try std.fmt.allocPrint(a, "{s}:{s}:{s}", .{ @tagName(action), col.id, rid }),
+                .operation = try a.print("{s}:{s}:{s}", .{ @tagName(action), col.id, rid }),
                 .key = ctx.header("idempotency-key").?,
                 .payload = payload,
                 .now = std.Io.Timestamp.now(app.io, .real).toSeconds(),
@@ -285,7 +285,7 @@ test "idempotent delete broadcasts its prepared private snapshot and retains it 
     defer tmp.cleanup();
     const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
     defer a.free(dir);
-    const path = try std.fmt.allocPrintSentinel(a, "{s}/test.db", .{dir}, 0);
+    const path = try a.printSentinel("{s}/test.db", .{dir}, 0);
     defer a.free(path);
     var pool = try db.Pool.init(a, std.testing.io, path);
     defer pool.deinit();

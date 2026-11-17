@@ -459,7 +459,7 @@ fn expectFractionalResendAge(d: *db.Db) !void {
         .{ .now = "2026-11-15T12:01:00.100Z", .age = 59 },
         .{ .now = "2026-11-15T12:01:01.100Z", .age = 60 },
     }) |case| {
-        const literal = try std.fmt.allocPrint(testing.allocator, "'{s}'{s}", .{ case.now, if (pg) "::timestamptz" else "" });
+        const literal = try testing.allocator.print("'{s}'{s}", .{ case.now, if (pg) "::timestamptz" else "" });
         defer testing.allocator.free(literal);
         const sql = try std.mem.replaceOwned(u8, testing.allocator, ageSecondsSql(d), if (pg) "now()" else "'now'", literal);
         defer testing.allocator.free(sql);

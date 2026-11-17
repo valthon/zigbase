@@ -68,7 +68,7 @@ fn rotatedRing() field_policy.Cipher {
 
 /// Read a column's at-rest TEXT value by the string `id` PK.
 fn cellById(a: std.mem.Allocator, d: *dbm.Db, table: []const u8, id: []const u8) ![]u8 {
-    const sql = try std.fmt.allocPrintSentinel(a, "SELECT v FROM {s} WHERE \"id\" = $1;", .{table}, 0);
+    const sql = try a.printSentinel("SELECT v FROM {s} WHERE \"id\" = $1;", .{table}, 0);
     var s = try d.prepare(sql);
     defer s.finalize();
     try s.bindText(1, id);

@@ -24,15 +24,15 @@ var schema_counter: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
 
 fn enterTempSchema(a: std.mem.Allocator, d: *dbm.Db) ![:0]const u8 {
     const n = schema_counter.fetchAdd(1, .monotonic);
-    const name = try std.fmt.allocPrint(a, "zb_dump_{d}", .{n});
-    try d.exec(try std.fmt.allocPrintSentinel(a, "DROP SCHEMA IF EXISTS \"{s}\" CASCADE;", .{name}, 0));
-    try d.exec(try std.fmt.allocPrintSentinel(a, "CREATE SCHEMA \"{s}\";", .{name}, 0));
-    try d.exec(try std.fmt.allocPrintSentinel(a, "SET search_path TO \"{s}\";", .{name}, 0));
-    return std.fmt.allocPrintSentinel(a, "{s}", .{name}, 0);
+    const name = try a.print("zb_dump_{d}", .{n});
+    try d.exec(try a.printSentinel("DROP SCHEMA IF EXISTS \"{s}\" CASCADE;", .{name}, 0));
+    try d.exec(try a.printSentinel("CREATE SCHEMA \"{s}\";", .{name}, 0));
+    try d.exec(try a.printSentinel("SET search_path TO \"{s}\";", .{name}, 0));
+    return a.printSentinel("{s}", .{name}, 0);
 }
 
 fn dropTempSchema(a: std.mem.Allocator, d: *dbm.Db, name: []const u8) void {
-    const sql = std.fmt.allocPrintSentinel(a, "DROP SCHEMA IF EXISTS \"{s}\" CASCADE;", .{name}, 0) catch return;
+    const sql = a.printSentinel("DROP SCHEMA IF EXISTS \"{s}\" CASCADE;", .{name}, 0) catch return;
     d.exec(sql) catch {};
 }
 

@@ -31,7 +31,7 @@ const Scan = struct {
             else => return err,
         };
         if (stat.kind != .file and stat.kind != .directory) return;
-        const key = if (prefix.len == 0) try self.alloc.dupe(u8, name) else try std.fmt.allocPrint(self.alloc, "{s}/{s}", .{ prefix, name });
+        const key = if (prefix.len == 0) try self.alloc.dupe(u8, name) else try self.alloc.print("{s}/{s}", .{ prefix, name });
         defer self.alloc.free(key);
         if (stat.kind == .directory) {
             if (depth == 2) return;

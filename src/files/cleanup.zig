@@ -84,7 +84,7 @@ pub fn jobHandler(ctx: *Ctx, payload: []const u8) !void {
     if (db.dbDialect(w).kind == .postgres) {
         const ident = try @import("../ddl.zig").quoteIdent(ctx.arena.a, col.name);
         defer ctx.arena.a.free(ident);
-        const sql = try std.fmt.allocPrintSentinel(ctx.arena.a, "LOCK TABLE {s} IN SHARE ROW EXCLUSIVE MODE;", .{ident}, 0);
+        const sql = try ctx.arena.a.printSentinel("LOCK TABLE {s} IN SHARE ROW EXCLUSIVE MODE;", .{ident}, 0);
         defer ctx.arena.a.free(sql);
         try w.exec(sql);
         // Match DDL's data-table -> metadata ordering. Revalidate the optimistic

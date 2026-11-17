@@ -191,7 +191,7 @@ fn insertRow(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection) Engine
     // Identifiers are double-quoted: the mixed-case columns (listRule/viewRule/…) were created
     // quoted by migration 0001, so Postgres (which folds UNQUOTED identifiers to lowercase) needs
     // them quoted to match; SQLite is unaffected.
-    const raw = try std.fmt.allocPrint(alloc,
+    const raw = try alloc.print(
         \\INSERT INTO "_collections"
         \\ ("id","name","type","system","schema","indexes","listRule","viewRule","createRule","updateRule","deleteRule","options","created","updated")
         \\ VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12, {s}, {s});
@@ -433,7 +433,7 @@ fn updateImpl(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, id_or_name: []con
             // keeps search's separate catalog validation from adopting migration objects.
             for (migration_objects) |obj| {
                 const kind = if (obj.kind == .index) "INDEX" else "TRIGGER";
-                try w.exec(try std.fmt.allocPrintSentinel(sa, "DROP {s} \"main\".{s};", .{ kind, try ddl.quoteIdent(sa, obj.name) }, 0));
+                try w.exec(try sa.printSentinel("DROP {s} \"main\".{s};", .{ kind, try ddl.quoteIdent(sa, obj.name) }, 0));
             }
             try fts.dropIndexFor(sa, w, old);
         }
@@ -474,7 +474,7 @@ fn updateRow(alloc: std.mem.Allocator, w: *db.Db, col_id: []const u8, col: schem
     const indexes_json = try schema.indexesToJson(alloc, col.indexes);
     const options_json = try schema.optionsToJson(alloc, col, false);
     const d = db.dbDialect(w);
-    const raw = try std.fmt.allocPrint(alloc,
+    const raw = try alloc.print(
         \\UPDATE "_collections" SET "schema"=?2, "indexes"=?3, "listRule"=?4, "viewRule"=?5,
         \\ "createRule"=?6, "updateRule"=?7, "deleteRule"=?8, "options"=?9, "updated"={s} WHERE "id"=?1;
     , .{d.nowTextExpr()});
@@ -561,7 +561,7 @@ pub fn updateRules(alloc: std.mem.Allocator, w: *db.Db, col_id: []const u8, rule
     const d = db.dbDialect(w);
     // Mixed-case identifiers are quoted for the same reason as insertRow/updateRow: migration
     // 0001 created them quoted, and Postgres folds unquoted identifiers to lowercase.
-    const raw = try std.fmt.allocPrint(sa,
+    const raw = try sa.print(
         \\UPDATE "_collections" SET "listRule"=?2, "viewRule"=?3, "createRule"=?4,
         \\ "updateRule"=?5, "deleteRule"=?6, "updated"={s} WHERE "id"=?1;
     , .{d.nowTextExpr()});
@@ -703,7 +703,7 @@ fn reconcileIndexes(alloc: std.mem.Allocator, w: *db.Db, old: schema.Collection,
         } else false;
         if (!unchanged) {
             std.log.info("provision: collection '{s}' DROP index '{s}'", .{ old.name, idx.name });
-            w.exec(try std.fmt.allocPrintSentinel(sa, "DROP INDEX IF EXISTS {s};", .{try ddl.quoteIdent(sa, idx.name)}, 0)) catch |err| {
+            w.exec(try sa.printSentinel("DROP INDEX IF EXISTS {s};", .{try ddl.quoteIdent(sa, idx.name)}, 0)) catch |err| {
                 std.log.warn("provision: collection '{s}' index '{s}' DROP failed: {s}; {s}", .{ old.name, idx.name, @errorName(err), w.errMsg() });
                 return err;
             };
@@ -733,7 +733,7 @@ fn reconcileIndexes(alloc: std.mem.Allocator, w: *db.Db, old: schema.Collection,
         }
     }
     {
-        const raw = try std.fmt.allocPrint(sa, "UPDATE \"_collections\" SET \"indexes\"=?2, \"updated\"={s} WHERE \"id\"=?1;", .{d.nowTextExpr()});
+        const raw = try sa.print("UPDATE \"_collections\" SET \"indexes\"=?2, \"updated\"={s} WHERE \"id\"=?1;", .{d.nowTextExpr()});
         var st = try w.prepare(try d.renumberPlaceholders(sa, raw));
         defer st.finalize();
         try st.bindText(1, old.id);
@@ -776,8 +776,8 @@ fn existingIndex(alloc: std.mem.Allocator, w: *db.Db, table: []const u8, idx: sc
             if (!try cols.step()) return .conflicting;
             if (cols.columnInt(1) != 0 or cols.columnInt(2) != 1 or cols.columnInt(3) != 1) return .conflicting;
             const quoted = try ddl.quoteIdent(a, field);
-            const bare_expr = if (idx.collation == .nocase) try std.fmt.allocPrint(a, "lower({s})", .{field}) else field;
-            const quoted_expr = if (idx.collation == .nocase) try std.fmt.allocPrint(a, "lower({s})", .{quoted}) else quoted;
+            const bare_expr = if (idx.collation == .nocase) try a.print("lower({s})", .{field}) else field;
+            const quoted_expr = if (idx.collation == .nocase) try a.print("lower({s})", .{quoted}) else quoted;
             if (!std.mem.eql(u8, cols.columnText(0), bare_expr) and !std.mem.eql(u8, cols.columnText(0), quoted_expr)) return .conflicting;
         }
     } else {
@@ -830,7 +830,7 @@ pub fn delete(alloc: std.mem.Allocator, w: *db.Db, id_or_name: []const u8) Engin
     // drop it (and its triggers) first, in the same transaction (#507). The Postgres tsvector
     // column and its GIN index go with the table.
     if (db.dbDialect(w).kind == .sqlite) try fts.dropIndexFor(sa, w, target);
-    try w.exec(try std.fmt.allocPrintSentinel(sa, "DROP TABLE {s};", .{try ddl.quoteIdent(sa, target.name)}, 0));
+    try w.exec(try sa.printSentinel("DROP TABLE {s};", .{try ddl.quoteIdent(sa, target.name)}, 0));
     var st = try w.prepare(try db.dbDialect(w).renumberPlaceholders(sa, "DELETE FROM \"_collections\" WHERE \"id\" = ?1;"));
     defer st.finalize();
     try st.bindText(1, target.id);
@@ -1580,7 +1580,7 @@ fn checkSqliteRebuild(alloc: std.mem.Allocator, w: *db.Db, old: schema.Collectio
     var shadow = try w.prepare("SELECT name FROM sqlite_temp_schema WHERE type IN ('table','view','index') AND (name=?1 COLLATE NOCASE OR name=?2 COLLATE NOCASE) LIMIT 1;");
     defer shadow.finalize();
     try shadow.bindText(1, old.name);
-    try shadow.bindText(2, try std.fmt.allocPrint(alloc, "{s}__new", .{old.name}));
+    try shadow.bindText(2, try alloc.print("{s}__new", .{old.name}));
     if (try shadow.step()) return unsafeSqliteRebuild(old.name, shadow.columnText(0), "shadowing TEMP object");
     var cols = try w.prepare("SELECT name, type, \"notnull\", pk, hidden FROM pragma_table_xinfo(?1);");
     defer cols.finalize();
@@ -1662,14 +1662,14 @@ fn sameTableObject(a: TableObject, b: TableObject) bool {
 }
 
 fn unsafeSqliteRebuild(table: []const u8, object: []const u8, reason: []const u8) error{UnsafeSqliteRebuild} {
-    last_rebuild_error = std.fmt.bufPrint(&rebuild_error_buf, "Collection '{s}': {s} '{s}'; use an explicit migration before changing the collection.", .{ table[0..@min(table.len, 256)], reason, object[0..@min(object.len, 768)] }) catch unreachable;
+    last_rebuild_error = std.mem.print(&rebuild_error_buf, "Collection '{s}': {s} '{s}'; use an explicit migration before changing the collection.", .{ table[0..@min(table.len, 256)], reason, object[0..@min(object.len, 768)] }) catch unreachable;
     std.log.warn("{s}", .{last_rebuild_error});
     return error.UnsafeSqliteRebuild;
 }
 
 fn migrationObjectConflict(object: []const u8, column: []const u8) error{MigrationObjectConflict} {
     // Prefix lengths prove the message fits even for arbitrarily long raw-SQL object names.
-    last_rebuild_error = std.fmt.bufPrint(&rebuild_error_buf, "Migration-owned object '{s}' conflicts with column or engine object '{s}'; explicitly migrate this object before changing the collection.", .{ object[0..@min(object.len, 768)], column[0..@min(column.len, 768)] }) catch unreachable;
+    last_rebuild_error = std.mem.print(&rebuild_error_buf, "Migration-owned object '{s}' conflicts with column or engine object '{s}'; explicitly migrate this object before changing the collection.", .{ object[0..@min(object.len, 768)], column[0..@min(column.len, 768)] }) catch unreachable;
     std.log.warn("{s}", .{last_rebuild_error});
     return error.MigrationObjectConflict;
 }
@@ -1752,7 +1752,7 @@ fn preflightTableObjects(scratch: *std.heap.ArenaAllocator, w: *db.Db, old: sche
         // Constraint autoindexes have no stored SQL (absent from old_engine) and a rebuild does
         // not preserve their numbering, so any INDEXED BY on one of this table's autoindexes
         // would break after the rebuild: refuse it before DDL.
-        if (obj.kind == .trigger and @import("sql/schema_check.zig").referencesIndexPrefix(obj.sql, try std.fmt.allocPrint(alloc, "sqlite_autoindex_{s}_", .{old.name})))
+        if (obj.kind == .trigger and @import("sql/schema_check.zig").referencesIndexPrefix(obj.sql, try alloc.print("sqlite_autoindex_{s}_", .{old.name})))
             return migrationObjectConflict(obj.name, "a SQLite constraint autoindex (INDEXED BY)");
         indexes: for (old_engine) |removed| {
             if (obj.kind != .trigger or removed.kind != .index) continue;
@@ -1866,8 +1866,7 @@ pub fn ensureTenantIndex(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collec
     defer alloc.free(qtbl);
     const qtf = try ddl.quoteIdent(alloc, tf);
     defer alloc.free(qtf);
-    const sql = try std.fmt.allocPrintSentinel(
-        alloc,
+    const sql = try alloc.printSentinel(
         "CREATE INDEX IF NOT EXISTS {s} ON {s} ({s});",
         .{ qidx, qtbl, qtf },
         0,
@@ -2022,7 +2021,7 @@ test "committed rebuild survives FK restoration failure and quarantines its conn
     defer tmp.cleanup();
     const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
     defer a.free(dir);
-    const path = try std.fmt.allocPrintSentinel(a, "{s}/data.db", .{dir}, 0);
+    const path = try a.printSentinel("{s}/data.db", .{dir}, 0);
     defer a.free(path);
     var conn = try db.Db.open(path);
     defer conn.close();
@@ -2114,7 +2113,7 @@ fn expectStoredNameRejected(a: std.mem.Allocator, reserved_name: []const u8, by_
     defer original.deinit(a);
     const quoted = try ddl.quoteIdent(a, original.name);
     defer a.free(quoted);
-    const index_sql = try std.fmt.allocPrintSentinel(a, "CREATE INDEX name_guard_marker ON {s}(created);", .{quoted}, 0);
+    const index_sql = try a.printSentinel("CREATE INDEX name_guard_marker ON {s}(created);", .{quoted}, 0);
     defer a.free(index_sql);
     try conn.exec(index_sql);
     const generation = try schema_gen.read(&conn);
@@ -2230,7 +2229,7 @@ fn ftsObjectCount(d: *db.Db, prefix: []const u8) !i64 {
 
 /// The ids of `name` rows its FTS index matches for `term`, as one `id|id|…|` string (by id).
 fn ftsMatches(a: std.mem.Allocator, d: *db.Db, name: []const u8, term: []const u8) ![]u8 {
-    const sql = try std.fmt.allocPrintSentinel(a, "SELECT n.id FROM \"{s}\" n JOIN \"{s}_fts\" f ON f.rowid = n.rowid WHERE \"{s}_fts\" MATCH ?1 ORDER BY n.id;", .{ name, name, name }, 0);
+    const sql = try a.printSentinel("SELECT n.id FROM \"{s}\" n JOIN \"{s}_fts\" f ON f.rowid = n.rowid WHERE \"{s}_fts\" MATCH ?1 ORDER BY n.id;", .{ name, name, name }, 0);
     defer a.free(sql);
     var st = try d.prepare(sql);
     defer st.finalize();
@@ -2437,7 +2436,7 @@ test "startup convergence refuses layout triggers on migration-reordered columns
         try conn.exec("CREATE TABLE items(id TEXT PRIMARY KEY,created TEXT,updated TEXT,account TEXT,slug TEXT UNIQUE);");
         try conn.exec("INSERT INTO items VALUES('kept','','','acct-a','one');");
         try conn.exec("CREATE TABLE audit AS SELECT * FROM items;");
-        const trigger = try std.fmt.allocPrintSentinel(a, "CREATE TRIGGER migration_layout AFTER INSERT ON items BEGIN {s}; END;", .{body}, 0);
+        const trigger = try a.printSentinel("CREATE TRIGGER migration_layout AFTER INSERT ON items BEGIN {s}; END;", .{body}, 0);
         defer a.free(trigger);
         try conn.exec(trigger);
         const generation = try schema_gen.read(&conn);

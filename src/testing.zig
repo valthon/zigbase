@@ -146,7 +146,7 @@ pub fn start(comptime AppType: type, opts: StartOptions) !Harness(AppType) {
         errdefer h.tmp.cleanup();
         const rp = try h.tmp.dir.realPathFileAlloc(io, ".", allocator);
         defer allocator.free(rp);
-        h.data_dir = try std.fmt.allocPrint(allocator, "{s}/data", .{rp});
+        h.data_dir = try allocator.print("{s}/data", .{rp});
     }
     errdefer allocator.free(h.data_dir);
     errdefer if (h.owns_tmp) h.tmp.cleanup();
@@ -455,7 +455,7 @@ pub fn Harness(comptime AppType: type) type {
                 .iat = now,
                 .exp = now + 14 * 24 * 3600,
             }, &key);
-            return std.fmt.allocPrint(a, "Bearer {s}", .{tok});
+            return a.print("Bearer {s}", .{tok});
         }
 
         /// Drive the REAL `auth-with-password` endpoint in-process and return `"Bearer <tok>"`.
@@ -464,11 +464,11 @@ pub fn Harness(comptime AppType: type) type {
         pub fn loginPassword(self: *Self, collection: []const u8, identity: []const u8, password: []const u8) ![]const u8 {
             const ap = try self.newArena();
             const a = ap.allocator();
-            const path = try std.fmt.allocPrint(a, "/api/collections/{s}/auth-with-password", .{collection});
+            const path = try a.print("/api/collections/{s}/auth-with-password", .{collection});
             const resp = try self.request(.POST, path, .{ .json = .{ .identity = identity, .password = password } });
             if (resp.status != 200) return error.LoginFailed;
             const parsed = try resp.json(struct { token: []const u8 });
-            return std.fmt.allocPrint(a, "Bearer {s}", .{parsed.token});
+            return a.print("Bearer {s}", .{parsed.token});
         }
 
         /// `loginPassword` against the built-in `_superusers` collection.
@@ -877,7 +877,7 @@ test "harness: a cookie-authenticated request (zb_auth) authorizes an .authed ro
     const bearer = try t.mintSession("_superusers", su_id);
     // The auth COOKIE carries the raw token (no "Bearer " prefix).
     const raw = bearer["Bearer ".len..];
-    const cookie = try std.fmt.allocPrint(std.testing.allocator, "zb_auth={s}", .{raw});
+    const cookie = try std.testing.allocator.print("zb_auth={s}", .{raw});
     defer std.testing.allocator.free(cookie);
 
     const ok = try t.request(.GET, "/api/whoami", .{ .cookie = cookie });
@@ -920,9 +920,9 @@ const LocalFileTestApp = framework.App(.{
 test "local file public helper: range and conditional matrix through framework route" {
     var t = try start(LocalFileTestApp, .{});
     defer t.deinit();
-    const path = try std.fmt.allocPrint(std.testing.allocator, "{s}/media.mp4", .{t.data_dir});
+    const path = try std.testing.allocator.print("{s}/media.mp4", .{t.data_dir});
     defer std.testing.allocator.free(path);
-    const url = try std.fmt.allocPrint(std.testing.allocator, "/api/media?{s}", .{path});
+    const url = try std.testing.allocator.print("/api/media?{s}", .{path});
     defer std.testing.allocator.free(url);
     try std.Io.Dir.cwd().writeFile(t.io, .{ .sub_path = path, .data = "0123456789" });
     const full = try t.request(.GET, url, .{});
@@ -949,14 +949,14 @@ test "local file public helper: range and conditional matrix through framework r
         const head = try t.request(.HEAD, url, .{ .headers = &.{.{ "Range", case[0] }} });
         try std.testing.expectEqual(r.status, head.status);
         try std.testing.expectEqualStrings("", head.body);
-        try std.testing.expectEqualStrings(try std.fmt.allocPrint(head.arena, "{d}", .{r.body.len}), head.header("content-length").?);
+        try std.testing.expectEqualStrings(try head.arena.print("{d}", .{r.body.len}), head.header("content-length").?);
     }
     const unchanged = try t.request(.GET, url, .{ .headers = &.{ .{ "If-None-Match", etag }, .{ "Range", "bytes=0-1" } } });
     try std.testing.expectEqual(@as(u16, 304), unchanged.status);
     try std.testing.expectEqualStrings("", unchanged.body);
     const hit = try t.request(.GET, url, .{ .headers = &.{ .{ "If-Range", etag }, .{ "Range", "bytes=2-3" } } });
     try std.testing.expectEqual(@as(u16, 206), hit.status);
-    for ([_][]const u8{ "\"old\"", try std.fmt.allocPrint(full.arena, "W/{s}", .{etag}) }) |validator| {
+    for ([_][]const u8{ "\"old\"", try full.arena.print("W/{s}", .{etag}) }) |validator| {
         const miss = try t.request(.GET, url, .{ .headers = &.{ .{ "If-Range", validator }, .{ "Range", "bytes=2-3" } } });
         try std.testing.expectEqual(@as(u16, 200), miss.status);
     }
@@ -999,10 +999,10 @@ fn fileRefHandler(ctx: *Ctx) !http.Response {
 test "local file responses own supplied options across success and conditional statuses" {
     var t = try start(LocalFileTestApp, .{});
     defer t.deinit();
-    const path = try std.fmt.allocPrint(std.testing.allocator, "{s}/owned.mp4", .{t.data_dir});
+    const path = try std.testing.allocator.print("{s}/owned.mp4", .{t.data_dir});
     defer std.testing.allocator.free(path);
     try std.Io.Dir.cwd().writeFile(t.io, .{ .sub_path = path, .data = "0123456789" });
-    const url = try std.fmt.allocPrint(std.testing.allocator, "/api/owned-options?{s}", .{path});
+    const url = try std.testing.allocator.print("/api/owned-options?{s}", .{path});
     defer std.testing.allocator.free(url);
     const cases = [_]struct { method: http.Method = .GET, range: []const u8 = "", conditional: []const u8 = "", status: u16 }{
         .{ .status = 200 },
@@ -1024,11 +1024,11 @@ test "local file responses own supplied options across success and conditional s
 test "harness ignores offsets for delegated files and honors explicit byte windows" {
     var t = try start(LocalFileTestApp, .{});
     defer t.deinit();
-    const path = try std.fmt.allocPrint(std.testing.allocator, "{s}/window.txt", .{t.data_dir});
+    const path = try std.testing.allocator.print("{s}/window.txt", .{t.data_dir});
     defer std.testing.allocator.free(path);
     try std.Io.Dir.cwd().writeFile(t.io, .{ .sub_path = path, .data = "0123456789" });
     for ([_][]const u8{ "whole", "window" }, [_][]const u8{ "0123456789", "456" }) |kind, expected| {
-        const url = try std.fmt.allocPrint(std.testing.allocator, "/api/file-ref-{s}?{s}", .{ kind, path });
+        const url = try std.testing.allocator.print("/api/file-ref-{s}?{s}", .{ kind, path });
         defer std.testing.allocator.free(url);
         const response = try t.request(.GET, url, .{});
         try std.testing.expectEqual(@as(u16, 200), response.status);
@@ -1055,7 +1055,7 @@ test "auth collection rule: staff allow, service and anonymous deny, superuser b
     const staff_token = try t.mintSession("staff", staff.object.get("id").?.string);
     const service_token = try t.mintSession("services", service.object.get("id").?.string);
     const document = try t.createRecord("documents", .{ .title = "private" });
-    const url = try std.fmt.allocPrint(std.testing.allocator, "/api/collections/documents/records/{s}", .{document.object.get("id").?.string});
+    const url = try std.testing.allocator.print("/api/collections/documents/records/{s}", .{document.object.get("id").?.string});
     defer std.testing.allocator.free(url);
     _ = try t.createSuperuser("admin@example.com", "password123");
     const admin = try t.loginSuperuser("admin@example.com", "password123");

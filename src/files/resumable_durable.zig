@@ -29,7 +29,7 @@ pub const Durable = struct {
         if (filename == null or filename[0] == 0) return error.DurableUploadsRequireFileDatabase;
         const path = try std.Io.Dir.cwd().realPathFileAlloc(io, std.mem.span(filename), allocator);
         defer allocator.free(path);
-        const lock_path = try std.fmt.allocPrint(allocator, "{s}.zigbase-uploads.lock", .{path});
+        const lock_path = try allocator.print("{s}.zigbase-uploads.lock", .{path});
         defer allocator.free(lock_path);
         const owner = try acquireOwner(io, lock_path);
         return .{ .pool = pool, .io = io, .owner = owner };
@@ -283,7 +283,7 @@ test "recovery projection does not materialize oversized state values" {
         "INSERT INTO _upload_sessions VALUES(printf('%032d',1),'{}',4,0,0,'receiving');" ++
         "INSERT INTO _upload_payloads VALUES(1,printf('%032d',1),zeroblob(4));");
     for ([_][:0]const u8{ "CAST(zeroblob(1048576) AS TEXT)", "zeroblob(1048576)" }) |value| {
-        const mutation = try std.fmt.allocPrintSentinel(std.testing.allocator, "UPDATE _upload_sessions SET state={s};", .{value}, 0);
+        const mutation = try std.testing.allocator.printSentinel("UPDATE _upload_sessions SET state={s};", .{value}, 0);
         defer std.testing.allocator.free(mutation);
         try w.exec(mutation);
         // Persisted corruption exceeds the connection's materialization limit.

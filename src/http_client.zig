@@ -416,7 +416,7 @@ const TestHttpServer = struct {
     }
 
     fn url(self: TestHttpServer, alloc: std.mem.Allocator) ![]const u8 {
-        return std.fmt.allocPrint(alloc, "http://127.0.0.1:{d}/", .{self.port});
+        return alloc.print("http://127.0.0.1:{d}/", .{self.port});
     }
 
     /// Thread function: accept one connection, write the fixed HTTP response, close.

@@ -15,7 +15,7 @@ fn put(alloc: std.mem.Allocator, w: *W, s: []const u8) !void {
 /// Format helper — allocs a temporary formatted string, copies the bytes into
 /// `w`, then frees the temporary (contract-1; works under any allocator).
 fn putf(alloc: std.mem.Allocator, w: *W, comptime fmt: []const u8, args: anytype) !void {
-    const s = try std.fmt.allocPrint(alloc, fmt, args);
+    const s = try alloc.print(fmt, args);
     defer alloc.free(s); // the bytes are copied into `w`; the temp is ours to free
     try w.appendSlice(alloc, s);
 }
@@ -111,7 +111,7 @@ fn vectorLine(alloc: std.mem.Allocator, c: schema.Collection) ![]const u8 {
         try u.appendSlice(alloc, f.name);
         try u.append(alloc, '"');
     }
-    return std.fmt.allocPrint(alloc, "    vector?: {{ field: {s}; metric?: \"cosine\" | \"l2\"; values: number[] }};\n", .{u.items});
+    return alloc.print("    vector?: {{ field: {s}; metric?: \"cosine\" | \"l2\"; values: number[] }};\n", .{u.items});
 }
 
 // ---------------------------------------------------------------------------
@@ -407,7 +407,7 @@ pub fn emitService(alloc: std.mem.Allocator, w: *W, c: schema.Collection) !void 
     defer alloc.free(wn);
     const fld = try ident.fieldsName(alloc, c.name);
     defer alloc.free(fld);
-    const sort_ty = try std.fmt.allocPrint(alloc, "{s}Sort | {s}Sort[]", .{ rec, rec });
+    const sort_ty = try alloc.print("{s}Sort | {s}Sort[]", .{ rec, rec });
     defer alloc.free(sort_ty);
     const search = searchLine(c); // static literal — not owned
     const vector = try vectorLine(alloc, c);
@@ -660,7 +660,7 @@ pub fn emitMeta(alloc: std.mem.Allocator, w: *W, c: schema.Collection) !void {
 pub fn emitImports(alloc: std.mem.Allocator, w: *W, in_repo: bool, needs_send_opts: bool) !void {
     const send_opts = if (needs_send_opts) ", type SendOptions" else "";
     if (in_repo) {
-        const imports = try std.fmt.allocPrint(alloc,
+        const imports = try alloc.print(
             \\import {{ createClient as baseCreateClient, type Client, type RecordAbilities{s} }} from "../../../src/index.js";
             \\import {{ withRealtime, type RealtimeEnabledClient }} from "../../../src/realtime-entry.js";
             \\import type {{ ListResult }} from "../../../src/records.js";
@@ -690,7 +690,7 @@ pub fn emitImports(alloc: std.mem.Allocator, w: *W, in_repo: bool, needs_send_op
         defer alloc.free(imports);
         try w.appendSlice(alloc, imports);
     } else {
-        const imports = try std.fmt.allocPrint(alloc,
+        const imports = try alloc.print(
             \\import {{ createClient as baseCreateClient, type Client, type RecordAbilities{s} }} from "@zigbase/client";
             \\import {{ withRealtime, type RealtimeEnabledClient }} from "@zigbase/client/realtime";
             \\import type {{ ListResult, CursorPage, FilesService, FileUrlOptions }} from "@zigbase/client";

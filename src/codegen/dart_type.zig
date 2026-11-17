@@ -45,7 +45,7 @@ pub fn selectEnumName(alloc: std.mem.Allocator, col_name: []const u8, field_name
     defer alloc.free(rec);
     const fp = try ident.pascal(alloc, field_name);
     defer alloc.free(fp);
-    return std.fmt.allocPrint(alloc, "{s}{s}", .{ rec, fp });
+    return alloc.print("{s}{s}", .{ rec, fp });
 }
 
 /// The scalar (element) Dart type of a field — the value domain for a single
@@ -74,12 +74,12 @@ pub fn dartRecordTypeOf(alloc: std.mem.Allocator, col_name: []const u8, f: schem
     const base = try dartBaseTypeOf(alloc, col_name, f);
     if (f.isMultiValue()) {
         defer alloc.free(base);
-        return std.fmt.allocPrint(alloc, "List<{s}>", .{base});
+        return alloc.print("List<{s}>", .{base});
     }
     switch (kindOf(f)) {
         .select_enum => {
             defer alloc.free(base);
-            return std.fmt.allocPrint(alloc, "{s}?", .{base});
+            return alloc.print("{s}?", .{base});
         },
         // `.json`'s base is already "Object?"; every other kind returns its base.
         else => return base,

@@ -274,7 +274,7 @@ test "completion persistence failure preserves the original handler error" {
     defer tmp.cleanup();
     const dir = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
     defer testing.allocator.free(dir);
-    const path = try std.fmt.allocPrintSentinel(testing.allocator, "{s}/jobs.db", .{dir}, 0);
+    const path = try testing.allocator.printSentinel("{s}/jobs.db", .{dir}, 0);
     defer testing.allocator.free(path);
     var pool = try db.Pool.init(testing.allocator, testing.io, path);
     defer pool.deinit();
@@ -347,7 +347,7 @@ test "distributed wrapper releases writer around handler and supplies stable occ
     defer tmp.cleanup();
     const dir = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
     defer testing.allocator.free(dir);
-    const path = try std.fmt.allocPrintSentinel(testing.allocator, "{s}/jobs.db", .{dir}, 0);
+    const path = try testing.allocator.printSentinel("{s}/jobs.db", .{dir}, 0);
     defer testing.allocator.free(path);
     var pool = try db.Pool.init(testing.allocator, testing.io, path);
     defer pool.deinit();

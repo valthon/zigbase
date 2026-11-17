@@ -182,7 +182,7 @@ fn hookIncident(ctx: *const Ctx, arena: RequestArena, col_name: []const u8, hand
     if (response.status < 500) return null;
     return .{
         .err = if (ctx.usedAllocationFallback(response)) error.OutOfMemory else error.Handled,
-        .message = std.fmt.allocPrint(arena.a, "{s}: {d} {s}", .{ col_name, handled.status, handled.message }) catch hook_incident_fallback_message,
+        .message = arena.a.print("{s}: {d} {s}", .{ col_name, handled.status, handled.message }) catch hook_incident_fallback_message,
     };
 }
 
@@ -275,7 +275,7 @@ fn uploadSchemaUnchanged(alloc: std.mem.Allocator, w: *@import("../db.zig").Db, 
         // that order before checking metadata, including on upload creates.
         const table = try @import("../ddl.zig").quoteIdent(alloc, planned.name);
         defer alloc.free(table);
-        const table_lock = try std.fmt.allocPrintSentinel(alloc, "LOCK TABLE {s} IN ROW EXCLUSIVE MODE", .{table}, 0);
+        const table_lock = try alloc.printSentinel("LOCK TABLE {s} IN ROW EXCLUSIVE MODE", .{table}, 0);
         defer alloc.free(table_lock);
         // A concurrent collection deletion can remove the table before LOCK.
         // Recover only this statement so missing/renamed metadata can still
@@ -333,7 +333,7 @@ fn lockUploadRecord(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection,
     if (db.dbDialect(w).kind != .postgres) return;
     const table = try @import("../ddl.zig").quoteIdent(alloc, col.name);
     defer alloc.free(table);
-    const sql = try std.fmt.allocPrintSentinel(alloc, "SELECT \"id\" FROM {s} WHERE \"id\"=$1 FOR UPDATE", .{table}, 0);
+    const sql = try alloc.printSentinel("SELECT \"id\" FROM {s} WHERE \"id\"=$1 FOR UPDATE", .{table}, 0);
     defer alloc.free(sql);
     var lock = try w.prepare(sql);
     defer lock.finalize();
@@ -1266,7 +1266,7 @@ const TestEnv = struct {
         env.tmp = std.testing.tmpDir(.{});
         const dir = try env.tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
         defer std.testing.allocator.free(dir);
-        const path = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/test.db", .{dir}, 0);
+        const path = try std.testing.allocator.printSentinel("{s}/test.db", .{dir}, 0);
         defer std.testing.allocator.free(path);
         env.pool = try db.Pool.init(std.testing.allocator, std.testing.io, path);
         {
@@ -1496,7 +1496,7 @@ test "fields= over the length cap is rejected 400 (DoS guard)" {
     // A spec longer than records.max_filter_len must 400 before any parse/projection work.
     const big = try a.alloc(u8, records.max_filter_len + 1);
     @memset(big, 'a');
-    const query = try std.fmt.allocPrint(a, "fields={s}", .{big});
+    const query = try a.print("fields={s}", .{big});
     const view_params = [_]http.Param{ .{ .key = "col", .value = "posts" }, .{ .key = "id", .value = rid } };
     var vctx = http.RequestCtx{ .method = .GET, .path = "/", .query = query, .allocator = RequestArena.from(&arena), .app = &env.app, .params = &view_params };
     const vres = try view(&vctx);
@@ -1567,7 +1567,7 @@ test "list handler clamps an oversized perPage to the 500 cap (F9 DoS)" {
 }
 
 fn extractStr(body: []const u8, key: []const u8) ?[]const u8 {
-    const k = std.fmt.allocPrint(std.testing.allocator, "\"{s}\":\"", .{key}) catch return null;
+    const k = std.testing.allocator.print("\"{s}\":\"", .{key}) catch return null;
     defer std.testing.allocator.free(k);
     const start = (std.mem.indexOf(u8, body, k) orelse return null) + k.len;
     const end = std.mem.indexOfScalarPos(u8, body, start, '"') orelse return null;
@@ -1629,7 +1629,7 @@ test "cursor handler: garbage cursor -> 400; changed sort -> 400" {
     env.app.pagination = .{ .offset_enabled = false, .cursor_enabled = true };
     const fres = try list(&first);
     const tok = extractStr(fres.body, "nextCursor").?;
-    const q2 = try std.fmt.allocPrint(a, "sort=-created&limit=1&cursor={s}", .{tok});
+    const q2 = try a.print("sort=-created&limit=1&cursor={s}", .{tok});
     var second = http.RequestCtx{ .method = .GET, .path = "/", .query = q2, .allocator = RequestArena.from(&arena), .app = &env.app, .params = &col_param };
     try std.testing.expectEqual(@as(u16, 400), (try list(&second)).status);
     // Client relation predicates are rejected even when a trusted list rule already
@@ -1660,7 +1660,7 @@ test "cursor handler: garbage cursor -> 400; changed sort -> 400" {
     // A long text sort boundary must fail as a client error, never mint an unusable token.
     const long_title = try a.alloc(u8, 2048);
     @memset(long_title, 'x');
-    const body = try std.fmt.allocPrint(a, "{{\"title\":\"{s}\"}}", .{long_title});
+    const body = try a.print("{{\"title\":\"{s}\"}}", .{long_title});
     for (0..2) |_| {
         var c = ctxFor(env, RequestArena.from(&arena), .POST, body, &col_param);
         try std.testing.expectEqual(@as(u16, 201), (try create(&c)).status);
@@ -1937,7 +1937,7 @@ test "#489 an undecodable or oversized cascaded row never fails the REST delete"
         _ = try collections.create(a, std.testing.io, w, tasks);
         // N: a cascaded row and a nulled row whose stored JSON does not parse.
         // M: a cascaded row whose at-rest snapshot is larger than one journal frame.
-        const seed = try std.fmt.allocPrintSentinel(a,
+        const seed = try a.printSentinel(
             \\INSERT INTO notes (id,created,updated) VALUES ('N','t','t'),('M','t','t');
             \\INSERT INTO items (id,created,updated,note,meta) VALUES ('I1','t','t','N','not json');
             \\INSERT INTO tasks (id,created,updated,note,meta) VALUES ('T1','t','t','N','not json');
@@ -2720,7 +2720,7 @@ test "durable cleanup commits with HTTP delete and retries safely after referenc
         defer env.pool.releaseWriter();
         var st = try w.prepare("SELECT payload FROM _queue_jobs WHERE payload LIKE ?1;");
         defer st.finalize();
-        try st.bindText(1, try std.fmt.allocPrint(a, "%{s}%", .{bare_id}));
+        try st.bindText(1, try a.print("%{s}%", .{bare_id}));
         try std.testing.expect(try st.step());
         break :blk try a.dupe(u8, st.columnText(0));
     };
@@ -2830,7 +2830,7 @@ test "multipart update: coercion + removal-key passthrough removes the file" {
 
     var uff: std.json.ObjectMap = .empty;
     try uff.put(a, "flag", .{ .string = "false" });
-    const minus = try std.fmt.allocPrint(a, "[\"{s}\"]", .{stored});
+    const minus = try a.print("[\"{s}\"]", .{stored});
     try uff.put(a, "photos-", .{ .string = minus });
     const up = [_]http.Param{ .{ .key = "col", .value = "mp_upd" }, .{ .key = "id", .value = rid } };
     var uctx = formCtx(env, RequestArena.from(&arena), .PATCH, uff, &.{}, &up);
@@ -2934,7 +2934,7 @@ fn countRows(env: *TestEnv, table: []const u8) !i64 {
     defer env.pool.releaseReader(&r);
     const qtbl = try ddl.quoteIdent(std.testing.allocator, table);
     defer std.testing.allocator.free(qtbl);
-    const sql = try std.fmt.allocPrintSentinel(std.testing.allocator, "SELECT COUNT(*) FROM {s};", .{qtbl}, 0);
+    const sql = try std.testing.allocator.printSentinel("SELECT COUNT(*) FROM {s};", .{qtbl}, 0);
     defer std.testing.allocator.free(sql);
     var st = try r.prepare(sql);
     defer st.finalize();
@@ -2969,7 +2969,7 @@ const RejectionHooks = struct {
             return ctx.invalid(&fields);
         }
         var buffer: [64]u8 = undefined;
-        const message = try std.fmt.bufPrint(&buffer, "{s}", .{"That item is already queued."});
+        const message = try std.mem.print(&buffer, "{s}", .{"That item is already queued."});
         return ctx.fail(try std.fmt.parseInt(u16, mode, 10), message);
     }
     const Case = struct { mode: []const u8, status: u16 = 400, code: []const u8 = "bad_request", message: []const u8 = "Request rejected by a hook." };
@@ -3272,7 +3272,7 @@ test "before-hook side-write rolls back with the triggering write on hook error"
             var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
             defer arena.deinit();
             const a = arena.allocator();
-            const body = try std.fmt.allocPrint(a, "{{\"title\":\"{s}\"}}", .{case.mode});
+            const body = try a.print("{{\"title\":\"{s}\"}}", .{case.mode});
             const col_param = [_]http.Param{.{ .key = "col", .value = "posts" }};
             var rid: []const u8 = "";
             if (phase != .before_create) {
@@ -3334,7 +3334,7 @@ test "update pre-authorizes tenant ownership BEFORE the before_update hook fires
     defer tmp.cleanup();
     const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", gpa);
     defer gpa.free(dir);
-    const path = try std.fmt.allocPrintSentinel(gpa, "{s}/t.db", .{dir}, 0);
+    const path = try gpa.printSentinel("{s}/t.db", .{dir}, 0);
     defer gpa.free(path);
     var pool = try db.Pool.init(gpa, std.testing.io, path);
     defer pool.deinit();
@@ -3409,7 +3409,7 @@ test "update pre-authorizes tenant ownership BEFORE the before_update hook fires
         defer pool.releaseWriter();
         break :blk try api_auth.mintToken(&mintctx, w, "users", u_id, u_tk, .auth, 100000, "");
     };
-    const bearer = try std.fmt.allocPrint(a, "Bearer {s}", .{tok});
+    const bearer = try a.print("Bearer {s}", .{tok});
     const hdrs = [_]http.Param{.{ .key = "x-account-id", .value = "accA" }};
 
     // Cross-tenant PATCH (accB's row) -> 404, and the before_update hook MUST NOT have fired.
@@ -3459,7 +3459,7 @@ test "a before-hook that sets a relation to another account's record is refused 
     defer tmp.cleanup();
     const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", gpa);
     defer gpa.free(dir);
-    const path = try std.fmt.allocPrintSentinel(gpa, "{s}/t.db", .{dir}, 0);
+    const path = try gpa.printSentinel("{s}/t.db", .{dir}, 0);
     defer gpa.free(path);
     var pool = try db.Pool.init(gpa, std.testing.io, path);
     defer pool.deinit();
@@ -3522,7 +3522,7 @@ test "a before-hook that sets a relation to another account's record is refused 
         defer pool.releaseWriter();
         break :blk try api_auth.mintToken(&mintctx, w, "users", u_id, u_tk, .auth, 100000, "");
     };
-    const bearer = try std.fmt.allocPrint(a, "Bearer {s}", .{tok});
+    const bearer = try a.print("Bearer {s}", .{tok});
     const hdrs = [_]http.Param{.{ .key = "x-account-id", .value = "accA" }};
     const col_params = [_]http.Param{.{ .key = "col", .value = "tasks" }};
     const row_params = [_]http.Param{ .{ .key = "col", .value = "tasks" }, .{ .key = "id", .value = "tA" } };
@@ -3566,7 +3566,7 @@ const F1Env = struct {
         env.tmp = std.testing.tmpDir(.{});
         const dir = try env.tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
         defer std.testing.allocator.free(dir);
-        const path = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/f1.db", .{dir}, 0);
+        const path = try std.testing.allocator.printSentinel("{s}/f1.db", .{dir}, 0);
         defer std.testing.allocator.free(path);
         env.pool = try db.Pool.init(std.testing.allocator, std.testing.io, path);
         env.arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -3625,7 +3625,7 @@ const F1Env = struct {
         const tk = (try api_auth.tokenKeyFor(a, w, "users", rid)).?;
         var mintctx = http.RequestCtx{ .method = .POST, .path = "/", .allocator = RequestArena.from(&env.arena), .app = &env.app };
         const tok = try api_auth.mintToken(&mintctx, w, "users", rid, tk, .auth, 100000, "");
-        return try std.fmt.allocPrint(a, "Bearer {s}", .{tok});
+        return try a.print("Bearer {s}", .{tok});
     }
 
     /// Mint a `_superusers` bearer (raw INSERT + mintToken; no register/login endpoint needed).
@@ -3636,7 +3636,7 @@ const F1Env = struct {
         try w.exec("INSERT INTO \"_superusers\" (\"id\",\"created\",\"updated\",\"email\",\"username\",\"passwordHash\",\"tokenKey\",\"verified\") VALUES ('su1','','','admin@x.io','','','sutk',1);");
         var mintctx = http.RequestCtx{ .method = .POST, .path = "/", .allocator = RequestArena.from(&env.arena), .app = &env.app };
         const tok = try api_auth.mintToken(&mintctx, w, "_superusers", "su1", "sutk", .auth, 100000, "");
-        return try std.fmt.allocPrint(a, "Bearer {s}", .{tok});
+        return try a.print("Bearer {s}", .{tok});
     }
 
     fn passwordHash(env: *F1Env, rid: []const u8) ![]const u8 {
@@ -3892,7 +3892,7 @@ test "F1 PATCH+password: .table mode purges old rows in-txn and re-issues exactl
     _ = issued1;
     try std.testing.expectEqual(@as(i64, 2), try env.sessionCountFor(rid));
 
-    const bearer = try std.fmt.allocPrint(a, "Bearer {s}", .{issued2.token});
+    const bearer = try a.print("Bearer {s}", .{issued2.token});
     var uctx = patchCtx(env, RequestArena.from(&env.arena), rid, bearer, "{\"password\":\"newpassword1\",\"oldPassword\":\"oldpassword1\"}");
     const res = try update(&uctx);
     try std.testing.expectEqual(@as(u16, 200), res.status);

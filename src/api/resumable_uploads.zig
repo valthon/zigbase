@@ -143,7 +143,7 @@ pub fn commit(ctx: *http.RequestCtx) anyerror!http.Response {
     const file = http.UploadedFile{ .field = target.field, .filename = target.filename, .mimetype = target.mimetype, .bytes = session.bytes };
     var adapted = ctx.*;
     adapted.method = .PATCH;
-    adapted.path = try std.fmt.allocPrint(ctx.allocator.a, "/api/collections/{s}/records/{s}", .{ target.collection, target.record });
+    adapted.path = try ctx.allocator.a.print("/api/collections/{s}/records/{s}", .{ target.collection, target.record });
     adapted.params = &.{ .{ .key = "col", .value = target.collection }, .{ .key = "id", .value = target.record } };
     adapted.body = "";
     adapted.query = "";
@@ -182,7 +182,7 @@ test "durable auth binding uses the credential verification snapshot across coll
         .filename = "a.txt",
         .mimetype = "text/plain",
     }, 4);
-    const path = try std.fmt.allocPrintSentinel(a, "{s}/data.db", .{harness.data_dir}, 0);
+    const path = try a.printSentinel("{s}/data.db", .{harness.data_dir}, 0);
     defer a.free(path);
     var other = try db.Db.open(path);
     defer other.close();
@@ -210,7 +210,7 @@ test "durable auth binding uses the credential verification snapshot across coll
     defer std.debug.assert(c.sqlite3_set_authorizer(handle, null, null) == c.SQLITE_OK);
     harness.app().pool.releaseReader(&reader);
     reader_held = false;
-    const url = try std.fmt.allocPrint(a, "/api/uploads/{s}", .{status_value.id});
+    const url = try a.print("/api/uploads/{s}", .{status_value.id});
     defer a.free(url);
     const first = try harness.request(.GET, url, .{ .auth = bearer });
     try std.testing.expect(probe.fired);

@@ -208,7 +208,7 @@ fn init_0010_token_epoch(m: *Migrator) db.DbError!void {
         // stranded without the column — `schema.isValidIdentifier` has no length cap, so a
         // 251+ char name passes creation and MUST also be migrated here. The column type comes
         // from the dialect (BIGINT on Postgres, INTEGER on SQLite).
-        const sql = std.fmt.allocPrintSentinel(a, "ALTER TABLE \"{s}\" ADD COLUMN \"token_epoch\" {s} NOT NULL DEFAULT 0;", .{ nm, int_ty }, 0) catch return error.ExecFailed;
+        const sql = a.printSentinel("ALTER TABLE \"{s}\" ADD COLUMN \"token_epoch\" {s} NOT NULL DEFAULT 0;", .{ nm, int_ty }, 0) catch return error.ExecFailed;
         // Propagate a genuine DDL failure (lock timeout, disk full, …); the columnExists guard
         // above already skipped the benign already-migrated case, so there is nothing to swallow.
         try m.db.exec(sql);
@@ -229,8 +229,8 @@ fn init_0010_token_epoch(m: *Migrator) db.DbError!void {
 /// interpolating it is safe; `col` is bound. Mirrors the introspection in `dumpload.zig`.
 fn columnExists(m: *Migrator, table: []const u8, col: []const u8) db.DbError!bool {
     const sql = switch (m.dialect.kind) {
-        .sqlite => std.fmt.allocPrintSentinel(m.arena, "SELECT COUNT(*) FROM pragma_table_info('{s}') WHERE \"name\" = ?1;", .{table}, 0),
-        .postgres => std.fmt.allocPrintSentinel(m.arena, "SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = '{s}' AND column_name = ?1;", .{table}, 0),
+        .sqlite => m.arena.printSentinel("SELECT COUNT(*) FROM pragma_table_info('{s}') WHERE \"name\" = ?1;", .{table}, 0),
+        .postgres => m.arena.printSentinel("SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = '{s}' AND column_name = ?1;", .{table}, 0),
     } catch return error.PrepareFailed;
     var st = try m.prepare(sql);
     defer st.finalize();
@@ -847,7 +847,7 @@ fn isApplied(m: *Migrator, name: []const u8) db.DbError!bool {
 }
 
 fn recordApplied(m: *Migrator, name: []const u8) db.DbError!void {
-    const sql = std.fmt.allocPrint(m.arena, "INSERT INTO \"_migrations\" (\"name\", \"applied_at\") VALUES (?1, {s});", .{m.dialect.nowTextExpr()}) catch return error.PrepareFailed;
+    const sql = m.arena.print("INSERT INTO \"_migrations\" (\"name\", \"applied_at\") VALUES (?1, {s});", .{m.dialect.nowTextExpr()}) catch return error.PrepareFailed;
     var st = try m.prepare(sql);
     defer st.finalize();
     try st.bindText(1, name);

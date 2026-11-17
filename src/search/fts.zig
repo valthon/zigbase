@@ -72,12 +72,12 @@ test "utf8SafeCap never splits a codepoint; passes ASCII + short input through" 
 /// The FTS5 shadow-table name for `col_name` (`"<col_name>_fts"`), on `alloc`. On Postgres the
 /// same name identifies the STORED `tsvector` generated column on the base table.
 pub fn tableName(alloc: std.mem.Allocator, col_name: []const u8) ![]u8 {
-    return std.fmt.allocPrint(alloc, "{s}{s}", .{ col_name, suffix });
+    return alloc.print("{s}{s}", .{ col_name, suffix });
 }
 
 /// The Postgres GIN index name for the tsvector column of `col_name` (`"<col_name>_fts_idx"`).
 fn pgIndexName(alloc: std.mem.Allocator, col_name: []const u8) ![]u8 {
-    return std.fmt.allocPrint(alloc, "{s}{s}_idx", .{ col_name, suffix });
+    return alloc.print("{s}{s}_idx", .{ col_name, suffix });
 }
 
 /// The Postgres text-search configuration used for both the generated `tsvector` and the
@@ -310,11 +310,11 @@ fn buildSqliteImpl(alloc: std.mem.Allocator, col: schema.Collection, raw_term: [
     // Build each escaping fragment into an errdefer'd local: if a LATER allocPrint OOMs, the
     // already-built ones are freed. On success they move into the returned Search (errdefer does
     // not fire), where the caller owns them.
-    const join_sql = try std.fmt.allocPrint(alloc, "JOIN \"{s}\" ON \"{s}\".\"rowid\" = \"{s}\".\"rowid\"", .{ ft, ft, col.name });
+    const join_sql = try alloc.print("JOIN \"{s}\" ON \"{s}\".\"rowid\" = \"{s}\".\"rowid\"", .{ ft, ft, col.name });
     errdefer alloc.free(join_sql);
-    const where_sql = try std.fmt.allocPrint(alloc, "\"{s}\" MATCH ?", .{ft});
+    const where_sql = try alloc.print("\"{s}\" MATCH ?", .{ft});
     errdefer alloc.free(where_sql);
-    const order_sql = try std.fmt.allocPrint(alloc, rank_fn ++ "(\"{s}\") DESC", .{ft});
+    const order_sql = try alloc.print(rank_fn ++ "(\"{s}\") DESC", .{ft});
     errdefer alloc.free(order_sql); // last today, but errdefer'd too so a future line before the return can't leak it
     return .{ .join_sql = join_sql, .where_sql = where_sql, .order_sql = order_sql, .param = .{ .text = q } };
 }
@@ -333,9 +333,9 @@ fn buildPostgres(alloc: std.mem.Allocator, col: schema.Collection, raw_term: []c
     const tsv = try tableName(alloc, col.name); // the generated tsvector column name
     defer alloc.free(tsv); // internal scratch: copied into the SQL strings below, never escapes
     // where_sql into an errdefer'd local so an order_sql OOM frees it (join_sql is a literal).
-    const where_sql = try std.fmt.allocPrint(alloc, "\"{s}\".\"{s}\" @@ plainto_tsquery('" ++ pg_ts_config ++ "', ?)", .{ col.name, tsv });
+    const where_sql = try alloc.print("\"{s}\".\"{s}\" @@ plainto_tsquery('" ++ pg_ts_config ++ "', ?)", .{ col.name, tsv });
     errdefer alloc.free(where_sql);
-    const order_sql = try std.fmt.allocPrint(alloc, "ts_rank(\"{s}\".\"{s}\", plainto_tsquery('" ++ pg_ts_config ++ "', ?)) DESC", .{ col.name, tsv });
+    const order_sql = try alloc.print("ts_rank(\"{s}\".\"{s}\", plainto_tsquery('" ++ pg_ts_config ++ "', ?)) DESC", .{ col.name, tsv });
     errdefer alloc.free(order_sql); // last today, but errdefer'd too so a future line before the return can't leak it
     return .{
         .join_sql = "",
@@ -561,12 +561,12 @@ fn ensureIndexSqliteImpl(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collec
 
     // CREATE VIRTUAL TABLE "<col>_fts" USING fts5(c1, c2, …, content='<col>');
     var create: std.ArrayList(u8) = .empty;
-    try create.appendSlice(sa, try std.fmt.allocPrint(sa, "CREATE VIRTUAL TABLE \"{s}\" USING fts5(", .{ft}));
+    try create.appendSlice(sa, try sa.print("CREATE VIRTUAL TABLE \"{s}\" USING fts5(", .{ft}));
     for (cols, 0..) |cn, i| {
         if (i > 0) try create.appendSlice(sa, ", ");
-        try create.appendSlice(sa, try std.fmt.allocPrint(sa, "\"{s}\"", .{cn}));
+        try create.appendSlice(sa, try sa.print("\"{s}\"", .{cn}));
     }
-    try create.appendSlice(sa, try std.fmt.allocPrint(sa, ", content=\"{s}\");", .{col.name}));
+    try create.appendSlice(sa, try sa.print(", content=\"{s}\");", .{col.name}));
     try w.exec(try toZ(sa, create.items));
 
     // Sync triggers (FTS5 external-content pattern). On delete/update we issue the special 'delete'
@@ -575,12 +575,12 @@ fn ensureIndexSqliteImpl(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collec
     const new_list = try columnList(sa, cols, "new");
     const old_list = try columnList(sa, cols, "old");
 
-    try w.exec(try toZ(sa, try std.fmt.allocPrint(sa, "CREATE TRIGGER \"{s}_ai\" AFTER INSERT ON \"{s}\" BEGIN INSERT INTO \"{s}\"(rowid, {s}) VALUES (new.rowid, {s}); END;", .{ ft, col.name, ft, col_list, new_list })));
-    try w.exec(try toZ(sa, try std.fmt.allocPrint(sa, "CREATE TRIGGER \"{s}_ad\" AFTER DELETE ON \"{s}\" BEGIN INSERT INTO \"{s}\"(\"{s}\", rowid, {s}) VALUES ('delete', old.rowid, {s}); END;", .{ ft, col.name, ft, ft, col_list, old_list })));
-    try w.exec(try toZ(sa, try std.fmt.allocPrint(sa, "CREATE TRIGGER \"{s}_au\" AFTER UPDATE ON \"{s}\" BEGIN INSERT INTO \"{s}\"(\"{s}\", rowid, {s}) VALUES ('delete', old.rowid, {s}); INSERT INTO \"{s}\"(rowid, {s}) VALUES (new.rowid, {s}); END;", .{ ft, col.name, ft, ft, col_list, old_list, ft, col_list, new_list })));
+    try w.exec(try toZ(sa, try sa.print("CREATE TRIGGER \"{s}_ai\" AFTER INSERT ON \"{s}\" BEGIN INSERT INTO \"{s}\"(rowid, {s}) VALUES (new.rowid, {s}); END;", .{ ft, col.name, ft, col_list, new_list })));
+    try w.exec(try toZ(sa, try sa.print("CREATE TRIGGER \"{s}_ad\" AFTER DELETE ON \"{s}\" BEGIN INSERT INTO \"{s}\"(\"{s}\", rowid, {s}) VALUES ('delete', old.rowid, {s}); END;", .{ ft, col.name, ft, ft, col_list, old_list })));
+    try w.exec(try toZ(sa, try sa.print("CREATE TRIGGER \"{s}_au\" AFTER UPDATE ON \"{s}\" BEGIN INSERT INTO \"{s}\"(\"{s}\", rowid, {s}) VALUES ('delete', old.rowid, {s}); INSERT INTO \"{s}\"(rowid, {s}) VALUES (new.rowid, {s}); END;", .{ ft, col.name, ft, ft, col_list, old_list, ft, col_list, new_list })));
 
     // Repopulate from the content table (no-op on an empty table).
-    try w.exec(try toZ(sa, try std.fmt.allocPrint(sa, "INSERT INTO \"{s}\"(\"{s}\") VALUES ('rebuild');", .{ ft, ft })));
+    try w.exec(try toZ(sa, try sa.print("INSERT INTO \"{s}\"(\"{s}\") VALUES ('rebuild');", .{ ft, ft })));
 
     std.log.info("provision: ensured FTS5 search index '{s}' on '{s}' ({d} field(s))", .{ ft, col.name, cols.len });
 }
@@ -654,14 +654,14 @@ fn ensureIndexPg(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection) !v
     try expr.appendSlice(alloc, "to_tsvector('" ++ pg_ts_config ++ "', ");
     for (cols, 0..) |cn, i| {
         if (i > 0) try expr.appendSlice(alloc, " || ' ' || ");
-        const frag = try std.fmt.allocPrint(alloc, "coalesce(\"{s}\",'')", .{cn});
+        const frag = try alloc.print("coalesce(\"{s}\",'')", .{cn});
         defer alloc.free(frag);
         try expr.appendSlice(alloc, frag);
     }
     try expr.appendSlice(alloc, ")");
 
     {
-        const sql = try std.fmt.allocPrintSentinel(alloc, "ALTER TABLE \"{s}\" ADD COLUMN \"{s}\" tsvector GENERATED ALWAYS AS ({s}) STORED;", .{ col.name, tsv, expr.items }, 0);
+        const sql = try alloc.printSentinel("ALTER TABLE \"{s}\" ADD COLUMN \"{s}\" tsvector GENERATED ALWAYS AS ({s}) STORED;", .{ col.name, tsv, expr.items }, 0);
         defer alloc.free(sql);
         try w.exec(sql);
     }
@@ -669,7 +669,7 @@ fn ensureIndexPg(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection) !v
     {
         // Record the searchable column set as a marker comment so a later additive change that adds
         // or removes a `.searchable` field is detected as drift and rebuilds the column.
-        const sql = try std.fmt.allocPrintSentinel(alloc, "COMMENT ON COLUMN \"{s}\".\"{s}\" IS '{s}';", .{ col.name, tsv, want_marker }, 0);
+        const sql = try alloc.printSentinel("COMMENT ON COLUMN \"{s}\".\"{s}\" IS '{s}';", .{ col.name, tsv, want_marker }, 0);
         defer alloc.free(sql);
         try w.exec(sql);
     }
@@ -721,12 +721,12 @@ const PgColumnState = union(enum) {
 fn pgColumnState(alloc: std.mem.Allocator, w: *db.Db, col_name: []const u8, tsv: []const u8) !PgColumnState {
     // Postgres-only path → the native `$n` placeholders are written directly (this never flows
     // through the `?`→`$n` ParamSink renumber that the cross-backend CRUD/query producers use).
-    const sql = try std.fmt.allocPrintSentinel(alloc, "SELECT col_description(a.attrelid, a.attnum) FROM pg_attribute a " ++
+    const sql = try alloc.printSentinel("SELECT col_description(a.attrelid, a.attnum) FROM pg_attribute a " ++
         "WHERE a.attrelid = to_regclass($1) AND a.attname = $2 AND a.attnum > 0 AND NOT a.attisdropped;", .{}, 0);
     defer alloc.free(sql);
     var st = try w.prepare(sql);
     defer st.finalize();
-    const quoted = try std.fmt.allocPrint(alloc, "\"{s}\"", .{col_name});
+    const quoted = try alloc.print("\"{s}\"", .{col_name});
     defer alloc.free(quoted); // bindText dupes its arg, so freeing after the bind is safe
     try st.bindText(1, quoted);
     try st.bindText(2, tsv);
@@ -738,11 +738,11 @@ fn pgColumnState(alloc: std.mem.Allocator, w: *db.Db, col_name: []const u8, tsv:
 /// True iff a relation named `rel` is visible on the active `search_path` (used to confirm the GIN
 /// index exists). `to_regclass` returns NULL for an absent name instead of raising.
 fn pgRelExists(alloc: std.mem.Allocator, w: *db.Db, rel: []const u8) !bool {
-    const sql = try std.fmt.allocPrintSentinel(alloc, "SELECT to_regclass($1) IS NOT NULL;", .{}, 0);
+    const sql = try alloc.printSentinel("SELECT to_regclass($1) IS NOT NULL;", .{}, 0);
     defer alloc.free(sql);
     var st = try w.prepare(sql);
     defer st.finalize();
-    const quoted = try std.fmt.allocPrint(alloc, "\"{s}\"", .{rel});
+    const quoted = try alloc.print("\"{s}\"", .{rel});
     defer alloc.free(quoted); // bindText dupes its arg, so freeing after the bind is safe
     try st.bindText(1, quoted);
     if (!try st.step()) return false;
@@ -753,7 +753,7 @@ fn pgRelExists(alloc: std.mem.Allocator, w: *db.Db, rel: []const u8) !bool {
 /// a fresh provision and to recreate JUST the index when the column is already correct but the index
 /// went missing (so we never drop+rebuild the expensive STORED generated column for an index-only gap).
 fn createGinIndexPg(alloc: std.mem.Allocator, w: *db.Db, col_name: []const u8, tsv: []const u8, idx: []const u8) !void {
-    const sql = try std.fmt.allocPrintSentinel(alloc, "CREATE INDEX \"{s}\" ON \"{s}\" USING GIN (\"{s}\");", .{ idx, col_name, tsv }, 0);
+    const sql = try alloc.printSentinel("CREATE INDEX \"{s}\" ON \"{s}\" USING GIN (\"{s}\");", .{ idx, col_name, tsv }, 0);
     defer alloc.free(sql);
     try w.exec(sql);
 }
@@ -772,7 +772,7 @@ fn dropIndexPg(alloc: std.mem.Allocator, w: *db.Db, col_name: []const u8, tsv: [
     try triggers.bindText(1, table);
     if (try triggers.step()) return error.Conflict;
     {
-        const sql = try std.fmt.allocPrintSentinel(alloc, "ALTER TABLE \"{s}\" DROP COLUMN IF EXISTS \"{s}\";", .{ col_name, tsv }, 0);
+        const sql = try alloc.printSentinel("ALTER TABLE \"{s}\" DROP COLUMN IF EXISTS \"{s}\";", .{ col_name, tsv }, 0);
         defer alloc.free(sql);
         try w.exec(sql);
     }
@@ -784,9 +784,9 @@ fn columnList(alloc: std.mem.Allocator, cols: []const []const u8, comptime prefi
     for (cols, 0..) |cn, i| {
         if (i > 0) try out.appendSlice(alloc, ", ");
         if (prefix) |p| {
-            try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, p ++ ".\"{s}\"", .{cn}));
+            try out.appendSlice(alloc, try alloc.print(p ++ ".\"{s}\"", .{cn}));
         } else {
-            try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, "\"{s}\"", .{cn}));
+            try out.appendSlice(alloc, try alloc.print("\"{s}\"", .{cn}));
         }
     }
     return out.toOwnedSlice(alloc);
@@ -794,10 +794,10 @@ fn columnList(alloc: std.mem.Allocator, cols: []const []const u8, comptime prefi
 
 /// DROP the FTS shadow table + its three sync triggers if present (idempotent).
 fn dropIndex(alloc: std.mem.Allocator, w: *db.Db, col_name: []const u8, ft: []const u8) !void {
-    try w.exec(try toZ(alloc, try std.fmt.allocPrint(alloc, "DROP TRIGGER IF EXISTS \"{s}_ai\";", .{ft})));
-    try w.exec(try toZ(alloc, try std.fmt.allocPrint(alloc, "DROP TRIGGER IF EXISTS \"{s}_ad\";", .{ft})));
-    try w.exec(try toZ(alloc, try std.fmt.allocPrint(alloc, "DROP TRIGGER IF EXISTS \"{s}_au\";", .{ft})));
-    try w.exec(try toZ(alloc, try std.fmt.allocPrint(alloc, "DROP TABLE IF EXISTS \"{s}\";", .{ft})));
+    try w.exec(try toZ(alloc, try alloc.print("DROP TRIGGER IF EXISTS \"{s}_ai\";", .{ft})));
+    try w.exec(try toZ(alloc, try alloc.print("DROP TRIGGER IF EXISTS \"{s}_ad\";", .{ft})));
+    try w.exec(try toZ(alloc, try alloc.print("DROP TRIGGER IF EXISTS \"{s}_au\";", .{ft})));
+    try w.exec(try toZ(alloc, try alloc.print("DROP TABLE IF EXISTS \"{s}\";", .{ft})));
     _ = col_name;
 }
 
@@ -810,7 +810,7 @@ fn tableExists(alloc: std.mem.Allocator, w: *db.Db, ft: []const u8) !bool {
 
 /// True iff the existing FTS table's indexed columns equal `want` (same set + order).
 fn columnsMatch(alloc: std.mem.Allocator, w: *db.Db, ft: []const u8, want: []const []const u8) !bool {
-    var st = try w.prepare(try toZ(alloc, try std.fmt.allocPrint(alloc, "PRAGMA table_info(\"{s}\");", .{ft})));
+    var st = try w.prepare(try toZ(alloc, try alloc.print("PRAGMA table_info(\"{s}\");", .{ft})));
     defer st.finalize();
     var i: usize = 0;
     while (try st.step()) : (i += 1) {
@@ -825,16 +825,16 @@ fn triggersPresent(alloc: std.mem.Allocator, w: *db.Db, col_name: []const u8) !b
     const ft = try tableName(alloc, col_name);
     var st = try w.prepare(try toZ(alloc, "SELECT count(*) FROM sqlite_master WHERE type='trigger' AND name IN (?1,?2,?3);"));
     defer st.finalize();
-    try st.bindText(1, try std.fmt.allocPrint(alloc, "{s}_ai", .{ft}));
-    try st.bindText(2, try std.fmt.allocPrint(alloc, "{s}_ad", .{ft}));
-    try st.bindText(3, try std.fmt.allocPrint(alloc, "{s}_au", .{ft}));
+    try st.bindText(1, try alloc.print("{s}_ai", .{ft}));
+    try st.bindText(2, try alloc.print("{s}_ad", .{ft}));
+    try st.bindText(3, try alloc.print("{s}_au", .{ft}));
     _ = try st.step();
     return st.columnInt(0) == 3;
 }
 
-/// allocPrint helpers hand us `[]u8`; `db.exec`/`db.prepare` want a sentinel-terminated slice.
+/// Allocator.print helpers hand us `[]u8`; `db.exec`/`db.prepare` want a sentinel-terminated slice.
 fn toZ(alloc: std.mem.Allocator, s: []const u8) ![:0]const u8 {
-    return std.fmt.allocPrintSentinel(alloc, "{s}", .{s}, 0);
+    return alloc.printSentinel("{s}", .{s}, 0);
 }
 
 // ---- Tests -----------------------------------------------------------------
@@ -1135,7 +1135,7 @@ test "ensureIndex provisions FTS5, triggers keep it in sync, MATCH search return
         a.free(s.order_sql);
         a.free(s.param.text);
     }
-    const sql = try std.fmt.allocPrintSentinel(a, "SELECT \"articles\".\"title\" FROM \"articles\" {s} WHERE {s};", .{ s.join_sql, s.where_sql }, 0);
+    const sql = try a.printSentinel("SELECT \"articles\".\"title\" FROM \"articles\" {s} WHERE {s};", .{ s.join_sql, s.where_sql }, 0);
     defer a.free(sql);
     var st = try d.prepare(sql);
     defer st.finalize();
@@ -1240,7 +1240,7 @@ test "search order is row-local: another tenant's text cannot reorder a tenant's
     try addNote(a, &d, col, "a", "alpha bravo bravo");
     for (0..5) |i| {
         var buf: [32]u8 = undefined;
-        try addNote(a, &d, col, "b", try std.fmt.bufPrint(&buf, "alpha filler{d}", .{i}));
+        try addNote(a, &d, col, "b", try std.mem.print(&buf, "alpha filler{d}", .{i}));
     }
     const case1 = try searchOrder(a, &d, col, scope_a, "alpha bravo");
     defer a.free(case1);
@@ -1263,7 +1263,7 @@ test "search order is not a word-presence oracle for another tenant's text (#495
     // otherwise-identical rows comes first.
     for (0..4) |i| {
         var buf: [32]u8 = undefined;
-        try addNote(a, &d, col, "b", try std.fmt.bufPrint(&buf, "filler note {d}", .{i}));
+        try addNote(a, &d, col, "b", try std.mem.print(&buf, "filler note {d}", .{i}));
     }
     try addNote(a, &d, col, "a", "zebrasecret pad");
     try addNote(a, &d, col, "a", "qqcontrolqq pad");
@@ -1339,7 +1339,7 @@ test "row-local rank is registered on pooled and fresh reader connections" {
     defer tmp.cleanup();
     const dir_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
     defer a.free(dir_path);
-    const db_path = try std.fmt.allocPrintSentinel(a, "{s}/rank.db", .{dir_path}, 0);
+    const db_path = try a.printSentinel("{s}/rank.db", .{dir_path}, 0);
     defer a.free(db_path);
 
     var pool = try db.Pool.init(a, std.testing.io, db_path);

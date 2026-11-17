@@ -157,7 +157,7 @@ pub const DefaultStoragePlugin = struct {
     };
 
     pub fn create(gpa: std.mem.Allocator, io: std.Io, cfg: config.Config) !DefaultStoragePlugin {
-        const root = try std.fmt.allocPrint(gpa, "{s}/storage", .{cfg.data_dir});
+        const root = try gpa.print("{s}/storage", .{cfg.data_dir});
         errdefer gpa.free(root);
         if (cfg.s3_bucket.len > 0) {
             if (comptime build_options.s3) {
@@ -2672,7 +2672,7 @@ fn printVersion(io: std.Io, file: std.Io.File) void {
     , .{
         build_options.version,
         build_options.commit,
-        @tagName(builtin.mode),
+        @tagName(builtin.optimize),
         @tagName(builtin.target.cpu.arch),
         @tagName(builtin.target.os.tag),
         @tagName(builtin.target.abi),
@@ -2695,7 +2695,7 @@ fn printVersionJson(io: std.Io, file: std.Io.File) void {
         "\"components\":{{\"sqlite\":{f},\"sqlite_source_id\":{f},\"sqlite_vec\":{f},\"sqlite_vec_linked\":{}," ++ "\"zap\":{f},\"zap_commit\":{f},\"facil\":{f}}}}}\n", .{
         std.json.fmt(build_options.version, .{}),
         std.json.fmt(build_options.commit, .{}),
-        @tagName(builtin.mode),
+        @tagName(builtin.optimize),
         @tagName(builtin.target.cpu.arch),
         @tagName(builtin.target.os.tag),
         @tagName(builtin.target.abi),
@@ -3395,7 +3395,7 @@ fn ensureDataDir(io: std.Io, data_dir: []const u8) void {
 
 fn openPool(allocator: std.mem.Allocator, io: std.Io, cfg: config.Config, options: db.PoolOptions) !db.Pool {
     ensureDataDir(io, cfg.data_dir);
-    const db_path = try std.fmt.allocPrintSentinel(allocator, "{s}/data.db", .{cfg.data_dir}, 0);
+    const db_path = try allocator.printSentinel("{s}/data.db", .{cfg.data_dir}, 0);
     defer allocator.free(db_path);
     return db.Pool.initOpts(allocator, io, db_path, options);
 }
@@ -3588,9 +3588,9 @@ fn openApiImpl(comptime route_meta: []const events.RouteMeta, comptime opts: Ser
                     "exporting the SQLite database at {s}/data.db instead",
                 .{cfg.data_dir},
             );
-            break :blk try std.fmt.allocPrint(allocator, "{s}/data.db", .{cfg.data_dir});
+            break :blk try allocator.print("{s}/data.db", .{cfg.data_dir});
         },
-        .sqlite => try std.fmt.allocPrint(allocator, "{s}/data.db", .{cfg.data_dir}),
+        .sqlite => try allocator.print("{s}/data.db", .{cfg.data_dir}),
     };
     defer if (db.chooseBackend(db_url) != .postgres) allocator.free(target);
 
@@ -4624,7 +4624,7 @@ fn fileInventoryRun(comptime opts: ServeOpts, allocator: std.mem.Allocator, io: 
     const db_url = (config.EnvGetter{ .environ = environ }).get("ZIGBASE_DB_URL");
     const backend = db.chooseBackend(db_url);
     if (backend == .postgres_url_without_build) return error.PostgresInventoryRequiresPostgresBuild;
-    const target = if (backend == .postgres) db_url.? else try std.fmt.allocPrint(allocator, "{s}/data.db", .{cfg.data_dir});
+    const target = if (backend == .postgres) db_url.? else try allocator.print("{s}/data.db", .{cfg.data_dir});
     defer if (backend != .postgres) allocator.free(target);
     var conn = try db.openInspectionConnection(allocator, io, target);
     defer conn.close();
@@ -4650,14 +4650,14 @@ fn fileReconcileRun(comptime opts: ServeOpts, allocator: std.mem.Allocator, io: 
     const cfg = try loadCfg(environ, .{ .data_dir = fa.data_dir });
     const db_url = (config.EnvGetter{ .environ = environ }).get("ZIGBASE_DB_URL");
     if (db.chooseBackend(db_url) != .sqlite or cfg.s3_bucket.len != 0) return error.ReconciliationLocalSqliteOnly;
-    const root_path = try std.fmt.allocPrint(allocator, "{s}/storage", .{cfg.data_dir});
+    const root_path = try allocator.print("{s}/storage", .{cfg.data_dir});
     defer allocator.free(root_path);
     // Do not create roots or databases as a side effect of a mistyped path.
     var root_dir = try std.Io.Dir.cwd().openDir(io, root_path, .{ .iterate = true });
     defer root_dir.close(io);
     const lock: ?std.Io.File = if (fa.apply) try @import("files/maintenance.zig").acquire(io, root_dir, true) else null;
     defer if (lock) |file| file.close(io);
-    const target = try std.fmt.allocPrintSentinel(allocator, "{s}/data.db", .{cfg.data_dir}, 0);
+    const target = try allocator.printSentinel("{s}/data.db", .{cfg.data_dir}, 0);
     defer allocator.free(target);
     var probe = try std.Io.Dir.cwd().openFile(io, target, .{});
     probe.close(io);
@@ -4725,7 +4725,7 @@ fn resolveJwtSecret(allocator: std.mem.Allocator, io: std.Io, cfg: config.Config
     // Unset: persist a per-deployment secret under the data dir so "unset" is never
     // a shared, guessable default. Ensure the data dir exists first.
     ensureDataDir(io, cfg.data_dir);
-    const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ cfg.data_dir, jwt_secret_filename });
+    const path = try allocator.print("{s}/{s}", .{ cfg.data_dir, jwt_secret_filename });
     defer allocator.free(path);
     if (std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(4096))) |existing| {
         const trimmed = std.mem.trim(u8, existing, " \t\r\n");
@@ -4936,7 +4936,7 @@ fn bootApp(
     if (comptime opts.StoragePlugin == DefaultStoragePlugin) {
         holder.storage_maintenance = null;
         if (!build_options.s3 or cfg.s3_bucket.len == 0) {
-            const root_path = try std.fmt.allocPrint(allocator, "{s}/storage", .{cfg.data_dir});
+            const root_path = try allocator.print("{s}/storage", .{cfg.data_dir});
             defer allocator.free(root_path);
             try std.Io.Dir.cwd().createDirPath(io, root_path);
             var root_dir = try std.Io.Dir.cwd().openDir(io, root_path, .{});
@@ -5736,7 +5736,7 @@ fn superuserCreateImpl(allocator: std.mem.Allocator, io: std.Io, environ: *const
 
     const dialect = db.dbDialect(w);
     var placeholders: [4][db.Dialect.placeholder_buf_len]u8 = undefined;
-    const sql = try std.fmt.allocPrintSentinel(allocator,
+    const sql = try allocator.printSentinel(
         \\INSERT INTO "_superusers" ("id","created","updated","email","username","passwordHash","tokenKey","verified")
         \\ VALUES ({s}, {s}, {s}, {s}, '', {s}, {s}, 1);
     , .{

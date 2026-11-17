@@ -194,7 +194,7 @@ fn bindEvent(st: *db.Stmt, io: std.Io, ev: EventContext) !void {
 /// The `_kv` key holding a rollup's incremental watermark (the `occurred_at` boundary already
 /// aggregated). Allocated on `alloc`.
 pub fn watermarkKey(alloc: std.mem.Allocator, name: []const u8) ![]const u8 {
-    return std.fmt.allocPrint(alloc, "analytics:rollup:{s}:watermark", .{name});
+    return alloc.print("analytics:rollup:{s}:watermark", .{name});
 }
 
 /// The `_rollup_<name>` summary-table name, guarded through `schema.isValidIdentifier`. Returns
@@ -202,7 +202,7 @@ pub fn watermarkKey(alloc: std.mem.Allocator, name: []const u8) ![]const u8 {
 /// comptime config already rejects these). Allocated (sentinel) on `alloc`.
 pub fn summaryTable(alloc: std.mem.Allocator, name: []const u8) ![:0]u8 {
     if (!schema.isValidIdentifier(name)) return error.InvalidIdentifier;
-    return std.fmt.allocPrintSentinel(alloc, "_rollup_{s}", .{name}, 0);
+    return alloc.printSentinel("_rollup_{s}", .{name}, 0);
 }
 
 /// Whether `table` (a `summaryTable` name) exists yet. A summary table is created by the first
@@ -258,7 +258,7 @@ pub fn provisionSummary(conn: *db.Db, alloc: std.mem.Allocator, name: []const u8
     // `from`/`to` range match SQLite and the primary-key index serves them (#487; tables created
     // before migration 0030 are pinned by it).
     const tc = db.dbDialect(conn).textCollate();
-    const create = try std.fmt.allocPrintSentinel(alloc,
+    const create = try alloc.printSentinel(
         \\CREATE TABLE IF NOT EXISTS "{[table]s}" (
         \\  "bucket" TEXT{[tc]s} NOT NULL DEFAULT '',
         \\  "account" TEXT{[tc]s} NOT NULL DEFAULT '',
@@ -319,7 +319,7 @@ pub fn runRollup(conn: *db.Db, alloc: std.mem.Allocator, spec: RollupSpec) !void
     // existing-row reference with the target table name and the conflict-source with `excluded.` —
     // ONE statement valid on both backends. (The SELECT aggregate is aliased `AS "value"` too so the
     // projection is unambiguous.)
-    const sql = try std.fmt.allocPrintSentinel(a,
+    const sql = try a.printSentinel(
         \\INSERT INTO "{s}" ("bucket","account","actor","value","computed_at")
         \\ SELECT {s} AS b, {s} AS a, {s} AS ac, COUNT(*) AS "value", ?2
         \\ FROM "_events"
@@ -340,7 +340,7 @@ pub fn runRollup(conn: *db.Db, alloc: std.mem.Allocator, spec: RollupSpec) !void
     try st.bindInt(4, max_rowid);
     _ = try st.step();
 
-    const new_mark = try std.fmt.allocPrint(a, "{d}", .{max_rowid});
+    const new_mark = try a.print("{d}", .{max_rowid});
     try kvSet(conn, a, wkey, new_mark);
 }
 

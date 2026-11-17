@@ -82,9 +82,9 @@ fn expectTenantScoped(w: *db.Db, tag: []const u8) !void {
     var a_id: [32]u8 = undefined;
     var b_id: [32]u8 = undefined;
     var a2_id: [32]u8 = undefined;
-    try std.testing.expect(insert(w, try std.fmt.bufPrint(&b_id, "b-{s}", .{tag}), "acct-b", "acme-corp"));
-    try std.testing.expect(insert(w, try std.fmt.bufPrint(&a_id, "a-{s}", .{tag}), "acct-a", "acme-corp"));
-    try std.testing.expect(!insert(w, try std.fmt.bufPrint(&a2_id, "a2-{s}", .{tag}), "acct-a", "acme-corp"));
+    try std.testing.expect(insert(w, try std.mem.print(&b_id, "b-{s}", .{tag}), "acct-b", "acme-corp"));
+    try std.testing.expect(insert(w, try std.mem.print(&a_id, "a-{s}", .{tag}), "acct-a", "acme-corp"));
+    try std.testing.expect(!insert(w, try std.mem.print(&a2_id, "a2-{s}", .{tag}), "acct-a", "acme-corp"));
 }
 
 /// Unique constraints/autoindexes over exactly `slug` (table-wide) and `account, slug` (scoped).
@@ -655,7 +655,7 @@ test "SQLite refuses trigger INDEXED BY a constraint autoindex before a rebuild"
     var auto = try c.db.prepare("SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='slugs' AND name LIKE 'sqlite_autoindex_slugs_%' LIMIT 1;");
     defer auto.finalize();
     try std.testing.expect(try auto.step());
-    const trigger = try std.fmt.allocPrintSentinel(a, "CREATE TRIGGER migration_auto AFTER INSERT ON slugs BEGIN SELECT 1 FROM slugs INDEXED BY \"{s}\" WHERE slug=NEW.slug; END;", .{auto.columnText(0)}, 0);
+    const trigger = try a.printSentinel("CREATE TRIGGER migration_auto AFTER INSERT ON slugs BEGIN SELECT 1 FROM slugs INDEXED BY \"{s}\" WHERE slug=NEW.slug; END;", .{auto.columnText(0)}, 0);
     defer a.free(trigger);
     try c.db.exec(trigger);
     const generation = try schema_gen.read(&c.db);

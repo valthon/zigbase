@@ -258,11 +258,11 @@ pub fn claimBatch(
     for (queue_names, 0..) |_, i| {
         if (i != 0) try sql.append(sa, ',');
         try sql.append(sa, '?');
-        try sql.appendSlice(sa, std.fmt.bufPrint(&numbuf, "{d}", .{pidx}) catch unreachable);
+        try sql.appendSlice(sa, std.mem.print(&numbuf, "{d}", .{pidx}) catch unreachable);
         pidx += 1;
     }
     try sql.appendSlice(sa, ") ORDER BY \"priority\" ASC, \"run_at\" ASC LIMIT ?");
-    try sql.appendSlice(sa, std.fmt.bufPrint(&numbuf, "{d}", .{pidx}) catch unreachable);
+    try sql.appendSlice(sa, std.mem.print(&numbuf, "{d}", .{pidx}) catch unreachable);
     // Lock candidates before UPDATE on PostgreSQL: another instance must skip
     // these rows, not wait and subsequently overwrite their claim. SQLite's
     // single writer already makes this statement atomic.
@@ -418,7 +418,7 @@ pub fn reclaimStale(w: *db.Db, queue_name: []const u8, now: i64, visibility_time
 /// The TTL is per-queue (`QueueDef.done_ttl_s`). Returns rows deleted. Writer held by caller.
 pub fn gcDoneJobs(w: *db.Db, queue_name: []const u8, ttl_s: i64) !usize {
     var buf: [32]u8 = undefined;
-    const modifier = std.fmt.bufPrint(&buf, "-{d} seconds", .{ttl_s}) catch unreachable;
+    const modifier = std.mem.print(&buf, "-{d} seconds", .{ttl_s}) catch unreachable;
     var total: usize = 0;
     while (true) {
         // `created` is always written canonical via datetime('now'), so compare it DIRECTLY
@@ -1174,7 +1174,7 @@ const PollTestEnv = struct {
         errdefer env.tmp.cleanup();
         const dir_path = try env.tmp.dir.realPathFileAlloc(std.testing.io, ".", ga);
         defer ga.free(dir_path);
-        env.db_path = try std.fmt.allocPrintSentinel(ga, "{s}/test.db", .{dir_path}, 0);
+        env.db_path = try ga.printSentinel("{s}/test.db", .{dir_path}, 0);
         errdefer ga.free(env.db_path);
         env.pool = try db.Pool.init(ga, std.testing.io, env.db_path);
         errdefer env.pool.deinit();

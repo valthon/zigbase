@@ -91,7 +91,7 @@ pub fn normalizeRange(alloc: std.mem.Allocator, raw: []const u8, size: u64) !?Ra
         .none => null,
         .unsatisfiable => .unsatisfiable,
         .slice => |s| blk: {
-            const canonical = try std.fmt.allocPrint(alloc, "bytes={d}-{d}", .{ s.offset, s.offset + s.len - 1 });
+            const canonical = try alloc.print("bytes={d}-{d}", .{ s.offset, s.offset + s.len - 1 });
             // Already exactly what facil.io handles? Don't touch the request. Free the
             // scratch here — a null return owns nothing, so on a non-arena allocator this
             // string would otherwise leak (a no-op under the request arena in production).
@@ -207,7 +207,7 @@ fn serveEmbedded(ctx: *http.RequestCtx, files: []const StaticFile, rel: []const 
     const hit = blk: {
         if (rel.len == 0) break :blk findEmbedded(files, "index.html");
         if (findEmbedded(files, rel)) |f| break :blk f;
-        const idx = try std.fmt.allocPrint(ctx.allocator.a, "{s}/index.html", .{rel});
+        const idx = try ctx.allocator.a.print("{s}/index.html", .{rel});
         break :blk findEmbedded(files, idx);
     } orelse return null;
     const content_type = mime.fromExtension(hit.path);
@@ -228,7 +228,7 @@ fn serveEmbedded(ctx: *http.RequestCtx, files: []const StaticFile, rel: []const 
         .{ .name = "Cache-Control", .value = cache_control },
     });
     if (p.status == 304) {
-        const representation_length = try std.fmt.allocPrint(ctx.allocator.a, "{d}", .{hit.bytes.len});
+        const representation_length = try ctx.allocator.a.print("{d}", .{hit.bytes.len});
         try hs.append(ctx.allocator.a, .{ .name = "content-length", .value = representation_length });
         return notModified(content_type, try hs.toOwnedSlice(ctx.allocator.a));
     }
@@ -330,7 +330,7 @@ pub fn deriveEmbeddedSpaRoots(alloc: std.mem.Allocator, files: []const StaticFil
         const has_index = if (prefix.len == 0)
             findEmbedded(files, "index.html") != null
         else blk: {
-            const idx = try std.fmt.allocPrint(alloc, "{s}/index.html", .{prefix});
+            const idx = try alloc.print("{s}/index.html", .{prefix});
             defer alloc.free(idx);
             break :blk findEmbedded(files, idx) != null;
         };
@@ -409,7 +409,7 @@ pub fn validateSpaMarkersDir(io: std.Io, alloc: std.mem.Allocator, root: []const
             const idx = if (prefix.len == 0)
                 try alloc.dupe(u8, "index.html")
             else
-                try std.fmt.allocPrint(alloc, "{s}/index.html", .{prefix});
+                try alloc.print("{s}/index.html", .{prefix});
             defer alloc.free(idx);
             const st = dir.statFile(io, idx, .{}) catch break :blk false;
             break :blk st.kind == .file;
@@ -474,14 +474,14 @@ fn resolveSpaMarkerDirLive(io: std.Io, alloc: std.mem.Allocator, root: []const u
         // intermediate levels a crafted path could otherwise force.
         if (levels_checked > spa_marker_walk_cap and dir_rel.len != 0) dir_rel = "";
 
-        const marker_path = try std.fmt.allocPrint(alloc, "{s}{s}.spa", .{ dir_rel, if (dir_rel.len == 0) "" else "/" });
+        const marker_path = try alloc.print("{s}{s}.spa", .{ dir_rel, if (dir_rel.len == 0) "" else "/" });
         defer alloc.free(marker_path);
         const marked = blk: {
             const st = dir_root.statFile(io, marker_path, .{}) catch break :blk false;
             break :blk st.kind == .file;
         };
         if (marked) {
-            const idx_path = try std.fmt.allocPrint(alloc, "{s}{s}index.html", .{ dir_rel, if (dir_rel.len == 0) "" else "/" });
+            const idx_path = try alloc.print("{s}{s}index.html", .{ dir_rel, if (dir_rel.len == 0) "" else "/" });
             errdefer alloc.free(idx_path);
             const has_index = blk: {
                 const ist = dir_root.statFile(io, idx_path, .{}) catch break :blk false;
@@ -513,15 +513,15 @@ pub fn validateRouteTargetsDir(io: std.Io, alloc: std.mem.Allocator, root: []con
     for (routes) |rt| {
         const rel = std.mem.trimStart(u8, rt.serve, "/");
         const full = if (rel.len == 0)
-            try std.fmt.allocPrint(alloc, "{s}/index.html", .{root})
+            try alloc.print("{s}/index.html", .{root})
         else
-            try std.fmt.allocPrint(alloc, "{s}/{s}", .{ root, rel });
+            try alloc.print("{s}/{s}", .{ root, rel });
         defer alloc.free(full);
         const ok = blk: {
             const st = std.Io.Dir.cwd().statFile(io, full, .{}) catch break :blk false;
             if (st.kind == .file) break :blk true;
             if (st.kind != .directory) break :blk false;
-            const idx = try std.fmt.allocPrint(alloc, "{s}/index.html", .{full});
+            const idx = try alloc.print("{s}/index.html", .{full});
             defer alloc.free(idx);
             const ist = std.Io.Dir.cwd().statFile(io, idx, .{}) catch break :blk false;
             break :blk ist.kind == .file;
@@ -533,10 +533,10 @@ pub fn validateRouteTargetsDir(io: std.Io, alloc: std.mem.Allocator, root: []con
 
 fn serveDir(io: std.Io, ctx: *http.RequestCtx, root: []const u8, rel: []const u8, owned_cache: ?[]const u8) !?http.Response {
     const first = if (rel.len == 0) "index.html" else rel;
-    var full = try std.fmt.allocPrint(ctx.allocator.a, "{s}/{s}", .{ root, first });
+    var full = try ctx.allocator.a.print("{s}/{s}", .{ root, first });
     var st = std.Io.Dir.cwd().statFile(io, full, .{}) catch return null;
     if (st.kind == .directory) {
-        full = try std.fmt.allocPrint(ctx.allocator.a, "{s}/index.html", .{full});
+        full = try ctx.allocator.a.print("{s}/index.html", .{full});
         st = std.Io.Dir.cwd().statFile(io, full, .{}) catch return null;
     }
     if (st.kind != .file) return null;
@@ -582,7 +582,7 @@ fn serveDir(io: std.Io, ctx: *http.RequestCtx, root: []const u8, rel: []const u8
         var size = st.size;
         if (ctx.header("accept-encoding")) |ae| {
             if (std.mem.indexOf(u8, ae, "gzip") != null and !std.mem.endsWith(u8, full, ".gz")) {
-                const gz = try std.fmt.allocPrint(ctx.allocator.a, "{s}.gz", .{full});
+                const gz = try ctx.allocator.a.print("{s}.gz", .{full});
                 if (std.Io.Dir.cwd().statFile(io, gz, .{})) |gst| {
                     if (gst.kind == .file) size = gst.size; // one extra stat, worst case
                 } else |_| {}
@@ -598,7 +598,7 @@ fn serveDir(io: std.Io, ctx: *http.RequestCtx, root: []const u8, rel: []const u8
             .unsatisfiable => if (!had_if_range) {
                 // Tiny owned response — the one static status facil.io cannot emit.
                 const hs416 = try ctx.allocator.a.dupe(http.Header, &.{
-                    .{ .name = "Content-Range", .value = try std.fmt.allocPrint(ctx.allocator.a, "bytes */{d}", .{size}) },
+                    .{ .name = "Content-Range", .value = try ctx.allocator.a.print("bytes */{d}", .{size}) },
                     nosniff,
                 });
                 return .{ .status = 416, .body = "", .content_type = mime.fromExtension(full), .extra_headers = hs416 };
@@ -633,21 +633,21 @@ fn serveDir(io: std.Io, ctx: *http.RequestCtx, root: []const u8, rel: []const u8
 /// deliberate, tiny widening of the owned surface, confined to one small HTML file.
 /// F10 still applies: the canonicalized shell must live under the canonicalized root.
 fn serveShellOwned(io: std.Io, ctx: *http.RequestCtx, root: []const u8, shell_rel: []const u8) !?http.Response {
-    const full = try std.fmt.allocPrint(ctx.allocator.a, "{s}/{s}", .{ root, shell_rel });
+    const full = try ctx.allocator.a.print("{s}/{s}", .{ root, shell_rel });
     const st = std.Io.Dir.cwd().statFile(io, full, .{}) catch return null;
     if (st.kind != .file) return null;
     const real_root = std.Io.Dir.cwd().realPathFileAlloc(io, root, ctx.allocator.a) catch return null;
     const real_full = std.Io.Dir.cwd().realPathFileAlloc(io, full, ctx.allocator.a) catch return null;
     if (!withinRoot(real_root, real_full)) return null;
     const mtime_s: i64 = @intCast(@divTrunc(st.mtime.nanoseconds, std.time.ns_per_s));
-    const etag = try std.fmt.allocPrint(ctx.allocator.a, "\"{x}-{x}\"", .{ st.size, @as(u64, @bitCast(mtime_s)) });
+    const etag = try ctx.allocator.a.print("\"{x}-{x}\"", .{ st.size, @as(u64, @bitCast(mtime_s)) });
     const hs = try ctx.allocator.a.dupe(http.Header, &.{
         .{ .name = "ETag", .value = etag },
         nosniff,
         .{ .name = "Cache-Control", .value = "no-cache" },
     });
     if (serve_file.etagMatches(ctx.if_none_match, etag)) {
-        const representation_length = try std.fmt.allocPrint(ctx.allocator.a, "{d}", .{st.size});
+        const representation_length = try ctx.allocator.a.print("{d}", .{st.size});
         const conditional_headers = try ctx.allocator.a.alloc(http.Header, hs.len + 1);
         @memcpy(conditional_headers[0..hs.len], hs);
         conditional_headers[hs.len] = .{ .name = "content-length", .value = representation_length };
@@ -737,7 +737,7 @@ fn serveContent(io: std.Io, ctx: *http.RequestCtx, source: Source, fb: Fallback)
                 const shell = if (root.len == 0)
                     "index.html"
                 else
-                    try std.fmt.allocPrint(ctx.allocator.a, "{s}/index.html", .{root});
+                    try ctx.allocator.a.print("{s}/index.html", .{root});
                 // §C.3: a FALLBACK-served shell is always no-cache — a cached stale shell
                 // after a redeploy references hashed assets that no longer exist, breaking
                 // deep links. Direct hits on the same file still get the knob value.
@@ -1028,7 +1028,7 @@ test "dir: a symlink inside the root pointing OUTSIDE it is refused (F10)" {
 
     const root = try root_tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
     const out_abs = try out_tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
-    const secret_abs = try std.fmt.allocPrint(a, "{s}/secret.txt", .{out_abs});
+    const secret_abs = try a.print("{s}/secret.txt", .{out_abs});
     // Plant the escaping symlink inside the served root: root/leak.txt -> outside/secret.txt
     try root_tmp.dir.symLink(std.testing.io, secret_abs, "leak.txt", .{});
 
@@ -1658,9 +1658,9 @@ test "spa live (dir): a marker just past the ancestor-walk cap depth is NOT foun
         try marker_rel.appendSlice(arena.allocator(), "seg");
     }
     try tmp.dir.createDirPath(std.testing.io, marker_rel.items);
-    const marker_path = try std.fmt.allocPrint(arena.allocator(), "{s}/.spa", .{marker_rel.items});
+    const marker_path = try arena.allocator().print("{s}/.spa", .{marker_rel.items});
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = marker_path, .data = "" });
-    const idx_path = try std.fmt.allocPrint(arena.allocator(), "{s}/index.html", .{marker_rel.items});
+    const idx_path = try arena.allocator().print("{s}/index.html", .{marker_rel.items});
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = idx_path, .data = "<h1>deep shell</h1>" });
 
     const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", arena.allocator());
@@ -1676,7 +1676,7 @@ test "spa live (dir): a marker just past the ancestor-walk cap depth is NOT foun
     while (j < 200) : (j += 1) {
         try req_buf.appendSlice(arena.allocator(), "/deep");
     }
-    const req_path = try std.fmt.allocPrint(arena.allocator(), "/{s}", .{req_buf.items});
+    const req_path = try arena.allocator().print("/{s}", .{req_buf.items});
 
     var deep = http.RequestCtx{ .method = .GET, .path = req_path, .allocator = RequestArena.from(&arena) };
     // No root marker exists here, so the capped walk (jumping to root once exhausted)

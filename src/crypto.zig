@@ -117,7 +117,7 @@ pub fn wrapLegacy(alloc: std.mem.Allocator, algorithm: []const u8, hash: []const
     // Validate the hash against the algorithm at IMPORT time, so a malformed credential is
     // rejected while an operator is watching rather than at some user's next login.
     if (std.mem.eql(u8, algorithm, "bcrypt") and !isBcryptHash(hash)) return LegacyError.MalformedLegacyHash;
-    return std.fmt.allocPrint(alloc, "{s}{s}${s}", .{ legacy_prefix, algorithm, hash });
+    return alloc.print("{s}{s}${s}", .{ legacy_prefix, algorithm, hash });
 }
 
 /// Verify a password against a TAGGED legacy hash. Returns false — never an error — on any

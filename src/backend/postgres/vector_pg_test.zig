@@ -47,7 +47,7 @@ var schema_counter: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
 /// own table lives in the (first, writable) temp schema.
 fn enterTempSchema(a: std.mem.Allocator, d: *dbm.Db) ![:0]const u8 {
     const n = schema_counter.fetchAdd(1, .monotonic);
-    const name = try std.fmt.allocPrint(a, "zb_vec_{d}", .{n});
+    const name = try a.print("zb_vec_{d}", .{n});
     defer a.free(name); // borrowed into each SQL string + the returned name below; freed after.
     // Each DDL string is copied by `exec` (the wire driver sends it immediately), so freeing it
     // right after the call is safe even under a checked allocator (the tests run on an arena, so
@@ -57,15 +57,15 @@ fn enterTempSchema(a: std.mem.Allocator, d: *dbm.Db) ![:0]const u8 {
         "CREATE SCHEMA \"{s}\";",
         "SET search_path TO \"{s}\", public;",
     }) |tmpl| {
-        const sql = try std.fmt.allocPrintSentinel(a, tmpl, .{name}, 0);
+        const sql = try a.printSentinel(tmpl, .{name}, 0);
         defer a.free(sql);
         try d.exec(sql);
     }
-    return std.fmt.allocPrintSentinel(a, "{s}", .{name}, 0);
+    return a.printSentinel("{s}", .{name}, 0);
 }
 
 fn dropTempSchema(a: std.mem.Allocator, d: *dbm.Db, name: []const u8) void {
-    const sql = std.fmt.allocPrintSentinel(a, "DROP SCHEMA IF EXISTS \"{s}\" CASCADE;", .{name}, 0) catch return;
+    const sql = a.printSentinel("DROP SCHEMA IF EXISTS \"{s}\" CASCADE;", .{name}, 0) catch return;
     defer a.free(sql);
     d.exec(sql) catch {};
 }
@@ -85,19 +85,19 @@ fn provisionTable(a: std.mem.Allocator, d: *dbm.Db, col: schema.Collection) !voi
     var sql: std.ArrayList(u8) = .empty;
     defer sql.deinit(a);
     {
-        const head = try std.fmt.allocPrint(a, "CREATE TABLE \"{s}\" (\"id\" TEXT{s} PRIMARY KEY, \"created\" TEXT{s}, \"updated\" TEXT{s}", .{ col.name, tc, tc, tc });
+        const head = try a.print("CREATE TABLE \"{s}\" (\"id\" TEXT{s} PRIMARY KEY, \"created\" TEXT{s}, \"updated\" TEXT{s}", .{ col.name, tc, tc, tc });
         defer a.free(head);
         try sql.appendSlice(a, head);
     }
     for (col.fields) |f| {
         const ty = Dialect.postgres.sqlType(f.storageClass());
         const collate = if (std.mem.eql(u8, ty, "TEXT")) tc else "";
-        const frag = try std.fmt.allocPrint(a, ", \"{s}\" {s}{s}", .{ f.name, ty, collate });
+        const frag = try a.print(", \"{s}\" {s}{s}", .{ f.name, ty, collate });
         defer a.free(frag);
         try sql.appendSlice(a, frag);
     }
     try sql.appendSlice(a, ");");
-    const ddl = try std.fmt.allocPrintSentinel(a, "{s}", .{sql.items}, 0);
+    const ddl = try a.printSentinel("{s}", .{sql.items}, 0);
     defer a.free(ddl);
     try d.exec(ddl);
 }

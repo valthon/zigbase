@@ -57,7 +57,7 @@ fn hasReference(a: std.mem.Allocator, w: *db.Db, ref: Reference, name: []const u
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const scratch = arena.allocator();
-    var st = try prepare(scratch, w, try std.fmt.allocPrint(scratch, "SELECT 1 FROM {s} WHERE {s}=?1 LIMIT 1;", .{
+    var st = try prepare(scratch, w, try scratch.print("SELECT 1 FROM {s} WHERE {s}=?1 LIMIT 1;", .{
         try ddl.quoteIdent(scratch, ref.table), try ddl.quoteIdent(scratch, ref.column),
     }));
     defer st.finalize();
@@ -72,9 +72,9 @@ fn changeReference(a: std.mem.Allocator, w: *db.Db, ref: Reference, old: []const
     const column = try ddl.quoteIdent(a, ref.column);
     defer a.free(column);
     const sql = if (new != null)
-        try std.fmt.allocPrint(a, "UPDATE {s} SET {s}=?2 WHERE {s}=?1;", .{ table, column, column })
+        try a.print("UPDATE {s} SET {s}=?2 WHERE {s}=?1;", .{ table, column, column })
     else
-        try std.fmt.allocPrint(a, "DELETE FROM {s} WHERE {s}=?1;", .{ table, column });
+        try a.print("DELETE FROM {s} WHERE {s}=?1;", .{ table, column });
     defer a.free(sql);
     var st = try prepare(a, w, sql);
     defer st.finalize();
@@ -108,15 +108,15 @@ fn remapStorage(alloc: std.mem.Allocator, w: *db.Db, old: schema.Collection, new
         // Return oversized payloads as invalid NULL, not a truncated JSON prefix.
         // SQLite TEXT length/substr stop at NUL: measure raw bytes instead.
         const length = if (db.dbDialect(w).kind == .sqlite)
-            try std.fmt.allocPrint(alloc, "length(CAST({s} AS BLOB))", .{source.column})
+            try alloc.print("length(CAST({s} AS BLOB))", .{source.column})
         else
-            try std.fmt.allocPrint(alloc, "octet_length({s})", .{source.column});
+            try alloc.print("octet_length({s})", .{source.column});
         defer alloc.free(length);
-        const sql = try std.fmt.allocPrint(alloc, "SELECT id,CASE WHEN {s}<=65536 THEN {s} ELSE NULL END FROM \"{s}\" WHERE {s}", .{ length, source.column, source.table, source.predicate });
+        const sql = try alloc.print("SELECT id,CASE WHEN {s}<=65536 THEN {s} ELSE NULL END FROM \"{s}\" WHERE {s}", .{ length, source.column, source.table, source.predicate });
         defer alloc.free(sql);
-        const first_sql = try std.fmt.allocPrint(alloc, "{s} ORDER BY id LIMIT 64;", .{sql});
+        const first_sql = try alloc.print("{s} ORDER BY id LIMIT 64;", .{sql});
         defer alloc.free(first_sql);
-        const next_sql = try std.fmt.allocPrint(alloc, "{s} AND id>?1 ORDER BY id LIMIT 64;", .{sql});
+        const next_sql = try alloc.print("{s} AND id>?1 ORDER BY id LIMIT 64;", .{sql});
         defer alloc.free(next_sql);
         var first = try prepare(alloc, w, first_sql);
         defer first.finalize();
@@ -240,7 +240,7 @@ pub fn rename(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, from: []const u8,
     try @import("collection_rename_indexes.zig").preflight(a, w, old, to);
     if ((try collections.get(a, w, to)) != null or try objectExists(a, w, to)) return error.Conflict;
     for ([_][]const u8{ "_fts", "_fts_ai", "_fts_ad", "_fts_au", "_fts_idx", "_fts_data", "_fts_docsize", "_fts_config", "_fts_content" }) |suffix| {
-        if (try objectExists(a, w, try std.fmt.allocPrint(a, "{s}{s}", .{ to, suffix }))) return error.Conflict;
+        if (try objectExists(a, w, try a.print("{s}{s}", .{ to, suffix }))) return error.Conflict;
     }
     try rejectDestinationRelations(alloc, w, to);
     // Imported metadata can make a legacy target name indistinguishable from
@@ -287,12 +287,12 @@ pub fn rename(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, from: []const u8,
     var without_search = old;
     without_search.fields = &.{};
     try fts.ensureIndex(a, w, without_search);
-    try w.exec(try std.fmt.allocPrintSentinel(a, "ALTER TABLE {s} RENAME TO {s};", .{
+    try w.exec(try a.printSentinel("ALTER TABLE {s} RENAME TO {s};", .{
         try ddl.quoteIdent(a, old.name), try ddl.quoteIdent(a, to),
     }, 0));
     try @import("collection_rename_indexes.zig").renameAuthIndexes(a, w, old, to);
     const now = db.dbDialect(w).nowTextExpr();
-    var st = try prepare(a, w, try std.fmt.allocPrint(a, "UPDATE \"_collections\" SET name=?1, updated={s}, rename_epoch=rename_epoch+1 WHERE id=?2;", .{now}));
+    var st = try prepare(a, w, try a.print("UPDATE \"_collections\" SET name=?1, updated={s}, rename_epoch=rename_epoch+1 WHERE id=?2;", .{now}));
     defer st.finalize();
     try st.bindText(1, to);
     try st.bindText(2, old.id);
@@ -318,7 +318,7 @@ pub fn rename(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, from: []const u8,
             try fields.append(a, updated);
         }
         if (changed) {
-            var update = try prepare(a, w, try std.fmt.allocPrint(a, "UPDATE \"_collections\" SET schema=?1, updated={s} WHERE id=?2;", .{now}));
+            var update = try prepare(a, w, try a.print("UPDATE \"_collections\" SET schema=?1, updated={s} WHERE id=?2;", .{now}));
             defer update.finalize();
             try update.bindText(1, try schema.fieldsToJson(a, fields.items));
             try update.bindText(2, col.id);
@@ -344,11 +344,11 @@ fn rotatePrincipals(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, name: []con
     defer scratch.deinit();
     const a = scratch.allocator();
     const table = try ddl.quoteIdent(a, name);
-    var first = try prepare(a, w, try std.fmt.allocPrint(a, "SELECT id FROM {s} ORDER BY id LIMIT 256;", .{table}));
+    var first = try prepare(a, w, try a.print("SELECT id FROM {s} ORDER BY id LIMIT 256;", .{table}));
     defer first.finalize();
-    var next = try prepare(a, w, try std.fmt.allocPrint(a, "SELECT id FROM {s} WHERE id>?1 ORDER BY id LIMIT 256;", .{table}));
+    var next = try prepare(a, w, try a.print("SELECT id FROM {s} WHERE id>?1 ORDER BY id LIMIT 256;", .{table}));
     defer next.finalize();
-    var rotate = try prepare(a, w, try std.fmt.allocPrint(a, "UPDATE {s} SET \"tokenKey\"=?1, token_epoch=COALESCE(token_epoch,0)+1 WHERE id=?2;", .{table}));
+    var rotate = try prepare(a, w, try a.print("UPDATE {s} SET \"tokenKey\"=?1, token_epoch=COALESCE(token_epoch,0)+1 WHERE id=?2;", .{table}));
     defer rotate.finalize();
     var last: std.ArrayList(u8) = .empty;
     var initial = true;
@@ -515,11 +515,11 @@ test "pg rename refuses fallback and view ledgers but respects valid receipt ret
     defer w.close();
     const token = try @import("crypto.zig").genToken(std.testing.io, a, 12);
     defer a.free(token);
-    const create = try std.fmt.allocPrintSentinel(a, "CREATE SCHEMA rename_receipt_{s}; CREATE SCHEMA fallback_receipt_{s}; SET search_path TO rename_receipt_{s},fallback_receipt_{s};", .{ token, token, token, token }, 0);
+    const create = try a.printSentinel("CREATE SCHEMA rename_receipt_{s}; CREATE SCHEMA fallback_receipt_{s}; SET search_path TO rename_receipt_{s},fallback_receipt_{s};", .{ token, token, token, token }, 0);
     defer a.free(create);
-    const drop = try std.fmt.allocPrintSentinel(a, "DROP SCHEMA rename_receipt_{s},fallback_receipt_{s} CASCADE;", .{ token, token }, 0);
+    const drop = try a.printSentinel("DROP SCHEMA rename_receipt_{s},fallback_receipt_{s} CASCADE;", .{ token, token }, 0);
     defer a.free(drop);
-    const fallback = try std.fmt.allocPrintSentinel(a, "CREATE TABLE fallback_receipt_{s}._idempotency_receipts(expires BIGINT); INSERT INTO fallback_receipt_{s}._idempotency_receipts VALUES(9223372036854775807);", .{ token, token }, 0);
+    const fallback = try a.printSentinel("CREATE TABLE fallback_receipt_{s}._idempotency_receipts(expires BIGINT); INSERT INTO fallback_receipt_{s}._idempotency_receipts VALUES(9223372036854775807);", .{ token, token }, 0);
     defer a.free(fallback);
     try w.exec(create);
     defer w.exec(drop) catch |err| std.log.err("rename receipt test cleanup: {s}", .{@errorName(err)});
@@ -610,22 +610,22 @@ test "offline rename rejects temporary shadows and destination FTS shadow tables
     for ([_][]const u8{ "posts", "articles", "_schema_state", "_collections", "_idempotency_receipts" }) |name| {
         const quoted = try ddl.quoteIdent(a, name);
         defer a.free(quoted);
-        const create = try std.fmt.allocPrintSentinel(a, "CREATE TEMP TABLE {s}(note TEXT);", .{quoted}, 0);
+        const create = try a.printSentinel("CREATE TEMP TABLE {s}(note TEXT);", .{quoted}, 0);
         defer a.free(create);
         try w.exec(create);
         try std.testing.expectError(error.Conflict, rename(a, std.testing.io, &w, "posts", "articles"));
-        const drop = try std.fmt.allocPrintSentinel(a, "DROP TABLE temp.{s};", .{quoted}, 0);
+        const drop = try a.printSentinel("DROP TABLE temp.{s};", .{quoted}, 0);
         defer a.free(drop);
         try w.exec(drop);
     }
     for ([_][]const u8{ "articles_fts_data", "articles_fts_docsize", "articles_fts_config", "articles_fts_content" }) |name| {
         const quoted = try ddl.quoteIdent(a, name);
         defer a.free(quoted);
-        const create = try std.fmt.allocPrintSentinel(a, "CREATE TABLE {s}(note TEXT);", .{quoted}, 0);
+        const create = try a.printSentinel("CREATE TABLE {s}(note TEXT);", .{quoted}, 0);
         defer a.free(create);
         try w.exec(create);
         try std.testing.expectError(error.Conflict, rename(a, std.testing.io, &w, "posts", "articles"));
-        const drop = try std.fmt.allocPrintSentinel(a, "DROP TABLE {s};", .{quoted}, 0);
+        const drop = try a.printSentinel("DROP TABLE {s};", .{quoted}, 0);
         defer a.free(drop);
         try w.exec(drop);
     }
@@ -691,7 +691,7 @@ test "offline rename refuses dangling physical FKs even without collection metad
         try @import("migrations.zig").run(&w);
         const posts = try collections.create(a, std.testing.io, &w, .{ .id = "", .name = "posts", .fields = &.{} });
         defer posts.deinit(a);
-        const sql = try std.fmt.allocPrintSentinel(a, "CREATE TABLE migration_links(parent TEXT REFERENCES \"{s}\"(id)); INSERT INTO migration_links VALUES ('r1');", .{target}, 0);
+        const sql = try a.printSentinel("CREATE TABLE migration_links(parent TEXT REFERENCES \"{s}\"(id)); INSERT INTO migration_links VALUES ('r1');", .{target}, 0);
         defer a.free(sql);
         // SQLite allows a dangling FK and, with enforcement disabled, records.
         try w.exec("PRAGMA foreign_keys=OFF;");
@@ -950,7 +950,7 @@ fn storageBatchRegression(w: *db.Db) !void {
     // More than two 64-row pages, including the empty ID before every keyset.
     for (0..129) |i| {
         var buf: [32]u8 = undefined;
-        const id = if (i == 0) "" else try std.fmt.bufPrint(&buf, "{d:0>5}", .{i});
+        const id = if (i == 0) "" else try std.mem.print(&buf, "{d:0>5}", .{i});
         upload.reset();
         try upload.clearBindings();
         try upload.bindText(1, id);

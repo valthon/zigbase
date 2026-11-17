@@ -238,7 +238,7 @@ test "jobHandler: an invalid urgency is rejected (dropped, no network)" {
     var env = JobEnv.init(try configuredCfg(testing.allocator));
     var cx = env.ctx();
     // Valid keys, so the ONLY reason nothing is sent is the unknown urgency value.
-    const payload = try std.fmt.allocPrint(testing.allocator,
+    const payload = try testing.allocator.print(
         \\{{"subscription":{{"endpoint":"{s}","p256dh":"{s}","auth":"{s}"}},"message":{{"title":"Hi","urgency":"{s}"}}}}
     , .{ test_endpoint, test_p256dh, test_auth, invalid_urgency });
     defer testing.allocator.free(payload);

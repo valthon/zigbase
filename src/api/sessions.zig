@@ -122,7 +122,7 @@ const app_mod = @import("../app.zig");
 /// Login via the real HTTP handler and return the bearer token.
 fn login(env: *api_auth.TestEnv, a: RequestArena, col_name: []const u8, email: []const u8, pw: []const u8) ![]const u8 {
     const p = [_]http.Param{.{ .key = "col", .value = col_name }};
-    const body = try std.fmt.allocPrint(a.a, "{{\"identity\":\"{s}\",\"password\":\"{s}\"}}", .{ email, pw });
+    const body = try a.a.print("{{\"identity\":\"{s}\",\"password\":\"{s}\"}}", .{ email, pw });
     var req = env.ctx(a, .POST, body, &p);
     const res = try api_auth.authWithPassword(&req);
     try std.testing.expectEqual(@as(u16, 200), res.status);
@@ -135,7 +135,7 @@ fn bearerCtx(env: *api_auth.TestEnv, a: RequestArena, m: http.Method, col_name: 
     try params.append(a.a, .{ .key = "col", .value = col_name });
     try params.appendSlice(a.a, extra);
     var c = env.ctx(a, m, "", try params.toOwnedSlice(a.a));
-    c.authorization = try std.fmt.allocPrint(a.a, "Bearer {s}", .{token});
+    c.authorization = try a.a.print("Bearer {s}", .{token});
     return c;
 }
 
@@ -264,7 +264,7 @@ test "sessions REST: revoke own → 204 empty body + token dead; non-owner and a
     // The revoked token (tok1b) now fails authRefresh.
     {
         var refresh_req = env.ctx(RequestArena.from(&arena), .POST, "", &[_]http.Param{.{ .key = "col", .value = "users" }});
-        refresh_req.authorization = try std.fmt.allocPrint(a, "Bearer {s}", .{tok1b});
+        refresh_req.authorization = try a.print("Bearer {s}", .{tok1b});
         const refresh_res = try api_auth.authRefresh(&refresh_req);
         try std.testing.expectEqual(@as(u16, 401), refresh_res.status);
     }
@@ -303,7 +303,7 @@ test "sessions REST: revoke-all works in BOTH modes — 204 + cleared cookies + 
         }
 
         var refresh_req = env.ctx(RequestArena.from(&arena), .POST, "", &[_]http.Param{.{ .key = "col", .value = "users" }});
-        refresh_req.authorization = try std.fmt.allocPrint(a, "Bearer {s}", .{tok});
+        refresh_req.authorization = try a.print("Bearer {s}", .{tok});
         const refresh_res = try api_auth.authRefresh(&refresh_req);
         try std.testing.expectEqual(@as(u16, 401), refresh_res.status);
     }
@@ -325,7 +325,7 @@ test "sessions REST: revoke-all works in BOTH modes — 204 + cleared cookies + 
         try std.testing.expectEqual(@as(usize, 2), res.cookies.len);
 
         var refresh_req = env.ctx(RequestArena.from(&arena), .POST, "", &[_]http.Param{.{ .key = "col", .value = "users" }});
-        refresh_req.authorization = try std.fmt.allocPrint(a, "Bearer {s}", .{tok});
+        refresh_req.authorization = try a.print("Bearer {s}", .{tok});
         const refresh_res = try api_auth.authRefresh(&refresh_req);
         try std.testing.expectEqual(@as(u16, 401), refresh_res.status);
 

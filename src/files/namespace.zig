@@ -169,7 +169,7 @@ fn reservationPlanRegression(w: *db.Db) !void {
         try std.testing.expect(std.mem.indexOf(u8, definition.columnText(0), "UNIQUE INDEX") != null);
         try std.testing.expect(std.mem.indexOf(u8, definition.columnText(0), "lower(namespace)") != null);
     }
-    const sql = try std.fmt.allocPrint(a, "{s}{s}", .{ if (pg) "EXPLAIN " else "EXPLAIN QUERY PLAN ", reservation_sql });
+    const sql = try a.print("{s}{s}", .{ if (pg) "EXPLAIN " else "EXPLAIN QUERY PLAN ", reservation_sql });
     defer a.free(sql);
     var plan = try prepare(a, w, sql);
     defer plan.finalize();

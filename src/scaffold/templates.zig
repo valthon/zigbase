@@ -234,7 +234,7 @@ pub const framework_readme =
 /// `build.zig.zon` with no dependency block — `zig fetch --save` writes that, with
 /// the correct hash. `fingerprint` is minted by the caller (see scaffold.zig).
 pub fn frameworkBuildZigZon(a: std.mem.Allocator, name: []const u8, fingerprint: u64) ![]u8 {
-    return std.fmt.allocPrint(a,
+    return a.print(
         \\.{{
         \\    .name = .{s},
         \\    .version = "0.0.0",
@@ -254,7 +254,7 @@ pub fn frameworkBuildZigZon(a: std.mem.Allocator, name: []const u8, fingerprint:
 /// The whole app. `App` is a `pub const` so the test block can reach it — an
 /// `App(.{...})` literal inlined into `main` cannot be tested.
 pub fn frameworkMainZig(a: std.mem.Allocator, name: []const u8) ![]u8 {
-    return std.fmt.allocPrint(a,
+    return a.print(
         \\const std = @import("std");
         \\const zigbase = @import("zigbase");
         \\

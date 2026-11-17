@@ -441,7 +441,7 @@ pub const Data = struct {
         // backends; `excluded` is the standard conflict-row alias on SQLite and Postgres.
         const dialect = db.dbDialect(self.conn);
         const now = dialect.nowTextExpr();
-        const sql = try std.fmt.allocPrintSentinel(self.alloc,
+        const sql = try self.alloc.printSentinel(
             \\INSERT INTO "_kv"(key,value,created,updated)
             \\VALUES(?1,?2,{s},{s})
             \\ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated={s};
@@ -503,7 +503,7 @@ pub const Data = struct {
         try sql.appendSlice(self.alloc, "SELECT key, value, created, updated FROM \"_kv\" WHERE ");
         for (prefixes, 0..) |_, i| {
             if (i > 0) try sql.appendSlice(self.alloc, " OR ");
-            const clause = try std.fmt.allocPrint(self.alloc, "key {s} ?{d}", .{ op, i + 1 });
+            const clause = try self.alloc.print("key {s} ?{d}", .{ op, i + 1 });
             defer self.alloc.free(clause); // copied by appendSlice; only a build-time temporary
             try sql.appendSlice(self.alloc, clause);
         }
@@ -521,7 +521,7 @@ pub const Data = struct {
         defer st.finalize();
         const wild = dialect.prefixWildcard();
         for (prefixes, 0..) |p, i| {
-            const pat = try std.fmt.allocPrint(self.alloc, "{s}{s}", .{ p, wild });
+            const pat = try self.alloc.print("{s}{s}", .{ p, wild });
             defer self.alloc.free(pat); // bind copies the bytes at bind time
             try st.bindText(@intCast(i + 1), pat);
         }

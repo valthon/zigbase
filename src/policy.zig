@@ -101,7 +101,7 @@ pub fn decide(col: schema.Collection, action: Action, rctx: *const request.Reque
 /// Allocations are on `alloc`.
 fn andPredicate(alloc: std.mem.Allocator, guard: ?Guard, sql: []const u8, extra: []const compiler.Param) std.mem.Allocator.Error!Guard {
     if (guard) |g| {
-        const where = try std.fmt.allocPrint(alloc, "({s}) AND ({s})", .{ g.where_sql, sql });
+        const where = try alloc.print("({s}) AND ({s})", .{ g.where_sql, sql });
         const params = try alloc.alloc(compiler.Param, g.params.len + extra.len);
         @memcpy(params[0..g.params.len], g.params);
         @memcpy(params[g.params.len..], extra);

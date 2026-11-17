@@ -298,7 +298,7 @@ fn linkCount(alloc: std.mem.Allocator, conn: *db.Db, collection_ref: []const u8,
 fn passwordIsSet(alloc: std.mem.Allocator, conn: *db.Db, table: []const u8, rid: []const u8) !bool {
     const qtbl = try ddl.quoteIdent(alloc, table);
     defer alloc.free(qtbl);
-    const sql = try std.fmt.allocPrintSentinel(alloc, "SELECT \"passwordHash\" FROM {s} WHERE \"id\"=?1;", .{qtbl}, 0);
+    const sql = try alloc.printSentinel("SELECT \"passwordHash\" FROM {s} WHERE \"id\"=?1;", .{qtbl}, 0);
     var st = try prep(conn, sql);
     defer st.finalize();
     try st.bindText(1, rid);
@@ -383,7 +383,7 @@ const TestEnv = struct {
         env.tmp = std.testing.tmpDir(.{});
         const dir = try env.tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
         defer std.testing.allocator.free(dir);
-        const path = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/t.db", .{dir}, 0);
+        const path = try std.testing.allocator.printSentinel("{s}/t.db", .{dir}, 0);
         defer std.testing.allocator.free(path);
         env.pool = try db.Pool.init(std.testing.allocator, std.testing.io, path);
         {
@@ -493,7 +493,7 @@ test "unlink refuses the last credential of a password-less account" {
     const token = try jwt.sign(a, .{ .id = "r1", .collection = "users", .type = .auth, .iat = 0, .exp = 9999999999 }, &key);
     const p = [_]http.Param{ .{ .key = "col", .value = "users" }, .{ .key = "id", .value = "r1" }, .{ .key = "provider", .value = "google" } };
     var c = env.ctx(RequestArena.from(&arena), .DELETE, "", &p);
-    c.authorization = try std.fmt.allocPrint(a, "Bearer {s}", .{token});
+    c.authorization = try a.print("Bearer {s}", .{token});
     try std.testing.expectEqual(@as(u16, 400), (try unlinkProvider(&c)).status);
 }
 
@@ -516,7 +516,7 @@ test "unlink succeeds when another credential remains (password set)" {
     const token = try jwt.sign(a, .{ .id = "r2", .collection = "users", .type = .auth, .iat = 0, .exp = 9999999999 }, &key);
     const p = [_]http.Param{ .{ .key = "col", .value = "users" }, .{ .key = "id", .value = "r2" }, .{ .key = "provider", .value = "google" } };
     var c = env.ctx(RequestArena.from(&arena), .DELETE, "", &p);
-    c.authorization = try std.fmt.allocPrint(a, "Bearer {s}", .{token});
+    c.authorization = try a.print("Bearer {s}", .{token});
     try std.testing.expectEqual(@as(u16, 204), (try unlinkProvider(&c)).status);
 }
 
@@ -624,7 +624,7 @@ test "OAuth identity cannot cross auth collections with overlapping imported IDs
     var ctx = env.ctx(request_arena, .POST, "", &.{});
     const key = crypto.deriveKey(env.app.jwt_secret, "tk");
     const tok = try jwt_mod.sign(a, .{ .id = "sameid", .collection = other.name, .type = .auth, .iat = 0, .exp = 9999999999 }, &key);
-    const bearer = try std.fmt.allocPrint(a, "Bearer {s}", .{tok});
+    const bearer = try a.print("Bearer {s}", .{tok});
     for ([_][]const u8{ "", bearer }) |authorization| {
         ctx.authorization = authorization;
         const result = try resolveRecordFromIdentity(&ctx, w, other, "google", identity);

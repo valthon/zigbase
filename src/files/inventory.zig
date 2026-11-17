@@ -90,7 +90,7 @@ test "retired namespace cannot resolve another collection through an ID name ali
         .fields = &.{.{ .id = "photo", .name = "photo", .options = .{ .file = .{} } }},
     });
     defer alias.deinit(a);
-    const sql = try std.fmt.allocPrintSentinel(a, "INSERT INTO \"{s}\" (id,created,updated,photo) VALUES ('r1','','','a.png');", .{alias.name}, 0);
+    const sql = try a.printSentinel("INSERT INTO \"{s}\" (id,created,updated,photo) VALUES ('r1','','','a.png');", .{alias.name}, 0);
     defer a.free(sql);
     try conn.exec(sql);
     try std.testing.expectEqual(Reference.unknown, reference(a, &conn, "photos/r1/a.png"));
@@ -217,7 +217,7 @@ test "reconciliation parses metadata once per fresh check and preserves stricter
     try std.testing.expectEqual(Reference.referenced, reference(a, &conn, "images/r1/a.png"));
     try std.testing.expectEqual(Reference.candidate_unreferenced, reference(a, &conn, "missing/r1/a.png"));
     try std.testing.expectEqual(Reference.unknown, reconciliationReference(a, &conn, "missing/r1/a.png"));
-    const alias = try std.fmt.allocPrint(a, "{s}/r1/a.png", .{col.id});
+    const alias = try a.print("{s}/r1/a.png", .{col.id});
     defer a.free(alias);
     try std.testing.expectEqual(Reference.candidate_unreferenced, reference(a, &conn, alias));
     try std.testing.expectEqual(Reference.unknown, reconciliationReference(a, &conn, alias));

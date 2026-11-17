@@ -378,7 +378,7 @@ pub fn makeEphemeralDir(io: Io, gpa: Allocator, environ: *const std.process.Envi
     // genHex's `len` is the number of HEX CHARACTERS, not bytes (src/crypto.zig).
     const suffix = try @import("crypto.zig").genHex(io, gpa, 8);
     defer gpa.free(suffix);
-    const path = try std.fmt.allocPrint(gpa, "{s}/{s}{d}-{s}", .{
+    const path = try gpa.print("{s}/{s}{d}-{s}", .{
         base, ephemeral_prefix, std.c.getpid(), suffix,
     });
     errdefer gpa.free(path);
@@ -417,7 +417,7 @@ pub fn runVerb(
     follow: bool,
     timeout_ms: u32,
 ) noreturn {
-    if (builtin.os.tag == .windows) {
+    if (builtin.target.os.tag == .windows) {
         std.debug.print("error: `zigbase serve {s}` is not supported on Windows (use the official Docker image)\n", .{@tagName(verb)});
         std.process.exit(1);
     }
@@ -437,7 +437,7 @@ fn renderWaitReady(gpa: Allocator, lf: serve_session.LockFile, json: bool) error
     if (!json) return renderStatusText(gpa, lf, true);
     const status = try renderStatusJson(gpa, lf, true);
     defer gpa.free(status);
-    return std.fmt.allocPrint(gpa, "{{\"ready\":true,{s}", .{status[1..]});
+    return gpa.print("{{\"ready\":true,{s}", .{status[1..]});
 }
 
 fn finishWait(gpa: Allocator, lf: serve_session.LockFile, json: bool, output: *?[]u8) WaitOutcome {
@@ -804,7 +804,7 @@ pub fn background(
     raw_args: []const []const u8,
     environ_map: *std.process.Environ.Map,
 ) noreturn {
-    if (builtin.os.tag == .windows) {
+    if (builtin.target.os.tag == .windows) {
         std.debug.print("error: serve --background is not supported on Windows (use the official Docker image)\n", .{});
         std.process.exit(1);
     }
@@ -1016,7 +1016,7 @@ pub fn openSession(io: Io, gpa: Allocator, args: SessionArgs) error{OutOfMemory}
     // clock honors the test's frozen-clock override, and every other wall-clock read in this
     // codebase routes through it.
     _ = serve_session.formatIso(&s.started_at, @intCast(clock.nowUnix(io)));
-    s.url = std.fmt.allocPrint(gpa, "http://{s}:{d}", .{
+    s.url = gpa.print("http://{s}:{d}", .{
         serve_session.probeHost(args.host), args.port,
     }) catch |e| {
         // The lock is already held; drop it before propagating, or a failed

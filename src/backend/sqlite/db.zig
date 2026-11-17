@@ -36,7 +36,7 @@ test "read-only open inspects an existing database and cannot create or write" {
     defer tmp.cleanup();
     const root = try tmp.dir.realPathFileAlloc(io, ".", a);
     defer a.free(root);
-    const path = try std.fmt.allocPrintSentinel(a, "{s}/data.db", .{root}, 0);
+    const path = try a.printSentinel("{s}/data.db", .{root}, 0);
     defer a.free(path);
     var writer = try Db.open(path);
     try writer.exec("CREATE TABLE sample (value TEXT); INSERT INTO sample VALUES ('ok');");
@@ -50,7 +50,7 @@ test "read-only open inspects an existing database and cannot create or write" {
     try std.testing.expectEqualStrings("ok", stmt.columnText(0));
     try std.testing.expectError(error.ExecFailed, reader.exec("INSERT INTO sample VALUES ('no');"));
 
-    const missing = try std.fmt.allocPrintSentinel(a, "{s}/missing.db", .{root}, 0);
+    const missing = try a.printSentinel("{s}/missing.db", .{root}, 0);
     defer a.free(missing);
     try std.testing.expectError(error.OpenFailed, Db.openReadOnly(missing));
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(io, missing, .{}));
@@ -805,7 +805,7 @@ test "pool: a reader sees writes committed by the writer (WAL)" {
     // realPathFileAlloc returns [:0]u8 (null-terminated) in Zig 0.16.
     const dir_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(dir_path);
-    const db_path = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/test.db", .{dir_path}, 0);
+    const db_path = try std.testing.allocator.printSentinel("{s}/test.db", .{dir_path}, 0);
     defer std.testing.allocator.free(db_path);
 
     var pool = try Pool.init(std.testing.allocator, std.testing.io, db_path);
@@ -846,7 +846,7 @@ test "pool: every query-serving connection registers sqlite-vec (#488)" {
     defer tmp.cleanup();
     const dir_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(dir_path);
-    const db_path = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/test.db", .{dir_path}, 0);
+    const db_path = try std.testing.allocator.printSentinel("{s}/test.db", .{dir_path}, 0);
     defer std.testing.allocator.free(db_path);
 
     var pool = try Pool.init(std.testing.allocator, std.testing.io, db_path);
@@ -902,7 +902,7 @@ test "pool: acquireReader reuses a warm connection and sees committed writes" {
     defer tmp.cleanup();
     const dir_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(dir_path);
-    const db_path = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/test.db", .{dir_path}, 0);
+    const db_path = try std.testing.allocator.printSentinel("{s}/test.db", .{dir_path}, 0);
     defer std.testing.allocator.free(db_path);
 
     var pool = try Pool.init(std.testing.allocator, std.testing.io, db_path);
@@ -950,7 +950,7 @@ test "pool: releaseReader closes overflow beyond the warm pool capacity" {
     defer tmp.cleanup();
     const dir_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(dir_path);
-    const db_path = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/test.db", .{dir_path}, 0);
+    const db_path = try std.testing.allocator.printSentinel("{s}/test.db", .{dir_path}, 0);
     defer std.testing.allocator.free(db_path);
 
     var pool = try Pool.init(std.testing.allocator, std.testing.io, db_path);
@@ -981,7 +981,7 @@ test "pool: cache_kib lever bounds the page cache on writer AND readers" {
     defer tmp.cleanup();
     const dir_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(dir_path);
-    const db_path = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/test.db", .{dir_path}, 0);
+    const db_path = try std.testing.allocator.printSentinel("{s}/test.db", .{dir_path}, 0);
     defer std.testing.allocator.free(db_path);
 
     // 512 KiB budget -> PRAGMA cache_size reports -512 (negative = KiB) on every connection.
@@ -1002,7 +1002,7 @@ test "pool: default cache_kib applies the memory-conscious default to connection
     defer tmp.cleanup();
     const dir_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(dir_path);
-    const db_path = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/test.db", .{dir_path}, 0);
+    const db_path = try std.testing.allocator.printSentinel("{s}/test.db", .{dir_path}, 0);
     defer std.testing.allocator.free(db_path);
 
     var pool = try Pool.init(std.testing.allocator, std.testing.io, db_path);

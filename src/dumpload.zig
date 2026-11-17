@@ -506,8 +506,8 @@ fn clearTarget(a: std.mem.Allocator, source: *db.Db, target: *db.Db, table: []co
     if (!any) return; // no shared columns → copyTable skips it, so leave it untouched
 
     const clear_sql = switch (db.dbBackend(target)) {
-        .postgres => try std.fmt.allocPrintSentinel(al, "TRUNCATE TABLE {s} RESTART IDENTITY CASCADE;", .{try ddl.quoteIdent(al, table)}, 0),
-        .sqlite => try std.fmt.allocPrintSentinel(al, "DELETE FROM {s};", .{try ddl.quoteIdent(al, table)}, 0),
+        .postgres => try al.printSentinel("TRUNCATE TABLE {s} RESTART IDENTITY CASCADE;", .{try ddl.quoteIdent(al, table)}, 0),
+        .sqlite => try al.printSentinel("DELETE FROM {s};", .{try ddl.quoteIdent(al, table)}, 0),
     };
     try target.exec(clear_sql);
 }
@@ -555,15 +555,15 @@ fn copyTable(a: std.mem.Allocator, source: *db.Db, target: *db.Db, table: []cons
             try params.appendSlice(al, ",");
         }
         try collist.appendSlice(al, try ddl.quoteIdent(al, c));
-        try params.appendSlice(al, try std.fmt.allocPrint(al, "?{d}", .{i + 1}));
+        try params.appendSlice(al, try al.print("?{d}", .{i + 1}));
     }
 
     // Deterministic source iteration order so the target's regenerated `_events._seq` IDENTITY is
     // assigned in source insertion order (SQLite `rowid` is exactly that). Other tables don't need
     // it (no server-generated ordering column).
     const order_by = orderClause(table, db.dbBackend(source));
-    const sel_sql = try std.fmt.allocPrintSentinel(al, "SELECT {s} FROM {s}{s};", .{ collist.items, try ddl.quoteIdent(al, table), order_by }, 0);
-    const ins_raw = try std.fmt.allocPrint(al, "INSERT INTO {s} ({s}) VALUES ({s});", .{ try ddl.quoteIdent(al, table), collist.items, params.items });
+    const sel_sql = try al.printSentinel("SELECT {s} FROM {s}{s};", .{ collist.items, try ddl.quoteIdent(al, table), order_by }, 0);
+    const ins_raw = try al.print("INSERT INTO {s} ({s}) VALUES ({s});", .{ try ddl.quoteIdent(al, table), collist.items, params.items });
 
     var sel = try source.prepare(sel_sql);
     defer sel.finalize();
@@ -651,7 +651,7 @@ fn listColumns(a: std.mem.Allocator, d: *db.Db, table: []const u8, include_ident
     switch (db.dbBackend(d)) {
         .sqlite => {
             // PRAGMA cannot be parameterized; quote the (validated) identifier inline.
-            const sql = try std.fmt.allocPrintSentinel(a, "PRAGMA table_info({s});", .{try ddl.quoteIdent(a, table)}, 0);
+            const sql = try a.printSentinel("PRAGMA table_info({s});", .{try ddl.quoteIdent(a, table)}, 0);
             var st = try d.prepare(sql);
             defer st.finalize();
             while (try st.step()) try out.append(a, try a.dupe(u8, st.columnText(1))); // col 1 = name
@@ -685,7 +685,7 @@ fn tableExists(a: std.mem.Allocator, d: *db.Db, table: []const u8) Error!bool {
 }
 
 fn countRows(a: std.mem.Allocator, d: *db.Db, table: []const u8) Error!usize {
-    const sql = try std.fmt.allocPrintSentinel(a, "SELECT COUNT(*) FROM {s};", .{try ddl.quoteIdent(a, table)}, 0);
+    const sql = try a.printSentinel("SELECT COUNT(*) FROM {s};", .{try ddl.quoteIdent(a, table)}, 0);
     var st = try d.prepare(sql);
     defer st.finalize();
     if (!try st.step()) return 0;

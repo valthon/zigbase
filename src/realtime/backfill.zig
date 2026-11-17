@@ -300,7 +300,7 @@ test "topic slot replacement and process restart require reset" {
     defer std.testing.allocator.free(checkpoint);
     for (0..max_topics) |i| {
         var name_buffer: [32]u8 = undefined;
-        const name = try std.fmt.bufPrint(&name_buffer, "topic{d}", .{i});
+        const name = try std.mem.print(&name_buffer, "topic{d}", .{i});
         try store.append(name, "{}");
     }
     try std.testing.expectError(error.ResetRequired, store.page(arena, "old", checkpoint, 1));
@@ -326,7 +326,7 @@ test "cursorless reads never displace occupied slots or allocate when full" {
     try store.append("oldest", "retained");
     for (0..max_topics - 1) |i| {
         var name_buffer: [32]u8 = undefined;
-        const name = try std.fmt.bufPrint(&name_buffer, "topic{d}", .{i});
+        const name = try std.mem.print(&name_buffer, "topic{d}", .{i});
         _ = try store.page(arena, name, null, 1);
     }
     const generation = store.generation;
@@ -413,7 +413,7 @@ test "full slot table retains prior generations on every replacement allocation 
     defer std.testing.allocator.free(checkpoint);
     for (0..max_topics - 1) |i| {
         var name_buffer: [32]u8 = undefined;
-        const name = try std.fmt.bufPrint(&name_buffer, "topic{d}", .{i});
+        const name = try std.mem.print(&name_buffer, "topic{d}", .{i});
         try store.append(name, "{}");
     }
     const generation = store.generation;

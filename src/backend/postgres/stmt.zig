@@ -73,13 +73,13 @@ pub const Stmt = struct {
 
     pub fn bindInt(self: *Stmt, idx: c_int, val: i64) StmtError!void {
         const i = try self.ensureParam(idx);
-        self.params.items[i] = std.fmt.allocPrint(self.param_arena.allocator(), "{d}", .{val}) catch return StmtError.OutOfMemory;
+        self.params.items[i] = self.param_arena.allocator().print("{d}", .{val}) catch return StmtError.OutOfMemory;
     }
 
     pub fn bindDouble(self: *Stmt, idx: c_int, val: f64) StmtError!void {
         const i = try self.ensureParam(idx);
         // Round-trippable shortest representation; PG accepts standard float text.
-        self.params.items[i] = std.fmt.allocPrint(self.param_arena.allocator(), "{d}", .{val}) catch return StmtError.OutOfMemory;
+        self.params.items[i] = self.param_arena.allocator().print("{d}", .{val}) catch return StmtError.OutOfMemory;
     }
 
     pub fn bindNull(self: *Stmt, idx: c_int) StmtError!void {

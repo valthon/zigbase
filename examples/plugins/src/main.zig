@@ -97,7 +97,7 @@ const AuditStorage = struct {
 
     pub fn create(gpa: std.mem.Allocator, io: std.Io, cfg: zigbase.Config) !AuditStorage {
         _ = io;
-        const root = try std.fmt.allocPrint(gpa, "{s}/storage", .{cfg.data_dir});
+        const root = try gpa.print("{s}/storage", .{cfg.data_dir});
         var local = zigbase.LocalStorage.init(root);
         const inner = local.storage();
         return .{ .gpa = gpa, .root = root, .local = local, .inner = inner };

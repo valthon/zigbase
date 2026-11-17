@@ -219,7 +219,7 @@ pub fn compute(
                     .kind = .retype_field,
                     .collection = want.name,
                     .field = wf.name,
-                    .detail = try std.fmt.allocPrint(sa, "{s} -> {s}", .{ @tagName(hf.fieldType()), @tagName(wf.fieldType()) }),
+                    .detail = try sa.print("{s} -> {s}", .{ @tagName(hf.fieldType()), @tagName(wf.fieldType()) }),
                 });
                 continue;
             }
@@ -228,7 +228,7 @@ pub fn compute(
                     .kind = .rename_field,
                     .collection = want.name,
                     .field = wf.name,
-                    .detail = try std.fmt.allocPrint(sa, "{s} -> {s}", .{ hf.name, wf.name }),
+                    .detail = try sa.print("{s} -> {s}", .{ hf.name, wf.name }),
                 });
                 continue;
             }
