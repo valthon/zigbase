@@ -3,7 +3,19 @@ export function cookie(name) {
   const m = document.cookie.match(new RegExp('(?:^|; )' + name + '=([^;]*)'));
   return m ? decodeURIComponent(m[1]) : '';
 }
-export async function api(method, path, body, isForm) {
+// Refresh rotates the auth cookie and its bound CSRF value. Browsers can defer
+// dispatch (e.g. behind an intercepted request), attaching the new cookie to a
+// request whose JS header was sampled before refresh. Keep unsafe requests in
+// order through response consumption, and sample CSRF only when their turn starts.
+let unsafeRequests = Promise.resolve();
+export function api(method, path, body, isForm) {
+  if (['GET', 'HEAD'].includes(method)) return request(method, path, body, isForm);
+  const pending = unsafeRequests.then(() => request(method, path, body, isForm));
+  // A rejected write must not prevent the next request from being dispatched.
+  unsafeRequests = pending.catch(() => {});
+  return pending;
+}
+async function request(method, path, body, isForm) {
   const headers = {};
   if (!['GET', 'HEAD'].includes(method)) headers['X-CSRF-Token'] = cookie('zb_csrf');
   let payload = body;
