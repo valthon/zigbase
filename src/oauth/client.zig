@@ -115,7 +115,7 @@ fn httpCall(ctx: *anyopaque, alloc: std.mem.Allocator, method: Method, url: []co
         };
     };
 
-    return .{ .status = @intFromEnum(res.status), .body = fw.buffered() };
+    return .{ .status = @backingInt(res.status), .body = fw.buffered() };
 }
 
 /// A production transport backed by std.http.Client (TLS via std.crypto.tls). `hc` must outlive use.

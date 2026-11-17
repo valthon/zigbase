@@ -669,7 +669,7 @@ test "invalid input and nested transactions do not mutate or end caller transact
     input.key = "";
     try std.testing.expectError(error.InvalidScope, I.execute(a, &conn, input, op.callbacks()));
     input = test_input;
-    input.payload = "x" ** 33;
+    input.payload = (&@as([33]u8, @splat('x')));
     try std.testing.expectError(error.PayloadTooLarge, I.execute(a, &conn, input, op.callbacks()));
     input = test_input;
     input.now = std.math.maxInt(i64);

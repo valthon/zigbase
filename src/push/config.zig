@@ -25,10 +25,10 @@ pub const Runtime = struct {
     configured: bool = false,
     /// Application-server VAPID public key (uncompressed SEC1, 65 bytes). Advertised to the
     /// browser as the subscription's `applicationServerKey` and sent as the header `k=`.
-    vapid_public: [65]u8 = [_]u8{0} ** 65,
+    vapid_public: [65]u8 = @as([65]u8, @splat(0)),
     /// Application-server VAPID private key (P-256 scalar, 32 bytes). SECRET — used to sign
     /// the VAPID JWT. Never logged.
-    vapid_private: [32]u8 = [_]u8{0} ** 32,
+    vapid_private: [32]u8 = @as([32]u8, @splat(0)),
 };
 
 pub const KeyError = error{

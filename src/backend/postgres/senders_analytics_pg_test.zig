@@ -557,15 +557,15 @@ test "analytics.summaryExists resolves the summary table through search_path on 
     // Statement text lives in fixed stack buffers (no allocation to leak-check).
     var drop_buf: [64]u8 = undefined;
     var buf: [160]u8 = undefined;
-    const drop = try std.fmt.bufPrintZ(&drop_buf, "DROP SCHEMA zb487_{s} CASCADE;", .{suffix});
-    try conn.exec(try std.fmt.bufPrintZ(&buf, "CREATE SCHEMA zb487_{s};", .{suffix}));
+    const drop = try std.mem.printSentinel(&drop_buf, "DROP SCHEMA zb487_{s} CASCADE;", .{suffix}, 0);
+    try conn.exec(try std.mem.printSentinel(&buf, "CREATE SCHEMA zb487_{s};", .{suffix}, 0));
     defer conn.exec(drop) catch |err| std.log.err("pg 487 schema cleanup failed: {s}", .{@errorName(err)});
-    try conn.exec(try std.fmt.bufPrintZ(&buf, "CREATE TABLE zb487_{s}.\"_rollup_later\" (\"bucket\" TEXT);", .{suffix}));
-    try conn.exec(try std.fmt.bufPrintZ(&buf, "CREATE TABLE zb487_{s}.\"_rollup_Mixed\" (\"bucket\" TEXT);", .{suffix}));
+    try conn.exec(try std.mem.printSentinel(&buf, "CREATE TABLE zb487_{s}.\"_rollup_later\" (\"bucket\" TEXT);", .{suffix}, 0));
+    try conn.exec(try std.mem.printSentinel(&buf, "CREATE TABLE zb487_{s}.\"_rollup_Mixed\" (\"bucket\" TEXT);", .{suffix}, 0));
 
     // The schema is LATER on the path than the current schema: an unqualified read finds the table
     // there, so the existence check must too.
-    try conn.exec(try std.fmt.bufPrintZ(&buf, "SET search_path TO public, zb487_{s};", .{suffix}));
+    try conn.exec(try std.mem.printSentinel(&buf, "SET search_path TO public, zb487_{s};", .{suffix}, 0));
     try testing.expect(try analytics.summaryExists(&conn, "_rollup_later"));
     try testing.expect(try analytics.summaryExists(&conn, "_rollup_Mixed"));
     try testing.expect(!try analytics.summaryExists(&conn, "_rollup_mixed"));

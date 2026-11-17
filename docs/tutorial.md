@@ -24,7 +24,7 @@ Build the binary and create a superuser (collection management is superuser-only
 then start serving:
 
 ```sh
-mise install                                     # Zig 0.16.0, pinned in mise.toml
+mise install                                     # Zig 0.17.1, pinned in mise.toml
 zig build                                         # -> zig-out/bin/zigbase
 ./zig-out/bin/zigbase superuser create --email admin@example.com --password "a-strong-password" --data-dir ./zb_data
 # --insecure-cookies: this tutorial runs over plain HTTP, and auth cookies are Secure by default.

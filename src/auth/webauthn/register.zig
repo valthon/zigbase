@@ -294,7 +294,7 @@ test "register: happy path — EC2/ES256 registration succeeds" {
     const origin = "https://example.test";
     const challenge_raw = [_]u8{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x20 };
     const cred_id = [_]u8{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00, 0x11 };
-    const aaguid = [_]u8{0} ** 16;
+    const aaguid = @as([16]u8, @splat(0));
 
     var x: [32]u8 = undefined;
     var y: [32]u8 = undefined;
@@ -335,9 +335,9 @@ test "register: negative — wrong rp_id causes RpIdMismatch" {
     const alloc = std.testing.allocator;
     const rp_id = "example.test";
     const origin = "https://example.test";
-    const challenge_raw = [_]u8{0x42} ** 16;
+    const challenge_raw = @as([16]u8, @splat(0x42));
     const cred_id = [_]u8{ 0x01, 0x02, 0x03, 0x04 };
-    const aaguid = [_]u8{0} ** 16;
+    const aaguid = @as([16]u8, @splat(0));
 
     var x: [32]u8 = undefined;
     var y: [32]u8 = undefined;
@@ -370,9 +370,9 @@ test "register: negative — UP not set causes UserNotPresent" {
     const alloc = std.testing.allocator;
     const rp_id = "example.test";
     const origin = "https://example.test";
-    const challenge_raw = [_]u8{0x43} ** 16;
+    const challenge_raw = @as([16]u8, @splat(0x43));
     const cred_id = [_]u8{ 0x01, 0x02, 0x03, 0x04 };
-    const aaguid = [_]u8{0} ** 16;
+    const aaguid = @as([16]u8, @splat(0));
 
     var x: [32]u8 = undefined;
     var y: [32]u8 = undefined;
@@ -405,9 +405,9 @@ test "register: negative — fmt:packed rejected with UnsupportedAttestationForm
     const alloc = std.testing.allocator;
     const rp_id = "example.test";
     const origin = "https://example.test";
-    const challenge_raw = [_]u8{0x44} ** 16;
+    const challenge_raw = @as([16]u8, @splat(0x44));
     const cred_id = [_]u8{ 0x01, 0x02, 0x03, 0x04 };
-    const aaguid = [_]u8{0} ** 16;
+    const aaguid = @as([16]u8, @splat(0));
 
     var x: [32]u8 = undefined;
     var y: [32]u8 = undefined;
@@ -459,10 +459,10 @@ test "register: negative — wrong challenge causes ChallengeMismatch" {
     const alloc = std.testing.allocator;
     const rp_id = "example.test";
     const origin = "https://example.test";
-    const stored_challenge = [_]u8{0x11} ** 16;
-    const wrong_challenge = [_]u8{0x22} ** 16;
+    const stored_challenge = @as([16]u8, @splat(0x11));
+    const wrong_challenge = @as([16]u8, @splat(0x22));
     const cred_id = [_]u8{ 0x01, 0x02, 0x03, 0x04 };
-    const aaguid = [_]u8{0} ** 16;
+    const aaguid = @as([16]u8, @splat(0));
 
     var x: [32]u8 = undefined;
     var y: [32]u8 = undefined;
@@ -495,9 +495,9 @@ test "register: negative — wrong origin causes OriginMismatch" {
     const alloc = std.testing.allocator;
     const rp_id = "example.test";
     const origin = "https://example.test";
-    const challenge_raw = [_]u8{0x55} ** 16;
+    const challenge_raw = @as([16]u8, @splat(0x55));
     const cred_id = [_]u8{ 0x01, 0x02, 0x03, 0x04 };
-    const aaguid = [_]u8{0} ** 16;
+    const aaguid = @as([16]u8, @splat(0));
 
     var x: [32]u8 = undefined;
     var y: [32]u8 = undefined;
@@ -530,9 +530,9 @@ test "register: negative — wrong clientData type (webauthn.get) causes TypeMis
     const alloc = std.testing.allocator;
     const rp_id = "example.test";
     const origin = "https://example.test";
-    const challenge_raw = [_]u8{0x66} ** 16;
+    const challenge_raw = @as([16]u8, @splat(0x66));
     const cred_id = [_]u8{ 0x01, 0x02, 0x03, 0x04 };
-    const aaguid = [_]u8{0} ** 16;
+    const aaguid = @as([16]u8, @splat(0));
 
     var x: [32]u8 = undefined;
     var y: [32]u8 = undefined;

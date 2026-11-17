@@ -8,9 +8,9 @@ pub fn resolve(comptime cfg: anytype) ?Config {
     if (!@hasField(@TypeOf(cfg), "admission")) return null;
     if (@typeInfo(@TypeOf(cfg.admission)) != .@"struct")
         @compileError(".admission must be a struct with admission limits");
-    for (std.meta.fields(@TypeOf(cfg.admission))) |field| {
-        if (!std.mem.eql(u8, field.name, "max_requests") and !std.mem.eql(u8, field.name, "max_work") and !std.mem.eql(u8, field.name, "max_job_bytes"))
-            @compileError("unknown .admission field: " ++ field.name);
+    for (@typeInfo(@TypeOf(cfg.admission)).@"struct".field_names) |field| {
+        if (!std.mem.eql(u8, field, "max_requests") and !std.mem.eql(u8, field, "max_work") and !std.mem.eql(u8, field, "max_job_bytes"))
+            @compileError("unknown .admission field: " ++ field);
     }
     const value: ?u32 = if (@hasField(@TypeOf(cfg.admission), "max_requests")) cfg.admission.max_requests else null;
     if (value != null and value.? == 0) @compileError(".admission.max_requests must be positive; omit .max_requests to disable HTTP admission");

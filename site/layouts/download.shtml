@@ -3,7 +3,7 @@
 <main id="main">
  <header class="dl__head"> <p class="dl__eyebrow">Download</p> <h1 class="dl__title">Get ZigBase</h1> <p class="dl__lede">
 Grab a <strong>prebuilt single binary</strong> for your platform, build
-        it <strong>from source</strong> with Zig 0.16, or pull ZigBase in as an
+        it <strong>from source</strong> with Zig 0.17.1, or pull ZigBase in as an
 <strong>embeddable library</strong>. Current release:
 <code>v0.13.0</code>, Apache-2.0.
 </p> </header> <section class="dl__section" aria-labelledby="binaries"> <h2 id="binaries">Release binaries</h2> <p>
@@ -31,14 +31,14 @@ The official image ships the same binary as the release tarballs above — no
 tags are published to <a href="https://github.com/valthon/zigbase/pkgs/container/zigbase" target="_blank" rel="noopener noreferrer">ghcr.io/valthon/zigbase</a>.
         See the <a href="$site.page('docs/docker').link().suffix('')">Docker guide</a> for the data-volume and non-root-user details.
 </p> </section> <section class="dl__section" aria-labelledby="from-source"> <h2 id="from-source">Build from source</h2> <p>
-ZigBase pins <strong>Zig 0.16</strong> via <code>mise.toml</code>.
+ZigBase pins <strong>Zig 0.17.1</strong> via <code>mise.toml</code>.
         Install the toolchain, then build:
-</p> <pre class="dl__code"><code>mise install                 # installs Zig 0.16.0 (pinned in mise.toml)
+</p> <pre class="dl__code"><code>mise install                 # installs Zig 0.17.1 (pinned in mise.toml)
 zig build                    # -&gt; zig-out/bin/zigbase
 ./zig-out/bin/zigbase serve --data-dir ./zb_data</code></pre> <p>
 The produced binary lives at <code>zig-out/bin/zigbase</code>. If you'd
         rather not install Zig globally, prefix with
-<code>mise exec zig@0.16.0 -- zig build</code>.
+<code>mise exec zig@0.17.1 -- zig build</code>.
 </p> </section> <section class="dl__section" aria-labelledby="as-library"> <h2 id="as-library">Use as a library</h2> <p>
 Build your own backend on top of ZigBase. Fetch it as a dependency:
 </p> <pre class="dl__code"><code>zig fetch --save git+https://github.com/valthon/zigbase</code></pre> <p>

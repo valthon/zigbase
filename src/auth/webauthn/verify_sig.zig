@@ -103,18 +103,18 @@ pub fn verify(key: cose.CoseKey, signature_base: []const u8, sig: []const u8) Ve
 
 test "verify_sig: ES256 happy path — DER signature verifies" {
     // Generate a deterministic key pair from a fixed seed.
-    const seed = [_]u8{0x42} ** 32;
+    const seed = @as([32]u8, @splat(0x42));
     const kp = try Ecdsa.KeyPair.generateDeterministic(seed);
 
     // Build a representative signature_base: 37-byte authData || 32-byte clientDataHash.
     // (In a real assertion: authData = rpIdHash[32]||flags[1]||signCount[4]; hash = SHA-256(clientDataJSON))
-    var auth_data = [_]u8{0xAA} ** 37;
+    var auth_data = @as([37]u8, @splat(0xAA));
     auth_data[32] = 0x05; // flags: UP | UV
     auth_data[33] = 0x00; // signCount BE u32 = 1
     auth_data[34] = 0x00;
     auth_data[35] = 0x00;
     auth_data[36] = 0x01;
-    const client_data_hash = [_]u8{0xBB} ** 32;
+    const client_data_hash = @as([32]u8, @splat(0xBB));
 
     // Concatenate: authData first, then the 32-byte hash (THE canonical order).
     var base: [37 + 32]u8 = undefined;
@@ -141,11 +141,11 @@ test "verify_sig: ES256 happy path — DER signature verifies" {
 }
 
 test "verify_sig: ES256 negative — flipped signature byte returns false or error (reject)" {
-    const seed = [_]u8{0x43} ** 32;
+    const seed = @as([32]u8, @splat(0x43));
     const kp = try Ecdsa.KeyPair.generateDeterministic(seed);
 
-    var auth_data = [_]u8{0xAA} ** 37;
-    const client_data_hash = [_]u8{0xBB} ** 32;
+    var auth_data = @as([37]u8, @splat(0xAA));
+    const client_data_hash = @as([32]u8, @splat(0xBB));
     var base: [37 + 32]u8 = undefined;
     @memcpy(base[0..37], &auth_data);
     @memcpy(base[37..], &client_data_hash);
@@ -173,11 +173,11 @@ test "verify_sig: ES256 negative — flipped signature byte returns false or err
 }
 
 test "verify_sig: ES256 negative — flipped signature_base byte returns false or error (reject)" {
-    const seed = [_]u8{0x44} ** 32;
+    const seed = @as([32]u8, @splat(0x44));
     const kp = try Ecdsa.KeyPair.generateDeterministic(seed);
 
-    var auth_data = [_]u8{0xAA} ** 37;
-    const client_data_hash = [_]u8{0xBB} ** 32;
+    var auth_data = @as([37]u8, @splat(0xAA));
+    const client_data_hash = @as([32]u8, @splat(0xBB));
     var base: [37 + 32]u8 = undefined;
     @memcpy(base[0..37], &auth_data);
     @memcpy(base[37..], &client_data_hash);
@@ -204,7 +204,7 @@ test "verify_sig: ES256 negative — flipped signature_base byte returns false o
 test "verify_sig: ES256 negative — raw 64-byte r||s must NOT verify as DER (DER-vs-raw guard)" {
     // This is THE classic WebAuthn bug: accepting raw r||s as if it were DER.
     // fromDer() must reject raw 64 bytes, so verify() must return an error (not true).
-    const seed = [_]u8{0x45} ** 32;
+    const seed = @as([32]u8, @splat(0x45));
     const kp = try Ecdsa.KeyPair.generateDeterministic(seed);
 
     var base: [37 + 32]u8 = undefined;
@@ -231,7 +231,7 @@ test "verify_sig: ES256 negative — raw 64-byte r||s must NOT verify as DER (DE
 }
 
 test "verify_sig: ES256 negative — truncated DER returns error.MalformedSignature" {
-    const seed = [_]u8{0x46} ** 32;
+    const seed = @as([32]u8, @splat(0x46));
     const kp = try Ecdsa.KeyPair.generateDeterministic(seed);
 
     var base: [37 + 32]u8 = undefined;
@@ -257,7 +257,7 @@ test "verify_sig: ES256 base-order sanity — authData||hash passes; hash||authD
     // Locks in the concatenation order: authData MUST come before the hash.
     // WebAuthn §7.2 step 20: "verify that sig is a valid signature over the
     // binary concatenation of authData and hash" — authData first.
-    const seed = [_]u8{0x47} ** 32;
+    const seed = @as([32]u8, @splat(0x47));
     const kp = try Ecdsa.KeyPair.generateDeterministic(seed);
 
     var auth_data: [37]u8 = undefined;
@@ -297,12 +297,12 @@ test "verify_sig: ES256 base-order sanity — authData||hash passes; hash||authD
 
 test "verify_sig: Ed25519 happy path — raw 64-byte signature verifies" {
     // Generate a deterministic Ed25519 key pair.
-    const seed: [32]u8 = [_]u8{0x55} ** 32;
+    const seed: [32]u8 = @as([32]u8, @splat(0x55));
     const kp = try Ed.KeyPair.generateDeterministic(seed);
 
-    var auth_data = [_]u8{0xAA} ** 37;
+    var auth_data = @as([37]u8, @splat(0xAA));
     auth_data[32] = 0x05;
-    const client_data_hash = [_]u8{0xBB} ** 32;
+    const client_data_hash = @as([32]u8, @splat(0xBB));
 
     var base: [37 + 32]u8 = undefined;
     @memcpy(base[0..37], &auth_data);
@@ -319,7 +319,7 @@ test "verify_sig: Ed25519 happy path — raw 64-byte signature verifies" {
 }
 
 test "verify_sig: Ed25519 negative — tampered message returns false or error (reject)" {
-    const seed: [32]u8 = [_]u8{0x56} ** 32;
+    const seed: [32]u8 = @as([32]u8, @splat(0x56));
     const kp = try Ed.KeyPair.generateDeterministic(seed);
 
     var base: [37 + 32]u8 = undefined;
@@ -339,9 +339,9 @@ test "verify_sig: Ed25519 negative — tampered message returns false or error (
 }
 
 test "verify_sig: Ed25519 negative — wrong length sig returns error.MalformedSignature" {
-    const key = cose.CoseKey{ .okp = .{ .alg = -8, .crv = 6, .x = [_]u8{0} ** 32 } };
-    const base = [_]u8{0} ** 69;
-    const bad_sig = [_]u8{0} ** 32; // 32 bytes, not 64
+    const key = cose.CoseKey{ .okp = .{ .alg = -8, .crv = 6, .x = @as([32]u8, @splat(0)) } };
+    const base = @as([69]u8, @splat(0));
+    const bad_sig = @as([32]u8, @splat(0)); // 32 bytes, not 64
     try std.testing.expectError(error.MalformedSignature, verify(key, &base, &bad_sig));
 }
 
@@ -349,11 +349,11 @@ test "verify_sig: RS256 key returns error.UnsupportedAlgorithm" {
     // RS256 is rejected cleanly — caller must treat this as "deny".
     // Document: to enable RS256, implement comptime modulus_len branching via
     //   std.crypto.Certificate.rsa.PKCS1v1_5Signature.verify(modulus_len, ...).
-    const n_bytes = [_]u8{0xCD} ** 256;
+    const n_bytes = @as([256]u8, @splat(0xCD));
     const e_bytes = [_]u8{ 0x01, 0x00, 0x01 };
     const key = cose.CoseKey{ .rsa = .{ .alg = -257, .n = &n_bytes, .e = &e_bytes } };
-    const base = [_]u8{0} ** 69;
-    const sig_bytes = [_]u8{0} ** 256;
+    const base = @as([69]u8, @splat(0));
+    const sig_bytes = @as([256]u8, @splat(0));
 
     try std.testing.expectError(error.UnsupportedAlgorithm, verify(key, &base, &sig_bytes));
 }

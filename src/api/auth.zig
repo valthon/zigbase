@@ -506,11 +506,11 @@ fn sessionSeqCol(conn: *db.Db) []const u8 {
 pub fn listSessions(alloc: std.mem.Allocator, conn: *db.Db, collection: []const u8, rid: []const u8) ![]SessionRow {
     const now = try nowUnix(conn);
     var sqlbuf: [320]u8 = undefined;
-    const sql = std.fmt.bufPrintZ(&sqlbuf,
+    const sql = std.mem.printSentinel(&sqlbuf,
         \\SELECT "id","created","lastSeen","userAgent","ip" FROM "_sessions"
         \\ WHERE "collectionRef" = ?1 AND "recordRef" = ?2 AND ("expires" IS NULL OR "expires" > ?3)
         \\ ORDER BY "created" DESC, {s} DESC;
-    , .{sessionSeqCol(conn)}) catch unreachable;
+    , .{sessionSeqCol(conn)}, 0) catch unreachable;
     var st = try prep(conn, sql);
     defer st.finalize();
     try st.bindText(1, collection);

@@ -78,8 +78,8 @@ and correctness, not about tooling.
 
 ## Development setup
 
-Every tool is pinned in [`mise.toml`](mise.toml) — Zig 0.16.0, Python 3.13, Node 24, Dart 3.12,
-JDK 17, Gradle 9.6. **The exact Zig version matters**; another 0.16.x is not guaranteed to work
+Every tool is pinned in [`mise.toml`](mise.toml) — Zig 0.17.1, Python 3.13, Node 24, Dart 3.12,
+JDK 17, Gradle 9.6. **The exact Zig version matters**; another Zig release is not guaranteed to work
 (and an unsupported version fails at compile time with a clear required-vs-actual message).
 
 ```sh
@@ -88,7 +88,7 @@ eval "$(mise activate bash)"          # ...then plain `zig`, `python`, `npm` are
 ```
 
 If you would rather not activate mise, prefix each command instead:
-`mise exec zig@0.16.0 -- zig build`. The commands below use the activated form.
+`mise exec zig@0.17.1 -- zig build`. The commands below use the activated form.
 
 **Platform:** Linux and macOS only. There is no Windows build — the embedded HTTP server depends on
 facil.io/zap. On a Windows host, develop in WSL2 or use the Docker image.
@@ -364,7 +364,7 @@ under the same terms. There is no separate CLA.
 
 Run `zig build bench -- --realtime-only --json` for the production
 `hub.frameForDelivery` authorization callback shared by WS and SSE. The private
-benchmark build defaults to ReleaseFast and disables test clock, entropy, and
+benchmark build defaults to fast and disables test clock, entropy, and
 capture seams. It measures 1/10/100/1000 serial subscriber callbacks with 1 KiB
 and 10 KiB body strings (the JSON envelope adds a few bytes), covering anonymous
 public records, authenticated ownership rules, tenant-scoped records, and an
@@ -387,8 +387,8 @@ these totals are not a measure of all heap traffic. Allocation metrics cover onl
 allocator: SQLite C allocations, database/cache setup, fixture payloads and
 connection storage are excluded. Every event must leave zero residual live
 bytes; unexpected denial, frame copying or cross-tenant delivery fails the run.
-CI runs these correctness checks under ReleaseSafe without timing thresholds;
-local measurements default to ReleaseFast. Successful rows omit residual live
+CI runs these correctness checks under safe without timing thresholds;
+local measurements default to fast. Successful rows omit residual live
 bytes because a nonzero residual fails before any row is emitted.
 
 This is a serial callback benchmark on a local SQLite database, not socket
@@ -397,8 +397,8 @@ one authenticated principal; tenant measurements use a retained account scope,
 not membership resolution. Transport queues/writes, subscription lookup,
 network overhead, PostgreSQL and writer contention are outside its scope.
 
-A local baseline on an Intel Core i9-13900K under Linux/WSL, Zig 0.16.0
-ReleaseFast, measured approximately 0.83 ms per 1,000-subscriber event for
+A local baseline on an Intel Core i9-13900K under Linux/WSL, Zig 0.17.1
+fast, measured approximately 0.83 ms per 1,000-subscriber event for
 public 1 KiB records, 18.4 ms for ownership authorization, 17.8 ms for tenant
 scoping and 14.3 ms for private custom topics. Increasing body size to 10 KiB
 raised public record delivery to about 5.9 ms and tenant delivery to 23.4 ms;

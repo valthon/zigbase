@@ -184,12 +184,12 @@ fn cosekeyFromKp(kp: Ecdsa.KeyPair) cose.CoseKey {
 
 test "verifyAssertion: happy path — valid assertion succeeds with new_sign_count=1, clone_suspected=false" {
     const alloc = testing.allocator;
-    const seed = [_]u8{0x10} ** 32;
+    const seed = @as([32]u8, @splat(0x10));
     const kp = try Ecdsa.KeyPair.generateDeterministic(seed);
 
     const rp_id = "example.test";
     const origin = "https://example.test";
-    const challenge_raw = [_]u8{0xAA} ** 16;
+    const challenge_raw = @as([16]u8, @splat(0xAA));
 
     const auth_data = buildAuthData(rp_id, 0x05, 1); // UP|UV, count=1
     const cdj = try buildClientDataJson(alloc, &challenge_raw, origin);
@@ -226,12 +226,12 @@ test "verifyAssertion: happy path — valid assertion succeeds with new_sign_cou
 
 test "verifyAssertion: tampered signature byte → error.SignatureInvalid" {
     const alloc = testing.allocator;
-    const seed = [_]u8{0x11} ** 32;
+    const seed = @as([32]u8, @splat(0x11));
     const kp = try Ecdsa.KeyPair.generateDeterministic(seed);
 
     const rp_id = "example.test";
     const origin = "https://example.test";
-    const challenge_raw = [_]u8{0xBB} ** 16;
+    const challenge_raw = @as([16]u8, @splat(0xBB));
 
     const auth_data = buildAuthData(rp_id, 0x05, 1);
     const cdj = try buildClientDataJson(alloc, &challenge_raw, origin);
@@ -260,12 +260,12 @@ test "verifyAssertion: tampered signature byte → error.SignatureInvalid" {
 
 test "verifyAssertion: UP flag off (flags=0x04) → error.UserNotPresent" {
     const alloc = testing.allocator;
-    const seed = [_]u8{0x12} ** 32;
+    const seed = @as([32]u8, @splat(0x12));
     const kp = try Ecdsa.KeyPair.generateDeterministic(seed);
 
     const rp_id = "example.test";
     const origin = "https://example.test";
-    const challenge_raw = [_]u8{0xCC} ** 16;
+    const challenge_raw = @as([16]u8, @splat(0xCC));
 
     // flags = 0x04 = UV only, no UP
     const auth_data = buildAuthData(rp_id, 0x04, 1);
@@ -290,13 +290,13 @@ test "verifyAssertion: UP flag off (flags=0x04) → error.UserNotPresent" {
 
 test "verifyAssertion: wrong rp_id → error.RpIdMismatch" {
     const alloc = testing.allocator;
-    const seed = [_]u8{0x13} ** 32;
+    const seed = @as([32]u8, @splat(0x13));
     const kp = try Ecdsa.KeyPair.generateDeterministic(seed);
 
     const rp_id = "example.test";
     const wrong_rp_id = "evil.test";
     const origin = "https://example.test";
-    const challenge_raw = [_]u8{0xDD} ** 16;
+    const challenge_raw = @as([16]u8, @splat(0xDD));
 
     // Build auth_data for the CORRECT rp_id
     const auth_data = buildAuthData(rp_id, 0x05, 1);
@@ -322,13 +322,13 @@ test "verifyAssertion: wrong rp_id → error.RpIdMismatch" {
 
 test "verifyAssertion: wrong challenge → error.ChallengeMismatch" {
     const alloc = testing.allocator;
-    const seed = [_]u8{0x14} ** 32;
+    const seed = @as([32]u8, @splat(0x14));
     const kp = try Ecdsa.KeyPair.generateDeterministic(seed);
 
     const rp_id = "example.test";
     const origin = "https://example.test";
-    const real_challenge = [_]u8{0xEE} ** 16;
-    const wrong_challenge = [_]u8{0xFF} ** 16;
+    const real_challenge = @as([16]u8, @splat(0xEE));
+    const wrong_challenge = @as([16]u8, @splat(0xFF));
 
     const auth_data = buildAuthData(rp_id, 0x05, 1);
     // clientDataJSON encodes real_challenge
@@ -354,13 +354,13 @@ test "verifyAssertion: wrong challenge → error.ChallengeMismatch" {
 
 test "verifyAssertion: wrong origin → error.OriginMismatch" {
     const alloc = testing.allocator;
-    const seed = [_]u8{0x15} ** 32;
+    const seed = @as([32]u8, @splat(0x15));
     const kp = try Ecdsa.KeyPair.generateDeterministic(seed);
 
     const rp_id = "example.test";
     const real_origin = "https://example.test";
     const wrong_origin = "https://evil.test";
-    const challenge_raw = [_]u8{0x11} ** 16;
+    const challenge_raw = @as([16]u8, @splat(0x11));
 
     const auth_data = buildAuthData(rp_id, 0x05, 1);
     // clientDataJSON has the real origin
@@ -386,12 +386,12 @@ test "verifyAssertion: wrong origin → error.OriginMismatch" {
 
 test "verifyAssertion: signCount clone — stored=5, assertion count=1 → clone_suspected=true" {
     const alloc = testing.allocator;
-    const seed = [_]u8{0x16} ** 32;
+    const seed = @as([32]u8, @splat(0x16));
     const kp = try Ecdsa.KeyPair.generateDeterministic(seed);
 
     const rp_id = "example.test";
     const origin = "https://example.test";
-    const challenge_raw = [_]u8{0x22} ** 16;
+    const challenge_raw = @as([16]u8, @splat(0x22));
 
     // Assertion reports count=1, but stored is 5 → clone signal
     const auth_data = buildAuthData(rp_id, 0x05, 1);
@@ -427,12 +427,12 @@ test "verifyAssertion: signCount clone — stored=5, assertion count=1 → clone
 
 test "verifyAssertion: both-zero signCount — stored=0, assertion count=0 → clone_suspected=false" {
     const alloc = testing.allocator;
-    const seed = [_]u8{0x17} ** 32;
+    const seed = @as([32]u8, @splat(0x17));
     const kp = try Ecdsa.KeyPair.generateDeterministic(seed);
 
     const rp_id = "example.test";
     const origin = "https://example.test";
-    const challenge_raw = [_]u8{0x33} ** 16;
+    const challenge_raw = @as([16]u8, @splat(0x33));
 
     // Both counts zero → passkey/authenticator with no counter — not a clone signal
     const auth_data = buildAuthData(rp_id, 0x05, 0);

@@ -770,7 +770,7 @@ fn rfc5322Date(ts: i64) Rfc5322DateBuf {
     _ = std.fmt.bufPrint(&buf, "{s}, {d:0>2} {s} {d:0>4} {d:0>2}:{d:0>2}:{d:0>2} +0000", .{
         dow_names[dow],
         @as(u32, month_day.day_index) + 1,
-        mon_names[@intFromEnum(month_day.month) - 1],
+        mon_names[@backingInt(month_day.month) - 1],
         year_day.year,
         day_secs.getHoursIntoDay(),
         day_secs.getMinutesIntoHour(),

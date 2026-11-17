@@ -204,7 +204,7 @@ pub const StopResult = enum { stopped, none, starting };
 /// `.gone` — "nothing to clean up" is the safe default for a failure mode we do
 /// not understand, and it never leads to killing something we are unsure about.
 fn probeAlive(pid: std.posix.pid_t) enum { alive, gone, not_ours } {
-    std.posix.kill(pid, @enumFromInt(0)) catch |err| return switch (err) {
+    std.posix.kill(pid, @fromBackingInt(@intCast(0))) catch |err| return switch (err) {
         error.ProcessNotFound => .gone,
         error.PermissionDenied => .not_ours,
         error.Unexpected => .gone,
@@ -789,7 +789,7 @@ fn failBackgroundStartup(io: Io, gpa: Allocator, log_path: []const u8, owned_eph
 /// its child, so a child that exits becomes a zombie — and a zombie still
 /// answers `kill(pid, 0)` successfully. Polling with signal 0 would therefore
 /// never notice a dead child and would stall for the whole 30s. `std.posix` has
-/// no `waitpid` in Zig 0.16.0; `Io.Threaded`'s own `childWaitPosix` reaps
+/// no `waitpid` in Zig 0.17.1; `Io.Threaded`'s own `childWaitPosix` reaps
 /// through `std.c.waitpid`, so this mirrors the standard library's own idiom
 /// rather than inventing one. Three outcomes, not two: `0` means still running;
 /// `child_pid` means it just exited (fail); `-1` is an ERROR (almost certainly

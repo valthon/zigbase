@@ -524,12 +524,12 @@ comptime {
     // Every name above must still be an error those layers can return: a rename there fails the
     // build here instead of silently turning an item failure into a repeating 500.
     const Sources = values.ValueError || values.EncryptError || policy.PolicyError;
-    for (@typeInfo(SnapshotItemError).error_set.?) |e| _ = @errorName(@field(Sources, e.name));
+    for (@typeInfo(SnapshotItemError).error_set.error_names.?) |e| _ = @errorName(@field(Sources, e));
 }
 
 fn isSnapshotItemError(err: anyerror) bool {
-    inline for (@typeInfo(SnapshotItemError).error_set.?) |e| {
-        if (err == @field(SnapshotItemError, e.name)) return true;
+    inline for (@typeInfo(SnapshotItemError).error_set.error_names.?) |e| {
+        if (err == @field(SnapshotItemError, e)) return true;
     }
     return false;
 }
@@ -569,7 +569,7 @@ fn snapshotSandbox(col: schema.Collection, snapshot: std.json.Value) !*SnapshotS
     var tmp = try db.Db.openMemory();
     errdefer tmp.close();
     try sandboxRegistry(&tmp);
-    try tmp.exec(try sa.dupeZ(u8, table_sql));
+    try tmp.exec(try sa.dupeSentinel(u8, table_sql, 0));
 
     // Direct INSERT of the snapshot's real id + every column, each converted back to the form the
     // LIVE table stores. (We bypass records.create on purpose: it regenerates the id and re-runs
@@ -2123,7 +2123,7 @@ test "frameForDelivery: committed mid-fanout policy and revocation affect later 
     const token = try jwt.sign(a, .{ .id = "u1", .collection = "principals", .type = .auth, .iat = 0, .exp = 9999999999 }, &key);
     defer a.free(token);
     const retained = Conn{ .auth = .{ .record = .null, .is_superuser = false, .exp = 9999999999, .token = token } };
-    const subscribers = [_]Conn{retained} ** 10;
+    const subscribers = @as([10]Conn, @splat(retained));
     const frame = "{\"action\":\"update\",\"record\":{\"id\":\"r1\"}}";
     // Warm col_cache for record/custom topics. The auth collection is re-read
     // directly per callback; mutations below must not reuse cached auth state.

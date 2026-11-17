@@ -34,8 +34,8 @@ jobs:
         uses: actions/cache@v5
         with:
           path: ${{ github.workspace }}/.zig-global
-          key: zig-global-${{ runner.os }}-zig0.16.0-${{ hashFiles('vendor/sqlite/sqlite3.c', 'build.zig', 'build.zig.zon') }}
-          restore-keys: zig-global-${{ runner.os }}-zig0.16.0-
+          key: zig-global-${{ runner.os }}-zig0.17.1-${{ hashFiles('vendor/sqlite/sqlite3.c', 'build.zig', 'build.zig.zon') }}
+          restore-keys: zig-global-${{ runner.os }}-zig0.17.1-
       - name: Cache npm downloads
         if: matrix.bundle == 'examples'
         uses: actions/cache@v5
@@ -52,19 +52,19 @@ jobs:
       - name: Build portable runtime fixtures (two compiler workers)
         if: matrix.bundle == 'core'
         run: >-
-          mise exec zig@0.16.0 -- zig build install dating-server auth2-server
+          mise exec zig@0.17.1 -- zig build install dating-server auth2-server
           features-fixture admission-fixture feature-remapped-fixture
           feature-disabled-fixture import-fixture full-fixture application-capacity
           -Dcpu=baseline -j2 --summary all
       - name: Build blog example consumer (dependency-graph proof)
         if: matrix.bundle == 'examples'
-        run: cd examples/blog && mise exec zig@0.16.0 -- zig build -Dcpu=baseline
+        run: cd examples/blog && mise exec zig@0.17.1 -- zig build -Dcpu=baseline
       - name: Build golfsim example consumer (realistic app)
         if: matrix.bundle == 'examples'
-        run: cd examples/golfsim && mise exec zig@0.16.0 -- zig build -Dcpu=baseline
+        run: cd examples/golfsim && mise exec zig@0.17.1 -- zig build -Dcpu=baseline
       - name: Build plugins example consumer (advanced framework surface)
         if: matrix.bundle == 'examples'
-        run: cd examples/plugins && mise exec zig@0.16.0 -- zig build -Dcpu=baseline
+        run: cd examples/plugins && mise exec zig@0.17.1 -- zig build -Dcpu=baseline
       - name: Pack core runtime paths
         if: matrix.bundle == 'core'
         run: tar -cf runtime-core.tar zig-out/bin
@@ -102,8 +102,8 @@ jobs:
         uses: actions/cache@v5
         with:
           path: ${{ github.workspace }}/.zig-global
-          key: zig-global-${{ runner.os }}-zig0.16.0-${{ hashFiles('vendor/sqlite/sqlite3.c', 'build.zig', 'build.zig.zon') }}
-          restore-keys: zig-global-${{ runner.os }}-zig0.16.0-
+          key: zig-global-${{ runner.os }}-zig0.17.1-${{ hashFiles('vendor/sqlite/sqlite3.c', 'build.zig', 'build.zig.zon') }}
+          restore-keys: zig-global-${{ runner.os }}-zig0.17.1-
       - name: Cache npm downloads
         uses: actions/cache@v5
         with:
@@ -111,33 +111,33 @@ jobs:
           key: npm-${{ runner.os }}-${{ hashFiles('**/package-lock.json') }}
           restore-keys: npm-${{ runner.os }}-
       - name: Build main zigbase binary
-        run: mise exec zig@0.16.0 -- zig build -Dcpu=baseline
+        run: mise exec zig@0.17.1 -- zig build -Dcpu=baseline
       - name: Build lean gating fixture
-        run: mise exec zig@0.16.0 -- zig build minimal-server
+        run: mise exec zig@0.17.1 -- zig build minimal-server
       - name: Build full gating fixture (positive control; also the browser suite's analytics-enabled fixture)
-        run: mise exec zig@0.16.0 -- zig build full-fixture -Dcpu=baseline
+        run: mise exec zig@0.17.1 -- zig build full-fixture -Dcpu=baseline
       - name: Build zigbase binary without dev-tools (custom-build proof; not a published artifact)
-        run: mise exec zig@0.16.0 -- zig build -Dcpu=baseline -Ddev-tools=false -p zig-out-devtools-off
+        run: mise exec zig@0.17.1 -- zig build -Dcpu=baseline -Ddev-tools=false -p zig-out-devtools-off
       - name: Blog example in-process tests (zigbase.testing)
-        run: cd examples/blog && mise exec zig@0.16.0 -- zig build test --summary all
+        run: cd examples/blog && mise exec zig@0.17.1 -- zig build test --summary all
       - name: Golfsim example in-process tests (zigbase.testing)
         run: |
           cd examples/golfsim/frontend
           ./build.sh
           cd ../
-          mise exec zig@0.16.0 -- zig build test --summary all
+          mise exec zig@0.17.1 -- zig build test --summary all
       - name: Test-runner diagnostics and real-failure regression
-        run: mise exec zig@0.16.0 python@3.13 -- python tests/test_runner/verify.py
+        run: mise exec zig@0.17.1 python@3.13 -- python tests/test_runner/verify.py
       - name: Compile and exercise documented Zig examples
-        run: mise exec zig@0.16.0 python@3.13 -- python tools/check_doc_examples.py
+        run: mise exec zig@0.17.1 python@3.13 -- python tools/check_doc_examples.py
       - name: Issue 261 standalone diagnostic regression
-        run: mise exec zig@0.16.0 python@3.13 -- python diagnostics/issue-261/verify.py
+        run: mise exec zig@0.17.1 python@3.13 -- python diagnostics/issue-261/verify.py
       - name: Consumer route compile-fail contracts
-        run: mise exec zig@0.16.0 -- zig build check-route-contracts -Dcpu=baseline
+        run: mise exec zig@0.17.1 -- zig build check-route-contracts -Dcpu=baseline
       - name: Scheduler and memory-worker compile-fail contracts
-        run: mise exec zig@0.16.0 -- zig build check-scheduler-contracts check-memory-job-contracts -Dcpu=baseline
+        run: mise exec zig@0.17.1 -- zig build check-scheduler-contracts check-memory-job-contracts -Dcpu=baseline
       - name: Admission and realtime compile contracts
-        run: mise exec zig@0.16.0 -- zig build check-admission-contracts check-realtime-cap-contracts
+        run: mise exec zig@0.17.1 -- zig build check-admission-contracts check-realtime-cap-contracts
       - name: Disabled agent CLI rejects discovery and diagnostics
         run: mise exec python@3.13 -- python scripts/check-disabled-agent-cli.py zig-out-devtools-off/bin/zigbase
       - name: Gating invariant (absent-symbols check)
@@ -166,12 +166,12 @@ jobs:
         uses: actions/cache@v5
         with:
           path: ${{ github.workspace }}/.zig-global
-          key: zig-global-${{ runner.os }}-zig0.16.0-${{ hashFiles('vendor/sqlite/sqlite3.c', 'build.zig', 'build.zig.zon') }}
-          restore-keys: zig-global-${{ runner.os }}-zig0.16.0-
+          key: zig-global-${{ runner.os }}-zig0.17.1-${{ hashFiles('vendor/sqlite/sqlite3.c', 'build.zig', 'build.zig.zon') }}
+          restore-keys: zig-global-${{ runner.os }}-zig0.17.1-
       - name: Realtime fanout benchmark correctness (no timing threshold)
-        run: mise exec zig@0.16.0 -- zig build bench -Dbench-optimize=ReleaseSafe -- --realtime-only --json
+        run: mise exec zig@0.17.1 -- zig build bench -Dbench-optimize=safe -- --realtime-only --json
       - name: Binary size and allocation contracts (no timing threshold)
-        run: mise exec python@3.13 zig@0.16.0 -- bash scripts/check-performance.sh > performance-contract-report.json
+        run: mise exec python@3.13 zig@0.17.1 -- bash scripts/check-performance.sh > performance-contract-report.json
       - uses: actions/upload-artifact@v7
         if: always()
         with:
@@ -194,31 +194,31 @@ jobs:
         uses: actions/cache@v5
         with:
           path: ${{ github.workspace }}/.zig-global
-          key: zig-global-${{ runner.os }}-zig0.16.0-${{ hashFiles('vendor/sqlite/sqlite3.c', 'build.zig', 'build.zig.zon') }}
-          restore-keys: zig-global-${{ runner.os }}-zig0.16.0-
+          key: zig-global-${{ runner.os }}-zig0.17.1-${{ hashFiles('vendor/sqlite/sqlite3.c', 'build.zig', 'build.zig.zon') }}
+          restore-keys: zig-global-${{ runner.os }}-zig0.17.1-
       - name: Dating client snapshot is fresh
-        run: mise exec zig@0.16.0 -- zig build gen-dating-client-check
+        run: mise exec zig@0.17.1 -- zig build gen-dating-client-check
       - name: Dating runtime client snapshot is fresh
-        run: mise exec zig@0.16.0 -- zig build gen-dating-runtime-client-check
+        run: mise exec zig@0.17.1 -- zig build gen-dating-runtime-client-check
       - name: Dating Dart client snapshot is fresh
         run: |
-          mise exec zig@0.16.0 -- zig build gen-dating-dart-client
+          mise exec zig@0.17.1 -- zig build gen-dating-dart-client
           mise exec dart@3.12 -- dart format --language-version=3.5 clients/dart/test/codegen/dating/zbase.gen.dart
           git diff --exit-code clients/dart/test/codegen/dating/zbase.gen.dart
       - name: Dating Python client snapshot is fresh
         run: |
-          mise exec zig@0.16.0 -- zig build gen-dating-python-client
+          mise exec zig@0.17.1 -- zig build gen-dating-python-client
           mise exec python@3.13 -- python -m pip install --quiet ruff==0.15.21
           mise exec python@3.13 -- python -m ruff format clients/python/tests/codegen/dating/zbase_gen.py
           git diff --exit-code clients/python/tests/codegen/dating/zbase_gen.py
       - name: Dating Kotlin client snapshot is fresh
         run: |
-          mise exec zig@0.16.0 -- zig build gen-dating-kotlin-client
+          mise exec zig@0.17.1 -- zig build gen-dating-kotlin-client
           mise exec gradle@9.6 -- gradle -p clients/kotlin spotlessApply
           git diff --exit-code clients/kotlin/src/test/kotlin/io/github/valthon/zigbase/codegen/dating/ZbaseGen.kt
       - name: Golfsim client snapshot is fresh
         working-directory: examples/golfsim
-        run: mise exec zig@0.16.0 -- zig build gen-client-check
+        run: mise exec zig@0.17.1 -- zig build gen-client-check
 
   unit:
     runs-on: ubuntu-latest
@@ -229,32 +229,32 @@ jobs:
       - uses: actions/checkout@v7
       - uses: jdx/mise-action@v4
         with:
-          install_args: zig@0.16.0
+          install_args: zig@0.17.1
       - name: Cache zig global cache
         uses: actions/cache@v5
         with:
           path: ${{ github.workspace }}/.zig-global
-          key: zig-global-${{ runner.os }}-zig0.16.0-${{ hashFiles('vendor/sqlite/sqlite3.c', 'build.zig', 'build.zig.zon') }}
-          restore-keys: zig-global-${{ runner.os }}-zig0.16.0-
+          key: zig-global-${{ runner.os }}-zig0.17.1-${{ hashFiles('vendor/sqlite/sqlite3.c', 'build.zig', 'build.zig.zon') }}
+          restore-keys: zig-global-${{ runner.os }}-zig0.17.1-
       - name: Formatting gate (zig fmt --check)
-        run: mise exec zig@0.16.0 -- zig fmt --check src build.zig
+        run: mise exec zig@0.17.1 -- zig fmt --check src build.zig
       - name: Unit tests
-        run: mise exec zig@0.16.0 -- zig build test --summary all
+        run: mise exec zig@0.17.1 -- zig build test --summary all
       - name: Compile fuzz harnesses
-        run: mise exec zig@0.16.0 -- zig build fuzz-compile --summary all
+        run: mise exec zig@0.17.1 -- zig build fuzz-compile --summary all
       - name: "Unit tests (prod gate: -Ddev-mode=false)"
-        run: mise exec zig@0.16.0 -- zig build test --summary all -Ddev-mode=false
+        run: mise exec zig@0.17.1 -- zig build test --summary all -Ddev-mode=false
       # Lean custom-build gate: -Ddev-tools=false must still compile AND pass the full
       # suite — proves the stripped configuration (no init/agents-md/typegen; see
       # src/devtools.zig) doesn't rot silently. NOT how we build our own published
       # artifacts (those stay at the default, dev-tools on); this is the configuration
       # a consumer opts into for their own custom build.
       - name: "Unit tests (custom-build gate: -Ddev-tools=false)"
-        run: mise exec zig@0.16.0 -- zig build test --summary all -Ddev-tools=false
+        run: mise exec zig@0.17.1 -- zig build test --summary all -Ddev-tools=false
       # Keep the lean binary build and exercise disabled-search rejection alongside
       # ordinary authorization, encryption and code generation in the full suite.
       - name: "Build and unit tests: -Dfts5=false (lean SQLite)"
-        run: mise exec zig@0.16.0 -- zig build install test -Dfts5=false -Dpostgres=false --summary all
+        run: mise exec zig@0.17.1 -- zig build install test -Dfts5=false -Dpostgres=false --summary all
 
   # Opt-in PostgreSQL backend (#159). Runs the full suite WITH -Dpostgres=true against a
   # real postgres service container, exercising the pure-Zig wire driver's SCRAM-SHA-256
@@ -298,25 +298,25 @@ jobs:
       - uses: actions/checkout@v7
       - uses: jdx/mise-action@v4
         with:
-          install_args: zig@0.16.0 python@3.13
+          install_args: zig@0.17.1 python@3.13
       - name: Cache zig global cache
         uses: actions/cache@v5
         with:
           path: ${{ github.workspace }}/.zig-global
-          key: zig-global-${{ runner.os }}-zig0.16.0-${{ hashFiles('vendor/sqlite/sqlite3.c', 'build.zig', 'build.zig.zon') }}
-          restore-keys: zig-global-${{ runner.os }}-zig0.16.0-
+          key: zig-global-${{ runner.os }}-zig0.17.1-${{ hashFiles('vendor/sqlite/sqlite3.c', 'build.zig', 'build.zig.zon') }}
+          restore-keys: zig-global-${{ runner.os }}-zig0.17.1-
       - name: Unit + PostgreSQL driver tests (-Dpostgres=true -Dvector=true)
-        run: mise exec zig@0.16.0 -- zig build test --summary all -Dpostgres=true -Dvector=true -Dquery-workbench=true -Ddurable-realtime=true -Drest-idempotency=true
+        run: mise exec zig@0.17.1 -- zig build test --summary all -Dpostgres=true -Dvector=true -Dquery-workbench=true -Ddurable-realtime=true -Drest-idempotency=true
       - name: PostgreSQL workbench paired gating and live HTTP
         run: |
-          mise exec zig@0.16.0 -- zig build query-workbench-fixture -Dpostgres=true --prefix zig-out/workbench-off
-          mise exec zig@0.16.0 -- zig build query-workbench-fixture -Dpostgres=true -Dquery-workbench=true --prefix zig-out/workbench-on
+          mise exec zig@0.17.1 -- zig build query-workbench-fixture -Dpostgres=true --prefix zig-out/workbench-off
+          mise exec zig@0.17.1 -- zig build query-workbench-fixture -Dpostgres=true -Dquery-workbench=true --prefix zig-out/workbench-on
           bash scripts/check-query-workbench-gating.sh zig-out/workbench-off/bin/query-workbench-fixture zig-out/workbench-on/bin/query-workbench-fixture
           mise exec python@3.13 -- python -m pip install --quiet pytest
           ZIGBASE_TEST_QUERY_WORKBENCH_OFF_BINARY="$GITHUB_WORKSPACE/zig-out/workbench-off/bin/query-workbench-fixture" ZIGBASE_TEST_QUERY_WORKBENCH_BINARY="$GITHUB_WORKSPACE/zig-out/workbench-on/bin/query-workbench-fixture" mise exec python@3.13 -- python -m pytest tests/admin/test_query_workbench_postgres.py -q
       - name: Durable realtime PostgreSQL cross-instance recovery
         run: |
-          mise exec zig@0.16.0 -- zig build -Dpostgres=true -Ddurable-realtime=true --prefix zig-out/replay-pg
+          mise exec zig@0.17.1 -- zig build -Dpostgres=true -Ddurable-realtime=true --prefix zig-out/replay-pg
           ZIGBASE_TEST_DURABLE_REALTIME_BINARY="$GITHUB_WORKSPACE/zig-out/replay-pg/bin/zigbase" mise exec python@3.13 -- python -m pytest tests/admin/test_durable_realtime.py -k postgres -q
       - name: PostgreSQL REST retry recovery and concurrent rule changes
         env:
@@ -324,7 +324,7 @@ jobs:
         run: |
           mise exec python@3.13 -- python -m pip install --quiet 'psycopg[binary]'
           mise exec python@3.13 -- python -c 'import os, psycopg; c = psycopg.connect(os.environ["ZIGBASE_PG_TEST_URL"], autocommit=True); c.execute("CREATE DATABASE zbresttest"); c.close()'
-          mise exec zig@0.16.0 -- zig build rest-idempotency-fixture -Dpostgres=true -Drest-idempotency=true -Ddurable-realtime=true --prefix zig-out/rest-pg
+          mise exec zig@0.17.1 -- zig build rest-idempotency-fixture -Dpostgres=true -Drest-idempotency=true -Ddurable-realtime=true --prefix zig-out/rest-pg
           ZIGBASE_TEST_REST_IDEMPOTENCY_BINARY="$GITHUB_WORKSPACE/zig-out/rest-pg/bin/rest-idempotency-fixture" mise exec python@3.13 -- python -m pytest tests/admin/test_rest_idempotency.py -q
       - name: Rails PostgreSQL row-source integration
         run: |
@@ -332,11 +332,11 @@ jobs:
           mise exec python@3.13 -- python -m pytest tests/rails/test_postgres_source.py -q
       - name: PostgreSQL idempotency HTTP positive control
         run: |
-          mise exec zig@0.16.0 -- zig build idempotency-fixture -Dpostgres=true --prefix zig-out/idempotency-pg
+          mise exec zig@0.17.1 -- zig build idempotency-fixture -Dpostgres=true --prefix zig-out/idempotency-pg
           ZIGBASE_DB_URL="$ZIGBASE_PG_TEST_URL" ZIGBASE_TEST_IDEMPOTENCY_BINARY="$GITHUB_WORKSPACE/zig-out/idempotency-pg/bin/idempotency-fixture" mise exec python@3.13 -- python -m pytest tests/admin/test_idempotency.py::test_concurrent_replay_payload_binding_and_current_guest_guard -q
       - name: PostgreSQL and SQLite CLI operator provisioning
         run: |
-          mise exec zig@0.16.0 -- zig build -Dpostgres=true
+          mise exec zig@0.17.1 -- zig build -Dpostgres=true
           ZIGBASE_TEST_BINARY="$GITHUB_WORKSPACE/zig-out/bin/zigbase" mise exec python@3.13 -- python -m pytest tests/admin/test_superuser_cli.py -q
 
   # PostgreSQL with server TLS, so the suite runs over a REAL sslmode=require connection —
@@ -356,13 +356,13 @@ jobs:
       - uses: actions/checkout@v7
       - uses: jdx/mise-action@v4
         with:
-          install_args: zig@0.16.0
+          install_args: zig@0.17.1
       - name: Cache zig global cache
         uses: actions/cache@v5
         with:
           path: ${{ github.workspace }}/.zig-global
-          key: zig-global-${{ runner.os }}-zig0.16.0-${{ hashFiles('vendor/sqlite/sqlite3.c', 'build.zig', 'build.zig.zon') }}
-          restore-keys: zig-global-${{ runner.os }}-zig0.16.0-
+          key: zig-global-${{ runner.os }}-zig0.17.1-${{ hashFiles('vendor/sqlite/sqlite3.c', 'build.zig', 'build.zig.zon') }}
+          restore-keys: zig-global-${{ runner.os }}-zig0.17.1-
       - name: Start PostgreSQL with server TLS + SCRAM
         run: |
           mkdir -p "$PWD/pgtls"
@@ -392,7 +392,7 @@ jobs:
           # Sanity: confirm SSL is actually on.
           docker exec pgtls psql -U zbpg -d zbpgtest -tAc "SHOW ssl;"
       - name: Unit + PostgreSQL driver tests over TLS (sslmode=require)
-        run: mise exec zig@0.16.0 -- zig build test --summary all -Dpostgres=true
+        run: mise exec zig@0.17.1 -- zig build test --summary all -Dpostgres=true
       - name: Stop PostgreSQL
         if: always()
         run: docker rm -f pgtls || true
@@ -415,13 +415,13 @@ jobs:
       - uses: actions/checkout@v7
       - uses: jdx/mise-action@v4
         with:
-          install_args: zig@0.16.0 python@3.13
+          install_args: zig@0.17.1 python@3.13
       - name: Cache zig global cache
         uses: actions/cache@v5
         with:
           path: ${{ github.workspace }}/.zig-global
-          key: zig-global-${{ runner.os }}-zig0.16.0-${{ hashFiles('vendor/sqlite/sqlite3.c', 'build.zig', 'build.zig.zon') }}
-          restore-keys: zig-global-${{ runner.os }}-zig0.16.0-
+          key: zig-global-${{ runner.os }}-zig0.17.1-${{ hashFiles('vendor/sqlite/sqlite3.c', 'build.zig', 'build.zig.zon') }}
+          restore-keys: zig-global-${{ runner.os }}-zig0.17.1-
       - name: Start SeaweedFS + wait for authenticated bucket access
         run: |
           # SeaweedFS 4.46; pin the manifest digest rather than a mutable tag.
@@ -445,12 +445,12 @@ jobs:
           echo "SeaweedFS bucket did not become ready" >&2
           exit 1
       - name: Unit + live S3 tests (-Ds3=true)
-        run: mise exec zig@0.16.0 -- zig build test --summary all -Ds3=true -Dfile-inventory=true
+        run: mise exec zig@0.17.1 -- zig build test --summary all -Ds3=true -Dfile-inventory=true
       - name: Build zigbase (-Ds3=true) for the raw-HTTP e2e
-        run: mise exec zig@0.16.0 -- zig build -Ds3=true -Dfile-inventory=true -Dcpu=baseline
+        run: mise exec zig@0.17.1 -- zig build -Ds3=true -Dfile-inventory=true -Dcpu=baseline
       - name: Inventory build-flag gating (absent and positive controls)
         run: |
-          mise exec zig@0.16.0 -- zig build -Dfile-inventory=false -Dcpu=baseline -p zig-out-inventory-off
+          mise exec zig@0.17.1 -- zig build -Dfile-inventory=false -Dcpu=baseline -p zig-out-inventory-off
           bash scripts/check-gating.sh --inventory zig-out-inventory-off/bin/zigbase zig-out/bin/zigbase
       - name: Install Python S3 and inventory test dependencies
         run: mise exec python@3.13 -- python -m pip install --quiet pytest
@@ -863,8 +863,8 @@ jobs:
         uses: actions/cache@v5
         with:
           path: ${{ github.workspace }}/.zig-global
-          key: zig-global-${{ runner.os }}-zig0.16.0-${{ hashFiles('vendor/sqlite/sqlite3.c', 'build.zig', 'build.zig.zon') }}
-          restore-keys: zig-global-${{ runner.os }}-zig0.16.0-
+          key: zig-global-${{ runner.os }}-zig0.17.1-${{ hashFiles('vendor/sqlite/sqlite3.c', 'build.zig', 'build.zig.zon') }}
+          restore-keys: zig-global-${{ runner.os }}-zig0.17.1-
       - name: Install common feature test dependencies
         run: mise exec python@3.13 -- python -m pip install --quiet pytest
       - name: Install thumbnail browser dependency + resolve version
@@ -878,13 +878,13 @@ jobs:
         run: mise exec python@3.13 -- python -m pip install --quiet pytest-xdist
       - name: Build default symbol-gating control
         if: matrix.lane != 'durable'
-        run: mise exec zig@0.16.0 -- zig build
+        run: mise exec zig@0.17.1 -- zig build
       - name: Export default binary path
         if: matrix.lane != 'durable'
         run: echo "ZIGBASE_TEST_BINARY=$GITHUB_WORKSPACE/zig-out/bin/zigbase" >> "$GITHUB_ENV"
       - name: Build RAM upload symbol-gating control
         if: matrix.lane == 'durable'
-        run: mise exec zig@0.16.0 -- zig build resumable-uploads-fixture -Dresumable-uploads=true --prefix zig-out/resumable
+        run: mise exec zig@0.17.1 -- zig build resumable-uploads-fixture -Dresumable-uploads=true --prefix zig-out/resumable
       - name: Build Golfsim thumbnail frontend
         if: matrix.lane == 'thumbnails'
         run: cd examples/golfsim/frontend && ./build.sh
@@ -904,7 +904,7 @@ jobs:
       - name: Opt-in shared HTTP and memory-job admission
         if: matrix.lane == 'admission'
         run: |
-          mise exec zig@0.16.0 -- zig build test check-admission-contracts check-durable-capacity-contracts durable-capacity-fixture shared-admission-fixture job-byte-admission-fixture -Dcoordinated-admission=true --summary all
+          mise exec zig@0.17.1 -- zig build test check-admission-contracts check-durable-capacity-contracts durable-capacity-fixture shared-admission-fixture job-byte-admission-fixture -Dcoordinated-admission=true --summary all
           ZIGBASE_TEST_DURABLE_CAPACITY_BINARY="$GITHUB_WORKSPACE/zig-out/bin/durable-capacity-fixture" mise exec python@3.13 -- python -m pytest tests/admin/test_durable_capacity.py -q
           bash scripts/check-shared-admission-gating.sh "$ZIGBASE_TEST_BINARY" zig-out/bin/shared-admission-fixture
           bash scripts/check-job-byte-admission-gating.sh zig-out/bin/job-byte-admission-fixture zig-out/bin/shared-admission-fixture
@@ -913,18 +913,18 @@ jobs:
       - name: Opt-in transactional REST retries
         if: matrix.lane == 'workbench'
         run: |
-          mise exec zig@0.16.0 -- zig build check-rest-idempotency-contracts
-          mise exec zig@0.16.0 -- zig build rest-idempotency-fixture check-rest-idempotency-contracts -Drest-idempotency=true --prefix zig-out/rest-retries
+          mise exec zig@0.17.1 -- zig build check-rest-idempotency-contracts
+          mise exec zig@0.17.1 -- zig build rest-idempotency-fixture check-rest-idempotency-contracts -Drest-idempotency=true --prefix zig-out/rest-retries
           bash scripts/check-rest-idempotency-gating.sh "$ZIGBASE_TEST_BINARY" zig-out/rest-retries/bin/rest-idempotency-fixture
           ZIGBASE_TEST_REST_IDEMPOTENCY_OFF_BINARY="$ZIGBASE_TEST_BINARY" ZIGBASE_TEST_REST_IDEMPOTENCY_BINARY="$GITHUB_WORKSPACE/zig-out/rest-retries/bin/rest-idempotency-fixture" mise exec python@3.13 -- python -m pytest tests/admin/test_rest_idempotency.py -q
-          mise exec zig@0.16.0 -- zig build rest-idempotency-fixture -Drest-idempotency=true -Ddurable-realtime=true --prefix zig-out/rest-replay
+          mise exec zig@0.17.1 -- zig build rest-idempotency-fixture -Drest-idempotency=true -Ddurable-realtime=true --prefix zig-out/rest-replay
           ZIGBASE_TEST_REST_REPLAY_BINARY="$GITHUB_WORKSPACE/zig-out/rest-replay/bin/rest-idempotency-fixture" mise exec python@3.13 -- python -m pytest tests/admin/test_rest_retry_integration.py -q
       - name: Opt-in bounded SQLite query workbench
         if: matrix.lane == 'workbench'
         run: |
-          mise exec zig@0.16.0 -- zig build check-query-workbench-contracts
-          mise exec zig@0.16.0 -- zig build test -Dquery-workbench=true --summary all
-          mise exec zig@0.16.0 -- zig build query-workbench-fixture application-capacity check-query-workbench-contracts -Dquery-workbench=true --prefix zig-out/workbench
+          mise exec zig@0.17.1 -- zig build check-query-workbench-contracts
+          mise exec zig@0.17.1 -- zig build test -Dquery-workbench=true --summary all
+          mise exec zig@0.17.1 -- zig build query-workbench-fixture application-capacity check-query-workbench-contracts -Dquery-workbench=true --prefix zig-out/workbench
           bash scripts/check-query-workbench-gating.sh "$ZIGBASE_TEST_BINARY" zig-out/workbench/bin/query-workbench-fixture
           ZIGBASE_TEST_QUERY_WORKBENCH_BINARY="$GITHUB_WORKSPACE/zig-out/workbench/bin/query-workbench-fixture" mise exec python@3.13 -- python -m pytest tests/admin/test_query_workbench.py -q
           ZIGBASE_TEST_CAPACITY_WORKBENCH_BINARY="$GITHUB_WORKSPACE/zig-out/workbench/bin/application-capacity" mise exec python@3.13 -- python -m pytest tests/tools/test_application_capacity.py -k live_workbench -q
@@ -934,10 +934,10 @@ jobs:
       - name: Opt-in ImageMagick thumbnail regressions and gating
         if: matrix.lane == 'thumbnails'
         run: |
-          mise exec zig@0.16.0 -- zig build check-thumbnail-contracts
-          mise exec zig@0.16.0 -- zig build check-thumbnail-contracts -Dimage-thumbnails=true
-          mise exec zig@0.16.0 -- zig build test -Dimage-thumbnails=true --summary all
-          mise exec zig@0.16.0 -- zig build thumbnails-fixture -Dimage-thumbnails=true --prefix zig-out/thumbnails
+          mise exec zig@0.17.1 -- zig build check-thumbnail-contracts
+          mise exec zig@0.17.1 -- zig build check-thumbnail-contracts -Dimage-thumbnails=true
+          mise exec zig@0.17.1 -- zig build test -Dimage-thumbnails=true --summary all
+          mise exec zig@0.17.1 -- zig build thumbnails-fixture -Dimage-thumbnails=true --prefix zig-out/thumbnails
           bash scripts/check-gating.sh --image-thumbnails "$ZIGBASE_TEST_BINARY" zig-out/thumbnails/bin/thumbnails-fixture
           ZIGBASE_TEST_THUMBNAILS_BINARY="$GITHUB_WORKSPACE/zig-out/thumbnails/bin/thumbnails-fixture" mise exec python@3.13 -- python -m pytest tests/admin/test_thumbnails.py -q
           mise exec python@3.13 -- python -m pytest examples/golfsim/test/test_thumbnail_gallery.py -q
@@ -945,54 +945,54 @@ jobs:
         if: matrix.lane == 'thumbnails'
         working-directory: examples/golfsim
         run: |
-          mise exec zig@0.16.0 -- zig build -Dimage-thumbnails=true --summary all
-          mise exec zig@0.16.0 -- zig build test gen-client-check -Dimage-thumbnails=true --summary all
+          mise exec zig@0.17.1 -- zig build -Dimage-thumbnails=true --summary all
+          mise exec zig@0.17.1 -- zig build test gen-client-check -Dimage-thumbnails=true --summary all
       - name: Opt-in resumable upload regressions and gating
         if: matrix.lane == 'resumable'
         run: |
-          mise exec zig@0.16.0 -- zig build check-resumable-contracts
-          mise exec zig@0.16.0 -- zig build check-resumable-contracts -Dresumable-uploads=true
-          mise exec zig@0.16.0 -- zig build test -Dresumable-uploads=true --summary all
-          mise exec zig@0.16.0 -- zig build resumable-uploads-fixture -Dresumable-uploads=true --prefix zig-out/resumable
+          mise exec zig@0.17.1 -- zig build check-resumable-contracts
+          mise exec zig@0.17.1 -- zig build check-resumable-contracts -Dresumable-uploads=true
+          mise exec zig@0.17.1 -- zig build test -Dresumable-uploads=true --summary all
+          mise exec zig@0.17.1 -- zig build resumable-uploads-fixture -Dresumable-uploads=true --prefix zig-out/resumable
           bash scripts/check-gating.sh --resumable-uploads "$ZIGBASE_TEST_BINARY" zig-out/resumable/bin/resumable-uploads-fixture
           ZIGBASE_TEST_UPLOADS_OFF_BINARY="$ZIGBASE_TEST_BINARY" ZIGBASE_TEST_RESUMABLE_BINARY="$GITHUB_WORKSPACE/zig-out/resumable/bin/resumable-uploads-fixture" mise exec python@3.13 -- python -m pytest tests/admin/test_resumable_uploads.py -q -n 2 --dist load --durations=20
       - name: SQLite upload restart recovery and persistence gating
         if: matrix.lane == 'durable'
         run: |
-          mise exec zig@0.16.0 -- zig build test durable-uploads-fixture check-resumable-contracts -Dresumable-uploads=true -Ddurable-resumable-uploads=true --prefix zig-out/durable-uploads --summary all
+          mise exec zig@0.17.1 -- zig build test durable-uploads-fixture check-resumable-contracts -Dresumable-uploads=true -Ddurable-resumable-uploads=true --prefix zig-out/durable-uploads --summary all
           bash scripts/check-gating.sh --durable-uploads zig-out/resumable/bin/resumable-uploads-fixture zig-out/durable-uploads/bin/durable-uploads-fixture
           ZIGBASE_TEST_DURABLE_UPLOADS_BINARY="$GITHUB_WORKSPACE/zig-out/durable-uploads/bin/durable-uploads-fixture" mise exec python@3.13 -- python -m pytest tests/admin/test_durable_uploads.py -q -n 2 --dist load --durations=20
       - name: Durable realtime replay regressions
         if: matrix.lane == 'coordination'
         run: |
-          mise exec zig@0.16.0 -- zig build -Ddurable-realtime=true -Drealtime-backfill=true --prefix zig-out/durable-realtime
+          mise exec zig@0.17.1 -- zig build -Ddurable-realtime=true -Drealtime-backfill=true --prefix zig-out/durable-realtime
           ZIGBASE_TEST_DURABLE_REALTIME_BINARY="$GITHUB_WORKSPACE/zig-out/durable-realtime/bin/zigbase" mise exec python@3.13 -- python -m pytest tests/admin/test_durable_realtime.py -q
       - name: Opt-in realtime backfill regressions
         if: matrix.lane == 'coordination'
         run: |
-          mise exec zig@0.16.0 -- zig build -Drealtime-backfill=true --prefix zig-out/backfill
+          mise exec zig@0.17.1 -- zig build -Drealtime-backfill=true --prefix zig-out/backfill
           ZIGBASE_TEST_BACKFILL_BINARY="$GITHUB_WORKSPACE/zig-out/backfill/bin/zigbase" mise exec python@3.13 -- python -m pytest tests/admin/test_realtime_backfill.py -q
       - name: Opt-in SQLite vector search regressions
         if: matrix.lane == 'vector'
         run: |
-          mise exec zig@0.16.0 -- zig build test -Dvector=true --summary all
-          mise exec zig@0.16.0 -- zig build -Dvector=true --prefix zig-out/vector
+          mise exec zig@0.17.1 -- zig build test -Dvector=true --summary all
+          mise exec zig@0.17.1 -- zig build -Dvector=true --prefix zig-out/vector
           ZIGBASE_TEST_VECTOR_BINARY="$GITHUB_WORKSPACE/zig-out/vector/bin/zigbase" mise exec python@3.13 -- python -m pytest tests/admin/test_vector_search.py -q
       - name: SQLite consumer migration process coordination
         if: matrix.lane == 'coordination'
         run: |
-          mise exec zig@0.16.0 -- zig build migration-coordination-fixture
+          mise exec zig@0.17.1 -- zig build migration-coordination-fixture
           ZIGBASE_TEST_MIGRATION_COORDINATION_BINARY="$GITHUB_WORKSPACE/zig-out/bin/migration-coordination-fixture" mise exec python@3.13 -- python -m pytest tests/admin/test_migration_coordination.py -q
       - name: Opt-in idempotent custom mutations
         if: matrix.lane == 'coordination'
         run: |
-          mise exec zig@0.16.0 -- zig build idempotency-fixture check-idempotency-contracts
+          mise exec zig@0.17.1 -- zig build idempotency-fixture check-idempotency-contracts
           bash scripts/check-idempotency-gating.sh "$ZIGBASE_TEST_BINARY" zig-out/bin/idempotency-fixture
           ZIGBASE_TEST_IDEMPOTENCY_BINARY="$GITHUB_WORKSPACE/zig-out/bin/idempotency-fixture" mise exec python@3.13 -- python -m pytest tests/admin/test_idempotency.py -q
       - name: Configurable memory-job worker resources
         if: matrix.lane == 'coordination'
         run: |
-          mise exec zig@0.16.0 -- zig build memory-jobs-fixture
+          mise exec zig@0.17.1 -- zig build memory-jobs-fixture
           ZIGBASE_TEST_MEMORY_JOBS_BINARY="$GITHUB_WORKSPACE/zig-out/bin/memory-jobs-fixture" mise exec python@3.13 -- python -m pytest tests/admin/test_memory_jobs.py -q
 
   # Keep the existing required check fail-closed across all split lanes.

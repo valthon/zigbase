@@ -17,8 +17,8 @@ pub fn resolve(comptime cfg: anytype) if (@import("build_options").rest_idempote
     if (!@hasField(@TypeOf(cfg), "rest_idempotency")) return if (@import("build_options").rest_idempotency) null else {};
     if (!@import("build_options").rest_idempotency) @compileError(".rest_idempotency requires -Drest-idempotency=true");
     const config = cfg.rest_idempotency;
-    for (std.meta.fields(@TypeOf(config))) |field| {
-        if (!std.mem.eql(u8, field.name, "collections") and !std.mem.eql(u8, field.name, "limits")) @compileError("unknown .rest_idempotency key: " ++ field.name);
+    for (@typeInfo(@TypeOf(config)).@"struct".field_names) |field| {
+        if (!std.mem.eql(u8, field, "collections") and !std.mem.eql(u8, field, "limits")) @compileError("unknown .rest_idempotency key: " ++ field);
     }
     if (!@hasField(@TypeOf(config), "collections") or !@hasField(@TypeOf(config), "limits")) @compileError(".rest_idempotency requires .collections and .limits");
     if (config.collections.len == 0 or config.collections.len > 64) @compileError(".rest_idempotency requires 1..64 collections");
@@ -29,9 +29,9 @@ pub fn resolve(comptime cfg: anytype) if (@import("build_options").rest_idempote
 fn Implementation(comptime config: anytype) type {
     const limits: idem.Limits = blk: {
         var value: idem.Limits = .{ .namespace = config.limits.namespace };
-        for (std.meta.fields(@TypeOf(config.limits))) |field| {
-            if (!@hasField(idem.Limits, field.name)) @compileError("unknown REST idempotency limit: " ++ field.name);
-            @field(value, field.name) = @field(config.limits, field.name);
+        for (@typeInfo(@TypeOf(config.limits)).@"struct".field_names) |field| {
+            if (!@hasField(idem.Limits, field)) @compileError("unknown REST idempotency limit: " ++ field);
+            @field(value, field) = @field(config.limits, field);
         }
         break :blk value;
     };

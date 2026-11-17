@@ -1326,7 +1326,7 @@ fn assembleListResult(d: *db.Db, a: std.mem.Allocator, col: schema.Collection) !
 test "ListResult.deinit: interned keyset + item values free exactly once (zero leaks)" {
     // (b) RAW std.testing.allocator, no arena to mask a leak. `res.deinit(a)` must free the ONE
     // interned keyset exactly once (not per row) and each item's owned scalar values + ObjectMap —
-    // a per-item key free would DOUBLE-FREE the shared keyset and the DebugAllocator would panic.
+    // a per-item key free would DOUBLE-FREE the shared keyset and the SafeAllocator would panic.
     const a = std.testing.allocator;
     var d = try db.Db.openMemory();
     defer d.close();
@@ -1842,7 +1842,12 @@ test "stored multi relation propagates allocation failures and tolerates malform
     defer d.close();
     const fx = try RelTenantFixture.init(a, &d);
     defer fx.deinit(a);
-    try d.exec("INSERT INTO tasks (id,created,updated,notes) VALUES ('legacy','t','t','[\"theirs\"" ++ ",\"mine\"" ** 512 ++ "]');");
+    const notes = try a.alloc(u8, 7 * 512);
+    defer a.free(notes);
+    for (0..512) |i| @memcpy(notes[i * 7 ..][0..7], ",\"mine\"");
+    const sql = try a.printSentinel("INSERT INTO tasks (id,created,updated,notes) VALUES ('legacy','t','t','[\"theirs\"{s}]');", .{notes}, 0);
+    defer a.free(sql);
+    try d.exec(sql);
     const field = fx.tasks.fields[1];
     try std.testing.checkAllAllocationFailures(a, checkStoredRelationAllocations, .{ &d, field });
 

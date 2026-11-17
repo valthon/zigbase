@@ -13,7 +13,7 @@ import re
 import subprocess
 
 REPO = pathlib.Path(__file__).resolve().parents[2]
-ZIG = ["mise", "exec", "zig@0.16.0", "--", "zig"]
+ZIG = ["mise", "exec", "zig@0.17.1", "--", "zig"]
 
 BOX_FILES = {
     "docker-compose.yml",

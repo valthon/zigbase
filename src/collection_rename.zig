@@ -462,7 +462,7 @@ test "offline rename rejects irreversible source names and unexpired opaque rece
     defer d.close();
     try @import("migrations.zig").run(&d);
     const a = std.testing.allocator;
-    const long_name = "a" ** 56;
+    const long_name = (&@as([56]u8, @splat('a')));
     const long = try collections.create(a, std.testing.io, &d, .{ .id = "", .name = long_name, .fields = &.{} });
     defer long.deinit(a);
     try std.testing.expectError(error.InvalidRenameName, rename(a, std.testing.io, &d, long_name, "short"));
@@ -593,7 +593,7 @@ test "offline rename validates missing source names before lookup" {
     defer d.close();
     try @import("migrations.zig").run(&d);
     const before = try generation.read(&d);
-    for ([_][]const u8{ "", "bad-name", "a" ** 56, "missing_fts", "9bad" }) |name|
+    for ([_][]const u8{ "", "bad-name", (&@as([56]u8, @splat('a'))), "missing_fts", "9bad" }) |name|
         try std.testing.expectError(error.InvalidRenameName, rename(std.testing.allocator, std.testing.io, &d, name, "destination"));
     try std.testing.expectError(error.NotFound, rename(std.testing.allocator, std.testing.io, &d, "missing", "destination"));
     try std.testing.expectEqual(before, try generation.read(&d));

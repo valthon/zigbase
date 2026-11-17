@@ -157,8 +157,8 @@ flag) and golfsim (hardcoded dir) examples.
 
 ## Building and running
 
-This example needs **Zig 0.16**, which you can get via [mise](https://mise.jdx.dev)
-(`mise exec zig@0.16.0 -- zig ...`). From `examples/plugins/`:
+This example needs **Zig 0.17.1**, which you can get via [mise](https://mise.jdx.dev)
+(`mise exec zig@0.17.1 -- zig ...`). From `examples/plugins/`:
 
 ```sh
 cd frontend && ./build.sh && cd ..

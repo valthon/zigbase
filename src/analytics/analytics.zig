@@ -348,7 +348,7 @@ pub fn runRollup(conn: *db.Db, alloc: std.mem.Allocator, spec: RollupSpec) !void
 /// writer. The monotonic high-water mark the incremental aggregation advances to.
 fn scalarMaxRowid(conn: *db.Db, event: []const u8) !i64 {
     var sqlbuf: [128]u8 = undefined;
-    const sql = std.fmt.bufPrintZ(&sqlbuf, "SELECT COALESCE(MAX({s}),0) FROM \"_events\" WHERE \"name\" = ?1;", .{seqCol(conn)}) catch unreachable;
+    const sql = std.mem.printSentinel(&sqlbuf, "SELECT COALESCE(MAX({s}),0) FROM \"_events\" WHERE \"name\" = ?1;", .{seqCol(conn)}, 0) catch unreachable;
     var st = try prep(conn, sql);
     defer st.finalize();
     try st.bindText(1, event);
@@ -430,7 +430,7 @@ test "batch capture is atomic, bounded, and preserves an outer transaction" {
     try migrations.run(&d);
     try insertBatch(&d, std.testing.io, &.{}, .{});
     try std.testing.expect(!d.inTransaction());
-    const large = [_]EventInput{.{ .name = "large" }} ** (max_batch_events + 1);
+    const large = @as([(max_batch_events + 1)]EventInput, @splat(.{ .name = "large" }));
     try std.testing.expectError(error.BatchTooLarge, insertBatch(&d, std.testing.io, &large, .{}));
     try std.testing.expectEqual(@as(i64, 0), try countEvents(&d));
     try d.exec("CREATE TRIGGER reject_batch BEFORE INSERT ON _events WHEN NEW.name='reject' BEGIN SELECT RAISE(ABORT,'rejected'); END;");
@@ -566,7 +566,7 @@ test "runRollup accepts a long valid rollup name on SQLite" {
     defer d.close();
     try migrations.run(&d);
     try insertEvent(&d, std.testing.io, .{ .name = "long-name-event", .payload_json = "{}" });
-    const name = "r" ** 5000;
+    const name = (&@as([5000]u8, @splat('r')));
     try runRollup(&d, std.testing.allocator, .{
         .name = name,
         .event = "long-name-event",

@@ -148,7 +148,7 @@ out of the box.
    ```
    The script will:
    - Cross-build `zigbase` for all four targets via
-     `mise exec zig@0.16.0 -- zig build -Dtarget=<t> -Doptimize=ReleaseSafe -Dcpu=baseline`.
+     `mise exec zig@0.17.1 -- zig build -Dtarget=<t> -Doptimize=safe -Dcpu=baseline`.
    - Copy each binary into the corresponding `server-<key>/zigbase`.
    - Verify all `@zigbase/server*` packages share one version, and that the
      `zigbase` alias carries that version and pins it exactly.

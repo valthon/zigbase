@@ -46,14 +46,14 @@ pub fn assembleTypes(comptime methods: anytype) []const type {
 
     if (!info.@"struct".is_tuple) {
         // New named form.
-        for (std.meta.fields(AM)) |f| {
-            if (!std.mem.eql(u8, f.name, "builtins") and !std.mem.eql(u8, f.name, "custom"))
-                @compileError(".auth.methods: unknown key '." ++ f.name ++ "' (recognized: .builtins, .custom)");
+        for (@typeInfo(AM).@"struct".field_names) |f| {
+            if (!std.mem.eql(u8, f, "builtins") and !std.mem.eql(u8, f, "custom"))
+                @compileError(".auth.methods: unknown key '." ++ f ++ "' (recognized: .builtins, .custom)");
         }
         comptime var result: []const type = &.{};
         if (@hasField(AM, "builtins")) {
-            inline for (std.meta.fields(@TypeOf(am.builtins))) |bf| {
-                const lit = @field(am.builtins, bf.name);
+            inline for (@typeInfo(@TypeOf(am.builtins)).@"struct".field_names) |bf| {
+                const lit = @field(am.builtins, bf);
                 const name = @tagName(lit);
                 const T: type = blk: {
                     if (std.mem.eql(u8, name, "password")) break :blk PasswordMethod;
@@ -70,8 +70,8 @@ pub fn assembleTypes(comptime methods: anytype) []const type {
             result = all_builtins;
         }
         if (@hasField(AM, "custom")) {
-            inline for (std.meta.fields(@TypeOf(am.custom))) |f| {
-                result = result ++ &[_]type{@field(am.custom, f.name)};
+            inline for (@typeInfo(@TypeOf(am.custom)).@"struct".field_names) |f| {
+                result = result ++ &[_]type{@field(am.custom, f)};
             }
         }
         return result;
@@ -79,8 +79,8 @@ pub fn assembleTypes(comptime methods: anytype) []const type {
 
     // Legacy bare tuple: all built-ins ++ customs (unchanged).
     comptime var result: []const type = all_builtins;
-    inline for (info.@"struct".fields) |f| {
-        result = result ++ &[_]type{@field(am, f.name)};
+    inline for (info.@"struct".field_names) |f| {
+        result = result ++ &[_]type{@field(am, f)};
     }
     return result;
 }
@@ -89,15 +89,15 @@ pub fn assembleTypes(comptime methods: anytype) []const type {
 // Instances — comptime-generated holder struct for heterogeneous instances
 // ---------------------------------------------------------------------------
 
-/// Generates a std.meta.Tuple type with one element per entry in `types`.
+/// Generates a @Tuple type with one element per entry in `types`.
 /// Field names are "0", "1", ..., "N-1". Enables stack-storage of
 /// heterogeneous instances without heap allocation.
-/// Note: @Type with .@"struct" is not supported in Zig 0.16; std.meta.Tuple
+/// Note: @Type with .@"struct" is not supported in Zig 0.16; @Tuple
 /// is used instead — it produces a tuple with the same field layout.
 pub fn Instances(comptime types: []const type) type {
     comptime var tuple_types: [types.len]type = undefined;
     for (types, 0..) |T, i| tuple_types[i] = T;
-    return std.meta.Tuple(&tuple_types);
+    return @Tuple(&tuple_types);
 }
 
 // ---------------------------------------------------------------------------

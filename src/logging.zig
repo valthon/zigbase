@@ -183,7 +183,7 @@ pub fn logFn(
     comptime fmt: []const u8,
     args: anytype,
 ) void {
-    if (@intFromEnum(level) > @intFromEnum(min_level)) return;
+    if (@backingInt(level) > @backingInt(min_level)) return;
     var msg_buf: [1024]u8 = undefined;
     const msg = formatInto(&msg_buf, fmt, args);
     var line_buf: [8192]u8 = undefined;
@@ -194,7 +194,7 @@ pub fn logFn(
 /// level floor is above `info`.
 pub fn request(rec: RequestRecord) void {
     if (!request_logging) return;
-    if (@intFromEnum(std.log.Level.info) > @intFromEnum(min_level)) return;
+    if (@backingInt(std.log.Level.info) > @backingInt(min_level)) return;
     var line_buf: [8192]u8 = undefined;
     write(formatRequest(&line_buf, format, rec));
 }

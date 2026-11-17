@@ -72,7 +72,7 @@ async function waitForHealth(url: string, timeoutMs = 20_000): Promise<void> {
 export async function startPlugins(): Promise<PluginsServer> {
   if (!process.env.ZIGBASE_TEST_PLUGINS_BINARY) {
     ensureFrontend();
-    const b = spawnSync("mise", ["exec", "zig@0.16.0", "--", "zig", "build"], { cwd: EXAMPLE_ROOT, stdio: "inherit" });
+    const b = spawnSync("mise", ["exec", "zig@0.17.1", "--", "zig", "build"], { cwd: EXAMPLE_ROOT, stdio: "inherit" });
     if (b.status !== 0) throw new Error("plugins build failed");
   }
   // Retry on a fresh port each attempt: a port collision makes the zap listener fail

@@ -1079,9 +1079,9 @@ test "normalizeRange matrix (§A.2): open/suffix/overlong rewritten; in-bounds/m
 test "dir shim: open-ended Range is rewritten via setRequestHeader; unsatisfiable answers owned 416; gz sidecar drives the size" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "big.bin", .data = "x" ** 1000 });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "big.bin", .data = (&@as([1000]u8, @splat('x'))) });
     // sidecar SMALLER than the base file, so a sidecar-selected rewrite is observable
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "big.bin.gz", .data = "z" ** 100 });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "big.bin.gz", .data = (&@as([100]u8, @splat('z'))) });
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();

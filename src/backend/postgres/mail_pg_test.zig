@@ -112,7 +112,7 @@ fn expectSuppressionRows(pool: *db.Pool, email: []const u8, want: []const []cons
     const w = pool.acquireWriter();
     defer pool.releaseWriter();
     var sql_buf: [256]u8 = undefined;
-    const sql = try std.fmt.bufPrintZ(&sql_buf, "SELECT \"account\",\"reason\",\"source\" FROM \"_suppressions\" WHERE \"email\"='{s}' ORDER BY \"account\";", .{email});
+    const sql = try std.mem.printSentinel(&sql_buf, "SELECT \"account\",\"reason\",\"source\" FROM \"_suppressions\" WHERE \"email\"='{s}' ORDER BY \"account\";", .{email}, 0);
     var st = try w.prepare(sql);
     defer st.finalize();
     var n: usize = 0;
@@ -133,7 +133,7 @@ fn expectRecipient(pool: *db.Pool, batch: []const u8, email: []const u8, want: W
     const w = pool.acquireWriter();
     defer pool.releaseWriter();
     var sql_buf: [256]u8 = undefined;
-    const sql = try std.fmt.bufPrintZ(&sql_buf, "SELECT \"status\",\"last_error\",\"attempts\",\"sent_at\" FROM \"_mail_batch_recipients\" WHERE \"batch\"='{s}' AND \"email\"='{s}';", .{ batch, email });
+    const sql = try std.mem.printSentinel(&sql_buf, "SELECT \"status\",\"last_error\",\"attempts\",\"sent_at\" FROM \"_mail_batch_recipients\" WHERE \"batch\"='{s}' AND \"email\"='{s}';", .{ batch, email }, 0);
     var st = try w.prepare(sql);
     defer st.finalize();
     try testing.expect(try st.step());
@@ -147,7 +147,7 @@ fn expectBatchRowStatus(pool: *db.Pool, batch: []const u8, want: []const u8) !vo
     const w = pool.acquireWriter();
     defer pool.releaseWriter();
     var sql_buf: [128]u8 = undefined;
-    const sql = try std.fmt.bufPrintZ(&sql_buf, "SELECT \"status\" FROM \"_mail_batches\" WHERE \"id\"='{s}';", .{batch});
+    const sql = try std.mem.printSentinel(&sql_buf, "SELECT \"status\" FROM \"_mail_batches\" WHERE \"id\"='{s}';", .{batch}, 0);
     var st = try w.prepare(sql);
     defer st.finalize();
     try testing.expect(try st.step());

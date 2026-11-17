@@ -108,13 +108,13 @@ const exe_mod = b.createModule(.{
 exe_mod.addImport("zigbase", dep.module("zigbase"));
 ```
 
-zigbase is pinned to a single Zig minor series (currently **0.16.0**, see
+zigbase is pinned to a single Zig minor series (currently **0.17.1**, see
 `build.zig.zon`'s `minimum_zig_version` and `mise.toml`). Building against an
 unsupported Zig version fails at **compile time** with a clear required-vs-actual
-message (e.g. `zigbase requires Zig 0.16.x … but you are building with 0.17.0`)
+message (e.g. `zigbase requires Zig 0.17.x … but you are building with 0.17.0`)
 instead of an opaque deep-compilation error, so a toolchain mismatch is obvious.
 Install the pinned toolchain with `mise install`, or invoke
-`mise exec zig@0.16.0 -- zig build`.
+`mise exec zig@0.17.1 -- zig build`.
 
 Minimal `src/main.zig`:
 
@@ -588,7 +588,7 @@ fn confirm(ctx: *zigbase.Ctx) anyerror!zigbase.http.Response {
     const req = ctx.request.?;
     const id = req.param("id") orelse
         return ctx.jsonError(404, "not_found", "Not found.");
-    const body = try std.fmt.allocPrint(ctx.arena.a, "{{\"id\":\"{s}\"}}", .{id});
+    const body = try ctx.arena.a.print("{{\"id\":\"{s}\"}}", .{id});
     return .{ .status = 200, .body = body }; // body lives in the request arena
 }
 ```
@@ -5187,7 +5187,7 @@ const MyStorage = struct {
 
     pub fn create(gpa: std.mem.Allocator, io: std.Io, cfg: zigbase.Config) !MyStorage {
         _ = io;
-        const root = try std.fmt.allocPrint(gpa, "{s}/storage", .{cfg.data_dir});
+        const root = try gpa.print("{s}/storage", .{cfg.data_dir});
         return .{ .backend = zigbase.LocalStorage.init(root) };
     }
     pub fn interface(self: *MyStorage) zigbase.Storage {
@@ -5808,7 +5808,7 @@ its children and removes temporary state. Run only trusted test binaries: custom
 startup hooks can have side effects beyond their data directory.
 
 ```sh
-zig build -Doptimize=ReleaseFast
+zig build -Doptimize=fast
 python3 tools/tuning/measure.py \
   --candidate stock=./zig-out/bin/zigbase \
   --revision YOUR_SOURCE_REVISION \
@@ -6533,11 +6533,13 @@ b.step("test", "Run tests").dependOn(&b.addRunArtifact(tests).step);
 Pass the **same** module you passed to `addTo`: rooting a second module at
 `src/main.zig` would place one file in two modules, which Zig rejects.
 
+Zig 0.17.1 no longer supports replacing the build runner. This helper customizes only the test executable runner through the supported `test_runner` option.
+
 `addTest` wires a `.simple`-mode test runner that ZigBase ships
 (`src/simple_runner.zig`, resolved out of the dependency — you do not vendor
 anything). That matters for two reasons:
 
-- **It avoids a misleading Zig 0.16.0 diagnostic.** The default server-mode
+- **It avoids a misleading Zig 0.17.1 diagnostic.** The default server-mode
   runner (`--listen=-`) can print `failed command:` after a successful child leaves
   stderr output at exit. The reproduced trigger is facil.io's destructor newline;
   the command exits zero and the summary reports passing tests. This does not
@@ -6553,6 +6555,8 @@ summary. Never dismiss a nonzero exit or signal as the newline diagnostic. See
 and [#261](https://github.com/valthon/zigbase/issues/261) for the investigation. The
 [standalone reproduction and candidate upstream patch](../diagnostics/issue-261/README.md)
 are contributor diagnostics; keep using `zigbase.addTest` in consumer apps.
+
+The library dependency also supplies its translated SQLite and optional thumbnail POSIX declarations using the pinned official `translate-c` package. Consumer build files need no C translation step or additional dependency.
 
 ## Compile-time build flags
 

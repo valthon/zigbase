@@ -47,12 +47,12 @@ pub fn resolve(comptime cfg: anytype) Config {
     const p = cfg.pagination;
     const T = @TypeOf(p);
     // Guard unknown keys so a typo fails loudly instead of silently defaulting.
-    inline for (std.meta.fields(T)) |f| {
+    inline for (@typeInfo(T).@"struct".field_names) |f| {
         comptime var ok = false;
         inline for (.{ "offset", "cursor", "cursor_token" }) |name| {
-            if (comptime std.mem.eql(u8, f.name, name)) ok = true;
+            if (comptime std.mem.eql(u8, f, name)) ok = true;
         }
-        if (!ok) @compileError("unknown '.pagination' field '" ++ f.name ++ "'; expected .offset / .cursor / .cursor_token");
+        if (!ok) @compileError("unknown '.pagination' field '" ++ f ++ "'; expected .offset / .cursor / .cursor_token");
     }
     comptime var out = Config{};
     if (@hasField(T, "offset")) out.offset = p.offset;

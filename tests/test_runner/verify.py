@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check Zig 0.16.0 diagnostics and the shipped simple runner without patching Zig."""
+"""Check Zig 0.17.1 diagnostics and the shipped simple runner without patching Zig."""
 
 import argparse
 import os
@@ -18,15 +18,15 @@ def main():
     parser.add_argument("--zig", default=shutil.which("zig"))
     args = parser.parse_args()
     if not args.zig:
-        parser.error("put pinned Zig 0.16.0 on PATH or pass --zig")
+        parser.error("put pinned Zig 0.17.1 on PATH or pass --zig")
     # Resolve before switching cwd; mise shims remain executable as provided.
     zig = str(Path(args.zig).absolute())
     env = dict(os.environ)
     for name in ("ZIG_BUILD_RUNNER", "ZIG_LIB_DIR", "ZIG_LOCAL_CACHE_DIR"):
         env.pop(name, None)
     version = subprocess.run([zig, "version"], env=env, capture_output=True, text=True, check=True, timeout=30)
-    if version.stdout.strip() != "0.16.0":
-        parser.error("this diagnostic regression targets exactly Zig 0.16.0")
+    if version.stdout.strip() != "0.17.1":
+        parser.error("this diagnostic regression targets exactly Zig 0.17.1")
     # The deliberate post-test signal must not create core dumps.
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
     with tempfile.TemporaryDirectory(prefix="zigbase-runner-") as directory:

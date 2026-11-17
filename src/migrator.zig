@@ -215,7 +215,7 @@ pub const Migrator = struct {
 
     /// Dupe an arena-built statement to a sentinel-terminated slice and run it.
     fn execArena(self: *Migrator, sql: []const u8) OpError!void {
-        const z = self.arena.dupeZ(u8, sql) catch return error.ExecFailed;
+        const z = self.arena.dupeSentinel(u8, sql, 0) catch return error.ExecFailed;
         return self.exec(z);
     }
 

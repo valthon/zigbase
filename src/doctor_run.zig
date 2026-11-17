@@ -43,7 +43,7 @@ fn gatherJwtSecretFile(arena: std.mem.Allocator, io: std.Io, cfg: config.Config,
         // rules in doctor.zig expect.
     }
     if (std.Io.Dir.cwd().statFile(io, path, .{})) |st| {
-        f.jwt_secret_file_mode = @intCast(@intFromEnum(st.permissions) & 0o7777);
+        f.jwt_secret_file_mode = @intCast(@backingInt(st.permissions) & 0o7777);
     } else |_| {
         // Stat failing (most commonly: the file doesn't exist) leaves mode
         // null, which checkJwtSecret already treats as "not 0600".

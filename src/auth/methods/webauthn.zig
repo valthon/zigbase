@@ -452,7 +452,7 @@ test "WebAuthnMethod: complete succeeds with valid fixture (ES256)" {
     const sa = setup_arena.allocator();
 
     // Generate an EC P-256 key pair deterministically.
-    const seed = [_]u8{0x42} ** 32;
+    const seed = @as([32]u8, @splat(0x42));
     const kp = try Ecdsa.KeyPair.generateDeterministic(seed);
 
     // Build EC2 COSE key bytes.
@@ -475,7 +475,7 @@ test "WebAuthnMethod: complete succeeds with valid fixture (ES256)" {
     defer alloc.free(cred_id_b64);
 
     // Generate a 32-byte raw challenge.
-    const challenge_raw = [_]u8{0xAB} ** 32;
+    const challenge_raw = @as([32]u8, @splat(0xAB));
     const challenge_b64 = try client_data.b64urlNoPad(alloc, &challenge_raw);
     defer alloc.free(challenge_b64);
 
@@ -613,7 +613,7 @@ test "WebAuthnMethod: complete with tampered signature returns 401" {
     const rp_id = "example.test";
     const origin = "https://example.test";
 
-    const seed = [_]u8{0x43} ** 32;
+    const seed = @as([32]u8, @splat(0x43));
     const kp = try Ecdsa.KeyPair.generateDeterministic(seed);
     const sec1 = kp.public_key.toUncompressedSec1();
     var x: [32]u8 = undefined;
@@ -629,7 +629,7 @@ test "WebAuthnMethod: complete with tampered signature returns 401" {
     const cred_id_b64 = try client_data.b64urlNoPad(alloc, &cred_id_raw);
     defer alloc.free(cred_id_b64);
 
-    const challenge_raw = [_]u8{0xCD} ** 32;
+    const challenge_raw = @as([32]u8, @splat(0xCD));
     const challenge_b64 = try client_data.b64urlNoPad(alloc, &challenge_raw);
     defer alloc.free(challenge_b64);
 
@@ -741,7 +741,7 @@ test "WebAuthnMethod: complete with unknown credentialId returns 400" {
                 .origin = "https://example.test",
             } } } },
         });
-        const challenge_raw = [_]u8{0xEF} ** 32;
+        const challenge_raw = @as([32]u8, @splat(0xEF));
         const cs = ChallengeStore{ .conn = w };
         break :blk try cs.put(alloc, std.testing.io, "wausers5", "webauthn", "", &challenge_raw, 300);
     };
@@ -802,7 +802,7 @@ test "WebAuthnMethod: complete with expired ceremonyId returns 400" {
             } } } },
         });
         // Put a challenge with negative TTL (already expired).
-        const challenge_raw = [_]u8{0xF0} ** 32;
+        const challenge_raw = @as([32]u8, @splat(0xF0));
         const cs = ChallengeStore{ .conn = w };
         break :blk try cs.put(alloc, std.testing.io, "wausers6", "webauthn", "", &challenge_raw, -1);
     };
@@ -853,7 +853,7 @@ test "WebAuthnMethod: complete with clone signal (stored count > new count) retu
     const rp_id = "example.test";
     const origin = "https://example.test";
 
-    const seed = [_]u8{0x77} ** 32;
+    const seed = @as([32]u8, @splat(0x77));
     const kp = try Ecdsa.KeyPair.generateDeterministic(seed);
     const sec1 = kp.public_key.toUncompressedSec1();
     var x: [32]u8 = undefined;
@@ -869,7 +869,7 @@ test "WebAuthnMethod: complete with clone signal (stored count > new count) retu
     const cred_id_b64 = try client_data.b64urlNoPad(alloc, &cred_id_raw);
     defer alloc.free(cred_id_b64);
 
-    const challenge_raw = [_]u8{0x77} ** 32;
+    const challenge_raw = @as([32]u8, @splat(0x77));
     const challenge_b64 = try client_data.b64urlNoPad(alloc, &challenge_raw);
     defer alloc.free(challenge_b64);
 
@@ -988,7 +988,7 @@ test "WebAuthnMethod: complete rejects a credential bound to a DIFFERENT collect
     defer setup_arena.deinit();
     const sa = setup_arena.allocator();
 
-    const seed = [_]u8{0x88} ** 32;
+    const seed = @as([32]u8, @splat(0x88));
     const kp = try Ecdsa.KeyPair.generateDeterministic(seed);
     const sec1 = kp.public_key.toUncompressedSec1();
     var x: [32]u8 = undefined;
@@ -1004,7 +1004,7 @@ test "WebAuthnMethod: complete rejects a credential bound to a DIFFERENT collect
     const cred_id_b64 = try client_data.b64urlNoPad(alloc, &cred_id_raw);
     defer alloc.free(cred_id_b64);
 
-    const challenge_raw = [_]u8{0x88} ** 32;
+    const challenge_raw = @as([32]u8, @splat(0x88));
     const challenge_b64 = try client_data.b64urlNoPad(alloc, &challenge_raw);
     defer alloc.free(challenge_b64);
 
@@ -1110,7 +1110,7 @@ test "WebAuthnMethod: complete with require_uv=true rejects an assertion lacking
     defer setup_arena.deinit();
     const sa = setup_arena.allocator();
 
-    const seed = [_]u8{0x99} ** 32;
+    const seed = @as([32]u8, @splat(0x99));
     const kp = try Ecdsa.KeyPair.generateDeterministic(seed);
     const sec1 = kp.public_key.toUncompressedSec1();
     var x: [32]u8 = undefined;
@@ -1126,7 +1126,7 @@ test "WebAuthnMethod: complete with require_uv=true rejects an assertion lacking
     const cred_id_b64 = try client_data.b64urlNoPad(alloc, &cred_id_raw);
     defer alloc.free(cred_id_b64);
 
-    const challenge_raw = [_]u8{0x99} ** 32;
+    const challenge_raw = @as([32]u8, @splat(0x99));
     const challenge_b64 = try client_data.b64urlNoPad(alloc, &challenge_raw);
     defer alloc.free(challenge_b64);
 

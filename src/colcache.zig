@@ -317,9 +317,8 @@ test "colcache: a load that raced an invalidation is NOT published (generation g
 
 test "colcache: concurrent lease/invalidate/release stress (no UAF, no leak)" {
     // N threads allocate/free THROUGH the cache concurrently (key dupes in publish, entry
-    // frees in unref). `std.testing.allocator` is a DebugAllocator whose `thread_safe`
-    // config defaults to `!single_threaded`, i.e. it is mutex-guarded in the (multi-threaded)
-    // test build — so this exercises the cache's OWN locking, not a racy allocator, while
+    // frees in unref). `std.testing.allocator` is a SafeAllocator backed by the
+    // thread-safe page allocator, so this exercises the cache's OWN locking while
     // still catching leaks at scope exit and any use-after-free / double-free the cache
     // might commit.
     var cache = Cache.init(testing.allocator);

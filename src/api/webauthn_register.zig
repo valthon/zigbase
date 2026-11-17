@@ -342,7 +342,7 @@ test "webauthn_register finish: wrong account leaves challenge redeemable by rea
     const rp_id = "example.test";
     const origin = "https://example.test";
 
-    const seed = [_]u8{0x33} ** 32;
+    const seed = @as([32]u8, @splat(0x33));
     const kp = try Ecdsa.KeyPair.generateDeterministic(seed);
     const sec1 = kp.public_key.toUncompressedSec1();
     var x_bytes: [32]u8 = undefined;
@@ -357,7 +357,7 @@ test "webauthn_register finish: wrong account leaves challenge redeemable by rea
     std.crypto.hash.sha2.Sha256.hash(rp_id, &rp_id_hash, .{});
 
     const cred_id_raw = [_]u8{ 0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33 };
-    const aaguid = [_]u8{0} ** 16;
+    const aaguid = @as([16]u8, @splat(0));
 
     // Build authData with AT|UP|UV flags.
     const auth_data_buf = try buildAuthDataWithCred(a, rp_id_hash, 0x45, 0, aaguid, &cred_id_raw, cose_key_buf);
@@ -382,7 +382,7 @@ test "webauthn_register finish: wrong account leaves challenge redeemable by rea
             .exp = now_ts + 86400,
         }, &key);
         // Build challenge + store it with method "webauthn_reg".
-        const challenge_raw = [_]u8{0x33} ** 32;
+        const challenge_raw = @as([32]u8, @splat(0x33));
         const cs = ChallengeStore{ .conn = w };
         const c = try cs.put(a, std.testing.io, "wrusers3", "webauthn_reg", r, &challenge_raw, 300);
         const other_id = (try api_auth.findByIdentity(a, w, (try collections.get(a, w, "wrusers3")).?, "other@x.io")).?;
@@ -399,7 +399,7 @@ test "webauthn_register finish: wrong account leaves challenge redeemable by rea
     };
 
     // Build clientDataJSON now that cid is known (challenge bytes are fixed above).
-    const challenge_raw = [_]u8{0x33} ** 32;
+    const challenge_raw = @as([32]u8, @splat(0x33));
     const challenge_b64 = try client_data.b64urlNoPad(a, &challenge_raw);
     const cdj = try std.fmt.allocPrint(
         a,
@@ -542,7 +542,7 @@ test "webauthn_register finish: duplicate credentialId returns 409" {
     const rp_id = "example.test";
     const origin = "https://example.test";
 
-    const seed = [_]u8{0x44} ** 32;
+    const seed = @as([32]u8, @splat(0x44));
     const kp = try Ecdsa.KeyPair.generateDeterministic(seed);
     const sec1 = kp.public_key.toUncompressedSec1();
     var x_bytes: [32]u8 = undefined;
@@ -555,7 +555,7 @@ test "webauthn_register finish: duplicate credentialId returns 409" {
     std.crypto.hash.sha2.Sha256.hash(rp_id, &rp_id_hash, .{});
 
     const cred_id_raw = [_]u8{ 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44 };
-    const aaguid = [_]u8{0} ** 16;
+    const aaguid = @as([16]u8, @splat(0));
     const auth_data_buf = try buildAuthDataWithCred(a, rp_id_hash, 0x45, 0, aaguid, &cred_id_raw, cose_key_buf);
     const att_obj_buf = try buildAttestationObj(a, auth_data_buf);
 
@@ -582,13 +582,13 @@ test "webauthn_register finish: duplicate credentialId returns 409" {
         const cose_key_b64_stored = try client_data.b64urlNoPad(a, cose_key_buf);
         try cred_store.insert(a, std.testing.io, "wrusers4", rid, cred_id_b64, cose_key_b64_stored, -7, 0, "", "");
         // Now store a challenge for the duplicate registration attempt.
-        const challenge_raw = [_]u8{0x44} ** 32;
+        const challenge_raw = @as([32]u8, @splat(0x44));
         const cs = ChallengeStore{ .conn = w };
         const c = try cs.put(a, std.testing.io, "wrusers4", "webauthn_reg", rid, &challenge_raw, 300);
         break :blk .{ tkn, c };
     };
 
-    const challenge_raw = [_]u8{0x44} ** 32;
+    const challenge_raw = @as([32]u8, @splat(0x44));
     const challenge_b64 = try client_data.b64urlNoPad(a, &challenge_raw);
     const cdj = try std.fmt.allocPrint(
         a,

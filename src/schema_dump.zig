@@ -464,7 +464,7 @@ test "schemaDump (sqlite) output is re-runnable into a fresh database" {
     // Replay the dumped SQL into a fresh in-memory DB; it must recreate everything.
     var fresh = try db.Db.openMemory();
     defer fresh.close();
-    const dump_z = try std.testing.allocator.dupeZ(u8, dump);
+    const dump_z = try std.testing.allocator.dupeSentinel(u8, dump, 0);
     defer std.testing.allocator.free(dump_z);
     try fresh.exec(dump_z);
 

@@ -48,7 +48,7 @@ jobs:
       - name: Assert tag matches build.zig.zon
         run: scripts/assert-version.sh "${GITHUB_REF_NAME#v}"
       - name: Build zigbase (${{ matrix.zig }})
-        run: mise exec zig@0.16.0 -- zig build -Dtarget=${{ matrix.zig }} -Doptimize=ReleaseSafe -Dcpu=baseline
+        run: mise exec zig@0.17.1 -- zig build -Dtarget=${{ matrix.zig }} -Doptimize=safe -Dcpu=baseline
       - name: Stage binary
         run: |
           mkdir -p staged

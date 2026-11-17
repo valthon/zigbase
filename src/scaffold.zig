@@ -66,7 +66,7 @@ pub fn packageName(a: std.mem.Allocator, dir: []const u8) ![]u8 {
 /// 0x306d84a9).
 ///
 /// DEVIATION FROM BRIEF: the brief specified `fingerprint(name) u64`, sourcing the
-/// id from `std.crypto.random` — which does not exist in Zig 0.16 (randomness moved
+/// id from `std.crypto.random` — which does not exist in Zig 0.17.1 (randomness moved
 /// behind `std.Io`, same migration documented for the rest of this codebase; see
 /// `src/entropy.zig` / `src/id.zig`, which already only ever draw randomness via an
 /// `io: std.Io` parameter). There is no ambient/global RNG left to call from a
@@ -93,7 +93,7 @@ pub fn detectMode(io: std.Io, dir: std.Io.Dir) Mode {
 
 /// One exclusive write. Returns the outcome; never truncates, never partially writes
 /// over an existing file.
-/// NOTE (verified against Zig 0.16.0): `std.Io.File.Mode` and `File.default_mode` DO NOT
+/// NOTE (verified against Zig 0.17.1): `std.Io.File.Mode` and `File.default_mode` DO NOT
 /// EXIST, and `Dir.CreateFileOptions` has no `mode` field — it carries only `read`,
 /// `truncate`, `exclusive`, and lock options (`std/Io/Dir.zig:585`). Permission bits are
 /// `std.Io.File.Permissions`, an `enum(std.posix.mode_t)` with `.fromMode(0o755)`

@@ -2024,7 +2024,7 @@ test "abilities deserialization fails closed on a malformed (non-string) min_rol
 test "optionsFromJson yields a fully-owned graph deinitOptions frees (methods + abilities)" {
     // Guards the deinit paths the Collection leak tests don't reach: magic_link/webauthn method
     // strings, methods.custom, and abilities via/min_role. Run under the RAW checking allocator:
-    // any static/borrowed pointer freed here (e.g. a leftover default) crashes the DebugAllocator,
+    // any static/borrowed pointer freed here (e.g. a leftover default) crashes the SafeAllocator,
     // and any unfreed dupe leaks.
     const a = std.testing.allocator;
     const j =

@@ -463,7 +463,7 @@ fn expectFractionalResendAge(d: *db.Db) !void {
         defer testing.allocator.free(literal);
         const sql = try std.mem.replaceOwned(u8, testing.allocator, ageSecondsSql(d), if (pg) "now()" else "'now'", literal);
         defer testing.allocator.free(sql);
-        const sql_z = try testing.allocator.dupeZ(u8, sql);
+        const sql_z = try testing.allocator.dupeSentinel(u8, sql, 0);
         defer testing.allocator.free(sql_z);
         var st = try prep(d, sql_z);
         defer st.finalize();

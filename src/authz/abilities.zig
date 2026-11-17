@@ -146,8 +146,8 @@ pub fn applyAbilities(
         var out: [base.len]schema.Collection = undefined;
         for (base, 0..) |c, i| out[i] = c;
 
-        for (std.meta.fields(ACfg)) |cf| {
-            const cname = cf.name;
+        for (@typeInfo(ACfg).@"struct".field_names) |cf| {
+            const cname = cf;
             var idx: ?usize = null;
             for (out, 0..) |c, i| {
                 if (std.mem.eql(u8, c.name, cname)) idx = i;
@@ -161,8 +161,8 @@ pub fn applyAbilities(
                 @compileError("abilities: collection '" ++ cname ++ "' must map to '.{ .view = ..., .update = ..., ... }'");
 
             var ab = Abilities{};
-            for (std.meta.fields(SpecT)) |af| {
-                const action = af.name;
+            for (@typeInfo(SpecT).@"struct".field_names) |af| {
+                const action = af;
                 const known = streq(action, "view") or streq(action, "update") or
                     streq(action, "delete") or streq(action, "create");
                 if (!known)
@@ -191,17 +191,17 @@ fn lowerRule(comptime cname: []const u8, comptime col: schema.Collection, compti
         const RT = @TypeOf(rule);
         if (@typeInfo(RT) != .@"struct" or !@hasField(RT, "relationship"))
             @compileError("abilities: '" ++ cname ++ "' rule must be '.{ .relationship = .{ .via = \"<relation>\", .min_role = .<role> } }'");
-        for (std.meta.fields(RT)) |f| {
-            if (!streq(f.name, "relationship"))
-                @compileError("abilities: '" ++ cname ++ "': unknown rule key '." ++ f.name ++ "' (recognized: .relationship)");
+        for (@typeInfo(RT).@"struct".field_names) |f| {
+            if (!streq(f, "relationship"))
+                @compileError("abilities: '" ++ cname ++ "': unknown rule key '." ++ f ++ "' (recognized: .relationship)");
         }
         const rel = rule.relationship;
         const RelT = @TypeOf(rel);
         if (@typeInfo(RelT) != .@"struct" or !@hasField(RelT, "via"))
             @compileError("abilities: '" ++ cname ++ "': .relationship must set .via (the relation field naming the owning account)");
-        for (std.meta.fields(RelT)) |f| {
-            if (!streq(f.name, "via") and !streq(f.name, "min_role"))
-                @compileError("abilities: '" ++ cname ++ "': unknown .relationship key '." ++ f.name ++ "' (recognized: .via, .min_role)");
+        for (@typeInfo(RelT).@"struct".field_names) |f| {
+            if (!streq(f, "via") and !streq(f, "min_role"))
+                @compileError("abilities: '" ++ cname ++ "': unknown .relationship key '." ++ f ++ "' (recognized: .via, .min_role)");
         }
         const via: []const u8 = rel.via;
 

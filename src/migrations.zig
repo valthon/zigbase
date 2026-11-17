@@ -714,7 +714,7 @@ fn init_0030_analytics_text_collation(m: *Migrator) db.DbError!void {
         var st = try m.prepare(analytics_collation_plan_sql);
         defer st.finalize();
         while (try st.step()) {
-            const sql = m.arena.dupeZ(u8, st.columnText(0)) catch return error.ExecFailed;
+            const sql = m.arena.dupeSentinel(u8, st.columnText(0), 0) catch return error.ExecFailed;
             stmts.append(m.arena, sql) catch return error.ExecFailed;
         }
     }
@@ -1163,7 +1163,7 @@ test "0010 backfills a long-named (251+ char) auth table — no fixed-buffer len
     try d.exec("CREATE TABLE \"_superusers\" (\"id\" TEXT PRIMARY KEY, \"email\" TEXT);");
     // A valid identifier of 260 chars (alpha-first, alnum) — passes schema.isValidIdentifier
     // (no length cap), so it must also be migrated. The old [320]u8/len<=250 guard skipped it.
-    const long_name = "a" ++ ("b" ** 259);
+    const long_name = "a" ++ ((&@as([259]u8, @splat('b'))));
     try std.testing.expectEqual(@as(usize, 260), long_name.len);
     try d.exec("INSERT INTO \"_collections\" (\"id\",\"name\",\"type\") VALUES ('c1','" ++ long_name ++ "','auth');");
     try d.exec("CREATE TABLE \"" ++ long_name ++ "\" (\"id\" TEXT PRIMARY KEY, \"tokenKey\" TEXT);");

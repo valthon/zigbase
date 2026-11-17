@@ -75,8 +75,8 @@ pub fn flagMeta(comptime flags_cfg: anytype) []const FlagDef {
         if (@typeInfo(T) != .@"struct")
             @compileError(".flags must be a struct literal of flag declarations");
         var list: []const FlagDef = &.{};
-        for (std.meta.fields(T)) |f| {
-            const name = f.name;
+        for (@typeInfo(T).@"struct".field_names) |f| {
+            const name = f;
             const spec = @field(flags_cfg, name);
             const ST = @TypeOf(spec);
             if (ST == bool) {
@@ -86,9 +86,9 @@ pub fn flagMeta(comptime flags_cfg: anytype) []const FlagDef {
             if (@typeInfo(ST) != .@"struct")
                 @compileError("flag '" ++ name ++ "' must be a bool (shorthand default) or a struct '.{ .default = <bool>, .description = \"…\" }'");
             // Loud-comptime: reject typo'd sub-keys.
-            for (std.meta.fields(ST)) |sf| {
-                if (!std.mem.eql(u8, sf.name, "default") and !std.mem.eql(u8, sf.name, "description"))
-                    @compileError("flag '" ++ name ++ "': unknown key '." ++ sf.name ++ "' (recognized keys: .default, .description)");
+            for (@typeInfo(ST).@"struct".field_names) |sf| {
+                if (!std.mem.eql(u8, sf, "default") and !std.mem.eql(u8, sf, "description"))
+                    @compileError("flag '" ++ name ++ "': unknown key '." ++ sf ++ "' (recognized keys: .default, .description)");
             }
             if (!@hasField(ST, "default"))
                 @compileError("flag '" ++ name ++ "': struct form requires a .default = <bool>");
@@ -118,18 +118,18 @@ pub fn experimentMeta(comptime exps_cfg: anytype) []const ExperimentDef {
         if (@typeInfo(T) != .@"struct")
             @compileError(".experiments must be a struct literal of experiment declarations");
         var list: []const ExperimentDef = &.{};
-        for (std.meta.fields(T)) |f| {
-            const name = f.name;
+        for (@typeInfo(T).@"struct".field_names) |f| {
+            const name = f;
             const spec = @field(exps_cfg, name);
             const ST = @TypeOf(spec);
             if (@typeInfo(ST) != .@"struct")
                 @compileError("experiment '" ++ name ++ "' must be a struct '.{ .variants = .{…}, .weights = .{…} }'");
-            for (std.meta.fields(ST)) |sf| {
-                if (!std.mem.eql(u8, sf.name, "variants") and
-                    !std.mem.eql(u8, sf.name, "weights") and
-                    !std.mem.eql(u8, sf.name, "sticky") and
-                    !std.mem.eql(u8, sf.name, "description"))
-                    @compileError("experiment '" ++ name ++ "': unknown key '." ++ sf.name ++ "' (recognized keys: .variants, .weights, .sticky, .description)");
+            for (@typeInfo(ST).@"struct".field_names) |sf| {
+                if (!std.mem.eql(u8, sf, "variants") and
+                    !std.mem.eql(u8, sf, "weights") and
+                    !std.mem.eql(u8, sf, "sticky") and
+                    !std.mem.eql(u8, sf, "description"))
+                    @compileError("experiment '" ++ name ++ "': unknown key '." ++ sf ++ "' (recognized keys: .variants, .weights, .sticky, .description)");
             }
             if (!@hasField(ST, "variants"))
                 @compileError("experiment '" ++ name ++ "': requires .variants = .{ \"v1\", \"v2\", … }");
@@ -141,8 +141,8 @@ pub fn experimentMeta(comptime exps_cfg: anytype) []const ExperimentDef {
             const VT = @TypeOf(spec.variants);
             if (@typeInfo(VT) != .@"struct")
                 @compileError("experiment '" ++ name ++ "': .variants must be a tuple of strings");
-            for (std.meta.fields(VT)) |vf| {
-                const v = @field(spec.variants, vf.name);
+            for (@typeInfo(VT).@"struct".field_names) |vf| {
+                const v = @field(spec.variants, vf);
                 if (!isStringType(@TypeOf(v)))
                     @compileError("experiment '" ++ name ++ "': every variant must be a string");
                 variants = variants ++ &[_][]const u8{v};
@@ -155,8 +155,8 @@ pub fn experimentMeta(comptime exps_cfg: anytype) []const ExperimentDef {
             const WT = @TypeOf(spec.weights);
             if (@typeInfo(WT) != .@"struct")
                 @compileError("experiment '" ++ name ++ "': .weights must be a tuple of integers");
-            for (std.meta.fields(WT)) |wf| {
-                const w = @field(spec.weights, wf.name);
+            for (@typeInfo(WT).@"struct".field_names) |wf| {
+                const w = @field(spec.weights, wf);
                 // Loud-comptime: a malformed weight (non-integer, negative, or >65535)
                 // would otherwise produce a raw Zig coercion error. Name the experiment,
                 // the offending value, and the valid range instead.
@@ -204,16 +204,17 @@ pub fn experimentMeta(comptime exps_cfg: anytype) []const ExperimentDef {
 
 /// Generate an exhaustive enum whose members are the field names of `cfg_struct`
 /// (in declaration order). Used for `App.Flag` / `App.Experiment`: a typo'd `.name`
-/// at a call site is a compile error, and `@intFromEnum` indexes the parallel
+/// at a call site is a compile error, and `@backingInt` indexes the parallel
 /// `flagMeta`/`experimentMeta` slice (same iteration order). An empty literal
 /// yields an empty enum (tag type `u0`).
 pub fn EnumFromFields(comptime cfg_struct: anytype) type {
-    const fields = std.meta.fields(@TypeOf(cfg_struct));
-    const IntTag = std.math.IntFittingRange(0, if (fields.len == 0) 0 else fields.len - 1);
+    const fields = @typeInfo(@TypeOf(cfg_struct)).@"struct".field_names;
+    if (fields.len == 0) return enum(noreturn) {};
+    const IntTag = std.math.IntFittingRange(0, fields.len - 1);
     var names: [fields.len][:0]const u8 = undefined;
     var values: [fields.len]IntTag = undefined;
     for (fields, 0..) |f, i| {
-        names[i] = f.name;
+        names[i] = f;
         values[i] = @intCast(i);
     }
     const frozen_names = names;
@@ -262,11 +263,11 @@ test "experimentMeta lowers variants/weights/sticky/description" {
 
 test "EnumFromFields generates members in declaration order" {
     const Flag = EnumFromFields(.{ .a = true, .b = false, .c = true });
-    try std.testing.expectEqual(@as(usize, 3), std.meta.fields(Flag).len);
-    try std.testing.expectEqual(@as(u2, 0), @intFromEnum(@field(Flag, "a")));
-    try std.testing.expectEqual(@as(u2, 1), @intFromEnum(@field(Flag, "b")));
-    try std.testing.expectEqual(@as(u2, 2), @intFromEnum(@field(Flag, "c")));
+    try std.testing.expectEqual(@as(usize, 3), @typeInfo(Flag).@"enum".field_names.len);
+    try std.testing.expectEqual(@as(u2, 0), @backingInt(@field(Flag, "a")));
+    try std.testing.expectEqual(@as(u2, 1), @backingInt(@field(Flag, "b")));
+    try std.testing.expectEqual(@as(u2, 2), @backingInt(@field(Flag, "c")));
 
     const Empty = EnumFromFields(.{});
-    try std.testing.expectEqual(@as(usize, 0), std.meta.fields(Empty).len);
+    try std.testing.expectEqual(@as(usize, 0), @typeInfo(Empty).@"enum".field_names.len);
 }

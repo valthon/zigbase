@@ -164,7 +164,7 @@ pub const Db = if (build_options.postgres) union(Backend) {
 pub fn openInspectionConnection(allocator: std.mem.Allocator, io: std.Io, target: []const u8) (DbError || std.mem.Allocator.Error)!Db {
     if (build_options.postgres and connstrLooksLikePostgres(target))
         return Db.openPostgres(allocator, io, target);
-    const path = try allocator.dupeZ(u8, target);
+    const path = try allocator.dupeSentinel(u8, target, 0);
     defer allocator.free(path);
     return Db.openReadOnly(path);
 }
@@ -241,7 +241,7 @@ pub const Stmt = if (build_options.postgres) union(Backend) {
     pub fn columnType(self: *Stmt, idx: c_int) ColumnType {
         switch (self.*) {
             // Same ordinal layout across all three enums (asserted by the seam tests).
-            inline else => |*s| return @enumFromInt(@intFromEnum(s.columnType(idx))),
+            inline else => |*s| return @fromBackingInt(@intCast(@backingInt(s.columnType(idx)))),
         }
     }
     pub fn isNull(self: *Stmt, idx: c_int) bool {
@@ -678,7 +678,7 @@ test "PostgreSQL writer recovery refuses a terminated transaction without resett
     if (comptime !build_options.postgres) return error.SkipZigTest;
     const url = std.testing.environ.getPosix("ZIGBASE_PG_TEST_URL") orelse return error.SkipZigTest;
     const a = std.testing.allocator;
-    const target = try a.dupeZ(u8, url);
+    const target = try a.dupeSentinel(u8, url, 0);
     defer a.free(target);
     var pool = try Pool.init(a, std.testing.io, target);
     defer pool.deinit();

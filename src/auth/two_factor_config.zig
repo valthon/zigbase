@@ -22,20 +22,20 @@ pub fn select(comptime config: anytype) Selection {
     }
     if (@typeInfo(T) != .@"struct")
         @compileError(".auth.two_factor must be a config struct or .disabled");
-    for (std.meta.fields(T)) |field| {
-        if (!std.mem.eql(u8, field.name, "factors") and !std.mem.eql(u8, field.name, "recovery_codes") and !std.mem.eql(u8, field.name, "policy"))
-            @compileError(".auth.two_factor: unknown key '." ++ field.name ++ "'");
+    for (@typeInfo(T).@"struct".field_names) |field| {
+        if (!std.mem.eql(u8, field, "factors") and !std.mem.eql(u8, field, "recovery_codes") and !std.mem.eql(u8, field, "policy"))
+            @compileError(".auth.two_factor: unknown key '." ++ field ++ "'");
     }
     if (!@hasField(T, "factors"))
         @compileError(".auth.two_factor.factors is required; select at least one factor");
     const F = @TypeOf(config.factors);
     if (@typeInfo(F) != .@"struct" or !@typeInfo(F).@"struct".is_tuple)
         @compileError(".auth.two_factor.factors must be a tuple of factor names");
-    if (std.meta.fields(F).len == 0)
+    if (@typeInfo(F).@"struct".field_names.len == 0)
         @compileError(".auth.two_factor.factors must contain at least one factor");
     var result = Selection{ .enabled = true, .recovery_codes = true };
-    for (std.meta.fields(F)) |field| {
-        const value = @field(config.factors, field.name);
+    for (@typeInfo(F).@"struct".field_names) |field| {
+        const value = @field(config.factors, field);
         if (@TypeOf(value) != @TypeOf(.enum_literal) and @TypeOf(value) != Factor)
             @compileError(".auth.two_factor.factors entries must be .totp or .webauthn");
         const name = @tagName(value);

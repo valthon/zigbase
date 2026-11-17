@@ -1,6 +1,7 @@
 # Durable batch sizing in a mixed application
 
 These raw reports record a local Debug experiment with Zig 0.16.0 on 2026-09-19.
+That compiler label records the historical measurement; current reproduction commands use the supported Zig 0.17.1 toolchain.
 They were built during implementation on base `59ac830b`, with the mixed-workload
 changes in this PR. They are not clean-release or dedicated-machine capacity
 measurements. Each report records the binary digest, embedded version, fixture
@@ -32,7 +33,7 @@ Use the checked-in fixture with batch 128. For the comparison, change only its
 a different filename. Use the same pinned compiler, build mode, and command:
 
 ```sh
-mise exec zig@0.16.0 -- zig build application-capacity --summary all
+mise exec zig@0.17.1 -- zig build application-capacity --summary all
 python3 tools/application_capacity.py --binary zig-out/bin/application-capacity \
   --tenants 2 --tasks 8 --concurrency 2 --stress-concurrency 4 \
   --seconds 2 --warmup 1 --recovery-seconds 2 --max-requests 120 > report.json

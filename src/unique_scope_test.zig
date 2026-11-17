@@ -59,7 +59,7 @@ fn slugs(tenant_field: ?[]const u8, indexes: []const schema.Index) schema.Collec
 
 fn insert(w: *db.Db, id: []const u8, account: []const u8, slug: []const u8) bool {
     var buf: [256]u8 = undefined;
-    const sql = std.fmt.bufPrintZ(&buf, "INSERT INTO slugs (id, created, updated, account, slug) VALUES ('{s}', '', '', '{s}', '{s}');", .{ id, account, slug }) catch unreachable;
+    const sql = std.mem.printSentinel(&buf, "INSERT INTO slugs (id, created, updated, account, slug) VALUES ('{s}', '', '', '{s}', '{s}');", .{ id, account, slug }, 0) catch unreachable;
     w.exec(sql) catch return false;
     return true;
 }
@@ -518,8 +518,8 @@ test "PostgreSQL long column uniqueness converges once" {
     const a = std.testing.allocator;
     var c = try Conn.open(.postgres, "long_column");
     defer c.deinit();
-    const long_name = "slug" ** 20;
-    const long_tenant = "account" ** 10;
+    const long_name = "slugslugslugslugslugslugslugslugslugslugslugslugslugslugslugslugslugslugslugslug";
+    const long_tenant = "accountaccountaccountaccountaccountaccountaccountaccountaccountaccount";
     var fields = fields_plain;
     fields[0].name = long_tenant;
     fields[1].name = long_name;
@@ -749,7 +749,7 @@ test "issue 523 SQLite rebuild SQL stays in main despite TEMP copy" {
     const old = slugs(null, &.{});
     const sql = try ddl.createTableSql(a, old, null, .sqlite, &.{});
     defer a.free(sql);
-    const sql_z = try a.dupeZ(u8, sql);
+    const sql_z = try a.dupeSentinel(u8, sql, 0);
     defer a.free(sql_z);
     try c.db.exec(sql_z);
     try std.testing.expect(insert(&c.db, "kept", "acct-a", "value"));
@@ -760,7 +760,7 @@ test "issue 523 SQLite rebuild SQL stays in main despite TEMP copy" {
         a.free(plan);
     }
     for (plan) |stmt| {
-        const stmt_z = try a.dupeZ(u8, stmt);
+        const stmt_z = try a.dupeSentinel(u8, stmt, 0);
         defer a.free(stmt_z);
         try c.db.exec(stmt_z);
     }

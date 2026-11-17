@@ -2,7 +2,7 @@
     .name = .zigbase_blog_example,
     .version = "0.0.0",
     .fingerprint = 0xdcb22d27ff8e4b60,
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.1",
     .dependencies = .{
         // in-repo example uses a relative path; external consumers run: zig fetch --save git+https://github.com/valthon/zigbase
         .zigbase = .{ .path = "../.." },

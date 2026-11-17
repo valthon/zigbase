@@ -34,7 +34,7 @@ test "postgres cleanup holds a reference write lock through storage deletion" {
     const a = std.testing.allocator;
     const io = std.testing.io;
     const url = std.testing.environ.getPosix("ZIGBASE_PG_TEST_URL") orelse return error.SkipZigTest;
-    const target = try a.dupeZ(u8, url);
+    const target = try a.dupeSentinel(u8, url, 0);
     defer a.free(target);
     var pool = try db.Pool.init(a, io, target);
     defer pool.deinit();

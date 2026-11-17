@@ -571,7 +571,7 @@ fn amzDate(ts: i64) AmzDateBuf {
     var buf: AmzDateBuf = undefined;
     _ = std.fmt.bufPrint(&buf, "{d:0>4}{d:0>2}{d:0>2}T{d:0>2}{d:0>2}{d:0>2}Z", .{
         year_day.year,
-        @intFromEnum(month_day.month),
+        @backingInt(month_day.month),
         @as(u32, month_day.day_index) + 1,
         day_secs.getHoursIntoDay(),
         day_secs.getMinutesIntoHour(),
@@ -1744,7 +1744,7 @@ test "S3Storage: eviction removes oldest spool entries once over cache_max_bytes
     defer s3.deinit();
     const st = s3.storage();
 
-    const body60 = "x" ** 60;
+    const body60 = (&@as([60]u8, @splat('x')));
     const names = [_][]const u8{ "a.bin", "b.bin", "c.bin" };
     for (names) |name| {
         testcapture.http.reset();
@@ -1786,7 +1786,7 @@ test "S3Storage: a cache hit bumps mtime so eviction approximates last-access LR
     defer s3.deinit();
     const st = s3.storage();
 
-    const body60 = "x" ** 60;
+    const body60 = (&@as([60]u8, @splat('x')));
     const nudge = std.Io.Duration.fromMilliseconds(10);
 
     // Miss-fill a.bin, then b.bin (spacing mtimes apart — some filesystems have

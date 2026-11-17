@@ -90,12 +90,12 @@ function ensureBuilt(): void {
     built = true;
     return;
   }
-  // The binaries MUST be built with zig 0.16.0; plain `zig` on PATH may be older.
+  // The binaries MUST be built with zig 0.17.1; plain `zig` on PATH may be older.
   // Build the generic binary (runtime-created collections), the dating-server
   // fixture, and the auth2-server fixture (schemas baked in) so every integration
   // test can spawn.
   for (const steps of [["build"], ["build", "dating-server"], ["build", "auth2-server"]]) {
-    const r = spawnSync("mise", ["exec", "zig@0.16.0", "--", "zig", ...steps], {
+    const r = spawnSync("mise", ["exec", "zig@0.17.1", "--", "zig", ...steps], {
       cwd: REPO_ROOT,
       stdio: "inherit",
     });

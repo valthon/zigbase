@@ -475,7 +475,7 @@ pub fn create(ctx: *http.RequestCtx) anyerror!http.Response {
     // Reserve a SERVER-generated id, never the client/hook's id. The immutable
     // file names may be uploaded before taking the writer; download authorization
     // cannot expose them until the committed record references them.
-    const upload_id = if (all.writes.len > 0) @import("../id.zig").collectionId(app.io) else [_]u8{0} ** 15;
+    const upload_id = if (all.writes.len > 0) @import("../id.zig").collectionId(app.io) else @as([15]u8, @splat(0));
     var committed = false;
     defer if (!committed) deleteWrites(app, col.storage_namespace, &upload_id, all.writes);
     if (all.writes.len > 0) {

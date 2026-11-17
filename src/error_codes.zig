@@ -551,15 +551,15 @@ test "error_codes: every Code appears in error-codes.frozen [ACTIVE]" {
     const gpa = std.testing.allocator;
     var active = try frozenLines(frozenSection("ACTIVE"), gpa);
     defer active.deinit(gpa);
-    inline for (@typeInfo(Code).@"enum".fields) |field| {
+    inline for (@typeInfo(Code).@"enum".field_names) |field| {
         var found = false;
         for (active.items) |line| {
-            if (std.mem.eql(u8, line, field.name)) {
+            if (std.mem.eql(u8, line, field)) {
                 found = true;
                 break;
             }
         }
-        if (!found) std.debug.print("Code.{s} has no matching line in [ACTIVE]\n", .{field.name});
+        if (!found) std.debug.print("Code.{s} has no matching line in [ACTIVE]\n", .{field});
         try std.testing.expect(found);
     }
 }
@@ -579,10 +579,10 @@ test "error_codes: no Code reuses a [RETIRED] name" {
     const gpa = std.testing.allocator;
     var retired = try frozenLines(frozenSection("RETIRED"), gpa);
     defer retired.deinit(gpa);
-    inline for (@typeInfo(Code).@"enum".fields) |field| {
+    inline for (@typeInfo(Code).@"enum".field_names) |field| {
         for (retired.items) |line| {
-            if (std.mem.eql(u8, line, field.name)) {
-                std.debug.print("Code.{s} reuses a RETIRED name — pick a new one\n", .{field.name});
+            if (std.mem.eql(u8, line, field)) {
+                std.debug.print("Code.{s} reuses a RETIRED name — pick a new one\n", .{field});
                 try std.testing.expect(false);
             }
         }
@@ -607,16 +607,16 @@ test "error_codes: [ACTIVE] is alphabetically sorted with no duplicates" {
 }
 
 test "error_codes: every Code has a non-empty summary and explanation" {
-    inline for (@typeInfo(Code).@"enum".fields) |field| {
-        const i = info(@as(Code, @enumFromInt(field.value)));
+    inline for (@typeInfo(Code).@"enum".field_names, @typeInfo(Code).@"enum".field_values) |_, field_value| {
+        const i = info(@as(Code, @fromBackingInt(@intCast(field_value))));
         try std.testing.expect(i.summary.len > 0);
         try std.testing.expect(i.explanation.len > 0);
     }
 }
 
 test "error_codes: s() round-trips through parse()" {
-    inline for (@typeInfo(Code).@"enum".fields) |field| {
-        const c: Code = @enumFromInt(field.value);
+    inline for (@typeInfo(Code).@"enum".field_names, @typeInfo(Code).@"enum".field_values) |_, field_value| {
+        const c: Code = @fromBackingInt(@intCast(field_value));
         try std.testing.expectEqual(@as(?Code, c), parse(s(c)));
     }
     try std.testing.expectEqual(@as(?Code, null), parse("definitely_not_a_code"));

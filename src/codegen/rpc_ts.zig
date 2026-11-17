@@ -32,8 +32,8 @@ pub fn isRepresentable(comptime T: type) bool {
         .optional => |o| isRepresentable(o.child),
         .pointer => |p| p.size == .slice and (p.child == u8 or isRepresentable(p.child)),
         .@"struct" => |s| blk: {
-            inline for (s.fields) |f| {
-                if (!isRepresentable(f.type)) break :blk false;
+            inline for (s.field_names, s.field_types) |_, f_type| {
+                if (!isRepresentable(f_type)) break :blk false;
             }
             break :blk true;
         },
@@ -104,10 +104,10 @@ fn renderNamedDeclsInner(comptime T: type, w: *std.ArrayList(u8), alloc: std.mem
             try w.appendSlice(alloc, "export type ");
             try w.appendSlice(alloc, nm);
             try w.appendSlice(alloc, " = ");
-            inline for (e.fields, 0..) |f, i| {
+            inline for (e.field_names, 0..) |f, i| {
                 if (i != 0) try w.appendSlice(alloc, " | ");
                 try w.appendSlice(alloc, "\"");
-                try w.appendSlice(alloc, f.name);
+                try w.appendSlice(alloc, f);
                 try w.appendSlice(alloc, "\"");
             }
             try w.appendSlice(alloc, ";\n");
@@ -126,16 +126,16 @@ fn renderNamedDeclsInner(comptime T: type, w: *std.ArrayList(u8), alloc: std.mem
             }
             try seen.put(nm, full); // mark before recursing so cycles still terminate
             // emit dependencies first
-            inline for (s.fields) |f| try renderNamedDeclsInner(f.type, w, alloc, seen);
+            inline for (s.field_names, s.field_types) |_, f_type| try renderNamedDeclsInner(f_type, w, alloc, seen);
             // now emit this struct's interface
             try w.appendSlice(alloc, "export interface ");
             try w.appendSlice(alloc, nm);
             try w.appendSlice(alloc, " {\n");
-            inline for (s.fields) |f| {
+            inline for (s.field_names, s.field_types) |f, f_type| {
                 try w.appendSlice(alloc, "  ");
-                try w.appendSlice(alloc, f.name);
+                try w.appendSlice(alloc, f);
                 try w.appendSlice(alloc, ": ");
-                try w.appendSlice(alloc, tsForType(f.type));
+                try w.appendSlice(alloc, tsForType(f_type));
                 try w.appendSlice(alloc, ";\n");
             }
             try w.appendSlice(alloc, "}\n");

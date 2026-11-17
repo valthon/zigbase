@@ -9,7 +9,7 @@ scripts/assert-version.sh "$ver"
 if scripts/assert-version.sh "0.0.0-nope" 2>/dev/null; then echo "FAIL: mismatch should have failed"; exit 1; fi
 
 # package-tarball: build one target, package it, assert the tarball contains the expected entries.
-mise exec zig@0.16.0 -- zig build -Dtarget=x86_64-linux-musl -Doptimize=ReleaseSafe -Dcpu=baseline
+mise exec zig@0.17.1 -- zig build -Dtarget=x86_64-linux-musl -Doptimize=safe -Dcpu=baseline
 tmp="$(mktemp -d)"
 scripts/package-tarball.sh "$ver" "x86_64-linux-musl" zig-out/bin/zigbase "$tmp"
 tarball="$tmp/zigbase-${ver}-x86_64-linux-musl.tar.gz"

@@ -234,7 +234,7 @@ test "clearBindings releases repeated large parameter copies without changing re
     var conn: Conn = undefined; // binding does not touch the connection
     var st = try Stmt.init(&conn, std.testing.allocator, "SELECT $1", null);
     defer st.finalize();
-    const payload = [_]u8{'x'} ** 65536;
+    const payload = @as([65536]u8, @splat('x'));
     for (0..128) |_| {
         try st.bindText(1, &payload);
         try std.testing.expect(st.param_arena.queryCapacity() >= payload.len);

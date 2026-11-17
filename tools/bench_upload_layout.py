@@ -29,7 +29,7 @@ def library(directory):
         "-DSQLITE_DEFAULT_MEMSTATUS=0",
     ]
     subprocess.run([
-        "mise", "exec", "zig@0.16.0", "--", "zig", "cc", "-O2", "-shared",
+        "mise", "exec", "zig@0.17.1", "--", "zig", "cc", "-O2", "-shared",
         "-fPIC", *flags, str(root / "vendor/sqlite/sqlite3.c"),
         "-o", str(output), "-lpthread", *(["-ldl"] if sys.platform == "linux" else []), "-lm",
     ], check=True)

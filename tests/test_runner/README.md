@@ -3,7 +3,7 @@
 Run with the pinned compiler and Python:
 
 ```sh
-mise exec zig@0.16.0 python@3.13 -- python tests/test_runner/verify.py
+mise exec zig@0.17.1 python@3.13 -- python tests/test_runner/verify.py
 ```
 
 The driver copies the dependency-free fixture and current `src/simple_runner.zig`
@@ -22,7 +22,7 @@ are supported; no installed compiler or source file is modified.
 | Logged error | 1 | Error message and failed command |
 | Skipped test | 0 | Skip count; same label distinction |
 
-The newline is sufficient to reproduce the Zig 0.16.0 diagnostic. It does not
+The newline is sufficient to reproduce the Zig 0.17.1 diagnostic. It does not
 prove a race or explain any nonzero build exit. The regression never suppresses
 output or turns failed executions into success. Any unexpected case aborts with
 the captured stdout/stderr. CI runs it in the contracts job.

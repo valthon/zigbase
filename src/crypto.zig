@@ -323,7 +323,7 @@ test "verifyLegacy truncates at 72 bytes the way every other bcrypt does" {
     // Reference implementations ignore bytes past 72. Zig's default instead HMAC-pre-hashes
     // a long password, which would lock out any user whose password exceeds 72 bytes.
     const a = std.testing.allocator;
-    const base = "x" ** 72;
+    const base = (&@as([72]u8, @splat('x')));
     const long = base ++ "IGNORED-BY-EVERY-OTHER-BCRYPT";
     const h = try bcryptHashForTest(a, base); // helper below
     defer a.free(h);

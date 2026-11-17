@@ -1,5 +1,5 @@
 //! SQL dialect abstraction (issue #159, PR-1b). ZigBase has historically emitted a single
-//! SQLite flavor of SQL via `std.fmt.allocPrint` scattered across the query/DDL/records layers.
+//! SQLite flavor of SQL via `Allocator.print` scattered across the query/DDL/records layers.
 //! Adding PostgreSQL as a runtime-selectable backend means those flavor-specific fragments must
 //! flow through ONE place that knows the active backend. This file is that place.
 //!
@@ -317,7 +317,7 @@ pub const Dialect = struct {
     /// the whole read/query stack is PR-3. Only `?` immediately followed by a digit is rewritten,
     /// so a bare `?` (none appear in the curated statements) is left untouched.
     pub fn renumberPlaceholders(self: Dialect, alloc: std.mem.Allocator, sql: []const u8) ![:0]u8 {
-        if (self.kind == .sqlite) return alloc.dupeZ(u8, sql);
+        if (self.kind == .sqlite) return alloc.dupeSentinel(u8, sql, 0);
         var out: std.ArrayList(u8) = .empty;
         errdefer out.deinit(alloc);
         var i: usize = 0;
@@ -345,14 +345,14 @@ pub const Dialect = struct {
     /// `INTEGER` substitution is safe for these statements because `INTEGER` never appears inside a
     /// string literal or identifier in the system migrations (only as a column type).
     pub fn lowerMigrationSql(self: Dialect, alloc: std.mem.Allocator, sql: []const u8) ![:0]u8 {
-        if (self.kind == .sqlite) return alloc.dupeZ(u8, sql);
+        if (self.kind == .sqlite) return alloc.dupeSentinel(u8, sql, 0);
         // Intermediates are freed explicitly so the function is leak-correct for any allocator
         // (production callers pass an arena, but the unit tests use the checked testing allocator).
         const s1 = try std.mem.replaceOwned(u8, alloc, sql, "INTEGER", self.sqlType(.integer));
         defer alloc.free(s1);
         const s2 = try std.mem.replaceOwned(u8, alloc, s1, "datetime('now')", self.nowTextExpr());
         defer alloc.free(s2);
-        if (std.mem.indexOf(u8, s2, "INSERT OR IGNORE") == null) return alloc.dupeZ(u8, s2);
+        if (std.mem.indexOf(u8, s2, "INSERT OR IGNORE") == null) return alloc.dupeSentinel(u8, s2, 0);
         const s3 = try std.mem.replaceOwned(u8, alloc, s2, "INSERT OR IGNORE", "INSERT");
         defer alloc.free(s3);
         // The `ON CONFLICT DO NOTHING` suffix must land before the statement TERMINATOR — but a

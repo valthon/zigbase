@@ -85,7 +85,7 @@ test "pg encryption: field_cipher plumbing + AEAD envelope round-trips through t
     defer arena.deinit();
     const ar = arena.allocator();
 
-    const url = try ar.dupeZ(u8, testUrl());
+    const url = try ar.dupeSentinel(u8, testUrl(), 0);
     var pool = dbm.Pool.init(a, io, url) catch |e| switch (e) {
         error.OpenFailed => return error.SkipZigTest,
         else => return e,

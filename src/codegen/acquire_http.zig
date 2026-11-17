@@ -132,7 +132,7 @@ fn doFetch(alloc: std.mem.Allocator, client: *std.http.Client, method: std.http.
         error.WriteFailed => return error.ResponseTooLarge,
         else => return e,
     };
-    return .{ .status = @intFromEnum(res.status), .body = fw.buffered() };
+    return .{ .status = @backingInt(res.status), .body = fw.buffered() };
 }
 
 fn extractToken(alloc: std.mem.Allocator, body: []const u8) ![]const u8 {

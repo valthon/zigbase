@@ -1,26 +1,46 @@
-diff --git a/std/Build/Step/Run.zig b/std/Build/Step/Run.zig
---- a/std/Build/Step/Run.zig
-+++ b/std/Build/Step/Run.zig
-@@ -1681 +1681 @@
--        switch (try waitZigTest(
-+        const issue261_wait_result = try waitZigTest(
-@@ -1688 +1688,2 @@
--        )) {
-+        );
-+        switch (issue261_wait_result) {
-@@ -1714,0 +1716,5 @@
+--- a/compiler/Maker/Step/Run.zig
++++ b/compiler/Maker/Step/Run.zig
+@@ -934,6 +934,7 @@
+                     .skip => results.skip_count +|= 1,
+                     .fail => results.fail_count +|= 1,
+                 }
++                std.debug.print("ISSUE261 received test_results index={d} status={s}\n", .{ tr_hdr.index, @tagName(tr_hdr.flags.status) });
+                 const leak_count = tr_hdr.flags.leak_count;
+                 const log_err_count = tr_hdr.flags.log_err_count;
+                 results.leak_count +|= leak_count;
+@@ -1624,6 +1625,7 @@
+                 multi_reader.deinit();
+                 child_killed = true;
+                 const term = try child.wait(io);
++                std.debug.print("ISSUE261 child.wait term={f}\n", .{fmtTerm(term)});
+                 step.result_peak_rss = @max(
+                     step.result_peak_rss,
+                     child.resource_usage_statistics.getMaxRss() orelse 0,
+@@ -1636,6 +1638,11 @@
+                 });
+             },
+             .no_poll => |no_poll| {
 +                std.debug.print("ISSUE261 waitZigTest=no_poll active_test_index={?d} stdout_buffered={d} stderr_buffered={d}\n", .{
 +                    no_poll.active_test_index,
 +                    multi_reader.reader(0).buffered().len,
 +                    multi_reader.reader(1).buffered().len,
 +                });
-@@ -1725,0 +1732 @@
+                 // This might be a success (we requested exit and the child dutifully closed stdout) or
+                 // a crash of some kind. Either way, the child will terminate by itself -- wait for it.
+                 const stderr_owned = try multi_reader.toOwnedSlice(1);
+@@ -1648,6 +1655,7 @@
+                 multi_reader.deinit();
+                 child_killed = true;
+                 const term = try child.wait(io);
 +                std.debug.print("ISSUE261 child.wait term={f}\n", .{fmtTerm(term)});
-@@ -1988,0 +1996,5 @@
-+                std.debug.print("ISSUE261 received test_results index={d} status={s}; requesting exit/next test\n", .{
-+                    tr_hdr.index,
-+                    @tagName(tr_hdr.flags.status),
-+                });
-+
-@@ -2557,0 +2570 @@
+                 step.result_peak_rss = @max(
+                     step.result_peak_rss,
+                     child.resource_usage_statistics.getMaxRss() orelse 0,
+@@ -1768,6 +1776,7 @@
+         return;
+     } else {
+         metadata.next_index = std.math.maxInt(u32); // indicate that all tests are done
 +        std.debug.print("ISSUE261 requestNextTest: all tests done; sending exit\n", .{});
+         try client.serveBodylessMessage(.exit);
+     }
+ }

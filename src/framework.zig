@@ -564,16 +564,16 @@ pub fn App(comptime cfg: anytype) type {
                 .{ "session_store", ".auth = .{ .session = .{ .store = ... } }" },
                 .{ "session_gc_cron", ".auth = .{ .session = .{ .gc_cron = ... } }" },
             };
-            for (std.meta.fields(@TypeOf(cfg))) |f| {
+            for (@typeInfo(@TypeOf(cfg)).@"struct".field_names) |f| {
                 for (moved) |mv| {
-                    if (std.mem.eql(u8, f.name, mv[0]))
+                    if (std.mem.eql(u8, f, mv[0]))
                         @compileError("'." ++ mv[0] ++ "' moved in the auth config grouping: use '" ++ mv[1] ++ "'");
                 }
                 var ok = false;
                 for (allowed) |name| {
-                    if (std.mem.eql(u8, f.name, name)) ok = true;
+                    if (std.mem.eql(u8, f, name)) ok = true;
                 }
-                if (!ok) @compileError("unknown App cfg field '" ++ f.name ++ "'; expected one of " ++ allowed_list);
+                if (!ok) @compileError("unknown App cfg field '" ++ f ++ "'; expected one of " ++ allowed_list);
             }
             // Validate the `.auth` group's own sub-keys (E3): only `hooks`/`methods`/
             // `captcha`/`session`. A field named like an old FLAT lifecycle hook (the
@@ -584,14 +584,14 @@ pub fn App(comptime cfg: anytype) type {
                 if (@typeInfo(AuthT) != .@"struct")
                     @compileError(".auth must be a config group struct: .auth = .{ .hooks = ..., .methods = ..., .captcha = ..., .session = ... }");
                 const hook_names = .{ "beforeRegister", "afterRegister", "beforeLogout", "afterLogout", "beforeRefresh", "afterRefresh", "beforePasswordChange", "afterPasswordChange" };
-                for (std.meta.fields(AuthT)) |f| {
+                for (@typeInfo(AuthT).@"struct".field_names) |f| {
                     for (hook_names) |hn| {
-                        if (std.mem.eql(u8, f.name, hn))
+                        if (std.mem.eql(u8, f, hn))
                             @compileError(".auth hook groups moved under .auth.hooks = .{ ... } (e.g. .auth = .{ .hooks = .{ ." ++ hn ++ " = fn } })");
                     }
-                    const sub_ok = std.mem.eql(u8, f.name, "hooks") or std.mem.eql(u8, f.name, "methods") or
-                        std.mem.eql(u8, f.name, "captcha") or std.mem.eql(u8, f.name, "session") or std.mem.eql(u8, f.name, "two_factor");
-                    if (!sub_ok) @compileError(".auth: unknown key '." ++ f.name ++ "' (recognized: .hooks, .methods, .captcha, .session, .two_factor)");
+                    const sub_ok = std.mem.eql(u8, f, "hooks") or std.mem.eql(u8, f, "methods") or
+                        std.mem.eql(u8, f, "captcha") or std.mem.eql(u8, f, "session") or std.mem.eql(u8, f, "two_factor");
+                    if (!sub_ok) @compileError(".auth: unknown key '." ++ f ++ "' (recognized: .hooks, .methods, .captcha, .session, .two_factor)");
                 }
                 if (@hasField(AuthT, "hooks")) {
                     const HT = @TypeOf(cfg.auth.hooks);
@@ -602,9 +602,9 @@ pub fn App(comptime cfg: anytype) type {
                     const ST = @TypeOf(cfg.auth.session);
                     if (@typeInfo(ST) != .@"struct")
                         @compileError(".auth.session must be a struct: .session = .{ .store = .epoch|.table, .gc_cron = \"...\", .rotation_grace_s = N }");
-                    for (std.meta.fields(ST)) |sf| {
-                        if (!std.mem.eql(u8, sf.name, "store") and !std.mem.eql(u8, sf.name, "gc_cron") and !std.mem.eql(u8, sf.name, "rotation_grace_s"))
-                            @compileError(".auth.session: unknown key '." ++ sf.name ++ "' (recognized: .store, .gc_cron, .rotation_grace_s)");
+                    for (@typeInfo(ST).@"struct".field_names) |sf| {
+                        if (!std.mem.eql(u8, sf, "store") and !std.mem.eql(u8, sf, "gc_cron") and !std.mem.eql(u8, sf, "rotation_grace_s"))
+                            @compileError(".auth.session: unknown key '." ++ sf ++ "' (recognized: .store, .gc_cron, .rotation_grace_s)");
                     }
                 }
             }
@@ -615,10 +615,10 @@ pub fn App(comptime cfg: anytype) type {
                 const PT = @TypeOf(cfg.pools);
                 if (@typeInfo(PT) != .@"struct")
                     @compileError(".pools must be a config group struct: .pools = .{ .jobs = N, .memory_jobs = N, .readers = N, .stack_size = N, .cache_kib = N }");
-                for (std.meta.fields(PT)) |pf| {
-                    const pok = std.mem.eql(u8, pf.name, "jobs") or std.mem.eql(u8, pf.name, "memory_jobs") or std.mem.eql(u8, pf.name, "readers") or
-                        std.mem.eql(u8, pf.name, "stack_size") or std.mem.eql(u8, pf.name, "cache_kib");
-                    if (!pok) @compileError(".pools: unknown key '." ++ pf.name ++ "' (recognized: .jobs, .memory_jobs, .readers, .stack_size, .cache_kib)");
+                for (@typeInfo(PT).@"struct".field_names) |pf| {
+                    const pok = std.mem.eql(u8, pf, "jobs") or std.mem.eql(u8, pf, "memory_jobs") or std.mem.eql(u8, pf, "readers") or
+                        std.mem.eql(u8, pf, "stack_size") or std.mem.eql(u8, pf, "cache_kib");
+                    if (!pok) @compileError(".pools: unknown key '." ++ pf ++ "' (recognized: .jobs, .memory_jobs, .readers, .stack_size, .cache_kib)");
                 }
             }
             var d = events.Dispatch{};
@@ -638,7 +638,7 @@ pub fn App(comptime cfg: anytype) type {
             // empty (or hook-less) `.auth = .{}` must NOT make `hasAuthLifecycle()` true
             // (that would force authLogout onto the writer+authenticate path for nothing).
             if (@hasField(@TypeOf(cfg), "auth") and @hasField(@TypeOf(cfg.auth), "hooks") and
-                std.meta.fields(@TypeOf(cfg.auth.hooks)).len > 0)
+                @typeInfo(@TypeOf(cfg.auth.hooks)).@"struct".field_names.len > 0)
                 d.auth_lifecycle = events.buildAuthLifecycleDispatcher(cfg.auth.hooks);
             if (@hasField(@TypeOf(cfg), "onFileServe")) d.on_file_serve = cfg.onFileServe;
             if (@hasField(@TypeOf(cfg), "onFileUpload")) d.on_file_upload = cfg.onFileUpload;
@@ -1179,9 +1179,9 @@ pub fn App(comptime cfg: anytype) type {
             }
             if (@typeInfo(T) != .@"struct")
                 @compileError(".reporter_dedup must be .off or .{ .window_s = N } (seconds)");
-            for (std.meta.fields(T)) |f| {
-                if (!std.mem.eql(u8, f.name, "window_s"))
-                    @compileError(".reporter_dedup: unknown key '." ++ f.name ++ "' (recognized: .window_s)");
+            for (@typeInfo(T).@"struct".field_names) |f| {
+                if (!std.mem.eql(u8, f, "window_s"))
+                    @compileError(".reporter_dedup: unknown key '." ++ f ++ "' (recognized: .window_s)");
             }
             if (!@hasField(T, "window_s"))
                 @compileError(".reporter_dedup struct must have a .window_s field (seconds), or use .off");
@@ -1325,7 +1325,7 @@ pub fn App(comptime cfg: anytype) type {
                 @compileError(".static_routes must be a list of '.{ .match = \"/…\", .serve = \"/…\" }' entries; got '" ++ @typeName(RT) ++ "'");
             };
             const n = switch (@typeInfo(@TypeOf(list))) {
-                .@"struct" => std.meta.fields(@TypeOf(list)).len,
+                .@"struct" => @typeInfo(@TypeOf(list)).@"struct".field_names.len,
                 .array => |a| a.len,
                 .pointer => list.len,
                 else => unreachable,
@@ -1340,9 +1340,9 @@ pub fn App(comptime cfg: anytype) type {
                 if (ET != static_files.StaticRoute) {
                     if (@typeInfo(ET) != .@"struct")
                         @compileError(".static_routes: each entry must be '.{ .match = \"/…\", .serve = \"/…\" }'");
-                    for (std.meta.fields(ET)) |f| {
-                        if (!std.mem.eql(u8, f.name, "match") and !std.mem.eql(u8, f.name, "serve"))
-                            @compileError(".static_routes: unknown key '." ++ f.name ++ "' (recognized: .match, .serve)");
+                    for (@typeInfo(ET).@"struct".field_names) |f| {
+                        if (!std.mem.eql(u8, f, "match") and !std.mem.eql(u8, f, "serve"))
+                            @compileError(".static_routes: unknown key '." ++ f ++ "' (recognized: .match, .serve)");
                     }
                     if (!@hasField(ET, "match") or !@hasField(ET, "serve"))
                         @compileError(".static_routes: each entry needs BOTH .match and .serve");
@@ -1494,9 +1494,9 @@ pub fn App(comptime cfg: anytype) type {
             const fcfg = cfg.features;
             if (@typeInfo(@TypeOf(fcfg)) != .@"struct")
                 @compileError(".features must be a struct, e.g. '.{ .public_route = \"/api/state\" }' or '.{ .public_route = .disabled }'");
-            for (std.meta.fields(@TypeOf(fcfg))) |f| {
-                if (!std.mem.eql(u8, f.name, "public_route"))
-                    @compileError(".features: unknown key '." ++ f.name ++ "' (recognized: .public_route)");
+            for (@typeInfo(@TypeOf(fcfg)).@"struct".field_names) |f| {
+                if (!std.mem.eql(u8, f, "public_route"))
+                    @compileError(".features: unknown key '." ++ f ++ "' (recognized: .public_route)");
             }
             if (!@hasField(@TypeOf(fcfg), "public_route")) break :blk "/api/state";
             const pr = fcfg.public_route;
@@ -1525,14 +1525,14 @@ pub fn App(comptime cfg: anytype) type {
         /// else the declared default). Typo'd `.name` → compile error. Swallows read
         /// errors back to the default, so a kill-switch check never fails the request.
         pub fn flag(ctx: *ctx_mod.Ctx, comptime f: Flag) bool {
-            const def = comptime features_registry.flags[@intFromEnum(f)];
+            const def = comptime features_registry.flags[@backingInt(f)];
             return ctx.resolveDeclaredFlag(def);
         }
 
         /// Set a DECLARED flag's override (`flag:<name>` = `"true"`/`"false"`) in `_kv`.
         /// Typo'd `.name` → compile error.
         pub fn setFlag(ctx: *ctx_mod.Ctx, comptime f: Flag, enabled: bool) !void {
-            const def = comptime features_registry.flags[@intFromEnum(f)];
+            const def = comptime features_registry.flags[@backingInt(f)];
             return ctx.writeFlagOverride(def.name, enabled);
         }
 
@@ -1540,7 +1540,7 @@ pub fn App(comptime cfg: anytype) type {
         /// from `_kv` if valid, else declared weights, then deterministic bucketing).
         /// Typo'd `.name` → compile error.
         pub fn experiment(ctx: *ctx_mod.Ctx, comptime e: Experiment, subject: []const u8) ![]const u8 {
-            const def = comptime features_registry.experiments[@intFromEnum(e)];
+            const def = comptime features_registry.experiments[@backingInt(e)];
             return ctx.resolveDeclaredExperiment(def, subject);
         }
 
@@ -1575,7 +1575,7 @@ pub fn App(comptime cfg: anytype) type {
             const info = @typeInfo(RT);
             if (info != .@"struct" or !info.@"struct".is_tuple)
                 @compileError("'.migrations' must be a tuple of '.{ .id = \"...\", .change = fn }' (or '.up = fn') entries or a typed slice '&[_]zigbase.Migration{ ... }'; got '" ++ @typeName(RT) ++ "'");
-            const n = std.meta.fields(RT).len;
+            const n = @typeInfo(RT).@"struct".field_names.len;
             var out: [n]provision.Migration = undefined;
             for (0..n) |i| {
                 const entry = raw[i];
@@ -1585,12 +1585,12 @@ pub fn App(comptime cfg: anytype) type {
                 // list-shaped config key carries (see `.static_routes` above).
                 if (@typeInfo(ET) != .@"struct")
                     @compileError(".migrations: each entry must be '.{ .id = \"...\", .change = fn }' (or '.up = fn')");
-                for (std.meta.fields(ET)) |mf| {
-                    const known = std.mem.eql(u8, mf.name, "id") or std.mem.eql(u8, mf.name, "change") or
-                        std.mem.eql(u8, mf.name, "up") or std.mem.eql(u8, mf.name, "down") or
-                        std.mem.eql(u8, mf.name, "transactional");
+                for (@typeInfo(ET).@"struct".field_names) |mf| {
+                    const known = std.mem.eql(u8, mf, "id") or std.mem.eql(u8, mf, "change") or
+                        std.mem.eql(u8, mf, "up") or std.mem.eql(u8, mf, "down") or
+                        std.mem.eql(u8, mf, "transactional");
                     if (!known)
-                        @compileError(".migrations: unknown key '." ++ mf.name ++ "' (recognized: .id, .change, .up, .down, .transactional)");
+                        @compileError(".migrations: unknown key '." ++ mf ++ "' (recognized: .id, .change, .up, .down, .transactional)");
                 }
                 if (!@hasField(ET, "id"))
                     @compileError(".migrations: each entry needs an .id (a stable unique string)");
@@ -1625,14 +1625,14 @@ pub fn App(comptime cfg: anytype) type {
             const CT = @TypeOf(cc);
             if (@typeInfo(CT) != .@"struct")
                 @compileError(".auth.captcha must be a struct, e.g. '.auth = .{ .captcha = .{ .provider = .recaptcha_v3, .secret = \"...\" } }'");
-            for (std.meta.fields(CT)) |f| {
+            for (@typeInfo(CT).@"struct".field_names) |f| {
                 const ok = blk2: {
                     for (.{ "provider", "secret" }) |k| {
-                        if (std.mem.eql(u8, f.name, k)) break :blk2 true;
+                        if (std.mem.eql(u8, f, k)) break :blk2 true;
                     }
                     break :blk2 false;
                 };
-                if (!ok) @compileError(".auth.captcha: unknown key '." ++ f.name ++ "' (recognized: .provider, .secret)");
+                if (!ok) @compileError(".auth.captcha: unknown key '." ++ f ++ "' (recognized: .provider, .secret)");
             }
             if (!@hasField(CT, "provider"))
                 @compileError(".auth.captcha: missing required key .provider — set e.g. .provider = .recaptcha_v3");
@@ -1667,10 +1667,10 @@ pub fn App(comptime cfg: anytype) type {
             const TC = @TypeOf(tc);
             if (@typeInfo(TC) != .@"struct")
                 @compileError(".tenancy must be a struct, e.g. '.{ .enabled = true, .auth_collection = \"users\" }'");
-            for (std.meta.fields(TC)) |f| {
-                const ok = std.mem.eql(u8, f.name, "enabled") or std.mem.eql(u8, f.name, "resolver") or
-                    std.mem.eql(u8, f.name, "auth_collection") or std.mem.eql(u8, f.name, "roles");
-                if (!ok) @compileError(".tenancy: unknown key '." ++ f.name ++ "' (recognized: .enabled, .resolver, .auth_collection, .roles)");
+            for (@typeInfo(TC).@"struct".field_names) |f| {
+                const ok = std.mem.eql(u8, f, "enabled") or std.mem.eql(u8, f, "resolver") or
+                    std.mem.eql(u8, f, "auth_collection") or std.mem.eql(u8, f, "roles");
+                if (!ok) @compileError(".tenancy: unknown key '." ++ f ++ "' (recognized: .enabled, .resolver, .auth_collection, .roles)");
             }
             var rt = tenancy.Runtime{};
             if (@hasField(TC, "enabled")) rt.enabled = tc.enabled;
@@ -1694,11 +1694,11 @@ pub fn App(comptime cfg: anytype) type {
             const MC = @TypeOf(mc);
             if (@typeInfo(MC) != .@"struct")
                 @compileError(".mail must be a struct, e.g. '.{ .require_verified_sender = true, .webhook_secret = \"…\" }'");
-            for (std.meta.fields(MC)) |f| {
-                const ok = std.mem.eql(u8, f.name, "require_verified_sender") or
-                    std.mem.eql(u8, f.name, "check_suppression") or std.mem.eql(u8, f.name, "webhook_secret") or
-                    std.mem.eql(u8, f.name, "unsubscribe_base_url") or std.mem.eql(u8, f.name, "max_message_bytes");
-                if (!ok) @compileError(".mail: unknown key '." ++ f.name ++ "' (recognized: .require_verified_sender, .check_suppression, .webhook_secret, .unsubscribe_base_url, .max_message_bytes)");
+            for (@typeInfo(MC).@"struct".field_names) |f| {
+                const ok = std.mem.eql(u8, f, "require_verified_sender") or
+                    std.mem.eql(u8, f, "check_suppression") or std.mem.eql(u8, f, "webhook_secret") or
+                    std.mem.eql(u8, f, "unsubscribe_base_url") or std.mem.eql(u8, f, "max_message_bytes");
+                if (!ok) @compileError(".mail: unknown key '." ++ f ++ "' (recognized: .require_verified_sender, .check_suppression, .webhook_secret, .unsubscribe_base_url, .max_message_bytes)");
             }
             var rt = mail_cfg.Runtime{};
             if (@hasField(MC, "require_verified_sender")) rt.require_verified_sender = mc.require_verified_sender;
@@ -1729,9 +1729,9 @@ pub fn App(comptime cfg: anytype) type {
             const SC = @TypeOf(sc);
             if (@typeInfo(SC) != .@"struct")
                 @compileError(".sms must be a struct, e.g. '.{ .default_region = .us, .queue = \"texts\" }'");
-            for (std.meta.fields(SC)) |f| {
-                const ok = std.mem.eql(u8, f.name, "default_region") or std.mem.eql(u8, f.name, "queue");
-                if (!ok) @compileError(".sms: unknown key '." ++ f.name ++ "' (recognized: .default_region, .queue)");
+            for (@typeInfo(SC).@"struct".field_names) |f| {
+                const ok = std.mem.eql(u8, f, "default_region") or std.mem.eql(u8, f, "queue");
+                if (!ok) @compileError(".sms: unknown key '." ++ f ++ "' (recognized: .default_region, .queue)");
             }
             var rt = sms_cfg.Runtime{};
             if (@hasField(SC, "default_region")) rt.default_region = sc.default_region;
@@ -1771,9 +1771,9 @@ pub fn App(comptime cfg: anytype) type {
             if (!@hasField(@TypeOf(cfg), "push")) break :blk .{};
             const pc = cfg.push;
             const PC = @TypeOf(pc);
-            for (std.meta.fields(PC)) |f| {
-                if (!std.mem.eql(u8, f.name, "subject"))
-                    @compileError(".push: unknown key '." ++ f.name ++ "' (recognized: .subject)");
+            for (@typeInfo(PC).@"struct".field_names) |f| {
+                if (!std.mem.eql(u8, f, "subject"))
+                    @compileError(".push: unknown key '." ++ f ++ "' (recognized: .subject)");
             }
             var rt = push_cfg.Runtime{};
             if (@hasField(PC, "subject")) rt.subject = pc.subject;
@@ -3421,7 +3421,7 @@ pub fn openPoolSelect(allocator: std.mem.Allocator, io: std.Io, cfg: config.Conf
     switch (db.chooseBackend(db_url)) {
         .postgres => {
             // Reachable only in a `-Dpostgres` build (chooseBackend gates on build_options).
-            const url = try allocator.dupeZ(u8, db_url.?);
+            const url = try allocator.dupeSentinel(u8, db_url.?, 0);
             defer allocator.free(url);
             std.log.info("database backend: PostgreSQL (experimental, #159)", .{});
             return db.Pool.initOpts(allocator, io, url, options);
@@ -4491,9 +4491,9 @@ fn migrateDbImpl(allocator: std.mem.Allocator, io: std.Io, ma: cli.MigrateDbArgs
         return error.PostgresSupportNotBuilt;
     } else {
         const dumpload = @import("dumpload.zig");
-        const from_z = try allocator.dupeZ(u8, from);
+        const from_z = try allocator.dupeSentinel(u8, from, 0);
         defer allocator.free(from_z);
-        const to_z = try allocator.dupeZ(u8, to);
+        const to_z = try allocator.dupeSentinel(u8, to, 0);
         defer allocator.free(to_z);
 
         var source = db.Db.open(from_z) catch |e| {
@@ -5494,7 +5494,7 @@ fn serveImpl(
         defer cx.deinit();
         h(&cx, &ev) catch |e| std.log.err("onBeforeTerminate hook failed: {s}", .{@errorName(e)});
     };
-    const host_z = try allocator.dupeZ(u8, cfg.http_host);
+    const host_z = try allocator.dupeSentinel(u8, cfg.http_host, 0);
     defer allocator.free(host_z);
     const Srv = server.Server(opts.gates);
     var srv = Srv{ .app = app, .host = host_z, .port = cfg.http_port };
@@ -5562,8 +5562,8 @@ fn explainCodeImpl(io: std.Io, ea: cli.ExplainCodeArgs) void {
     const code_str = ea.code orelse {
         if (ea.json) {
             emit(io, out, "{{\"codes\":[", .{});
-            inline for (@typeInfo(error_codes.Code).@"enum".fields, 0..) |field, idx| {
-                const c: error_codes.Code = @enumFromInt(field.value);
+            inline for (@typeInfo(error_codes.Code).@"enum".field_names, 0.., @typeInfo(error_codes.Code).@"enum".field_values) |_, idx, field_value| {
+                const c: error_codes.Code = @fromBackingInt(@intCast(field_value));
                 emit(io, out, "{s}{{\"code\":{f},\"summary\":{f}}}", .{
                     if (idx == 0) "" else ",",
                     std.json.fmt(error_codes.s(c), .{}),
@@ -5572,8 +5572,8 @@ fn explainCodeImpl(io: std.Io, ea: cli.ExplainCodeArgs) void {
             }
             emit(io, out, "]}}\n", .{});
         } else {
-            inline for (@typeInfo(error_codes.Code).@"enum".fields) |field| {
-                const c: error_codes.Code = @enumFromInt(field.value);
+            inline for (@typeInfo(error_codes.Code).@"enum".field_names, @typeInfo(error_codes.Code).@"enum".field_values) |_, field_value| {
+                const c: error_codes.Code = @fromBackingInt(@intCast(field_value));
                 emit(io, out, "{s}\t{s}\n", .{ error_codes.s(c), error_codes.info(c).summary });
             }
         }
@@ -5811,7 +5811,7 @@ test "App(cfg) synthesizes a default queue + implicit worker; no durable jobs fo
     try std.testing.expect(!Bare.has_durable_queue);
     // The generated Queue enum carries `.default`; an empty Job enum has no members.
     try std.testing.expectEqualStrings("default", @tagName(@as(Bare.Queue, .default)));
-    try std.testing.expectEqual(@as(usize, 0), std.meta.fields(Bare.Job).len);
+    try std.testing.expectEqual(@as(usize, 0), @typeInfo(Bare.Job).@"enum".field_names.len);
     // A memory-only app installs NO queue worker/GC jobs.
     for (Bare.jobs) |j| {
         try std.testing.expect(!std.mem.startsWith(u8, j.name, "_queue"));
@@ -5865,7 +5865,7 @@ test "App(cfg) sets the scheduler pool size via .pools.jobs alongside the job re
     try std.testing.expectEqualStrings("resize", A.job_regs[4].kind);
     // The compile-checked Job enum still reflects ONLY the consumer kinds (mail is a
     // built-in reached via ctx.mail().enqueue / ctx.enqueueByName, not the typed enum).
-    try std.testing.expectEqual(@as(usize, 1), std.meta.fields(A.Job).len);
+    try std.testing.expectEqual(@as(usize, 1), @typeInfo(A.Job).@"enum".field_names.len);
 }
 
 test "R2-5: built-in job kinds register only when their capability is configured" {
@@ -5984,7 +5984,7 @@ test "App(cfg) preserves declared precedence for literal and capture routes" {
 
 test "consumer route reservation validation scales past realistic migrated route tables" {
     comptime {
-        const path_source = "/consumer/" ++ ("x" ** 100);
+        const path_source = "/consumer/" ++ ((&@as([100]u8, @splat('x'))));
         var routes: [100]events.RouteMeta = undefined;
         for (0..routes.len) |index| {
             routes[index] = .{
@@ -6399,16 +6399,16 @@ test "App(cfg) lowers .flags/.experiments into the registry + generated enums (#
     // Static registry mirrors the slices.
     try std.testing.expectEqual(@as(usize, 2), A.features_registry.flags.len);
     try std.testing.expectEqual(@as(usize, 1), A.features_registry.experiments.len);
-    // Generated enums: members are the declared names; @intFromEnum indexes the registry.
-    try std.testing.expectEqual(@as(usize, 2), std.meta.fields(A.Flag).len);
-    try std.testing.expectEqual(@as(usize, 1), std.meta.fields(A.Experiment).len);
-    try std.testing.expectEqualStrings("new_dashboard", A.features_registry.flags[@intFromEnum(@field(A.Flag, "new_dashboard"))].name);
+    // Generated enums: members are the declared names; @backingInt indexes the registry.
+    try std.testing.expectEqual(@as(usize, 2), @typeInfo(A.Flag).@"enum".field_names.len);
+    try std.testing.expectEqual(@as(usize, 1), @typeInfo(A.Experiment).@"enum".field_names.len);
+    try std.testing.expectEqualStrings("new_dashboard", A.features_registry.flags[@backingInt(@field(A.Flag, "new_dashboard"))].name);
 
     // Empty default: no flags/experiments, empty enums.
     const E = App(.{});
     try std.testing.expectEqual(@as(usize, 0), E.flags.len);
     try std.testing.expectEqual(@as(usize, 0), E.experiments.len);
-    try std.testing.expectEqual(@as(usize, 0), std.meta.fields(E.Flag).len);
+    try std.testing.expectEqual(@as(usize, 0), @typeInfo(E.Flag).@"enum".field_names.len);
 }
 
 test "App(cfg) lowers the comptime .tenancy config (#156; defaults to disabled)" {

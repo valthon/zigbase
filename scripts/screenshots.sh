@@ -25,7 +25,7 @@
 #   example-plugins-browser.png    plugins example: authors + published posts
 #
 # REQUIREMENTS:
-#   - Zig 0.16   (via `mise exec zig@0.16.0 -- zig ...`)
+#   - Zig 0.17.1   (via `mise exec zig@0.17.1 -- zig ...`)
 #   - Python 3.13 with Playwright + Chromium (via mise); Pillow is installed
 #     on the fly if missing (for the generated sample photo)
 #   - Node/npm via mise (the repo mise.toml pins node) for the example frontends
@@ -72,7 +72,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-ZIG() { mise exec zig@0.16.0 -- zig "$@"; }
+ZIG() { mise exec zig@0.17.1 -- zig "$@"; }
 PY()  { mise exec python@3.13 -- python "$@"; }
 NPM() { mise exec -- npm "$@"; }
 

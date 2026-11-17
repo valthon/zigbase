@@ -168,7 +168,7 @@ fn enqueueUnchecked(w: *db.Db, io: std.Io, def: QueueDef, kind: []const u8, payl
     try st.bindText(2, def.name);
     try st.bindText(3, kind);
     try st.bindText(4, payload);
-    try st.bindInt(5, @intFromEnum(def.priority));
+    try st.bindInt(5, @backingInt(def.priority));
     try st.bindInt(6, @intCast(def.retry.max_attempts));
     try st.bindInt(7, value);
     _ = try st.step();
@@ -268,7 +268,7 @@ pub fn claimBatch(
     // single writer already makes this statement atomic.
     if (db.dbDialect(w).kind == .postgres) try sql.appendSlice(sa, " FOR UPDATE SKIP LOCKED");
     try sql.appendSlice(sa, ") RETURNING \"id\",\"queue\",\"kind\",\"payload\",\"attempts\",\"max_attempts\",\"claim_generation\";");
-    const sql_z = try sa.dupeZ(u8, sql.items);
+    const sql_z = try sa.dupeSentinel(u8, sql.items, 0);
 
     var st = try w.prepare(try @import("../sql/param_sink.zig").lowerStmtZ(sa, db.dbDialect(w), sql_z));
     defer st.finalize();
@@ -786,10 +786,10 @@ const PgQueueTest = struct {
         errdefer second.close();
         const name = id.collectionId(testing.io);
         var buf: [128]u8 = undefined;
-        try first.exec(try std.fmt.bufPrintZ(&buf, "CREATE SCHEMA \"zbq_{s}\";", .{name}));
-        errdefer first.exec(std.fmt.bufPrintZ(&buf, "DROP SCHEMA \"zbq_{s}\" CASCADE;", .{name}) catch unreachable) catch |e|
+        try first.exec(try std.mem.printSentinel(&buf, "CREATE SCHEMA \"zbq_{s}\";", .{name}, 0));
+        errdefer first.exec(std.mem.printSentinel(&buf, "DROP SCHEMA \"zbq_{s}\" CASCADE;", .{name}, 0) catch unreachable) catch |e|
             std.log.err("queue test schema cleanup failed: {s}", .{@errorName(e)});
-        const path = try std.fmt.bufPrintZ(&buf, "SET search_path TO \"zbq_{s}\";", .{name});
+        const path = try std.mem.printSentinel(&buf, "SET search_path TO \"zbq_{s}\";", .{name}, 0);
         try first.exec(path);
         try second.exec(path);
         try migrations.run(&first);
@@ -799,7 +799,7 @@ const PgQueueTest = struct {
     fn deinit(self: *PgQueueTest) void {
         self.second.close();
         var buf: [128]u8 = undefined;
-        self.first.exec(std.fmt.bufPrintZ(&buf, "DROP SCHEMA \"zbq_{s}\" CASCADE;", .{self.name}) catch unreachable) catch |e|
+        self.first.exec(std.mem.printSentinel(&buf, "DROP SCHEMA \"zbq_{s}\" CASCADE;", .{self.name}, 0) catch unreachable) catch |e|
             std.log.err("queue test schema cleanup failed: {s}", .{@errorName(e)});
         self.first.close();
     }
@@ -938,7 +938,7 @@ const PgPollEnv = struct {
         errdefer ga.destroy(env);
         env.queues = try PgQueueTest.init();
         errdefer env.queues.deinit();
-        env.url = try ga.dupeZ(u8, @import("../backend/postgres/tests.zig").testUrl());
+        env.url = try ga.dupeSentinel(u8, @import("../backend/postgres/tests.zig").testUrl(), 0);
         errdefer ga.free(env.url);
         env.pool = try db.Pool.init(ga, testing.io, env.url);
         errdefer env.pool.deinit();
@@ -946,7 +946,7 @@ const PgPollEnv = struct {
             const w = env.pool.acquireWriter();
             defer env.pool.releaseWriter();
             var buf: [128]u8 = undefined;
-            try w.exec(try std.fmt.bufPrintZ(&buf, "SET search_path TO \"zbq_{s}\";", .{env.queues.name}));
+            try w.exec(try std.mem.printSentinel(&buf, "SET search_path TO \"zbq_{s}\";", .{env.queues.name}, 0));
         }
         env.app = App{ .allocator = ga, .io = testing.io, .pool = &env.pool };
         return env;

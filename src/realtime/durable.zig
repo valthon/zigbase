@@ -26,7 +26,7 @@ fn prep(a: std.mem.Allocator, conn: *db.Db, sql: []const u8) !db.Stmt {
     defer if (pg) a.free(numbered);
     const qualified = try std.mem.replaceOwned(u8, a, numbered, "journal.", prefix);
     defer a.free(qualified);
-    const z = try a.dupeZ(u8, qualified);
+    const z = try a.dupeSentinel(u8, qualified, 0);
     defer a.free(z);
     return conn.prepare(z);
 }
@@ -554,7 +554,7 @@ test "a chunk whose floor passed its position requires reset" {
 
 test "opaque cursor authenticates scope and ciphertext without exposing positions" {
     const a = std.testing.allocator;
-    const key = [_]u8{7} ** 32;
+    const key = @as([32]u8, @splat(7));
     const first = try sealCursor(a, std.testing.io, key, "collection:0", 42);
     defer a.free(first);
     const same = try sealCursor(a, std.testing.io, key, "collection:0", 42);

@@ -493,7 +493,7 @@ test "sign refuses to mint a token that verify would reject" {
     // the caller-supplied `pl` claim mints a token that fails at the NEXT request, surfacing
     // the error far from its cause.
     const a = std.testing.allocator;
-    const key = [_]u8{7} ** 32;
+    const key = @as([32]u8, @splat(7));
 
     var big: [max_token_len]u8 = undefined;
     @memset(&big, 'x');
@@ -518,7 +518,7 @@ test "scratch_size holds for the largest token max_token_len admits" {
     // change to `Claims` or `max_token_len` pushes this payload over the ceiling, `try` makes
     // that a loud failure instead of a silently hollow test.
     const a = std.testing.allocator;
-    const key = [_]u8{3} ** 32;
+    const key = @as([32]u8, @splat(3));
 
     var pl: [1450]u8 = undefined;
     @memset(&pl, '"');

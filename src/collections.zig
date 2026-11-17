@@ -126,11 +126,11 @@ pub fn create(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, def: schema.Colle
     const tx = try Tx.begin(w);
     errdefer tx.rollback();
     try @import("files/namespace.zig").reserve(sa, w, col.id, col.name);
-    try w.exec(try sa.dupeZ(u8, try ddl.createTableSql(sa, ddl_col, null, d, &.{})));
-    for (col.indexes) |idx| try w.exec(try sa.dupeZ(u8, try ddl.createIndexSql(sa, col.name, idx, d)));
+    try w.exec(try sa.dupeSentinel(u8, try ddl.createTableSql(sa, ddl_col, null, d, &.{}), 0));
+    for (col.indexes) |idx| try w.exec(try sa.dupeSentinel(u8, try ddl.createIndexSql(sa, col.name, idx, d), 0));
     if (col.type == .auth) {
         for (col.options.auth.identityFields) |idf| {
-            try w.exec(try sa.dupeZ(u8, try ddl.authIdentityIndexSql(sa, col.name, idf)));
+            try w.exec(try sa.dupeSentinel(u8, try ddl.authIdentityIndexSql(sa, col.name, idf), 0));
         }
     }
     // The search index (FTS5 shadow table + triggers, or the Postgres tsvector) is part of the
@@ -440,7 +440,7 @@ fn updateImpl(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, id_or_name: []con
         // PostgreSQL alters in place; remove dependent search state only when its operands change.
         if (d.kind == .postgres and !fts.sameSearchColumns(old, newc)) try fts.dropIndexFor(sa, w, old);
         const plan = try ddl.rebuildPlan(sa, old, ddl_new, d);
-        for (plan) |stmt| try w.exec(try sa.dupeZ(u8, stmt));
+        for (plan) |stmt| try w.exec(try sa.dupeSentinel(u8, stmt, 0));
         // Postgres alters in place, so its field-level unique constraints converge from the
         // catalog: scope changes, unique toggles, and a collection made (un)tenant-owned (#498).
         if (d.kind == .postgres and newc.type != .auth) {
@@ -448,7 +448,7 @@ fn updateImpl(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, id_or_name: []con
         }
         if (newc.type == .auth) {
             for (newc.options.auth.identityFields) |idf| {
-                try w.exec(try sa.dupeZ(u8, try ddl.authIdentityIndexSql(sa, newc.name, idf)));
+                try w.exec(try sa.dupeSentinel(u8, try ddl.authIdentityIndexSql(sa, newc.name, idf), 0));
             }
         }
         if (d.kind == .sqlite or expected != null) try ensureTenantIndex(sa, w, newc);
@@ -456,7 +456,7 @@ fn updateImpl(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, id_or_name: []con
         try fts.ensureIndex(sa, w, newc);
         for (migration_objects) |obj| {
             std.log.info("provision: collection '{s}' restoring '{s}' after the unique-scope rebuild", .{ old.name, obj.name });
-            try w.exec(try sa.dupeZ(u8, obj.sql));
+            try w.exec(try sa.dupeSentinel(u8, obj.sql, 0));
         }
         try updateRow(sa, w, newc.id, newc); // persist user fields only
         try schema_gen.bump(w); // inside the tx: a rolled-back rebuild must not advertise a change
@@ -726,7 +726,7 @@ fn reconcileIndexes(alloc: std.mem.Allocator, w: *db.Db, old: schema.Collection,
                 .absent => {},
             }
             std.log.info("provision: collection '{s}' CREATE index '{s}'", .{ old.name, idx.name });
-            w.exec(try sa.dupeZ(u8, try ddl.createIndexSql(sa, old.name, idx, d))) catch |err| {
+            w.exec(try sa.dupeSentinel(u8, try ddl.createIndexSql(sa, old.name, idx, d), 0)) catch |err| {
                 std.log.warn("provision: collection '{s}' index '{s}' CREATE failed: {s}; {s}; startup refused", .{ old.name, idx.name, @errorName(err), w.errMsg() });
                 return err;
             };
@@ -1125,7 +1125,7 @@ test "deinit frees a fully-owned base collection: every field type + indexes + r
     // multiple indexes (unique / partial-where / multi-column), all five rules, and ttl/tenant
     // fields. Read back with get() → a fully-owned graph → Collection.deinit under the RAW
     // leak-detecting allocator. A missed free leaks; a stray free of a static/borrowed string, or
-    // freeing an already-freed pointer, panics the DebugAllocator. Zero leaks == the deinit mirrors
+    // freeing an already-freed pointer, panics the SafeAllocator. Zero leaks == the deinit mirrors
     // fromJson exactly.
     const a = std.testing.allocator;
     var d = try db.Db.openMemory();
@@ -1466,7 +1466,7 @@ fn reconcileUniqueConstraintsPg(alloc: std.mem.Allocator, w: *db.Db, old: ?schem
     const cons = try uniqueConstraints(alloc, w, new.name);
     const run = struct {
         fn exec(a: std.mem.Allocator, conn: *db.Db, sql: []const u8) EngineError!void {
-            const sql_z = try a.dupeZ(u8, sql);
+            const sql_z = try a.dupeSentinel(u8, sql, 0);
             defer a.free(sql_z);
             // step preserves uniqueness violations as Constraint for the API's 409 mapping.
             var st = try conn.prepare(sql_z);
@@ -1646,10 +1646,10 @@ fn engineTableObjectsSqlite(scratch: *std.heap.ArenaAllocator, col: schema.Colle
     defer model.close();
     try model.exec("PRAGMA foreign_keys=OFF;");
     const d = db.dbDialect(&model);
-    try model.exec(try alloc.dupeZ(u8, try ddl.createTableSql(alloc, col, null, d, &.{})));
-    for (col.indexes) |idx| try model.exec(try alloc.dupeZ(u8, try ddl.createIndexSql(alloc, col.name, idx, d)));
+    try model.exec(try alloc.dupeSentinel(u8, try ddl.createTableSql(alloc, col, null, d, &.{}), 0));
+    for (col.indexes) |idx| try model.exec(try alloc.dupeSentinel(u8, try ddl.createIndexSql(alloc, col.name, idx, d), 0));
     if (col.type == .auth) for (col.options.auth.identityFields) |field| {
-        try model.exec(try alloc.dupeZ(u8, try ddl.authIdentityIndexSql(alloc, col.name, field)));
+        try model.exec(try alloc.dupeSentinel(u8, try ddl.authIdentityIndexSql(alloc, col.name, field), 0));
     };
     try ensureTenantIndex(alloc, &model, col);
     try fts.ensureIndex(alloc, &model, col);

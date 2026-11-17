@@ -231,11 +231,11 @@ test "RFC 8291 Appendix A: intermediates + final body match the published vector
 test "encrypt: body header framing (salt, rs, idlen, keyid) is well-formed" {
     const a = std.testing.allocator;
 
-    const auth_secret = [_]u8{0x11} ** 16;
+    const auth_secret = @as([16]u8, @splat(0x11));
     const ua_public = b64dec(65, "BCVxsr7N_eNgVRqvHtD0zTZsEc6-VV-JvLexhqUzORcxaOzi6-AYWXvTBHm4bjyPjs7Vd8pZGH6SRpkNtoIAiw4");
     const as_public = b64dec(65, "BP4z9KsN6nGRTbVYI_c7VJSPQTBtkgcy27mlmlMoZIIgDll6e3vCYLocInmYWAmS6TlzAC8wEqKK6PBru3jl7A8");
     const as_private = b64dec(32, "yfWPiYE-n46HLnH0KqZOF1fJJU3MYrct3AELtAQ-oRw");
-    const salt = [_]u8{0x22} ** 16;
+    const salt = @as([16]u8, @splat(0x22));
 
     const body = try encrypt(a, std.testing.io, "hello", ua_public, auth_secret, as_public, as_private, salt);
     defer a.free(body);
@@ -250,15 +250,15 @@ test "encrypt: body header framing (salt, rs, idlen, keyid) is well-formed" {
 
 test "encrypt: a bad UA public key fails closed" {
     const a = std.testing.allocator;
-    const bad_ua = [_]u8{0x00} ** 65; // not a valid SEC1 point.
+    const bad_ua = @as([65]u8, @splat(0x00)); // not a valid SEC1 point.
     try std.testing.expectError(error.InvalidPublicKey, encrypt(
         a,
         std.testing.io,
         "x",
         bad_ua,
-        [_]u8{0} ** 16,
-        [_]u8{0x04} ** 65,
-        [_]u8{1} ** 32,
-        [_]u8{0} ** 16,
+        @as([16]u8, @splat(0)),
+        @as([65]u8, @splat(0x04)),
+        @as([32]u8, @splat(1)),
+        @as([16]u8, @splat(0)),
     ));
 }

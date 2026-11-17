@@ -155,8 +155,7 @@ fn getPostBySlug(req: *zigbase.Req(void)) zigbase.RouteError!std.json.Value {
 
     // Read through the per-request capability object — `req.ctx.records()` manages
     // the pooled connection itself (no manual acquireReader / Data wiring).
-    const filter = std.fmt.allocPrint(req.ctx.arena.a,
-        "slug = '{s}' && status = 'published'", .{slug}) catch return error.RouteFailed;
+    const filter = req.ctx.arena.a.print("slug = '{s}' && status = 'published'", .{slug}) catch return error.RouteFailed;
     const result = req.ctx.records().list("posts", .{ .filter = filter, .perPage = 1 }) catch return error.RouteFailed;
     if (result.items.len == 0) return error.NotFound;
     return result.items[0];
@@ -209,7 +208,7 @@ Your executable module must `.link_libc = true` (SQLite needs libc).
 From `examples/blog/`:
 
 ```sh
-mise exec zig@0.16.0 -- zig build           # produces ./zig-out/bin/blog
+mise exec zig@0.17.1 -- zig build           # produces ./zig-out/bin/blog
 ./zig-out/bin/blog superuser create --email you@example.com --password <pw> --data-dir ./zb_data
 # --insecure-cookies: local dev over plain HTTP (auth cookies are Secure by default).
 # A random JWT secret is generated + persisted at zb_data/.jwt_secret on first run.
@@ -269,7 +268,7 @@ For a fully-typed client, see golfsim (comptime-generated) and the
 ## Three test surfaces, on purpose
 
 ```sh
-mise exec zig@0.16.0 -- zig build test            # in-process, no socket
+mise exec zig@0.17.1 -- zig build test            # in-process, no socket
 mise exec node@24 -- npm install && npm run test:e2e   # real server, real SDK
 npm run test:browser                                  # real server, real browser
 ```
@@ -300,7 +299,7 @@ cd frontend
 ./build.sh                   # pinned Zigapagos v0.5.0 -> frontend/dist
 ../../../scripts/zigapagos.sh doctor dist --format=json
 cd ..
-mise exec zig@0.16.0 -- zig build
+mise exec zig@0.17.1 -- zig build
 # --insecure-cookies for plain-HTTP local dev. The frontend is served from this same
 # binary, so the live post-list WebSocket is same-origin and allowed by default; only a
 # separate-origin browser app needs --realtime-origins.

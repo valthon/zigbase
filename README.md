@@ -2,7 +2,7 @@
 
 **Build beyond your team size.**
 
-ZigBase is an open-source backend and embeddable **Zig 0.16 framework** for ambitious
+ZigBase is an open-source backend and embeddable **Zig 0.17.1 framework** for ambitious
 web applications built by individuals and small teams. Integrated application services,
 explicit resource controls, and a single-binary deployment let you spend more effort
 on your product and make deliberate use of your hardware.
@@ -32,8 +32,8 @@ ZigBase draws inspiration from PocketBase but is not API-compatible.
 ## Quickstart (run the binary)
 
 ```sh
-mise install                                    # installs Zig 0.16.0 (pinned in mise.toml)
-zig build                                        # -> zig-out/bin/zigbase   (or: mise exec zig@0.16.0 -- zig build)
+mise install                                    # installs Zig 0.17.1 (pinned in mise.toml)
+zig build                                        # -> zig-out/bin/zigbase   (or: mise exec zig@0.17.1 -- zig build)
 ./zig-out/bin/zigbase superuser create --email you@example.com --password "<a strong password>" --data-dir ./zb_data
 # --insecure-cookies: local dev is over plain HTTP, and auth cookies are Secure by default.
 ./zig-out/bin/zigbase serve --insecure-cookies --data-dir ./zb_data
@@ -48,8 +48,8 @@ The default bind is `127.0.0.1:8090` (loopback only). To expose ZigBase on all
 interfaces, pass `--http-host 0.0.0.0` (front it with a firewall / reverse proxy).
 On first `serve` with no `ZIGBASE_JWT_SECRET`, a strong random secret is generated and
 persisted at `<data-dir>/.jwt_secret` (mode 0600), then reused on later runs. Your `zig`
-must be 0.16.0 — either activate mise (`eval "$(mise activate bash)"`) or prefix commands
-with `mise exec zig@0.16.0 --`. Building with an unsupported Zig version fails at compile
+must be 0.17.1 — either activate mise (`eval "$(mise activate bash)"`) or prefix commands
+with `mise exec zig@0.17.1 --`. Building with an unsupported Zig version fails at compile
 time with a clear required-vs-actual message rather than a confusing deep-compile error.
 
 ## Docker

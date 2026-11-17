@@ -7,7 +7,7 @@ pub fn build(b: *std.Build) void {
     const mod = b.createModule(.{
         .root_source_file = b.path("test.zig"),
         .target = b.standardTargetOptions(.{}),
-        .optimize = .Debug,
+        .optimize = .debug,
         .link_libc = true,
     });
     const options = b.addOptions();

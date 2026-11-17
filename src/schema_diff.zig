@@ -347,7 +347,7 @@ test "a retype and a dropped field are destructive; a rename is not" {
     defer p.deinit();
     try std.testing.expect(p.hasDestructive());
 
-    var kinds = std.EnumSet(ChangeKind).initEmpty();
+    var kinds = std.EnumSet(ChangeKind).empty;
     for (p.changes) |c| kinds.insert(c.kind);
     try std.testing.expect(kinds.contains(.retype_field));
     try std.testing.expect(kinds.contains(.drop_field));
@@ -442,7 +442,7 @@ test "a relation cycle reports a deferred back edge; a self-relation does not" {
     try std.testing.expectEqualStrings("toA", p.deferred[0].field);
 
     // Order is a permutation: must contain every index [0..1] exactly once.
-    var seen = [_]bool{false} ** 2;
+    var seen = @as([2]bool, @splat(false));
     for (p.order) |idx| {
         try std.testing.expect(idx < 2);
         try std.testing.expect(!seen[idx]); // no duplicate
@@ -481,7 +481,7 @@ test "a redefined index is a modify_index; add/drop still key off the name" {
     var p = try compute(a, &.{live_c}, &.{want_c}, .{});
     defer p.deinit();
 
-    var kinds = std.EnumSet(ChangeKind).initEmpty();
+    var kinds = std.EnumSet(ChangeKind).empty;
     var modified_name: []const u8 = "";
     for (p.changes) |c| {
         kinds.insert(c.kind);
@@ -506,8 +506,8 @@ test "exactly three change kinds are destructive" {
     // and the documented kind table all key off it. A kind appended in the wrong place would
     // silently move that boundary, so pin the whole enum rather than the three members.
     var n: usize = 0;
-    inline for (@typeInfo(ChangeKind).@"enum".fields) |f| {
-        if (isDestructive(@field(ChangeKind, f.name))) n += 1;
+    inline for (@typeInfo(ChangeKind).@"enum".field_names) |f| {
+        if (isDestructive(@field(ChangeKind, f))) n += 1;
     }
     try std.testing.expectEqual(@as(usize, 3), n);
     try std.testing.expect(isDestructive(.retype_field));

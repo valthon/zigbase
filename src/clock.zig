@@ -12,7 +12,7 @@
 //!
 //! ## Production gate (hard requirement)
 //! The override is compiled in ONLY when the `dev_mode` build option is true. That
-//! option defaults to `optimize == .Debug` (see build.zig) and is forced false by the
+//! option defaults to `optimize == .debug` (see build.zig) and is forced false by the
 //! release script's cross-compiles, so a production binary never even reads the env var:
 //! `enabled` is `comptime false` there, the parse code is dead, and `frozenUnix()` folds
 //! to `null` at compile time. It is impossible to freeze time on a prod build.

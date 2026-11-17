@@ -531,7 +531,7 @@ fn zigSchema(comptime T: type, alloc: std.mem.Allocator) !Value {
         .@"enum" => |e| {
             try out.put(alloc, "type", .{ .string = "string" });
             var values = array(alloc);
-            inline for (e.fields) |field| try values.append(.{ .string = field.name });
+            inline for (e.field_names) |field| try values.append(.{ .string = field });
             try out.put(alloc, "enum", .{ .array = values });
         },
         .optional => |o| {
@@ -556,10 +556,10 @@ fn zigSchema(comptime T: type, alloc: std.mem.Allocator) !Value {
             try out.put(alloc, "type", .{ .string = "object" });
             var props = object();
             var required = array(alloc);
-            inline for (s.fields) |field| {
-                try props.put(alloc, field.name, try zigSchema(field.type, alloc));
-                if (field.default_value_ptr == null)
-                    try required.append(.{ .string = field.name });
+            inline for (s.field_names, s.field_types, s.field_attrs) |field, field_type, field_attrs| {
+                try props.put(alloc, field, try zigSchema(field_type, alloc));
+                if (field_attrs.default_value_ptr == null)
+                    try required.append(.{ .string = field });
             }
             try out.put(alloc, "properties", .{ .object = props });
             if (required.items.len > 0) try out.put(alloc, "required", .{ .array = required });
@@ -651,8 +651,8 @@ fn builtinOperations(alloc: std.mem.Allocator) !Value {
 
 fn exportedGates(comptime namespace: Namespace, alloc: std.mem.Allocator) !Value {
     var gates = object();
-    inline for (std.meta.fields(engine_server.Gates)) |field|
-        try gates.put(alloc, field.name, .{ .bool = @field(namespace.gates, field.name) });
+    inline for (@typeInfo(engine_server.Gates).@"struct".field_names) |field|
+        try gates.put(alloc, field, .{ .bool = @field(namespace.gates, field) });
     return .{ .object = gates };
 }
 
@@ -712,13 +712,13 @@ fn canonicalPathItem(paths: *const Object, candidate: []const u8) ?[]const u8 {
     return null;
 }
 
-fn queryFieldParameter(comptime field: std.builtin.Type.StructField, alloc: std.mem.Allocator) !Value {
+fn queryFieldParameter(comptime name: [:0]const u8, comptime T: type, comptime attrs: std.lang.Type.Struct.FieldAttributes, alloc: std.mem.Allocator) !Value {
     var param = object();
-    try param.put(alloc, "name", .{ .string = field.name });
+    try param.put(alloc, "name", .{ .string = name });
     try param.put(alloc, "in", .{ .string = "query" });
-    if (@typeInfo(field.type) != .optional and field.default_value_ptr == null)
+    if (@typeInfo(T) != .optional and attrs.default_value_ptr == null)
         try param.put(alloc, "required", .{ .bool = true });
-    try param.put(alloc, "schema", try zigSchema(field.type, alloc));
+    try param.put(alloc, "schema", try zigSchema(T, alloc));
     return .{ .object = param };
 }
 
@@ -797,8 +797,8 @@ fn addRoute(comptime meta: events.RouteMeta, alloc: std.mem.Allocator, paths: *O
     const path = canonicalPathItem(paths, rendered_path) orelse rendered_path;
     var params = try routePathParameters(meta, path, alloc);
     if (!meta.untyped and meta.Input != void and route_types.inputUsesQuery(meta.method) and @typeInfo(meta.Input) == .@"struct") {
-        inline for (@typeInfo(meta.Input).@"struct".fields) |field|
-            try params.append(try queryFieldParameter(field, alloc));
+        inline for (@typeInfo(meta.Input).@"struct".field_names, @typeInfo(meta.Input).@"struct".field_types, @typeInfo(meta.Input).@"struct".field_attrs) |name, T, attrs|
+            try params.append(try queryFieldParameter(name, T, attrs, alloc));
     }
     if (meta.path_secret) |secret| {
         if (secret.in != .path) try params.append(try secretParameter(secret, alloc));

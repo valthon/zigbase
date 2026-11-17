@@ -71,9 +71,9 @@ pub fn lower(comptime files_cfg: anytype) Runtime {
     const FC = @TypeOf(files_cfg);
     if (@typeInfo(FC) != .@"struct")
         @compileError(".files must be a struct, e.g. '.{ .s3_presign_redirect = true, .s3_presign_ttl_s = 900 }'");
-    inline for (std.meta.fields(FC)) |f| {
-        if (comptime !std.mem.eql(u8, f.name, "thumbnails") and !std.mem.eql(u8, f.name, "resumable") and !std.mem.eql(u8, f.name, "cleanup_queue") and !std.mem.eql(u8, f.name, "s3_presign_redirect") and !std.mem.eql(u8, f.name, "s3_presign_ttl_s"))
-            @compileError(".files: unknown key '." ++ f.name ++ "' (recognized: .thumbnails, .resumable, .cleanup_queue, .s3_presign_redirect, .s3_presign_ttl_s)");
+    inline for (@typeInfo(FC).@"struct".field_names) |f| {
+        if (comptime !std.mem.eql(u8, f, "thumbnails") and !std.mem.eql(u8, f, "resumable") and !std.mem.eql(u8, f, "cleanup_queue") and !std.mem.eql(u8, f, "s3_presign_redirect") and !std.mem.eql(u8, f, "s3_presign_ttl_s"))
+            @compileError(".files: unknown key '." ++ f ++ "' (recognized: .thumbnails, .resumable, .cleanup_queue, .s3_presign_redirect, .s3_presign_ttl_s)");
     }
     var rt = Runtime{};
     if (@hasField(FC, "thumbnails")) {
@@ -83,11 +83,11 @@ pub fn lower(comptime files_cfg: anytype) Runtime {
     if (@hasField(FC, "resumable")) {
         if (!@import("build_options").resumable_uploads) @compileError(".files.resumable requires -Dresumable-uploads=true");
         if (@typeInfo(@TypeOf(files_cfg.resumable)) != .@"struct") @compileError(".files.resumable must be a struct of resource budgets");
-        inline for (std.meta.fields(@TypeOf(files_cfg.resumable))) |field| {
-            if (!@hasField(ResumableLimits, field.name)) @compileError("Unknown .files.resumable limit: " ++ field.name);
-            if (comptime std.mem.eql(u8, field.name, "durable") and !@import("build_options").durable_resumable_uploads) {
+        inline for (@typeInfo(@TypeOf(files_cfg.resumable)).@"struct".field_names) |field| {
+            if (!@hasField(ResumableLimits, field)) @compileError("Unknown .files.resumable limit: " ++ field);
+            if (comptime std.mem.eql(u8, field, "durable") and !@import("build_options").durable_resumable_uploads) {
                 if (files_cfg.resumable.durable) @compileError(".files.resumable.durable requires -Ddurable-resumable-uploads=true");
-            } else @field(rt.resumable, field.name) = @field(files_cfg.resumable, field.name);
+            } else @field(rt.resumable, field) = @field(files_cfg.resumable, field);
         }
         if (!validResumableLimits(rt.resumable))
             @compileError("Invalid .files.resumable budgets: positive limits, sessions<=1024, principal<=sessions, chunk<=upload<=total<=1GiB, TTL<=86400 required; durable upload<=999983360 bytes");

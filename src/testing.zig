@@ -302,12 +302,12 @@ pub fn Harness(comptime AppType: type) type {
             // `.jsn` / `.headr` is a compile error instead of a silent no-op.
             comptime {
                 const allowed = [_][]const u8{ "json", "body", "auth", "headers", "query", "content_type", "cookie" };
-                for (std.meta.fields(O)) |f| {
+                for (@typeInfo(O).@"struct".field_names) |f| {
                     var ok = false;
                     for (allowed) |name| {
-                        if (std.mem.eql(u8, f.name, name)) ok = true;
+                        if (std.mem.eql(u8, f, name)) ok = true;
                     }
-                    if (!ok) @compileError("zigbase.testing request: unknown option '." ++ f.name ++
+                    if (!ok) @compileError("zigbase.testing request: unknown option '." ++ f ++
                         "' (allowed: json, body, auth, headers, query, content_type, cookie)");
                 }
             }

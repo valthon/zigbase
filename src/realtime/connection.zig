@@ -13,9 +13,9 @@ pub fn resolveLimit(comptime cfg: anytype) u32 {
     if (!@hasField(@TypeOf(cfg), "realtime")) return MAX_CONNECTIONS;
     if (@typeInfo(@TypeOf(cfg.realtime)) != .@"struct")
         @compileError(".realtime must be a struct");
-    for (std.meta.fields(@TypeOf(cfg.realtime))) |field| {
-        if (!std.mem.eql(u8, field.name, "canSubscribe") and !std.mem.eql(u8, field.name, "max_connections"))
-            @compileError(".realtime: unknown key '." ++ field.name ++ "' (recognized: .canSubscribe, .max_connections)");
+    for (@typeInfo(@TypeOf(cfg.realtime)).@"struct".field_names) |field| {
+        if (!std.mem.eql(u8, field, "canSubscribe") and !std.mem.eql(u8, field, "max_connections"))
+            @compileError(".realtime: unknown key '." ++ field ++ "' (recognized: .canSubscribe, .max_connections)");
     }
     if (!@hasField(@TypeOf(cfg.realtime), "max_connections")) return MAX_CONNECTIONS;
     const limit: u32 = cfg.realtime.max_connections;

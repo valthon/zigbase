@@ -1,4 +1,5 @@
 const std = @import("std");
+const Translator = @import("translate_c").Translator;
 
 const BuildOptionValues = struct {
     version: []const u8,
@@ -34,10 +35,21 @@ const BuildOptionValues = struct {
 
 fn createBuildOptions(b: *std.Build, values: BuildOptionValues) *std.Build.Step.Options {
     const options = b.addOptions();
-    inline for (@typeInfo(BuildOptionValues).@"struct".fields) |field| {
-        options.addOption(field.type, field.name, @field(values, field.name));
+    inline for (@typeInfo(BuildOptionValues).@"struct".field_names, @typeInfo(BuildOptionValues).@"struct".field_types) |name, T| {
+        options.addOption(T, name, @field(values, name));
     }
     return options;
+}
+
+// The backend also has an isolated test root, so keep its translated C
+// dependency independent of the full ZigBase module configuration.
+fn configureThumbnailPosix(b: *std.Build, module: *std.Build.Module) void {
+    const posix: Translator = .init(b.dependency("translate_c", .{}), .{
+        .c_source_file = b.path("src/files/thumbnail_posix.h"),
+        .target = module.resolved_target.?,
+        .optimize = module.optimize.?,
+    });
+    module.addImport("thumbnail_posix", posix.mod);
 }
 
 fn configureZigbaseModule(
@@ -49,6 +61,14 @@ fn configureZigbaseModule(
     vector: bool,
 ) void {
     module.addOptions("build_options", build_options);
+    const translate_c = b.dependency("translate_c", .{});
+    const sqlite: Translator = .init(translate_c, .{
+        .c_source_file = b.path("vendor/sqlite/sqlite3.h"),
+        .target = module.resolved_target.?,
+        .optimize = module.optimize.?,
+    });
+    module.addImport("sqlite_c", sqlite.mod);
+    configureThumbnailPosix(b, module);
     module.addIncludePath(b.path("vendor/sqlite"));
     module.addCSourceFile(.{
         .file = b.path("vendor/sqlite/sqlite3.c"),
@@ -81,7 +101,7 @@ pub fn build(b: *std.Build) void {
     // is ~7 MiB — and the @zigbase/server npm packages ship the unpacked binary,
     // so this is a direct ~72% cut to install size. Debug builds keep symbols;
     // override with -Dstrip=false to keep them in a release build too.
-    const strip = b.option(bool, "strip", "Strip debug info from shipped binaries (default: on except in Debug)") orelse (optimize != .Debug);
+    const strip = b.option(bool, "strip", "Strip debug info from shipped binaries (default: on except in Debug)") orelse (optimize != .debug);
 
     const zap = b.dependency("zap", .{ .target = target, .optimize = optimize });
 
@@ -92,11 +112,9 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
-    // Build provenance for `zigbase --version`. The server version is single-sourced
-    // from build.zig.zon; the commit is captured at configure time. `-Dcommit=<sha>` lets
-    // CI/release inject a deterministic SHA (used verbatim); otherwise `gitCommit` tries
-    // `git rev-parse` and, if that's unavailable (sandboxed configure step, no git on PATH),
-    // falls back to a spawn-free parse of `.git` (worktree-aware) before giving up.
+    // Build provenance for `zigbase --version`. Track Git's files explicitly so
+    // cached configuration is invalidated by commits, checkouts, and ref packing.
+    // Releases may inject a deterministic SHA without reading Git at all.
     const commit_override = b.option([]const u8, "commit", "Commit SHA to bake into --version (CI/release inject the real SHA; default: auto-detect from git)");
     const commit = commit_override orelse gitCommit(b);
     // Single-source the required Zig version so the compile-time guard in
@@ -104,10 +122,10 @@ pub fn build(b: *std.Build) void {
     // Dev-only seams (injectable clock, seeded entropy, test-capture, fake field-crypto).
     // Compiled in ONLY when this is true so a production binary can never use any of them.
     // Defaults to on in Debug, off in any release/optimized build; the release script
-    // cross-compiles ReleaseFast/ReleaseSafe, so shipped binaries get `false` and the
+    // cross-compiles fast/safe, so shipped binaries get `false` and the
     // override code folds to comptime-dead. Override with -Ddev-mode=true to build a
     // debuggable binary that still honors the dev-only env vars (e2e dev).
-    const dev_mode = b.option(bool, "dev-mode", "Compile in the dev-only, never-in-prod seams: ZIGBASE_FAKE_NOW clock, ZIGBASE_FAKE_SEED entropy, test-capture, and ZIGBASE_FIELD_CRYPTO fake crypto (default: on in Debug, off in release)") orelse (optimize == .Debug);
+    const dev_mode = b.option(bool, "dev-mode", "Compile in the dev-only, never-in-prod seams: ZIGBASE_FAKE_NOW clock, ZIGBASE_FAKE_SEED entropy, test-capture, and ZIGBASE_FIELD_CRYPTO fake crypto (default: on in Debug, off in release)") orelse (optimize == .debug);
     // Development CLI: init, agents-md, typegen, capabilities, routes, migrate preview, tune, diagnostics.
     // ON by default — every
     // official artifact we publish (GitHub release tarballs, the Docker image, the
@@ -265,7 +283,7 @@ pub fn build(b: *std.Build) void {
         .dependOn(&b.addInstallArtifact(migration_coordination_exe, .{}).step);
 
     const run_cmd = b.addRunArtifact(exe);
-    if (b.args) |args| run_cmd.addArgs(args);
+    run_cmd.addPassthruArgs();
     const run_step = b.step("run", "Run zigbase");
     run_step.dependOn(&run_cmd.step);
 
@@ -288,12 +306,12 @@ pub fn build(b: *std.Build) void {
     audit_step.dependOn(&audit_cmd.step);
 
     // --- bench: allocation + timing harness (report-only; see the allocator-ownership spec)
-    // Benchmarks have an independent optimization mode: ReleaseFast by default,
-    // overridable with -Dbench-optimize=Debug|ReleaseSafe|ReleaseFast|ReleaseSmall.
+    // Benchmarks have an independent optimization mode: fast by default,
+    // overridable with -Dbench-optimize=debug|safe|fast|small.
     // Their private ZigBase module enables only the internal benchmark API surface;
     // dev-only clock, entropy, capture, and fake-crypto seams remain compiled out so
     // measured record paths match the production shape.
-    const bench_optimize = b.option(std.builtin.OptimizeMode, "bench-optimize", "Optimization mode for `zig build bench` (default: ReleaseFast)") orelse .ReleaseFast;
+    const bench_optimize = b.option(std.lang.Optimize, "bench-optimize", "Optimization mode for `zig build bench` (default: fast)") orelse .fast;
     var bench_option_values = option_values;
     bench_option_values.dev_mode = false;
     bench_option_values.internal_api = true;
@@ -315,7 +333,7 @@ pub fn build(b: *std.Build) void {
     bench_mod.addImport("zigbase", bench_zigbase_mod);
     const bench_exe = b.addExecutable(.{ .name = "zigbase-bench", .root_module = bench_mod });
     const bench_run = b.addRunArtifact(bench_exe);
-    if (b.args) |args| bench_run.addArgs(args);
+    bench_run.addPassthruArgs();
     const bench_step = b.step("bench", "Run the benchmark harness (ns/op + allocation profile)");
     bench_step.dependOn(&bench_run.step);
 
@@ -699,6 +717,7 @@ pub fn build(b: *std.Build) void {
 
     if (image_thumbnails) {
         const codec_tests_mod = b.createModule(.{ .root_source_file = b.path("src/files/thumbnail_imagemagick.zig"), .target = target, .optimize = optimize, .link_libc = true });
+        configureThumbnailPosix(b, codec_tests_mod);
         const codec_tests = b.addTest(.{ .root_module = codec_tests_mod });
         b.step("test-thumbnail-backend", "Run isolated ImageMagick backend tests").dependOn(&b.addRunArtifact(codec_tests).step);
     }
@@ -768,10 +787,10 @@ pub fn build(b: *std.Build) void {
         const parser_fuzz_mod = b.createModule(.{
             .root_source_file = b.path(root_source_file),
             .target = target,
-            // Zig 0.16.0's Debug test runner has a StackTrace type mismatch when it
-            // rebuilds fuzz mode. ReleaseSafe preserves runtime safety while also
+            // Zig 0.17.1's Debug test runner has a StackTrace type mismatch when it
+            // rebuilds fuzz mode. safe preserves runtime safety while also
             // making campaigns fast enough for useful local iteration counts.
-            .optimize = .ReleaseSafe,
+            .optimize = .safe,
         });
         const parser_fuzz_tests = b.addTest(.{ .root_module = parser_fuzz_mod });
         fuzz_compile_step.dependOn(&parser_fuzz_tests.step);
@@ -792,7 +811,7 @@ pub fn build(b: *std.Build) void {
     // init.environ_map (pure-Zig). It still links libc transitively through
     // zigbase_mod (facil.io C deps), so we don't set link_libc here.
     //
-    // Module design (Zig 0.16 "file in one module" constraint):
+    // Module design (Zig 0.17.1 "file in one module" constraint):
     // gen_client.zig uses relative @imports (../schema.zig, emit.zig, etc.) which
     // claim those files for whichever module it belongs to. Since zigbase_mod already
     // owns those files, gen_client.zig cannot be the exe module root when zigbase is
@@ -801,7 +820,7 @@ pub fn build(b: *std.Build) void {
     const gen_mod = b.createModule(.{
         .root_source_file = b.path("src/codegen/gen_main.zig"),
         .target = b.graph.host,
-        .optimize = .Debug,
+        .optimize = .debug,
     });
     gen_mod.addImport("zigbase", zigbase_mod);
     gen_mod.addImport("app", dating_app_mod);
@@ -825,7 +844,7 @@ pub fn build(b: *std.Build) void {
     const gen_rt_mod = b.createModule(.{
         .root_source_file = b.path("src/codegen/gen_runtime_main.zig"),
         .target = b.graph.host,
-        .optimize = .Debug,
+        .optimize = .debug,
         .link_libc = true,
     });
     gen_rt_mod.addImport("zigbase", zigbase_mod);
@@ -885,13 +904,13 @@ pub fn build(b: *std.Build) void {
     // Builds gen_test_root.zig as a test binary with both zigbase_mod (for
     // gen_client.generate) and dating_app_mod (for App.collections) injected.
     // gen_test_root.zig is the module root — it does NOT share files with zigbase_mod,
-    // avoiding the Zig 0.16 "file in two modules" constraint.
+    // avoiding the Zig 0.17.1 "file in two modules" constraint.
     // NOTE: this step re-runs generate() to compare against the committed snapshot.
     // Run `zig build gen-dating-client` first if the snapshot does not yet exist.
     const gen_test_mod = b.createModule(.{
         .root_source_file = b.path("src/codegen/gen_test_root.zig"),
         .target = b.graph.host,
-        .optimize = .Debug,
+        .optimize = .debug,
     });
     gen_test_mod.addImport("zigbase", zigbase_mod);
     gen_test_mod.addImport("app", dating_app_mod);
@@ -909,7 +928,8 @@ pub fn build(b: *std.Build) void {
 /// surface automatically. Panics loudly if the macro or its quoted value is absent, so
 /// a header reshuffle fails the build rather than silently shipping a wrong version.
 fn readCDefineStr(b: *std.Build, rel_path: []const u8, macro: []const u8) []const u8 {
-    const data = b.build_root.handle.readFileAlloc(b.graph.io, rel_path, b.allocator, .unlimited) catch |e|
+    b.dependOnFileContents(b.path(rel_path));
+    const data = std.Io.Dir.cwd().readFileAlloc(b.graph.io, b.root.joinString(b.allocator, rel_path) catch @panic("OOM"), b.allocator, .unlimited) catch |e|
         std.debug.panic("version aggregation: cannot read '{s}': {s}", .{ rel_path, @errorName(e) });
     // The whole header (sqlite3.h is ~600 KB) is read into this buffer; we only dupe the
     // matched substring out, so free the buffer before returning.
@@ -939,39 +959,36 @@ fn zapPinnedCommit() []const u8 {
     return url[hash + 1 ..];
 }
 
-/// Capture the short git commit at configure time; "unknown" outside a repo.
-///
-/// Two strategies, in order: (1) `git rev-parse --short HEAD` — works in a normal checkout
-/// with git on PATH; but a sandboxed configure step (e.g. an agent harness) can block the
-/// spawn, so (2) fall back to a spawn-free filesystem parse of `.git` that also handles the
-/// linked-worktree case (`.git` is a *file* pointing at the real gitdir, whose branch refs
-/// live in the shared common dir). Both failing → "unknown" (graceful, never a crash).
+/// Capture provenance without spawning Git or poisoning configuration caching.
 fn gitCommit(b: *std.Build) []const u8 {
-    const root = b.build_root.path orelse ".";
-    var code: u8 = undefined;
-    if (b.runAllowFail(&.{ "git", "-C", root, "rev-parse", "--short", "HEAD" }, &code, .ignore)) |stdout| {
-        if (code == 0) {
-            const trimmed = std.mem.trim(u8, stdout, " \t\r\n");
-            if (trimmed.len > 0) return trimmed;
-        }
-    } else |_| {}
     return gitCommitFromFs(b) orelse "unknown";
+}
+
+/// Track even missing files: a loose ref or commondir created later must invalidate
+/// the cached configuration just as changing an existing HEAD does.
+fn readGitFile(b: *std.Build, path: []const u8) ![]u8 {
+    b.dependOnFileMetadata(b.graph.cwdRelativePath(path));
+    return std.Io.Dir.cwd().readFileAlloc(b.graph.io, path, b.allocator, .limited(64 * 1024 * 1024));
 }
 
 /// Spawn-free short-SHA detection by parsing `.git` directly (sandbox- and worktree-proof).
 /// Returns null on any read/parse failure so the caller degrades to "unknown".
 fn gitCommitFromFs(b: *std.Build) ?[]const u8 {
     const io = b.graph.io;
-    const alloc = b.allocator;
     const cwd = std.Io.Dir.cwd();
-    const root = b.build_root.path orelse return null;
-    const small: std.Io.Limit = .limited(64 * 1024);
+    const root = b.root.joinString(b.allocator, "") catch return null;
 
     // 1. Resolve the git dir. `.git` is a directory (normal repo) or a file
     //    "gitdir: <path>" (linked worktree / submodule). readFileAlloc errors on a dir.
     const dot_git = b.fmt("{s}/.git", .{root});
     const git_dir: []const u8 = blk: {
-        const contents = cwd.readFileAlloc(io, dot_git, alloc, small) catch break :blk dot_git;
+        if (cwd.openDir(io, dot_git, .{})) |opened| {
+            var dir = opened;
+            dir.close(io);
+            b.dependOnDirectoryMetadata(b.graph.cwdRelativePath(dot_git));
+            break :blk dot_git;
+        } else |_| {}
+        const contents = readGitFile(b, dot_git) catch break :blk dot_git;
         const trimmed = std.mem.trim(u8, contents, " \t\r\n");
         const gd = "gitdir:";
         if (std.mem.startsWith(u8, trimmed, gd)) {
@@ -982,7 +999,7 @@ fn gitCommitFromFs(b: *std.Build) ?[]const u8 {
     };
 
     // 2. Read HEAD. Either "ref: refs/heads/<branch>" or a detached raw SHA.
-    const head = cwd.readFileAlloc(io, b.fmt("{s}/HEAD", .{git_dir}), alloc, small) catch return null;
+    const head = readGitFile(b, b.fmt("{s}/HEAD", .{git_dir})) catch return null;
     const head_trim = std.mem.trim(u8, head, " \t\r\n");
     const rp = "ref:";
     if (!std.mem.startsWith(u8, head_trim, rp)) return shortSha(b, head_trim);
@@ -991,18 +1008,18 @@ fn gitCommitFromFs(b: *std.Build) ?[]const u8 {
     // 3. Branch refs live in the COMMON dir. In a linked worktree, gitdir/commondir points
     //    at it (relative to gitdir); a normal repo has no commondir, so gitdir IS the common dir.
     const common_dir: []const u8 = blk: {
-        const cd = cwd.readFileAlloc(io, b.fmt("{s}/commondir", .{git_dir}), alloc, small) catch break :blk git_dir;
+        const cd = readGitFile(b, b.fmt("{s}/commondir", .{git_dir})) catch break :blk git_dir;
         const cd_trim = std.mem.trim(u8, cd, " \t\r\n");
         break :blk if (std.fs.path.isAbsolute(cd_trim)) cd_trim else b.fmt("{s}/{s}", .{ git_dir, cd_trim });
     };
 
     // 3a. Loose ref file.
-    if (cwd.readFileAlloc(io, b.fmt("{s}/{s}", .{ common_dir, ref }), alloc, small)) |loose| {
+    if (readGitFile(b, b.fmt("{s}/{s}", .{ common_dir, ref }))) |loose| {
         return shortSha(b, std.mem.trim(u8, loose, " \t\r\n"));
     } else |_| {}
 
     // 3b. Packed refs: lines are "<sha> <refname>" (skip comments and "^" peel lines).
-    if (cwd.readFileAlloc(io, b.fmt("{s}/packed-refs", .{common_dir}), alloc, .unlimited)) |packed_refs| {
+    if (readGitFile(b, b.fmt("{s}/packed-refs", .{common_dir}))) |packed_refs| {
         var it = std.mem.tokenizeScalar(u8, packed_refs, '\n');
         while (it.next()) |line| {
             if (line.len == 0 or line[0] == '#' or line[0] == '^') continue;
@@ -1067,7 +1084,7 @@ fn genClientStepInner(
     // init.environ_map (pure-Zig). It still links libc transitively through
     // zigbase_mod (facil.io C deps), so we don't set link_libc here.
     //
-    // Module design (Zig 0.16 "file in one module" constraint):
+    // Module design (Zig 0.17.1 "file in one module" constraint):
     // gen_client.zig uses relative @imports (../schema.zig, emit.zig, etc.) which
     // claim those files for whichever module it belongs to. Since zigbase_mod already
     // owns those files, gen_client.zig cannot be the exe module root when zigbase is
@@ -1077,7 +1094,7 @@ fn genClientStepInner(
     const gen_mod = b.createModule(.{
         .root_source_file = zigbase_builder.path("src/codegen/gen_main.zig"),
         .target = b.graph.host,
-        .optimize = .Debug,
+        .optimize = .debug,
     });
     gen_mod.addImport("zigbase", zigbase_mod);
     gen_mod.addImport("app", app_mod);
@@ -1111,7 +1128,8 @@ fn genClientStepInner(
 pub fn embedStaticDir(b: *std.Build, dir_rel: []const u8) *std.Build.Module {
     const alloc = b.allocator;
     const io = b.graph.io;
-    var dir = b.build_root.handle.openDir(io, dir_rel, .{ .iterate = true }) catch
+    b.dependOnDirectoryContents(b.path(dir_rel));
+    var dir = b.root.openDir(io, dir_rel, .{ .iterate = true }) catch
         std.debug.panic("embedStaticDir: cannot open '{s}' — build the frontend first (e.g. `cd {s}/.. && npm install && npm run build`)", .{ dir_rel, dir_rel });
     defer dir.close(io);
 
@@ -1119,6 +1137,9 @@ pub fn embedStaticDir(b: *std.Build, dir_rel: []const u8) *std.Build.Module {
     var walker = dir.walk(alloc) catch @panic("OOM");
     defer walker.deinit();
     while (walker.next(io) catch |e| std.debug.panic("embedStaticDir: walk failed: {s}", .{@errorName(e)})) |entry| {
+        if (entry.kind == .directory) {
+            b.dependOnDirectoryContents(b.path(b.fmt("{s}/{s}", .{ dir_rel, entry.path })));
+        }
         if (entry.kind != .file) continue;
         const path = alloc.dupe(u8, entry.path) catch @panic("OOM");
         // walk() joins with the native separator; manifest paths must be
@@ -1144,6 +1165,7 @@ pub fn embedStaticDir(b: *std.Build, dir_rel: []const u8) *std.Build.Module {
     for (names.items) |rel| {
         _ = wf.addCopyFile(b.path(b.fmt("{s}/{s}", .{ dir_rel, rel })), rel);
         // no size limit: runs at build time on the developer's machine, not in the server
+        b.dependOnFileContents(b.path(b.fmt("{s}/{s}", .{ dir_rel, rel })));
         const data = dir.readFileAlloc(io, rel, alloc, .unlimited) catch |e|
             std.debug.panic("embedStaticDir: cannot read '{s}/{s}': {s}", .{ dir_rel, rel, @errorName(e) });
         defer alloc.free(data);
@@ -1182,7 +1204,7 @@ pub const TestOptions = struct {
 
 /// A test artifact for a consumer app, wired with ZigBase's `.simple`-mode runner.
 ///
-/// The default server-mode runner (`--listen=-`) in Zig 0.16.0 can label a
+/// The default server-mode runner (`--listen=-`) in Zig 0.17.1 can label a
 /// successful command as failed when stderr remains at exit (issue #261).
 /// `.simple` mode reports through the exit code instead. Assertions, leaks,
 /// logged errors, and abnormal process exits still fail the build.

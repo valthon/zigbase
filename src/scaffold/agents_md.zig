@@ -204,7 +204,7 @@ const framework_traps =
     \\`serve` and a real client. Test both layers; do not assume one implies the
     \\other.
     \\
-    \\Two build notes while you are here: the Zig toolchain is pinned to **0.16.0
+    \\Two build notes while you are here: the Zig toolchain is pinned to **0.17.1
     \\exactly** (another 0.16.x may not work), and config mistakes in `App(.{...})`
     \\are `@compileError`s that print the valid keys — read the error text, it names
     \\the fix. Your spawned-server tests run whatever binary you built last — if

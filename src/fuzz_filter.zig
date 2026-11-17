@@ -11,8 +11,8 @@ fn fuzzInput(_: void, smith: *std.testing.Smith) !void {
     const len = smith.sliceWithHash(&input_buf, @src().line);
     const input = input_buf[0..len];
 
-    var gpa: std.heap.DebugAllocator(.{}) = .init;
-    defer std.debug.assert(gpa.deinit() == .ok);
+    var gpa: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .check_write_after_free = true });
+    defer std.debug.assert(gpa.deinit() == 0);
     const alloc = gpa.allocator();
 
     const toks = lexer.lex(alloc, input) catch return;

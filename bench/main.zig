@@ -30,7 +30,7 @@ const QueryCtx = struct { conn: *Db };
 // The JSON record-read path: a record decodes into a std.json.Value object (id +
 // created/updated + each field via values.readValue) — the shape every REST read returns and
 // serializes. The result is an interlinked ObjectMap (arena-lifetime, contract-4), so these
-// are measured under runArena only; the DebugAllocator `run` would (correctly) leak-flag it.
+// are measured under runArena only; the SafeAllocator `run` would (correctly) leak-flag it.
 const RecCtx = struct { conn: *Db, col: schema.Collection, id0: []const u8 };
 
 // Single-record read (the findById shape): one prepare + one row -> one json.Value object.
@@ -143,7 +143,7 @@ pub fn main(init: std.process.Init) !void {
     {
         var i: usize = 0;
         while (i < 50) : (i += 1) {
-            const sql = try std.fmt.allocPrintSentinel(arena, "INSERT INTO \"bench_posts\" VALUES ('id{d}','Post number {d} title','Body text for post {d}, a sentence or so of content.',{d});", .{ i, i, i, i * 7 }, 0);
+            const sql = try arena.printSentinel("INSERT INTO \"bench_posts\" VALUES ('id{d}','Post number {d} title','Body text for post {d}, a sentence or so of content.',{d});", .{ i, i, i, i * 7 }, 0);
             try qdb.exec(sql);
         }
     }
@@ -163,9 +163,9 @@ pub fn main(init: std.process.Init) !void {
     {
         var i: usize = 0;
         while (i < 50) : (i += 1) {
-            const id = try std.fmt.allocPrint(arena, "id{d}", .{i});
+            const id = try arena.print("id{d}", .{i});
             try ids.append(arena, id);
-            const sql = try std.fmt.allocPrintSentinel(arena, "INSERT INTO \"posts\" VALUES ('{s}','2026-01-01 00:00:00','2026-01-01 00:00:00','Post number {d} title','Body text for post {d}, a sentence or so of content.',{d});", .{ id, i, i, i * 7 }, 0);
+            const sql = try arena.printSentinel("INSERT INTO \"posts\" VALUES ('{s}','2026-01-01 00:00:00','2026-01-01 00:00:00','Post number {d} title','Body text for post {d}, a sentence or so of content.',{d});", .{ id, i, i, i * 7 }, 0);
             try rdb.exec(sql);
         }
     }

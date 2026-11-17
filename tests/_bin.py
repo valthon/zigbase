@@ -10,7 +10,7 @@ import shutil
 import subprocess
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
-ZIG = ["mise", "exec", "zig@0.16.0", "--", "zig"]
+ZIG = ["mise", "exec", "zig@0.17.1", "--", "zig"]
 
 # Declared step names per package dir, keyed by resolved path. `zig build
 # --list-steps` re-runs the configure phase, so ask once per process.

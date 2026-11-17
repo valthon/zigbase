@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Verify the standalone reproduction against stock and privately patched Zig.
 
-No installed toolchain files are changed. Run with pinned Zig 0.16.0 on PATH;
+No installed toolchain files are changed. Run with pinned Zig 0.17.1 on PATH;
 --zig-lib-dir supports installations whose lib directory is not beside zig.
 """
 
@@ -30,15 +30,15 @@ def main():
     parser.add_argument("--zig-lib-dir", type=Path)
     args = parser.parse_args()
     if not args.zig:
-        parser.error("pinned Zig 0.16.0 must be on PATH, or pass --zig")
+        parser.error("pinned Zig 0.17.1 must be on PATH, or pass --zig")
     zig = Path(args.zig).resolve()
     env = dict(os.environ)
     env.pop("ZIG_BUILD_RUNNER", None)
     env.pop("ZIG_LIB_DIR", None)
-    if check([str(zig), "version"], cwd=ROOT, env=env).stdout.strip() != "0.16.0":
-        parser.error("this reproduction and patch target exactly Zig 0.16.0")
+    if check([str(zig), "version"], cwd=ROOT, env=env).stdout.strip() != "0.17.1":
+        parser.error("this reproduction and patch target exactly Zig 0.17.1")
     library = (args.zig_lib_dir or zig.parent / "lib").resolve()
-    if not (library / "std/Build/Step/Run.zig").is_file():
+    if not (library / "compiler/Maker/Step/Run.zig").is_file():
         parser.error("cannot locate Zig's lib directory; pass --zig-lib-dir")
     # Deliberate destructor signal must not create large core files in CI.
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))

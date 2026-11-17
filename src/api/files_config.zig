@@ -35,9 +35,9 @@ pub fn get(ctx: *http.RequestCtx) anyerror!http.Response {
 test "files config JSON never contains credential keys" {
     const info = @import("../files/info.zig");
     // Pin: the Info struct has no access-key/secret fields at all.
-    const fields = @typeInfo(info.Info).@"struct".fields;
+    const fields = @typeInfo(info.Info).@"struct".field_names;
     inline for (fields) |f| {
-        try std.testing.expect(std.mem.indexOf(u8, f.name, "access_key") == null);
-        try std.testing.expect(std.mem.indexOf(u8, f.name, "secret") == null);
+        try std.testing.expect(std.mem.indexOf(u8, f, "access_key") == null);
+        try std.testing.expect(std.mem.indexOf(u8, f, "secret") == null);
     }
 }

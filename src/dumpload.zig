@@ -312,13 +312,13 @@ fn provisionRecordTables(a: std.mem.Allocator, target: *db.Db, src_cols: []const
         const full = try schema.injectAuthFields(a, col);
         const ddl_col = try resolveRelationTargets(a, full, id_to_name);
         const skip: []const []const u8 = if (defer_cycle_fks) try cycleFieldNames(a, plan.cycle_edges, src_cols, idx) else &.{};
-        try target.exec(try a.dupeZ(u8, try ddl.createTableSql(a, ddl_col, null, d, skip)));
-        for (col.indexes) |ix| target.exec(try a.dupeZ(u8, try ddl.createIndexSql(a, col.name, ix, d))) catch |e| {
+        try target.exec(try a.dupeSentinel(u8, try ddl.createTableSql(a, ddl_col, null, d, skip), 0));
+        for (col.indexes) |ix| target.exec(try a.dupeSentinel(u8, try ddl.createIndexSql(a, col.name, ix, d), 0)) catch |e| {
             std.log.warn("migrate-db: index '{s}' on '{s}' skipped ({s})", .{ ix.name, col.name, @errorName(e) });
         };
         if (col.type == .auth) {
             for (col.options.auth.identityFields) |idf|
-                try target.exec(try a.dupeZ(u8, try ddl.authIdentityIndexSql(a, col.name, idf)));
+                try target.exec(try a.dupeSentinel(u8, try ddl.authIdentityIndexSql(a, col.name, idf), 0));
         }
         created_flags[idx] = true;
         created += 1;
@@ -334,7 +334,7 @@ fn provisionRecordTables(a: std.mem.Allocator, target: *db.Db, src_cols: []const
             const r = f.options.relation;
             const tgt = id_to_name.get(r.targetCollectionId) orelse r.targetCollectionId;
             const sql = try ddl.addDeferrableFkSql(a, col.name, f.name, tgt, r.cascadeDelete);
-            target.exec(try a.dupeZ(u8, sql)) catch |err| {
+            target.exec(try a.dupeSentinel(u8, sql, 0)) catch |err| {
                 std.log.err(
                     "migrate-db: could not add deferrable FK \"fk_{s}_{s}\" on \"{s}\"(\"{s}\") -> \"{s}\"(\"id\"): {s}. Fix the target schema (or use a superuser target role) and re-run.",
                     .{ col.name, f.name, col.name, f.name, tgt, @errorName(err) },

@@ -119,10 +119,10 @@ pub fn buildCollections(comptime cfg: anytype) []const schema.Collection {
         const Cfg = @TypeOf(cfg);
         const info = @typeInfo(Cfg);
         if (info != .@"struct") @compileError("collections config must be a struct literal");
-        const cols_fields = info.@"struct".fields;
+        const cols_fields = info.@"struct".field_names;
         var out: [cols_fields.len]schema.Collection = undefined;
         for (cols_fields, 0..) |cf, ci| {
-            out[ci] = buildCollection(cf.name, @field(cfg, cf.name));
+            out[ci] = buildCollection(cf, @field(cfg, cf));
         }
         const frozen = out;
         return &frozen;
@@ -148,16 +148,16 @@ fn rejectUnknownKeys(comptime spec: anytype, comptime allowed: []const []const u
     comptime {
         const info = @typeInfo(@TypeOf(spec));
         if (info != .@"struct") return;
-        for (info.@"struct".fields) |fld| {
+        for (info.@"struct".field_names) |fld| {
             var ok = false;
             for (allowed) |a| {
-                if (std.mem.eql(u8, fld.name, a)) {
+                if (std.mem.eql(u8, fld, a)) {
                     ok = true;
                     break;
                 }
             }
             if (!ok)
-                @compileError(what ++ ": unknown key '." ++ fld.name ++ "' (recognized keys: " ++ keyList(allowed) ++ ")");
+                @compileError(what ++ ": unknown key '." ++ fld ++ "' (recognized keys: " ++ keyList(allowed) ++ ")");
         }
     }
 }
@@ -192,17 +192,17 @@ fn rejectUnknownFieldKeys(comptime f: anytype, comptime ftype: schema.FieldType,
         if (info != .@"struct") return;
         const common = [_][]const u8{ "name", "type", "required", "unique", "hidden", "encrypted", "searchable" };
         const opt = fieldOptionKeys(ftype);
-        for (info.@"struct".fields) |fld| {
+        for (info.@"struct".field_names) |fld| {
             var ok = false;
             for (common) |a| {
-                if (std.mem.eql(u8, fld.name, a)) ok = true;
+                if (std.mem.eql(u8, fld, a)) ok = true;
             }
             if (!ok) for (opt) |a| {
-                if (std.mem.eql(u8, fld.name, a)) ok = true;
+                if (std.mem.eql(u8, fld, a)) ok = true;
             };
             if (!ok) {
                 const opt_msg = if (opt.len == 0) "" else " (+ for type ." ++ @tagName(ftype) ++ ": " ++ keyList(opt) ++ ")";
-                @compileError(where ++ ": unknown key '." ++ fld.name ++ "' (recognized keys: " ++ keyList(&common) ++ opt_msg ++ ")");
+                @compileError(where ++ ": unknown key '." ++ fld ++ "' (recognized keys: " ++ keyList(&common) ++ opt_msg ++ ")");
             }
         }
     }
@@ -227,10 +227,10 @@ fn buildCollection(comptime name: []const u8, comptime spec: anytype) schema.Col
         const FT = @TypeOf(ftuple);
         const ftinfo = @typeInfo(FT);
         if (ftinfo != .@"struct") @compileError("collection '" ++ name ++ "' .fields must be a tuple of field literals");
-        const ff = ftinfo.@"struct".fields;
+        const ff = ftinfo.@"struct".field_names;
         var fields: [ff.len]schema.Field = undefined;
         for (ff, 0..) |f, i| {
-            fields[i] = buildField(name, @field(ftuple, f.name));
+            fields[i] = buildField(name, @field(ftuple, f));
         }
         const frozen_fields = fields;
 
@@ -395,10 +395,10 @@ fn buildOAuth2Options(comptime what: []const u8, comptime o: anytype) schema.OAu
             const pinfo = @typeInfo(PT);
             if (pinfo != .@"struct")
                 @compileError(".auth.oauth2.providers must be a tuple of provider literals");
-            const pf = pinfo.@"struct".fields;
+            const pf = pinfo.@"struct".field_names;
             var provs: [pf.len]schema.OAuth2Provider = undefined;
             for (pf, 0..) |pff, i| {
-                provs[i] = buildOAuth2Provider(@field(pt, pff.name));
+                provs[i] = buildOAuth2Provider(@field(pt, pff));
             }
             const frozen = provs;
             out.providers = &frozen;
@@ -604,10 +604,10 @@ fn strTupleToSlice(comptime t: anytype) []const []const u8 {
     comptime {
         const info = @typeInfo(@TypeOf(t));
         if (info != .@"struct") @compileError("expected a tuple of string literals");
-        const tf = info.@"struct".fields;
+        const tf = info.@"struct".field_names;
         var out: [tf.len][]const u8 = undefined;
         for (tf, 0..) |tff, i| {
-            const v: []const u8 = @field(t, tff.name);
+            const v: []const u8 = @field(t, tff);
             out[i] = v;
         }
         const frozen = out;
@@ -628,10 +628,10 @@ fn customSlugsToSlice(comptime t: anytype) []const []const u8 {
         const tup = if (@typeInfo(@TypeOf(t)) == .pointer) t.* else t;
         const info = @typeInfo(@TypeOf(tup));
         if (info != .@"struct") @compileError(".auth.methods.custom must be a tuple of slug strings and/or typed-method structs");
-        const tf = info.@"struct".fields;
+        const tf = info.@"struct".field_names;
         var out: [tf.len][]const u8 = undefined;
         for (tf, 0..) |tff, i| {
-            const elem = @field(tup, tff.name);
+            const elem = @field(tup, tff);
             switch (@typeInfo(@TypeOf(elem))) {
                 .pointer => {
                     const slug: []const u8 = elem;
@@ -661,10 +661,10 @@ fn buildIndexes(comptime col_name: []const u8, comptime t: anytype) []const sche
         const info = @typeInfo(T);
         if (info != .@"struct")
             @compileError("collection '" ++ col_name ++ "' .indexes must be a tuple of index literals");
-        const tf = info.@"struct".fields;
+        const tf = info.@"struct".field_names;
         var out: [tf.len]schema.Index = undefined;
         for (tf, 0..) |tff, i| {
-            const idx = @field(t, tff.name);
+            const idx = @field(t, tff);
             const I = @TypeOf(idx);
             if (!@hasField(I, "name"))
                 @compileError("an index in collection '" ++ col_name ++ "' is missing .name");

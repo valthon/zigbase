@@ -4,7 +4,7 @@ from contextlib import ExitStack, contextmanager
 from _bin import resolve_binary
 
 REPO = pathlib.Path(__file__).resolve().parents[2]
-ZIG = ["mise", "exec", "zig@0.16.0", "--", "zig"]
+ZIG = ["mise", "exec", "zig@0.17.1", "--", "zig"]
 
 # SUITE-WIDE foreground pin. Every server this suite spawns — the fixtures
 # below, but also the ~25 inline `{**os.environ, ...}` spawns in

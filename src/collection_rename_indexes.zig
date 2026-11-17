@@ -70,8 +70,8 @@ fn sqliteAuthIndexes(scratch: *std.heap.ArenaAllocator, w: *db.Db, old: schema.C
     // ownership-by-name can accidentally adopt a migration-owned index.
     var model = try db.Db.openMemory();
     defer model.close();
-    try model.exec(try a.dupeZ(u8, try ddl.createTableSql(a, old, null, db.dbDialect(&model), &.{})));
-    for (old.options.auth.identityFields) |field| try model.exec(try a.dupeZ(u8, try ddl.authIdentityIndexSql(a, old.name, field)));
+    try model.exec(try a.dupeSentinel(u8, try ddl.createTableSql(a, old, null, db.dbDialect(&model), &.{}), 0));
+    for (old.options.auth.identityFields) |field| try model.exec(try a.dupeSentinel(u8, try ddl.authIdentityIndexSql(a, old.name, field), 0));
     if (mutate) try model.exec(try std.fmt.allocPrintSentinel(a, "ALTER TABLE {s} RENAME TO {s};", .{ try ddl.quoteIdent(a, old.name), try ddl.quoteIdent(a, to) }, 0));
     for (old.options.auth.identityFields) |field| {
         const source_name = try std.fmt.allocPrint(a, "idx_auth_{s}_{s}", .{ old.name, field });
@@ -98,7 +98,7 @@ fn sqliteAuthIndexes(scratch: *std.heap.ArenaAllocator, w: *db.Db, old: schema.C
             if (try destination.step()) return error.Conflict;
         }
         if (mutate) {
-            try w.exec(try a.dupeZ(u8, try ddl.authIdentityIndexSql(a, to, field)));
+            try w.exec(try a.dupeSentinel(u8, try ddl.authIdentityIndexSql(a, to, field), 0));
             if (exists) try w.exec(try std.fmt.allocPrintSentinel(a, "DROP INDEX main.{s};", .{try ddl.quoteIdent(a, source_name)}, 0));
         }
     }
@@ -220,7 +220,7 @@ test "SQLite auth rename moves only verified engine indexes and preserves unique
     try w.exec("DROP INDEX idx_auth_users_email;");
     const restore = try ddl.authIdentityIndexSql(a, "users", "email");
     defer a.free(restore);
-    const restore_z = try a.dupeZ(u8, restore);
+    const restore_z = try a.dupeSentinel(u8, restore, 0);
     defer a.free(restore_z);
     try w.exec(restore_z);
     try rename(a, std.testing.io, &w, "users", "people");
@@ -303,8 +303,8 @@ test "pg: rename provenance preserves identity index OID and refuses owned-data 
     try w.begin();
     defer w.rollback() catch |err| std.log.err("rename index test rollback failed: {s}", .{@errorName(err)});
     const collections = @import("collections.zig");
-    const long_source = "x" ** 54 ++ "a";
-    const long_destination = "x" ** 54 ++ "b";
+    const long_source = (&@as([54]u8, @splat('x'))) ++ "a";
+    const long_destination = (&@as([54]u8, @splat('x'))) ++ "b";
     const long_auth = try collections.create(a, std.testing.io, &w, .{ .id = "", .name = long_source, .type = .auth, .fields = &.{} });
     defer long_auth.deinit(a);
     const before_long = try @import("schema_gen.zig").read(&w);
@@ -336,7 +336,7 @@ test "pg: rename provenance preserves identity index OID and refuses owned-data 
     });
     defer users.deinit(a);
     const original = (try indexOid(a, &w, "users", "idx_auth_users_email")).?;
-    try std.testing.expectError(error.Conflict, preflight(a, &w, users, "x" ** 55));
+    try std.testing.expectError(error.Conflict, preflight(a, &w, users, (&@as([55]u8, @splat('x')))));
     try w.exec("CREATE TABLE idx_auth_people_email(note TEXT); INSERT INTO idx_auth_people_email VALUES('keep');");
     try std.testing.expectError(error.Conflict, preflight(a, &w, users, "people"));
     try w.exec("DROP TABLE idx_auth_people_email;");
@@ -347,7 +347,7 @@ test "pg: rename provenance preserves identity index OID and refuses owned-data 
     try std.testing.expect((try indexOid(a, &w, "people", "idx_auth_users_email")) == null);
     const ensure = try ddl.authIdentityIndexSql(a, "people", "email");
     defer a.free(ensure);
-    const ensure_z = try a.dupeZ(u8, ensure);
+    const ensure_z = try a.dupeSentinel(u8, ensure, 0);
     defer a.free(ensure_z);
     try w.exec(ensure_z);
     try std.testing.expectEqual(original, (try indexOid(a, &w, "people", "idx_auth_people_email")).?);

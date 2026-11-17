@@ -36,23 +36,23 @@ pub fn queueMeta(comptime queues_cfg: anytype) []const QueueDef {
             @compileError(".queues must be a struct literal of queue declarations");
         var list: []const QueueDef = &.{};
         var has_default = false;
-        for (std.meta.fields(T)) |f| {
-            if (std.mem.eql(u8, f.name, "default")) has_default = true;
-            const spec = @field(queues_cfg, f.name);
+        for (@typeInfo(T).@"struct".field_names) |f| {
+            if (std.mem.eql(u8, f, "default")) has_default = true;
+            const spec = @field(queues_cfg, f);
             const ST = @TypeOf(spec);
             if (@typeInfo(ST) != .@"struct")
-                @compileError("queue '" ++ f.name ++ "' must be a struct '.{ .backend = …, .priority = …, .retry = .{…} }'");
-            for (std.meta.fields(ST)) |sf| {
-                if (!std.mem.eql(u8, sf.name, "backend") and
-                    !std.mem.eql(u8, sf.name, "priority") and
-                    !std.mem.eql(u8, sf.name, "retry") and
-                    !std.mem.eql(u8, sf.name, "visibility_timeout_s") and
-                    !std.mem.eql(u8, sf.name, "done_ttl_s") and
-                    !std.mem.eql(u8, sf.name, "rate") and
-                    !std.mem.eql(u8, sf.name, "capacity"))
-                    @compileError("queue '" ++ f.name ++ "': unknown key '." ++ sf.name ++ "' (recognized keys: .backend, .priority, .retry, .visibility_timeout_s, .done_ttl_s, .rate, .capacity)");
+                @compileError("queue '" ++ f ++ "' must be a struct '.{ .backend = …, .priority = …, .retry = .{…} }'");
+            for (@typeInfo(ST).@"struct".field_names) |sf| {
+                if (!std.mem.eql(u8, sf, "backend") and
+                    !std.mem.eql(u8, sf, "priority") and
+                    !std.mem.eql(u8, sf, "retry") and
+                    !std.mem.eql(u8, sf, "visibility_timeout_s") and
+                    !std.mem.eql(u8, sf, "done_ttl_s") and
+                    !std.mem.eql(u8, sf, "rate") and
+                    !std.mem.eql(u8, sf, "capacity"))
+                    @compileError("queue '" ++ f ++ "': unknown key '." ++ sf ++ "' (recognized keys: .backend, .priority, .retry, .visibility_timeout_s, .done_ttl_s, .rate, .capacity)");
             }
-            var def = QueueDef{ .name = f.name };
+            var def = QueueDef{ .name = f };
             if (@hasField(ST, "backend")) {
                 const be: queue.Backend = spec.backend;
                 def.backend = be;
@@ -61,26 +61,26 @@ pub fn queueMeta(comptime queues_cfg: anytype) []const QueueDef {
                 const pr: queue.Priority = spec.priority;
                 def.priority = pr;
             }
-            if (@hasField(ST, "retry")) def.retry = retryMeta(f.name, spec.retry);
+            if (@hasField(ST, "retry")) def.retry = retryMeta(f, spec.retry);
             if (@hasField(ST, "visibility_timeout_s")) {
                 if (spec.visibility_timeout_s <= 0)
-                    @compileError("queue '" ++ f.name ++ "': .visibility_timeout_s must be >= 1 (set it above the queue's longest job runtime)");
+                    @compileError("queue '" ++ f ++ "': .visibility_timeout_s must be >= 1 (set it above the queue's longest job runtime)");
                 def.visibility_timeout_s = spec.visibility_timeout_s;
             }
             if (@hasField(ST, "done_ttl_s")) {
                 // A non-positive TTL makes gcDoneJobs's `datetime('now','-{d} seconds')`
                 // modifier malformed → SQLite yields NULL and GC silently reaps nothing.
                 if (spec.done_ttl_s <= 0)
-                    @compileError("queue '" ++ f.name ++ "': .done_ttl_s must be >= 1 (seconds to retain done/failed jobs; omit for the 7-day default)");
+                    @compileError("queue '" ++ f ++ "': .done_ttl_s must be >= 1 (seconds to retain done/failed jobs; omit for the 7-day default)");
                 def.done_ttl_s = spec.done_ttl_s;
             }
             if (@hasField(ST, "rate")) {
                 const rs = spec.rate;
                 const RST = @TypeOf(rs);
                 if (@typeInfo(RST) != .@"struct" or !@hasField(RST, "per_second"))
-                    @compileError("queue '" ++ f.name ++ "': .rate must be '.{ .per_second = N }'");
+                    @compileError("queue '" ++ f ++ "': .rate must be '.{ .per_second = N }'");
                 if (rs.per_second == 0)
-                    @compileError("queue '" ++ f.name ++ "': .rate.per_second must be >= 1");
+                    @compileError("queue '" ++ f ++ "': .rate.per_second must be >= 1");
                 def.rate = .{ .per_second = rs.per_second };
             }
             if (@hasField(ST, "capacity")) {
@@ -88,9 +88,9 @@ pub fn queueMeta(comptime queues_cfg: anytype) []const QueueDef {
                 const CT = @TypeOf(cap);
                 if (@typeInfo(CT) != .@"struct" or !@hasField(CT, "max_jobs"))
                     @compileError("queue capacity requires .{ .max_jobs = N, .max_payload_bytes = N }");
-                for (std.meta.fields(CT)) |cf| {
-                    if (!std.mem.eql(u8, cf.name, "max_jobs") and !std.mem.eql(u8, cf.name, "max_payload_bytes"))
-                        @compileError("unknown queue capacity field: " ++ cf.name);
+                for (@typeInfo(CT).@"struct".field_names) |cf| {
+                    if (!std.mem.eql(u8, cf, "max_jobs") and !std.mem.eql(u8, cf, "max_payload_bytes"))
+                        @compileError("unknown queue capacity field: " ++ cf);
                 }
                 if (cap.max_jobs < 1 or cap.max_jobs > 1_000_000)
                     @compileError("queue capacity .max_jobs must be in 1..1000000");
@@ -101,7 +101,7 @@ pub fn queueMeta(comptime queues_cfg: anytype) []const QueueDef {
                 def.capacity = .{ .max_jobs = cap.max_jobs, .max_payload_bytes = bytes };
             }
             if (def.rate != null and def.backend != .durable)
-                @compileError("queue '" ++ f.name ++ "': .rate requires .backend = .durable (memory jobs dispatch inline and cannot be throttled)");
+                @compileError("queue '" ++ f ++ "': .rate requires .backend = .durable (memory jobs dispatch inline and cannot be throttled)");
             list = list ++ &[_]QueueDef{def};
         }
         if (!has_default)
@@ -115,13 +115,13 @@ fn retryMeta(comptime qname: []const u8, comptime spec: anytype) RetryPolicy {
         const ST = @TypeOf(spec);
         if (@typeInfo(ST) != .@"struct")
             @compileError("queue '" ++ qname ++ "': .retry must be a struct '.{ .max_attempts = …, .backoff = …, .base_ms = …, .max_ms = …, .jitter = … }'");
-        for (std.meta.fields(ST)) |sf| {
-            if (!std.mem.eql(u8, sf.name, "max_attempts") and
-                !std.mem.eql(u8, sf.name, "backoff") and
-                !std.mem.eql(u8, sf.name, "base_ms") and
-                !std.mem.eql(u8, sf.name, "max_ms") and
-                !std.mem.eql(u8, sf.name, "jitter"))
-                @compileError("queue '" ++ qname ++ "': .retry has unknown key '." ++ sf.name ++ "' (recognized: .max_attempts, .backoff, .base_ms, .max_ms, .jitter)");
+        for (@typeInfo(ST).@"struct".field_names) |sf| {
+            if (!std.mem.eql(u8, sf, "max_attempts") and
+                !std.mem.eql(u8, sf, "backoff") and
+                !std.mem.eql(u8, sf, "base_ms") and
+                !std.mem.eql(u8, sf, "max_ms") and
+                !std.mem.eql(u8, sf, "jitter"))
+                @compileError("queue '" ++ qname ++ "': .retry has unknown key '." ++ sf ++ "' (recognized: .max_attempts, .backoff, .base_ms, .max_ms, .jitter)");
         }
         var r = RetryPolicy{};
         if (@hasField(ST, "max_attempts")) {
@@ -155,7 +155,7 @@ pub fn workerMeta(comptime workers_cfg: anytype, comptime queue_defs: []const Qu
         const T = @TypeOf(workers_cfg);
         if (@typeInfo(T) != .@"struct")
             @compileError(".workers must be a struct literal of worker declarations");
-        const fields = std.meta.fields(T);
+        const fields = @typeInfo(T).@"struct".field_names;
         if (fields.len == 0) {
             // Implicit single worker over every declared queue, strict priority.
             var all: []const []const u8 = &.{};
@@ -164,38 +164,38 @@ pub fn workerMeta(comptime workers_cfg: anytype, comptime queue_defs: []const Qu
         }
         var list: []const WorkerDef = &.{};
         for (fields) |f| {
-            const spec = @field(workers_cfg, f.name);
+            const spec = @field(workers_cfg, f);
             const ST = @TypeOf(spec);
             if (@typeInfo(ST) != .@"struct")
-                @compileError("worker '" ++ f.name ++ "' must be a struct '.{ .queues = .{ \"q1\", … }, .concurrency = N }'");
-            for (std.meta.fields(ST)) |sf| {
-                if (!std.mem.eql(u8, sf.name, "queues") and !std.mem.eql(u8, sf.name, "concurrency"))
-                    @compileError("worker '" ++ f.name ++ "': unknown key '." ++ sf.name ++ "' (recognized keys: .queues, .concurrency)");
+                @compileError("worker '" ++ f ++ "' must be a struct '.{ .queues = .{ \"q1\", … }, .concurrency = N }'");
+            for (@typeInfo(ST).@"struct".field_names) |sf| {
+                if (!std.mem.eql(u8, sf, "queues") and !std.mem.eql(u8, sf, "concurrency"))
+                    @compileError("worker '" ++ f ++ "': unknown key '." ++ sf ++ "' (recognized keys: .queues, .concurrency)");
             }
             if (!@hasField(ST, "queues"))
-                @compileError("worker '" ++ f.name ++ "': requires .queues = .{ \"q1\", … } (the queue names it drains)");
+                @compileError("worker '" ++ f ++ "': requires .queues = .{ \"q1\", … } (the queue names it drains)");
             var names: []const []const u8 = &.{};
             const QT = @TypeOf(spec.queues);
             if (@typeInfo(QT) != .@"struct")
-                @compileError("worker '" ++ f.name ++ "': .queues must be a tuple of queue-name strings, e.g. .{ \"emails\", \"default\" }");
-            for (std.meta.fields(QT)) |qf| {
-                const qn = @field(spec.queues, qf.name);
+                @compileError("worker '" ++ f ++ "': .queues must be a tuple of queue-name strings, e.g. .{ \"emails\", \"default\" }");
+            for (@typeInfo(QT).@"struct".field_names) |qf| {
+                const qn = @field(spec.queues, qf);
                 if (!isStringType(@TypeOf(qn)))
-                    @compileError("worker '" ++ f.name ++ "': every .queues entry must be a queue-name string");
+                    @compileError("worker '" ++ f ++ "': every .queues entry must be a queue-name string");
                 var found = false;
                 for (queue_defs) |q| if (std.mem.eql(u8, q.name, qn)) {
                     found = true;
                 };
                 if (!found)
-                    @compileError("worker '" ++ f.name ++ "': references undeclared queue '" ++ qn ++ "' (declare it under .queues, or use \"default\")");
+                    @compileError("worker '" ++ f ++ "': references undeclared queue '" ++ qn ++ "' (declare it under .queues, or use \"default\")");
                 names = names ++ &[_][]const u8{qn};
             }
             if (names.len == 0)
-                @compileError("worker '" ++ f.name ++ "': .queues must list at least one queue");
-            var def = WorkerDef{ .name = f.name, .queues = names };
+                @compileError("worker '" ++ f ++ "': .queues must list at least one queue");
+            var def = WorkerDef{ .name = f, .queues = names };
             if (@hasField(ST, "concurrency")) {
                 if (spec.concurrency == 0)
-                    @compileError("worker '" ++ f.name ++ "': .concurrency must be >= 1");
+                    @compileError("worker '" ++ f ++ "': .concurrency must be >= 1");
                 def.concurrency = spec.concurrency;
             }
             list = list ++ &[_]WorkerDef{def};
@@ -221,10 +221,10 @@ pub fn jobsMeta(comptime jobs_cfg: anytype) []const JobReg {
         if (@typeInfo(T) != .@"struct")
             @compileError(".jobs must be a struct literal of kind = handlerFn bindings");
         var list: []const JobReg = &.{};
-        for (std.meta.fields(T)) |f| {
-            if (std.mem.eql(u8, f.name, reserved_pool_size_key))
+        for (@typeInfo(T).@"struct".field_names) |f| {
+            if (std.mem.eql(u8, f, reserved_pool_size_key))
                 @compileError("'.jobs.pool_size' was removed; set '.pools = .{ .jobs = N }' instead");
-            const h = @field(jobs_cfg, f.name);
+            const h = @field(jobs_cfg, f);
             const HT = @TypeOf(h);
             const is_fn = switch (@typeInfo(HT)) {
                 .@"fn" => true,
@@ -232,9 +232,9 @@ pub fn jobsMeta(comptime jobs_cfg: anytype) []const JobReg {
                 else => false,
             };
             if (!is_fn)
-                @compileError("job '" ++ f.name ++ "' must be a handler fn 'fn(*Ctx, []const u8) anyerror!void'");
+                @compileError("job '" ++ f ++ "' must be a handler fn 'fn(*Ctx, []const u8) anyerror!void'");
             const handler: queue.JobHandler = h; // coerces or fails loudly with the contract type
-            list = list ++ &[_]JobReg{.{ .kind = f.name, .handler = handler }};
+            list = list ++ &[_]JobReg{.{ .kind = f, .handler = handler }};
         }
         return list;
     }
@@ -257,12 +257,12 @@ pub fn assertNoReservedJobKinds(comptime jobs_cfg: anytype, comptime reserved: [
     comptime {
         const T = @TypeOf(jobs_cfg);
         if (@typeInfo(T) != .@"struct") return; // jobsMeta validates shape; nothing to check here
-        for (std.meta.fields(T)) |f| {
-            if (std.mem.eql(u8, f.name, reserved_pool_size_key))
+        for (@typeInfo(T).@"struct".field_names) |f| {
+            if (std.mem.eql(u8, f, reserved_pool_size_key))
                 @compileError("'.jobs.pool_size' was removed; set '.pools = .{ .jobs = N }' instead");
             for (reserved) |r| {
-                if (std.mem.eql(u8, f.name, r))
-                    @compileError("job kind '" ++ f.name ++ "' is reserved by the framework (use ctx." ++ f.name ++ "().enqueue) — rename your .jobs entry");
+                if (std.mem.eql(u8, f, r))
+                    @compileError("job kind '" ++ f ++ "' is reserved by the framework (use ctx." ++ f ++ "().enqueue) — rename your .jobs entry");
             }
         }
     }
@@ -273,15 +273,15 @@ pub fn assertNoReservedJobKinds(comptime jobs_cfg: anytype, comptime reserved: [
 /// via `@tagName`, so this is purely a compile-time spelling check.
 pub fn QueueEnum(comptime queues_cfg: anytype) type {
     comptime {
-        const fields = std.meta.fields(@TypeOf(queues_cfg));
+        const fields = @typeInfo(@TypeOf(queues_cfg)).@"struct".field_names;
         var has_default = false;
-        for (fields) |f| if (std.mem.eql(u8, f.name, "default")) {
+        for (fields) |f| if (std.mem.eql(u8, f, "default")) {
             has_default = true;
         };
         const extra: usize = if (has_default) 0 else 1;
         const n = fields.len + extra;
         var names: [n][:0]const u8 = undefined;
-        for (fields, 0..) |f, i| names[i] = f.name;
+        for (fields, 0..) |f, i| names[i] = f;
         if (!has_default) names[fields.len] = "default";
         return enumFromNames(n, names);
     }
@@ -292,13 +292,13 @@ pub fn QueueEnum(comptime queues_cfg: anytype) type {
 /// `reserved_pool_size_key`) rather than excluded from the enum.
 pub fn JobEnum(comptime jobs_cfg: anytype) type {
     comptime {
-        const all = std.meta.fields(@TypeOf(jobs_cfg));
+        const all = @typeInfo(@TypeOf(jobs_cfg)).@"struct".field_names;
         var names: [all.len][:0]const u8 = undefined;
         var n: usize = 0;
         for (all) |f| {
-            if (std.mem.eql(u8, f.name, reserved_pool_size_key))
+            if (std.mem.eql(u8, f, reserved_pool_size_key))
                 @compileError("'.jobs.pool_size' was removed; set '.pools = .{ .jobs = N }' instead");
-            names[n] = f.name;
+            names[n] = f;
             n += 1;
         }
         return enumFromNames(n, names[0..n].*);
@@ -306,7 +306,8 @@ pub fn JobEnum(comptime jobs_cfg: anytype) type {
 }
 
 fn enumFromNames(comptime n: usize, comptime names: [n][:0]const u8) type {
-    const IntTag = std.math.IntFittingRange(0, if (n == 0) 0 else n - 1);
+    if (n == 0) return enum(noreturn) {};
+    const IntTag = std.math.IntFittingRange(0, n - 1);
     var values: [n]IntTag = undefined;
     for (0..n) |i| values[i] = @intCast(i);
     const frozen_names = names;
@@ -416,13 +417,13 @@ test "QueueEnum includes synthesized default + declared queues" {
     const Q = QueueEnum(.{ .emails = .{}, .reports = .{} });
     try testing.expectEqualStrings("emails", @tagName(@as(Q, .emails)));
     try testing.expectEqualStrings("default", @tagName(@as(Q, .default)));
-    try testing.expectEqual(@as(usize, 3), std.meta.fields(Q).len);
+    try testing.expectEqual(@as(usize, 3), @typeInfo(Q).@"enum".field_names.len);
 }
 
 test "JobEnum members are the declared kinds" {
     const J = JobEnum(.{ .resize = testHandler });
     try testing.expectEqualStrings("resize", @tagName(@as(J, .resize)));
-    try testing.expectEqual(@as(usize, 1), std.meta.fields(J).len);
+    try testing.expectEqual(@as(usize, 1), @typeInfo(J).@"enum".field_names.len);
 }
 
 test "queue capacity is explicitly bounded and absent by default" {

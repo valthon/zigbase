@@ -217,7 +217,7 @@ fn boundedDetail(detail: []const u8) []const u8 {
 }
 
 test "plan details stay bounded valid UTF-8 at a multibyte boundary" {
-    const detail = "a" ** 511 ++ "é";
+    const detail = (&@as([511]u8, @splat('a'))) ++ "é";
     try std.testing.expectEqual(@as(usize, 511), boundedDetail(detail).len);
     try std.testing.expect(std.unicode.utf8ValidateSlice(boundedDetail(detail)));
 }

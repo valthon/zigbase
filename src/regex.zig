@@ -814,8 +814,8 @@ pub fn matches(prog: Program, haystack: []const u8) bool {
     // developer patterns (COMPTIME_VM_CAP).
     var fb_clist_pcs: [COMPTIME_VM_CAP]usize = undefined;
     var fb_nlist_pcs: [COMPTIME_VM_CAP]usize = undefined;
-    var fb_clist_seen: [COMPTIME_VM_CAP]u32 = [_]u32{0} ** COMPTIME_VM_CAP;
-    var fb_nlist_seen: [COMPTIME_VM_CAP]u32 = [_]u32{0} ** COMPTIME_VM_CAP;
+    var fb_clist_seen: [COMPTIME_VM_CAP]u32 = @as([COMPTIME_VM_CAP]u32, @splat(0));
+    var fb_nlist_seen: [COMPTIME_VM_CAP]u32 = @as([COMPTIME_VM_CAP]u32, @splat(0));
     var fb_work: [2 * COMPTIME_VM_CAP + 1]usize = undefined;
 
     var clist_pcs: []usize = undefined;

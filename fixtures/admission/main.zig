@@ -27,7 +27,7 @@ fn fail(_: *zigbase.Ctx) anyerror!zigbase.http.Response {
 
 fn file(ctx: *zigbase.Ctx) anyerror!zigbase.http.Response {
     // Response.file borrows this path until the HTTP callback drops its arena.
-    const path = try std.fmt.allocPrint(ctx.arena.a, "{s}/payload", .{gate_dir});
+    const path = try ctx.arena.a.print("{s}/payload", .{gate_dir});
     return .{ .status = 200, .file = .{ .path = path, .len = 3 }, .body = "" };
 }
 

@@ -13,7 +13,7 @@ from tools.rails.fullstack import load_operations
 
 
 REPO = pathlib.Path(__file__).resolve().parents[2]
-ZIG = ["mise", "exec", "zig@0.16.0", "--", "zig"]
+ZIG = ["mise", "exec", "zig@0.17.1", "--", "zig"]
 
 
 @pytest.fixture(scope="session")

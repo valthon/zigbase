@@ -108,7 +108,7 @@ fn sqliteSearch(scratch: *std.heap.ArenaAllocator, w: *db.Db, old: schema.Collec
     // without duplicating their DDL here or treating an ordinary table as FTS.
     var model = try db.Db.openMemory();
     defer model.close();
-    try model.exec(try a.dupeZ(u8, try ddl.createTableSql(a, physical, null, db.dbDialect(&model), &.{})));
+    try model.exec(try a.dupeSentinel(u8, try ddl.createTableSql(a, physical, null, db.dbDialect(&model), &.{}), 0));
     try fts.ensureIndex(a, &model, physical);
     var expected = try sqliteObjects(a, &model, ft);
     defer expected.finalize();
@@ -275,7 +275,7 @@ fn postgresExpression(scratch: *std.heap.ArenaAllocator, w: *db.Db, table: []con
     // The engine reserves underscore-prefixed field names, avoiding collision
     // with any searchable field copied into this private probe table.
     try create.appendSlice(a, try std.fmt.allocPrint(a, "_expected TSVECTOR GENERATED ALWAYS AS ({s}) STORED) ON COMMIT DROP;", .{expr.items}));
-    try w.exec(try a.dupeZ(u8, create.items));
+    try w.exec(try a.dupeSentinel(u8, create.items, 0));
     var compare = try prepare(a, w, "SELECT pg_get_expr(actual.adbin,actual.adrelid)=pg_get_expr(expected.adbin,expected.adrelid) " ++
         "FROM pg_attrdef actual,pg_attrdef expected WHERE actual.adrelid=to_regclass(?1) AND actual.adnum=?2 " ++
         "AND expected.adrelid='pg_temp.zb_rename_fts_probe'::regclass;");

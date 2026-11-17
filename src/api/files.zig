@@ -385,7 +385,7 @@ test "isInlineSafeExt allows only known-safe types" {
     // Empty extension -> not safe.
     try std.testing.expect(!isInlineSafeExt(""));
     // Anything longer than the 16-byte buffer -> not safe (length boundary).
-    try std.testing.expect(!isInlineSafeExt("a" ** 17));
+    try std.testing.expect(!isInlineSafeExt((&@as([17]u8, @splat('a')))));
 }
 
 test "recordReferencesFile matches single + array file fields, ignores non-file fields" {
@@ -455,7 +455,7 @@ test "serve: header emission — exactly one Cache-Control, ETag, Accept-Ranges;
     }
     var local = files_storage.LocalStorage.init(dir_path);
     const storage_iface = local.storage();
-    try storage_iface.put(std.testing.io, "docs", "r1", "a_0000000000.png", "x" ** 1000);
+    try storage_iface.put(std.testing.io, "docs", "r1", "a_0000000000.png", (&@as([1000]u8, @splat('x'))));
     var app = app_mod.App{ .allocator = ga, .io = std.testing.io, .pool = &pool, .storage = &storage_iface };
 
     const params = [_]http.Param{
@@ -574,7 +574,7 @@ test "serve: presign_redirect issues a 302 Location; default (off) still proxies
     }
     // A real on-disk object so the proxy fallback can succeed (200); the stub's fetch returns its path.
     var local = files_storage.LocalStorage.init(dir_path);
-    try local.storage().put(std.testing.io, "docs", "r1", "a_0000000000.png", "x" ** 100);
+    try local.storage().put(std.testing.io, "docs", "r1", "a_0000000000.png", (&@as([100]u8, @splat('x'))));
     {
         const w = pool.acquireWriter();
         defer pool.releaseWriter();

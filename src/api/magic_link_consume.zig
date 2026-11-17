@@ -66,9 +66,9 @@ fn isSafeRelative(path: []const u8) bool {
     }
     // Defense in depth: refuse any still-encoded dot/slash/backslash anywhere in
     // the target so a double-encoded "%252e" -> "%2e" -> "." can't slip through.
-    if (std.ascii.indexOfIgnoreCase(path, "%2e") != null or // '.'
-        std.ascii.indexOfIgnoreCase(path, "%2f") != null or // '/'
-        std.ascii.indexOfIgnoreCase(path, "%5c") != null) // '\'
+    if (std.ascii.findIgnoreCase(path, "%2e") != null or // '.'
+        std.ascii.findIgnoreCase(path, "%2f") != null or // '/'
+        std.ascii.findIgnoreCase(path, "%5c") != null) // '\'
     {
         return false;
     }

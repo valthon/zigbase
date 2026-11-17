@@ -419,7 +419,7 @@ test "workbench reuses rejected prepare fingerprint across resets" {
     var scope = workbench.Scope.init(store, "GET", "/oversize");
     scope.enter();
     defer scope.leave();
-    const sql = "SELECT 1 /*" ++ ("x" ** 16384) ++ "*/";
+    const sql = "SELECT 1 /*" ++ ((&@as([16384]u8, @splat('x')))) ++ "*/";
     {
         var stmt = try database.prepare(sql);
         defer stmt.finalize();
@@ -636,7 +636,7 @@ pub const Pool = struct {
     /// connections; it changes only memory/perf trade-off, not read/write/WAL semantics.
     pub fn initOpts(allocator: std.mem.Allocator, io: std.Io, path: [:0]const u8, options: PoolOptions) (DbError || std.mem.Allocator.Error)!Pool {
         const reader_cap = options.reader_cap;
-        const owned = try allocator.dupeZ(u8, path);
+        const owned = try allocator.dupeSentinel(u8, path, 0);
         errdefer allocator.free(owned);
         var writer = try Db.open(owned);
         errdefer writer.close();
@@ -679,7 +679,7 @@ pub const Pool = struct {
     fn setCacheSize(db: *Db, cache_kib: u32) DbError!void {
         const kib: i64 = resources.cacheTargetKib(cache_kib) orelse return;
         var buf: [64]u8 = undefined;
-        const sql = std.fmt.bufPrintZ(&buf, "PRAGMA cache_size=-{d};", .{kib}) catch return DbError.ExecFailed;
+        const sql = std.mem.printSentinel(&buf, "PRAGMA cache_size=-{d};", .{kib}, 0) catch return DbError.ExecFailed;
         try db.exec(sql);
     }
 

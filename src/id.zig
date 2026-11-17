@@ -87,7 +87,7 @@ test "with a seed: collectionId and fieldId are deterministic (dev builds only)"
 }
 
 test "generate is unbiased across the alphabet (rejection sampling)" {
-    var counts = [_]usize{0} ** alphabet.len;
+    var counts = @as([alphabet.len]usize, @splat(0));
     var buf: [4000]u8 = undefined;
     generate(std.testing.io, &buf);
     for (buf) |c| {

@@ -256,7 +256,7 @@ test "verifyClientData: passes on matching type/origin/challenge" {
 test "verifyClientData: fails on wrong type" {
     const alloc = std.testing.allocator;
 
-    const stored_raw = [_]u8{0xAA} ** 8;
+    const stored_raw = @as([8]u8, @splat(0xAA));
     const encoded_challenge = try b64urlNoPad(alloc, &stored_raw);
     defer alloc.free(encoded_challenge);
 
@@ -275,7 +275,7 @@ test "verifyClientData: fails on wrong type" {
 test "verifyClientData: fails on wrong origin (exact match required)" {
     const alloc = std.testing.allocator;
 
-    const stored_raw = [_]u8{0xBB} ** 8;
+    const stored_raw = @as([8]u8, @splat(0xBB));
     const encoded_challenge = try b64urlNoPad(alloc, &stored_raw);
     defer alloc.free(encoded_challenge);
 

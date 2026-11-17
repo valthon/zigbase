@@ -2,15 +2,7 @@
 //! Pixel-cache limits are child policies, not allocator or total-RSS ceilings.
 const std = @import("std");
 const builtin = @import("builtin");
-const c = @cImport({
-    @cInclude("stdlib.h");
-    @cInclude("unistd.h");
-    @cInclude("fcntl.h");
-    @cInclude("poll.h");
-    @cInclude("signal.h");
-    @cInclude("sys/socket.h");
-    @cInclude("sys/wait.h");
-});
+const c = @import("thumbnail_posix");
 
 pub const Format = enum {
     png,

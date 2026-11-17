@@ -2,7 +2,7 @@
 
 **Scope:** ZigBase v0.3.0 (single-binary PocketBase-style backend in Zig 0.16; SQLite-backed
 REST + realtime + auth + file storage + embeddable framework).
-**Date:** 2026-06-13.
+**Date:** 2026-06-13. The scope and compiler above describe the original audit; the current project requires Zig 0.17.1.
 **Perspectives:**
 
 - **A — Stock ZigBase:** the shipped binary as deployed out-of-the-box.
