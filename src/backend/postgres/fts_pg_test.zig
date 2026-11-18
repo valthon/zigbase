@@ -310,8 +310,12 @@ test "pg-fts: provisions a tsvector index and ranks `?search=` matches (parity w
     var sl = try dbm.Db.openMemory();
     defer sl.close();
     try migrations.run(&sl);
-    const scol = try collections.create(al, io, &sl, .{ .id = "", .name = "articles", .fields = &fields });
-    try fts.ensureIndex(al, &sl, scol);
+    const sqlite_def = schema.Collection{ .id = "", .name = "articles", .fields = &fields };
+    const scol: ?schema.Collection = if (fts.enabled) try collections.create(al, io, &sl, sqlite_def) else blk: {
+        try std.testing.expectError(error.SearchDisabled, collections.create(al, io, &sl, sqlite_def));
+        break :blk null;
+    };
+    if (scol) |sqlite_col| try fts.ensureIndex(al, &sl, sqlite_col);
 
     // Row "high" mentions zig three times (ranks highest); "low" once; "miss" never.
     const rows = .{
@@ -326,7 +330,7 @@ test "pg-fts: provisions a tsvector index and ranks `?search=` matches (parity w
             .{ "slug", std.json.Value{ .string = r[0] } },
         });
         _ = try records.create(al, io, &d, col, data);
-        _ = try records.create(al, io, &sl, scol, data);
+        if (scol) |sqlite_col| _ = try records.create(al, io, &sl, sqlite_col, data);
     }
 
     // Ranked search on Postgres: only the two zig rows, "high" before "low" (ts_rank DESC).
@@ -340,10 +344,12 @@ test "pg-fts: provisions a tsvector index and ranks `?search=` matches (parity w
     // algorithm-specific — SQLite's row-local `zb_rank` divides by row length while Postgres
     // ts_rank (default normalization) does not, so the two can order rows differently — so we
     // assert set parity, not identical ordering across backends.)
-    const sl_res = try records.list(al, &sl, scol, .{ .search = "zig", .perPage = 50 });
-    try std.testing.expectEqual(pg_res.items.len, sl_res.items.len);
-    var pg_slugs = try valueSet(al, pg_res.items, "slug");
-    for (sl_res.items) |it| try std.testing.expect(pg_slugs.contains(getStr(it, "slug")));
+    if (scol) |sqlite_col| {
+        const sl_res = try records.list(al, &sl, sqlite_col, .{ .search = "zig", .perPage = 50 });
+        try std.testing.expectEqual(pg_res.items.len, sl_res.items.len);
+        var pg_slugs = try valueSet(al, pg_res.items, "slug");
+        for (sl_res.items) |it| try std.testing.expect(pg_slugs.contains(getStr(it, "slug")));
+    }
 
     // A body-only term matches via the multi-column tsvector (title || body).
     const body_res = try records.list(al, &d, col, .{ .search = "salt", .perPage = 50 });
