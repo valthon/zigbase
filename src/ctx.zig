@@ -266,7 +266,7 @@ pub const Ctx = struct {
     pub fn resolveDeclaredFlag(self: *Ctx, def: features.FlagDef) bool {
         const conn = self.connForRead() catch return def.default;
         const data = Data{ .app = self.app, .conn = conn, .io = self.app.io, .alloc = self.arena.a };
-        const key = std.fmt.allocPrint(self.arena.a, "flag:{s}", .{def.name}) catch return def.default;
+        const key = self.arena.a.print("flag:{s}", .{def.name}) catch return def.default;
         const ov = self.readOverride(data, key) catch return def.default;
         const value = features_resolver.resolveFlag(ov, def);
         // Notify-only exposure seam (zero-cost when no .onFeatureExposure handler).
@@ -303,7 +303,7 @@ pub const Ctx = struct {
     /// PERSISTED assignment (reader-first — see `stickyConns`; only a first-time miss
     /// touches the writer). Used by the typed `App.experiment` accessor.
     pub fn resolveDeclaredExperiment(self: *Ctx, def: features.ExperimentDef, subject: []const u8) ![]const u8 {
-        const key = try std.fmt.allocPrint(self.arena.a, "exp:{s}:weights", .{def.name});
+        const key = try self.arena.a.print("exp:{s}:weights", .{def.name});
         const sticky = def.sticky and subject.len > 0;
         const sc: ?features_resolver.StickyConns = if (sticky) try self.stickyConns() else null;
         // The weight-override read uses the sticky read conn when present (else a reader).
@@ -320,7 +320,7 @@ pub const Ctx = struct {
     /// Write a `flag:<name>` override (`"true"`/`"false"`) into `_kv`. Used by the
     /// typed `App.setFlag` accessor (the App-side enum guarantees `name` is declared).
     pub fn writeFlagOverride(self: *Ctx, name: []const u8, enabled: bool) !void {
-        const key = try std.fmt.allocPrint(self.arena.a, "flag:{s}", .{name});
+        const key = try self.arena.a.print("flag:{s}", .{name});
         try self.kv().set(key, if (enabled) "true" else "false");
         // Invalidate the feature-override cache (#230) so the next resolution on THIS
         // instance re-scans and sees the write. Called unconditionally — NOT gated on the
@@ -784,7 +784,7 @@ pub const Ctx = struct {
     /// handler, hook, job, or cron via the same `*Ctx`. Its own allocation failure is
     /// swallowed (the message falls back to `@errorName(err)`), so it can never throw.
     pub fn reportError(self: *Ctx, err: anyerror, comptime fmt: []const u8, args: anytype) void {
-        const msg = std.fmt.allocPrint(self.arena.a, fmt, args) catch @errorName(err);
+        const msg = self.arena.a.print(fmt, args) catch @errorName(err);
         var ev = events.ErrorEvent{
             .app = self.app,
             // Attach the request identity only when there IS a request (route handler);
@@ -1652,7 +1652,7 @@ const CtxTestEnv = struct {
 
         const dir_path = try env.tmp.dir.realPathFileAlloc(std.testing.io, ".", ga);
         defer ga.free(dir_path);
-        env.db_path = try std.fmt.allocPrintSentinel(ga, "{s}/test.db", .{dir_path}, 0);
+        env.db_path = try ga.printSentinel("{s}/test.db", .{dir_path}, 0);
         errdefer ga.free(env.db_path);
 
         env.pool = try db.Pool.init(ga, std.testing.io, env.db_path);
@@ -1691,7 +1691,7 @@ const CtxTestEnv = struct {
 
         const dir_path = try env.tmp.dir.realPathFileAlloc(std.testing.io, ".", ga);
         defer ga.free(dir_path);
-        env.db_path = try std.fmt.allocPrintSentinel(ga, "{s}/test.db", .{dir_path}, 0);
+        env.db_path = try ga.printSentinel("{s}/test.db", .{dir_path}, 0);
         errdefer ga.free(env.db_path);
 
         env.pool = try db.Pool.init(ga, std.testing.io, env.db_path);

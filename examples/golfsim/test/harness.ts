@@ -102,7 +102,7 @@ export async function startGolfsim(opts: StartOptions = {}): Promise<GolfServer>
   // A prebuilt binary supplied via ZIGBASE_TEST_GOLFSIM_BINARY skips the zig build
   // entirely — no Zig toolchain needed in that job.
   if (!process.env.ZIGBASE_TEST_GOLFSIM_BINARY) {
-    const b = spawnSync("mise", ["exec", "zig@0.16.0", "--", "zig", "build"], { cwd: EXAMPLE_ROOT, stdio: "inherit" });
+    const b = spawnSync("mise", ["exec", "zig@0.17.1", "--", "zig", "build"], { cwd: EXAMPLE_ROOT, stdio: "inherit" });
     if (b.status !== 0) throw new Error("golfsim build failed");
   }
   // The Zigapagos frontend is built unconditionally: the binary serves frontend/dist

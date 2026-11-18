@@ -72,7 +72,7 @@ pub fn buildJwt(
     const claims_b64 = try b64enc(alloc, claims_json);
     defer alloc.free(claims_b64);
 
-    const signing_input = try std.fmt.allocPrint(alloc, "{s}.{s}", .{ header_b64, claims_b64 });
+    const signing_input = try alloc.print("{s}.{s}", .{ header_b64, claims_b64 });
     defer alloc.free(signing_input);
 
     const sk = Ecdsa.SecretKey.fromBytes(private_key) catch return error.InvalidKey;
@@ -84,7 +84,7 @@ pub fn buildJwt(
     const sig_b64 = try b64enc(alloc, &sig_raw);
     defer alloc.free(sig_b64);
 
-    return std.fmt.allocPrint(alloc, "{s}.{s}", .{ signing_input, sig_b64 });
+    return alloc.print("{s}.{s}", .{ signing_input, sig_b64 });
 }
 
 /// Produce the full `Authorization` header value:
@@ -110,7 +110,7 @@ pub fn vapidAuthHeader(
     defer alloc.free(jwt);
     const k = try publicKeyB64(alloc, public_key);
     defer alloc.free(k);
-    return std.fmt.allocPrint(alloc, "vapid t={s}, k={s}", .{ jwt, k });
+    return alloc.print("vapid t={s}, k={s}", .{ jwt, k });
 }
 
 // ---------------------------------------------------------------------------
@@ -134,7 +134,7 @@ test "vapid: header segment decodes to the ES256 JWT header" {
 test "vapid: JWT claims JSON is {aud,exp,sub} and the signature round-trips + is 64-byte r||s" {
     const a = std.testing.allocator;
 
-    const kp = try Ecdsa.KeyPair.generateDeterministic([_]u8{0x7} ** 32);
+    const kp = try Ecdsa.KeyPair.generateDeterministic(@as([32]u8, @splat(0x7)));
     const priv = kp.secret_key.toBytes();
 
     const jwt = try buildJwt(a, std.testing.io, "https://push.example.com", "mailto:ops@example.com", priv, 1700000000);
@@ -161,7 +161,7 @@ test "vapid: JWT claims JSON is {aud,exp,sub} and the signature round-trips + is
     try std.testing.expectEqual(@as(usize, 64), sig_bytes.len);
 
     // Round-trip verify over "header.claims".
-    const signing_input = try std.fmt.allocPrint(a, "{s}.{s}", .{ h, c });
+    const signing_input = try a.print("{s}.{s}", .{ h, c });
     defer a.free(signing_input);
     const sig = Ecdsa.Signature.fromBytes(sig_bytes[0..64].*);
     try sig.verify(signing_input, kp.public_key);
@@ -170,7 +170,7 @@ test "vapid: JWT claims JSON is {aud,exp,sub} and the signature round-trips + is
 test "vapid: tampered claims break signature verification" {
     const a = std.testing.allocator;
 
-    const kp = try Ecdsa.KeyPair.generateDeterministic([_]u8{0x9} ** 32);
+    const kp = try Ecdsa.KeyPair.generateDeterministic(@as([32]u8, @splat(0x9)));
     const jwt = try buildJwt(a, std.testing.io, "https://p.example", "mailto:x@e.com", kp.secret_key.toBytes(), 1700000000);
     defer a.free(jwt);
 
@@ -183,7 +183,7 @@ test "vapid: tampered claims break signature verification" {
     const bad_c = try a.dupe(u8, c);
     defer a.free(bad_c);
     bad_c[0] = if (bad_c[0] == 'e') 'f' else 'e';
-    const bad_input = try std.fmt.allocPrint(a, "{s}.{s}", .{ h, bad_c });
+    const bad_input = try a.print("{s}.{s}", .{ h, bad_c });
     defer a.free(bad_input);
     const sig_bytes = try b64dec(a, s);
     defer a.free(sig_bytes);
@@ -194,7 +194,7 @@ test "vapid: tampered claims break signature verification" {
 test "vapid: Authorization header shape is `vapid t=..., k=base64url(public_key)`" {
     const a = std.testing.allocator;
 
-    const kp = try Ecdsa.KeyPair.generateDeterministic([_]u8{0x3} ** 32);
+    const kp = try Ecdsa.KeyPair.generateDeterministic(@as([32]u8, @splat(0x3)));
     const pub_sec1 = kp.public_key.toUncompressedSec1();
 
     const hdr = try vapidAuthHeader(a, std.testing.io, "https://push.example.com", "mailto:ops@example.com", pub_sec1, kp.secret_key.toBytes(), 1699999000, 1700000000);
@@ -225,7 +225,7 @@ test "vapid: Authorization header shape is `vapid t=..., k=base64url(public_key)
 
 test "vapid: publicKeyB64FromKeyPair matches publicKeyB64 of the SEC1 key" {
     const a = std.testing.allocator;
-    const kp = try Ecdsa.KeyPair.generateDeterministic([_]u8{0x5} ** 32);
+    const kp = try Ecdsa.KeyPair.generateDeterministic(@as([32]u8, @splat(0x5)));
     const from_kp = try publicKeyB64FromKeyPair(a, kp);
     defer a.free(from_kp);
     const from_bytes = try publicKeyB64(a, kp.public_key.toUncompressedSec1());

@@ -85,7 +85,7 @@ pub fn buildBody(alloc: std.mem.Allocator, from: []const u8, message_stream: []c
     if (email.list_unsubscribe) |lu| {
         var h1: std.json.ObjectMap = .empty;
         try h1.put(a, "Name", .{ .string = "List-Unsubscribe" });
-        try h1.put(a, "Value", .{ .string = try std.fmt.allocPrint(a, "<{s}>", .{lu}) });
+        try h1.put(a, "Value", .{ .string = try a.print("<{s}>", .{lu}) });
         var h2: std.json.ObjectMap = .empty;
         try h2.put(a, "Name", .{ .string = "List-Unsubscribe-Post" });
         try h2.put(a, "Value", .{ .string = "List-Unsubscribe=One-Click" });
@@ -210,7 +210,7 @@ test "buildBody emits an Attachments array with base64 Content when attachments 
     const expect_b64 = try a.alloc(u8, enc.calcSize(ics.len));
     defer a.free(expect_b64);
     _ = enc.encode(expect_b64, ics);
-    const needle = try std.fmt.allocPrint(a, "\"Content\":\"{s}\"", .{expect_b64});
+    const needle = try a.print("\"Content\":\"{s}\"", .{expect_b64});
     defer a.free(needle);
     try testing.expect(std.mem.indexOf(u8, body, needle) != null);
 }

@@ -168,7 +168,7 @@ fn enqueueUnchecked(w: *db.Db, io: std.Io, def: QueueDef, kind: []const u8, payl
     try st.bindText(2, def.name);
     try st.bindText(3, kind);
     try st.bindText(4, payload);
-    try st.bindInt(5, @intFromEnum(def.priority));
+    try st.bindInt(5, @backingInt(def.priority));
     try st.bindInt(6, @intCast(def.retry.max_attempts));
     try st.bindInt(7, value);
     _ = try st.step();
@@ -258,17 +258,17 @@ pub fn claimBatch(
     for (queue_names, 0..) |_, i| {
         if (i != 0) try sql.append(sa, ',');
         try sql.append(sa, '?');
-        try sql.appendSlice(sa, std.fmt.bufPrint(&numbuf, "{d}", .{pidx}) catch unreachable);
+        try sql.appendSlice(sa, std.mem.print(&numbuf, "{d}", .{pidx}) catch unreachable);
         pidx += 1;
     }
     try sql.appendSlice(sa, ") ORDER BY \"priority\" ASC, \"run_at\" ASC LIMIT ?");
-    try sql.appendSlice(sa, std.fmt.bufPrint(&numbuf, "{d}", .{pidx}) catch unreachable);
+    try sql.appendSlice(sa, std.mem.print(&numbuf, "{d}", .{pidx}) catch unreachable);
     // Lock candidates before UPDATE on PostgreSQL: another instance must skip
     // these rows, not wait and subsequently overwrite their claim. SQLite's
     // single writer already makes this statement atomic.
     if (db.dbDialect(w).kind == .postgres) try sql.appendSlice(sa, " FOR UPDATE SKIP LOCKED");
     try sql.appendSlice(sa, ") RETURNING \"id\",\"queue\",\"kind\",\"payload\",\"attempts\",\"max_attempts\",\"claim_generation\";");
-    const sql_z = try sa.dupeZ(u8, sql.items);
+    const sql_z = try sa.dupeSentinel(u8, sql.items, 0);
 
     var st = try w.prepare(try @import("../sql/param_sink.zig").lowerStmtZ(sa, db.dbDialect(w), sql_z));
     defer st.finalize();
@@ -418,7 +418,7 @@ pub fn reclaimStale(w: *db.Db, queue_name: []const u8, now: i64, visibility_time
 /// The TTL is per-queue (`QueueDef.done_ttl_s`). Returns rows deleted. Writer held by caller.
 pub fn gcDoneJobs(w: *db.Db, queue_name: []const u8, ttl_s: i64) !usize {
     var buf: [32]u8 = undefined;
-    const modifier = std.fmt.bufPrint(&buf, "-{d} seconds", .{ttl_s}) catch unreachable;
+    const modifier = std.mem.print(&buf, "-{d} seconds", .{ttl_s}) catch unreachable;
     var total: usize = 0;
     while (true) {
         // `created` is always written canonical via datetime('now'), so compare it DIRECTLY
@@ -786,10 +786,10 @@ const PgQueueTest = struct {
         errdefer second.close();
         const name = id.collectionId(testing.io);
         var buf: [128]u8 = undefined;
-        try first.exec(try std.fmt.bufPrintZ(&buf, "CREATE SCHEMA \"zbq_{s}\";", .{name}));
-        errdefer first.exec(std.fmt.bufPrintZ(&buf, "DROP SCHEMA \"zbq_{s}\" CASCADE;", .{name}) catch unreachable) catch |e|
+        try first.exec(try std.mem.printSentinel(&buf, "CREATE SCHEMA \"zbq_{s}\";", .{name}, 0));
+        errdefer first.exec(std.mem.printSentinel(&buf, "DROP SCHEMA \"zbq_{s}\" CASCADE;", .{name}, 0) catch unreachable) catch |e|
             std.log.err("queue test schema cleanup failed: {s}", .{@errorName(e)});
-        const path = try std.fmt.bufPrintZ(&buf, "SET search_path TO \"zbq_{s}\";", .{name});
+        const path = try std.mem.printSentinel(&buf, "SET search_path TO \"zbq_{s}\";", .{name}, 0);
         try first.exec(path);
         try second.exec(path);
         try migrations.run(&first);
@@ -799,7 +799,7 @@ const PgQueueTest = struct {
     fn deinit(self: *PgQueueTest) void {
         self.second.close();
         var buf: [128]u8 = undefined;
-        self.first.exec(std.fmt.bufPrintZ(&buf, "DROP SCHEMA \"zbq_{s}\" CASCADE;", .{self.name}) catch unreachable) catch |e|
+        self.first.exec(std.mem.printSentinel(&buf, "DROP SCHEMA \"zbq_{s}\" CASCADE;", .{self.name}, 0) catch unreachable) catch |e|
             std.log.err("queue test schema cleanup failed: {s}", .{@errorName(e)});
         self.first.close();
     }
@@ -938,7 +938,7 @@ const PgPollEnv = struct {
         errdefer ga.destroy(env);
         env.queues = try PgQueueTest.init();
         errdefer env.queues.deinit();
-        env.url = try ga.dupeZ(u8, @import("../backend/postgres/tests.zig").testUrl());
+        env.url = try ga.dupeSentinel(u8, @import("../backend/postgres/tests.zig").testUrl(), 0);
         errdefer ga.free(env.url);
         env.pool = try db.Pool.init(ga, testing.io, env.url);
         errdefer env.pool.deinit();
@@ -946,7 +946,7 @@ const PgPollEnv = struct {
             const w = env.pool.acquireWriter();
             defer env.pool.releaseWriter();
             var buf: [128]u8 = undefined;
-            try w.exec(try std.fmt.bufPrintZ(&buf, "SET search_path TO \"zbq_{s}\";", .{env.queues.name}));
+            try w.exec(try std.mem.printSentinel(&buf, "SET search_path TO \"zbq_{s}\";", .{env.queues.name}, 0));
         }
         env.app = App{ .allocator = ga, .io = testing.io, .pool = &env.pool };
         return env;
@@ -1174,7 +1174,7 @@ const PollTestEnv = struct {
         errdefer env.tmp.cleanup();
         const dir_path = try env.tmp.dir.realPathFileAlloc(std.testing.io, ".", ga);
         defer ga.free(dir_path);
-        env.db_path = try std.fmt.allocPrintSentinel(ga, "{s}/test.db", .{dir_path}, 0);
+        env.db_path = try ga.printSentinel("{s}/test.db", .{dir_path}, 0);
         errdefer ga.free(env.db_path);
         env.pool = try db.Pool.init(ga, std.testing.io, env.db_path);
         errdefer env.pool.deinit();

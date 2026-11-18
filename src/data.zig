@@ -26,9 +26,9 @@ fn prep(alloc: std.mem.Allocator, conn: *db.Db, sql: [:0]const u8) !db.Stmt {
 /// field of `T`, so a typo'd key in a `createAs`/`updateAs` literal fails the build rather
 /// than silently no-op'ing at runtime. `who` names the calling method for the error.
 fn assertFieldsExist(comptime T: type, comptime Input: type, comptime who: []const u8) void {
-    inline for (std.meta.fields(Input)) |f| {
-        if (!@hasField(T, f.name)) {
-            @compileError(who ++ ": field '" ++ f.name ++ "' is not a field of " ++ @typeName(T));
+    inline for (@typeInfo(Input).@"struct".field_names) |f| {
+        if (!@hasField(T, f)) {
+            @compileError(who ++ ": field '" ++ f ++ "' is not a field of " ++ @typeName(T));
         }
     }
 }
@@ -40,7 +40,7 @@ fn containsRawJson(comptime T: type) bool {
     if (T == std.json.Value or T == std.json.ObjectMap or T == std.json.Array) return true;
     return switch (@typeInfo(T)) {
         .@"struct" => |s| blk: {
-            inline for (s.fields) |f| if (containsRawJson(f.type)) break :blk true;
+            inline for (s.field_types) |Field| if (containsRawJson(Field)) break :blk true;
             break :blk false;
         },
         .@"union" => |u| blk: {
@@ -199,8 +199,8 @@ pub fn queryAs(comptime T: type, conn: *db.Db, alloc: std.mem.Allocator, sql: [:
     defer st.finalize();
 
     // Bind args positionally (SQLite/PG placeholder binds are 1-based).
-    inline for (std.meta.fields(@TypeOf(args)), 0..) |f, i| {
-        try bindArg(&st, @intCast(i + 1), @field(args, f.name));
+    inline for (@typeInfo(@TypeOf(args)).@"struct".field_names, 0..) |f, i| {
+        try bindArg(&st, @intCast(i + 1), @field(args, f));
     }
 
     // Force execution + expose column metadata. SQLite knows the column names right after
@@ -211,25 +211,25 @@ pub fn queryAs(comptime T: type, conn: *db.Db, alloc: std.mem.Allocator, sql: [:
     // Resolve each field of T to a result-column index BY NAME, once. A non-optional field
     // with no matching column is a hard error (named in the log); an optional one resolves
     // to -1 and decodes to null.
-    const fields = std.meta.fields(T);
+    const fields = @typeInfo(T).@"struct".field_names;
     var col_of: [fields.len]c_int = undefined;
     const ncols = st.columnCount();
-    inline for (fields, 0..) |f, fi| {
+    inline for (fields, 0.., @typeInfo(T).@"struct".field_types) |f, fi, f_type| {
         var found: c_int = -1;
         var ci: c_int = 0;
         while (ci < ncols) : (ci += 1) {
-            if (std.mem.eql(u8, st.columnName(ci), f.name)) {
+            if (std.mem.eql(u8, st.columnName(ci), f)) {
                 found = ci;
                 break;
             }
         }
-        if (found < 0 and @typeInfo(f.type) != .optional) {
+        if (found < 0 and @typeInfo(f_type) != .optional) {
             // Named here because a Zig error value can't carry the field name. Logged at
             // `.warn`, not `.err`: unit tests exercise this via `expectError` and an
             // `.err`-level log trips the Zig test runner's "logged N errors" gate (same
             // precedent as `migrator.notReversible` / `provision.injectOAuthSecrets`). The
             // returned error still surfaces loudly to the caller.
-            std.log.warn("queryAs: no result column named '{s}' for non-optional field {s}.{s}", .{ f.name, @typeName(T), f.name });
+            std.log.warn("queryAs: no result column named '{s}' for non-optional field {s}.{s}", .{ f, @typeName(T), f });
             return error.ColumnNotFound;
         }
         col_of[fi] = found;
@@ -239,8 +239,8 @@ pub fn queryAs(comptime T: type, conn: *db.Db, alloc: std.mem.Allocator, sql: [:
     errdefer list.deinit(alloc);
     while (has_row) {
         var row: T = undefined;
-        inline for (fields, 0..) |f, fi| {
-            @field(row, f.name) = try decodeField(f.type, &st, col_of[fi], alloc);
+        inline for (fields, 0.., @typeInfo(T).@"struct".field_types) |f, fi, f_type| {
+            @field(row, f) = try decodeField(f_type, &st, col_of[fi], alloc);
         }
         try list.append(alloc, row);
         has_row = try st.step();
@@ -441,7 +441,7 @@ pub const Data = struct {
         // backends; `excluded` is the standard conflict-row alias on SQLite and Postgres.
         const dialect = db.dbDialect(self.conn);
         const now = dialect.nowTextExpr();
-        const sql = try std.fmt.allocPrintSentinel(self.alloc,
+        const sql = try self.alloc.printSentinel(
             \\INSERT INTO "_kv"(key,value,created,updated)
             \\VALUES(?1,?2,{s},{s})
             \\ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated={s};
@@ -503,12 +503,12 @@ pub const Data = struct {
         try sql.appendSlice(self.alloc, "SELECT key, value, created, updated FROM \"_kv\" WHERE ");
         for (prefixes, 0..) |_, i| {
             if (i > 0) try sql.appendSlice(self.alloc, " OR ");
-            const clause = try std.fmt.allocPrint(self.alloc, "key {s} ?{d}", .{ op, i + 1 });
+            const clause = try self.alloc.print("key {s} ?{d}", .{ op, i + 1 });
             defer self.alloc.free(clause); // copied by appendSlice; only a build-time temporary
             try sql.appendSlice(self.alloc, clause);
         }
         try sql.appendSlice(self.alloc, " ORDER BY key;");
-        const sql_z = try self.alloc.dupeZ(u8, sql.items);
+        const sql_z = try self.alloc.dupeSentinel(u8, sql.items, 0);
         defer self.alloc.free(sql_z);
 
         // Route the assembled, placeholder-bearing SQL through the `$n` renumber chokepoint
@@ -521,7 +521,7 @@ pub const Data = struct {
         defer st.finalize();
         const wild = dialect.prefixWildcard();
         for (prefixes, 0..) |p, i| {
-            const pat = try std.fmt.allocPrint(self.alloc, "{s}{s}", .{ p, wild });
+            const pat = try self.alloc.print("{s}{s}", .{ p, wild });
             defer self.alloc.free(pat); // bind copies the bytes at bind time
             try st.bindText(@intCast(i + 1), pat);
         }

@@ -8,7 +8,7 @@ pub fn writeAtomic(alloc: std.mem.Allocator, io: std.Io, path: []const u8, data:
     if (std.fs.path.dirname(path)) |dir| try std.Io.Dir.cwd().createDirPath(io, dir);
     var random: [8]u8 = undefined;
     io.random(&random);
-    const temp = try std.fmt.allocPrint(alloc, "{s}.tmp-{x}", .{ path, random });
+    const temp = try alloc.print("{s}.tmp-{x}", .{ path, random });
     defer alloc.free(temp);
     errdefer std.Io.Dir.cwd().deleteFile(io, temp) catch {};
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = temp, .data = data });

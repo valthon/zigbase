@@ -7,7 +7,7 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
-ZIG=(mise exec zig@0.16.0 -- zig)
+ZIG=(mise exec zig@0.17.1 -- zig)
 VERSION="$(grep -oE '\.version = "[^"]+"' build.zig.zon | head -1 | cut -d'"' -f2)"
 TAG="v${VERSION}"
 OUT="dist"
@@ -35,10 +35,10 @@ fi
 
 rm -rf "$OUT"
 mkdir -p "$OUT"
-echo "Building zigbase ${VERSION} for ${#TARGETS[@]} targets (ReleaseSafe)..."
+echo "Building zigbase ${VERSION} for ${#TARGETS[@]} targets (safe)..."
 for t in "${TARGETS[@]}"; do
   echo "  -> $t"
-  "${ZIG[@]}" build -Dtarget="$t" -Doptimize=ReleaseSafe -Dcpu=baseline
+  "${ZIG[@]}" build -Dtarget="$t" -Doptimize=safe -Dcpu=baseline
   scripts/package-tarball.sh "$VERSION" "$t" zig-out/bin/zigbase "$OUT"
 done
 

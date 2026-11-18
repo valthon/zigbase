@@ -39,7 +39,7 @@ pub fn respond(io: std.Io, ctx: *http.RequestCtx, path: []const u8, options: Opt
             offset += n;
         }
         const digest = hash.finalResult();
-        break :blk try std.fmt.allocPrint(a, "\"{s}\"", .{std.fmt.bytesToHex(digest, .lower)});
+        break :blk try a.print("\"{s}\"", .{std.fmt.bytesToHex(digest, .lower)});
     };
     const p = try serve_file.plan(a, .{
         .size = st.size,
@@ -58,7 +58,7 @@ pub fn respond(io: std.Io, ctx: *http.RequestCtx, path: []const u8, options: Opt
     if (p.content_range) |value| try headers.append(a, .{ .name = "Content-Range", .value = value });
     if (p.status == 304 or ctx.method == .HEAD) try headers.append(a, .{
         .name = "content-length",
-        .value = try std.fmt.allocPrint(a, "{d}", .{if (p.status == 304) st.size else p.len}),
+        .value = try a.print("{d}", .{if (p.status == 304) st.size else p.len}),
     });
     return .{
         .status = p.status,

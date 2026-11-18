@@ -1,5 +1,5 @@
 //! SQL dialect abstraction (issue #159, PR-1b). ZigBase has historically emitted a single
-//! SQLite flavor of SQL via `std.fmt.allocPrint` scattered across the query/DDL/records layers.
+//! SQLite flavor of SQL via `Allocator.print` scattered across the query/DDL/records layers.
 //! Adding PostgreSQL as a runtime-selectable backend means those flavor-specific fragments must
 //! flow through ONE place that knows the active backend. This file is that place.
 //!
@@ -53,7 +53,7 @@ pub const Dialect = struct {
     pub fn placeholder(self: Dialect, buf: []u8, n: usize) []const u8 {
         return switch (self.kind) {
             .sqlite => "?",
-            .postgres => std.fmt.bufPrint(buf, "${d}", .{n}) catch unreachable,
+            .postgres => std.mem.print(buf, "${d}", .{n}) catch unreachable,
         };
     }
 
@@ -154,13 +154,11 @@ pub const Dialect = struct {
     /// rendered to the same ISO-`Z` TEXT shape, so the lexical `<=` is a valid instant compare.
     pub fn agedBeyondDaysPredicate(self: Dialect, alloc: std.mem.Allocator, col: []const u8, days: u32) ![]u8 {
         return switch (self.kind) {
-            .sqlite => std.fmt.allocPrint(
-                alloc,
+            .sqlite => alloc.print(
                 "strftime('%Y-%m-%dT%H:%M:%SZ', {s}) IS NOT NULL AND strftime('%Y-%m-%dT%H:%M:%SZ', {s}) <= strftime('%Y-%m-%dT%H:%M:%SZ','now','-{d} days')",
                 .{ col, col, days },
             ),
-            .postgres => std.fmt.allocPrint(
-                alloc,
+            .postgres => alloc.print(
                 "{s} ~ " ++ iso_z_regex ++ " AND {s} <= to_char((now() - make_interval(days => {d})) AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')",
                 .{ col, col, days },
             ),
@@ -189,8 +187,8 @@ pub const Dialect = struct {
     /// uniqueness SQLite gets from COLLATE NOCASE (#159).
     pub fn nocaseIndexExpr(self: Dialect, alloc: std.mem.Allocator, col_quoted: []const u8) ![]u8 {
         return switch (self.kind) {
-            .sqlite => std.fmt.allocPrint(alloc, "{s} COLLATE NOCASE", .{col_quoted}),
-            .postgres => std.fmt.allocPrint(alloc, "lower({s})", .{col_quoted}),
+            .sqlite => alloc.print("{s} COLLATE NOCASE", .{col_quoted}),
+            .postgres => alloc.print("lower({s})", .{col_quoted}),
         };
     }
 
@@ -209,8 +207,8 @@ pub const Dialect = struct {
     /// must agree, or a user registered as one case could not log in as the other on SQLite.
     pub fn nocaseEqOperand(self: Dialect, alloc: std.mem.Allocator, expr: []const u8) ![]u8 {
         return switch (self.kind) {
-            .sqlite => std.fmt.allocPrint(alloc, "{s} COLLATE NOCASE", .{expr}),
-            .postgres => std.fmt.allocPrint(alloc, "lower({s})", .{expr}),
+            .sqlite => alloc.print("{s} COLLATE NOCASE", .{expr}),
+            .postgres => alloc.print("lower({s})", .{expr}),
         };
     }
 
@@ -317,7 +315,7 @@ pub const Dialect = struct {
     /// the whole read/query stack is PR-3. Only `?` immediately followed by a digit is rewritten,
     /// so a bare `?` (none appear in the curated statements) is left untouched.
     pub fn renumberPlaceholders(self: Dialect, alloc: std.mem.Allocator, sql: []const u8) ![:0]u8 {
-        if (self.kind == .sqlite) return alloc.dupeZ(u8, sql);
+        if (self.kind == .sqlite) return alloc.dupeSentinel(u8, sql, 0);
         var out: std.ArrayList(u8) = .empty;
         errdefer out.deinit(alloc);
         var i: usize = 0;
@@ -345,14 +343,14 @@ pub const Dialect = struct {
     /// `INTEGER` substitution is safe for these statements because `INTEGER` never appears inside a
     /// string literal or identifier in the system migrations (only as a column type).
     pub fn lowerMigrationSql(self: Dialect, alloc: std.mem.Allocator, sql: []const u8) ![:0]u8 {
-        if (self.kind == .sqlite) return alloc.dupeZ(u8, sql);
+        if (self.kind == .sqlite) return alloc.dupeSentinel(u8, sql, 0);
         // Intermediates are freed explicitly so the function is leak-correct for any allocator
         // (production callers pass an arena, but the unit tests use the checked testing allocator).
         const s1 = try std.mem.replaceOwned(u8, alloc, sql, "INTEGER", self.sqlType(.integer));
         defer alloc.free(s1);
         const s2 = try std.mem.replaceOwned(u8, alloc, s1, "datetime('now')", self.nowTextExpr());
         defer alloc.free(s2);
-        if (std.mem.indexOf(u8, s2, "INSERT OR IGNORE") == null) return alloc.dupeZ(u8, s2);
+        if (std.mem.indexOf(u8, s2, "INSERT OR IGNORE") == null) return alloc.dupeSentinel(u8, s2, 0);
         const s3 = try std.mem.replaceOwned(u8, alloc, s2, "INSERT OR IGNORE", "INSERT");
         defer alloc.free(s3);
         // The `ON CONFLICT DO NOTHING` suffix must land before the statement TERMINATOR — but a
@@ -376,7 +374,7 @@ pub const Dialect = struct {
     /// sites. `type_sql` is a trusted, dialect-correct type keyword (often `sqlType(...)`).
     pub fn castExpr(self: Dialect, alloc: std.mem.Allocator, expr: []const u8, type_sql: []const u8) ![]u8 {
         _ = self;
-        return std.fmt.allocPrint(alloc, "CAST({s} AS {s})", .{ expr, type_sql });
+        return alloc.print("CAST({s} AS {s})", .{ expr, type_sql });
     }
 
     /// A boolean predicate that is TRUE when the ISO-8601 TEXT timestamp in `col` is in the past
@@ -393,9 +391,8 @@ pub const Dialect = struct {
     /// correct once the shape is validated.)
     pub fn ttlExpiredPredicate(self: Dialect, alloc: std.mem.Allocator, col: []const u8) ![]u8 {
         return switch (self.kind) {
-            .sqlite => std.fmt.allocPrint(alloc, "strftime('%Y-%m-%dT%H:%M:%SZ','now') > {s}", .{col}),
-            .postgres => std.fmt.allocPrint(
-                alloc,
+            .sqlite => alloc.print("strftime('%Y-%m-%dT%H:%M:%SZ','now') > {s}", .{col}),
+            .postgres => alloc.print(
                 "({s} ~ " ++ iso_z_regex ++ " AND {s} > {s})",
                 .{ col, self.nowIso8601Expr(), col },
             ),
@@ -425,13 +422,11 @@ pub const Dialect = struct {
     /// `>` compare on the ISO-`Z` regex and treats a non-matching value as visible (`!~`).
     pub fn ttlVisiblePredicate(self: Dialect, alloc: std.mem.Allocator, col: []const u8) ![]u8 {
         return switch (self.kind) {
-            .sqlite => std.fmt.allocPrint(
-                alloc,
+            .sqlite => alloc.print(
                 "{s} IS NULL OR strftime('%Y-%m-%dT%H:%M:%SZ', {s}) IS NULL OR strftime('%Y-%m-%dT%H:%M:%SZ', {s}) > strftime('%Y-%m-%dT%H:%M:%SZ', 'now')",
                 .{ col, col, col },
             ),
-            .postgres => std.fmt.allocPrint(
-                alloc,
+            .postgres => alloc.print(
                 "{s} IS NULL OR {s} !~ " ++ iso_z_regex ++ " OR {s} > {s}",
                 .{ col, col, col, self.nowIso8601Expr() },
             ),
@@ -445,13 +440,11 @@ pub const Dialect = struct {
     /// Postgres gates the `<=` compare on the ISO-`Z` regex (an unmatched value can't be expired).
     pub fn ttlExpiredDeletePredicate(self: Dialect, alloc: std.mem.Allocator, col: []const u8) ![]u8 {
         return switch (self.kind) {
-            .sqlite => std.fmt.allocPrint(
-                alloc,
+            .sqlite => alloc.print(
                 "{s} IS NOT NULL AND strftime('%Y-%m-%dT%H:%M:%SZ', {s}) <= strftime('%Y-%m-%dT%H:%M:%SZ','now')",
                 .{ col, col },
             ),
-            .postgres => std.fmt.allocPrint(
-                alloc,
+            .postgres => alloc.print(
                 "{s} IS NOT NULL AND {s} ~ " ++ iso_z_regex ++ " AND {s} <= {s}",
                 .{ col, col, col, self.nowIso8601Expr() },
             ),

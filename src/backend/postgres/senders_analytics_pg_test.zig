@@ -93,7 +93,7 @@ fn expectIds(reply: Reply, want: []const []const u8) !void {
 fn setUpdated(pool: *db.Pool, out: std.mem.Allocator, value: []const u8) !void {
     const w = pool.acquireWriter();
     defer pool.releaseWriter();
-    try w.exec(try std.fmt.allocPrintSentinel(out, "UPDATE \"_sender_identities\" SET \"updated\"={s};", .{value}, 0));
+    try w.exec(try out.printSentinel("UPDATE \"_sender_identities\" SET \"updated\"={s};", .{value}, 0));
 }
 
 fn expectRollups(reply: Reply, want: []const struct { []const u8, []const u8, i64 }) !void {
@@ -121,22 +121,22 @@ fn memberBearer(pool: *db.Pool, out: std.mem.Allocator) ![]const u8 {
     const rec = try records.create(out, testing.io, w, col, prepared);
     const uid = rec.object.get("id").?.string;
     const token_key = rec.object.get("tokenKey") orelse blk: {
-        const sql = try std.fmt.allocPrintSentinel(out, "SELECT \"tokenKey\" FROM \"users\" WHERE \"id\"='{s}';", .{uid}, 0);
+        const sql = try out.printSentinel("SELECT \"tokenKey\" FROM \"users\" WHERE \"id\"='{s}';", .{uid}, 0);
         var st = try w.prepare(sql);
         defer st.finalize();
         try testing.expect(try st.step());
         break :blk std.json.Value{ .string = try out.dupe(u8, st.columnText(0)) };
     };
-    try w.exec(try std.fmt.allocPrintSentinel(out, "INSERT INTO \"_memberships\" (\"id\",\"created\",\"updated\",\"account\",\"user_collection\",\"user\",\"role\",\"status\") " ++
+    try w.exec(try out.printSentinel("INSERT INTO \"_memberships\" (\"id\",\"created\",\"updated\",\"account\",\"user_collection\",\"user\",\"role\",\"status\") " ++
         "VALUES ('m1','','','acc1','users','{s}','member','active');", .{uid}, 0));
     const key = crypto.deriveKey(secret, token_key.string);
     const token = try jwt.sign(out, .{ .id = uid, .collection = "users", .type = .auth, .iat = 1, .exp = 9999999999 }, &key);
-    return std.fmt.allocPrint(out, "Bearer {s}", .{token});
+    return out.print("Bearer {s}", .{token});
 }
 
 fn tokenFor(conn: *db.Db, out: std.mem.Allocator, id: []const u8) ![]const u8 {
     // Ids are server-minted base36; interpolating one into a test-only literal is safe.
-    const sql = try std.fmt.allocPrintSentinel(out, "SELECT \"verification_token\" FROM \"_sender_identities\" WHERE \"id\"='{s}';", .{id}, 0);
+    const sql = try out.printSentinel("SELECT \"verification_token\" FROM \"_sender_identities\" WHERE \"id\"='{s}';", .{id}, 0);
     var st = try conn.prepare(sql);
     defer st.finalize();
     try testing.expect(try st.step());
@@ -182,7 +182,7 @@ fn runScenario(pool: *db.Pool) !void {
         .tenancy = .{ .enabled = true, .resolver = .header, .auth_collection = "users" },
     };
     app.analytics = @ptrCast(&registry);
-    const c = Client{ .app = &app, .out = out, .authorization = try std.fmt.allocPrint(out, "Bearer {s}", .{token}) };
+    const c = Client{ .app = &app, .out = out, .authorization = try out.print("Bearer {s}", .{token}) };
     const member = Client{ .app = &app, .out = out, .authorization = try memberBearer(pool, out) };
 
     // ---- senders: list, create, throttle, re-issue, verify, list, already-verified ----
@@ -250,7 +250,7 @@ fn runScenario(pool: *db.Pool) !void {
         const params = [_]http.Param{.{ .key = "id", .value = sid }};
         const wrong = try c.call(senders_api.verify, .POST, "", "{\"token\":\"not-the-token\"}", &params);
         try testing.expectEqual(@as(u16, 404), wrong.status);
-        const body = try std.fmt.allocPrint(out, "{{\"token\":\"{s}\"}}", .{tok});
+        const body = try out.print("{{\"token\":\"{s}\"}}", .{tok});
         const ok = try c.call(senders_api.verify, .POST, "", body, &params);
         try testing.expectEqual(@as(u16, 200), ok.status);
         try testing.expect(ok.json.object.get("verified").?.bool);
@@ -295,12 +295,12 @@ fn runScenario(pool: *db.Pool) !void {
         const cur1 = str(p1.json, "nextCursor");
         try testing.expectEqualStrings("2026-01-02T10:00:00Z|e4", cur1);
 
-        const p2 = try c.call(analytics_api.events, .GET, try std.fmt.allocPrint(out, "limit=2&cursor={s}", .{cur1}), "", &.{});
+        const p2 = try c.call(analytics_api.events, .GET, try out.print("limit=2&cursor={s}", .{cur1}), "", &.{});
         try expectIds(p2, &.{ "e3", "e2" });
         const cur2 = str(p2.json, "nextCursor");
         try testing.expectEqualStrings("2026-01-01T09:00:00Z|e2", cur2);
 
-        const p3 = try c.call(analytics_api.events, .GET, try std.fmt.allocPrint(out, "limit=2&cursor={s}", .{cur2}), "", &.{});
+        const p3 = try c.call(analytics_api.events, .GET, try out.print("limit=2&cursor={s}", .{cur2}), "", &.{});
         try expectIds(p3, &.{"e1"});
         try testing.expect(!p3.json.object.get("hasNext").?.bool);
         try testing.expect(p3.json.object.get("nextCursor").? == .null);
@@ -370,7 +370,7 @@ test "senders + analytics routes: SQLite reference run" {
     defer tmp.cleanup();
     const dir = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
     defer testing.allocator.free(dir);
-    const path = try std.fmt.allocPrintSentinel(testing.allocator, "{s}/routes.db", .{dir}, 0);
+    const path = try testing.allocator.printSentinel("{s}/routes.db", .{dir}, 0);
     defer testing.allocator.free(path);
     var pool = try db.Pool.init(testing.allocator, testing.io, path);
     defer pool.deinit();
@@ -386,7 +386,7 @@ test "senders + analytics routes: SQLite reference run" {
 fn withDatabase(a: std.mem.Allocator, url: []const u8, name: []const u8) ![:0]u8 {
     const q = std.mem.indexOfScalar(u8, url, '?') orelse url.len;
     const slash = std.mem.lastIndexOfScalar(u8, url[0..q], '/') orelse return error.BadTestUrl;
-    return std.fmt.allocPrintSentinel(a, "{s}/{s}{s}", .{ url[0..slash], name, url[q..] }, 0);
+    return a.printSentinel("{s}/{s}{s}", .{ url[0..slash], name, url[q..] }, 0);
 }
 
 /// Whether the connected role may run CREATE DATABASE (a superuser or CREATEDB role).
@@ -406,20 +406,20 @@ test "senders + analytics routes: PostgreSQL matches SQLite (#487)" {
     // A per-run name, so concurrent runs against one server never drop each other's database.
     const suffix = try crypto.genHex(testing.io, testing.allocator, 12);
     defer testing.allocator.free(suffix);
-    const name = try std.fmt.allocPrint(testing.allocator, "zb_pg487_{s}", .{suffix});
+    const name = try testing.allocator.print("zb_pg487_{s}", .{suffix});
     defer testing.allocator.free(name);
     // ICU `en-US` orders `a` before `B` and `z` before `Z` (unlike byte order), and Kiritimati is
     // UTC+14: the settings under which an uncollated ORDER BY or a zone-dependent age would differ.
     // A database-level ICU locale needs PostgreSQL 15+ built with ICU; without it the database
     // gets the server's default locale and the locale premise below is not asserted.
     const icu = try hasIcuDatabaseLocale(&admin);
-    const create = try std.fmt.allocPrintSentinel(testing.allocator, "CREATE DATABASE {s} TEMPLATE template0{s};", .{
+    const create = try testing.allocator.printSentinel("CREATE DATABASE {s} TEMPLATE template0{s};", .{
         name, if (icu) " LOCALE_PROVIDER icu ICU_LOCALE 'en-US' LOCALE 'C'" else "",
     }, 0);
     defer testing.allocator.free(create);
-    const tz = try std.fmt.allocPrintSentinel(testing.allocator, "ALTER DATABASE {s} SET timezone TO 'Pacific/Kiritimati';", .{name}, 0);
+    const tz = try testing.allocator.printSentinel("ALTER DATABASE {s} SET timezone TO 'Pacific/Kiritimati';", .{name}, 0);
     defer testing.allocator.free(tz);
-    const drop = try std.fmt.allocPrintSentinel(testing.allocator, "DROP DATABASE IF EXISTS {s} WITH (FORCE);", .{name}, 0);
+    const drop = try testing.allocator.printSentinel("DROP DATABASE IF EXISTS {s} WITH (FORCE);", .{name}, 0);
     defer testing.allocator.free(drop);
 
     try admin.exec(create);
@@ -557,15 +557,15 @@ test "analytics.summaryExists resolves the summary table through search_path on 
     // Statement text lives in fixed stack buffers (no allocation to leak-check).
     var drop_buf: [64]u8 = undefined;
     var buf: [160]u8 = undefined;
-    const drop = try std.fmt.bufPrintZ(&drop_buf, "DROP SCHEMA zb487_{s} CASCADE;", .{suffix});
-    try conn.exec(try std.fmt.bufPrintZ(&buf, "CREATE SCHEMA zb487_{s};", .{suffix}));
+    const drop = try std.mem.printSentinel(&drop_buf, "DROP SCHEMA zb487_{s} CASCADE;", .{suffix}, 0);
+    try conn.exec(try std.mem.printSentinel(&buf, "CREATE SCHEMA zb487_{s};", .{suffix}, 0));
     defer conn.exec(drop) catch |err| std.log.err("pg 487 schema cleanup failed: {s}", .{@errorName(err)});
-    try conn.exec(try std.fmt.bufPrintZ(&buf, "CREATE TABLE zb487_{s}.\"_rollup_later\" (\"bucket\" TEXT);", .{suffix}));
-    try conn.exec(try std.fmt.bufPrintZ(&buf, "CREATE TABLE zb487_{s}.\"_rollup_Mixed\" (\"bucket\" TEXT);", .{suffix}));
+    try conn.exec(try std.mem.printSentinel(&buf, "CREATE TABLE zb487_{s}.\"_rollup_later\" (\"bucket\" TEXT);", .{suffix}, 0));
+    try conn.exec(try std.mem.printSentinel(&buf, "CREATE TABLE zb487_{s}.\"_rollup_Mixed\" (\"bucket\" TEXT);", .{suffix}, 0));
 
     // The schema is LATER on the path than the current schema: an unqualified read finds the table
     // there, so the existence check must too.
-    try conn.exec(try std.fmt.bufPrintZ(&buf, "SET search_path TO public, zb487_{s};", .{suffix}));
+    try conn.exec(try std.mem.printSentinel(&buf, "SET search_path TO public, zb487_{s};", .{suffix}, 0));
     try testing.expect(try analytics.summaryExists(&conn, "_rollup_later"));
     try testing.expect(try analytics.summaryExists(&conn, "_rollup_Mixed"));
     try testing.expect(!try analytics.summaryExists(&conn, "_rollup_mixed"));

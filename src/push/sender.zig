@@ -105,7 +105,7 @@ fn buildPayload(alloc: std.mem.Allocator, msg: PushMessage) ![]u8 {
     const body = try std.json.Stringify.valueAlloc(alloc, msg.body, .{});
     defer alloc.free(body);
     const data: []const u8 = if (msg.data.len == 0) "null" else msg.data;
-    return std.fmt.allocPrint(alloc, "{{\"title\":{s},\"body\":{s},\"data\":{s}}}", .{ title, body, data });
+    return alloc.print("{{\"title\":{s},\"body\":{s},\"data\":{s}}}", .{ title, body, data });
 }
 
 /// Encrypt + POST `msg` to `sub`'s endpoint using the VAPID identity in `cfg`. Returns the
@@ -147,7 +147,7 @@ pub fn deliver(ctx: *Ctx, cfg: config.Runtime, sub: PushSubscription, msg: PushM
     // (5) POST. A transport error is transient → `.failed`.
     var headers: std.ArrayList(http_client.Header) = .empty;
     defer headers.deinit(a.a);
-    const ttl_str = try std.fmt.allocPrint(a.a, "{d}", .{msg.ttl_s});
+    const ttl_str = try a.a.print("{d}", .{msg.ttl_s});
     defer a.a.free(ttl_str);
     try headers.append(a.a, .{ .name = "TTL", .value = ttl_str });
     if (msg.urgency) |u| try headers.append(a.a, .{ .name = "Urgency", .value = u.wireValue() });

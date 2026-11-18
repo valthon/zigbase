@@ -478,8 +478,7 @@ fn validateBooking(ctx: *zigbase.Ctx, ev: *zigbase.RecordEvent) anyerror!void {
 
     // 1) Conflict check: any CONFIRMED booking for this listing that overlaps?
     //    ctx.records().list runs a curated query on the request's connection.
-    const filter = try std.fmt.allocPrint(ev.arena.a,
-        "listing = \"{s}\" && status = \"confirmed\" && starts_at < \"{s}\" && ends_at > \"{s}\"",
+    const filter = try ev.arena.a.print("listing = \"{s}\" && status = \"confirmed\" && starts_at < \"{s}\" && ends_at > \"{s}\"",
         .{ listing, ends, starts },
     );
     const conflicts = try ctx.records().list("bookings", .{ .filter = filter, .perPage = 1 });
@@ -634,8 +633,7 @@ fn expireStaleBookings(ctx: *zigbase.Ctx, ev: *zigbase.events.JobEvent) anyerror
     const records = ctx.records();
 
     const now = "2026-06-10 00:00:00"; // compute the current timestamp in your format
-    const filter = try std.fmt.allocPrint(a,
-        "status = \"pending\" && starts_at < \"{s}\"", .{now});
+    const filter = try a.print("status = \"pending\" && starts_at < \"{s}\"", .{now});
 
     const stale = try records.list("bookings", .{ .filter = filter, .perPage = 200 });
     for (stale.items) |item| {
@@ -747,8 +745,8 @@ fn magicRequest(ctx: *zigbase.Ctx) anyerror!zigbase.http.Response {
         const lt = try zigbase.auth.mintLinkToken(
             ctx.request.?, w, "members", member.object.get("id").?.string, 900, .{},
         );
-        const link = try std.fmt.allocPrint(a, "https://app.example.com/auth/confirm?token={s}", .{lt.token});
-        const body = try std.fmt.allocPrint(a, "Click to sign in (expires in 15 minutes):\n\n{s}", .{link});
+        const link = try a.print("https://app.example.com/auth/confirm?token={s}", .{lt.token});
+        const body = try a.print("Click to sign in (expires in 15 minutes):\n\n{s}", .{link});
         // Best-effort queued delivery: no allocator argument and no error union.
         zigbase.auth.deliverAuthMail(ctx.app, email, "Your sign-in link", body);
     }

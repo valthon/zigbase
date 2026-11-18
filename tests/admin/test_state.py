@@ -28,7 +28,7 @@ import pytest
 from _bin import resolve_binary
 
 REPO = pathlib.Path(__file__).resolve().parents[2]
-ZIG = ["mise", "exec", "zig@0.16.0", "--", "zig"]
+ZIG = ["mise", "exec", "zig@0.17.1", "--", "zig"]
 
 
 

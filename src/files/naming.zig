@@ -59,10 +59,10 @@ pub fn storedName(io: std.Io, alloc: std.mem.Allocator, original: []const u8) ![
             const raw_ext = clean[dot + 1 ..];
             const elen = @min(raw_ext.len, ext_buf.len);
             for (raw_ext[0..elen], 0..) |c, i| ext_buf[i] = std.ascii.toLower(c);
-            return std.fmt.allocPrint(alloc, "{s}_{s}.{s}", .{ stem, rand, ext_buf[0..elen] });
+            return alloc.print("{s}_{s}.{s}", .{ stem, rand, ext_buf[0..elen] });
         }
     }
-    return std.fmt.allocPrint(alloc, "{s}_{s}", .{ clean, rand });
+    return alloc.print("{s}_{s}", .{ clean, rand });
 }
 
 test "sanitizeBase strips path components and unsafe chars" {

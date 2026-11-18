@@ -191,7 +191,7 @@ def inventory() -> dict:
                     "requirements": {
                         "tools": {
                             "python": "3.13",
-                            "zig": "0.16.0" if "/admin/" in module else None,
+                            "zig": "0.17.1" if "/admin/" in module else None,
                         },
                         "python_packages": ["pytest", "playwright"]
                         if "/admin/" in module

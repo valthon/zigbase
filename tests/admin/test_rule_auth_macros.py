@@ -34,21 +34,31 @@ def _setup(page, rules):
     assert r.status in (200, 201), r.text()
 
 
-def _signup_login(browser, server, email):
+def _signup(browser, server, email):
     ctx = browser.new_context(base_url=server)
-    pg = ctx.new_page()
-    r = pg.request.post("/api/collections/users/records",
-                        data=json.dumps({"email": email, "password": "userpassword1"}),
-                        headers={"Content-Type": "application/json"})
+    r = ctx.new_page().request.post("/api/collections/users/records",
+                                    data=json.dumps({"email": email, "password": "userpassword1"}),
+                                    headers={"Content-Type": "application/json"})
     assert r.status == 201, r.text()
     uid = r.json()["id"]
-    r = pg.request.post("/api/collections/users/auth-with-password",
-                        data=json.dumps({"identity": email, "password": "userpassword1"}),
-                        headers={"Content-Type": "application/json"})
+    ctx.close()
+    return uid
+
+
+def _user_token(browser, server, email):
+    ctx = browser.new_context(base_url=server)
+    r = ctx.new_page().request.post("/api/collections/users/auth-with-password",
+                                    data=json.dumps({"identity": email, "password": "userpassword1"}),
+                                    headers={"Content-Type": "application/json"})
     assert r.status == 200, r.text()
     tok = r.json()["token"]
     ctx.close()
-    return uid, tok
+    return tok
+
+
+def _signup_login(browser, server, email):
+    uid = _signup(browser, server, email)
+    return uid, _user_token(browser, server, email)
 
 
 def _note(page, **fields):
@@ -153,10 +163,15 @@ def test_realtime_owner_rules_deliver_live_but_not_expired(page, server, rule):
     """
     _setup(page, {"listRule": rule, "viewRule": rule})
     browser = page.context.browser
-    a_id, _ = _signup_login(browser, server, "a@x.io")
-    b_id, b_tok = _signup_login(browser, server, "b@x.io")
+    a_id = _signup(browser, server, "a@x.io")
+    b_id = _signup(browser, server, "b@x.io")
+    # Every argon2id hash eats into an 8 s TTL, and a debug build hashes slowly. Re-mint the
+    # admin session after the signups and mint B's token last: B's live window then holds no
+    # hash, and the admin's holds only B's one.
+    login(page)
     ra = _note(page, owner=a_id, title="A0")
     rb = _note(page, owner=b_id, title="B0")
+    b_tok = _user_token(browser, server, "b@x.io")
     sub = _anon(browser, server)
     sub.goto("/api/health")  # a same-origin document, so the in-page WebSocket passes the Origin check
     sub.evaluate(WS_CLIENT_JS, b_tok)

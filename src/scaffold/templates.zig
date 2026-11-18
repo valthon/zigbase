@@ -172,7 +172,7 @@ pub const framework_build_zig =
     \\
     \\    const run = b.addRunArtifact(exe);
     \\    run.step.dependOn(b.getInstallStep());
-    \\    if (b.args) |args| run.addArgs(args);
+    \\    run.addPassthruArgs();
     \\    b.step("run", "Run the server").dependOn(&run.step);
     \\
     \\    // `zig build test` — in-process tests through the real router, rules, auth,
@@ -214,7 +214,7 @@ pub const framework_readme =
     \\`zig fetch --save` is what writes the `zigbase` dependency (URL **and** the
     \\content hash) into `build.zig.zon`. Do not hand-write it.
     \\
-    \\Admin UI: <http://127.0.0.1:8090/_/>. The Zig toolchain is pinned to 0.16.0.
+    \\Admin UI: <http://127.0.0.1:8090/_/>. The Zig toolchain is pinned to 0.17.1.
     \\
     \\## Where things go
     \\
@@ -234,12 +234,12 @@ pub const framework_readme =
 /// `build.zig.zon` with no dependency block — `zig fetch --save` writes that, with
 /// the correct hash. `fingerprint` is minted by the caller (see scaffold.zig).
 pub fn frameworkBuildZigZon(a: std.mem.Allocator, name: []const u8, fingerprint: u64) ![]u8 {
-    return std.fmt.allocPrint(a,
+    return a.print(
         \\.{{
         \\    .name = .{s},
         \\    .version = "0.0.0",
         \\    .fingerprint = 0x{x:0>16},
-        \\    .minimum_zig_version = "0.16.0",
+        \\    .minimum_zig_version = "0.17.1",
         \\    // Run: zig fetch --save git+https://github.com/valthon/zigbase
         \\    // It writes the URL and the content hash here. Never hand-write either,
         \\    // and never use a relative `.path` — that only works inside the zigbase
@@ -254,7 +254,7 @@ pub fn frameworkBuildZigZon(a: std.mem.Allocator, name: []const u8, fingerprint:
 /// The whole app. `App` is a `pub const` so the test block can reach it — an
 /// `App(.{...})` literal inlined into `main` cannot be tested.
 pub fn frameworkMainZig(a: std.mem.Allocator, name: []const u8) ![]u8 {
-    return std.fmt.allocPrint(a,
+    return a.print(
         \\const std = @import("std");
         \\const zigbase = @import("zigbase");
         \\
@@ -355,7 +355,7 @@ test "build.zig.zon is rendered with the package name and fingerprint, and has n
     defer a.free(zon);
     try std.testing.expect(std.mem.indexOf(u8, zon, ".name = .my_app,") != null);
     try std.testing.expect(std.mem.indexOf(u8, zon, ".fingerprint = 0xdeadbeef00000001,") != null);
-    try std.testing.expect(std.mem.indexOf(u8, zon, ".minimum_zig_version = \"0.16.0\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zon, ".minimum_zig_version = \"0.17.1\"") != null);
     // The dependency is written by `zig fetch --save`, never by us: we cannot know
     // the package hash, and a hand-written one goes stale silently.
     try std.testing.expect(std.mem.indexOf(u8, zon, "zigbase = .{") == null);
@@ -420,7 +420,7 @@ test "no template names a command the binary does not have" {
     }
 
     // The two templates above are baked-in `const`s; `frameworkBuildZigZon` and
-    // `frameworkMainZig` instead build their text via `std.fmt.allocPrint` at
+    // `frameworkMainZig` instead build their text via `Allocator.print` at
     // scaffold time, so an unknown command hiding in THEIR format string would slip
     // past a scan of only the static consts. Render both and scan the output too.
     const a = std.testing.allocator;

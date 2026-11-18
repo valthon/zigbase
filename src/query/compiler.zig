@@ -41,8 +41,8 @@ fn filterArgToParam(alloc: std.mem.Allocator, field: ?schema.Field, arg: FilterA
         .bool => |b| coerceScalar(field, .{ .boolean = b }),
         // Render the native number to a decimal string so it flows through the exact same
         // scale/parse path (`values.decimalToScaledInt`/`parseFloat`) as an inline numeric literal.
-        .int => |n| coerceScalar(field, .{ .num = try std.fmt.allocPrint(alloc, "{d}", .{n}) }),
-        .float => |f| coerceScalar(field, .{ .num = try std.fmt.allocPrint(alloc, "{d}", .{f}) }),
+        .int => |n| coerceScalar(field, .{ .num = try alloc.print("{d}", .{n}) }),
+        .float => |f| coerceScalar(field, .{ .num = try alloc.print("{d}", .{f}) }),
     };
 }
 
@@ -126,7 +126,7 @@ fn emit(alloc: std.mem.Allocator, j: *joiner.Joiner, node: *parser.Node, params:
             const l = try emit(alloc, j, lg.l, params, rctx, dialect, filter_args);
             const r = try emit(alloc, j, lg.r, params, rctx, dialect, filter_args);
             const conj = if (lg.op == .l_and) "AND" else "OR";
-            return std.fmt.allocPrint(alloc, "({s} {s} {s})", .{ l, conj, r });
+            return alloc.print("({s} {s} {s})", .{ l, conj, r });
         },
         .cmp => |c| return emitCmp(alloc, j, c, params, rctx, dialect, filter_args),
     }
@@ -276,7 +276,7 @@ fn emitCmp(alloc: std.mem.Allocator, j: *joiner.Joiner, c: Cmp, params: *std.Arr
         const ci = (lc.nocase or rc.nocase) and isEqNe(c.op);
         const lsql = if (ci) try dialect.nocaseEqOperand(alloc, lc.sql) else lc.sql;
         const rsql = if (ci) try dialect.nocaseEqOperand(alloc, rc.sql) else rc.sql;
-        return std.fmt.allocPrint(alloc, "{s} {s} {s}", .{ lsql, opSql(c.op, dialect), rsql });
+        return alloc.print("{s} {s} {s}", .{ lsql, opSql(c.op, dialect), rsql });
     }
 
     if (l_col or r_col) {
@@ -286,8 +286,8 @@ fn emitCmp(alloc: std.mem.Allocator, j: *joiner.Joiner, c: Cmp, params: *std.Arr
             if (!likeAllowed(col.field)) return error.BadValue;
             if (absent_false) return alloc.dupe(u8, dialect.constFalse());
             const term = try operandToText(val_op, rctx, filter_args);
-            try params.append(alloc, .{ .text = try std.fmt.allocPrint(alloc, "%{s}%", .{term}) });
-            return std.fmt.allocPrint(alloc, "{s} {s} ?", .{ col.sql, opSql(c.op, dialect) });
+            try params.append(alloc, .{ .text = try alloc.print("%{s}%", .{term}) });
+            return alloc.print("{s} {s} ?", .{ col.sql, opSql(c.op, dialect) });
         }
         if (absent_false) return alloc.dupe(u8, dialect.constFalse());
         try params.append(alloc, try operandToParam(alloc, col.field, val_op, rctx, filter_args));
@@ -297,8 +297,8 @@ fn emitCmp(alloc: std.mem.Allocator, j: *joiner.Joiner, c: Cmp, params: *std.Arr
         const ci = col.nocase and isEqNe(c.op);
         const col_sql = if (ci) try dialect.nocaseEqOperand(alloc, col.sql) else col.sql;
         const ph = if (ci) try dialect.nocaseEqOperand(alloc, "?") else "?";
-        if (l_col) return std.fmt.allocPrint(alloc, "{s} {s} {s}", .{ col_sql, opSql(c.op, dialect), ph });
-        return std.fmt.allocPrint(alloc, "{s} {s} {s}", .{ ph, opSql(c.op, dialect), col_sql });
+        if (l_col) return alloc.print("{s} {s} {s}", .{ col_sql, opSql(c.op, dialect), ph });
+        return alloc.print("{s} {s} {s}", .{ ph, opSql(c.op, dialect), col_sql });
     }
 
     // neither side is a column: both are macros/literals -> bind both as text
@@ -313,12 +313,12 @@ fn emitCmp(alloc: std.mem.Allocator, j: *joiner.Joiner, c: Cmp, params: *std.Arr
         const lt = try operandToText(c.lhs, rctx, filter_args);
         const rt = try operandToText(c.rhs, rctx, filter_args);
         try params.append(alloc, .{ .text = lt });
-        try params.append(alloc, .{ .text = try std.fmt.allocPrint(alloc, "%{s}%", .{rt}) });
-        return std.fmt.allocPrint(alloc, "? {s} ?", .{opSql(c.op, dialect)});
+        try params.append(alloc, .{ .text = try alloc.print("%{s}%", .{rt}) });
+        return alloc.print("? {s} ?", .{opSql(c.op, dialect)});
     }
     try params.append(alloc, .{ .text = try operandToText(c.lhs, rctx, filter_args) });
     try params.append(alloc, .{ .text = try operandToText(c.rhs, rctx, filter_args) });
-    return std.fmt.allocPrint(alloc, "? {s} ?", .{opSql(c.op, dialect)});
+    return alloc.print("? {s} ?", .{opSql(c.op, dialect)});
 }
 
 /// Emit a set-membership predicate `<col> IN (?,?,…)`, binding each element as a parameter.

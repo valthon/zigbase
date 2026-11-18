@@ -32,7 +32,7 @@ fn ingestUrl(alloc: std.mem.Allocator, dsn: []const u8) ![]const u8 {
     const host = host_and_path[0..slash];
     const project = host_and_path[slash + 1 ..];
     if (host.len == 0 or project.len == 0) return error.InvalidDsn;
-    return std.fmt.allocPrint(alloc, "{s}://{s}/api/{s}/envelope/", .{ scheme, host, project });
+    return alloc.print("{s}://{s}/api/{s}/envelope/", .{ scheme, host, project });
 }
 
 /// Build a Sentry envelope (header line + item header + payload) for a single
@@ -46,8 +46,7 @@ pub fn buildEnvelope(
     const url = try ingestUrl(alloc, dsn);
     errdefer alloc.free(url);
     const pubkey = try publicKey(dsn);
-    const auth_header = try std.fmt.allocPrint(
-        alloc,
+    const auth_header = try alloc.print(
         "Sentry sentry_version=7, sentry_key={s}",
         .{pubkey},
     );
@@ -65,11 +64,11 @@ pub fn buildEnvelope(
 
     // Envelope header references the DSN; item header carries the payload length. Also
     // scratch — `body` copies their contents, so they're freed here too.
-    const header = try std.fmt.allocPrint(alloc, "{{\"dsn\":\"{s}\"}}", .{dsn});
+    const header = try alloc.print("{{\"dsn\":\"{s}\"}}", .{dsn});
     defer alloc.free(header);
-    const item_header = try std.fmt.allocPrint(alloc, "{{\"type\":\"event\",\"length\":{d}}}", .{payload.len});
+    const item_header = try alloc.print("{{\"type\":\"event\",\"length\":{d}}}", .{payload.len});
     defer alloc.free(item_header);
-    const body = try std.fmt.allocPrint(alloc, "{s}\n{s}\n{s}", .{ header, item_header, payload });
+    const body = try alloc.print("{s}\n{s}\n{s}", .{ header, item_header, payload });
 
     return .{ .url = url, .auth_header = auth_header, .body = body };
 }

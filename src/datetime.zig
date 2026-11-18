@@ -100,7 +100,7 @@ pub fn formatUtc(unix: i64) [19]u8 {
     var buf: [19]u8 = undefined;
     // Year is clamped to 4 digits by the caller's contract (frozen instants are modern);
     // bufPrint can't fail into a 19-byte buffer for in-range values.
-    _ = std.fmt.bufPrint(&buf, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}", .{
+    _ = std.mem.print(&buf, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}", .{
         @as(u64, @intCast(civ.y)), @as(u64, @intCast(civ.m)), @as(u64, @intCast(civ.d)),
         @as(u64, @intCast(hh)),    @as(u64, @intCast(mm)),    @as(u64, @intCast(ss)),
     }) catch unreachable;

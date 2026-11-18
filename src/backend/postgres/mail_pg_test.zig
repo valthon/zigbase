@@ -69,7 +69,7 @@ fn postWebhook(app: *App, account: []const u8, body: []const u8) !u16 {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const ts = try std.fmt.allocPrint(a, "{d}", .{clock.nowUnix(testing.io)});
+    const ts = try a.print("{d}", .{clock.nowUnix(testing.io)});
     const sig = try inbound.signMailInbound(a, webhook_secret, ts, "ses", account, body);
     const headers = [_]http.Param{
         .{ .key = inbound.sig_header, .value = sig },
@@ -94,7 +94,7 @@ fn postUnsubscribe(app: *App, account: []const u8, list: []const u8, recipient: 
     defer arena.deinit();
     const a = arena.allocator();
     const token = try unsubscribe.mint(a, secret, account, list, recipient);
-    const query = try std.fmt.allocPrint(a, "t={s}", .{token});
+    const query = try a.print("t={s}", .{token});
     var ctx = http.RequestCtx{ .method = .POST, .path = "/api/mail/unsubscribe", .query = query, .allocator = RequestArena.from(&arena), .app = app };
     return (try unsubscribe_api.post(&ctx)).status;
 }
@@ -112,14 +112,14 @@ fn expectSuppressionRows(pool: *db.Pool, email: []const u8, want: []const []cons
     const w = pool.acquireWriter();
     defer pool.releaseWriter();
     var sql_buf: [256]u8 = undefined;
-    const sql = try std.fmt.bufPrintZ(&sql_buf, "SELECT \"account\",\"reason\",\"source\" FROM \"_suppressions\" WHERE \"email\"='{s}' ORDER BY \"account\";", .{email});
+    const sql = try std.mem.printSentinel(&sql_buf, "SELECT \"account\",\"reason\",\"source\" FROM \"_suppressions\" WHERE \"email\"='{s}' ORDER BY \"account\";", .{email}, 0);
     var st = try w.prepare(sql);
     defer st.finalize();
     var n: usize = 0;
     while (try st.step()) : (n += 1) {
         try testing.expect(n < want.len);
         var row_buf: [128]u8 = undefined;
-        const got = try std.fmt.bufPrint(&row_buf, "{s}|{s}|{s}", .{ st.columnText(0), st.columnText(1), st.columnText(2) });
+        const got = try std.mem.print(&row_buf, "{s}|{s}|{s}", .{ st.columnText(0), st.columnText(1), st.columnText(2) });
         try testing.expectEqualStrings(want[n], got);
     }
     try testing.expectEqual(want.len, n);
@@ -133,7 +133,7 @@ fn expectRecipient(pool: *db.Pool, batch: []const u8, email: []const u8, want: W
     const w = pool.acquireWriter();
     defer pool.releaseWriter();
     var sql_buf: [256]u8 = undefined;
-    const sql = try std.fmt.bufPrintZ(&sql_buf, "SELECT \"status\",\"last_error\",\"attempts\",\"sent_at\" FROM \"_mail_batch_recipients\" WHERE \"batch\"='{s}' AND \"email\"='{s}';", .{ batch, email });
+    const sql = try std.mem.printSentinel(&sql_buf, "SELECT \"status\",\"last_error\",\"attempts\",\"sent_at\" FROM \"_mail_batch_recipients\" WHERE \"batch\"='{s}' AND \"email\"='{s}';", .{ batch, email }, 0);
     var st = try w.prepare(sql);
     defer st.finalize();
     try testing.expect(try st.step());
@@ -147,7 +147,7 @@ fn expectBatchRowStatus(pool: *db.Pool, batch: []const u8, want: []const u8) !vo
     const w = pool.acquireWriter();
     defer pool.releaseWriter();
     var sql_buf: [128]u8 = undefined;
-    const sql = try std.fmt.bufPrintZ(&sql_buf, "SELECT \"status\" FROM \"_mail_batches\" WHERE \"id\"='{s}';", .{batch});
+    const sql = try std.mem.printSentinel(&sql_buf, "SELECT \"status\" FROM \"_mail_batches\" WHERE \"id\"='{s}';", .{batch}, 0);
     var st = try w.prepare(sql);
     defer st.finalize();
     try testing.expect(try st.step());
@@ -328,7 +328,7 @@ test "mail suppression + bulk: SQLite reference run" {
     defer tmp.cleanup();
     const dir = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
     defer testing.allocator.free(dir);
-    const path = try std.fmt.allocPrintSentinel(testing.allocator, "{s}/mail.db", .{dir}, 0);
+    const path = try testing.allocator.printSentinel("{s}/mail.db", .{dir}, 0);
     defer testing.allocator.free(path);
     var pool = try db.Pool.init(testing.allocator, testing.io, path);
     defer pool.deinit();
@@ -344,7 +344,7 @@ test "mail suppression + bulk: SQLite reference run" {
 fn withDatabase(a: std.mem.Allocator, url: []const u8, name: []const u8) ![:0]u8 {
     const q = std.mem.indexOfScalar(u8, url, '?') orelse url.len;
     const slash = std.mem.lastIndexOfScalar(u8, url[0..q], '/') orelse return error.BadTestUrl;
-    return std.fmt.allocPrintSentinel(a, "{s}/{s}{s}", .{ url[0..slash], name, url[q..] }, 0);
+    return a.printSentinel("{s}/{s}{s}", .{ url[0..slash], name, url[q..] }, 0);
 }
 
 /// Whether the connected role may run CREATE DATABASE (a superuser or CREATEDB role).
@@ -363,11 +363,11 @@ test "mail suppression + bulk: PostgreSQL matches SQLite" {
     // A per-run name, so concurrent runs against one server never drop each other's database.
     const suffix = try crypto.genHex(testing.io, testing.allocator, 12);
     defer testing.allocator.free(suffix);
-    const name = try std.fmt.allocPrint(testing.allocator, "zb_pgmail_{s}", .{suffix});
+    const name = try testing.allocator.print("zb_pgmail_{s}", .{suffix});
     defer testing.allocator.free(name);
-    const create = try std.fmt.allocPrintSentinel(testing.allocator, "CREATE DATABASE {s};", .{name}, 0);
+    const create = try testing.allocator.printSentinel("CREATE DATABASE {s};", .{name}, 0);
     defer testing.allocator.free(create);
-    const drop = try std.fmt.allocPrintSentinel(testing.allocator, "DROP DATABASE IF EXISTS {s} WITH (FORCE);", .{name}, 0);
+    const drop = try testing.allocator.printSentinel("DROP DATABASE IF EXISTS {s} WITH (FORCE);", .{name}, 0);
     defer testing.allocator.free(drop);
 
     try admin.exec(create);

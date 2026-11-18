@@ -221,7 +221,7 @@ fn stickyPersist(alloc: std.mem.Allocator, sc: StickyConns, def: ExperimentDef, 
     // CONFLICT DO NOTHING` (Postgres), `strftime` ISO now ⇄ `to_char(now())`, `?N` ⇄ `$n`.
     // `created` is the ISO-8601 `Z` shape (matches the records autodate format) → `nowIso8601Expr`.
     const dialect = db.dbDialect(writer);
-    const ins_tmpl = try std.fmt.allocPrintSentinel(alloc, "{s} INTO \"_experiment_assignments\" (\"experiment\",\"subject\",\"variant\",\"created\") VALUES (?1, ?2, ?3, {s}){s};", .{ dialect.insertVerb(true), dialect.nowIso8601Expr(), dialect.onConflictDoNothing() }, 0);
+    const ins_tmpl = try alloc.printSentinel("{s} INTO \"_experiment_assignments\" (\"experiment\",\"subject\",\"variant\",\"created\") VALUES (?1, ?2, ?3, {s}){s};", .{ dialect.insertVerb(true), dialect.nowIso8601Expr(), dialect.onConflictDoNothing() }, 0);
     defer alloc.free(ins_tmpl);
     const ins_sql = try param_sink.renumberZ(alloc, dialect, ins_tmpl);
     defer if (dialect.kind == .postgres) alloc.free(ins_sql); // SQLite returns the input slice
@@ -287,7 +287,7 @@ fn stickyBatchLookup(alloc: std.mem.Allocator, conn: *db.Db, sticky_defs: []cons
     var pbuf: [16]u8 = undefined;
     for (sticky_defs, 0..) |_, i| {
         if (i > 0) try sb.append(alloc, ',');
-        try sb.appendSlice(alloc, try std.fmt.bufPrint(&pbuf, "?{d}", .{i + 2}));
+        try sb.appendSlice(alloc, try std.mem.print(&pbuf, "?{d}", .{i + 2}));
     }
     try sb.appendSlice(alloc, ");");
     const raw = try sb.toOwnedSliceSentinel(alloc, 0);
@@ -351,8 +351,7 @@ pub fn gcExpiredAssignments(conn: *db.Db, ttl_days: u32) !usize {
     const dialect = db.dbDialect(conn);
     const aged = try dialect.agedBeyondDaysPredicate(a, "\"created\"", ttl_days);
     const rid = dialect.physicalRowId();
-    const sql = try std.fmt.allocPrintSentinel(
-        a,
+    const sql = try a.printSentinel(
         "DELETE FROM \"_experiment_assignments\" WHERE {s} IN (" ++
             "SELECT {s} FROM \"_experiment_assignments\" WHERE {s} LIMIT {d}" ++
             ") RETURNING \"experiment\";",
@@ -384,7 +383,7 @@ pub fn resolveAll(
 ) !Resolved {
     const flags_out = try alloc.alloc(ResolvedFlag, reg.flags.len);
     for (reg.flags, 0..) |def, i| {
-        const key = try std.fmt.allocPrint(alloc, "flag:{s}", .{def.name});
+        const key = try alloc.print("flag:{s}", .{def.name});
         defer alloc.free(key);
         var ov: ?[]const u8 = null;
         for (entries) |e| {
@@ -419,7 +418,7 @@ pub fn resolveAll(
 
     const exps_out = try alloc.alloc(ResolvedExperiment, reg.experiments.len);
     for (reg.experiments, 0..) |def, i| {
-        const key = try std.fmt.allocPrint(alloc, "exp:{s}:weights", .{def.name});
+        const key = try alloc.print("exp:{s}:weights", .{def.name});
         defer alloc.free(key);
         var ov: ?[]const u8 = null;
         for (entries) |e| {
@@ -491,7 +490,7 @@ test "bucket distribution roughly follows weights" {
     var i: usize = 0;
     var buf: [32]u8 = undefined;
     while (i < 2000) : (i += 1) {
-        const subj = std.fmt.bufPrint(&buf, "subject-{d}", .{i}) catch unreachable;
+        const subj = std.mem.print(&buf, "subject-{d}", .{i}) catch unreachable;
         counts[bucket("layout", subj, &weights)] += 1;
     }
     // Variant 0 should dominate (~90%). Loose bounds to avoid flakiness.
@@ -516,7 +515,7 @@ test "weight override changes the split" {
     var i: usize = 0;
     var buf: [32]u8 = undefined;
     while (i < 1000) : (i += 1) {
-        const subj = std.fmt.bufPrint(&buf, "u{d}", .{i}) catch unreachable;
+        const subj = std.mem.print(&buf, "u{d}", .{i}) catch unreachable;
         if (std.mem.eql(u8, try resolveExperiment(a, null, null, def, subj), "control")) control_default += 1;
         if (std.mem.eql(u8, try resolveExperiment(a, null, "[100,0]", def, subj), "control")) control_override += 1;
     }

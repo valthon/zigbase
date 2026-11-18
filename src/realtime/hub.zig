@@ -524,12 +524,12 @@ comptime {
     // Every name above must still be an error those layers can return: a rename there fails the
     // build here instead of silently turning an item failure into a repeating 500.
     const Sources = values.ValueError || values.EncryptError || policy.PolicyError;
-    for (@typeInfo(SnapshotItemError).error_set.?) |e| _ = @errorName(@field(Sources, e.name));
+    for (@typeInfo(SnapshotItemError).error_set.error_names.?) |e| _ = @errorName(@field(Sources, e));
 }
 
 fn isSnapshotItemError(err: anyerror) bool {
-    inline for (@typeInfo(SnapshotItemError).error_set.?) |e| {
-        if (err == @field(SnapshotItemError, e.name)) return true;
+    inline for (@typeInfo(SnapshotItemError).error_set.error_names.?) |e| {
+        if (err == @field(SnapshotItemError, e)) return true;
     }
     return false;
 }
@@ -551,7 +551,7 @@ fn snapshotSandbox(col: schema.Collection, snapshot: std.json.Value) !*SnapshotS
     const snap_json = try std.json.Stringify.valueAlloc(sa, snapshot, .{});
     const table_sql = try sandboxTableSql(sa, col);
     const fields_json = try schema.fieldsToJson(sa, col.fields);
-    const key = try std.fmt.allocPrint(sa, "{s}\x00{s}\x00{s}\x00{s}\x00{s}", .{ col.id, col.name, table_sql, fields_json, snap_json });
+    const key = try sa.print("{s}\x00{s}\x00{s}\x00{s}\x00{s}", .{ col.id, col.name, table_sql, fields_json, snap_json });
 
     if (snapshot_sandbox) |*cached| {
         if (std.mem.eql(u8, cached.key, key)) return cached; // hit: same (collection, snapshot)
@@ -569,7 +569,7 @@ fn snapshotSandbox(col: schema.Collection, snapshot: std.json.Value) !*SnapshotS
     var tmp = try db.Db.openMemory();
     errdefer tmp.close();
     try sandboxRegistry(&tmp);
-    try tmp.exec(try sa.dupeZ(u8, table_sql));
+    try tmp.exec(try sa.dupeSentinel(u8, table_sql, 0));
 
     // Direct INSERT of the snapshot's real id + every column, each converted back to the form the
     // LIVE table stores. (We bypass records.create on purpose: it regenerates the id and re-runs
@@ -594,9 +594,9 @@ fn snapshotSandbox(col: schema.Collection, snapshot: std.json.Value) !*SnapshotS
     for (col.fields, 0..) |f, i| {
         try cols_sql.append(sa, ',');
         try cols_sql.appendSlice(sa, try ddl.quoteIdent(sa, f.name));
-        try ph_sql.appendSlice(sa, try std.fmt.allocPrint(sa, ",?{d}", .{i + 4}));
+        try ph_sql.appendSlice(sa, try sa.print(",?{d}", .{i + 4}));
     }
-    const sql = try std.fmt.allocPrintSentinel(sa, "INSERT INTO {s} ({s}) VALUES ({s});", .{ try ddl.quoteIdent(sa, col.name), cols_sql.items, ph_sql.items }, 0);
+    const sql = try sa.printSentinel("INSERT INTO {s} ({s}) VALUES ({s});", .{ try ddl.quoteIdent(sa, col.name), cols_sql.items, ph_sql.items }, 0);
     var st = try tmp.prepare(sql);
     defer st.finalize();
     try st.bindText(1, snapshot.object.get("id").?.string);
@@ -658,7 +658,7 @@ pub fn buildEventFrames(
 ) !EventFrames {
     const coll_channel = try alloc.dupe(u8, collection);
     errdefer alloc.free(coll_channel);
-    const rec_channel = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ collection, record_id });
+    const rec_channel = try alloc.print("{s}/{s}", .{ collection, record_id });
     errdefer alloc.free(rec_channel);
 
     // The delete-only wrapper map (`delete_body`) is pure scratch: both serializeEvent calls below
@@ -1873,7 +1873,7 @@ const PoolEnv = struct {
         errdefer tmp.cleanup();
         const dir_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", ga);
         defer ga.free(dir_path);
-        const db_path = try std.fmt.allocPrintSentinel(ga, "{s}/test.db", .{dir_path}, 0);
+        const db_path = try ga.printSentinel("{s}/test.db", .{dir_path}, 0);
         errdefer ga.free(db_path);
         var pool = try db.Pool.init(ga, std.testing.io, db_path);
         errdefer pool.deinit();
@@ -1935,7 +1935,7 @@ test "subscribeCheck decision table: limit / __features / unknown / auth_require
     var full = Conn{};
     var i: usize = 0;
     while (i < connection.MAX_SUBS) : (i += 1) {
-        const topic = try std.fmt.allocPrint(a, "t{d}", .{i});
+        const topic = try a.print("t{d}", .{i});
         try full.addSub(a, topic, null);
     }
     try std.testing.expectEqual(SubscribeOutcome.limit, subscribeCheck(&app, &full, RequestArena.from(&arena), "one_more"));
@@ -2123,7 +2123,7 @@ test "frameForDelivery: committed mid-fanout policy and revocation affect later 
     const token = try jwt.sign(a, .{ .id = "u1", .collection = "principals", .type = .auth, .iat = 0, .exp = 9999999999 }, &key);
     defer a.free(token);
     const retained = Conn{ .auth = .{ .record = .null, .is_superuser = false, .exp = 9999999999, .token = token } };
-    const subscribers = [_]Conn{retained} ** 10;
+    const subscribers = @as([10]Conn, @splat(retained));
     const frame = "{\"action\":\"update\",\"record\":{\"id\":\"r1\"}}";
     // Warm col_cache for record/custom topics. The auth collection is re-read
     // directly per callback; mutations below must not reuse cached auth state.

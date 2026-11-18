@@ -44,7 +44,7 @@ fn handle(ctx: *http.RequestCtx, mutate: bool) anyerror!http.Response {
 
     // IP rate limit (shared limiter; honors ZIGBASE_TRUST_PROXY via ctx.remote_ip).
     if (app.rate_limiter) |rl| {
-        const key = try std.fmt.allocPrint(ctx.allocator.a, "mail_unsub:ip:{s}", .{ctx.remote_ip});
+        const key = try ctx.allocator.a.print("mail_unsub:ip:{s}", .{ctx.remote_ip});
         if (!rl.allowCustom(key, clock.nowUnix(app.io), rate_max, rate_window_s)) {
             return ApiError.withCode(429, .too_many_requests, "Too many requests. Try again later.").toResponse(ctx.allocator.a);
         }
@@ -57,7 +57,7 @@ fn handle(ctx: *http.RequestCtx, mutate: bool) anyerror!http.Response {
 
     if (!mutate) return confirmPage(ctx, token);
 
-    const source = try std.fmt.allocPrint(ctx.allocator.a, "one_click:{s}", .{parts.list});
+    const source = try ctx.allocator.a.print("one_click:{s}", .{parts.list});
     {
         const w = app.pool.acquireWriter();
         defer app.pool.releaseWriter();
@@ -111,7 +111,7 @@ const Env = struct {
         errdefer env.tmp.cleanup();
         const dir_path = try env.tmp.dir.realPathFileAlloc(testing.io, ".", ga);
         defer ga.free(dir_path);
-        env.db_path = try std.fmt.allocPrintSentinel(ga, "{s}/unsub.db", .{dir_path}, 0);
+        env.db_path = try ga.printSentinel("{s}/unsub.db", .{dir_path}, 0);
         errdefer ga.free(env.db_path);
         env.pool = try db.Pool.init(ga, testing.io, env.db_path);
         errdefer env.pool.deinit();
@@ -155,7 +155,7 @@ test "POST valid token -> 204, list-suppresses only, correct reason/source" {
     const a = arena.allocator();
 
     const token = try unsubscribe.mint(a, jwt_secret, "acc1", "news", "u@x.io");
-    const query = try std.fmt.allocPrint(a, "t={s}", .{token});
+    const query = try a.print("t={s}", .{token});
     var ctx = http.RequestCtx{ .method = .POST, .path = "/api/mail/unsubscribe", .query = query, .allocator = RequestArena.from(&arena), .app = &env.app };
     const res = try post(&ctx);
     try testing.expectEqual(@as(u16, 204), res.status);
@@ -182,7 +182,7 @@ test "repeat POST -> 204 again, idempotent (exactly one row, non-oracle)" {
     const a = arena.allocator();
 
     const token = try unsubscribe.mint(a, jwt_secret, "acc1", "news", "u@x.io");
-    const query = try std.fmt.allocPrint(a, "t={s}", .{token});
+    const query = try a.print("t={s}", .{token});
 
     var ctx1 = http.RequestCtx{ .method = .POST, .path = "/api/mail/unsubscribe", .query = query, .allocator = RequestArena.from(&arena), .app = &env.app };
     const res1 = try post(&ctx1);
@@ -213,7 +213,7 @@ test "invalid/tampered/absent token -> 400, generic message, no row written" {
     const token = try unsubscribe.mint(a, jwt_secret, "acc1", "news", "u@x.io");
     const bad = try a.dupe(u8, token);
     bad[0] = if (bad[0] == 'A') 'B' else 'A';
-    const query = try std.fmt.allocPrint(a, "t={s}", .{bad});
+    const query = try a.print("t={s}", .{bad});
     var ctx_tampered = http.RequestCtx{ .method = .POST, .path = "/api/mail/unsubscribe", .query = query, .allocator = RequestArena.from(&arena), .app = &env.app };
     const res_tampered = try post(&ctx_tampered);
     try testing.expectEqual(@as(u16, 400), res_tampered.status);
@@ -229,7 +229,7 @@ test "GET never mutates: valid token -> 200 HTML confirmation, suppression count
     const a = arena.allocator();
 
     const token = try unsubscribe.mint(a, jwt_secret, "acc1", "news", "u@x.io");
-    const query = try std.fmt.allocPrint(a, "t={s}", .{token});
+    const query = try a.print("t={s}", .{token});
     var ctx = http.RequestCtx{ .method = .GET, .path = "/api/mail/unsubscribe", .query = query, .allocator = RequestArena.from(&arena), .app = &env.app };
     const res = try get(&ctx);
     try testing.expectEqual(@as(u16, 200), res.status);
@@ -246,7 +246,7 @@ test "feature off -> 404 for both verbs even with a valid token" {
     var app = App{ .allocator = a, .io = testing.io, .pool = undefined, .jwt_secret = jwt_secret, .mail = .{} };
 
     const token = try unsubscribe.mint(a, jwt_secret, "acc1", "news", "u@x.io");
-    const query = try std.fmt.allocPrint(a, "t={s}", .{token});
+    const query = try a.print("t={s}", .{token});
 
     var ctx_post = http.RequestCtx{ .method = .POST, .path = "/api/mail/unsubscribe", .query = query, .allocator = RequestArena.from(&arena), .app = &app };
     try testing.expectEqual(@as(u16, 404), (try post(&ctx_post)).status);

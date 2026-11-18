@@ -97,7 +97,7 @@ const AuditStorage = struct {
 
     pub fn create(gpa: std.mem.Allocator, io: std.Io, cfg: zigbase.Config) !AuditStorage {
         _ = io;
-        const root = try std.fmt.allocPrint(gpa, "{s}/storage", .{cfg.data_dir});
+        const root = try gpa.print("{s}/storage", .{cfg.data_dir});
         var local = zigbase.LocalStorage.init(root);
         const inner = local.storage();
         return .{ .gpa = gpa, .root = root, .local = local, .inner = inner };
@@ -488,7 +488,7 @@ fn auditSweepJob(ctx: *zigbase.Ctx, ev: *zigbase.events.JobEvent) anyerror!void 
     defer ctx.app.pool.releaseWriter();
 
     var buf: [256]u8 = undefined;
-    const insert_sql = std.fmt.bufPrintZ(&buf, insert_fmt, .{published_count}) catch return;
+    const insert_sql = std.mem.printSentinel(&buf, insert_fmt, .{published_count}, 0) catch return;
     w.exec(insert_sql) catch |e| {
         std.log.warn("[audit-sweep] audit insert failed: {s}", .{@errorName(e)});
     };
@@ -553,180 +553,180 @@ fn addAuditNoteIndex(m: *zigbase.Migrator) anyerror!void {
 // schema is reachable as `Backend.collections` -- which the audit-sweep job passes to
 // `zigbase.checkedSql` / `checkSqlOpts` (#281) to comptime-check its raw SQL against the schema.
 const Backend = zigbase.App(.{
-        // 1. Custom storage plugin -- wraps LocalStorage with audit logging.
-        .storage = AuditStorage,
+    // 1. Custom storage plugin -- wraps LocalStorage with audit logging.
+    .storage = AuditStorage,
 
-        // 2. Custom mailer plugin -- logs + counts every outbound email.
-        .mailer = AuditMailer,
+    // 2. Custom mailer plugin -- logs + counts every outbound email.
+    .mailer = AuditMailer,
 
-        // 10. App-level custom auth method registry.
-        //     ApiTokenMethod is enabled on `authors` via the collection's `.auth.methods.custom`.
-        .auth = .{ .methods = .{ApiTokenMethod} },
+    // 10. App-level custom auth method registry.
+    //     ApiTokenMethod is enabled on `authors` via the collection's `.auth.methods.custom`.
+    .auth = .{ .methods = .{ApiTokenMethod} },
 
-        // 3. Comptime schema: FOUR related collections.
-        //    Relation graph:
-        //      posts.author       -> authors     (cascade-delete)
-        //      comments.post      -> posts       (cascade-delete)
-        //      comments.commenter -> commenters
-        .collections = .{
-            .authors = .{
-                // Auth collection: system fields (email, passwordHash, verified, ...) are
-                // injected automatically. contact_email and bio are user-defined fields.
-                // NOTE: "email" is a reserved system field name on auth collections.
-                .type = .auth,
-                .fields = .{
-                    .{ .name = "name", .type = .text, .required = true },
-                    .{ .name = "contact_email", .type = .email },
-                    .{ .name = "bio", .type = .text, .max = 500 },
-                    // At-rest encryption (Theme B1): stored AES-256-GCM-encrypted in
-                    // SQLite, transparent plaintext to handlers/API. Requires the
-                    // ZIGBASE_FIELD_KEY env var (the server refuses to start without it
-                    // when an .encrypted field is declared). Encrypted fields cannot be
-                    // indexed / .unique / filtered / sorted.
-                    .{ .name = "private_notes", .type = .text, .encrypted = true },
-                },
-                // webauthn: passkey login for human authors.
-                // custom:   "api_token" slug enables ApiTokenMethod for programmatic auth.
-                .auth = .{
-                    .methods = .{
-                        .webauthn = .{
-                            .rp_id = "localhost",
-                            .rp_name = "ZigBase Plugins Example",
-                            .origin = "http://localhost:8090",
-                        },
-                        // Typed custom method (issue #119): the struct form declares
-                        // comptime I/O types so `zig build gen-client` emits precise TS
-                        // interfaces (ApiTokenInitiateOutput / ApiTokenCompleteInput /
-                        // ApiTokenCompleteOutput) instead of the untyped Record stub.
-                        .custom = &.{
-                            .{
-                                .slug = "api_token",
-                                .Initiate = .{ .Output = ApiTokenInitiateOutput },
-                                .Complete = .{ .Input = ApiTokenCompleteInput, .Output = ApiTokenCompleteOutput },
-                            },
+    // 3. Comptime schema: FOUR related collections.
+    //    Relation graph:
+    //      posts.author       -> authors     (cascade-delete)
+    //      comments.post      -> posts       (cascade-delete)
+    //      comments.commenter -> commenters
+    .collections = .{
+        .authors = .{
+            // Auth collection: system fields (email, passwordHash, verified, ...) are
+            // injected automatically. contact_email and bio are user-defined fields.
+            // NOTE: "email" is a reserved system field name on auth collections.
+            .type = .auth,
+            .fields = .{
+                .{ .name = "name", .type = .text, .required = true },
+                .{ .name = "contact_email", .type = .email },
+                .{ .name = "bio", .type = .text, .max = 500 },
+                // At-rest encryption (Theme B1): stored AES-256-GCM-encrypted in
+                // SQLite, transparent plaintext to handlers/API. Requires the
+                // ZIGBASE_FIELD_KEY env var (the server refuses to start without it
+                // when an .encrypted field is declared). Encrypted fields cannot be
+                // indexed / .unique / filtered / sorted.
+                .{ .name = "private_notes", .type = .text, .encrypted = true },
+            },
+            // webauthn: passkey login for human authors.
+            // custom:   "api_token" slug enables ApiTokenMethod for programmatic auth.
+            .auth = .{
+                .methods = .{
+                    .webauthn = .{
+                        .rp_id = "localhost",
+                        .rp_name = "ZigBase Plugins Example",
+                        .origin = "http://localhost:8090",
+                    },
+                    // Typed custom method (issue #119): the struct form declares
+                    // comptime I/O types so `zig build gen-client` emits precise TS
+                    // interfaces (ApiTokenInitiateOutput / ApiTokenCompleteInput /
+                    // ApiTokenCompleteOutput) instead of the untyped Record stub.
+                    .custom = &.{
+                        .{
+                            .slug = "api_token",
+                            .Initiate = .{ .Output = ApiTokenInitiateOutput },
+                            .Complete = .{ .Input = ApiTokenCompleteInput, .Output = ApiTokenCompleteOutput },
                         },
                     },
                 },
-                .rules = .{ .list = "@public", .view = "@public" },
-                // Comptime index: NOCASE on contact_email so lookups are case-insensitive.
-                // Contrast: migration 0002 indexes plugin_audit_log.note (a migration-owned table)
-                // because that table is outside the comptime schema. For comptime-managed
-                // collections, .indexes is the right tool -- columns are human-named (field.name).
-                .indexes = .{
-                    .{ .name = "idx_authors_contact_email", .fields = .{"contact_email"}, .collation = .nocase },
-                },
             },
-            .commenters = .{
-                // Lightweight passwordless auth collection for casual readers who want to comment.
-                // magic_link with auto_create = true: account is created on first login
-                // (no separate sign-up step). Set ZIGBASE_PUBLIC_URL for clickable email links;
-                // in local dev the token also appears in the server log.
-                .type = .auth,
-                .fields = .{
-                    .{ .name = "display_name", .type = .text, .max = 80 },
-                },
-                .auth = .{
-                    .methods = .{
-                        // Comptime per-method rate limit: cap magic-link requests at 5 per 60s
-                        // per client key (vs the runtime `ac.rateLimit(...)` the custom api_token
-                        // method calls imperatively). `.rate_limit = .default` uses the global
-                        // ZIGBASE_RATE_LIMIT_* config; `.custom` overrides it for this method only.
-                        .magic_link = .{
-                            .ttl_s = 900,
-                            .auto_create = true,
-                            .rate_limit = .{ .custom = .{ .max = 5, .window_s = 60 } },
-                        },
+            .rules = .{ .list = "@public", .view = "@public" },
+            // Comptime index: NOCASE on contact_email so lookups are case-insensitive.
+            // Contrast: migration 0002 indexes plugin_audit_log.note (a migration-owned table)
+            // because that table is outside the comptime schema. For comptime-managed
+            // collections, .indexes is the right tool -- columns are human-named (field.name).
+            .indexes = .{
+                .{ .name = "idx_authors_contact_email", .fields = .{"contact_email"}, .collation = .nocase },
+            },
+        },
+        .commenters = .{
+            // Lightweight passwordless auth collection for casual readers who want to comment.
+            // magic_link with auto_create = true: account is created on first login
+            // (no separate sign-up step). Set ZIGBASE_PUBLIC_URL for clickable email links;
+            // in local dev the token also appears in the server log.
+            .type = .auth,
+            .fields = .{
+                .{ .name = "display_name", .type = .text, .max = 80 },
+            },
+            .auth = .{
+                .methods = .{
+                    // Comptime per-method rate limit: cap magic-link requests at 5 per 60s
+                    // per client key (vs the runtime `ac.rateLimit(...)` the custom api_token
+                    // method calls imperatively). `.rate_limit = .default` uses the global
+                    // ZIGBASE_RATE_LIMIT_* config; `.custom` overrides it for this method only.
+                    .magic_link = .{
+                        .ttl_s = 900,
+                        .auto_create = true,
+                        .rate_limit = .{ .custom = .{ .max = 5, .window_s = 60 } },
                     },
                 },
-                // Publicly listable (frontend can render display_name on comments);
-                // full record view is gated on authentication.
-                .rules = .{
-                    .list = "@public",
-                    .view = "@request.auth.id != \"\"",
-                },
             },
-            .posts = .{
-                .type = .base,
-                .fields = .{
-                    .{ .name = "title", .type = .text, .required = true, .max = 200 },
-                    .{ .name = "body", .type = .text },
-                    .{ .name = "author", .type = .relation, .target = "authors", .cascadeDelete = true },
-                    .{ .name = "status", .type = .select, .values = .{ "draft", "published" } },
-                },
-                .rules = .{ .list = "status = \"published\"" },
-            },
-            .comments = .{
-                .type = .base,
-                .fields = .{
-                    .{ .name = "body", .type = .text, .required = true, .max = 2000 },
-                    .{ .name = "post", .type = .relation, .target = "posts", .cascadeDelete = true },
-                    // commenter relation replaces the old free-text author_name field.
-                    // The beforeCreateComment hook auto-populates this from the session.
-                    .{ .name = "commenter", .type = .relation, .target = "commenters" },
-                    .{ .name = "approved", .type = .bool },
-                },
-                .rules = .{
-                    .list = "approved = true",
-                    .view = "approved = true",
-                    // Gate: requester must have a valid session (any collection).
-                    .create = "@request.auth.id != \"\"",
-                },
+            // Publicly listable (frontend can render display_name on comments);
+            // full record view is gated on authentication.
+            .rules = .{
+                .list = "@public",
+                .view = "@request.auth.id != \"\"",
             },
         },
-        .enable_typegen = true,
-
-        // 4. Explicit migrations -- escape hatch for non-additive / seeding changes.
-        // SQLite batches hold data.db.migrations.lock across these commits. A
-        // concurrent migration command fails with MigrationBusy; retry afterward.
-        .migrations = &[_]zigbase.Migration{
-            .{ .id = "0001_create_audit_log", .up = createAuditLog },
-            .{ .id = "0002_index_audit_note", .up = addAuditNoteIndex },
+        .posts = .{
+            .type = .base,
+            .fields = .{
+                .{ .name = "title", .type = .text, .required = true, .max = 200 },
+                .{ .name = "body", .type = .text },
+                .{ .name = "author", .type = .relation, .target = "authors", .cascadeDelete = true },
+                .{ .name = "status", .type = .select, .values = .{ "draft", "published" } },
+            },
+            .rules = .{ .list = "status = \"published\"" },
         },
-
-        // 5. onError handler -- logs phase + message for every caught error.
-        .onError = handleError,
-
-        // 9. onAuth hook -- fires after any successful session mint across all collections.
-        .onAuth = handleAuth,
-
-        // Record hooks -- beforeCreate on comments auto-populates the `commenter`
-        // relation from the session identity.
-        .hooks = .{
-            .comments = .{ .beforeCreate = beforeCreateComment },
-        },
-
-        // 6. Cron job -- fires every minute (UTC, 5-field numeric cron).
-        .cron = .{
-            .{
-                .name = "audit-sweep",
-                .distributed = .{ .lease_seconds = 120 }, // one shared schedule across replicas
-                .schedule = zigbase.schedule.Schedule{ .cron = "* * * * *" },
-                .handler = auditSweepJob,
+        .comments = .{
+            .type = .base,
+            .fields = .{
+                .{ .name = "body", .type = .text, .required = true, .max = 2000 },
+                .{ .name = "post", .type = .relation, .target = "posts", .cascadeDelete = true },
+                // commenter relation replaces the old free-text author_name field.
+                // The beforeCreateComment hook auto-populates this from the session.
+                .{ .name = "commenter", .type = .relation, .target = "commenters" },
+                .{ .name = "approved", .type = .bool },
+            },
+            .rules = .{
+                .list = "approved = true",
+                .view = "approved = true",
+                // Gate: requester must have a valid session (any collection).
+                .create = "@request.auth.id != \"\"",
             },
         },
+    },
+    .enable_typegen = true,
 
-        // 7. Pool footprint tuning levers.
-        .resource_profile = .minimal,
-        // Explicit fields override profile defaults; inspect with `resources`.
-        .pools = .{ .readers = 4, .jobs = 1, .memory_jobs = 2, .cache_kib = 512 },
-        .admission = .{ .max_requests = 3 }, // leave one of four HTTP threads available to reject excess work
-        // To share a work-count budget with memory jobs/app.submit, forward
-        // .@"coordinated-admission" = true to the zigbase dependency in build.zig,
-        // then add .max_work = 16 above. This is a work count, not a memory cap.
-        // Optionally add .max_job_bytes = 64 * 1024 for retained payload/name
-        // copies only; it excludes serialization, handler memory and total RSS.
+    // 4. Explicit migrations -- escape hatch for non-additive / seeding changes.
+    // SQLite batches hold data.db.migrations.lock across these commits. A
+    // concurrent migration command fails with MigrationBusy; retry afterward.
+    .migrations = &[_]zigbase.Migration{
+        .{ .id = "0001_create_audit_log", .up = createAuditLog },
+        .{ .id = "0002_index_audit_note", .up = addAuditNoteIndex },
+    },
 
-        // 8. Fully embedded static frontend (see build.zig embedStaticDir).
-        .static_files = .{ .embedded = &@import("static_assets").files },
+    // 5. onError handler -- logs phase + message for every caught error.
+    .onError = handleError,
 
-        // 12. Tier-2 SPA fallback routing (issue #183): any GET/HEAD static MISS below
-        //     /app/ serves the embedded frontend shell. The serve target is validated
-        //     against the embedded manifest AT COMPTIME — misspell it and the build
-        //     fails. Declaring routes also flips the Tier-1 `.spa` marker default OFF
-        //     (set `.enable_spa_marker = true` to combine both).
-        .static_routes = &.{
-            .{ .match = "/app/**", .serve = "/index.html" },
+    // 9. onAuth hook -- fires after any successful session mint across all collections.
+    .onAuth = handleAuth,
+
+    // Record hooks -- beforeCreate on comments auto-populates the `commenter`
+    // relation from the session identity.
+    .hooks = .{
+        .comments = .{ .beforeCreate = beforeCreateComment },
+    },
+
+    // 6. Cron job -- fires every minute (UTC, 5-field numeric cron).
+    .cron = .{
+        .{
+            .name = "audit-sweep",
+            .distributed = .{ .lease_seconds = 120 }, // one shared schedule across replicas
+            .schedule = zigbase.schedule.Schedule{ .cron = "* * * * *" },
+            .handler = auditSweepJob,
         },
+    },
+
+    // 7. Pool footprint tuning levers.
+    .resource_profile = .minimal,
+    // Explicit fields override profile defaults; inspect with `resources`.
+    .pools = .{ .readers = 4, .jobs = 1, .memory_jobs = 2, .cache_kib = 512 },
+    .admission = .{ .max_requests = 3 }, // leave one of four HTTP threads available to reject excess work
+    // To share a work-count budget with memory jobs/app.submit, forward
+    // .@"coordinated-admission" = true to the zigbase dependency in build.zig,
+    // then add .max_work = 16 above. This is a work count, not a memory cap.
+    // Optionally add .max_job_bytes = 64 * 1024 for retained payload/name
+    // copies only; it excludes serialization, handler memory and total RSS.
+
+    // 8. Fully embedded static frontend (see build.zig embedStaticDir).
+    .static_files = .{ .embedded = &@import("static_assets").files },
+
+    // 12. Tier-2 SPA fallback routing (issue #183): any GET/HEAD static MISS below
+    //     /app/ serves the embedded frontend shell. The serve target is validated
+    //     against the embedded manifest AT COMPTIME — misspell it and the build
+    //     fails. Declaring routes also flips the Tier-1 `.spa` marker default OFF
+    //     (set `.enable_spa_marker = true` to combine both).
+    .static_routes = &.{
+        .{ .match = "/app/**", .serve = "/index.html" },
+    },
 });
 
 /// Structured logging: this routes every std.log call through the same JSON-capable

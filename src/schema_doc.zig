@@ -106,7 +106,7 @@ pub fn dump(alloc: std.mem.Allocator, w: *db.Db) DocError![]u8 {
 
     const body = try std.json.Stringify.valueAlloc(sa, std.json.Value{ .object = root }, .{ .whitespace = .indent_2 });
     // A trailing newline so the file is a well-formed text file and `git diff` is clean.
-    return std.fmt.allocPrint(alloc, "{s}\n", .{body});
+    return alloc.print("{s}\n", .{body});
 }
 
 /// Parse a document into collections, in document order. Each element is parsed by

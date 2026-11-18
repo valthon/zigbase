@@ -106,7 +106,7 @@ const TestEnv = struct {
         env.tmp = std.testing.tmpDir(.{});
         const dir = try env.tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
         defer std.testing.allocator.free(dir);
-        const path = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/test.db", .{dir}, 0);
+        const path = try std.testing.allocator.printSentinel("{s}/test.db", .{dir}, 0);
         defer std.testing.allocator.free(path);
         env.pool = try db.Pool.init(std.testing.allocator, std.testing.io, path);
         {

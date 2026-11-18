@@ -119,7 +119,7 @@ pub fn guardPasses(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection, 
     const js = try guardJoinsSql(sa, g.joins);
     const qcol = try ddl.quoteIdent(sa, col.name);
     defer sa.free(qcol); // copied into `sql`; free the temporary (a no-op on the arena, correct off it)
-    const sql = try std.fmt.allocPrintSentinel(sa, "SELECT 1 FROM {s}{s} WHERE {s}.\"id\"=?1 AND ({s});", .{ qcol, js, qcol, g.where_sql }, 0);
+    const sql = try sa.printSentinel("SELECT 1 FROM {s}{s} WHERE {s}.\"id\"=?1 AND ({s});", .{ qcol, js, qcol, g.where_sql }, 0);
     var st = try prep(sa, w, sql);
     defer st.finalize();
     try st.bindText(1, rid);
@@ -364,7 +364,7 @@ fn readAtRest(alloc: std.mem.Allocator, r: *db.Db, col: schema.Collection, id: [
     // `_`-prefixed collections a migration-only, engine-owned set.
     const tbl = try ddl.quoteIdent(alloc, col.name);
     defer alloc.free(tbl);
-    const sql = try std.fmt.allocPrintSentinel(alloc, "SELECT {s} FROM {s} WHERE \"id\" = ?1;", .{ cols, tbl }, 0);
+    const sql = try alloc.printSentinel("SELECT {s} FROM {s} WHERE \"id\" = ?1;", .{ cols, tbl }, 0);
     defer alloc.free(sql);
     var st = try prep(alloc, r, sql);
     defer st.finalize();
@@ -412,9 +412,9 @@ pub fn get(alloc: std.mem.Allocator, r: *db.Db, col: schema.Collection, id: []co
             defer alloc.free(qtf);
             const ttl_pred = try dialect.ttlVisiblePredicate(alloc, qtf);
             defer alloc.free(ttl_pred);
-            break :blk try std.fmt.allocPrintSentinel(alloc, "SELECT {s} FROM {s} WHERE \"id\" = ?1 AND ({s});", .{ cols, tbl, ttl_pred }, 0);
+            break :blk try alloc.printSentinel("SELECT {s} FROM {s} WHERE \"id\" = ?1 AND ({s});", .{ cols, tbl, ttl_pred }, 0);
         }
-        break :blk try std.fmt.allocPrintSentinel(alloc, "SELECT {s} FROM {s} WHERE \"id\" = ?1;", .{ cols, tbl }, 0);
+        break :blk try alloc.printSentinel("SELECT {s} FROM {s} WHERE \"id\" = ?1;", .{ cols, tbl }, 0);
     };
     defer alloc.free(sql);
     var st = try prep(alloc, r, sql);
@@ -498,7 +498,7 @@ fn storedRelationIds(alloc: std.mem.Allocator, conn: *db.Db, row: RelationCheck.
     var result: StoredRelationIds = .{ .arena = std.heap.ArenaAllocator.init(alloc) };
     errdefer result.deinit();
     const sa = result.arena.allocator();
-    const sql = try std.fmt.allocPrintSentinel(sa, "SELECT {s} FROM {s} WHERE \"id\" = ?1;", .{ try ddl.quoteIdent(sa, f.name), try ddl.quoteIdent(sa, row.table) }, 0);
+    const sql = try sa.printSentinel("SELECT {s} FROM {s} WHERE \"id\" = ?1;", .{ try ddl.quoteIdent(sa, f.name), try ddl.quoteIdent(sa, row.table) }, 0);
     var st = try prep(sa, conn, sql);
     defer st.finalize();
     try st.bindText(1, row.id);
@@ -673,9 +673,9 @@ fn validateFieldValue(alloc: std.mem.Allocator, conn: *db.Db, f: schema.Field, v
             defer if (stored) |*owned| owned.deinit();
             const kept: []const []const u8 = if (stored) |owned| owned.ids else &.{};
             const q = if (tscope) |sp|
-                try std.fmt.allocPrintSentinel(sa, "SELECT 1 FROM {s} WHERE {s}.\"id\" = ? AND {s} AND ? <> '';", .{ qtarget, qtarget, sp.sql }, 0)
+                try sa.printSentinel("SELECT 1 FROM {s} WHERE {s}.\"id\" = ? AND {s} AND ? <> '';", .{ qtarget, qtarget, sp.sql }, 0)
             else
-                try std.fmt.allocPrintSentinel(sa, "SELECT 1 FROM {s} WHERE \"id\" = ?1;", .{qtarget}, 0);
+                try sa.printSentinel("SELECT 1 FROM {s} WHERE \"id\" = ?1;", .{qtarget}, 0);
             for (items) |it| if (it == .string) {
                 if (tscope != null and containsId(kept, it.string)) continue; // already stored: kept as is
                 var st = try prep(sa, conn, q);
@@ -1028,7 +1028,7 @@ pub fn createInTxnOpts(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, col: sch
     var cols: std.ArrayList(u8) = .empty;
     var vals: std.ArrayList(u8) = .empty;
     try cols.appendSlice(sa, "\"id\",\"created\",\"updated\"");
-    try vals.appendSlice(sa, try std.fmt.allocPrint(sa, "?1,{s},{s}", .{ now_iso, now_iso }));
+    try vals.appendSlice(sa, try sa.print("?1,{s},{s}", .{ now_iso, now_iso }));
 
     var binds: std.ArrayList(BindItem) = .empty;
     var next: usize = 2;
@@ -1052,7 +1052,7 @@ pub fn createInTxnOpts(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, col: sch
             try cols.append(sa, ',');
             try cols.appendSlice(sa, try ddl.quoteIdent(sa, f.name));
             try vals.append(sa, ',');
-            try vals.appendSlice(sa, try std.fmt.allocPrint(sa, "?{d}", .{next}));
+            try vals.appendSlice(sa, try sa.print("?{d}", .{next}));
             try binds.append(sa, .{ .idx = @intCast(next), .field = f, .value = pv });
             next += 1;
         }
@@ -1079,7 +1079,7 @@ pub fn createInTxnOpts(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, col: sch
 
     const qcol = try ddl.quoteIdent(sa, col.name);
     defer sa.free(qcol);
-    const sql = try std.fmt.allocPrintSentinel(sa, "INSERT INTO {s} ({s}) VALUES ({s}) RETURNING {s};", .{ qcol, cols.items, vals.items, rcols }, 0);
+    const sql = try sa.printSentinel("INSERT INTO {s} ({s}) VALUES ({s}) RETURNING {s};", .{ qcol, cols.items, vals.items, rcols }, 0);
     var st = try prep(sa, w, sql);
     defer st.finalize();
     try st.bindText(1, id_slice);
@@ -1310,7 +1310,7 @@ fn assembleListResult(d: *db.Db, a: std.mem.Allocator, col: schema.Collection) !
     defer a.free(cols);
     const qcol = try ddl.quoteIdent(a, col.name);
     defer a.free(qcol);
-    const sql = try std.fmt.allocPrintSentinel(a, "SELECT {s} FROM {s} ORDER BY \"id\";", .{ cols, qcol }, 0);
+    const sql = try a.printSentinel("SELECT {s} FROM {s} ORDER BY \"id\";", .{ cols, qcol }, 0);
     defer a.free(sql);
     var st = try prep(a, d, sql);
     defer st.finalize();
@@ -1326,7 +1326,7 @@ fn assembleListResult(d: *db.Db, a: std.mem.Allocator, col: schema.Collection) !
 test "ListResult.deinit: interned keyset + item values free exactly once (zero leaks)" {
     // (b) RAW std.testing.allocator, no arena to mask a leak. `res.deinit(a)` must free the ONE
     // interned keyset exactly once (not per row) and each item's owned scalar values + ObjectMap —
-    // a per-item key free would DOUBLE-FREE the shared keyset and the DebugAllocator would panic.
+    // a per-item key free would DOUBLE-FREE the shared keyset and the SafeAllocator would panic.
     const a = std.testing.allocator;
     var d = try db.Db.openMemory();
     defer d.close();
@@ -1842,7 +1842,12 @@ test "stored multi relation propagates allocation failures and tolerates malform
     defer d.close();
     const fx = try RelTenantFixture.init(a, &d);
     defer fx.deinit(a);
-    try d.exec("INSERT INTO tasks (id,created,updated,notes) VALUES ('legacy','t','t','[\"theirs\"" ++ ",\"mine\"" ** 512 ++ "]');");
+    const notes = try a.alloc(u8, 7 * 512);
+    defer a.free(notes);
+    for (0..512) |i| @memcpy(notes[i * 7 ..][0..7], ",\"mine\"");
+    const sql = try a.printSentinel("INSERT INTO tasks (id,created,updated,notes) VALUES ('legacy','t','t','[\"theirs\"{s}]');", .{notes}, 0);
+    defer a.free(sql);
+    try d.exec(sql);
     const field = fx.tasks.fields[1];
     try std.testing.checkAllAllocationFailures(a, checkStoredRelationAllocations, .{ &d, field });
 
@@ -2160,20 +2165,20 @@ pub fn updateInTxnOpts(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collecti
     const now_iso = dialect.nowIso8601Expr();
 
     var sets: std.ArrayList(u8) = .empty;
-    try sets.appendSlice(sa, try std.fmt.allocPrint(sa, "\"updated\"={s}", .{now_iso}));
+    try sets.appendSlice(sa, try sa.print("\"updated\"={s}", .{now_iso}));
     var binds: std.ArrayList(BindItem) = .empty;
     var next: usize = 2; // ?1 is the id in WHERE
 
     for (col.fields) |f| {
         if (f.fieldType() == .autodate) {
             if (f.options.autodate.onUpdate) {
-                try sets.appendSlice(sa, try std.fmt.allocPrint(sa, ",{s}={s}", .{ try ddl.quoteIdent(sa, f.name), now_iso }));
+                try sets.appendSlice(sa, try sa.print(",{s}={s}", .{ try ddl.quoteIdent(sa, f.name), now_iso }));
             }
             continue;
         }
         const provided = data.object.get(f.name) orelse continue; // partial: only provided fields
         try validateFieldValue(alloc, w, f, provided, .{ .scope = opts.relation_scope, .row = if (opts.allow_stored_relations) .{ .table = col.name, .id = id } else null }, &errs);
-        try sets.appendSlice(sa, try std.fmt.allocPrint(sa, ",{s}=?{d}", .{ try ddl.quoteIdent(sa, f.name), next }));
+        try sets.appendSlice(sa, try sa.print(",{s}=?{d}", .{ try ddl.quoteIdent(sa, f.name), next }));
         try binds.append(sa, .{ .idx = @intCast(next), .field = f, .value = provided });
         next += 1;
     }
@@ -2186,7 +2191,7 @@ pub fn updateInTxnOpts(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collecti
 
     const qcol = try ddl.quoteIdent(sa, col.name);
     defer sa.free(qcol);
-    const sql = try std.fmt.allocPrintSentinel(sa, "UPDATE {s} SET {s} WHERE \"id\"=?1 RETURNING {s};", .{ qcol, sets.items, rcols }, 0);
+    const sql = try sa.printSentinel("UPDATE {s} SET {s} WHERE \"id\"=?1 RETURNING {s};", .{ qcol, sets.items, rcols }, 0);
     var st = try prep(sa, w, sql);
     defer st.finalize();
     try st.bindText(1, id);
@@ -2212,7 +2217,7 @@ pub fn delete(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection, id: [
 pub fn deleteInTxn(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection, id: []const u8) RecordError!bool {
     const qcol = try ddl.quoteIdent(alloc, col.name);
     defer alloc.free(qcol);
-    const sql = try std.fmt.allocPrintSentinel(alloc, "DELETE FROM {s} WHERE \"id\"=?1 RETURNING \"id\";", .{qcol}, 0);
+    const sql = try alloc.printSentinel("DELETE FROM {s} WHERE \"id\"=?1 RETURNING \"id\";", .{qcol}, 0);
     defer alloc.free(sql);
     var st = try prep(alloc, w, sql);
     defer st.finalize();
@@ -2422,7 +2427,7 @@ const CascadePlanner = struct {
     /// key-share lock on the row it references, so it waits for this transaction (and then
     /// fails its FK check) instead of slipping in between discovery and the delete.
     fn lockRoot(self: *CascadePlanner, root: schema.Collection, id: []const u8) !void {
-        const sql = try std.fmt.allocPrintSentinel(self.a, "SELECT \"id\" FROM {s} WHERE \"id\"=?1 FOR UPDATE;", .{try ddl.quoteIdent(self.a, root.name)}, 0);
+        const sql = try self.a.printSentinel("SELECT \"id\" FROM {s} WHERE \"id\"=?1 FOR UPDATE;", .{try ddl.quoteIdent(self.a, root.name)}, 0);
         var st = try prep(self.a, self.w, sql);
         defer st.finalize();
         try st.bindText(1, id);
@@ -2513,7 +2518,7 @@ const CascadePlanner = struct {
     fn visibleColumn(self: *CascadePlanner, col: schema.Collection) ![]const u8 {
         const tf = col.options.ttl_field orelse return "1";
         const pred = try db.dbDialect(self.w).ttlVisiblePredicate(self.a, try ddl.quoteIdent(self.a, tf));
-        return std.fmt.allocPrint(self.a, "CASE WHEN ({s}) THEN 1 ELSE 0 END", .{pred});
+        return self.a.print("CASE WHEN ({s}) THEN 1 ELSE 0 END", .{pred});
     }
 
     /// ID-only discovery, bounded before PostgreSQL buffers the result. Each page is
@@ -2781,7 +2786,7 @@ fn cascadeScenarioWide(d: *db.Db) !void {
     defer fx.deinit(a);
     const n = cascade_chunk + 44;
     try d.exec("INSERT INTO notes (id,created,updated) VALUES ('N','t','t');");
-    const seed = try std.fmt.allocPrintSentinel(a,
+    const seed = try a.printSentinel(
         \\WITH RECURSIVE k(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM k WHERE i<{d})
         \\INSERT INTO items (id,created,updated,note) SELECT 'i'||i,'t','t','N' FROM k;
         \\WITH RECURSIVE k(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM k WHERE i<{d})
@@ -3019,9 +3024,9 @@ test "#489 PostgreSQL: cascade and SET NULL reporting matches SQLite" {
         defer conn.close();
         const token = try @import("crypto.zig").genHex(std.testing.io, a, 12);
         defer a.free(token);
-        const enter = try std.fmt.allocPrintSentinel(a, "CREATE SCHEMA cascade_{s}; SET search_path TO cascade_{s};", .{ token, token }, 0);
+        const enter = try a.printSentinel("CREATE SCHEMA cascade_{s}; SET search_path TO cascade_{s};", .{ token, token }, 0);
         defer a.free(enter);
-        const drop = try std.fmt.allocPrintSentinel(a, "DROP SCHEMA cascade_{s} CASCADE;", .{token}, 0);
+        const drop = try a.printSentinel("DROP SCHEMA cascade_{s} CASCADE;", .{token}, 0);
         defer a.free(drop);
         try conn.exec(enter);
         defer conn.exec(drop) catch |err| std.log.err("cascade test schema cleanup failed: {s}", .{@errorName(err)});
@@ -3159,7 +3164,7 @@ test "#489 a delete affecting more rows than the cap reports overflow and every 
     const fx = try CascadeFixture.init(&d, a);
     defer fx.deinit(a);
     try d.exec("INSERT INTO notes (id,created,updated) VALUES ('N','t','t');");
-    const seed = try std.fmt.allocPrintSentinel(a,
+    const seed = try a.printSentinel(
         \\WITH RECURSIVE k(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM k WHERE i<{d})
         \\INSERT INTO items (id,created,updated,note) SELECT 'i'||i,'t','t','N' FROM k;
     , .{cascade_announce_cap + 1}, 0);
@@ -3185,7 +3190,7 @@ test "#489 a delete affecting more rows than the cap reports overflow and every 
 
     // At exactly the cap every row is still announced.
     try d.exec("INSERT INTO notes (id,created,updated) VALUES ('M','t','t');");
-    const at_cap = try std.fmt.allocPrintSentinel(a,
+    const at_cap = try a.printSentinel(
         \\WITH RECURSIVE k(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM k WHERE i<{d})
         \\INSERT INTO items (id,created,updated,note) SELECT 'm'||i,'t','t','M' FROM k;
     , .{cascade_announce_cap}, 0);
@@ -3489,7 +3494,7 @@ fn qualifiedCol(alloc: std.mem.Allocator, collection: []const u8, column: []cons
     defer alloc.free(qc);
     const qf = try ddl.quoteIdent(alloc, column);
     defer alloc.free(qf);
-    return std.fmt.allocPrint(alloc, "{s}.{s}", .{ qc, qf });
+    return alloc.print("{s}.{s}", .{ qc, qf });
 }
 
 fn baseColumnList(alloc: std.mem.Allocator, col: schema.Collection) ![]u8 {
@@ -3497,9 +3502,9 @@ fn baseColumnList(alloc: std.mem.Allocator, col: schema.Collection) ![]u8 {
     errdefer out.deinit(alloc);
     const qcol = try ddl.quoteIdent(alloc, col.name);
     defer alloc.free(qcol); // copied into `out` below; free the temporary
-    try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, "{s}.\"id\",{s}.\"created\",{s}.\"updated\"", .{ qcol, qcol, qcol }));
+    try out.appendSlice(alloc, try alloc.print("{s}.\"id\",{s}.\"created\",{s}.\"updated\"", .{ qcol, qcol, qcol }));
     for (col.fields) |f| {
-        try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, ",{s}.{s}", .{ qcol, try ddl.quoteIdent(alloc, f.name) }));
+        try out.appendSlice(alloc, try alloc.print(",{s}.{s}", .{ qcol, try ddl.quoteIdent(alloc, f.name) }));
     }
     return out.toOwnedSlice(alloc);
 }
@@ -3594,7 +3599,7 @@ fn storeStatefulCursor(alloc: std.mem.Allocator, q: ListQuery, conn: *db.Db, col
     id_gen.generate(io, &id_buf);
     const id: []const u8 = try alloc.dupe(u8, &id_buf);
     const now = try nowUnixDb(conn);
-    const insert_sql = try std.fmt.allocPrintSentinel(alloc, "INSERT INTO \"_cursorStates\" (\"id\",\"collectionRef\",\"payload\",\"expires\",\"created\") VALUES (?1,?2,?3,?4,{s});", .{db.dbDialect(w).nowExpr()}, 0);
+    const insert_sql = try alloc.printSentinel("INSERT INTO \"_cursorStates\" (\"id\",\"collectionRef\",\"payload\",\"expires\",\"created\") VALUES (?1,?2,?3,?4,{s});", .{db.dbDialect(w).nowExpr()}, 0);
     var st = try prep(alloc, w, insert_sql);
     defer st.finalize();
     try st.bindText(1, id);
@@ -4179,7 +4184,7 @@ pub fn gcExpiredRecords(alloc: std.mem.Allocator, w: *db.Db) !usize {
         const tf = col.options.ttl_field orelse continue;
         const qtf = try ddl.quoteIdent(a, tf);
         const expired = try db.dbDialect(w).ttlExpiredDeletePredicate(a, qtf);
-        const sql = try std.fmt.allocPrintSentinel(a, "DELETE FROM {s} WHERE {s};", .{ try ddl.quoteIdent(a, col.name), expired }, 0);
+        const sql = try a.printSentinel("DELETE FROM {s} WHERE {s};", .{ try ddl.quoteIdent(a, col.name), expired }, 0);
         // Resilient per-collection: a single drifted collection (e.g. the table was
         // dropped but its `_collections` metadata remains) must not abort the whole
         // sweep and silence GC for every later collection. Log and skip to the next.
@@ -4367,7 +4372,7 @@ pub fn list(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, q: L
         const v = try vector.build(sa, dialect, col, vspec);
         if (q.cursor != null or q.cursorMode) return error.VectorCursorUnsupported;
         where_sql = if (where_sql.len > 0)
-            try std.fmt.allocPrint(sa, "({s}) AND ({s})", .{ where_sql, v.where_sql })
+            try sa.print("({s}) AND ({s})", .{ where_sql, v.where_sql })
         else
             v.where_sql;
         vector_order = v.order_sql;
@@ -4389,7 +4394,7 @@ pub fn list(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, q: L
         // APPEND params — never assign, which would clobber the search predicate AND drop its bound
         // term, so `?search=X&filter=Y` would silently ignore the search. Mirrors the rule block.
         where_sql = if (where_sql.len > 0)
-            try std.fmt.allocPrint(sa, "({s}) AND ({s})", .{ where_sql, compiled.where_sql })
+            try sa.print("({s}) AND ({s})", .{ where_sql, compiled.where_sql })
         else
             compiled.where_sql;
         var merged: std.ArrayList(compiler.Param) = .empty;
@@ -4411,7 +4416,7 @@ pub fn list(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, q: L
         const rast = try parser.parse(sa, rtoks);
         const rc = try compiler.compile(sa, &j, rast, q.rctx, dialect, &.{});
         if (where_sql.len > 0) {
-            where_sql = try std.fmt.allocPrint(sa, "({s}) AND ({s})", .{ where_sql, rc.where_sql });
+            where_sql = try sa.print("({s}) AND ({s})", .{ where_sql, rc.where_sql });
         } else {
             where_sql = rc.where_sql;
         }
@@ -4432,7 +4437,7 @@ pub fn list(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, q: L
         const view_ability = if (col.options.abilities) |ab| ab.view else null;
         if (try abilities.abilityPredicate(sa, col, view_ability, rctx, dialect)) |ap| {
             where_sql = if (where_sql.len > 0)
-                try std.fmt.allocPrint(sa, "({s}) AND ({s})", .{ where_sql, ap.sql })
+                try sa.print("({s}) AND ({s})", .{ where_sql, ap.sql })
             else
                 ap.sql;
             var merged: std.ArrayList(compiler.Param) = .empty;
@@ -4455,10 +4460,10 @@ pub fn list(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, q: L
     // They were charset-gated on `schema.isValidIdentifier` instead, which silently DROPPED the
     // predicate for a `_`-prefixed (system) collection — making `list` serve rows `get` hides.
     if (col.options.ttl_field) |tf| {
-        const qtf = try std.fmt.allocPrint(sa, "{s}.{s}", .{ try ddl.quoteIdent(sa, col.name), try ddl.quoteIdent(sa, tf) });
+        const qtf = try sa.print("{s}.{s}", .{ try ddl.quoteIdent(sa, col.name), try ddl.quoteIdent(sa, tf) });
         const ttl_pred = try dialect.ttlVisiblePredicate(sa, qtf);
         where_sql = if (where_sql.len > 0)
-            try std.fmt.allocPrint(sa, "({s}) AND ({s})", .{ where_sql, ttl_pred })
+            try sa.print("({s}) AND ({s})", .{ where_sql, ttl_pred })
         else
             ttl_pred;
     }
@@ -4470,7 +4475,7 @@ pub fn list(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, q: L
     // (no tenancy / not tenant-owned / superuser) is a no-op → byte-identical to the prior SQL.
     if (q.rctx) |rctx| if (try tenancy.scopePredicate(sa, col, rctx)) |sp| {
         where_sql = if (where_sql.len > 0)
-            try std.fmt.allocPrint(sa, "({s}) AND ({s})", .{ where_sql, sp.sql })
+            try sa.print("({s}) AND ({s})", .{ where_sql, sp.sql })
         else
             sp.sql;
         var merged: std.ArrayList(compiler.Param) = .empty;
@@ -4489,7 +4494,7 @@ pub fn list(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, q: L
     else blk: {
         const qcol = try ddl.quoteIdent(sa, col.name);
         defer sa.free(qcol);
-        break :blk try std.fmt.allocPrint(sa, "{s}.\"created\" DESC{s}", .{ qcol, dialect.nullsOrder(.desc) });
+        break :blk try sa.print("{s}.\"created\" DESC{s}", .{ qcol, dialect.nullsOrder(.desc) });
     };
     // Search/vector relevance leads the OFFSET ordering: the row-local text score (FTS) and/or
     // nearest-neighbor distance (vector), with any client sort kept as the tiebreaker. Cursor mode
@@ -4500,12 +4505,12 @@ pub fn list(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, q: L
     if (search_order) |so| {
         const qcol = try ddl.quoteIdent(sa, col.name);
         offset_order_sql = if (base_terms.len > 0)
-            try std.fmt.allocPrint(sa, "{s}, {s}, {s}.\"id\" ASC", .{ so, offset_order_sql, qcol })
+            try sa.print("{s}, {s}, {s}.\"id\" ASC", .{ so, offset_order_sql, qcol })
         else
-            try std.fmt.allocPrint(sa, "{s}, {s}.\"id\" ASC", .{ so, qcol });
+            try sa.print("{s}, {s}.\"id\" ASC", .{ so, qcol });
     }
     if (vector_order) |vo|
-        offset_order_sql = if (base_terms.len > 0 or search_order != null) try std.fmt.allocPrint(sa, "{s}, {s}", .{ vo, offset_order_sql }) else vo;
+        offset_order_sql = if (base_terms.len > 0 or search_order != null) try sa.print("{s}, {s}", .{ vo, offset_order_sql }) else vo;
     const eff_terms = try effectiveSortTerms(sa, col, base_terms);
     const order_sql = try sort.orderByFromTerms(sa, eff_terms, dialect);
 
@@ -4514,7 +4519,7 @@ pub fn list(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, q: L
         try joins_sql.append(sa, ' ');
         try joins_sql.appendSlice(sa, jn);
     }
-    const where_clause = if (where_sql.len > 0) try std.fmt.allocPrint(sa, " WHERE {s}", .{where_sql}) else "";
+    const where_clause = if (where_sql.len > 0) try sa.print(" WHERE {s}", .{where_sql}) else "";
     const bcols = try baseColumnList(sa, col);
     const per: u32 = blk: {
         const requested = if ((q.cursor != null or q.cursorMode) and q.limit != null) q.limit.? else q.perPage;
@@ -4570,9 +4575,9 @@ pub fn list(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, q: L
             const ks = try keyset.build(sa, eff_terms, cur.keys, forward, dialect);
             ks_params = ks.params;
             win_where = if (where_sql.len > 0)
-                try std.fmt.allocPrint(sa, " WHERE ({s}) AND {s}", .{ where_sql, ks.where_sql })
+                try sa.print(" WHERE ({s}) AND {s}", .{ where_sql, ks.where_sql })
             else
-                try std.fmt.allocPrint(sa, " WHERE {s}", .{ks.where_sql});
+                try sa.print(" WHERE {s}", .{ks.where_sql});
         }
 
         // Backward travel: reverse the ORDER BY so the DB returns the rows CLOSEST to the boundary
@@ -4581,7 +4586,7 @@ pub fn list(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, q: L
 
         const qcol = try ddl.quoteIdent(sa, col.name);
         defer sa.free(qcol);
-        const page_sql = try std.fmt.allocPrintSentinel(sa, "SELECT {s} FROM {s}{s}{s} ORDER BY {s} LIMIT ?;", .{ bcols, qcol, joins_sql.items, win_where, fetch_order }, 0);
+        const page_sql = try sa.printSentinel("SELECT {s} FROM {s}{s}{s} ORDER BY {s} LIMIT ?;", .{ bcols, qcol, joins_sql.items, win_where, fetch_order }, 0);
         var pst = try prep(sa, conn, page_sql);
         defer pst.finalize();
         var idx = try bindParams(&pst, params, 1);
@@ -4676,7 +4681,7 @@ pub fn list(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, q: L
     const offset: i64 = @as(i64, (page - 1)) * @as(i64, per);
     const qcol_page = try ddl.quoteIdent(sa, col.name);
     defer sa.free(qcol_page);
-    const page_sql = try std.fmt.allocPrintSentinel(sa, "SELECT {s} FROM {s}{s}{s} ORDER BY {s} LIMIT ? OFFSET ?;", .{ bcols, qcol_page, joins_sql.items, where_clause, offset_order_sql }, 0);
+    const page_sql = try sa.printSentinel("SELECT {s} FROM {s}{s}{s} ORDER BY {s} LIMIT ? OFFSET ?;", .{ bcols, qcol_page, joins_sql.items, where_clause, offset_order_sql }, 0);
     var pst = try prep(sa, conn, page_sql);
     defer pst.finalize();
     var after = try bindParams(&pst, params, 1);
@@ -4717,7 +4722,7 @@ pub fn list(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, q: L
 fn countTotal(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, joins: []const u8, where_clause: []const u8, params: []const compiler.Param) !i64 {
     const qcol_count = try ddl.quoteIdent(alloc, col.name);
     defer alloc.free(qcol_count);
-    const count_sql = try std.fmt.allocPrintSentinel(alloc, "SELECT COUNT(*) FROM {s}{s}{s};", .{ qcol_count, joins, where_clause }, 0);
+    const count_sql = try alloc.printSentinel("SELECT COUNT(*) FROM {s}{s}{s};", .{ qcol_count, joins, where_clause }, 0);
     var cst = try prep(alloc, conn, count_sql);
     defer cst.finalize();
     _ = try bindParams(&cst, params, 1);
@@ -4795,7 +4800,7 @@ test "list applies a rule clause AND-ed with the filter" {
 fn seedSeq(d: *db.Db, n: usize) !void {
     var i: usize = 1;
     while (i <= n) : (i += 1) {
-        const sql = try std.fmt.allocPrintSentinel(std.testing.allocator, "INSERT INTO posts (id,created,updated,title,price) VALUES ('r{d:0>3}','2026-01-{d:0>2}T00:00:00Z','t','t{d}',{d});", .{ i, i, i, i * 10 }, 0);
+        const sql = try std.testing.allocator.printSentinel("INSERT INTO posts (id,created,updated,title,price) VALUES ('r{d:0>3}','2026-01-{d:0>2}T00:00:00Z','t','t{d}',{d});", .{ i, i, i, i * 10 }, 0);
         defer std.testing.allocator.free(sql);
         try d.exec(sql);
     }
@@ -4845,7 +4850,7 @@ test "cursor: forward walk to exhaustion has no dup/skip and ends hasNext=false"
     // Strictly increasing, no dup/skip.
     for (seen.items, 0..) |id, i| {
         var buf: [8]u8 = undefined;
-        const want = try std.fmt.bufPrint(&buf, "r{d:0>3}", .{i + 1});
+        const want = try std.mem.print(&buf, "r{d:0>3}", .{i + 1});
         try std.testing.expectEqualStrings(want, id);
     }
 }

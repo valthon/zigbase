@@ -14,7 +14,7 @@ work; do not report only the fastest job or exclude slow required checks.
 | `cli-tests` | Lifecycle/doctor, tooling (including performance-parser tests), SMTP TLS |
 | `feature-tests` matrix | Workbench; ImageMagick/Golfsim; RAM uploads; durable uploads; realtime backfill/migration coordination/idempotency/memory jobs |
 | `contracts` | Compile-fail contracts, symbol gating, example in-process tests, allocator/ledger/changelog checks |
-| `performance` | Realtime ReleaseSafe correctness plus ReleaseSmall size and allocation contracts |
+| `performance` | Realtime safe correctness plus small size and allocation contracts |
 | `codegen` | All checked-in client snapshots, including language-specific formatting |
 | Existing standalone lanes | Default/prod/dev-tools-off units and fuzz compilation, PostgreSQL, PostgreSQL TLS, S3, public site |
 | Existing downstream lanes | TypeScript, Dart, Python, Kotlin SDKs and migration-agent evaluations |

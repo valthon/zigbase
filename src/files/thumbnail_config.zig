@@ -22,32 +22,32 @@ pub const Config = struct {
 pub fn lower(comptime cfg: anytype) Config {
     if (@typeInfo(@TypeOf(cfg)) != .@"struct") @compileError(".files.thumbnails must be a struct");
     var out = Config{};
-    for (std.meta.fields(@TypeOf(cfg))) |f| {
-        if (!@hasField(Config, f.name)) @compileError("Unknown .files.thumbnails key: " ++ f.name);
-        if (std.mem.eql(u8, f.name, "imagemagick")) {
+    for (@typeInfo(@TypeOf(cfg)).@"struct".field_names) |f| {
+        if (!@hasField(Config, f)) @compileError("Unknown .files.thumbnails key: " ++ f);
+        if (std.mem.eql(u8, f, "imagemagick")) {
             const image = cfg.imagemagick;
             if (@typeInfo(@TypeOf(image)) != .@"struct") @compileError(".files.thumbnails.imagemagick must be a struct");
-            for (std.meta.fields(@TypeOf(image))) |field| {
-                if (!@hasField(backend.Config, field.name)) @compileError("Unknown thumbnail ImageMagick key: " ++ field.name);
-                @field(out.imagemagick, field.name) = @field(image, field.name);
+            for (@typeInfo(@TypeOf(image)).@"struct".field_names) |field| {
+                if (!@hasField(backend.Config, field)) @compileError("Unknown thumbnail ImageMagick key: " ++ field);
+                @field(out.imagemagick, field) = @field(image, field);
             }
-        } else if (!std.mem.eql(u8, f.name, "profiles")) @field(out, f.name) = @field(cfg, f.name);
+        } else if (!std.mem.eql(u8, f, "profiles")) @field(out, f) = @field(cfg, f);
     }
     if (!@hasField(@TypeOf(cfg), "profiles")) @compileError(".files.thumbnails requires named .profiles");
     if (@typeInfo(@TypeOf(cfg.profiles)) != .@"struct") @compileError(".files.thumbnails.profiles must be a named struct");
-    const fields = std.meta.fields(@TypeOf(cfg.profiles));
+    const fields = @typeInfo(@TypeOf(cfg.profiles)).@"struct".field_names;
     if (fields.len == 0 or fields.len > 32) @compileError(".files.thumbnails requires 1..32 named profiles");
     const profiles = blk: {
         var values: [fields.len]Profile = undefined;
         for (fields, 0..) |f, i| {
-            if (!validName(f.name)) @compileError("Thumbnail profile names must start with a lowercase letter and contain only lowercase letters, digits and hyphens (1..64 bytes)");
-            const p = @field(cfg.profiles, f.name);
+            if (!validName(f)) @compileError("Thumbnail profile names must start with a lowercase letter and contain only lowercase letters, digits and hyphens (1..64 bytes)");
+            const p = @field(cfg.profiles, f);
             if (@typeInfo(@TypeOf(p)) != .@"struct") @compileError("Thumbnail profile must contain .width and .height");
             if (!@hasField(@TypeOf(p), "width") or !@hasField(@TypeOf(p), "height")) @compileError("Thumbnail profile requires .width and .height");
-            var profile = Profile{ .name = f.name, .width = p.width, .height = p.height };
-            for (std.meta.fields(@TypeOf(p))) |pf| {
-                if (!@hasField(backend.Profile, pf.name)) @compileError("Unknown thumbnail profile key: " ++ pf.name);
-                @field(profile, pf.name) = @field(p, pf.name);
+            var profile = Profile{ .name = f, .width = p.width, .height = p.height };
+            for (@typeInfo(@TypeOf(p)).@"struct".field_names) |pf| {
+                if (!@hasField(backend.Profile, pf)) @compileError("Unknown thumbnail profile key: " ++ pf);
+                @field(profile, pf) = @field(p, pf);
             }
             if (!backend.validProfile(out.imagemagick, profile.image())) @compileError("Invalid thumbnail profile: positive dimensions within max_dimension/max_pixels and quality in 1..100 required");
             values[i] = profile;

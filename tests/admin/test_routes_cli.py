@@ -18,7 +18,7 @@ def discovery_binaries(tmp_path_factory):
     prefix = tmp_path_factory.mktemp("route-binaries")
     for options in ([], ["-Ddev-tools=false", "--prefix", str(prefix)],
                     ["-Drealtime-backfill=true", "--prefix", str(prefix / "backfill")]):
-        subprocess.run(["mise", "exec", "zig@0.16.0", "--", "zig", "build", "route-discovery-fixture", *options],
+        subprocess.run(["mise", "exec", "zig@0.17.1", "--", "zig", "build", "route-discovery-fixture", *options],
                        cwd=REPO, check=True, timeout=180)
     return (REPO / "zig-out/bin/route-discovery-fixture", prefix / "bin/route-discovery-fixture",
             prefix / "backfill/bin/route-discovery-fixture")

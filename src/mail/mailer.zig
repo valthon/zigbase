@@ -326,13 +326,13 @@ pub const SmtpMailer = struct {
         }
 
         // MAIL FROM.
-        const mail_from = try std.fmt.allocPrint(alloc, "MAIL FROM:<{s}>\r\n", .{env_from});
+        const mail_from = try alloc.print("MAIL FROM:<{s}>\r\n", .{env_from});
         defer alloc.free(mail_from);
         try writeLine(conn, mail_from);
         try expectCode(conn.r, 250);
 
         // RCPT TO.
-        const rcpt = try std.fmt.allocPrint(alloc, "RCPT TO:<{s}>\r\n", .{email.to});
+        const rcpt = try alloc.print("RCPT TO:<{s}>\r\n", .{email.to});
         defer alloc.free(rcpt);
         try writeLine(conn, rcpt);
         try expectCode(conn.r, 250);
@@ -373,7 +373,7 @@ pub const SmtpMailer = struct {
         const out = try alloc.alloc(u8, enc.calcSize(raw.len));
         defer alloc.free(out);
         _ = enc.encode(out, raw);
-        const line = try std.fmt.allocPrint(alloc, "{s}\r\n", .{out});
+        const line = try alloc.print("{s}\r\n", .{out});
         defer alloc.free(line);
         try writeLine(conn, line);
     }
@@ -634,18 +634,17 @@ pub fn buildMessage(alloc: std.mem.Allocator, io: std.Io, from: []const u8, emai
 
     // Common headers shared by every body shape. `Reply-To` is emitted only when set.
     const reply_hdr = if (email.reply_to) |rt|
-        try std.fmt.allocPrint(alloc, "Reply-To: {s}\r\n", .{rt})
+        try alloc.print("Reply-To: {s}\r\n", .{rt})
     else
         "";
     defer if (email.reply_to != null) alloc.free(reply_hdr);
     // RFC 8058 one-click unsubscribe pair, emitted only when `list_unsubscribe` is set.
     const unsub_hdr = if (email.list_unsubscribe) |lu|
-        try std.fmt.allocPrint(alloc, "List-Unsubscribe: <{s}>\r\nList-Unsubscribe-Post: List-Unsubscribe=One-Click\r\n", .{lu})
+        try alloc.print("List-Unsubscribe: <{s}>\r\nList-Unsubscribe-Post: List-Unsubscribe=One-Click\r\n", .{lu})
     else
         "";
     defer if (email.list_unsubscribe != null) alloc.free(unsub_hdr);
-    const head = try std.fmt.allocPrint(
-        alloc,
+    const head = try alloc.print(
         "From: {s}\r\nTo: {s}\r\n{s}{s}Subject: {s}\r\nDate: {s}\r\nMIME-Version: 1.0\r\n",
         .{ from, email.to, reply_hdr, unsub_hdr, email.subject, date },
     );
@@ -658,7 +657,7 @@ pub fn buildMessage(alloc: std.mem.Allocator, io: std.Io, from: []const u8, emai
 
     if (email.attachments.len == 0) {
         // No attachments → head + body-part is EXACTLY the pre-#219 output (byte-for-byte).
-        return std.fmt.allocPrint(alloc, "{s}{s}", .{ head, body_part });
+        return alloc.print("{s}{s}", .{ head, body_part });
     }
 
     // Attachments → wrap the body-part in a multipart/mixed, then one base64 part per attachment.
@@ -669,12 +668,11 @@ pub fn buildMessage(alloc: std.mem.Allocator, io: std.Io, from: []const u8, emai
     io.random(&rnd);
     const rhex = std.fmt.bytesToHex(rnd, .lower);
     var bbuf: [48]u8 = undefined;
-    const outer = std.fmt.bufPrint(&bbuf, "=_zigbase_{s}_mixed", .{rhex}) catch unreachable;
+    const outer = std.mem.print(&bbuf, "=_zigbase_{s}_mixed", .{rhex}) catch unreachable;
 
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(alloc);
-    const opener = try std.fmt.allocPrint(
-        alloc,
+    const opener = try alloc.print(
         "{s}Content-Type: multipart/mixed; boundary=\"{s}\"\r\n\r\n--{s}\r\n",
         .{ head, outer, outer },
     );
@@ -683,8 +681,7 @@ pub fn buildMessage(alloc: std.mem.Allocator, io: std.Io, from: []const u8, emai
     try out.appendSlice(alloc, body_part);
     try out.appendSlice(alloc, "\r\n");
     for (email.attachments) |att| {
-        const part_hdr = try std.fmt.allocPrint(
-            alloc,
+        const part_hdr = try alloc.print(
             "--{s}\r\nContent-Type: {s}\r\nContent-Disposition: attachment; filename=\"{s}\"\r\nContent-Transfer-Encoding: base64\r\n\r\n",
             .{ outer, att.content_type, att.filename },
         );
@@ -693,7 +690,7 @@ pub fn buildMessage(alloc: std.mem.Allocator, io: std.Io, from: []const u8, emai
         try appendBase64Wrapped(&out, alloc, att.data);
         try out.appendSlice(alloc, "\r\n");
     }
-    const closing = try std.fmt.allocPrint(alloc, "--{s}--\r\n", .{outer});
+    const closing = try alloc.print("--{s}--\r\n", .{outer});
     defer alloc.free(closing);
     try out.appendSlice(alloc, closing);
     return out.toOwnedSlice(alloc);
@@ -707,11 +704,11 @@ fn buildBodyPart(alloc: std.mem.Allocator, io: std.Io, email: Email) ![]u8 {
     const html = email.html_body;
     if (html == null) {
         // Original single-part text/plain form (byte-compatible with pre-#141 output).
-        return std.fmt.allocPrint(alloc, "Content-Type: text/plain; charset=utf-8\r\n\r\n{s}", .{email.text_body});
+        return alloc.print("Content-Type: text/plain; charset=utf-8\r\n\r\n{s}", .{email.text_body});
     }
     if (email.text_body.len == 0) {
         // HTML-only: a single text/html part.
-        return std.fmt.allocPrint(alloc, "Content-Type: text/html; charset=utf-8\r\n\r\n{s}", .{html.?});
+        return alloc.print("Content-Type: text/html; charset=utf-8\r\n\r\n{s}", .{html.?});
     }
     // Both parts: multipart/alternative, text first (least-rich), HTML last (most-rich),
     // per RFC 2046 §5.1.4 (clients render the LAST part they understand). The boundary is RANDOM
@@ -722,9 +719,8 @@ fn buildBodyPart(alloc: std.mem.Allocator, io: std.Io, email: Email) ![]u8 {
     io.random(&rnd);
     const rhex = std.fmt.bytesToHex(rnd, .lower);
     var bbuf: [48]u8 = undefined;
-    const boundary = std.fmt.bufPrint(&bbuf, "=_zigbase_{s}_part", .{rhex}) catch unreachable;
-    return std.fmt.allocPrint(
-        alloc,
+    const boundary = std.mem.print(&bbuf, "=_zigbase_{s}_part", .{rhex}) catch unreachable;
+    return alloc.print(
         "Content-Type: multipart/alternative; boundary=\"{s}\"\r\n\r\n" ++
             "--{s}\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n{s}\r\n" ++
             "--{s}\r\nContent-Type: text/html; charset=utf-8\r\n\r\n{s}\r\n" ++
@@ -767,10 +763,10 @@ fn rfc5322Date(ts: i64) Rfc5322DateBuf {
     const dow = @as(usize, @intCast(@mod(epoch_day.day + 4, 7)));
 
     var buf: Rfc5322DateBuf = undefined;
-    _ = std.fmt.bufPrint(&buf, "{s}, {d:0>2} {s} {d:0>4} {d:0>2}:{d:0>2}:{d:0>2} +0000", .{
+    _ = std.mem.print(&buf, "{s}, {d:0>2} {s} {d:0>4} {d:0>2}:{d:0>2}:{d:0>2} +0000", .{
         dow_names[dow],
         @as(u32, month_day.day_index) + 1,
-        mon_names[@intFromEnum(month_day.month) - 1],
+        mon_names[@backingInt(month_day.month) - 1],
         year_day.year,
         day_secs.getHoursIntoDay(),
         day_secs.getMinutesIntoHour(),
@@ -1045,7 +1041,7 @@ test "SmtpMailer.initTls records explicit mode + insecure flag" {
 }
 
 test "CommandMailer pipes the serialized message to the child and accepts exit 0" {
-    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    if (@import("builtin").target.os.tag == .windows) return error.SkipZigTest;
     const a = std.testing.allocator;
     const io = std.testing.io;
 
@@ -1057,9 +1053,9 @@ test "CommandMailer pipes the serialized message to the child and accepts exit 0
     var rand_bytes: [8]u8 = undefined;
     io.random(&rand_bytes);
     var name_buf: [64]u8 = undefined;
-    const rel = try std.fmt.bufPrint(&name_buf, "zb-cmdmailer-{x}.eml", .{std.mem.readInt(u64, &rand_bytes, .little)});
+    const rel = try std.mem.print(&name_buf, "zb-cmdmailer-{x}.eml", .{std.mem.readInt(u64, &rand_bytes, .little)});
     defer cwd.deleteFile(io, rel) catch {};
-    const script = try std.fmt.allocPrint(a, "cat > '{s}'", .{rel});
+    const script = try a.print("cat > '{s}'", .{rel});
     defer a.free(script);
 
     var cm = CommandMailer.init(&.{ "/bin/sh", "-c", script }, "noreply@zigbase.dev");
@@ -1079,16 +1075,16 @@ test "CommandMailer pipes the serialized message to the child and accepts exit 0
 }
 
 test "CommandMailer pipes an attachment (multipart/mixed) verbatim — SMTP/Command inherit #219 free" {
-    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    if (@import("builtin").target.os.tag == .windows) return error.SkipZigTest;
     const a = std.testing.allocator;
     const io = std.testing.io;
     const cwd = std.Io.Dir.cwd();
     var rand_bytes: [8]u8 = undefined;
     io.random(&rand_bytes);
     var name_buf: [64]u8 = undefined;
-    const rel = try std.fmt.bufPrint(&name_buf, "zb-cmdmailer-att-{x}.eml", .{std.mem.readInt(u64, &rand_bytes, .little)});
+    const rel = try std.mem.print(&name_buf, "zb-cmdmailer-att-{x}.eml", .{std.mem.readInt(u64, &rand_bytes, .little)});
     defer cwd.deleteFile(io, rel) catch {};
-    const script = try std.fmt.allocPrint(a, "cat > '{s}'", .{rel});
+    const script = try a.print("cat > '{s}'", .{rel});
     defer a.free(script);
 
     var cm = CommandMailer.init(&.{ "/bin/sh", "-c", script }, "noreply@zigbase.dev");
@@ -1109,7 +1105,7 @@ test "CommandMailer pipes an attachment (multipart/mixed) verbatim — SMTP/Comm
 }
 
 test "CommandMailer surfaces a non-zero child exit as an error" {
-    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    if (@import("builtin").target.os.tag == .windows) return error.SkipZigTest;
     const a = std.testing.allocator;
     // `sh -c 'exit 7'` consumes nothing and fails; send must not report success.
     var cm = CommandMailer.init(&.{ "/bin/sh", "-c", "exit 7" }, "noreply@zigbase.dev");
@@ -1122,7 +1118,7 @@ test "CommandMailer surfaces a non-zero child exit as an error" {
 }
 
 test "CommandMailer reports closed input as failed delivery regardless of exit code" {
-    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    if (@import("builtin").target.os.tag == .windows) return error.SkipZigTest;
     const a = std.testing.allocator;
     // Keep well above Linux's default and macOS's maximum 64 KiB pipe capacity.
     // Neither the parent nor the child requests a larger Linux pipe (F_SETPIPE_SZ);
@@ -1141,7 +1137,7 @@ test "CommandMailer reports closed input as failed delivery regardless of exit c
 }
 
 test "CommandMailer rejects header injection before spawning" {
-    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    if (@import("builtin").target.os.tag == .windows) return error.SkipZigTest;
     const a = std.testing.allocator;
     // A CRLF in `to` is caught by buildMessage; argv points at a missing binary
     // so a spawn would error too, but the injection check fires first.

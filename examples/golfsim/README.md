@@ -92,8 +92,7 @@ fn prepareBooking(ctx: *zigbase.Ctx, ev: *zigbase.RecordEvent) anyerror!void {
         return error.ListingNotFound;
 
     // 2. Double-booking check — allocate filter with ev.arena.a.
-    const overlap_filter = try std.fmt.allocPrint(ev.arena.a,
-        "listing = \"{s}\" && status != \"cancelled\" && starts_at < \"{s}\" && ends_at > \"{s}\"",
+    const overlap_filter = try ev.arena.a.print("listing = \"{s}\" && status != \"cancelled\" && starts_at < \"{s}\" && ends_at > \"{s}\"",
         .{ listing_id, ends_at, starts_at });
     const conflicts = try ctx.records().list("bookings", .{ .filter = overlap_filter, .perPage = 1 });
     // totalItems is optional (cursor mode may skip COUNT); offset mode always sets it.
@@ -378,8 +377,7 @@ fn notifyBookingConfirmed(ctx: *zigbase.Ctx, booking_id: []const u8) void {
 fn webhookJob(ctx: *zigbase.Ctx, ev: *zigbase.events.JobEvent) anyerror!void {
     const booking_id = ev.name;
     const url = (ctx.kv().get("booking_webhook_url") catch return) orelse return;
-    const body = std.fmt.allocPrint(ctx.arena.a,
-        "{{\"event\":\"booking.confirmed\",\"booking\":\"{s}\"}}", .{booking_id}) catch return;
+    const body = ctx.arena.a.print("{{\"event\":\"booking.confirmed\",\"booking\":\"{s}\"}}", .{booking_id}) catch return;
     _ = ctx.http().post(url, .{
         .headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
         .body = body,
@@ -571,7 +569,7 @@ const health = await zb.rpc.golfsimHealth();
 ## Two test surfaces, on purpose
 
 ```sh
-mise exec zig@0.16.0 -- zig build test              # in-process, no socket
+mise exec zig@0.17.1 -- zig build test              # in-process, no socket
 cd frontend && ../../../scripts/zigapagos.sh validate --format=json && ./build.sh && ../../../scripts/zigapagos.sh doctor dist --format=json && cd ..
 mise exec node@24 -- npm install && npm run test:e2e # real server, real generated client
 ```
@@ -709,7 +707,7 @@ cd frontend
 cd ..
 
 # 2. Build the backend
-mise exec zig@0.16.0 -- zig build          # -> ./zig-out/bin/golfsim
+mise exec zig@0.17.1 -- zig build          # -> ./zig-out/bin/golfsim
 
 # Inspect this application's registered backend routes without opening a database
 ./zig-out/bin/golfsim routes --json

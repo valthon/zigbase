@@ -90,7 +90,7 @@ pub fn acquire(gpa: std.mem.Allocator, io: std.Io, origin: []const u8, email: []
     defer client.deinit();
 
     // 1) superuser auth-with-password -> token
-    const auth_url = try std.fmt.allocPrint(alloc, "{s}/api/collections/_superusers/auth-with-password", .{origin});
+    const auth_url = try alloc.print("{s}/api/collections/_superusers/auth-with-password", .{origin});
     const auth_body = blk: {
         var obj: std.json.ObjectMap = .empty;
         try obj.put(alloc, "identity", std.json.Value{ .string = email });
@@ -105,8 +105,8 @@ pub fn acquire(gpa: std.mem.Allocator, io: std.Io, origin: []const u8, email: []
     const token = try extractToken(alloc, auth_resp.body);
 
     // 2) GET /api/collections with the bearer token
-    const cols_url = try std.fmt.allocPrint(alloc, "{s}/api/collections", .{origin});
-    const bearer = try std.fmt.allocPrint(alloc, "Bearer {s}", .{token});
+    const cols_url = try alloc.print("{s}/api/collections", .{origin});
+    const bearer = try alloc.print("Bearer {s}", .{token});
     const cols_resp = try doFetch(alloc, &client, .GET, cols_url, &.{.{ .name = "authorization", .value = bearer }}, null);
     if (cols_resp.status != 200) {
         std.log.err("typegen: GET /api/collections failed (HTTP {d})", .{cols_resp.status});
@@ -132,7 +132,7 @@ fn doFetch(alloc: std.mem.Allocator, client: *std.http.Client, method: std.http.
         error.WriteFailed => return error.ResponseTooLarge,
         else => return e,
     };
-    return .{ .status = @intFromEnum(res.status), .body = fw.buffered() };
+    return .{ .status = @backingInt(res.status), .body = fw.buffered() };
 }
 
 fn extractToken(alloc: std.mem.Allocator, body: []const u8) ![]const u8 {

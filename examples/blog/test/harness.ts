@@ -62,7 +62,7 @@ async function waitForHealth(url: string, timeoutMs = 20_000): Promise<void> {
 
 export async function startBlog(): Promise<BlogServer> {
   if (!process.env.ZIGBASE_TEST_BLOG_BINARY) {
-    const b = spawnSync("mise", ["exec", "zig@0.16.0", "--", "zig", "build"], { cwd: EXAMPLE_ROOT, stdio: "inherit" });
+    const b = spawnSync("mise", ["exec", "zig@0.17.1", "--", "zig", "build"], { cwd: EXAMPLE_ROOT, stdio: "inherit" });
     if (b.status !== 0) throw new Error("blog build failed");
   }
   const email = "admin@blog.local", password = "test-password-123";

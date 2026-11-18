@@ -182,7 +182,7 @@ test "dedup: overflow clears the map (bounded) without false-suppressing new key
     var buf: [32]u8 = undefined;
     var i: usize = 0;
     while (i < max_entries) : (i += 1) {
-        const msg = std.fmt.bufPrint(&buf, "err-{d}", .{i}) catch unreachable;
+        const msg = std.mem.print(&buf, "err-{d}", .{i}) catch unreachable;
         try testing.expect(dd.shouldReportAt(0, msg, "request"));
     }
     try testing.expectEqual(max_entries, dd.seen.count());

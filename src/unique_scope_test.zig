@@ -59,7 +59,7 @@ fn slugs(tenant_field: ?[]const u8, indexes: []const schema.Index) schema.Collec
 
 fn insert(w: *db.Db, id: []const u8, account: []const u8, slug: []const u8) bool {
     var buf: [256]u8 = undefined;
-    const sql = std.fmt.bufPrintZ(&buf, "INSERT INTO slugs (id, created, updated, account, slug) VALUES ('{s}', '', '', '{s}', '{s}');", .{ id, account, slug }) catch unreachable;
+    const sql = std.mem.printSentinel(&buf, "INSERT INTO slugs (id, created, updated, account, slug) VALUES ('{s}', '', '', '{s}', '{s}');", .{ id, account, slug }, 0) catch unreachable;
     w.exec(sql) catch return false;
     return true;
 }
@@ -82,9 +82,9 @@ fn expectTenantScoped(w: *db.Db, tag: []const u8) !void {
     var a_id: [32]u8 = undefined;
     var b_id: [32]u8 = undefined;
     var a2_id: [32]u8 = undefined;
-    try std.testing.expect(insert(w, try std.fmt.bufPrint(&b_id, "b-{s}", .{tag}), "acct-b", "acme-corp"));
-    try std.testing.expect(insert(w, try std.fmt.bufPrint(&a_id, "a-{s}", .{tag}), "acct-a", "acme-corp"));
-    try std.testing.expect(!insert(w, try std.fmt.bufPrint(&a2_id, "a2-{s}", .{tag}), "acct-a", "acme-corp"));
+    try std.testing.expect(insert(w, try std.mem.print(&b_id, "b-{s}", .{tag}), "acct-b", "acme-corp"));
+    try std.testing.expect(insert(w, try std.mem.print(&a_id, "a-{s}", .{tag}), "acct-a", "acme-corp"));
+    try std.testing.expect(!insert(w, try std.mem.print(&a2_id, "a2-{s}", .{tag}), "acct-a", "acme-corp"));
 }
 
 /// Unique constraints/autoindexes over exactly `slug` (table-wide) and `account, slug` (scoped).
@@ -518,8 +518,8 @@ test "PostgreSQL long column uniqueness converges once" {
     const a = std.testing.allocator;
     var c = try Conn.open(.postgres, "long_column");
     defer c.deinit();
-    const long_name = "slug" ** 20;
-    const long_tenant = "account" ** 10;
+    const long_name = "slugslugslugslugslugslugslugslugslugslugslugslugslugslugslugslugslugslugslugslug";
+    const long_tenant = "accountaccountaccountaccountaccountaccountaccountaccountaccountaccount";
     var fields = fields_plain;
     fields[0].name = long_tenant;
     fields[1].name = long_name;
@@ -655,7 +655,7 @@ test "SQLite refuses trigger INDEXED BY a constraint autoindex before a rebuild"
     var auto = try c.db.prepare("SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='slugs' AND name LIKE 'sqlite_autoindex_slugs_%' LIMIT 1;");
     defer auto.finalize();
     try std.testing.expect(try auto.step());
-    const trigger = try std.fmt.allocPrintSentinel(a, "CREATE TRIGGER migration_auto AFTER INSERT ON slugs BEGIN SELECT 1 FROM slugs INDEXED BY \"{s}\" WHERE slug=NEW.slug; END;", .{auto.columnText(0)}, 0);
+    const trigger = try a.printSentinel("CREATE TRIGGER migration_auto AFTER INSERT ON slugs BEGIN SELECT 1 FROM slugs INDEXED BY \"{s}\" WHERE slug=NEW.slug; END;", .{auto.columnText(0)}, 0);
     defer a.free(trigger);
     try c.db.exec(trigger);
     const generation = try schema_gen.read(&c.db);
@@ -749,7 +749,7 @@ test "issue 523 SQLite rebuild SQL stays in main despite TEMP copy" {
     const old = slugs(null, &.{});
     const sql = try ddl.createTableSql(a, old, null, .sqlite, &.{});
     defer a.free(sql);
-    const sql_z = try a.dupeZ(u8, sql);
+    const sql_z = try a.dupeSentinel(u8, sql, 0);
     defer a.free(sql_z);
     try c.db.exec(sql_z);
     try std.testing.expect(insert(&c.db, "kept", "acct-a", "value"));
@@ -760,7 +760,7 @@ test "issue 523 SQLite rebuild SQL stays in main despite TEMP copy" {
         a.free(plan);
     }
     for (plan) |stmt| {
-        const stmt_z = try a.dupeZ(u8, stmt);
+        const stmt_z = try a.dupeSentinel(u8, stmt, 0);
         defer a.free(stmt_z);
         try c.db.exec(stmt_z);
     }

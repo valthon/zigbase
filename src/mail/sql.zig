@@ -37,8 +37,8 @@ test "every mail statement lowers for PostgreSQL inside prep's scratch" {
     const modules = .{ @import("bulk.zig").stmts, @import("suppression.zig").stmts };
     var n: usize = 0;
     inline for (modules) |S| {
-        inline for (@typeInfo(S).@"struct".decls) |d| {
-            const sql: [:0]const u8 = @field(S, d.name);
+        inline for (@typeInfo(S).@"struct".decl_names) |d| {
+            const sql: [:0]const u8 = @field(S, d);
             var scratch: [scratch_len]u8 = undefined;
             const out = try lower(&scratch, param_sink.Dialect.postgres, sql);
             // Fully lowered: no SQLite placeholder or `now` form survives.

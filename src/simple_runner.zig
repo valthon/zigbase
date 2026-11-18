@@ -1,7 +1,7 @@
 //! A `.simple`-mode test runner for apps built on ZigBase, handed to consumers by
 //! `zigbase.addTest` in build.zig.
 //!
-//! Zig 0.16.0's default server-mode runner (`--listen=-`) can print a stale
+//! Zig 0.17.1's default server-mode runner (`--listen=-`) can print a stale
 //! `failed command:` label after a successful child leaves stderr output at exit.
 //! facil.io's destructor newline reproduces it; no crash or race is established
 //! by that diagnostic (issue #261). A `.simple` runner reports through the exit
@@ -15,7 +15,7 @@
 //! (default `.warn`) — otherwise a booted app's routine `info:` startup lines would
 //! spam every run.
 //!
-//! Structure follows Zig 0.16's own `mainTerminal`, minus the progress/fuzz/tty paths.
+//! Structure follows Zig 0.17.1's own `mainTerminal`, minus the progress/fuzz/tty paths.
 
 const builtin = @import("builtin");
 const std = @import("std");
@@ -44,7 +44,7 @@ pub fn main(init: std.process.Init.Minimal) void {
     var leaks: usize = 0;
 
     for (tests, 0..) |t, i| {
-        testing.allocator_instance = .{};
+        testing.allocator_instance = .init(std.heap.page_allocator, .{ .canary = 0xc3a701ba, .check_write_after_free = true });
         testing.io_instance = .init(testing.allocator, .{
             .argv0 = .init(init.args),
             .environ = init.environ,
@@ -69,7 +69,7 @@ pub fn main(init: std.process.Init.Minimal) void {
         }
 
         testing.io_instance.deinit();
-        if (testing.allocator_instance.deinit() == .leak) {
+        if (testing.allocator_instance.deinit() != 0) {
             leaks += 1;
             std.debug.print("    ^ LEAKED memory in {s}\n", .{t.name});
         }
@@ -92,10 +92,10 @@ pub fn log(
     comptime format: []const u8,
     args: anytype,
 ) void {
-    if (@intFromEnum(message_level) <= @intFromEnum(std.log.Level.err)) {
+    if (@backingInt(message_level) <= @backingInt(std.log.Level.err)) {
         log_err_count +|= 1;
     }
-    if (@intFromEnum(message_level) <= @intFromEnum(testing.log_level)) {
+    if (@backingInt(message_level) <= @backingInt(testing.log_level)) {
         std.debug.print(
             "[" ++ @tagName(scope) ++ "] (" ++ @tagName(message_level) ++ "): " ++ format ++ "\n",
             args,

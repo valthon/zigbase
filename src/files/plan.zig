@@ -150,7 +150,7 @@ pub fn planAllFileFields(
         if (field.options != .file) continue;
         var ups: std.ArrayList(http.UploadedFile) = .empty;
         for (files) |f| if (std.mem.eql(u8, f.field, field.name)) try ups.append(alloc, f);
-        const minus_key = try std.fmt.allocPrint(alloc, "{s}-", .{field.name});
+        const minus_key = try alloc.print("{s}-", .{field.name});
         const removals = try parseRemovals(alloc, data.object.get(minus_key));
         _ = out.swapRemove(minus_key);
 

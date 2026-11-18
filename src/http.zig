@@ -8,8 +8,8 @@ pub const Method = enum { GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD, UNKNOWN 
 /// unnamed integers, which the socket adapter cannot preserve as API responses.
 pub fn transportStatus(status: u16) ?@import("zap").http.StatusCode {
     const StatusCode = @import("zap").http.StatusCode;
-    inline for (std.meta.fields(StatusCode)) |field| {
-        if (field.value == status) return @field(StatusCode, field.name);
+    inline for (@typeInfo(StatusCode).@"enum".field_names, @typeInfo(StatusCode).@"enum".field_values) |field, field_value| {
+        if (field_value == status) return @field(StatusCode, field);
     }
     return null;
 }

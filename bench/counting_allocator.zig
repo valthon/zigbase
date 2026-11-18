@@ -7,7 +7,7 @@ pub const Stats = struct {
     bytes: u64 = 0,
     /// [<=64B, <=512B, <=4K, <=64K, >64K] — distinguishes one large allocation
     /// from thousands of small ones, which byte totals hide.
-    buckets: [5]u64 = .{0} ** 5,
+    buckets: [5]u64 = @splat(0),
     peak_live: u64 = 0,
 };
 

@@ -583,7 +583,7 @@ const KeyEpoch = struct { token_key: []const u8, epoch: i64 };
 /// A NULL epoch (back-compat default) reads as 0; the column itself is guaranteed present by
 /// migration 0010. Null when the row is absent.
 fn tokenKeyEpochFor(alloc: std.mem.Allocator, conn: *db.Db, table: []const u8, rid: []const u8) !?KeyEpoch {
-    const sql = try std.fmt.allocPrintSentinel(alloc, "SELECT \"tokenKey\", COALESCE(\"token_epoch\", 0) FROM \"{s}\" WHERE \"id\" = ?1;", .{table}, 0);
+    const sql = try alloc.printSentinel("SELECT \"tokenKey\", COALESCE(\"token_epoch\", 0) FROM \"{s}\" WHERE \"id\" = ?1;", .{table}, 0);
     var st = try prep(conn, sql);
     defer st.finalize();
     try st.bindText(1, rid);
@@ -693,7 +693,7 @@ test "authenticate resolves a valid bearer token to its record" {
     const key = crypto.deriveKey(app.jwt_secret, "tk-secret");
     const token = try jwt.sign(a, .{ .id = "rec1", .collection = "users", .type = .auth, .iat = 0, .exp = 9999999999 }, &key);
     defer a.free(token);
-    const authz = try std.fmt.allocPrint(a, "Bearer {s}", .{token});
+    const authz = try a.print("Bearer {s}", .{token});
     defer a.free(authz);
     var ctx = http.RequestCtx{ .method = .GET, .path = "/", .allocator = RequestArena.forTest(a), .authorization = authz };
     var authed = (try authenticate(app.io, a, &app, &ctx, &d)) orelse return error.TestUnexpectedNull;
@@ -705,7 +705,7 @@ test "authenticate resolves a valid bearer token to its record" {
     // Collection-ID token claims resolve to the same canonical name as normal issuers.
     const alias_token = try jwt.sign(a, .{ .id = "rec1", .collection = created.id, .type = .auth, .iat = 0, .exp = 9999999999 }, &key);
     defer a.free(alias_token);
-    const alias_authz = try std.fmt.allocPrint(a, "Bearer {s}", .{alias_token});
+    const alias_authz = try a.print("Bearer {s}", .{alias_token});
     defer a.free(alias_authz);
     ctx.authorization = alias_authz;
     var alias_authed = (try authenticate(app.io, a, &app, &ctx, &d)) orelse return error.TestUnexpectedNull;
@@ -731,7 +731,7 @@ test "authenticate rejects a token signed with the wrong key (returns null)" {
     const wrong = crypto.deriveKey(app.jwt_secret, "different-key");
     const token = try jwt.sign(a, .{ .id = "rec1", .collection = "users", .type = .auth, .iat = 0, .exp = 9999999999 }, &wrong);
     defer a.free(token);
-    const authz = try std.fmt.allocPrint(a, "Bearer {s}", .{token});
+    const authz = try a.print("Bearer {s}", .{token});
     defer a.free(authz);
     var ctx = http.RequestCtx{ .method = .GET, .path = "/", .allocator = RequestArena.forTest(a), .authorization = authz };
     try std.testing.expect((try authenticate(app.io, a, &app, &ctx, &d)) == null);
@@ -754,7 +754,7 @@ test "authenticate requires CSRF on the cookie + unsafe-method path" {
     const key = crypto.deriveKey(app.jwt_secret, "tk-secret");
     const token = try jwt.sign(a, .{ .id = "rec1", .collection = "users", .type = .auth, .csrf = "csrf-abc", .iat = 0, .exp = 9999999999 }, &key);
     defer a.free(token);
-    const cookie_hdr = try std.fmt.allocPrint(a, "zb_auth={s}", .{token});
+    const cookie_hdr = try a.print("zb_auth={s}", .{token});
     defer a.free(cookie_hdr);
     var bad = http.RequestCtx{ .method = .POST, .path = "/", .allocator = RequestArena.forTest(a), .cookie_header = cookie_hdr };
     try std.testing.expect((try authenticate(app.io, a, &app, &bad, &d)) == null);

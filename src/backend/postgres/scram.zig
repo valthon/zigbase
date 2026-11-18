@@ -65,7 +65,7 @@ pub const Client = struct {
         const nonce = try allocator.alloc(u8, b64.Encoder.calcSize(nonce_seed.len));
         errdefer allocator.free(nonce);
         _ = b64.Encoder.encode(nonce, &nonce_seed);
-        const bare = try std.fmt.allocPrint(allocator, "n=,r={s}", .{nonce});
+        const bare = try allocator.print("n=,r={s}", .{nonce});
         return .{ .allocator = allocator, .client_nonce = nonce, .client_first_bare = bare };
     }
 
@@ -77,7 +77,7 @@ pub const Client = struct {
     /// The full client-first SASL message (`n,,` GS2 header + client-first-bare). Caller
     /// owns the returned slice and must free it.
     pub fn clientFirst(self: *Client) ScramError![]u8 {
-        return std.fmt.allocPrint(self.allocator, "n,,{s}", .{self.client_first_bare});
+        return self.allocator.print("n,,{s}", .{self.client_first_bare});
     }
 
     /// Consume the server-first message and produce the client-final message
@@ -119,11 +119,11 @@ pub const Client = struct {
         Sha256.hash(&client_key, &stored_key, .{});
 
         // client-final-without-proof = "c=biws,r=<combined-nonce>"  (biws = base64("n,,"))
-        const client_final_no_proof = try std.fmt.allocPrint(self.allocator, "c=biws,r={s}", .{combined_nonce});
+        const client_final_no_proof = try self.allocator.print("c=biws,r={s}", .{combined_nonce});
         defer self.allocator.free(client_final_no_proof);
 
         // AuthMessage = client-first-bare + "," + server-first + "," + client-final-without-proof
-        const auth_message = try std.fmt.allocPrint(self.allocator, "{s},{s},{s}", .{
+        const auth_message = try self.allocator.print("{s},{s},{s}", .{
             self.client_first_bare, server_first, client_final_no_proof,
         });
         defer self.allocator.free(auth_message);
@@ -142,7 +142,7 @@ pub const Client = struct {
 
         var proof_b64: [b64.Encoder.calcSize(32)]u8 = undefined;
         _ = b64.Encoder.encode(&proof_b64, &proof);
-        return std.fmt.allocPrint(self.allocator, "c=biws,r={s},p={s}", .{ combined_nonce, &proof_b64 });
+        return self.allocator.print("c=biws,r={s},p={s}", .{ combined_nonce, &proof_b64 });
     }
 
     /// Verify the server-final message `v=<b64 ServerSignature>` against the value we
@@ -200,7 +200,7 @@ test "scram-sha-256 RFC-style exchange round-trips against a server stub" {
     var salt_raw: [64]u8 = undefined;
     const salt_len = try b64.Decoder.calcSizeForSlice(salt);
     try b64.Decoder.decode(salt_raw[0..salt_len], salt);
-    const server_first = try std.fmt.allocPrint(a, "r={s}servernonce,s={s},i=4096", .{ client.client_nonce, salt });
+    const server_first = try a.print("r={s}servernonce,s={s},i=4096", .{ client.client_nonce, salt });
     defer a.free(server_first);
 
     const cfinal = try client.clientFinal(password, server_first);
@@ -215,15 +215,15 @@ test "scram-sha-256 RFC-style exchange round-trips against a server stub" {
         var server_key: [32]u8 = undefined;
         HmacSha256.create(&server_key, "Server Key", &salted);
         // Reconstruct AuthMessage exactly as the client did.
-        const cfnp = try std.fmt.allocPrint(a, "c=biws,r={s}servernonce", .{client.client_nonce});
+        const cfnp = try a.print("c=biws,r={s}servernonce", .{client.client_nonce});
         defer a.free(cfnp);
-        const auth_message = try std.fmt.allocPrint(a, "{s},{s},{s}", .{ client.client_first_bare, server_first, cfnp });
+        const auth_message = try a.print("{s},{s},{s}", .{ client.client_first_bare, server_first, cfnp });
         defer a.free(auth_message);
         HmacSha256.create(&server_sig, auth_message, &server_key);
     }
     var sig_b64: [b64.Encoder.calcSize(32)]u8 = undefined;
     _ = b64.Encoder.encode(&sig_b64, &server_sig);
-    const server_final = try std.fmt.allocPrint(a, "v={s}", .{&sig_b64});
+    const server_final = try a.print("v={s}", .{&sig_b64});
     defer a.free(server_final);
 
     try client.verifyServerFinal(server_final);
@@ -235,7 +235,7 @@ test "scram rejects a tampered server signature" {
     for (&seed, 0..) |*b, i| b.* = @intCast(i +% 7);
     var client = try Client.init(a, seed);
     defer client.deinit();
-    const server_first = try std.fmt.allocPrint(a, "r={s}xx,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096", .{client.client_nonce});
+    const server_first = try a.print("r={s}xx,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096", .{client.client_nonce});
     defer a.free(server_first);
     const cfinal = try client.clientFinal("pencil", server_first);
     defer a.free(cfinal);
@@ -250,7 +250,7 @@ test "scram rejects an absurd iteration count before running pbkdf2" {
     var client = try Client.init(a, seed);
     defer client.deinit();
     // i= just above the ceiling must be refused (no multi-second pbkdf2 grind).
-    const server_first = try std.fmt.allocPrint(a, "r={s}zz,s=W22ZaJ0SNY7soEsUEjb6gQ==,i={d}", .{ client.client_nonce, max_iterations + 1 });
+    const server_first = try a.print("r={s}zz,s=W22ZaJ0SNY7soEsUEjb6gQ==,i={d}", .{ client.client_nonce, max_iterations + 1 });
     defer a.free(server_first);
     try std.testing.expectError(ScramError.IterationCountTooHigh, client.clientFinal("pencil", server_first));
 }
@@ -269,7 +269,7 @@ test "scram: SASLprep feeds PBKDF2 — a soft-hyphen password authenticates as i
     var salt_raw: [64]u8 = undefined;
     const salt_len = try b64.Decoder.calcSizeForSlice(salt);
     try b64.Decoder.decode(salt_raw[0..salt_len], salt);
-    const server_first = try std.fmt.allocPrint(a, "r={s}servernonce,s={s},i=4096", .{ client.client_nonce, salt });
+    const server_first = try a.print("r={s}servernonce,s={s},i=4096", .{ client.client_nonce, salt });
     defer a.free(server_first);
 
     const cfinal = try client.clientFinal("I\u{00AD}X", server_first);
@@ -282,15 +282,15 @@ test "scram: SASLprep feeds PBKDF2 — a soft-hyphen password authenticates as i
         try pbkdf2(&salted, "IX", salt_raw[0..salt_len], 4096, HmacSha256);
         var server_key: [32]u8 = undefined;
         HmacSha256.create(&server_key, "Server Key", &salted);
-        const cfnp = try std.fmt.allocPrint(a, "c=biws,r={s}servernonce", .{client.client_nonce});
+        const cfnp = try a.print("c=biws,r={s}servernonce", .{client.client_nonce});
         defer a.free(cfnp);
-        const auth_message = try std.fmt.allocPrint(a, "{s},{s},{s}", .{ client.client_first_bare, server_first, cfnp });
+        const auth_message = try a.print("{s},{s},{s}", .{ client.client_first_bare, server_first, cfnp });
         defer a.free(auth_message);
         HmacSha256.create(&server_sig, auth_message, &server_key);
     }
     var sig_b64: [b64.Encoder.calcSize(32)]u8 = undefined;
     _ = b64.Encoder.encode(&sig_b64, &server_sig);
-    const server_final = try std.fmt.allocPrint(a, "v={s}", .{&sig_b64});
+    const server_final = try a.print("v={s}", .{&sig_b64});
     defer a.free(server_final);
     try client.verifyServerFinal(server_final);
 }
@@ -301,7 +301,7 @@ test "scram: a needs-NFKC password fails clientFinal loudly" {
     for (&seed, 0..) |*b, i| b.* = @intCast(i +% 13);
     var client = try Client.init(a, seed);
     defer client.deinit();
-    const server_first = try std.fmt.allocPrint(a, "r={s}zz,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096", .{client.client_nonce});
+    const server_first = try a.print("r={s}zz,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096", .{client.client_nonce});
     defer a.free(server_first);
     try std.testing.expectError(ScramError.PasswordNeedsNormalization, client.clientFinal("\u{2168}", server_first));
 }

@@ -223,7 +223,7 @@ test "no bare ApiError literal in src/ ships an implicit code that contradicts i
         // false-positive against itself. Same precedent as the `"validation_` mechanical-sweep
         // gate excluding this file (see task-2-report.md).
         if (std.mem.eql(u8, entry.path, "api/error.zig")) continue;
-        const rel = try std.fmt.allocPrint(a, "src/{s}", .{entry.path});
+        const rel = try a.print("src/{s}", .{entry.path});
         defer a.free(rel);
         const content = std.Io.Dir.cwd().readFileAlloc(std.testing.io, rel, a, .limited(4 * 1024 * 1024)) catch continue;
         defer a.free(content);

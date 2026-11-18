@@ -307,11 +307,11 @@ test "pg receipts coordinate cold starts, namespaces, binary replay and bounded 
     defer second.close();
     const token = try @import("crypto.zig").genToken(std.testing.io, a, 12);
     defer a.free(token);
-    const create = try std.fmt.allocPrintSentinel(a, "CREATE SCHEMA idem_{s};", .{token}, 0);
+    const create = try a.printSentinel("CREATE SCHEMA idem_{s};", .{token}, 0);
     defer a.free(create);
-    const drop = try std.fmt.allocPrintSentinel(a, "DROP SCHEMA idem_{s} CASCADE;", .{token}, 0);
+    const drop = try a.printSentinel("DROP SCHEMA idem_{s} CASCADE;", .{token}, 0);
     defer a.free(drop);
-    const path = try std.fmt.allocPrintSentinel(a, "SET search_path TO idem_{s};", .{token}, 0);
+    const path = try a.printSentinel("SET search_path TO idem_{s};", .{token}, 0);
     defer a.free(path);
     try first.exec(create);
     defer first.exec(drop) catch |err| std.log.err("idempotency test schema cleanup: {s}", .{@errorName(err)});
@@ -446,9 +446,9 @@ test "pg receipts coordinate cold starts, namespaces, binary replay and bounded 
     try std.testing.expectEqual(@as(i64, 0), untouched.columnInt(0));
     try std.testing.expectEqual(@as(i64, 3), try counter(&first));
     // A ledger found later on search_path must not be adopted into this schema.
-    const fallback_create = try std.fmt.allocPrintSentinel(a, "CREATE SCHEMA fallback_{s}; ALTER TABLE _idempotency_receipts SET SCHEMA fallback_{s}; SET search_path TO idem_{s},fallback_{s};", .{ token, token, token, token }, 0);
+    const fallback_create = try a.printSentinel("CREATE SCHEMA fallback_{s}; ALTER TABLE _idempotency_receipts SET SCHEMA fallback_{s}; SET search_path TO idem_{s},fallback_{s};", .{ token, token, token, token }, 0);
     defer a.free(fallback_create);
-    const fallback_drop = try std.fmt.allocPrintSentinel(a, "DROP SCHEMA fallback_{s} CASCADE;", .{token}, 0);
+    const fallback_drop = try a.printSentinel("DROP SCHEMA fallback_{s} CASCADE;", .{token}, 0);
     defer a.free(fallback_drop);
     try first.exec(fallback_create);
     defer first.exec(fallback_drop) catch |err| std.log.err("idempotency fallback test cleanup: {s}", .{@errorName(err)});
@@ -459,7 +459,7 @@ test "pg receipts coordinate cold starts, namespaces, binary replay and bounded 
     try std.testing.expectError(error.InvalidReceiptLedger, I.execute(a, &first, changed, callbacks));
     try std.testing.expectError(error.InvalidReceiptLedger, copy.run(a, &first, &sqlite, .{ .force = true }));
     try first.exec("DROP VIEW _idempotency_receipts;");
-    const restore = try std.fmt.allocPrintSentinel(a, "ALTER TABLE fallback_{s}._idempotency_receipts SET SCHEMA idem_{s};", .{ token, token }, 0);
+    const restore = try a.printSentinel("ALTER TABLE fallback_{s}._idempotency_receipts SET SCHEMA idem_{s};", .{ token, token }, 0);
     defer a.free(restore);
     try first.exec(restore);
     try first.exec("CREATE TEMP TABLE _idempotency_receipts(sentinel INTEGER); INSERT INTO _idempotency_receipts VALUES(42);");
@@ -516,13 +516,13 @@ test "pg quoted schema names and cold temporary paths retain durable ownership" 
     defer first.close();
     const token = try @import("crypto.zig").genToken(std.testing.io, a, 12);
     defer a.free(token);
-    const create = try std.fmt.allocPrintSentinel(a, "CREATE SCHEMA \"Idem-App Data-{s}\";", .{token}, 0);
+    const create = try a.printSentinel("CREATE SCHEMA \"Idem-App Data-{s}\";", .{token}, 0);
     defer a.free(create);
-    const drop = try std.fmt.allocPrintSentinel(a, "DROP SCHEMA \"Idem-App Data-{s}\" CASCADE;", .{token}, 0);
+    const drop = try a.printSentinel("DROP SCHEMA \"Idem-App Data-{s}\" CASCADE;", .{token}, 0);
     defer a.free(drop);
-    const path = try std.fmt.allocPrintSentinel(a, "SET search_path TO \"Idem-App Data-{s}\";", .{token}, 0);
+    const path = try a.printSentinel("SET search_path TO \"Idem-App Data-{s}\";", .{token}, 0);
     defer a.free(path);
-    const update = try std.fmt.allocPrintSentinel(a, "UPDATE \"Idem-App Data-{s}\".counter SET n=n+1;", .{token}, 0);
+    const update = try a.printSentinel("UPDATE \"Idem-App Data-{s}\".counter SET n=n+1;", .{token}, 0);
     defer a.free(update);
     try first.exec(create);
     defer first.exec(drop) catch |err| std.log.err("quoted schema test cleanup: {s}", .{@errorName(err)});
@@ -669,7 +669,7 @@ test "invalid input and nested transactions do not mutate or end caller transact
     input.key = "";
     try std.testing.expectError(error.InvalidScope, I.execute(a, &conn, input, op.callbacks()));
     input = test_input;
-    input.payload = "x" ** 33;
+    input.payload = (&@as([33]u8, @splat('x')));
     try std.testing.expectError(error.PayloadTooLarge, I.execute(a, &conn, input, op.callbacks()));
     input = test_input;
     input.now = std.math.maxInt(i64);
@@ -762,7 +762,7 @@ test "independent SQLite writers cannot execute a concurrent duplicate" {
     defer tmp.cleanup();
     const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
     defer a.free(root);
-    const path = try std.fmt.allocPrintSentinel(a, "{s}/data.db", .{root}, 0);
+    const path = try a.printSentinel("{s}/data.db", .{root}, 0);
     defer a.free(path);
     var first = try db.Db.open(path);
     defer first.close();

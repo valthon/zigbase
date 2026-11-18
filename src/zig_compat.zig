@@ -19,10 +19,10 @@ comptime {
     const have = builtin.zig_version;
 
     // Pinned to a single minor series: reject a different major OR minor, so
-    // 0.16.x passes but 0.15.x / 0.17.x are rejected.
-    if (have.major != need.major or have.minor != need.minor) {
+    // 0.17.1 and later patches pass; other minor series are rejected.
+    if (have.major != need.major or have.minor != need.minor or have.order(need) == .lt) {
         @compileError(std.fmt.comptimePrint(
-            "zigbase requires Zig {d}.{d}.x (pinned {s}), but you are building with {s}. " ++
+            "zigbase requires Zig {d}.{d}.x at least {s}, but you are building with {s}. " ++
                 "Install the pinned toolchain: run `mise install` in the repo, or " ++
                 "`mise exec zig@{s} -- zig build`. See mise.toml / build.zig.zon minimum_zig_version.",
             .{ need.major, need.minor, build_options.min_zig_version, builtin.zig_version_string, build_options.min_zig_version },

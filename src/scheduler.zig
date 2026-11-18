@@ -23,19 +23,19 @@ pub const RuntimeJob = struct {
 /// boot-fire and silently retire). The handler type differs by mode (reactive returns
 /// `Reactive`, others `void`), so it is not hard-asserted here.
 fn validateJobSpecs(comptime specs: anytype) void {
-    inline for (std.meta.fields(@TypeOf(specs))) |f| {
-        const s = @field(specs, f.name);
+    inline for (@typeInfo(@TypeOf(specs)).@"struct".field_names) |f| {
+        const s = @field(specs, f);
         if (!@hasField(@TypeOf(s), "name")) @compileError("job spec is missing '.name' (expected .{ .name = \"...\", .schedule = ..., .handler = fn })");
         if (!@hasField(@TypeOf(s), "schedule")) @compileError("job spec is missing '.schedule' (expected .{ .name = \"...\", .schedule = ..., .handler = fn })");
         if (!@hasField(@TypeOf(s), "handler")) @compileError("job spec is missing '.handler' (expected .{ .name = \"...\", .schedule = ..., .handler = fn })");
         // Fail loud on a typo'd key (only .name/.schedule/.handler are read) so a misspelling
         // isn't silently dropped, mirroring the unknown-key gates on collections/fields/routes.
-        inline for (std.meta.fields(@TypeOf(s))) |sf| {
+        inline for (@typeInfo(@TypeOf(s)).@"struct".field_names) |sf| {
             comptime var ok = false;
             inline for ([_][]const u8{ "name", "schedule", "handler", "distributed" }) |a| {
-                if (comptime std.mem.eql(u8, sf.name, a)) ok = true;
+                if (comptime std.mem.eql(u8, sf, a)) ok = true;
             }
-            if (!ok) @compileError("job spec '" ++ s.name ++ "': unknown key '." ++ sf.name ++
+            if (!ok) @compileError("job spec '" ++ s.name ++ "': unknown key '." ++ sf ++
                 "' (recognized keys: .name, .schedule, .handler, .distributed)");
         }
         // Validate a comptime-known cron grammar so a malformed expression (wrong field
@@ -51,10 +51,10 @@ fn validateJobSpecs(comptime specs: anytype) void {
             if (sched == .interval and (sched.interval == .minutes and (sched.interval.minutes == 0 or sched.interval.minutes > 525600))) @compileError("distributed minute intervals must be between 1 and 525600");
         }
     }
-    inline for (std.meta.fields(@TypeOf(specs)), 0..) |f, i| {
-        inline for (std.meta.fields(@TypeOf(specs))[0..i]) |prior| {
-            const current = @field(specs, f.name);
-            const previous = @field(specs, prior.name);
+    inline for (@typeInfo(@TypeOf(specs)).@"struct".field_names, 0..) |f, i| {
+        inline for (@typeInfo(@TypeOf(specs)).@"struct".field_names[0..i]) |prior| {
+            const current = @field(specs, f);
+            const previous = @field(specs, prior);
             if ((@hasField(@TypeOf(current), "distributed") or @hasField(@TypeOf(previous), "distributed")) and std.mem.eql(u8, current.name, previous.name)) @compileError("distributed job names must be unique");
         }
     }
@@ -66,14 +66,14 @@ fn validateJobSpecs(comptime specs: anytype) void {
 /// per-spec wrapper struct (each spec gets its own `Wrap` type, hence its own `run` fn ptr).
 pub fn buildJobs(comptime specs: anytype) []const RuntimeJob {
     comptime validateJobSpecs(specs);
-    const fields = std.meta.fields(@TypeOf(specs));
+    const fields = @typeInfo(@TypeOf(specs)).@"struct".field_names;
     // A struct-namespace const has static lifetime, so &Holder.table is a valid []const
     // returnable at runtime (a plain comptime local is not).
     const Holder = struct {
         const table: [fields.len]RuntimeJob = blk: {
             var t: [fields.len]RuntimeJob = undefined;
             for (fields, 0..) |f, i| {
-                const s = @field(specs, f.name);
+                const s = @field(specs, f);
                 const sched: schedule.Schedule = s.schedule;
                 const reactive = sched == .reactive;
                 const handler = s.handler;

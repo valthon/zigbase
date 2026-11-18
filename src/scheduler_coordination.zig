@@ -9,11 +9,11 @@ const scheduler = @import("scheduler.zig");
 pub const Config = struct { lease_seconds: u32 = 300 };
 pub fn lowerConfig(comptime value: anytype) Config {
     const fields = switch (@typeInfo(@TypeOf(value))) {
-        .@"struct" => |s| s.fields,
+        .@"struct" => |s| s.field_names,
         else => @compileError("distributed must be a configuration struct"),
     };
     inline for (fields) |field| {
-        if (!std.mem.eql(u8, field.name, "lease_seconds")) @compileError("unknown distributed configuration field: " ++ field.name);
+        if (!std.mem.eql(u8, field, "lease_seconds")) @compileError("unknown distributed configuration field: " ++ field);
     }
     const lease: u32 = if (@hasField(@TypeOf(value), "lease_seconds")) value.lease_seconds else 300;
     if (lease == 0) @compileError("distributed lease_seconds must be positive");
@@ -274,7 +274,7 @@ test "completion persistence failure preserves the original handler error" {
     defer tmp.cleanup();
     const dir = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
     defer testing.allocator.free(dir);
-    const path = try std.fmt.allocPrintSentinel(testing.allocator, "{s}/jobs.db", .{dir}, 0);
+    const path = try testing.allocator.printSentinel("{s}/jobs.db", .{dir}, 0);
     defer testing.allocator.free(path);
     var pool = try db.Pool.init(testing.allocator, testing.io, path);
     defer pool.deinit();
@@ -347,7 +347,7 @@ test "distributed wrapper releases writer around handler and supplies stable occ
     defer tmp.cleanup();
     const dir = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
     defer testing.allocator.free(dir);
-    const path = try std.fmt.allocPrintSentinel(testing.allocator, "{s}/jobs.db", .{dir}, 0);
+    const path = try testing.allocator.printSentinel("{s}/jobs.db", .{dir}, 0);
     defer testing.allocator.free(path);
     var pool = try db.Pool.init(testing.allocator, testing.io, path);
     defer pool.deinit();
@@ -411,9 +411,9 @@ const PgEnv = struct {
         errdefer second.close();
         const name = @import("id.zig").collectionId(testing.io);
         var buf: [128]u8 = undefined;
-        try first.exec(try std.fmt.bufPrintZ(&buf, "CREATE SCHEMA \"zbs_{s}\";", .{name}));
-        errdefer first.exec(std.fmt.bufPrintZ(&buf, "DROP SCHEMA \"zbs_{s}\" CASCADE;", .{name}) catch unreachable) catch |e| std.log.err("scheduler test cleanup: {s}", .{@errorName(e)});
-        const path = try std.fmt.bufPrintZ(&buf, "SET search_path TO \"zbs_{s}\";", .{name});
+        try first.exec(try std.mem.printSentinel(&buf, "CREATE SCHEMA \"zbs_{s}\";", .{name}, 0));
+        errdefer first.exec(std.mem.printSentinel(&buf, "DROP SCHEMA \"zbs_{s}\" CASCADE;", .{name}, 0) catch unreachable) catch |e| std.log.err("scheduler test cleanup: {s}", .{@errorName(e)});
+        const path = try std.mem.printSentinel(&buf, "SET search_path TO \"zbs_{s}\";", .{name}, 0);
         try first.exec(path);
         try second.exec(path);
         try @import("migrations.zig").run(&first);
@@ -422,7 +422,7 @@ const PgEnv = struct {
     fn deinit(self: *PgEnv) void {
         self.second.close();
         var buf: [128]u8 = undefined;
-        self.first.exec(std.fmt.bufPrintZ(&buf, "DROP SCHEMA \"zbs_{s}\" CASCADE;", .{self.name}) catch unreachable) catch |e| std.log.err("scheduler test cleanup: {s}", .{@errorName(e)});
+        self.first.exec(std.mem.printSentinel(&buf, "DROP SCHEMA \"zbs_{s}\" CASCADE;", .{self.name}, 0) catch unreachable) catch |e| std.log.err("scheduler test cleanup: {s}", .{@errorName(e)});
         self.first.close();
     }
 };

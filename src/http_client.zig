@@ -145,7 +145,7 @@ pub const HttpClient = struct {
         // Mirror std.http.Client.fetch: follow up to 3 redirects for bodyless
         // requests; leave redirect handling to the caller for requests with a body.
         const redirect_behavior: std.http.Client.Request.RedirectBehavior =
-            if (opts.body == null) @enumFromInt(3) else .unhandled;
+            if (opts.body == null) @fromBackingInt(@intCast(3)) else .unhandled;
 
         var req = client.request(method, uri, .{
             .extra_headers = extra,
@@ -190,7 +190,7 @@ pub const HttpClient = struct {
         if (responseHasNoBody(method, response.head.status)) {
             if (req.connection) |connection| connection.closing = true;
             return .{
-                .status = @intFromEnum(response.head.status),
+                .status = @backingInt(response.head.status),
                 .headers = captured_headers,
                 .body = fw.buffered(),
             };
@@ -214,7 +214,7 @@ pub const HttpClient = struct {
         // TLS certificate verification is on by default in std.http.Client;
         // do not disable it here.
         return .{
-            .status = @intFromEnum(response.head.status),
+            .status = @backingInt(response.head.status),
             .headers = captured_headers,
             .body = fw.buffered(),
         };
@@ -276,7 +276,7 @@ pub const HttpClient = struct {
         // Mirror std.http.Client.fetch: follow up to 3 redirects for bodyless
         // requests; leave redirect handling to the caller for requests with a body.
         const redirect_behavior: std.http.Client.Request.RedirectBehavior =
-            if (opts.body == null) @enumFromInt(3) else .unhandled;
+            if (opts.body == null) @fromBackingInt(@intCast(3)) else .unhandled;
 
         var req = client.request(method, uri, .{
             .extra_headers = extra,
@@ -311,7 +311,7 @@ pub const HttpClient = struct {
             });
         }
         const captured_headers = try header_list.toOwnedSlice(self.alloc);
-        const status: u16 = @intFromEnum(response.head.status);
+        const status: u16 = @backingInt(response.head.status);
 
         // A response DEFINED to have no body (see `responseHasNoBody`) is never read —
         // `writer` stays untouched, same as a normal small body below the discard
@@ -416,7 +416,7 @@ const TestHttpServer = struct {
     }
 
     fn url(self: TestHttpServer, alloc: std.mem.Allocator) ![]const u8 {
-        return std.fmt.allocPrint(alloc, "http://127.0.0.1:{d}/", .{self.port});
+        return alloc.print("http://127.0.0.1:{d}/", .{self.port});
     }
 
     /// Thread function: accept one connection, write the fixed HTTP response, close.

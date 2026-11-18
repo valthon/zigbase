@@ -358,7 +358,7 @@ def test_subprocess_commands_resolve_pinned_tools_before_home_isolation(tmp_path
     assert (
         commands.run(["npm", "--version"], cwd=workspace_path).stdout == "npm-direct\n"
     )
-    assert resolved == [("zig@0.16.0", "zig"), ("node@24", "bin/npm")]
+    assert resolved == [("zig@0.17.1", "zig"), ("node@24", "bin/npm")]
 
 
 def test_health_timeout_still_tears_down(tmp_path):

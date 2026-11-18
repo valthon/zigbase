@@ -17,7 +17,7 @@ fn prep(a: std.mem.Allocator, conn: *db.Db, sql: []const u8) !db.Stmt {
         var ns = try conn.prepare("SELECT pg_catalog.quote_ident(current_schema()), current_schema();");
         defer ns.finalize();
         if (!try ns.step() or ns.isNull(0) or std.mem.startsWith(u8, ns.columnText(1), "pg_")) return error.InvalidReplaySchema;
-        break :blk try std.fmt.allocPrint(a, "{s}.", .{ns.columnText(0)});
+        break :blk try a.print("{s}.", .{ns.columnText(0)});
     } else try a.dupe(u8, "main.");
     defer a.free(prefix);
     // Rewrite only engine-owned placeholders. A quoted PostgreSQL schema may
@@ -26,7 +26,7 @@ fn prep(a: std.mem.Allocator, conn: *db.Db, sql: []const u8) !db.Stmt {
     defer if (pg) a.free(numbered);
     const qualified = try std.mem.replaceOwned(u8, a, numbered, "journal.", prefix);
     defer a.free(qualified);
-    const z = try a.dupeZ(u8, qualified);
+    const z = try a.dupeSentinel(u8, qualified, 0);
     defer a.free(z);
     return conn.prepare(z);
 }
@@ -407,15 +407,15 @@ test "pg journal isolates schema and serializes visibility across connections" {
     defer other.close();
     const token = try @import("../crypto.zig").genToken(std.testing.io, a, 12);
     defer a.free(token);
-    const name = try std.fmt.allocPrint(a, "replay?\"'{s}", .{token});
+    const name = try a.print("replay?\"'{s}", .{token});
     defer a.free(name);
     const quoted = try @import("../ddl.zig").quoteIdent(a, name);
     defer a.free(quoted);
-    const create = try std.fmt.allocPrintSentinel(a, "CREATE SCHEMA {s};", .{quoted}, 0);
+    const create = try a.printSentinel("CREATE SCHEMA {s};", .{quoted}, 0);
     defer a.free(create);
-    const drop = try std.fmt.allocPrintSentinel(a, "DROP SCHEMA {s} CASCADE;", .{quoted}, 0);
+    const drop = try a.printSentinel("DROP SCHEMA {s} CASCADE;", .{quoted}, 0);
     defer a.free(drop);
-    const path = try std.fmt.allocPrintSentinel(a, "SET search_path TO {s};", .{quoted}, 0);
+    const path = try a.printSentinel("SET search_path TO {s};", .{quoted}, 0);
     defer a.free(path);
     try first.exec(create);
     defer first.exec(drop) catch |err| std.log.err("replay test cleanup: {s}", .{@errorName(err)});
@@ -554,7 +554,7 @@ test "a chunk whose floor passed its position requires reset" {
 
 test "opaque cursor authenticates scope and ciphertext without exposing positions" {
     const a = std.testing.allocator;
-    const key = [_]u8{7} ** 32;
+    const key = @as([32]u8, @splat(7));
     const first = try sealCursor(a, std.testing.io, key, "collection:0", 42);
     defer a.free(first);
     const same = try sealCursor(a, std.testing.io, key, "collection:0", 42);

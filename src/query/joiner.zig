@@ -89,7 +89,7 @@ pub const Joiner = struct {
                     if (fl.encrypted) return error.EncryptedField;
                     if (fl.hidden and !self.allow_hidden) return error.HiddenField;
                 }
-                const ref = try std.fmt.allocPrint(sa, "{s}.{s}", .{ cur_alias, try ddl.quoteIdent(sa, seg) });
+                const ref = try sa.print("{s}.{s}", .{ cur_alias, try ddl.quoteIdent(sa, seg) });
                 return .{ .sql = ref, .field = field, .nocase = ddl.isNocaseField(cur_col, seg) };
             }
             const rf = schema.fieldByName(cur_col, seg) orelse return error.UnknownField;
@@ -120,8 +120,8 @@ pub const Joiner = struct {
                 } else (try collections.get(sa, self.conn, rf.options.relation.targetCollectionId)) orelse return error.UnknownField;
                 try self.checkClientTarget(target);
                 self.counter += 1;
-                const alias = try std.fmt.allocPrint(sa, "j{d}", .{self.counter});
-                const join = try std.fmt.allocPrint(sa, "LEFT JOIN {s} AS {s} ON {s}.{s} = {s}.\"id\"", .{ try ddl.quoteIdent(sa, target.name), alias, cur_alias, try ddl.quoteIdent(sa, seg), alias });
+                const alias = try sa.print("j{d}", .{self.counter});
+                const join = try sa.print("LEFT JOIN {s} AS {s} ON {s}.{s} = {s}.\"id\"", .{ try ddl.quoteIdent(sa, target.name), alias, cur_alias, try ddl.quoteIdent(sa, seg), alias });
                 try self.joins.append(self.alloc, join);
                 try self.seen.append(self.alloc, .{ .prefix = try sa.dupe(u8, prefix), .alias = alias, .col = target });
                 cur_alias = alias;

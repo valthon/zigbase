@@ -34,7 +34,7 @@ fn urlAs(a: std.mem.Allocator, user: []const u8, pass: []const u8) ![]const u8 {
     const base = pgtests.testUrl();
     const scheme_end = (std.mem.indexOf(u8, base, "://") orelse return error.TestUnexpectedResult) + 3;
     const at = std.mem.indexOfScalarPos(u8, base, scheme_end, '@') orelse return error.TestUnexpectedResult;
-    return std.fmt.allocPrint(a, "{s}{s}:{s}@{s}", .{ base[0..scheme_end], user, pass, base[at + 1 ..] });
+    return a.print("{s}{s}:{s}@{s}", .{ base[0..scheme_end], user, pass, base[at + 1 ..] });
 }
 
 test "pg scram: a non-ASCII already-NFC password authenticates end-to-end" {

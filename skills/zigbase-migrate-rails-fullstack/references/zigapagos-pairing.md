@@ -75,7 +75,7 @@ Build the frontend release into `frontend/dist`, then build the application bina
 cd frontend
 npx --yes --package zigapagos@0.5.0 -- zigapagos release --output=dist --force
 cd ..
-mise exec zig@0.16.0 -- zig build
+mise exec zig@0.17.1 -- zig build
 ```
 
 For the most flexible development/deployment shape, leave the framework's static-files mode at
@@ -101,7 +101,7 @@ exception. Plain HTTP local development needs `--insecure-cookies`. Production m
 Zigapagos can run the built consumer binary rather than its stock backend:
 
 ```sh
-mise exec zig@0.16.0 -- zig build
+mise exec zig@0.17.1 -- zig build
 cd frontend
 ZIGAPAGOS_DEV_BACKGROUND=0 ZIGBASE_SERVE_BACKGROUND=0 \
   npx --yes --package zigapagos@0.5.0 -- zigapagos dev \
@@ -143,7 +143,7 @@ The reference matrix is deliberately redundant:
 
 ```sh
 # Server policy, hooks, routes, and deterministic behavior without a socket
-mise exec zig@0.16.0 -- zig build test --summary all
+mise exec zig@0.17.1 -- zig build test --summary all
 
 # Frontend static analysis and release integrity
 cd frontend

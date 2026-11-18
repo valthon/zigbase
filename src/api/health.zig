@@ -58,8 +58,7 @@ test "health returns 200 and ok status with backend badge + versions" {
     // No live app in this pure-handler test → reports the default backend, never any secret.
     // The versions come from build_options / the linked SQLite; assemble the expected body from
     // the same sources so a version bump doesn't require editing this literal by hand.
-    const expected = try std.fmt.allocPrint(
-        arena.allocator(),
+    const expected = try arena.allocator().print(
         "{{\"status\":\"ok\",\"backend\":\"sqlite\",\"versions\":{{" ++
             "\"zigbase\":\"{s}\",\"commit\":\"{s}\",\"sqlite\":\"{s}\"," ++
             "\"sqliteVec\":\"{s}\",\"zap\":\"{s}\",\"facil\":\"{s}\"}}}}",

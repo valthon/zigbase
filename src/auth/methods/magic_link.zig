@@ -148,11 +148,10 @@ fn buildMailBody(
     redirect: []const u8,
 ) ![]const u8 {
     if (public_url.len == 0) {
-        return std.fmt.allocPrint(alloc, "Your sign-in link token:\n\n{s}\n", .{token});
+        return alloc.print("Your sign-in link token:\n\n{s}\n", .{token});
     }
     const base = std.mem.trimEnd(u8, public_url, "/");
-    return std.fmt.allocPrint(
-        alloc,
+    return alloc.print(
         "Click the link to sign in:\n\n{s}/api/collections/{s}/auth/magic-link/consume?token={s}&redirect={s}\n",
         .{ base, col_name, token, redirect },
     );
@@ -213,7 +212,7 @@ test "MagicLinkMethod: complete with valid token resolves to record id" {
     const rid = rid_buf[0..rid_len];
 
     // Build the complete request body
-    const body = try std.fmt.allocPrint(a, "{{\"token\":\"{s}\"}}", .{token});
+    const body = try a.print("{{\"token\":\"{s}\"}}", .{token});
     var req_ok = env.ctx(RequestArena.from(&arena), .POST, body, &[_]http.Param{});
     var ac_ok = AuthCtx{
         .app = &env.app,
@@ -626,7 +625,7 @@ test "MagicLinkMethod: auto_create initiate then complete succeeds end-to-end" {
     }
 
     // complete resolves to the auto-created record's id
-    const body = try std.fmt.allocPrint(a, "{{\"token\":\"{s}\"}}", .{token});
+    const body = try a.print("{{\"token\":\"{s}\"}}", .{token});
     var req_comp = env.ctx(RequestArena.from(&arena), .POST, body, &[_]http_mod.Param{});
     const col3 = blk: {
         const w = env.pool.acquireWriter();

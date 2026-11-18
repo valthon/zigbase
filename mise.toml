@@ -1,6 +1,6 @@
 [tools]
 python = "3.13"
-zig = "0.16.0"
+zig = "0.17.1"
 node = "24"
 dart = "3.12"
 java = "openjdk-17"

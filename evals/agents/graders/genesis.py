@@ -97,7 +97,7 @@ class SubprocessCommands:
 
     def _resolve_command(self, argv: list[str]) -> list[str]:
         pins = {
-            "zig": ("zig@0.16.0", "zig"),
+            "zig": ("zig@0.17.1", "zig"),
             "npm": ("node@24", "bin/npm"),
         }
         if argv[0] not in pins:

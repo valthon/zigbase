@@ -180,10 +180,10 @@ test "verifySignature accepts a correct HMAC (ts+provider+account+body) and reje
 test "timestampFresh accepts in-window, rejects stale / future / garbage (M5)" {
     const now: i64 = 1_700_000_000;
     var buf: [32]u8 = undefined;
-    try testing.expect(timestampFresh(try std.fmt.bufPrint(&buf, "{d}", .{now}), now));
-    try testing.expect(timestampFresh(try std.fmt.bufPrint(&buf, "{d}", .{now - max_skew_s}), now));
-    try testing.expect(!timestampFresh(try std.fmt.bufPrint(&buf, "{d}", .{now - max_skew_s - 1}), now));
-    try testing.expect(!timestampFresh(try std.fmt.bufPrint(&buf, "{d}", .{now + max_skew_s + 1}), now));
+    try testing.expect(timestampFresh(try std.mem.print(&buf, "{d}", .{now}), now));
+    try testing.expect(timestampFresh(try std.mem.print(&buf, "{d}", .{now - max_skew_s}), now));
+    try testing.expect(!timestampFresh(try std.mem.print(&buf, "{d}", .{now - max_skew_s - 1}), now));
+    try testing.expect(!timestampFresh(try std.mem.print(&buf, "{d}", .{now + max_skew_s + 1}), now));
     try testing.expect(!timestampFresh("not-a-number", now));
     try testing.expect(!timestampFresh("", now));
 }
@@ -207,7 +207,7 @@ test "webhook_handler rejects an invalid signature (401, fail closed)" {
     // exercises the signature check.
     const a = std.testing.allocator;
     var app = App{ .allocator = a, .io = testing.io, .pool = undefined, .mail = .{ .webhook_secret = "shh" } };
-    const ts = try std.fmt.allocPrint(a, "{d}", .{clock.nowUnix(testing.io)});
+    const ts = try a.print("{d}", .{clock.nowUnix(testing.io)});
     defer a.free(ts);
     const headers = [_]http.Param{
         .{ .key = sig_header, .value = "deadbeef" }, // not the real signature
@@ -233,7 +233,7 @@ test "webhook_handler: signed-account event verifies (200); tampering account â†
     defer tmp.cleanup();
     const dir_path = try tmp.dir.realPathFileAlloc(testing.io, ".", ga);
     defer ga.free(dir_path);
-    const db_path = try std.fmt.allocPrintSentinel(ga, "{s}/inbound.db", .{dir_path}, 0);
+    const db_path = try ga.printSentinel("{s}/inbound.db", .{dir_path}, 0);
     defer ga.free(db_path);
     var pool = try db.Pool.init(ga, testing.io, db_path);
     defer pool.deinit();
@@ -248,7 +248,7 @@ test "webhook_handler: signed-account event verifies (200); tampering account â†
         \\{"notificationType":"Bounce","bounce":{"bounceType":"Permanent","bouncedRecipients":[{"emailAddress":"bad@x.io"}]}}
     ;
     const a = ga;
-    const ts = try std.fmt.allocPrint(a, "{d}", .{clock.nowUnix(testing.io)});
+    const ts = try a.print("{d}", .{clock.nowUnix(testing.io)});
     defer a.free(ts);
     // A relay signs ts.provider.account.body and injects X-Account-Id.
     const sig = try signMailInbound(a, "relay-secret", ts, "ses", "acc1", body);

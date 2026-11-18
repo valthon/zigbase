@@ -32,9 +32,9 @@ pub fn rollupSpecs(comptime acfg: anytype) []const RollupSpec {
     const ACT = @TypeOf(acfg);
     if (@typeInfo(ACT) != .@"struct")
         @compileError(".analytics must be a struct, e.g. '.{ .rollups = .{ … } }'");
-    for (std.meta.fields(ACT)) |f| {
-        if (!std.mem.eql(u8, f.name, "rollups"))
-            @compileError(".analytics: unknown key '." ++ f.name ++ "' (recognized: .rollups)");
+    for (@typeInfo(ACT).@"struct".field_names) |f| {
+        if (!std.mem.eql(u8, f, "rollups"))
+            @compileError(".analytics: unknown key '." ++ f ++ "' (recognized: .rollups)");
     }
     if (!@hasField(ACT, "rollups")) return &.{};
 
@@ -43,11 +43,11 @@ pub fn rollupSpecs(comptime acfg: anytype) []const RollupSpec {
     if (@typeInfo(RT) != .@"struct")
         @compileError(".analytics.rollups must be a struct of named rollups, e.g. '.{ .signups_daily = .{ … } }'");
 
-    const fields = std.meta.fields(RT);
+    const fields = @typeInfo(RT).@"struct".field_names;
     const Holder = struct {
         const table: [fields.len]RollupSpec = blk: {
             var t: [fields.len]RollupSpec = undefined;
-            for (fields, 0..) |f, i| t[i] = lowerOne(f.name, @field(rcfg, f.name));
+            for (fields, 0..) |f, i| t[i] = lowerOne(f, @field(rcfg, f));
             break :blk t;
         };
     };
@@ -65,11 +65,11 @@ fn lowerOne(comptime name: []const u8, comptime entry: anytype) RollupSpec {
         @compileError(".analytics.rollups." ++ name ++ " must be a struct '.{ .event = \"…\", .every = …, … }'");
 
     // Reject unknown keys.
-    for (std.meta.fields(ET)) |f| {
-        const ok = std.mem.eql(u8, f.name, "event") or std.mem.eql(u8, f.name, "every") or
-            std.mem.eql(u8, f.name, "group_by") or std.mem.eql(u8, f.name, "metric");
+    for (@typeInfo(ET).@"struct".field_names) |f| {
+        const ok = std.mem.eql(u8, f, "event") or std.mem.eql(u8, f, "every") or
+            std.mem.eql(u8, f, "group_by") or std.mem.eql(u8, f, "metric");
         if (!ok)
-            @compileError(".analytics.rollups." ++ name ++ ": unknown key '." ++ f.name ++
+            @compileError(".analytics.rollups." ++ name ++ ": unknown key '." ++ f ++
                 "' (recognized: .event, .every, .group_by, .metric)");
     }
 
@@ -139,11 +139,11 @@ fn lowerGroupBy(comptime name: []const u8, comptime gcfg: anytype, comptime spec
     const GT = @TypeOf(gcfg);
     if (@typeInfo(GT) != .@"struct")
         @compileError(".analytics.rollups." ++ name ++ ".group_by must be a struct, e.g. '.{ .account = true, .time_bucket = .day }'");
-    for (std.meta.fields(GT)) |f| {
-        const ok = std.mem.eql(u8, f.name, "account") or std.mem.eql(u8, f.name, "actor") or
-            std.mem.eql(u8, f.name, "time_bucket");
+    for (@typeInfo(GT).@"struct".field_names) |f| {
+        const ok = std.mem.eql(u8, f, "account") or std.mem.eql(u8, f, "actor") or
+            std.mem.eql(u8, f, "time_bucket");
         if (!ok)
-            @compileError(".analytics.rollups." ++ name ++ ".group_by: unknown key '." ++ f.name ++
+            @compileError(".analytics.rollups." ++ name ++ ".group_by: unknown key '." ++ f ++
                 "' (recognized: .account, .actor, .time_bucket)");
     }
     if (@hasField(GT, "account")) spec.group_account = gcfg.account;

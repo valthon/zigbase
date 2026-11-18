@@ -120,13 +120,13 @@ fn xFunc(ctx: ?*c.sqlite3_context, argc: c_int, argv: [*c]?*c.sqlite3_value) cal
     // Build `SELECT <name>(?1, ?2, …)` (null-terminated) for delegation.
     var sql_buf: [256]u8 = undefined;
     var len: usize = 0;
-    len += (std.fmt.bufPrint(sql_buf[len..], "SELECT {s}(", .{name}) catch {
+    len += (std.mem.print(sql_buf[len..], "SELECT {s}(", .{name}) catch {
         c.sqlite3_result_error(ctx, "clock_sql: sql build failed", -1);
         return;
     }).len;
     var k: usize = 0;
     while (k < nph) : (k += 1) {
-        const piece = std.fmt.bufPrint(sql_buf[len..], "{s}?{d}", .{ if (k == 0) "" else ",", k + 1 }) catch {
+        const piece = std.mem.print(sql_buf[len..], "{s}?{d}", .{ if (k == 0) "" else ",", k + 1 }) catch {
             c.sqlite3_result_error(ctx, "clock_sql: sql build failed", -1);
             return;
         };

@@ -2,7 +2,7 @@
     .name = .zigbase,
     .version = "0.13.0",
     .fingerprint = 0x306d84a90c011454,
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.1",
     .dependencies = .{
         // Fork of upstream v0.10.6 (f6099ece), retaining issue #380's protection
         // for descriptors outside facil.io and the connection-generation fix:
@@ -13,10 +13,14 @@
         // Flush and close revalidate identity inside their respective locks. This fixes
         // connection resets and truncated HTTP responses during browser startup.
         // Preserve both fixes when upgrading; keep build.zig's upstream versions
-        // in sync with the fork's base tag.
+        // in sync with the fork's base tag. The fork also ports zap to Zig 0.17.1.
         .zap = .{
-            .url = "git+https://github.com/valthon/zap#2bfc918ff1e07ced69fb5535c19b56251c9fcea0",
-            .hash = "zap-0.10.6-GoeB8_TjJABuc_dEhxCk4cDo7Bwu3-3-3BeY6b5jaaVg",
+            .url = "git+https://github.com/valthon/zap#d4ce3d990fc8a35ad4037a04272e85a2ba9871ff",
+            .hash = "zap-0.10.6-GoeB8zTfJADpnRIkST00NUo7ai2Ds7Yi0o00OpIrOp-4",
+        },
+        .translate_c = .{
+            .url = "git+https://codeberg.org/ziglang/translate-c?ref=zig-0.17.x#cfac21f3199b2b02ce3fd7db652aa456421fe4ab",
+            .hash = "translate_c-2.0.2-Q_BUWvBNBwDnyehSiuAJmdFcMYHYGA-Jc3KiYdrV2Dqx",
         },
     },
     .paths = .{

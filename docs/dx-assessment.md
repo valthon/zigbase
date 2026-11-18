@@ -1,5 +1,7 @@
 # ZigBase framework DX assessment
 
+> Historical assessment: compiler commands and the 361-test count below record the original Zig 0.16.0 audit. Current builds require Zig 0.17.1; see [Contributing](../CONTRIBUTING.md).
+
 > **Point-in-time audit — 2026-06-13 (updated 2026-06-27).** This document records the
 > state of the framework surface, its papercuts, and the fixes landed in response *at
 > that time*. Version strings, line numbers, and "tracked for post-v0.1" style notes

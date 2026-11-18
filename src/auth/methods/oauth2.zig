@@ -172,7 +172,7 @@ const TestEnv = struct {
         env.tmp = std.testing.tmpDir(.{});
         const dir = try env.tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
         defer std.testing.allocator.free(dir);
-        const path = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/t.db", .{dir}, 0);
+        const path = try std.testing.allocator.printSentinel("{s}/t.db", .{dir}, 0);
         defer std.testing.allocator.free(path);
         env.pool = try db.Pool.init(std.testing.allocator, std.testing.io, path);
         {
@@ -237,7 +237,7 @@ const OAuthStub = struct {
         if (std.mem.indexOf(u8, url, "token") != null) {
             return .{ .status = self.token_status, .body = try alloc.dupe(u8, self.token_body) };
         }
-        const j = try std.fmt.allocPrint(alloc, "{{\"sub\":\"{s}\",\"email\":\"{s}\",\"email_verified\":{s}}}", .{
+        const j = try alloc.print("{{\"sub\":\"{s}\",\"email\":\"{s}\",\"email_verified\":{s}}}", .{
             self.pid, self.email, if (self.verified) "true" else "false",
         });
         return .{ .status = self.userinfo_status, .body = j };
@@ -249,11 +249,11 @@ const OAuthStub = struct {
 };
 
 fn oauthBody(a: std.mem.Allocator) ![]const u8 {
-    return std.fmt.allocPrint(a, "{{\"provider\":\"google\",\"code\":\"c\",\"codeVerifier\":\"v\",\"redirectUrl\":\"https://app/cb\"}}", .{});
+    return a.print("{{\"provider\":\"google\",\"code\":\"c\",\"codeVerifier\":\"v\",\"redirectUrl\":\"https://app/cb\"}}", .{});
 }
 
 fn oauthBodyWithState(a: std.mem.Allocator, state: []const u8) ![]const u8 {
-    return std.fmt.allocPrint(a, "{{\"provider\":\"google\",\"code\":\"c\",\"codeVerifier\":\"v\",\"redirectUrl\":\"https://app/cb\",\"state\":\"{s}\"}}", .{state});
+    return a.print("{{\"provider\":\"google\",\"code\":\"c\",\"codeVerifier\":\"v\",\"redirectUrl\":\"https://app/cb\",\"state\":\"{s}\"}}", .{state});
 }
 
 test "OAuth2Method: completeImpl creates a new record (isNew) with valid stub" {

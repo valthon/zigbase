@@ -118,11 +118,11 @@ pub fn build(alloc: std.mem.Allocator, dialect: db.Dialect, col: schema.Collecti
     defer alloc.free(qcol);
     const qfield = try ddl.quoteIdent(alloc, field);
     defer alloc.free(qfield);
-    const where_sql = try std.fmt.allocPrint(alloc, "{s}.{s} IS NOT NULL", .{ qcol, qfield });
+    const where_sql = try alloc.print("{s}.{s} IS NOT NULL", .{ qcol, qfield });
     errdefer alloc.free(where_sql); // free the first fragment if the second allocPrint OOMs
     const order_sql = switch (dialect.kind) {
         // sqlite-vec scalar distance functions over the JSON-array column.
-        .sqlite => try std.fmt.allocPrint(alloc, "{s}({s}.{s}, ?)", .{
+        .sqlite => try alloc.print("{s}({s}.{s}, ?)", .{
             switch (metric) {
                 .cosine => "vec_distance_cosine",
                 .l2 => "vec_distance_L2",
@@ -134,7 +134,7 @@ pub fn build(alloc: std.mem.Allocator, dialect: db.Dialect, col: schema.Collecti
         // and order by the native KNN operator (`<=>` cosine distance, `<->` L2). Smaller = nearer,
         // so ASC ordering yields nearest-first. `?::vector` renumbers to `$n::vector` (the `:` after
         // `?` is not a digit, so the ParamSink treats it as the anonymous placeholder).
-        .postgres => try std.fmt.allocPrint(alloc, "({s}.{s})::vector {s} ?::vector", .{
+        .postgres => try alloc.print("({s}.{s})::vector {s} ?::vector", .{
             qcol,
             qfield,
             switch (metric) {
@@ -287,7 +287,7 @@ test "sqlite-vec extension is registered and vec_distance functions evaluate (KN
         .{ .id = "f1", .name = "v", .options = .{ .json = .{} } },
     } }, "v:l2:[1,0]");
     defer v.deinit(a);
-    const sql = try std.fmt.allocPrintSentinel(a, "SELECT id FROM emb WHERE {s} ORDER BY {s};", .{ v.where_sql, v.order_sql }, 0);
+    const sql = try a.printSentinel("SELECT id FROM emb WHERE {s} ORDER BY {s};", .{ v.where_sql, v.order_sql }, 0);
     defer a.free(sql);
     var qs = try d.prepare(sql);
     defer qs.finalize();

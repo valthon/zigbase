@@ -325,7 +325,7 @@ test "durable uploads resume after offline auth and file collection renames" {
     defer tmp.cleanup();
     const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(dir);
-    const path = try std.fmt.allocPrintSentinel(allocator, "{s}/uploads.db", .{dir}, 0);
+    const path = try allocator.printSentinel("{s}/uploads.db", .{dir}, 0);
     defer allocator.free(path);
     var pool = try db.Pool.init(allocator, std.testing.io, path);
     defer pool.deinit();
@@ -387,7 +387,7 @@ test "durable restart allocation failures release restored graphs and ownership 
     defer tmp.cleanup();
     const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(dir);
-    const path = try std.fmt.allocPrintSentinel(allocator, "{s}/uploads.db", .{dir}, 0);
+    const path = try allocator.printSentinel("{s}/uploads.db", .{dir}, 0);
     defer allocator.free(path);
     var pool = try db.Pool.init(allocator, std.testing.io, path);
     defer pool.deinit();
@@ -420,7 +420,7 @@ test "expired durable payloads are validated without allocating their bytes" {
     defer tmp.cleanup();
     const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(dir);
-    const path = try std.fmt.allocPrintSentinel(allocator, "{s}/uploads.db", .{dir}, 0);
+    const path = try allocator.printSentinel("{s}/uploads.db", .{dir}, 0);
     defer allocator.free(path);
     var pool = try db.Pool.init(allocator, std.testing.io, path);
     defer pool.deinit();
@@ -450,7 +450,7 @@ test "durable recovery rejects session keys and counts before reading payloads" 
     defer tmp.cleanup();
     const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(dir);
-    const path = try std.fmt.allocPrintSentinel(allocator, "{s}/uploads.db", .{dir}, 0);
+    const path = try allocator.printSentinel("{s}/uploads.db", .{dir}, 0);
     defer allocator.free(path);
     var pool = try db.Pool.init(allocator, std.testing.io, path);
     defer pool.deinit();
@@ -499,7 +499,7 @@ test "durable startup validates the runtime SQLite whole-row limit before persis
     defer tmp.cleanup();
     const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(dir);
-    const path = try std.fmt.allocPrintSentinel(allocator, "{s}/uploads.db", .{dir}, 0);
+    const path = try allocator.printSentinel("{s}/uploads.db", .{dir}, 0);
     defer allocator.free(path);
     var pool = try db.Pool.init(allocator, std.testing.io, path);
     defer pool.deinit();
@@ -554,7 +554,7 @@ test "durable writes release transactions after commit failure" {
     defer tmp.cleanup();
     const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(dir);
-    const path = try std.fmt.allocPrintSentinel(allocator, "{s}/uploads.db", .{dir}, 0);
+    const path = try allocator.printSentinel("{s}/uploads.db", .{dir}, 0);
     defer allocator.free(path);
     var pool = try db.Pool.init(allocator, std.testing.io, path);
     defer pool.deinit();
@@ -665,7 +665,7 @@ test "durable contention parks and acknowledges only persisted session offsets" 
     defer tmp.cleanup();
     const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(dir);
-    const path = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/contention.db", .{dir}, 0);
+    const path = try std.testing.allocator.printSentinel("{s}/contention.db", .{dir}, 0);
     defer std.testing.allocator.free(path);
     var pool = try db.Pool.init(std.testing.allocator, io, path);
     defer pool.deinit();

@@ -164,7 +164,7 @@ pub const Db = if (build_options.postgres) union(Backend) {
 pub fn openInspectionConnection(allocator: std.mem.Allocator, io: std.Io, target: []const u8) (DbError || std.mem.Allocator.Error)!Db {
     if (build_options.postgres and connstrLooksLikePostgres(target))
         return Db.openPostgres(allocator, io, target);
-    const path = try allocator.dupeZ(u8, target);
+    const path = try allocator.dupeSentinel(u8, target, 0);
     defer allocator.free(path);
     return Db.openReadOnly(path);
 }
@@ -241,7 +241,7 @@ pub const Stmt = if (build_options.postgres) union(Backend) {
     pub fn columnType(self: *Stmt, idx: c_int) ColumnType {
         switch (self.*) {
             // Same ordinal layout across all three enums (asserted by the seam tests).
-            inline else => |*s| return @enumFromInt(@intFromEnum(s.columnType(idx))),
+            inline else => |*s| return @fromBackingInt(@intCast(@backingInt(s.columnType(idx)))),
         }
     }
     pub fn isNull(self: *Stmt, idx: c_int) bool {
@@ -516,7 +516,7 @@ test "seam: a SQLite pool reports the sqlite backend + dialect" {
     defer tmp.cleanup();
     const dir_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(dir_path);
-    const db_path = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/sel.db", .{dir_path}, 0);
+    const db_path = try std.testing.allocator.printSentinel("{s}/sel.db", .{dir_path}, 0);
     defer std.testing.allocator.free(db_path);
 
     var pool = try Pool.init(std.testing.allocator, std.testing.io, db_path);
@@ -591,7 +591,7 @@ test "writer recovery rolls back a failed commit and preserves connection state"
     defer tmp.cleanup();
     const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
     defer a.free(dir);
-    const path = try std.fmt.allocPrintSentinel(a, "{s}/recovery.db", .{dir}, 0);
+    const path = try a.printSentinel("{s}/recovery.db", .{dir}, 0);
     defer a.free(path);
     var pool = try Pool.init(a, std.testing.io, path);
     defer pool.deinit();
@@ -636,7 +636,7 @@ test "writer recovery quarantines a ledger rollback failure across seam views an
     defer tmp.cleanup();
     const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
     defer a.free(dir);
-    const path = try std.fmt.allocPrintSentinel(a, "{s}/poison.db", .{dir}, 0);
+    const path = try a.printSentinel("{s}/poison.db", .{dir}, 0);
     defer a.free(path);
     var pool = try Pool.init(a, std.testing.io, path);
     defer pool.deinit();
@@ -678,7 +678,7 @@ test "PostgreSQL writer recovery refuses a terminated transaction without resett
     if (comptime !build_options.postgres) return error.SkipZigTest;
     const url = std.testing.environ.getPosix("ZIGBASE_PG_TEST_URL") orelse return error.SkipZigTest;
     const a = std.testing.allocator;
-    const target = try a.dupeZ(u8, url);
+    const target = try a.dupeSentinel(u8, url, 0);
     defer a.free(target);
     var pool = try Pool.init(a, std.testing.io, target);
     defer pool.deinit();

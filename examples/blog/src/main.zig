@@ -102,7 +102,7 @@ fn computeReadingTime(ctx: *zigbase.Ctx, ev: *zigbase.RecordEvent) anyerror!void
     // what reads return (see docs/fields.md and src/values.zig readValue), so we write one here
     // for symmetry. A raw JSON integer is also accepted on write (values.zig bindValue binds it
     // directly), so binding `minutes` straight would work too.
-    const rt = try std.fmt.allocPrint(ev.arena.a, "{d}", .{minutes});
+    const rt = try ev.arena.a.print("{d}", .{minutes});
     try ev.record.object.put(ev.arena.a, "reading_time", .{ .string = rt });
 }
 
@@ -147,7 +147,7 @@ fn getPostBySlug(req: *zigbase.Req(void)) zigbase.RouteError!std.json.Value {
 
     // Read through the per-request capability object — `req.ctx.records()` manages
     // the pooled connection itself (no manual acquireReader / Data wiring).
-    const filter = std.fmt.allocPrint(req.ctx.arena.a, "slug = '{s}' && status = 'published'", .{slug}) catch return error.RouteFailed;
+    const filter = req.ctx.arena.a.print("slug = '{s}' && status = 'published'", .{slug}) catch return error.RouteFailed;
     const result = req.ctx.records().list("posts", .{ .filter = filter, .perPage = 1 }) catch return error.RouteFailed;
     if (result.items.len == 0) return error.NotFound;
     return result.items[0];

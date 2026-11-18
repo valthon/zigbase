@@ -33,7 +33,7 @@ fn field(value: std.json.Value, name: []const u8) ?[]const u8 {
 
 fn generation(ctx: *http.RequestCtx, conn: *db.Db, col: schema.Collection, id: []const u8) ![]const u8 {
     const ke = (try auth.tokenKeyAndEpochFor(ctx.allocator.a, conn, col.name, id)) orelse return error.NotFound;
-    const value = try std.fmt.allocPrint(ctx.allocator.a, "{s}:{d}", .{ ke.token_key, ke.epoch });
+    const value = try ctx.allocator.a.print("{s}:{d}", .{ ke.token_key, ke.epoch });
     var hash: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(value, &hash, .{});
     return ctx.allocator.a.dupe(u8, &std.fmt.bytesToHex(hash, .lower));
@@ -403,7 +403,7 @@ test "required TOTP gates password, rejects pending as session, completes once a
     const replay = try dispatch(&completion);
     try std.testing.expectEqual(@as(u16, 401), replay.status);
     var refresh = env.ctx(TestArena.from(&arena), .POST, "{}", &params);
-    refresh.authorization = try std.fmt.allocPrint(a, "Bearer {s}", .{session_token});
+    refresh.authorization = try a.print("Bearer {s}", .{session_token});
     const renewed = try auth.authRefresh(&refresh);
     try std.testing.expectEqual(@as(u16, 200), renewed.status);
     const renewal = try std.json.parseFromSlice(std.json.Value, a, renewed.body, .{});

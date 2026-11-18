@@ -53,7 +53,7 @@ pub fn lockPrincipal(alloc: std.mem.Allocator, conn: *db.Db, collection: []const
     const table = try @import("../ddl.zig").quoteIdent(alloc, collection);
     defer alloc.free(table);
     const suffix = if (db.dbDialect(conn).kind == .postgres) " FOR UPDATE" else "";
-    const sql = try std.fmt.allocPrintSentinel(alloc, "SELECT \"id\" FROM {s} WHERE \"id\"=?1{s};", .{ table, suffix }, 0);
+    const sql = try alloc.printSentinel("SELECT \"id\" FROM {s} WHERE \"id\"=?1{s};", .{ table, suffix }, 0);
     defer alloc.free(sql);
     var st = try prepare(alloc, conn, sql);
     defer st.finalize();

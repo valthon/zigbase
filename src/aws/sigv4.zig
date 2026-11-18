@@ -38,7 +38,7 @@ pub fn signingKey(secret: []const u8, date: []const u8, region: []const u8, serv
     // NOT fall back to a truncated/raw seed: a wrong seed silently computes the WRONG signing key (a
     // confusing auth failure at AWS), which is worse than a clear crash on impossible input.
     var seed_buf: [1024]u8 = undefined;
-    const seed = std.fmt.bufPrint(&seed_buf, "AWS4{s}", .{secret}) catch unreachable;
+    const seed = std.mem.print(&seed_buf, "AWS4{s}", .{secret}) catch unreachable;
     const k_date = hmac(seed, date);
     const k_region = hmac(&k_date, region);
     const k_service = hmac(&k_region, service);
@@ -149,7 +149,7 @@ pub fn presignGetUrl(alloc: std.mem.Allocator, in: PresignInput) ![]const u8 {
     if (in.amz_date.len < 16) return error.InvalidAmzDate;
     const date = in.amz_date[0..8]; // YYYYMMDD
 
-    const scope = try std.fmt.allocPrint(alloc, "{s}/{s}/{s}/aws4_request", .{ date, in.region, in.service });
+    const scope = try alloc.print("{s}/{s}/{s}/aws4_request", .{ date, in.region, in.service });
     defer alloc.free(scope);
 
     // Build the canonical query as a list of already-encoded `key=value` pairs, sorted by
@@ -169,16 +169,16 @@ pub fn presignGetUrl(alloc: std.mem.Allocator, in: PresignInput) ![]const u8 {
             defer a.free(ek);
             const ev = try uriEncodeComponent(a, value);
             defer a.free(ev);
-            const kv = try std.fmt.allocPrint(a, "{s}={s}", .{ ek, ev });
+            const kv = try a.print("{s}={s}", .{ ek, ev });
             errdefer a.free(kv);
             // The stored key slice is a prefix of kv (up to '='); safe because kv outlives it.
             try list.append(a, .{ .key = kv[0..ek.len], .kv = kv });
         }
     }.call;
 
-    const expires_str = try std.fmt.allocPrint(alloc, "{d}", .{in.expires_seconds});
+    const expires_str = try alloc.print("{d}", .{in.expires_seconds});
     defer alloc.free(expires_str);
-    const credential = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ in.access_key, scope });
+    const credential = try alloc.print("{s}/{s}", .{ in.access_key, scope });
     defer alloc.free(credential);
 
     try appendParam(alloc, &pairs, "X-Amz-Algorithm", algorithm);
@@ -220,8 +220,7 @@ pub fn presignGetUrl(alloc: std.mem.Allocator, in: PresignInput) ![]const u8 {
     // Canonical request: host is the only signed header; body is the literal UNSIGNED-PAYLOAD.
     const canonical_uri = try uriEncodePath(alloc, in.path);
     defer alloc.free(canonical_uri);
-    const canonical_request = try std.fmt.allocPrint(
-        alloc,
+    const canonical_request = try alloc.print(
         "GET\n{s}\n{s}\nhost:{s}\n\nhost\nUNSIGNED-PAYLOAD",
         .{ canonical_uri, canonical_query.items, in.host },
     );
@@ -229,15 +228,14 @@ pub fn presignGetUrl(alloc: std.mem.Allocator, in: PresignInput) ![]const u8 {
     const canonical_hash = try sha256Hex(alloc, canonical_request);
     defer alloc.free(canonical_hash);
 
-    const string_to_sign = try std.fmt.allocPrint(alloc, "{s}\n{s}\n{s}\n{s}", .{ algorithm, in.amz_date, scope, canonical_hash });
+    const string_to_sign = try alloc.print("{s}\n{s}\n{s}\n{s}", .{ algorithm, in.amz_date, scope, canonical_hash });
     defer alloc.free(string_to_sign);
 
     const key = signingKey(in.secret_key, date, in.region, in.service);
     const sig = hmac(&key, string_to_sign);
     const sig_hex = std.fmt.bytesToHex(sig, .lower);
 
-    return std.fmt.allocPrint(
-        alloc,
+    return alloc.print(
         "{s}://{s}{s}?{s}&X-Amz-Signature={s}",
         .{ in.scheme, in.host, in.path, canonical_query.items, sig_hex },
     );
@@ -284,8 +282,7 @@ pub fn signRequest(alloc: std.mem.Allocator, in: SignInput) ![]const u8 {
 
     const canonical_uri = try uriEncodePath(alloc, in.path);
     defer alloc.free(canonical_uri);
-    const canonical_request = try std.fmt.allocPrint(
-        alloc,
+    const canonical_request = try alloc.print(
         "{s}\n{s}\n{s}\n{s}\n{s}\n{s}",
         .{ in.method, canonical_uri, in.query, canonical_headers.items, signed_names.items, in.payload_sha256 },
     );
@@ -293,16 +290,15 @@ pub fn signRequest(alloc: std.mem.Allocator, in: SignInput) ![]const u8 {
     const canonical_hash = try sha256Hex(alloc, canonical_request);
     defer alloc.free(canonical_hash);
 
-    const scope = try std.fmt.allocPrint(alloc, "{s}/{s}/{s}/aws4_request", .{ date, in.region, in.service });
+    const scope = try alloc.print("{s}/{s}/{s}/aws4_request", .{ date, in.region, in.service });
     defer alloc.free(scope);
-    const string_to_sign = try std.fmt.allocPrint(alloc, "{s}\n{s}\n{s}\n{s}", .{ algorithm, in.amz_date, scope, canonical_hash });
+    const string_to_sign = try alloc.print("{s}\n{s}\n{s}\n{s}", .{ algorithm, in.amz_date, scope, canonical_hash });
     defer alloc.free(string_to_sign);
 
     const key = signingKey(in.secret_key, date, in.region, in.service);
     const sig = hmac(&key, string_to_sign);
     const sig_hex = std.fmt.bytesToHex(sig, .lower);
-    return std.fmt.allocPrint(
-        alloc,
+    return alloc.print(
         "{s} Credential={s}/{s}, SignedHeaders={s}, Signature={s}",
         .{ algorithm, in.access_key, scope, signed_names.items, sig_hex },
     );

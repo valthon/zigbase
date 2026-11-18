@@ -699,7 +699,7 @@ live-server smoke test:
 
 ```sh
 # 1. Build the server binary once.
-mise exec zig@0.16.0 -- zig build
+mise exec zig@0.17.1 -- zig build
 
 # 2. Point ZIGBASE_TEST_BINARY at it and run the tagged suite.
 ZIGBASE_TEST_BINARY="$(pwd)/zig-out/bin/zigbase" \

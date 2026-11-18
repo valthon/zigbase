@@ -18,13 +18,13 @@ pub const Result = struct {
 /// Warm up `warmup` times (JIT-free, but page/cache warm), then measure `iters`
 /// timed runs. Allocation stats cover the MEASURED runs only.
 ///
-/// Deviation from the brief: this pinned Zig (0.16.0) has no `std.time.Timer` —
+/// Deviation from the brief: this pinned Zig (0.17.1) has no `std.time.Timer` —
 /// timing goes through `std.Io.Timestamp.now(io, .awake)` instead, matching the
 /// pattern already established in this repo (see `src/http_client.zig`,
 /// `src/feature_cache.zig`), which is why `run` takes an `io: std.Io` param.
 /// Measure `f` under a leak-detecting general-purpose allocator. The `ns` here is the
 /// raw-malloc cost; allocation totals count successful alloc calls and requested bytes,
-/// excluding resize/remap growth. The DebugAllocator backing catches leaked allocations.
+/// excluding resize/remap growth. The SafeAllocator backing catches leaked allocations.
 pub fn run(
     name: []const u8,
     warmup: usize,
@@ -33,7 +33,7 @@ pub fn run(
     ctx: anytype,
     comptime f: fn (@TypeOf(ctx), std.mem.Allocator) anyerror!void,
 ) !Result {
-    var gpa: std.heap.DebugAllocator(.{}) = .init;
+    var gpa: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{});
     defer _ = gpa.deinit();
 
     var w: usize = 0;
@@ -83,7 +83,7 @@ pub fn runArena(
     ctx: anytype,
     comptime f: fn (@TypeOf(ctx), std.mem.Allocator) anyerror!void,
 ) !Result {
-    var gpa: std.heap.DebugAllocator(.{}) = .init;
+    var gpa: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{});
     defer _ = gpa.deinit();
 
     var arena = std.heap.ArenaAllocator.init(gpa.allocator());
@@ -201,7 +201,7 @@ test "fanout JSON normalizes measured allocation totals and subscriber timing" {
         .ns_max = 1300,
         .allocs = 200,
         .bytes = 51200,
-        .buckets = .{0} ** 5,
+        .buckets = @splat(0),
         .peak_live = 256,
         .iterations = 20,
         .subscribers = 10,

@@ -73,7 +73,7 @@ pub fn lookup(name: []const u8) ?Provider {
 fn jsonToStr(alloc: std.mem.Allocator, v: std.json.Value) !?[]const u8 {
     return switch (v) {
         .string => |s| try alloc.dupe(u8, s),
-        .integer => |n| try std.fmt.allocPrint(alloc, "{d}", .{n}),
+        .integer => |n| try alloc.print("{d}", .{n}),
         .bool => |b| try alloc.dupe(u8, if (b) "true" else "false"),
         else => null,
     };

@@ -39,14 +39,13 @@ pub fn plan(alloc: std.mem.Allocator, in: PlanInput) !Plan {
             .none => {}, // malformed / multi-range / non-bytes: ignore → full 200 (RFC-permitted)
             .unsatisfiable => return .{
                 .status = 416,
-                .content_range = try std.fmt.allocPrint(alloc, "bytes */{d}", .{in.size}),
+                .content_range = try alloc.print("bytes */{d}", .{in.size}),
             },
             .slice => |s| return .{
                 .status = 206,
                 .offset = s.offset,
                 .len = s.len,
-                .content_range = try std.fmt.allocPrint(
-                    alloc,
+                .content_range = try alloc.print(
                     "bytes {d}-{d}/{d}",
                     .{ s.offset, s.offset + s.len - 1, in.size },
                 ),
@@ -110,7 +109,7 @@ pub fn fileEtag(alloc: std.mem.Allocator, col: []const u8, rid: []const u8, name
     h.update(rid);
     h.update("/");
     h.update(name);
-    return std.fmt.allocPrint(alloc, "\"{x:0>16}\"", .{h.final()});
+    return alloc.print("\"{x:0>16}\"", .{h.final()});
 }
 
 /// Strip an RFC 7232 weak-validator prefix ("W/") from an entity tag.

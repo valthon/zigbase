@@ -207,7 +207,7 @@ test "cap + eviction does not crash and fails open when saturated with live wind
     var buf: [16]u8 = undefined;
     var i: usize = 0;
     while (i < 8) : (i += 1) {
-        const k = try std.fmt.bufPrint(&buf, "k{d}", .{i});
+        const k = try std.mem.print(&buf, "k{d}", .{i});
         try std.testing.expect(rl.allow(k, 0));
     }
     try std.testing.expectEqual(@as(usize, 8), rl.map.count());

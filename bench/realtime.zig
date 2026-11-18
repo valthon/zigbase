@@ -15,11 +15,11 @@ fn guard(ctx: *zb.Ctx, _: []const u8) bool {
 pub fn run(alloc: std.mem.Allocator, io: std.Io, results: *std.ArrayList(harness.Result)) !void {
     var nonce: [12]u8 = undefined;
     io.random(&nonce);
-    const directory = try std.fmt.allocPrint(alloc, "/tmp/zigbase-fanout-{x}", .{nonce});
+    const directory = try alloc.print("/tmp/zigbase-fanout-{x}", .{nonce});
     defer alloc.free(directory);
     try std.Io.Dir.cwd().createDir(io, directory, .default_dir);
     defer std.Io.Dir.cwd().deleteTree(io, directory) catch |err| std.log.err("benchmark cleanup: {s}", .{@errorName(err)});
-    const path = try std.fmt.allocPrintSentinel(alloc, "{s}/bench.db", .{directory}, 0);
+    const path = try alloc.printSentinel("{s}/bench.db", .{directory}, 0);
     defer alloc.free(path);
     var pool = try i.db.Pool.init(alloc, io, path);
     defer pool.deinit();
@@ -82,7 +82,7 @@ pub fn run(alloc: std.mem.Allocator, io: std.Io, results: *std.ArrayList(harness
             const payload = try alloc.alloc(u8, payload_size);
             defer alloc.free(payload);
             @memset(payload, 'x');
-            const message = try std.fmt.allocPrint(alloc, "{{\"action\":\"update\",\"record\":{{\"id\":\"r1\",\"body\":\"{s}\"}}}}", .{payload});
+            const message = try alloc.print("{{\"action\":\"update\",\"record\":{{\"id\":\"r1\",\"body\":\"{s}\"}}}}", .{payload});
             defer alloc.free(message);
             for ([_]usize{ 1, 10, 100, 1000 }) |fanout| {
                 // Distinct retained connection structs, one principal. Subscription lookup

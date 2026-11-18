@@ -244,8 +244,8 @@ const ics = await fetch("/api/golfsim/calendar.ics").then((r) => r.text());
 
 ## Building and running
 
-This example needs **Zig 0.16**, which you can get via [mise](https://mise.jdx.dev)
-(`mise exec zig@0.16.0 -- zig ...`). From `examples/golfsim/`:
+This example needs **Zig 0.17.1**, which you can get via [mise](https://mise.jdx.dev)
+(`mise exec zig@0.17.1 -- zig ...`). From `examples/golfsim/`:
 
 ```sh
 cd frontend && ./build.sh && cd ..

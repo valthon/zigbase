@@ -19,9 +19,9 @@ pub fn resolve(comptime cfg: anytype) Limits {
     if (!@import("build_options").query_workbench) @compileError(".query_workbench requires -Dquery-workbench=true");
     if (@typeInfo(@TypeOf(cfg.query_workbench)) != .@"struct") @compileError(".query_workbench must be a struct");
     var result: Limits = .{};
-    for (std.meta.fields(@TypeOf(cfg.query_workbench))) |f| {
-        if (!@hasField(Limits, f.name)) @compileError("unknown .query_workbench limit: " ++ f.name);
-        @field(result, f.name) = @field(cfg.query_workbench, f.name);
+    for (@typeInfo(@TypeOf(cfg.query_workbench)).@"struct".field_names) |f| {
+        if (!@hasField(Limits, f)) @compileError("unknown .query_workbench limit: " ++ f);
+        @field(result, f) = @field(cfg.query_workbench, f);
     }
     if (result.max_entries == 0 or result.max_entries > 256 or result.slow_ms == 0)
         @compileError("query workbench requires 1..256 entries and positive slow_ms");
@@ -239,7 +239,7 @@ pub const PoolMeasurement = struct {
         const store = scope.store orelse return;
         if (self.scope_id == 0 or self.scope_id != scope.id) return;
         const ns = elapsed(self.started, std.Io.Timestamp.now(store.io, .awake).nanoseconds);
-        const bucket = &scope.pool_waits[@as(usize, @intFromEnum(backend)) * 2 + @intFromEnum(kind)];
+        const bucket = &scope.pool_waits[@as(usize, @backingInt(backend)) * 2 + @backingInt(kind)];
         bucket.acquisitions +|= 1;
         bucket.total_ns +|= ns;
         bucket.max_ns = @max(bucket.max_ns, ns);
@@ -678,7 +678,7 @@ test "route scopes include no-query work and omit disabled scopes" {
     try std.testing.expectEqual(@as(u64, 1), store.routes[0].completed);
     try std.testing.expectEqual(@as(usize, 0), store.count);
     try std.testing.expect(current == null);
-    const long_route = [_]u8{'x'} ** 193;
+    const long_route = @as([193]u8, @splat('x'));
     const oversized = Scope.init(store, "GET", &long_route);
     store.recordRoute(&oversized, 1);
     try std.testing.expectEqual(@as(u64, 1), store.dropped_routes);

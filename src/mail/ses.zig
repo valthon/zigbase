@@ -36,9 +36,9 @@ pub const SesMailer = struct {
 
     fn send(ptr: *anyopaque, io: std.Io, alloc: std.mem.Allocator, email: Email) anyerror!void {
         const self: *SesMailer = @ptrCast(@alignCast(ptr));
-        const host = try std.fmt.allocPrint(alloc, "email.{s}.amazonaws.com", .{self.region});
+        const host = try alloc.print("email.{s}.amazonaws.com", .{self.region});
         defer alloc.free(host);
-        const url = try std.fmt.allocPrint(alloc, "https://{s}{s}", .{ host, path });
+        const url = try alloc.print("https://{s}{s}", .{ host, path });
         defer alloc.free(url);
 
         // Simple content cannot carry attachments (#219) — with any, switch to Raw MIME: the full
@@ -95,9 +95,9 @@ pub fn amzDate(ts: i64) AmzDateBuf {
     const year_day = epoch_day.calculateYearDay();
     const month_day = year_day.calculateMonthDay();
     var buf: AmzDateBuf = undefined;
-    _ = std.fmt.bufPrint(&buf, "{d:0>4}{d:0>2}{d:0>2}T{d:0>2}{d:0>2}{d:0>2}Z", .{
+    _ = std.mem.print(&buf, "{d:0>4}{d:0>2}{d:0>2}T{d:0>2}{d:0>2}{d:0>2}Z", .{
         year_day.year,
-        @intFromEnum(month_day.month),
+        @backingInt(month_day.month),
         @as(u32, month_day.day_index) + 1,
         day_secs.getHoursIntoDay(),
         day_secs.getMinutesIntoHour(),
@@ -157,7 +157,7 @@ pub fn buildBody(alloc: std.mem.Allocator, from: []const u8, email: Email) ![]u8
         // to SES's own contact lists rather than our endpoint).
         var h1: std.json.ObjectMap = .empty;
         try h1.put(a, "Name", .{ .string = "List-Unsubscribe" });
-        try h1.put(a, "Value", .{ .string = try std.fmt.allocPrint(a, "<{s}>", .{lu}) });
+        try h1.put(a, "Value", .{ .string = try a.print("<{s}>", .{lu}) });
         var h2: std.json.ObjectMap = .empty;
         try h2.put(a, "Name", .{ .string = "List-Unsubscribe-Post" });
         try h2.put(a, "Value", .{ .string = "List-Unsubscribe=One-Click" });

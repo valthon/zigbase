@@ -204,7 +204,7 @@ three-tier strategy.
 cd examples/plugins
 ./frontend/build.sh
 (cd frontend && ../../../scripts/zigapagos.sh doctor dist --format=json)
-mise exec zig@0.16.0 -- zig build
+mise exec zig@0.17.1 -- zig build
 ./zig-out/bin/plugins help
 # --insecure-cookies: local dev over plain HTTP (auth cookies are Secure by default).
 # ZIGBASE_PUBLIC_URL makes magic-link emails contain a real clickable URL.

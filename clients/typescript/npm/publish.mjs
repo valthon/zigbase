@@ -73,8 +73,8 @@ if (DO_SERVER) {
     const dest = join(HERE, `server-${t.key}`, "zigbase");
     if (!SKIP_BUILD) {
       console.log(`building zigbase for ${t.zig}`);
-      const b = spawnSync("mise", ["exec", "zig@0.16.0", "--", "zig", "build",
-        `-Dtarget=${t.zig}`, "-Doptimize=ReleaseSafe", "-Dcpu=baseline"], { cwd: REPO_ROOT, stdio: "inherit" });
+      const b = spawnSync("mise", ["exec", "zig@0.17.1", "--", "zig", "build",
+        `-Dtarget=${t.zig}`, "-Doptimize=safe", "-Dcpu=baseline"], { cwd: REPO_ROOT, stdio: "inherit" });
       if (b.error) throw b.error;
       if (b.status !== 0) throw new Error(`build failed for ${t.zig}`);
       copyFileSync(join(REPO_ROOT, "zig-out/bin/zigbase"), dest);

@@ -208,7 +208,7 @@ fn init_0010_token_epoch(m: *Migrator) db.DbError!void {
         // stranded without the column — `schema.isValidIdentifier` has no length cap, so a
         // 251+ char name passes creation and MUST also be migrated here. The column type comes
         // from the dialect (BIGINT on Postgres, INTEGER on SQLite).
-        const sql = std.fmt.allocPrintSentinel(a, "ALTER TABLE \"{s}\" ADD COLUMN \"token_epoch\" {s} NOT NULL DEFAULT 0;", .{ nm, int_ty }, 0) catch return error.ExecFailed;
+        const sql = a.printSentinel("ALTER TABLE \"{s}\" ADD COLUMN \"token_epoch\" {s} NOT NULL DEFAULT 0;", .{ nm, int_ty }, 0) catch return error.ExecFailed;
         // Propagate a genuine DDL failure (lock timeout, disk full, …); the columnExists guard
         // above already skipped the benign already-migrated case, so there is nothing to swallow.
         try m.db.exec(sql);
@@ -229,8 +229,8 @@ fn init_0010_token_epoch(m: *Migrator) db.DbError!void {
 /// interpolating it is safe; `col` is bound. Mirrors the introspection in `dumpload.zig`.
 fn columnExists(m: *Migrator, table: []const u8, col: []const u8) db.DbError!bool {
     const sql = switch (m.dialect.kind) {
-        .sqlite => std.fmt.allocPrintSentinel(m.arena, "SELECT COUNT(*) FROM pragma_table_info('{s}') WHERE \"name\" = ?1;", .{table}, 0),
-        .postgres => std.fmt.allocPrintSentinel(m.arena, "SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = '{s}' AND column_name = ?1;", .{table}, 0),
+        .sqlite => m.arena.printSentinel("SELECT COUNT(*) FROM pragma_table_info('{s}') WHERE \"name\" = ?1;", .{table}, 0),
+        .postgres => m.arena.printSentinel("SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = '{s}' AND column_name = ?1;", .{table}, 0),
     } catch return error.PrepareFailed;
     var st = try m.prepare(sql);
     defer st.finalize();
@@ -714,7 +714,7 @@ fn init_0030_analytics_text_collation(m: *Migrator) db.DbError!void {
         var st = try m.prepare(analytics_collation_plan_sql);
         defer st.finalize();
         while (try st.step()) {
-            const sql = m.arena.dupeZ(u8, st.columnText(0)) catch return error.ExecFailed;
+            const sql = m.arena.dupeSentinel(u8, st.columnText(0), 0) catch return error.ExecFailed;
             stmts.append(m.arena, sql) catch return error.ExecFailed;
         }
     }
@@ -847,7 +847,7 @@ fn isApplied(m: *Migrator, name: []const u8) db.DbError!bool {
 }
 
 fn recordApplied(m: *Migrator, name: []const u8) db.DbError!void {
-    const sql = std.fmt.allocPrint(m.arena, "INSERT INTO \"_migrations\" (\"name\", \"applied_at\") VALUES (?1, {s});", .{m.dialect.nowTextExpr()}) catch return error.PrepareFailed;
+    const sql = m.arena.print("INSERT INTO \"_migrations\" (\"name\", \"applied_at\") VALUES (?1, {s});", .{m.dialect.nowTextExpr()}) catch return error.PrepareFailed;
     var st = try m.prepare(sql);
     defer st.finalize();
     try st.bindText(1, name);
@@ -1163,7 +1163,7 @@ test "0010 backfills a long-named (251+ char) auth table — no fixed-buffer len
     try d.exec("CREATE TABLE \"_superusers\" (\"id\" TEXT PRIMARY KEY, \"email\" TEXT);");
     // A valid identifier of 260 chars (alpha-first, alnum) — passes schema.isValidIdentifier
     // (no length cap), so it must also be migrated. The old [320]u8/len<=250 guard skipped it.
-    const long_name = "a" ++ ("b" ** 259);
+    const long_name = "a" ++ ((&@as([259]u8, @splat('b'))));
     try std.testing.expectEqual(@as(usize, 260), long_name.len);
     try d.exec("INSERT INTO \"_collections\" (\"id\",\"name\",\"type\") VALUES ('c1','" ++ long_name ++ "','auth');");
     try d.exec("CREATE TABLE \"" ++ long_name ++ "\" (\"id\" TEXT PRIMARY KEY, \"tokenKey\" TEXT);");

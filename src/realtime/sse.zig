@@ -522,7 +522,7 @@ test "handleUplink: subscribe/auth run the SHARED hub verbs (pool-backed decisio
     defer tmp.cleanup();
     const dir_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", ga);
     defer ga.free(dir_path);
-    const db_path = try std.fmt.allocPrintSentinel(ga, "{s}/test.db", .{dir_path}, 0);
+    const db_path = try ga.printSentinel("{s}/test.db", .{dir_path}, 0);
     defer ga.free(db_path);
     var pool = try db.Pool.init(ga, std.testing.io, db_path);
     defer pool.deinit();
@@ -570,7 +570,7 @@ test "subscribe rejects invalid client filters before registering or replacing s
     defer tmp.cleanup();
     const dir_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
     defer a.free(dir_path);
-    const db_path = try std.fmt.allocPrintSentinel(a, "{s}/test.db", .{dir_path}, 0);
+    const db_path = try a.printSentinel("{s}/test.db", .{dir_path}, 0);
     defer a.free(db_path);
     var pool = try db.Pool.init(a, std.testing.io, db_path);
     defer pool.deinit();

@@ -33,9 +33,9 @@ jobs:
           path: |
             ${{ github.workspace }}/.zig-global
             ${{ github.workspace }}/.zig-local
-          key: parser-fuzz-${{ runner.os }}-zig0.16.0-${{ hashFiles('src/fuzz_*.zig', 'src/query/**', 'src/auth/webauthn/**', 'src/backend/postgres/connstr.zig', 'build.zig', 'build.zig.zon') }}
-          restore-keys: parser-fuzz-${{ runner.os }}-zig0.16.0-
+          key: parser-fuzz-${{ runner.os }}-zig0.17.1-${{ hashFiles('src/fuzz_*.zig', 'src/query/**', 'src/auth/webauthn/**', 'src/backend/postgres/connstr.zig', 'build.zig', 'build.zig.zon') }}
+          restore-keys: parser-fuzz-${{ runner.os }}-zig0.17.1-
       - name: Run bounded coverage-guided campaigns
         # 100x the original per-target budget; the job timeout includes headroom
         # for hosted-runner throughput, cold compilation, and corpus growth.
-        run: mise exec zig@0.16.0 -- zig build fuzz --fuzz=10M --summary all
+        run: mise exec zig@0.17.1 -- zig build fuzz --fuzz=10M --summary all

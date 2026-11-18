@@ -60,13 +60,13 @@ Zig does not document an official registry image. Do not guess a builder such as
 nonexistent. Start from a pinned general-purpose Linux builder and download the matching Zig
 release archive from `https://ziglang.org/download/<version>/`, verifying the SHA-256 published in
 Zig's official `download/index.json`, or use an independently maintained builder image only when
-its provenance and immutable digest are explicitly accepted. For Zig 0.16.0 on x86_64 Linux, the
+its provenance and immutable digest are explicitly accepted. For Zig 0.17.1 on x86_64 Linux, the
 official archive SHA-256 is
-`70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00`.
+`3581863e3cbcfd0fce0efc682ce7e9e93da96668a977791d356a26d2a7e9b17a`.
 
 The final runtime base and the build target must agree. In particular,
 `gcr.io/distroless/static-debian12:nonroot` has no glibc dynamic loader, so build a static musl
-artifact (for example, `zig build -Dtarget=x86_64-linux-musl -Doptimize=ReleaseSafe`) before
+artifact (for example, `zig build -Dtarget=x86_64-linux-musl -Doptimize=safe`) before
 copying it there. A native glibc build copied into that image exits as
 `exec /path/to/app: no such file or directory` even though the file exists. If you intentionally
 build for glibc, choose a runtime image containing the matching loader instead. Smoke-test the

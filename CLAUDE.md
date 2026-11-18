@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-ZigBase is a single-binary, PocketBase-inspired (not API-compatible) backend in **Zig 0.16**, backed by an embedded SQLite (vendored amalgamation) and the `zap`/facil.io HTTP server. It is **two things at once**:
+ZigBase is a single-binary, PocketBase-inspired (not API-compatible) backend in **Zig 0.17.1**, backed by an embedded SQLite (vendored amalgamation) and the `zap`/facil.io HTTP server. It is **two things at once**:
 - A standalone server binary (`zigbase serve`) with collections/records, a typed query API (filter/sort/expand), per-collection access rules, argon2id+JWT auth, OAuth2+PKCE, realtime over WebSocket, local file storage, and an embedded admin SPA at `/_/`.
 - An **embeddable Zig framework**: consumers `zig fetch --save` it, `@import("zigbase")`, and configure `zigbase.App(.{...})` with comptime hooks, custom routes, scheduled jobs, plugins, a comptime schema, and migrations. See `docs/framework.md`.
 
@@ -14,19 +14,19 @@ Linux and macOS only (the HTTP server depends on facil.io). No Windows build.
 
 ## Toolchain & commands
 
-All tools are pinned in `mise.toml` (Zig 0.16.0, Python 3.13, Node 24). Either `eval "$(mise activate bash)"` once, or prefix every command with `mise exec <tool> --`. The exact Zig version matters; another 0.16.x will not necessarily work.
+All tools are pinned in `mise.toml` (Zig 0.17.1, Python 3.13, Node 24). Either `eval "$(mise activate bash)"` once, or prefix every command with `mise exec <tool> --`. The exact Zig version matters; another Zig release will not necessarily work.
 
 ```sh
-mise exec zig@0.16.0 -- zig build                    # build -> zig-out/bin/zigbase
-mise exec zig@0.16.0 -- zig build test --summary all  # all Zig unit tests
-mise exec zig@0.16.0 -- zig build run -- <args>       # run the binary via the build system
+mise exec zig@0.17.1 -- zig build                    # build -> zig-out/bin/zigbase
+mise exec zig@0.17.1 -- zig build test --summary all  # all Zig unit tests
+mise exec zig@0.17.1 -- zig build run -- <args>       # run the binary via the build system
 ```
 
 CLI subcommands: `serve`, `migrate`, `superuser create --email … --password …`, `help`. For **local plain-HTTP development you must pass `--insecure-cookies`** or the admin-UI auth cookie won't be stored (cookies are `Secure` by default). The default bind is `127.0.0.1` (loopback); `--http-host 0.0.0.0` exposes all interfaces. A random JWT secret is auto-generated and persisted under the data dir on first run if `ZIGBASE_JWT_SECRET` is unset.
 
 ### Tests — there are two suites, both run in CI (`.github/workflows/ci.yml`)
 
-1. **Zig unit tests** (`zig build test`). **Caveat:** Zig 0.16.0 can print a stale `failed command: …` label after successful tests emit stderr at exit (#261). Check both the shell exit status and final `Build Summary` (hence `--summary all`); never ignore a nonzero exit, signal, or failed test. Consumer apps should use `zigbase.addTest`. `tests/test_runner/verify.py` reproduces the diagnostic and verifies that the shipped simple runner rejects real failures. To run the suite against a fresh tree, build the test binary directly. There is no per-test filter wired into `build.zig`.
+1. **Zig unit tests** (`zig build test`). **Caveat:** Zig 0.17.1 still reproduces a stale `failed command: …` label after successful tests emit stderr at exit (#261). Check both the shell exit status and final `Build Summary` (hence `--summary all`); never ignore a nonzero exit, signal, or failed test. Consumer apps should use `zigbase.addTest`. `tests/test_runner/verify.py` reproduces the diagnostic and verifies that the shipped simple runner rejects real failures. To run the suite against a fresh tree, build the test binary directly. There is no per-test filter wired into `build.zig`.
 2. **Python/Playwright "browser" suite** (`tests/admin/`) + a live SMTP-TLS test (`tests/smtp/`). These build the binary, launch a real server, and drive the admin SPA with a headless Chromium. Run one:
    ```sh
    mise exec python@3.13 -- python -m pytest tests/admin/test_schema.py::test_edit_rules_lock_toggle -q

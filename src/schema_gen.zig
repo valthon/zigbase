@@ -212,7 +212,7 @@ test "schema_gen: Watcher clears a cached NEGATIVE entry after another connectio
     defer tmp.cleanup();
     const path = try tmp.dir.realPathFileAlloc(testing.io, ".", a);
     defer a.free(path);
-    const dbpath = try std.fmt.allocPrintSentinel(a, "{s}/wt.db", .{path}, 0);
+    const dbpath = try a.printSentinel("{s}/wt.db", .{path}, 0);
     defer a.free(dbpath);
 
     // The "server": a real pool, so the watcher exercises the actual pooled-READER path rather

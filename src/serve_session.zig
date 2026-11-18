@@ -90,7 +90,7 @@ pub fn acquire(io: Io, data_dir_abs: []const u8, gpa: Allocator) error{OutOfMemo
     // No background sessions on Windows. Reported as `.unavailable` rather
     // than `.held` for the same reason as any other open failure: there is no
     // session here to stop.
-    if (builtin.os.tag == .windows) return .{ .unavailable = error.SessionsUnsupportedOnWindows };
+    if (builtin.target.os.tag == .windows) return .{ .unavailable = error.SessionsUnsupportedOnWindows };
     const path = try std.fs.path.join(gpa, &.{ data_dir_abs, lock_name });
     defer gpa.free(path);
     // `.truncate = false`: the file is create-once and permanent (see `remove`),
@@ -106,7 +106,7 @@ pub fn acquire(io: Io, data_dir_abs: []const u8, gpa: Allocator) error{OutOfMemo
 
 /// True when a live process holds the session flock. Contract 1.
 pub fn isLive(io: Io, gpa: Allocator, data_dir_abs: []const u8) bool {
-    if (builtin.os.tag == .windows) return false;
+    if (builtin.target.os.tag == .windows) return false;
     const path = std.fs.path.join(gpa, &.{ data_dir_abs, lock_name }) catch return false;
     defer gpa.free(path);
     const f = Io.Dir.cwd().openFile(io, path, .{}) catch return false;
@@ -169,7 +169,7 @@ pub fn formatIso(buf: *[20]u8, epoch_secs: u64) []const u8 {
     const yd = es.getEpochDay().calculateYearDay();
     const md = yd.calculateMonthDay();
     const ds = es.getDaySeconds();
-    return std.fmt.bufPrint(buf, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z", .{
+    return std.mem.print(buf, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z", .{
         yd.year,              md.month.numeric(),      md.day_index + 1,
         ds.getHoursIntoDay(), ds.getMinutesIntoHour(), ds.getSecondsIntoMinute(),
     }) catch unreachable;

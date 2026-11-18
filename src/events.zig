@@ -280,13 +280,13 @@ fn lowerSecretSource(comptime src: anytype, comptime path: []const u8) PathSecre
     if (@typeInfo(S) != .@"struct")
         @compileError("route '" ++ path ++ "': .path_secret.source must be one of " ++
             ".{ .kv = \"key\" } / .{ .settings = \"key\" } / .{ .config = \"secret\" }");
-    for (std.meta.fields(S)) |f| {
-        const ok = std.mem.eql(u8, f.name, "kv") or std.mem.eql(u8, f.name, "settings") or std.mem.eql(u8, f.name, "config");
-        if (!ok) @compileError("route '" ++ path ++ "': unknown .path_secret.source variant '." ++ f.name ++ "' (recognized: .kv, .settings, .config)");
+    for (@typeInfo(S).@"struct".field_names) |f| {
+        const ok = std.mem.eql(u8, f, "kv") or std.mem.eql(u8, f, "settings") or std.mem.eql(u8, f, "config");
+        if (!ok) @compileError("route '" ++ path ++ "': unknown .path_secret.source variant '." ++ f ++ "' (recognized: .kv, .settings, .config)");
     }
     // Exactly one source variant — `.{ .kv = "a", .settings = "b" }` would otherwise compile
     // and silently use only `.kv`, dropping the rest (loud-comptime convention).
-    if (std.meta.fields(S).len != 1)
+    if (@typeInfo(S).@"struct".field_names.len != 1)
         @compileError("route '" ++ path ++ "': .path_secret.source must have exactly one field (.kv, .settings, or .config)");
     if (@hasField(S, "kv")) return .{ .kv = src.kv };
     if (@hasField(S, "settings")) return .{ .settings = src.settings };
@@ -310,9 +310,9 @@ fn lowerRouteAuthGuard(comptime a: anytype, comptime path: []const u8) RouteAuth
     if (@typeInfo(A) != .@"struct")
         @compileError("route '" ++ path ++ "': .auth must be an AuthLevel (.public/.authed/.superuser) " ++
             "or a guard struct like .{ .path_secret = .{ .param = \"...\", .source = .{ .kv = \"...\" } } }");
-    for (std.meta.fields(A)) |f| {
-        if (!std.mem.eql(u8, f.name, "path_secret"))
-            @compileError("route '" ++ path ++ "': unknown .auth guard '." ++ f.name ++ "' (recognized guard: .path_secret)");
+    for (@typeInfo(A).@"struct".field_names) |f| {
+        if (!std.mem.eql(u8, f, "path_secret"))
+            @compileError("route '" ++ path ++ "': unknown .auth guard '." ++ f ++ "' (recognized guard: .path_secret)");
     }
     if (!@hasField(A, "path_secret"))
         @compileError("route '" ++ path ++ "': .auth guard struct must have a .path_secret field");
@@ -324,10 +324,10 @@ fn lowerRouteAuthGuard(comptime a: anytype, comptime path: []const u8) RouteAuth
         @compileError("route '" ++ path ++ "': .path_secret is missing required '.param' (the path/query/header name carrying the secret)");
     if (!@hasField(P, "source"))
         @compileError("route '" ++ path ++ "': .path_secret is missing required '.source' (.{ .kv = \"key\" } / .{ .settings = \"key\" } / .{ .config = \"secret\" })");
-    for (std.meta.fields(P)) |f| {
-        const ok = std.mem.eql(u8, f.name, "param") or std.mem.eql(u8, f.name, "source") or
-            std.mem.eql(u8, f.name, "in") or std.mem.eql(u8, f.name, "on_mismatch");
-        if (!ok) @compileError("route '" ++ path ++ "': unknown .path_secret key '." ++ f.name ++ "' (recognized: .param, .source, .in, .on_mismatch)");
+    for (@typeInfo(P).@"struct".field_names) |f| {
+        const ok = std.mem.eql(u8, f, "param") or std.mem.eql(u8, f, "source") or
+            std.mem.eql(u8, f, "in") or std.mem.eql(u8, f, "on_mismatch");
+        if (!ok) @compileError("route '" ++ path ++ "': unknown .path_secret key '." ++ f ++ "' (recognized: .param, .source, .in, .on_mismatch)");
     }
     var guard = PathSecretGuard{ .param = ps.param, .source = lowerSecretSource(ps.source, path) };
     if (@hasField(P, "in")) guard.in = ps.in;
@@ -372,9 +372,9 @@ fn lowerAuthedCollection(comptime a: anytype, comptime path: []const u8) AuthedC
     if (A == AuthedCollection) return a;
     if (@typeInfo(A) != .@"struct")
         @compileError("route '" ++ path ++ "': .auth collection gate must be a struct .{ .authed = \"<collection>\" } (optionally .allow_superuser = true)");
-    for (std.meta.fields(A)) |f| {
-        const ok = std.mem.eql(u8, f.name, "authed") or std.mem.eql(u8, f.name, "allow_superuser");
-        if (!ok) @compileError("route '" ++ path ++ "': unknown key '." ++ f.name ++ "' on the .auth gate (recognized: .authed, .allow_superuser)");
+    for (@typeInfo(A).@"struct".field_names) |f| {
+        const ok = std.mem.eql(u8, f, "authed") or std.mem.eql(u8, f, "allow_superuser");
+        if (!ok) @compileError("route '" ++ path ++ "': unknown key '." ++ f ++ "' on the .auth gate (recognized: .authed, .allow_superuser)");
     }
     if (!@hasField(A, "authed"))
         @compileError("route '" ++ path ++ "': .auth gate struct must have an .authed = \"<collection>\" field");
@@ -590,8 +590,8 @@ pub fn validateRouteSpecs(comptime specs: anytype) void {
     // lock-step with those readers — a key read there must appear here or a valid spec
     // would falsely @compileError.
     const allowed = [_][]const u8{ "method", "path", "handler", "auth", "name", "rate_limit", "rate_limit_key" };
-    inline for (std.meta.fields(@TypeOf(specs))) |f| {
-        const s = @field(specs, f.name);
+    inline for (@typeInfo(@TypeOf(specs)).@"struct".field_names) |f| {
+        const s = @field(specs, f);
         if (!@hasField(@TypeOf(s), "method")) @compileError("route spec is missing '.method' (expected .{ .method = .GET, .path = \"/...\", .handler = fn })");
         if (!@hasField(@TypeOf(s), "path")) @compileError("route spec is missing '.path' (expected .{ .method = .GET, .path = \"/...\", .handler = fn })");
         if (!@hasField(@TypeOf(s), "handler")) @compileError("route spec is missing '.handler' (expected .{ .method = .GET, .path = \"/...\", .handler = fn })");
@@ -603,12 +603,12 @@ pub fn validateRouteSpecs(comptime specs: anytype) void {
         // Fail loud on a typo'd optional key (e.g. `.rate_limt`, `.rate_limit_ky`) which the
         // `@hasField`-gated readers would otherwise silently ignore, shipping the route with
         // NO rate limit / default keying the developer believed they had configured.
-        inline for (std.meta.fields(@TypeOf(s))) |sf| {
+        inline for (@typeInfo(@TypeOf(s)).@"struct".field_names) |sf| {
             comptime var ok = false;
             inline for (allowed) |a| {
-                if (comptime std.mem.eql(u8, sf.name, a)) ok = true;
+                if (comptime std.mem.eql(u8, sf, a)) ok = true;
             }
-            if (!ok) @compileError("route spec (path '" ++ s.path ++ "'): unknown key '." ++ sf.name ++
+            if (!ok) @compileError("route spec (path '" ++ s.path ++ "'): unknown key '." ++ sf ++
                 "' (recognized keys: .method, .path, .handler, .auth, .name, .rate_limit, .rate_limit_key)");
         }
     }
@@ -628,8 +628,8 @@ pub fn isUntypedHandler(comptime H: type) bool {
     const info = @typeInfo(T);
     if (info != .@"fn") return false;
     const f = info.@"fn";
-    if (f.params.len != 1) return false;
-    const p = f.params[0].type orelse return false;
+    if (f.param_types.len != 1) return false;
+    const p = f.param_types[0] orelse return false;
     const pi = @typeInfo(p);
     if (pi != .pointer or pi.pointer.size != .one) return false;
     return pi.pointer.child == Ctx;
@@ -682,9 +682,9 @@ fn validateFlowKeys(comptime Flow: type, comptime col_name: []const u8, comptime
     comptime {
         if (@typeInfo(Flow) != .@"struct")
             @compileError("collection '" ++ col_name ++ "' custom auth entry ." ++ which ++ " must be a struct of the form .{ .Input = T, .Output = U }");
-        for (std.meta.fields(Flow)) |kf| {
-            if (!std.mem.eql(u8, kf.name, "Input") and !std.mem.eql(u8, kf.name, "Output"))
-                @compileError("collection '" ++ col_name ++ "' custom auth entry ." ++ which ++ ": unknown key '." ++ kf.name ++ "' (recognized keys: .Input, .Output)");
+        for (@typeInfo(Flow).@"struct".field_names) |kf| {
+            if (!std.mem.eql(u8, kf, "Input") and !std.mem.eql(u8, kf, "Output"))
+                @compileError("collection '" ++ col_name ++ "' custom auth entry ." ++ which ++ ": unknown key '." ++ kf ++ "' (recognized keys: .Input, .Output)");
         }
     }
 }
@@ -703,8 +703,8 @@ pub fn customAuthMeta(comptime cols_cfg: anytype) []const CustomAuthMeta {
         const cinfo = @typeInfo(Cfg);
         if (cinfo != .@"struct") return &.{};
         var list: []const CustomAuthMeta = &.{};
-        for (cinfo.@"struct".fields) |cf| {
-            const col_name = cf.name;
+        for (cinfo.@"struct".field_names) |cf| {
+            const col_name = cf;
             const spec = @field(cols_cfg, col_name);
             if (@typeInfo(@TypeOf(spec)) != .@"struct") continue;
             if (!@hasField(@TypeOf(spec), "auth")) continue;
@@ -720,8 +720,8 @@ pub fn customAuthMeta(comptime cols_cfg: anytype) []const CustomAuthMeta {
             const TT = @TypeOf(tup);
             if (@typeInfo(TT) != .@"struct")
                 @compileError("collection '" ++ col_name ++ "' .auth.methods.custom must be a tuple of slug strings and/or typed-method structs");
-            for (std.meta.fields(TT)) |ef| {
-                const elem = @field(tup, ef.name);
+            for (@typeInfo(TT).@"struct".field_names) |ef| {
+                const elem = @field(tup, ef);
                 const E = @TypeOf(elem);
                 switch (@typeInfo(E)) {
                     // Bare slug string (`*const [N:0]u8` or `[]const u8`) → untyped, no meta.
@@ -730,11 +730,11 @@ pub fn customAuthMeta(comptime cols_cfg: anytype) []const CustomAuthMeta {
                         if (!@hasField(E, "slug"))
                             @compileError("collection '" ++ col_name ++ "' custom auth entry must be a slug string or a struct with a .slug field");
                         // Loud-comptime: reject typo'd keys on the typed entry.
-                        for (std.meta.fields(E)) |kf| {
-                            if (!std.mem.eql(u8, kf.name, "slug") and
-                                !std.mem.eql(u8, kf.name, "Initiate") and
-                                !std.mem.eql(u8, kf.name, "Complete"))
-                                @compileError("collection '" ++ col_name ++ "' custom auth entry: unknown key '." ++ kf.name ++ "' (recognized keys: .slug, .Initiate, .Complete)");
+                        for (@typeInfo(E).@"struct".field_names) |kf| {
+                            if (!std.mem.eql(u8, kf, "slug") and
+                                !std.mem.eql(u8, kf, "Initiate") and
+                                !std.mem.eql(u8, kf, "Complete"))
+                                @compileError("collection '" ++ col_name ++ "' custom auth entry: unknown key '." ++ kf ++ "' (recognized keys: .slug, .Initiate, .Complete)");
                         }
                         var meta = CustomAuthMeta{ .col_name = col_name, .slug = elem.slug };
                         // Loud-comptime: an `.Initiate`/`.Complete` sub-struct must be a
@@ -819,7 +819,7 @@ pub fn comptimeRouteName(comptime path: []const u8, comptime override: ?[]const 
 /// handler). The `Holder`-const pattern gives the table static lifetime so the `[]const`
 /// slice is returnable.
 pub fn routeMeta(comptime specs: anytype) []const RouteMeta {
-    const fields = std.meta.fields(@TypeOf(specs));
+    const fields = @typeInfo(@TypeOf(specs)).@"struct".field_names;
     comptime {
         @setEvalBranchQuota(10_000 + fields.len * 5_000); // scale with route count
         validateRouteSpecs(specs);
@@ -829,7 +829,7 @@ pub fn routeMeta(comptime specs: anytype) []const RouteMeta {
             @setEvalBranchQuota(10_000 + fields.len * 5_000); // scale with route count
             var t: [fields.len]RouteMeta = undefined;
             for (fields, 0..) |f, i| {
-                const s = @field(specs, f.name);
+                const s = @field(specs, f);
                 const H = @TypeOf(s.handler);
                 const untyped = isUntypedHandler(H);
                 const override: ?[]const u8 = if (@hasField(@TypeOf(s), "name")) s.name else null;
@@ -874,7 +874,7 @@ pub fn routeMeta(comptime specs: anytype) []const RouteMeta {
 /// Comptime-validates each route's Input/Output representability and `@compileError`s on a
 /// duplicate derived method name.
 pub fn buildRoutes(comptime specs: anytype) []const RuntimeRoute {
-    const fields = std.meta.fields(@TypeOf(specs));
+    const fields = @typeInfo(@TypeOf(specs)).@"struct".field_names;
     const meta = comptime routeMeta(specs);
     // Representability + duplicate-name guards, all at comptime.
     comptime {
@@ -905,7 +905,7 @@ pub fn buildRoutes(comptime specs: anytype) []const RuntimeRoute {
             @setEvalBranchQuota(10_000 + fields.len * 5_000); // scale with route count
             var t: [fields.len]RuntimeRoute = undefined;
             for (fields, 0..) |f, i| {
-                const s = @field(specs, f.name);
+                const s = @field(specs, f);
                 const auth: AuthLevel = routeAuthLevel(s);
                 // Untyped handlers already match RouteHandler — store directly so they keep
                 // full control of the response (cookies/redirect/content-type). Typed handlers
@@ -979,8 +979,8 @@ fn phaseFieldName(comptime p: RecordPhase) []const u8 {
 /// True iff `name` is one of the six canonical camelCase phase field names.
 /// Kept DRY with `phaseFieldName` by deriving the set from `RecordPhase`.
 fn isPhaseFieldName(comptime name: []const u8) bool {
-    inline for (std.meta.fields(RecordPhase)) |p| {
-        if (std.mem.eql(u8, name, phaseFieldName(@field(RecordPhase, p.name)))) return true;
+    inline for (@typeInfo(RecordPhase).@"enum".field_names) |p| {
+        if (std.mem.eql(u8, name, phaseFieldName(@field(RecordPhase, p)))) return true;
     }
     return false;
 }
@@ -989,19 +989,19 @@ fn isPhaseFieldName(comptime name: []const u8) bool {
 /// name, so a typo (e.g. `.beforeCreat`) fails loudly instead of silently
 /// never firing. Runs over every group, including the `any` wildcard.
 fn validateHooks(comptime hooks: anytype) void {
-    inline for (std.meta.fields(@TypeOf(hooks))) |group| {
-        const g = @field(hooks, group.name);
+    inline for (@typeInfo(@TypeOf(hooks)).@"struct".field_names) |group| {
+        const g = @field(hooks, group);
         switch (@typeInfo(@TypeOf(g))) {
             .@"struct" => {},
-            else => @compileError("record hook group '" ++ group.name ++ "' must be a struct like .{ .beforeCreate = fn }"),
+            else => @compileError("record hook group '" ++ group ++ "' must be a struct like .{ .beforeCreate = fn }"),
         }
-        inline for (std.meta.fields(@TypeOf(g))) |f| {
-            if (!isPhaseFieldName(f.name)) {
-                @compileError("unknown record hook '" ++ group.name ++ "." ++ f.name ++
+        inline for (@typeInfo(@TypeOf(g)).@"struct".field_names) |f| {
+            if (!isPhaseFieldName(f)) {
+                @compileError("unknown record hook '" ++ group ++ "." ++ f ++
                     "'; expected one of beforeCreate/afterCreate/beforeUpdate/afterUpdate/beforeDelete/afterDelete");
             }
             // Assert the value coerces to RecordHandler so a wrong-typed hook fails loudly too.
-            const _coerce: RecordHandler = @field(g, f.name);
+            const _coerce: RecordHandler = @field(g, f);
             _ = _coerce;
         }
     }
@@ -1018,14 +1018,14 @@ pub fn buildRecordDispatcher(comptime hooks: anytype) RecordHandler {
         fn dispatch(ctx: *Ctx, ev: *RecordEvent) anyerror!void {
             // Pass 1: wildcard ("any") groups. Pass 2: collection-specific groups.
             inline for (.{ true, false }) |wildcard_pass| {
-                inline for (std.meta.fields(@TypeOf(hooks))) |group| {
-                    const is_wildcard = comptime std.mem.eql(u8, group.name, "any");
+                inline for (@typeInfo(@TypeOf(hooks)).@"struct".field_names) |group| {
+                    const is_wildcard = comptime std.mem.eql(u8, group, "any");
                     // Only the groups belonging to the current pass participate.
                     if (comptime is_wildcard == wildcard_pass) {
                         // Non-wildcard groups gate on the runtime collection name.
-                        const collection_matches = is_wildcard or std.mem.eql(u8, ev.collection, group.name);
+                        const collection_matches = is_wildcard or std.mem.eql(u8, ev.collection, group);
                         if (collection_matches) {
-                            const g = @field(hooks, group.name);
+                            const g = @field(hooks, group);
                             switch (ev.phase) {
                                 inline else => |p| {
                                     const fname = comptime phaseFieldName(p);
@@ -1060,8 +1060,8 @@ fn authLifecyclePhaseFieldName(comptime p: AuthLifecyclePhase) []const u8 {
 
 /// True iff `name` is one of the eight canonical camelCase lifecycle field names.
 fn isAuthLifecycleFieldName(comptime name: []const u8) bool {
-    inline for (std.meta.fields(AuthLifecyclePhase)) |p| {
-        if (std.mem.eql(u8, name, authLifecyclePhaseFieldName(@field(AuthLifecyclePhase, p.name)))) return true;
+    inline for (@typeInfo(AuthLifecyclePhase).@"enum".field_names) |p| {
+        if (std.mem.eql(u8, name, authLifecyclePhaseFieldName(@field(AuthLifecyclePhase, p)))) return true;
     }
     return false;
 }
@@ -1074,13 +1074,13 @@ fn validateAuthLifecycleHooks(comptime auth_cfg: anytype) void {
         .@"struct" => {},
         else => @compileError("App cfg '.auth' must be a struct like .{ .beforeRegister = fn }"),
     }
-    inline for (std.meta.fields(@TypeOf(auth_cfg))) |f| {
-        if (!isAuthLifecycleFieldName(f.name)) {
-            @compileError("unknown auth lifecycle hook 'auth." ++ f.name ++
+    inline for (@typeInfo(@TypeOf(auth_cfg)).@"struct".field_names) |f| {
+        if (!isAuthLifecycleFieldName(f)) {
+            @compileError("unknown auth lifecycle hook 'auth." ++ f ++
                 "'; expected one of beforeRegister/afterRegister/beforeLogout/afterLogout/beforeRefresh/afterRefresh/beforePasswordChange/afterPasswordChange");
         }
         // Assert the value coerces to AuthLifecycleHandler so a wrong-typed hook fails loudly too.
-        const _coerce: AuthLifecycleHandler = @field(auth_cfg, f.name);
+        const _coerce: AuthLifecycleHandler = @field(auth_cfg, f);
         _ = _coerce;
     }
 }
@@ -1681,7 +1681,7 @@ const TestEnv = struct {
 
         const dir_path = try env.tmp.dir.realPathFileAlloc(std.testing.io, ".", ga);
         defer ga.free(dir_path);
-        env.db_path = try std.fmt.allocPrintSentinel(ga, "{s}/test.db", .{dir_path}, 0);
+        env.db_path = try ga.printSentinel("{s}/test.db", .{dir_path}, 0);
         errdefer ga.free(env.db_path);
 
         env.pool = try db.Pool.init(ga, std.testing.io, env.db_path);

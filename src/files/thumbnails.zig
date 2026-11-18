@@ -80,7 +80,7 @@ fn validator(ctx: *http.RequestCtx, cfg: config.Config, profile: config.Profile,
     }, .{});
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(metadata, &digest, .{});
-    return std.fmt.allocPrint(ctx.allocator.a, "W/\"{x}\"", .{digest});
+    return ctx.allocator.a.print("W/\"{x}\"", .{digest});
 }
 
 fn matches(header: []const u8, etag: []const u8) bool {
@@ -142,8 +142,8 @@ pub fn serve(ctx: *http.RequestCtx, storage: storage_mod.Storage, col: []const u
         .{ .name = "X-Content-Type-Options", .value = "nosniff" },
         .{ .name = "Referrer-Policy", .value = "no-referrer" },
         .{ .name = "Content-Security-Policy", .value = "default-src 'none'; sandbox" },
-        .{ .name = "Content-Disposition", .value = try std.fmt.allocPrint(ctx.allocator.a, "inline; filename=\"thumbnail.{s}\"", .{@tagName(result.format)}) },
-        .{ .name = "Content-Length", .value = try std.fmt.allocPrint(ctx.allocator.a, "{d}", .{result.bytes().len}) },
+        .{ .name = "Content-Disposition", .value = try ctx.allocator.a.print("inline; filename=\"thumbnail.{s}\"", .{@tagName(result.format)}) },
+        .{ .name = "Content-Length", .value = try ctx.allocator.a.print("{d}", .{result.bytes().len}) },
     });
     return .{ .status = 200, .content_type = result.format.mime(), .extra_headers = headers, .body = if (ctx.method == .HEAD) "" else try ctx.allocator.a.dupe(u8, result.bytes()) };
 }

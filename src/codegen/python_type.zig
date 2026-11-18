@@ -44,7 +44,7 @@ pub fn selectEnumName(alloc: std.mem.Allocator, col_name: []const u8, field_name
     defer alloc.free(rec);
     const fp = try ident.pascal(alloc, field_name);
     defer alloc.free(fp);
-    return std.fmt.allocPrint(alloc, "{s}{s}", .{ rec, fp });
+    return alloc.print("{s}{s}", .{ rec, fp });
 }
 
 /// The scalar (element) Python type of a field — the value domain for a
@@ -75,11 +75,11 @@ pub fn pyRecordTypeOf(alloc: std.mem.Allocator, col_name: []const u8, f: schema.
     const base = try pyBaseTypeOf(alloc, col_name, f);
     if (f.isMultiValue()) {
         defer alloc.free(base);
-        return std.fmt.allocPrint(alloc, "list[{s}]", .{base});
+        return alloc.print("list[{s}]", .{base});
     }
     if (kindOf(f) == .select_enum) {
         defer alloc.free(base);
-        return std.fmt.allocPrint(alloc, "{s} | None", .{base});
+        return alloc.print("{s} | None", .{base});
     }
     return base; // json ("Any") and all scalars: base is already the owned result
 }

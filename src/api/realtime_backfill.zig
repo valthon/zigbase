@@ -45,7 +45,7 @@ pub fn get(ctx: *http.RequestCtx) !http.Response {
     if (hub.subscribeCheck(app, &conn, ctx.allocator, input.topic) != .ok) return ApiError.withCode(403, .forbidden, "Subscription denied.").toResponse(a);
     const collection = col.?;
     const cursor_scope = if (comptime @import("build_options").durable_realtime)
-        try std.fmt.allocPrint(a, "{s}:{d}", .{ collection.id, collection.rename_epoch })
+        try a.print("{s}:{d}", .{ collection.id, collection.rename_epoch })
     else
         collection.id;
     const checkpoint: ?[]const u8 = if (input.cursor) |cursor| blk: {
@@ -77,7 +77,7 @@ pub fn get(ctx: *http.RequestCtx) !http.Response {
         break :blk .{ filled, try store.seal(a, collection.id, .{ .generation = start.generation, .sequence = filled.next }) };
     };
     const filled, const position = page;
-    const next_cursor = try std.fmt.allocPrint(a, "{s}:{s}", .{ cursor_scope, position });
+    const next_cursor = try a.print("{s}:{s}", .{ cursor_scope, position });
     if (comptime @import("build_options").durable_realtime) {
         return .{ .status = 200, .body = try std.json.Stringify.valueAlloc(a, .{ .items = filled.items, .nextCursor = next_cursor, .hasNext = filled.has_next, .resetRequired = false, .retention = .{ .maxEntries = durable.max_entries, .maxBytes = durable.max_bytes, .maxFrameBytes = durable.max_frame_bytes, .seconds = durable.retention_seconds } }, .{}) };
     }

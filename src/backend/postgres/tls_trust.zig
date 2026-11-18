@@ -133,7 +133,7 @@ test "tls_trust: an empty PEM and a no-marker garbage PEM yield CaBundleEmpty" {
     defer a.free(dir_path);
 
     inline for (.{ "empty.pem", "garbage.pem" }) |name| {
-        const url = try std.fmt.allocPrint(a, "postgres://h/db?sslmode=verify-ca&sslrootcert={s}/{s}", .{ dir_path, name });
+        const url = try a.print("postgres://h/db?sslmode=verify-ca&sslrootcert={s}/{s}", .{ dir_path, name });
         defer a.free(url);
         var cfg = try connstr.parse(a, url);
         defer cfg.deinit();
@@ -151,7 +151,7 @@ test "tls_trust: a truncated PEM block (BEGIN without END) is CaFileUnreadable" 
     });
     const dir_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
     defer a.free(dir_path);
-    const url = try std.fmt.allocPrint(a, "postgres://h/db?sslmode=verify-full&sslrootcert={s}/truncated.pem", .{dir_path});
+    const url = try a.print("postgres://h/db?sslmode=verify-full&sslrootcert={s}/truncated.pem", .{dir_path});
     defer a.free(url);
     var cfg = try connstr.parse(a, url);
     defer cfg.deinit();

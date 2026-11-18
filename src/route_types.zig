@@ -91,8 +91,8 @@ pub fn HandlerInput(comptime H: type) type {
     const info = @typeInfo(H);
     if (info != .@"fn") @compileError("route handler must be a function");
     const fn_info = info.@"fn";
-    if (fn_info.params.len != 1) @compileError("route handler must take exactly one *Req(Input) parameter");
-    const ptr_t = fn_info.params[0].type orelse @compileError("route handler parameter type is unknown");
+    if (fn_info.param_types.len != 1) @compileError("route handler must take exactly one *Req(Input) parameter");
+    const ptr_t = fn_info.param_types[0] orelse @compileError("route handler parameter type is unknown");
     const ptr_info = @typeInfo(ptr_t);
     if (ptr_info != .pointer) @compileError("route handler parameter must be *Req(Input)");
     if (ptr_info.pointer.size != .one) @compileError("route handler parameter must be a single-item pointer *Req(Input)");
@@ -138,8 +138,8 @@ pub fn isRepresentable(comptime T: type) bool {
             break :blk isRepresentable(p.child);
         },
         .@"struct" => |s| blk: {
-            inline for (s.fields) |f| {
-                if (!isRepresentable(f.type)) break :blk false;
+            inline for (s.field_names, s.field_types) |_, f_type| {
+                if (!isRepresentable(f_type)) break :blk false;
             }
             break :blk true;
         },
@@ -165,8 +165,8 @@ fn assertRepresentableField(comptime T: type, comptime route_name: []const u8, c
             if (p.child != u8) assertRepresentableField(p.child, route_name, path ++ "[]");
         },
         .@"struct" => |s| {
-            inline for (s.fields) |f| {
-                assertRepresentableField(f.type, route_name, if (path.len == 0) f.name else path ++ "." ++ f.name);
+            inline for (s.field_names, s.field_types) |f, f_type| {
+                assertRepresentableField(f_type, route_name, if (path.len == 0) f else path ++ "." ++ f);
             }
         },
         else => @compileError("route '" ++ route_name ++ "' field '" ++ path ++ "': type " ++ @typeName(T) ++ " is not representable in the bounded Zig→TS subset"),
@@ -271,9 +271,9 @@ fn parseQuery(comptime T: type, a: std.mem.Allocator, query: []const u8) !T {
     if (@typeInfo(T) != .@"struct")
         @compileError("GET/HEAD/DELETE route Input must be a struct (typed query input lands in SP2.2b): " ++ @typeName(T));
     var result: T = undefined;
-    inline for (@typeInfo(T).@"struct".fields) |f| {
-        const raw = findQueryValue(query, f.name);
-        @field(result, f.name) = try coerceQueryField(f.type, a, raw);
+    inline for (@typeInfo(T).@"struct".field_names, @typeInfo(T).@"struct".field_types) |f, f_type| {
+        const raw = findQueryValue(query, f);
+        @field(result, f) = try coerceQueryField(f_type, a, raw);
     }
     return result;
 }
@@ -316,8 +316,8 @@ pub fn isQueryParseable(comptime T: type) bool {
     if (T == void) return true;
     return switch (@typeInfo(T)) {
         .@"struct" => |s| blk: {
-            inline for (s.fields) |f| {
-                if (!isQueryScalar(f.type)) break :blk false;
+            inline for (s.field_names, s.field_types) |_, f_type| {
+                if (!isQueryScalar(f_type)) break :blk false;
             }
             break :blk true;
         },

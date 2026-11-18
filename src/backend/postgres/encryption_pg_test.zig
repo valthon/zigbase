@@ -68,7 +68,7 @@ fn rotatedRing() field_policy.Cipher {
 
 /// Read a column's at-rest TEXT value by the string `id` PK.
 fn cellById(a: std.mem.Allocator, d: *dbm.Db, table: []const u8, id: []const u8) ![]u8 {
-    const sql = try std.fmt.allocPrintSentinel(a, "SELECT v FROM {s} WHERE \"id\" = $1;", .{table}, 0);
+    const sql = try a.printSentinel("SELECT v FROM {s} WHERE \"id\" = $1;", .{table}, 0);
     var s = try d.prepare(sql);
     defer s.finalize();
     try s.bindText(1, id);
@@ -85,7 +85,7 @@ test "pg encryption: field_cipher plumbing + AEAD envelope round-trips through t
     defer arena.deinit();
     const ar = arena.allocator();
 
-    const url = try ar.dupeZ(u8, testUrl());
+    const url = try ar.dupeSentinel(u8, testUrl(), 0);
     var pool = dbm.Pool.init(a, io, url) catch |e| switch (e) {
         error.OpenFailed => return error.SkipZigTest,
         else => return e,

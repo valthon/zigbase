@@ -736,7 +736,7 @@ pub const Conn = struct {
     /// identifier and first validated (rejecting `"`/NUL) to foreclose injection.
     pub fn listen(self: *Conn, channel: []const u8) ConnError!void {
         try validateIdentifier(channel);
-        const sql = std.fmt.allocPrint(self.gpa, "LISTEN \"{s}\";", .{channel}) catch return ConnError.OutOfMemory;
+        const sql = self.gpa.print("LISTEN \"{s}\";", .{channel}) catch return ConnError.OutOfMemory;
         defer self.gpa.free(sql);
         try self.simpleExec(sql);
     }
@@ -888,7 +888,7 @@ fn md5Token(user: []const u8, password: []const u8, salt: []const u8, out: *[35]
         h.final(&inner);
     }
     var inner_hex: [32]u8 = undefined;
-    _ = std.fmt.bufPrint(&inner_hex, "{x}", .{&inner}) catch unreachable;
+    _ = std.mem.print(&inner_hex, "{x}", .{&inner}) catch unreachable;
     var outer: [16]u8 = undefined;
     {
         var h = Md5.init(.{});
@@ -896,7 +896,7 @@ fn md5Token(user: []const u8, password: []const u8, salt: []const u8, out: *[35]
         h.update(salt);
         h.final(&outer);
     }
-    return std.fmt.bufPrint(out, "md5{x}", .{&outer}) catch unreachable;
+    return std.mem.print(out, "md5{x}", .{&outer}) catch unreachable;
 }
 
 test "md5Token derives the PostgreSQL md5 auth token" {
@@ -909,14 +909,14 @@ test "md5Token derives the PostgreSQL md5 auth token" {
     var inner: [16]u8 = undefined;
     Md5.hash("s3cretalice", &inner, .{});
     var inner_hex: [32]u8 = undefined;
-    _ = try std.fmt.bufPrint(&inner_hex, "{x}", .{&inner});
+    _ = try std.mem.print(&inner_hex, "{x}", .{&inner});
     var buf: [32 + 4]u8 = undefined;
     @memcpy(buf[0..32], &inner_hex);
     @memcpy(buf[32..36], &salt);
     var outer: [16]u8 = undefined;
     Md5.hash(&buf, &outer, .{});
     var expected: [35]u8 = undefined;
-    _ = try std.fmt.bufPrint(&expected, "md5{x}", .{&outer});
+    _ = try std.mem.print(&expected, "md5{x}", .{&outer});
 
     var out: [35]u8 = undefined;
     const tok = md5Token(user, pass, &salt, &out);

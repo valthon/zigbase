@@ -43,7 +43,7 @@ These are the checks that reflect Zig's actual design guarantees. A violation is
 
 ### 2.1 Explicit allocators — no hidden allocation
 - **Rule:** *Any function that allocates memory takes an `Allocator` parameter.* There are **no hidden allocations** in idiomatic Zig.
-- **Flag:** a function that allocates internally by reaching for a global allocator (`std.heap.page_allocator`, a file-scope `GeneralPurposeAllocator`, a hidden singleton) instead of accepting `allocator: std.mem.Allocator`.
+- **Flag:** a function that allocates internally by reaching for a global allocator (`std.heap.page_allocator`, a file-scope `SafeAllocator`/`DebugAllocator`, a hidden singleton) instead of accepting `allocator: std.mem.Allocator`.
 - **Flag:** library/API code that hard-codes an allocator, denying the caller control over allocation strategy (arena vs. GPA vs. fixed-buffer).
 - **Why:** allocation policy belongs to the caller; hiding it breaks composability, testability (`std.testing.allocator` leak detection), and arena-based lifetime management.
 
@@ -96,6 +96,14 @@ allocator-taking function must be exactly one of these, and say which:
 - **Flag:** `anytype` parameters that erase intent and could be a concrete type or a small explicit vtable.
 - **Trade-off to weigh:** comptime cleverness vs. readability and compile time — Zig prizes fast builds; gratuitous comptime taxes them.
 
+### 2.7 Zig 0.17 semantics that changed without a compile error
+This repo targets **Zig 0.17.1**. The 0.17.0 release changed a few things that still compile but now mean something different. Code that was right on 0.16 can be wrong here, so check these as bug-class. Each item below was checked against the 0.17.1 compiler or its std source.
+- **`@bitCast` on arrays, vectors and extern types.** It now reinterprets the *logical* bit representation: elements are concatenated starting from the least-significant bit, the same on every target endianness (`@as(u16, @bitCast([2]u8{ 0x12, 0xAB })) == 0xAB12`). Casts to or from `extern struct`/`extern union` are now compile errors. **Flag:** a `@bitCast` whose operand or result is an array or vector and that relied on in-memory byte order. Type punning is written as `@ptrCast` or an `extern union`, which states the intent. A `@bitCast` *to an enum* is now safety-checked for an invalid tag.
+- **`@hasDecl` sees only `pub` declarations**, even in the declaring file. **Flag:** a comptime feature check (`if (@hasDecl(Cfg, "x"))`) over a declaration that is not `pub`. It is now always false, so the feature silently turns off.
+- **`std.mem.containsAtLeastScalar(T, list, element, minimum)`.** The old `(…, minimum, element)` order still compiles for many element types. **Flag:** any call site, until its argument order has been read.
+- **`std.mem.eql`/`findDiff` on float slices** no longer short-circuit on identical pointers, so a slice containing NaN is not equal to itself. Code that compared a float buffer with itself as an "unchanged" check now sees a difference whenever the buffer holds a NaN.
+- **Configure-phase side effects in `build.zig`.** Since 0.17, `zig build` caches the *configuration*. If `build.zig` reads a file or probes the host and doesn't say so, the cache keeps returning the old answer. **Flag:** a `build.zig` that reads a file at configure time without `b.dependOnFileContents`/`dependOnFileMetadata` (or `dependOnDirectory*`). Also flag `findProgram` where `findProgramLazy` would do, because `findProgram` poisons the cache. The symptom is a stale value baked into the binary, such as a stale commit id.
+
 ---
 
 ## 3. Reviewer rubric — the readability & "one obvious way" rules
@@ -107,6 +115,28 @@ These flow from *Favor reading code over writing code*, *Only one obvious way*, 
 - **Communicate intent precisely.** Names, types, and structure should make intent obvious to a *new* reader. Prefer explicit, narrow types over `anytype`/`anyerror`/`usize`-for-everything when a precise type exists.
 - **Reduce what one must remember.** Flag "spooky action" — invariants that must be maintained across distant code with nothing local to signal them.
 - **No dead/speculative generality.** Unused parameters, unused variables (a *compile error* in Zig — see §5), premature "flexible" abstractions with one caller.
+- **Use the current spelling, not the deprecated alias.** On 0.17 the "one obvious way" is the form the release notes introduced. The deprecated alias still compiles but is due for removal:
+
+  | Write | Not (deprecated / removed in 0.17) |
+  | ----- | ---------------------------------- |
+  | `allocator.print(fmt, args)` | `std.fmt.allocPrint(allocator, fmt, args)` |
+  | `allocator.printSentinel(fmt, args, 0)` | `std.fmt.allocPrintSentinel(allocator, fmt, args, 0)` |
+  | `std.mem.print(buf, fmt, args)` | `std.fmt.bufPrint(buf, fmt, args)` |
+  | `@backingInt(e)` / `@fromBackingInt(i)` (`zig fmt` rewrites these; `@fromBackingInt` takes exactly the backing integer type, so a wider index needs `@intCast`) | `@intFromEnum` / `@enumFromInt` |
+  | `var a: [n]T = @splat(v);` | `[1]T{v} ** n` (removed) |
+  | `@divCeil(a, b)` | `std.math.divCeil(…) catch unreachable` (this also violates §2.3) |
+  | `list.last()` / `list.last().?` | `getLastOrNull()` / `getLast()` |
+  | `std.lang`, `std.lang.Optimize` (`.debug/.safe/.fast/.small`) | `std.builtin`, `OptimizeMode` (`.Debug/.ReleaseSafe/…`) |
+  | `@import("builtin").target.os` / `.target.cpu` / `.target.abi` / `.target.ofmt` | `@import("builtin").os` / `.cpu` / `.abi` / `.object_format` (removed in 0.18) |
+  | `@import("builtin").optimize.runtimeSafety()` | `std.debug.runtime_safety` (it reports std's safety setting, not the calling module's) |
+  | `@import("builtin").optimize` | `@import("builtin").mode` (removed after 0.18) |
+  | `var gpa: std.heap.SafeAllocator = .init(backing, .{});` … `gpa.deinit() == 0` | `std.heap.DebugAllocator(.{})` … `gpa.deinit() == .ok`. Not a rename: `deinit` returns a leak *count* (and logs each leak); a discarded result does not fail the run, so compare it with `0` wherever a leak must fail. SafeAllocator never refills space inside a bucket, and it reuses memory only if its backing allocator does (std: "Given the backing allocator does not reuse memory, this does not reuse memory either"), so keep it to tests, fuzzing, benchmarks and debugging |
+  | `std.heap.BufferFirstAllocator.init(&buf, fallback)` | `std.heap.stackFallback(n, fallback)` (removed) |
+  | `@typeInfo(T).@"struct".field_names` / `.field_types` / `.field_attrs` | `.fields` (removed: struct-of-arrays reflection) |
+  | `run.addPassthruArgs()` in `build.zig` | `if (b.args) \|args\| run.addArgs(args)` |
+  | a separate inner function plus `catch \|err\|` | `errdefer \|err\|` (capture removed) |
+
+- **Simplification claims carry a number.** `zig fmt --complexity <files>` counts tokens and AST nodes. A change sold as a simplification quotes its before/after counts, which say more than a line count does.
 
 ---
 
@@ -213,12 +243,14 @@ Also note the honest source-strength split: §2–§5 rest on **primary** source
 - [ ] Assertions encode proven invariants, not swept-under states
 - [ ] Correctness reasoned to edge cases — not "tests pass"; concrete failure scenario for each finding
 - [ ] Hot, high-cardinality structs aren't obviously cache-hostile (padding/pointers/rare fields inline)
+- [ ] Zig 0.17 silent changes checked (§2.7): array/vector `@bitCast`, `@hasDecl` on non-`pub` decls, `containsAtLeastScalar` argument order, float `mem.eql`, untracked configure-time reads in `build.zig`
 
 **Readability/idiom — suggest (don't block):**
 - [ ] Canonical construct over clever bespoke one ("one obvious way")
 - [ ] Precise names/types; no namespace-redundant names; intent obvious to a new reader
 - [ ] comptime/`anytype` justified vs. a simpler runtime/explicit form; build-time cost respected
 - [ ] Doc comments accurate and focused on the declared interface
+- [ ] Current 0.17 spelling, not a deprecated alias (§3 table); simplification claims quote `zig fmt --complexity`
 
 **Do NOT flag:**
 - [ ] Naming-convention style as a rule (it's optional commonality)
@@ -238,6 +270,7 @@ Also note the honest source-strength split: §2–§5 rest on **primary** source
 - Zig — *Code of Conduct: Strict No LLM / No AI Policy* — https://ziglang.org/code-of-conduct/
 - Kelley (`andrewrk`), *Zig will not enforce naming conventions; errors are about catching bugs* — https://github.com/ziglang/zig/issues/14228
 - *The Zen of Zig* (`zig zen`) — published in the Zig compiler/docs
+- Zig — *0.17.0 Release Notes* (the source for §2.7 and the §3 spelling table) — https://ziglang.org/download/0.17.0/release-notes.html
 
 **Corroborating secondary (AI-stance quotes):**
 - The Register, *Zig creator seeks 'uncompromising perfection' before blessing 1.0* — https://www.theregister.com/software/2026/05/28/zig-creator-seeks-uncompromising-perfection-before-blessing-10/

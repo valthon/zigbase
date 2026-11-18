@@ -234,7 +234,7 @@ fn validateRules(ctx: *http.RequestCtx, w: *db.Db, def: schema.Collection) !?htt
     const report = try lint.checkChanges(ctx.allocator.a, w, live, &.{def}, false);
     for (report.findings) |finding| {
         if (!std.mem.eql(u8, finding.severity, "error")) continue;
-        const message = try std.fmt.allocPrint(ctx.allocator.a, "{s} collection '{s}' {s}: {s} ({s}).", .{ if (std.mem.eql(u8, finding.collection, def.name)) "Proposed" else "Retained (different)", finding.collection, finding.rule, finding.message, finding.code });
+        const message = try ctx.allocator.a.print("{s} collection '{s}' {s}: {s} ({s}).", .{ if (std.mem.eql(u8, finding.collection, def.name)) "Proposed" else "Retained (different)", finding.collection, finding.rule, finding.message, finding.code });
         return try ApiError.badRequest(message).toResponse(ctx.allocator.a);
     }
     return null;
@@ -267,7 +267,7 @@ const TestEnv = struct {
         env.tmp = std.testing.tmpDir(.{});
         const dir = try env.tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
         defer std.testing.allocator.free(dir);
-        const path = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/test.db", .{dir}, 0);
+        const path = try std.testing.allocator.printSentinel("{s}/test.db", .{dir}, 0);
         defer std.testing.allocator.free(path);
         env.pool = try db.Pool.init(std.testing.allocator, std.testing.io, path);
         {
@@ -304,7 +304,7 @@ test "create then get then list a collection over handlers" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    const auth_hdr = try std.fmt.allocPrint(a, "Bearer {s}", .{try env.superuserToken(a)});
+    const auth_hdr = try a.print("Bearer {s}", .{try env.superuserToken(a)});
 
     const body =
         \\{"name":"posts","fields":[{"id":"","name":"title","type":"text","options":{}}]}
@@ -347,7 +347,7 @@ test "create then get then list a collection over handlers" {
         defer env.pool.releaseWriter();
         break :blk (try collections.get(a, writer, "posts")).?;
     };
-    const comments_body = try std.fmt.allocPrint(a, "{{\"name\":\"comments\",\"fields\":[{{\"id\":\"\",\"name\":\"author\",\"type\":\"relation\",\"options\":{{\"targetCollectionId\":\"{s}\",\"maxSelect\":1}}}}],\"viewRule\":\"author.title != ''\"}}", .{posts.id});
+    const comments_body = try a.print("{{\"name\":\"comments\",\"fields\":[{{\"id\":\"\",\"name\":\"author\",\"type\":\"relation\",\"options\":{{\"targetCollectionId\":\"{s}\",\"maxSelect\":1}}}}],\"viewRule\":\"author.title != ''\"}}", .{posts.id});
     var comments_ctx = ctxFor(env, RequestArena.from(&arena), .POST, "/api/collections", comments_body, &.{});
     comments_ctx.authorization = auth_hdr;
     try std.testing.expectEqual(@as(u16, 201), (try create(&comments_ctx)).status);
@@ -379,7 +379,7 @@ test "collections_frozen 403s the runtime DDL endpoints without mutating collect
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const auth_hdr = try std.fmt.allocPrint(a, "Bearer {s}", .{try env.superuserToken(a)});
+    const auth_hdr = try a.print("Bearer {s}", .{try env.superuserToken(a)});
 
     // Seed a collection while NOT frozen — the default path is unchanged.
     {
@@ -439,7 +439,7 @@ test "runtime API mirrors the comptime encryption guards (the bypass fix)" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const auth_hdr = try std.fmt.allocPrint(a, "Bearer {s}", .{try env.superuserToken(a)});
+    const auth_hdr = try a.print("Bearer {s}", .{try env.superuserToken(a)});
 
     // (4) No field key configured (pool.field_cipher == null): an encrypted field is
     // rejected BEFORE anything is stored — closes the startup-guard gap for the
@@ -508,7 +508,7 @@ test "create with invalid name returns 400 with field errors" {
     defer arena.deinit();
     const a = arena.allocator();
     var cctx = ctxFor(env, RequestArena.from(&arena), .POST, "/api/collections", "{\"name\":\"1bad\",\"fields\":[]}", &.{});
-    cctx.authorization = try std.fmt.allocPrint(a, "Bearer {s}", .{try env.superuserToken(a)});
+    cctx.authorization = try a.print("Bearer {s}", .{try env.superuserToken(a)});
     const res = try create(&cctx);
     try std.testing.expectEqual(@as(u16, 400), res.status);
     try std.testing.expect(std.mem.indexOf(u8, res.body, codes.s(.validation_invalid_name)) != null);
@@ -528,7 +528,7 @@ test "enabled oauth2 provider with no client secret is rejected at save" {
         \\ ]}}}}
     ;
     var c = ctxFor(env, RequestArena.from(&arena), .POST, "/api/collections", body, &.{});
-    c.authorization = try std.fmt.allocPrint(a, "Bearer {s}", .{token});
+    c.authorization = try a.print("Bearer {s}", .{token});
     try std.testing.expectEqual(@as(u16, 400), (try create(&c)).status);
 }
 
@@ -544,7 +544,7 @@ test "collection management requires a superuser" {
 
     const token = try env.superuserToken(a);
     var su = ctxFor(env, RequestArena.from(&arena), .GET, "/api/collections", "", &.{});
-    su.authorization = try std.fmt.allocPrint(a, "Bearer {s}", .{token});
+    su.authorization = try a.print("Bearer {s}", .{token});
     try std.testing.expectEqual(@as(u16, 200), (try list(&su)).status);
 }
 
@@ -562,7 +562,7 @@ test "creating an oauth2 collection encrypts the clientSecret and redacts it in 
         \\ ]}}}}
     ;
     var c = ctxFor(env, RequestArena.from(&arena), .POST, "/api/collections", body, &.{});
-    c.authorization = try std.fmt.allocPrint(a, "Bearer {s}", .{token});
+    c.authorization = try a.print("Bearer {s}", .{token});
     const res = try create(&c);
     try std.testing.expectEqual(@as(u16, 201), res.status);
     try std.testing.expect(std.mem.indexOf(u8, res.body, "PLAINTEXT") == null);
@@ -589,7 +589,7 @@ test "non-https generic provider endpoint is rejected at save" {
         \\ ]}}}}
     ;
     var c = ctxFor(env, RequestArena.from(&arena), .POST, "/api/collections", body, &.{});
-    c.authorization = try std.fmt.allocPrint(a, "Bearer {s}", .{token});
+    c.authorization = try a.print("Bearer {s}", .{token});
     try std.testing.expectEqual(@as(u16, 400), (try create(&c)).status);
 }
 
@@ -620,7 +620,7 @@ test "R1-4: collection DDL invalidates the metadata cache (negative entry cleare
         \\{"name":"cachedcol","fields":[{"id":"","name":"title","type":"text","options":{}}]}
     ;
     var ctx = ctxFor(env, RequestArena.from(&arena), .POST, "/api/collections", body, &.{});
-    ctx.authorization = try std.fmt.allocPrint(a, "Bearer {s}", .{token});
+    ctx.authorization = try a.print("Bearer {s}", .{token});
     const resp = try create(&ctx);
     try std.testing.expectEqual(@as(u16, 201), resp.status);
 

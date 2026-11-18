@@ -56,11 +56,11 @@ pub fn install(conn: *conn_mod.Conn) void {
     const frozen = clock.frozenUnix() orelse return; // no freeze → genuine now()
 
     var buf: [512]u8 = undefined;
-    const sql = std.fmt.bufPrintZ(&buf,
+    const sql = std.mem.printSentinel(&buf,
         \\CREATE SCHEMA IF NOT EXISTS {[schema]s};
         \\CREATE OR REPLACE FUNCTION {[schema]s}.now() RETURNS timestamptz LANGUAGE sql STABLE AS 'SELECT to_timestamp({[unix]d}::double precision)';
         \\SELECT set_config('search_path', current_setting('search_path') || ', {[schema]s}, pg_catalog', false);
-    , .{ .schema = schema_name, .unix = frozen }) catch {
+    , .{ .schema = schema_name, .unix = frozen }, 0) catch {
         std.log.warn("clock_pg: could not format frozen-now() install SQL; Postgres SQL clock NOT frozen", .{});
         return;
     };
@@ -127,7 +127,7 @@ test "frozen: Postgres now()/nowIso8601 resolve to the frozen instant (dev build
     // columns must now reflect the frozen instant.
     const iso_expr = dialect_mod.Dialect.postgres.nowIso8601Expr();
     var qbuf: [256]u8 = undefined;
-    const q = try std.fmt.bufPrint(&qbuf, "SELECT {s}", .{iso_expr});
+    const q = try std.mem.print(&qbuf, "SELECT {s}", .{iso_expr});
     const iso = try scalarText(a, conn, q);
     defer a.free(iso);
     try std.testing.expectEqualStrings(frozen_iso, iso);
@@ -164,9 +164,9 @@ test "frozen: an autodate-style INSERT stamps the frozen instant on Postgres (de
     // it session-local (no shared-schema pollution) while exercising the real now() resolution.
     const iso_expr = dialect_mod.Dialect.postgres.nowIso8601Expr();
     var cbuf: [320]u8 = undefined;
-    const create_sql = try std.fmt.bufPrintZ(&cbuf,
+    const create_sql = try std.mem.printSentinel(&cbuf,
         \\CREATE TEMP TABLE t (id TEXT PRIMARY KEY, created TEXT DEFAULT {s});
-    , .{iso_expr});
+    , .{iso_expr}, 0);
     try conn.simpleExec(create_sql);
     try conn.simpleExec("INSERT INTO t (id) VALUES ('r1');");
 

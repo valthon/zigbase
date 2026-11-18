@@ -73,13 +73,13 @@ pub const Stmt = struct {
 
     pub fn bindInt(self: *Stmt, idx: c_int, val: i64) StmtError!void {
         const i = try self.ensureParam(idx);
-        self.params.items[i] = std.fmt.allocPrint(self.param_arena.allocator(), "{d}", .{val}) catch return StmtError.OutOfMemory;
+        self.params.items[i] = self.param_arena.allocator().print("{d}", .{val}) catch return StmtError.OutOfMemory;
     }
 
     pub fn bindDouble(self: *Stmt, idx: c_int, val: f64) StmtError!void {
         const i = try self.ensureParam(idx);
         // Round-trippable shortest representation; PG accepts standard float text.
-        self.params.items[i] = std.fmt.allocPrint(self.param_arena.allocator(), "{d}", .{val}) catch return StmtError.OutOfMemory;
+        self.params.items[i] = self.param_arena.allocator().print("{d}", .{val}) catch return StmtError.OutOfMemory;
     }
 
     pub fn bindNull(self: *Stmt, idx: c_int) StmtError!void {
@@ -234,7 +234,7 @@ test "clearBindings releases repeated large parameter copies without changing re
     var conn: Conn = undefined; // binding does not touch the connection
     var st = try Stmt.init(&conn, std.testing.allocator, "SELECT $1", null);
     defer st.finalize();
-    const payload = [_]u8{'x'} ** 65536;
+    const payload = @as([65536]u8, @splat('x'));
     for (0..128) |_| {
         try st.bindText(1, &payload);
         try std.testing.expect(st.param_arena.queryCapacity() >= payload.len);

@@ -26,13 +26,13 @@ The commands below show how to run the server directly.
 
 ## Build from source
 
-You need **Zig 0.16.0** (pinned in `mise.toml`). Either activate mise
-(`eval "$(mise activate bash)"`) or prefix the build with `mise exec zig@0.16.0 --`.
+You need **Zig 0.17.1** (pinned in `mise.toml`). Either activate mise
+(`eval "$(mise activate bash)"`) or prefix the build with `mise exec zig@0.17.1 --`.
 
 ```sh
-mise install                                    # installs Zig 0.16.0 (pinned in mise.toml)
+mise install                                    # installs Zig 0.17.1 (pinned in mise.toml)
 zig build                                        # -> zig-out/bin/zigbase
-# or: mise exec zig@0.16.0 -- zig build
+# or: mise exec zig@0.17.1 -- zig build
 ```
 
 ## Download a binary

@@ -75,18 +75,18 @@ pub const TwilioSender = struct {
 
 /// Build the `Messages.json` endpoint URL for `account_sid`. Pure; unit-testable.
 pub fn messagesUrl(alloc: std.mem.Allocator, account_sid: []const u8) ![]u8 {
-    return std.fmt.allocPrint(alloc, "{s}{s}/Messages.json", .{ api_base, account_sid });
+    return alloc.print("{s}{s}/Messages.json", .{ api_base, account_sid });
 }
 
 /// Build the `Authorization: Basic …` header value (base64 of "sid:token"). Pure.
 pub fn basicAuthHeader(alloc: std.mem.Allocator, account_sid: []const u8, auth_token: []const u8) ![]u8 {
-    const raw = try std.fmt.allocPrint(alloc, "{s}:{s}", .{ account_sid, auth_token });
+    const raw = try alloc.print("{s}:{s}", .{ account_sid, auth_token });
     defer alloc.free(raw);
     const enc = std.base64.standard.Encoder;
     const b64 = try alloc.alloc(u8, enc.calcSize(raw.len));
     defer alloc.free(b64);
     _ = enc.encode(b64, raw);
-    return std.fmt.allocPrint(alloc, "Basic {s}", .{b64});
+    return alloc.print("Basic {s}", .{b64});
 }
 
 /// Build the `application/x-www-form-urlencoded` request body. Pure (no I/O), so it is
@@ -99,7 +99,7 @@ pub fn buildBody(alloc: std.mem.Allocator, from: []const u8, sms: Sms) ![]u8 {
     defer alloc.free(from_enc);
     const body_enc = try urlenc.percentEncode(alloc, sms.body);
     defer alloc.free(body_enc);
-    return std.fmt.allocPrint(alloc, "To={s}&From={s}&Body={s}", .{ to_enc, from_enc, body_enc });
+    return alloc.print("To={s}&From={s}&Body={s}", .{ to_enc, from_enc, body_enc });
 }
 
 // ---------------------------------------------------------------------------
@@ -164,7 +164,7 @@ test "send builds the right URL + Basic auth + encoded body (via the http captur
             const enc = std.base64.standard.Encoder;
             var buf: [64]u8 = undefined;
             const b64 = enc.encode(buf[0..enc.calcSize("ACtest:tok".len)], "ACtest:tok");
-            const want = try std.fmt.allocPrint(a, "Basic {s}", .{b64});
+            const want = try a.print("Basic {s}", .{b64});
             defer a.free(want);
             try testing.expectEqualStrings(want, h.value);
         }

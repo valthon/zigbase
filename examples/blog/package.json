@@ -4,7 +4,7 @@
   "type": "module",
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "build:backend": "mise exec zig@0.16.0 -- zig build",
+    "build:backend": "mise exec zig@0.17.1 -- zig build",
     "build:frontend": "bash frontend/build.sh",
     "test:e2e": "npm run build:frontend && vitest run",
     "test:browser": "npm run build:frontend && npm run build:backend && python test/frontend.browser.py"

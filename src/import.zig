@@ -270,8 +270,7 @@ fn applyLegacyCredential(
     // `col.name` came from `_collections` and passed `schema.isValidIdentifier` on creation;
     // re-check before interpolating, per the repo's identifier discipline.
     if (!schema.isValidIdentifier(col.name)) return ImportError.InvalidCollectionName;
-    const sql = try std.fmt.allocPrintSentinel(
-        a,
+    const sql = try a.printSentinel(
         "UPDATE \"{s}\" SET \"passwordHash\" = COALESCE(?2, \"passwordHash\"), \"verified\" = COALESCE(?3, \"verified\") WHERE \"id\" = ?1;",
         .{col.name},
         0,
@@ -426,8 +425,7 @@ pub const TimestampRestorer = struct {
         var scratch = std.heap.ArenaAllocator.init(a);
         defer scratch.deinit();
         const sa = scratch.allocator();
-        const sql = try std.fmt.allocPrintSentinel(
-            sa,
+        const sql = try sa.printSentinel(
             "UPDATE {s} SET \"created\"=?2, \"updated\"=?3 WHERE \"id\"=?1;",
             .{try ddl.quoteIdent(sa, col.name)},
             0,
@@ -592,7 +590,7 @@ fn captureDetail(e: anyerror) []const u8 {
     const errs = records.last_errors orelse return "";
     if (errs.len == 0) return "";
     const ve = errs[0];
-    return std.fmt.bufPrint(&last_error_detail_buf, "{s}: {s} ({s})", .{ ve.field, ve.message, ve.code }) catch "";
+    return std.mem.print(&last_error_detail_buf, "{s}: {s} ({s})", .{ ve.field, ve.message, ve.code }) catch "";
 }
 
 /// Stream NDJSON from `reader` into `opts.collection` on writer `w`. Returns the row counts.
@@ -700,18 +698,17 @@ pub fn run(app: *App, w: *db.Db, io: std.Io, reader: *std.Io.Reader, opts: Optio
         }
         lookups.tenant_field = if (schema.uniqueScope(col, f) == .tenant) col.options.tenant_field else null;
         const tenant_predicate = if (lookups.tenant_field) |tf|
-            try std.fmt.allocPrint(ca, " AND {s}=?2", .{try ddl.quoteIdent(ca, tf)})
+            try ca.print(" AND {s}=?2", .{try ddl.quoteIdent(ca, tf)})
         else
             "";
-        const sql = try std.fmt.allocPrintSentinel(ca, "SELECT \"id\" FROM {s} WHERE {s}=?1{s} LIMIT 1;", .{ try ddl.quoteIdent(ca, col.name), try ddl.quoteIdent(ca, key), tenant_predicate }, 0);
+        const sql = try ca.printSentinel("SELECT \"id\" FROM {s} WHERE {s}=?1{s} LIMIT 1;", .{ try ddl.quoteIdent(ca, col.name), try ddl.quoteIdent(ca, key), tenant_predicate }, 0);
         lookups.upsert = try prep(ca, w, sql);
     } else if (opts.preserve_ids) {
-        const sql = try std.fmt.allocPrintSentinel(ca, "SELECT 1 FROM {s} WHERE \"id\"=?1 LIMIT 1;", .{try ddl.quoteIdent(ca, col.name)}, 0);
+        const sql = try ca.printSentinel("SELECT 1 FROM {s} WHERE \"id\"=?1 LIMIT 1;", .{try ddl.quoteIdent(ca, col.name)}, 0);
         lookups.dup_check = try prep(ca, w, sql);
     }
     if (opts.preserve_timestamps) {
-        const sql = try std.fmt.allocPrintSentinel(
-            ca,
+        const sql = try ca.printSentinel(
             "UPDATE {s} SET \"created\"=?2, \"updated\"=?3 WHERE \"id\"=?1;",
             .{try ddl.quoteIdent(ca, col.name)},
             0,

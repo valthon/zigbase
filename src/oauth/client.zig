@@ -51,7 +51,7 @@ pub fn exchangeCode(
     const enc_secret = try urlenc.percentEncode(alloc, client_secret);
     defer alloc.free(enc_secret);
 
-    const body = try std.fmt.allocPrint(alloc, "grant_type=authorization_code&code={s}&redirect_uri={s}&code_verifier={s}&client_id={s}&client_secret={s}", .{
+    const body = try alloc.print("grant_type=authorization_code&code={s}&redirect_uri={s}&code_verifier={s}&client_id={s}&client_secret={s}", .{
         enc_code, enc_redirect, enc_verifier, enc_client_id, enc_secret,
     });
     defer alloc.free(body);
@@ -77,7 +77,7 @@ pub fn fetchIdentity(
     provider: providers.Provider,
     access_token: []const u8,
 ) ClientError!providers.Identity {
-    const auth_value = try std.fmt.allocPrint(alloc, "Bearer {s}", .{access_token});
+    const auth_value = try alloc.print("Bearer {s}", .{access_token});
     defer alloc.free(auth_value);
     const headers = [_]Header{
         .{ .name = "authorization", .value = auth_value },
@@ -115,7 +115,7 @@ fn httpCall(ctx: *anyopaque, alloc: std.mem.Allocator, method: Method, url: []co
         };
     };
 
-    return .{ .status = @intFromEnum(res.status), .body = fw.buffered() };
+    return .{ .status = @backingInt(res.status), .body = fw.buffered() };
 }
 
 /// A production transport backed by std.http.Client (TLS via std.crypto.tls). `hc` must outlive use.

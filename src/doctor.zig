@@ -127,7 +127,7 @@ fn append(
     comptime fmt: []const u8,
     args: anytype,
 ) !void {
-    const message = try std.fmt.allocPrint(arena, fmt, args);
+    const message = try arena.print(fmt, args);
     try out.append(arena, .{
         .check = check,
         .severity = sevName(severity),
@@ -195,7 +195,7 @@ fn checkPublicRules(arena: std.mem.Allocator, f: Facts, production: bool, out: *
         // escalate in production. System auth collections never qualify for
         // the signup exception.
         const sev: Severity = if (production and r.write and !r.auth_signup) .err else .warn;
-        const subject = try std.fmt.allocPrint(arena, "{s}.{s}Rule", .{ r.collection, r.op });
+        const subject = try arena.print("{s}.{s}Rule", .{ r.collection, r.op });
         if (r.auth_signup) {
             try append(arena, out, id, sev, subject, "auth collection '{s}' allows open signup", .{r.collection});
         } else {
@@ -332,7 +332,7 @@ fn checkCrossTenantRelations(arena: std.mem.Allocator, f: Facts, production: boo
         return append(arena, out, id, .ok, null, "no relation links another account's record", .{});
     }
     for (f.cross_tenant_links) |l| {
-        const subject = try std.fmt.allocPrint(arena, "{s}.{s}", .{ l.collection, l.field });
+        const subject = try arena.print("{s}.{s}", .{ l.collection, l.field });
         if (l.count > 0 and l.unparseable > 0) {
             try append(arena, out, id, .warn, subject, "{d} stored link(s) from '{s}.{s}' point at a '{s}' record owned by another account; a delete there cascades into or clears a single-relation link, and leaves a multi-relation id stale. {d} stored value(s) are not a JSON id array and were not examined", .{ l.count, l.collection, l.field, l.target, l.unparseable });
         } else if (l.count > 0) {

@@ -107,7 +107,7 @@ pub const Migrator = struct {
     /// `std.fmt`-format a statement into the arena and run it raw (backend-specific). The format
     /// string is comptime; remember `std.fmt` treats `{`/`}` specially (double them in SQL).
     pub fn execf(self: *Migrator, comptime fmt: []const u8, args: anytype) db.DbError!void {
-        const sql = std.fmt.allocPrintSentinel(self.arena, fmt, args, 0) catch return error.ExecFailed;
+        const sql = self.arena.printSentinel(fmt, args, 0) catch return error.ExecFailed;
         return self.db.exec(sql);
     }
 
@@ -215,7 +215,7 @@ pub const Migrator = struct {
 
     /// Dupe an arena-built statement to a sentinel-terminated slice and run it.
     fn execArena(self: *Migrator, sql: []const u8) OpError!void {
-        const z = self.arena.dupeZ(u8, sql) catch return error.ExecFailed;
+        const z = self.arena.dupeSentinel(u8, sql, 0) catch return error.ExecFailed;
         return self.exec(z);
     }
 
@@ -235,7 +235,7 @@ pub const Migrator = struct {
 
     fn dropTableForward(self: *Migrator, name: []const u8) OpError!void {
         const q = ddl.quoteIdent(self.arena, name) catch return error.ExecFailed;
-        const sql = std.fmt.allocPrintSentinel(self.arena, "DROP TABLE IF EXISTS {s};", .{q}, 0) catch return error.ExecFailed;
+        const sql = self.arena.printSentinel("DROP TABLE IF EXISTS {s};", .{q}, 0) catch return error.ExecFailed;
         return self.exec(sql);
     }
 
@@ -258,14 +258,14 @@ pub const Migrator = struct {
     fn addColumnForward(self: *Migrator, table: []const u8, col: Col) OpError!void {
         const q = ddl.quoteIdent(self.arena, table) catch return error.ExecFailed;
         const def = self.columnDefSql(col) catch return error.ExecFailed;
-        const sql = std.fmt.allocPrintSentinel(self.arena, "ALTER TABLE {s} ADD COLUMN {s};", .{ q, def }, 0) catch return error.ExecFailed;
+        const sql = self.arena.printSentinel("ALTER TABLE {s} ADD COLUMN {s};", .{ q, def }, 0) catch return error.ExecFailed;
         return self.exec(sql);
     }
 
     fn dropColumnForward(self: *Migrator, table: []const u8, name: []const u8) OpError!void {
         const qt = ddl.quoteIdent(self.arena, table) catch return error.ExecFailed;
         const qc = ddl.quoteIdent(self.arena, name) catch return error.ExecFailed;
-        const sql = std.fmt.allocPrintSentinel(self.arena, "ALTER TABLE {s} DROP COLUMN {s};", .{ qt, qc }, 0) catch return error.ExecFailed;
+        const sql = self.arena.printSentinel("ALTER TABLE {s} DROP COLUMN {s};", .{ qt, qc }, 0) catch return error.ExecFailed;
         return self.exec(sql);
     }
 
@@ -309,7 +309,7 @@ pub const Migrator = struct {
 
     fn dropIndexForward(self: *Migrator, name: []const u8) OpError!void {
         const q = ddl.quoteIdent(self.arena, name) catch return error.ExecFailed;
-        const sql = std.fmt.allocPrintSentinel(self.arena, "DROP INDEX IF EXISTS {s};", .{q}, 0) catch return error.ExecFailed;
+        const sql = self.arena.printSentinel("DROP INDEX IF EXISTS {s};", .{q}, 0) catch return error.ExecFailed;
         return self.exec(sql);
     }
 
@@ -340,7 +340,7 @@ pub const Migrator = struct {
         const dst = if (self.direction == .reverse) from else to;
         const qs = ddl.quoteIdent(self.arena, src) catch return error.ExecFailed;
         const qd = ddl.quoteIdent(self.arena, dst) catch return error.ExecFailed;
-        const sql = std.fmt.allocPrintSentinel(self.arena, "ALTER TABLE {s} RENAME TO {s};", .{ qs, qd }, 0) catch return error.ExecFailed;
+        const sql = self.arena.printSentinel("ALTER TABLE {s} RENAME TO {s};", .{ qs, qd }, 0) catch return error.ExecFailed;
         return self.exec(sql);
     }
 
@@ -361,7 +361,7 @@ pub const Migrator = struct {
         const qt = ddl.quoteIdent(self.arena, table) catch return error.ExecFailed;
         const qs = ddl.quoteIdent(self.arena, src) catch return error.ExecFailed;
         const qd = ddl.quoteIdent(self.arena, dst) catch return error.ExecFailed;
-        const sql = std.fmt.allocPrintSentinel(self.arena, "ALTER TABLE {s} RENAME COLUMN {s} TO {s};", .{ qt, qs, qd }, 0) catch return error.ExecFailed;
+        const sql = self.arena.printSentinel("ALTER TABLE {s} RENAME COLUMN {s} TO {s};", .{ qt, qs, qd }, 0) catch return error.ExecFailed;
         return self.exec(sql);
     }
 
@@ -374,8 +374,7 @@ pub const Migrator = struct {
         var scratch = std.heap.ArenaAllocator.init(a);
         defer scratch.deinit();
         const sa = scratch.allocator();
-        return std.fmt.allocPrint(
-            a,
+        return a.print(
             "ALTER TABLE {s} ADD CONSTRAINT {s} FOREIGN KEY ({s}) REFERENCES {s} ({s}){s};",
             .{ try ddl.quoteIdent(sa, table), try ddl.quoteIdent(sa, name), try ddl.quoteIdent(sa, column), try ddl.quoteIdent(sa, ref_table), try ddl.quoteIdent(sa, ref_column), on_delete },
         );
@@ -385,7 +384,7 @@ pub const Migrator = struct {
         var scratch = std.heap.ArenaAllocator.init(a);
         defer scratch.deinit();
         const sa = scratch.allocator();
-        return std.fmt.allocPrint(a, "ALTER TABLE {s} DROP CONSTRAINT IF EXISTS {s};", .{ try ddl.quoteIdent(sa, table), try ddl.quoteIdent(sa, name) });
+        return a.print("ALTER TABLE {s} DROP CONSTRAINT IF EXISTS {s};", .{ try ddl.quoteIdent(sa, table), try ddl.quoteIdent(sa, name) });
     }
 
     /// SQLite guard for `addForeignKey`: SQLite has no `ALTER TABLE ADD/DROP CONSTRAINT` (adding an
@@ -412,7 +411,7 @@ pub const Migrator = struct {
         name: ?[]const u8 = null,
     }) (OpError || error{WrongBackend})!void {
         if (self.dialect.kind == .sqlite) return self.foreignKeyUnsupportedOnSqlite();
-        const name = opts.name orelse (std.fmt.allocPrint(self.arena, "fk_{s}_{s}", .{ table, column }) catch return error.ExecFailed);
+        const name = opts.name orelse (self.arena.print("fk_{s}_{s}", .{ table, column }) catch return error.ExecFailed);
         if (self.direction == .reverse) {
             const sql = dropConstraintSqlPg(self.arena, table, name) catch return error.ExecFailed;
             return self.execArena(sql);
@@ -516,7 +515,7 @@ test "raw picks the dialect statement; direction defaults forward" {
 /// failure means the relation is absent. (openMemory is SQLite, so these run on SQLite; the PG
 /// path is covered by the live PG harness.)
 fn tableExists(m: *Migrator, name: []const u8) !bool {
-    const sql = try std.fmt.allocPrintSentinel(m.arena, "SELECT 1 FROM {s} LIMIT 0;", .{try ddl.quoteIdent(m.arena, name)}, 0);
+    const sql = try m.arena.printSentinel("SELECT 1 FROM {s} LIMIT 0;", .{try ddl.quoteIdent(m.arena, name)}, 0);
     var st = m.prepare(sql) catch return false;
     st.finalize();
     return true;
@@ -572,7 +571,7 @@ test "dropTable without .was is not reversible" {
 
 /// True when `col` exists on `table` (probe a SELECT of just that column).
 fn columnExists(m: *Migrator, table: []const u8, col: []const u8) !bool {
-    const sql = try std.fmt.allocPrintSentinel(m.arena, "SELECT {s} FROM {s} LIMIT 0;", .{ try ddl.quoteIdent(m.arena, col), try ddl.quoteIdent(m.arena, table) }, 0);
+    const sql = try m.arena.printSentinel("SELECT {s} FROM {s} LIMIT 0;", .{ try ddl.quoteIdent(m.arena, col), try ddl.quoteIdent(m.arena, table) }, 0);
     var st = m.prepare(sql) catch return false;
     st.finalize();
     return true;

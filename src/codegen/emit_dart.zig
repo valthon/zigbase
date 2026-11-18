@@ -24,7 +24,7 @@ fn put(alloc: std.mem.Allocator, w: *W, s: []const u8) !void {
     try w.appendSlice(alloc, s);
 }
 fn putf(alloc: std.mem.Allocator, w: *W, comptime fmt: []const u8, args: anytype) !void {
-    const s = try std.fmt.allocPrint(alloc, fmt, args);
+    const s = try alloc.print(fmt, args);
     try w.appendSlice(alloc, s);
 }
 
@@ -94,7 +94,7 @@ const client_reserved: []const []const u8 = &.{ "raw", "owned", "close", "send",
 fn memberIdent(alloc: std.mem.Allocator, name: []const u8, reserved: []const []const u8) ![]const u8 {
     var out = name;
     while (isDartKeyword(out) or isObjectMember(out) or inSet(out, reserved)) {
-        out = try std.fmt.allocPrint(alloc, "{s}_", .{out});
+        out = try alloc.print("{s}_", .{out});
     }
     return out;
 }
@@ -175,25 +175,25 @@ fn coerceExpr(alloc: std.mem.Allocator, col: []const u8, f: schema.Field) ![]con
     const key = f.name;
     return switch (dt.kindOf(f)) {
         .string, .relation_id, .file_name => if (f.isMultiValue())
-            try std.fmt.allocPrint(alloc, "coerceStringList(r['{s}'])", .{key})
+            try alloc.print("coerceStringList(r['{s}'])", .{key})
         else
-            try std.fmt.allocPrint(alloc, "coerceString(r['{s}'])", .{key}),
+            try alloc.print("coerceString(r['{s}'])", .{key}),
         .integer => if (f.isMultiValue())
-            try std.fmt.allocPrint(alloc, "coerceIntList(r['{s}'])", .{key})
+            try alloc.print("coerceIntList(r['{s}'])", .{key})
         else
-            try std.fmt.allocPrint(alloc, "coerceInt(r['{s}'])", .{key}),
+            try alloc.print("coerceInt(r['{s}'])", .{key}),
         .double_ => if (f.isMultiValue())
-            try std.fmt.allocPrint(alloc, "coerceDoubleList(r['{s}'])", .{key})
+            try alloc.print("coerceDoubleList(r['{s}'])", .{key})
         else
-            try std.fmt.allocPrint(alloc, "coerceDouble(r['{s}'])", .{key}),
-        .boolean => try std.fmt.allocPrint(alloc, "coerceBool(r['{s}'])", .{key}),
-        .json => try std.fmt.allocPrint(alloc, "r['{s}']", .{key}),
+            try alloc.print("coerceDouble(r['{s}'])", .{key}),
+        .boolean => try alloc.print("coerceBool(r['{s}'])", .{key}),
+        .json => try alloc.print("r['{s}']", .{key}),
         .select_enum => blk: {
             const en = try dt.selectEnumName(alloc, col, f.name);
             break :blk if (f.isMultiValue())
-                try std.fmt.allocPrint(alloc, "coerceStringList(r['{s}']).map({s}.fromWire).whereType<{s}>().toList()", .{ key, en, en })
+                try alloc.print("coerceStringList(r['{s}']).map({s}.fromWire).whereType<{s}>().toList()", .{ key, en, en })
             else
-                try std.fmt.allocPrint(alloc, "{s}.fromWire(r['{s}'])", .{ en, key });
+                try alloc.print("{s}.fromWire(r['{s}'])", .{ en, key });
         },
     };
 }
@@ -210,7 +210,7 @@ pub fn emitRecord(alloc: std.mem.Allocator, w: *W, cols: []const schema.Collecti
         idents[i] = try memberIdent(alloc, f.name, record_reserved);
         names[i] = f.name;
     }
-    try checkDuplicateIdents(idents, names, try std.fmt.allocPrint(alloc, "record class {s} (collection '{s}')", .{ rec, c.name }));
+    try checkDuplicateIdents(idents, names, try alloc.print("record class {s} (collection '{s}')", .{ rec, c.name }));
 
     // Constructor with an initializer list from the ZbRecord.
     try putf(alloc, w, "class {s} {{\n", .{rec});
@@ -303,22 +303,22 @@ fn emitToMapEntry(alloc: std.mem.Allocator, w: *W, f: schema.Field, mid: []const
     // non-null when guarded).
     var val: []const u8 = undefined;
     switch (dt.kindOf(f)) {
-        .integer => val = try std.fmt.allocPrint(alloc, "encodeInt({s})", .{mid}),
+        .integer => val = try alloc.print("encodeInt({s})", .{mid}),
         .double_ => {
             if (f.options == .number and f.options.number.mode == .fixed) {
                 const scale = f.options.number.scale orelse 0;
-                val = try std.fmt.allocPrint(alloc, "encodeFixed({s}, {d})", .{ mid, scale });
+                val = try alloc.print("encodeFixed({s}, {d})", .{ mid, scale });
             } else {
                 val = mid; // float: send the double as-is
             }
         },
         .select_enum => {
             if (f.isMultiValue()) {
-                val = try std.fmt.allocPrint(alloc, "{s}.map((e) => e.wire).toList()", .{mid});
+                val = try alloc.print("{s}.map((e) => e.wire).toList()", .{mid});
             } else if (optional) {
-                val = try std.fmt.allocPrint(alloc, "{s}!.wire", .{mid});
+                val = try alloc.print("{s}!.wire", .{mid});
             } else {
-                val = try std.fmt.allocPrint(alloc, "{s}.wire", .{mid});
+                val = try alloc.print("{s}.wire", .{mid});
             }
         },
         else => val = mid, // string/relation/bool/json/file -> pass through
@@ -411,20 +411,20 @@ pub fn emitUpdate(alloc: std.mem.Allocator, w: *W, c: schema.Collection) !void {
 fn fluentExpr(alloc: std.mem.Allocator, cols: []const schema.Collection, col: []const u8, f: schema.Field) !?[]const u8 {
     return switch (dt.kindOf(f)) {
         .file_name, .json => null,
-        .string => try std.fmt.allocPrint(alloc, "StringFieldExpr('${{_p}}{s}')", .{f.name}),
-        .integer, .double_ => try std.fmt.allocPrint(alloc, "NumFieldExpr('${{_p}}{s}')", .{f.name}),
-        .boolean => try std.fmt.allocPrint(alloc, "BoolFieldExpr('${{_p}}{s}')", .{f.name}),
+        .string => try alloc.print("StringFieldExpr('${{_p}}{s}')", .{f.name}),
+        .integer, .double_ => try alloc.print("NumFieldExpr('${{_p}}{s}')", .{f.name}),
+        .boolean => try alloc.print("BoolFieldExpr('${{_p}}{s}')", .{f.name}),
         .select_enum => blk: {
             const en = try dt.selectEnumName(alloc, col, f.name);
-            break :blk try std.fmt.allocPrint(alloc, "EnumFieldExpr<{s}>('${{_p}}{s}', (e) => e.wire)", .{ en, f.name });
+            break :blk try alloc.print("EnumFieldExpr<{s}>('${{_p}}{s}', (e) => e.wire)", .{ en, f.name });
         },
         .relation_id => blk: {
             const target = f.options.relation.targetCollectionId;
             if (collectionExists(cols, target)) {
                 const tf = try ident.fieldsName(alloc, target);
-                break :blk try std.fmt.allocPrint(alloc, "RelFieldExpr<{s}>('${{_p}}{s}', (p) => {s}(p))", .{ tf, f.name, tf });
+                break :blk try alloc.print("RelFieldExpr<{s}>('${{_p}}{s}', (p) => {s}(p))", .{ tf, f.name, tf });
             }
-            break :blk try std.fmt.allocPrint(alloc, "FieldExpr<String>('${{_p}}{s}')", .{f.name});
+            break :blk try alloc.print("FieldExpr<String>('${{_p}}{s}')", .{f.name});
         },
     };
 }
@@ -437,13 +437,13 @@ fn fluentReturnType(alloc: std.mem.Allocator, cols: []const schema.Collection, c
         .boolean => "BoolFieldExpr",
         .select_enum => blk: {
             const en = try dt.selectEnumName(alloc, col, f.name);
-            break :blk try std.fmt.allocPrint(alloc, "EnumFieldExpr<{s}>", .{en});
+            break :blk try alloc.print("EnumFieldExpr<{s}>", .{en});
         },
         .relation_id => blk: {
             const target = f.options.relation.targetCollectionId;
             if (collectionExists(cols, target)) {
                 const tf = try ident.fieldsName(alloc, target);
-                break :blk try std.fmt.allocPrint(alloc, "RelFieldExpr<{s}>", .{tf});
+                break :blk try alloc.print("RelFieldExpr<{s}>", .{tf});
             }
             break :blk "FieldExpr<String>";
         },
@@ -699,7 +699,7 @@ pub fn emitService(alloc: std.mem.Allocator, w: *W, cols: []const schema.Collect
 
     // Per-single-file-field fileUrl.
     if (hasSingleFileFields(c)) {
-        const ffenum = try std.fmt.allocPrint(alloc, "{s}FileField", .{rec});
+        const ffenum = try alloc.print("{s}FileField", .{rec});
         // enum of single file fields
         try putf(alloc, w, "  String fileUrl({s} record,\n          {{required {s} field, bool download = false, String? thumb, String? token}}) {{\n", .{ rec, ffenum });
         try put(alloc, w, "    final filename = switch (field) {\n");
@@ -731,7 +731,7 @@ pub fn emitService(alloc: std.mem.Allocator, w: *W, cols: []const schema.Collect
 
 fn enumMemberFor(alloc: std.mem.Allocator, name: []const u8) ![]const u8 {
     if (schema.isValidIdentifier(name)) return memberIdent(alloc, name, enum_reserved);
-    return std.fmt.allocPrint(alloc, "f_{s}", .{name});
+    return alloc.print("f_{s}", .{name});
 }
 
 // ---------------------------------------------------------------------------
@@ -766,13 +766,13 @@ pub fn emitClient(alloc: std.mem.Allocator, w: *W, cols: []const schema.Collecti
     const all_names = try alloc.alloc([]const u8, cols.len * 2);
     for (cols, 0..) |c, i| {
         svc_idents[i] = try memberIdent(alloc, c.name, client_reserved);
-        rt_idents[i] = try memberIdent(alloc, try std.fmt.allocPrint(alloc, "{s}Realtime", .{c.name}), client_reserved);
+        rt_idents[i] = try memberIdent(alloc, try alloc.print("{s}Realtime", .{c.name}), client_reserved);
         all_idents[i] = svc_idents[i];
         all_names[i] = c.name;
         all_idents[cols.len + i] = rt_idents[i];
-        all_names[cols.len + i] = try std.fmt.allocPrint(alloc, "{s} (realtime accessor)", .{c.name});
+        all_names[cols.len + i] = try alloc.print("{s} (realtime accessor)", .{c.name});
     }
-    try checkDuplicateIdents(all_idents, all_names, try std.fmt.allocPrint(alloc, "client class {s}", .{client_name}));
+    try checkDuplicateIdents(all_idents, all_names, try alloc.print("client class {s}", .{client_name}));
 
     try putf(alloc, w, "class {s} {{\n", .{client_name});
     try putf(alloc, w, "  {s}(this.raw, {{this.owned = false}});\n\n  final ZigbaseClient raw;\n  final bool owned;\n\n", .{client_name});
@@ -801,7 +801,7 @@ pub fn emitClient(alloc: std.mem.Allocator, w: *W, cols: []const schema.Collecti
 
     // Factory function.
     const auth_default = if (auth_collection.len > 0)
-        try std.fmt.allocPrint(alloc, "  String authCollection = '{s}',\n", .{auth_collection})
+        try alloc.print("  String authCollection = '{s}',\n", .{auth_collection})
     else
         "  String? authCollection,\n";
     try putf(alloc, w,

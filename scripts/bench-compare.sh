@@ -7,7 +7,7 @@ cd "$(dirname "$0")/.."
 
 A="${1:?usage: bench-compare.sh <rev-a> <rev-b>}"
 B="${2:?usage: bench-compare.sh <rev-a> <rev-b>}"
-ZIG=(mise exec zig@0.16.0 -- zig)
+ZIG=(mise exec zig@0.17.1 -- zig)
 tmp="$(mktemp -d)"
 
 # Worktree paths this script has created, so the EXIT trap can force-remove
@@ -53,11 +53,11 @@ for rev in "$A" "$B"; do
 
   created_worktrees+=("$wt")
   git_quiet worktree add --detach "$wt" "$rev"
-  # Pin ReleaseFast explicitly for meaningful, comparable timings. Revisions that
+  # Pin fast explicitly for meaningful, comparable timings. Revisions that
   # expose -Ddev-mode also need it for the bench-only `zigbase.internal` surface;
   # older releases predate that option and hard-error if an unknown -D flag is passed.
   if ! build_help="$(cd "$wt" && "${ZIG[@]}" build -h 2>&1)"; then
-    printf 'error: revision %s failed to configure with Zig 0.16.0:\n%s\n' "$rev" "$build_help" >&2
+    printf 'error: revision %s failed to configure with Zig 0.17.1:\n%s\n' "$rev" "$build_help" >&2
     exit 1
   fi
   if ! grep -q '^[[:space:]]*bench[[:space:]]' <<< "$build_help"; then
@@ -65,9 +65,9 @@ for rev in "$A" "$B"; do
     exit 2
   fi
   if grep -q -- '-Dbench-optimize' <<< "$build_help"; then
-    bench_flags=(-Dbench-optimize=ReleaseFast)
+    bench_flags=(-Dbench-optimize=fast)
   else
-    bench_flags=(-Doptimize=ReleaseFast)
+    bench_flags=(-Doptimize=fast)
     # Older harnesses gate module access on dev_mode. Newer revisions expose a
     # benchmark-only internal_api and therefore keep production seams compiled out.
     if grep -q -- '-Ddev-mode' <<< "$build_help"; then

@@ -152,13 +152,13 @@ pub fn deliver(ctx: *Ctx, job: WebhookJob) !void {
         switch (try attemptOnce(ctx, job)) {
             .ok => return,
             .terminal => |status| {
-                const msg = std.fmt.allocPrint(ctx.arena.a, "webhook POST {s} rejected with HTTP {d} (terminal)", .{ job.url, status }) catch "webhook delivery rejected (terminal)";
+                const msg = ctx.arena.a.print("webhook POST {s} rejected with HTTP {d} (terminal)", .{ job.url, status }) catch "webhook delivery rejected (terminal)";
                 fireOnError(ctx, error.WebhookDeliveryFailed, msg);
                 return;
             },
             .retryable => |retry_after_ms| {
                 if (attempt >= max) {
-                    const msg = std.fmt.allocPrint(ctx.arena.a, "webhook POST {s} failed after {d} attempt(s)", .{ job.url, attempt }) catch "webhook delivery failed (attempts exhausted)";
+                    const msg = ctx.arena.a.print("webhook POST {s} failed after {d} attempt(s)", .{ job.url, attempt }) catch "webhook delivery failed (attempts exhausted)";
                     fireOnError(ctx, error.WebhookDeliveryFailed, msg);
                     return;
                 }
@@ -168,7 +168,7 @@ pub fn deliver(ctx: *Ctx, job: WebhookJob) !void {
                     // Sleeping this long would keep the worker/claim past the queue's
                     // visibility_timeout_s, inviting reclaimStale to re-deliver concurrently. Abandon
                     // the delivery instead (same exhausted-delivery signal as running out of attempts).
-                    const msg = std.fmt.allocPrint(ctx.arena.a, "webhook POST {s} abandoned after {d} attempt(s): retry backoff would exceed the {d}ms in-handler budget (raise the queue visibility_timeout_s or lower the backoff)", .{ job.url, attempt, max_total_backoff_ms }) catch "webhook delivery abandoned (retry budget exceeded)";
+                    const msg = ctx.arena.a.print("webhook POST {s} abandoned after {d} attempt(s): retry backoff would exceed the {d}ms in-handler budget (raise the queue visibility_timeout_s or lower the backoff)", .{ job.url, attempt, max_total_backoff_ms }) catch "webhook delivery abandoned (retry budget exceeded)";
                     fireOnError(ctx, error.WebhookDeliveryFailed, msg);
                     return;
                 }
@@ -187,7 +187,7 @@ fn attemptOnce(ctx: *Ctx, job: WebhookJob) !Disposition {
     if (job.idempotency_key) |k|
         try headers.append(ctx.arena.a, .{ .name = job.idempotency_header, .value = k });
     if (job.sign) |s| {
-        const ts = try std.fmt.allocPrint(ctx.arena.a, "{d}", .{clock.nowUnix(ctx.app.io)});
+        const ts = try ctx.arena.a.print("{d}", .{clock.nowUnix(ctx.app.io)});
         const sig = try signBody(ctx.arena.a, s.secret, ts, job.body);
         try headers.append(ctx.arena.a, .{ .name = s.timestamp_header, .value = ts });
         try headers.append(ctx.arena.a, .{ .name = s.signature_header, .value = sig });
@@ -462,7 +462,7 @@ const WebhookTestServer = struct {
     }
 
     fn url(self: WebhookTestServer, alloc: std.mem.Allocator) ![]const u8 {
-        return std.fmt.allocPrint(alloc, "http://127.0.0.1:{d}/hook", .{self.port});
+        return alloc.print("http://127.0.0.1:{d}/hook", .{self.port});
     }
 
     fn serveLoop(srv: std.Io.net.Server, rec: *Recorder) void {

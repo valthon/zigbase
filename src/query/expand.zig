@@ -51,7 +51,7 @@ fn resolveTarget(alloc: std.mem.Allocator, conn: *db.Db, pc: ?*PageCache, target
 /// When `pc` is present the deterministic decision is memoized per `(target,id)` (#16).
 fn canView(alloc: std.mem.Allocator, conn: *db.Db, pc: ?*PageCache, target: schema.Collection, id: []const u8, rctx: *const request.RequestContext) ExpandError!bool {
     if (pc) |c| {
-        const key = try std.fmt.allocPrint(alloc, "{s}\x00{s}", .{ target.id, id });
+        const key = try alloc.print("{s}\x00{s}", .{ target.id, id });
         if (c.views.get(key)) |v| {
             alloc.free(key); // probe key not stored on a hit — free it
             return v;

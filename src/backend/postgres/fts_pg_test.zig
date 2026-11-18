@@ -68,8 +68,8 @@ test "pg search rejects registry shadowing probe collisions and empty ownership 
     defer col.deinit(a);
     try fts.ensureIndex(a, &d, col);
     try d.exec("INSERT INTO articles(id,title) VALUES('r1','kept');");
-    const shadow = try std.fmt.allocPrint(al, "{s}_shadow", .{ns});
-    try d.exec(try std.fmt.allocPrintSentinel(al, "CREATE SCHEMA \"{s}\"; CREATE TABLE \"{s}\".articles(title TEXT); INSERT INTO \"{s}\".articles VALUES('untouched'); SET search_path TO \"{s}\",\"{s}\";", .{ shadow, shadow, shadow, shadow, ns }, 0));
+    const shadow = try al.print("{s}_shadow", .{ns});
+    try d.exec(try al.printSentinel("CREATE SCHEMA \"{s}\"; CREATE TABLE \"{s}\".articles(title TEXT); INSERT INTO \"{s}\".articles VALUES('untouched'); SET search_path TO \"{s}\",\"{s}\";", .{ shadow, shadow, shadow, shadow, ns }, 0));
     defer dropTempSchema(al, &d, shadow);
     try std.testing.expectError(error.Conflict, fts.ensureIndex(a, &d, col));
     {
@@ -81,7 +81,7 @@ test "pg search rejects registry shadowing probe collisions and empty ownership 
         defer added.finalize();
         try std.testing.expect(!try added.step());
     }
-    try d.exec(try std.fmt.allocPrintSentinel(al, "SET search_path TO \"{s}\";", .{ns}, 0));
+    try d.exec(try al.printSentinel("SET search_path TO \"{s}\";", .{ns}, 0));
     try d.exec("CREATE TEMP TABLE zb_rename_fts_probe(value TEXT); INSERT INTO zb_rename_fts_probe VALUES('sentinel');");
     try std.testing.expectError(error.Conflict, fts.ensureIndex(a, &d, col));
     {
@@ -189,7 +189,7 @@ test "pg search ownership holds a schema lock without blocking record writes" {
     var writer = (try openOrSkip(a, std.testing.io)) orelse return error.SkipZigTest;
     defer writer.close();
     try writer.exec("SET statement_timeout='1000ms';");
-    try writer.exec(try std.fmt.allocPrintSentinel(al, "INSERT INTO \"{s}\".articles(id,title) VALUES('r1','hello');", .{ns}, 0));
+    try writer.exec(try al.printSentinel("INSERT INTO \"{s}\".articles(id,title) VALUES('r1','hello');", .{ns}, 0));
 }
 
 fn openOrSkip(a: std.mem.Allocator, io: std.Io) !?dbm.Db {
@@ -203,15 +203,15 @@ var schema_counter: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
 
 fn enterTempSchema(a: std.mem.Allocator, d: *dbm.Db) ![:0]const u8 {
     const n = schema_counter.fetchAdd(1, .monotonic);
-    const name = try std.fmt.allocPrint(a, "zb_fts_{d}", .{n});
-    try d.exec(try std.fmt.allocPrintSentinel(a, "DROP SCHEMA IF EXISTS \"{s}\" CASCADE;", .{name}, 0));
-    try d.exec(try std.fmt.allocPrintSentinel(a, "CREATE SCHEMA \"{s}\";", .{name}, 0));
-    try d.exec(try std.fmt.allocPrintSentinel(a, "SET search_path TO \"{s}\";", .{name}, 0));
-    return std.fmt.allocPrintSentinel(a, "{s}", .{name}, 0);
+    const name = try a.print("zb_fts_{d}", .{n});
+    try d.exec(try a.printSentinel("DROP SCHEMA IF EXISTS \"{s}\" CASCADE;", .{name}, 0));
+    try d.exec(try a.printSentinel("CREATE SCHEMA \"{s}\";", .{name}, 0));
+    try d.exec(try a.printSentinel("SET search_path TO \"{s}\";", .{name}, 0));
+    return a.printSentinel("{s}", .{name}, 0);
 }
 
 fn dropTempSchema(a: std.mem.Allocator, d: *dbm.Db, name: []const u8) void {
-    const sql = std.fmt.allocPrintSentinel(a, "DROP SCHEMA IF EXISTS \"{s}\" CASCADE;", .{name}, 0) catch return;
+    const sql = a.printSentinel("DROP SCHEMA IF EXISTS \"{s}\" CASCADE;", .{name}, 0) catch return;
     d.exec(sql) catch {};
 }
 
@@ -223,19 +223,19 @@ fn provisionFts(a: std.mem.Allocator, d: *dbm.Db, col: schema.Collection) !void 
     var sql: std.ArrayList(u8) = .empty;
     defer sql.deinit(a);
     {
-        const head = try std.fmt.allocPrint(a, "CREATE TABLE \"{s}\" (\"id\" TEXT{s} PRIMARY KEY, \"created\" TEXT{s}, \"updated\" TEXT{s}", .{ col.name, tc, tc, tc });
+        const head = try a.print("CREATE TABLE \"{s}\" (\"id\" TEXT{s} PRIMARY KEY, \"created\" TEXT{s}, \"updated\" TEXT{s}", .{ col.name, tc, tc, tc });
         defer a.free(head);
         try sql.appendSlice(a, head);
     }
     for (col.fields) |f| {
         const ty = Dialect.postgres.sqlType(f.storageClass());
         const collate = if (std.mem.eql(u8, ty, "TEXT")) tc else "";
-        const frag = try std.fmt.allocPrint(a, ", \"{s}\" {s}{s}", .{ f.name, ty, collate });
+        const frag = try a.print(", \"{s}\" {s}{s}", .{ f.name, ty, collate });
         defer a.free(frag);
         try sql.appendSlice(a, frag);
     }
     try sql.appendSlice(a, ");");
-    const ddl = try std.fmt.allocPrintSentinel(a, "{s}", .{sql.items}, 0);
+    const ddl = try a.printSentinel("{s}", .{sql.items}, 0);
     defer a.free(ddl);
     try d.exec(ddl);
     try fts.ensureIndex(a, d, col); // build the tsvector generated column + GIN index
@@ -262,10 +262,10 @@ fn valueSet(a: std.mem.Allocator, items: []std.json.Value, key: []const u8) !std
 /// reuses an attnum, so a stable attnum across a provision call proves the column was NOT
 /// dropped+recreated (it distinguishes "recreated just the index" from "rebuilt the column").
 fn colAttnum(a: std.mem.Allocator, d: *dbm.Db, table: []const u8, col: []const u8) !?i64 {
-    const sql = try std.fmt.allocPrintSentinel(a, "SELECT a.attnum FROM pg_attribute a WHERE a.attrelid = to_regclass($1) AND a.attname = $2 AND a.attnum > 0 AND NOT a.attisdropped;", .{}, 0);
+    const sql = try a.printSentinel("SELECT a.attnum FROM pg_attribute a WHERE a.attrelid = to_regclass($1) AND a.attname = $2 AND a.attnum > 0 AND NOT a.attisdropped;", .{}, 0);
     var st = try d.prepare(sql);
     defer st.finalize();
-    try st.bindText(1, try std.fmt.allocPrint(a, "\"{s}\"", .{table}));
+    try st.bindText(1, try a.print("\"{s}\"", .{table}));
     try st.bindText(2, col);
     if (!try st.step()) return null;
     return st.columnInt(0);
@@ -273,10 +273,10 @@ fn colAttnum(a: std.mem.Allocator, d: *dbm.Db, table: []const u8, col: []const u
 
 /// True iff a relation named `rel` resolves on the active search_path (e.g. the GIN index exists).
 fn relExists(a: std.mem.Allocator, d: *dbm.Db, rel: []const u8) !bool {
-    const sql = try std.fmt.allocPrintSentinel(a, "SELECT to_regclass($1) IS NOT NULL;", .{}, 0);
+    const sql = try a.printSentinel("SELECT to_regclass($1) IS NOT NULL;", .{}, 0);
     var st = try d.prepare(sql);
     defer st.finalize();
-    try st.bindText(1, try std.fmt.allocPrint(a, "\"{s}\"", .{rel}));
+    try st.bindText(1, try a.print("\"{s}\"", .{rel}));
     if (!try st.step()) return false;
     return st.columnInt(0) != 0;
 }

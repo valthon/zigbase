@@ -19,7 +19,7 @@ in-process testing structurally cannot see.
 The repository also tests the lean SQLite configuration without FTS5:
 
 ```sh
-mise exec zig@0.16.0 -- zig build install test -Dfts5=false -Dpostgres=false --summary all
+mise exec zig@0.17.1 -- zig build install test -Dfts5=false -Dpostgres=false --summary all
 ```
 
 This builds the stripped binary and runs the full unit suite. SQLite search-only
@@ -135,7 +135,7 @@ Warmup, normal measurement, higher-load stress, and recovery run against the sam
 From a clean checkout, preserve the revision and build command alongside each report:
 
 ```sh
-mise exec zig@0.16.0 -- zig build application-capacity -Doptimize=ReleaseFast -Dcpu=baseline
+mise exec zig@0.17.1 -- zig build application-capacity -Doptimize=fast -Dcpu=baseline
 mise exec python@3.13 -- python tools/application_capacity.py \
   --binary zig-out/bin/application-capacity --tenants 2 --tasks 100 \
   --concurrency 4 --stress-concurrency 8 --warmup 2 --seconds 10 \
@@ -256,7 +256,7 @@ Performance contracts are offline build/CI tooling, not application runtime
 configuration. They enforce caller-owned binary-size and allocation ceilings;
 they do not add instrumentation to deployed binaries or gate wall-clock timing.
 
-Run the checked-in Linux x86_64 example with Zig 0.16.0 on PATH:
+Run the checked-in Linux x86_64 example with Zig 0.17.1 on PATH:
 
 ```sh
 bash scripts/check-performance.sh > performance-report.json
@@ -264,9 +264,9 @@ bash scripts/check-performance.sh > performance-report.json
 bash scripts/check-performance.sh --baseline performance-report.json > next-report.json
 ```
 
-The script builds the normal server with `ReleaseSmall`, baseline CPU,
+The script builds the normal server with `small`, baseline CPU,
 `x86_64-linux-gnu`, and `-Ddev-tools=false`, then runs the benchmark-only harness
-in `ReleaseFast` with the same target/CPU. Its temporary binary and JSONL inputs
+in `fast` with the same target/CPU. Its temporary binary and JSONL inputs
 are removed afterward; the report retains their SHA-256 digests. CI runs this
 example and uploads the report. No noisy latency percentage determines success.
 
@@ -315,7 +315,7 @@ CLI trusts declared build labels: hashes bind files, not their build provenance.
 It neither rebuilds the app nor authenticates supplied benchmark observations.
 
 The example's ceilings are deliberate regression headroom, not universal promises.
-Initial x86_64 Linux measurements with Zig 0.16.0 were approximately 3.25 MB for
+Initial x86_64 Linux measurements with Zig 0.17.1 were approximately 3.25 MB for
 the configured server (4 MB ceiling), 0 allocations for JWT verification,
 38,000 allocations / 3,214,000 requested bytes / 1,028 logical peak bytes for
 2,000 record reads, and 34,000 / 8,032,000 / 5,198 for 2,000 filter compilations.
@@ -329,7 +329,7 @@ budgets. Different app features and targets need their own measured contract.
 runner. It reports through the process exit code and fails on assertions, leaked
 allocations, logged errors, and abnormal process exits.
 
-Zig 0.16.0's default server-mode runner (`--listen=-`) can print a misleading
+Zig 0.17.1's default server-mode runner (`--listen=-`) can print a misleading
 `failed command:` label after successful tests when the child leaves stderr output
 at exit. A single newline from facil.io's destructor is sufficient; the reproduced
 case exits zero and reports all tests passed. This is a diagnostic bug, not evidence
@@ -339,7 +339,7 @@ must be investigated separately.
 
 The supported `addTest` wiring avoids this label on successful runs. Contributors
 can reproduce the distinction and verify real failure handling with
-`mise exec zig@0.16.0 python@3.13 -- python tests/test_runner/verify.py`. The
+`mise exec zig@0.17.1 python@3.13 -- python tests/test_runner/verify.py`. The
 [regression fixture](https://github.com/valthon/zigbase/blob/main/tests/test_runner/README.md) checks the installed compiler
 and the shipped runner without patching either. Upstream diagnosis remains tracked
 in [#261](https://github.com/valthon/zigbase/issues/261). The

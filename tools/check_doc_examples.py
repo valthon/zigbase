@@ -27,11 +27,11 @@ def main() -> None:
     parser.add_argument("--zig", default=shutil.which("zig"))
     args = parser.parse_args()
     if not args.zig:
-        parser.error("put pinned Zig 0.16.0 on PATH or pass --zig")
+        parser.error("put pinned Zig 0.17.1 on PATH or pass --zig")
     zig = str(Path(args.zig).absolute())
     version = subprocess.check_output([zig, "version"], text=True, timeout=30).strip()
-    if version != "0.16.0":
-        parser.error("documentation examples require pinned Zig 0.16.0")
+    if version != "0.17.1":
+        parser.error("documentation examples require pinned Zig 0.17.1")
 
     booking = snippet("docs/tutorial.md", "fn confirmBooking(ctx:")
     for path in ("site/sources/docs/tutorial.md", "docs/recipes.md"):
@@ -52,7 +52,7 @@ def main() -> None:
         # Fixed package identity; only the local dependency path varies by checkout.
         (scratch / "build.zig.zon").write_text(
             '.{ .name = .doc_proof, .version = "0.0.0", '
-            '.fingerprint = 0x94102d8b4f0a182d, .minimum_zig_version = "0.16.0", '
+            '.fingerprint = 0x94102d8b4f0a182d, .minimum_zig_version = "0.17.1", '
             ".dependencies = .{ .zigbase = .{ .path = "
             + json.dumps(os.path.relpath(REPO, scratch))
             + ' } }, .paths = .{ "" } }\n'

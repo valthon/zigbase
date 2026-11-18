@@ -34,7 +34,7 @@ pub const data_dir_probe_filename = ".zigbase-doctor-probe";
 /// make doctor's "0 = absent/empty" a lie relative to what the server itself
 /// decides) and reports absence as a fact instead of fixing it.
 fn gatherJwtSecretFile(arena: std.mem.Allocator, io: std.Io, cfg: config.Config, f: *doctor.Facts) void {
-    const path = std.fmt.allocPrint(arena, "{s}/{s}", .{ cfg.data_dir, framework.jwt_secret_filename }) catch return;
+    const path = arena.print("{s}/{s}", .{ cfg.data_dir, framework.jwt_secret_filename }) catch return;
     if (std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(4096))) |contents| {
         f.jwt_secret_file_len = std.mem.trim(u8, contents, " \t\r\n").len;
     } else |_| {
@@ -43,7 +43,7 @@ fn gatherJwtSecretFile(arena: std.mem.Allocator, io: std.Io, cfg: config.Config,
         // rules in doctor.zig expect.
     }
     if (std.Io.Dir.cwd().statFile(io, path, .{})) |st| {
-        f.jwt_secret_file_mode = @intCast(@intFromEnum(st.permissions) & 0o7777);
+        f.jwt_secret_file_mode = @intCast(@backingInt(st.permissions) & 0o7777);
     } else |_| {
         // Stat failing (most commonly: the file doesn't exist) leaves mode
         // null, which checkJwtSecret already treats as "not 0600".
@@ -55,7 +55,7 @@ fn gatherJwtSecretFile(arena: std.mem.Allocator, io: std.Io, cfg: config.Config,
 /// below — an existing, readable `data.db` says nothing about whether the
 /// mount is still writable.
 fn gatherDataDirWritable(arena: std.mem.Allocator, io: std.Io, cfg: config.Config, f: *doctor.Facts) void {
-    const path = std.fmt.allocPrint(arena, "{s}/{s}", .{ cfg.data_dir, data_dir_probe_filename }) catch return;
+    const path = arena.print("{s}/{s}", .{ cfg.data_dir, data_dir_probe_filename }) catch return;
     std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "x", .flags = .{ .exclusive = false } }) catch |err| {
         f.data_dir_writable = false;
         f.data_dir_error = @errorName(err);
@@ -150,7 +150,7 @@ fn gatherLegacyPasswordHashes(arena: std.mem.Allocator, w: *db.Db, cols: []const
     for (cols) |c| {
         if (c.type != .auth) continue;
         const quoted_table = try ddl.quoteIdent(arena, c.name);
-        const raw = try std.fmt.allocPrint(arena, "SELECT COUNT(*) FROM {s} WHERE \"passwordHash\" LIKE ?1;", .{quoted_table});
+        const raw = try arena.print("SELECT COUNT(*) FROM {s} WHERE \"passwordHash\" LIKE ?1;", .{quoted_table});
         var st = try w.prepare(try d.renumberPlaceholders(arena, raw));
         defer st.finalize();
         try st.bindText(1, legacy_password_hash_like_pattern);

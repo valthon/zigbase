@@ -958,7 +958,7 @@ pub fn parse(args: []const []const u8, popts: ParseOpts) ParseError!Command {
 
 test "no args -> top-level help" {
     // Use std.meta.activeTag for union-tag comparison; direct `== .help` on a
-    // tagged union value does not compile in Zig 0.16.0.
+    // tagged union value does not compile in Zig 0.17.1.
     const cmd = try parse(&.{}, .{});
     try std.testing.expect(std.meta.activeTag(cmd) == .help);
     try std.testing.expectEqual(HelpTopic.top, cmd.help);

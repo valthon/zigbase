@@ -69,7 +69,7 @@ pub fn get(ctx: *http.RequestCtx) anyerror!http.Response {
     // ── Flags ──────────────────────────────────────────────────────────────
     var flags_arr = std.json.Array.init(ctx.allocator.a);
     for (reg.flags) |def| {
-        const key = try std.fmt.allocPrint(ctx.allocator.a, "flag:{s}", .{def.name});
+        const key = try ctx.allocator.a.print("flag:{s}", .{def.name});
         var override_val: ?[]const u8 = null;
         for (all_kv) |e| {
             if (std.mem.eql(u8, e.key, key)) {
@@ -93,7 +93,7 @@ pub fn get(ctx: *http.RequestCtx) anyerror!http.Response {
     // ── Experiments ────────────────────────────────────────────────────────
     var exps_arr = std.json.Array.init(ctx.allocator.a);
     for (reg.experiments) |def| {
-        const key = try std.fmt.allocPrint(ctx.allocator.a, "exp:{s}:weights", .{def.name});
+        const key = try ctx.allocator.a.print("exp:{s}:weights", .{def.name});
         var weight_override: ?[]const u8 = null;
         for (all_kv) |e| {
             if (std.mem.eql(u8, e.key, key)) {
@@ -147,7 +147,7 @@ const TestEnv = struct {
         env.tmp = std.testing.tmpDir(.{});
         const dir = try env.tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
         defer std.testing.allocator.free(dir);
-        const path = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/test.db", .{dir}, 0);
+        const path = try std.testing.allocator.printSentinel("{s}/test.db", .{dir}, 0);
         defer std.testing.allocator.free(path);
         env.pool = try db.Pool.init(std.testing.allocator, std.testing.io, path);
         {
@@ -192,7 +192,7 @@ test "GET /api/features returns empty arrays when no registry is wired" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const auth_hdr = try std.fmt.allocPrint(a, "Bearer {s}", .{try env.superuserToken(a)});
+    const auth_hdr = try a.print("Bearer {s}", .{try env.superuserToken(a)});
 
     var ctx = ctxFor(env, RequestArena.from(&arena), .GET, "/api/features", &.{});
     ctx.authorization = auth_hdr;
@@ -209,7 +209,7 @@ test "GET /api/features returns declared flags with overrides" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const auth_hdr = try std.fmt.allocPrint(a, "Bearer {s}", .{try env.superuserToken(a)});
+    const auth_hdr = try a.print("Bearer {s}", .{try env.superuserToken(a)});
 
     // Wire a registry with one flag.
     const reg = features.Registry{
@@ -249,7 +249,7 @@ test "GET /api/features returns declared experiments with weight_override" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const auth_hdr = try std.fmt.allocPrint(a, "Bearer {s}", .{try env.superuserToken(a)});
+    const auth_hdr = try a.print("Bearer {s}", .{try env.superuserToken(a)});
 
     // Wire a registry with one experiment.
     const reg = features.Registry{

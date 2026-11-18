@@ -94,17 +94,17 @@ pub fn decimalToScaledInt(s: []const u8, scale: u8) ValueError!i64 {
 }
 
 pub fn scaledIntToDecimal(alloc: std.mem.Allocator, v: i64, scale: u8) ![]u8 {
-    if (scale == 0) return std.fmt.allocPrint(alloc, "{d}", .{v});
+    if (scale == 0) return alloc.print("{d}", .{v});
     const pow: u64 = @intCast(try pow10(scale));
     const neg = v < 0;
     const av = @abs(v);
     const int_part = @divTrunc(av, pow);
     const frac_part = @rem(av, pow);
     var fbuf: [24]u8 = undefined;
-    const fs = try std.fmt.bufPrint(&fbuf, "{d}", .{frac_part});
+    const fs = try std.mem.print(&fbuf, "{d}", .{frac_part});
     const pad = scale - @as(u8, @intCast(fs.len));
     var ibuf: [24]u8 = undefined;
-    const is = try std.fmt.bufPrint(&ibuf, "{d}", .{int_part});
+    const is = try std.mem.print(&ibuf, "{d}", .{int_part});
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(alloc);
     if (neg) try out.append(alloc, '-');
@@ -152,7 +152,7 @@ pub fn bindValue(alloc: std.mem.Allocator, stmt: *db.Stmt, idx: c_int, field: sc
                     .string => try stmt.bindInt(idx, try decimalToScaledInt(v.string, 0)),
                     .integer => try stmt.bindInt(idx, v.integer),
                     .float => {
-                        const str = try std.fmt.allocPrint(alloc, "{d}", .{v.float});
+                        const str = try alloc.print("{d}", .{v.float});
                         defer alloc.free(str);
                         try stmt.bindInt(idx, try decimalToScaledInt(str, 0));
                     },
@@ -170,11 +170,11 @@ pub fn bindValue(alloc: std.mem.Allocator, stmt: *db.Stmt, idx: c_int, field: sc
                 const str = switch (v) {
                     .string => v.string,
                     .integer => blk: {
-                        allocated = try std.fmt.allocPrint(alloc, "{d}", .{v.integer});
+                        allocated = try alloc.print("{d}", .{v.integer});
                         break :blk allocated.?;
                     },
                     .float => blk: {
-                        allocated = try std.fmt.allocPrint(alloc, "{d}", .{v.float});
+                        allocated = try alloc.print("{d}", .{v.float});
                         break :blk allocated.?;
                     },
                     else => return error.TypeMismatch,
@@ -321,7 +321,7 @@ pub fn readValue(alloc: std.mem.Allocator, stmt: *db.Stmt, idx: c_int, field: sc
 fn roundTrip(a: std.mem.Allocator, field: schema.Field, sql_type: []const u8, in: std.json.Value) !std.json.Value {
     var d = try db.Db.openMemory();
     defer d.close();
-    const create = try std.fmt.allocPrintSentinel(a, "CREATE TABLE t (v {s});", .{sql_type}, 0);
+    const create = try a.printSentinel("CREATE TABLE t (v {s});", .{sql_type}, 0);
     defer a.free(create); // a build-time temporary, not the returned value — free regardless of allocator
     try d.exec(create);
     var ins = try d.prepare("INSERT INTO t (v) VALUES (?1);");

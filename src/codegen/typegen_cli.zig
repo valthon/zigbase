@@ -206,10 +206,10 @@ test "checkOrWrite: write path creates file" {
     // as failures). Stale detection is covered by the checkContent test above.
     const a = std.testing.allocator;
     const io = std.testing.io;
-    const dir = try std.fmt.allocPrint(a, "zig-cache/typegen-test-{d}", .{std.testing.random_seed});
+    const dir = try a.print("zig-cache/typegen-test-{d}", .{std.testing.random_seed});
     defer a.free(dir);
     std.Io.Dir.cwd().createDirPath(io, dir) catch {};
-    const path = try std.fmt.allocPrint(a, "{s}/out.ts", .{dir});
+    const path = try a.print("{s}/out.ts", .{dir});
     defer a.free(path);
 
     try checkOrWrite(io, path, "hello", false); // writes

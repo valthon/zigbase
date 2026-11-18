@@ -72,7 +72,7 @@ agent's isolated workspace and pass that non-secret value explicitly:
 
 ```sh
 commit="$(git rev-parse HEAD)"
-export ZIGBASE_EVAL_HASH="$(mise exec zig@0.16.0 -- zig fetch "git+https://github.com/valthon/zigbase.git#$commit")"
+export ZIGBASE_EVAL_HASH="$(mise exec zig@0.17.1 -- zig fetch "git+https://github.com/valthon/zigbase.git#$commit")"
 python3 -m evals.agents.run genesis --agent codex --pass-env ZIGBASE_EVAL_HASH
 ```
 
@@ -84,7 +84,7 @@ Use the same command with `pocketbase` to evaluate an unattended migration from 
 synthetic PocketBase 0.39.11 snapshot:
 
 ```sh
-mise exec zig@0.16.0 -- zig build
+mise exec zig@0.17.1 -- zig build
 ZIGBASE_EVAL_BINARY="$PWD/zig-out/bin/zigbase" \
   python3 -m evals.agents.run pocketbase --agent codex \
   --pass-env ZIGBASE_EVAL_BINARY
@@ -102,7 +102,7 @@ Use `rails-api` to evaluate an unattended migration from the committed, frozen R
 API-only snapshot:
 
 ```sh
-mise exec zig@0.16.0 -- zig build
+mise exec zig@0.17.1 -- zig build
 ZIGBASE_EVAL_BINARY="$PWD/zig-out/bin/zigbase" \
   python3 -m evals.agents.run rails-api --agent codex \
   --pass-env ZIGBASE_EVAL_BINARY

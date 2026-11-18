@@ -106,10 +106,10 @@ pub fn formatMessage(buf: []u8, mode: Format, comptime level: std.log.Level, sco
     // `.warn` as "warning" in JSON, which the wire format never emits.
     const written = switch (mode) {
         .text => if (std.mem.eql(u8, scope, "default"))
-            std.fmt.bufPrint(buf, "{s} {s}: {s}\n", .{ &ts, level.asText(), m })
+            std.mem.print(buf, "{s} {s}: {s}\n", .{ &ts, level.asText(), m })
         else
-            std.fmt.bufPrint(buf, "{s} {s}({s}): {s}\n", .{ &ts, level.asText(), scope, m }),
-        .json => std.fmt.bufPrint(
+            std.mem.print(buf, "{s} {s}({s}): {s}\n", .{ &ts, level.asText(), scope, m }),
+        .json => std.mem.print(
             buf,
             "{{\"ts\":\"{s}\",\"level\":\"{s}\",\"scope\":{f},\"msg\":{f}}}\n",
             .{ &ts, @tagName(level), std.json.fmt(scope, .{}), std.json.fmt(m, .{}) },
@@ -129,10 +129,10 @@ pub fn formatMessage(buf: []u8, mode: Format, comptime level: std.log.Level, sco
 pub fn formatRequest(buf: []u8, mode: Format, rec: RequestRecord) []const u8 {
     const ts = timestamp();
     const written = switch (mode) {
-        .text => std.fmt.bufPrint(buf, "{s} info(http): {s} {s} {d} {d}ms\n", .{
+        .text => std.mem.print(buf, "{s} info(http): {s} {s} {d} {d}ms\n", .{
             &ts, rec.method, rec.path, rec.status, rec.duration_ms,
         }),
-        .json => std.fmt.bufPrint(
+        .json => std.mem.print(
             buf,
             "{{\"ts\":\"{s}\",\"level\":\"info\",\"scope\":\"http\",\"msg\":\"request\"," ++
                 "\"method\":{f},\"path\":{f},\"status\":{d},\"duration_ms\":{d}}}\n",
@@ -161,7 +161,7 @@ fn write(line: []const u8) void {
 /// Format into `buf`, truncating rather than failing, and return ONLY the bytes that
 /// were actually written.
 ///
-/// `std.fmt.bufPrint` throws away that length on `NoSpaceLeft`, so the idiomatic
+/// `std.mem.print` throws away that length on `NoSpaceLeft`, so the idiomatic
 /// `bufPrint(...) catch buf` fallback hands back the buffer's UNWRITTEN tail as if it
 /// were message text — 0xAA filler on a safety build, whatever was on the stack under
 /// ReleaseFast. As of Zig 0.16 `Writer.fixed`'s drain always saturates the buffer
@@ -183,7 +183,7 @@ pub fn logFn(
     comptime fmt: []const u8,
     args: anytype,
 ) void {
-    if (@intFromEnum(level) > @intFromEnum(min_level)) return;
+    if (@backingInt(level) > @backingInt(min_level)) return;
     var msg_buf: [1024]u8 = undefined;
     const msg = formatInto(&msg_buf, fmt, args);
     var line_buf: [8192]u8 = undefined;
@@ -194,7 +194,7 @@ pub fn logFn(
 /// level floor is above `info`.
 pub fn request(rec: RequestRecord) void {
     if (!request_logging) return;
-    if (@intFromEnum(std.log.Level.info) > @intFromEnum(min_level)) return;
+    if (@backingInt(std.log.Level.info) > @backingInt(min_level)) return;
     var line_buf: [8192]u8 = undefined;
     write(formatRequest(&line_buf, format, rec));
 }

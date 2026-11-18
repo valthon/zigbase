@@ -73,9 +73,9 @@ pub fn rateLimited(ctx: *http.RequestCtx, scope: []const u8, ident: []const u8) 
     const app = ctx.app.?;
     const limiter = app.rate_limiter orelse return null;
     const key = if (ctx.remote_ip.len > 0)
-        try std.fmt.allocPrint(ctx.allocator.a, "{s}:ip:{s}", .{ scope, ctx.remote_ip })
+        try ctx.allocator.a.print("{s}:ip:{s}", .{ scope, ctx.remote_ip })
     else
-        try std.fmt.allocPrint(ctx.allocator.a, "{s}:ident:{s}", .{ scope, ident });
+        try ctx.allocator.a.print("{s}:ident:{s}", .{ scope, ident });
     if (limiter.allow(key, wallNowUnix(app.io))) return null;
     return try ApiError.withCode(429, .too_many_requests, "Too many requests. Try again later.").toResponse(ctx.allocator.a);
 }
@@ -92,9 +92,9 @@ pub fn rateLimitedCustom(ctx: *http.RequestCtx, scope: []const u8, ident: []cons
     const app = ctx.app.?;
     const limiter = app.rate_limiter orelse return null;
     const key = if (ctx.remote_ip.len > 0)
-        try std.fmt.allocPrint(ctx.allocator.a, "{s}:ip:{s}", .{ scope, ctx.remote_ip })
+        try ctx.allocator.a.print("{s}:ip:{s}", .{ scope, ctx.remote_ip })
     else
-        try std.fmt.allocPrint(ctx.allocator.a, "{s}:ident:{s}", .{ scope, ident });
+        try ctx.allocator.a.print("{s}:ident:{s}", .{ scope, ident });
     if (limiter.allowCustom(key, wallNowUnix(app.io), max, window_s)) return null;
     return try ApiError.withCode(429, .too_many_requests, "Too many requests. Try again later.").toResponse(ctx.allocator.a);
 }
@@ -127,7 +127,7 @@ fn findByField(alloc: std.mem.Allocator, conn: *db.Db, col: schema.Collection, f
     defer if (ci) alloc.free(rhs);
     const qtbl = try ddl.quoteIdent(alloc, col.name);
     defer alloc.free(qtbl);
-    const sql = try std.fmt.allocPrintSentinel(alloc, "SELECT \"id\" FROM {s} WHERE {s} = {s} AND {s} != '' LIMIT 1;", .{ qtbl, lhs, rhs, col_quoted }, 0);
+    const sql = try alloc.printSentinel("SELECT \"id\" FROM {s} WHERE {s} = {s} AND {s} != '' LIMIT 1;", .{ qtbl, lhs, rhs, col_quoted }, 0);
     defer alloc.free(sql);
     var st = try prep(conn, sql);
     defer st.finalize();
@@ -203,7 +203,7 @@ test "findByIdentity: a .nocase email index makes the SQLite lookup case-insensi
 pub fn passwordHashFor(alloc: std.mem.Allocator, conn: *db.Db, table: []const u8, rid: []const u8) !?[]const u8 {
     const qtbl = try ddl.quoteIdent(alloc, table);
     defer alloc.free(qtbl);
-    const sql = try std.fmt.allocPrintSentinel(alloc, "SELECT \"passwordHash\" FROM {s} WHERE \"id\" = ?1;", .{qtbl}, 0);
+    const sql = try alloc.printSentinel("SELECT \"passwordHash\" FROM {s} WHERE \"id\" = ?1;", .{qtbl}, 0);
     defer alloc.free(sql);
     var st = try prep(conn, sql);
     defer st.finalize();
@@ -256,8 +256,7 @@ fn upgradeHash(
     if (!schema.isValidIdentifier(table)) return error.InvalidIdentifier;
     const phc = try crypto.hashPassword(app.io, alloc, password);
     defer alloc.free(phc);
-    const sql = try std.fmt.allocPrintSentinel(
-        alloc,
+    const sql = try alloc.printSentinel(
         "UPDATE \"{s}\" SET \"passwordHash\" = ?1 WHERE \"id\" = ?2 AND \"passwordHash\" = ?3;",
         .{table},
         0,
@@ -282,7 +281,7 @@ fn upgradeHash(
 pub fn tokenKeyFor(alloc: std.mem.Allocator, conn: *db.Db, table: []const u8, rid: []const u8) !?[]const u8 {
     const qtbl = try ddl.quoteIdent(alloc, table);
     defer alloc.free(qtbl);
-    const sql = try std.fmt.allocPrintSentinel(alloc, "SELECT \"tokenKey\" FROM {s} WHERE \"id\" = ?1;", .{qtbl}, 0);
+    const sql = try alloc.printSentinel("SELECT \"tokenKey\" FROM {s} WHERE \"id\" = ?1;", .{qtbl}, 0);
     defer alloc.free(sql);
     var st = try prep(conn, sql);
     defer st.finalize();
@@ -300,7 +299,7 @@ pub const KeyEpoch = struct { token_key: []const u8, epoch: i64 };
 pub fn tokenKeyAndEpochFor(alloc: std.mem.Allocator, conn: *db.Db, table: []const u8, rid: []const u8) !?KeyEpoch {
     const qtbl = try ddl.quoteIdent(alloc, table);
     defer alloc.free(qtbl);
-    const sql = try std.fmt.allocPrintSentinel(alloc, "SELECT \"tokenKey\", COALESCE(\"token_epoch\", 0) FROM {s} WHERE \"id\" = ?1;", .{qtbl}, 0);
+    const sql = try alloc.printSentinel("SELECT \"tokenKey\", COALESCE(\"token_epoch\", 0) FROM {s} WHERE \"id\" = ?1;", .{qtbl}, 0);
     defer alloc.free(sql);
     var st = try prep(conn, sql);
     defer st.finalize();
@@ -316,7 +315,7 @@ pub fn tokenKeyAndEpochFor(alloc: std.mem.Allocator, conn: *db.Db, table: []cons
 pub fn tokenEpochFor(alloc: std.mem.Allocator, conn: *db.Db, table: []const u8, rid: []const u8) !?i64 {
     const qtbl = try ddl.quoteIdent(alloc, table);
     defer alloc.free(qtbl);
-    const sql = try std.fmt.allocPrintSentinel(alloc, "SELECT COALESCE(\"token_epoch\", 0) FROM {s} WHERE \"id\" = ?1;", .{qtbl}, 0);
+    const sql = try alloc.printSentinel("SELECT COALESCE(\"token_epoch\", 0) FROM {s} WHERE \"id\" = ?1;", .{qtbl}, 0);
     defer alloc.free(sql);
     var st = try prep(conn, sql);
     defer st.finalize();
@@ -331,7 +330,7 @@ pub fn tokenEpochFor(alloc: std.mem.Allocator, conn: *db.Db, table: []const u8, 
 pub fn bumpTokenEpoch(alloc: std.mem.Allocator, conn: *db.Db, table: []const u8, rid: []const u8) !i64 {
     const qtbl = try ddl.quoteIdent(alloc, table);
     defer alloc.free(qtbl);
-    const sql = try std.fmt.allocPrintSentinel(alloc, "UPDATE {s} SET \"token_epoch\" = COALESCE(\"token_epoch\", 0) + 1 WHERE \"id\" = ?1;", .{qtbl}, 0);
+    const sql = try alloc.printSentinel("UPDATE {s} SET \"token_epoch\" = COALESCE(\"token_epoch\", 0) + 1 WHERE \"id\" = ?1;", .{qtbl}, 0);
     defer alloc.free(sql);
     var st = try prep(conn, sql);
     defer st.finalize();
@@ -506,11 +505,11 @@ fn sessionSeqCol(conn: *db.Db) []const u8 {
 pub fn listSessions(alloc: std.mem.Allocator, conn: *db.Db, collection: []const u8, rid: []const u8) ![]SessionRow {
     const now = try nowUnix(conn);
     var sqlbuf: [320]u8 = undefined;
-    const sql = std.fmt.bufPrintZ(&sqlbuf,
+    const sql = std.mem.printSentinel(&sqlbuf,
         \\SELECT "id","created","lastSeen","userAgent","ip" FROM "_sessions"
         \\ WHERE "collectionRef" = ?1 AND "recordRef" = ?2 AND ("expires" IS NULL OR "expires" > ?3)
         \\ ORDER BY "created" DESC, {s} DESC;
-    , .{sessionSeqCol(conn)}) catch unreachable;
+    , .{sessionSeqCol(conn)}, 0) catch unreachable;
     var st = try prep(conn, sql);
     defer st.finalize();
     try st.bindText(1, collection);
@@ -1180,7 +1179,7 @@ fn requestEmailToken(
             if (try findByEmail(ctx.allocator.a, w, col, email)) |rid| {
                 if (try tokenKeyFor(ctx.allocator.a, w, col.name, rid)) |tk| {
                     const token = try mintToken(ctx, w, col.name, rid, tk, tt, ttl, "");
-                    const mail_body = try std.fmt.allocPrint(ctx.allocator.a, body_fmt, .{ col.name, token });
+                    const mail_body = try ctx.allocator.a.print(body_fmt, .{ col.name, token });
                     pending = .{ .email = email, .mail_body = mail_body };
                 }
             }
@@ -1215,7 +1214,7 @@ pub fn confirmVerification(ctx: *http.RequestCtx) anyerror!http.Response {
     // Single-use (F7): redeeming the same token twice fails here even within the TTL.
     consumeToken(w, claims) catch
         return ApiError.badRequest("Invalid or expired token.").toResponse(ctx.allocator.a);
-    const sql = try std.fmt.allocPrintSentinel(ctx.allocator.a, "UPDATE {s} SET \"verified\" = 1 WHERE \"id\" = ?1;", .{try ddl.quoteIdent(ctx.allocator.a, col.name)}, 0);
+    const sql = try ctx.allocator.a.printSentinel("UPDATE {s} SET \"verified\" = 1 WHERE \"id\" = ?1;", .{try ddl.quoteIdent(ctx.allocator.a, col.name)}, 0);
     var st = try prep(w, sql);
     defer st.finalize();
     try st.bindText(1, claims.id);
@@ -1306,7 +1305,7 @@ pub const TestEnv = struct {
         env.tmp = std.testing.tmpDir(.{});
         const dir = try env.tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
         defer std.testing.allocator.free(dir);
-        const path = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/test.db", .{dir}, 0);
+        const path = try std.testing.allocator.printSentinel("{s}/test.db", .{dir}, 0);
         defer std.testing.allocator.free(path);
         env.pool = try db.Pool.init(std.testing.allocator, std.testing.io, path);
         {
@@ -1375,7 +1374,7 @@ pub const TestEnv = struct {
         env.tmp = std.testing.tmpDir(.{});
         const dir = try env.tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
         defer std.testing.allocator.free(dir);
-        const path = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/test.db", .{dir}, 0);
+        const path = try std.testing.allocator.printSentinel("{s}/test.db", .{dir}, 0);
         defer std.testing.allocator.free(path);
         env.pool = try db.Pool.init(std.testing.allocator, std.testing.io, path);
         {
@@ -1412,7 +1411,7 @@ pub const TestEnv = struct {
         const col = (collections.get(a, w, col_name) catch return false).?;
         const rid = (findByIdentity(a, w, col, email) catch return false) orelse return false;
         const qtbl = ddl.quoteIdent(a, col.name) catch return false;
-        const sql = std.fmt.allocPrintSentinel(a, "SELECT \"verified\" FROM {s} WHERE \"id\" = ?1;", .{qtbl}, 0) catch return false;
+        const sql = a.printSentinel("SELECT \"verified\" FROM {s} WHERE \"id\" = ?1;", .{qtbl}, 0) catch return false;
         var st = w.prepare(sql) catch return false;
         defer st.finalize();
         st.bindText(1, rid) catch return false;
@@ -1483,7 +1482,7 @@ test "auth-with-password then authenticate round-trips the issued token (bearer)
     const token = parsed.value.object.get("token").?.string;
     // refresh with the bearer token should succeed (200)
     var refresh = env.ctx(RequestArena.from(&arena), .POST, "", &p);
-    refresh.authorization = try std.fmt.allocPrint(a, "Bearer {s}", .{token});
+    refresh.authorization = try a.print("Bearer {s}", .{token});
     try std.testing.expectEqual(@as(u16, 200), (try authRefresh(&refresh)).status);
 }
 
@@ -1502,7 +1501,7 @@ test "verification: request always 204; confirm returns 204 and sets verified=tr
     try std.testing.expectEqual(@as(u16, 204), (try requestVerification(&req_missing)).status);
 
     const token = try env.mintTyped(a, "users", "v@x.io", .verification);
-    const body = try std.fmt.allocPrint(a, "{{\"token\":\"{s}\"}}", .{token});
+    const body = try a.print("{{\"token\":\"{s}\"}}", .{token});
     var conf = env.ctx(RequestArena.from(&arena), .POST, body, &p);
     try std.testing.expectEqual(@as(u16, 204), (try confirmVerification(&conf)).status);
     try std.testing.expect(env.recordVerified(a, "users", "v@x.io"));
@@ -1517,7 +1516,7 @@ test "password reset: confirm changes the password and rotates the token" {
     try env.createUser(a, "users", "r@x.io", "oldpassword");
     const p = [_]http.Param{.{ .key = "col", .value = "users" }};
     const token = try env.mintTyped(a, "users", "r@x.io", .password_reset);
-    const body = try std.fmt.allocPrint(a, "{{\"token\":\"{s}\",\"password\":\"newpassword\"}}", .{token});
+    const body = try a.print("{{\"token\":\"{s}\",\"password\":\"newpassword\"}}", .{token});
     var conf = env.ctx(RequestArena.from(&arena), .POST, body, &p);
     try std.testing.expectEqual(@as(u16, 204), (try confirmPasswordReset(&conf)).status);
     var conf2 = env.ctx(RequestArena.from(&arena), .POST, body, &p);
@@ -1559,7 +1558,7 @@ test "F7: a verification token cannot be redeemed twice (single-use)" {
     try env.createUser(a, "users", "v2@x.io", "longenough");
     const p = [_]http.Param{.{ .key = "col", .value = "users" }};
     const token = try env.mintTyped(a, "users", "v2@x.io", .verification);
-    const body = try std.fmt.allocPrint(a, "{{\"token\":\"{s}\"}}", .{token});
+    const body = try a.print("{{\"token\":\"{s}\"}}", .{token});
     // First redemption succeeds. Verification does NOT rotate tokenKey, so without the
     // single-use ledger this token would remain replayable for its full TTL.
     var c1 = env.ctx(RequestArena.from(&arena), .POST, body, &p);
@@ -1579,7 +1578,7 @@ test "F7: a password-reset token cannot be redeemed twice (single-use)" {
     try env.createUser(a, "users", "r2@x.io", "oldpassword");
     const p = [_]http.Param{.{ .key = "col", .value = "users" }};
     const token = try env.mintTyped(a, "users", "r2@x.io", .password_reset);
-    const body = try std.fmt.allocPrint(a, "{{\"token\":\"{s}\",\"password\":\"newpassword\"}}", .{token});
+    const body = try a.print("{{\"token\":\"{s}\",\"password\":\"newpassword\"}}", .{token});
     var c1 = env.ctx(RequestArena.from(&arena), .POST, body, &p);
     try std.testing.expectEqual(@as(u16, 204), (try confirmPasswordReset(&c1)).status);
     // Replay rejected even though we re-send the identical valid-window token.
@@ -1596,11 +1595,11 @@ test "F7: a too-short password does not consume the reset token" {
     try env.createUser(a, "users", "r3@x.io", "oldpassword");
     const p = [_]http.Param{.{ .key = "col", .value = "users" }};
     const token = try env.mintTyped(a, "users", "r3@x.io", .password_reset);
-    const short = try std.fmt.allocPrint(a, "{{\"token\":\"{s}\",\"password\":\"x\"}}", .{token});
+    const short = try a.print("{{\"token\":\"{s}\",\"password\":\"x\"}}", .{token});
     var bad = env.ctx(RequestArena.from(&arena), .POST, short, &p);
     try std.testing.expectEqual(@as(u16, 400), (try confirmPasswordReset(&bad)).status); // too short
     // The token survives the failed attempt and still works once.
-    const ok = try std.fmt.allocPrint(a, "{{\"token\":\"{s}\",\"password\":\"newpassword\"}}", .{token});
+    const ok = try a.print("{{\"token\":\"{s}\",\"password\":\"newpassword\"}}", .{token});
     var good = env.ctx(RequestArena.from(&arena), .POST, ok, &p);
     try std.testing.expectEqual(@as(u16, 204), (try confirmPasswordReset(&good)).status);
 }
@@ -1960,7 +1959,7 @@ test "rotation grace: after auth-refresh the predecessor token stays valid until
 
     const p = [_]http.Param{.{ .key = "col", .value = "users" }};
     var refresh = env.ctx(RequestArena.from(&arena), .POST, "", &p);
-    refresh.authorization = try std.fmt.allocPrint(a, "Bearer {s}", .{old_token});
+    refresh.authorization = try a.print("Bearer {s}", .{old_token});
     const res = try authRefresh(&refresh);
     try std.testing.expectEqual(@as(u16, 200), res.status);
 
@@ -2016,7 +2015,7 @@ test "rotation grace 0: auth-refresh deletes the predecessor immediately (legacy
 
     const p = [_]http.Param{.{ .key = "col", .value = "users" }};
     var refresh = env.ctx(RequestArena.from(&arena), .POST, "", &p);
-    refresh.authorization = try std.fmt.allocPrint(a, "Bearer {s}", .{old_token});
+    refresh.authorization = try a.print("Bearer {s}", .{old_token});
     try std.testing.expectEqual(@as(u16, 200), (try authRefresh(&refresh)).status);
 
     try std.testing.expectEqual(@as(i64, 1), try sessionCount(env)); // old row gone
@@ -2149,7 +2148,7 @@ test "#99 table mode: logout deletes the current device's session row" {
     // Logout with this token (bearer) deletes the row.
     const p = [_]http.Param{.{ .key = "col", .value = "users" }};
     var lo = env.ctx(RequestArena.from(&arena), .POST, "", &p);
-    lo.authorization = try std.fmt.allocPrint(a, "Bearer {s}", .{issued.token});
+    lo.authorization = try a.print("Bearer {s}", .{issued.token});
     try std.testing.expectEqual(@as(u16, 204), (try authLogout(&lo)).status);
     try std.testing.expectEqual(@as(i64, 0), try sessionCount(env));
 }
@@ -2258,7 +2257,7 @@ test "#114 gcExpiredSessions drains a backlog larger than the batch size" {
     const total: usize = session_gc_batch + 50; // forces >1 batch
     var i: usize = 0;
     while (i < total) : (i += 1) {
-        const id = try std.fmt.allocPrint(a, "s{d}", .{i});
+        const id = try a.print("s{d}", .{i});
         defer a.free(id);
         try insertSessionRow(env, id, 1); // all expired
     }
@@ -2341,7 +2340,7 @@ fn countTable(env: *TestEnv, table: []const u8) !i64 {
     defer env.pool.releaseWriter();
     const qtbl = try ddl.quoteIdent(std.testing.allocator, table);
     defer std.testing.allocator.free(qtbl);
-    const sql = try std.fmt.allocPrintSentinel(std.testing.allocator, "SELECT COUNT(*) FROM {s};", .{qtbl}, 0);
+    const sql = try std.testing.allocator.printSentinel("SELECT COUNT(*) FROM {s};", .{qtbl}, 0);
     defer std.testing.allocator.free(sql);
     var st = try w.prepare(sql);
     defer st.finalize();
@@ -2352,7 +2351,7 @@ fn countTable(env: *TestEnv, table: []const u8) !i64 {
 /// Login and return the issued bearer token (arena-owned).
 fn loginToken(env: *TestEnv, a: RequestArena, col: []const u8, identity: []const u8, pw: []const u8) ![]const u8 {
     const p = [_]http.Param{.{ .key = "col", .value = col }};
-    const body = try std.fmt.allocPrint(a.a, "{{\"identity\":\"{s}\",\"password\":\"{s}\"}}", .{ identity, pw });
+    const body = try a.a.print("{{\"identity\":\"{s}\",\"password\":\"{s}\"}}", .{ identity, pw });
     var login = env.ctx(a, .POST, body, &p);
     const res = try authWithPassword(&login);
     const parsed = try std.json.parseFromSlice(std.json.Value, a.a, res.body, .{});
@@ -2370,7 +2369,7 @@ fn seedAuthRecord(env: *TestEnv, a: std.mem.Allocator, col_name: []const u8, ema
     defer env.pool.releaseWriter();
     const col = (try collections.get(a, w, col_name)).?;
     const rid = (try findByIdentity(a, w, col, email)).?;
-    const sql = try std.fmt.allocPrintSentinel(a, "UPDATE \"{s}\" SET \"passwordHash\" = ?1 WHERE \"id\" = ?2;", .{col.name}, 0);
+    const sql = try a.printSentinel("UPDATE \"{s}\" SET \"passwordHash\" = ?1 WHERE \"id\" = ?2;", .{col.name}, 0);
     var st = try prep(w, sql);
     defer st.finalize();
     try st.bindText(1, stored);
@@ -2414,7 +2413,7 @@ fn seedRawHash(env: *TestEnv, a: std.mem.Allocator, col_name: []const u8, email:
     const rid = try a.dupe(u8, rec.object.get("id").?.string);
     errdefer a.free(rid);
 
-    const sql = try std.fmt.allocPrintSentinel(a, "UPDATE \"{s}\" SET \"passwordHash\" = ?1 WHERE \"id\" = ?2;", .{col.name}, 0);
+    const sql = try a.printSentinel("UPDATE \"{s}\" SET \"passwordHash\" = ?1 WHERE \"id\" = ?2;", .{col.name}, 0);
     defer a.free(sql);
     var st = try prep(w, sql);
     defer st.finalize();
@@ -2555,7 +2554,7 @@ test "#98 refresh: all authenticated hook contexts authorize role-gated owners" 
         }
         var refresh = env.ctx(RequestArena.from(&arena), .POST, "", &p);
         refresh.headers = &.{.{ .key = "x-account-id", .value = if (role.len > 0) "acc1" else "not-a-membership" }};
-        refresh.authorization = try std.fmt.allocPrint(a, "Bearer {s}", .{token});
+        refresh.authorization = try a.print("Bearer {s}", .{token});
         const res = try authRefresh(&refresh);
         try std.testing.expectEqual(@as(u16, 200), res.status);
     }
@@ -2586,7 +2585,7 @@ test "#98 refresh: aborting beforeRefresh blocks the session AND rolls back side
 
     const p = [_]http.Param{.{ .key = "col", .value = "refreshb" }};
     var refresh = env.ctx(RequestArena.from(&arena), .POST, "", &p);
-    refresh.authorization = try std.fmt.allocPrint(a, "Bearer {s}", .{token});
+    refresh.authorization = try a.print("Bearer {s}", .{token});
     const res = try authRefresh(&refresh);
     try std.testing.expectEqual(@as(u16, 403), res.status); // fail closed
     try std.testing.expectEqual(@as(usize, 0), res.cookies.len); // no new session
@@ -2634,7 +2633,7 @@ test "#98 logout: a regular token cannot gain superuser hook scope from the URL"
     for ([_][]const u8{ "logoutu", "_superusers" }) |url_collection| {
         const p = [_]http.Param{.{ .key = "col", .value = url_collection }};
         var logout = env.ctx(RequestArena.from(&arena), .POST, "", &p);
-        logout.authorization = try std.fmt.allocPrint(a, "Bearer {s}", .{token});
+        logout.authorization = try a.print("Bearer {s}", .{token});
         logout.path = if (std.mem.eql(u8, url_collection, "_superusers")) "/api/collections/_superusers/auth-logout" else "/api/collections/logoutu/auth-logout";
         const res = try authLogout(&logout);
         try std.testing.expectEqual(@as(u16, 204), res.status);
@@ -2704,7 +2703,7 @@ test "#98 password-change: before/after hooks fire on confirm-password-reset" {
     env.app.dispatch = &disp;
 
     const p = [_]http.Param{.{ .key = "col", .value = "pcu" }};
-    const body = try std.fmt.allocPrint(a, "{{\"token\":\"{s}\",\"password\":\"newpassword\"}}", .{token});
+    const body = try a.print("{{\"token\":\"{s}\",\"password\":\"newpassword\"}}", .{token});
     var conf = env.ctx(RequestArena.from(&arena), .POST, body, &p);
     try std.testing.expectEqual(@as(u16, 204), (try confirmPasswordReset(&conf)).status);
     try std.testing.expectEqual(@as(usize, 1), Hook.before_seen);
@@ -2731,7 +2730,7 @@ test "#98 password-change: aborting beforePasswordChange leaves password + reset
     env.app.dispatch = &disp;
 
     const p = [_]http.Param{.{ .key = "col", .value = "pcb" }};
-    const body = try std.fmt.allocPrint(a, "{{\"token\":\"{s}\",\"password\":\"newpassword\"}}", .{token});
+    const body = try a.print("{{\"token\":\"{s}\",\"password\":\"newpassword\"}}", .{token});
     var conf = env.ctx(RequestArena.from(&arena), .POST, body, &p);
     try std.testing.expectEqual(@as(u16, 403), (try confirmPasswordReset(&conf)).status);
 
@@ -2900,7 +2899,7 @@ test "#80 authRefresh: before_refresh then beforeAuthSuccess(.refresh) in ONE tx
     env.app.dispatch = &disp;
 
     const p = [_]http.Param{.{ .key = "col", .value = "rf1" }};
-    const bearer = try std.fmt.allocPrint(a, "Bearer {s}", .{tok});
+    const bearer = try a.print("Bearer {s}", .{tok});
     var refresh = env.ctx(RequestArena.from(&arena), .POST, "", &p);
     refresh.authorization = bearer;
     const res = try authRefresh(&refresh);
@@ -2935,7 +2934,7 @@ test "#80 onAuth reports .refresh (not .password) on auth-refresh" {
     env.app.dispatch = &disp;
 
     const p = [_]http.Param{.{ .key = "col", .value = "rf2" }};
-    const bearer = try std.fmt.allocPrint(a, "Bearer {s}", .{tok});
+    const bearer = try a.print("Bearer {s}", .{tok});
     var refresh = env.ctx(RequestArena.from(&arena), .POST, "", &p);
     refresh.authorization = bearer;
     try std.testing.expectEqual(@as(u16, 200), (try authRefresh(&refresh)).status);

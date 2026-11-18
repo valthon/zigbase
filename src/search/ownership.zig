@@ -33,7 +33,7 @@ pub fn verify(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection, renam
         // Serialize provisioners and structural DDL without blocking ordinary
         // record reads/writes. The caller retains this lock until its schema
         // transaction ends, so a proved column cannot be replaced before DROP.
-        try w.exec(try std.fmt.allocPrintSentinel(a, "LOCK TABLE {s} IN SHARE UPDATE EXCLUSIVE MODE;", .{try ddl.quoteIdent(a, col.name)}, 0));
+        try w.exec(try a.printSentinel("LOCK TABLE {s} IN SHARE UPDATE EXCLUSIVE MODE;", .{try ddl.quoteIdent(a, col.name)}, 0));
     }
     if (db.dbDialect(w).kind == .sqlite) return sqliteSearch(&scratch, w, col, rename_to);
     return postgresSearch(&scratch, w, col, rename_to != null);
@@ -80,7 +80,7 @@ fn sqliteSearch(scratch: *std.heap.ArenaAllocator, w: *db.Db, old: schema.Collec
     var physical = old;
     if (!exact) {
         var fields: std.ArrayList(schema.Field) = .empty;
-        var columns = try prepare(a, w, try std.fmt.allocPrint(a, "PRAGMA main.table_info({s});", .{try ddl.quoteIdent(a, ft)}));
+        var columns = try prepare(a, w, try a.print("PRAGMA main.table_info({s});", .{try ddl.quoteIdent(a, ft)}));
         defer columns.finalize();
         var base_column = try prepare(a, w, "SELECT 1 FROM pragma_table_info(?1,'main') WHERE name=?2 AND upper(type)='TEXT' LIMIT 1;");
         defer base_column.finalize();
@@ -108,7 +108,7 @@ fn sqliteSearch(scratch: *std.heap.ArenaAllocator, w: *db.Db, old: schema.Collec
     // without duplicating their DDL here or treating an ordinary table as FTS.
     var model = try db.Db.openMemory();
     defer model.close();
-    try model.exec(try a.dupeZ(u8, try ddl.createTableSql(a, physical, null, db.dbDialect(&model), &.{})));
+    try model.exec(try a.dupeSentinel(u8, try ddl.createTableSql(a, physical, null, db.dbDialect(&model), &.{}), 0));
     try fts.ensureIndex(a, &model, physical);
     var expected = try sqliteObjects(a, &model, ft);
     defer expected.finalize();
@@ -137,7 +137,7 @@ fn postgresSearch(scratch: *std.heap.ArenaAllocator, w: *db.Db, old: schema.Coll
     const a = scratch.allocator();
     const table = try ddl.quoteIdent(a, old.name);
     const ft = try fts.tableName(a, old.name);
-    const index = try std.fmt.allocPrint(a, "{s}_idx", .{ft});
+    const index = try a.print("{s}_idx", .{ft});
     var column = try prepare(a, w, "SELECT a.attnum,a.attgenerated='s' AND a.atttypid='pg_catalog.tsvector'::regtype,col_description(a.attrelid,a.attnum),d.oid " ++
         "FROM pg_attribute a LEFT JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum " ++
         "WHERE a.attrelid=to_regclass(?1) AND a.attname=?2 AND a.attnum>0 AND NOT a.attisdropped;");
@@ -184,7 +184,7 @@ fn postgresSearch(scratch: *std.heap.ArenaAllocator, w: *db.Db, old: schema.Coll
             return std.mem.lessThan(u8, x, y);
         }
     }.less);
-    const marker = try std.fmt.allocPrint(a, "zbfts:{s}", .{try std.mem.join(a, ",", names.items)});
+    const marker = try a.print("zbfts:{s}", .{try std.mem.join(a, ",", names.items)});
     if (!std.mem.eql(u8, column.columnText(2), marker)) return error.Conflict;
     if (idx) |oid| {
         var check = try prepare(a, w, "SELECT 1 FROM pg_index i JOIN pg_class c ON c.oid=i.indexrelid JOIN pg_am am ON am.oid=c.relam " ++
@@ -267,15 +267,15 @@ fn postgresExpression(scratch: *std.heap.ArenaAllocator, w: *db.Db, table: []con
     var expr: std.ArrayList(u8) = .empty;
     try expr.appendSlice(a, "to_tsvector('simple', ");
     for (names, 0..) |name, i| {
-        try create.appendSlice(a, try std.fmt.allocPrint(a, "{s} TEXT,", .{try ddl.quoteIdent(a, name)}));
+        try create.appendSlice(a, try a.print("{s} TEXT,", .{try ddl.quoteIdent(a, name)}));
         if (i > 0) try expr.appendSlice(a, " || ' ' || ");
-        try expr.appendSlice(a, try std.fmt.allocPrint(a, "coalesce({s},'')", .{try ddl.quoteIdent(a, name)}));
+        try expr.appendSlice(a, try a.print("coalesce({s},'')", .{try ddl.quoteIdent(a, name)}));
     }
     try expr.appendSlice(a, ")");
     // The engine reserves underscore-prefixed field names, avoiding collision
     // with any searchable field copied into this private probe table.
-    try create.appendSlice(a, try std.fmt.allocPrint(a, "_expected TSVECTOR GENERATED ALWAYS AS ({s}) STORED) ON COMMIT DROP;", .{expr.items}));
-    try w.exec(try a.dupeZ(u8, create.items));
+    try create.appendSlice(a, try a.print("_expected TSVECTOR GENERATED ALWAYS AS ({s}) STORED) ON COMMIT DROP;", .{expr.items}));
+    try w.exec(try a.dupeSentinel(u8, create.items, 0));
     var compare = try prepare(a, w, "SELECT pg_get_expr(actual.adbin,actual.adrelid)=pg_get_expr(expected.adbin,expected.adrelid) " ++
         "FROM pg_attrdef actual,pg_attrdef expected WHERE actual.adrelid=to_regclass(?1) AND actual.adnum=?2 " ++
         "AND expected.adrelid='pg_temp.zb_rename_fts_probe'::regclass;");

@@ -12,10 +12,10 @@ if [[ "$(uname -s)" != Linux || "$(uname -m)" != x86_64 ]]; then
 fi
 perf_tmp="$(mktemp -d)"
 trap 'rm -rf "$perf_tmp"' EXIT
-if [[ "$(zig version)" != 0.16.0 ]]; then
-  echo 'Performance contract example requires Zig 0.16.0 on PATH.' >&2
+if [[ "$(zig version)" != 0.17.1 ]]; then
+  echo 'Performance contract example requires Zig 0.17.1 on PATH.' >&2
   exit 2
 fi
-zig build -Dtarget=x86_64-linux-gnu -Dcpu=baseline -Doptimize=ReleaseSmall -Ddev-tools=false -p "$perf_tmp/install" >&2
-zig build bench -Dtarget=x86_64-linux-gnu -Dcpu=baseline -Dbench-optimize=ReleaseFast -- --json > "$perf_tmp/bench.jsonl"
+zig build -Dtarget=x86_64-linux-gnu -Dcpu=baseline -Doptimize=small -Ddev-tools=false -p "$perf_tmp/install" >&2
+zig build bench -Dtarget=x86_64-linux-gnu -Dcpu=baseline -Dbench-optimize=fast -- --json > "$perf_tmp/bench.jsonl"
 python3 tools/performance_contracts.py --contract bench/contracts/release-small-linux.json --binary "$perf_tmp/install/bin/zigbase" --benchmarks "$perf_tmp/bench.jsonl" "$@"

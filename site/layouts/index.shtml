@@ -53,7 +53,7 @@
     <div class="framework-panel"><p class="pitch-number">YOUR FRAMEWORK PROJECT</p><pre><code>npx zigbase init --framework --dir myapp
 cd myapp
 zig fetch --save git+https://github.com/valthon/zigbase
-zig build test</code></pre><p>Use the pinned Zig 0.16.0 toolchain. The scaffold wires the library, example schema, and in-process tests.</p><p>Prefer the stock server? <code>npx zigbase init</code> scaffolds a backend without a Zig toolchain.</p><a href="$site.page('docs/app-genesis').link()">Choose the right application shape →</a></div>
+zig build test</code></pre><p>Use the pinned Zig 0.17.1 toolchain. The scaffold wires the library, example schema, and in-process tests.</p><p>Prefer the stock server? <code>npx zigbase init</code> scaffolds a backend without a Zig toolchain.</p><a href="$site.page('docs/app-genesis').link()">Choose the right application shape →</a></div>
   </section>
 
   <section class="container pitch-section" aria-labelledby="services">

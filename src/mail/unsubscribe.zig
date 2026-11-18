@@ -130,7 +130,7 @@ pub fn buildUrl(alloc: std.mem.Allocator, base_url: []const u8, jwt_secret: []co
     const token = try mint(alloc, jwt_secret, account, list, recipient);
     defer alloc.free(token);
     const base = std.mem.trimEnd(u8, base_url, "/");
-    return std.fmt.allocPrint(alloc, "{s}/api/mail/unsubscribe?t={s}", .{ base, token });
+    return alloc.print("{s}/api/mail/unsubscribe?t={s}", .{ base, token });
 }
 
 // ---------------------------------------------------------------------------
@@ -213,7 +213,7 @@ test "verify rejects malformed tokens: truncated, dot-less, oversized" {
     const oversized = try a.alloc(u8, max_part_len + 10);
     defer a.free(oversized);
     @memset(oversized, 'A');
-    const oversized_token = try std.fmt.allocPrint(a, "{s}.AAAA", .{oversized});
+    const oversized_token = try a.print("{s}.AAAA", .{oversized});
     defer a.free(oversized_token);
     try testing.expect(verify(a, "s3cret", oversized_token) == null);
 }

@@ -262,7 +262,7 @@ test "authdata: attestation authData with AT set, parses attestedCredentialData"
     const cd = result.cred orelse return error.TestUnexpectedNull;
 
     // aaguid should be 16 zeros
-    try std.testing.expectEqualSlices(u8, &[_]u8{0} ** 16, &cd.aaguid);
+    try std.testing.expectEqualSlices(u8, &@as([16]u8, @splat(0)), &cd.aaguid);
 
     // credential_id should be our 4 bytes
     try std.testing.expectEqualSlices(u8, &cred_id, cd.credential_id);

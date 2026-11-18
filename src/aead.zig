@@ -84,7 +84,7 @@ pub fn seal(io: std.Io, alloc: std.mem.Allocator, key: [32]u8, version: u16, pla
     const enc = try alloc.alloc(u8, b64.Encoder.calcSize(raw.len));
     defer alloc.free(enc); // scratch
     _ = b64.Encoder.encode(enc, raw);
-    return std.fmt.allocPrint(alloc, "v{d}:{s}", .{ version, enc });
+    return alloc.print("v{d}:{s}", .{ version, enc });
 }
 
 /// Open a `v<N>:` envelope with `key`. The caller is responsible for selecting

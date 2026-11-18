@@ -117,7 +117,7 @@ pub fn wrapLegacy(alloc: std.mem.Allocator, algorithm: []const u8, hash: []const
     // Validate the hash against the algorithm at IMPORT time, so a malformed credential is
     // rejected while an operator is watching rather than at some user's next login.
     if (std.mem.eql(u8, algorithm, "bcrypt") and !isBcryptHash(hash)) return LegacyError.MalformedLegacyHash;
-    return std.fmt.allocPrint(alloc, "{s}{s}${s}", .{ legacy_prefix, algorithm, hash });
+    return alloc.print("{s}{s}${s}", .{ legacy_prefix, algorithm, hash });
 }
 
 /// Verify a password against a TAGGED legacy hash. Returns false — never an error — on any
@@ -323,7 +323,7 @@ test "verifyLegacy truncates at 72 bytes the way every other bcrypt does" {
     // Reference implementations ignore bytes past 72. Zig's default instead HMAC-pre-hashes
     // a long password, which would lock out any user whose password exceeds 72 bytes.
     const a = std.testing.allocator;
-    const base = "x" ** 72;
+    const base = (&@as([72]u8, @splat('x')));
     const long = base ++ "IGNORED-BY-EVERY-OTHER-BCRYPT";
     const h = try bcryptHashForTest(a, base); // helper below
     defer a.free(h);
