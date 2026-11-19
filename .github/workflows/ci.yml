@@ -36,6 +36,8 @@ jobs:
           path: ${{ github.workspace }}/.zig-global
           key: zig-global-${{ runner.os }}-zig0.17.1-${{ hashFiles('vendor/sqlite/sqlite3.c', 'build.zig', 'build.zig.zon') }}
           restore-keys: zig-global-${{ runner.os }}-zig0.17.1-
+      - name: Fetch Zig packages (retries transient remote failures)
+        run: scripts/zig-fetch.sh
       - name: Cache npm downloads
         if: matrix.bundle == 'examples'
         uses: actions/cache@v5
@@ -104,6 +106,10 @@ jobs:
           path: ${{ github.workspace }}/.zig-global
           key: zig-global-${{ runner.os }}-zig0.17.1-${{ hashFiles('vendor/sqlite/sqlite3.c', 'build.zig', 'build.zig.zon') }}
           restore-keys: zig-global-${{ runner.os }}-zig0.17.1-
+      - name: Fetch Zig packages (retries transient remote failures)
+        run: scripts/zig-fetch.sh
+      - name: Configure in a branch clone and a tree without .git (PR checkouts are detached)
+        run: scripts/check-configure-checkouts.sh
       - name: Cache npm downloads
         uses: actions/cache@v5
         with:
@@ -168,6 +174,8 @@ jobs:
           path: ${{ github.workspace }}/.zig-global
           key: zig-global-${{ runner.os }}-zig0.17.1-${{ hashFiles('vendor/sqlite/sqlite3.c', 'build.zig', 'build.zig.zon') }}
           restore-keys: zig-global-${{ runner.os }}-zig0.17.1-
+      - name: Fetch Zig packages (retries transient remote failures)
+        run: scripts/zig-fetch.sh
       - name: Realtime fanout benchmark correctness (no timing threshold)
         run: mise exec zig@0.17.1 -- zig build bench -Dbench-optimize=safe -- --realtime-only --json
       - name: Binary size and allocation contracts (no timing threshold)
@@ -196,6 +204,8 @@ jobs:
           path: ${{ github.workspace }}/.zig-global
           key: zig-global-${{ runner.os }}-zig0.17.1-${{ hashFiles('vendor/sqlite/sqlite3.c', 'build.zig', 'build.zig.zon') }}
           restore-keys: zig-global-${{ runner.os }}-zig0.17.1-
+      - name: Fetch Zig packages (retries transient remote failures)
+        run: scripts/zig-fetch.sh
       - name: Dating client snapshot is fresh
         run: mise exec zig@0.17.1 -- zig build gen-dating-client-check
       - name: Dating runtime client snapshot is fresh
@@ -236,6 +246,8 @@ jobs:
           path: ${{ github.workspace }}/.zig-global
           key: zig-global-${{ runner.os }}-zig0.17.1-${{ hashFiles('vendor/sqlite/sqlite3.c', 'build.zig', 'build.zig.zon') }}
           restore-keys: zig-global-${{ runner.os }}-zig0.17.1-
+      - name: Fetch Zig packages (retries transient remote failures)
+        run: scripts/zig-fetch.sh
       - name: Formatting gate (zig fmt --check)
         run: mise exec zig@0.17.1 -- zig fmt --check src build.zig
       - name: Unit tests
@@ -305,6 +317,8 @@ jobs:
           path: ${{ github.workspace }}/.zig-global
           key: zig-global-${{ runner.os }}-zig0.17.1-${{ hashFiles('vendor/sqlite/sqlite3.c', 'build.zig', 'build.zig.zon') }}
           restore-keys: zig-global-${{ runner.os }}-zig0.17.1-
+      - name: Fetch Zig packages (retries transient remote failures)
+        run: scripts/zig-fetch.sh
       - name: Unit + PostgreSQL driver tests (-Dpostgres=true -Dvector=true)
         run: mise exec zig@0.17.1 -- zig build test --summary all -Dpostgres=true -Dvector=true -Dquery-workbench=true -Ddurable-realtime=true -Drest-idempotency=true
       - name: PostgreSQL workbench paired gating and live HTTP
@@ -363,6 +377,8 @@ jobs:
           path: ${{ github.workspace }}/.zig-global
           key: zig-global-${{ runner.os }}-zig0.17.1-${{ hashFiles('vendor/sqlite/sqlite3.c', 'build.zig', 'build.zig.zon') }}
           restore-keys: zig-global-${{ runner.os }}-zig0.17.1-
+      - name: Fetch Zig packages (retries transient remote failures)
+        run: scripts/zig-fetch.sh
       - name: Start PostgreSQL with server TLS + SCRAM
         run: |
           mkdir -p "$PWD/pgtls"
@@ -422,6 +438,8 @@ jobs:
           path: ${{ github.workspace }}/.zig-global
           key: zig-global-${{ runner.os }}-zig0.17.1-${{ hashFiles('vendor/sqlite/sqlite3.c', 'build.zig', 'build.zig.zon') }}
           restore-keys: zig-global-${{ runner.os }}-zig0.17.1-
+      - name: Fetch Zig packages (retries transient remote failures)
+        run: scripts/zig-fetch.sh
       - name: Start SeaweedFS + wait for authenticated bucket access
         run: |
           # SeaweedFS 4.46; pin the manifest digest rather than a mutable tag.
@@ -742,6 +760,17 @@ jobs:
       - uses: jdx/mise-action@v4
         with:
           install_args: zig python node
+      # The admin suite still runs `zig build` (route-discovery fixture, `init` scaffold),
+      # so fetch packages up front like every other Zig job. Restore-only: this job
+      # does not save the cache.
+      - name: Restore zig global cache
+        uses: actions/cache/restore@v5
+        with:
+          path: ${{ github.workspace }}/.zig-global
+          key: zig-global-${{ runner.os }}-zig0.17.1-${{ hashFiles('vendor/sqlite/sqlite3.c', 'build.zig', 'build.zig.zon') }}
+          restore-keys: zig-global-${{ runner.os }}-zig0.17.1-
+      - name: Fetch Zig packages (retries transient remote failures)
+        run: scripts/zig-fetch.sh
       - name: Download prebuilt binaries
         uses: actions/download-artifact@v8
         with:
@@ -865,6 +894,8 @@ jobs:
           path: ${{ github.workspace }}/.zig-global
           key: zig-global-${{ runner.os }}-zig0.17.1-${{ hashFiles('vendor/sqlite/sqlite3.c', 'build.zig', 'build.zig.zon') }}
           restore-keys: zig-global-${{ runner.os }}-zig0.17.1-
+      - name: Fetch Zig packages (retries transient remote failures)
+        run: scripts/zig-fetch.sh
       - name: Install common feature test dependencies
         run: mise exec python@3.13 -- python -m pip install --quiet pytest
       - name: Install thumbnail browser dependency + resolve version

@@ -964,11 +964,30 @@ fn gitCommit(b: *std.Build) []const u8 {
     return gitCommitFromFs(b) orelse "unknown";
 }
 
-/// Track even missing files: a loose ref or commondir created later must invalidate
-/// the cached configuration just as changing an existing HEAD does.
+/// Read a Git file and register it as a configure input. A missing file must still
+/// invalidate the cached configuration once it appears (a loose ref, `commondir`,
+/// `packed-refs`), but it cannot be registered itself: after the configure script
+/// exits, the build runner opens every registered path, and one that does not exist
+/// fails the whole build with `configuration failed: FileSystemFailure`. Every plain
+/// clone on a branch lacks `commondir` (CI pushes to main, the nightly fuzz run), and a
+/// fetched package has no `.git` at all. So a missing file registers the metadata of
+/// its nearest existing ancestor directory instead, whose mtime changes when the file
+/// is created.
 fn readGitFile(b: *std.Build, path: []const u8) ![]u8 {
-    b.dependOnFileMetadata(b.graph.cwdRelativePath(path));
-    return std.Io.Dir.cwd().readFileAlloc(b.graph.io, path, b.allocator, .limited(64 * 1024 * 1024));
+    const io = b.graph.io;
+    if (std.Io.Dir.cwd().readFileAlloc(io, path, b.allocator, .limited(64 * 1024 * 1024))) |data| {
+        b.dependOnFileMetadata(b.graph.cwdRelativePath(path));
+        return data;
+    } else |err| {
+        var dir: ?[]const u8 = std.fs.path.dirname(path);
+        while (dir) |d| : (dir = std.fs.path.dirname(d)) {
+            var opened = std.Io.Dir.cwd().openDir(io, d, .{}) catch continue;
+            opened.close(io);
+            b.dependOnDirectoryMetadata(b.graph.cwdRelativePath(d));
+            break;
+        }
+        return err;
+    }
 }
 
 /// Spawn-free short-SHA detection by parsing `.git` directly (sandbox- and worktree-proof).

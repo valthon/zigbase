@@ -35,6 +35,8 @@ jobs:
             ${{ github.workspace }}/.zig-local
           key: parser-fuzz-${{ runner.os }}-zig0.17.1-${{ hashFiles('src/fuzz_*.zig', 'src/query/**', 'src/auth/webauthn/**', 'src/backend/postgres/connstr.zig', 'build.zig', 'build.zig.zon') }}
           restore-keys: parser-fuzz-${{ runner.os }}-zig0.17.1-
+      - name: Fetch Zig packages (retries transient remote failures)
+        run: scripts/zig-fetch.sh
       - name: Run bounded coverage-guided campaigns
         # 100x the original per-target budget; the job timeout includes headroom
         # for hosted-runner throughput, cold compilation, and corpus growth.

@@ -46,6 +46,20 @@ password hashing costs to accelerate test setup.
   one runner. This trades some recompilation for bounded transfer overhead;
   measure cold runs as well as warm ones before expanding caching again.
   Other workflows such as scheduled fuzzing retain their own cache policies.
+- Every job that runs Zig fetches the package tree first with
+  `scripts/zig-fetch.sh` (`zig build --fetch`, four attempts with jittered
+  backoff); `browser-tests` restores the cache read-only before its fetch.
+  translate-c and its arocc dependency come from Codeberg, and Zig 0.17.1
+  reports any non-200 from it only as `unable to discover remote git server
+  capabilities: ProtocolError`. A PR can restore only its own caches and
+  main's, so the package tarballs in `.zig-global/p` reach PRs and release tags
+  only after a green main run saves them. `release.yml` restores main's cache
+  read-only and uses the same retried fetch.
+- PR runs check out a detached merge commit; pushes to main check out a branch,
+  and a fetched package has no `.git`. The `contracts` job runs
+  `scripts/check-configure-checkouts.sh`, which configures a branch clone and a
+  tree without `.git`, so a configure input that exists only in a detached
+  checkout fails before merge instead of after it.
 - Build the portable root fixtures in one graph with two compiler workers
   (`-j2`), sharing prerequisites without unbounded concurrent compilation.
 - Core and example artifacts are produced concurrently. Tar archives preserve
