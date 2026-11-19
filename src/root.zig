@@ -412,6 +412,7 @@ test {
     _ = @import("schema.zig");
     _ = @import("collections.zig");
     _ = @import("unique_scope_test.zig"); // #498: tenant-scoped field-level unique (SQLite + live PG)
+    _ = @import("auth_identity_index.zig");
     _ = @import("collection_rename.zig");
     _ = @import("collection_rename_indexes.zig");
     _ = @import("search/ownership.zig");

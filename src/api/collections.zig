@@ -141,6 +141,7 @@ pub fn create(ctx: *http.RequestCtx) anyerror!http.Response {
     try @import("../schema_gen.zig").lock(w);
     if (try validateRules(ctx, w, def_mut)) |resp| return resp;
     const created = collections.create(ctx.allocator.a, app.io, w, def_mut) catch |e| switch (e) {
+        error.AuthIdentityIndexConflict => return ApiError.badRequest(@import("../auth_identity_index.zig").last_error).toResponse(ctx.allocator.a),
         error.Validation => return validationResponse(ctx),
         // The pre-check (`get() != null`) catches the common duplicate; error.Constraint covers a
         // duplicate that races in between the pre-check and the write — still a 409, never a 500.
@@ -201,6 +202,13 @@ pub fn update(ctx: *http.RequestCtx) anyerror!http.Response {
                 return ApiError.badRequest("Superuser updates accept auth options only; omit fields, indexes, and access rules.").toResponse(ctx.allocator.a);
             var updated = old;
             updated.options.auth = def_mut.options.auth;
+            const identity_index = @import("../auth_identity_index.zig");
+            for (updated.options.auth.identityFields) |field| {
+                identity_index.ensure(ctx.allocator.a, w, updated.name, field) catch |err| switch (err) {
+                    error.AuthIdentityIndexConflict => return ApiError.badRequest(identity_index.last_error).toResponse(ctx.allocator.a),
+                    else => return err,
+                };
+            }
             const options = try schema.optionsToJson(ctx.allocator.a, updated, false);
             const dialect = db.dbDialect(w);
             var st = try w.prepare(try dialect.renumberPlaceholders(ctx.allocator.a, "UPDATE \"_collections\" SET \"options\"=?1 WHERE \"name\"='_superusers';"));
@@ -216,6 +224,7 @@ pub fn update(ctx: *http.RequestCtx) anyerror!http.Response {
     if (existing) |old| def_mut.name = old.name;
     if (try validateRules(ctx, w, def_mut)) |resp| return resp;
     const updated = collections.update(ctx.allocator.a, app.io, w, key, def_mut) catch |e| switch (e) {
+        error.AuthIdentityIndexConflict => return ApiError.badRequest(@import("../auth_identity_index.zig").last_error).toResponse(ctx.allocator.a),
         error.NotFound => return ApiError.notFound().toResponse(ctx.allocator.a),
         error.MigrationObjectConflict, error.UnsafeSqliteRebuild => return ApiError.badRequest(collections.last_rebuild_error).toResponse(ctx.allocator.a),
         error.Validation => return validationResponse(ctx),

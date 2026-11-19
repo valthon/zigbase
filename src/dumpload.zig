@@ -306,7 +306,14 @@ fn provisionRecordTables(a: std.mem.Allocator, target: *db.Db, src_cols: []const
     var created: usize = 0;
     for (plan.order) |idx| {
         const col = src_cols[idx];
-        if (try tableExists(a, target, col.name)) continue; // system tables already exist
+        if (try tableExists(a, target, col.name)) {
+            // Existing system tables and --force targets must enforce the SOURCE's
+            // desired identities before any target rows are cleared or copied.
+            if (col.type == .auth) for (col.options.auth.identityFields) |idf| {
+                try @import("auth_identity_index.zig").ensure(a, target, col.name, idf);
+            };
+            continue;
+        }
         // For auth collections, materialize the injected system columns (passwordHash/tokenKey/…)
         // exactly as `collections.create` does, so the physical table matches.
         const full = try schema.injectAuthFields(a, col);
@@ -318,7 +325,7 @@ fn provisionRecordTables(a: std.mem.Allocator, target: *db.Db, src_cols: []const
         };
         if (col.type == .auth) {
             for (col.options.auth.identityFields) |idf|
-                try target.exec(try a.dupeSentinel(u8, try ddl.authIdentityIndexSql(a, col.name, idf), 0));
+                try @import("auth_identity_index.zig").ensure(a, target, col.name, idf);
         }
         created_flags[idx] = true;
         created += 1;
@@ -1145,4 +1152,54 @@ test "dumpload: planCreateOrder — a diamond feeding a cycle only defers the in
         const f = cols[e.col_idx].fields[e.field_idx];
         try std.testing.expectEqualStrings("pair", f.name);
     }
+}
+
+fn existingIdentityImport(comptime pg: bool) !void {
+    if (pg and !@import("build_options").postgres) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var target = if (pg) try db.Db.openPostgres(a, std.testing.io, std.testing.environ.getPosix("ZIGBASE_PG_TEST_URL") orelse return error.SkipZigTest) else try db.Db.openMemory();
+    defer target.close();
+    if (pg) {
+        try target.exec("DROP SCHEMA IF EXISTS zb_import_identity CASCADE; CREATE SCHEMA zb_import_identity; SET search_path TO zb_import_identity;");
+    }
+    defer if (pg) target.exec("DROP SCHEMA zb_import_identity CASCADE;") catch |err| {
+        std.log.warn("import identity test cleanup failed: {s}", .{@errorName(err)});
+    };
+    try migrations.run(&target);
+    var source = try db.Db.openMemory();
+    defer source.close();
+    try migrations.run(&source);
+    const def = schema.Collection{ .id = "", .name = "import_members", .type = .auth, .fields = &.{} };
+    const src = try collections.create(a, std.testing.io, &source, def);
+    defer src.deinit(a);
+    const dst = try collections.create(a, std.testing.io, &target, def);
+    defer dst.deinit(a);
+    try target.exec("INSERT INTO import_members(id,email) VALUES('keep','keep@example.com');");
+    for ([_][:0]const u8{
+        "DROP INDEX idx_auth_import_members_email; CREATE INDEX idx_auth_import_members_email ON import_members(email);",
+        "DROP INDEX idx_auth_import_members_email; CREATE UNIQUE INDEX idx_auth_import_members_email ON import_members(username) WHERE email != '';",
+        "DROP INDEX idx_auth_import_members_email;",
+        "DROP INDEX idx_auth__superusers_email; CREATE INDEX idx_auth__superusers_email ON _superusers(email);",
+    }, 0..) |sql, i| {
+        try target.exec(sql);
+        if (i == 3) try target.exec("INSERT INTO import_members(id,email) VALUES('keep','keep@example.com');");
+        if (i == 2) {
+            const report = try run(a, &source, &target, .{ .force = true });
+            defer report.deinit(a);
+            try std.testing.expect(try @import("auth_identity_index.zig").verify(a, &target, "import_members", "email"));
+        } else {
+            try std.testing.expectError(error.AuthIdentityIndexConflict, run(a, &source, &target, .{ .force = true }));
+            var row = try target.prepare("SELECT id FROM import_members WHERE id='keep';");
+            defer row.finalize();
+            try std.testing.expect(try row.step());
+        }
+    }
+}
+
+test "dumpload verifies existing auth tables before clearing rows (sqlite)" {
+    try existingIdentityImport(false);
+}
+
+test "dumpload verifies existing auth tables before clearing rows (postgres)" {
+    try existingIdentityImport(true);
 }

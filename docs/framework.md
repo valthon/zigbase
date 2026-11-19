@@ -4837,6 +4837,44 @@ on both backends; case-insensitive identity is opt-in by declaring a `.nocase` i
 field (the pattern the example apps use). One nuance: Postgres `lower()` is locale-aware
 (folds non-ASCII, e.g. `É`→`é`), whereas SQLite `NOCASE` folds ASCII A–Z only.
 
+**Identity index adoption.** Names of the form `idx_auth_<collection>_<field>` are
+reserved for identity enforcement. Before adopting an existing object, the engine verifies
+that it is a valid unique index on the collection's table, over exactly the identity column,
+with the non-empty predicate (`field != ''`). SQLite compares catalog properties and a
+conservative predicate grammar (quoting, whitespace, redundant parentheses and `<>` are
+accepted, but SQLite keywords and boolean literal names require identifier quoting);
+PostgreSQL compares catalog properties and its deparsed predicate. Unsupported
+or unreadable definitions fail closed. SQLite identity columns must have BINARY default
+collation: NOCASE, RTRIM and custom column collations are refused because authentication
+inherits that comparison while the identity index requires BINARY uniqueness. The opt-in
+`.nocase` declared unique index on a BINARY column remains supported. PostgreSQL identity
+indexes must use the column collation, including nondeterministic ICU collations, so
+uniqueness agrees with authentication equality. This applies to collection creation and updates,
+offline rename, database import (including existing tables with `migrate-db --force`),
+superuser auth-options updates, and startup convergence, including runtime-created auth
+collections. PostgreSQL checks indexes in the resolved collection table's schema, even when
+that schema is a later `search_path` entry; temporary table shadows are refused. Declared-index
+adoption and index changes use the collection table's namespace, preserving same-name indexes
+in earlier schemas. PostgreSQL index names are compared case-sensitively after truncation;
+SQLite compares them case-insensitively and ignores same-name triggers when checking index
+occupancy. Search ownership may separately refuse a table outside the first schema.
+SQLite provisioning drops and inspects declared indexes in `main`, preserving temporary
+same-name indexes. A matching identity index is adopted. An incompatible index, table or view is preserved and the operation fails;
+startup refuses to serve. The diagnostic names the collection,
+field and index. Repair it in an explicit migration, checking for duplicate non-empty
+identities before creating the required unique index, then retry. The engine never drops
+an incompatible migration object to repair identity enforcement automatically.
+When an update or provisioning deployment removes an identity field, its old index
+name is no longer trusted for authentication. Incompatible migration-owned objects
+under that name are preserved, even when the deployment also removes a declared
+index with that name; they do not block identity removal. A declaration under that name
+is kept only while it is unchanged or the preserved object already matches it: a new or
+changed declaration (for example, making it unique) is refused, as a REST 400 or a
+startup refusal, with a diagnostic naming the collection and index, rather than recorded
+over an object that does not enforce it. Migrate the object to the declared definition,
+or declare the index under another name, then retry. Remaining or newly added
+identities still require verification.
+
 #### Migrating an existing SQLite instance to Postgres (`migrate-db`)
 
 Once you have built a `-Dpostgres` binary, the `migrate-db` subcommand copies an

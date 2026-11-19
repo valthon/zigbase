@@ -6,6 +6,7 @@ const ddl = @import("ddl.zig");
 const id = @import("id.zig");
 const schema_gen = @import("schema_gen.zig");
 const fts = @import("search/fts.zig");
+const identity_index = @import("auth_identity_index.zig");
 
 /// The JSON parse helpers in schema.zig return the inferred error set of
 /// std.json.parseFromSlice, which is wider than schema.ParseError. Capture it so
@@ -13,7 +14,7 @@ const fts = @import("search/fts.zig");
 const SchemaJsonError = @typeInfo(@typeInfo(@TypeOf(schema.fieldsFromJson)).@"fn".return_type.?).error_union.error_set ||
     @typeInfo(@typeInfo(@TypeOf(schema.indexesFromJson)).@"fn".return_type.?).error_union.error_set;
 
-pub const EngineError = error{ Validation, NotFound, Conflict, UnsafeSqliteRebuild, MigrationObjectConflict, StorageNamespaceMissing } || @import("files/namespace.zig").Error || db.DbError || std.mem.Allocator.Error || schema.ParseError || SchemaJsonError || fts.EnsureIndexError;
+pub const EngineError = error{ Validation, NotFound, Conflict, UnsafeSqliteRebuild, MigrationObjectConflict, StorageNamespaceMissing } || @import("files/namespace.zig").Error || identity_index.Error || db.DbError || std.mem.Allocator.Error || schema.ParseError || SchemaJsonError || fts.EnsureIndexError;
 
 /// Validation details for the most recent failed create/update (2b surfaces these).
 pub threadlocal var last_errors: ?[]const schema.ValidationError = null;
@@ -130,7 +131,7 @@ pub fn create(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, def: schema.Colle
     for (col.indexes) |idx| try w.exec(try sa.dupeSentinel(u8, try ddl.createIndexSql(sa, col.name, idx, d), 0));
     if (col.type == .auth) {
         for (col.options.auth.identityFields) |idf| {
-            try w.exec(try sa.dupeSentinel(u8, try ddl.authIdentityIndexSql(sa, col.name, idf), 0));
+            try identity_index.ensure(sa, w, col.name, idf);
         }
     }
     // The search index (FTS5 shadow table + triggers, or the Postgres tsvector) is part of the
@@ -398,6 +399,11 @@ fn updateImpl(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, id_or_name: []con
     try validateStoredName(alloc, old.name);
     newc.id = try sa.dupe(u8, old.id);
     newc.name = try sa.dupe(u8, old.name);
+    // Only desired identities will trust these names. Removed identities instead
+    // undergo ownership classification below, preserving incompatible objects.
+    if (newc.type == .auth) for (newc.options.auth.identityFields) |field| {
+        _ = try identity_index.verify(sa, w, newc.name, field);
+    };
     const same_definition = expected != null and try definitionEql(sa, old, newc);
     // A provisioning caller (`expected` set) also rebuilds an unchanged SQLite definition whose
     // physical unique constraints do not match it: a table created before #498 enforces a
@@ -420,11 +426,25 @@ fn updateImpl(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, id_or_name: []con
         const newc_full = try schema.injectAuthFields(sa, newc);
         // relation-resolved view for the rebuild's FK generation
         const ddl_new = try resolveRelations(sa, w, newc_full);
+        // Refuse a new or changed declaration a preserved migration replacement would shadow
+        // before any DDL; SQLite preflight relies on every remaining replacement being vetted.
+        const desired_indexes = try declaredIndexesWithoutIdentityReplacements(sa, w, old, ddl_new.indexes);
 
         const migration_objects = if (d.kind == .sqlite)
             try preflightTableObjects(&scratch, w, old, ddl_new, foreign)
         else
             &[_]TableObject{};
+        var plan_old = old;
+        var plan_new = ddl_new;
+        if (d.kind == .postgres) {
+            // The pure DDL planner cannot classify catalog ownership. Remove migration
+            // replacements from its drop input while the schema lock is held.
+            plan_old.indexes = try indexesWithoutIdentityReplacements(sa, w, old, old.indexes);
+        }
+        // Classify before SQLite drops captured migration objects. PostgreSQL retains
+        // them in place; SQLite restores their SQL after rebuilding. Neither may
+        // recreate a retained legacy declaration.
+        plan_new.indexes = desired_indexes;
         // Validate/drop old search state while all old columns still exist. Sync triggers
         // are regenerated from the new definition after the base table has been rebuilt.
         if (d.kind == .sqlite) {
@@ -439,7 +459,8 @@ fn updateImpl(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, id_or_name: []con
         }
         // PostgreSQL alters in place; remove dependent search state only when its operands change.
         if (d.kind == .postgres and !fts.sameSearchColumns(old, newc)) try fts.dropIndexFor(sa, w, old);
-        const plan = try ddl.rebuildPlan(sa, old, ddl_new, d);
+        const namespace = if (d.kind == .postgres) try tableNamespacePg(sa, w, old.name) else null;
+        const plan = try ddl.rebuildPlanInSchema(sa, plan_old, plan_new, d, namespace);
         for (plan) |stmt| try w.exec(try sa.dupeSentinel(u8, stmt, 0));
         // Postgres alters in place, so its field-level unique constraints converge from the
         // catalog: scope changes, unique toggles, and a collection made (un)tenant-owned (#498).
@@ -448,7 +469,7 @@ fn updateImpl(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, id_or_name: []con
         }
         if (newc.type == .auth) {
             for (newc.options.auth.identityFields) |idf| {
-                try w.exec(try sa.dupeSentinel(u8, try ddl.authIdentityIndexSql(sa, newc.name, idf), 0));
+                try identity_index.ensure(sa, w, newc.name, idf);
             }
         }
         if (d.kind == .sqlite or expected != null) try ensureTenantIndex(sa, w, newc);
@@ -601,7 +622,17 @@ pub fn provisionMetadata(alloc: std.mem.Allocator, w: *db.Db, expected: schema.C
         try validateStoredName(alloc, current.name);
         try checkDefinitionSnapshot(a, expected, current);
     }
+    // Refuse only identities this deployment will trust. Reconciliation separately
+    // preserves incompatible objects under removed identity names.
+    if (desired.type == .auth) for (desired.options.auth.identityFields) |field| {
+        _ = try identity_index.verify(a, w, desired.name, field);
+    };
     try reconcileIndexes(alloc, w, current, desired);
+    // Reconciliation may remove a matching declared identity index. Restore it
+    // in this transaction rather than commit a gap before startup convergence.
+    if (desired.type == .auth) for (desired.options.auth.identityFields) |field| {
+        try identity_index.ensure(a, w, desired.name, field);
+    };
     try ensureTenantIndex(a, w, desired);
     try fts.ensureIndex(a, w, desired);
     if (!unchanged) {
@@ -666,6 +697,80 @@ fn userFieldsJson(alloc: std.mem.Allocator, col: schema.Collection) ![]u8 {
     return schema.fieldsToJson(alloc, user_fields.items);
 }
 
+/// Self-freeing; caller frees the namespace of the resolved persistent table.
+fn tableNamespacePg(a: std.mem.Allocator, w: *db.Db, table: []const u8) EngineError![]u8 {
+    const quoted = try ddl.quoteIdent(a, ddl.physicalIdentifier(table, true));
+    defer a.free(quoted);
+    var st = try w.prepare("SELECT ns.nspname FROM pg_class t JOIN pg_namespace ns ON ns.oid=t.relnamespace WHERE t.oid=to_regclass($1) AND t.relkind IN ('r','p') AND t.relpersistence<>'t';");
+    defer st.finalize();
+    try st.bindText(1, quoted);
+    if (!try st.step()) return error.Conflict;
+    return a.dupe(u8, st.columnText(0));
+}
+
+/// Caller frees the returned slice; index contents remain borrowed from metadata.
+fn indexesWithoutIdentityReplacements(a: std.mem.Allocator, w: *db.Db, old: schema.Collection, indexes: []const schema.Index) EngineError![]const schema.Index {
+    var kept: std.ArrayList(schema.Index) = .empty;
+    errdefer kept.deinit(a);
+    for (indexes) |idx| {
+        if (!try preserveIdentityReplacement(a, w, old, idx.name)) try kept.append(a, idx);
+    }
+    return kept.toOwnedSlice(a);
+}
+
+/// Caller frees the returned slice; index contents remain borrowed from `indexes`.
+/// Like indexesWithoutIdentityReplacements, for the DESIRED declarations: a preserved object
+/// may stand in only for a declaration that is unchanged or that the object already matches.
+/// Anything else would be recorded in metadata while a different index stays in force.
+fn declaredIndexesWithoutIdentityReplacements(a: std.mem.Allocator, w: *db.Db, old: schema.Collection, indexes: []const schema.Index) EngineError![]const schema.Index {
+    var kept: std.ArrayList(schema.Index) = .empty;
+    errdefer kept.deinit(a);
+    for (indexes) |idx| {
+        if (!try preserveIdentityReplacement(a, w, old, idx.name)) {
+            try kept.append(a, idx);
+            continue;
+        }
+        try checkPreservedDeclaration(a, w, old, idx);
+    }
+    return kept.toOwnedSlice(a);
+}
+
+/// `idx` names an object preserved as a removed identity's migration replacement, so the
+/// engine will neither drop nor create it. Refuse a new or changed declaration unless the
+/// preserved object already has exactly that definition.
+fn checkPreservedDeclaration(a: std.mem.Allocator, w: *db.Db, old: schema.Collection, idx: schema.Index) EngineError!void {
+    for (old.indexes) |prev| if (indexEql(prev, idx)) return;
+    if (try existingIndex(a, w, old.name, idx) == .matching) {
+        std.log.info("provision: collection '{s}' ADOPT existing index '{s}'", .{ old.name, idx.name });
+        return;
+    }
+    return preservedDeclarationConflict(old.name, idx.name);
+}
+
+fn preservedDeclarationConflict(table: []const u8, name: []const u8) error{MigrationObjectConflict} {
+    last_rebuild_error = std.mem.print(&rebuild_error_buf, "Collection '{s}': declared index '{s}' is new or changed, but the existing object of that name is a removed identity's migration-owned index with a different definition and is preserved, not replaced. Explicitly migrate that object to the declared definition (or drop it, or declare the index under another name), then retry.", .{ table[0..@min(table.len, 256)], name[0..@min(name.len, 768)] }) catch unreachable;
+    std.log.warn("{s}", .{last_rebuild_error});
+    return error.MigrationObjectConflict;
+}
+
+fn preserveIdentityReplacement(a: std.mem.Allocator, w: *db.Db, old: schema.Collection, name: []const u8) EngineError!bool {
+    if (old.type != .auth) return false;
+    const pg = db.dbDialect(w).kind == .postgres;
+    for (old.options.auth.identityFields) |field| {
+        const identity_name = try ddl.authIdentityIndexName(a, old.name, field);
+        defer a.free(identity_name);
+        const physical_name = ddl.physicalIdentifier(name, pg);
+        const physical_identity = ddl.physicalIdentifier(identity_name, pg);
+        const same_name = if (pg) std.mem.eql(u8, physical_name, physical_identity) else std.ascii.eqlIgnoreCase(physical_name, physical_identity);
+        if (!same_name) continue;
+        _ = identity_index.verify(a, w, old.name, field) catch |err| switch (err) {
+            error.AuthIdentityIndexConflict => return true,
+            else => return err,
+        };
+    }
+    return false;
+}
+
 /// Caller owns the metadata transaction and generation bump. Reconcile declared
 /// indexes without rebuilding records or touching migration-owned objects.
 fn reconcileIndexes(alloc: std.mem.Allocator, w: *db.Db, old: schema.Collection, desired: schema.Collection) EngineError!void {
@@ -695,6 +800,7 @@ fn reconcileIndexes(alloc: std.mem.Allocator, w: *db.Db, old: schema.Collection,
         return error.Validation;
     }
     const d = db.dbDialect(w);
+    const namespace: []const u8 = if (d.kind == .postgres) try tableNamespacePg(sa, w, old.name) else "main";
     // Only names recorded as belonging to this collection may be dropped. In particular,
     // never DROP a newly declared name: an unrelated migration/collection may own it.
     for (old.indexes) |idx| {
@@ -702,8 +808,9 @@ fn reconcileIndexes(alloc: std.mem.Allocator, w: *db.Db, old: schema.Collection,
             if (indexEql(idx, next)) break true;
         } else false;
         if (!unchanged) {
+            if (try preserveIdentityReplacement(sa, w, old, idx.name)) continue;
             std.log.info("provision: collection '{s}' DROP index '{s}'", .{ old.name, idx.name });
-            w.exec(try sa.printSentinel("DROP INDEX IF EXISTS {s};", .{try ddl.quoteIdent(sa, idx.name)}, 0)) catch |err| {
+            w.exec(try sa.printSentinel("DROP INDEX IF EXISTS {s};", .{try ddl.quoteQualifiedIdent(sa, namespace, idx.name)}, 0)) catch |err| {
                 std.log.warn("provision: collection '{s}' index '{s}' DROP failed: {s}; {s}", .{ old.name, idx.name, @errorName(err), w.errMsg() });
                 return err;
             };
@@ -714,6 +821,12 @@ fn reconcileIndexes(alloc: std.mem.Allocator, w: *db.Db, old: schema.Collection,
             if (indexEql(prev, idx)) break true;
         } else false;
         if (!unchanged) {
+            // A preserved removed-identity object is neither dropped nor replaced above, so
+            // the generic adoption check below would only report a bare CREATE refusal.
+            if (try preserveIdentityReplacement(sa, w, old, idx.name)) {
+                try checkPreservedDeclaration(sa, w, old, idx);
+                continue;
+            }
             switch (try existingIndex(sa, w, old.name, idx)) {
                 .matching => {
                     std.log.info("provision: collection '{s}' ADOPT existing index '{s}'", .{ old.name, idx.name });
@@ -726,7 +839,7 @@ fn reconcileIndexes(alloc: std.mem.Allocator, w: *db.Db, old: schema.Collection,
                 .absent => {},
             }
             std.log.info("provision: collection '{s}' CREATE index '{s}'", .{ old.name, idx.name });
-            w.exec(try sa.dupeSentinel(u8, try ddl.createIndexSql(sa, old.name, idx, d), 0)) catch |err| {
+            w.exec(try sa.dupeSentinel(u8, try ddl.createIndexSqlInSchema(sa, old.name, idx, d, namespace), 0)) catch |err| {
                 std.log.warn("provision: collection '{s}' index '{s}' CREATE failed: {s}; {s}; startup refused", .{ old.name, idx.name, @errorName(err), w.errMsg() });
                 return err;
             };
@@ -753,13 +866,14 @@ fn existingIndex(alloc: std.mem.Allocator, w: *db.Db, table: []const u8, idx: sc
     // indnullsnotdistinct was introduced in PostgreSQL 15. Catalog-row JSON keeps
     // older servers compatible: absence means their only supported NULLS DISTINCT.
     var st = try w.prepare(if (pg)
-        "SELECT t.relname, i.indisunique::int, i.indisvalid::int, i.indnatts, i.indnkeyatts, (i.indpred IS NULL)::int, am.amname, (NOT EXISTS (SELECT 1 FROM pg_constraint c WHERE c.conindid=i.indexrelid))::int, COALESCE((to_jsonb(i)->>'indnullsnotdistinct')::boolean, false)::int FROM pg_class n JOIN pg_namespace ns ON ns.oid=n.relnamespace LEFT JOIN pg_index i ON i.indexrelid=n.oid LEFT JOIN pg_class t ON t.oid=i.indrelid LEFT JOIN pg_am am ON am.oid=n.relam WHERE ns.nspname=current_schema() AND n.relname=$1;"
+        "SELECT t.relname, i.indisunique::int, i.indisvalid::int, i.indnatts, i.indnkeyatts, (i.indpred IS NULL)::int, am.amname, (NOT EXISTS (SELECT 1 FROM pg_constraint c WHERE c.conindid=i.indexrelid))::int, COALESCE((to_jsonb(i)->>'indnullsnotdistinct')::boolean, false)::int FROM pg_class n JOIN pg_namespace ns ON ns.oid=n.relnamespace LEFT JOIN pg_index i ON i.indexrelid=n.oid LEFT JOIN pg_class t ON t.oid=i.indrelid LEFT JOIN pg_am am ON am.oid=n.relam WHERE n.relnamespace=(SELECT relnamespace FROM pg_class WHERE oid=to_regclass($2)) AND n.relname=$1;"
     else
-        "SELECT tbl_name FROM sqlite_master WHERE name=?1 COLLATE NOCASE;");
+        "SELECT tbl_name FROM sqlite_master WHERE type IN ('table','view','index') AND name=?1 COLLATE NOCASE;");
     defer st.finalize();
-    try st.bindText(1, idx.name);
+    try st.bindText(1, ddl.physicalIdentifier(idx.name, pg));
+    if (pg) try st.bindText(2, try ddl.quoteIdent(a, ddl.physicalIdentifier(table, true)));
     if (!try st.step()) return .absent;
-    if (!std.mem.eql(u8, st.columnText(0), table) or idx.where != null) return .conflicting;
+    if (!std.mem.eql(u8, st.columnText(0), ddl.physicalIdentifier(table, pg)) or idx.where != null) return .conflicting;
     if (pg) {
         if (st.columnInt(1) != @intFromBool(idx.unique) or st.columnInt(2) != 1 or
             st.columnInt(3) != idx.fields.len or st.columnInt(4) != idx.fields.len or
@@ -767,12 +881,15 @@ fn existingIndex(alloc: std.mem.Allocator, w: *db.Db, table: []const u8, idx: sc
             st.columnInt(8) != 0) return .conflicting;
         // Column-only pg_get_indexdef omits ordering/opclass/collation decorations;
         // check those catalog properties separately before comparing the expression.
-        var cols = try w.prepare("SELECT pg_get_indexdef(n.oid, k, true), i.indoption[k-1], op.opcdefault::int, (i.indcollation[k-1] = (SELECT a.attcollation FROM pg_attribute a WHERE a.attrelid=i.indrelid AND a.attname=(string_to_array($3, ','))[k]))::int FROM pg_class n JOIN pg_namespace ns ON ns.oid=n.relnamespace JOIN pg_index i ON i.indexrelid=n.oid CROSS JOIN generate_series(1, $2::int) k JOIN pg_opclass op ON op.oid=i.indclass[k-1] WHERE ns.nspname=current_schema() AND n.relname=$1 ORDER BY k;");
+        var cols = try w.prepare("SELECT pg_get_indexdef(n.oid, k, true), i.indoption[k-1], op.opcdefault::int, (i.indcollation[k-1] = (SELECT a.attcollation FROM pg_attribute a WHERE a.attrelid=i.indrelid AND a.attname=(string_to_array($3, ','))[k]))::int FROM pg_class n JOIN pg_namespace ns ON ns.oid=n.relnamespace JOIN pg_index i ON i.indexrelid=n.oid CROSS JOIN generate_series(1, $2::int) k JOIN pg_opclass op ON op.oid=i.indclass[k-1] WHERE n.relnamespace=(SELECT relnamespace FROM pg_class WHERE oid=to_regclass($4)) AND n.relname=$1 ORDER BY k;");
         defer cols.finalize();
-        try cols.bindText(1, idx.name);
+        try cols.bindText(1, ddl.physicalIdentifier(idx.name, true));
         try cols.bindInt(2, @intCast(idx.fields.len));
-        try cols.bindText(3, try std.mem.join(a, ",", idx.fields));
-        for (idx.fields) |field| {
+        const physical_fields = try a.alloc([]const u8, idx.fields.len);
+        for (idx.fields, physical_fields) |field, *physical| physical.* = ddl.physicalIdentifier(field, true);
+        try cols.bindText(3, try std.mem.join(a, ",", physical_fields));
+        try cols.bindText(4, try ddl.quoteIdent(a, ddl.physicalIdentifier(table, true)));
+        for (physical_fields) |field| {
             if (!try cols.step()) return .conflicting;
             if (cols.columnInt(1) != 0 or cols.columnInt(2) != 1 or cols.columnInt(3) != 1) return .conflicting;
             const quoted = try ddl.quoteIdent(a, field);
@@ -787,7 +904,7 @@ fn existingIndex(alloc: std.mem.Allocator, w: *db.Db, table: []const u8, idx: sc
         try props.bindText(2, idx.name);
         if (!try props.step() or props.columnInt(0) != @intFromBool(idx.unique) or
             !std.mem.eql(u8, props.columnText(1), "c") or props.columnInt(2) != 0) return .conflicting;
-        var cols = try w.prepare("SELECT name, \"desc\", coll FROM pragma_index_xinfo(?1) WHERE key=1 ORDER BY seqno;");
+        var cols = try w.prepare("SELECT name, \"desc\", coll FROM pragma_index_xinfo(?1, 'main') WHERE key=1 ORDER BY seqno;");
         defer cols.finalize();
         try cols.bindText(1, idx.name);
         for (idx.fields) |field| {
@@ -1422,7 +1539,7 @@ fn constraintColsEql(a: []const []const u8, b: []const []const u8, postgres: boo
     if (!postgres) return colsEql(a, b);
     if (a.len != b.len) return false;
     for (a, b) |physical, metadata| {
-        if (!std.mem.eql(u8, physical, metadata[0..@min(metadata.len, 63)])) return false;
+        if (!std.mem.eql(u8, physical, ddl.physicalIdentifier(metadata, true))) return false;
     }
     return true;
 }
@@ -1519,7 +1636,7 @@ fn reconcileUniqueConstraintsPg(alloc: std.mem.Allocator, w: *db.Db, old: ?schem
 /// table-wide: Postgres swaps the constraints in place, SQLite rebuilds the table (the only way
 /// it can drop an inline column constraint). A no-op for a collection that already matches, so
 /// it is safe on every boot and under concurrent boots (the rebuild re-checks under the lock).
-/// Auth collections are excluded; their physical uniqueness remains as on main.
+/// Auth collections verify/restore their configured identity indexes only.
 pub fn ensureUniqueScopes(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, name: []const u8) EngineError!void {
     var scratch = std.heap.ArenaAllocator.init(alloc);
     defer scratch.deinit();
@@ -1541,8 +1658,10 @@ pub fn ensureUniqueScopes(alloc: std.mem.Allocator, io: std.Io, w: *db.Db, name:
         try tx.commit();
         return;
     };
-    // Auth keeps main's physical uniqueness, including legacy non-identity usernames.
+    // Fail fast at boot, including for runtime-created auth collections. Leave
+    // non-identity uniqueness (such as legacy usernames) alone.
     if (live.type == .auth) {
+        for (live.options.auth.identityFields) |field| try identity_index.ensure(sa, w, live.name, field);
         try tx.commit();
         return;
     }
@@ -1568,7 +1687,6 @@ pub fn ensureAllUniqueScopes(alloc: std.mem.Allocator, io: std.Io, w: *db.Db) En
     defer scratch.deinit();
     const sa = scratch.allocator();
     for (try list(sa, w)) |col| {
-        if (col.type == .auth) continue;
         try ensureUniqueScopes(alloc, io, w, col.id);
     }
 }
@@ -1661,6 +1779,16 @@ fn sameTableObject(a: TableObject, b: TableObject) bool {
         @import("sql/schema_check.zig").whitespaceEql(a.sql, b.sql);
 }
 
+fn verifiedIdentityObject(alloc: std.mem.Allocator, w: *db.Db, col: schema.Collection, obj: TableObject) EngineError!bool {
+    if (col.type != .auth or obj.kind != .index) return false;
+    for (col.options.auth.identityFields) |field| {
+        const name = try ddl.authIdentityIndexName(alloc, col.name, field);
+        defer alloc.free(name);
+        if (std.ascii.eqlIgnoreCase(obj.name, name)) return identity_index.owns(alloc, w, col.name, field);
+    }
+    return false;
+}
+
 fn unsafeSqliteRebuild(table: []const u8, object: []const u8, reason: []const u8) error{UnsafeSqliteRebuild} {
     last_rebuild_error = std.mem.print(&rebuild_error_buf, "Collection '{s}': {s} '{s}'; use an explicit migration before changing the collection.", .{ table[0..@min(table.len, 256)], reason, object[0..@min(object.len, 768)] }) catch unreachable;
     std.log.warn("{s}", .{last_rebuild_error});
@@ -1718,6 +1846,11 @@ fn preflightTableObjects(scratch: *std.heap.ArenaAllocator, w: *db.Db, old: sche
                 .sql = occupied.columnText(2),
                 .kind = if (std.mem.eql(u8, kind, "trigger")) .trigger else if (std.mem.eql(u8, kind, "index")) .index else .table,
             };
+            if (try verifiedIdentityObject(alloc, w, new, obj)) continue :occupants;
+            // A removed identity's preserved replacement is restored as-is after the rebuild,
+            // never regenerated; updateImpl has already refused any declaration it would shadow
+            // unless the declaration is unchanged or the object already matches it.
+            if (obj.kind == .index and try preserveIdentityReplacement(alloc, w, old, obj.name)) continue :occupants;
             for (old_engine) |owned| if (sameTableObject(obj, owned)) continue :occupants;
             return migrationObjectConflict(obj.name, generated.name);
         }
@@ -1746,7 +1879,13 @@ fn preflightTableObjects(scratch: *std.heap.ArenaAllocator, w: *db.Db, old: sche
     }
     var migrations_owned: std.ArrayList(TableObject) = .empty;
     objects: for (actual) |obj| {
-        for (old_engine) |generated| if (sameTableObject(obj, generated)) continue :objects;
+        if (try verifiedIdentityObject(alloc, w, old, obj) or try verifiedIdentityObject(alloc, w, new, obj)) continue :objects;
+        // Legacy metadata can itself declare an incompatible identity-name index.
+        // Matching that declaration's SQL does not confer engine ownership.
+        const identity_replacement = obj.kind == .index and try preserveIdentityReplacement(alloc, w, old, obj.name);
+        if (!identity_replacement) for (old_engine) |generated| {
+            if (sameTableObject(obj, generated)) continue :objects;
+        };
         if (layout_changed and obj.kind == .trigger and @import("sql/schema_check.zig").hasLayoutDependency(obj.sql, old.name))
             return migrationObjectConflict(obj.name, "column layout (wildcard or positional dependency)");
         // Constraint autoindexes have no stored SQL (absent from old_engine) and a rebuild does

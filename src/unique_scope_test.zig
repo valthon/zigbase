@@ -432,7 +432,7 @@ test "startup convergence uses metadata reloaded after the lock (postgres)" {
     try std.testing.expect(live.options.tenant_field == null);
 }
 
-test "auth identity changes retain main engine and custom indexes (postgres)" {
+test "auth identity changes retain engine indexes and custom replacements (postgres)" {
     const a = std.testing.allocator;
     // Both a generated index and a same-name migration replacement are exercised.
     inline for (.{ false, true }) |custom| {
@@ -468,6 +468,297 @@ test "auth identity changes retain main engine and custom indexes (postgres)" {
         const unscoped = try collections.update(a, std.testing.io, w, col.id, def);
         defer unscoped.deinit(a);
         try std.testing.expect(try indexExists(w, "idx_auth_slugs_email"));
+    }
+}
+
+const IdentityObject = struct {
+    oid: i64,
+    definition: []const u8,
+
+    fn read(a: std.mem.Allocator, w: *db.Db) !IdentityObject {
+        return readNamed(a, w, "idx_auth_slugs_slug");
+    }
+
+    fn readNamed(a: std.mem.Allocator, w: *db.Db, name: []const u8) !IdentityObject {
+        var st = try w.prepare(if (db.dbDialect(w).kind == .postgres)
+            "SELECT oid,CASE WHEN relkind='i' THEN pg_get_indexdef(oid) WHEN relkind='v' THEN pg_get_viewdef(oid) ELSE relkind::text END FROM pg_class WHERE relnamespace=current_schema()::regnamespace AND relname=$1;"
+        else
+            "SELECT rootpage,sql FROM main.sqlite_schema WHERE name=?1;");
+        defer st.finalize();
+        try st.bindText(1, @import("ddl.zig").physicalIdentifier(name, db.dbDialect(w).kind == .postgres));
+        try std.testing.expect(try st.step());
+        return .{ .oid = st.columnInt(0), .definition = try a.dupe(u8, st.columnText(1)) };
+    }
+
+    fn deinit(self: IdentityObject, a: std.mem.Allocator) void {
+        a.free(self.definition);
+    }
+
+    fn expectUnchanged(self: IdentityObject, a: std.mem.Allocator, w: *db.Db) !void {
+        const after = try read(a, w);
+        defer after.deinit(a);
+        try std.testing.expectEqual(self.oid, after.oid);
+        try std.testing.expectEqualStrings(self.definition, after.definition);
+    }
+};
+
+fn identityIndexDefinitions(comptime backend: Backend) !void {
+    const a = std.testing.allocator;
+    const identity = @import("auth_identity_index.zig");
+    const cases = [_][:0]const u8{
+        "CREATE UNIQUE INDEX idx_auth_slugs_slug ON slugs(slug) WHERE ((slug) <> (''));",
+        "CREATE INDEX idx_auth_slugs_slug ON slugs(slug) WHERE slug != '';",
+        "CREATE UNIQUE INDEX idx_auth_slugs_slug ON slugs(account) WHERE slug != '';",
+        "CREATE UNIQUE INDEX idx_auth_slugs_slug ON slugs(slug,account) WHERE slug != '';",
+        "CREATE UNIQUE INDEX idx_auth_slugs_slug ON slugs(slug) WHERE slug != 'excluded';",
+        "CREATE UNIQUE INDEX idx_auth_slugs_slug ON slugs(slug);",
+        "CREATE UNIQUE INDEX idx_auth_slugs_slug ON slugs(slug) WHERE slug != '' AND account != '';",
+        "CREATE UNIQUE INDEX idx_auth_slugs_slug ON migration_identities(slug) WHERE slug != '';",
+        "CREATE TABLE idx_auth_slugs_slug(note TEXT); INSERT INTO idx_auth_slugs_slug VALUES('keep');",
+        "CREATE VIEW idx_auth_slugs_slug AS SELECT 'keep' AS note;",
+        "CREATE UNIQUE INDEX idx_auth_slugs_slug ON slugs(lower(slug)) WHERE slug != '';",
+        "CREATE UNIQUE INDEX idx_auth_slugs_slug ON slugs(slug DESC) WHERE slug != '';",
+    };
+    for (cases, 0..) |sql, i| {
+        var c = try Conn.open(backend, "identity_definitions");
+        defer c.deinit();
+        const w = &c.db;
+        var def = slugs(null, &.{});
+        def.type = .auth;
+        def.options.auth.identityFields = &.{"slug"};
+        var identity_fields = fields_plain;
+        identity_fields[1].unique = false;
+        def.fields = &identity_fields;
+        const col = try collections.create(a, std.testing.io, w, def);
+        defer col.deinit(a);
+        try w.exec("DROP INDEX idx_auth_slugs_slug; CREATE TABLE migration_identities(slug TEXT);");
+        try w.exec(sql);
+        const before = try IdentityObject.read(a, w);
+        defer before.deinit(a);
+        if (i == 0) {
+            try collections.ensureAllUniqueScopes(a, std.testing.io, w);
+            try before.expectUnchanged(a, w); // adoption does not replace the migration's index
+            const updated = try collections.update(a, std.testing.io, w, col.id, def);
+            defer updated.deinit(a);
+            try std.testing.expect(try identity.verify(a, w, "slugs", "slug"));
+            try w.exec("INSERT INTO slugs(id,slug) VALUES('first','same');");
+            try std.testing.expectError(error.ExecFailed, w.exec("INSERT INTO slugs(id,slug) VALUES('duplicate','same');"));
+            try w.exec("INSERT INTO slugs(id,slug) VALUES('empty1',''),('empty2','');");
+            continue;
+        }
+        try std.testing.expectError(error.AuthIdentityIndexConflict, collections.ensureAllUniqueScopes(a, std.testing.io, w));
+        try std.testing.expect(std.mem.indexOf(u8, identity.last_error, "Collection 'slugs', identity field 'slug'") != null);
+        try std.testing.expect(std.mem.indexOf(u8, identity.last_error, "idx_auth_slugs_slug") != null);
+        try before.expectUnchanged(a, w);
+        try std.testing.expectError(error.AuthIdentityIndexConflict, collections.update(a, std.testing.io, w, col.id, def));
+        try before.expectUnchanged(a, w);
+        // Removing the identity preserves incompatible migration objects without
+        // trusting them. Re-adding it must still refuse.
+        def.options.auth.identityFields = &.{"email"};
+        const removed = try collections.update(a, std.testing.io, w, col.id, def);
+        defer removed.deinit(a);
+        const after = try IdentityObject.read(a, w);
+        defer after.deinit(a);
+        try std.testing.expectEqualStrings(before.definition, after.definition);
+        if (backend == .postgres) try std.testing.expectEqual(before.oid, after.oid);
+        try std.testing.expect(try identity.verify(a, w, "slugs", "email"));
+        def.options.auth.identityFields = &.{"slug"};
+        try std.testing.expectError(error.AuthIdentityIndexConflict, collections.update(a, std.testing.io, w, col.id, def));
+        try after.expectUnchanged(a, w);
+        if (i == 8 or i == 9) try std.testing.expectEqual(@as(i64, 1), try count(w, "SELECT count(*) FROM idx_auth_slugs_slug WHERE note='keep';"));
+    }
+}
+
+test "auth identity index definitions are verified before startup and update (sqlite)" {
+    try identityIndexDefinitions(.sqlite);
+}
+
+test "auth identity index definitions are verified before startup and update (postgres)" {
+    try identityIndexDefinitions(.postgres);
+}
+
+fn identityCreateCollisions(comptime backend: Backend) !void {
+    const a = std.testing.allocator;
+    inline for (.{
+        "CREATE INDEX idx_auth_slugs_slug ON migration_identities(slug);",
+        "CREATE UNIQUE INDEX idx_auth_slugs_slug ON migration_identities(slug) WHERE slug != '';",
+        "CREATE TABLE idx_auth_slugs_slug(note TEXT); INSERT INTO idx_auth_slugs_slug VALUES('keep');",
+        "CREATE VIEW idx_auth_slugs_slug AS SELECT 'keep' AS note;",
+    }) |sql| {
+        var c = try Conn.open(backend, "identity_create");
+        defer c.deinit();
+        const w = &c.db;
+        try w.exec("CREATE TABLE migration_identities(slug TEXT);");
+        try w.exec(sql);
+        const before = try IdentityObject.read(a, w);
+        defer before.deinit(a);
+        var def = slugs(null, &.{});
+        def.type = .auth;
+        def.options.auth.identityFields = &.{"slug"};
+        try std.testing.expectError(error.AuthIdentityIndexConflict, collections.create(a, std.testing.io, w, def));
+        try before.expectUnchanged(a, w);
+        try std.testing.expect((try collections.get(a, w, "slugs")) == null);
+    }
+}
+
+test "auth identity index create refuses migration name collisions (sqlite)" {
+    try identityCreateCollisions(.sqlite);
+}
+
+test "auth identity index create refuses migration name collisions (postgres)" {
+    try identityCreateCollisions(.postgres);
+}
+
+fn declaredIdentityAdoption(comptime backend: Backend) !void {
+    const a = std.testing.allocator;
+    var c = try Conn.open(backend, "identity_declared");
+    defer c.deinit();
+    const w = &c.db;
+    var def = slugs(null, &.{.{ .name = "idx_auth_slugs_slug", .fields = &.{"slug"}, .unique = true, .where = "slug <> ''" }});
+    var identity_fields = fields_plain;
+    identity_fields[1].unique = false;
+    def.fields = &identity_fields;
+    def.type = .auth;
+    def.options.auth.identityFields = &.{"slug"};
+    // The declared matching index exists before auth provisioning reaches it.
+    const col = try collections.create(a, std.testing.io, w, def);
+    defer col.deinit(a);
+    const before = try IdentityObject.read(a, w);
+    defer before.deinit(a);
+    try collections.ensureAllUniqueScopes(a, std.testing.io, w);
+    try before.expectUnchanged(a, w);
+    def.indexes = &.{};
+    try provision.applySpecs(a, std.testing.io, w, &.{def});
+    try std.testing.expect(try @import("auth_identity_index.zig").verify(a, w, "slugs", "slug"));
+    try w.exec("DROP INDEX idx_auth_slugs_slug;");
+    try collections.ensureAllUniqueScopes(a, std.testing.io, w);
+    try std.testing.expect(try @import("auth_identity_index.zig").verify(a, w, "slugs", "slug"));
+    try w.exec("INSERT INTO slugs(id,slug) VALUES('first','same');");
+    try std.testing.expectError(error.ExecFailed, w.exec("INSERT INTO slugs(id,slug) VALUES('duplicate','same');"));
+    try w.exec("INSERT INTO slugs(id,slug) VALUES('empty1',''),('empty2','');");
+}
+
+test "matching declared auth identity index is adopted and missing indexes restored (sqlite)" {
+    try declaredIdentityAdoption(.sqlite);
+}
+
+test "matching declared auth identity index is adopted and missing indexes restored (postgres)" {
+    try declaredIdentityAdoption(.postgres);
+}
+
+fn provisioningIdentityReplacement(comptime backend: Backend) !void {
+    const a = std.testing.allocator;
+    for ([_][:0]const u8{
+        "CREATE INDEX idx_auth_slugs_slug ON slugs(account);",
+        "CREATE UNIQUE INDEX idx_auth_slugs_slug ON slugs(slug);",
+        "CREATE UNIQUE INDEX idx_auth_slugs_slug ON slugs(slug) WHERE slug != 'excluded';",
+    }) |replacement| {
+        var c = try Conn.open(backend, "identity_provision_replacement");
+        defer c.deinit();
+        const w = &c.db;
+        var def = slugs(null, &.{.{ .name = "idx_auth_slugs_slug", .fields = &.{"slug"}, .unique = true, .where = "slug <> ''" }});
+        def.type = .auth;
+        def.options.auth.identityFields = &.{"slug"};
+        const col = try collections.create(a, std.testing.io, w, def);
+        defer col.deinit(a);
+        try w.exec("DROP INDEX idx_auth_slugs_slug;");
+        try w.exec(replacement);
+        const before = try IdentityObject.read(a, w);
+        defer before.deinit(a);
+        const generation = try schema_gen.read(w);
+        // The next deployment removes the declaration, while auth still relies
+        // on the same name. Reconciliation must not drop the migration's object.
+        def.indexes = &.{};
+        try std.testing.expectError(error.AuthIdentityIndexConflict, provision.applySpecs(a, std.testing.io, w, &.{def}));
+        try before.expectUnchanged(a, w);
+        try std.testing.expectEqual(generation, try schema_gen.read(w));
+        const stored = (try collections.get(a, w, col.id)).?;
+        defer stored.deinit(a);
+        try std.testing.expectEqual(@as(usize, 1), stored.indexes.len);
+        try std.testing.expectEqualStrings("idx_auth_slugs_slug", stored.indexes[0].name);
+        // Removing both the identity and its declaration preserves the replacement.
+        // applySpecs retains stored auth options; exercise the metadata API directly.
+        var desired = stored;
+        desired.options.auth.identityFields = &.{"email"};
+        desired.indexes = &.{};
+        try collections.provisionMetadata(a, w, stored, desired);
+        try before.expectUnchanged(a, w);
+        const removed = (try collections.get(a, w, col.id)).?;
+        defer removed.deinit(a);
+        try std.testing.expectEqual(@as(usize, 0), removed.indexes.len);
+        try std.testing.expectEqualStrings("email", removed.options.auth.identityFields[0]);
+        try std.testing.expect(try @import("auth_identity_index.zig").verify(a, w, "slugs", "email"));
+        try collections.ensureAllUniqueScopes(a, std.testing.io, w);
+        try before.expectUnchanged(a, w);
+    }
+}
+
+test "provisioning preserves replacements and refuses only desired identities (sqlite)" {
+    try provisioningIdentityReplacement(.sqlite);
+}
+
+test "provisioning preserves replacements and refuses only desired identities (postgres)" {
+    try provisioningIdentityReplacement(.postgres);
+}
+
+test "provisioning preserves PostgreSQL identity replacements with truncated declared names" {
+    const a = std.testing.allocator;
+    const identity = @import("auth_identity_index.zig");
+    inline for (.{
+        .{ "identity_collection_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "slug" },
+        .{ "slugs", "identity_field_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" },
+    }) |names| {
+        var c = try Conn.open(.postgres, "identity_long_name");
+        defer c.deinit();
+        const w = &c.db;
+        const table = names[0];
+        const field = names[1];
+        const name = "idx_auth_" ++ table ++ "_" ++ field;
+        try std.testing.expect(name.len > 63);
+        var fields = fields_plain;
+        fields[1].name = field;
+        fields[1].unique = false;
+        var def = slugs(null, &.{.{ .name = name, .fields = &.{field}, .unique = true, .where = field ++ " <> ''" }});
+        def.name = table;
+        def.fields = &fields;
+        def.type = .auth;
+        def.options.auth.identityFields = &.{field};
+        const col = try collections.create(a, std.testing.io, w, def);
+        defer col.deinit(a);
+        try std.testing.expect(try identity.verify(a, w, table, field));
+        try w.exec("DROP INDEX " ++ name ++ "; CREATE INDEX " ++ name ++ " ON " ++ table ++ "(account);");
+        const before = try IdentityObject.readNamed(a, w, name);
+        defer before.deinit(a);
+        var desired = col;
+        desired.indexes = &.{};
+        try std.testing.expectError(error.AuthIdentityIndexConflict, collections.provisionMetadata(a, w, col, desired));
+        desired.options.auth.identityFields = &.{"email"};
+        try collections.provisionMetadata(a, w, col, desired);
+        const after = try IdentityObject.readNamed(a, w, name);
+        defer after.deinit(a);
+        try std.testing.expectEqual(before.oid, after.oid);
+        try std.testing.expectEqualStrings(before.definition, after.definition);
+        const stored = (try collections.get(a, w, col.id)).?;
+        defer stored.deinit(a);
+        try std.testing.expectEqual(@as(usize, 0), stored.indexes.len);
+        try std.testing.expectEqualStrings("email", stored.options.auth.identityFields[0]);
+        try std.testing.expect(try identity.verify(a, w, table, "email"));
+        // Both verification entry points must find the same truncated object.
+        try std.testing.expect(!try identity.owns(a, w, table, field));
+        desired.options.auth.identityFields = &.{field};
+        try std.testing.expectError(error.AuthIdentityIndexConflict, collections.provisionMetadata(a, w, stored, desired));
+        // Ordinary-index adoption also compares metadata against catalog names.
+        const ordinary = "declared_index_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+        try w.exec("CREATE INDEX " ++ ordinary ++ " ON " ++ table ++ "(" ++ field ++ ");");
+        const adopted_before = try IdentityObject.readNamed(a, w, ordinary);
+        defer adopted_before.deinit(a);
+        desired = stored;
+        desired.indexes = &.{.{ .name = ordinary, .fields = &.{field} }};
+        try collections.provisionMetadata(a, w, stored, desired);
+        const adopted_after = try IdentityObject.readNamed(a, w, ordinary);
+        defer adopted_after.deinit(a);
+        try std.testing.expectEqual(adopted_before.oid, adopted_after.oid);
+        try std.testing.expectEqualStrings(adopted_before.definition, adopted_after.definition);
     }
 }
 
@@ -859,4 +1150,478 @@ test "SQLite unique-scope drift reads main, not a TEMP table of the same name" {
     try c.db.exec("CREATE TEMP TABLE slugs(id TEXT PRIMARY KEY, created TEXT, updated TEXT, account TEXT, slug TEXT, UNIQUE(account, slug));");
     // Drift must be detected on main; the TEMP shadow then refuses the rebuild before DDL.
     try std.testing.expectError(error.UnsafeSqliteRebuild, collections.ensureAllUniqueScopes(a, std.testing.io, &c.db));
+}
+
+test "PostgreSQL identity lookup follows the resolved table namespace and rejects temp shadows" {
+    var c = try Conn.open(.postgres, "identity_search_path");
+    defer c.deinit();
+    const w = &c.db;
+    const a = std.testing.allocator;
+    const identity = @import("auth_identity_index.zig");
+    try w.exec("CREATE TABLE path_members(email TEXT);");
+    try identity.ensure(a, w, "path_members", "email");
+    // The first schema exists but the table resolves in the second schema.
+    try w.exec("SET search_path TO public, zb_uniq_identity_search_path;");
+    try std.testing.expect(try identity.verify(a, w, "path_members", "email"));
+    try identity.ensure(a, w, "path_members", "email");
+    try w.exec("DROP INDEX zb_uniq_identity_search_path.idx_auth_path_members_email;");
+    try identity.ensure(a, w, "path_members", "email");
+    try std.testing.expect(try identity.verify(a, w, "path_members", "email"));
+    try w.exec("CREATE TEMP TABLE path_members(email TEXT);");
+    try std.testing.expectError(error.AuthIdentityIndexConflict, identity.ensure(a, w, "path_members", "email"));
+    try w.exec("CREATE UNIQUE INDEX idx_auth_path_members_email ON path_members(email) WHERE email != '';");
+    try std.testing.expectError(error.AuthIdentityIndexConflict, identity.ensure(a, w, "path_members", "email"));
+}
+
+test "PostgreSQL updates preserve removed identity migration replacements" {
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |keep_declaration| {
+        var c = try Conn.open(.postgres, "identity_update_replacement");
+        defer c.deinit();
+        const w = &c.db;
+        var def = slugs(null, &.{.{ .name = "idx_auth_slugs_slug", .fields = &.{"slug"}, .unique = true, .where = "slug <> ''" }});
+        def.type = .auth;
+        def.options.auth.identityFields = &.{"slug"};
+        const col = try collections.create(a, std.testing.io, w, def);
+        defer col.deinit(a);
+        try w.exec("DROP INDEX idx_auth_slugs_slug;");
+        try w.exec("CREATE INDEX idx_auth_slugs_slug ON slugs(account);");
+        const before = try IdentityObject.read(a, w);
+        defer before.deinit(a);
+        def.options.auth.identityFields = &.{"email"};
+        if (!keep_declaration) def.indexes = &.{};
+        const updated = try collections.update(a, std.testing.io, w, col.id, def);
+        defer updated.deinit(a);
+        try before.expectUnchanged(a, w);
+        try std.testing.expect(try @import("auth_identity_index.zig").verify(a, w, "slugs", "email"));
+    }
+}
+
+const CrossSchemaOperation = enum { update, update_remove, provision_remove, provision_create, plan_remove, plan_recreate };
+
+fn crossSchemaChange(comptime operation: CrossSchemaOperation, a: std.mem.Allocator, w: *db.Db, created: schema.Collection, definition: schema.Collection) !void {
+    switch (operation) {
+        .plan_remove, .plan_recreate => {
+            const ddl = @import("ddl.zig");
+            var desired = created;
+            if (operation == .plan_remove) desired.indexes = &.{};
+            const plan = try ddl.rebuildPlanInSchema(a, created, desired, .postgres, "public");
+            defer {
+                for (plan) |stmt| a.free(stmt);
+                a.free(plan);
+            }
+            try w.begin();
+            errdefer w.rollback() catch |err| std.debug.panic("planner test rollback: {s}", .{@errorName(err)});
+            try schema_gen.lock(w);
+            for (plan) |stmt| {
+                const sql = try a.dupeSentinel(u8, stmt, 0);
+                defer a.free(sql);
+                try w.exec(sql);
+            }
+            try @import("auth_identity_index.zig").ensure(a, w, "users", "email");
+            try w.commit();
+        },
+        .update, .update_remove => {
+            var def = definition;
+            def.indexes = if (operation == .update_remove) &.{} else definition.indexes[0..1];
+            const updated = try collections.update(a, std.testing.io, w, created.id, def);
+            defer updated.deinit(a);
+        },
+        .provision_remove, .provision_create => {
+            const old = (try collections.get(a, w, created.id)).?;
+            defer old.deinit(a);
+            var desired = old;
+            desired.indexes = if (operation == .provision_create) &.{
+                definition.indexes[0], .{ .name = "idx_users_nickname", .fields = &.{"nickname"} },
+            } else &.{};
+            try collections.provisionMetadata(a, w, old, desired);
+        },
+    }
+}
+
+fn crossSchemaIndexDdl(comptime operation: CrossSchemaOperation) !void {
+    if (comptime !@import("build_options").postgres) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const url = std.testing.environ.getPosix("ZIGBASE_PG_TEST_URL") orelse return error.SkipZigTest;
+    var w = try db.Db.openPostgres(a, std.testing.io, url);
+    defer w.close();
+    // CREATE without IF NOT EXISTS: teardown only owns a schema created by this test.
+    try w.exec("CREATE SCHEMA app;");
+    defer w.exec("DROP SCHEMA app CASCADE;") catch |err| std.log.warn("cross-schema cleanup: {s}", .{@errorName(err)});
+    try w.exec("SET search_path TO app,public;");
+    try migrations.run(&w);
+    const identity_decl = schema.Index{ .name = "idx_auth_users_email", .fields = &.{"email"}, .unique = true, .where = "email <> ''" };
+    const ordinary_decl = schema.Index{ .name = "idx_users_nickname", .fields = &.{"nickname"} };
+    const def = schema.Collection{
+        .id = "",
+        .name = "users",
+        .type = .auth,
+        .fields = &.{.{ .id = "nickname", .name = "nickname", .options = .{ .text = .{} } }},
+        .indexes = if (operation == .provision_create) &.{identity_decl} else &.{ identity_decl, ordinary_decl },
+    };
+    const created = try collections.create(a, std.testing.io, &w, def);
+    defer created.deinit(a);
+    try w.exec("ALTER TABLE app.users SET SCHEMA public;");
+    defer w.exec("DROP TABLE public.users CASCADE;") catch |err| std.log.warn("cross-schema table cleanup: {s}", .{@errorName(err)});
+    try w.exec("CREATE TABLE app.migration_holder(email TEXT, nickname TEXT);");
+    try w.exec("CREATE UNIQUE INDEX idx_auth_users_email ON app.migration_holder(email);");
+    try w.exec("CREATE UNIQUE INDEX idx_users_nickname ON app.migration_holder(nickname);");
+    const identity_oid = try count(&w, "SELECT 'app.idx_auth_users_email'::regclass::oid::bigint;");
+    const ordinary_oid = try count(&w, "SELECT 'app.idx_users_nickname'::regclass::oid::bigint;");
+    // Search ownership refuses a table outside the first schema on PostgreSQL,
+    // independently of the SQLite FTS flag. Index DDL must not hit another schema
+    // or return an unrelated name-collision error before that guard runs.
+    if (operation == .plan_remove or operation == .plan_recreate) {
+        // Exercise the planner independently of the later search-ownership refusal.
+        try crossSchemaChange(operation, a, &w, created, def);
+    } else {
+        try std.testing.expectError(error.Conflict, crossSchemaChange(operation, a, &w, created, def));
+    }
+    try std.testing.expectEqual(identity_oid, try count(&w, "SELECT 'app.idx_auth_users_email'::regclass::oid::bigint;"));
+    try std.testing.expectEqual(ordinary_oid, try count(&w, "SELECT 'app.idx_users_nickname'::regclass::oid::bigint;"));
+    try std.testing.expect(try @import("auth_identity_index.zig").verify(a, &w, "users", "email"));
+    try w.exec("INSERT INTO app.migration_holder VALUES('keep', 'keep');");
+    try expectConstraint(&w, "INSERT INTO app.migration_holder VALUES('keep', 'other');");
+    try expectConstraint(&w, "INSERT INTO app.migration_holder VALUES('other', 'keep');");
+    const expected: i64 = if (operation == .provision_create or operation == .plan_remove) 0 else 1;
+    try std.testing.expectEqual(expected, try count(&w, "SELECT count(*) FROM pg_class WHERE relnamespace='public'::regnamespace AND relname='idx_users_nickname';"));
+}
+
+test "PostgreSQL update preserves same-name indexes in an earlier search schema" {
+    try crossSchemaIndexDdl(.update);
+}
+
+test "PostgreSQL provisioning drops indexes only in the collection schema" {
+    try crossSchemaIndexDdl(.provision_remove);
+}
+
+test "PostgreSQL provisioning creates declared indexes despite earlier-schema names" {
+    try crossSchemaIndexDdl(.provision_create);
+}
+
+test "PostgreSQL update drops declarations only in the collection schema" {
+    try crossSchemaIndexDdl(.update_remove);
+}
+
+test "SQLite provisioning preserves a temporary same-name declared index" {
+    const a = std.testing.allocator;
+    var c = try Conn.open(.sqlite, "declared_temp_shadow");
+    defer c.deinit();
+    const w = &c.db;
+    const declaration = schema.Index{ .name = "idx_slugs_account", .fields = &.{"account"} };
+    const created = try collections.create(a, std.testing.io, w, slugs(null, &.{declaration}));
+    defer created.deinit(a);
+    try w.exec("CREATE TEMP TABLE migration_holder(value TEXT); CREATE INDEX idx_slugs_account ON migration_holder(value);");
+    var desired = created;
+    desired.indexes = &.{};
+    try collections.provisionMetadata(a, w, created, desired);
+    try std.testing.expectEqual(@as(i64, 1), try count(w, "SELECT count(*) FROM sqlite_temp_schema WHERE name='idx_slugs_account';"));
+    try std.testing.expectEqual(@as(i64, 0), try count(w, "SELECT count(*) FROM main.sqlite_schema WHERE name='idx_slugs_account';"));
+    const old = (try collections.get(a, w, created.id)).?;
+    defer old.deinit(a);
+    desired.indexes = &.{declaration};
+    try collections.provisionMetadata(a, w, old, desired);
+    try std.testing.expectEqual(@as(i64, 1), try count(w, "SELECT count(*) FROM main.sqlite_schema WHERE name='idx_slugs_account';"));
+    try std.testing.expectEqual(@as(i64, 1), try count(w, "SELECT count(*) FROM sqlite_temp_schema WHERE name='idx_slugs_account';"));
+}
+
+test "SQLite provisioning adopts a main declared index despite a temporary shadow" {
+    const a = std.testing.allocator;
+    var c = try Conn.open(.sqlite, "declared_temp_adoption");
+    defer c.deinit();
+    const w = &c.db;
+    const created = try collections.create(a, std.testing.io, w, slugs(null, &.{}));
+    defer created.deinit(a);
+    try w.exec("CREATE INDEX main.idx_slugs_account ON slugs(account);");
+    try w.exec("CREATE TEMP TABLE migration_holder(value TEXT); CREATE INDEX idx_slugs_account ON migration_holder(value);");
+    var desired = created;
+    desired.indexes = &.{.{ .name = "idx_slugs_account", .fields = &.{"account"} }};
+    try collections.provisionMetadata(a, w, created, desired);
+    try std.testing.expectEqual(@as(i64, 1), try count(w, "SELECT count(*) FROM main.sqlite_schema WHERE name='idx_slugs_account';"));
+    try std.testing.expectEqual(@as(i64, 1), try count(w, "SELECT count(*) FROM sqlite_temp_schema WHERE name='idx_slugs_account';"));
+}
+
+test "PostgreSQL scoped planner drops only the collection schema indexes" {
+    try crossSchemaIndexDdl(.plan_remove);
+}
+
+test "PostgreSQL scoped planner recreates only the collection schema indexes" {
+    try crossSchemaIndexDdl(.plan_recreate);
+}
+
+test "SQLite identity predicates require quoted keywords and literals" {
+    const a = std.testing.allocator;
+    const identity = @import("auth_identity_index.zig");
+    for ([_][]const u8{ "null", "NULL", "true", "false", "current_time", "current_date", "current_timestamp" }) |field| {
+        var w = try db.Db.openMemory();
+        defer w.close();
+        const table_sql = try a.printSentinel("CREATE TABLE members(\"{s}\" TEXT);", .{field}, 0);
+        defer a.free(table_sql);
+        try w.exec(table_sql);
+        const index_sql = try a.printSentinel("CREATE UNIQUE INDEX idx_auth_members_{s} ON members(\"{s}\") WHERE {s} != '';", .{ field, field, field }, 0);
+        defer a.free(index_sql);
+        if (std.mem.startsWith(u8, field, "current_")) {
+            // SQLite itself rejects non-deterministic functions in index predicates.
+            try std.testing.expectError(error.ExecFailed, w.exec(index_sql));
+            try std.testing.expect(!try identity.verify(a, &w, "members", field));
+        } else {
+            try w.exec(index_sql);
+            try std.testing.expectError(error.AuthIdentityIndexConflict, identity.verify(a, &w, "members", field));
+        }
+        if (std.ascii.eqlIgnoreCase(field, "null")) {
+            try w.exec("INSERT INTO members(\"null\") VALUES('duplicate'),('duplicate');");
+            try w.exec("DELETE FROM members;");
+        }
+        const drop_sql = try a.printSentinel("DROP INDEX IF EXISTS idx_auth_members_{s};", .{field}, 0);
+        defer a.free(drop_sql);
+        try w.exec(drop_sql);
+        try identity.ensure(a, &w, "members", field);
+        try std.testing.expect(try identity.verify(a, &w, "members", field));
+        const insert_sql = try a.printSentinel("INSERT INTO members(\"{s}\") VALUES('duplicate');", .{field}, 0);
+        defer a.free(insert_sql);
+        try w.exec(insert_sql);
+        try expectConstraint(&w, insert_sql);
+    }
+}
+
+test "SQLite identity indexes coexist with main and temporary namesake triggers" {
+    const a = std.testing.allocator;
+    var c = try Conn.open(.sqlite, "identity_trigger");
+    defer c.deinit();
+    const w = &c.db;
+    var def = slugs(null, &.{});
+    def.type = .auth;
+    def.options.auth.identityFields = &.{"slug"};
+    const col = try collections.create(a, std.testing.io, w, def);
+    defer col.deinit(a);
+    try w.exec("CREATE TRIGGER idx_auth_slugs_slug AFTER INSERT ON slugs BEGIN SELECT 1; END;");
+    try collections.ensureAllUniqueScopes(a, std.testing.io, w);
+    try w.exec("CREATE TEMP TRIGGER idx_auth_slugs_slug AFTER INSERT ON main.slugs BEGIN SELECT 1; END;");
+    try w.exec("CREATE TEMP TRIGGER slugs AFTER UPDATE ON main.slugs BEGIN SELECT 1; END;");
+    try collections.ensureAllUniqueScopes(a, std.testing.io, w);
+    try std.testing.expect(try @import("auth_identity_index.zig").verify(a, w, "slugs", "slug"));
+    try w.exec("INSERT INTO slugs(id,slug) VALUES('first','shared');");
+    try expectConstraint(w, "INSERT INTO slugs(id,slug) VALUES('second','shared');");
+}
+
+test "PostgreSQL removed identity replacements do not preserve differently cased declarations" {
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |provisioning| {
+        var c = try Conn.open(.postgres, "identity_case");
+        defer c.deinit();
+        const w = &c.db;
+        var def = slugs(null, &.{.{ .name = "IDX_AUTH_slugs_slug", .fields = &.{"account"}, .unique = true }});
+        def.type = .auth;
+        def.options.auth.identityFields = &.{"slug"};
+        const col = try collections.create(a, std.testing.io, w, def);
+        defer col.deinit(a);
+        try w.exec("DROP INDEX idx_auth_slugs_slug;");
+        try w.exec("CREATE INDEX idx_auth_slugs_slug ON slugs(slug);");
+        def.indexes = &.{};
+        def.options.auth.identityFields = &.{"email"};
+        if (provisioning) {
+            try collections.provisionMetadata(a, w, col, def);
+        } else {
+            const updated = try collections.update(a, std.testing.io, w, col.id, def);
+            defer updated.deinit(a);
+        }
+        try std.testing.expect(!try indexExists(w, "IDX_AUTH_slugs_slug"));
+        try std.testing.expect(try indexExists(w, "idx_auth_slugs_slug"));
+        try w.exec("INSERT INTO slugs(id,account,slug) VALUES('first','shared','one'),('second','shared','two');");
+    }
+}
+
+test "SQLite index adoption and identity rename ignore namesake triggers" {
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |rename| {
+        var c = try Conn.open(.sqlite, "identity_trigger_catalog");
+        defer c.deinit();
+        const w = &c.db;
+        var def = slugs(null, &.{});
+        def.type = .auth;
+        def.options.auth.identityFields = &.{"slug"};
+        const col = try collections.create(a, std.testing.io, w, def);
+        defer col.deinit(a);
+        if (rename) {
+            try w.exec("CREATE TRIGGER idx_auth_members_slug AFTER INSERT ON slugs BEGIN SELECT 1; END;");
+            try @import("collection_rename.zig").rename(a, std.testing.io, w, "slugs", "members");
+            try std.testing.expect(try @import("auth_identity_index.zig").verify(a, w, "members", "slug"));
+            try std.testing.expectEqual(@as(i64, 1), try count(w, "SELECT count(*) FROM sqlite_schema WHERE type='trigger' AND name='idx_auth_members_slug';"));
+        } else {
+            // A trigger on another table can precede the index's catalog row.
+            try w.exec("CREATE TABLE other(value TEXT);");
+            try w.exec("CREATE TRIGGER declared_account AFTER INSERT ON other BEGIN SELECT 1; END;");
+            try w.exec("CREATE INDEX declared_account ON slugs(account);");
+            def.indexes = &.{.{ .name = "declared_account", .fields = &.{"account"} }};
+            try provision.applySpecs(a, std.testing.io, w, &.{def});
+            try std.testing.expect(try indexExists(w, "declared_account"));
+        }
+    }
+}
+
+test "SQLite identity adoption rejects column comparisons broader than BINARY uniqueness" {
+    const a = std.testing.allocator;
+    const identity = @import("auth_identity_index.zig");
+    for ([_][]const u8{ "NOCASE", "RTRIM" }) |collation| {
+        var c = try Conn.open(.sqlite, "identity_column_collation");
+        defer c.deinit();
+        const w = &c.db;
+        const sql = try a.printSentinel("CREATE TABLE members(id TEXT, email TEXT COLLATE {s});", .{collation}, 0);
+        defer a.free(sql);
+        try w.exec(sql);
+        try w.exec("CREATE UNIQUE INDEX idx_auth_members_email ON members(email COLLATE BINARY) WHERE \"email\" != '';");
+        try w.exec("INSERT INTO members VALUES('a','Alice@example.com');");
+        try w.exec(if (std.mem.eql(u8, collation, "NOCASE")) "INSERT INTO members VALUES('b','alice@example.com');" else "INSERT INTO members VALUES('b','Alice@example.com ');");
+        try std.testing.expectEqual(@as(i64, 2), try count(w, "SELECT count(*) FROM members WHERE email='Alice@example.com' AND email!='';"));
+        try std.testing.expectError(error.AuthIdentityIndexConflict, identity.verify(a, w, "members", "email"));
+        try std.testing.expectEqual(@as(i64, 2), try count(w, "SELECT count(*) FROM members;"));
+    }
+}
+
+fn legacyIdentityDeclaration(comptime backend: Backend) !void {
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |keep_declaration| {
+        var c = try Conn.open(backend, "legacy_identity_declaration");
+        defer c.deinit();
+        const w = &c.db;
+        var def = slugs(null, &.{});
+        def.type = .auth;
+        def.options.auth.identityFields = &.{"slug"};
+        const col = try collections.create(a, std.testing.io, w, def);
+        defer col.deinit(a);
+        // Releases before identity verification could store this incompatible declaration.
+        def.indexes = &.{.{ .name = "idx_auth_slugs_slug", .fields = &.{"account"} }};
+        const json = try schema.indexesToJson(a, def.indexes);
+        defer a.free(json);
+        var st = try w.prepare(if (backend == .postgres) "UPDATE _collections SET indexes=$1 WHERE name='slugs';" else "UPDATE _collections SET indexes=?1 WHERE name='slugs';");
+        defer st.finalize();
+        try st.bindText(1, json);
+        _ = try st.step();
+        try w.exec("DROP INDEX idx_auth_slugs_slug;");
+        const index_sql = try @import("ddl.zig").createIndexSql(a, "slugs", def.indexes[0], db.dbDialect(w));
+        defer a.free(index_sql);
+        const index_sql_z = try a.dupeSentinel(u8, index_sql, 0);
+        defer a.free(index_sql_z);
+        try w.exec(index_sql_z);
+        const before = try IdentityObject.read(a, w);
+        defer before.deinit(a);
+        def.options.auth.identityFields = &.{"email"};
+        if (!keep_declaration) def.indexes = &.{};
+        const updated = try collections.update(a, std.testing.io, w, col.id, def);
+        defer updated.deinit(a);
+        const after = try IdentityObject.read(a, w);
+        defer after.deinit(a);
+        try std.testing.expectEqualStrings(before.definition, after.definition);
+        if (backend == .postgres) try std.testing.expectEqual(before.oid, after.oid);
+        try std.testing.expect(try @import("auth_identity_index.zig").verify(a, w, "slugs", "email"));
+    }
+}
+
+test "legacy incompatible identity declarations survive removal and retention (sqlite)" {
+    try legacyIdentityDeclaration(.sqlite);
+}
+
+test "legacy incompatible identity declarations survive removal and retention (postgres)" {
+    try legacyIdentityDeclaration(.postgres);
+}
+
+/// A preserved former-identity object cannot carry a new or changed declaration: making the
+/// legacy non-unique `idx_auth_slugs_slug` unique while removing the identity must be refused,
+/// never recorded as `unique` over the still non-unique index. A preserved object that already
+/// matches the changed declaration is adopted instead.
+fn changedLegacyIdentityDeclaration(comptime backend: Backend) !void {
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |provisioning| for ([_]bool{ false, true }) |matching| {
+        var c = try Conn.open(backend, "changed_identity_declaration");
+        defer c.deinit();
+        const w = &c.db;
+        var def = slugs(null, &.{});
+        def.type = .auth;
+        def.options.auth.identityFields = &.{"slug"};
+        const created = try collections.create(a, std.testing.io, w, def);
+        defer created.deinit(a);
+        // Releases before identity verification could store this incompatible declaration.
+        def.indexes = &.{.{ .name = "idx_auth_slugs_slug", .fields = &.{"account"} }};
+        const json = try schema.indexesToJson(a, def.indexes);
+        defer a.free(json);
+        var st = try w.prepare(if (backend == .postgres) "UPDATE _collections SET indexes=$1 WHERE name='slugs';" else "UPDATE _collections SET indexes=?1 WHERE name='slugs';");
+        defer st.finalize();
+        try st.bindText(1, json);
+        _ = try st.step();
+        try w.exec("DROP INDEX idx_auth_slugs_slug;");
+        const changed: schema.Index = .{ .name = "idx_auth_slugs_slug", .fields = &.{"account"}, .unique = true };
+        // `matching`: a migration already rebuilt the object to the changed definition.
+        const index_sql = try @import("ddl.zig").createIndexSql(a, "slugs", if (matching) changed else def.indexes[0], db.dbDialect(w));
+        defer a.free(index_sql);
+        const index_sql_z = try a.dupeSentinel(u8, index_sql, 0);
+        defer a.free(index_sql_z);
+        try w.exec(index_sql_z);
+        const before = try IdentityObject.read(a, w);
+        defer before.deinit(a);
+        const col = (try collections.get(a, w, "slugs")).?;
+        defer col.deinit(a);
+        // Provisioning persists the desired definition by its id.
+        def.id = col.id;
+        def.options.auth.identityFields = &.{"email"};
+        def.indexes = &.{changed};
+        if (matching) {
+            if (provisioning) {
+                try collections.provisionMetadata(a, w, col, def);
+            } else {
+                const updated = try collections.update(a, std.testing.io, w, col.id, def);
+                defer updated.deinit(a);
+            }
+        } else if (provisioning) {
+            try std.testing.expectError(error.MigrationObjectConflict, collections.provisionMetadata(a, w, col, def));
+        } else {
+            try std.testing.expectError(error.MigrationObjectConflict, collections.update(a, std.testing.io, w, col.id, def));
+        }
+        if (!matching) try std.testing.expect(std.mem.indexOf(u8, collections.last_rebuild_error, "idx_auth_slugs_slug") != null);
+        const after = try IdentityObject.read(a, w);
+        defer after.deinit(a);
+        try std.testing.expectEqualStrings(before.definition, after.definition);
+        if (backend == .postgres) try std.testing.expectEqual(before.oid, after.oid);
+        const stored = (try collections.get(a, w, "slugs")).?;
+        defer stored.deinit(a);
+        try std.testing.expectEqual(@as(usize, 1), stored.indexes.len);
+        try std.testing.expectEqual(matching, stored.indexes[0].unique);
+        try std.testing.expectEqualStrings(if (matching) "email" else "slug", stored.options.auth.identityFields[0]);
+        try w.exec("INSERT INTO slugs(id,account,slug) VALUES('first','shared','one');");
+        if (matching) {
+            try expectConstraint(w, "INSERT INTO slugs(id,account,slug) VALUES('second','shared','two');");
+        } else {
+            try w.exec("INSERT INTO slugs(id,account,slug) VALUES('second','shared','two');");
+        }
+    };
+}
+
+test "changed legacy identity declarations are refused, not recorded (sqlite)" {
+    try changedLegacyIdentityDeclaration(.sqlite);
+}
+
+test "changed legacy identity declarations are refused, not recorded (postgres)" {
+    try changedLegacyIdentityDeclaration(.postgres);
+}
+
+test "PostgreSQL identity uniqueness follows column collation including nondeterministic ICU" {
+    const a = std.testing.allocator;
+    var c = try Conn.open(.postgres, "identity_column_collation");
+    defer c.deinit();
+    const w = &c.db;
+    const identity = @import("auth_identity_index.zig");
+    try w.exec("CREATE COLLATION identity_ci (provider=icu, locale='und-u-ks-level2', deterministic=false);");
+    try w.exec("CREATE TABLE members(id TEXT, email TEXT COLLATE identity_ci);");
+    try identity.ensure(a, w, "members", "email");
+    try w.exec("INSERT INTO members VALUES('alice','Alice@example.com');");
+    try expectConstraint(w, "INSERT INTO members VALUES('other','alice@example.com');");
+    const col = schema.Collection{ .id = "", .name = "members", .type = .auth, .fields = &.{} };
+    const found = (try @import("api/auth.zig").findByIdentity(a, w, col, "alice@example.com")).?;
+    defer a.free(found);
+    try std.testing.expectEqualStrings("alice", found);
+    try std.testing.expect(try identity.verify(a, w, "members", "email"));
+    try w.exec("DROP INDEX idx_auth_members_email;");
+    try w.exec("CREATE UNIQUE INDEX idx_auth_members_email ON members(email COLLATE \"C\") WHERE email != '';");
+    try w.exec("INSERT INTO members VALUES('other','alice@example.com');");
+    try std.testing.expectEqual(@as(i64, 2), try count(w, "SELECT count(*) FROM members WHERE email='Alice@example.com' AND email!='';"));
+    try std.testing.expectError(error.AuthIdentityIndexConflict, identity.verify(a, w, "members", "email"));
 }

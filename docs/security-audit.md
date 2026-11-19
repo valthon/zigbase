@@ -115,7 +115,11 @@ The three compose: nothing reaches an identifier position that is not either a s
 an escaped one, and values are bound as parameters throughout. Where a downstream refusal is the
 right answer rather than escaping, it must fail **closed and loudly** — `authz/abilities.zig`
 (constant-false predicate) and `search/fts.zig` (`error.NotSearchable`, with the provisioner now
-logging any index it declines to build) are the two such sites.
+logging any index it declines to build) follow that rule. Auth identity index adoption also
+fails closed: bound catalog lookups check the table, unique key and non-empty predicate
+before a same-name object can stand in for identity enforcement. Incompatible or unreadable
+definitions refuse startup or the collection change with a collection/field/index diagnostic,
+preserving the migration's object for explicit repair (issue #522).
 
 ---
 

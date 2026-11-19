@@ -22,6 +22,11 @@ const std = @import("std");
 const schema = @import("schema.zig");
 const dialect = @import("sql/dialect.zig");
 
+/// Borrowed catalog spelling of a validated ASCII schema identifier.
+pub fn physicalIdentifier(name: []const u8, postgres: bool) []const u8 {
+    return name[0..if (postgres) @min(name.len, 63) else name.len];
+}
+
 pub fn quoteIdent(alloc: std.mem.Allocator, name: []const u8) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(alloc);
@@ -133,11 +138,25 @@ fn createTableSqlMain(alloc: std.mem.Allocator, c: schema.Collection, single_rel
     return out.toOwnedSlice(alloc);
 }
 
-pub fn createIndexSql(alloc: std.mem.Allocator, table: []const u8, idx: schema.Index, d: dialect.Dialect) ![]u8 {
-    return createIndexSqlMain(alloc, table, idx, d, false);
+/// Self-freeing; caller frees the quoted (optionally schema-qualified) identifier.
+pub fn quoteQualifiedIdent(alloc: std.mem.Allocator, namespace: ?[]const u8, name: []const u8) ![]u8 {
+    const quoted = try quoteIdent(alloc, name);
+    if (namespace) |ns| {
+        defer alloc.free(quoted);
+        const quoted_ns = try quoteIdent(alloc, ns);
+        defer alloc.free(quoted_ns);
+        return alloc.print("{s}.{s}", .{ quoted_ns, quoted });
+    }
+    return quoted;
 }
 
-fn createIndexSqlMain(alloc: std.mem.Allocator, table: []const u8, idx: schema.Index, d: dialect.Dialect, main: bool) ![]u8 {
+pub fn createIndexSql(alloc: std.mem.Allocator, table: []const u8, idx: schema.Index, d: dialect.Dialect) ![]u8 {
+    return createIndexSqlInSchema(alloc, table, idx, d, null);
+}
+
+/// Self-freeing. PostgreSQL places an index in its table's namespace: qualify
+/// the table, not the index name. SQLite instead qualifies the index name.
+pub fn createIndexSqlInSchema(alloc: std.mem.Allocator, table: []const u8, idx: schema.Index, d: dialect.Dialect, namespace: ?[]const u8) ![]u8 {
     // Self-freeing (contract 1): see `createTableSql`.
     var scratch = std.heap.ArenaAllocator.init(alloc);
     defer scratch.deinit();
@@ -150,10 +169,9 @@ fn createIndexSqlMain(alloc: std.mem.Allocator, table: []const u8, idx: schema.I
     // and a UNIQUE one over `lower("col")` rejects case-variant duplicates just like SQLite's. A
     // `.binary` index is the plain quoted column on both backends.
     try out.appendSlice(alloc, if (idx.unique) "CREATE UNIQUE INDEX " else "CREATE INDEX ");
-    if (main) try out.appendSlice(alloc, "\"main\".");
-    try out.appendSlice(alloc, try quoteIdent(sa, idx.name));
+    try out.appendSlice(alloc, try quoteQualifiedIdent(sa, if (d.kind == .sqlite) namespace else null, idx.name));
     try out.appendSlice(alloc, " ON ");
-    try out.appendSlice(alloc, try quoteIdent(sa, table));
+    try out.appendSlice(alloc, try quoteQualifiedIdent(sa, if (d.kind == .postgres) namespace else null, table));
     try out.append(alloc, ' ');
     try out.append(alloc, '(');
     for (idx.fields, 0..) |fname, i| {
@@ -207,6 +225,8 @@ pub fn authIdentityIndexName(alloc: std.mem.Allocator, table: []const u8, field:
 /// A partial UNIQUE index enforcing identity uniqueness only over non-empty values:
 ///   CREATE UNIQUE INDEX IF NOT EXISTS "idx_auth_<table>_<field>" ON "<table>" ("<field>") WHERE "<field>" != '';
 /// Every identifier is escaped — the comment here used to claim quoting the code did not do.
+/// This SQL builder does not validate existing objects. Engine execution must use
+/// auth_identity_index.ensure; direct execution is only for private catalog models/tests.
 pub fn authIdentityIndexSql(alloc: std.mem.Allocator, table: []const u8, field: []const u8) ![]u8 {
     const name = try authIdentityIndexName(alloc, table, field);
     defer alloc.free(name);
@@ -249,7 +269,13 @@ pub fn addDeferrableFkSql(alloc: std.mem.Allocator, table: []const u8, field: []
 /// targeted `ALTER TABLE ADD/RENAME/ALTER TYPE/DROP COLUMN` against the live table (no rebuild),
 /// keyed off the same id matching — see `rebuildPlanPg`.
 pub fn rebuildPlan(alloc: std.mem.Allocator, old: schema.Collection, new: schema.Collection, d: dialect.Dialect) ![]const []u8 {
-    if (d.kind == .postgres) return rebuildPlanPg(alloc, old, new, d);
+    return rebuildPlanInSchema(alloc, old, new, d, null);
+}
+
+/// Same ownership as rebuildPlan. PostgreSQL callers resolve the table's namespace
+/// under the schema lock so index drops never resolve through another search_path entry.
+pub fn rebuildPlanInSchema(alloc: std.mem.Allocator, old: schema.Collection, new: schema.Collection, d: dialect.Dialect, namespace: ?[]const u8) ![]const []u8 {
+    if (d.kind == .postgres) return rebuildPlanPg(alloc, old, new, d, namespace);
 
     // Self-freeing (contract 1): `tmp`/`new_cols`/`src_cols` and every column-fragment allocPrint
     // are scratch (consumed to build one of the returned statements, then discarded) — built on
@@ -303,7 +329,7 @@ pub fn rebuildPlan(alloc: std.mem.Allocator, old: schema.Collection, new: schema
     try stmts.append(alloc, try alloc.print("INSERT INTO \"main\".{s} (\"_rowid_\",{s}) SELECT \"_rowid_\",{s} FROM \"main\".{s};", .{ try quoteIdent(sa, tmp), new_cols.items, src_cols.items, try quoteIdent(sa, old.name) }));
     try stmts.append(alloc, try alloc.print("DROP TABLE \"main\".{s};", .{try quoteIdent(sa, old.name)}));
     try stmts.append(alloc, try alloc.print("ALTER TABLE \"main\".{s} RENAME TO {s};", .{ try quoteIdent(sa, tmp), try quoteIdent(sa, new.name) }));
-    for (new.indexes) |idx| try stmts.append(alloc, try createIndexSqlMain(alloc, new.name, idx, d, true));
+    for (new.indexes) |idx| try stmts.append(alloc, try createIndexSqlInSchema(alloc, new.name, idx, d, "main"));
     return stmts.toOwnedSlice(alloc);
 }
 
@@ -321,7 +347,7 @@ pub fn rebuildPlan(alloc: std.mem.Allocator, old: schema.Collection, new: schema
 ///      PG's in-place ALTER would leave them stale), then DROP-and-recreate every declared `new`
 ///      index (covers renamed columns + new declarations; idempotent via DROP IF EXISTS).
 /// Retained columns keep their data; the table is never dropped.
-fn rebuildPlanPg(alloc: std.mem.Allocator, old: schema.Collection, new: schema.Collection, d: dialect.Dialect) ![]const []u8 {
+fn rebuildPlanPg(alloc: std.mem.Allocator, old: schema.Collection, new: schema.Collection, d: dialect.Dialect, namespace: ?[]const u8) ![]const []u8 {
     var stmts: std.ArrayList([]u8) = .empty;
     // See `rebuildPlan`: `stmts.items` is exactly what's been successfully appended so far.
     errdefer {
@@ -334,7 +360,7 @@ fn rebuildPlanPg(alloc: std.mem.Allocator, old: schema.Collection, new: schema.C
     defer scratch.deinit();
     const sa = scratch.allocator();
     const tbl = new.name;
-    const qtbl = try quoteIdent(sa, tbl);
+    const qtbl = try quoteQualifiedIdent(sa, namespace, tbl);
 
     // 1a. Drop the FK of every old single relation field (converges all relation changes; gemini #2).
     for (old.fields) |of| switch (of.options) {
@@ -389,12 +415,12 @@ fn rebuildPlanPg(alloc: std.mem.Allocator, old: schema.Collection, new: schema.C
             for (new.indexes) |nix| if (std.mem.eql(u8, oix.name, nix.name)) break :blk true;
             break :blk false;
         };
-        if (!kept) try stmts.append(alloc, try alloc.print("DROP INDEX IF EXISTS {s};", .{try quoteIdent(sa, oix.name)}));
+        if (!kept) try stmts.append(alloc, try alloc.print("DROP INDEX IF EXISTS {s};", .{try quoteQualifiedIdent(sa, namespace, oix.name)}));
     }
     // 4b. Drop-if-exists + recreate every declared index.
     for (new.indexes) |idx| {
-        try stmts.append(alloc, try alloc.print("DROP INDEX IF EXISTS {s};", .{try quoteIdent(sa, idx.name)}));
-        try stmts.append(alloc, try createIndexSql(alloc, tbl, idx, d));
+        try stmts.append(alloc, try alloc.print("DROP INDEX IF EXISTS {s};", .{try quoteQualifiedIdent(sa, namespace, idx.name)}));
+        try stmts.append(alloc, try createIndexSqlInSchema(alloc, tbl, idx, d, namespace));
     }
     return stmts.toOwnedSlice(alloc);
 }
