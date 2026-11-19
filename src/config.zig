@@ -220,6 +220,9 @@ pub const Config = struct {
     // entirely. null = real OS CSPRNG (the always-correct default).
     fake_seed: ?u64 = null,
 
+    // DEV-ONLY weak password hashing for spawned test servers.
+    fake_hash: bool = false,
+
     // DEV-ONLY fake field-crypto (`ZIGBASE_FIELD_CRYPTO=fake`). When `.fake`, `.encrypted`
     // fields are stored READABLE as `fake:<key>:<value>` for debugging. ALWAYS `.real` on a
     // production build — `field_policy.resolveModeFromEnv` is comptime-gated off when
@@ -325,6 +328,9 @@ pub const Config = struct {
         cfg.fake_now_unix = clock.resolveFromEnv(getter.get(clock.env_var));
         // Dev-only seeded entropy. resolveFromEnv is comptime-gated off on a prod build.
         cfg.fake_seed = entropy.resolveFromEnv(getter.get(entropy.env_var));
+        if (comptime @import("dev.zig").enabled) {
+            cfg.fake_hash = @import("crypto.zig").resolveFakeHash(getter.get(@import("crypto.zig").fake_hash_env));
+        }
         // Dev-only fake field-crypto. resolveModeFromEnv is comptime-gated off on a prod build.
         cfg.field_crypto = field_policy.resolveModeFromEnv(getter.get(field_policy.env_var));
         return cfg;
@@ -349,7 +355,9 @@ pub const EnvGetter = struct {
     }
 };
 
-/// Every ZIGBASE_* variable `loadDiag` reads, alphabetically. The single source of
+/// Production ZIGBASE_* variables `loadDiag` reads, alphabetically. The dev-only
+/// password-cost name is registered separately in `isKnown` so it disappears in release.
+/// The single source of
 /// truth for "is this name a real knob"; `tests/admin/test_docs_parity.py` cross-checks
 /// it against the string literals actually present in src/, so it cannot drift.
 pub const known_vars = [_][]const u8{
@@ -439,6 +447,10 @@ pub const known_external_vars = [_][]const u8{
 /// so can never be listed: the field-key generations (`ZIGBASE_FIELD_KEY_V<n>`) and the
 /// per-provider OAuth credentials (`ZIGBASE_OAUTH_<PROVIDER>_CLIENT_ID`/`_CLIENT_SECRET`).
 pub fn isKnown(name: []const u8) bool {
+    // Keep this dev-only name out of the production registry and binary.
+    if (comptime @import("dev.zig").enabled) {
+        if (std.mem.eql(u8, name, @import("crypto.zig").fake_hash_env)) return true;
+    }
     for (known_vars) |k| {
         if (std.mem.eql(u8, name, k)) return true;
     }
@@ -861,4 +873,18 @@ test "isKnown accepts the templated families and rejects a typo" {
     try std.testing.expect(!isKnown("ZIGBASE_OAUTH_GOOGLE_SECRET"));
     // Non-ZIGBASE names are never our business.
     try std.testing.expect(!isKnown("PATH"));
+}
+
+test "fake password hash config is never read with dev mode off" {
+    const Getter = struct {
+        pub fn get(_: @This(), key: []const u8) ?[]const u8 {
+            if (std.mem.eql(u8, key, @import("crypto.zig").fake_hash_env)) {
+                if (!@import("dev.zig").enabled) @panic("production read the password cost override");
+                return "1";
+            }
+            return null;
+        }
+    };
+    const cfg = try Config.load(Getter{});
+    try std.testing.expectEqual(@import("dev.zig").enabled, cfg.fake_hash);
 }

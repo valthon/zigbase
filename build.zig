@@ -125,7 +125,7 @@ pub fn build(b: *std.Build) void {
     // cross-compiles fast/safe, so shipped binaries get `false` and the
     // override code folds to comptime-dead. Override with -Ddev-mode=true to build a
     // debuggable binary that still honors the dev-only env vars (e2e dev).
-    const dev_mode = b.option(bool, "dev-mode", "Compile in the dev-only, never-in-prod seams: ZIGBASE_FAKE_NOW clock, ZIGBASE_FAKE_SEED entropy, test-capture, and ZIGBASE_FIELD_CRYPTO fake crypto (default: on in Debug, off in release)") orelse (optimize == .debug);
+    const dev_mode = b.option(bool, "dev-mode", "Compile in the dev-only, never-in-prod seams: ZIGBASE_FAKE_NOW clock, ZIGBASE_FAKE_SEED entropy, ZIGBASE_FAKE_HASH password cost, test-capture, and ZIGBASE_FIELD_CRYPTO fake crypto (default: on in Debug, off in release)") orelse (optimize == .debug);
     // Development CLI: init, agents-md, typegen, capabilities, routes, migrate preview, tune, diagnostics.
     // ON by default — every
     // official artifact we publish (GitHub release tarballs, the Docker image, the

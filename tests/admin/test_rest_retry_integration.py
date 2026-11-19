@@ -22,6 +22,7 @@ def app(tmp_path):
     shutil.copytree(_su_template_for(binary), tmp_path, dirs_exist_ok=True)
     with _reserve_port() as port:
         env = {k: v for k, v in os.environ.items() if not k.startswith("ZIGBASE_")}
+        env["ZIGBASE_FAKE_HASH"] = "1"
         env.update(ZIGBASE_DATA_DIR=str(tmp_path), ZIGBASE_HTTP_PORT=str(port), ZIGBASE_SERVE_BACKGROUND="0")
         log_path = tmp_path / "server.log"
         with log_path.open("wb") as log:

@@ -1135,6 +1135,7 @@ variables, and `zigbase.testcapture` is the process-global capture API:
 ```sh
 ZIGBASE_FAKE_NOW="2029-03-07T16:00:00Z" \
 ZIGBASE_FAKE_SEED=12345 \
+ZIGBASE_FAKE_HASH=1 \
   ./myserver serve --data-dir ./zb_data --insecure-cookies
 ```
 

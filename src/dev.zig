@@ -3,6 +3,7 @@
 //! script cross-compiles ReleaseSafe, so `dev_mode` defaults off there). It gates
 //! every dev-only-never-in-production seam so a prod binary can't use any of them:
 //! the frozen clock (`ZIGBASE_FAKE_NOW`), seeded entropy (`ZIGBASE_FAKE_SEED`),
+//! cheap password hashing (`ZIGBASE_FAKE_HASH`),
 //! the test-capture mailer/sms/push, and fake field-crypto (`ZIGBASE_FIELD_CRYPTO`).
 //! When false, each of those folds to comptime-dead code and its env var is never read.
 const build_options = @import("build_options");

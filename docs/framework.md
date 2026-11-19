@@ -6257,8 +6257,8 @@ collections at runtime.
 
 ## 14. Test / dev-mode determinism seams
 
-Three env vars (dev builds only) make a test suite reproducible and encrypted-field
-apps debuggable. All three are compiled out entirely in production — a release binary
+Four env vars (dev builds only) make test suites reproducible and fast, and encrypted-field
+apps debuggable. All four are compiled out entirely in production — a release binary
 never reads any of them.
 
 ### Freezing time: `ZIGBASE_FAKE_NOW`
@@ -6333,12 +6333,26 @@ test harness (§15) exposes the same behavior via `StartOptions.field_crypto` /
 ZIGBASE_FIELD_CRYPTO=fake ./zigbase serve --insecure-cookies ...
 ```
 
+### Cheap password hashing: `ZIGBASE_FAKE_HASH`
+
+Set `ZIGBASE_FAKE_HASH=1` before launching a test server or `superuser create` to
+use deliberately weak Argon2id parameters (`t=1, m=8 KiB, p=1`). Unset, `0`, and
+other values retain `interactive_2id` (`t=2, m=64 MiB, p=1`). The login-miss dummy
+uses the same cost as newly written hashes. Verification always uses the parameters
+in the stored PHC string: existing production hashes retain their cost, and cheap
+hashes verify in any build. Use a fresh test data directory; never use cheap hashes
+for real credentials. Zig unit tests already use cheap parameters.
+
+Every Python test harness opts in, including CLI, tools, SMTP, S3 and migration
+suites. A test measuring password hashing must explicitly unset or override it.
+
 ### Production gate
 
-All three seams are compiled in ONLY when the `dev_mode` build option is `true` (the
+All four seams are compiled in ONLY when the `dev_mode` build option is `true` (the
 default in `Debug` builds). The release script forces `-Ddev-mode=false` for all
 shipped binaries, so a production binary has the override code comptime-eliminated:
 
+- `ZIGBASE_FAKE_HASH` is never read; new password hashes always use production cost.
 - `ZIGBASE_FAKE_NOW` is never read; the clock always returns wall time.
 - `ZIGBASE_FAKE_SEED` is never read; ID/token generation always uses the OS CSPRNG.
 - `ZIGBASE_FIELD_CRYPTO` is never read; `.encrypted` fields always use real AES-GCM —
@@ -6581,7 +6595,7 @@ code to comptime-dead when off, so a build that doesn't need a feature doesn't p
 | `-Drest-idempotency` | off | Compile opt-in persistent REST retry receipts. |
 | `-Dquery-workbench` | off | Bounded SQLite step and PostgreSQL client-exchange metrics, statement lifecycle timing, route attribution and repeated/slow shape counters. Structural EXPLAIN remains SQLite-only; no SQL/parameter capture. |
 | `-Dcoordinated-admission` | off | Compile memory/durable job admission: `.admission.max_work` shares HTTP/memory-job/durable-batch work capacity and requires `.max_requests`; independent `.max_job_bytes` bounds retained payload/name copy lengths without enabling HTTP admission. No RSS cap; durable claim payloads are not charged to `.max_job_bytes`. |
-| `-Ddev-mode` | on in `Debug`, off in release | The dev-only, never-in-prod seams: `ZIGBASE_FAKE_NOW` / `ZIGBASE_FAKE_SEED` (§14 above), test-capture, and fake field-crypto; the release script forces it off for shipped binaries. |
+| `-Ddev-mode` | on in `Debug`, off in release | The dev-only, never-in-prod seams: `ZIGBASE_FAKE_NOW` / `ZIGBASE_FAKE_SEED` / `ZIGBASE_FAKE_HASH` (§14 above), test-capture, and fake field-crypto; the release script forces it off for shipped binaries. |
 | `-Ddev-tools` | **on** | The `init`/`agents-md`/`typegen` scaffolding/codegen verbs, `capabilities`/`routes`/`migrate preview` offline discovery, `tune` offline measurement advisor, and `diagnostics` structured doctor adapter (which can probe filesystem writability and initialize the migration ledger). Ordinary `doctor` and other migration actions remain available. Official release, Docker and npm artifacts include this tooling. Consumers can opt out for their deployment binary; stripped verbs exit nonzero with `-Ddev-tools=true` rebuild guidance. Distinct from `.enable_typegen` below — see §3b. |
 | `-Dstrip` | on except in `Debug` | Strip debug info from the binary (~7 MiB vs ~24 MiB unstripped in a release build). |
 

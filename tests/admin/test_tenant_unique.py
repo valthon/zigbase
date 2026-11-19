@@ -32,6 +32,7 @@ class Server:
     def start(self):
         with _reserve_port() as port:
             env = {k: v for k, v in os.environ.items() if not k.startswith("ZIGBASE_")}
+            env["ZIGBASE_FAKE_HASH"] = "1"
             env.update(ZIGBASE_DATA_DIR=str(self.data_dir), ZIGBASE_HTTP_PORT=str(port), ZIGBASE_SERVE_BACKGROUND="0")
             log_path = self.data_dir / "server.log"
             start = log_path.stat().st_size if log_path.exists() else 0

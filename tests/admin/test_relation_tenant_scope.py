@@ -40,6 +40,7 @@ def app(dating_binary, tmp_path):
     shutil.copytree(_su_template_for(dating_binary), tmp_path, dirs_exist_ok=True)
     with _reserve_port() as port:
         env = {k: v for k, v in os.environ.items() if not k.startswith("ZIGBASE_")}
+        env["ZIGBASE_FAKE_HASH"] = "1"
         env.update(ZIGBASE_DATA_DIR=str(tmp_path), ZIGBASE_HTTP_PORT=str(port), ZIGBASE_SERVE_BACKGROUND="0")
         log_path = tmp_path / "server.log"
         with log_path.open("wb") as log:
@@ -202,6 +203,7 @@ def test_superuser_can_still_link_across_tenants_and_doctor_reports_it(app):
     assert code == 201 and rec["note"] == a_note, rec
 
     env = {k: v for k, v in os.environ.items() if not k.startswith("ZIGBASE_")}
+    env["ZIGBASE_FAKE_HASH"] = "1"
     doctor = subprocess.run([binary, "doctor", "--json", "--data-dir", str(data_dir)], env=env,
                             capture_output=True, text=True, timeout=60)
     lines = [json.loads(line) for line in doctor.stdout.splitlines() if line.startswith("{")]
@@ -215,6 +217,7 @@ def test_superuser_can_still_link_across_tenants_and_doctor_reports_it(app):
 
 def _doctor(binary, data_dir):
     env = {k: v for k, v in os.environ.items() if not k.startswith("ZIGBASE_")}
+    env["ZIGBASE_FAKE_HASH"] = "1"
     run = subprocess.run([binary, "doctor", "--json", "--data-dir", str(data_dir)], env=env,
                          capture_output=True, text=True, timeout=60)
     return [json.loads(line) for line in run.stdout.splitlines() if line.startswith("{")], run

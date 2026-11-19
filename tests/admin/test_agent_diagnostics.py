@@ -8,6 +8,7 @@ import pytest
 
 def run(binary, *args, env=None):
     clean = {k: v for k, v in os.environ.items() if not k.startswith("ZIGBASE_")}
+    clean["ZIGBASE_FAKE_HASH"] = "1"
     return subprocess.run([binary, *args], env={**clean, **(env or {})},
                           capture_output=True, text=True, timeout=15)
 
@@ -137,6 +138,7 @@ def test_diagnostics_help_is_explicit(binary):
 def test_json_respects_redirected_stdout_offset(binary, tmp_path, mode):
     args = ["diagnostics", "--data-dir", str(tmp_path / "data")]
     env = {k: v for k, v in os.environ.items() if not k.startswith("ZIGBASE_")}
+    env["ZIGBASE_FAKE_HASH"] = "1"
     if mode == "arguments":
         args = ["diagnostics", "--bad"]
     elif mode == "configuration":

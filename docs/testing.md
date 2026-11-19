@@ -522,7 +522,7 @@ free-port dance.
 ## See also
 
 - [framework.md §15](framework.md#15-testing-your-app-zigbasetesting) — the full `zigbase.testing` API
-- [framework.md §14](framework.md#14-test--dev-mode-determinism-seams) — determinism seams for a spawned server (`ZIGBASE_FAKE_NOW`, `ZIGBASE_FAKE_SEED`, `zigbase.testcapture`)
+- [framework.md §14](framework.md#14-test--dev-mode-determinism-seams) — determinism seams for a spawned server (`ZIGBASE_FAKE_NOW`, `ZIGBASE_FAKE_SEED`, `ZIGBASE_FAKE_HASH=1` for cheap password hashing, `zigbase.testcapture`)
 - [recipes.md](recipes.md) — task-oriented recipes, including a deterministic-test recipe
 
 ## Durable queue capacity checks

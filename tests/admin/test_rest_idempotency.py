@@ -446,6 +446,7 @@ def test_keyed_relation_to_another_account_answers_like_a_missing_id(binary, tmp
     import subprocess
     from conftest import _reserve_port, _stop_server, _wait_reachable_or_fail
     env = {k: v for k, v in os.environ.items() if not k.startswith("ZIGBASE_")}
+    env["ZIGBASE_FAKE_HASH"] = "1"
     env.update(ZIGBASE_DATA_DIR=str(tmp_path), ZIGBASE_SERVE_BACKGROUND="0")
     subprocess.run([binary, "superuser", "create", "--email", "admin@x.io", "--password", "adminpassword"],
                    env=env, check=True, capture_output=True, timeout=30)

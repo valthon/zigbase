@@ -25,7 +25,8 @@ def command(binary, directory, reverse=False):
 
 
 def environment():
-    return {key: value for key, value in os.environ.items() if not key.startswith("ZIGBASE_")}
+    return {**{key: value for key, value in os.environ.items() if not key.startswith("ZIGBASE_")},
+            "ZIGBASE_FAKE_HASH": "1"}
 
 
 def run(binary, directory, reverse=False):
