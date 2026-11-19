@@ -213,6 +213,33 @@ def test_user_drawer_refreshes_required_profile_and_password_policy(page, editin
     assert authenticated.ok, authenticated.text()
 
 
+def test_users_entry_waits_for_its_collection_refresh(page):
+    login(page)
+    collection(page, 'members')
+    response = api_request(page, 'POST', '/api/collections/members/records', {
+        'email': 'existing@example.com', 'password': 'original password',
+    })
+    assert response.ok, response.text()
+    # The shell's starting list already names `members`, as when its mount fetch lands late.
+    with page.expect_response('**/api/collections'):
+        page.reload()
+    expect(page.locator('[data-test=nav-members]')).to_be_visible()
+    held = []
+    page.route('**/api/collections', lambda route: held.append(route))
+    rows = []
+    page.on('request', lambda request: rows.append(request) if '/members/records?' in request.url else None)
+    with page.expect_request('**/api/collections'):
+        page.evaluate("location.hash = '#/users/members'")
+    expect(page.locator('[data-test=users-view]')).to_be_visible()
+    expect(page.locator('[data-test=user-new]')).to_be_disabled()
+    assert rows == []
+    held[0].continue_()
+    page.unroute('**/api/collections')
+    expect(page.locator('[data-test=user-row]')).to_have_count(1)
+    expect(page.locator('[data-test=user-new]')).to_be_enabled()
+    assert len(rows) == 1
+
+
 def test_user_drawer_blocks_saves_while_definition_loading_or_failed(page):
     login(page)
     collection(page, 'members')

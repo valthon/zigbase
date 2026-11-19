@@ -152,8 +152,20 @@ function Shell({ route }) {
     }
   }, []);
   // Mount supplies the initial list; later Users entries refresh it once.
+  // Effects run after the entry render has painted, so the Users view is held
+  // back (`usersReady`) until that refresh lands: otherwise it renders the
+  // stale list as ready, loads its rows, then loads them again when the refresh
+  // replaces the list.
+  const [usersReady, setUsersReady] = useState(false);
+  const routeEntry = useRef(0);
   useEffect(() => {
-    if (cols == null || route.name === 'users') refreshCollections();
+    const entry = ++routeEntry.current;
+    if (route.name !== 'users') {
+      setUsersReady(false);
+      if (cols == null) refreshCollections();
+      return;
+    }
+    refreshCollections().then(() => { if (entry === routeEntry.current) setUsersReady(true); });
   }, [route.name]);
   const [backend, setBackend] = useState('');
   const [collapsed, setCollapsed] = useState(localStorage.getItem('zb_sidebar') === '1');
@@ -222,7 +234,7 @@ function Shell({ route }) {
         <a class="navitem" data-test="logout" onClick=${logout} style="cursor:pointer">⎋ <span class="hide-collapsed">Logout</span></a>
       </div>
       <div class="main">
-        ${route.name === 'users' ? html`<${UsersView} key=${route.col} collection=${route.col} collections=${collectionsLoading ? null : cols} collectionsError=${err}/>`
+        ${route.name === 'users' ? html`<${UsersView} key=${route.col} collection=${route.col} collections=${collectionsLoading || !usersReady ? null : cols} collectionsError=${err}/>`
           : route.name === 'email' ? html`<${EmailView}/>`
           : route.name === 'files' ? html`<${FilesView}/>`
           : route.name === 'logs' && analyticsEnabled ? html`<${LogsView}/>`
