@@ -217,16 +217,25 @@ def test_abort_expiry_and_configured_limits(server):
 
 def test_token_revocation_and_current_file_constraints(server):
     admin, tokens, col, record = setup(server)
+    # Revocation: a session opened with tokens[0] becomes unusable to it once the
+    # password changes. Every upload handler authenticates before looking the session
+    # up, so these 401s hold even if the 5 s fixture TTL lapses during the hash.
     _, upload = begin(server, tokens[0], record)
-    path = "/api/uploads/" + upload["id"]
-    assert call(server, "PATCH", path, b"abcd", tokens[0], 0)[0] == 204
+    revoked_path = "/api/uploads/" + upload["id"]
+    assert call(server, "PATCH", revoked_path, b"abcd", tokens[0], 0)[0] == 204
     users = call(server, "GET", "/api/collections/users/records", token=admin)[1]["items"]
     user = next(user for user in users if user["email"] == "one@x.io")
     assert call(server, "PATCH", "/api/collections/users/records/" + user["id"], {"password": "replacementpassword"}, admin)[0] == 200
     for method, suffix, body, offset in [("GET", "", None, None), ("PATCH", "", b"abcd", 0), ("DELETE", "", None, None), ("POST", "/commit", None, None)]:
-        assert call(server, method, path + suffix, body, tokens[0], offset)[0] == 401
+        assert call(server, method, revoked_path + suffix, body, tokens[0], offset)[0] == 401
     code, refreshed = call(server, "POST", "/api/collections/users/auth-with-password", {"identity": "one@x.io", "password": "replacementpassword"})
     assert code == 200, refreshed
+    # Current constraints: a second session opened after both argon2id hashes, so the
+    # commit below runs well inside the TTL; maxSize shrinks after begin.
+    code, upload = begin(server, refreshed["token"], record)
+    assert code == 201, upload
+    path = "/api/uploads/" + upload["id"]
+    assert call(server, "PATCH", path, b"abcd", refreshed["token"], 0)[0] == 204
     col["fields"] = col["schema"]
     next(field for field in col["fields"] if field["name"] == "file")["options"]["maxSize"] = 2
     assert call(server, "PATCH", "/api/collections/" + col["id"], col, admin)[0] == 200
