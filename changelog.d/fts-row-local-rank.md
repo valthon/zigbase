@@ -1,2 +1,0 @@
-### Security
-- On SQLite, `?search=` no longer ranks with FTS5 `bm25`, whose corpus statistics span every tenant's rows of a collection: the order of one tenant's results could reveal whether another tenant's text contained a word (#495). Results are now ranked by a row-local score (`zb_rank`: per-term hit counts in the row, normalized by the row's length) and ties are broken by record `id` on both backends. Expect the relevance order of some SQLite searches to change; the matched rows are unchanged. The formula is in the search guide's Ranking section.

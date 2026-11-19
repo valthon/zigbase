@@ -1,6 +1,6 @@
 # Known Limitations
 
-ZigBase v0.13.0 is an early release. The gaps below are known and tracked for future releases.
+ZigBase v0.14.0 is an early release. The gaps below are known and tracked for future releases.
 
 ## Toolchain and test diagnostics
 - **Consumers require Zig 0.17.1.** ZigBase's library, server, examples, and tooling use the 0.17 APIs. Use `-Doptimize=safe` (or `debug`, `fast`, `small`) and the same spellings for `-Dbench-optimize`.
