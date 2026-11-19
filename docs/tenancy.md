@@ -222,12 +222,16 @@ same connection first. SQLite object-name collisions are checked without case se
 including indexes attached to other tables. Migrate those objects explicitly first; ambiguous SQL identifier references are treated
 conservatively as dependencies.
 
-Auth collections are excluded from unique-scope convergence at startup and on API updates.
-Their uniqueness behavior is unchanged from before this change: configured `identityFields`
+Auth collections keep table-wide uniqueness at startup and on API updates. Configured `identityFields`
 receive global partial unique indexes over non-empty values, and declared unique fields stay
 global. With the default `["email"]` identity, this change adds no username uniqueness;
 existing duplicate non-empty usernames remain accepted. Adding `tenant_field` does not opt
 an auth collection into per-tenant uniqueness.
+
+Startup verifies each configured identity index, including for runtime-created collections.
+A same-name migration object is adopted only if its definition matches the required unique
+index and non-empty predicate; incompatible or unreadable definitions refuse startup or
+the collection change without modifying that object. See [identity index adoption](framework.md).
 
 OpenAPI exposes `x-zigbase-unique-scope` (`tenant` or `global`) beside `x-zigbase-unique`;
 tenant scope also includes `x-zigbase-unique-tenant-field`. The admin schema editor shows
