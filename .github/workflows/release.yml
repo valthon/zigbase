@@ -42,11 +42,25 @@ jobs:
             zig: aarch64-macos
             runner: macos-latest
     runs-on: ${{ matrix.runner }}
+    env:
+      ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-global
     steps:
       - uses: actions/checkout@v7
       - uses: jdx/mise-action@v4
       - name: Assert tag matches build.zig.zon
         run: scripts/assert-version.sh "${GITHUB_REF_NAME#v}"
+      # Restore-only: reuse the global cache (package tarballs p/*.tar.gz, plus compiled
+      # objects) that ci.yml's main-branch runs saved, so a release does not depend on reaching Codeberg. Tag runs can read
+      # default-branch caches. Linux-only in practice (CI has no macOS jobs); macOS
+      # builds rely on the retried fetch below.
+      - name: Restore zig global cache from main
+        uses: actions/cache/restore@v5
+        with:
+          path: ${{ github.workspace }}/.zig-global
+          key: zig-global-${{ runner.os }}-zig0.17.1-${{ hashFiles('vendor/sqlite/sqlite3.c', 'build.zig', 'build.zig.zon') }}
+          restore-keys: zig-global-${{ runner.os }}-zig0.17.1-
+      - name: Fetch Zig packages (retries transient remote failures)
+        run: scripts/zig-fetch.sh
       - name: Build zigbase (${{ matrix.zig }})
         run: mise exec zig@0.17.1 -- zig build -Dtarget=${{ matrix.zig }} -Doptimize=safe -Dcpu=baseline
       - name: Stage binary
