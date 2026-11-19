@@ -50,6 +50,11 @@ done
 shopt -u nullglob
 
 if [ "${#FRAGMENTS[@]}" -eq 0 ]; then
+  if [ "$DRY_RUN" -eq 1 ]; then
+    # CI validates fragments with --dry-run; right after a release there are none, which is valid.
+    echo "no fragments in $FRAG_DIR/ — nothing to validate." >&2
+    exit 0
+  fi
   echo "::error::no fragments in $FRAG_DIR/ — nothing to assemble for $VERSION." >&2
   echo "Add changelog.d/<slug>.md fragments before releasing (see $FRAG_DIR/README.md)." >&2
   exit 1
