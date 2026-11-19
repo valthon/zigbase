@@ -7,23 +7,40 @@ const argon2 = std.crypto.pwhash.argon2;
 const bcrypt = std.crypto.pwhash.bcrypt;
 const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
 
-/// Argon2id cost parameters. Production uses `interactive_2id` (64 MiB, t=2) for real
-/// resistance. **Test builds** drop to deliberately weak params: the unit suite hashes
-/// and verifies passwords across ~700 tests, and at production cost that KDF work alone
-/// is ~25 s of every `zig build test`. The switch is keyed on `builtin.is_test`, so it
-/// affects ONLY the test binary — the shipped server binary, and the Playwright browser
-/// suite (which drives that real binary), always run full-strength params.
-const hash_params: argon2.Params = if (builtin.is_test)
-    .{ .t = 1, .m = 8, .p = 1 }
-else
-    argon2.Params.interactive_2id;
+const dev = @import("dev.zig");
+
+pub const fake_hash_env = "ZIGBASE_FAKE_HASH";
+const cheap_params: argon2.Params = .{ .t = 1, .m = 8, .p = 1 };
+var fake_hash = std.atomic.Value(bool).init(false);
+
+/// Only an explicit `1` opts in. The override is comptime-dead outside dev mode.
+pub fn resolveFakeHash(raw: ?[]const u8) bool {
+    if (!dev.enabled) return false;
+    return std.mem.eql(u8, raw orelse return false, "1");
+}
+
+/// Install at startup, before any password work. Unit tests retain their cheap cost.
+pub fn installFakeHash(enabled: bool) void {
+    if (!dev.enabled) return;
+    fake_hash.store(enabled, .release);
+}
+
+fn cheapHashActive() bool {
+    if (builtin.is_test) return true;
+    if (!dev.enabled) return false;
+    return fake_hash.load(.acquire);
+}
+
+fn hashParams(cheap: bool) argon2.Params {
+    return if (cheap) cheap_params else argon2.Params.interactive_2id;
+}
 
 /// Hash a password with argon2id, returning a PHC-format string allocated from `alloc`.
 pub fn hashPassword(io: std.Io, alloc: std.mem.Allocator, password: []const u8) ![]u8 {
     var buf: [256]u8 = undefined;
     const phc = try argon2.strHash(password, .{
         .allocator = alloc,
-        .params = hash_params,
+        .params = hashParams(cheapHashActive()),
     }, &buf, io);
     return alloc.dupe(u8, phc);
 }
@@ -34,21 +51,23 @@ pub fn verifyPassword(io: std.Io, alloc: std.mem.Allocator, phc: []const u8, pas
     return true;
 }
 
-/// A fixed, valid argon2id PHC hash with the same params `hashPassword` uses. Used to
-/// perform identity-independent argon2 work on a login miss so the response time of an
-/// unknown identity matches that of a known one (defeats account enumeration via a timing
-/// oracle). Both variants hash the plaintext "zigbase-login-timing-dummy"; the test build
-/// uses weak params (matching `hash_params`) so the timing-defense work stays cheap under
-/// the unit suite, while production keeps the real 64 MiB / t=2 cost.
-pub const dummy_password_hash = if (builtin.is_test)
-    "$argon2id$v=19$m=8,t=1,p=1$Nogl5w29zufCdU9yMIexgeEuZY1gLIIvqHdjpw3tA7c$8kCzMNdJBFhiyspDpZQLe0e2jmHnCXAQhNbrhC8SmoE"
-else
-    "$argon2id$v=19$m=65536,t=2,p=1$X6nNL1XIBemv6GtMawOzIiupjeI6RhVcq4OM6oHc2Ds$7q5akLEU/XJR2q91NLbc9ARqZfPFtOSdtSIQZBP4I2o";
+/// Both PHC constants hash "zigbase-login-timing-dummy". Select with the same
+/// cost as new password hashes; stored PHC strings always carry their own cost.
+fn dummyHash(cheap: bool) []const u8 {
+    return if (cheap)
+        "$argon2id$v=19$m=8,t=1,p=1$Nogl5w29zufCdU9yMIexgeEuZY1gLIIvqHdjpw3tA7c$8kCzMNdJBFhiyspDpZQLe0e2jmHnCXAQhNbrhC8SmoE"
+    else
+        "$argon2id$v=19$m=65536,t=2,p=1$X6nNL1XIBemv6GtMawOzIiupjeI6RhVcq4OM6oHc2Ds$7q5akLEU/XJR2q91NLbc9ARqZfPFtOSdtSIQZBP4I2o";
+}
+
+pub fn dummyPasswordHash() []const u8 {
+    return dummyHash(cheapHashActive());
+}
 
 /// Run an argon2 verify against the fixed dummy hash, discarding the result. Call this on a
 /// login miss (unknown identity / missing hash) to keep the work identity-independent.
 pub fn dummyVerify(io: std.Io, alloc: std.mem.Allocator) void {
-    _ = verifyPassword(io, alloc, dummy_password_hash, "zigbase-login-timing-dummy-mismatch");
+    _ = verifyPassword(io, alloc, dummyPasswordHash(), "zigbase-login-timing-dummy-mismatch");
 }
 
 // ---------------------------------------------------------------------------
@@ -255,9 +274,9 @@ test "genHex produces a lowercase-hex string of the requested length" {
 
 test "dummy login-timing hash is a well-formed argon2id PHC string" {
     const a = std.testing.allocator;
-    try std.testing.expect(std.mem.startsWith(u8, dummy_password_hash, "$argon2id$"));
+    try std.testing.expect(std.mem.startsWith(u8, dummyPasswordHash(), "$argon2id$"));
     // It verifies its own plaintext (proves the constant parses + is real work) ...
-    try std.testing.expect(verifyPassword(std.testing.io, a, dummy_password_hash, "zigbase-login-timing-dummy"));
+    try std.testing.expect(verifyPassword(std.testing.io, a, dummyPasswordHash(), "zigbase-login-timing-dummy"));
     // ... and dummyVerify (which uses a deliberately-mismatched plaintext) just runs the work.
     dummyVerify(std.testing.io, a);
 }
@@ -281,7 +300,7 @@ test "legacy tag round-trips and rejects everything outside the allowlist" {
     defer a.free(tagged);
     try std.testing.expectEqualStrings("$zblegacy$bcrypt$" ++ bc, tagged);
     try std.testing.expect(isLegacyHash(tagged));
-    try std.testing.expect(!isLegacyHash(dummy_password_hash)); // an argon2 PHC is not legacy
+    try std.testing.expect(!isLegacyHash(dummyPasswordHash())); // an argon2 PHC is not legacy
 
     const parsed = try parseLegacy(tagged);
     try std.testing.expectEqualStrings("bcrypt", parsed.algorithm);
@@ -345,4 +364,36 @@ test "verifyLegacy fails closed on garbage, and verifyPassword never accepts a l
     defer a.free(tagged);
     try std.testing.expect(!verifyPassword(std.testing.io, a, tagged, "abc"));
     try std.testing.expect(!verifyPassword(std.testing.io, a, bc, "abc"));
+}
+
+test "fake password hashing is opt-in and gated by dev mode" {
+    try std.testing.expect(!resolveFakeHash(null));
+    try std.testing.expect(!resolveFakeHash(""));
+    try std.testing.expect(!resolveFakeHash("0"));
+    try std.testing.expect(!resolveFakeHash("true"));
+    try std.testing.expectEqual(dev.enabled, resolveFakeHash("1"));
+    installFakeHash(true);
+    defer installFakeHash(false);
+    try std.testing.expectEqual(dev.enabled, fake_hash.load(.acquire));
+}
+
+test "login dummy PHC parameters match both password costs" {
+    inline for (.{ false, true }) |cheap| {
+        const params = hashParams(cheap);
+        var buf: [80]u8 = undefined;
+        const prefix = try std.mem.print(&buf, "$argon2id$v=19$m={d},t={d},p={d}$", .{ params.m, params.t, params.p });
+        try std.testing.expect(std.mem.startsWith(u8, dummyHash(cheap), prefix));
+        try std.testing.expect(verifyPassword(std.testing.io, std.testing.allocator, dummyHash(cheap), "zigbase-login-timing-dummy"));
+    }
+}
+
+test "active login dummy matches newly written password PHC cost" {
+    const a = std.testing.allocator;
+    const phc = try hashPassword(std.testing.io, a, "password");
+    defer a.free(phc);
+    // The fourth PHC field contains all cost parameters, ahead of salt and digest.
+    var written = std.mem.splitScalar(u8, phc, '$');
+    var dummy = std.mem.splitScalar(u8, dummyPasswordHash(), '$');
+    for (0..4) |_| try std.testing.expectEqualStrings(written.next().?, dummy.next().?);
+    try std.testing.expect(verifyPassword(std.testing.io, a, phc, "password"));
 }

@@ -3380,6 +3380,7 @@ fn loadCfg(environ: *const std.process.Environ.Map, sa: cli.ServeArgs) !config.C
     logging.apply(cfg.log_format, cfg.log_level, cfg.log_requests);
     // Warn AFTER the logger is configured, so the warning honors --log-format and
     // --log-level like every other record.
+    crypto.installFakeHash(cfg.fake_hash);
     config.warnUnknownVars(environ);
     return cfg;
 }
@@ -4955,6 +4956,7 @@ fn bootApp(
     // deterministic PRNG seeded from this value for reproducible snapshot tests. No-op + null
     // on a prod build (the gate is comptime-off; see entropy.zig).
     entropy_mod.install(cfg.fake_seed);
+    crypto.installFakeHash(cfg.fake_hash);
     if (std.mem.eql(u8, cfg.http_host, "0.0.0.0") or std.mem.eql(u8, cfg.http_host, "::")) {
         std.log.warn("binding to all interfaces ({s}); ensure a firewall/reverse proxy is in front (default is loopback 127.0.0.1)", .{cfg.http_host});
     }

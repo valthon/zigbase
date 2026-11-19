@@ -139,6 +139,10 @@ surface and the unit-test root. This is easy to forget and silently skips your t
 
 ### 2. Python / Playwright browser suite
 
+Python harnesses set `ZIGBASE_FAKE_HASH=1` to use cheap Argon2id parameters in dev-mode
+binaries, keeping hashing out of short timeout/TTL budgets. Hashing benchmarks must unset
+or override it. Production builds ignore it; see [the dev seams](docs/framework.md#14-test--dev-mode-determinism-seams).
+
 **Before running this, rebuild.** The suite shells out to whatever binary is already sitting in
 `zig-out/bin/` — if the tree has moved since your last `zig build` (a rebase, a stash, a branch
 switch, or just time passing while you edited), that binary can be stale without anything telling

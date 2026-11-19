@@ -33,6 +33,7 @@ def inventory_data(tmp_path, inventory_binary):
     result = subprocess.run(
         [inventory_binary, "schema", "apply", str(schema), "--data-dir", str(tmp_path)],
         env={**{key: value for key, value in os.environ.items() if not key.startswith("ZIGBASE_")},
+             "ZIGBASE_FAKE_HASH": "1",
              "ZIGBASE_JWT_SECRET": "inventory-fixture-secret-not-for-production"},
         capture_output=True, text=True, timeout=10,
     )

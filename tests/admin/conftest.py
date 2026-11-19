@@ -29,6 +29,7 @@ ZIG = ["mise", "exec", "zig@0.17.1", "--", "zig"]
 # Assigned, not setdefault: no test in this suite wants a backgrounded server,
 # so an inherited ZIGBASE_SERVE_BACKGROUND=1 would be a mistake to honor.
 os.environ["ZIGBASE_SERVE_BACKGROUND"] = "0"
+os.environ["ZIGBASE_FAKE_HASH"] = "1"
 
 @contextmanager
 def _reserve_port():

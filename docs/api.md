@@ -2078,7 +2078,7 @@ binary carries:
 | `admin` | The admin SPA + its API surface (`/_/`) is mounted. |
 | `analytics` | The analytics event-capture + rollup API is mounted. |
 | `collectionsFrozen` | This deployment was built with `App(.{ .collections_frozen = true })`: runtime collection DDL (`POST`/`PATCH`/`DELETE /api/collections`) is categorically disabled — schema evolves via `.migrations` + a redeploy. |
-| `devMode` | The binary was built with `-Ddev-mode` (dev-only seams: fake clock, fake entropy, fake field crypto). **Must never be true in production.** |
+| `devMode` | The binary was built with `-Ddev-mode` (dev-only seams: fake clock, fake entropy, cheap password hashing (`ZIGBASE_FAKE_HASH`), fake field crypto). **Must never be true in production.** |
 | `magicLink` | The passwordless magic-link auth method route group is mounted. |
 | `mailUnsubscribe` | The public one-click unsubscribe route (RFC 8058) is mounted. |
 | `mailWebhook` | The mail bounce/complaint webhook route is mounted. |

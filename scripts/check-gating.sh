@@ -86,6 +86,17 @@ if [ "${1:-}" = --image-thumbnails ]; then
   exit 0
 fi
 
+# Password-cost override: prove absence in a shipped configuration, with the
+# default dev binary as a positive control so a renamed env var cannot pass.
+DEV_MODE_OFF=zig-out/dev-mode-off/bin/zigbase
+mise exec zig@0.17.1 -- zig build -Doptimize=safe -Ddev-mode=false -p zig-out/dev-mode-off
+if strings "$DEV_MODE_OFF" | grep -F 'ZIGBASE_FAKE_HASH' >/dev/null; then
+  echo 'LEAK: password-cost override in dev-mode=false binary'; exit 1
+fi
+if ! strings zig-out/bin/zigbase | grep -F 'ZIGBASE_FAKE_HASH' >/dev/null; then
+  echo 'DRIFT: password-cost override absent in dev-mode binary'; exit 1
+fi
+
 FULL=zig-out/bin/zigbase
 check_inventory "$FULL"
 FULL2=zig-out/bin/full-fixture

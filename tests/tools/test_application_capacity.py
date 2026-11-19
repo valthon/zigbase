@@ -216,7 +216,7 @@ class Capacity(unittest.TestCase):
 
     @unittest.skipUnless(os.environ.get("ZIGBASE_TEST_CAPACITY_BINARY"), "set ZIGBASE_TEST_CAPACITY_BINARY for live app")
     def test_real_tenant_workload_and_provenance(self):
-        result = subprocess.run([sys.executable, str(SCRIPT), "--binary", os.environ["ZIGBASE_TEST_CAPACITY_BINARY"],
+        result = subprocess.run([sys.executable, str(ROOT / "tests/_capacity.py"), "--binary", os.environ["ZIGBASE_TEST_CAPACITY_BINARY"],
                                  "--tasks", "4", "--seconds", "30", "--warmup", "30", "--max-requests", "24", "--recovery-seconds", "1"],
                                 text=True, capture_output=True, timeout=120)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -247,7 +247,7 @@ class Capacity(unittest.TestCase):
 
     @unittest.skipUnless(os.environ.get("ZIGBASE_TEST_CAPACITY_WORKBENCH_BINARY"), "set instrumented capacity binary")
     def test_live_workbench_snapshots_include_http_and_durable_attempts(self):
-        result = subprocess.run([sys.executable, str(SCRIPT), "--binary",
+        result = subprocess.run([sys.executable, str(ROOT / "tests/_capacity.py"), "--binary",
                                  os.environ["ZIGBASE_TEST_CAPACITY_WORKBENCH_BINARY"], "--workbench",
                                  "--tasks", "4", "--concurrency", "2", "--stress-concurrency", "4",
                                  "--seconds", "2", "--warmup", "0", "--recovery-seconds", "2",

@@ -164,14 +164,9 @@ def test_realtime_owner_rules_deliver_live_but_not_expired(page, server, rule):
     _setup(page, {"listRule": rule, "viewRule": rule})
     browser = page.context.browser
     a_id = _signup(browser, server, "a@x.io")
-    b_id = _signup(browser, server, "b@x.io")
-    # Every argon2id hash eats into an 8 s TTL, and a debug build hashes slowly. Re-mint the
-    # admin session after the signups and mint B's token last: B's live window then holds no
-    # hash, and the admin's holds only B's one.
-    login(page)
+    b_id, b_tok = _signup_login(browser, server, "b@x.io")
     ra = _note(page, owner=a_id, title="A0")
     rb = _note(page, owner=b_id, title="B0")
-    b_tok = _user_token(browser, server, "b@x.io")
     sub = _anon(browser, server)
     sub.goto("/api/health")  # a same-origin document, so the in-page WebSocket passes the Origin check
     sub.evaluate(WS_CLIENT_JS, b_tok)

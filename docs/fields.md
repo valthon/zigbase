@@ -484,7 +484,8 @@ and for the `zigbase.testing` harness to boot such an app at all (previously imp
 boot fails closed with no key configured).
 
 - **Dev-build-only, never on a production binary.** Fake mode is gated by the same `dev_mode`
-  build option as the frozen clock and seeded entropy (`-Ddev-mode`, on by default in `Debug`,
+  build option as the frozen clock, seeded entropy, and cheap password hashing
+  (`ZIGBASE_FAKE_HASH=1`; `-Ddev-mode`, on by default in `Debug`,
   off in every release build — see [framework.md §14](framework.md#14-test--dev-mode-determinism-seams)).
   On a release binary the `ZIGBASE_FIELD_CRYPTO` env var is never even read; the mode is always
   `.real`.
