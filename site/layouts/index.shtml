@@ -16,7 +16,7 @@
           <a class="btn btn--secondary" href="$site.page('docs/why-zigbase').link()">Why ZigBase</a>
         </div>
         <div class="pitch-command"><code>npx zigbase init</code><a href="$site.page('docs/quick-start').link()">Quick start →</a></div>
-        <p class="pitch-meta">v0.13.0 · Apache-2.0 · Linux &amp; macOS · Early release</p>
+        <p class="pitch-meta">v0.14.0 · Apache-2.0 · Linux &amp; macOS · Early release</p>
       </div>
       <div class="architecture" aria-label="ZigBase application architecture">
         <div class="architecture-top"><span>Your application</span><span class="architecture-tag">COMPILED IN ZIG</span></div>

@@ -165,7 +165,7 @@ should pin a release, omit the local plain-HTTP cookie override, and keep the na
 ```yaml
 services:
   zigbase:
-    image: ghcr.io/valthon/zigbase:0.13.0
+    image: ghcr.io/valthon/zigbase:0.14.0
     restart: unless-stopped
     stop_grace_period: 30s
     ports:
@@ -221,7 +221,7 @@ app = "replace-with-your-app"
 primary_region = "iad"
 
 [build]
-  image = "ghcr.io/valthon/zigbase:0.13.0"
+  image = "ghcr.io/valthon/zigbase:0.14.0"
 
 [env]
   ZIGBASE_HTTP_HOST = "0.0.0.0"
@@ -301,7 +301,7 @@ IP-derived rate limits therefore see Railway's proxy address. Prefer an applicat
 when per-client enforcement is required.
 
 Add the stable JWT secret and mail credentials as Railway secret variables. Configure the service
-to use `ghcr.io/valthon/zigbase:0.13.0`, attach the volume, and set the healthcheck path to
+to use `ghcr.io/valthon/zigbase:0.14.0`, attach the volume, and set the healthcheck path to
 `/api/health`. Railway waits for HTTP 200 before activating a deployment, but currently uses that
 check only during deployment—not as continuous monitoring.
 

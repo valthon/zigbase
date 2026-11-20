@@ -2021,7 +2021,7 @@ full, only the work-count rejection is counted because it is checked first.
 
 ```json
 {
-  "zigbase": "0.13.0",
+  "zigbase": "0.14.0",
   "commit": "087ca67",
   "api": 1,
   "capabilities": {

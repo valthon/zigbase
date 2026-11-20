@@ -5,15 +5,15 @@
 Grab a <strong>prebuilt single binary</strong> for your platform, build
         it <strong>from source</strong> with Zig 0.17.1, or pull ZigBase in as an
 <strong>embeddable library</strong>. Current release:
-<code>v0.13.0</code>, Apache-2.0.
+<code>v0.14.0</code>, Apache-2.0.
 </p> </header> <section class="dl__section" aria-labelledby="binaries"> <h2 id="binaries">Release binaries</h2> <p>
 Prebuilt, statically-linked binaries for the
-<a href="https://github.com/valthon/zigbase/releases/tag/v0.13.0" target="_blank" rel="noopener noreferrer">v0.13.0 release</a>.
+<a href="https://github.com/valthon/zigbase/releases/tag/v0.14.0" target="_blank" rel="noopener noreferrer">v0.14.0 release</a>.
         Download, extract, and run — no toolchain required.
-</p> <div class="dl__table-wrap"> <table class="dl__table"> <thead> <tr> <th>Platform</th> <th>Architecture</th> <th>Download</th> </tr> </thead> <tbody> <tr> <td>Linux</td> <td><code>x86_64</code></td> <td> <a href="https://github.com/valthon/zigbase/releases/download/v0.13.0/zigbase-0.13.0-x86_64-linux-musl.tar.gz">zigbase-0.13.0-x86_64-linux-musl.tar.gz</a> </td> </tr><tr> <td>Linux</td> <td><code>aarch64</code></td> <td> <a href="https://github.com/valthon/zigbase/releases/download/v0.13.0/zigbase-0.13.0-aarch64-linux-musl.tar.gz">zigbase-0.13.0-aarch64-linux-musl.tar.gz</a> </td> </tr><tr> <td>macOS</td> <td><code>x86_64</code></td> <td> <a href="https://github.com/valthon/zigbase/releases/download/v0.13.0/zigbase-0.13.0-x86_64-macos.tar.gz">zigbase-0.13.0-x86_64-macos.tar.gz</a> </td> </tr><tr> <td>macOS</td> <td><code>aarch64</code></td> <td> <a href="https://github.com/valthon/zigbase/releases/download/v0.13.0/zigbase-0.13.0-aarch64-macos.tar.gz">zigbase-0.13.0-aarch64-macos.tar.gz</a> </td> </tr> </tbody> </table> </div> <p class="dl__links">
+</p> <div class="dl__table-wrap"> <table class="dl__table"> <thead> <tr> <th>Platform</th> <th>Architecture</th> <th>Download</th> </tr> </thead> <tbody> <tr> <td>Linux</td> <td><code>x86_64</code></td> <td> <a href="https://github.com/valthon/zigbase/releases/download/v0.14.0/zigbase-0.14.0-x86_64-linux-musl.tar.gz">zigbase-0.14.0-x86_64-linux-musl.tar.gz</a> </td> </tr><tr> <td>Linux</td> <td><code>aarch64</code></td> <td> <a href="https://github.com/valthon/zigbase/releases/download/v0.14.0/zigbase-0.14.0-aarch64-linux-musl.tar.gz">zigbase-0.14.0-aarch64-linux-musl.tar.gz</a> </td> </tr><tr> <td>macOS</td> <td><code>x86_64</code></td> <td> <a href="https://github.com/valthon/zigbase/releases/download/v0.14.0/zigbase-0.14.0-x86_64-macos.tar.gz">zigbase-0.14.0-x86_64-macos.tar.gz</a> </td> </tr><tr> <td>macOS</td> <td><code>aarch64</code></td> <td> <a href="https://github.com/valthon/zigbase/releases/download/v0.14.0/zigbase-0.14.0-aarch64-macos.tar.gz">zigbase-0.14.0-aarch64-macos.tar.gz</a> </td> </tr> </tbody> </table> </div> <p class="dl__links">
 Verify checksums with
-<a href="https://github.com/valthon/zigbase/releases/download/v0.13.0/SHA256SUMS">SHA256SUMS</a>, or browse the
-<a href="https://github.com/valthon/zigbase/releases/tag/v0.13.0" target="_blank" rel="noopener noreferrer">full release page</a>.
+<a href="https://github.com/valthon/zigbase/releases/download/v0.14.0/SHA256SUMS">SHA256SUMS</a>, or browse the
+<a href="https://github.com/valthon/zigbase/releases/tag/v0.14.0" target="_blank" rel="noopener noreferrer">full release page</a>.
 </p> <aside class="dl__note" role="note"> <p class="dl__note-label">Note — macOS Gatekeeper</p> <p>
 The macOS binaries are <strong>unsigned</strong>. Gatekeeper may block
           the first run; clear the quarantine attribute after extracting:
@@ -27,7 +27,7 @@ npx zigbase serve --data-dir ./zb_data</code></pre> <p class="dl__links"> <code>
 </p> </section> <section class="dl__section" aria-labelledby="docker"> <h2 id="docker">Docker</h2> <p>
 The official image ships the same binary as the release tarballs above — no
         Windows build required.
-</p> <pre class="dl__code"><code>docker run -d -p 8090:8090 -v zigbase_data:/data ghcr.io/valthon/zigbase:0.13.0</code></pre> <p class="dl__links"> <code>latest</code>, <code>{X.Y.Z}</code>, and rolling <code>{X.Y}</code>/<code>{X}</code>
+</p> <pre class="dl__code"><code>docker run -d -p 8090:8090 -v zigbase_data:/data ghcr.io/valthon/zigbase:0.14.0</code></pre> <p class="dl__links"> <code>latest</code>, <code>{X.Y.Z}</code>, and rolling <code>{X.Y}</code>/<code>{X}</code>
 tags are published to <a href="https://github.com/valthon/zigbase/pkgs/container/zigbase" target="_blank" rel="noopener noreferrer">ghcr.io/valthon/zigbase</a>.
         See the <a href="$site.page('docs/docker').link().suffix('')">Docker guide</a> for the data-volume and non-root-user details.
 </p> </section> <section class="dl__section" aria-labelledby="from-source"> <h2 id="from-source">Build from source</h2> <p>
